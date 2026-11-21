@@ -21123,8 +21123,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 //
 // The named move is the same body run for triplets its caller names (ggml_sycl_expert_move_transaction_run): each is
 // checked against the published plan (moe_expert_move_validate), prepared and moved on its own, so one refused leaves
-// the others to move, and all that moved are published in one plan. It keeps no ledger. Its admit moves a host triplet
-// to the device from its pinned host copy (unified_cache::admit_host_triplet). It runs only while nothing is lent.
+// the others to move, and all that moved are published in one plan. It keeps no ledger. Its evicts run first: each
+// moves a resident triplet to pinned host storage through the loan's cache body (unified_cache::loan_expert_triplet),
+// and its device storage comes back only when a later deferred-free pass reaps the entries it retired, never to an
+// admit in the same call. Its admit moves a host triplet to the device from its pinned host copy
+// (unified_cache::admit_host_triplet). It runs only while nothing is lent.
 //
 // Every direction sizes from the tensor (ggml_sycl_expert_prepare_triplet): each copy moves the expert's bytes per
 // expert (nb[2]), a host copy holds exactly them, and a device copy is minted at the staged size with its padded tail
@@ -21206,10 +21209,11 @@ static bool ggml_sycl_expert_loan_resolve_registered(const ggml_sycl::lifecycle:
     return true;
 }
 
-// Which way the expert placement transaction moves whole triplets (llama.cpp-sif1). A loan moves resident triplets to
-// pinned host storage for a prompt phase's ring; a refill moves lent triplets back to the device after it. A named
-// move moves the triplets its caller names, each on its own, and keeps no ledger: its admit moves a host triplet to
-// the device. One body runs all three, as the KV probe and publish share one.
+// Which way the expert placement transaction moves whole triplets. A loan moves resident triplets to pinned host
+// storage for a prompt phase's ring; a refill moves lent triplets back to the device after it. A named move moves the
+// triplets its caller names, each on its own, and keeps no ledger: its evict moves a resident triplet to pinned host
+// storage and its admit moves a host triplet to the device. One body runs all three, as the KV probe and publish share
+// one.
 enum class ggml_sycl_expert_txn_direction {
     LOAN,
     REFILL,
@@ -21218,11 +21222,13 @@ enum class ggml_sycl_expert_txn_direction {
 
 // What one triplet's move is: the cache body that moves it, the way its bytes go, and the words its refusals use. The
 // direction says what a call does and the kind what each of its triplets does, so the body asks one table instead of
-// a chain of direction tests at every refusal.
+// a chain of direction tests at every refusal. A named move's triplets are ADMIT or EVICT, by the list that names
+// them; an evict is a loan's move under a named move's rules.
 enum class ggml_sycl_expert_move_kind {
     LOAN,
     REFILL,
     ADMIT,
+    EVICT,
 };
 
 // The words one kind's refusals and log lines use: a member no tensor resolves, no cache entry to copy from, an
@@ -21242,23 +21248,29 @@ static ggml_sycl_expert_move_texts ggml_sycl_expert_move_texts_of(ggml_sycl_expe
             return { "no tensor for a lent expert", "not lent", "exception while refilling", "refill" };
         case ggml_sycl_expert_move_kind::ADMIT:
             return { "no tensor for a named expert", "not on host", "exception while moving", "named move" };
+        case ggml_sycl_expert_move_kind::EVICT:
+            return { "no tensor for a named expert", "not resident", "exception while moving", "named move" };
     }
     GGML_ABORT("unknown expert move kind");
 }
 
-// A refill or an admit copies host bytes to the device; a loan copies device bytes to the host.
+// A refill or an admit copies host bytes to the device; a loan or an evict copies device bytes to the host.
 static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
     return kind == ggml_sycl_expert_move_kind::REFILL || kind == ggml_sycl_expert_move_kind::ADMIT;
 }
 
 // One named triplet's answer from a named move: moved (and the plan that says so published), or refused with the
 // reason, BUSY when a later boundary may move it. reason is null until the transaction decides; the entry gives a
-// triplet the body never decided the call's own answer, since a refusal of the whole call refuses each.
+// triplet the body never decided the call's own answer, since a refusal of the whole call refuses each. to_device
+// says which list named it, the admits' or the evicts'. device_bytes is the device storage a moved triplet took (an
+// admit) or gives back once the cache reaps the entries it retired (an evict).
 struct ggml_sycl_expert_move_outcome {
     ggml_sycl::moe_expert_triplet_ref triplet;
-    bool                              moved  = false;
-    ggml_sycl_txn_result              code   = ggml_sycl_txn_result::REFUSED;
-    const char *                      reason = nullptr;
+    bool                              to_device    = true;
+    bool                              moved        = false;
+    ggml_sycl_txn_result              code         = ggml_sycl_txn_result::REFUSED;
+    const char *                      reason       = nullptr;
+    size_t                            device_bytes = 0;
 };
 
 // Per device, the triplets lent and not yet re-admitted, in the order they were lent, under the identity of the
@@ -21400,22 +21412,29 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
     return keys;
 }
 
-// A refill or admit refusal is final when the same inputs give it again with nothing changed, so a later boundary
-// would meet it again: the arguments or a member are malformed; the device storage is not VRAM of the cache's card
-// owned outside the cache, which the WEIGHT zone allocator the transaction mints from never changes (a full zone stops
-// the transaction before the cache is asked); the host copy is not one the direction copies from (a loan's for a
-// refill, whole pinned storage in a host zone for an admit), or is gone, or holds fewer bytes than the expert's tensor
-// says one expert has; or the device storage's size is not the one the direction requires. A refill drops such a
-// triplet from the ledger rather than retrying it at every decode graph, and a named move answers it REFUSED. Every
-// other refusal clears by itself, so it is transient (BUSY for a named move) and the triplet is tried again at the
-// next boundary: a load or a plan publication in flight, a retired device entry not yet reaped, a submit or an
-// allocation that threw, a host copy changed between the check and the publish.
+// A cache refusal is final when the same inputs give it again with nothing changed, so a later boundary would meet it
+// again. One list serves both cache bodies, the copy to the device (a refill or an admit) and the copy to the host (an
+// evict; a loan's refusal ends the loan whatever its class). To the device: the arguments or a member are malformed;
+// the device storage is not VRAM of the cache's card owned outside the cache, which the WEIGHT zone allocator the
+// transaction mints from never changes (a full zone stops the transaction before the cache is asked); the host copy
+// is not one the direction copies from (a loan's for a refill, whole pinned storage in a host zone for an admit), or
+// is gone, or holds fewer bytes than the expert's tensor says one expert has; or the device storage's size is not the
+// one the direction requires. To the host: the host storage is not pinned, which the pinned pool the transaction mints
+// from never changes; the device entry is gone, not on the device, in a layout the copy cannot read, a view into a
+// bulk tensor's shared allocation, or shorter than the expert; or the host storage is shorter than the expert. A
+// refill drops such a triplet from the ledger rather than retrying it at every decode graph, and a named move answers
+// it REFUSED. Every other refusal clears by itself, so it is transient (BUSY for a named move) and the triplet is
+// tried again at the next boundary: a load or a plan publication in flight, a retired entry not yet reaped, storage a
+// retention still holds, a submit, an allocation or a registration that threw, an entry changed between the check
+// and the publish.
 static bool ggml_sycl_expert_move_refusal_is_final(const char * reason) {
     static const char * const final_reasons[] = {
-        "invalid arguments", "invalid member",       "device storage not owned",
-        "not lent",          "not on host",          "layout",
-        "not a lent copy",   "host copy not pinned", "host copy not published",
-        "host copy size",    "device storage size"
+        "invalid arguments", "invalid member",        "device storage not owned",
+        "not lent",          "not on host",           "layout",
+        "not a lent copy",   "host copy not pinned",  "host copy not published",
+        "host copy size",    "device storage size",   "host storage not pinned",
+        "not resident",      "not on device",         "shared storage",
+        "device entry size", "host storage too small"
     };
     for (const char * final_reason : final_reasons) {
         if (std::strcmp(reason, final_reason) == 0) {
@@ -21437,27 +21456,31 @@ static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t si
     return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
 }
 
-// A named move's selection: the published plan's verdict on each named triplet (moe_expert_move_validate). A triplet
-// the plan refuses takes that refusal as its outcome, REFUSED; the others' keys come out in list order, gate, up and
-// down, and `place` receives each one's index in `moves`.
+// A named move's selection: the published plan's verdict on each named triplet (moe_expert_move_validate), the evicts
+// and the admits judged together. `moves` holds the evicts first, as the plan judges them, so a triplet named in both
+// lists is refused where the plan says. A triplet the plan refuses takes that refusal as its outcome, REFUSED; the
+// others' keys come out in list order, gate, up and down, and `place` receives each one's index in `moves`.
 static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_named_select(
     const ggml_sycl::placement_plan &            plan,
     int                                          device,
     std::vector<ggml_sycl_expert_move_outcome> & moves,
     std::vector<size_t> &                        place) {
+    std::vector<ggml_sycl::moe_expert_triplet_ref> evict;
     std::vector<ggml_sycl::moe_expert_triplet_ref> admit;
-    admit.reserve(moves.size());
     for (const ggml_sycl_expert_move_outcome & m : moves) {
-        admit.push_back(m.triplet);
+        (m.to_device ? admit : evict).push_back(m.triplet);
     }
-    const ggml_sycl::moe_expert_move_check       check = ggml_sycl::moe_expert_move_validate(plan, device, {}, admit);
+    const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, admit);
     std::vector<ggml_sycl::expert_placement_key> keys;
     keys.reserve(3 * moves.size());
     place.reserve(moves.size());
+    size_t n_evict = 0;
+    size_t n_admit = 0;
     for (size_t i = 0; i < moves.size(); ++i) {
-        if (check.admit[i]) {
+        const char * verdict = moves[i].to_device ? check.admit[n_admit++] : check.evict[n_evict++];
+        if (verdict) {
             moves[i].code   = ggml_sycl_txn_result::REFUSED;
-            moves[i].reason = check.admit[i];
+            moves[i].reason = verdict;
             continue;
         }
         for (int r = 0; r < 3; ++r) {
@@ -21503,7 +21526,8 @@ struct ggml_sycl_expert_prepared_triplet {
 // tail the cache zero-fills behind the copy. So an expert that goes to the host and back does not grow, and its record
 // keeps resolving. A member with no cache entry to copy from stops with the refusal the cache would give. Returns null
 // when every member is prepared, else the refusal, with *transient true when a later boundary may prepare it: a full
-// WEIGHT zone, which the ring gives back. The storage minted before a refusal goes back with `out`.
+// WEIGHT zone, which the ring gives back, or an evict's exhausted pinned pool. The storage minted before a refusal goes
+// back with `out`.
 static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache &             cache,
                                                      int                                    device,
                                                      const ggml_sycl::placement_plan &      plan,
@@ -21542,6 +21566,9 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
         } else {
             storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);
             if (!storage.valid()) {
+                // An evict is tried again at a later boundary, by when an admit's or a refill's host copy may have
+                // gone back to the pool. A loan refuses: its ring asks again at its next shortfall.
+                *transient = out.kind == ggml_sycl_expert_move_kind::EVICT;
                 return "host pinned pool exhausted";
             }
         }
@@ -21778,9 +21805,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     }
 
     // Before the inventory lock: map each member to the cache and mint its storage owner-first, pinned host storage
-    // for a loan and WEIGHT zone storage on the device for a refill or an admit. A triplet that cannot be prepared ends
-    // a loan's or a refill's list, and the ones before it still move; a named move refuses that triplet alone and goes
-    // on. A refill or an admit that finds no room in the zone is tried again at a later boundary.
+    // for a loan or an evict and WEIGHT zone storage on the device for a refill or an admit. A triplet that cannot be
+    // prepared ends a loan's or a refill's list, and the ones before it still move; a named move refuses that triplet
+    // alone and goes on. A refill or an admit that finds no room in the zone, or an evict none in the pinned pool, is
+    // tried again at a later boundary.
     ggml_sycl_expert_loan_resolver registered;
     if (!resolver) {
         const ggml_sycl::lifecycle::ModelToken owner = ggml_sycl_identity_owner(current);
@@ -21790,7 +21818,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         resolver = &registered;
     }
 
-    // Each triplet's kind: a loan's and a refill's are the call's own, and a named move's are admits.
+    // The call's kind: a loan's and a refill's triplets are all of it, and a named move's are admits unless the evict
+    // list names them.
     const ggml_sycl_expert_move_kind kind = refill ? ggml_sycl_expert_move_kind::REFILL :
                                             named  ? ggml_sycl_expert_move_kind::ADMIT :
                                                      ggml_sycl_expert_move_kind::LOAN;
@@ -21807,8 +21836,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     const char *                                   unpreparable_reason = nullptr;
     for (uint32_t t = 0; t < n_selected && !stop; ++t) {
         ggml_sycl_expert_prepared_triplet triplet;
-        triplet.kind  = kind;
         triplet.named = named ? named_place[t] : 0;
+        triplet.kind  = named && !(*named_moves)[triplet.named].to_device ? ggml_sycl_expert_move_kind::EVICT : kind;
         stop = ggml_sycl_expert_prepare_triplet(*cache, device, *current->plan, &keys[3 * t], *resolver, triplet,
                                                 &transient);
         if (!stop) {
@@ -21877,11 +21906,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
     std::exception_ptr                 escaped;
-    // A loan's drops keep a lease on every view they take here, retained after the loop (llama.cpp-6aj4).
+    // A loan's or an evict's drops keep a lease on every view they take here, retained after the loop.
     std::vector<ggml_sycl::mem_handle> lent_views;
     for (ggml_sycl_expert_prepared_triplet & triplet : prepared) {
         const bool                    to_device = ggml_sycl_expert_move_to_device(triplet.kind);
         const bool                    admit     = triplet.kind == ggml_sycl_expert_move_kind::ADMIT;
+        const bool                    evict     = triplet.kind == ggml_sycl_expert_move_kind::EVICT;
         ggml_sycl::expert_move_record record;
         bool                          loaned = false;
         try {
@@ -21898,9 +21928,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             loaned = !to_device ? cache->loan_expert_triplet(triplet.members, record) :
                      admit      ? cache->admit_host_triplet(triplet.members, record) :
                                   cache->refill_lent_triplet(triplet.members, record);
-            // A named triplet the cache refuses is refused alone, REFUSED when a later boundary would meet the
-            // refusal again and BUSY otherwise, and the next one moves; nothing of it moved.
-            if (!loaned && admit) {
+            // A named triplet the cache refuses, admit or evict, is refused alone, REFUSED when a later boundary would
+            // meet the refusal again and BUSY otherwise, and the next one moves; nothing of it moved.
+            if (!loaned && (admit || evict)) {
                 refuse_named(triplet.named,
                              ggml_sycl_expert_move_refusal_is_final(record.reason) ? ggml_sycl_txn_result::REFUSED :
                                                                                      ggml_sycl_txn_result::BUSY,
@@ -21926,9 +21956,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                 }
             } else {
                 // Drop each extra's leases on its withdrawn device copy, before anything that allocates, so only the
-                // retention below holds the retired entry until the loan's boundary drains it: every storage-record,
-                // pointer-table, route-table and hybrid-record view of the entry, matched by the key the loan retired
-                // it under, and then any device record left for the expert.
+                // retention below holds the retired entry: every storage-record, pointer-table, route-table and
+                // hybrid-record view of the entry, matched by the key the cache retired it under, and then any device
+                // record left for the expert. A loan and an evict alike: each drop and record change moves the
+                // tensor's storage generation, so a decode route stamped before this move decides again.
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
@@ -21956,7 +21987,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         }
         // A triplet the cache moved has moved whatever followed, so the plan says where it now lives and the ledger
         // records it: a lent triplet is appended (into the room reserved above), a re-admitted one leaves the back. A
-        // named move keeps no ledger; its outcome says the triplet moved, decided once the plan is published.
+        // named move keeps no ledger; its outcome says the triplet moved, decided once the plan is published, and the
+        // device storage it took or gives back.
         if (loaned) {
             const ggml_sycl::expert_placement_key placed[3] = {
                 triplet.members[0].placement,
@@ -21985,7 +22017,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                     ledger.triplet_bytes.pop_back();
                     break;
                 case ggml_sycl_expert_move_kind::ADMIT:
-                    (*named_moves)[triplet.named].moved = true;
+                case ggml_sycl_expert_move_kind::EVICT:
+                    (*named_moves)[triplet.named].moved        = true;
+                    (*named_moves)[triplet.named].device_bytes = record.device_bytes;
                     break;
             }
             ++lent;
@@ -21995,12 +22029,14 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             break;
         }
     }
-    // The views the loan dropped stay leased until the device's execution queue passes a barrier, so no kernel still
-    // reading a pointer table or a hybrid decode record sees a freed buffer. The boundary that ran the loan drains the
-    // retention, so the deferred-free pass that follows erases each withdrawn entry, or the next pass does when that
-    // bounded drain times out (llama.cpp-6aj4). A failure to retain them (the barrier's submit, or
-    // the retention's allocation) joins the loop's exception, so the triplets already lent are still published; only
-    // then do the views go at once.
+    // The views a loan or an evict dropped stay leased until the device's execution queue passes a barrier, so no
+    // kernel still reading a pointer table or a hybrid decode record sees a freed buffer. The boundary that ran a loan
+    // drains the retention, so the deferred-free pass that follows erases each withdrawn entry, or the next pass does
+    // when that bounded drain times out. A named move waits for nothing: the background worker releases its evicts'
+    // retention once the barrier completes, and a later deferred-free pass erases the entries and returns their room
+    // to the WEIGHT zone. So an evict's device storage is never room for an admit in the same call. A failure to retain
+    // them (the barrier's submit, or the retention's allocation) joins the loop's exception, so the triplets already
+    // moved are still published; only then do the views go at once.
     if (!lent_views.empty()) {
         try {
             // Null only before the device has a cache or a TP queue, and a loan runs on the cache; a null queue would
@@ -22095,18 +22131,28 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         GGML_LOG_DEBUG("[MOE-EXEC] refill device %d: %u triplets, %zu MiB re-admitted, %u still lent (%s)\n", device,
                        lent, freed / (1024 * 1024), result.n_remaining, reason);
     } else if (named) {
-        result.bytes_readmitted = freed;
         // A triplet the cache moved has moved now that the plan saying so is published. A lost swap never gets here,
-        // and its entry answers each such triplet with the call's refusal.
+        // and its entry answers each such triplet with the call's refusal. The bytes are summed per direction, since
+        // the two are not one figure: an admit took its storage now, and an evict gives its back only when the cache
+        // reaps the entries it retired.
+        uint32_t n_evicted = 0;
         for (ggml_sycl_expert_move_outcome & m : *named_moves) {
-            if (m.moved) {
-                m.code   = ggml_sycl_txn_result::ACCEPTED;
-                m.reason = "OK";
+            if (!m.moved) {
+                continue;
+            }
+            m.code   = ggml_sycl_txn_result::ACCEPTED;
+            m.reason = "OK";
+            if (m.to_device) {
+                result.bytes_readmitted += m.device_bytes;
+            } else {
+                result.bytes_freed += m.device_bytes;
+                ++n_evicted;
             }
         }
         // Its caller reads each triplet's answer, so the line is DEBUG.
-        GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u triplets, %zu MiB admitted (%s)\n", device, lent,
-                       freed / (1024 * 1024), reason);
+        GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\n",
+                       device, n_evicted, result.bytes_freed / (1024 * 1024), lent - n_evicted,
+                       result.bytes_readmitted / (1024 * 1024), reason);
     } else {
         result.bytes_freed = freed;
         if (stop) {
@@ -22133,21 +22179,28 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                     resolver, out, warn_busy);
 }
 
-// The triplets a named move admits, in the order it tries them. An evict list joins this request, judged and moved
-// before the admits, without changing a caller that names only admits.
+// The triplets a named move moves, in the order it tries them: the evicts first, each from the device to pinned host
+// storage, then the admits, each from its pinned host copy to the device. A caller that names only admits leaves the
+// evict list empty.
 struct ggml_sycl_expert_move_request {
+    std::vector<ggml_sycl::moe_expert_triplet_ref> evict;
     std::vector<ggml_sycl::moe_expert_triplet_ref> admit;
 };
 
 // What a named move did. accepted when a triplet moved and the plan that says so was published: the call is then
 // ACCEPTED, and `reason` is "OK" or, when a triplet was refused, its refusal. Otherwise the call is BUSY when any
-// refusal was (a later boundary may move that triplet) and REFUSED when none was. admitted holds one outcome per
-// admit-list triplet, in its order. A call that ends in an exception writes none of it (see the entry).
+// refusal was (a later boundary may move that triplet) and REFUSED when none was. evicted and admitted hold one
+// outcome per triplet of each list, in its order. The bytes are per direction: an evict's device storage comes back
+// only when the cache reaps the entries it retired, after the call, so no admit in the same call can use it. A call
+// that ends in an exception writes none of it (see the entry).
 struct ggml_sycl_expert_move_result {
     bool                                       accepted       = false;
-    uint32_t                                   n_moved        = 0;
+    uint32_t                                   n_evicted      = 0;
+    uint32_t                                   n_admitted     = 0;
+    size_t                                     bytes_evicted  = 0;  // device storage the evicted triplets give back
     size_t                                     bytes_admitted = 0;  // device storage the admitted triplets took
     const char *                               reason         = "none";
+    std::vector<ggml_sycl_expert_move_outcome> evicted;
     std::vector<ggml_sycl_expert_move_outcome> admitted;
 };
 
@@ -22163,9 +22216,12 @@ struct ggml_sycl_expert_move_result {
     const ggml_sycl_expert_move_request &  request,
     const ggml_sycl_expert_loan_resolver * resolver,
     ggml_sycl_expert_move_result *         out) {
-    std::vector<ggml_sycl_expert_move_outcome> moves(request.admit.size());
+    // One list, the evicts first, as the plan judges them and the body moves them.
+    const size_t                               n_evict = request.evict.size();
+    std::vector<ggml_sycl_expert_move_outcome> moves(n_evict + request.admit.size());
     for (size_t i = 0; i < moves.size(); ++i) {
-        moves[i].triplet = request.admit[i];
+        moves[i].to_device = i >= n_evict;
+        moves[i].triplet   = i < n_evict ? request.evict[i] : request.admit[i - n_evict];
     }
     ggml_sycl_expert_loan_result answer;
     const ggml_sycl_txn_result   code = ggml_sycl_expert_txn_run(
@@ -22181,12 +22237,22 @@ struct ggml_sycl_expert_move_result {
             m.reason = answer.reason;
         }
     }
+    // Each outcome goes back to its own list, and the counts and bytes are summed per direction.
     if (out) {
-        out->accepted       = answer.accepted;
-        out->n_moved        = answer.n_triplets;
-        out->bytes_admitted = answer.bytes_readmitted;
-        out->reason         = answer.reason;
-        out->admitted       = std::move(moves);
+        ggml_sycl_expert_move_result r;
+        r.accepted = answer.accepted;
+        r.reason   = answer.reason;
+        for (ggml_sycl_expert_move_outcome & m : moves) {
+            if (m.moved && m.to_device) {
+                ++r.n_admitted;
+                r.bytes_admitted += m.device_bytes;
+            } else if (m.moved) {
+                ++r.n_evicted;
+                r.bytes_evicted += m.device_bytes;
+            }
+            (m.to_device ? r.admitted : r.evicted).push_back(m);
+        }
+        *out = std::move(r);
     }
     return code;
 }
@@ -23615,13 +23681,18 @@ bool test_admit_outcome_is(const ::ggml_sycl_expert_move_outcome & m,
     return m.moved == moved && m.code == code && m.reason && std::strcmp(m.reason, reason) == 0;
 }
 
-// A named move's answer, and its first outcome when it has one, as a failure message names them.
+// A named move's answer, and the first outcome of each list when it has one, as a failure message names them.
 std::string test_admit_answer(::ggml_sycl_txn_result code, const ::ggml_sycl_expert_move_result & result) {
-    const ::ggml_sycl_expert_move_outcome * m = result.admitted.empty() ? nullptr : &result.admitted.front();
-    return test_loan_fail("code=%d accepted=%d moved=%u bytes=%zu (%s); %zu outcomes, the first moved=%d code=%d (%s)",
-                          (int) code, (int) result.accepted, result.n_moved, result.bytes_admitted, result.reason,
-                          result.admitted.size(), m ? (int) m->moved : -1, m ? (int) m->code : -1,
-                          m && m->reason ? m->reason : "none");
+    auto first = [](const std::vector<::ggml_sycl_expert_move_outcome> & list) {
+        const ::ggml_sycl_expert_move_outcome * m = list.empty() ? nullptr : &list.front();
+        return test_loan_fail("%zu outcomes, the first moved=%d code=%d (%s)", list.size(), m ? (int) m->moved : -1,
+                              m ? (int) m->code : -1, m && m->reason ? m->reason : "none");
+    };
+    return test_loan_fail(
+        "code=%d accepted=%d evicted=%u (%zu bytes) admitted=%u (%zu bytes) (%s); evicts: %s; "
+        "admits: %s",
+        (int) code, (int) result.accepted, result.n_evicted, result.bytes_evicted, result.n_admitted,
+        result.bytes_admitted, result.reason, first(result.evicted).c_str(), first(result.admitted).c_str());
 }
 
 }  // namespace
@@ -25713,7 +25784,7 @@ std::string test_expert_admit_zero_fills_a_padded_tail() {
         return test_loan_fail("the admit took %llu staged host-to-device copies, not the direct DMA",
                               (unsigned long long) copies);
     }
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         result.bytes_admitted != 3 * staged || std::strcmp(result.reason, "OK") != 0 || result.admitted.size() != 1 ||
         !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
         return "the admit of one padded triplet answered " + test_admit_answer(code, result);
@@ -25814,7 +25885,7 @@ std::string test_expert_admit_refuses_a_file_mapped_member() {
     request.admit.push_back({ /*layer_id=*/1, /*expert_id=*/1 });
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         result.bytes_admitted != 3 * bytes || std::strcmp(result.reason, "host copy not pinned") != 0 ||
         result.admitted.size() != 2 ||
         !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::REFUSED, "host copy not pinned") ||
@@ -25874,7 +25945,7 @@ std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full() {
         ::ggml_sycl_expert_move_result result;
         const ::ggml_sycl_txn_result   code =
             ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-        if (code != ::ggml_sycl_txn_result::BUSY || result.accepted || result.n_moved != 0 ||
+        if (code != ::ggml_sycl_txn_result::BUSY || result.accepted || result.n_admitted != 0 ||
             result.bytes_admitted != 0 || std::strcmp(result.reason, reason) != 0 || result.admitted.size() != 1 ||
             !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::BUSY, reason)) {
             return test_loan_fail("%s, the admit answered %s, not BUSY \"%s\"", when,
@@ -25954,7 +26025,7 @@ std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full() {
     }
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         result.bytes_admitted != 3 * bytes ||
         !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
         return "the admit with the ledger empty and the room back answered " + test_admit_answer(code, result);
@@ -26006,7 +26077,7 @@ std::string test_expert_admit_returns_the_host_zone_bytes() {
     request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
         return "the admit answered " + test_admit_answer(code, result);
     }
@@ -26064,7 +26135,7 @@ std::string test_expert_admit_completes_a_block_read_through_its_table() {
     request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
         return "the admit that completes the block answered " + test_admit_answer(code, result);
     }
@@ -26191,7 +26262,7 @@ std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy() {
     request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         result.bytes_admitted != 3 * staged || std::strcmp(result.reason, "OK") != 0 || result.admitted.size() != 1 ||
         !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
         return "the admit from longer host copies answered " + test_admit_answer(code, result);
@@ -26277,7 +26348,7 @@ std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor() {
     request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_moved != 0 ||
+    if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_admitted != 0 ||
         result.bytes_admitted != 0 || std::strcmp(result.reason, "host copy size") != 0 ||
         result.admitted.size() != 1 ||
         !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::REFUSED, "host copy size")) {
@@ -26351,7 +26422,7 @@ std::string test_expert_admit_completes_a_block_the_direct_route_serves() {
     request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
     ::ggml_sycl_expert_move_result result;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_moved != 1 ||
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
         !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
         return "the admit that completes the block answered " + test_admit_answer(code, result);
     }
