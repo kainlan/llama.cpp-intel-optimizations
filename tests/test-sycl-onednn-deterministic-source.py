@@ -27,14 +27,21 @@ attribute object the backend builds carries it, so this gate holds that, and hol
       never decides anything. Any third read fails;
   D5  every primitive descriptor is built with an attribute: its last argument names an attribute object of the
       file (one D3 holds, or a const reference parameter that carries one), whether it is built with parentheses or
-      braces; no descriptor is built through the C API, where a null attribute would pass unseen;
+      braces; no descriptor is built through the C API, where a null attribute would pass unseen; and every call of
+      a function that takes an attribute by reference (the primitive cache's get_or_create) passes, in that
+      position, an attribute object this pin holds, never a temporary or a fresh `{}` the helper never saw;
   D6  docs/backend/sycl-env-vars.md has the variable's row, default ON, stating that only the exact value 0 turns
       it off.
 
 The scan covers every .cpp/.hpp/.h under ggml/src/ggml-sycl except its tests/ directory, plus the standalone oneDNN
 benchmark tests/bench-dnnl-ops.cpp there and the three oneDNN probes under the top-level tests/ (PROBES). Each includes
 dnnl-deterministic.hpp: a benchmark must time, and a probe must ask oneDNN about, the primitive production builds, and
-an attribute without the deterministic setting describes another primitive.
+an attribute without the deterministic setting describes another primitive. The four oneDNN references of
+tools/sycl-kernel-bench (TOOLS_REFS) are scanned for the same reason.
+
+Not scanned: tools/onednn-f4-probe and tools/onednn-woq-repro. They are standalone reproducers built against
+hard-coded oneDNN 2025.3 include paths, outside the project build, so they cannot include the helper; they reproduce
+a oneDNN behaviour on its own terms rather than ask about the primitive production builds.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
@@ -61,6 +68,8 @@ PROBE_WOQ = "tests/test-onednn-woq-mxfp4.cpp"
 PROBE_INT8 = "tests/test-sycl-onednn-int8-grouped-probe.cpp"
 PROBE_FEAS = "tests/test-sycl-onednn-mxfp4-feasibility.cpp"
 PROBES = (PROBE_WOQ, PROBE_INT8, PROBE_FEAS)
+TOOLS_REF_DIR = "tools/sycl-kernel-bench/kernels/reference"
+TOOLS_REFS = tuple(f"{TOOLS_REF_DIR}/onednn_{kind}_gemm.cpp" for kind in ("fp16", "int8", "mxfp4", "woq"))
 GGML_SYCL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 DOCS_KEY = "docs/backend/sycl-env-vars.md"
 
@@ -91,6 +100,7 @@ PARAM_REF = re.compile(r"(?:const\s+)?dnnl::primitive_attr\s*&\s*([A-Za-z_]\w*)\
 BARE_TYPE = re.compile(r"(?<![\w:])primitive_attr\s+[A-Za-z_]\w*\s*[;={(]")
 C_API_CREATE = re.compile(r"\bdnnl_primitive_attr_(?:create|clone)\s*\(")
 PD_CALL = re.compile(r"\bprimitive_desc\s*[({]|\bprimitive_desc\s+[A-Za-z_]\w*\s*[({]")
+PARAM_REF_ANY = re.compile(r"\bdnnl::primitive_attr\s*&")
 C_API_PD = re.compile(r"\bdnnl_\w*primitive_desc_create\s*\(")
 SET_DETERMINISTIC = re.compile(r"set_deterministic\s*\(")
 ENV_READ = re.compile(r"\b(?:std::)?(?:getenv|secure_getenv|get_sycl_env)\s*\(\s*([^,)]*)")
@@ -179,6 +189,24 @@ def paren_args(code: str, open_at: int) -> list[str]:
             cur.append(c)
         k += 1
     return args
+
+
+def enclosing_paren(code: str, at: int) -> int:
+    """Offset of the unmatched `(` that encloses `at`, or -1."""
+    depth = 0
+    k = at - 1
+    while k >= 0:
+        c = code[k]
+        if c == ")":
+            depth += 1
+        elif c == "(":
+            if depth == 0:
+                return k
+            depth -= 1
+        elif c in ";{}" and depth == 0:
+            return -1
+        k -= 1
+    return -1
 
 
 def definition_body(files: dict[str, str], rel: str, marker: str, pin: str) -> str:
@@ -321,6 +349,40 @@ def check(files: dict[str, str]) -> None:
     if n_pd == 0:
         raise ContractError("FAIL [pin D5]: no primitive descriptor found, so the pin read the wrong text")
 
+    # A function that takes an attribute by reference builds from whatever its caller hands it, so the attribute it
+    # gets must be one D3 holds: a held name at every call site, never a temporary or a fresh `{}`.
+    takers: list[tuple[str, int, str, int]] = []  # (function, parameter index, file, offset of its `(`)
+    for rel, code in sources.items():
+        for m in PARAM_REF_ANY.finditer(code):
+            open_at = enclosing_paren(code, m.start())
+            if open_at < 0:
+                continue
+            fm = re.search(r"([A-Za-z_]\w*)\s*$", code[:open_at])
+            if not fm or fm.group(1) == HELPER:
+                continue
+            params = paren_args(code, open_at)
+            index = next(i for i, p in enumerate(params) if PARAM_REF_ANY.search(p))
+            takers.append((fm.group(1), index, rel, open_at))
+    if not takers:
+        raise ContractError("FAIL [pin D5]: no function takes an attribute by reference, so the pin read the wrong text")
+    n_calls = 0
+    for name, index, def_rel, def_open in takers:
+        for rel, code in sources.items():
+            for m in re.finditer(rf"\b{name}\s*\(", code):
+                open_at = m.end() - 1
+                if rel == def_rel and open_at == def_open:
+                    continue
+                args = paren_args(code, open_at)
+                arg = args[index] if index < len(args) else ""
+                n_calls += 1
+                if arg not in attr_names.get(rel, set()):
+                    raise ContractError(
+                        f"FAIL [pin D5]: {rel}:{line_of(code, m.start())}: {name}() is handed `{arg}` as its attribute, "
+                        "not an attribute object this pin holds"
+                    )
+    if n_calls == 0:
+        raise ContractError("FAIL [pin D5]: no call of a function that takes an attribute by reference was found")
+
     # D6 ---------------------------------------------------------------------------------------------------------------
     rows = [line for line in files[DOCS_KEY].splitlines() if line.startswith(DOCS_ROW)]
     if len(rows) != 1:
@@ -338,7 +400,7 @@ def load() -> dict[str, str]:
         if rel.startswith("ggml/src/ggml-sycl/tests/") and rel != BENCH:
             continue
         raws[rel] = path.read_text(errors="replace")
-    for rel in PROBES:
+    for rel in PROBES + TOOLS_REFS:
         raws[rel] = (ROOT / rel).read_text(errors="replace")
     raws[DOCS_KEY] = DOCS.read_text()
     return raws
@@ -434,6 +496,14 @@ def self_test(raws: dict[str, str]) -> int:
                     "        dnnl_softmax_forward_primitive_desc_create(&raw_pd, eng.get(), dnnl_forward_inference,\n"
                     "            dnnl_softmax_accurate, src_md.get(), dst_md.get(), 1, nullptr);\n"
                     "        auto softmax_pd"))])
+    # A function taking an attribute by reference is handed one the helper never saw.
+    expect_fail("get-or-create-with-fresh-attr", "D5", gemm,
+                [("cache.get_or_create(key, eng, a_md, b_any_md, c_md, attr);",
+                  "cache.get_or_create(key, eng, a_md, b_any_md, c_md, {});")])
+    # The kernel bench's references time the primitive the backend runs.
+    expect_fail("tools-ref-attr-without-helper", "D3", f"{TOOLS_REF_DIR}/onednn_woq_gemm.cpp",
+                [("    dnnl::primitive_attr attr;\n    ggml_sycl_dnnl_attr_set_reproducible(attr);\n",
+                  "    dnnl::primitive_attr attr;\n")])
     # The benchmark builds its descriptors through the helper too.
     expect_fail("bench-attr-without-helper", "D3", BENCH,
                 [("    dnnl::primitive_attr attr;\n    ggml_sycl_dnnl_attr_set_reproducible(attr);\n"

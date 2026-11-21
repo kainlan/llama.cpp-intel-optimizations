@@ -7,6 +7,8 @@
 
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
+// The attribute the backend builds with, so the reference times the primitive the backend would run.
+#include "ggml-sycl/dnnl-deterministic.hpp"
 
 namespace sycl_bench {
 
@@ -121,6 +123,7 @@ bool run_onednn_int8_gemm(const GeneratedWeights & weights,
     auto c_md = dnnl::memory::desc(c_dims, dnnl::memory::data_type::s32, c_strides);
 
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
 
     auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_md, b_md, c_md, attr);
