@@ -26,7 +26,12 @@ equal share of the device slots. This gate holds how the switch is built:
       moe_swap_host_headroom_bytes), held in one place: record_host_ledger_plan() calls the hold after the lazy tables
       are decided and before its [HOST-LEDGER] plan line, and no builder calls it. The hold writes the zone only as its
       terms' total(), populate_host_zone_sizing() zeroes the headroom before it sizes the zones, and the [HOST-PLAN]
-      WEIGHT zone line names no swap_headroom; the headroom's own line prints the zone total and host_planned_bytes.
+      WEIGHT zone line names no swap_headroom; every headroom line prints the zone total and host_planned_bytes.
+  S6  a plan whose routed host experts stay mapped holds no headroom: a swap can admit only a pinned host triplet. The
+      hold returns once it has zeroed the headroom and before it holds any, when a host routed expert (not a device
+      entry, which a mapping load also marks FILE_MAPPED) is FILE_MAPPED, and that branch logs one WARN on the
+      headroom's prefix saying so. The stay-mapped WARN names the swap-headroom lines only when plan.moe_spread is set;
+      with it unset, the WARN's format is byte for byte the one the planner printed before the switch existed.
 
 Checks run on comment-blanked text with whitespace squashed. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -103,6 +108,27 @@ POPULATE_ZERO = ("plan.moe_swap_host_headroom_triplets = 0; plan.moe_swap_host_h
                  "const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);")
 WEIGHT_ZONE_LINE = '"[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu '
 HEADROOM_FIGURES = "weight_zone_total=%zu host_planned_bytes=%zu"
+HEADROOM_ZEROED = "plan.moe_swap_host_headroom_bytes = 0;"
+MAPPED_DECL = ("const bool host_experts_mapped = std::any_of(plan.entries.begin(), plan.entries.end(), "
+               "[](const placement_entry & e) { return e.expert_id >= 0 && !e.on_device && "
+               "e.host_backing == placement_host_backing::FILE_MAPPED; });")
+MAPPED_GUARD = "if (host_experts_mapped) {"
+MAPPED_LINE = "[PLACEMENT-MOE] spread swap headroom: triplets=0 bytes=0 (0.0 MB)"
+MAPPED_REASON = "none held: the routed host experts stay mapped"
+FIRST_HOLD = "const bool fits_bare = hold(0);"
+SIZE_HOST_DEF = "static void placement_plan_size_host_side("
+STAY_PREFIX = "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: %s. "
+STAY_SELECT = ('const char * described = plan.moe_spread ? "host-ledger, lazy-table and swap-headroom lines" : '
+               '"host-ledger and lazy-table lines";')
+STAY_ARGS = "why.c_str(), moved / mb, plan.moe_stream_ring_reserve_bytes / mb, described"
+# The stay-mapped WARN's format as the planner printed it before the spread switch existed, and with the switch on.
+STAY_FORMAT_OFF = ("[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: %s. %.1f MB of experts "
+                   "go back to the mapping, and %.1f MB of window-ring room stays held. The host-ledger and lazy-table "
+                   "lines above describe the pinned plan, which is not kept; the lines after this one describe the "
+                   "plan kept\\n")
+STAY_FORMAT_ON = STAY_FORMAT_OFF.replace("The host-ledger and lazy-table lines",
+                                         "The host-ledger, lazy-table and swap-headroom lines")
+_LITERAL = re.compile(r"\"((?:\\.|[^\"\\\n])*)\"")
 
 
 class ContractError(AssertionError):
@@ -283,13 +309,40 @@ def check(raws: dict[str, str]) -> None:
     hold = body(uc, HOLD_DEF, "S5")
     if len(ZONE_WRITE.findall(hold)) != 1 or hold.count(ZONE_FROM_TERMS) != 1:
         raise ContractError(f"FAIL [pin S5]: the hold does not write the WEIGHT zone once, as `{ZONE_FROM_TERMS}`")
-    if not any(HEADROOM_FIGURES in a for a in calls(hold, "GGML_LOG_WARN")):
-        raise ContractError("FAIL [pin S5]: the headroom's line does not print the zone total and host_planned_bytes")
+    headroom_lines = ["".join(_LITERAL.findall(a)) for a in calls(hold, "GGML_LOG_WARN")]
+    if not headroom_lines or not all(HEADROOM_FIGURES in line for line in headroom_lines):
+        raise ContractError("FAIL [pin S5]: a headroom line does not print the zone total and host_planned_bytes")
     populate = body(uc, POPULATE_DEF, "S5")
     zone_lines = [a for a in calls(populate, "GGML_LOG_INFO") if WEIGHT_ZONE_LINE in a]
     if populate.count(POPULATE_ZERO) != 1 or len(zone_lines) != 1 or "swap_headroom" in zone_lines[0]:
         raise ContractError("FAIL [pin S5]: populate_host_zone_sizing does not zero the headroom before it sizes the "
                             "WEIGHT zone, or its WEIGHT zone line names a swap_headroom it cannot hold")
+
+    # S6: a plan whose routed host experts stay mapped holds no headroom; the stay-mapped WARN's clause.
+    guard_at = hold.find(MAPPED_GUARD)
+    return_at = hold.find("return;", guard_at)
+    if (hold.count(squash(MAPPED_DECL)) != 1 or hold.count(MAPPED_GUARD) != 1
+            or not ordered(hold, HEADROOM_ZEROED, MAPPED_DECL, MAPPED_GUARD, FIRST_HOLD)
+            or return_at < 0 or return_at > hold.find(FIRST_HOLD)):
+        raise ContractError("FAIL [pin S6]: the hold does not return, once it has zeroed the headroom and before it "
+                            "holds any, when a host routed expert is FILE_MAPPED")
+    branch = hold[guard_at:return_at]
+    mapped_lines = ["".join(_LITERAL.findall(a)) for a in calls(branch, "GGML_LOG_WARN")]
+    if (len(mapped_lines) != 1 or not mapped_lines[0].startswith(MAPPED_LINE) or MAPPED_REASON not in mapped_lines[0]
+            or ZONE_WRITE.search(branch) or "hold(" in branch):
+        raise ContractError("FAIL [pin S6]: the mapped plan's branch does not log one headroom line saying none is held "
+                            "because the routed host experts stay mapped, or it holds or sizes something")
+    size_host = body(uc, SIZE_HOST_DEF, "S6")
+    stay = [a for a in calls(size_host, "GGML_LOG_WARN") if "".join(_LITERAL.findall(a)).startswith(STAY_PREFIX)]
+    if len(stay) != 1 or size_host.count(squash(STAY_SELECT)) != 1 or not stay[0].rstrip().endswith(STAY_ARGS):
+        raise ContractError("FAIL [pin S6]: the stay-mapped WARN does not take its clause from plan.moe_spread, naming "
+                            "the swap-headroom lines only when it is set")
+    parts = "".join(_LITERAL.findall(stay[0])).split("%s")
+    rendered = [parts[0] + "%s" + parts[1] + clause + "".join(parts[2:]) if len(parts) == 3 else ""
+                for clause in ("host-ledger and lazy-table lines", "host-ledger, lazy-table and swap-headroom lines")]
+    if rendered != [STAY_FORMAT_OFF, STAY_FORMAT_ON]:
+        raise ContractError("FAIL [pin S6]: the stay-mapped WARN's format, with the switch off, is not the one printed "
+                            f"before the switch existed: {rendered[0]!r}")
 
 
 def self_test(raws: dict[str, str]) -> int:
@@ -397,7 +450,36 @@ def self_test(raws: dict[str, str]) -> int:
                 '"tlsf_bound=%zu total=%zu (%.1f MB); unplanned: ',
                 '"tlsf_bound=%zu swap_headroom=%zu total=%zu (%.1f MB); unplanned: ')
     expect_fail("headroom-line-drops-the-figures", "S5", CACHE_CPP,
-                '; weight_zone_total=%zu host_planned_bytes=%zu%s\\n",', '%s\\n",')
+                '"weight_zone_total=%zu host_planned_bytes=%zu%s\\n",', '"%s\\n",')
+    mapped_return = "plan.host_planned_bytes);\n        return;\n    }\n\n    // Holds `n` triplets"
+    mapped_block = ("    if (host_experts_mapped) {\n        GGML_LOG_WARN(\n"
+                    '            "[PLACEMENT-MOE] spread swap headroom: triplets=0 bytes=0 (0.0 MB) in the host WEIGHT '
+                    'zone for %zu device "\n'
+                    '            "expert slots at %zu bytes a triplet; weight_zone_total=%zu host_planned_bytes=%zu; none '
+                    'held: the routed "\n'
+                    '            "host experts stay mapped, and a swap can admit only a pinned host triplet\\n",\n'
+                    "            wanted, triplet_bytes, plan.host_zone_weight_bytes, plan.host_planned_bytes);\n"
+                    "        return;\n    }\n")
+    stay_select = ('        plan.moe_spread ? "host-ledger, lazy-table and swap-headroom lines" : '
+                   '"host-ledger and lazy-table lines";\n')
+    expect_fail("stay-mapped-guard-removed", "S6", CACHE_CPP, mapped_block, "")
+    expect_fail("stay-mapped-guard-falls-through", "S6", CACHE_CPP, mapped_return,
+                "plan.host_planned_bytes);\n    }\n\n    // Holds `n` triplets")
+    expect_fail("stay-mapped-guard-counts-device-entries", "S6", CACHE_CPP,
+                "return e.expert_id >= 0 && !e.on_device && e.host_backing == placement_host_backing::FILE_MAPPED;",
+                "return e.expert_id >= 0 && e.host_backing == placement_host_backing::FILE_MAPPED;")
+    expect_fail("stay-mapped-guard-gives-no-reason", "S6", CACHE_CPP,
+                '"host experts stay mapped, and a swap can admit only a pinned host triplet\\n",',
+                '"host experts, and a swap can admit only a pinned host triplet\\n",')
+    expect_fail("stay-mapped-line-always-names-the-headroom", "S6", CACHE_CPP, stay_select,
+                '        "host-ledger, lazy-table and swap-headroom lines";\n')
+    expect_fail("stay-mapped-line-off-clause-changed", "S6", CACHE_CPP, stay_select,
+                stay_select.replace('"host-ledger and lazy-table lines"', '"host-ledger, lazy-table lines"'))
+    expect_fail("stay-mapped-line-reads-the-switch-input", "S6", CACHE_CPP, stay_select,
+                stay_select.replace("plan.moe_spread", "kv_info.moe_spread"))
+    expect_fail("stay-mapped-line-format-changed", "S6", CACHE_CPP,
+                'stays held. The %s above describe the pinned plan, which is "',
+                'stays held. The %s above describes the pinned plan, which is "')
 
     try:
         mutate(BACKEND, "this anchor is in no source", "x")

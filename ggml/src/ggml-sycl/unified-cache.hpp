@@ -759,8 +759,9 @@ struct placement_kv_info {
     // where it copies the inventory in; a test sets them directly. Mask 0 sizes no ring and holds no room.
     uint64_t              moe_stream_staged_types  = 0;
     size_t                moe_stream_group_cap     = 0;
-    // GGML_SYCL_MOE_SPREAD_PLACEMENT: walk the routed experts in the spread order when they do not all fit. The backend
-    // fills it where it copies the inventory in; a test sets it directly.
+    // GGML_SYCL_MOE_SPREAD_PLACEMENT: the single-device planner walks the routed experts in the spread order when they
+    // do not all fit; a multi-device plan ignores it and keeps the layer-first order. The backend fills it where it
+    // copies the inventory in; a test sets it directly.
     bool                  moe_spread               = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
@@ -1201,7 +1202,10 @@ struct placement_plan {
     std::vector<placement_moe_block_slots>     moe_block_device_slots;
     // A spread plan's room in the host WEIGHT zone for swaps (host_weight_zone_terms::swap_headroom): this many extra
     // triplets, one per device expert slot unless the host plan cannot afford them, at these bytes. The ledger record
-    // holds them after the lazy tables, so host_zone_weight_bytes and host_planned_bytes count them. 0 otherwise.
+    // holds them after the lazy tables, so host_zone_weight_bytes and host_planned_bytes count them. 0 otherwise, and
+    // 0 on a plan whose routed host experts stay mapped, where no swap can be issued. Like the HOST_COMPUTE reserve,
+    // they are the figure planned at load, not a reservation: any role-WEIGHT host allocation takes from the same
+    // room, a prompt-phase loan's host copies included, and the loan's republish of the plan does not update them.
     size_t                                     moe_swap_host_headroom_triplets = 0;
     size_t                                     moe_swap_host_headroom_bytes    = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
@@ -2316,7 +2320,10 @@ struct placement_plan {
 // The host WEIGHT zone's size, term by term: the bytes the cache materializes for every host weight the zone holds,
 // plus one named term for each real extra, never a ratio over the weights. A ratio is slack nobody can name, a second
 // source for a fact the plan already knows, and over a large host-expert set it is more than the host budget holds.
-// populate_host_zone_sizing() sizes host_zone_weight_bytes as total() and prints every term on a [HOST-PLAN] line.
+// host_zone_weight_bytes is total(), written in two places: populate_host_zone_sizing(), which zeroes the swap headroom
+// first and prints every other term on a [HOST-PLAN] line, and the ledger record's swap-headroom hold, which writes the
+// zone again once it holds the room. swap_headroom is not on the [HOST-PLAN] line, which prints before it is held;
+// the hold's own [PLACEMENT-MOE] line prints it.
 //
 // One tenant of the zone is deliberately not a term: the model loader's SYCL_Host buffer, which holds every weight
 // the loader reads (role WEIGHT, category HOST_COMPUTE). Planning it would plan a duplicate copy of the weights that
@@ -2619,8 +2626,10 @@ static constexpr const char * MOE_PIN_HOST_EXPERTS_ENV = "GGML_SYCL_MOE_PIN_HOST
 bool                          placement_pin_host_experts_enabled();
 
 // The opt-in spread placement of routed experts, off by default: GGML_SYCL_MOE_SPREAD_PLACEMENT=1 has the single-device
-// planner walk the expert triplets rank-major over every block when they do not all fit, so each block gets an equal
-// share of the device slots, and plan host WEIGHT room for swaps. A multi-device plan keeps the layer-first order.
+// planner walk the expert triplets rank-major over every block when they do not all fit, and plan host WEIGHT room for
+// swaps. Each block then gets an equal share of the device slots when every triplet charges the same; the pack is the
+// same first fit by bytes, so a mixed-quant pack, or one type carrying a PP-SOA alternate charge, gives the blocks
+// whose triplets charge less more slots. A multi-device plan keeps the layer-first order.
 // placement_moe_spread_enabled() is its one reader and reads the environment once; the backend hands the value to the
 // planner as placement_kv_info::moe_spread and ggml_check_sycl reports it.
 static constexpr const char * MOE_SPREAD_PLACEMENT_ENV = "GGML_SYCL_MOE_SPREAD_PLACEMENT";

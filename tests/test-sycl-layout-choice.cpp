@@ -2585,7 +2585,7 @@ static bool run_moe_spread_order_test() {
     {
         log_line_counter order_line(
             "[PLACEMENT-MOE] expert order: mode=spread hotness=spread(rank,layer,expert) blocks=4 ranked_blocks=0 "
-            "device_slots=13 per_block_min=3 (3 blocks) per_block_max=4 (1 blocks)\n");
+            "device_slots=13 per_block_min=3 (3 blocks) per_block_max=4 (1 block)\n");
         log_line_counter headroom_line("[PLACEMENT-MOE] spread swap headroom: triplets=");
         log_line_counter no_sample_line(
             "; none held: no MemAvailable sample, so P3's margin cannot be kept (host_budget=");
@@ -2828,11 +2828,10 @@ static bool run_moe_spread_swap_headroom_test() {
     }
     {
         // A budget a byte short of that: the plan without headroom already takes the reserve, so none is held, the
-        // host figure stays that plan's, and the line says why.
+        // host figure stays that plan's, and the line names the reserve as the room taken: P3 has room to spare.
         const size_t     budget = bare.host_planned_bytes + reserve - 1;
         log_line_counter none_line(
-            "; none held: the host plan without headroom already takes the host budget's reserve or P3's margin "
-            "(host_budget=");
+            "; none held: the host plan without headroom already takes the host budget's reserve (host_budget=");
         const auto on = plan_for(big_budget, true, big_role, budget, mem_pre);
         if (on.moe_swap_host_headroom_triplets != 0 || on.moe_swap_host_headroom_bytes != 0 ||
             on.host_planned_bytes != bare.host_planned_bytes || none_line.count != 1) {
@@ -2975,6 +2974,152 @@ static bool run_moe_spread_swap_headroom_lazy_storage_test() {
         printf(
             "PASS: a spread plan with a lazy STORAGE table holds only the swap headroom that fits the WEIGHT zone's "
             "rounding slack and takes none of the table's room\n");
+    }
+    return ok;
+}
+
+// A spread plan whose routed host experts stay mapped holds no swap headroom: a swap can admit only a pinned host
+// triplet, so none can be issued there, and room held for one would only shrink what the mapped working set has. The
+// ring-room case's cold expert class refuses its lazy table, so the pinned plan, which holds headroom, is withdrawn:
+// the plan kept holds none, says why on its headroom line, and sizes its WEIGHT zone without the term. The opt-out
+// keeps the experts mapped from the start, so its one headroom line holds none. The stay-mapped line names the
+// swap-headroom lines only with the switch on; off, it is the line the planner printed before the switch existed.
+static bool run_moe_spread_stay_mapped_holds_no_headroom_test() {
+    using namespace ring_room_case;
+    using spread_case::ends_with;
+    using spread_case::printed_field;
+    bool ok = true;
+
+    // The pinned plan needs the variable unset, whatever the shell exported; the guard puts it back.
+    env_var_scope_guard pin_env("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+    unsetenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, weight_slot, 0, 0, 1);
+    const size_t charge = triplet_charge(plan_for(base + 2 * static_cast<size_t>(n_triplets) * ring_bytes, q4_0_bit));
+    const size_t budget = base + 40 * charge;
+    const double mb     = 1024.0 * 1024.0;
+
+    struct planned {
+        ggml_sycl::placement_plan plan;
+        std::vector<std::string>  headroom;  // its swap-headroom lines
+        std::vector<std::string>  stay;      // its stay-mapped lines
+    };
+
+    // A mapping load with a roomy host budget and MemAvailable_pre, so a pinned spread plan holds every triplet it
+    // wants. `cold` adds a cold expert class and one lazy table, which that class refuses.
+    const auto make = [&](bool spread, bool cold) {
+        ggml_sycl::placement_kv_info kv = kv_info(q4_0_bit, 0);
+        kv.load_maps_files              = true;
+        kv.moe_spread                   = spread;
+        kv.host_mem_available_pre       = size_t(256) << 30;
+        if (cold) {
+            kv.cold_expert_class = true;
+            ggml_sycl::placement_lazy_table_info table;
+            table.name           = "blk.0.cold_table";
+            table.table_bytes    = size_t(1) << 20;
+            table.consumer_layer = 0;
+            kv.lazy_tables.push_back(table);
+        }
+        log_line_counter headroom("[PLACEMENT-MOE] spread swap headroom: ");
+        log_line_counter stay(stay_mapped_line);
+        planned          out;
+        out.plan     = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_exps, size_t(64) << 30);
+        out.headroom = headroom.lines;
+        out.stay     = stay.lines;
+        return out;
+    };
+    const char * none_held = "; none held: the routed host experts stay mapped";
+
+    const planned       on    = make(true, true);
+    const backing_count c     = count_backings(on.plan);
+    const auto          terms = ggml_sycl::placement_plan_host_weight_zone_terms(on.plan);
+    if (!on.plan.moe_spread || on.plan.lazy_refusal != "cold-set-not-implemented" || c.host == 0 ||
+        c.host_pinned != 0 || on.plan.moe_stream_ring_reserve_bytes == 0) {
+        printf(
+            "FAIL: spread stay-mapped: vacuous fixture: moe_spread=%d, refusal '%s', host %zu, pinned %zu, ring room "
+            "%zu (want a spread plan with ring room whose lazy table refuses and whose host experts stay mapped)\n",
+            on.plan.moe_spread ? 1 : 0, on.plan.lazy_refusal.c_str(), c.host, c.host_pinned,
+            on.plan.moe_stream_ring_reserve_bytes);
+        ok = false;
+    }
+    if (on.plan.moe_swap_host_headroom_triplets != 0 || on.plan.moe_swap_host_headroom_bytes != 0 ||
+        terms.swap_headroom != 0 || on.plan.host_zone_weight_bytes != terms.total()) {
+        printf(
+            "FAIL: spread stay-mapped: held %zu triplets %zu bytes, WEIGHT term %zu, zone %zu vs its terms' %zu "
+            "(want 0, 0, 0 and the terms' total)\n",
+            on.plan.moe_swap_host_headroom_triplets, on.plan.moe_swap_host_headroom_bytes, terms.swap_headroom,
+            on.plan.host_zone_weight_bytes, terms.total());
+        ok = false;
+    }
+    // The pinned plan's line, holding triplets, is the positive control; the plan kept's line holds none and says why.
+    const bool lines_ok = on.headroom.size() == 2 && printed_field(on.headroom[0], " triplets=") != 0 &&
+                          printed_field(on.headroom[0], " triplets=") != SIZE_MAX &&
+                          on.headroom[0].find(none_held) == std::string::npos &&
+                          printed_field(on.headroom[1], " triplets=") == 0 &&
+                          on.headroom[1].find(none_held) != std::string::npos &&
+                          printed_field(on.headroom[1], " weight_zone_total=") == on.plan.host_zone_weight_bytes &&
+                          printed_field(on.headroom[1], " host_planned_bytes=") == on.plan.host_planned_bytes;
+    if (!lines_ok) {
+        printf(
+            "FAIL: spread stay-mapped: %zu headroom lines (want 2: the pinned plan's, holding triplets, then the plan "
+            "kept's, holding none because its host experts stay mapped, with its zone %zu and host plan %zu):\n",
+            on.headroom.size(), on.plan.host_zone_weight_bytes, on.plan.host_planned_bytes);
+        for (const std::string & line : on.headroom) {
+            printf("  %s", line.c_str());
+        }
+        ok = false;
+    }
+    const std::string on_clause =
+        " MB of window-ring room stays held. The host-ledger, lazy-table and swap-headroom lines above describe the "
+        "pinned plan, which is not kept; the lines after this one describe the plan kept\n";
+    if (on.stay.size() != 1 || !ends_with(on.stay[0], on_clause)) {
+        printf("FAIL: spread stay-mapped: %zu stay-mapped lines (want 1 naming the swap-headroom lines)%s%s\n",
+               on.stay.size(), on.stay.empty() ? "" : ": ", on.stay.empty() ? "" : on.stay[0].c_str());
+        ok = false;
+    }
+
+    // The opt-out never pins, so its plan is mapped when the hold first runs.
+    planned opt_out;
+    {
+        env_var_scope_guard off_env("GGML_SYCL_MOE_PIN_HOST_EXPERTS");
+        setenv("GGML_SYCL_MOE_PIN_HOST_EXPERTS", "0", 1);
+        opt_out = make(true, false);
+    }
+    if (!opt_out.plan.moe_spread || opt_out.plan.moe_swap_host_headroom_bytes != 0 || opt_out.headroom.size() != 1 ||
+        opt_out.headroom[0].find(none_held) == std::string::npos || !opt_out.stay.empty()) {
+        printf(
+            "FAIL: spread stay-mapped opt-out: moe_spread=%d, headroom %zu bytes, %zu headroom lines, %zu stay-mapped "
+            "lines (want 1, 0, 1 saying the host experts stay mapped, 0)\n",
+            opt_out.plan.moe_spread ? 1 : 0, opt_out.plan.moe_swap_host_headroom_bytes, opt_out.headroom.size(),
+            opt_out.stay.size());
+        ok = false;
+    }
+
+    // The switch off: no headroom line, and the stay-mapped line is the one printed before the switch existed.
+    const planned off = make(false, true);
+    char          tail[320];
+    std::snprintf(tail, sizeof(tail),
+                  "%.1f MB of experts go back to the mapping, and %.1f MB of window-ring room stays held. The "
+                  "host-ledger and lazy-table lines above describe the pinned plan, which is not kept; the lines after "
+                  "this one describe the plan kept\n",
+                  count_backings(off.plan).host_src / mb, off.plan.moe_stream_ring_reserve_bytes / mb);
+    const std::string want_off =
+        "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: a lazy table refuses the pinned "
+        "plan: " +
+        ggml_sycl::placement_lazy_refusal_text(off.plan) + ". " + tail;
+    if (off.plan.moe_spread || !off.headroom.empty() || off.stay.size() != 1 || off.stay[0] != want_off) {
+        printf(
+            "FAIL: spread stay-mapped, switch off: moe_spread=%d, %zu headroom lines, %zu stay-mapped lines (want 0, "
+            "0, 1); want the line\n%sgot\n%s",
+            off.plan.moe_spread ? 1 : 0, off.headroom.size(), off.stay.size(), want_off.c_str(),
+            off.stay.empty() ? "(none)\n" : off.stay[0].c_str());
+        ok = false;
+    }
+
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(0, 0, 0, 0, 0);
+    if (ok) {
+        printf(
+            "PASS: a spread plan whose routed host experts stay mapped holds no swap headroom and says why, and the "
+            "stay-mapped line names the swap-headroom lines only with the switch on\n");
     }
     return ok;
 }
@@ -5323,6 +5468,7 @@ int main() {
         mock_ok = run_moe_spread_fits_whole_test() && mock_ok;
         mock_ok = run_moe_spread_swap_headroom_test() && mock_ok;
         mock_ok = run_moe_spread_swap_headroom_lazy_storage_test() && mock_ok;
+        mock_ok = run_moe_spread_stay_mapped_holds_no_headroom_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;

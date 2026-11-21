@@ -17683,9 +17683,11 @@ static void ggml_sycl_plan_dry_run_lazy(uint32_t                                
 }
 
 // Reports plan `index`: every host term from the plan's own record, each printed on its own line under its name. The
-// WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
-// sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
-// summed, with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
+// WEIGHT terms are the finished plan's: the walk populate_host_zone_sizing() sized the zone with, plus the swap
+// headroom record_host_ledger_plan() held after it, which the [HOST-PLAN] line never shows (it prints before the hold),
+// so this report prints it; the result struct does not carry it. The commit terms are the configure step's sizing
+// (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan() summed,
+// with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
 static void ggml_sycl_plan_dry_run_record(uint32_t                                                  index,
                                           const ggml_sycl::placement_plan &                         plan,
                                           bool                                                      multi_device,
