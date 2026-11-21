@@ -927,6 +927,14 @@ if (Python3_Interpreter_FOUND)
     # TIMEOUT: its mutant self-test took 29.5 s wall at host load 43, against the old 30 s.
     set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The token-start stamps of a replayed MoE decode token (backend entry, replay begin, per-block enqueue, PLE
+    # gather, logits wait) sit inside the trace flag's branch, add no wait, event query or allocation, and keep the
+    # per-block stamps in a fixed buffer. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-token-start-stamps-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-token-start-stamps-source.py --self-test)
+    set_tests_properties(test-sycl-token-start-stamps-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # CPU expert job joins go on the cache's join-only queue behind GGML_SYCL_MOE_JOIN_QUEUE, after the latest
     # recorded host task, and the scatter still depends on them (llama.cpp-wfsl). Run WITH --self-test so each
     # pin is proven to catch its mutant.

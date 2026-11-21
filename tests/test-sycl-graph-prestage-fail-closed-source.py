@@ -389,16 +389,25 @@ def evaluate(backend, common, memo_hdr):
     # llama.cpp-7pm2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
     # decline; a replay or a record runs only past it, and each re-reads the slot, since a staging swap at the
     # gateway retires every slot after begin() chose the action. A replay whose inputs now stage to other buffers
-    # than the slot's graphs read forgets the slot and runs direct.
+    # than the slot's graphs read forgets the slot and runs direct. The token-start trace stamps (each the sole
+    # statement of its trace-flag guard, pinned by test-sycl-token-start-stamps-source.py) may sit between these
+    # statements: they record a clock and change no control flow.
+    def stamp(call):
+        return r"(?:if\s*\(moe_hostpath_waits_enabled\(\)\)\s*\{\s*" + call + r";\s*\}\s*)?"
+
     keyed = re.search(
         r"\}\s*else if\s*\(slot_action == gsc::action::DIRECT\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*" + site +
-        r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*"
+        r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*" +
+        stamp(r"moe_token_stamps_note_step\(MOE_TOKEN_STEP_PRESTAGE_END\)") +
         r"const auto \* slot = sycl_ctx->moe_segment_slots\.payload\(slot_key\);\s*if\s*\(!slot\)\s*\{\s*"
         r"compute_impl_unlocked\(\);\s*\}\s*"
         r"else if\s*\(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{[^{}]*?"
         r"sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*compute_impl_unlocked\(\);\s*\}\s*"
-        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*"
-        r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*graph_executed = true;\s*\}\s*\}\s*"
+        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*" +
+        stamp(r"moe_token_stamps_note_replay\(\)") +
+        r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*" +
+        stamp(r"moe_token_stamps_note_replay_end\(\)") +
+        r"graph_executed = true;\s*\}\s*\}\s*"
         r"else if\s*\(!sycl_ctx->moe_segment_slots\.state\(slot_key\)\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{",
         compute)
     results["site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists"] = \
@@ -1028,6 +1037,10 @@ if args.self_test:
         ("the keyed slot records past a decline", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
          (mutate_in_func(backend, r"slot_action == gsc::action::DIRECT\)", "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
                          "} else if (false) {"), common, mem_)),
+        ("a trace-stamp guard in the keyed replay also runs the graph direct",
+         "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, cmp_sig, "moe_token_stamps_note_replay();",
+                         "moe_token_stamps_note_replay(); compute_impl_unlocked();"), common, mem_)),
         ("an eighth recorder appears", "no unnamed pre-stage consumer: the seven recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),
