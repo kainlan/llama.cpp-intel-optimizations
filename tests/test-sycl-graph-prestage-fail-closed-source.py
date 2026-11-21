@@ -70,6 +70,16 @@ reuse. A staging failure is also not permanent for a signature: the memo forgets
 skipped tokens, so a transient failure (a staging allocation) recovers while a structural one (a
 host-resident input) re-declines at the cost of one pass.
 
+A host-resident op output is a graph input too (llama.cpp-34pj). Under spread expert placement the plan has no CPU
+work, so the CPU backend computes into the generic host buft, and the scheduler makes no device copy of an activation
+it produces: Qwen's mask ADD (`node_6686`) reached a SYCL split in host memory, the pre-stage classed it COPY, the
+cache arm refused it, and the decode graph was never recorded. The class rule lives in prestage-class.hpp
+(ggml_sycl_prestage_class_of, unit-tested by test-sycl-prestage-class); the checks below pin that the backend asks it
+instead of carrying a second copy, that the rule reads the VIEW ROOT's op (a view's own op is GGML_OP_VIEW), that the
+flag still precedes KV_HOST and KV_HOST precedes the op-output rule (KV state is never per-call staging), and that the
+replay refresh discovers these tensors as it discovers flagged inputs, since a replay that skips the pre-stage would
+otherwise leave their staging at the recorded token's bytes.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -84,6 +94,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--common", default=str(sycl / "common.hpp"))
 parser.add_argument("--memo", default=str(sycl / "graph-prestage-decline-memo.hpp"))
+parser.add_argument("--prestage-class", default=str(sycl / "prestage-class.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -248,8 +259,10 @@ def entry_blocks_graphs(compute):
     return reason
 
 
-def evaluate(backend, common, memo_hdr):
+def evaluate(backend, common, memo_hdr, class_hdr=None):
     results = {}
+    if class_hdr is None:
+        class_hdr = CLASS_HDR
 
     prestage = function_body(backend, r"static bool graph_prestage_leaf_tensors\([^)]*\)\s*\{")
     refresh = function_body(backend, r"static void graph_refresh_input_tensors\([^)]*\)\s*\{")
@@ -275,7 +288,31 @@ def evaluate(backend, common, memo_hdr):
         "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in classify
     results["pre-stage has no flag-only INPUT test left"] = \
         "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify
+    # A host-resident op output is another split's per-token activation (llama.cpp-34pj). The backend gathers the facts
+    # and asks the shared rule; it returns no class of its own.
+    results["classify asks the shared class rule, with the view root's op as a fact"] = \
+        "ggml_sycl_prestage_class_of(" in classify and \
+        "ggml_sycl_prestage_root_is_op_output(tensor)" in classify and \
+        re.search(r"return\s+ggml_sycl_prestage_class::", classify) is None
+    class_of = function_body(class_hdr, r"ggml_sycl_prestage_class\s+ggml_sycl_prestage_class_of\([^)]*\)\s*\{") or ""
+    results["the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY"] = \
+        re.fullmatch(r"\{\s*"
+                     r"if\s*\(facts\.is_control\)\s*\{\s*return ggml_sycl_prestage_class::CONTROL;\s*\}\s*"
+                     r"if\s*\(facts\.is_weight\)\s*\{\s*return ggml_sycl_prestage_class::WEIGHT;\s*\}\s*"
+                     r"if\s*\(facts\.is_device\)\s*\{\s*return ggml_sycl_prestage_class::DEVICE;\s*\}\s*"
+                     r"if\s*\(facts\.is_input\)\s*\{\s*return ggml_sycl_prestage_class::INPUT;\s*\}\s*"
+                     r"if\s*\(facts\.is_kv_host\)\s*\{\s*return ggml_sycl_prestage_class::KV_HOST;\s*\}\s*"
+                     r"if\s*\(facts\.root_is_op_output\)\s*\{\s*return ggml_sycl_prestage_class::INPUT;\s*\}\s*"
+                     r"return ggml_sycl_prestage_class::COPY;\s*\}", class_of) is not None
+    root_walk = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_root_is_op_output\([^)]*\)\s*\{") or ""
+    results["the op-output fact reads the view root's op, not the view's"] = \
+        re.search(r"while\s*\(\s*tensor->view_src\s*\)\s*\{\s*tensor\s*=\s*tensor->view_src;\s*\}", root_walk) is not None \
+        and re.search(r"return\s+tensor->op\s*!=\s*GGML_OP_NONE;", root_walk) is not None
     results["refresh discovery asks the view-aware INPUT test"] = "graph_tensor_is_input(" in refresh
+    results["refresh discovery also takes the host op outputs the pre-stage stages as INPUT"] = \
+        re.search(r"graph_tensor_is_input\(tensor\)\s*\|\|\s*"
+                  r"ggml_sycl_prestage_classify\(tensor,\s*ggml_sycl_prestage_source_buft\(tensor\)\)\s*==\s*"
+                  r"ggml_sycl_prestage_class::INPUT", refresh) is not None
     results["refresh discovery has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in refresh
     # A zero-byte tensor has nothing to stage; reporting it as a failure is what made fail-closed unusable. The test
     # returns from stage_tensor before its first stage action (stage_effect holds the actions that can fail).
@@ -654,6 +691,7 @@ def run(label, sources, expect_fail=None):
 
 backend, common = read(args.backend), read(args.common)
 memo_hdr = read(args.memo) if Path(args.memo).exists() else ""
+CLASS_HDR = read(args.prestage_class) if Path(args.prestage_class).exists() else ""
 failed = run("tree", (backend, common, memo_hdr))
 
 if args.self_test:
@@ -843,6 +881,25 @@ if args.self_test:
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
          (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
+        ("classify returns a class of its own", "classify asks the shared class rule, with the view root's op as a fact",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{",
+                         "return ggml_sycl_prestage_class_of(", "if (facts.is_kv_host) { return ggml_sycl_prestage_class::KV_HOST; }\n    return ggml_sycl_prestage_class_of("),
+          common, mem_)),
+        ("classify drops the op-output fact", "classify asks the shared class rule, with the view root's op as a fact",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{",
+                         "ggml_sycl_prestage_root_is_op_output(tensor)", "false"), common, mem_)),
+        ("the op-output rule moves ahead of KV_HOST", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_,
+          re.sub(r"(if \(facts\.is_kv_host\) \{\s*return ggml_sycl_prestage_class::KV_HOST;\s*\})(\s*)"
+                 r"(if \(facts\.root_is_op_output\) \{\s*return ggml_sycl_prestage_class::INPUT;\s*\})",
+                 r"\3\2\1", CLASS_HDR, count=1))),
+        ("a host op output is copied", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_, mutate(CLASS_HDR, "if (facts.root_is_op_output) {", "if (false) {"))),
+        ("the op-output fact reads the view's own op", "the op-output fact reads the view root's op, not the view's",
+         (backend, common, mem_, mutate(CLASS_HDR, "tensor = tensor->view_src;", "break;"))),
+        ("refresh discovery skips host op outputs", "refresh discovery also takes the host op outputs the pre-stage stages as INPUT",
+         (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor) ||", "graph_tensor_is_input(tensor) || false &&"),
+          common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
          (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
