@@ -1485,6 +1485,12 @@ static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,
 // plan's build_index() must have run. The cache checks the storage itself under its own locks, and its refusal is the
 // authority on whether a copy can move: this check says only what the plan already rules out.
 
+// The refusal the cache gives a move to the host whose device copy is not its entry's own whole allocation: a view
+// into a bulk-staged tensor's shared allocation (unified_cache::loan_expert_triplet). Every expert of such a tensor is
+// one, so the swap driver's caller reads it as a refusal every evict of the block would meet. One spelling, for the
+// cache that gives it and the callers that classify it.
+constexpr const char MOE_EXPERT_MOVE_SHARED_STORAGE[] = "shared storage";
+
 // One named triplet: the (gate, up, down) entries of expert_id in layer_id.
 struct moe_expert_triplet_ref {
     int layer_id  = -1;
@@ -1679,10 +1685,11 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
 // can hand it back (a bulk-staged tensor is views into one allocation: moe_loan_triplet_is_lendable); a cell the plan
 // has no triplet for, a split triplet, or one on another card makes the block not eligible. pair_bytes: the pinned
 // host bytes an evict of one of the block's triplets takes, its three copies each aligned as the pinned pool aligns.
-// file_mapped counts the file-mapped host triplets of eligible blocks, the ones the driver passes over. device_held:
-// a non-expert entry (or its alternate, or the multi-device layer map) holds this card, so a plan that moves every
-// expert off the card still uses it. single_device: the plan does not span cards. `bulk_memo` keeps the bulk answers
-// across builds of the same plan. Reads the plan only: no device, no lock, no state of its own.
+// admissible_count: each block's admissible cells, so a boundary need not read them. file_mapped counts the
+// file-mapped host triplets of eligible blocks, the ones the driver passes over. device_held: a non-expert entry (or
+// its alternate, or the multi-device layer map) holds this card, so a plan that moves every expert off the card still
+// uses it. single_device: the plan does not span cards. `bulk_memo` keeps the bulk answers across builds of the same
+// plan. Reads the plan only: no device, no lock, no state of its own.
 static inline void moe_swap_plan_view_build(const placement_plan &               plan,
                                             int                                  device,
                                             int                                  n_blocks,
@@ -1771,6 +1778,7 @@ static inline void moe_swap_plan_view_build(const placement_plan &              
             out.file_mapped += mapped;
         }
     }
+    moe_swap_plan_view_count_admissible(out);
 }
 
 }  // namespace ggml_sycl

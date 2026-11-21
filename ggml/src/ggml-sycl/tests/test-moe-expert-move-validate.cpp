@@ -289,6 +289,18 @@ void test_swap_view_reads_residency_admissibility_and_eligibility() {
     CHECK(v.file_mapped == 2);  // layer 1's two host triplets
     CHECK(v.pair_bytes[0] == 3 * 4096);
     CHECK(v.device_held && v.single_device);
+    // Each block's admissible cells, counted when the view is built, so a boundary reads one count per block.
+    CHECK(v.admissible_count.size() == 4);
+    if (v.admissible_count.size() == 4) {
+        CHECK(v.admissible_count[0] == 2 && v.admissible_count[1] == 0 && v.admissible_count[2] == 1);
+        for (int b = 0; b < 4; ++b) {
+            uint32_t n = 0;
+            for (int e = 0; e < 4; ++e) {
+                n += at(v.admissible, 4, b, e) != 0 ? 1 : 0;
+            }
+            CHECK(v.admissible_count[static_cast<size_t>(b)] == n);
+        }
+    }
 }
 
 // The card is held only when something other than an expert lives there, and a plan across cards is reported.
