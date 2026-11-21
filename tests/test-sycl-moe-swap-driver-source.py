@@ -2,8 +2,8 @@
 """Source contract: the decode-boundary expert swap driver runs once per boundary, never waits and never holds a lock
 across its policy.
 
-Host-only: reads ggml-sycl.cpp, moe-swap-driver.hpp and moe-stream-plan.hpp, builds nothing, loads no model and touches
-no device.
+Host-only: reads ggml-sycl.cpp, moe-swap-driver.hpp, moe-stream-plan.hpp and unified-cache.cpp, builds nothing, loads
+no model and touches no device.
 
 The driver (GGML_SYCL_MOE_SWAP=1) asks the swap policy at each synchronize boundary which resident triplet leaves and
 which host triplet enters, and sends the answer through the named move. tests/test-sycl-moe-swap-driver.cpp shows the
@@ -30,8 +30,25 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       variable, no atomic or lock), and reaches no device, cache, log or environment;
   D9  the plan-view builder keeps no state and takes no lock, logs nothing and reads no environment;
   D10 a named evict's host copy never grows the pinned host zone: the to-host branch mints an evict's copy through
-      ggml_sycl_host_expert_alloc_no_growth, whose request forbids host-zone growth and keeps the miss out of the
-      error log, while a loan's copy keeps the growing mint.
+      ggml_sycl_host_expert_alloc_no_growth, while a loan's copy keeps the growing mint. There is one host mint:
+      ggml_sycl_host_expert_alloc takes grow_zone, and with it false its request forbids host-zone growth and keeps
+      the miss out of the error log; the no-growth name only calls it with false;
+  D11 the route counters are copied into the driver's own snapshot arrays: the step calls the counts callback once,
+      with d.decode.data() and d.prompt.data(), the arrays the policy's block inputs point at;
+  D12 a final refusal reaches the log at WARN once per reason and direction: the caller's transaction callback calls
+      ggml_sycl_moe_swap_warn_refusal for every move; the helper passes over every outcome but REFUSED, keeps the
+      reasons it logged in the instance's per-direction sets (touched nowhere else), and logs only a reason it had
+      not logged;
+  D13 the refusal that latches a block has one spelling: the plan header defines MOE_EXPERT_MOVE_SHARED_STORAGE as
+      the only "shared storage" literal in the four sources; the cache's loan assigns it by name; the caller marks a
+      move as latching only through ggml_sycl_moe_swap_refusal_latches_block, which compares the reason to that
+      constant for a refused evict; and the step latches a block only when the move says so;
+  D14 a device where no driver ran still reports: ggml_sycl_moe_swap_report, with no driver, takes both counters
+      kept apart and prints them in one WARN line when either is nonzero;
+  D15 the evict batch's room and the evict mint's cap are one figure: the driver's room callback returns
+      unified_cache::host_zone_no_growth_room for the WEIGHT zone, the mint refuses a no-growth request past that
+      same accessor, and the accessor is the zone's capacity capped at its reserved figure, less what it holds,
+      never below zero.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -55,6 +72,7 @@ FILES = {
     "sycl": ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp",
     "driver": ROOT / "ggml/src/ggml-sycl/moe-swap-driver.hpp",
     "plan": ROOT / "ggml/src/ggml-sycl/moe-stream-plan.hpp",
+    "cache": ROOT / "ggml/src/ggml-sycl/unified-cache.cpp",
 }
 
 SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {"
@@ -67,6 +85,14 @@ BUILDER_SIG = "static inline void moe_swap_plan_view_build("
 ACCESSOR_SIG = "static bool ggml_sycl_moe_swap_enabled("
 PREP_SIG = "static const char * ggml_sycl_expert_prepare_triplet("
 NO_GROWTH_SIG = "static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc_no_growth("
+MINT_SIG = "static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size, bool grow_zone) {"
+STEP_SIG = "moe_swap_driver_status moe_swap_driver_step("
+WARN_SIG = "static void ggml_sycl_moe_swap_warn_refusal("
+LATCH_SIG = "static bool ggml_sycl_moe_swap_refusal_latches_block("
+REPORT_SIG = "static void ggml_sycl_moe_swap_report("
+ROOM_SIG = "static size_t ggml_sycl_moe_swap_host_room("
+LOAN_SIG = "bool unified_cache::loan_expert_triplet("
+NO_GROWTH_ROOM_SIG = "size_t unified_cache::host_zone_no_growth_room("
 HELPER_DEF = re.compile(r"^static\s+[\w:<>,\s\*&]*?\b(ggml_sycl_moe_swap_\w+)\s*\(", re.MULTILINE)
 
 GATES = ("ggml_sycl_moe_swap_enabled()", "g_sycl_graph_multithreaded", "unified_cache_is_graph_compute_active()",
@@ -85,9 +111,33 @@ EVICT_MINT = re.compile(r"if\s*\(\s*out\.kind\s*==\s*ggml_sycl_expert_move_kind:
                         r"storage\s*=\s*ggml_sycl_host_expert_alloc_no_growth\(\s*device\s*,\s*target\.logical_bytes\s*\)"
                         r"\s*;\s*\}\s*else\s*\{\s*storage\s*=\s*ggml_sycl_host_expert_alloc\(\s*device\s*,\s*"
                         r"target\.logical_bytes\s*\)\s*;\s*\}")
-NO_GROWTH_FIELDS = ("req.intent.role = ggml_sycl::alloc_role::WEIGHT;", "req.intent.constraints.must_host_pinned = true;",
-                    "req.intent.constraints.use_pinned_pool = true;",
-                    "req.intent.constraints.forbid_host_zone_growth = true;", "req.suppress_failure_log = true;")
+MINT_FIELDS = ("req.intent.role = ggml_sycl::alloc_role::WEIGHT;", "req.intent.constraints.must_host_pinned = true;",
+               "req.intent.constraints.use_pinned_pool = true;",
+               "req.intent.constraints.forbid_host_zone_growth = !grow_zone;", "req.suppress_failure_log = !grow_zone;",
+               "unified_allocate_owner(req)")
+NO_GROWTH_CALL = "return ggml_sycl_host_expert_alloc(device, size, false);"
+COUNTS_CALL = "counts(d.decode.data(), d.prompt.data());"
+WARN_CALL = "ggml_sycl_moe_swap_warn_refusal(inst, device, m);"
+WARN_FIELDS = ("if (m.outcome != ggml_sycl::MOE_SWAP_MOVE_REFUSED) { return; }",
+               "evict ? inst.refusals_warned_evict : inst.refusals_warned_admit;",
+               "if (!warned.insert(reason).second) { return; }",
+               'GGML_LOG_WARN("[MOE-SWAP] device %d: %s refused: %s (logged once per reason)\\n", device, '
+               'evict ? "evict" : "admit", reason);')
+SHARED_LITERAL = '"shared storage"'
+SHARED_DEF = 'constexpr const char MOE_EXPERT_MOVE_SHARED_STORAGE[] = "shared storage";'
+SHARED_ASSIGN = "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;"
+LATCH_FIELDS = ("m.kind == ggml_sycl::MOE_SWAP_MOVE_EVICT", "m.outcome == ggml_sycl::MOE_SWAP_MOVE_REFUSED",
+                "std::strcmp(m.reason, ggml_sycl::MOE_EXPERT_MOVE_SHARED_STORAGE) == 0")
+LATCH_SET = "m.latches_block = ggml_sycl_moe_swap_refusal_latches_block(m);"
+STEP_LATCH = "if (m.latches_block) { d.latched[static_cast<size_t>(q.block)] = 1; }"
+NO_DRIVER_FIELDS = ("const uint64_t off = inst.off_multithreaded.exchange(0, std::memory_order_relaxed);",
+                    "const uint64_t skipped = inst.skipped.exchange(0, std::memory_order_relaxed);",
+                    "if (off != 0 || skipped != 0) { GGML_LOG_WARN(\"[MOE-SWAP] device %d: no driver ran: ")
+ROOM_RETURN = "return cache->host_zone_no_growth_room(ggml_sycl::host_zone_id::WEIGHT);"
+MINT_CAP = ("if (req.intent.constraints.forbid_host_zone_growth && alloc_size > ucache->host_zone_no_growth_room(zone)) "
+            "{ return nullptr; }")
+NO_GROWTH_ROOM_FIELDS = ("const size_t limit = reserved > 0 ? std::min(capacity, reserved) : capacity;",
+                         "return limit > used ? limit - used : 0;")
 
 WAITS = re.compile(
     r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
@@ -256,6 +306,7 @@ def check(raw: dict[str, str]) -> None:
     sycl = strip_comments(raw["sycl"])
     driver = strip_comments(raw["driver"])
     plan = strip_comments(raw["plan"])
+    cache = strip_comments(raw["cache"])
     sync = body(sycl, SYNC_SIG)
     caller = body(sycl, CALLER_SIG)
     builder = body(plan, BUILDER_SIG)
@@ -364,12 +415,64 @@ def check(raw: dict[str, str]) -> None:
 
     # D10 --------------------------------------------------------------------------------------------------------------
     prep = body(sycl, PREP_SIG)
+    mint = norm(body(sycl, MINT_SIG))
     no_growth = norm(body(sycl, NO_GROWTH_SIG))
     if len(EVICT_MINT.findall(prep)) != 1:
         fail("D10", "the to-host branch does not mint an evict's copy without growth and a loan's with the growing mint")
-    if not no_growth or not all(f in no_growth for f in NO_GROWTH_FIELDS) or "unified_allocate_owner(req)" not in no_growth:
-        fail("D10", "the evict's host mint does not forbid host-zone growth in a pinned WEIGHT request with its miss kept "
-                    "out of the error log")
+    if not mint or not all(f in mint for f in MINT_FIELDS):
+        fail("D10", "the host mint does not forbid host-zone growth, with its miss kept out of the error log, exactly "
+                    "when grow_zone is false, in a pinned WEIGHT request")
+    if not no_growth or NO_GROWTH_CALL not in no_growth or "unified_allocate_owner" in no_growth:
+        fail("D10", "the no-growth mint is not one call of the host mint with grow_zone false")
+
+    # D11 --------------------------------------------------------------------------------------------------------------
+    step = norm(body(driver, STEP_SIG))
+    if not step or step.count(COUNTS_CALL) != 1 or len(re.findall(r"\bcounts\(", step)) != 1:
+        fail("D11", "the step does not call the counts callback once, with the driver's own decode and prompt arrays")
+
+    # D12 --------------------------------------------------------------------------------------------------------------
+    warn = norm(body(sycl, WARN_SIG))
+    callback = caller[step_at:]
+    if not warn or not all(f in warn for f in WARN_FIELDS):
+        fail("D12", "ggml_sycl_moe_swap_warn_refusal does not log each REFUSED reason once per direction at WARN")
+    if norm(callback).count(WARN_CALL) != 1 or sycl.count("ggml_sycl_moe_swap_warn_refusal(") != 2:
+        fail("D12", "the transaction callback does not hand every move to ggml_sycl_moe_swap_warn_refusal, once")
+    if sycl.count("refusals_warned_") != warn.count("refusals_warned_") + 2:
+        fail("D12", "the logged-reason sets are touched outside their declaration and the warn helper")
+
+    # D13 --------------------------------------------------------------------------------------------------------------
+    latch = norm(body(sycl, LATCH_SIG))
+    if norm(plan).count(SHARED_DEF) != 1 or plan.count(SHARED_LITERAL) != 1:
+        fail("D13", "the plan header does not define MOE_EXPERT_MOVE_SHARED_STORAGE as the one \"shared storage\"")
+    for name, text in (("ggml-sycl.cpp", sycl), ("the driver header", driver), ("unified-cache.cpp", cache)):
+        if SHARED_LITERAL in text:
+            fail("D13", f"{name} spells \"shared storage\" instead of naming MOE_EXPERT_MOVE_SHARED_STORAGE")
+    if norm(body(cache, LOAN_SIG)).count(SHARED_ASSIGN) != 1:
+        fail("D13", "the cache's loan does not give the shared-storage refusal by its name")
+    if not latch or not all(f in latch for f in LATCH_FIELDS):
+        fail("D13", "the block latch is not read from a refused evict whose reason is MOE_EXPERT_MOVE_SHARED_STORAGE")
+    if norm(callback).count(LATCH_SET) != 1 or "latches_block" in norm(caller[:step_at]):
+        fail("D13", "the transaction callback does not set each move's latch from ggml_sycl_moe_swap_refusal_latches_block")
+    if step.count(STEP_LATCH) != 1 or step.count("d.latched[static_cast<size_t>(q.block)]") != 1:
+        fail("D13", "the step latches an evict's block other than when the move says the refusal latches it")
+
+    # D14 --------------------------------------------------------------------------------------------------------------
+    report = body(sycl, REPORT_SIG)
+    lead = report.find("if (!inst.driver) {")
+    s0, e0 = block_span(report, report.find("{", lead)) if lead >= 0 else (-1, -1)
+    no_driver = norm(report[s0:e0]) if s0 >= 0 else ""
+    if not no_driver or not all(f in no_driver for f in NO_DRIVER_FIELDS):
+        fail("D14", "with no driver, the report does not print the boundaries turned off and skipped in a WARN line")
+
+    # D15 --------------------------------------------------------------------------------------------------------------
+    room = norm(body(sycl, ROOM_SIG))
+    if not room or ROOM_RETURN not in room or "host_zone_capacity" in room or "host_zone_used" in room:
+        fail("D15", "the evict batch's room is not the WEIGHT zone's no-growth room")
+    if norm(cache).count(MINT_CAP) != 1:
+        fail("D15", "the evict mint's no-growth cap is not the cache's no-growth room")
+    accessor_room = norm(body(cache, NO_GROWTH_ROOM_SIG))
+    if not accessor_room or not all(f in accessor_room for f in NO_GROWTH_ROOM_FIELDS):
+        fail("D15", "the no-growth room is not capacity capped at the reserved figure, less what is used, never below 0")
 
 
 def _helper_body(sycl: str, name: str) -> str:
@@ -459,6 +562,13 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", CALLER_SIG, "ggml_sycl_graph_inflight_count()", "0")])
     expect_fail("instance-not-claimed", "D5",
                 [("sycl", CALLER_SIG, "compare_exchange_strong(", "compare_exchange_weak(")])
+    expect_fail("claim-deleted", "D5",
+                [("sycl", CALLER_SIG,
+                  "    bool expected = false;\n"
+                  "    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {\n"
+                  "        inst.skipped.fetch_add(1, std::memory_order_relaxed);\n"
+                  "        return;\n"
+                  "    }\n", "")])
     expect_fail("env-spelled-in-the-backend", "D6",
                 [("sycl", "", "ggml_sycl::MOE_SWAP_ENV)", "\"GGML_SYCL_MOE_SWAP\")")])
     expect_fail("env-read-at-every-boundary", "D6",
@@ -489,8 +599,54 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", PREP_SIG, "ggml_sycl_host_expert_alloc_no_growth(device, target.logical_bytes)",
                   "ggml_sycl_host_expert_alloc(device, target.logical_bytes)")])
     expect_fail("no-growth-mint-grows", "D10",
-                [("sycl", NO_GROWTH_SIG, "req.intent.constraints.forbid_host_zone_growth = true;", "")])
-    expect_fail("no-growth-miss-logged", "D10", [("sycl", NO_GROWTH_SIG, "req.suppress_failure_log", "(void) req.size")])
+                [("sycl", NO_GROWTH_SIG, "/*grow_zone=*/false", "/*grow_zone=*/true")])
+    expect_fail("mint-ignores-the-flag", "D10",
+                [("sycl", MINT_SIG, "forbid_host_zone_growth = !grow_zone;", "forbid_host_zone_growth = false;")])
+    expect_fail("no-growth-miss-logged", "D10", [("sycl", MINT_SIG, "req.suppress_failure_log", "(void) req.size")])
+    expect_fail("no-growth-mints-its-own", "D10",
+                [("sycl", NO_GROWTH_SIG, "return ggml_sycl_host_expert_alloc(",
+                  "(void) ggml_sycl::unified_allocate_owner(ggml_sycl::alloc_request{});\n"
+                  "    return ggml_sycl_host_expert_alloc(")])
+    expect_fail("counts-into-the-wrong-arrays", "D11",
+                [("driver", STEP_SIG, "counts(d.decode.data(), d.prompt.data());",
+                  "counts(d.prompt.data(), d.decode.data());")])
+    expect_fail("counts-read-twice", "D11",
+                [("driver", STEP_SIG, "counts(d.decode.data(), d.prompt.data());",
+                  "counts(d.decode.data(), d.prompt.data());\n        counts(d.decode.data(), d.prompt.data());")])
+    expect_fail("refusal-logged-every-time", "D12",
+                [("sycl", WARN_SIG, "if (!warned.insert(reason).second) {\n        return;\n    }",
+                  "(void) warned.insert(reason);")])
+    expect_fail("refusal-logged-for-busy", "D12",
+                [("sycl", WARN_SIG, "if (m.outcome != ggml_sycl::MOE_SWAP_MOVE_REFUSED) {", "if (false) {")])
+    expect_fail("refusal-at-info", "D12",
+                [("sycl", WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
+    expect_fail("refusal-not-logged", "D12", [("sycl", CALLER_SIG, "ggml_sycl_moe_swap_warn_refusal(inst, device, m);", "")])
+    expect_fail("warned-set-cleared-elsewhere", "D12",
+                [("sycl", "", "    ggml_sycl_moe_swap_fold(inst);\n    if (inst.driver->stats.boundaries",
+                  "    inst.refusals_warned_evict.clear();\n    ggml_sycl_moe_swap_fold(inst);\n"
+                  "    if (inst.driver->stats.boundaries")])
+    expect_fail("cache-spells-the-refusal", "D13",
+                [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;", 'refusal = "shared storage";')])
+    expect_fail("latch-compares-a-literal", "D13",
+                [("sycl", LATCH_SIG, "ggml_sycl::MOE_EXPERT_MOVE_SHARED_STORAGE", '"shared storage"')])
+    expect_fail("latch-on-any-refused-move", "D13",
+                [("sycl", LATCH_SIG, "m.kind == ggml_sycl::MOE_SWAP_MOVE_EVICT && ", "")])
+    expect_fail("latch-not-set", "D13",
+                [("sycl", CALLER_SIG, "m.latches_block = ggml_sycl_moe_swap_refusal_latches_block(m);", "")])
+    expect_fail("step-latches-every-refusal", "D13", [("driver", STEP_SIG, "if (m.latches_block) {", "if (true) {")])
+    expect_fail("no-driver-line-drops-skipped", "D14",
+                [("sycl", REPORT_SIG, "if (off != 0 || skipped != 0) {", "if (off != 0) {")])
+    expect_fail("no-driver-line-at-debug", "D14", [("sycl", REPORT_SIG, "GGML_LOG_WARN(\n", "GGML_LOG_DEBUG(\n")])
+    expect_fail("room-is-capacity-less-used", "D15",
+                [("sycl", ROOM_SIG, "return cache->host_zone_no_growth_room(ggml_sycl::host_zone_id::WEIGHT);",
+                  "return cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);")])
+    expect_fail("mint-caps-at-reserved", "D15",
+                [("cache", "", "alloc_size > ucache->host_zone_no_growth_room(zone)",
+                  "ucache->host_zone_used(zone) + alloc_size > ucache->host_zone_reserved_capacity(zone)")])
+    expect_fail("no-growth-room-negative", "D15",
+                [("cache", NO_GROWTH_ROOM_SIG, "return limit > used ? limit - used : 0;", "return limit - used;")])
+    expect_fail("no-growth-room-ignores-capacity", "D15",
+                [("cache", NO_GROWTH_ROOM_SIG, "std::min(capacity, reserved)", "reserved")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
@@ -527,7 +683,7 @@ def main(argv: list[str]) -> int:
         print(e)
         return 1
     print("PASS: the swap driver runs once per synchronize boundary after the refill, gated, without a wait or a lock "
-          "across its policy, and its evict copies never grow the host zone")
+          "across its policy, its evict copies never grow the host zone, and its refusals, latch and room are named")
     return 0
 
 

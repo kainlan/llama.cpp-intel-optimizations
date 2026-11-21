@@ -634,7 +634,7 @@ def claim_batched_dispatch_skips_a_repeated_ready_event(sycl: str) -> bool:
 LAYOUT_CHECK = 'if (e.layout != GGML_LAYOUT_AOS) { refusal = "layout"; break; }'
 OWNER_CHECK = ("if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) || "
                "md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) "
-               '{ refusal = "shared storage"; break; }')
+               "{ refusal = MOE_EXPERT_MOVE_SHARED_STORAGE; break; }")
 USE_CHECK = 'if (e.direct_alloc_owner.owner_use_count() != 1) { refusal = "storage still referenced"; break; }'
 
 

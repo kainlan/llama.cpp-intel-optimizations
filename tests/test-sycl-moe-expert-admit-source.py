@@ -100,6 +100,7 @@ FILES = {
     "pad": ROOT / "ggml/src/ggml-sycl/weight-row-padding.hpp",
     "common": ROOT / "ggml/src/ggml-sycl/common.hpp",
     "hostpath": ROOT / "ggml/src/ggml-sycl/moe-decode-hostpath.hpp",
+    "plan": ROOT / "ggml/src/ggml-sycl/moe-stream-plan.hpp",
 }
 
 _LEXEME_RE = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
@@ -362,6 +363,18 @@ SUCCESS_REASON = "OK"
 _REASON_ASSIGN_RE = re.compile(r"\b(?:refusal|out\.reason) = ([^;]*);")
 _LITERAL_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
 _FINAL_LIST_RE = re.compile(r"final_reasons\[\] = \{([^}]*)\}")
+# A refusal the cache gives and the transaction classifies by a named constant: its one spelling is in the plan header.
+_NAMED_REASON_DEF_RE = re.compile(r"constexpr const char (MOE_EXPERT_MOVE_\w+)\[\] = (\"(?:\\.|[^\"\\])*\");")
+
+
+def resolve_named_reasons(plan: str, *texts: str) -> list[str]:
+    """Each named refusal constant in `texts` replaced by the literal the plan header defines it as, so A11 reads the
+    reason a body assigns or lists whether it is spelled as a literal or by its name."""
+    out = list(texts)
+    for name, literal in _NAMED_REASON_DEF_RE.findall(plan):
+        use = re.compile(r"(?:\bggml_sycl::)?\b" + name + r"\b(?!\[)")
+        out = [use.sub(lambda _m: literal, t) for t in out]
+    return out
 # Each named triplet takes its own list's verdict: the plan judged the evicts and the admits in two lists.
 VERDICT = ("const char * verdict = moves[i].to_device ? check.admit[n_admit++] : check.evict[n_evict++]; "
            "if (verdict) { moves[i].code = ggml_sycl_txn_result::REFUSED; moves[i].reason = verdict; continue; }")
@@ -426,8 +439,10 @@ def _private_testing_lines(raw: str) -> list[bool]:
 
 
 def check(raw: dict[str, str]) -> None:
-    sycl = norm(raw["sycl"])
-    cache = norm(raw["cache"])
+    plan = norm(raw["plan"])
+    if not _NAMED_REASON_DEF_RE.search(plan):
+        fail("A11", "the plan header defines no named refusal (MOE_EXPERT_MOVE_SHARED_STORAGE) this pin can resolve")
+    sycl, cache = resolve_named_reasons(plan, norm(raw["sycl"]), norm(raw["cache"]))
     pad = norm(raw["pad"])
     txn = body(sycl, TXN_SIG)
     entry = body(sycl, ENTRY_SIG)
@@ -697,9 +712,9 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("evict-view-drop-waits", "A1", [("sycl", DROP_SIG, "++w.moe_expert_storage_generation;",
                                                  "++w.moe_expert_storage_generation;\n"
                                                  "        dpct::get_in_order_queue().wait();")])
-    expect_fail("evict-cache-loan-reaps", "A1", [("cache", LOAN_SIG, 'refusal = "shared storage";',
+    expect_fail("evict-cache-loan-reaps", "A1", [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;",
                                                   "(void) finalize_retired_entries_locked();\n"
-                                                  '                refusal = "shared storage";')])
+                                                  "                refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;")])
     expect_fail("lock-before-mint", "A2", [("sycl", PREP_SIG,
                                             "            storage = ggml_sycl_device_expert_alloc(device, staged);",
                                             "            std::lock_guard early(g_tensor_inventory_mutex);\n"
@@ -831,11 +846,12 @@ def self_test(raw: dict[str, str]) -> int:
                                                          'out.reason = "copy submit faild";')])
     expect_fail("transient-refusal-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
                                                          '"invalid arguments", "entry changed",')])
-    expect_fail("loan-refusal-unclassified", "A11", [("cache", LOAN_SIG, 'refusal = "shared storage";',
+    expect_fail("loan-refusal-unclassified", "A11", [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;",
                                                       'refusal = "shared storage held";')])
     expect_fail("loan-transient-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
                                                       '"invalid arguments", "storage still referenced",')])
-    expect_fail("loan-final-dropped-from-the-list", "A11", [("sycl", FINAL_SIG, '"shared storage",', "")])
+    expect_fail("loan-final-dropped-from-the-list", "A11",
+                [("sycl", FINAL_SIG, "ggml_sycl::MOE_EXPERT_MOVE_SHARED_STORAGE,", "")])
     expect_fail("live-host-entry-unclassified", "A11", [("sycl", FINAL_SIG, '"host entry exists"',
                                                          '"host entry exist"')])
     expect_fail("retiring-host-entry-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',

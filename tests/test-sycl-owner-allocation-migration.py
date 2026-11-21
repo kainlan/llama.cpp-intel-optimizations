@@ -190,12 +190,9 @@ NAMED_OWNER_FIRST_SITES = (
     ("ggml_sycl_host_expert_alloc",
      "llama.cpp-36j0: S1-PRELOAD's pinned-pool storage for one host-planned expert (role WEIGHT), replacing a legacy "
      "unified_alloc; the expert registers with this typed owner so its leases report HOST_PINNED/WEIGHT through "
-     "owner_metadata() and the prefill ring copies from it directly; refuses on failure, handed over via "
-     "from_owned_alloc"),
-    ("ggml_sycl_host_expert_alloc_no_growth",
-     "the same pinned-pool WEIGHT storage for a named evict's host copy, with forbid_host_zone_growth so a decode "
-     "boundary never grows the host zone the plan sized, and its miss kept out of the error log (the evict answers "
-     "BUSY and the swap driver counts it); refuses on failure, handed over via from_owned_alloc"),
+     "owner_metadata() and the prefill ring copies from it directly; with grow_zone false (a named evict's host copy, "
+     "through ggml_sycl_host_expert_alloc_no_growth, which calls it) the request forbids host-zone growth and keeps "
+     "its miss out of the error log; refuses on failure, handed over via from_owned_alloc"),
 )
 
 
