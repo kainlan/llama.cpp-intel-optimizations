@@ -3342,11 +3342,11 @@ never a use after free.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
-released. That is an estimate, not a guarantee. The TLSF allocator's
-`largest_free_block()` returns the head of its highest size class rather than a
-scanned maximum. With two or more KV-zone slots (ring depth above 1, or both
-kinds in the zone), a later allocation can take the exact-class fallback and
-miss. The check covers the single-allocation case. For the rest, the reserve
+released. That is a necessary check, not a guarantee. The TLSF allocator's
+`largest_free_block()` is the exact size of the largest free block, but with two
+or more KV-zone slots (ring depth above 1, or both kinds in the zone), an
+earlier slot can take part of that block and leave a later one no block large
+enough. The check covers the single-allocation case. For the rest, the reserve
 fails, and the refusal says the allocator could not place the slots rather than
 naming the size it just refused. An automatic `-ub` then keeps its last
 accepted size; an explicit one fails context creation.
@@ -4138,8 +4138,8 @@ what the compute buffers free is the contiguous tail of the zone, not holes betw
 sizes seen on the B70 are a 39.2 MB Q8 buffer and a 61.4 MB + 24.6 MB f16 pair in a 512 MB default RUNTIME zone. If a
 layout nonetheless fragmented the zone, the failure is the clean one that already exists: the walk's `ensure_buffer`
 cannot place the buffer and the graph is refused before submission, naming the zone's free bytes. `zone_largest_free`
-is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
-would be a second heuristic beside the aggregate one rather than a contiguity proof.
+is not consulted: `largest_free_block()` is the exact size of the largest free block, but it bounds one allocation, not
+the set of planned buffers, so it would be a second check beside the aggregate one rather than a contiguity proof.
 
 *Plan inputs are per owner (llama.cpp-45qo).* The per-token and weight maxima and the `n_ubatch` are each model's own
 terms in the planned load terms' owner table (`planned-load-terms.hpp`, canonical contract 12.4), keyed by the model's

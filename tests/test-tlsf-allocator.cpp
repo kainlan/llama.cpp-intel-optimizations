@@ -180,14 +180,14 @@ static void test_reset() {
     arena.alloc->reset();
     REQUIRE(arena.alloc->used() == 0 && "used() must be 0 after reset");
 
-    // Should be able to allocate a large block after reset.
-    // Note: allocate() uses mapping_search() which rounds up to the next SL
-    // boundary, so requesting exactly largest_free_block() may search a class
-    // above the block's actual class. Use 90% of the largest block instead.
+    // Should be able to allocate the whole largest block after reset.
+    // allocate() places any size up to largest_free_block(), except where the
+    // block ends off the grain (only a region whose size is not a multiple of
+    // it) and the rounded request passes its end; this arena is on the grain.
     size_t largest = arena.alloc->largest_free_block();
     REQUIRE(largest > 0 && "largest_free_block should be positive after reset");
 
-    size_t big = arena.alloc->allocate(largest * 9 / 10);
+    size_t big = arena.alloc->allocate(largest);
     REQUIRE(big != SIZE_MAX && "should allocate large block after reset");
     (void) big;
 
@@ -224,8 +224,8 @@ static void test_alloc_failure() {
 static void test_exhaust_recycle() {
     test_arena arena;
 
-    // Determine largest block — use 90% to account for TLSF rounding in
-    // mapping_search(), which may search a size class above the block's class.
+    // Determine largest block and take 90% of it, so a second request of the
+    // same size exercises the failure path.
     size_t largest = arena.alloc->largest_free_block();
     REQUIRE(largest > 0);
     size_t alloc_size = largest * 9 / 10;
@@ -1542,6 +1542,38 @@ static void test_largest_free_block_walks_top_class() {
     std::cout << "test_largest_free_block_walks_top_class: PASSED\n";
 }
 
+// With every byte allocated there is no free block: largest_free_block() is 0,
+// and it returns to the freed size once a block is released.
+static void test_largest_free_block_empty_pool() {
+    tlsf_allocator t(TRIPLET_SMALL + TRIPLET_LARGE_ROUNDED);
+    const size_t   a = t.allocate(TRIPLET_SMALL);
+    const size_t   b = t.allocate(TRIPLET_LARGE);
+    REQUIRE(a != SIZE_MAX && b != SIZE_MAX && t.available() == 0);
+    REQUIRE(t.largest_free_block() == 0 && "a full pool has no free block");
+    t.free(a);
+    REQUIRE(t.largest_free_block() == TRIPLET_SMALL);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_largest_free_block_empty_pool: PASSED\n";
+}
+
+// A region off the grain ends in a block off the grain.  largest_free_block()
+// reports its whole size, a request rounded up past its end is refused, and
+// the size rounded down to the grain is placed and takes the whole block (the
+// host pinned pool's segmented allocation sizes a piece that way).
+static void test_largest_free_block_off_grain_tail() {
+    const size_t   region = 16 * 256 + 100;
+    tlsf_allocator t(region);
+    REQUIRE(t.largest_free_block() == region);
+    REQUIRE(t.allocate(region - 50) == SIZE_MAX && "rounded up to the grain, the request passes the block's end");
+    REQUIRE(t.used() == 0);
+    const size_t on_grain = region & ~size_t(255);
+    REQUIRE(t.allocate(on_grain) == 0 && "the on-grain part of the block is placed");
+    REQUIRE(t.used() == region && "the sub-grain tail is absorbed into the block");
+    REQUIRE(t.largest_free_block() == 0);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_largest_free_block_off_grain_tail: PASSED\n";
+}
+
 // A replay of expert triplets in a pool sized for exactly n of them: allocate
 // every triplet with members (small, small, large), free the triplets in
 // `freed` (members in `member_free_order`), then re-allocate as many triplets
@@ -1741,6 +1773,8 @@ int main() {
     test_allocate_class_walk_takes_smallest_fit();
     test_allocate_class_walk_refuses_when_none_fits();
     test_largest_free_block_walks_top_class();
+    test_largest_free_block_empty_pool();
+    test_largest_free_block_off_grain_tail();
     test_allocate_class_walk_triplet_replay();
     test_allocate_refuses_only_without_a_fitting_block();
 

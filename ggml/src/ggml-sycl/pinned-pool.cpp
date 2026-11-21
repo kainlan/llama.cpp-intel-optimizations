@@ -543,11 +543,17 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
             continue;
         }
 
-        size_t try_size = std::min(remaining, avail);
         // Round UP to TLSF alignment to avoid leaving a sub-alignment remainder
         // that would round to 0 on the next iteration and cause allocation failure.
-        try_size        = (try_size + tlsf_align - 1) & ~(tlsf_align - 1);
-        if (try_size == 0 || try_size > avail) {
+        size_t try_size = (std::min(remaining, avail) + tlsf_align - 1) & ~(tlsf_align - 1);
+        if (try_size > avail) {
+            // Host zone sizes are not multiples of the grain, so a chunk's last
+            // block can end off it, and rounding up can pass the block.  Take the
+            // block's on-grain part instead of skipping the chunk; the rest of the
+            // request goes to the next chunk.
+            try_size = avail & ~(tlsf_align - 1);
+        }
+        if (try_size == 0) {
             continue;
         }
 

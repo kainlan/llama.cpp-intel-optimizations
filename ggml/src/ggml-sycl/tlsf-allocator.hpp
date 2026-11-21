@@ -443,7 +443,8 @@ class tlsf_allocator {
             if (fl >= FL_COUNT) {
                 // This last class has no upper bound, so find_suitable()'s head there is not checked against the
                 // request.  Safe while no request exceeds the class floor, 2^35 * 31/16 bytes (about 62 GiB), which is
-                // larger than any device zone on these cards: every block in the class is at least the floor.
+                // larger than any TLSF region here (device zones, and host pinned chunks of 2 GiB by default): every
+                // block in the class is at least the floor.
                 fl = FL_COUNT - 1;
                 sl = SL_COUNT - 1;
             }
