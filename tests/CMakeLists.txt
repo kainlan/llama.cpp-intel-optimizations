@@ -1036,6 +1036,15 @@ if (Python3_Interpreter_FOUND)
             --self-test)
     set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The opt-in spread order of routed experts: both orders go through one comparator, the switch is read once and
+    # reaches the planner only through the inventory intake, the planner writes no popularity rank, the spread sort runs
+    # before the ring room and the pack, and the swap headroom is a WEIGHT zone term. Run WITH --self-test so each
+    # mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-spread-placement-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-spread-placement-source.py
+            --self-test)
+    set_tests_properties(test-sycl-moe-spread-placement-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The q8_0 matvec's column-split form: production asks the shape rule with the card's compute units, the row form
     # still launches unchanged for every other shape, and the split kernels keep the barrier-before-sum order a single
     # device run cannot show. Run WITH --self-test so each pin is shown to catch its mutant.
