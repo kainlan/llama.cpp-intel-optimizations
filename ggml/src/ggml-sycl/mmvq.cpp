@@ -2303,7 +2303,9 @@ static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::qu
 template <int qtype> class mmvq_kernel_name;
 template <int qtype> class mmvq_reorder_kernel_name;
 template <int qtype> class mmvq_reorder_slm_kernel_name;
+template <int qtype> class mmvq_reorder_column_split_kernel_name;
 template <int qtype> class mmvq_coalesced_kernel_name;
+template <int qtype> class mmvq_coalesced_column_split_kernel_name;
 template <int qtype> class mmvq_id_kernel_name;
 template <int qtype> class mmvq_soa_id_kernel_name;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -2382,6 +2384,128 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
     if (sg.leader()) {
         dst[row] = sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + row);
     }
+}
+
+// Where a sub-group of a column-split work-group works. A work-group holds 16 / chunks rows; a row's chunks are
+// consecutive sub-groups, chunk 0 first, so sub-group sg_id works on chunk sg_id % chunks of row sg_id / chunks.
+struct mmvq_column_split_slot {
+    int sg_id;  // the sub-group's index in its work-group, which is also its slot in the row partials
+    int chunk;  // which of its row's chunks the sub-group walks
+    int row;    // the output row, in the slice; past nrows in the padded tail of the last work-group
+};
+
+static __dpct_inline__ mmvq_column_split_slot mmvq_column_split_slot_locate(const sycl::nd_item<3> & nd_item,
+                                                                            const int                chunks) {
+    const int              workgroup = static_cast<int>(nd_item.get_group_linear_id());
+    mmvq_column_split_slot slot;
+    slot.sg_id = static_cast<int>(nd_item.get_sub_group().get_group_linear_id());
+    slot.chunk = slot.sg_id % chunks;
+    slot.row   = workgroup * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + slot.sg_id / chunks;
+    return slot;
+}
+
+// The end of a column-split kernel, once for both layouts: every sub-group reduces its lanes' partial sum, its leader
+// publishes it to the sub-group's slot in `row_partials` (local memory, one float per sub-group), the work-group
+// barrier makes all of them visible, and the leader of the row's chunk-0 sub-group adds the row's partials in chunk
+// order, a fixed order so the result is deterministic, then the fused addend once. Every sub-group of the work-group
+// must call this, padded rows included: they bring a zero partial to the barrier and write nothing.
+static __dpct_inline__ void mmvq_column_split_finish_row(const sycl::nd_item<3> &       nd_item,
+                                                         const mmvq_column_split_slot & slot,
+                                                         const int                      chunks,
+                                                         const int                      nrows,
+                                                         const float                    partial_sum,
+                                                         float * __restrict__ row_partials,
+                                                         float *       dst,
+                                                         const float * fused_add,
+                                                         const int64_t fused_add_ne0,
+                                                         const int64_t fused_add_nb0,
+                                                         const int64_t fused_add_row_base) {
+    const auto  sg  = nd_item.get_sub_group();
+    const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+    if (sg.leader()) {
+        row_partials[slot.sg_id] = sum;
+    }
+    // A work-group's fence scope is the work-group, which covers row_partials in local memory.
+    sycl::group_barrier(nd_item.get_group());
+
+    if (slot.chunk == 0 && slot.row < nrows && sg.leader()) {
+        float row_sum = 0.0f;
+        for (int c = 0; c < chunks; ++c) {
+            row_sum += row_partials[slot.sg_id + c];
+        }
+        dst[slot.row] =
+            row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + slot.row);
+    }
+}
+
+// Column-split form of mul_mat_vec_q_reorder, for matrices with too few rows to occupy the card
+// (mmvq-launch-geometry.hpp says when and why). A work-group's 16 sub-groups hold 16 / chunks rows; sub-group
+// `chunk` of a row walks the row form's sub-group steps chunk, chunk + chunks, ... The per-block body is a copy of
+// mul_mat_vec_q_reorder's loop body, not a call: that template serves every reorder type and walks a whole row, and
+// splitting it would touch every type's row form for the sake of this one. With chunks == 1 the copy reads exactly
+// what the row form reads. mmvq_column_split_finish_row then reduces and adds the row's chunks in chunk order: a fixed
+// order, so the result is deterministic, but not the row form's order, so it matches the row form to rounding rather
+// than bit for bit. Rows past nrows in the last work-group compute nothing and write nothing, but cannot return early:
+// every sub-group of the work-group must reach the barrier inside mmvq_column_split_finish_row.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_reorder_column_split(const void * __restrict__ vx,
+                                               const void * __restrict__ vy,
+                                               float *                  dst,
+                                               const int                ncols,
+                                               const int                nrows,
+                                               const int                total_nrows,
+                                               const int                row_low,
+                                               const int                chunks,
+                                               const sycl::nd_item<3> & nd_item,
+                                               float * __restrict__ row_partials,
+                                               const float * fused_add,
+                                               const int64_t fused_add_ne0,
+                                               const int64_t fused_add_nb0,
+                                               const int64_t fused_add_row_base) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const mmvq_column_split_slot slot  = mmvq_column_split_slot_locate(nd_item, chunks);
+    const int                    chunk = slot.chunk;
+    const int                    row   = slot.row;
+    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    // Use total_nrows (full tensor size) for SoA offset calculations, NOT nrows (slice size)
+    const int     nblocks                     = total_nrows * blocks_per_row;
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    float partial_sum = 0.0f;
+    if (row < nrows) {
+        const int block_stride = ggml_sycl::mmvq_column_split_block_stride(chunks, blocks_per_subgroup);
+        for (int i = ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup,
+                                                              blocks_per_subgroup);
+             i < blocks_per_row; i += block_stride) {
+            // SoA offsets are over the whole tensor, so the block index uses the global row (row_low + row).
+            const int ibx = (row_low + row) * blocks_per_row + i;
+
+            const auto          bx_offset      = block_type::get_block_offset(ibx, nblocks);
+            const auto          d_offset       = block_type::get_d_offset(total_nrows, ncols, ibx);
+            const int           iby            = i * block_type::block_to_q8_1_ratio();
+            const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+            const sycl::half2 * q8_1_ds_ptr =
+                (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int iqs = elem + block_traits::vdr_mmvq * (lane % block_elements_per_subgroup);
+
+                partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            }
+        }
+    }
+
+    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, fused_add_ne0,
+                                 fused_add_nb0, fused_add_row_base);
 }
 
 // Multi-row reordered kernel with SLM Y-vector sharing
@@ -3611,6 +3735,10 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Q8_0 reorder MMVQ dispatch function
 // Note: total_nrows is the full tensor row count (ne01), nrows is the slice size (row_diff)
 //       row_low is the starting row offset for this slice (for split tensor support)
+// compute_units is the card's SYCL compute-unit count (0 when unknown). With it the shape picks the row form or the
+// column-split form (mmvq_column_split_chunks, mmvq-launch-geometry.hpp); both go out under the same profile label,
+// the split one with ";chunks=N" in its metadata. If chunks_out is set it receives the chunks launched, 1 for the row
+// form.
 static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                const void *    vy,
                                                float *         dst,
@@ -3618,28 +3746,70 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                const int       nrows,
                                                const int       total_nrows,
                                                const int       row_low,
+                                               const int       compute_units,
                                                dpct::queue_ptr stream,
                                                const float *   fused_add          = nullptr,
                                                const int64_t   fused_add_ne0      = 0,
                                                const int64_t   fused_add_nb0      = sizeof(float),
-                                               const int64_t   fused_add_row_base = 0) {
+                                               const int64_t   fused_add_row_base = 0,
+                                               int *           chunks_out         = nullptr) {
     GGML_ASSERT(ncols % QK8_0 == 0);
+    using q8_0_traits             = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>::traits;
+    // The row form's sub-group step, mul_mat_vec_q_reorder's blocks_per_subgroup: 8 blocks.
+    constexpr int blocks_per_step = ceil_div(q8_0_traits::vdr_mmvq * WARP_SIZE, q8_0_traits::qi);
+    const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units);
+    if (chunks_out) {
+        *chunks_out = chunks;
+    }
+
+    // P4 TG-cost-visibility (llama.cpp-os8k): SOA-layout arm of the same
+    // Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS sibling,
+    // further down this file) comment for the full rationale.
+    std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    if (chunks > 1) {
+        profile_metadata += ";chunks=" + std::to_string(chunks);
+    }
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_soa", profile_metadata.c_str(), "mulmat");
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
+
+    if (chunks > 1) {
+        // Column-split form: the row form's work-group of 16 sub-groups, 16 / chunks rows per work-group, one SLM
+        // float per sub-group for the row partials. Same queue, same submit wrapper, no dependency added.
+        // row_partials has one float per sub-group, so it is in bounds only while three things agree: the
+        // accessor's `subgroups` floats, a work-group of `subgroups * WARP_SIZE` items, and the kernel's
+        // reqd_sub_group_size(WARP_SIZE), which makes those items exactly `subgroups` sub-groups.
+        constexpr int    subgroups             = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;
+        static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,
+                      "the row partials hold one float per sub-group of the split work-group");
+        const int            workgroups = ggml_sycl::mmvq_column_split_workgroups(nrows, chunks);
+        const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);
+        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);
+
+        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);
+                cgh.parallel_for<mmvq_reorder_column_split_kernel_name<GGML_TYPE_Q8_0>>(
+                    sycl::nd_range<3>(split_global, split_workgroup),
+                    [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q_reorder_column_split<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+                            vx, vy, dst, ncols, nrows, total_nrows, row_low, chunks, nd_item,
+                            row_partials.get_pointer(), fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
+                    });
+            });
+        });
+        return;
+    }
+
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
     const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
-
-    // P4 TG-cost-visibility (llama.cpp-os8k): SOA-layout arm of the same
-    // Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS sibling,
-    // further down this file) comment for the full rationale.
-    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    ggml_sycl_profile_label profile_label =
-        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_soa", profile_metadata.c_str(), "mulmat");
-    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
-    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
-    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -4015,7 +4185,77 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Source (block-major): [B0.W0-W7][B1.W0-W7]...[B(TILE_BLOCKS-1).W0-W7]
 // Dest (word-major):    [W0:B0-B(TILE_BLOCKS-1)]...[W7:B0-B(TILE_BLOCKS-1)]
 //
-// Thread mapping: threads iterate block_in_tile and process both halves per block
+// Thread mapping: within a tile, lane l takes blocks l, l + WARP_SIZE, ... and processes both 16-byte halves of
+// each. The per-tile body below holds that mapping; the row form and the column-split form differ only in which
+// tiles of a row a sub-group passes to it.
+
+// One tile of one row of the coalesced Q8_0 x Q8_1 dot product, added into this lane's `partial_sum`. The row form
+// walks every tile of a row; the column-split form walks one chunk's tiles. One body, so both forms read the layout
+// the same way and add a tile's terms in the same order.
+static __dpct_inline__ void mmvq_q8_0_coalesced_accumulate_tile(const uint8_t *     x_qs,
+                                                                const ggml_half *   x_d,
+                                                                const int8_t *      y_qs,
+                                                                const sycl::half2 * y_ds,
+                                                                const int           row,
+                                                                const int           tile,
+                                                                const int           x_row_stride,
+                                                                const int           blocks_per_row,
+                                                                const int           lane_id,
+                                                                float &             partial_sum) {
+    constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;
+    const int     word_stride = TILE_BLOCKS * 4;
+
+    // Base offset for this tile's quants
+    const int tile_base = row * x_row_stride + tile * MMVQ_COALESCED_TILE_BYTES_Q8_0;
+
+    for (int block_in_tile = lane_id; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
+        const int y_block = tile * TILE_BLOCKS + block_in_tile;
+        if (y_block >= blocks_per_row) {
+            continue;
+        }
+        // Get scale for this block (scales are NOT coalesced, remain block-sequential)
+        const int   block_idx = row * blocks_per_row + y_block;
+        const float d         = x_d[block_idx];
+
+        // Y block index and base offset
+        const int y_base = y_block * QK8_1;
+
+        for (int half = 0; half < 2; ++half) {
+            // Coalesced load: word w of block b at offset w*word_stride + b*4
+            // Thread loads 4 words (16 bytes total) per half
+            const int word_base = half * (4 * word_stride);
+
+            // Perfectly coalesced 4-byte loads
+            const int v0 = *((const int *) (x_qs + tile_base + word_base + 0 * word_stride + block_in_tile * 4));
+            const int v1 = *((const int *) (x_qs + tile_base + word_base + 1 * word_stride + block_in_tile * 4));
+            const int v2 = *((const int *) (x_qs + tile_base + word_base + 2 * word_stride + block_in_tile * 4));
+            const int v3 = *((const int *) (x_qs + tile_base + word_base + 3 * word_stride + block_in_tile * 4));
+
+            // Load Y data matching the X half we're processing
+            // For half=0: Y elements 0-15
+            // For half=1: Y elements 16-31
+            const int y_offset = half * 16;                                                   // 0 or 16 (in bytes)
+            const int u0       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 0);  // Y[0:3] or Y[16:19]
+            const int u1       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 1);  // Y[4:7] or Y[20:23]
+            const int u2       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 2);  // Y[8:11] or Y[24:27]
+            const int u3       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 3);  // Y[12:15] or Y[28:31]
+
+            // dp4a: compute dot product of 4 int8 pairs
+            int sumi = 0;
+            sumi     = dpct::dp4a(v0, u0, sumi);
+            sumi     = dpct::dp4a(v1, u1, sumi);
+            sumi     = dpct::dp4a(v2, u2, sumi);
+            sumi     = dpct::dp4a(v3, u3, sumi);
+
+            // Apply scales: Q8_0 × Q8_1 = d8_0 * d8_1 * sumi
+            const sycl::half2 ds8  = y_ds[y_block];
+            const float       d8_1 = ds8[0];
+            partial_sum += d * d8_1 * sumi;
+        }
+    }
+}
+
+// Row form: one sub-group per output row, walking every tile of the row.
 static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                        const void * __restrict__ vy,  // Reordered Y activations
                                        float *                  dst,
@@ -4037,11 +4277,8 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
         return;
     }
 
-    constexpr int TILE_BLOCKS    = MMVQ_COALESCED_TILE_BLOCKS;
-    const int     blocks_per_row = ncols / QK8_0;
-    const int     tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
-
-    const int word_stride = TILE_BLOCKS * 4;
+    const int blocks_per_row = ncols / QK8_0;
+    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
 
     // X base pointers (coalesced layout: quants first, then scales)
     // Quants: tiles_per_row * TILE_BLOCKS * 32 bytes per row = ncols bytes
@@ -4058,54 +4295,8 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
     float partial_sum = 0.0f;
 
     for (int tile = 0; tile < tiles_per_row; tile++) {
-        // Base offset for this tile's quants
-        const int tile_base = row * x_row_stride + tile * MMVQ_COALESCED_TILE_BYTES_Q8_0;
-
-        for (int block_in_tile = lane_id; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
-            const int y_block = tile * TILE_BLOCKS + block_in_tile;
-            if (y_block >= blocks_per_row) {
-                continue;
-            }
-            // Get scale for this block (scales are NOT coalesced, remain block-sequential)
-            const int   block_idx = row * blocks_per_row + y_block;
-            const float d         = x_d[block_idx];
-
-            // Y block index and base offset
-            const int y_base = y_block * QK8_1;
-
-            for (int half = 0; half < 2; ++half) {
-                // Coalesced load: word w of block b at offset w*word_stride + b*4
-                // Thread loads 4 words (16 bytes total) per half
-                const int word_base = half * (4 * word_stride);
-
-                // Perfectly coalesced 4-byte loads
-                const int v0 = *((const int *) (x_qs + tile_base + word_base + 0 * word_stride + block_in_tile * 4));
-                const int v1 = *((const int *) (x_qs + tile_base + word_base + 1 * word_stride + block_in_tile * 4));
-                const int v2 = *((const int *) (x_qs + tile_base + word_base + 2 * word_stride + block_in_tile * 4));
-                const int v3 = *((const int *) (x_qs + tile_base + word_base + 3 * word_stride + block_in_tile * 4));
-
-                // Load Y data matching the X half we're processing
-                // For half=0: Y elements 0-15
-                // For half=1: Y elements 16-31
-                const int y_offset = half * 16;                                                   // 0 or 16 (in bytes)
-                const int u0       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 0);  // Y[0:3] or Y[16:19]
-                const int u1       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 1);  // Y[4:7] or Y[20:23]
-                const int u2       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 2);  // Y[8:11] or Y[24:27]
-                const int u3 = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 3);  // Y[12:15] or Y[28:31]
-
-                // dp4a: compute dot product of 4 int8 pairs
-                int sumi = 0;
-                sumi     = dpct::dp4a(v0, u0, sumi);
-                sumi     = dpct::dp4a(v1, u1, sumi);
-                sumi     = dpct::dp4a(v2, u2, sumi);
-                sumi     = dpct::dp4a(v3, u3, sumi);
-
-                // Apply scales: Q8_0 × Q8_1 = d8_0 * d8_1 * sumi
-                const sycl::half2 ds8  = y_ds[y_block];
-                const float       d8_1 = ds8[0];
-                partial_sum += d * d8_1 * sumi;
-            }
-        }
+        mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane_id,
+                                            partial_sum);
     }
 
     // Warp reduction using subgroup intrinsic
@@ -4114,6 +4305,52 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
     if (sg.leader()) {
         dst[row] = sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + row);
     }
+}
+
+// Column-split form of mul_mat_vec_q8_0_coalesced, for matrices with too few rows to occupy the card
+// (mmvq-launch-geometry.hpp says when and why). A step of the row form is one tile, so sub-group `chunk` of a row
+// walks the tiles mmvq_column_split_first_step / step_stride give it through the same per-tile body. The reduction
+// is the SOA column-split kernel's own, mmvq_column_split_finish_row. Padded rows reach its barrier and write
+// nothing. The coalesced layout is never sliced (the dispatcher asserts it), so nrows is the tensor's row
+// count, as in the row form.
+static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx,
+                                                    const void * __restrict__ vy,
+                                                    float *                  dst,
+                                                    const int                ncols,
+                                                    const int                nrows,
+                                                    const int                chunks,
+                                                    const sycl::nd_item<3> & nd_item,
+                                                    float * __restrict__ row_partials,
+                                                    const float * fused_add,
+                                                    const int64_t fused_add_ne0,
+                                                    const int64_t fused_add_nb0,
+                                                    const int64_t fused_add_row_base) {
+    const mmvq_column_split_slot slot  = mmvq_column_split_slot_locate(nd_item, chunks);
+    const int                    chunk = slot.chunk;
+    const int                    row   = slot.row;
+    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();
+
+    const int blocks_per_row = ncols / QK8_0;
+    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
+
+    const uint8_t *     x_qs         = (const uint8_t *) vx;
+    const int           x_row_stride = static_cast<int>(ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row));
+    const ggml_half *   x_d          = (const ggml_half *) ((const char *) vx + nrows * x_row_stride);
+    const int8_t *      y_qs         = (const int8_t *) vy;
+    const sycl::half2 * y_ds         = (const sycl::half2 *) ((const char *) vy + ncols);
+
+    float partial_sum = 0.0f;
+    if (row < nrows) {
+        // The shared step walk, in tiles: the host test sweeps these same two functions.
+        const int tile_stride = ggml_sycl::mmvq_column_split_step_stride(chunks);
+        for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; tile += tile_stride) {
+            mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane,
+                                                partial_sum);
+        }
+    }
+
+    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, fused_add_ne0,
+                                 fused_add_nb0, fused_add_row_base);
 }
 
 // GPU kernel to convert Q8_0 reordered format to warp-coalesced format
@@ -4240,17 +4477,70 @@ bool ggml_sycl_convert_to_coalesced_q6_k(const ggml_tensor * tensor, dpct::queue
 }
 
 // Dispatch function for coalesced Q8_0 MMVQ kernel
+// compute_units and chunks_out as for reorder_mul_mat_vec_q8_0_q8_1_sycl: the shape picks the row form or the
+// column-split form, both under the same profile label.
 static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                  const void *    vy,
                                                  float *         dst,
                                                  const int       ncols,
                                                  const int       nrows,
+                                                 const int       compute_units,
                                                  dpct::queue_ptr stream,
                                                  const float *   fused_add          = nullptr,
                                                  const int64_t   fused_add_ne0      = 0,
                                                  const int64_t   fused_add_nb0      = sizeof(float),
-                                                 const int64_t   fused_add_row_base = 0) {
+                                                 const int64_t   fused_add_row_base = 0,
+                                                 int *           chunks_out         = nullptr) {
     GGML_ASSERT(ncols % QK8_0 == 0);
+
+    // The row form's sub-group step is one tile of MMVQ_COALESCED_TILE_BLOCKS blocks, so the rule's step count is the
+    // kernel's tiles_per_row (both round the row's blocks up to whole tiles).
+    constexpr int blocks_per_step = MMVQ_COALESCED_TILE_BLOCKS;
+    const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units);
+    if (chunks_out) {
+        *chunks_out = chunks;
+    }
+
+    // P4 TG-cost-visibility (llama.cpp-os8k): COALESCED-layout arm of the
+    // same Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS
+    // sibling) comment above for the full rationale.
+    std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    if (chunks > 1) {
+        profile_metadata += ";chunks=" + std::to_string(chunks);
+    }
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_coalesced", profile_metadata.c_str(), "mulmat");
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
+
+    if (chunks > 1) {
+        // Column-split form, the same geometry as the SOA one: 16 sub-groups per work-group, 16 / chunks rows each.
+        // row_partials has one float per sub-group, so it is in bounds only while three things agree: the
+        // accessor's `subgroups` floats, a work-group of `subgroups * WARP_SIZE` items, and the kernel's
+        // reqd_sub_group_size(WARP_SIZE), which makes those items exactly `subgroups` sub-groups.
+        constexpr int    subgroups             = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;
+        static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,
+                      "the row partials hold one float per sub-group of the split work-group");
+        const int            workgroups = ggml_sycl::mmvq_column_split_workgroups(nrows, chunks);
+        const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);
+        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);
+
+        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);
+                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name<GGML_TYPE_Q8_0>>(
+                    sycl::nd_range<3>(split_global, split_workgroup),
+                    [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q8_0_coalesced_column_split(vx, vy, dst, ncols, nrows, chunks, nd_item,
+                                                                row_partials.get_pointer(), fused_add, fused_add_ne0,
+                                                                fused_add_nb0, fused_add_row_base);
+                    });
+            });
+        });
+        return;
+    }
 
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
@@ -4258,16 +4548,6 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
 
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
-
-    // P4 TG-cost-visibility (llama.cpp-os8k): COALESCED-layout arm of the
-    // same Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS
-    // sibling) comment above for the full rationale.
-    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    ggml_sycl_profile_label profile_label =
-        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_coalesced", profile_metadata.c_str(), "mulmat");
-    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
-    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
-    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -22974,6 +23254,15 @@ static bool mmvq_build_stream_segments(const ggml_tensor * src0,
     return true;
 }
 
+// The card's SYCL compute-unit count, the one device fact the Q8_0 column-split rule reads
+// (mmvq_column_split_chunks). 0 for a device index the backend does not know, which keeps the row form.
+static int mmvq_device_compute_units(const int device_id) {
+    if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
+        return 0;
+    }
+    return ggml_sycl_info().devices[device_id].nsm;
+}
+
 static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                     const char *            src0_dd_i,
                                     const void *            layout_base,
@@ -23120,8 +23409,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                          (long long) row_diff);
                         mmvq_assert_coalesced_slice_supported(src0 ? src0->name : nullptr, ne01, row_low, row_diff);
                         coalesced_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
-                                                             stream, fused_add, fused_add_ne0, fused_add_nb0,
-                                                             fused_add_row_base);
+                                                             mmvq_device_compute_units(device_id), stream, fused_add,
+                                                             fused_add_ne0, fused_add_nb0, fused_add_row_base);
                     } else if (mode == reorder_mode::SOA) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
                         GGML_SYCL_KTRACE("mmvq_q8_0_soa", " ne00=%lld row_diff=%lld ne01=%lld row_low=%lld",
@@ -23129,8 +23418,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                         // For SoA layout, use base pointer (not pre-offset src0_dd_i) and pass row_low for correct block indexing
                         const void * soa_base = layout_base;
                         reorder_mul_mat_vec_q8_0_q8_1_sycl(soa_base, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, ne01,
-                                                           row_low, stream, fused_add, fused_add_ne0, fused_add_nb0,
-                                                           fused_add_row_base);
+                                                           row_low, mmvq_device_compute_units(device_id), stream,
+                                                           fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
                     } else {
                         GGML_SYCL_KTRACE("mmvq_q8_0_aos", " ne00=%lld row_diff=%lld", (long long) ne00,
                                          (long long) row_diff);
@@ -23515,6 +23804,36 @@ static sycl::event mmvq_stream_slice(sycl::queue &                    queue,
 
     return ggml_sycl_submit_marker<ggml_sycl_mmvq_marker_kernel>(queue);
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The Q8_0 launchers exactly as ggml_sycl_mmvq_dispatch calls them, for a device test that has no ggml tensor:
+// `compute_units` is what the dispatcher would read from the card, so the test drives the row form (0) and the
+// column-split form (the card's count) through the production dispatch rule. Returns the chunks launched.
+int mmvq_test_q8_0_launch(sycl::queue & q,
+                          bool          coalesced,
+                          const void *  vx,
+                          const void *  vy,
+                          float *       dst,
+                          int           ncols,
+                          int           nrows,
+                          int           total_nrows,
+                          int           row_low,
+                          int           compute_units,
+                          const float * fused_add,
+                          int64_t       fused_add_ne0,
+                          int64_t       fused_add_row_base) {
+    int chunks = 0;
+    if (coalesced) {
+        mmvq_assert_coalesced_slice_supported("mmvq_test_q8_0_launch", total_nrows, row_low, nrows);
+        coalesced_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, compute_units, &q, fused_add, fused_add_ne0,
+                                             sizeof(float), fused_add_row_base, &chunks);
+    } else {
+        reorder_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, total_nrows, row_low, compute_units, &q,
+                                           fused_add, fused_add_ne0, sizeof(float), fused_add_row_base, &chunks);
+    }
+    return chunks;
+}
+#endif
 
 // =============================================================================
 // Direct MMVQ kernel submission wrappers for persistent TG micro-graph

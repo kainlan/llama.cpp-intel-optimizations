@@ -433,6 +433,13 @@ llama_build_and_test(test-archs-table.cpp)
 llama_build_and_test(test-sycl-moe-mmvq-tables.cpp)
 set_tests_properties(test-sycl-moe-mmvq-tables PROPERTIES LABELS "sycl;moe;source;hostonly")
 
+# Host-only gate for the column-split form of the Q8_0 matvec: which shapes take it (few rows, long rows) on the two
+# cards' compute-unit counts, and that its chunks read every quant of a row exactly once. Unguarded for the same reason
+# as the table gate above: mmvq-launch-geometry.hpp includes nothing, so this needs no oneAPI and no GPU.
+llama_build_and_test(test-sycl-mmvq-column-split-rule.cpp)
+set_tests_properties(test-sycl-mmvq-column-split-rule PROPERTIES LABELS "sycl;mmvq;hostonly")
+target_include_directories(test-sycl-mmvq-column-split-rule PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 # MoE route-table stamp: pure invalidation-decision logic (perf-recovery epic,
 # track B, llama.cpp-s6ac). No device or oneDNN dependency in the tested
 # portion -- see ggml-sycl/moe-route-table.hpp. The header's only backend
@@ -1043,6 +1050,14 @@ if (Python3_Interpreter_FOUND)
             --self-test)
     set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The q8_0 matvec's column-split form: production asks the shape rule with the card's compute units, the row form
+    # still launches unchanged for every other shape, and the split kernels keep the barrier-before-sum order a single
+    # device run cannot show. Run WITH --self-test so each pin is shown to catch its mutant.
+    add_test(NAME test-sycl-mmvq-q8-0-column-split-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmvq-q8-0-column-split-source.py --self-test)
+    set_tests_properties(test-sycl-mmvq-q8-0-column-split-source PROPERTIES
+        LABELS "sycl;mmvq;source;source-contract;hostonly;python" TIMEOUT 60)
     # llama.cpp-36j0 Task 4: the MoE executor knobs' literals, log formats, env-report rows and teardown summary.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-exec-knobs-source
@@ -3782,6 +3797,30 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-mmvq-q8-0-soa-numerics PROPERTIES
         LABELS "sycl;mmvq;quant;soa;gpu-serial"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+
+    # Column-split form of the Q8_0 matvec against its row form and a CPU reference, SOA and coalesced. The cases are
+    # in test-sycl-mmvq-q8-0-column-split-cases.h: the decode-profile shapes with and without a fused addend, SOA row
+    # slices, and row counts that leave padded rows in the last work-group of each layout. It runs the production
+    # launchers through the GGML_SYCL_PRIVATE_TESTING entry mmvq_test_q8_0_launch, so it links the private backend
+    # objects. It loads no model and allocates under 2 MB of device memory. Pinned to the B70, the card whose decode
+    # profile found the shapes; it exits 77 when no GPU is usable or the card would not take the split.
+    add_executable(test-sycl-mmvq-q8-0-column-split test-sycl-mmvq-q8-0-column-split.cpp)
+    target_link_libraries(test-sycl-mmvq-q8-0-column-split PRIVATE ggml-sycl-private-fixtures)
+    target_include_directories(test-sycl-mmvq-q8-0-column-split PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-mmvq-q8-0-column-split PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_PRIVATE_TESTING=1)
+    target_compile_options(test-sycl-mmvq-q8-0-column-split PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-mmvq-q8-0-column-split PRIVATE "-fsycl")
+    add_test(NAME test-sycl-mmvq-q8-0-column-split COMMAND $<TARGET_FILE:test-sycl-mmvq-q8-0-column-split>)
+    set_tests_properties(test-sycl-mmvq-q8-0-column-split PROPERTIES
+        LABELS "sycl;mmvq;quant;device;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300
