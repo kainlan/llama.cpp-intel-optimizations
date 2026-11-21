@@ -38,24 +38,41 @@ def strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", text)
 
 
+class UnbalancedBraces(Exception):
+    pass
+
+
+def block_end(code: str, brace: int) -> int:
+    """Index just past the brace that closes the one at `brace`, skipping string and char literals."""
+    depth, i, n = 1, brace + 1, len(code)
+    while depth:
+        if i >= n:
+            raise UnbalancedBraces(f"no closing brace for the block at offset {brace}")
+        ch = code[i]
+        if ch in "\"'":
+            i += 1
+            while i < n and code[i] != ch:
+                i += 2 if code[i] == "\\" else 1
+            if i >= n:
+                raise UnbalancedBraces(f"unterminated literal in the block at offset {brace}")
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return i
+
+
 def lambda_body(code: str) -> str:
     start = code.index("auto stage_raw_host_source = [&]")
     brace = code.index("{", code.index("->", start))
-    depth, i = 1, brace + 1
-    while depth:
-        depth += {"{": 1, "}": -1}.get(code[i], 0)
-        i += 1
-    return code[brace:i]
+    return code[brace:block_end(code, brace)]
 
 
 def helper_body(code: str) -> str:
     start = code.index("static void * " + HELPER)
     brace = code.index("{", start)
-    depth, i = 1, brace + 1
-    while depth:
-        depth += {"{": 1, "}": -1}.get(code[i], 0)
-        i += 1
-    return code[brace:i]
+    return code[brace:block_end(code, brace)]
 
 
 def main() -> int:
@@ -66,17 +83,21 @@ def main() -> int:
     except ValueError:
         print("FAIL: binbcast.cpp no longer has stage_raw_host_source or " + HELPER.rstrip("("))
         return 1
+    except UnbalancedBraces as exc:
+        print(f"FAIL: binbcast.cpp could not be scanned: {exc}")
+        return 1
     failures = []
 
     call = body.find(HELPER)
     if call < 0:
         failures.append("stage_raw_host_source no longer looks up a staged graph input")
     else:
-        for marker, what in (
-            ("ggml_sycl_binbcast_needs_raw_host_staging(", "the no-staging-needed return"),
-            ("if (span_bytes == 0)", "the zero-span return"),
+        for pattern, what in (
+            (r"ggml_sycl_binbcast_needs_raw_host_staging\(", "the no-staging-needed return"),
+            (r"if\s*\(\s*span_bytes\s*==\s*0u?\s*\)", "the zero-span return"),
         ):
-            pos = body.find(marker)
+            m = re.search(pattern, body)
+            pos = m.start() if m else -1
             if pos < 0 or pos > call:
                 failures.append(f"the staged-input lookup must come after {what}")
         for marker, what in (
@@ -91,11 +112,24 @@ def main() -> int:
                 failures.append(f"the staged-input lookup must come before {what}")
 
         hit_open = body.find("{", call)
-        depth, i = 1, hit_open + 1
-        while depth:
-            depth += {"{": 1, "}": -1}.get(body[i], 0)
-            i += 1
-        hit = body[hit_open:i]
+        try:
+            hit_end = block_end(body, hit_open) if hit_open >= 0 else -1
+        except UnbalancedBraces as exc:
+            print(f"FAIL: the staged-input hit block could not be scanned: {exc}")
+            return 1
+        if hit_end < 0:
+            print("FAIL: the staged-input lookup has no hit block")
+            return 1
+        hit = body[hit_open:hit_end]
+        # A miss while recording must reach the throw: a return between the hit block and the weight path would let
+        # a recorded kernel bake the host pointer. (The allocation-failure return further down is not on this
+        # stretch.)
+        weight = body.find("if (ggml_sycl_tensor_is_weight(tensor)", hit_end)
+        if weight < 0:
+            failures.append("stage_raw_host_source lost the weight cache path after the staged-input lookup")
+        elif re.search(r"\breturn\b", body[hit_end:weight]):
+            failures.append("a staged-input miss must not return before the weight path (a recording would bake "
+                            "the host pointer instead of throwing)")
         if "staged_raw_host" in hit:
             failures.append("a staged-input hit must not set staged_raw_host (its end-of-op wait is the drain)")
         if not re.search(r"\bstage\s*=\s*std::move\(", hit):
