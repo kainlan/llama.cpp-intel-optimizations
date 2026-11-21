@@ -18,6 +18,7 @@
 
 #if GGML_SYCL_DNNL
 
+#    include "dnnl-deterministic.hpp"
 #    include "dnnl-ops.hpp"
 #    include "dnnl.hpp"
 #    include "dnnl_sycl.hpp"

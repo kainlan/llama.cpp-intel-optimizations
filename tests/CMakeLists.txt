@@ -1027,7 +1027,9 @@ if (Python3_Interpreter_FOUND)
     # Every dnnl::primitive_attr the backend builds goes through the one helper that asks oneDNN for a deterministic
     # implementation, behind one default-ON switch read once (GGML_SYCL_ONEDNN_DETERMINISTIC). Without it identical
     # inputs gave different bits run to run. Run WITH --self-test so each mutant is caught by the pin it names. Text
-    # only: no device, no model. TIMEOUT: the 22-mutant self-test took 11 s wall.
+    # only: no device, no model. TIMEOUT: the self-test runs one full check of the scanned sources per mutant,
+    # about 0.6 s of CPU each on this host, so its time grows with the mutant list; 120 s leaves room for the
+    # host's permanent load and for more mutants. Raise it when a self-test run comes near it.
     add_test(NAME test-sycl-onednn-deterministic-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-deterministic-source.py --self-test)
     set_tests_properties(test-sycl-onednn-deterministic-source PROPERTIES

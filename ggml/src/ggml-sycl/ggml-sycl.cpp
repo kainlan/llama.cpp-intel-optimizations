@@ -426,7 +426,7 @@ int g_ggml_sycl_kqv_force_simple = 0;
 int g_ggml_sycl_kqv_disable_fp16 = 0;
 #if GGML_SYCL_DNNL
 // GGML_SYCL_ONEDNN_DETERMINISTIC as the report's integer, SET from ggml_sycl_onednn_deterministic_enabled()
-// (dnnl-ops.hpp) after the table parse, so the report says what is in effect.
+// (dnnl-deterministic.hpp) after the table parse, so the report says what is in effect.
 int g_ggml_sycl_onednn_deterministic = 1;
 #endif
 #ifdef GGML_SYCL_XMX_GEMM
