@@ -6,6 +6,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1760,13 +1761,14 @@ static ggml_sycl::placement_plan plan_mapping(size_t   budget,
 // The planner's line when its routed host experts go back to the mapping.
 constexpr const char * stay_mapped_line = "routed host experts stay mapped";
 
-// Counts the log lines that carry `needle` while it lives, and passes every line on to the callback it replaced, which
-// it puts back when the scope ends.
+// Counts the log lines that carry `needle` while it lives, and keeps them, so a case can read the figures they print.
+// It passes every line on to the callback it replaced, which it puts back when the scope ends.
 struct log_line_counter {
-    const char *      needle;
-    size_t            count   = 0;
-    ggml_log_callback prev_cb = nullptr;
-    void *            prev_ud = nullptr;
+    const char *             needle;
+    size_t                   count   = 0;
+    ggml_log_callback        prev_cb = nullptr;
+    void *                   prev_ud = nullptr;
+    std::vector<std::string> lines;
 
     explicit log_line_counter(const char * text) : needle(text) {
         ggml_log_get(&prev_cb, &prev_ud);
@@ -1782,6 +1784,7 @@ struct log_line_counter {
         auto * self = static_cast<log_line_counter *>(user);
         if (text != nullptr && std::strstr(text, self->needle) != nullptr) {
             self->count++;
+            self->lines.emplace_back(text);
         }
         if (self->prev_cb != nullptr) {
             self->prev_cb(level, text, self->prev_ud);
@@ -2509,11 +2512,38 @@ static std::string plan_difference(const ggml_sycl::placement_plan & a, const gg
     }
     return std::string();
 }
+
+// Whether `line` ends with `tail`.
+static bool ends_with(const std::string & line, const std::string & tail) {
+    return line.size() >= tail.size() && line.compare(line.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+// The number a log line prints after `key`, or SIZE_MAX when the line does not carry the key.
+static size_t printed_field(const std::string & line, const char * key) {
+    const size_t at = line.find(key);
+    if (at == std::string::npos) {
+        return SIZE_MAX;
+    }
+    return static_cast<size_t>(std::strtoull(line.c_str() + at + std::strlen(key), nullptr, 10));
+}
+
+// `plan` holding `n` swap-headroom triplets of `bound` bytes each, with its WEIGHT zone written as its terms' total()
+// and its host figures re-recorded, as the planner's hold writes them.
+static ggml_sycl::placement_plan with_headroom(const ggml_sycl::placement_plan & plan, size_t n, size_t bound) {
+    ggml_sycl::placement_plan held       = plan;
+    held.moe_swap_host_headroom_triplets = n;
+    held.moe_swap_host_headroom_bytes    = n * bound;
+    held.host_zone_weight_bytes          = ggml_sycl::placement_plan_host_weight_zone_terms(held).total();
+    ggml_sycl::placement_plan_rerecord_host_zone_terms(held);
+    return held;
+}
 }  // namespace spread_case
 
 // The switch off is the layer-first plan; on, with no ranks, every block gets an equal share of the device slots
 // within one, filled with its lowest-numbered experts, and no more device bytes; on, with one block ranked, that block
-// keeps its best-ranked experts and the others their lowest-numbered ones. Thirteen triplets fit the budget.
+// keeps its best-ranked experts and the others their lowest-numbered ones. Thirteen triplets fit the budget. The cases
+// carry no MemAvailable sample, so P3's margin cannot be kept: the spread plan holds no swap headroom and its line says
+// why.
 static bool run_moe_spread_order_test() {
     using namespace spread_case;
     using ring_room_case::log_line_counter;
@@ -2557,8 +2587,10 @@ static bool run_moe_spread_order_test() {
             "[PLACEMENT-MOE] expert order: mode=spread hotness=spread(rank,layer,expert) blocks=4 ranked_blocks=0 "
             "device_slots=13 per_block_min=3 (3 blocks) per_block_max=4 (1 blocks)\n");
         log_line_counter headroom_line("[PLACEMENT-MOE] spread swap headroom: triplets=");
-        const auto       on    = plan_for(budget, true);
-        const auto       slots = block_slots(on, first);
+        log_line_counter no_sample_line(
+            "; none held: no MemAvailable sample, so P3's margin cannot be kept (host_budget=");
+        const auto on    = plan_for(budget, true);
+        const auto slots = block_slots(on, first);
         if (!on.moe_spread || slots != even_split(13)) {
             printf("FAIL: spread on, no ranks: blocks hold %s device triplets (want %s), moe_spread=%d\n",
                    text(slots).c_str(), text(even_split(13)).c_str(), on.moe_spread ? 1 : 0);
@@ -2581,6 +2613,14 @@ static bool run_moe_spread_order_test() {
             printf(
                 "FAIL: spread on, no ranks: %zu order lines with the expected text, %zu headroom lines (want 1, 1)\n",
                 order_line.count, headroom_line.count);
+            ok = false;
+        }
+        if (on.moe_swap_host_headroom_triplets != 0 || on.moe_swap_host_headroom_bytes != 0 ||
+            no_sample_line.count != 1) {
+            printf(
+                "FAIL: spread on, no MemAvailable sample: headroom %zu triplets %zu bytes, %zu lines naming the "
+                "missing sample (want 0, 0, 1)\n",
+                on.moe_swap_host_headroom_triplets, on.moe_swap_host_headroom_bytes, no_sample_line.count);
             ok = false;
         }
     }
@@ -2662,9 +2702,11 @@ static bool run_moe_spread_fits_whole_test() {
 }
 
 // The spread plan's swap headroom in the host WEIGHT zone: one extra triplet per device expert slot, each at its
-// members' device charge plus a TLSF grain, held when the host plan can afford it and capped to what keeps the host
-// budget's reserve when it cannot. The experts are 32 MiB a role, so the 24 slots want 2.25 GiB, more than one 2 GiB
-// chunk of the commit's rounding, and a budget that leaves only the reserve above the plan without headroom must cap.
+// members' device charge plus a TLSF grain, held when the host plan can afford it and capped to what keeps both rooms
+// when it cannot. The experts are 32 MiB a role, so the 24 slots want 2.25 GiB, more than one 2 GiB chunk of the
+// commit's rounding. A roomy plan holds them all, and its headroom line and ledger line print the finished plan's
+// figures. A budget that leaves only the reserve above the plan without headroom caps on the reserve, and one a byte
+// short of that holds none. A MemAvailable_pre that leaves only P3's margin above that plan caps on P3.
 static bool run_moe_spread_swap_headroom_test() {
     using namespace spread_case;
     using ring_room_case::log_line_counter;
@@ -2673,6 +2715,8 @@ static bool run_moe_spread_swap_headroom_test() {
     constexpr size_t big_budget = big_slots * 3 * big_role + big_role;
     constexpr size_t bound      = 3 * (big_role + 256);  // each member's charge plus one TLSF grain
     constexpr size_t mem_pre    = 256 * gib;
+    constexpr size_t reserve    = 2 * gib;               // host_reserve's floor, above 1% of every budget here
+    constexpr size_t p3_margin  = 29 * gib;              // P3's 24 GiB floor and 5 GiB runtime allowance
     const rank_scope ranks(first);
     bool             ok = true;
 
@@ -2682,9 +2726,16 @@ static bool run_moe_spread_swap_headroom_test() {
                   big_slots * bound);
     log_line_counter headroom_line(needle);
     log_line_counter cap_lines("; capped from ");
-    const auto       spread         = plan_for(big_budget, true, big_role, 64 * gib, mem_pre);
-    const size_t     headroom_count = headroom_line.count;
-    const size_t     cap_count      = cap_lines.count;
+    log_line_counter ledger_line("[HOST-LEDGER] device=0 plan host_budget=");
+    const auto       spread = plan_for(big_budget, true, big_role, 64 * gib, mem_pre);
+
+    // The spread plan's own lines: the counters go on counting the later cases' lines.
+    const std::vector<std::string> headroom_printed = headroom_line.lines;
+    const std::vector<std::string> ledger_printed   = ledger_line.lines;
+    const size_t                   cap_count        = cap_lines.count;
+
+    // The spread plan without headroom: its term taken out and its host figures re-recorded.
+    const ggml_sycl::placement_plan bare = with_headroom(spread, 0, bound);
     {
         const auto   slots   = block_slots(spread, first);
         const auto   terms   = ggml_sycl::placement_plan_host_weight_zone_terms(spread);
@@ -2706,24 +2757,40 @@ static bool run_moe_spread_swap_headroom_test() {
                 off.host_zone_weight_bytes + big_slots * bound, spread.host_planned_bytes, planned);
             ok = false;
         }
-        if (headroom_count != 1 || cap_count != 0) {
-            printf("FAIL: swap headroom: %zu headroom lines with the held figures, %zu cap lines (want 1, 0)\n",
-                   headroom_count, cap_count);
+        if (headroom_printed.size() != 1 || cap_count != 0 || ledger_printed.size() != 1) {
+            printf(
+                "FAIL: swap headroom: %zu headroom lines with the held figures, %zu cap lines, %zu ledger plan lines "
+                "(want 1, 0, 1)\n",
+                headroom_printed.size(), cap_count, ledger_printed.size());
             ok = false;
+        } else {
+            // Both lines print the finished plan's figures, so the ledger's host_planned_bytes counts the headroom:
+            // it is above the plan without headroom's, since 24 triplets need more than the zone's rounding slack.
+            const std::string & held_text   = headroom_printed[0];
+            const std::string & ledger_text = ledger_printed[0];
+            if (printed_field(held_text, " triplets=") != spread.moe_swap_host_headroom_triplets ||
+                printed_field(held_text, " bytes=") != spread.moe_swap_host_headroom_bytes ||
+                printed_field(held_text, " weight_zone_total=") != spread.host_zone_weight_bytes ||
+                printed_field(held_text, " host_planned_bytes=") != spread.host_planned_bytes ||
+                printed_field(ledger_text, " host_planned_bytes=") != spread.host_planned_bytes ||
+                spread.host_planned_bytes <= bare.host_planned_bytes) {
+                printf(
+                    "FAIL: swap headroom: the printed figures are not the plan's (triplets=%zu bytes=%zu "
+                    "weight_zone_total=%zu host_planned_bytes=%zu, %zu without headroom); the lines:\n%s%s",
+                    spread.moe_swap_host_headroom_triplets, spread.moe_swap_host_headroom_bytes,
+                    spread.host_zone_weight_bytes, spread.host_planned_bytes, bare.host_planned_bytes,
+                    held_text.c_str(), ledger_text.c_str());
+                ok = false;
+            }
         }
     }
     {
-        // Room for the spread plan without headroom and the reserve, and no more: the plan keeps the reserve and holds
-        // fewer triplets than it wants, and one more triplet would take the reserve. The plan without headroom is the
-        // one above with its term taken out and its host figures re-recorded.
-        ggml_sycl::placement_plan bare       = spread;
-        bare.moe_swap_host_headroom_triplets = 0;
-        bare.moe_swap_host_headroom_bytes    = 0;
-        bare.host_zone_weight_bytes          = ggml_sycl::placement_plan_host_weight_zone_terms(bare).total();
-        ggml_sycl::placement_plan_rerecord_host_zone_terms(bare);
-        const size_t     reserve = 2 * gib;
-        const size_t     budget  = bare.host_planned_bytes + reserve;
+        // Room for the plan without headroom and the reserve, and no more: the plan keeps the reserve and holds fewer
+        // triplets than it wants, one more would take the reserve, and the line prints both rooms at the count held.
+        // P3 has room to spare, so the line names the reserve alone.
+        const size_t     budget = bare.host_planned_bytes + reserve;
         log_line_counter cap_line("; capped from 24 triplets (");
+        log_line_counter reserve_line("): one more would take the host budget's reserve (host_budget=");
         const auto       on = plan_for(big_budget, true, big_role, budget, mem_pre);
         if (budget / 100 > reserve) {
             printf("FAIL: swap headroom cap: the case's host budget %zu sets a reserve above 2 GiB\n", budget);
@@ -2738,34 +2805,187 @@ static bool run_moe_spread_swap_headroom_test() {
                 held, on.moe_swap_host_headroom_bytes, on.host_planned_bytes, reserve, budget);
             ok = false;
         }
-        ggml_sycl::placement_plan more = on;
-        more.moe_swap_host_headroom_triplets++;
-        more.moe_swap_host_headroom_bytes += bound;
-        more.host_zone_weight_bytes += bound;
-        ggml_sycl::placement_plan_rerecord_host_zone_terms(more);
-        if (more.host_planned_bytes + reserve <= budget) {
-            printf("FAIL: swap headroom cap: %zu triplets would still keep the reserve (host_planned %zu)\n", held + 1,
-                   more.host_planned_bytes);
+        const ggml_sycl::placement_plan more = with_headroom(on, held + 1, bound);
+        if (more.host_planned_bytes + reserve <= budget || more.host_planned_bytes + p3_margin > mem_pre) {
+            printf("FAIL: swap headroom cap: %zu triplets would not take the reserve alone (host_planned %zu)\n",
+                   held + 1, more.host_planned_bytes);
             ok = false;
         }
-        if (cap_line.count != 1) {
-            printf("FAIL: swap headroom cap: %zu cap lines (want 1)\n", cap_line.count);
+        if (cap_line.count != 1 || reserve_line.count != 1) {
+            printf("FAIL: swap headroom cap: %zu cap lines, %zu naming the reserve (want 1, 1)\n", cap_line.count,
+                   reserve_line.count);
+            ok = false;
+        } else if (on.host_planned_bytes + reserve <= budget &&
+                   (printed_field(cap_line.lines[0], " fit_room=") != budget - reserve - on.host_planned_bytes ||
+                    printed_field(cap_line.lines[0], " p3_room=") != mem_pre - p3_margin - on.host_planned_bytes)) {
+            printf(
+                "FAIL: swap headroom cap: the line's rooms are not the plan's at %zu triplets (fit_room=%zu "
+                "p3_room=%zu): %s",
+                held, budget - reserve - on.host_planned_bytes, mem_pre - p3_margin - on.host_planned_bytes,
+                cap_line.lines[0].c_str());
+            ok = false;
+        }
+    }
+    {
+        // A budget a byte short of that: the plan without headroom already takes the reserve, so none is held, the
+        // host figure stays that plan's, and the line says why.
+        const size_t     budget = bare.host_planned_bytes + reserve - 1;
+        log_line_counter none_line(
+            "; none held: the host plan without headroom already takes the host budget's reserve or P3's margin "
+            "(host_budget=");
+        const auto on = plan_for(big_budget, true, big_role, budget, mem_pre);
+        if (on.moe_swap_host_headroom_triplets != 0 || on.moe_swap_host_headroom_bytes != 0 ||
+            on.host_planned_bytes != bare.host_planned_bytes || none_line.count != 1) {
+            printf(
+                "FAIL: swap headroom, none held: %zu triplets %zu bytes, host_planned %zu (want 0, 0, %zu), %zu lines "
+                "saying why (want 1)\n",
+                on.moe_swap_host_headroom_triplets, on.moe_swap_host_headroom_bytes, on.host_planned_bytes,
+                bare.host_planned_bytes, none_line.count);
+            ok = false;
+        }
+    }
+    {
+        // A roomy budget and a MemAvailable_pre that leaves P3's margin above the plan without headroom and no more, so
+        // P3 is the binding side. The commit rounds the WEIGHT zone up to whole chunks, so the plan holds the triplets
+        // that fit the zone's rounding slack, which grow no host figure, fewer than 24. One more would take P3's
+        // margin while the budget's reserve stays, and the line prints a p3_room of 0.
+        const size_t     mem_tight = bare.host_planned_bytes + p3_margin;
+        log_line_counter p3_line("): one more would take P3's margin (host_budget=");
+        const auto       on   = plan_for(big_budget, true, big_role, 64 * gib, mem_tight);
+        const size_t     held = on.moe_swap_host_headroom_triplets;
+        if (held >= big_slots || on.moe_swap_host_headroom_bytes != held * bound ||
+            on.host_planned_bytes != bare.host_planned_bytes) {
+            printf(
+                "FAIL: swap headroom P3 cap: held %zu of 24 triplets, %zu bytes, host_planned %zu (want the plan "
+                "without headroom's %zu)\n",
+                held, on.moe_swap_host_headroom_bytes, on.host_planned_bytes, bare.host_planned_bytes);
+            ok = false;
+        }
+        const ggml_sycl::placement_plan more = with_headroom(on, held + 1, bound);
+        if (more.host_planned_bytes + p3_margin <= mem_tight || more.host_planned_bytes + reserve > 64 * gib) {
+            printf("FAIL: swap headroom P3 cap: %zu triplets would not take P3's margin alone (host_planned %zu)\n",
+                   held + 1, more.host_planned_bytes);
+            ok = false;
+        }
+        if (p3_line.count != 1) {
+            printf("FAIL: swap headroom P3 cap: %zu lines naming P3's margin (want 1)\n", p3_line.count);
+            ok = false;
+        } else if (on.host_planned_bytes + reserve <= 64 * gib &&
+                   (printed_field(p3_line.lines[0], " p3_room=") != 0 ||
+                    printed_field(p3_line.lines[0], " fit_room=") != 64 * gib - reserve - on.host_planned_bytes)) {
+            printf("FAIL: swap headroom P3 cap: the line's rooms are not the plan's (fit_room=%zu p3_room=0): %s",
+                   64 * gib - reserve - on.host_planned_bytes, p3_line.lines[0].c_str());
             ok = false;
         }
     }
     if (ok) {
         printf(
-            "PASS: a spread plan holds host WEIGHT room for one triplet per device expert slot, capped to keep the "
-            "host budget's reserve\n");
+            "PASS: a spread plan holds host WEIGHT room for one triplet per device expert slot, prints the figures it "
+            "holds, and caps to keep the host budget's reserve and P3's margin, saying which\n");
     }
     return ok;
 }
 
-// The multi-device plan walks the same order. The mock gives the two devices a direct peer path, so the planner takes
-// its general branch, not the whole-layer one; in LAYER mode every block belongs to device 0, which the second
-// device's tiny VRAM leaves with every layer, and the pack fills device 0 in the group order. It runs outside the
-// shared mock's guard, which does not nest.
-static bool run_multi_device_moe_spread_order_test() {
+// A spread plan with a lazy STORAGE table: a 128 GiB table at 4 KiB a row, which the host budget cannot hold whole.
+// The tables are decided before the headroom and fill a STORAGE cache to the smaller of the two rooms the host plan
+// leaves, here the budget's, so what the code holds is the triplets that fit the WEIGHT zone's chunk-rounding slack,
+// which the commit already counts: the headroom grows no host figure and takes none of the table's room, whose cache
+// keeps the slots it has with the switch off. That is fewer than the 24 triplets the plan wants, none included, since
+// 24 need more than one 2 GiB chunk, and one more would take the budget's reserve.
+static bool run_moe_spread_swap_headroom_lazy_storage_test() {
+    using namespace spread_case;
+    using ring_room_case::log_line_counter;
+    constexpr size_t big_role   = 32ull * 1024ull * 1024ull;
+    constexpr size_t big_slots  = 24;
+    constexpr size_t big_budget = big_slots * 3 * big_role + big_role;
+    constexpr size_t bound      = 3 * (big_role + 256);  // each member's charge plus one TLSF grain
+    constexpr size_t host       = 64 * gib;
+    constexpr size_t mem_pre    = 256 * gib;
+    constexpr size_t reserve    = 2 * gib;   // host_reserve's floor, above 1% of the budget
+    constexpr size_t p3_margin  = 29 * gib;  // P3's 24 GiB floor and 5 GiB runtime allowance
+    constexpr size_t row_size   = 4096;
+    const rank_scope ranks(first);
+    bool             ok = true;
+
+    // A ring-less pin: the table is STORAGE-eligible and the block ring is charged at its mapped need.
+    const ggml_sycl::lazy_test_coverage_pin pin = ggml_sycl::ggml_sycl_test_make_coverage_pin(0);
+    ggml_sycl::placement_lazy_table_info    table;
+    table.name           = "blk.20.spread_lazy_table";
+    table.type           = GGML_TYPE_F32;
+    table.ne[0]          = static_cast<int64_t>(row_size / sizeof(float));
+    table.ne[1]          = static_cast<int64_t>(128 * gib / row_size);
+    table.ne[2]          = 1;
+    table.ne[3]          = 1;
+    table.row_size       = row_size;
+    table.rows_per_token = 1;
+    table.consumer_layer = first;
+    table.table_bytes    = 128 * gib;
+
+    const auto plan = [&](bool spread) {
+        ggml_sycl::placement_kv_info kv = kv_info(spread, mem_pre);
+        kv.lazy_tables.push_back(table);
+        return ggml_sycl::compute_placement_plan(inventory(first, big_role), big_budget, 0, kv, nullptr, n_exps, host,
+                                                 pin.pin());
+    };
+    const auto       off = plan(false);
+    log_line_counter cap_line("): one more would take the host budget's reserve (host_budget=");
+    const auto       on = plan(true);
+
+    const bool storage = on.lazy_tables.size() == 1 && off.lazy_tables.size() == 1 && on.lazy_refusal.empty() &&
+                         on.lazy_tables[0].residency == ggml_sycl::lazy_residency::STORAGE &&
+                         on.lazy_tables[0].cache_slots > on.lazy_tables[0].cache_floor_slots;
+    if (!storage || !on.moe_spread) {
+        printf(
+            "FAIL: swap headroom with a lazy table: vacuous fixture: %zu tables, refusal '%s', moe_spread=%d (want "
+            "one STORAGE table whose cache holds more than its floor)\n",
+            on.lazy_tables.size(), on.lazy_refusal.c_str(), on.moe_spread ? 1 : 0);
+        return false;
+    }
+    const size_t                    held = on.moe_swap_host_headroom_triplets;
+    const ggml_sycl::placement_plan bare = with_headroom(on, 0, bound);
+    if (held >= big_slots || on.moe_swap_host_headroom_bytes != held * bound ||
+        on.host_planned_bytes != bare.host_planned_bytes || on.host_planned_bytes + reserve > host) {
+        printf(
+            "FAIL: swap headroom with a lazy table: held %zu of 24 triplets, %zu bytes, host_planned %zu (want the "
+            "plan without headroom's %zu, within the budget's reserve)\n",
+            held, on.moe_swap_host_headroom_bytes, on.host_planned_bytes, bare.host_planned_bytes);
+        ok = false;
+    }
+    if (on.lazy_tables[0].cache_slots != off.lazy_tables[0].cache_slots) {
+        printf("FAIL: swap headroom with a lazy table: the table's cache holds %zu slots, %zu with the switch off\n",
+               on.lazy_tables[0].cache_slots, off.lazy_tables[0].cache_slots);
+        ok = false;
+    }
+    if (on.host_planned_bytes + reserve <= host && host - reserve - on.host_planned_bytes >= bound) {
+        printf(
+            "FAIL: swap headroom with a lazy table: the table left %zu bytes of the budget's room, a triplet or more\n",
+            host - reserve - on.host_planned_bytes);
+        ok = false;
+    }
+    const ggml_sycl::placement_plan more = with_headroom(on, held + 1, bound);
+    if (more.host_planned_bytes + reserve <= host || more.host_planned_bytes + p3_margin > mem_pre ||
+        cap_line.count != 1) {
+        printf(
+            "FAIL: swap headroom with a lazy table: %zu triplets plan %zu host bytes, which must take the reserve "
+            "alone; %zu lines naming the reserve (want 1)\n",
+            held + 1, more.host_planned_bytes, cap_line.count);
+        ok = false;
+    }
+    if (ok) {
+        printf(
+            "PASS: a spread plan with a lazy STORAGE table holds only the swap headroom that fits the WEIGHT zone's "
+            "rounding slack and takes none of the table's room\n");
+    }
+    return ok;
+}
+
+// A multi-device plan keeps the layer-first order with the switch on: its pack picks each expert's card by its layer
+// (the layer's own card in LAYER mode, a whole-layer target in EXPERT mode) and holds the room per card. So it plans
+// the same as with the switch off, holds no swap headroom, and its order line says why, in both modes. The mock gives
+// the two devices a direct peer path, so the planner takes its general branch, not the whole-layer one; the second
+// device's tiny VRAM leaves device 0 with only some of the experts. It runs outside the shared mock's guard, which
+// does not nest.
+static bool run_multi_device_moe_spread_keeps_layer_first_test() {
     using namespace spread_case;
     using ring_room_case::log_line_counter;
     const size_t primary = 13 * triplet + triplet / 2;
@@ -2783,46 +3003,61 @@ static bool run_multi_device_moe_spread_order_test() {
         { 0, primary,     primary,     1.0, true },
         { 1, triplet / 2, triplet / 2, 1.0, true },
     };
-    const auto plan = [&](bool spread) {
-        return ggml_sycl::compute_multi_device_plan(devices, inventory(0), n_blocks, ggml_sycl::multi_gpu_mode::LAYER,
-                                                    kv_info(spread), nullptr, n_exps, ggml_sycl::host_ledger_budget());
+    using ggml_sycl::multi_gpu_mode;
+
+    struct mode_case {
+        multi_gpu_mode mode;
+        const char *   name;
+        const char *   reason;
     };
-    log_line_counter cohesive_lines("cohesive complete-layer MoE placement");
-    log_line_counter order_line("[PLACEMENT-MOE-MULTI] expert order: mode=spread hotness=spread(rank,layer,expert) ");
-    const auto       off       = plan(false);
-    const auto       on        = plan(true);
-    const auto       off_slots = block_slots(off, 0);
-    const auto       on_slots  = block_slots(on, 0);
-    const size_t     n         = total(off_slots);
-    bool             ok        = true;
-    if (cohesive_lines.count != 0 || n == 0 || n >= static_cast<size_t>(n_blocks * n_exps)) {
-        printf("FAIL: multi device spread: vacuous fixture: %zu whole-layer branch lines, %zu of 32 device triplets\n",
-               cohesive_lines.count, n);
-        ok = false;
-    }
-    if (off_slots != layer_first_split(n) || on_slots != even_split(n) || !on.moe_spread || off.moe_spread) {
-        printf("FAIL: multi device spread: off holds %s (want %s), on holds %s (want %s), moe_spread off=%d on=%d\n",
-               text(off_slots).c_str(), text(layer_first_split(n)).c_str(), text(on_slots).c_str(),
-               text(even_split(n)).c_str(), off.moe_spread ? 1 : 0, on.moe_spread ? 1 : 0);
-        ok = false;
-    }
-    if (!residents_are_best_ranked(on, 0, [](int, int e) { return e; }) || triplet_order(on) != spread_order(0)) {
-        printf("FAIL: multi device spread: the residents or the entries' order are not the spread order's\n");
-        ok = false;
-    }
-    for (const auto & e : on.entries) {
-        if (e.expert_id >= 0 && e.on_device && e.target_device != 0) {
-            printf("FAIL: multi device spread: %s targets device %d, want 0\n", e.name.c_str(), e.target_device);
+
+    const mode_case cases[] = {
+        { multi_gpu_mode::LAYER,  "LAYER",  "the multi-device pack puts each expert on its layer's card first" },
+        { multi_gpu_mode::EXPERT, "EXPERT", "the multi-device pack gives complete layers to one card first"    },
+    };
+    bool ok = true;
+    for (const mode_case & c : cases) {
+        const auto plan = [&](bool spread) {
+            return ggml_sycl::compute_multi_device_plan(devices, inventory(0), n_blocks, c.mode, kv_info(spread),
+                                                        nullptr, n_exps, ggml_sycl::host_ledger_budget());
+        };
+        const std::string reason_text =
+            std::string("; the switch is on, but ") + c.reason + ", so the order stays layer-first\n";
+        const auto        off = plan(false);
+        log_line_counter  cohesive_lines("cohesive complete-layer MoE placement");
+        log_line_counter  order_lines("[PLACEMENT-MOE-MULTI] expert order: ");
+        log_line_counter  headroom_lines("spread swap headroom:");
+        const auto        on   = plan(true);
+        const std::string diff = plan_difference(off, on);
+        const size_t      n    = total(block_slots(on, 0));
+        if (cohesive_lines.count != 0 || n == 0 || n >= static_cast<size_t>(n_blocks * n_exps)) {
+            printf(
+                "FAIL: multi device %s, spread on: vacuous fixture: %zu whole-layer branch lines, %zu of 32 device "
+                "triplets\n",
+                c.name, cohesive_lines.count, n);
             ok = false;
-            break;
+        }
+        if (!diff.empty() || on.moe_spread || on.moe_swap_host_headroom_triplets != 0 ||
+            on.moe_swap_host_headroom_bytes != 0 || headroom_lines.count != 0) {
+            printf(
+                "FAIL: multi device %s, spread on: must plan as with the switch off: %s differs, moe_spread=%d, "
+                "headroom %zu triplets %zu bytes, %zu headroom lines (want none)\n",
+                c.name, diff.empty() ? "nothing" : diff.c_str(), on.moe_spread ? 1 : 0,
+                on.moe_swap_host_headroom_triplets, on.moe_swap_host_headroom_bytes, headroom_lines.count);
+            ok = false;
+        }
+        const std::string order = order_lines.lines.empty() ? std::string() : order_lines.lines[0];
+        if (order_lines.count != 1 || order.find("mode=layer-first ") == std::string::npos ||
+            !ends_with(order, reason_text)) {
+            printf("FAIL: multi device %s, spread on: %zu order lines (want 1, layer-first, ending \"%s\"): %s", c.name,
+                   order_lines.count, c.reason, order.empty() ? "none\n" : order.c_str());
+            ok = false;
         }
     }
-    if (order_line.count != 1) {
-        printf("FAIL: multi device spread: %zu order lines (want 1)\n", order_line.count);
-        ok = false;
-    }
     if (ok) {
-        printf("PASS: the multi-device plan walks the spread order and splits the device slots evenly\n");
+        printf(
+            "PASS: a multi-device plan keeps the layer-first order with the spread switch on, in LAYER and EXPERT "
+            "mode, and says why\n");
     }
     return ok;
 }
@@ -5087,6 +5322,7 @@ int main() {
         mock_ok = run_moe_spread_order_test() && mock_ok;
         mock_ok = run_moe_spread_fits_whole_test() && mock_ok;
         mock_ok = run_moe_spread_swap_headroom_test() && mock_ok;
+        mock_ok = run_moe_spread_swap_headroom_lazy_storage_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
@@ -5100,7 +5336,7 @@ int main() {
     // Its own device-info overrides (1 and 2 exposed of 2 physical), so it runs outside the shared mock's guard.
     mock_ok = run_multi_device_mmid_owner_exposure_test() && mock_ok;
     // Its own device info with a direct peer path, for the same reason.
-    mock_ok = run_multi_device_moe_spread_order_test() && mock_ok;
+    mock_ok = run_multi_device_moe_spread_keeps_layer_first_test() && mock_ok;
     if (!mock_ok) {
         return 1;
     }

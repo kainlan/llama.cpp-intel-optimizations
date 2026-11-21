@@ -374,8 +374,10 @@ void check_weight_zone(const char *           builder,
         static_cast<size_t>(static_cast<double>(t.host_weights) * 1.2) + k_host_compute_reserve_bytes;
     // Vacuity guard: the two answers must differ on this inventory, or "not 1.2x" would prove nothing.
     check(ratio_size != t.total(), "the fixture separates exact-plus-terms from the 1.2x ratio");
-    check_eq("host_zone_weight_bytes == host_weights + host_compute_reserve + layout_copies + tlsf_bound",
-             plan.host_zone_weight_bytes, t.total());
+    check_eq(
+        "host_zone_weight_bytes == host_weights + host_compute_reserve + layout_copies + tlsf_bound + "
+        "swap_headroom",
+        plan.host_zone_weight_bytes, t.total());
     check(plan.host_zone_weight_bytes != ratio_size, "host_zone_weight_bytes is not the 1.2x ratio");
 
     // The builder sized the zone through the one terms function.

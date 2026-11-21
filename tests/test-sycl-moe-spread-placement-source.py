@@ -18,11 +18,15 @@ equal share of the device slots. This gate holds how the switch is built:
       row), and the planner file never calls the reader or reads the environment itself;
   S3  the planner never writes the rank store: unified-cache.cpp calls no set_expert_popularity_rank() and names no
       g_expert_popularity, and the order's functions read only the ranks build_moe_triplet_groups put on the groups;
-  S4  the spread order is in place before anything predicts the pack: in the single-device builder after the PP
-      alternate charges and before the window ring's room, and in the multi-device builder's per-group branch right
-      after its groups are built and before the pack;
+  S4  the spread order is in place before anything predicts the pack, in the single-device builder only: there after
+      the PP alternate charges and before the window ring's room. The multi-device builder never takes it, because its
+      pack picks cards by layer: it calls no moe_spread_order_groups(), builds both branches' groups const, and logs the
+      order line in both branches with a multi-device reason, never "every routed expert fits";
   S5  the swap headroom is a named term of the host WEIGHT zone (host_weight_zone_terms::swap_headroom, from the plan's
-      moe_swap_host_headroom_bytes) and each builder holds it after its host side is sized.
+      moe_swap_host_headroom_bytes), held in one place: record_host_ledger_plan() calls the hold after the lazy tables
+      are decided and before its [HOST-LEDGER] plan line, and no builder calls it. The hold writes the zone only as its
+      terms' total(), populate_host_zone_sizing() zeroes the headroom before it sizes the zones, and the [HOST-PLAN]
+      WEIGHT zone line names no swap_headroom; the headroom's own line prints the zone total and host_planned_bytes.
 
 Checks run on comment-blanked text with whitespace squashed. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -76,21 +80,29 @@ MULTI_DEF = (
 PP_ALT_LINE = 'GGML_LOG_INFO("[PLACEMENT-MOE] PP executable alternate reserve: '
 SINGLE_SPREAD = "moe_spread_order_groups(plan, moe_groups, kv_info, remaining, &hotness_source);"
 RING_ROOM_CALL = "hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining, host_experts_pinned);"
-MULTI_BUILD = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
-MULTI_SPREAD = (
-    "moe_spread_order_groups(plan, moe_groups, kv_info, std::accumulate(remaining.begin(), remaining.end(), size_t(0)), "
-    "&hotness_source);"
-)
-MULTI_PACK = "for (const auto & group : moe_groups) { if (moe_triplet_complete(group)) {"
+SPREAD_CALL = "moe_spread_order_groups"
+GROUPS_BUILT = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
+ORDER_LINE_CALL = "log_moe_spread_placement"
+FITS_REASON = '"every routed expert fits"'
 
 TERMS_TOTAL = (
     "size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound + swap_headroom; }"
 )
 TERMS_DEF = "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"
 TERMS_SET = "terms.swap_headroom = plan.moe_swap_host_headroom_bytes;"
-HOST_SIDE = "placement_plan_size_host_side("
-SINGLE_HOLD = 'placement_plan_hold_moe_swap_host_headroom(plan, kv_info, "PLACEMENT-MOE");'
-MULTI_HOLD = 'placement_plan_hold_moe_swap_host_headroom(plan, kv_info, "PLACEMENT-MOE-MULTI");'
+HOLD = "placement_plan_hold_moe_swap_host_headroom"
+HOLD_DEF = "static void placement_plan_hold_moe_swap_host_headroom("
+HOLD_CALL = "placement_plan_hold_moe_swap_host_headroom(plan, kv_info);"
+RECORD_DEF = "static void record_host_ledger_plan("
+LAZY_CALL = "placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);"
+LEDGER_LINE = '"[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu '
+ZONE_WRITE = re.compile(r"host_zone_weight_bytes\s*[-+*/]?=(?!=)")
+ZONE_FROM_TERMS = "plan.host_zone_weight_bytes = placement_plan_host_weight_zone_terms(plan).total();"
+POPULATE_DEF = "static void populate_host_zone_sizing("
+POPULATE_ZERO = ("plan.moe_swap_host_headroom_triplets = 0; plan.moe_swap_host_headroom_bytes = 0; "
+                 "const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);")
+WEIGHT_ZONE_LINE = '"[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu '
+HEADROOM_FIGURES = "weight_zone_total=%zu host_planned_bytes=%zu"
 
 
 class ContractError(AssertionError):
@@ -243,25 +255,41 @@ def check(raws: dict[str, str]) -> None:
         if re.search(r"\b(?:get|set)_expert_popularity_rank\(|\bis_expert_popularity_initialized\(", fn):
             raise ContractError(f"FAIL [pin S3]: `{marker}` reaches the rank store instead of the groups' ranks")
 
-    # S4: the spread order is in place before anything predicts the pack.
+    # S4: the spread order is in place before anything predicts the pack, in the single-device builder only.
     single = body(uc, SINGLE_DEF, "S4")
     if single.count(squash(SINGLE_SPREAD)) != 1 or not ordered(single, PP_ALT_LINE, SINGLE_SPREAD, RING_ROOM_CALL):
         raise ContractError("FAIL [pin S4]: the single-device builder does not order its groups once, after the PP "
                             "alternate charges and before the window ring's room")
+    if len(calls(uc, SPREAD_CALL)) != 1:
+        raise ContractError(f"FAIL [pin S4]: {SPREAD_CALL} is called {len(calls(uc, SPREAD_CALL))} times in "
+                            f"{CACHE_CPP}, not once, from the single-device builder")
     multi = body(uc, MULTI_DEF, "S4")
-    at = multi.find(squash(MULTI_SPREAD))
-    before = multi[:at].rstrip()
-    if (multi.count(squash(MULTI_SPREAD)) != 1 or not before.endswith(MULTI_BUILD)
-            or before.endswith("const " + MULTI_BUILD) or not ordered(multi, MULTI_SPREAD, MULTI_PACK)):
-        raise ContractError("FAIL [pin S4]: the multi-device builder does not order its per-group branch's groups once, "
-                            "right after building them and before the pack")
+    if calls(multi, SPREAD_CALL) or multi.count(GROUPS_BUILT) != 2 or multi.count("const " + GROUPS_BUILT) != 2:
+        raise ContractError("FAIL [pin S4]: the multi-device builder takes the spread order, or does not build both "
+                            "branches' groups const")
+    order_lines = calls(multi, ORDER_LINE_CALL)
+    if len(order_lines) != 2 or any(FITS_REASON in a for a in order_lines):
+        raise ContractError("FAIL [pin S4]: the multi-device builder does not log the order line in both branches with "
+                            f"a multi-device reason: {order_lines}")
 
-    # S5: the swap headroom is a named WEIGHT zone term, held after the host side is sized.
+    # S5: the swap headroom is a named WEIGHT zone term, held by the ledger record alone.
     if hpp.count(squash(TERMS_TOTAL)) != 1 or body(uc, TERMS_DEF, "S5").count(squash(TERMS_SET)) != 1:
         raise ContractError("FAIL [pin S5]: the swap headroom is not a named term of the host WEIGHT zone")
-    for fn, hold in ((single, SINGLE_HOLD), (multi, MULTI_HOLD)):
-        if fn.count(squash(hold)) != 1 or not ordered(fn, HOST_SIDE, hold):
-            raise ContractError(f"FAIL [pin S5]: `{hold}` is not called once after the builder sizes its host side")
+    record = body(uc, RECORD_DEF, "S5")
+    if (len(calls(uc, HOLD)) != 1 or record.count(squash(HOLD_CALL)) != 1
+            or not ordered(record, LAZY_CALL, HOLD_CALL, LEDGER_LINE)):
+        raise ContractError(f"FAIL [pin S5]: `{HOLD_CALL}` is not called once, by record_host_ledger_plan, after the "
+                            "lazy tables and before its ledger line")
+    hold = body(uc, HOLD_DEF, "S5")
+    if len(ZONE_WRITE.findall(hold)) != 1 or hold.count(ZONE_FROM_TERMS) != 1:
+        raise ContractError(f"FAIL [pin S5]: the hold does not write the WEIGHT zone once, as `{ZONE_FROM_TERMS}`")
+    if not any(HEADROOM_FIGURES in a for a in calls(hold, "GGML_LOG_WARN")):
+        raise ContractError("FAIL [pin S5]: the headroom's line does not print the zone total and host_planned_bytes")
+    populate = body(uc, POPULATE_DEF, "S5")
+    zone_lines = [a for a in calls(populate, "GGML_LOG_INFO") if WEIGHT_ZONE_LINE in a]
+    if populate.count(POPULATE_ZERO) != 1 or len(zone_lines) != 1 or "swap_headroom" in zone_lines[0]:
+        raise ContractError("FAIL [pin S5]: populate_host_zone_sizing does not zero the headroom before it sizes the "
+                            "WEIGHT zone, or its WEIGHT zone line names a swap_headroom it cannot hold")
 
 
 def self_test(raws: dict[str, str]) -> int:
@@ -313,6 +341,11 @@ def self_test(raws: dict[str, str]) -> int:
     ring = "        hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining, host_experts_pinned);\n"
     total = ("    size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound + "
              "swap_headroom; }")
+    multi_build = ("            const auto             moe_groups     = build_moe_triplet_groups(plan, moe_indices, "
+                   "&hotness_source);\n")
+    hold_call = "    placement_plan_hold_moe_swap_host_headroom(plan, kv_info);\n"
+    single_host_side = "                                  host_experts_pinned);\n"
+    ledger_check = "        t.rounding);\n    if (plan.host_planned_bytes > plan.host_budget) {\n"
 
     expect_fail("layer-first-sorts-with-its-own-lambda", "S1", CACHE_CPP, build_sort, own_sort)
     expect_fail("spread-sorts-with-its-own-lambda", "S1", CACHE_CPP, spread_sort, own_sort)
@@ -339,14 +372,32 @@ def self_test(raws: dict[str, str]) -> int:
                 "    (void) get_expert_popularity_rank(0, 0);\n    std::sort(groups.begin(), groups.end(), [order, ranked]")
     expect_fail("spread-after-the-ring-room", "S4", CACHE_CPP, single_spread, "", (ring, ring + single_spread))
     expect_fail("single-spread-dropped", "S4", CACHE_CPP, single_spread, "")
-    expect_fail("multi-spread-dropped", "S4", CACHE_CPP,
-                "            moe_spread_order_groups(plan, moe_groups, kv_info,\n", "            (void) (plan, kv_info,\n")
+    expect_fail("multi-takes-the-spread-order", "S4", CACHE_CPP, multi_build,
+                "            auto                   moe_groups     = build_moe_triplet_groups(plan, moe_indices, "
+                "&hotness_source);\n"
+                "            moe_spread_order_groups(plan, moe_groups, kv_info, remaining[0], &hotness_source);\n")
+    expect_fail("multi-reason-says-it-fits", "S4", CACHE_CPP,
+                '"without a direct peer path the multi-device plan places whole layers");\n',
+                '"every routed expert fits");\n')
     expect_fail("headroom-not-in-the-zone-total", "S5", CACHE_HPP, total,
                 "    size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound; }")
     expect_fail("headroom-term-unset", "S5", CACHE_CPP,
                 "    terms.swap_headroom        = plan.moe_swap_host_headroom_bytes;\n", "")
-    expect_fail("multi-holds-no-headroom", "S5", CACHE_CPP,
-                '    placement_plan_hold_moe_swap_host_headroom(plan, kv_info, "PLACEMENT-MOE-MULTI");\n', "")
+    expect_fail("record-holds-no-headroom", "S5", CACHE_CPP, hold_call, "")
+    expect_fail("builder-holds-the-headroom", "S5", CACHE_CPP, single_host_side, single_host_side + hold_call)
+    expect_fail("headroom-after-the-ledger-line", "S5", CACHE_CPP, hold_call, "",
+                (ledger_check, hold_call + ledger_check))
+    expect_fail("headroom-zone-from-base-plus-bytes", "S5", CACHE_CPP,
+                "        plan.host_zone_weight_bytes          = placement_plan_host_weight_zone_terms(plan).total();\n",
+                "        plan.host_zone_weight_bytes          = base + plan.moe_swap_host_headroom_bytes;\n")
+    expect_fail("populate-keeps-a-stale-headroom", "S5", CACHE_CPP,
+                "    plan.moe_swap_host_headroom_triplets = 0;\n    plan.moe_swap_host_headroom_bytes    = 0;\n\n"
+                "    // WEIGHT: exact bytes plus named terms.", "    // WEIGHT: exact bytes plus named terms.")
+    expect_fail("weight-zone-line-names-the-headroom", "S5", CACHE_CPP,
+                '"tlsf_bound=%zu total=%zu (%.1f MB); unplanned: ',
+                '"tlsf_bound=%zu swap_headroom=%zu total=%zu (%.1f MB); unplanned: ')
+    expect_fail("headroom-line-drops-the-figures", "S5", CACHE_CPP,
+                '; weight_zone_total=%zu host_planned_bytes=%zu%s\\n",', '%s\\n",')
 
     try:
         mutate(BACKEND, "this anchor is in no source", "x")

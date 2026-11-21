@@ -1194,12 +1194,14 @@ struct placement_plan {
     // prompt. 0 when the plan stages nothing, has no host expert, or is a multi-device plan.
     size_t                                     moe_stream_ring_reserve_bytes = 0;
     // The order the routed-expert pack walked the triplets in: true for the spread order, rank-major over every block,
-    // which GGML_SYCL_MOE_SPREAD_PLACEMENT asks for and the planner takes only when the experts do not all fit; false
-    // for the layer-first order. moe_block_device_slots is each block's share of the device slots, in block order.
+    // which GGML_SYCL_MOE_SPREAD_PLACEMENT asks for and the single-device planner takes only when the experts do not
+    // all fit; false for the layer-first order, which a multi-device plan always keeps. moe_block_device_slots is each
+    // block's share of the device slots, in block order.
     bool                                       moe_spread                    = false;
     std::vector<placement_moe_block_slots>     moe_block_device_slots;
     // A spread plan's room in the host WEIGHT zone for swaps (host_weight_zone_terms::swap_headroom): this many extra
-    // triplets, one per device expert slot unless the host plan cannot afford them, at these bytes. 0 otherwise.
+    // triplets, one per device expert slot unless the host plan cannot afford them, at these bytes. The ledger record
+    // holds them after the lazy tables, so host_zone_weight_bytes and host_planned_bytes count them. 0 otherwise.
     size_t                                     moe_swap_host_headroom_triplets = 0;
     size_t                                     moe_swap_host_headroom_bytes    = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
@@ -2616,11 +2618,11 @@ void lifecycle_plan_clear_for_test();
 static constexpr const char * MOE_PIN_HOST_EXPERTS_ENV = "GGML_SYCL_MOE_PIN_HOST_EXPERTS";
 bool                          placement_pin_host_experts_enabled();
 
-// The opt-in spread placement of routed experts, off by default: GGML_SYCL_MOE_SPREAD_PLACEMENT=1 has the planner walk
-// the expert triplets rank-major over every block when they do not all fit, so each block gets an equal share of the
-// device slots, and plan host WEIGHT room for swaps. placement_moe_spread_enabled() is its one reader and reads the
-// environment once; the backend hands the value to the planner as placement_kv_info::moe_spread and ggml_check_sycl
-// reports it.
+// The opt-in spread placement of routed experts, off by default: GGML_SYCL_MOE_SPREAD_PLACEMENT=1 has the single-device
+// planner walk the expert triplets rank-major over every block when they do not all fit, so each block gets an equal
+// share of the device slots, and plan host WEIGHT room for swaps. A multi-device plan keeps the layer-first order.
+// placement_moe_spread_enabled() is its one reader and reads the environment once; the backend hands the value to the
+// planner as placement_kv_info::moe_spread and ggml_check_sycl reports it.
 static constexpr const char * MOE_SPREAD_PLACEMENT_ENV = "GGML_SYCL_MOE_SPREAD_PLACEMENT";
 bool                          placement_moe_spread_enabled();
 
