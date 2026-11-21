@@ -657,7 +657,7 @@ DROP = "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.devi
 REMEMBER = ("(void) triplet.extras[r]->remember_moe_storage_handle(triplet.members[r].placement.expert_id, "
             "GGML_LAYOUT_AOS, std::move(record.handles[r]), &record.copy_events[r], 0, "
             "triplet.members[r].logical_bytes);")
-# A triplet goes to the device (a refill or a named admit) or to the host (a loan); the flip follows that direction.
+# A triplet goes to the device (a refill or an admit) or to the host (a loan or an evict); the flip follows that direction.
 FLIP = ("(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, to_device, "
         "to_device ? device : -1);")
 # A lent member's host bytes are the pinned copy the transaction minted; one moved to the device is staged from the

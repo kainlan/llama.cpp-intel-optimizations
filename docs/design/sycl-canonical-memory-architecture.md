@@ -762,11 +762,14 @@ and per prompt phase. It is owned through the context's `moe_stream` member,
 reserved slot by slot at the first layer the batched prompt executor claims, and
 released by `moe_stream_phase::end_prompt`. Its loan and its refill are plan
 transactions that republish the expert plan, not direct edits to the plan. A lent
-triplet's host copy keeps its owner until the refill retires it. A named admit
-(`ggml_sycl_expert_move_transaction_run`) is a third such transaction: it brings
-named host triplets onto the card at a graph boundary, mints each device copy
-from the WEIGHT zone at the size direct staging gives the expert, and retires the
-pinned host copy once its last lease drains.
+triplet's host copy keeps its owner until the refill retires it. A named move
+(`ggml_sycl_expert_move_transaction_run`) is a third such transaction, run at a
+graph boundary. Its admit brings named host triplets onto the card, mints each
+device copy from the WEIGHT zone at the size direct staging gives the expert, and
+retires the pinned host copy once its last lease drains. Its evict moves named
+resident triplets to pinned host storage through the loan's cache body; the
+device copy's room returns only when a later deferred-free pass reaps the
+retired entry, so an admit in the same call never gets it.
 
 ---
 

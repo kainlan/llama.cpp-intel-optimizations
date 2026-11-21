@@ -62,7 +62,7 @@ runs in exactly one direction:
 Placement is chosen for fit and for where execution will be most optimal — e.g.
 **dense weights fill VRAM first, before MoE experts are placed there** — and
 that decision is made in the planning pass and revised only by the plan
-transaction at a graph boundary (the loan, the refill and the named admit,
+transaction at a graph boundary (the loan, the refill and the named move,
 below), which republishes the plan the next graph reads. The dispatcher never
 re-litigates it at op time. Two symmetric failure modes are therefore forbidden:
 
@@ -305,29 +305,58 @@ process that exits after its last context pays nothing. The fit's
 ring term charges the ring bytes that neither the room nor a loan would cover to
 the rung's demand, so a rung that needs them is refused with a figure.
 
-**The named admit.** A third plan transaction brings named host triplets onto
-the card at a graph boundary. `ggml_sycl_expert_move_transaction_run` takes a
-request listing (block, expert) triplets to admit and runs the NAMED direction
-of `ggml_sycl_expert_txn_run`, the loan's and the refill's body: lease, mint
+**The named move.** A third plan transaction moves named triplets between the
+card and pinned host storage at a graph boundary.
+`ggml_sycl_expert_move_transaction_run` takes a request listing (block, expert)
+triplets to evict and to admit and runs the NAMED direction of
+`ggml_sycl_expert_txn_run`, the loan's and the refill's body: lease, mint
 outside the locks, inventory mutex, the cache's lock pair, plan flip, one CAS,
-one publish and the unconditional epoch bump. It keeps no ledger. Each triplet
-is checked against the published plan by `moe_expert_move_validate`
-("incomplete triplet", "duplicate triplet", "wrong device", "not on host",
-"layout") and moves whole or not at all. A refused triplet leaves the others to
-move, and every triplet gets an outcome: moved, or refused with its reason and a
-BUSY or REFUSED class. An exception inside the transaction propagates out of
+one publish and the unconditional epoch bump. It keeps no ledger. The evicts go
+first in the one list the body runs. Each triplet is checked against the
+published plan by `moe_expert_move_validate` ("incomplete triplet", "duplicate
+triplet", "wrong device", "not on host" for an admit, "not on device" for an
+evict, "layout") and moves whole or not at all. A refused triplet leaves the
+others to move, and every triplet gets an outcome in its own list: moved, or
+refused with its reason and a BUSY or REFUSED class. One list of final refusals
+(`ggml_sycl_expert_move_refusal_is_final`) serves both cache bodies, and every
+other refusal is BUSY. An exception inside the transaction propagates out of
 the call, as the loan's and the refill's do, and the caller gets no outcome
 list. The triplets moved before it are published first, as they would have
 been without it, and stay published and resolvable, so the published plan, not
-the outcome list, is then the record of what moved. A named admit runs only
+the outcome list, is then the record of what moved. A named move runs only
 while nothing is lent: with a
 loan outstanding the request is refused "loans outstanding", BUSY, because lent
-triplets come back through the refill, which finds them by the ledger. The
-source is a whole pinned host copy that is a slice of a host zone. Whole means
-its owner has the entry's base and the entry's size, so retiring the entry gives
-back exactly its bytes; an owner wider than its entry may hold another expert.
-A copy served in place from a file mapping, or one whose owner is wider than
-its entry, is refused "host copy not pinned", REFUSED, and stays on the host.
+triplets come back through the refill, which finds them by the ledger. An
+admit's source is a whole pinned host copy that is a slice of a host zone. Whole
+means its owner has the entry's base and the entry's size, so retiring the entry
+gives back exactly its bytes; an owner wider than its entry may hold another
+expert. A copy served in place from a file mapping, or one whose owner is wider
+than its entry, is refused "host copy not pinned", REFUSED, and stays on the
+host.
+
+An evict is the loan's move under the named move's rules. The preparation mints
+pinned host storage for the tensor's bytes per expert, and the loan's cache body
+(`unified_cache::loan_expert_triplet`) copies those bytes from offset 0 of the
+device entry and retires the entry. Its refusals are the loan's. REFUSED:
+"host storage not pinned", "not resident", "not on device", "layout",
+"shared storage" (a view into a bulk tensor's one allocation),
+"device entry size" and "host storage too small". BUSY:
+"storage still referenced" and "host entry exists" (what a recent admit leaves
+until the deferred-free pass reaps it), and an exhausted pinned pool.
+Each extra then drops its views of the withdrawn device entry and remembers the
+host copy, as a loan's extras do. Every drop and remember moves the tensor's
+storage generation, so a decode direct route that served the block from a
+full-coverage table decides again and never serves it from the old table, which
+names retired storage. An evicted triplet comes back only through a later admit:
+it is in no ledger, so the refill never re-admits it.
+
+An evict's device bytes come back only when `finalize_retired_entries_locked`
+reaps the entries it retired. A named move waits for nothing: the views it
+dropped stay leased until the device queue passes a barrier, the background
+worker then releases them, and a later deferred-free pass erases the entries and
+returns their room to the WEIGHT zone. So an admit in the same call never gets
+an evict's room: in a full zone the admit is BUSY "WEIGHT zone full" beside the
+evict that moved, and moves at a later boundary, after the pass.
 
 An expert's size is a fact of its tensor, never of a cache entry: the
 transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
@@ -338,13 +367,15 @@ AOS that is `aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight
 gets a tail that completes its last row to a multiple of `MATRIX_ROW_PADDING`
 columns, which the quantized kernels may read. The size is asked of the
 layout, so a layout that stages another way adds its own case in one place. A
-host copy may be longer than the expert: a loan of a padded device entry lends
-its tail too. The copy moves exactly `nb[2]` bytes from the host copy's offset
-0 and never reads past them, so an expert that goes to the host and back does
-not grow. A host copy shorter than `nb[2]` is refused "host copy size",
-REFUSED. The cache requires the device size to equal the staged size and to be
-at least `nb[2]`. The tail is zero-filled behind the copy on the same queue,
-the device entry is published behind the fill, and the extra's record covers
+host copy may be longer than the expert when another writer padded it; a loan
+or an evict copies only the expert's bytes, so the host copies they make hold
+exactly `nb[2]` and a padded device entry's tail stays on the card. The copy
+moves exactly `nb[2]` bytes from the host copy's offset 0 and never reads past
+them, so an expert that goes to the host and back does not grow. A host copy
+shorter than `nb[2]` is refused "host copy size", REFUSED. The cache requires
+the device size to equal the staged size and to be at least `nb[2]`. The tail
+is zero-filled behind the copy on the same queue, the device entry is published
+behind the fill, and the extra's record covers
 `nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
 The admit gives back the whole host entry, all of its zone bytes. A Q4_0
 expert 640 columns wide gains 216 bytes. The first graph after the publish
@@ -365,7 +396,10 @@ the graph: while a graph records, the direct route's upload chains no ready
 event; it asks each slot's event for its status and refuses the table while a
 slot's copy is still in flight.
 
-The admit bounds memory as follows. It returns each admitted triplet's pinned
+The named move bounds memory as follows. An evict mints its pinned host copy
+before it retires the device copy, so a boundary evicts only as many triplets as
+the pinned pool has room for; the rest are BUSY "host pinned pool exhausted".
+The admit returns each admitted triplet's pinned
 host copy once that copy's last lease drains, so the experts' host pinned use
 stays within the triplets not on the card times the triplet size. It mints its
 device copies before it frees anything, so a boundary admits only as many
@@ -374,7 +408,7 @@ refused "WEIGHT zone full", BUSY, after giving back what its other members
 minted, and the plan the transaction publishes leaves it on the host; when no
 triplet fits, nothing is published. The caller retries at a later boundary.
 Planned headroom in the zone is the planner's job, not the transaction's. Only
-the private fixtures call the named admit for now; the boundary driver that
+the private fixtures call the named move for now; the boundary driver that
 will name triplets is not yet written.
 
 **Gates.** Three gates keep the rule enforceable.
