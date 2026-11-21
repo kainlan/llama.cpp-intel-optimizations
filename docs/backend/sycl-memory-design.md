@@ -42,7 +42,8 @@ canonical contract §1 for the formal version):
    owner* of backend memory. Holds the tiered weight cache (device VRAM / pinned
    host / mmap, LRU eviction), the VRAM arena and its zones, the host pinned
    pool, and all runtime/scratch/KV allocations. Enforces the VRAM budget
-   (`min(total*pct, free_at_init)`) and does ref-counted eviction.
+   (`min(total*pct, free_at_init)` with the free reading rounded down to
+   64 MiB, less the external headroom) and does ref-counted eviction.
 
 3. **`mem_handle`** (`ggml_sycl::mem_handle`) — the *ownership and lifetime
    token*. A lightweight, copyable, ref-counted handle that resolves to the
@@ -2207,16 +2208,37 @@ sides. This is the same *disagreeing-independent-computations* disease as the
 **The fix is structural, not a bigger constant.** `compute_vram_budget_authority()`
 (`unified-cache.cpp`, declared in `unified-cache.hpp`) is now the **only**
 function that parses `GGML_SYCL_VRAM_BUDGET_PCT`, derives the host-unified-
-adjusted device total, caps to pre-probe free VRAM, and computes the external
+adjusted device total, caps to pre-probe free VRAM (rounded down to a 64 MiB
+grid, see below), and computes the external
 headroom (via `unified_cache_max_external_headroom()`, itself a composition
 of the arena's own device-proportional term and the oneDNN batched-pipeline-
 aware floor from `vram-headroom.hpp`, conservatively assuming the pipeline
 *is* planned since this authority runs before that flag is decided for the
 current model). It returns a `vram_budget_authority` struct — `budget_pct`,
-`base_mem`, `free_mem`, `external_headroom`, `budget_bytes` — and
+`base_mem`, `external_headroom`, `budget_bytes` and `free_floored` — and
 `create_cache_for_device()` **publishes** that result onto the `unified_cache`
 instance it constructs (`budget_pct()`, `external_headroom()`,
 `authority_base_mem()` getters, alongside the pre-existing `base_budget()`).
+
+**The free reading is floored to a 64 MiB grid (llama.cpp-h3t5).** The cap
+used the driver's free figure as read when the cache was made. That figure
+moves by under 0.1 MB between runs on an otherwise idle card, and on the B70
+(total 32656 MiB, free 31947.9 or 31948.0 MiB, 2048 MiB headroom) the budget
+it gave sat exactly on the arena's 2 MiB rounding step: the arena came out
+29898 or 29900 MB, about three experts (0.88 MB each) moved between host and
+device, and because placement decides the executor a different kernel
+computed them and the generated text parted. Four Qwen3.8 runs gave two
+outcomes, predicted 4 of 4 by the arena size. The authority now rounds the
+reading down to `k_vram_budget_free_grid` (64 MiB, `unified-cache.cpp`)
+before it caps the budget. A reading below one step is used as it is, since
+0 means "no reading" to the cap and would switch it off. The cost is at most
+one step of the card left out of the plan (12 MiB on the B70 at the readings
+above, which floor to 31936 MiB); the gain is that jitter of size j crosses a
+step with odds j/64 MiB instead of j/2 MiB. The struct carries the floored
+figure as `free_floored` (set by the authority only; a budget read off a live
+cache leaves it 0), and the `[UNIFIED-CACHE] Device N budget authority:` line
+prints it right after `free=`, so the megabytes left out are visible. Host
+cases: `run_vram_budget_free_floor_test` in `tests/test-sycl-layout-choice.cpp`.
 
 Every other site now either calls `compute_vram_budget_authority()` directly
 (only when no cache exists yet for the device in question — a defensive,
