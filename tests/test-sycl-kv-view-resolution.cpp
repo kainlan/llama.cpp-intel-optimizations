@@ -910,10 +910,12 @@ static bool test_binbcast_reads_staged_graph_input_while_recording() {
     // Never deleted: its destructor tears down backend-wide state (queues, cache holds, execution bindings) that
     // this synthetic context never set up. Only its staging map is used here.
     auto * ctx = new ggml_backend_sycl_context(0);
+    // A reused, larger buffer: its capacity exceeds the bytes the pre-stage copied for this tensor.
     ctx->graph_input_staging_adopt_for_test(
         &bias,
-        ggml_sycl::mem_handle::from_direct(staged_fake, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0, bias_bytes),
-        bias_bytes);
+        ggml_sycl::mem_handle::from_direct(staged_fake, GGML_LAYOUT_AOS,
+                                           /*on_device=*/true, /*device=*/0, sizeof(staged_fake)),
+        sizeof(staged_fake));
     ctx->graph_input_staging_adopt_for_test(
         &not_input,
         ggml_sycl::mem_handle::from_direct(staged_fake, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0, bias_bytes),
@@ -937,7 +939,7 @@ static bool test_binbcast_reads_staged_graph_input_while_recording() {
         TEST_ASSERT(ggml_sycl_test_binbcast_needs_raw_host_staging(&unplanted, raw_host, 0),
                     "an INPUT with no staged copy still needs raw host staging");
         TEST_ASSERT(ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &bias, bias_bytes + 4, 0) == nullptr,
-                    "a kernel span past the staged bytes must not read the staged copy");
+                    "a kernel span past the bytes copied must not read the staged copy, whatever its capacity");
         TEST_ASSERT(
             ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &not_input, ggml_nbytes(&not_input), 0) == nullptr,
             "a host tensor without the INPUT flag must not read a staging entry keyed by its pointer");
