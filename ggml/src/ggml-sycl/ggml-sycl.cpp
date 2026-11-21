@@ -23433,7 +23433,8 @@ static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason) {
 }
 
 // Device storage for one expert moved to the device, re-admitted or admitted: owner-first from the WEIGHT zone, where
-// direct staging places a planned expert, exactly `size` bytes (llama.cpp-sif1). Invalid when the zone has no room.
+// direct staging places a planned expert, so a moved expert takes the room a staged one takes, and exactly `size`
+// bytes. Invalid when the zone has no room.
 static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t size) {
     ggml_sycl::allocation_result allocation =
         ggml_sycl::unified_cache_zone_allocate_owner(device, ggml_sycl::vram_zone_id::WEIGHT, size);
@@ -23593,15 +23594,15 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
     }
 }
 
-// The body, every direction (llama.cpp-sif1). `amount` is the bytes a loan should free, the most triplets a refill
-// re-admits, or the number of triplets a named move names. A loan counts `amount` in ring slots of `slot_bytes`
-// (moe_expert_loan_select, llama.cpp-9x8t); 0 counts bytes, and the other directions pass 0. `resolver` is null in
-// production (the registry resolver above, bound to the published plan's owner); the private device tests pass their
-// own for their synthetic tensors. A loan WARNs each refusal unless the caller re-posts BUSY ones (warn_busy false). A
-// refill runs at every decode graph's boundary, so it WARNs only the lent triplets it drops from the ledger, once each
-// (a triplet is dropped once); its boundary runner WARNs refusals, rate-limited. `named_moves` is a named move's list,
-// one outcome per triplet, which the body fills in; null for the other directions. A named move WARNs nothing: its
-// caller reads every answer from the outcomes.
+// The body, every direction, so the loan, the refill and the named move share one lock order and one publish. `amount`
+// is the bytes a loan should free, the most triplets a refill re-admits, or the number of triplets a named move names.
+// A loan counts `amount` in ring slots of `slot_bytes`, as moe_expert_loan_select does; 0 counts bytes, and the other
+// directions pass 0. `resolver` is null in production (the registry resolver above, bound to the published plan's
+// owner); the private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless the
+// caller re-posts BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the
+// lent triplets it drops from the ledger, once each (a triplet is dropped once); its boundary runner WARNs refusals,
+// rate-limited. `named_moves` is a named move's list, one outcome per triplet, which the body fills in; null for the
+// other directions. A named move WARNs nothing: its caller reads every answer from the outcomes.
 static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     ggml_sycl_expert_txn_direction               direction,
     int                                          device,
@@ -23645,9 +23646,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     // such an owner, so every later copy from an unzoned one, the prefill ring's and the refill's, would take the
     // synchronous staged branch: a host bounce the boundary thread waits on. Once the zones are configured, the pinned
     // pool serves a lent copy only from the WEIGHT zone, so this one query covers every copy the loan mints. REFUSED,
-    // not BUSY: the zones change only at a model load, so a re-posted request would refuse again at every boundary
-    // (lead ruling, llama.cpp-sif1). A named move asks too: an admit copies only from a host-zone slice, which the
-    // cache checks per copy, so with no zones it could move nothing.
+    // not BUSY: the zones change only at a model load, so a re-posted request would refuse again at every boundary.
+    // A named move asks too: an admit copies only from a host-zone slice, which the cache checks per copy, so with no
+    // zones it could move nothing.
     if (!refill && !cache->host_zones_configured()) {
         return refuse(ggml_sycl_txn_result::REFUSED, "host zones not configured");
     }

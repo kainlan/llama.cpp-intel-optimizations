@@ -3779,16 +3779,16 @@ struct expert_loan_record {
     unified_cache_key    device_keys[3]   = {};
 };
 
-// One member of a triplet moved from its host copy to the device: a lent triplet re-admitted after a prompt phase
-// (llama.cpp-sif1), the loan's member inverted, or a host triplet admitted by name. key is the cache id the member's
-// AOS device entry is staged under and its host copy is published under; host_keys are every id the host copy is
-// published under, key first. device_owner is the member's device storage, minted owner-first by the caller from the
-// WEIGHT zone before it took any listed lock, so no allocation for the bytes runs under one. A refill's must be the
-// host copy's size (refill_copy_bytes()), and a refill reads none of the three fields below. An admit's must be the
-// staged size, staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes: the
-// weight's type, row width and bytes per expert (nb[2]) the caller resolved from its tensor. The expert's size is a
-// fact of its tensor, never of the host copy, which a padded copy exceeds; the admit copies logical_bytes from offset
-// 0 of the host copy and refuses one that holds fewer.
+// One member of a triplet moved from its host copy to the device: a lent triplet re-admitted after a prompt phase, the
+// loan's member inverted, or a host triplet admitted by name. key is the cache id the member's AOS device entry is
+// staged under and its host copy is published under; host_keys are every id the host copy is published under, key
+// first. device_owner is the member's device storage, minted owner-first by the caller from the WEIGHT zone before it
+// took any listed lock, so no allocation for the bytes runs under one. A refill's must be the host copy's size
+// (refill_copy_bytes()), and a refill reads none of the three fields below. An admit's must be the staged size,
+// staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes: the weight's type,
+// row width and bytes per expert (nb[2]) the caller resolved from its tensor. The expert's size is a fact of its
+// tensor, never of the host copy, which a padded copy exceeds; the admit copies logical_bytes from offset 0 of the host
+// copy and refuses one that holds fewer.
 struct expert_refill_member {
     expert_placement_key            placement;
     ggml_sycl_cache_id              key;

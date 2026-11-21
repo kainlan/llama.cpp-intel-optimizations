@@ -11722,7 +11722,7 @@ bool unified_cache::admit_host_triplet(const expert_refill_member members[3], ex
     return copy_host_triplet_to_device(members, /*admit=*/true, out);
 }
 
-// llama.cpp-sif1: move one triplet from its host copies to the device, loan_expert_triplet() inverted; a refill takes
+// Move one triplet from its host copies to the device, loan_expert_triplet() inverted; a refill takes
 // back a loan's host copy, an admit any pinned host copy in a host zone. The copies go first, from each host copy's
 // typed pinned owner into the caller's device owner, so the copy path takes the direct DMA and both owners stay
 // retained until it completes; an admit's storage is longer by the padded tail, which is zero-filled behind the copy.
@@ -11791,7 +11791,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
                 break;
             }
             const unified_cache_entry & e = it->second;
-            // c-n4gw: a loan copies AOS bytes only, so a lent copy is AOS; an admit stages AOS only.
+            // A loan copies AOS bytes only, so a lent copy is AOS; an admit stages AOS only.
             if (e.layout != GGML_LAYOUT_AOS) {
                 refusal = "layout";
                 break;
