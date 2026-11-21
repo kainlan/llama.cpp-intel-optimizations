@@ -177,6 +177,48 @@
 //                           After the admit it decides again and serves each tensor from AOS, its table names the
 //                           admitted device copy, and a kernel behind the upload reads the bytes through the table.
 //
+// The named move's evict, through the same transaction:
+//
+//   evict_moves_a_resident_triplet
+//                           One evict: accepted "OK", three staged sizes to give back, a new plan with the triplet on
+//                           the host, each member resolving to a pinned host copy of its original bytes, no ledger or
+//                           teardown count written. Its three device entries are all still there right after the call,
+//                           and a deferred-free pass reaps them and returns their room.
+//   evict_is_not_refilled
+//                           An evict, then a one-triplet loan of another: one decode boundary's refill, allowed four,
+//                           re-admits the lent triplet alone, the evicted one stays on the host, and the teardown
+//                           counts read 1/1.
+//   evict_refuses_shared_storage
+//                           A bulk-staged pair's expert 0 is REFUSED "shared storage", nothing published, the triplet
+//                           left on the device. The control, the same evict of a pair staged per expert, moves.
+//   evict_is_busy_right_after_an_admit
+//                           Right after an admit the evict of that triplet is BUSY ("storage still referenced" or
+//                           "host entry exists") and changes nothing; once the host entries are reaped and the copy's
+//                           retention drained, it moves.
+//   evict_is_busy_while_lent
+//                           With a loan outstanding the evict is BUSY "loans outstanding" and changes nothing; after
+//                           the refill it moves.
+//   evict_and_admit_swap_in_one_call
+//                           One call evicts expert 0 and admits expert 2: both "OK" with three staged sizes each, the
+//                           block's resident count unchanged, and once the evicted entries are reaped the WEIGHT zone
+//                           has the room it had before the call.
+//   evict_and_admit_cycles_return_the_room
+//                           Four evict and admit cycles of one triplet. Right after the first evict an admit is BUSY
+//                           "device entry exists"; after each cycle's reaping the WEIGHT zone and the WEIGHT host zone
+//                           are where they started, and the bytes at the end are the originals.
+//   evict_refusal_leaves_the_admit_list_alone
+//                           An evict of a host triplet is REFUSED "not on device" in its list while the admit beside it
+//                           moves: accepted with that refusal as the reason, none evicted, one admitted.
+//   evict_room_is_not_an_admit_in_the_same_call
+//                           With the WEIGHT zone full (the control: no room for one member), one call evicts expert 0
+//                           and admits expert 2: the evict moves, the admit is BUSY "WEIGHT zone full", and right after
+//                           the call the zone still has no member's room. Once expert 0's entries are reaped, a later
+//                           call admits expert 2.
+//   evict_takes_a_block_off_the_direct_route
+//                           The control: once an admit completes the block, the decode direct route serves each tensor
+//                           from AOS. The evict of expert 0 moves each tensor's storage generation, and the route then
+//                           refuses the block rather than serve its old table.
+//
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
 // without staging. Every lend in the refill cases checks it. The zones cannot be unconfigured, so the one case that
@@ -267,6 +309,20 @@ int main() {
                    ggml_sycl::test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor);
     ok &= run_case("admit_completes_a_block_the_direct_route_serves",
                    ggml_sycl::test_expert_admit_completes_a_block_the_direct_route_serves);
+    ok &= run_case("evict_moves_a_resident_triplet", ggml_sycl::test_expert_evict_moves_a_resident_triplet);
+    ok &= run_case("evict_is_not_refilled", ggml_sycl::test_expert_evict_is_not_refilled);
+    ok &= run_case("evict_refuses_shared_storage", ggml_sycl::test_expert_evict_refuses_shared_storage);
+    ok &= run_case("evict_is_busy_right_after_an_admit", ggml_sycl::test_expert_evict_is_busy_right_after_an_admit);
+    ok &= run_case("evict_is_busy_while_lent", ggml_sycl::test_expert_evict_is_busy_while_lent);
+    ok &= run_case("evict_and_admit_swap_in_one_call", ggml_sycl::test_expert_evict_and_admit_swap_in_one_call);
+    ok &= run_case("evict_and_admit_cycles_return_the_room",
+                   ggml_sycl::test_expert_evict_and_admit_cycles_return_the_room);
+    ok &= run_case("evict_refusal_leaves_the_admit_list_alone",
+                   ggml_sycl::test_expert_evict_refusal_leaves_the_admit_list_alone);
+    ok &= run_case("evict_room_is_not_an_admit_in_the_same_call",
+                   ggml_sycl::test_expert_evict_room_is_not_an_admit_in_the_same_call);
+    ok &= run_case("evict_takes_a_block_off_the_direct_route",
+                   ggml_sycl::test_expert_evict_takes_a_block_off_the_direct_route);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

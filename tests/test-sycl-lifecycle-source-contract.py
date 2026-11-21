@@ -712,7 +712,9 @@ INTERNAL_WRAPPER_SITES = {
         # "not resident" and a refill that dropped a triplet "not lent" must leave in place, and then reads the current
         # plan to show the dropped triplet is still on the host.
         # 2 -> 5: the padded, file-mapped and block-completing admit cases read the plan an accepted admit published.
-        "const auto now = ::ggml_sycl_global_plan_snapshot();": 5,
+        # 5 -> 8: the evict cases that refill after an evict, swap in one call and refuse an evict beside an admit
+        # read the plan the call published, to show which side each triplet ended on.
+        "const auto now = ::ggml_sycl_global_plan_snapshot();": 8,
         # 14 -> 15: the fixture's lent_bytes_are helper reads the current plan to show which bytes are lent.
         # 15 -> 16: test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned reads the published plan in
         # its members_read helper, to show each lent member's backing and the plan's mapped staging source before the
@@ -721,7 +723,9 @@ INTERNAL_WRAPPER_SITES = {
         # and the busy admit case's refusal check reads the one a refused admit must leave in place.
         # 20 -> 21: the case that admits from a host copy shorter than the tensor reads the publication its refusal
         # must leave in place.
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 21,
+        # 21 -> 25: the evict cases read the publication a call starts from: one shows an accepted evict replaced
+        # it, and the shared-storage, just-admitted and lent cases show a refused or BUSY evict left it in place.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 25,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
@@ -735,7 +739,16 @@ INTERNAL_WRAPPER_SITES = {
         # then took it to 9: a boundary with no decode graph since the refill, and a refill whose only triplet was
         # dropped, published nothing. 9 -> 10: the busy admit case shows each BUSY admit published nothing. 10 -> 11:
         # the case that admits from a host copy shorter than the tensor shows that refusal published nothing.
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 11,
+        # 11 -> 13: the shared-storage evict case shows its refused evict, and the just-admitted evict case each of
+        # its BUSY evicts, published nothing.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 13,
+        # An accepted evict publishes a plan with the triplet on the host, so the case that evicts one resident
+        # triplet shows the publication changed.
+        "if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {": 1,
+        # The evict a loan made BUSY published nothing, kept the triplet's device entries and left the ledger alone,
+        # in one condition.
+        ("if (::ggml_sycl_global_plan_snapshot().get() != published.get() || "
+         "test_evict_device_entries(fx, 0, 0) != 3 ||"): 1,
         # llama.cpp-pu8v: test_expert_loan_and_refill_stop_on_a_missing_entry checks, in one condition each, that the
         # refused loan and the refill that dropped a triplet published nothing and left the request and the ledger
         # as they must be.

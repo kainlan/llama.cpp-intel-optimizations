@@ -690,6 +690,23 @@ std::string test_expert_admit_completes_a_block_read_through_its_table();
 std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy();
 std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor();
 std::string test_expert_admit_completes_a_block_the_direct_route_serves();
+// The named move's evict, on the same fixture. A resident triplet moves to pinned host storage through the loan's
+// cache body, writes no ledger, so the refill never re-admits it, and its device entries go only when a deferred-free
+// pass reaps them. A bulk-staged triplet is REFUSED "shared storage"; right after an admit, or with a loan
+// outstanding, an evict is BUSY and changes nothing; a swap keeps the block's resident count and, once reaped, the
+// zone's room; evict and admit cycles keep no storage on either side; a refused evict leaves the admit beside it to
+// move; an evict's device room is never an admit's in the same call; and an evict out of a block the decode direct
+// route served moves the tensor's storage generation, so the route refuses the block instead of its old table.
+std::string test_expert_evict_moves_a_resident_triplet();
+std::string test_expert_evict_is_not_refilled();
+std::string test_expert_evict_refuses_shared_storage();
+std::string test_expert_evict_is_busy_right_after_an_admit();
+std::string test_expert_evict_is_busy_while_lent();
+std::string test_expert_evict_and_admit_swap_in_one_call();
+std::string test_expert_evict_and_admit_cycles_return_the_room();
+std::string test_expert_evict_refusal_leaves_the_admit_list_alone();
+std::string test_expert_evict_room_is_not_an_admit_in_the_same_call();
+std::string test_expert_evict_takes_a_block_off_the_direct_route();
 #endif
 
 }  // namespace ggml_sycl
