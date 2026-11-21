@@ -551,7 +551,48 @@ static void test_multiple_buffer_types() {
     check_no_overlap(graph);
     check_max_size(ctx);
     GGML_ASSERT(backend_a.context->allocated_total() <= 32 + 32 + 24);
-    GGML_ASSERT(backend_b.context->allocated_total() <= 32 + 24);
+    // x3 (24 bytes) and x4 (8 after alignment) are live together in b: x3 cannot take x2's memory in place, because
+    // x2 is in buffer a (test_inplace_reuse_stays_in_the_nodes_buffer).
+    GGML_ASSERT(backend_b.context->allocated_total() <= 32 + 32);
+}
+
+// An in-place op reuses a parent's memory only inside the buffer it was assigned. The scheduler gives a node the
+// buffer type of the backend that runs it; a device node that took over a host input's memory would write its
+// output into the host buffer, which is what a backend that reads host buffers in place made happen.
+static void test_inplace_reuse_stays_in_the_nodes_buffer() {
+    dummy_backend host   = dummy_backend_init(SIZE_MAX);
+    dummy_backend device = dummy_backend_init(SIZE_MAX);
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[3];
+    x[0] = make_input_with_size(ctx, 64);  // a host input with one reader
+    x[1] = make_input_with_size(ctx, 64);  // a device input with one reader
+    x[2] = ggml_add(ctx, x[0], x[1]);      // runs on the device; both parents have its layout
+    assign_names(ctx, "x");
+
+    ggml_set_output(x[2]);
+    ggml_build_forward_expand(graph, x[2]);
+    ggml_backend_buffer_type_t bufts[2] = { &host.buffer_type, &device.buffer_type };
+
+    GGML_ASSERT(graph->n_leafs == 2);
+    int leaf_buffer_ids[2];
+    leaf_buffer_ids[get_leaf_id(graph, "x0")] = 0;
+    leaf_buffer_ids[get_leaf_id(graph, "x1")] = 1;
+
+    GGML_ASSERT(graph->n_nodes == 1);
+    int node_buffer_ids[1];
+    node_buffer_ids[get_node_id(graph, "x2")] = 1;
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 2));
+    GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+
+    check_all_allocated(graph);
+    GGML_ASSERT(ggml_backend_buffer_get_type(x[0]->buffer) == &host.buffer_type);
+    GGML_ASSERT(ggml_backend_buffer_get_type(x[2]->buffer) == &device.buffer_type);
+    // In-place reuse is still taken where it is legal: the device parent's memory.
+    GGML_ASSERT(x[2]->buffer == x[1]->buffer && x[2]->data == x[1]->data);
 }
 
 static void test_buffer_size_zero() {
@@ -767,6 +808,7 @@ int main() {
     run("test_merge_free_block(SIZE_MAX)", []() { test_merge_free_block(SIZE_MAX); });
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
+    run("test_inplace_reuse_stays_in_the_nodes_buffer", test_inplace_reuse_stays_in_the_nodes_buffer);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_backend_tensor_alloc_sets_data", test_backend_tensor_alloc_sets_data);
     run("test_reallocation", test_reallocation);
