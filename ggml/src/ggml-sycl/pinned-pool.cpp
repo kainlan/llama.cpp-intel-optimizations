@@ -543,19 +543,13 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
             continue;
         }
 
-        // Round UP to TLSF alignment to avoid leaving a sub-alignment remainder
-        // that would round to 0 on the next iteration and cause allocation failure.
-        size_t try_size = (std::min(remaining, avail) + tlsf_align - 1) & ~(tlsf_align - 1);
-        if (try_size > avail) {
-            // Host zone sizes are not multiples of the grain, so a chunk's last
-            // block can end off it, and rounding up can pass the block.  Take the
-            // block's on-grain part instead of skipping the chunk; the rest of the
-            // request goes to the next chunk.
-            try_size = avail & ~(tlsf_align - 1);
-        }
-        if (try_size == 0) {
-            continue;
-        }
+        // The piece is the whole remainder when it fits, rounded up to the TLSF
+        // alignment so no sub-alignment remainder is left for a later chunk.  Host
+        // zone sizes are not multiples of the grain, so a chunk's last block can
+        // end off it; when rounding up passes that block, the piece is the block's
+        // on-grain part and the rest of the request goes to the next chunk.
+        const size_t try_size = tlsf_allocator::segment_piece(remaining, avail, tlsf_align);
+        GGML_ASSERT(try_size != 0 && "avail >= tlsf_align, so the block holds at least one whole granule");
 
         const size_t offset = zcs.allocator->allocate(try_size, tlsf_align);
         if (offset == SIZE_MAX) {

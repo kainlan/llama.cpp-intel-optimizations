@@ -3343,10 +3343,14 @@ never a use after free.
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
 released. That is a necessary check, not a guarantee. The TLSF allocator's
-`largest_free_block()` is the exact size of the largest free block, but with two
-or more KV-zone slots (ring depth above 1, or both kinds in the zone), an
-earlier slot can take part of that block and leave a later one no block large
-enough. The check covers the single-allocation case. For the rest, the reserve
+`largest_free_block()` is the exact size of the largest free block, and with two
+or more KV-zone slots (ring depth above 1, or both kinds in the zone) the slots
+still fit it together whenever their sum does: each is a multiple of the 256-byte
+grain, a slot placed in that block is carved from its front (`split_block`) and
+leaves the rest whole, and a slot placed elsewhere leaves the block untouched.
+What the check cannot see is a change between the read and the reserve: another
+KV-zone tenant can allocate in between, and the read is not taken under the
+zone's allocator lock (llama.cpp-zvnh). Then the reserve
 fails, and the refusal says the allocator could not place the slots rather than
 naming the size it just refused. An automatic `-ub` then keeps its last
 accepted size; an explicit one fails context creation.

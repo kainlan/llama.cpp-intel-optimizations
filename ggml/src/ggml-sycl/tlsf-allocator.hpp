@@ -69,6 +69,21 @@ class tlsf_allocator {
         return (size + granularity - 1) & ~(granularity - 1);
     }
 
+    // The piece of a `remaining`-byte request that a free block of `largest`
+    // bytes (a largest_free_block() answer) takes when the request is split
+    // across regions: all of it if it fits, otherwise as much as fits.  Rounded
+    // up by the same granularity as round_request(), so no sub-grain remainder
+    // is left for a later piece; when that rounding passes the block's end (a
+    // region's last block ends off the grain when the region's size does), the
+    // block's on-grain part instead, which allocate() places.  0 when `largest`
+    // holds no whole granule or `remaining` is 0.
+    static size_t segment_piece(size_t remaining, size_t largest, size_t alignment) {
+        const size_t granularity = alignment > block_grain ? alignment : block_grain;
+        const size_t want        = remaining < largest ? remaining : largest;
+        const size_t piece       = (want + granularity - 1) & ~(granularity - 1);
+        return piece <= largest ? piece : largest & ~(granularity - 1);
+    }
+
     // Initialize with the SIZE of the managed region [0, size).
     // No pointer to the managed region is needed — all bookkeeping is
     // in host memory.  min_alloc_size: minimum block granularity
@@ -441,10 +456,9 @@ class tlsf_allocator {
             fl = (int) (sizeof(size_t) * 8 - 1 - __builtin_clzll(size)) - FL_OFFSET;
             sl = (int) ((size >> (fl + FL_OFFSET - SL_BITS)) - SL_COUNT);
             if (fl >= FL_COUNT) {
-                // This last class has no upper bound, so find_suitable()'s head there is not checked against the
-                // request.  Safe while no request exceeds the class floor, 2^35 * 31/16 bytes (about 62 GiB), which is
-                // larger than any TLSF region here (device zones, and host pinned chunks of 2 GiB by default): every
-                // block in the class is at least the floor.
+                // This last class has no upper bound: from 2^35 * 31/16 bytes (about 62 GiB) up, a request that
+                // maps here can be larger than a block in it.  allocate() therefore checks the fast path's block
+                // and sends such a request to the walk of this class, which takes only a block that fits.
                 fl = FL_COUNT - 1;
                 sl = SL_COUNT - 1;
             }
@@ -696,10 +710,14 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t ta
     mapping_search(adjusted, fl, sl);
 
     int block_id = find_suitable(fl, sl);
+    if (block_id >= 0 && blocks_[block_id].size < size) {
+        block_id = -1;  // only the unbounded last class can hold a block below a request that maps to it
+    }
     if (block_id < 0) {
         // mapping_search rounds the size UP to the next class, every block of
         // which is >= size, so a miss there means no class above the request's
-        // own holds a block.  The request's own class holds sizes in
+        // own holds a block (in the unbounded last class, the request's own,
+        // the block found was too small).  The request's own class holds sizes in
         // [lower_bound, upper), and a block in it may still fit, behind a
         // smaller head (two sizes rounding into one class, like an expert
         // triplet's 921600- and 921856-byte members), so its head alone is not

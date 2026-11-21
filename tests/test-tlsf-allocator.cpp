@@ -239,16 +239,11 @@ static void test_exhaust_recycle() {
     REQUIRE(avail_after < arena.size && "available should decrease after large alloc");
     (void) avail_after;
 
-    // Try another large allocation — should fail
-    size_t o2 = arena.alloc->allocate(alloc_size);
-    // This may or may not succeed depending on remaining space, but it
-    // exercises the failure path.
+    // Another large allocation fails: the largest free block is the 10% left.
+    REQUIRE(arena.alloc->allocate(alloc_size) == SIZE_MAX && "a second 90% block does not fit");
 
     // Free and verify recovery
     arena.alloc->free(o1);
-    if (o2 != SIZE_MAX) {
-        arena.alloc->free(o2);
-    }
 
     // After freeing, we should be able to allocate again
     size_t o3 = arena.alloc->allocate(256);
@@ -1558,20 +1553,74 @@ static void test_largest_free_block_empty_pool() {
 
 // A region off the grain ends in a block off the grain.  largest_free_block()
 // reports its whole size, a request rounded up past its end is refused, and
-// the size rounded down to the grain is placed and takes the whole block (the
-// host pinned pool's segmented allocation sizes a piece that way).
+// segment_piece() (how the host pinned pool sizes each piece of a segmented
+// allocation) gives the block's on-grain part, which is placed and takes the
+// whole block.
 static void test_largest_free_block_off_grain_tail() {
     const size_t   region = 16 * 256 + 100;
     tlsf_allocator t(region);
     REQUIRE(t.largest_free_block() == region);
     REQUIRE(t.allocate(region - 50) == SIZE_MAX && "rounded up to the grain, the request passes the block's end");
     REQUIRE(t.used() == 0);
-    const size_t on_grain = region & ~size_t(255);
-    REQUIRE(t.allocate(on_grain) == 0 && "the on-grain part of the block is placed");
+    const size_t piece = tlsf_allocator::segment_piece(region - 50, t.largest_free_block(), 256);
+    REQUIRE(piece == 16 * 256 && "the piece is the block's on-grain part");
+    REQUIRE(t.allocate(piece) == 0 && "the on-grain part of the block is placed");
     REQUIRE(t.used() == region && "the sub-grain tail is absorbed into the block");
     REQUIRE(t.largest_free_block() == 0);
     REQUIRE(t.check_invariants());
     std::cout << "test_largest_free_block_off_grain_tail: PASSED\n";
+}
+
+// segment_piece(): the whole remainder rounded up to the granularity when that
+// fits the block, otherwise the block's on-grain part.  The off-grain rows are
+// the ones a piece rounded up past the block would get wrong.
+static void test_segment_piece() {
+    const size_t off = 16 * 256 + 100;  // a block ending 100 bytes past the grain
+    // Fits: rounded up, never past the block.
+    REQUIRE(tlsf_allocator::segment_piece(1000, 4096, 256) == 1024);
+    REQUIRE(tlsf_allocator::segment_piece(100, 4096, 64) == 256 && "a small alignment still rounds to the grain");
+    REQUIRE(tlsf_allocator::segment_piece(4096, 4096, 256) == 4096);
+    REQUIRE(tlsf_allocator::segment_piece(5000, 8192, 256) == 5120);
+    REQUIRE(tlsf_allocator::segment_piece(16 * 256, off, 256) == 16 * 256);
+    // Larger than an on-grain block: the whole block.
+    REQUIRE(tlsf_allocator::segment_piece(10000, 4096, 256) == 4096);
+    // Off-grain block, remainder past its on-grain part: the on-grain part.
+    REQUIRE(tlsf_allocator::segment_piece(16 * 256 + 1, off, 256) == 16 * 256);
+    REQUIRE(tlsf_allocator::segment_piece(off - 50, off, 256) == 16 * 256);
+    REQUIRE(tlsf_allocator::segment_piece(off, off, 256) == 16 * 256);
+    REQUIRE(tlsf_allocator::segment_piece(10000, off, 256) == 16 * 256);
+    // Nothing to place.
+    REQUIRE(tlsf_allocator::segment_piece(0, 4096, 256) == 0);
+    REQUIRE(tlsf_allocator::segment_piece(1000, 200, 256) == 0 && "a block below one granule holds no piece");
+    // Every piece the helper gives for an off-grain region is placed by allocate().
+    for (size_t remaining = 1; remaining <= 2 * off; remaining += 37) {
+        tlsf_allocator t(off);
+        const size_t   piece = tlsf_allocator::segment_piece(remaining, t.largest_free_block(), 256);
+        REQUIRE(piece != 0 && t.allocate(piece) == 0 && "a segment piece always fits the block it was sized for");
+    }
+    std::cout << "test_segment_piece: PASSED\n";
+}
+
+// The last size class has no upper bound: every block from about 62 GiB up
+// maps to it.  A request in it must not get a smaller block from the fast
+// path, and a larger block behind that head must be found.  The region is
+// bookkeeping only, so a region this size costs nothing.
+static void test_allocate_unbounded_last_class() {
+    const size_t     GiB   = size_t(1) << 30;
+    const size_t     small = 63 * GiB;  // both blocks map to the last class
+    const size_t     large = 66 * GiB;
+    tlsf_allocator   t(small + 256 + large + 256);
+    const class_pair p = class_pair_setup(t, small, large);
+    REQUIRE(t.largest_free_block() == large);
+    const size_t used = t.used();
+    REQUIRE(t.allocate(67 * GiB) == SIZE_MAX && "no block of the last class holds the request");
+    REQUIRE(t.used() == used);
+    const size_t got = t.allocate(65 * GiB);
+    REQUIRE(got == p.behind_offset && "the larger block behind the smaller head is taken");
+    REQUIRE(t.block_size_at(got) >= 65 * GiB && "the block holds the request");
+    REQUIRE(t.allocate(small) == p.head_offset);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_allocate_unbounded_last_class: PASSED\n";
 }
 
 // A replay of expert triplets in a pool sized for exactly n of them: allocate
@@ -1708,7 +1757,8 @@ static void test_allocate_refuses_only_without_a_fitting_block() {
         { 0, 1, 2 },
         { 2, 1, 0 }
     };
-    size_t runs = 0;
+    size_t runs    = 0;
+    size_t refused = 0;
     for (const bool member_major : { false, true }) {
         for (const std::vector<size_t> & freed : freed_sets) {
             for (const auto & order : orders) {
@@ -1720,13 +1770,15 @@ static void test_allocate_refuses_only_without_a_fitting_block() {
                         { free_order[0], free_order[1], free_order[2] },
                         { order[0],      order[1],      order[2]      },
                     };
-                    triplet_replay_run(r);
+                    refused += triplet_replay_run(r).refused;
                     runs++;
                 }
             }
         }
     }
     REQUIRE(runs == 72);
+    // Shape refusals occur in this set, so the census check above has run.
+    REQUIRE(refused > 0);
     std::cout << "test_allocate_refuses_only_without_a_fitting_block: PASSED\n";
 }
 
@@ -1775,6 +1827,8 @@ int main() {
     test_largest_free_block_walks_top_class();
     test_largest_free_block_empty_pool();
     test_largest_free_block_off_grain_tail();
+    test_segment_piece();
+    test_allocate_unbounded_last_class();
     test_allocate_class_walk_triplet_replay();
     test_allocate_refuses_only_without_a_fitting_block();
 

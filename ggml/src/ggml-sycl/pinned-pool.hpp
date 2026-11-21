@@ -132,7 +132,8 @@ struct segmented_buffer {
 // Optional: set GGML_SYCL_PINNED_CHUNK_MB to override the default chunk size.
 // Optional: set GGML_SYCL_PINNED_ALLOC_TIMEOUT_MS to abort if a chunk allocation hangs.
 //
-// Uses per-zone-per-chunk TLSF sub-allocators for O(1) alloc/free with coalescing.
+// Uses per-zone-per-chunk TLSF sub-allocators: O(1) free with coalescing, and O(1)
+// allocation unless it walks the request's own size class (see tlsf_allocator::allocate).
 // Each zone has isolated TLSF allocators, enabling proper zone_reset() without
 // disturbing other zones' allocations.
 // A chunk is released at the pool's destruction, or earlier by
