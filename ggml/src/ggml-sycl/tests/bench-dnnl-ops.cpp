@@ -25,6 +25,7 @@
 #include <thread>
 
 #if GGML_SYCL_DNNL
+#include "dnnl-deterministic.hpp"
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
 #endif
@@ -185,9 +186,11 @@ static void bench_dnnl_softmax_op(dnnl::engine & eng, dnnl::stream & strm,
     dnnl::memory::dims dims = {batch, features};
     auto md = dnnl::memory::desc(dims, dt::f32, tag::ab);
 
+    // The same attribute as the backend's, so the benchmark times the implementation the backend runs.
+    dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     auto softmax_pd = dnnl::softmax_forward::primitive_desc(
-        eng, dnnl::prop_kind::forward_inference,
-        dnnl::algorithm::softmax_accurate, md, md, /*axis=*/1);
+        eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::softmax_accurate, md, md, /*axis=*/1, attr);
 
     auto src_mem = dnnl::memory(md, eng, const_cast<float*>(src));
     auto dst_mem = dnnl::memory(md, eng, dst);
@@ -287,8 +290,9 @@ static void dnnl_binary_mul_broadcast(dnnl::engine & eng, dnnl::stream & strm,
     auto src1_md = dnnl::memory::desc(src1_dims, dt::f32, tag::ab);
     auto dst_md  = dnnl::memory::desc(dst_dims,  dt::f32, tag::ab);
 
-    auto binary_pd = dnnl::binary::primitive_desc(
-        eng, dnnl::algorithm::binary_mul, src0_md, src1_md, dst_md);
+    dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
+    auto binary_pd = dnnl::binary::primitive_desc(eng, dnnl::algorithm::binary_mul, src0_md, src1_md, dst_md, attr);
 
     auto src0_mem = dnnl::memory(src0_md, eng, const_cast<float*>(src0));
     auto src1_mem = dnnl::memory(src1_md, eng, const_cast<float*>(src1));
@@ -460,9 +464,10 @@ static void dnnl_layer_norm_mul(dnnl::engine & eng, dnnl::stream & strm,
     auto dst_md = dnnl::memory::desc(dims, dt::f32, tag::ab);
 
     // use_scale = gamma (our "weight"), no shift (beta)
-    auto ln_pd = dnnl::layer_normalization_forward::primitive_desc(
-        eng, dnnl::prop_kind::forward_inference,
-        src_md, dst_md, eps, flags::use_scale);
+    dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
+    auto ln_pd = dnnl::layer_normalization_forward::primitive_desc(eng, dnnl::prop_kind::forward_inference, src_md,
+                                                                   dst_md, eps, flags::use_scale, attr);
 
     auto src_mem    = dnnl::memory(src_md, eng, const_cast<float*>(src));
     auto dst_mem    = dnnl::memory(dst_md, eng, dst);

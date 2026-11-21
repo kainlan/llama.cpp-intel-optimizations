@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""Source contract: the column-split form of the Q8_0 matvec, and the rule that picks it.
+
+Host-only: reads ggml/src/ggml-sycl/mmvq.cpp and mmvq-launch-geometry.hpp, builds nothing, loads no model and touches
+no device.
+
+A Q8_0 matvec with few rows and long rows used to run one sub-group per row (4 x 10240: four sub-groups while the card
+idles). The SOA and coalesced Q8_0 launchers now pick a column-split form from the shape. The host test
+(test-sycl-mmvq-column-split-rule) proves the rule's arithmetic and the device test (test-sycl-mmvq-q8-0-column-split)
+the numbers. Neither can see whether production consults the rule with the right inputs, whether the row form is still
+what the other shapes launch, or whether the split kernels keep the properties a single device run cannot show. This
+gate holds those by text:
+
+  R1  the rule (mmvq_column_split_chunks) keeps the row form for rows >= compute units and for an unknown device, and
+      caps the chunks at the work-group's 16 sub-groups and at the row's steps; the header includes nothing;
+  D1  the SOA launcher computes the chunks from (nrows, ncols / QK8_0, its row form's sub-group step, compute_units),
+      the step being mul_mat_vec_q_reorder's blocks_per_subgroup, and launches the split kernel and returns before the
+      unchanged row-form launch;
+  D2  the same for the coalesced launcher, whose step is one MMVQ_COALESCED_TILE_BLOCKS tile;
+  D3  the dispatcher passes the card's compute-unit count (ggml_sycl_info().devices[id].nsm, 0 for an unknown index)
+      to both launchers, and nothing in either launcher's rule call names a tensor;
+  W1  both split kernels walk a row through the one shared step walk the host test sweeps
+      (mmvq_column_split_first_step / mmvq_column_split_step_stride): the coalesced kernel calls it directly over tile
+      indices, the SOA kernel through mmvq_column_split_first_block / block_stride, which the header defines through
+      it;
+  K1  the reduction protocol exists once, in mmvq_column_split_finish_row: reduce the sub-group, publish one partial
+      per sub-group to local memory, one work-group barrier with no early return before it, and only then the row's
+      chunk-0 sub-group adds the partials in chunk order and the fused addend once; the sub-group's slot (its index,
+      chunk and row) is derived once, in mmvq_column_split_slot_locate; each split kernel locates its slot through the
+      one and ends in the other, with no return, barrier or dst write of its own;
+  P1  padded rows read nothing: in both split kernels the walk sits inside `if (row < nrows) {`, which opens right
+      after the partial sum and closes before the finish helper;
+  T1  the host rule test includes no backend header, so it transcribes WARP, QI8_0, VDR and TILE_BLOCKS; each copy
+      must equal its production definition (the Intel GGML_SYCL_WARP_SIZE in ggml-sycl/CMakeLists.txt and the
+      presets.hpp default, QI8_0 as ggml-common.h computes it and the Q8_0 trait's qi, the Q8_0 trait's vdr_mmvq,
+      common.hpp's MMVQ_COALESCED_TILE_BLOCKS), and MMVQ_COLUMN_SPLIT_SUBGROUPS must equal the row form's
+      num_subgroups in both Q8_0 launchers;
+  K2  the row forms still walk what they walked: the SOA row kernel's block loop, and the coalesced row kernel's
+      every-tile loop through the shared per-tile body;
+  E1  no host wait and no new dependency in either launcher: both forms go through the one ggml_sycl_profile_submit
+      on the caller's stream, with no wait and no depends_on;
+  A1  the split path allocates nothing: its only memory is a 16-float local_accessor; no malloc and no unified-cache
+      call in either launcher.
+
+Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources;
+each names the pin that must catch it and is reported if it survives, if another pin catches it, or if its anchor no
+longer matches exactly once (NOT APPLIED). ctest registers it with --self-test.
+
+WHAT THIS DOES NOT PROVE. It reads text: that the kernels compute the right numbers is the device test's job, that the
+rule's arithmetic is right on every shape is the host test's. It cannot see a decision made from a tensor name through
+a variable the rule call does not spell, only one spelled in the call itself.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MMVQ = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
+HEADER = ROOT / "ggml/src/ggml-sycl/mmvq-launch-geometry.hpp"
+# T1 reads the host test's transcribed constants and the production definitions they copy.
+TRANSCRIBED = {
+    "host": ROOT / "tests/test-sycl-mmvq-column-split-rule.cpp",
+    "cmake": ROOT / "ggml/src/ggml-sycl/CMakeLists.txt",
+    "presets": ROOT / "ggml/src/ggml-sycl/presets.hpp",
+    "ggml_common": ROOT / "ggml/src/ggml-common.h",
+    "quants": ROOT / "ggml/src/ggml-sycl/quants.hpp",
+    "common": ROOT / "ggml/src/ggml-sycl/common.hpp",
+}
+
+_COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
+
+
+class ContractError(AssertionError):
+    pass
+
+
+class MutantNotApplied(Exception):
+    pass
+
+
+def blank(text: str) -> str:
+    """Comments blanked (line structure kept), string and character literals kept."""
+
+    def repl(m: re.Match) -> str:
+        t = m.group(0)
+        if t.startswith("//") or t.startswith("/*"):
+            return "".join("\n" if c == "\n" else " " for c in t)
+        return t
+
+    return _COMMENT_OR_LITERAL.sub(repl, text)
+
+
+def squeeze(text: str) -> str:
+    """Runs of blanks to one space, newlines to spaces: clang-format's alignment and wrapping cannot move a needle."""
+    return re.sub(r"\s+", " ", text)
+
+
+def body(code: str, signature: str, pin: str) -> str:
+    """The text of the function whose definition starts with `signature`, through its matching closing brace."""
+    n = code.count(signature)
+    if n != 1:
+        raise ContractError(f"FAIL [pin {pin}]: `{signature}` appears {n} times, not once")
+    start = code.index(signature)
+    open_at = code.index("{", code.index(")", start))
+    depth = 0
+    for k in range(open_at, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[start : k + 1]
+    raise ContractError(f"FAIL [pin {pin}]: `{signature}` has no closing brace")
+
+
+def ordered(text: str, *needles: str) -> bool:
+    at = -1
+    for needle in needles:
+        found = text.find(needle, at + 1)
+        if found < 0:
+            return False
+        at = found
+    return True
+
+
+def need(ok: bool, pin: str, what: str) -> None:
+    if not ok:
+        raise ContractError(f"FAIL [pin {pin}]: {what}")
+
+
+SOA_LAUNCHER = "static void reorder_mul_mat_vec_q8_0_q8_1_sycl("
+COALESCED_LAUNCHER = "static void coalesced_mul_mat_vec_q8_0_q8_1_sycl("
+SOA_SPLIT = "static void mul_mat_vec_q_reorder_column_split("
+COALESCED_SPLIT = "static void mul_mat_vec_q8_0_coalesced_column_split("
+SOA_ROW = "static void mul_mat_vec_q_reorder("
+COALESCED_ROW = "static void mul_mat_vec_q8_0_coalesced("
+DISPATCH = "static void ggml_sycl_mmvq_dispatch("
+UNITS = "static int mmvq_device_compute_units("
+SLOT = "static __dpct_inline__ mmvq_column_split_slot mmvq_column_split_slot_locate("
+FINISH = "static __dpct_inline__ void mmvq_column_split_finish_row("
+LOCATE_CALL = "const mmvq_column_split_slot slot = mmvq_column_split_slot_locate(nd_item, chunks);"
+FINISH_CALL = ("mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, "
+               "fused_add_ne0, fused_add_nb0, fused_add_row_base); }")
+ROW_ANCHOR = "constexpr size_t num_subgroups = 16;"
+
+
+def check_launcher(launcher: str, pin: str, step_decl: str, split_kernel_call: str, row_kernel_call: str) -> None:
+    need(step_decl in launcher, pin, f"the launcher's sub-group step is not `{step_decl}`")
+    # D3 before the exact call: a rule call that reads the tensor must be named as that, not as a changed call.
+    rule_call = re.search(r"mmvq_column_split_chunks\(([^;]*)\);", launcher)
+    need(rule_call is not None and not re.search(r"name|src0|tensor", rule_call.group(1)), "D3",
+         "the rule call reads something other than the shape and the compute units")
+    need(
+        "ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units)" in launcher,
+        pin,
+        "the launcher does not ask the rule with (nrows, ncols / QK8_0, blocks_per_step, compute_units)",
+    )
+    need(ROW_ANCHOR in launcher, pin, "the row-form launch geometry is gone")
+    split_at = launcher.find("if (chunks > 1) { constexpr int subgroups")
+    need(split_at >= 0, pin, "no `if (chunks > 1)` split branch opening with the work-group's sub-groups")
+    row_at = launcher.index(ROW_ANCHOR)
+    need(split_at < row_at, pin, "the split branch does not come before the row-form launch")
+    branch = launcher[split_at:row_at]
+    need(
+        ordered(branch, "sycl::local_accessor<float, 1> row_partials(", split_kernel_call, "return; }"),
+        pin,
+        "the split branch does not launch the split kernel and return before the row form",
+    )
+    # One float of row_partials per sub-group stays in bounds only while the accessor's size, the work-group's items
+    # and the kernel's required sub-group size agree.
+    need(
+        ordered(
+            branch,
+            "constexpr int subgroups = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;",
+            "constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;",
+            "static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,",
+            "const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);",
+            "const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);",
+            "sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);",
+            "sycl::nd_range<3>(split_global, split_workgroup),",
+            "[=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] { " + split_kernel_call,
+        ),
+        pin,
+        "the split launch does not tie the partials' size, the work-group's items and the sub-group size together",
+    )
+    need(row_kernel_call in launcher[row_at:], pin, "the row-form launch no longer calls the row kernel")
+    need("chunks_out" in launcher and "*chunks_out = chunks;" in launcher, pin, "the launcher does not report chunks")
+    # E1: one submit wrapper per form, on the caller's stream, no wait, no dependency.
+    need(launcher.count("ggml_sycl_profile_submit(*stream, profile_label,") == 2, "E1",
+         "the launcher does not submit both forms through ggml_sycl_profile_submit on its stream")
+    need(not re.search(r"(?:\.|->)\s*wait\w*\s*\(|\bdepends_on\b", launcher), "E1",
+         "a wait or a dependency in the launcher")
+    # A1: no allocation on the split path; the local accessor is its only memory.
+    need(not re.search(r"\b(?:sycl::)?malloc\w*\s*[<(]|\bunified_\w+\s*\(|\bsycl::free\s*\(", launcher), "A1",
+         "an allocation in the launcher")
+    need(launcher.count("sycl::local_accessor<") == 1, "A1", "the split path holds memory other than one accessor")
+
+
+def check_finish_row(finish: str, slot: str) -> None:
+    barrier = "sycl::group_barrier(nd_item.get_group());"
+    need(
+        ordered(
+            finish,
+            "const auto sg = nd_item.get_sub_group();",
+            "const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());",
+            "if (sg.leader()) { row_partials[slot.sg_id] = sum; }",
+            barrier,
+            "if (slot.chunk == 0 && slot.row < nrows && sg.leader()) {",
+            "for (int c = 0; c < chunks; ++c) { row_sum += row_partials[slot.sg_id + c]; }",
+            "dst[slot.row] = row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
+            "fused_add_row_base + slot.row);",
+        ),
+        "K1",
+        "reduce, publish, barrier, then the chunk-0 sum and the fused addend, in that order",
+    )
+    need(finish.count(barrier) == 1, "K1", "the finish helper does not have exactly one barrier")
+    need("return" not in finish[: finish.index(barrier)], "K1", "a return before the barrier: a work-group would hang")
+    need(finish.count("dst[") == 1, "K1", "the finish helper writes dst more than once")
+    need(
+        ordered(
+            slot,
+            "slot.sg_id = static_cast<int>(nd_item.get_sub_group().get_group_linear_id());",
+            "slot.chunk = slot.sg_id % chunks;",
+            "slot.row = workgroup * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + slot.sg_id / chunks;",
+        ),
+        "K1",
+        "a sub-group's slot is not chunk sg_id % chunks of row sg_id / chunks of its work-group's rows",
+    )
+
+
+def brace_close(text: str, open_at: int) -> int:
+    depth = 0
+    for k in range(open_at, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+
+def check_guarded_walk(kernel: str, walk: str, what: str) -> None:
+    guard = "float partial_sum = 0.0f; if (row < nrows) {"
+    at = kernel.find(guard)
+    need(at >= 0, "P1", f"the {what} split kernel does not open the row guard right after its partial sum")
+    open_at = at + len(guard) - 1
+    close_at = brace_close(kernel, open_at)
+    walk_at = kernel.find(walk)
+    finish_at = kernel.find(FINISH_CALL)
+    need(open_at < walk_at < close_at < finish_at, "P1",
+         f"the {what} split kernel's walk is not inside the row guard, before the finish helper")
+
+
+def check_split_kernel(kernel: str) -> None:
+    need(kernel.count(LOCATE_CALL) == 1, "K1", "the split kernel does not locate its slot through the shared helper")
+    need(kernel.count(FINISH_CALL) == 1 and kernel.endswith(FINISH_CALL), "K1",
+         "the split kernel does not end in the shared finish helper")
+    need("return" not in kernel and "barrier" not in kernel and "dst[" not in kernel, "K1",
+         "the split kernel returns, waits or writes dst outside the shared finish helper")
+    need("const int chunk = slot.chunk; const int row = slot.row;" in kernel, "K1",
+         "the split kernel derives its chunk or row other than from its slot")
+    need("if (row < nrows) {" in kernel, "K1", "padded rows are not kept from computing")
+
+
+def one_int(text: str, pattern: str, pin: str, what: str) -> int:
+    found = re.findall(pattern, text)
+    need(len(found) == 1, pin, f"{what}: {len(found)} definitions, not one")
+    return int(found[0])
+
+
+def intel_warp_size(cmake: str) -> int:
+    """GGML_SYCL_WARP_SIZE as the Intel arm of the target selection in ggml-sycl/CMakeLists.txt defines it."""
+    values = []
+    for m in re.finditer(r'^if \(GGML_SYCL_TARGET STREQUAL "INTEL"\)$', cmake, re.MULTILINE):
+        # The arm ends at the first top-level elseif, else or endif after it.
+        end = re.search(r"^(?:elseif|else|endif)\b", cmake[m.end() :], re.MULTILINE)
+        span = cmake[m.end() : m.end() + end.start() if end else len(cmake)]
+        values += re.findall(r"^\s*add_compile_definitions\(GGML_SYCL_WARP_SIZE=(\d+)\)", span, re.MULTILINE)
+    need(len(values) == 1, "T1", f"the Intel GGML_SYCL_WARP_SIZE: {len(values)} definitions, not one")
+    return int(values[0])
+
+
+def check_transcribed(src: dict[str, str], code: str, header: str) -> None:
+    host = squeeze(blank(src["host"]))
+
+    def host_int(name: str) -> int:
+        return one_int(host, rf"static constexpr int {name} = (\d+);", "T1", f"the host test's {name}")
+
+    warp = intel_warp_size(src["cmake"])
+    preset = one_int(src["presets"], r"#ifndef GGML_SYCL_WARP_SIZE\s*\n#define GGML_SYCL_WARP_SIZE (\d+)", "T1",
+                     "the presets.hpp GGML_SYCL_WARP_SIZE default")
+    need(preset == warp, "T1", f"the presets.hpp WARP_SIZE default {preset} is not the Intel build's {warp}")
+    need("#define WARP_SIZE GGML_SYCL_WARP_SIZE" in src["presets"], "T1", "WARP_SIZE is not GGML_SYCL_WARP_SIZE")
+    need(host_int("WARP") == warp, "T1", f"the host test's WARP is not the Intel build's WARP_SIZE {warp}")
+
+    gc = src["ggml_common"]
+    qk = one_int(gc, r"#define QK8_0 (\d+)\b", "T1", "QK8_0")
+    qr = one_int(gc, r"#define QR8_0 (\d+)\b", "T1", "QR8_0")
+    need("#define QI8_0 (QK8_0 / (4 * QR8_0))" in gc, "T1", "QI8_0 is no longer QK8_0 / (4 * QR8_0)")
+    quants = squeeze(blank(src["quants"]))
+    q8 = body(quants, "template <> struct block_q_t<GGML_TYPE_Q8_0> {", "T1")
+    need("static constexpr uint32_t qi = QI8_0;" in q8, "T1", "the Q8_0 trait's qi is not QI8_0")
+    need(host_int("QI8_0") == qk // (4 * qr), "T1", f"the host test's QI8_0 is not QK8_0 / (4 * QR8_0) = {qk // (4 * qr)}")
+    vdr = one_int(q8, r"static constexpr uint32_t vdr_mmvq = (\d+);", "T1", "the Q8_0 trait's vdr_mmvq")
+    need(host_int("VDR") == vdr, "T1", f"the host test's VDR is not the Q8_0 trait's vdr_mmvq {vdr}")
+
+    common = squeeze(blank(src["common"]))
+    tile = re.findall(r"constexpr int MMVQ_COALESCED_TILE_BLOCKS = (WARP_SIZE|\d+);", common)
+    need(len(tile) == 1, "T1", f"MMVQ_COALESCED_TILE_BLOCKS: {len(tile)} definitions, not one")
+    tile_blocks = warp if tile[0] == "WARP_SIZE" else int(tile[0])
+    need(host_int("TILE_BLOCKS") == tile_blocks, "T1",
+         f"the host test's TILE_BLOCKS is not MMVQ_COALESCED_TILE_BLOCKS {tile_blocks}")
+
+    split = one_int(header, r"constexpr int MMVQ_COLUMN_SPLIT_SUBGROUPS = (\d+);", "T1", "MMVQ_COLUMN_SPLIT_SUBGROUPS")
+    for signature in (SOA_LAUNCHER, COALESCED_LAUNCHER):
+        row = one_int(body(code, signature, "T1"), r"constexpr size_t num_subgroups = (\d+);", "T1",
+                      f"the row form's num_subgroups in {signature}")
+        need(row == split, "T1", f"MMVQ_COLUMN_SPLIT_SUBGROUPS {split} is not the row form's {row} in {signature}")
+
+
+def check(src: dict[str, str]) -> None:
+    mmvq_raw = src["mmvq"]
+    header_raw = src["header"]
+    code = squeeze(blank(mmvq_raw))
+    header = squeeze(blank(header_raw))
+
+    # R1 ---------------------------------------------------------------------------------------------------------------
+    need("#include" not in header, "R1", "the geometry header includes something")
+    need("constexpr int MMVQ_COLUMN_SPLIT_SUBGROUPS = 16;" in header, "R1", "the split work-group is not 16 sub-groups")
+    rule = body(header, "inline int mmvq_column_split_chunks(", "R1")
+    need("if (rows <= 0 || compute_units <= 0 || rows >= compute_units) { return 1; }" in rule, "R1",
+         "the rule does not keep the row form for rows >= compute units or an unknown device")
+    need("while (chunks * 2 <= MMVQ_COLUMN_SPLIT_SUBGROUPS && chunks * 2 <= steps) { chunks *= 2; }" in rule, "R1",
+         "the chunks are not the largest power of two within the work-group and the row's steps")
+    steps = body(header, "inline int mmvq_column_split_steps(", "R1")
+    need("(blocks_per_row + blocks_per_step - 1) / blocks_per_step" in steps, "R1", "the steps do not round up")
+
+    # D1 / D2 ----------------------------------------------------------------------------------------------------------
+    check_launcher(
+        body(code, SOA_LAUNCHER, "D1"),
+        "D1",
+        "constexpr int blocks_per_step = ceil_div(q8_0_traits::vdr_mmvq * WARP_SIZE, q8_0_traits::qi);",
+        "mul_mat_vec_q_reorder_column_split<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(",
+        "mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(",
+    )
+    check_launcher(
+        body(code, COALESCED_LAUNCHER, "D2"),
+        "D2",
+        "constexpr int blocks_per_step = MMVQ_COALESCED_TILE_BLOCKS;",
+        "mul_mat_vec_q8_0_coalesced_column_split(",
+        "mul_mat_vec_q8_0_coalesced(",
+    )
+
+    # D3 ---------------------------------------------------------------------------------------------------------------
+    units = body(code, UNITS, "D3")
+    need(
+        ordered(units, "if (device_id < 0 || device_id >= ggml_sycl_info().device_count) { return 0; }",
+                "return ggml_sycl_info().devices[device_id].nsm;"),
+        "D3",
+        "the compute units are not the device's nsm with 0 for an unknown index",
+    )
+    dispatch = body(code, DISPATCH, "D3")
+    need(
+        re.search(r"coalesced_mul_mat_vec_q8_0_q8_1_sycl\([^;]*mmvq_device_compute_units\(device_id\)[^;]*\);",
+                  dispatch) is not None,
+        "D3",
+        "the dispatcher does not pass the card's compute units to the coalesced launcher",
+    )
+    need(
+        re.search(r"reorder_mul_mat_vec_q8_0_q8_1_sycl\([^;]*mmvq_device_compute_units\(device_id\)[^;]*\);",
+                  dispatch) is not None,
+        "D3",
+        "the dispatcher does not pass the card's compute units to the SOA launcher",
+    )
+
+    # W1 ---------------------------------------------------------------------------------------------------------------
+    first_block = body(header, "inline int mmvq_column_split_first_block(", "W1")
+    need("return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;" in first_block, "W1",
+         "the SOA block walk does not start from the shared step walk")
+    block_stride = body(header, "inline int mmvq_column_split_block_stride(", "W1")
+    need("return mmvq_column_split_step_stride(chunks) * blocks_per_step;" in block_stride, "W1",
+         "the SOA block stride is not the shared step stride")
+    soa_split = body(code, SOA_SPLIT, "W1")
+    need(
+        ordered(
+            soa_split,
+            "ggml_sycl::mmvq_column_split_block_stride(chunks, blocks_per_subgroup);",
+            "for (int i = ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup, "
+            "blocks_per_subgroup); i < blocks_per_row; i += block_stride) {",
+        ),
+        "W1",
+        "the SOA split kernel does not walk its chunk's blocks through the shared walk",
+    )
+    coalesced_split = body(code, COALESCED_SPLIT, "W1")
+    need(
+        ordered(
+            coalesced_split,
+            "const int tile_stride = ggml_sycl::mmvq_column_split_step_stride(chunks);",
+            "for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; tile += tile_stride) {",
+            "mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane,"
+            " partial_sum);",
+        ),
+        "W1",
+        "the coalesced split kernel does not walk its chunk's tiles through the shared walk",
+    )
+
+    # K1 ---------------------------------------------------------------------------------------------------------------
+    check_finish_row(body(code, FINISH, "K1"), body(code, SLOT, "K1"))
+    check_split_kernel(soa_split)
+    check_split_kernel(coalesced_split)
+
+    # P1 ---------------------------------------------------------------------------------------------------------------
+    check_guarded_walk(soa_split, "for (int i = ggml_sycl::mmvq_column_split_first_block(", "SOA")
+    check_guarded_walk(coalesced_split, "for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk);", "coalesced")
+
+    # T1 ---------------------------------------------------------------------------------------------------------------
+    check_transcribed(src, code, header)
+
+    # K2 ---------------------------------------------------------------------------------------------------------------
+    need(
+        "for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; "
+        "i += blocks_per_subgroup) {" in body(code, SOA_ROW, "K2"),
+        "K2",
+        "the SOA row kernel no longer walks every block of its row",
+    )
+    need(
+        "for (int tile = 0; tile < tiles_per_row; tile++) { mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, "
+        "row, tile, x_row_stride, blocks_per_row, lane_id, partial_sum); }" in body(code, COALESCED_ROW, "K2"),
+        "K2",
+        "the coalesced row kernel no longer walks every tile through the shared body",
+    )
+
+
+def mutate(raw: str, edits: list[tuple[str, str]]) -> str:
+    for old, new in edits:
+        n = raw.count(old)
+        if n != 1:
+            raise MutantNotApplied(f"NOT APPLIED: anchor appears {n} times, not once: {old[:70]!r}")
+        raw = raw.replace(old, new)
+    return raw
+
+
+# The split kernels' one write to dst, as the source spells it (clang-format keeps it on one line).
+SPLIT_DST = ("        dst[row] = row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
+             "fused_add_row_base + row);")
+
+# Each mutant: (name, pin that must catch it, file, edits). Anchors are exact source text, so a mutant whose anchor
+# drifts reports NOT APPLIED instead of passing.
+MUTANTS = [
+    ("the rule splits a matrix the row form already spreads", "R1", "header",
+     [("rows >= compute_units) {", "rows >= 4 * compute_units) {")]),
+    ("the rule ignores the row's step count", "R1", "header",
+     [("chunks * 2 <= MMVQ_COLUMN_SPLIT_SUBGROUPS && chunks * 2 <= steps", "chunks * 2 <= MMVQ_COLUMN_SPLIT_SUBGROUPS")]),
+    ("the split work-group grows past the row form's", "R1", "header",
+     [("constexpr int MMVQ_COLUMN_SPLIT_SUBGROUPS = 16;", "constexpr int MMVQ_COLUMN_SPLIT_SUBGROUPS = 32;")]),
+    ("the SOA launcher asks the rule with the coalesced step", "D1", "mmvq",
+     [("    constexpr int blocks_per_step = ceil_div(q8_0_traits::vdr_mmvq * WARP_SIZE, q8_0_traits::qi);",
+       "    constexpr int blocks_per_step = MMVQ_COALESCED_TILE_BLOCKS + 0 * q8_0_traits::qi;")]),
+    ("the SOA split branch falls through into the row form", "D1", "mmvq",
+     [("                            row_partials.get_pointer(), fused_add, fused_add_ne0, fused_add_nb0, "
+       "fused_add_row_base);\n                    });\n            });\n        });\n        return;\n",
+       "                            row_partials.get_pointer(), fused_add, fused_add_ne0, fused_add_nb0, "
+       "fused_add_row_base);\n                    });\n            });\n        });\n")]),
+    ("the coalesced launcher asks the rule with the SOA step", "D2", "mmvq",
+     [("    constexpr int blocks_per_step = MMVQ_COALESCED_TILE_BLOCKS;",
+       "    constexpr int blocks_per_step = 8;")]),
+    ("the dispatcher keeps the SOA launcher on the row form", "D3", "mmvq",
+     [("row_low, mmvq_device_compute_units(device_id), stream,", "row_low, 0, stream,")]),
+    ("the compute units come from somewhere other than the device", "D3", "mmvq",
+     [("    return ggml_sycl_info().devices[device_id].nsm;", "    return 256;")]),
+    ("the rule call reads the tensor", "D3", "mmvq",
+     [("const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units);\n"
+       "    if (chunks_out) {\n        *chunks_out = chunks;\n    }\n\n    // P4 TG-cost-visibility (llama.cpp-os8k): SOA",
+       "const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units"
+       " + (int) sizeof(src0_name));\n"
+       "    if (chunks_out) {\n        *chunks_out = chunks;\n    }\n\n"
+       "    // P4 TG-cost-visibility (llama.cpp-os8k): SOA")]),
+    ("the coalesced split kernel returns early for padded rows", "K1", "mmvq",
+     [("    const int blocks_per_row = ncols / QK8_0;\n    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count"
+       "(blocks_per_row);\n\n    const uint8_t *     x_qs",
+       "    if (row >= nrows) {\n        return;\n    }\n    const int blocks_per_row = ncols / QK8_0;\n"
+       "    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);\n\n"
+       "    const uint8_t *     x_qs")]),
+    ("the finish helper loses its barrier", "K1", "mmvq",
+     [("        row_partials[slot.sg_id] = sum;\n    }\n"
+       "    // A work-group's fence scope is the work-group, which covers row_partials in local memory.\n"
+       "    sycl::group_barrier(nd_item.get_group());\n",
+       "        row_partials[slot.sg_id] = sum;\n    }\n")]),
+    ("the finish helper fences only its sub-group", "K1", "mmvq",
+     [("    sycl::group_barrier(nd_item.get_group());\n\n    if (slot.chunk == 0",
+       "    sycl::group_barrier(nd_item.get_sub_group());\n\n    if (slot.chunk == 0")]),
+    ("the finish helper drops the fused addend", "K1", "mmvq",
+     [("        dst[slot.row] =\n            row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, "
+       "fused_add_row_base + slot.row);",
+       "        dst[slot.row] = row_sum;")]),
+    ("the finish helper sums the first row's partials for every row", "K1", "mmvq",
+     [("            row_sum += row_partials[slot.sg_id + c];", "            row_sum += row_partials[c];")]),
+    ("a sub-group's slot puts consecutive sub-groups on different rows", "K1", "mmvq",
+     [("    slot.chunk = slot.sg_id % chunks;", "    slot.chunk = slot.sg_id / chunks;")]),
+    ("the SOA split kernel ends in its own reduction", "K1", "mmvq",
+     [("partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);\n"
+       "            }\n        }\n    }\n\n    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, "
+       "row_partials, dst, fused_add, fused_add_ne0,\n"
+       "                                 fused_add_nb0, fused_add_row_base);\n",
+       "partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);\n"
+       "            }\n        }\n    }\n\n    dst[row] = sycl::reduce_over_group(nd_item.get_sub_group(), partial_sum, "
+       "std::plus<>());\n")]),
+    ("the coalesced split kernel derives its row with its own arithmetic", "K1", "mmvq",
+     [("    const int                    row   = slot.row;\n    const int                    lane  = "
+       "nd_item.get_sub_group().get_local_linear_id();\n\n    const int blocks_per_row = ncols / QK8_0;",
+       "    const int                    row   = (int) nd_item.get_group_linear_id() * 2 + slot.sg_id / chunks;\n"
+       "    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();\n\n"
+       "    const int blocks_per_row = ncols / QK8_0;")]),
+    ("the SOA split chunks all start at the row's first step", "W1", "mmvq",
+     [("ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup,",
+       "ggml_sycl::mmvq_column_split_first_block(0, lane / block_elements_per_subgroup,")]),
+    ("the coalesced split kernel walks its tiles with its own arithmetic", "W1", "mmvq",
+     [("        for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; "
+       "tile += tile_stride) {",
+       "        for (int tile = chunk; tile < tiles_per_row; tile += chunks) {")]),
+    ("the SOA block walk stops going through the shared step walk", "W1", "header",
+     [("    return mmvq_column_split_first_step(chunk) * blocks_per_step + lane_block;",
+       "    return chunk * blocks_per_step + lane_block;")]),
+    ("the SOA split walk is hoisted out of the row guard", "P1", "mmvq",
+     [("    float partial_sum = 0.0f;\n    if (row < nrows) {\n        const int block_stride",
+       "    float partial_sum = 0.0f;\n    {\n        const int block_stride"),
+      ("q8_1_ds_ptr, iqs);\n            }\n        }\n    }\n\n    mmvq_column_split_finish_row(",
+       "q8_1_ds_ptr, iqs);\n            }\n        }\n    }\n    if (row < nrows) {\n    }\n\n"
+       "    mmvq_column_split_finish_row(")]),
+    ("the coalesced split walk runs for padded rows too", "P1", "mmvq",
+     [("    float partial_sum = 0.0f;\n    if (row < nrows) {\n        // The shared step walk",
+       "    float partial_sum = 0.0f;\n    if (row < nrows) {\n    }\n    {\n        // The shared step walk")]),
+    ("the SOA split launch drops the required sub-group size", "D1", "mmvq",
+     [("[=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {\n"
+       "                        mul_mat_vec_q_reorder_column_split<",
+       "[=](sycl::nd_item<3> nd_item) {\n                        mul_mat_vec_q_reorder_column_split<")]),
+    ("the coalesced split accessor is sized by chunks, not sub-groups", "D2", "mmvq",
+     [("                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);\n"
+       "                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name",
+       "                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(chunks), cgh);\n"
+       "                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name")]),
+    ("the host test's VDR copy drifts from the Q8_0 trait", "T1", "host",
+     [("static constexpr int VDR             = 2;", "static constexpr int VDR             = 4;")]),
+    ("the coalesced tile grows past the host test's copy", "T1", "common",
+     [("constexpr int MMVQ_COALESCED_TILE_BLOCKS      = WARP_SIZE;",
+       "constexpr int MMVQ_COALESCED_TILE_BLOCKS      = 64;")]),
+    ("the Intel build changes its sub-group size", "T1", "cmake",
+     [("    # issues in load_tiles_q4_0. Intel hardware supports subgroup size 32.\n"
+       "    add_compile_definitions(GGML_SYCL_WARP_SIZE=32)",
+       "    # issues in load_tiles_q4_0. Intel hardware supports subgroup size 32.\n"
+       "    add_compile_definitions(GGML_SYCL_WARP_SIZE=16)")]),
+    ("the coalesced row form skips its first tile", "K2", "mmvq",
+     [("    for (int tile = 0; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(",
+       "    for (int tile = 1; tile < tiles_per_row; tile++) {\n        mmvq_q8_0_coalesced_accumulate_tile(")]),
+    ("the coalesced split branch waits on the host", "E1", "mmvq",
+     [("                                                                fused_add_nb0, fused_add_row_base);\n"
+       "                    });\n            });\n        });\n        return;\n",
+       "                                                                fused_add_nb0, fused_add_row_base);\n"
+       "                    });\n            });\n        });\n        stream->wait();\n        return;\n")]),
+    ("the SOA split branch allocates a device scratch", "A1", "mmvq",
+     [("        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);\n\n"
+       "        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {\n"
+       "            return profiled_queue.submit([&](sycl::handler & cgh) {\n"
+       "                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);\n"
+       "                cgh.parallel_for<mmvq_reorder_column_split_kernel_name",
+       "        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);\n"
+       "        float * scratch = sycl::malloc_device<float>(16, *stream);\n\n"
+       "        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {\n"
+       "            return profiled_queue.submit([&](sycl::handler & cgh) {\n"
+       "                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);\n"
+       "                cgh.parallel_for<mmvq_reorder_column_split_kernel_name")]),
+]
+
+
+def self_test(src: dict[str, str]) -> int:
+    failures: list[str] = []
+    for name, pin, target, edits in MUTANTS:
+        try:
+            mutated = dict(src)
+            mutated[target] = mutate(src[target], edits)
+        except MutantNotApplied as e:
+            failures.append(f"{name}: {e}")
+            continue
+        try:
+            check(mutated)
+        except ContractError as e:
+            caught = re.search(r"\[pin (\w+)\]", str(e))
+            if not caught or caught.group(1) != pin:
+                failures.append(f"{name}: caught by {caught.group(1) if caught else '?'}, not {pin}: {e}")
+            continue
+        failures.append(f"{name}: SURVIVED (pin {pin} did not fire)")
+
+    # The NOT APPLIED report must itself fire, or a drifted anchor would read as a kill.
+    try:
+        mutate(src["mmvq"], [("this text is not in mmvq.cpp", "")])
+        failures.append("NOT APPLIED does not fire on a missing anchor")
+    except MutantNotApplied:
+        pass
+
+    for f in failures:
+        print("SELF-TEST FAIL: " + f)
+    if failures:
+        return 1
+    print(f"mmvq q8_0 column-split source contract: self-test PASS ({len(MUTANTS)} mutants, each caught by its pin)")
+    return 0
+
+
+def main() -> int:
+    src = {"mmvq": MMVQ.read_text(encoding="utf-8"), "header": HEADER.read_text(encoding="utf-8")}
+    for key, path in TRANSCRIBED.items():
+        src[key] = path.read_text(encoding="utf-8")
+    try:
+        check(src)
+    except ContractError as e:
+        print(e)
+        return 1
+    print("mmvq q8_0 column-split source contract: PASS")
+    if "--self-test" in sys.argv[1:]:
+        return self_test(src)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

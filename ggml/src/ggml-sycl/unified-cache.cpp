@@ -1978,6 +1978,22 @@ static constexpr size_t k_sycl_mib                            = 1024ull * 1024ul
 static constexpr size_t k_graph_compute_min_external_headroom = 512ull * k_sycl_mib;
 static constexpr size_t k_runtime_external_headroom_margin    = 64ull * k_sycl_mib;
 
+// The driver's free-memory figure moves by tens of kilobytes between runs on an otherwise idle card. A budget that
+// followed it could cross the arena's 2 MiB rounding step, which changes how many experts are device resident, hence
+// which kernel computes them, hence the generated text. The budget authority floors the figure to this grid before it
+// caps the budget: at most one step of the card is left out of the plan, and jitter of size j crosses a step with odds
+// j / 64 MiB instead of j / 2 MiB.
+static constexpr size_t k_vram_budget_free_grid = 64ull * k_sycl_mib;
+
+// The free figure rounded down to k_vram_budget_free_grid. A figure below one step is kept as it is: 0 means "no
+// reading" to the budget cap, so flooring a small reading to 0 would switch the cap off.
+static size_t vram_budget_free_floor(size_t free_bytes) {
+    if (free_bytes < k_vram_budget_free_grid) {
+        return free_bytes;
+    }
+    return free_bytes / k_vram_budget_free_grid * k_vram_budget_free_grid;
+}
+
 static size_t arena_min_safe_external_headroom(size_t device_total_vram) {
     if (device_total_vram == 0) {
         return 0;
@@ -2104,10 +2120,14 @@ vram_budget_authority compute_vram_budget_authority(bool   host_unified,
 
     // Cap to the pre-probe free VRAM snapshot (not a post-probe live query --
     // see create_cache_for_device()'s "IMPORTANT" comment on why the alloc
-    // probe's own freed-then-cached USM pool makes a live query read low).
+    // probe's own freed-then-cached USM pool makes a live query read low),
+    // floored to k_vram_budget_free_grid so that sub-megabyte jitter of the
+    // driver's reading between runs does not move the plan.
     const size_t clean_free = free_vram_at_init_in > 0 ? free_vram_at_init_in : free_mem_in;
-    if (clean_free > 0 && budget > clean_free) {
-        budget = clean_free;
+    result.free_reading     = clean_free;
+    result.free_floored     = vram_budget_free_floor(clean_free);
+    if (result.free_floored > 0 && budget > result.free_floored) {
+        budget = result.free_floored;
     }
 
     // External headroom (driver/runtime working memory outside the unified
@@ -2141,6 +2161,8 @@ static vram_budget_authority device_budget_authority_from(unified_cache * cache,
                                                           size_t          free_mem,
                                                           int             default_pct) {
     if (cache && cache->authority_resolved()) {
+        // The cache publishes the budget, not the free reading that capped it, so free_reading and free_floored stay
+        // 0 here: they are the log's figures at cache creation, and no reader of a published authority uses them.
         vram_budget_authority result;
         result.budget_pct        = cache->budget_pct();
         result.base_mem          = cache->authority_base_mem();
@@ -19802,11 +19824,14 @@ static unified_cache * create_cache_for_device(int                     device_id
         const size_t base_mem = authority.base_mem;
         budget                = authority.budget_bytes;
 
+        // free is the reading the authority rounded (the hint's init reading when there is one, else free_mem) and
+        // free_floored the figure that caps the budget, so free minus free_floored is what the grid leaves out.
         GGML_LOG_INFO(
-            "[UNIFIED-CACHE] Device %d budget authority: base=%.1f MB free=%.1f MB pct=%d%% "
+            "[UNIFIED-CACHE] Device %d budget authority: base=%.1f MB free=%.1f MB free_floored=%.1f MB pct=%d%% "
             "external_headroom=%.1f MB budget=%.1f MB\n",
-            device_id, base_mem / (1024.0 * 1024.0), free_mem / (1024.0 * 1024.0), resolved_budget_pct,
-            resolved_headroom / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
+            device_id, base_mem / (1024.0 * 1024.0), authority.free_reading / (1024.0 * 1024.0),
+            authority.free_floored / (1024.0 * 1024.0), resolved_budget_pct, resolved_headroom / (1024.0 * 1024.0),
+            budget / (1024.0 * 1024.0));
 
         // Leave additional headroom for KV cache and ggml compute buffers.
         // When the VRAM arena is active, KV allocates from the shared KV+weight

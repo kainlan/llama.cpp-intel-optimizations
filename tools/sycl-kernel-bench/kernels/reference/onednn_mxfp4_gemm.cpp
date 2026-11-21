@@ -1,5 +1,7 @@
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
+// The attribute the backend builds with, so the reference times the primitive the backend would run.
+#include "ggml-sycl/dnnl-deterministic.hpp"
 #include "reference_kernels.hpp"
 
 #include <chrono>
@@ -231,6 +233,7 @@ bool run_onednn_mxfp4_gemm(const GeneratedWeights &     weights,
                                   { m, 1 });
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { QK_MXFP4, 1 },
                         use_f32_scales ? dnnl::memory::data_type::f32 : dnnl::memory::data_type::e8m0);
         attr.set_fpmath_mode(dnnl::fpmath_mode::f16);

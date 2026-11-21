@@ -118,6 +118,9 @@ GEMM_FORWARDERS = (("row_gemm", "std::optional<sycl::event>"), ("woq_gemm_q4_0",
 GEMM_DEAD = ("woq_gemm_q4_0_packed", "gemm_batch_array", "row_gemm_batch")
 GEMM_DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*scratchpad_mem\s*,\s*"
                            r"(?:scratchpad_md|cached\w*\s*->\s*scratchpad_md)\s*\)\s*\)\s*\{\s*return\s+([\w:]+)\s*;\s*\}")
+# The batched f16 caller's rethrow of a named error; MAIN_PINS pins it and its mutant removes the rethrow from it.
+RETHROW_PIN = ("batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst); } "
+               "catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) {")
 # Statements in ggml-sycl.cpp and outprod.cpp that carry a declined gemm to its declared next path: text -> how many.
 MAIN_PINS = (
     ('throw ggml_sycl_fallback_error("dnnl_gemm declined in mul_mat\'s f16 dense arm', 1),
@@ -127,8 +130,7 @@ MAIN_PINS = (
     ("batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(", 2),
     ("[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(", 1),
     # M-1: caller 1 rethrows a named error ahead of the resource-exhaustion ladder (its abort would misname the failure)
-    ("batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst); } catch (const ggml_sycl_fallback_error &) { throw; } "
-     "catch (const std::exception & e) {", 1),
+    (RETHROW_PIN, 1),
     # the hoisted pre-query declines before any write, and only the first slice may take the fallback
     ("{}, nullptr, true)) { return false; }", 1),
     ("if (b_a == 0) { return false; } throw ggml_sycl_fallback_error(\"dnnl_decline_after_write:dnnl_gemm\");", 1),
@@ -629,6 +631,8 @@ def gemm_mutants(files, edit):
         result = "std::nullopt"
         out.append(("a return follows %s's first-arm note" % name,
                     edit(g, first, first + "            if (m < 0) {\n                return %s;\n            }\n" % result)))
+    RETHROW_NOT_RETHROWN = RETHROW_PIN.replace("catch (const ggml_sycl_fallback_error &) { throw; } ", "", 1)
+    assert RETHROW_NOT_RETHROWN != RETHROW_PIN, "mutant anchor missing: the rethrow clause in RETHROW_PIN"
     for label, pin, new in (
             ("the hoisted pre-query no longer returns false on a decline", "{}, nullptr, true)) { return false; }",
              "{}, nullptr, true)) { }"),
@@ -649,8 +653,9 @@ def gemm_mutants(files, edit):
              'if (gemm_declined) { return true; }'),
             ("mul_mat_id reports a decline as done", "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }",
              "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return true; }"),
-            ("caller 1 rethrows the named error as std::exception", "catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) {",
-             "catch (const std::exception & e) {")):
+            # anchored on the whole pin: the bare catch pair also stands in other functions, and a mutant that
+            # edits the first of those leaves the batched caller's rethrow in place
+            ("caller 1 rethrows the named error as std::exception", RETHROW_PIN, RETHROW_NOT_RETHROWN)):
         out.append((label, edit_pin(m, pin, new)))
     q4_note = "        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0);\n"
     q4_late = "        // Every later `return false` is behind us: \"engaged\" means the primitive is about to be submitted.\n" + q4_note

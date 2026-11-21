@@ -11,6 +11,7 @@
 
 #if GGML_SYCL_DNNL
 
+#include "dnnl-deterministic.hpp"
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
 
@@ -68,6 +69,7 @@ public:
         auto dst_md = dnnl::memory::desc(dims, data_type, tag::ab);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         auto softmax_pd = dnnl::softmax_forward::primitive_desc(
@@ -187,6 +189,7 @@ public:
         auto md = dnnl::memory::desc(dims, data_type, tag::a);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         alg algorithm = to_dnnl_algorithm(operation);
@@ -288,6 +291,7 @@ public:
         auto dst_md = dnnl::memory::desc(src0_dims, data_type, tag::ab);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         alg algorithm = to_dnnl_algorithm(operation);

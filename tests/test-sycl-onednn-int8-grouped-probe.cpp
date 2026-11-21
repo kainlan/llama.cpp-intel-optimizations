@@ -15,7 +15,10 @@
 // It is deliberately STANDALONE: dnnl + sycl only, no ggml, no backend, no
 // unified cache. Raw sycl::malloc_device here is a probe fixture, not a
 // backend allocation (the unified-cache rule in CLAUDE.md governs backend
-// code; this binary never links it). Nothing here is production code.
+// code; this binary never links it). Nothing here is production code. The one
+// backend header it includes, ggml-sycl/dnnl-deterministic.hpp, needs only
+// oneDNN and the C library: it gives the probe's attribute the deterministic
+// setting production builds with.
 //
 // Per variant and shape it prints ONE line:
 //   variant=<id> shape=M<M>xN<N>xK<K> created=<Y|N> [reason=...]
@@ -49,6 +52,8 @@
 #    include <oneapi/dnnl/dnnl.hpp>
 #    include <oneapi/dnnl/dnnl_sycl.hpp>
 #    include <sycl/sycl.hpp>
+// The attribute production builds with, so the answer is about the primitive the backend would run.
+#    include "ggml-sycl/dnnl-deterministic.hpp"
 #endif
 
 #include <algorithm>
@@ -81,7 +86,8 @@ constexpr int64_t GROUP = 32;  // Q8_0 / Q8_1 / Q4_0 / MXFP4 block size
 // HALVED vs. ggml's own kvalues_mxfp4 (ggml-common.h:1126), paired with an
 // un-halved e8m0_to_f32 -- algebraically identical to ggml's doubled-int
 // table paired with its own e8m0_to_fp32_half. Not shared via #include: this
-// binary must stay standalone (dnnl + sycl only, no ggml/backend deps).
+// binary must stay standalone (dnnl + sycl only, no ggml/backend deps beyond
+// the header-only dnnl-deterministic.hpp).
 const float kvalues_mxfp4[16] = { 0, .5f, 1, 1.5f, 2, 3, 4, 6, -0, -.5f, -1, -1.5f, -2, -3, -4, -6 };
 
 // Mirrors ggml_e8m0_to_fp32 (ggml-impl.h), including its e==0 special case.
@@ -402,6 +408,7 @@ int run_one(sycl::queue &   q,
     const dnnl::memory::desc c_md({ M, N }, dt::f32, { N, 1 });
 
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
     try {
         if (v.src == src_kind::s8_grouped) {
