@@ -585,7 +585,7 @@ static void test_no_admissible_host_expert_proposes_nothing_and_says_so() {
 }
 
 // The decode graphs that ran after a boundary that moved something are counted, so their tokens can be timed, and so
-// are the accepted transactions, one per direction of the round: each one drops every recorded graph.
+// are the accepted transactions, one per direction of the round: each one can make a context drop what it recorded.
 static void test_decode_graphs_after_a_move_are_counted() {
     rig r(1, 8, 4);
     r.decode[r.index(0, 5)] = 10;

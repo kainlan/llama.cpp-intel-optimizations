@@ -441,15 +441,19 @@ instance per device, keyed on the route table it reads, since that table is one
 per device and shared by every context on the card.
 
 A round is not free. Each accepted transaction publishes a plan, and a published
-plan bumps the exec-graph epoch, so every context on every device drops its
-recorded graphs at its next graph compute. A round is two transactions, the
-evicts at one boundary and their admits at the next, so after each round about
-three decode tokens run without a replay: one direct after the evict, one direct
-after the admit, and one that records. That is the mechanism read from the code;
-no measured figure exists yet. The second `[MOE-SWAP]` summary line puts the
-accepted transactions, evicts and admits apart, beside the decode graphs they
-cost replays in, and the policy's margin and decay are what keep rounds rare once
-the routing settles.
+plan bumps the exec-graph epoch. A context reads the epoch at its next graph
+compute and clears what it recorded only while it holds a whole-graph recording,
+valid one-slot segments (a prompt records those) or block graphs. That clear also
+retires the keyed decode slots, and each keyed split then runs direct once and
+records once before it replays again. A keyed decode sets none of the three
+again, so the first transaction after a prompt can cost that re-record, and the
+later transactions of the same decode clear nothing: their keyed slots keep
+replaying. That is sound because a keyed split keeps every `MUL_MAT_ID` out of
+its recorded segments, and the direct node resolves its experts at each call.
+That is the mechanism read from the code; no measured figure exists yet. The
+second `[MOE-SWAP]` summary line puts the accepted transactions, evicts and
+admits apart, beside the decode graphs they ran among, and the policy's margin
+and decay are what keep rounds rare once the routing settles.
 
 **Gates.** Three gates keep the rule enforceable.
 

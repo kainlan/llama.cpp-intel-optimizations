@@ -22718,10 +22718,15 @@ static void ggml_sycl_run_expert_refill_at_boundary(ggml_backend_t backend) {
 // host WEIGHT zone's free bytes, the device's loans and its deferred frees.
 //
 // Cost: each accepted transaction publishes a plan, and a published plan bumps the exec-graph epoch
-// (ggml_sycl_optional_layouts_retired), so every context on every device drops its recorded graphs at its next graph
-// compute; a keyed decode segment then runs direct once, records once, and replays only after that. A round is two
-// transactions, the evicts at one boundary and their admits at the next, so about three decode tokens run without a
-// replay after each round. The policy's margin and decay are what keep rounds rare once the routing settles.
+// (ggml_sycl_optional_layouts_retired). A context reads the epoch at its next graph compute and clears what it
+// recorded only while it holds a whole-graph recording, valid one-slot segments (a prompt records those) or block
+// graphs. That clear retires the keyed decode slots too, and each keyed split then runs direct once and records once
+// before it replays again. The keyed slots are not in the test: a keyed decode sets none of the three again, so the
+// later transactions of the same decode clear nothing and the slots keep replaying. A slot that outlives a
+// transaction holds no expert's address: a keyed split keeps every MUL_MAT_ID out of its recorded segments, and the
+// direct node resolves its experts at each call. So the first transaction after a prompt can cost each keyed split
+// one re-record, and the ones after it cost none. The policy's margin and decay are what keep rounds rare once the
+// routing settles.
 // ---------------------------------------------------------------------------------------------------------------------
 
 // The switch, read once. Off by default until the device step has verified the driver.
@@ -100707,9 +100712,9 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         // After a prompt phase, each decode graph's boundary re-admits lent triplets, behind the deferred-free pass
         // that reclaims the loan's withdrawn device entries and the zone room the ring released (llama.cpp-sif1).
         ggml_sycl_run_expert_refill_at_boundary(backend);
-        // GGML_SYCL_MOE_SWAP=1: the swap policy's evicts, or the admits they left pending, after the refill. A round is
-        // not free: each accepted transaction drops every context's recorded graphs, so about three decode tokens of a
-        // round (evict here, admit at the next boundary) run without a replay.
+        // GGML_SYCL_MOE_SWAP=1: the swap policy's evicts, or the admits they left pending, after the refill. Not free:
+        // an accepted transaction bumps the exec-graph epoch, and a context that still holds a prompt's segments
+        // then retires its keyed decode slots at its next graph (the cost note above the driver's instance says when).
         ggml_sycl_run_expert_swap_at_boundary(backend);
 
         if (ggml_sycl::unified_alloc_strict_mode()) {

@@ -24,7 +24,7 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       accessor after the parse, so the non-default report says what is in effect;
   D7  each summary line reaches the log at WARN: every summary call is an argument of GGML_LOG_WARN, and both exist;
       the second line names the accepted transactions, evicts and admits apart, beside the decode graphs, and the
-      step counts each direction's accepted transaction once (each one drops every recorded graph);
+      step counts each direction's accepted transaction once (each one can cost a context what it recorded);
   D8  the driver header is plain host code: it includes the policy header and a short list of standard headers, and
       keeps no state outside the caller's struct (no static, thread_local, extern, mutable or volatile, no inline
       variable, no atomic or lock), and reaches no device, cache, log or environment;

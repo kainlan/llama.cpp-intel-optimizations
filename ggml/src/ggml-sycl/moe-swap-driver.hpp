@@ -135,8 +135,8 @@ inline uint64_t moe_swap_reason_count_of(const std::vector<moe_swap_reason_count
 }
 
 // Everything the summary lines print. Cumulative over the driver's life. The accepted transactions are counted apart
-// from the triplets they moved: each one publishes a plan, and a published plan drops every context's recorded graphs
-// on every device, so it is the transactions, not the triplets, that cost decode tokens their replay.
+// from the triplets they moved: each one publishes a plan, and a published plan can make a context drop what it
+// recorded, so it is the transactions, not the triplets, that can cost decode tokens their replay.
 struct moe_swap_driver_stats {
     uint64_t                           boundaries               = 0;
     uint64_t                           boundaries_off           = 0;
@@ -521,8 +521,8 @@ inline std::string moe_swap_driver_summary_moves(const moe_swap_driver_stats & s
     return line;
 }
 
-// The second summary line: the accepted transactions beside the decode graphs they cost replays in (a round is two,
-// and each drops every recorded graph), then what the driver could not do, and why.
+// The second summary line: the accepted transactions beside the decode graphs they ran among (a round is two, and
+// each can make a context drop what it recorded), then what the driver could not do, and why.
 inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & st, int device) {
     using ull = unsigned long long;
     char room[64];
