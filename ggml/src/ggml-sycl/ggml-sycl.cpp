@@ -424,6 +424,11 @@ int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_kqv_force_simple = 0;
 int g_ggml_sycl_kqv_disable_fp16 = 0;
+#if GGML_SYCL_DNNL
+// GGML_SYCL_ONEDNN_DETERMINISTIC as the report's integer, SET from ggml_sycl_onednn_deterministic_enabled()
+// (dnnl-deterministic.hpp) after the table parse, so the report says what is in effect.
+int g_ggml_sycl_onednn_deterministic = 1;
+#endif
 #ifdef GGML_SYCL_XMX_GEMM
 int g_ggml_sycl_use_xmx_gemm  = 0;  // Enable XMX-accelerated GEMM (experimental, 5-11x slower)
 // Max batch size for XMX (XMX is used for 1 <= N < threshold).
@@ -34268,6 +34273,10 @@ static void ggml_check_sycl() try {
             // The planner's pin of a mapping load's routed host experts, likewise overwritten from its one reader,
             // which the planner calls on every plan.
             { ggml_sycl::MOE_PIN_HOST_EXPERTS_ENV, &g_ggml_sycl_moe_pin_host_experts, 1 },
+#if GGML_SYCL_DNNL
+            // The deterministic attribute on every oneDNN primitive, likewise overwritten from its one reader.
+            { GGML_SYCL_ONEDNN_DETERMINISTIC_ENV, &g_ggml_sycl_onednn_deterministic, 1 },
+#endif
             // clang-format on
         };
 
@@ -34281,6 +34290,9 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
         g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
         g_ggml_sycl_moe_pin_host_experts         = ggml_sycl::placement_pin_host_experts_enabled() ? 1 : 0;
+#if GGML_SYCL_DNNL
+        g_ggml_sycl_onednn_deterministic = ggml_sycl_onednn_deterministic_enabled() ? 1 : 0;
+#endif
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
@@ -34417,6 +34429,7 @@ static void ggml_check_sycl() try {
         }
 #if GGML_SYCL_DNNL
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
+        GGML_LOG_INFO("  GGML_SYCL_ONEDNN_DETERMINISTIC: %d\n", g_ggml_sycl_onednn_deterministic);
 #else
 
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
@@ -40922,6 +40935,7 @@ static sycl::event ggml_sycl_fill_onednn_packed(sycl::queue &                   
         const dnnl::memory::desc c_md({ ctx->pack_m, ctx->nrows }, dtype, { ctx->nrows, 1 });
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_md, b_any_md, c_md, attr);
         auto packed_md = matmul_pd.weights_desc();
@@ -66811,6 +66825,7 @@ static size_t ggml_sycl_layout_bytes_onednn_packed_for_dims(ggml_type type,
         const dnnl::memory::desc c_md({ batch_m, nrows }, dtype, { nrows, 1 });
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_md, b_any_md, c_md, attr);
         return matmul_pd.weights_desc().get_size();

@@ -4175,7 +4175,7 @@ static bool run_vram_budget_authority_test() {
     // passes through unchanged (host_unified=false), external_headroom
     // equals unified_cache_max_external_headroom(base_mem) exactly (the
     // authority must not invent a separate headroom formula), and
-    // budget_bytes = min(base_mem*pct, free_vram_at_init) - external_headroom.
+    // budget_bytes = min(base_mem*pct, free floored to the 64 MiB grid) - external_headroom.
     {
         env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
         unsetenv("GGML_SYCL_VRAM_BUDGET_PCT");
@@ -4203,7 +4203,14 @@ static bool run_vram_budget_authority_test() {
                 authority.external_headroom, expected_headroom);
             return false;
         }
-        const size_t expected_budget = free_now > expected_headroom ? free_now - expected_headroom : 0;
+        // 16250 MiB is not on the 64 MiB grid: the cap is the figure rounded down, 16192 MiB.
+        const size_t free_floored    = free_now / (64ull * mib) * (64ull * mib);
+        const size_t expected_budget = free_floored > expected_headroom ? free_floored - expected_headroom : 0;
+        if (authority.free_floored != free_floored) {
+            printf("FAIL: authority free_floored mismatch, got %zu expected %zu\n", authority.free_floored,
+                   free_floored);
+            return false;
+        }
         if (authority.budget_bytes != expected_budget) {
             printf("FAIL: authority budget_bytes mismatch, got %zu expected %zu\n", authority.budget_bytes,
                    expected_budget);
@@ -4270,7 +4277,9 @@ static bool run_vram_budget_authority_test() {
         constexpr size_t tight_free = 2000ull * mib;
         const auto   authority = ggml_sycl::compute_vram_budget_authority(false, total, tight_free, tight_free, 100);
         const size_t headroom  = ggml_sycl::unified_cache_max_external_headroom(total);
-        const size_t expected  = tight_free > headroom ? tight_free - headroom : 0;
+        // 2000 MiB is not on the 64 MiB grid: the cap is 1984 MiB.
+        const size_t capped    = tight_free / (64ull * mib) * (64ull * mib);
+        const size_t expected  = capped > headroom ? capped - headroom : 0;
         if (authority.budget_bytes != expected) {
             printf(
                 "FAIL: free_vram_at_init should cap the budget before headroom is subtracted, got %zu expected "
@@ -4295,6 +4304,190 @@ static bool run_vram_budget_authority_test() {
     }
 
     printf("PASS: VRAM budget authority arithmetic\n");
+    return true;
+}
+
+// The authority floors the driver's free figure to a 64 MiB grid before it caps the budget. The figure moves by tens of
+// kilobytes between runs on an idle card; on the B70 it sat on the arena's 2 MiB rounding step, so the arena came out
+// 2 MiB apart run to run, about three experts moved between host and device, a different kernel computed them, and the
+// generated text parted. These cases hold the floor's arithmetic.
+static bool run_vram_budget_free_floor_test() {
+    constexpr size_t mib  = 1024ull * 1024ull;
+    constexpr size_t kib  = 1024ull;
+    // The authority's grid (k_vram_budget_free_grid, unified-cache.cpp).
+    constexpr size_t grid = 64ull * mib;
+
+    env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+    unsetenv("GGML_SYCL_VRAM_BUDGET_PCT");
+
+    auto authority_at = [](bool host_unified, size_t total, size_t reading) {
+        return ggml_sycl::compute_vram_budget_authority(host_unified, total, reading, reading, 100);
+    };
+    // The budget without the grid: min(base, reading) less the headroom, and 0 at least. A reading of 0 is no cap.
+    auto unfloored_budget = [](size_t base, size_t reading) {
+        const size_t headroom = ggml_sycl::unified_cache_max_external_headroom(base);
+        const size_t capped   = (reading > 0 && reading < base) ? reading : base;
+        return capped > headroom ? capped - headroom : size_t(0);
+    };
+
+    // Two readings 64 KiB apart on either side of a 2 MiB step give one budget.
+    {
+        constexpr size_t total = 16304ull * mib;
+        constexpr size_t step  = 16250ull * mib;  // an even MiB count: a 2 MiB step
+        const auto       below = authority_at(false, total, step - 32ull * kib);
+        const auto       above = authority_at(false, total, step + 32ull * kib);
+        if (below.budget_bytes != above.budget_bytes || below.free_floored != above.free_floored) {
+            printf("FAIL: free grid: readings 64 KiB apart across a 2 MiB step gave budgets %zu and %zu\n",
+                   below.budget_bytes, above.budget_bytes);
+            return false;
+        }
+    }
+
+    // The B70's two readings of the same idle card (total 32656 MiB, free 31947.9 and 31948.0 MiB), which gave
+    // arenas of 29898 and 29900 MB before the grid, now give one budget: 31936 MiB less the headroom.
+    {
+        constexpr size_t total     = 32656ull * mib;
+        constexpr size_t reading_a = 33499801190ull;  // 31947.9 MiB
+        constexpr size_t reading_b = 33499906048ull;  // 31948.0 MiB
+        constexpr size_t on_grid   = 31936ull * mib;
+        const auto       a         = authority_at(false, total, reading_a);
+        const auto       b         = authority_at(false, total, reading_b);
+        const size_t     headroom  = ggml_sycl::unified_cache_max_external_headroom(total);
+        if (a.free_floored != on_grid || b.free_floored != on_grid) {
+            printf("FAIL: free grid: B70 readings floored to %zu and %zu, expected %zu\n", a.free_floored,
+                   b.free_floored, on_grid);
+            return false;
+        }
+        if (a.budget_bytes != b.budget_bytes || a.budget_bytes != on_grid - headroom) {
+            printf("FAIL: free grid: B70 budgets %zu and %zu, expected both %zu\n", a.budget_bytes, b.budget_bytes,
+                   on_grid - headroom);
+            return false;
+        }
+    }
+
+    // The grid never raises a budget, and takes off less than one step.
+    {
+        constexpr size_t total      = 32656ull * mib;
+        const size_t     readings[] = { 1ull * mib,           63ull * mib + 999ull, 64ull * mib,    64ull * mib + 1,
+                                        2000ull * mib + 7ull, 16250ull * mib,       31947ull * mib, 31999ull * mib,
+                                        32655ull * mib,       32656ull * mib,       40000ull * mib };
+        for (const size_t reading : readings) {
+            const size_t got  = authority_at(false, total, reading).budget_bytes;
+            const size_t want = unfloored_budget(total, reading);
+            if (got > want || got + grid <= want) {
+                printf("FAIL: free grid: free=%zu gave budget %zu, outside (%zu - one step, %zu]\n", reading, got, want,
+                       want);
+                return false;
+            }
+        }
+    }
+
+    // A reading exactly on a grid step is used unchanged.
+    {
+        constexpr size_t total   = 32656ull * mib;
+        constexpr size_t reading = 500ull * grid;
+        const auto       a       = authority_at(false, total, reading);
+        if (a.free_floored != reading || a.budget_bytes != unfloored_budget(total, reading)) {
+            printf("FAIL: free grid: a reading on the grid moved: floored %zu budget %zu\n", a.free_floored,
+                   a.budget_bytes);
+            return false;
+        }
+    }
+
+    // A reading below one step is used as it is and still caps: flooring it to 0 would read as "no reading" and
+    // switch the cap off, giving the whole card's budget.
+    {
+        constexpr size_t total   = 16304ull * mib;
+        constexpr size_t reading = 40ull * mib;
+        const auto       a       = authority_at(false, total, reading);
+        if (a.free_floored != reading || a.budget_bytes != unfloored_budget(total, reading)) {
+            printf("FAIL: free grid: a reading below one step: floored %zu budget %zu, expected %zu and %zu\n",
+                   a.free_floored, a.budget_bytes, reading, unfloored_budget(total, reading));
+            return false;
+        }
+        if (a.budget_bytes >= unfloored_budget(total, 0)) {
+            printf("FAIL: free grid: a reading below one step switched the cap off (budget %zu)\n", a.budget_bytes);
+            return false;
+        }
+    }
+
+    // A reading of 0 keeps meaning "no reading": no cap, the budget follows the total.
+    {
+        constexpr size_t total = 16304ull * mib;
+        const auto       a     = authority_at(false, total, 0);
+        if (a.free_floored != 0 || a.budget_bytes != unfloored_budget(total, 0)) {
+            printf("FAIL: free grid: free=0 gave floored %zu budget %zu, expected 0 and %zu\n", a.free_floored,
+                   a.budget_bytes, unfloored_budget(total, 0));
+            return false;
+        }
+    }
+
+    // A host-unified device keeps its own base (a fixed modest share of host memory); only the reading that caps it
+    // is floored. That base follows this host's available memory, so the reading is placed halfway between the
+    // headroom and the base, off the grid: then the floored reading caps the budget and the floor changes it. If the
+    // host leaves too little room for that, the case says NOT TESTED rather than passing on equal budgets.
+    bool host_unified_tested = false;
+    {
+        constexpr size_t raw_total = 231700ull * mib;
+        const auto       probe     = authority_at(true, raw_total, 0);
+        if (probe.base_mem == raw_total) {
+            printf("FAIL: free grid: a host-unified device's base passed the raw total through\n");
+            return false;
+        }
+        const size_t probe_headroom = ggml_sycl::unified_cache_max_external_headroom(probe.base_mem);
+        const size_t room           = probe.base_mem > probe_headroom ? probe.base_mem - probe_headroom : 0;
+        const size_t reading        = probe_headroom + room / 2 + 12345ull;
+        const size_t on_grid        = reading / grid * grid;
+        const auto   a              = authority_at(true, raw_total, reading);
+        const size_t headroom       = ggml_sycl::unified_cache_max_external_headroom(a.base_mem);
+        if (reading % grid == 0 || reading >= a.base_mem || on_grid <= headroom) {
+            printf(
+                "NOT TESTED: free grid: host-unified base %zu with headroom %zu leaves no reading the floor would "
+                "change (reading %zu)\n",
+                a.base_mem, headroom, reading);
+        } else {
+            host_unified_tested = true;
+            if (a.free_floored != on_grid || a.budget_bytes != unfloored_budget(a.base_mem, on_grid)) {
+                printf("FAIL: free grid: host-unified floored %zu budget %zu, expected %zu and %zu\n", a.free_floored,
+                       a.budget_bytes, on_grid, unfloored_budget(a.base_mem, on_grid));
+                return false;
+            }
+            if (a.budget_bytes >= unfloored_budget(a.base_mem, reading)) {
+                printf("FAIL: free grid: host-unified budget %zu was not lowered by the floor\n", a.budget_bytes);
+                return false;
+            }
+        }
+    }
+
+    // The authority reports the reading it floored: the init reading when there is one, else the free figure.
+    {
+        constexpr size_t total    = 32656ull * mib;
+        constexpr size_t live     = 30000ull * mib + 777ull;
+        constexpr size_t at_init  = 31000ull * mib + 555ull;
+        const auto       hinted   = ggml_sycl::compute_vram_budget_authority(false, total, live, at_init, 100);
+        const auto       unhinted = ggml_sycl::compute_vram_budget_authority(false, total, live, 0, 100);
+        if (hinted.free_reading != at_init || hinted.free_floored != at_init / grid * grid) {
+            printf(
+                "FAIL: free grid: with an init reading the authority reported free %zu floored %zu, expected %zu "
+                "and %zu\n",
+                hinted.free_reading, hinted.free_floored, at_init, at_init / grid * grid);
+            return false;
+        }
+        if (unhinted.free_reading != live || unhinted.free_floored != live / grid * grid) {
+            printf(
+                "FAIL: free grid: without an init reading the authority reported free %zu floored %zu, expected "
+                "%zu and %zu\n",
+                unhinted.free_reading, unhinted.free_floored, live, live / grid * grid);
+            return false;
+        }
+    }
+
+    // The summary names an untested case, so the pass line cannot be read as covering it.
+    if (host_unified_tested) {
+        printf("PASS: VRAM budget authority floors the free reading to a 64 MiB grid\n");
+    } else {
+        printf("PASS: VRAM budget authority floors the free reading to a 64 MiB grid (host-unified case NOT TESTED)\n");
+    }
     return true;
 }
 
@@ -4554,6 +4747,9 @@ int main() {
         return 1;
     }
     if (!run_vram_budget_authority_test()) {
+        return 1;
+    }
+    if (!run_vram_budget_free_floor_test()) {
         return 1;
     }
     // Every case in the mocked-device block prints its own PASS or FAIL, and a failure does not stop the run: a stale

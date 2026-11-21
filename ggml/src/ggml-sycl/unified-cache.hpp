@@ -9902,7 +9902,14 @@ struct vram_budget_authority {
     int    budget_pct        = 100;  // resolved GGML_SYCL_VRAM_BUDGET_PCT
     size_t base_mem          = 0;    // host-unified-adjusted device total
     size_t external_headroom = 0;    // unified_cache_max_external_headroom(base_mem)
-    size_t budget_bytes      = 0;    // min(base_mem*pct/100, free_vram_at_init) - external_headroom, floored at 0
+    size_t budget_bytes      = 0;    // min(base_mem*pct/100, free_floored) - external_headroom, floored at 0
+    // The free reading that caps the budget, rounded down to a 64 MiB grid so that run-to-run jitter of the driver's
+    // figure does not move the plan; a reading below one step is kept as it is, and 0 means no reading (no cap).
+    // Set by compute_vram_budget_authority() only: a budget read off a live cache leaves it 0.
+    size_t free_floored      = 0;
+    // The reading free_floored was taken from: the hint's reading at init when it has one, else the caller's free
+    // figure. Set with free_floored, so the log states the figure that was rounded, whichever caller supplied it.
+    size_t free_reading      = 0;
 };
 
 // llama.cpp-o3h1 quality review (final batch, F2/F4): the shared entry
