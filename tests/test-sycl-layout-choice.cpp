@@ -4426,6 +4426,7 @@ static bool run_vram_budget_free_floor_test() {
     // is floored. That base follows this host's available memory, so the reading is placed halfway between the
     // headroom and the base, off the grid: then the floored reading caps the budget and the floor changes it. If the
     // host leaves too little room for that, the case says NOT TESTED rather than passing on equal budgets.
+    bool host_unified_tested = false;
     {
         constexpr size_t raw_total = 231700ull * mib;
         const auto       probe     = authority_at(true, raw_total, 0);
@@ -4445,6 +4446,7 @@ static bool run_vram_budget_free_floor_test() {
                 "change (reading %zu)\n",
                 a.base_mem, headroom, reading);
         } else {
+            host_unified_tested = true;
             if (a.free_floored != on_grid || a.budget_bytes != unfloored_budget(a.base_mem, on_grid)) {
                 printf("FAIL: free grid: host-unified floored %zu budget %zu, expected %zu and %zu\n", a.free_floored,
                        a.budget_bytes, on_grid, unfloored_budget(a.base_mem, on_grid));
@@ -4480,7 +4482,12 @@ static bool run_vram_budget_free_floor_test() {
         }
     }
 
-    printf("PASS: VRAM budget authority floors the free reading to a 64 MiB grid\n");
+    // The summary names an untested case, so the pass line cannot be read as covering it.
+    if (host_unified_tested) {
+        printf("PASS: VRAM budget authority floors the free reading to a 64 MiB grid\n");
+    } else {
+        printf("PASS: VRAM budget authority floors the free reading to a 64 MiB grid (host-unified case NOT TESTED)\n");
+    }
     return true;
 }
 
