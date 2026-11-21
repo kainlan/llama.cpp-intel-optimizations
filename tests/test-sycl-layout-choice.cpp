@@ -1758,8 +1758,9 @@ static ggml_sycl::placement_plan plan_mapping(size_t   budget,
     return ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv, nullptr, n_exps, host_budget);
 }
 
-// The planner's line when its routed host experts go back to the mapping.
-constexpr const char * stay_mapped_line = "routed host experts stay mapped";
+// The planner's line when its routed host experts go back to the mapping. With its tag: a spread plan's swap headroom
+// line says "the routed host experts stay mapped" too, as the reason it holds none, and is not this line.
+constexpr const char * stay_mapped_line = "[PLACEMENT] routed host experts stay mapped";
 
 // Counts the log lines that carry `needle` while it lives, and keeps them, so a case can read the figures they print.
 // It passes every line on to the callback it replaced, which it puts back when the scope ends.
