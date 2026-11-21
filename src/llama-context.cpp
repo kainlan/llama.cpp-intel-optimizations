@@ -729,9 +729,10 @@ static bool llama_context_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
 // the device. With no CPU work the host buft stays: the dedicated identity would
 // add split-copy names to the graph (the dkw0 replay-futility detector disables
 // command-graph replay on a '#' name). The CPU can still run input-side ops then,
-// such as a mask ADD whose sources are all CPU inputs; the scheduler makes no copy
-// of their outputs, and the SYCL backend stages each one to the device as a graph
-// input before it records or replays.
+// such as a mask ADD whose sources are all CPU inputs, and the scheduler makes no
+// copy of their outputs. The SYCL graph pre-stage stages each one to the device
+// as a graph input, so the graph records; a consumer that looks staging up by the
+// INPUT flag (flash attention) does not use that copy and stages the tensor itself.
 //
 // The answer depends on the placement plan, which the auto-ubatch resyncs
 // re-publish after the constructor enumerates the backends, so sched_reserve()
