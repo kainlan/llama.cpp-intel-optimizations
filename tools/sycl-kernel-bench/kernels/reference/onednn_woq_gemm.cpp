@@ -5,6 +5,8 @@
 
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
+// The attribute the backend builds with, so the reference times the primitive the backend would run.
+#include "ggml-sycl/dnnl-deterministic.hpp"
 
 namespace sycl_bench {
 
@@ -149,6 +151,7 @@ bool run_onednn_woq_gemm(const GeneratedWeights & weights,
     dnnl::memory::desc wei_any_md({k, m}, dnnl::memory::data_type::s4, dnnl::memory::format_tag::any);
 
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     const int mask = (1 << 0) | (1 << 1);
     dnnl_dims_t group_dims = { QK4_0, 1 };
     if (dnnl_primitive_attr_set_scales(attr.get(), DNNL_ARG_WEIGHTS, mask, 2, group_dims,

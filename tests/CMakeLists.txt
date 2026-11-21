@@ -617,6 +617,8 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     find_package(DNNL QUIET)
     if (TARGET DNNL::dnnl)
         target_link_libraries(test-onednn-woq-mxfp4 PRIVATE DNNL::dnnl)
+        # ggml-sycl/dnnl-deterministic.hpp: the attribute production builds with.
+        target_include_directories(test-onednn-woq-mxfp4 PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     else()
         message(WARNING "test-onednn-woq-mxfp4: DNNL::dnnl not found in this directory scope; the target will fail to link")
     endif()
@@ -778,6 +780,8 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     find_package(DNNL QUIET)
     if (TARGET DNNL::dnnl)
         target_link_libraries(test-sycl-onednn-int8-grouped-probe PRIVATE DNNL::dnnl)
+        # ggml-sycl/dnnl-deterministic.hpp: the attribute production builds with.
+        target_include_directories(test-sycl-onednn-int8-grouped-probe PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
         target_compile_definitions(test-sycl-onednn-int8-grouped-probe PRIVATE GGML_SYCL_DNNL=1)
     else()
         message(WARNING "test-sycl-onednn-int8-grouped-probe: DNNL::dnnl not found in this directory scope; the target will fail to link")
@@ -1035,6 +1039,23 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-policy-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-policy-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # The named expert move's admit: no wait, the device storage minted at the staged size before the inventory lock,
+    # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and no
+    # production caller yet. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
+    add_test(NAME test-sycl-moe-expert-admit-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-admit-source.py --self-test)
+    set_tests_properties(test-sycl-moe-expert-admit-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # Every dnnl::primitive_attr the backend builds goes through the one helper that asks oneDNN for a deterministic
+    # implementation, behind one default-ON switch read once (GGML_SYCL_ONEDNN_DETERMINISTIC). Without it identical
+    # inputs gave different bits run to run. Run WITH --self-test so each mutant is caught by the pin it names. Text
+    # only: no device, no model. TIMEOUT: the self-test runs one full check of the scanned sources per mutant,
+    # about 0.6 s of CPU each on this host, so its time grows with the mutant list; 120 s leaves room for the
+    # host's permanent load and for more mutants. Raise it when a self-test run comes near it.
+    add_test(NAME test-sycl-onednn-deterministic-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-deterministic-source.py --self-test)
+    set_tests_properties(test-sycl-onednn-deterministic-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # The legacy expert ranking is gone: no warmup profile, gate-norm placement, periodic rerank, runtime or adaptive
     # prestage, hash-keyed rank or eviction frequency term is left in the backend, while the planner's block-keyed rank
     # API and its one writer stay, and the down-I8 hot set ranks by usage score and that rank alone. Run WITH

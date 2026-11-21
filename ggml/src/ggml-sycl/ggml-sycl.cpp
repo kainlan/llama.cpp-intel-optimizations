@@ -424,6 +424,11 @@ int g_ggml_sycl_prioritize_dmmv  = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_kqv_force_simple = 0;
 int g_ggml_sycl_kqv_disable_fp16 = 0;
+#if GGML_SYCL_DNNL
+// GGML_SYCL_ONEDNN_DETERMINISTIC as the report's integer, SET from ggml_sycl_onednn_deterministic_enabled()
+// (dnnl-deterministic.hpp) after the table parse, so the report says what is in effect.
+int g_ggml_sycl_onednn_deterministic = 1;
+#endif
 #ifdef GGML_SYCL_XMX_GEMM
 int g_ggml_sycl_use_xmx_gemm  = 0;  // Enable XMX-accelerated GEMM (experimental, 5-11x slower)
 // Max batch size for XMX (XMX is used for 1 <= N < threshold).
@@ -21120,18 +21125,33 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // storage for them before the inventory lock, has the cache re-admit each (unified_cache::refill_lent_triplet), flips
 // the plan copy back on the device and publishes once. It runs at the boundary of each decode graph after a prompt
 // phase, behind the deferred-free pass, and an accepted loan cancels the refills still to run.
+//
+// The named move is the same body run for triplets its caller names (ggml_sycl_expert_move_transaction_run): each is
+// checked against the published plan (moe_expert_move_validate), prepared and moved on its own, so one refused leaves
+// the others to move, and all that moved are published in one plan. It keeps no ledger. Its evicts run first: each
+// moves a resident triplet to pinned host storage through the loan's cache body (unified_cache::loan_expert_triplet),
+// and its device storage comes back only when a later deferred-free pass reaps the entries it retired, never to an
+// admit in the same call. Its admit moves a host triplet to the device from its pinned host copy
+// (unified_cache::admit_host_triplet). It runs only while nothing is lent.
+//
+// Every direction sizes from the tensor (ggml_sycl_expert_prepare_triplet): each copy moves the expert's bytes per
+// expert (nb[2]), a host copy holds exactly them, and a device copy is minted at the staged size with its padded tail
+// zero-filled behind the copy, so an expert that goes to the host and back does not grow.
 // ---------------------------------------------------------------------------------------------------------------------
 
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size);
 
 // A partial loan (a later triplet refused after earlier ones were lent) is accepted: accepted=true and ACCEPTED, with
-// `reason` holding the refusal that stopped it, not "OK". A partial refill reports the same way.
+// `reason` holding the refusal that stopped it, not "OK". A partial refill reports the same way. An accepted move
+// reports its device storage per direction: bytes_freed what its moves to the host give back (a loan's triplets, a
+// named move's evicts) and bytes_readmitted what its moves to the device took (a refill's triplets, a named move's
+// admits); a direction the call did not take reports 0.
 struct ggml_sycl_expert_loan_result {
     bool         accepted         = false;
-    size_t       bytes_freed      = 0;  // device storage the lent triplets returned (a probe: the selection's charge)
+    size_t       bytes_freed      = 0;  // device storage moved to the host (a probe: the selection's charge)
     size_t       slots_funded     = 0;  // a probe's: the ring slots the selection funds; 0 when it counted bytes
-    size_t       bytes_readmitted = 0;  // a refill's: device storage the re-admitted triplets took
-    uint32_t     n_triplets       = 0;  // the triplets lent, or re-admitted
+    size_t       bytes_readmitted = 0;  // device storage moved to the device
+    uint32_t     n_triplets       = 0;  // the triplets moved: lent, re-admitted, or a named move's in both directions
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
     uint32_t     n_dropped        = 0;  // a refill's: the lent triplets it dropped from the ledger, to stay on the host
     const char * reason           = "none";
@@ -21143,6 +21163,13 @@ struct ggml_sycl_expert_loan_target {
     ggml_sycl_cache_id              key{};
     std::vector<ggml_sycl_cache_id> host_keys;
     ggml_tensor_extra_gpu *         extra = nullptr;
+    // The member's weight type, row width and bytes per expert (nb[2]), from its tensor. The expert's size is a fact of
+    // its tensor, never of a cache entry, whose storage may be padded: every move copies those bytes and records them
+    // as the new record's range, and a move to the device mints its copy at the staged size the three give
+    // (staged_expert_bytes).
+    ggml_type                       type          = GGML_TYPE_COUNT;
+    int64_t                         ncols         = 0;
+    size_t                          logical_bytes = 0;
 };
 
 using ggml_sycl_expert_loan_resolver =
@@ -21183,16 +21210,84 @@ static bool ggml_sycl_expert_loan_resolve_registered(const ggml_sycl::lifecycle:
             out.host_keys.push_back(canonical);
         }
     }
-    out.extra = extra;
+    out.extra         = extra;
+    out.type          = tensor->type;
+    out.ncols         = tensor->ne[0];
+    out.logical_bytes = tensor->nb[2];
     return true;
 }
 
-// Which way the expert placement transaction moves whole triplets (llama.cpp-sif1). A loan moves resident triplets to
-// pinned host storage for a prompt phase's ring; a refill moves lent triplets back to the device after it. One body
-// runs both, as the KV probe and publish share one.
+// Which way the expert placement transaction moves whole triplets. A loan moves resident triplets to pinned host
+// storage for a prompt phase's ring; a refill moves lent triplets back to the device after it. A named move moves the
+// triplets its caller names, each on its own, and keeps no ledger: its evict moves a resident triplet to pinned host
+// storage and its admit moves a host triplet to the device. One body runs all three, as the KV probe and publish share
+// one.
 enum class ggml_sycl_expert_txn_direction {
     LOAN,
     REFILL,
+    NAMED,
+};
+
+// What one triplet's move is: the cache body that moves it, the way its bytes go, and the words its refusals use. The
+// direction says what a call does and the kind what each of its triplets does, so the body asks one table instead of
+// a chain of direction tests at every refusal. A named move's triplets are ADMIT or EVICT, by the list that names
+// them; an evict is a loan's move under a named move's rules.
+enum class ggml_sycl_expert_move_kind {
+    LOAN,
+    REFILL,
+    ADMIT,
+    EVICT,
+};
+
+// The words one kind's refusals and log lines use: a member no tensor resolves, no cache entry to copy from, an
+// exception while it moved, and the call's name in the log.
+struct ggml_sycl_expert_move_texts {
+    const char * no_tensor;
+    const char * no_source;
+    const char * exception;
+    const char * name;
+};
+
+static ggml_sycl_expert_move_texts ggml_sycl_expert_move_texts_of(ggml_sycl_expert_move_kind kind) {
+    switch (kind) {
+        case ggml_sycl_expert_move_kind::LOAN:
+            return { "no tensor for a selected expert", "not resident", "exception while lending", "loan" };
+        case ggml_sycl_expert_move_kind::REFILL:
+            return { "no tensor for a lent expert", "not lent", "exception while refilling", "refill" };
+        case ggml_sycl_expert_move_kind::ADMIT:
+            return { "no tensor for a named expert", "not on host", "exception while moving", "named move" };
+        case ggml_sycl_expert_move_kind::EVICT:
+            return { "no tensor for a named expert", "not resident", "exception while moving", "named move" };
+    }
+    GGML_ABORT("unknown expert move kind");
+}
+
+// A refill or an admit copies host bytes to the device; a loan or an evict copies device bytes to the host. The switch
+// has no default, so a new kind is a compile warning here rather than a move in a direction nobody chose.
+static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
+    switch (kind) {
+        case ggml_sycl_expert_move_kind::REFILL:
+        case ggml_sycl_expert_move_kind::ADMIT:
+            return true;
+        case ggml_sycl_expert_move_kind::LOAN:
+        case ggml_sycl_expert_move_kind::EVICT:
+            return false;
+    }
+    GGML_ABORT("unknown expert move kind");
+}
+
+// One named triplet's answer from a named move: moved (and the plan that says so published), or refused with the
+// reason, BUSY when a later boundary may move it. reason is null until the transaction decides; the entry gives a
+// triplet the body never decided the call's own answer, since a refusal of the whole call refuses each. to_device
+// says which list named it, the admits' or the evicts'. device_bytes is the device storage a moved triplet took (an
+// admit) or gives back once the cache reaps the entries it retired (an evict).
+struct ggml_sycl_expert_move_outcome {
+    ggml_sycl::moe_expert_triplet_ref triplet;
+    bool                              to_device    = true;
+    bool                              moved        = false;
+    ggml_sycl_txn_result              code         = ggml_sycl_txn_result::REFUSED;
+    const char *                      reason       = nullptr;
+    size_t                            device_bytes = 0;
 };
 
 // Per device, the triplets lent and not yet re-admitted, in the order they were lent, under the identity of the
@@ -21279,7 +21374,7 @@ static ggml_sycl_expert_lent_ledger & ggml_sycl_expert_lent_ledger_locked(
 }
 
 static bool ggml_sycl_expert_triplet_is(const std::array<ggml_sycl::expert_placement_key, 3> & lent,
-                                        const ggml_sycl::expert_refill_member                  members[3]) {
+                                        const ggml_sycl::expert_move_member                    members[3]) {
     for (int r = 0; r < 3; ++r) {
         const ggml_sycl::expert_placement_key & a = lent[r];
         const ggml_sycl::expert_placement_key & b = members[r].placement;
@@ -21334,12 +21429,34 @@ static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_sele
     return keys;
 }
 
-// A refill refusal a later boundary would meet again: the host copy is not a loan's (or no longer is), or the device
-// storage's size does not equal the lent copy's size. Such a triplet leaves the ledger rather than being retried at
-// every decode graph; any other refusal is transient and the triplet is tried again at the next one.
-static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason) {
+// A cache refusal is final when the same inputs give it again with nothing changed, so a later boundary would meet it
+// again. One list serves both cache bodies, the copy to the device (a refill or an admit) and the copy to the host (an
+// evict; a loan's refusal ends the loan whatever its class). To the device: the arguments or a member are malformed;
+// the device storage is not VRAM of the cache's card owned outside the cache, which the WEIGHT zone allocator the
+// transaction mints from never changes (a full zone stops the transaction before the cache is asked); the host copy
+// is not one the direction copies from (a loan's for a refill, whole pinned storage in a host zone for an admit), or
+// is gone, or holds fewer bytes than the expert's tensor says one expert has; or the device storage's size is not the
+// one the direction requires. To the host: the host storage is not pinned, which the pinned pool the transaction mints
+// from never changes; the device entry is gone, not on the device, in a layout the copy cannot read, a view into a
+// bulk tensor's shared allocation, or shorter than the expert; the host storage is shorter than the expert; or a host
+// id already names a live entry ("host entry exists"), which is another owner's, never replaced, and stays until that
+// owner withdraws it. A refill drops such a triplet from the ledger rather than retrying it at every decode graph,
+// and a named move answers it REFUSED. Every other refusal can clear with nothing asked of the caller, so it is
+// transient (BUSY for a named move) and the triplet is tried again at the next boundary: a load or a plan publication
+// in flight, a retired entry not yet reaped (a host one gives "host entry retiring"), storage a retention still
+// holds, a submit, an allocation or a registration that threw, an entry changed between the check and the publish.
+// Transient does not promise that the refusal clears: a host WEIGHT zone smaller than one triplet refuses every evict
+// "host pinned pool exhausted", and a card the published plan does not use holds no plan, so its cache refuses every
+// copy to it "plan not coherent" until a plan uses the card again. A caller that retries a transient refusal must
+// bound its retries.
+static bool ggml_sycl_expert_move_refusal_is_final(const char * reason) {
     static const char * const final_reasons[] = {
-        "invalid member", "not lent", "layout", "not a lent copy", "host copy not published", "device storage size"
+        "invalid arguments", "invalid member",       "device storage not owned",
+        "not lent",          "not on host",          "layout",
+        "not a lent copy",   "host copy not pinned", "host copy not published",
+        "host copy size",    "device storage size",  "host storage not pinned",
+        "not resident",      "not on device",        "shared storage",
+        "device entry size", "host entry exists",    "host storage too small"
     };
     for (const char * final_reason : final_reasons) {
         if (std::strcmp(reason, final_reason) == 0) {
@@ -21349,8 +21466,9 @@ static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason) {
     return false;
 }
 
-// Device storage for one re-admitted expert: owner-first from the WEIGHT zone, where direct staging places a planned
-// expert, exactly `size` bytes (llama.cpp-sif1). Invalid when the zone has no room.
+// Device storage for one expert moved to the device, re-admitted or admitted: owner-first from the WEIGHT zone, where
+// direct staging places a planned expert, so a moved expert takes the room a staged one takes, and exactly `size`
+// bytes. Invalid when the zone has no room.
 static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t size) {
     ggml_sycl::allocation_result allocation =
         ggml_sycl::unified_cache_zone_allocate_owner(device, ggml_sycl::vram_zone_id::WEIGHT, size);
@@ -21360,27 +21478,159 @@ static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t si
     return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
 }
 
+// A named move's selection: the published plan's verdict on each named triplet (moe_expert_move_validate), the evicts
+// and the admits judged together. `moves` holds the evicts first, as the plan judges them, so a triplet named in both
+// lists is refused where the plan says. A triplet the plan refuses takes that refusal as its outcome, REFUSED; the
+// others' keys come out in list order, gate, up and down, and `place` receives each one's index in `moves`.
+static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_named_select(
+    const ggml_sycl::placement_plan &            plan,
+    int                                          device,
+    std::vector<ggml_sycl_expert_move_outcome> & moves,
+    std::vector<size_t> &                        place) {
+    std::vector<ggml_sycl::moe_expert_triplet_ref> evict;
+    std::vector<ggml_sycl::moe_expert_triplet_ref> admit;
+    for (const ggml_sycl_expert_move_outcome & m : moves) {
+        (m.to_device ? admit : evict).push_back(m.triplet);
+    }
+    const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, admit);
+    std::vector<ggml_sycl::expert_placement_key> keys;
+    keys.reserve(3 * moves.size());
+    place.reserve(moves.size());
+    size_t n_evict = 0;
+    size_t n_admit = 0;
+    for (size_t i = 0; i < moves.size(); ++i) {
+        const char * verdict = moves[i].to_device ? check.admit[n_admit++] : check.evict[n_evict++];
+        if (verdict) {
+            moves[i].code   = ggml_sycl_txn_result::REFUSED;
+            moves[i].reason = verdict;
+            continue;
+        }
+        for (int r = 0; r < 3; ++r) {
+            keys.push_back({ moves[i].triplet.layer_id, moves[i].triplet.expert_id,
+                             static_cast<ggml_sycl::expert_tensor_role>(r + 1) });
+        }
+        place.push_back(i);
+    }
+    return keys;
+}
+
+// The refusal a named move answers with when a triplet was refused: the first BUSY one when any was (a later boundary
+// may move that triplet), else the first one; null when none was. *busy says which.
+static const char * ggml_sycl_expert_named_stop(const std::vector<ggml_sycl_expert_move_outcome> & moves, bool * busy) {
+    const char * first = nullptr;
+    for (const ggml_sycl_expert_move_outcome & m : moves) {
+        if (!m.reason || m.moved) {
+            continue;
+        }
+        if (m.code == ggml_sycl_txn_result::BUSY) {
+            *busy = true;
+            return m.reason;
+        }
+        first = first ? first : m.reason;
+    }
+    *busy = false;
+    return first;
+}
+
+// One triplet prepared outside the locks: its members with the storage minted for them, the extra that remembers each
+// member's storage, what its move is, and for a named move its place in the caller's list.
+struct ggml_sycl_expert_prepared_triplet {
+    ggml_sycl::expert_move_member members[3];
+    ggml_tensor_extra_gpu *       extras[3] = { nullptr, nullptr, nullptr };
+    ggml_sycl_expert_move_kind    kind      = ggml_sycl_expert_move_kind::LOAN;
+    size_t                        named     = 0;
+};
+
+// Prepare `out` (its kind already set) for the triplet `keys` names, with no lock held: map each member to the cache
+// through `resolver` and mint its storage owner-first. Every size comes from the member's tensor, never from a cache
+// entry, whose storage direct staging may have padded: a move to the host mints pinned storage for the expert's own
+// bytes, and a move to the device mints WEIGHT zone storage at the size direct staging gives them, with the padded
+// tail the cache zero-fills behind the copy. So an expert that goes to the host and back does not grow, and its record
+// keeps resolving. A member with no cache entry to copy from stops with the refusal the cache would give. Returns null
+// when every member is prepared, else the refusal, with *transient true when a later boundary may prepare it: a full
+// WEIGHT zone, which the ring gives back, or an evict's exhausted pinned pool. The storage minted before a refusal goes
+// back with `out`.
+static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache &             cache,
+                                                     int                                    device,
+                                                     const ggml_sycl::placement_plan &      plan,
+                                                     const ggml_sycl::expert_placement_key  keys[3],
+                                                     const ggml_sycl_expert_loan_resolver & resolver,
+                                                     ggml_sycl_expert_prepared_triplet &    out,
+                                                     bool *                                 transient) {
+    const ggml_sycl_expert_move_texts texts     = ggml_sycl_expert_move_texts_of(out.kind);
+    const bool                        to_device = ggml_sycl_expert_move_to_device(out.kind);
+    *transient                                  = false;
+    for (int r = 0; r < 3; ++r) {
+        const ggml_sycl::expert_placement_key & k = keys[r];
+        const ggml_sycl::placement_entry *      e = plan.find_expert_entry(k.layer_id, k.expert_id, k.role);
+        ggml_sycl_expert_loan_target            target;
+        if (!e || !resolver(*e, target) || !target.extra) {
+            return texts.no_tensor;
+        }
+        if (!cache.has_expert_source(target.key, to_device)) {
+            return texts.no_source;
+        }
+        ggml_sycl::mem_handle storage;
+        if (to_device) {
+            const size_t staged =
+                ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, target.logical_bytes);
+            if (staged == 0) {
+                return "layout";
+            }
+            storage = ggml_sycl_device_expert_alloc(device, staged);
+            if (!storage.valid()) {
+                // A full zone is transient: the ring gives its room back, so the next boundary tries again. No
+                // WEIGHT arena is not, since only a model load makes one, and a load replaces the ledger too.
+                const bool arena = cache.arena_active() && cache.zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0;
+                *transient       = arena;
+                return arena ? "WEIGHT zone full" : "no WEIGHT arena";
+            }
+        } else {
+            storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);
+            if (!storage.valid()) {
+                // An evict is tried again at a later boundary, by when an admit's or a refill's host copy may have
+                // gone back to the pool. A loan refuses: its ring asks again at its next shortfall.
+                *transient = out.kind == ggml_sycl_expert_move_kind::EVICT;
+                return "host pinned pool exhausted";
+            }
+        }
+        ggml_sycl::expert_move_member & m = out.members[r];
+        m.placement                       = k;
+        m.key                             = target.key;
+        m.host_keys                       = std::move(target.host_keys);
+        m.owner                           = std::move(storage);
+        m.type                            = target.type;
+        m.ncols                           = target.ncols;
+        m.logical_bytes                   = target.logical_bytes;
+        out.extras[r]                     = target.extra;
+    }
+    return nullptr;
+}
+
 // Defined with the record (llama.cpp-7pvo): appends every handle a hybrid decode record holds, its table among them.
 static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
                                                               std::vector<ggml_sycl::mem_handle> & out);
 
-// Take every view `extra` holds of the device entry a loan retired under `withdrawn` off the extra, keeping a lease on
-// each in `retained` (llama.cpp-6aj4). The caller keeps `retained` until the device's queue passes a barrier, so no
-// kernel still reading a dropped table sees a freed buffer. The boundary that ran the loan drains that retention
+// Take every view `extra` holds of the device entry a loan or an evict retired under `withdrawn` off the extra, keeping
+// a lease on each in `retained`. The caller keeps `retained` until the device's queue passes a barrier, so no kernel
+// still reading a dropped table sees a freed buffer. The boundary that ran a loan drains that retention
 // (ggml_sycl_expert_loan_boundary_drain), so the deferred-free pass right after it erases the entry; when that bounded
-// drain times out, the retention stands and the erase lags one pass. Views are matched by the entry's key, never by a
-// resolve: once the cache generation moves, a retired entry refuses the resolve forget_moe_storage_handle_on_device()
-// matches by. The views are the expert's storage records, its slot in the pointer table's handles, the table's
-// per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route table when one of its entries leases the entry
-// (invalidated, with every lease it held retained, since another expert it names may be lent next), and the hybrid
-// decode record, which holds every expert's lease and its table, all retained. Dropping any of them marks the device
-// table stale, so the next MUL_MAT_ID or preload rebuilds it under the plan the loan publishes.
+// drain times out, the retention stands and the erase lags one pass. Nothing drains an evict's retention: the
+// background worker releases it once the barrier completes, and a later deferred-free pass erases the entry and returns
+// its room. Views are matched by the entry's key, never by a resolve: once the cache generation moves, a retired entry
+// refuses the resolve forget_moe_storage_handle_on_device() matches by. The views are the expert's storage records, its
+// slot in the pointer table's handles, the table's per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route
+// table when one of its entries leases the entry (invalidated, with every lease it held retained, since another expert
+// it names may be lent next), and the hybrid decode record, which holds every expert's lease and its table, all
+// retained. Dropping any of them marks the device table stale, so the next MUL_MAT_ID or preload rebuilds it under the
+// plan the move publishes.
 static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
                                              int                                  device,
                                              int                                  expert_id,
                                              const ggml_sycl::unified_cache_key & withdrawn,
                                              std::vector<ggml_sycl::mem_handle> & retained) {
-    // Boundary premise: the loan runs after synchronize's stream wait; the retention covers work still on the queue.
+    // Boundary premise: a loan runs after synchronize's stream wait and an evict between graphs; the retention
+    // covers work still on the queue.
     if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
         return;
     }
@@ -21460,22 +21710,27 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
     }
 }
 
-// The body, both directions (llama.cpp-sif1). `amount` is the bytes a loan should free, or the most triplets a refill
-// re-admits. A loan counts `amount` in ring slots of `slot_bytes` (moe_expert_loan_select, llama.cpp-9x8t); 0 counts
-// bytes, and a refill passes 0. `resolver` is null in production (the registry resolver above, bound to the published
-// plan's owner); the private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless
-// the caller re-posts BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the
+// The body, every direction, so the loan, the refill and the named move share one lock order and one publish. `amount`
+// is the bytes a loan should free, the most triplets a refill re-admits, or the number of triplets a named move names.
+// A loan counts `amount` in ring slots of `slot_bytes`, as moe_expert_loan_select does; 0 counts bytes, and the other
+// directions pass 0. `resolver` is null in production (the registry resolver above, bound to the published plan's
+// owner); the private device tests pass their own for their synthetic tensors. A loan WARNs each refusal unless the
+// caller re-posts BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the
 // lent triplets it drops from the ledger, once each (a triplet is dropped once); its boundary runner WARNs refusals,
-// rate-limited.
-static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction         direction,
-                                                     int                                    device,
-                                                     size_t                                 amount,
-                                                     size_t                                 slot_bytes,
-                                                     bool                                   probe_mode,
-                                                     const ggml_sycl_expert_loan_resolver * resolver,
-                                                     ggml_sycl_expert_loan_result *         out,
-                                                     bool                                   warn_busy) {
+// rate-limited. `named_moves` is a named move's list, one outcome per triplet, which the body fills in; null for the
+// other directions. A named move WARNs nothing: its caller reads every answer from the outcomes.
+static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
+    ggml_sycl_expert_txn_direction               direction,
+    int                                          device,
+    size_t                                       amount,
+    size_t                                       slot_bytes,
+    bool                                         probe_mode,
+    const ggml_sycl_expert_loan_resolver *       resolver,
+    ggml_sycl_expert_loan_result *               out,
+    bool                                         warn_busy,
+    std::vector<ggml_sycl_expert_move_outcome> * named_moves = nullptr) {
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
+    const bool                   named  = direction == ggml_sycl_expert_txn_direction::NAMED;
     ggml_sycl_expert_loan_result result{};
     auto                         finish = [&](ggml_sycl_txn_result code, const char * reason) {
         result.reason = reason;
@@ -21487,22 +21742,29 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     // One WARN per refusal, naming it. A probe is a question, not a loan, so it logs nothing, and a caller that
     // re-posts BUSY refusals (the boundary runner, warn_busy false) logs those itself, rate-limited.
     auto refuse = [&](ggml_sycl_txn_result code, const char * reason) {
-        if (!probe_mode && !refill && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {
+        if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, reason);
         }
         return finish(code, reason);
     };
+    // A named triplet refused alone: its outcome takes the refusal, and the others go on.
+    auto refuse_named = [&](size_t i, ggml_sycl_txn_result code, const char * reason) {
+        (*named_moves)[i].code   = code;
+        (*named_moves)[i].reason = reason;
+    };
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || amount == 0 || (refill && probe_mode)) {
+    if (!cache || amount == 0 || ((refill || named) && probe_mode) || named != (named_moves != nullptr) ||
+        (named && named_moves->size() != amount)) {
         return refuse(ggml_sycl_txn_result::REFUSED, "invalid arguments");
     }
     // A loan's host copies must be slices of a host zone. The copy path proves a pinned endpoint is host USM only from
     // such an owner, so every later copy from an unzoned one, the prefill ring's and the refill's, would take the
     // synchronous staged branch: a host bounce the boundary thread waits on. Once the zones are configured, the pinned
     // pool serves a lent copy only from the WEIGHT zone, so this one query covers every copy the loan mints. REFUSED,
-    // not BUSY: the zones change only at a model load, so a re-posted request would refuse again at every boundary
-    // (lead ruling, llama.cpp-sif1).
+    // not BUSY: the zones change only at a model load, so a re-posted request would refuse again at every boundary.
+    // A named move asks too: an admit copies only from a host-zone slice, which the cache checks per copy, so with no
+    // zones it could move nothing.
     if (!refill && !cache->host_zones_configured()) {
         return refuse(ggml_sycl_txn_result::REFUSED, "host zones not configured");
     }
@@ -21514,15 +21776,25 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     if (!current || !current->plan) {
         return refuse(ggml_sycl_txn_result::REFUSED, "no plan published");
     }
+    // A named move runs only while nothing is lent. Lent triplets come back through the refill, which finds each by
+    // the ledger, and the ledger and its byte count describe the published plan's lent set: an admit that took a lent
+    // triplet's host copy would leave a ledger entry the plan contradicts. BUSY: the refills at the decode boundaries
+    // after a prompt empty the ledger. Asked again under the inventory lock, where no loan can race it.
+    if (named && g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0) {
+        return refuse(ggml_sycl_txn_result::BUSY, "loans outstanding");
+    }
 
     // A loan selects the least popular resident triplets that free `amount` bytes, in slots of `slot_bytes`; a refill
-    // takes up to `amount` lent ones from the back of the ledger, and none when its cursor is disarmed.
+    // takes up to `amount` lent ones from the back of the ledger, and none when its cursor is disarmed; a named move
+    // takes the named triplets the plan lets it move, each with its place in named_moves.
     size_t                                       selected     = 0;
     size_t                                       slots_funded = 0;
+    std::vector<size_t>                          named_place;
     std::vector<ggml_sycl::expert_placement_key> keys =
+        named ? ggml_sycl_expert_named_select(*current->plan, device, *named_moves, named_place) :
         refill ?
-            ggml_sycl_expert_refill_select(device, *current, amount, &result.n_remaining) :
-            ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected, &slots_funded);
+                ggml_sycl_expert_refill_select(device, *current, amount, &result.n_remaining) :
+                ggml_sycl::moe_expert_loan_select(*current->plan, device, amount, slot_bytes, &selected, &slots_funded);
     const uint32_t n_selected = static_cast<uint32_t>(keys.size() / 3);
     if (probe_mode) {
         result.accepted     = n_selected != 0;
@@ -21531,6 +21803,11 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         result.n_triplets   = n_selected;
         return n_selected != 0 ? finish(ggml_sycl_txn_result::ACCEPTED, "OK") :
                                  finish(ggml_sycl_txn_result::REFUSED, "nothing lendable");
+    }
+    // The plan refused every named triplet: the call answers with the first refusal.
+    if (named && n_selected == 0) {
+        bool busy = false;
+        return refuse(ggml_sycl_txn_result::REFUSED, ggml_sycl_expert_named_stop(*named_moves, &busy));
     }
     if (n_selected == 0) {
         return refuse(ggml_sycl_txn_result::REFUSED, refill ? "nothing to refill" : "nothing lendable");
@@ -21553,8 +21830,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     }
 
     // Before the inventory lock: map each member to the cache and mint its storage owner-first, pinned host storage
-    // for a loan and WEIGHT zone storage on the device for a refill. A triplet that cannot be prepared ends the list;
-    // the ones before it still move. A refill that finds no room in the zone is tried again at the next boundary.
+    // for a loan or an evict and WEIGHT zone storage on the device for a refill or an admit. A triplet that cannot be
+    // prepared ends a loan's or a refill's list, and the ones before it still move; a named move refuses that triplet
+    // alone and goes on. A refill or an admit that finds no room in the zone, or an evict none in the pinned pool, is
+    // tried again at a later boundary.
     ggml_sycl_expert_loan_resolver registered;
     if (!resolver) {
         const ggml_sycl::lifecycle::ModelToken owner = ggml_sycl_identity_owner(current);
@@ -21564,13 +21843,13 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         resolver = &registered;
     }
 
-    struct prepared_triplet {
-        ggml_sycl::expert_loan_member   members[3];
-        ggml_sycl::expert_refill_member refill_members[3];
-        ggml_tensor_extra_gpu *         extras[3] = { nullptr, nullptr, nullptr };
-    };
+    // The call's kind: a loan's and a refill's triplets are all of it, and a named move's are admits unless the evict
+    // list names them.
+    const ggml_sycl_expert_move_kind kind = refill ? ggml_sycl_expert_move_kind::REFILL :
+                                            named  ? ggml_sycl_expert_move_kind::ADMIT :
+                                                     ggml_sycl_expert_move_kind::LOAN;
 
-    std::vector<prepared_triplet> prepared;
+    std::vector<ggml_sycl_expert_prepared_triplet> prepared;
     prepared.reserve(n_selected);
     const char * stop      = nullptr;
     bool         transient = false;
@@ -21581,57 +21860,26 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     std::array<ggml_sycl::expert_placement_key, 3> unpreparable{};
     const char *                                   unpreparable_reason = nullptr;
     for (uint32_t t = 0; t < n_selected && !stop; ++t) {
-        prepared_triplet triplet;
-        for (int r = 0; r < 3 && !stop; ++r) {
-            const ggml_sycl::expert_placement_key & k = keys[3 * t + r];
-            const ggml_sycl::placement_entry * e = current->plan->find_expert_entry(k.layer_id, k.expert_id, k.role);
-            ggml_sycl_expert_loan_target       target;
-            if (!e || !(*resolver)(*e, target) || !target.extra) {
-                stop = refill ? "no tensor for a lent expert" : "no tensor for a selected expert";
-                break;
-            }
-            // Each copy is minted at the size of the cache entry it will hold, which the cache compares it with, not
-            // at the plan's dst_size, which leaves out the quantized tail direct staging pads (llama.cpp-pu8v). No
-            // entry stops with the refusal the cache would give.
-            const size_t bytes = refill ? cache->refill_copy_bytes(target.key) : cache->loan_copy_bytes(target.key);
-            if (bytes == 0) {
-                stop = refill ? "not lent" : "not resident";
-                break;
-            }
-            if (refill) {
-                ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, bytes);
-                if (!storage.valid()) {
-                    // A full zone is transient: the ring gives its room back, so the next boundary tries again. No
-                    // WEIGHT arena is not, since only a model load makes one, and a load replaces the ledger too.
-                    const bool arena =
-                        cache->arena_active() && cache->zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0;
-                    stop      = arena ? "WEIGHT zone full" : "no WEIGHT arena";
-                    transient = arena;
-                    break;
-                }
-                triplet.refill_members[r].placement    = k;
-                triplet.refill_members[r].key          = target.key;
-                triplet.refill_members[r].host_keys    = std::move(target.host_keys);
-                triplet.refill_members[r].device_owner = std::move(storage);
-            } else {
-                ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);
-                if (!host.valid()) {
-                    stop = "host pinned pool exhausted";
-                    break;
-                }
-                triplet.members[r].placement  = k;
-                triplet.members[r].key        = target.key;
-                triplet.members[r].host_keys  = std::move(target.host_keys);
-                triplet.members[r].host_owner = std::move(host);
-            }
-            triplet.extras[r] = target.extra;
-        }
+        ggml_sycl_expert_prepared_triplet triplet;
+        triplet.named = named ? named_place[t] : 0;
+        triplet.kind  = named && !(*named_moves)[triplet.named].to_device ? ggml_sycl_expert_move_kind::EVICT : kind;
+        stop = ggml_sycl_expert_prepare_triplet(*cache, device, *current->plan, &keys[3 * t], *resolver, triplet,
+                                                &transient);
         if (!stop) {
             prepared.push_back(std::move(triplet));
+        } else if (named) {
+            // The storage minted for its other members goes back with `triplet`, so a refusal leaves nothing behind.
+            refuse_named(triplet.named, transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED, stop);
+            stop      = nullptr;
+            transient = false;
         } else if (refill && !transient) {
             unpreparable        = { keys[3 * t], keys[3 * t + 1], keys[3 * t + 2] };
             unpreparable_reason = stop;
         }
+    }
+    // A named move whose every triplet was refused answers with their refusals.
+    if (named && prepared.empty()) {
+        stop = ggml_sycl_expert_named_stop(*named_moves, &transient);
     }
     if (prepared.empty() && !unpreparable_reason) {
         return refuse(transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED,
@@ -21650,12 +21898,19 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     auto                           next      = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
     auto                           next_plan = std::make_shared<ggml_sycl::placement_plan>(*current->plan);
     ggml_sycl_expert_lent_ledger & ledger    = ggml_sycl_expert_lent_ledger_locked(device, *current);
-    if (!refill) {
+    if (named && !ledger.triplets.empty()) {
+        lock.unlock();
+        return refuse(ggml_sycl_txn_result::BUSY, "loans outstanding");
+    }
+    if (!refill && !named) {
         ledger.triplets.reserve(ledger.triplets.size() + prepared.size());
         ledger.triplet_bytes.reserve(ledger.triplet_bytes.size() + prepared.size());
     }
+    // The triplets moved, and the device storage they moved summed per direction: what the moves to the host give back
+    // (a loan's, an evict's) and what the moves to the device took (a refill's, an admit's).
     uint32_t lent  = 0;
     size_t   freed = 0;
+    size_t   taken = 0;
 
     // The lent triplets this call drops from the ledger, each to stay on the host: at most the one the cache refuses
     // for good (the loop stops there) and the one the preparation could not prepare. Each is WARNed once the lock is
@@ -21679,75 +21934,86 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     // An exception while moving a triplet stops the loop; the triplets already moved are still published below, and it
     // is rethrown once the inventory lock is released.
     std::exception_ptr                 escaped;
-    // A loan's drops keep a lease on every view they take here, retained after the loop (llama.cpp-6aj4).
+    // A loan's or an evict's drops keep a lease on every view they take here, retained after the loop.
     std::vector<ggml_sycl::mem_handle> lent_views;
-    for (prepared_triplet & triplet : prepared) {
-        ggml_sycl::expert_loan_record   record;
-        ggml_sycl::expert_refill_record refilled;
-        bool                            loaned = false;
+    for (ggml_sycl_expert_prepared_triplet & triplet : prepared) {
+        const bool                    to_device = ggml_sycl_expert_move_to_device(triplet.kind);
+        const bool                    admit     = triplet.kind == ggml_sycl_expert_move_kind::ADMIT;
+        const bool                    evict     = triplet.kind == ggml_sycl_expert_move_kind::EVICT;
+        ggml_sycl::expert_move_record record;
+        bool                          loaned = false;
         try {
-            if (refill) {
-                // The cursor must still hold this triplet at its back. A loan accepted since the selection disarmed
-                // it: the new prompt phase owns what is still lent, and the refill is cancelled.
-                if (!ledger.refill_armed || ledger.triplets.empty() ||
-                    !ggml_sycl_expert_triplet_is(ledger.triplets.back(), triplet.refill_members)) {
-                    stop = ledger.refill_armed ? "busy (lent triplets changed while acquiring the transaction lock)" :
-                                                 "cancelled by a loan";
-                    transient = ledger.refill_armed;
+            // A refill's cursor must still hold this triplet at its back. A loan accepted since the selection
+            // disarmed it: the new prompt phase owns what is still lent, and the refill is cancelled.
+            if (triplet.kind == ggml_sycl_expert_move_kind::REFILL &&
+                (!ledger.refill_armed || ledger.triplets.empty() ||
+                 !ggml_sycl_expert_triplet_is(ledger.triplets.back(), triplet.members))) {
+                stop      = ledger.refill_armed ? "busy (lent triplets changed while acquiring the transaction lock)" :
+                                                  "cancelled by a loan";
+                transient = ledger.refill_armed;
+                break;
+            }
+            // The kind picks the cache body, with no default: a new kind is a compile warning here, not a move through
+            // another kind's body.
+            switch (triplet.kind) {
+                case ggml_sycl_expert_move_kind::LOAN:
+                case ggml_sycl_expert_move_kind::EVICT:
+                    loaned = cache->loan_expert_triplet(triplet.members, record);
                     break;
-                }
-                loaned = cache->refill_lent_triplet(triplet.refill_members, refilled);
-                if (!loaned) {
-                    stop      = refilled.reason;
-                    transient = !ggml_sycl_expert_refill_refusal_is_final(stop);
+                case ggml_sycl_expert_move_kind::ADMIT:
+                    loaned = cache->admit_host_triplet(triplet.members, record);
+                    break;
+                case ggml_sycl_expert_move_kind::REFILL:
+                    loaned = cache->refill_lent_triplet(triplet.members, record);
+                    break;
+            }
+            // A named triplet the cache refuses, admit or evict, is refused alone, REFUSED when a later boundary would
+            // meet the refusal again and BUSY otherwise, and the next one moves; nothing of it moved.
+            if (!loaned && (admit || evict)) {
+                refuse_named(triplet.named,
+                             ggml_sycl_expert_move_refusal_is_final(record.reason) ? ggml_sycl_txn_result::REFUSED :
+                                                                                     ggml_sycl_txn_result::BUSY,
+                             record.reason);
+                continue;
+            }
+            if (!loaned) {
+                stop = record.reason;
+                if (triplet.kind == ggml_sycl_expert_move_kind::REFILL) {
+                    transient = !ggml_sycl_expert_move_refusal_is_final(stop);
                     if (!transient) {
                         drop_back(stop);
                     }
-                    break;
                 }
+                break;
+            }
+            if (to_device) {
                 // Drop each extra's lease on the withdrawn host copy, so the retired entry can be reclaimed, before
-                // anything that allocates; then remember each device copy the way direct staging's caller remembers
-                // one, behind its copy event.
+                // anything that allocates.
                 for (int r = 0; r < 3; ++r) {
-                    const ggml_sycl::expert_placement_key & k     = triplet.refill_members[r].placement;
-                    ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
-                    (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS,
-                                                                      ggml_sycl::mem_handle::HOST_DEVICE);
-                }
-                for (int r = 0; r < 3; ++r) {
-                    const ggml_sycl::expert_placement_key & k       = triplet.refill_members[r].placement;
-                    ggml_tensor_extra_gpu *                 extra   = triplet.extras[r];
-                    const size_t                            logical = refilled.device_handles[r].size();
-                    (void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS,
-                                                              std::move(refilled.device_handles[r]),
-                                                              &refilled.copy_events[r], /*logical_offset=*/0, logical);
+                    (void) triplet.extras[r]->forget_moe_storage_handle_on_device(
+                        triplet.members[r].placement.expert_id, GGML_LAYOUT_AOS, ggml_sycl::mem_handle::HOST_DEVICE);
                 }
             } else {
-                loaned = cache->loan_expert_triplet(triplet.members, record);
-                if (!loaned) {
-                    stop = record.reason;
-                    break;
-                }
                 // Drop each extra's leases on its withdrawn device copy, before anything that allocates, so only the
-                // retention below holds the retired entry until the loan's boundary drains it: every storage-record,
-                // pointer-table, route-table and hybrid-record view of the entry, matched by the key the loan retired
-                // it under (llama.cpp-6aj4), and then any device record left for the expert. Then remember each host
-                // copy the way S1-PRELOAD remembers a host-planned expert, behind its copy event. A remember that
-                // fails leaves the expert to the cache's own host entries.
+                // retention below holds the retired entry: every storage-record, pointer-table, route-table and
+                // hybrid-record view of the entry, matched by the key the cache retired it under, and then any device
+                // record left for the expert. A loan and an evict alike: each drop and record change moves the
+                // tensor's storage generation, so a decode route stamped before this move decides again.
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
                     ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);
                     (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
                 }
-                for (int r = 0; r < 3; ++r) {
-                    const ggml_sycl::expert_placement_key & k       = triplet.members[r].placement;
-                    ggml_tensor_extra_gpu *                 extra   = triplet.extras[r];
-                    const size_t                            logical = record.host_handles[r].size();
-                    (void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS,
-                                                              std::move(record.host_handles[r]), &record.copy_events[r],
-                                                              /*logical_offset=*/0, logical);
-                }
+            }
+            // Then remember each new copy behind its last write, as direct staging's caller remembers a device copy
+            // and S1-PRELOAD a host-planned one: on the device, the tail fill behind the copy; on the host, the copy.
+            // Each record covers the expert's own range, its tensor's bytes per expert, which is what its readers
+            // resolve. A remember that fails leaves the expert to the cache's own entries.
+            for (int r = 0; r < 3; ++r) {
+                (void) triplet.extras[r]->remember_moe_storage_handle(
+                    triplet.members[r].placement.expert_id, GGML_LAYOUT_AOS, std::move(record.handles[r]),
+                    &record.copy_events[r], /*logical_offset=*/0, triplet.members[r].logical_bytes);
             }
         } catch (const ggml_sycl_fallback_error &) {
             // G-CATCH requires this clause before catch (...). Nothing on the loan or refill path throws the op
@@ -21756,48 +22022,60 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
             throw;
         } catch (...) {
             escaped = std::current_exception();
-            stop    = refill ? "exception while refilling" : "exception while lending";
+            stop    = ggml_sycl_expert_move_texts_of(triplet.kind).exception;
         }
         // A triplet the cache moved has moved whatever followed, so the plan says where it now lives and the ledger
-        // records it: a lent triplet is appended (into the room reserved above), a re-admitted one leaves the back.
+        // records it: a lent triplet is appended (into the room reserved above), a re-admitted one leaves the back. A
+        // named move keeps no ledger; its outcome says the triplet moved, decided once the plan is published, and the
+        // device storage it took or gives back.
         if (loaned) {
             const ggml_sycl::expert_placement_key placed[3] = {
-                refill ? triplet.refill_members[0].placement : triplet.members[0].placement,
-                refill ? triplet.refill_members[1].placement : triplet.members[1].placement,
-                refill ? triplet.refill_members[2].placement : triplet.members[2].placement,
+                triplet.members[0].placement,
+                triplet.members[1].placement,
+                triplet.members[2].placement,
             };
             for (int r = 0; r < 3; ++r) {
                 const ggml_sycl::expert_placement_key & k = placed[r];
-                (void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, /*on_device=*/refill,
-                                                          refill ? device : -1);
+                (void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role,
+                                                          /*on_device=*/to_device, to_device ? device : -1);
                 // The plan says whose memory the host bytes are. A lent member's are the pinned copy this transaction
-                // minted. A re-admitted member is staged from the load's own source again: the mapping when the load
-                // maps files. The ring's plan index reads this to decide what it can stage.
+                // minted. A member moved to the device is staged from the load's own source again: the mapping when
+                // the load maps files. The ring's plan index reads this to decide what it can stage.
                 (void) next_plan->set_expert_host_backing(k.layer_id, k.expert_id, k.role,
-                                                          refill && next_plan->host_backing_maps_files ?
+                                                          to_device && next_plan->host_backing_maps_files ?
                                                               ggml_sycl::placement_host_backing::FILE_MAPPED :
                                                               ggml_sycl::placement_host_backing::PINNED);
             }
-            if (refill) {
-                ledger.triplets.pop_back();
-                ledger.triplet_bytes.pop_back();
-            } else {
-                ledger.triplets.push_back({ placed[0], placed[1], placed[2] });
-                ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed));
+            switch (triplet.kind) {
+                case ggml_sycl_expert_move_kind::LOAN:
+                    ledger.triplets.push_back({ placed[0], placed[1], placed[2] });
+                    ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed));
+                    break;
+                case ggml_sycl_expert_move_kind::REFILL:
+                    ledger.triplets.pop_back();
+                    ledger.triplet_bytes.pop_back();
+                    break;
+                case ggml_sycl_expert_move_kind::ADMIT:
+                case ggml_sycl_expert_move_kind::EVICT:
+                    (*named_moves)[triplet.named].moved        = true;
+                    (*named_moves)[triplet.named].device_bytes = record.device_bytes;
+                    break;
             }
             ++lent;
-            freed += refill ? refilled.bytes_readmitted : record.bytes_freed;
+            (to_device ? taken : freed) += record.device_bytes;
         }
         if (escaped) {
             break;
         }
     }
-    // The views the loan dropped stay leased until the device's execution queue passes a barrier, so no kernel still
-    // reading a pointer table or a hybrid decode record sees a freed buffer. The boundary that ran the loan drains the
-    // retention, so the deferred-free pass that follows erases each withdrawn entry, or the next pass does when that
-    // bounded drain times out (llama.cpp-6aj4). A failure to retain them (the barrier's submit, or
-    // the retention's allocation) joins the loop's exception, so the triplets already lent are still published; only
-    // then do the views go at once.
+    // The views a loan or an evict dropped stay leased until the device's execution queue passes a barrier, so no
+    // kernel still reading a pointer table or a hybrid decode record sees a freed buffer. The boundary that ran a loan
+    // drains the retention, so the deferred-free pass that follows erases each withdrawn entry, or the next pass does
+    // when that bounded drain times out. A named move waits for nothing: the background worker releases its evicts'
+    // retention once the barrier completes, and a later deferred-free pass erases the entries and returns their room
+    // to the WEIGHT zone. So an evict's device storage is never room for an admit in the same call. A failure to retain
+    // them (the barrier's submit, or the retention's allocation) joins the loop's exception, so the triplets already
+    // moved are still published; only then do the views go at once.
     if (!lent_views.empty()) {
         try {
             // Null only before the device has a cache or a TP queue, and a loan runs on the cache; a null queue would
@@ -21822,18 +22100,26 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
         drop_back(unpreparable_reason);
     }
     result.n_dropped = static_cast<uint32_t>(n_dropped);
-    // An accepted loan starts a prompt phase: the refills still to run are cancelled, and what they would have
-    // re-admitted stays lent with this loan's triplets.
-    if (!refill && lent != 0) {
-        ledger.refill_armed = false;
+    // A named move keeps no ledger: the cursor, the ledger's mirrors and the totals stay as they are.
+    if (!named) {
+        // An accepted loan starts a prompt phase: the refills still to run are cancelled, and what they would have
+        // re-admitted stays lent with this loan's triplets.
+        if (!refill && lent != 0) {
+            ledger.refill_armed = false;
+        }
+        result.n_remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;
+        g_sycl_expert_lent_count[device].store(static_cast<uint32_t>(ledger.triplets.size()),
+                                               std::memory_order_release);
+        g_sycl_expert_lent_bytes[device].store(ggml_sycl_expert_lent_ledger_bytes(ledger), std::memory_order_release);
+        if (refill) {
+            g_sycl_expert_readmitted_total[device].fetch_add(lent, std::memory_order_relaxed);
+        } else {
+            g_sycl_expert_lent_total[device].fetch_add(lent, std::memory_order_relaxed);
+        }
     }
-    result.n_remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;
-    g_sycl_expert_lent_count[device].store(static_cast<uint32_t>(ledger.triplets.size()), std::memory_order_release);
-    g_sycl_expert_lent_bytes[device].store(ggml_sycl_expert_lent_ledger_bytes(ledger), std::memory_order_release);
-    if (refill) {
-        g_sycl_expert_readmitted_total[device].fetch_add(lent, std::memory_order_relaxed);
-    } else {
-        g_sycl_expert_lent_total[device].fetch_add(lent, std::memory_order_relaxed);
+    // A named move answers with its triplets' refusals, the first BUSY one when any was.
+    if (named && !escaped) {
+        stop = ggml_sycl_expert_named_stop(*named_moves, &transient);
     }
     const ggml_sycl_txn_result stop_code = transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED;
     if (lent == 0) {
@@ -21868,23 +22154,42 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     warn_dropped();
     if (!swapped) {
         GGML_LOG_ERROR("[MOE-EXEC] %s device %d: %u moved triplets left unpublished, the plan swap lost\n",
-                       refill ? "refill" : "loan", device, lent);
+                       ggml_sycl_expert_move_texts_of(kind).name, device, lent);
         if (escaped) {
             std::rethrow_exception(escaped);
         }
         return finish(ggml_sycl_txn_result::REFUSED, "concurrent transaction won the CAS");
     }
 
-    result.accepted     = true;
-    result.n_triplets   = lent;
-    const char * reason = stop ? stop : "OK";
+    result.accepted         = true;
+    result.n_triplets       = lent;
+    result.bytes_freed      = freed;
+    result.bytes_readmitted = taken;
+    const char * reason     = stop ? stop : "OK";
     if (refill) {
-        result.bytes_readmitted = freed;
         // Once per decode graph while lent triplets remain: DEBUG, not a WARN. The teardown line counts them.
         GGML_LOG_DEBUG("[MOE-EXEC] refill device %d: %u triplets, %zu MiB re-admitted, %u still lent (%s)\n", device,
-                       lent, freed / (1024 * 1024), result.n_remaining, reason);
+                       lent, taken / (1024 * 1024), result.n_remaining, reason);
+    } else if (named) {
+        // A triplet the cache moved has moved now that the plan saying so is published. A lost swap never gets here,
+        // and its entry answers each such triplet with the call's refusal. The two byte figures stay apart, since they
+        // are not one figure: an admit took its storage now, and an evict gives its back only when the cache reaps the
+        // entries it retired.
+        uint32_t n_evicted = 0;
+        for (ggml_sycl_expert_move_outcome & m : *named_moves) {
+            if (!m.moved) {
+                continue;
+            }
+            m.code   = ggml_sycl_txn_result::ACCEPTED;
+            m.reason = "OK";
+            if (!m.to_device) {
+                ++n_evicted;
+            }
+        }
+        // Its caller reads each triplet's answer, so the line is DEBUG.
+        GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\n",
+                       device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);
     } else {
-        result.bytes_freed = freed;
         if (stop) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, stop);
         }
@@ -21907,6 +22212,85 @@ static ggml_sycl_txn_result ggml_sycl_expert_loan_transaction_run(int           
                                                                   bool warn_busy = true) {
     return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, slot_bytes, probe_mode,
                                     resolver, out, warn_busy);
+}
+
+// The triplets a named move moves, in the order it tries them: the evicts first, each from the device to pinned host
+// storage, then the admits, each from its pinned host copy to the device. A caller that names only admits leaves the
+// evict list empty.
+struct ggml_sycl_expert_move_request {
+    std::vector<ggml_sycl::moe_expert_triplet_ref> evict;
+    std::vector<ggml_sycl::moe_expert_triplet_ref> admit;
+};
+
+// What a named move did. accepted when a triplet moved and the plan that says so was published: the call is then
+// ACCEPTED, and `reason` is "OK" or, when a triplet was refused, its refusal. Otherwise the call is BUSY when any
+// refusal was (a later boundary may move that triplet) and REFUSED when none was. evicted and admitted hold one
+// outcome per triplet of each list, in its order. The bytes are per direction: an evict's device storage comes back
+// only when the cache reaps the entries it retired, after the call, so no admit in the same call can use it. A call
+// that ends in an exception writes none of it (see the entry).
+struct ggml_sycl_expert_move_result {
+    bool                                       accepted       = false;
+    uint32_t                                   n_evicted      = 0;
+    uint32_t                                   n_admitted     = 0;
+    size_t                                     bytes_evicted  = 0;  // device storage the evicted triplets give back
+    size_t                                     bytes_admitted = 0;  // device storage the admitted triplets took
+    const char *                               reason         = "none";
+    std::vector<ggml_sycl_expert_move_outcome> evicted;
+    std::vector<ggml_sycl_expert_move_outcome> admitted;
+};
+
+// The named move: each named triplet moved on its own, everything that moved published in one plan. It runs between
+// graphs; its caller is a boundary driver, and the private device tests call it with their own resolver. Until that
+// driver lands only the private device tests call it, so a build without them does not.
+// An exception inside the body propagates out of this call, as it does out of the loan's and the refill's, and *out is
+// left unwritten. The body publishes what it moved before the exception, as it would have without one, and only then
+// rethrows, so those triplets stay published and resolvable where they moved: an admitted triplet's device entries are
+// in the cache and the plan places it on the card; an evicted triplet's host copy is registered behind its copy event,
+// its device entries are retired, and the plan places it on the host. The published plan, not an outcome list, is
+// then the record of what moved.
+[[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(
+    int                                    device,
+    const ggml_sycl_expert_move_request &  request,
+    const ggml_sycl_expert_loan_resolver * resolver,
+    ggml_sycl_expert_move_result *         out) {
+    // One list, the evicts first, as the plan judges them and the body moves them.
+    const size_t                               n_evict = request.evict.size();
+    std::vector<ggml_sycl_expert_move_outcome> moves(n_evict + request.admit.size());
+    for (size_t i = 0; i < moves.size(); ++i) {
+        moves[i].to_device = i >= n_evict;
+        moves[i].triplet   = i < n_evict ? request.evict[i] : request.admit[i - n_evict];
+    }
+    ggml_sycl_expert_loan_result answer;
+    const ggml_sycl_txn_result   code = ggml_sycl_expert_txn_run(
+        ggml_sycl_expert_txn_direction::NAMED, device, moves.size(), 0, false, resolver, &answer, false, &moves);
+    // A triplet the body never decided takes the call's answer: a refusal of the whole call refuses each, and a triplet
+    // the cache moved under a plan that was never published (a lost swap) has not moved. An accepted call decided every
+    // triplet, moved or refused.
+    for (ggml_sycl_expert_move_outcome & m : moves) {
+        if (!m.reason) {
+            GGML_ASSERT(code != ggml_sycl_txn_result::ACCEPTED);
+            m.moved  = false;
+            m.code   = code;
+            m.reason = answer.reason;
+        }
+    }
+    // Each outcome goes back to its own list and is counted in its direction. The body summed the bytes per direction
+    // once the plan was published, so a call that published nothing reports none.
+    if (out) {
+        ggml_sycl_expert_move_result r;
+        r.accepted       = answer.accepted;
+        r.reason         = answer.reason;
+        r.bytes_evicted  = answer.bytes_freed;
+        r.bytes_admitted = answer.bytes_readmitted;
+        for (ggml_sycl_expert_move_outcome & m : moves) {
+            if (m.moved) {
+                ++(m.to_device ? r.n_admitted : r.n_evicted);
+            }
+            (m.to_device ? r.admitted : r.evicted).push_back(m);
+        }
+        *out = std::move(r);
+    }
+    return code;
 }
 
 // What a loan of `bytes_wanted` would lend on `device`, copying and publishing nothing; 0 when the probe is refused (a
@@ -22338,6 +22722,12 @@ static void ggml_sycl_expert_refill_log_report() {
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The decode direct route, defined with the MUL_MAT_ID routes below. A case reads its table after a named move.
+static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_context & ctx,
+                                                              const ggml_tensor *         src0,
+                                                              int64_t                     selected_rows,
+                                                              layout_mode *               layout_out);
+
 // The loan transaction on synthetic MoE tensors whose experts are staged directly, so no model fixture is needed
 // (llama.cpp-mwmr). Each case returns an empty string on a pass and otherwise names the first assertion that failed.
 namespace ggml_sycl {
@@ -22440,6 +22830,11 @@ struct test_loan_fixture {
     // What stage_per_expert() gives each device entry: the expert's bytes, or more, as S1-PRELOAD pads an AOS
     // quantized expert's tail while the plan keeps the unpadded size (llama.cpp-pu8v). The padding is zeros.
     size_t                                              staged_bytes = test_loan_expert_bytes();
+    // What resolver() reports as each member's tensor type, width and bytes per expert, which an admit copies, records
+    // and sizes its device copy from: the fixture's f32 rows, or a quantized width whose last row direct staging pads.
+    ggml_type                                           resolved_type = GGML_TYPE_F32;
+    int64_t resolved_ncols   = static_cast<int64_t>(test_loan_expert_bytes() / sizeof(float));
+    size_t  resolved_logical = test_loan_expert_bytes();
 
     test_loan_fixture(int layers, int experts, uint64_t model_id, bool configure_zones = true) :
         n_layers(layers),
@@ -22556,12 +22951,16 @@ struct test_loan_fixture {
 
     // Experts other than host_expert, one direct-staged AOS entry each, remembered by their tensor's extra as
     // S1-PRELOAD remembers them. Waits for the fills and for their copies' retained owners, so each entry is the only
-    // holder of its storage, as a loaded model's is.
-    std::string stage_per_expert(int host_expert) {
+    // holder of its storage, as a loaded model's is. Every layer's, or only_layer's alone when it is not -1, so a case
+    // can stage another layer in bulk.
+    std::string stage_per_expert(int host_expert, int only_layer = -1) {
         std::vector<sycl::event> fills;
         {
             scoped_planned_materialization materialization(cache, "test/expert loan");
             for (int l = 0; l < n_layers; ++l) {
+                if (only_layer >= 0 && l != only_layer) {
+                    continue;
+                }
                 for (int s = 0; s < 3; ++s) {
                     for (int e = 0; e < n_experts; ++e) {
                         if (e == host_expert) {
@@ -22592,8 +22991,10 @@ struct test_loan_fixture {
     }
 
     // Each tensor's experts as one bulk allocation, every expert a view into it (try_bulk_stage_moe_tensor's shape).
-    std::string stage_bulk() {
-        if (!test_ensure_weight_zone(cache, *queue, names.size() * n_experts * test_loan_expert_bytes())) {
+    // Every layer's tensors, or only_layer's alone when it is not -1.
+    std::string stage_bulk(int only_layer = -1) {
+        const size_t n_tensors = only_layer >= 0 ? 3 : names.size();
+        if (!test_ensure_weight_zone(cache, *queue, n_tensors * n_experts * test_loan_expert_bytes())) {
             return "no WEIGHT zone could be reserved for the bulk-staged tensors";
         }
         std::vector<sycl::event>          fills;
@@ -22601,6 +23002,9 @@ struct test_loan_fixture {
         {
             scoped_planned_materialization materialization(cache, "test/expert loan bulk");
             for (int l = 0; l < n_layers; ++l) {
+                if (only_layer >= 0 && l != only_layer) {
+                    continue;
+                }
                 for (int s = 0; s < 3; ++s) {
                     std::vector<ggml_sycl_cache_id> tensor_keys;
                     std::vector<uint8_t>            source;
@@ -22663,7 +23067,10 @@ struct test_loan_fixture {
                     }
                     target.key = keys[index(l, s, entry.expert_id)];
                     target.host_keys.assign(1, target.key);
-                    target.extra = extras[l * 3 + s].get();
+                    target.extra         = extras[l * 3 + s].get();
+                    target.type          = resolved_type;
+                    target.ncols         = resolved_ncols;
+                    target.logical_bytes = resolved_logical;
                     return true;
                 }
             }
@@ -23170,7 +23577,260 @@ struct test_loan_fixture {
         return host_gone ? std::string() :
                            test_loan_fail("layer %d expert %d still has a host entry after 2 s", layer, expert);
     }
+
+    // (layer, slot, expert)'s host copy at `ptr`, `size` bytes held by `owner`, registered as S1-PRELOAD registers an
+    // expert the plan keeps on the host: the cache's entry under the expert's id over the whole copy, and the extra's
+    // record over the expert's own bytes.
+    std::string register_host_copy(int                layer,
+                                   int                slot,
+                                   int                expert,
+                                   const mem_handle & owner,
+                                   void *             ptr,
+                                   size_t             size = test_loan_expert_bytes()) {
+        mem_handle handle;
+        {
+            scoped_planned_materialization materialization(cache, "test/expert admit host copy");
+            if (!cache->register_host_expert_owned(keys[index(layer, slot, expert)], ptr, size, GGML_LAYOUT_AOS,
+                                                   &handle, owner) ||
+                !handle.resolve().ptr) {
+                return test_loan_fail("layer %d slot %d expert %d's host copy was not registered", layer, slot, expert);
+            }
+        }
+        if (!extras[layer * 3 + slot]->remember_moe_storage_handle(expert, GGML_LAYOUT_AOS, std::move(handle), nullptr,
+                                                                   /*logical_offset=*/0, test_loan_expert_bytes())) {
+            return test_loan_fail("the extra refused layer %d slot %d expert %d's host copy", layer, slot, expert);
+        }
+        return {};
+    }
+
+    // (layer, slot, expert)'s original bytes copied to the pinned pool, as S1-PRELOAD copies an expert the plan keeps
+    // on the host: a whole pinned owner, which is a slice of the WEIGHT host zone once the zones are configured. A
+    // `size` past the expert's bytes makes a longer copy, as a copy of a padded device entry is, its tail `tail`.
+    std::string pin_host_copy(int layer, int slot, int expert, size_t size = test_loan_expert_bytes(), int tail = 0) {
+        const size_t expert_bytes = test_loan_expert_bytes();
+        if (size < expert_bytes) {
+            return test_loan_fail("a %zu-byte host copy cannot hold the %zu-byte expert", size, expert_bytes);
+        }
+        mem_handle   owner = ::ggml_sycl_host_expert_alloc(device, size);
+        void * const ptr   = owner.valid() ? owner.resolve().ptr : nullptr;
+        if (!ptr) {
+            return test_loan_fail("no pinned host storage for layer %d slot %d expert %d", layer, slot, expert);
+        }
+        std::memcpy(ptr, bytes[index(layer, slot, expert)].data(), expert_bytes);
+        std::memset(static_cast<uint8_t *>(ptr) + expert_bytes, tail, size - expert_bytes);
+        return register_host_copy(layer, slot, expert, owner, ptr, size);
+    }
+
+    std::string pin_host_triplet(int layer, int expert, size_t size = test_loan_expert_bytes(), int tail = 0) {
+        for (int s = 0; s < 3; ++s) {
+            if (std::string why = pin_host_copy(layer, s, expert, size, tail); !why.empty()) {
+                return why;
+            }
+        }
+        return {};
+    }
+
+#    if !defined(_WIN32)
+    // (layer, slot, expert)'s host copy served in place from a file mapping, as S1-PRELOAD registers an expert a
+    // mapping load leaves in its mapping: the cache's entry over the mapped bytes, holding the mapping's owner. The
+    // owner keeps its own descriptor and the mapping, so the file is closed and unlinked once it is mapped.
+    std::string map_host_copy(int layer, int slot, int expert) {
+        const size_t size   = test_loan_expert_bytes();
+        char         path[] = "/tmp/test-expert-admit-XXXXXX";
+        const int    fd     = ::mkstemp(path);
+        if (fd < 0) {
+            return "no temporary file for the mapped host copy";
+        }
+        if (::write(fd, bytes[index(layer, slot, expert)].data(), size) != static_cast<ssize_t>(size)) {
+            ::close(fd);
+            ::unlink(path);
+            return "the mapped host copy's file was not written whole";
+        }
+        file_mapping_request req{};
+        req.device      = device;
+        req.fd          = fd;
+        req.file_size   = size;
+        req.reservation = { 0, size };
+        req.role        = alloc_role::WEIGHT;
+        req.segments.push_back({ 0, size });
+        allocation_result mapped = unified_allocate_file_mapping(req);
+        ::close(fd);
+        ::unlink(path);
+        if (!mapped) {
+            return test_loan_fail("the file-mapping tier refused layer %d slot %d expert %d's %zu bytes", layer, slot,
+                                  expert, size);
+        }
+        void * const     ptr   = mapped.owner.metadata().ptr;
+        const mem_handle owner = mem_handle::from_owned_alloc(std::move(mapped.owner));
+        return register_host_copy(layer, slot, expert, owner, ptr);
+    }
+#    endif
+
+    // The allocation metadata of the owner (layer, slot, expert)'s host entry holds; empty with no entry or owner.
+    alloc_metadata host_copy_owner(int layer, int slot, int expert) const {
+        alloc_metadata owner{};
+        (void) cache->test_expert_host_entry_state(keys[index(layer, slot, expert)], nullptr, nullptr, &owner);
+        return owner;
+    }
+
+    // Every block the WEIGHT zone hands out now, at each of `sizes` in turn, largest first, filled with `value` and
+    // then handed back, so storage minted next reads `value` wherever nothing writes it. `filled` receives each block's
+    // address range as numbers, only to test where later storage lies, never dereferenced or used as a key. False when
+    // the zone's room did not come back within 2 s.
+    bool poison_weight_zone(std::initializer_list<size_t>                  sizes,
+                            int                                            value,
+                            std::vector<std::pair<uintptr_t, uintptr_t>> & filled) {
+        constexpr size_t         max_blocks = 1u << 16;
+        const size_t             room       = cache->zone_available(vram_zone_id::WEIGHT);
+        std::vector<mem_handle>  blocks;
+        std::vector<sycl::event> fills;
+        for (const size_t size : sizes) {
+            while (blocks.size() < max_blocks) {
+                mem_handle   block = ::ggml_sycl_device_expert_alloc(device, size);
+                void * const ptr   = block.valid() ? block.resolve(device).ptr : nullptr;
+                if (!ptr) {
+                    break;
+                }
+                filled.emplace_back(reinterpret_cast<uintptr_t>(ptr), reinterpret_cast<uintptr_t>(ptr) + size);
+                fills.push_back(mem_fill_async(block, value, size, *queue));
+                blocks.push_back(std::move(block));
+            }
+        }
+        for (sycl::event & fill : fills) {
+            fill.wait_and_throw();
+        }
+        blocks.clear();
+        return reclaim_until([&] { return cache->zone_available(vram_zone_id::WEIGHT) >= room; });
+    }
 };
+
+// Whether every byte of [begin, end) lies in one of `ranges`, address ranges held as numbers.
+bool test_admit_covered(const std::vector<std::pair<uintptr_t, uintptr_t>> & ranges, uintptr_t begin, uintptr_t end) {
+    while (begin < end) {
+        const auto it = std::find_if(ranges.begin(), ranges.end(), [&](const std::pair<uintptr_t, uintptr_t> & r) {
+            return r.first <= begin && begin < r.second;
+        });
+        if (it == ranges.end()) {
+            return false;
+        }
+        begin = it->second;
+    }
+    return true;
+}
+
+// Whether a named triplet's outcome is `moved`, `code` and `reason`.
+bool test_admit_outcome_is(const ::ggml_sycl_expert_move_outcome & m,
+                           bool                                    moved,
+                           ::ggml_sycl_txn_result                  code,
+                           const char *                            reason) {
+    return m.moved == moved && m.code == code && m.reason && std::strcmp(m.reason, reason) == 0;
+}
+
+// A named move's answer, and the first outcome of each list when it has one, as a failure message names them.
+std::string test_admit_answer(::ggml_sycl_txn_result code, const ::ggml_sycl_expert_move_result & result) {
+    auto first = [](const std::vector<::ggml_sycl_expert_move_outcome> & list) {
+        const ::ggml_sycl_expert_move_outcome * m = list.empty() ? nullptr : &list.front();
+        return test_loan_fail("%zu outcomes, the first moved=%d code=%d (%s)", list.size(), m ? (int) m->moved : -1,
+                              m ? (int) m->code : -1, m && m->reason ? m->reason : "none");
+    };
+    return test_loan_fail(
+        "code=%d accepted=%d evicted=%u (%zu bytes) admitted=%u (%zu bytes) (%s); evicts: %s; "
+        "admits: %s",
+        (int) code, (int) result.accepted, result.n_evicted, result.bytes_evicted, result.n_admitted,
+        result.bytes_admitted, result.reason, first(result.evicted).c_str(), first(result.admitted).c_str());
+}
+
+// The (layer, expert) a named move's list leaves out.
+constexpr std::pair<int, int> test_no_triplet{ -1, -1 };
+
+// One named move through the fixture's resolver: an evict of `evict` and an admit of `admit`, each a (layer, expert)
+// pair, and a list left empty where its pair is test_no_triplet.
+::ggml_sycl_txn_result test_named_move(test_loan_fixture &              fx,
+                                       std::pair<int, int>              evict,
+                                       std::pair<int, int>              admit,
+                                       ::ggml_sycl_expert_move_result & result) {
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    if (evict != test_no_triplet) {
+        request.evict.push_back({ evict.first, evict.second });
+    }
+    if (admit != test_no_triplet) {
+        request.admit.push_back({ admit.first, admit.second });
+    }
+    return ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+}
+
+// How many of (layer, expert)'s three device entries, or of its three host entries, the cache still has, retired or
+// not: a retired entry stays until a deferred-free pass reaps it.
+int test_evict_device_entries(const test_loan_fixture & fx, int layer, int expert) {
+    int n = 0;
+    for (int s = 0; s < 3; ++s) {
+        n += fx.device_entry_present(layer, s, expert) ? 1 : 0;
+    }
+    return n;
+}
+
+int test_evict_host_entries(const test_loan_fixture & fx, int layer, int expert) {
+    int n = 0;
+    for (int s = 0; s < 3; ++s) {
+        n += fx.host_entry_present(layer, s, expert) ? 1 : 0;
+    }
+    return n;
+}
+
+// Whether the device's cache holds the plan the process published, which every copy to the device checks first ("plan
+// not coherent" otherwise). A publication gives a cache the plan only while the plan uses its card, so a move that
+// leaves the card with nothing in the plan leaves its cache without one.
+bool test_move_cache_coherent(const test_loan_fixture & fx) {
+    return cache_placement_coherence(fx.cache).coherence == placement_cache_coherence::MATCH;
+}
+
+// An evicted triplet: each member on the host in the published plan, planned for no device with the pinned copy the
+// evict minted as its host bytes, the device's cache holding that plan, each member resolving to a pinned host copy of
+// its original bytes under its own host entry (read once the copy's ready event completes, while the entry still
+// carries one), and each extra naming that host copy and no device copy.
+std::string test_evict_landed(const test_loan_fixture & fx, int layer, int expert) {
+    if (!test_move_cache_coherent(fx)) {
+        return test_loan_fail("after layer %d expert %d's evict the device's cache does not hold the published plan",
+                              layer, expert);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    for (int s = 0; s < 3; ++s) {
+        const placement_entry * e =
+            now && now->plan ? now->plan->find_expert_entry(layer, expert, test_loan_fixture::role(s)) : nullptr;
+        if (!e || e->on_device || e->target_device != -1 || e->host_backing != placement_host_backing::PINNED) {
+            return test_loan_fail(
+                "evicted layer %d expert %d slot %d reads on_device=%d target=%d backing=%d in the published plan, not "
+                "0, -1 and PINNED (0)",
+                layer, expert, s, e ? (int) e->on_device : -1, e ? e->target_device : -2,
+                e ? (int) e->host_backing : -1);
+        }
+    }
+    for (int s = 0; s < 3; ++s) {
+        expert_resolve_result host = fx.resolve(layer, s, expert);
+        if (!host || host.location != cache_location::HOST_PINNED || host.size != test_loan_expert_bytes() ||
+            !fx.host_entry_present(layer, s, expert)) {
+            return test_loan_fail(
+                "evicted layer %d expert %d slot %d does not resolve to a %zu-byte host-pinned copy under its own host "
+                "entry",
+                layer, expert, s, test_loan_expert_bytes());
+        }
+        if (host.has_ready_event) {
+            host.ready_event.wait_and_throw();
+        }
+        if (std::memcmp(host.ptr, fx.bytes[fx.index(layer, s, expert)].data(), test_loan_expert_bytes()) != 0) {
+            return test_loan_fail("layer %d expert %d slot %d's host copy differs from the original", layer, expert, s);
+        }
+        const ggml_tensor_extra_gpu & extra = *fx.extras[layer * 3 + s];
+        if (extra.find_moe_storage_handle_on_device(expert, GGML_LAYOUT_AOS, fx.device) ||
+            !extra.find_moe_storage_handle_on_device(expert, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE)) {
+            return test_loan_fail(
+                "layer %d expert %d slot %d's extra still names the device copy or lacks the host one", layer, expert,
+                s);
+        }
+    }
+    return {};
+}
 
 }  // namespace
 
@@ -23481,9 +24141,10 @@ std::string test_expert_loan_probe_changes_nothing() {
 }
 
 std::string test_expert_loan_refuses_replacing_a_host_entry() {
-    // c-mwmr-3: an idle host entry already sits under the selected expert's host id. Registering the loan's host copy
-    // would replace it and free its storage with it, and a loan that failed later could not put it back, so the loan
-    // is refused before anything is copied and the planted entry keeps its storage.
+    // An idle host entry already sits under the selected expert's host id. Registering the loan's host copy would
+    // replace it and free its storage with it, and a loan that failed later could not put it back, so the loan is
+    // refused before anything is copied and the planted entry keeps its storage. A named evict of the same triplet is
+    // refused the same way, and REFUSED: the entry is live, another owner's, and no later boundary finds it gone.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x6d776d7204ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -23528,18 +24189,24 @@ std::string test_expert_loan_refuses_replacing_a_host_entry() {
         return test_loan_fail("the loan answered code=%d accepted=%d triplets=%u (%s), not a host-entry-exists refusal",
                               (int) code, (int) result.accepted, result.n_triplets, result.reason);
     }
+    ::ggml_sycl_expert_move_result evicted;
+    const ::ggml_sycl_txn_result   evict_code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
+    if (evict_code != ::ggml_sycl_txn_result::REFUSED || evicted.accepted || evicted.evicted.size() != 1 ||
+        !test_admit_outcome_is(evicted.evicted[0], false, ::ggml_sycl_txn_result::REFUSED, "host entry exists")) {
+        return "the evict under the live host entry answered " + test_admit_answer(evict_code, evicted);
+    }
     if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
-        return "the refused loan published a plan";
+        return "the refused loan or evict published a plan";
     }
     for (int s = 0; s < 3; ++s) {
         if (!fx.device_entry_present(0, s, 0) ||
             !fx.extras[s]->find_moe_storage_handle_on_device(0, GGML_LAYOUT_AOS, fx.device)) {
-            return test_loan_fail("the refused loan moved slot %d expert 0 off the device", s);
+            return test_loan_fail("the refused loan or evict moved slot %d expert 0 off the device", s);
         }
     }
     if (const expert_resolve_result still = fx.resolve(0, 2, 0);
         !still || still.location != cache_location::HOST_PINNED || still.ptr != planted_ptr) {
-        return "the refused loan replaced the planted host entry";
+        return "the refused loan or evict replaced the planted host entry";
     }
     return {};
 }
@@ -24313,102 +24980,168 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
     return {};
 }
 
-std::string test_expert_loan_sizes_its_copies_from_the_entry() {
-    // llama.cpp-pu8v: each device entry is 72 bytes larger than the plan's dst_size, as S1-PRELOAD stages a Q4_0
-    // expert whose rows are not a multiple of MATRIX_ROW_PADDING (Qwen1.5-MoE's ffn_down_exps, 1408 columns, padded by
-    // 128 columns of Q4_0). A host copy minted at the plan's size is still refused "host storage too small" and moves
-    // nothing. The transaction sizes its copies from the entry, so the loan lends both triplets, each host copy the
-    // entry's size with its zero tail, and the refill re-admits both at that size.
-    constexpr size_t  tail = 72;
+std::string test_expert_loan_and_refill_size_from_the_tensor() {
+    // An expert's size is its tensor's, never a cache entry's. Each device entry is staged as direct staging stages a
+    // Q4_0 expert of 640 columns, 216 bytes past the tensor's bytes per expert, which is what a loan and a refill must
+    // move. The loan copies the expert's own bytes and leaves the padded tail on the device; the refill mints the
+    // device copy at the staged size, copies the expert's bytes and zero-fills the tail. Sized from the entry instead,
+    // every host copy would carry the tail, and every expert that went to the host and back would be recorded over
+    // the padded size. The free WEIGHT zone is poisoned before the refill, so a tail the refill did not fill reads the
+    // poison, and each tail is checked to lie in poisoned storage.
     test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7075387601ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
     }
-    fx.staged_bytes = test_loan_expert_bytes() + tail;
-    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * fx.staged_bytes)) {
+    const size_t bytes  = test_loan_expert_bytes();
+    fx.resolved_type    = GGML_TYPE_Q4_0;
+    fx.resolved_ncols   = 640;
+    const size_t staged = staged_expert_bytes(GGML_LAYOUT_AOS, fx.resolved_type, fx.resolved_ncols, bytes);
+    if (staged != bytes + 216) {
+        return test_loan_fail("a %zu-byte Q4_0 expert of 640 columns stages at %zu bytes, not %zu", bytes, staged,
+                              bytes + 216);
+    }
+    fx.staged_bytes = staged;
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * staged)) {
         return "no WEIGHT zone could be reserved";
     }
     if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
         return why;
     }
     ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
-    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    const size_t charge = placement_vram_charge_bytes(bytes);
 
-    // The guard stays: a host copy smaller than the entry it must hold is refused, whatever sized it.
-    expert_loan_member members[3];
-    for (int s = 0; s < 3; ++s) {
-        members[s].placement  = { 1, 2, test_loan_fixture::role(s) };
-        members[s].key        = fx.keys[fx.index(1, s, 2)];
-        members[s].host_keys  = { members[s].key };
-        members[s].host_owner = ::ggml_sycl_host_expert_alloc(fx.device, test_loan_expert_bytes());
-        if (!members[s].host_owner.valid()) {
-            return "no pinned host storage for the short host copy";
+    // The guards, on layer 1 expert 2: host storage that cannot hold the expert's bytes, and an expert longer than
+    // its device entry, which is then not the expert's whole weight. Each is refused and moves nothing.
+    struct guard_case {
+        size_t       owner_bytes;
+        size_t       logical_bytes;
+        const char * reason;
+    };
+
+    const guard_case guards[] = {
+        { bytes - 4096, bytes,       "host storage too small" },
+        { staged + 64,  staged + 64, "device entry size"      },
+    };
+    for (const guard_case & g : guards) {
+        expert_move_member members[3];
+        for (int s = 0; s < 3; ++s) {
+            members[s].placement     = { 1, 2, test_loan_fixture::role(s) };
+            members[s].key           = fx.keys[fx.index(1, s, 2)];
+            members[s].host_keys     = { members[s].key };
+            members[s].owner         = ::ggml_sycl_host_expert_alloc(fx.device, g.owner_bytes);
+            members[s].type          = fx.resolved_type;
+            members[s].ncols         = fx.resolved_ncols;
+            members[s].logical_bytes = g.logical_bytes;
+            if (!members[s].owner.valid()) {
+                return test_loan_fail("no pinned host storage of %zu bytes for the guard", g.owner_bytes);
+            }
         }
-    }
-    expert_loan_record refused;
-    bool               accepted = false;
-    {
-        std::lock_guard lock(g_tensor_inventory_mutex);
-        accepted = fx.cache->loan_expert_triplet(members, refused);
-    }
-    if (accepted || std::strcmp(refused.reason, "host storage too small") != 0) {
-        return test_loan_fail(
-            "a host copy of the plan's %zu bytes for a %zu-byte entry was %s (%s), not refused "
-            "\"host storage too small\"",
-            test_loan_expert_bytes(), fx.staged_bytes, accepted ? "accepted" : "refused", refused.reason);
-    }
-    for (int s = 0; s < 3; ++s) {
-        if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {
-            return test_loan_fail("the refused loan moved layer 1 expert 2 slot %d", s);
+        expert_move_record refused;
+        bool               accepted = false;
+        {
+            std::lock_guard lock(g_tensor_inventory_mutex);
+            accepted = fx.cache->loan_expert_triplet(members, refused);
         }
-    }
-    for (expert_loan_member & m : members) {
-        m.host_owner = mem_handle();
+        if (accepted || std::strcmp(refused.reason, g.reason) != 0) {
+            return test_loan_fail(
+                "a loan of %zu bytes into %zu bytes of host storage from a %zu-byte entry was %s (%s), not refused "
+                "\"%s\"",
+                g.logical_bytes, g.owner_bytes, staged, accepted ? "accepted" : "refused", refused.reason, g.reason);
+        }
+        for (int s = 0; s < 3; ++s) {
+            if (!fx.device_entry_present(1, s, 2) || fx.host_entry_present(1, s, 2)) {
+                return test_loan_fail("the loan refused \"%s\" moved layer 1 expert 2 slot %d", g.reason, s);
+            }
+        }
     }
 
     size_t freed = 0;
     if (std::string why = fx.lend(6 * charge, 2, /*host_expert=*/3, &freed); !why.empty()) {
         return why;
     }
-    // The storage the loan returned, exactly: the entries' sizes, past the plan's charge by the six tails.
-    if (freed != 6 * fx.staged_bytes) {
-        return test_loan_fail("the loan reports %zu bytes freed, not the six entries' %zu", freed, 6 * fx.staged_bytes);
+    // The device storage the loan gave back is the entries' whole size, each past the plan's charge by its tail.
+    if (freed != 6 * staged) {
+        return test_loan_fail("the loan reports %zu bytes freed, not the six entries' %zu", freed, 6 * staged);
     }
     const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
     if (lent.size() != 2) {
         return test_loan_fail("the published plan has %zu lent triplets, not 2", lent.size());
     }
-    const std::vector<uint8_t> zeros(tail, 0);
     for (const auto & t : lent) {
         for (int s = 0; s < 3; ++s) {
             expert_resolve_result host = fx.resolve(t.first, s, t.second);
-            if (!host || host.location != cache_location::HOST_PINNED || host.size != fx.staged_bytes) {
-                return test_loan_fail("layer %d expert %d slot %d does not resolve to a %zu-byte host-pinned copy",
-                                      t.first, t.second, s, fx.staged_bytes);
+            if (!host || host.location != cache_location::HOST_PINNED || host.size != bytes) {
+                return test_loan_fail(
+                    "layer %d expert %d slot %d does not resolve to a host-pinned copy of the tensor's %zu bytes (it "
+                    "resolves to %zu)",
+                    t.first, t.second, s, bytes, host ? host.size : 0);
+            }
+            const auto * record = fx.extras[t.first * 3 + s]->find_moe_storage_handle_on_device(
+                t.second, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE);
+            if (!record || record->logical_offset != 0 || record->logical_bytes != bytes) {
+                return test_loan_fail("layer %d expert %d slot %d's host record does not cover the %zu tensor bytes",
+                                      t.first, t.second, s, bytes);
             }
             if (host.has_ready_event) {
                 host.ready_event.wait_and_throw();
             }
-            const uint8_t * copy = static_cast<const uint8_t *>(host.ptr);
-            if (std::memcmp(copy, fx.bytes[fx.index(t.first, s, t.second)].data(), test_loan_expert_bytes()) != 0 ||
-                std::memcmp(copy + test_loan_expert_bytes(), zeros.data(), tail) != 0) {
-                return test_loan_fail("layer %d expert %d slot %d's host copy is not the whole padded entry", t.first,
+            if (std::memcmp(host.ptr, fx.bytes[fx.index(t.first, s, t.second)].data(), bytes) != 0) {
+                return test_loan_fail("layer %d expert %d slot %d's host copy differs from the expert's bytes", t.first,
                                       t.second, s);
             }
         }
     }
 
+    constexpr int                                poison = 0xa5;
+    std::vector<std::pair<uintptr_t, uintptr_t>> poisoned;
+    if (!fx.poison_weight_zone({ staged, 64 * 1024, 4 * 1024, 256 }, poison, poisoned)) {
+        return "the poisoned WEIGHT zone's room did not come back within 2 s";
+    }
     const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
     ::ggml_sycl_expert_loan_result         result;
     const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/2, &resolver, &result);
     if (!result.accepted || result.n_triplets != 2 || result.n_dropped != 0 || remaining != 0 ||
-        result.bytes_readmitted != 6 * fx.staged_bytes) {
+        result.bytes_readmitted != 6 * staged) {
         return test_loan_fail(
             "the refill re-admitted %u triplets and %zu bytes, dropped %u, with %u remaining (%s), not 2, %zu, 0 and 0",
-            result.n_triplets, result.bytes_readmitted, result.n_dropped, remaining, result.reason,
-            6 * fx.staged_bytes);
+            result.n_triplets, result.bytes_readmitted, result.n_dropped, remaining, result.reason, 6 * staged);
     }
+    const std::vector<uint8_t> zeros(staged - bytes, 0);
     for (const auto & t : lent) {
+        for (int s = 0; s < 3; ++s) {
+            const auto * record =
+                fx.extras[t.first * 3 + s]->find_moe_storage_handle_on_device(t.second, GGML_LAYOUT_AOS, fx.device);
+            if (!record || record->logical_offset != 0 || record->logical_bytes != bytes) {
+                return test_loan_fail("layer %d expert %d slot %d's device record does not cover the %zu tensor bytes",
+                                      t.first, t.second, s, bytes);
+            }
+            const expert_resolve_result resolved = fx.resolve(t.first, s, t.second);
+            if (!resolved || resolved.location != cache_location::DEVICE || resolved.size != staged) {
+                return test_loan_fail("layer %d expert %d slot %d does not resolve to a %zu-byte device copy", t.first,
+                                      t.second, s, staged);
+            }
+            // The control: the tail lay in poisoned storage, so only the refill's fill can have zeroed it.
+            const uintptr_t tail = reinterpret_cast<uintptr_t>(resolved.ptr) + bytes;
+            if (!test_admit_covered(poisoned, tail, tail + (staged - bytes))) {
+                return test_loan_fail(
+                    "the control: layer %d expert %d slot %d's tail was not poisoned, so a missing fill would not show",
+                    t.first, t.second, s);
+            }
+            if (record->has_ready_event) {
+                sycl::event ready = record->ready_event;
+                ready.wait_and_throw();
+            }
+            mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, staged);
+            if (!readback.valid()) {
+                return "no pinned host storage for the readback";
+            }
+            mem_copy_async(readback, record->handle, staged, *fx.queue).wait_and_throw();
+            const uint8_t * copy = static_cast<const uint8_t *>(readback.resolve().ptr);
+            if (std::memcmp(copy + bytes, zeros.data(), zeros.size()) != 0) {
+                return test_loan_fail("layer %d expert %d slot %d's padded tail does not read zero (0x%02x)", t.first,
+                                      t.second, s, (unsigned) copy[bytes]);
+            }
+        }
         if (std::string why = fx.readmitted(t.first, t.second); !why.empty()) {
             return "a padded triplet: " + why;
         }
@@ -25134,6 +25867,1461 @@ std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pin
         if (!drain_retained_handles(true, 5000)) {
             return "the refill's retained owners did not drain";
         }
+    }
+    return {};
+}
+
+std::string test_expert_admit_zero_fills_a_padded_tail() {
+    // An admit mints each device copy at the size direct staging gives the expert: the host bytes, and for a quantized
+    // width that is not a multiple of MATRIX_ROW_PADDING the tail that completes the last row, zero-filled behind the
+    // copy. The resolver reports Q4_0 rows of 640 columns, which staging pads by 384 columns (216 bytes); the cache
+    // checks sizes, not that the host bytes are whole rows. The other expert is staged padded too, as S1-PRELOAD stages
+    // a Q4_0 tensor's device experts. The free WEIGHT zone is poisoned first, so a tail the admit did not fill reads
+    // the poison, and each tail is checked to lie in poisoned storage.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7401ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes  = test_loan_expert_bytes();
+    fx.resolved_type    = GGML_TYPE_Q4_0;
+    fx.resolved_ncols   = 640;
+    const size_t staged = staged_expert_bytes(GGML_LAYOUT_AOS, fx.resolved_type, fx.resolved_ncols, bytes);
+    if (staged != bytes + 216) {
+        return test_loan_fail("a %zu-byte Q4_0 expert of 640 columns stages at %zu bytes, not %zu", bytes, staged,
+                              bytes + 216);
+    }
+    fx.staged_bytes = staged;
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 6 * staged)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+    // Each host copy is one an admit takes: a whole pinned owner in a host zone.
+    for (int s = 0; s < 3; ++s) {
+        const alloc_metadata owner = fx.host_copy_owner(0, s, 1);
+        if (owner.tier != alloc_tier::HOST_PINNED || owner.host_zone == host_zone_id::COUNT) {
+            return test_loan_fail("slot %d's host copy is not a host-zone slice (tier=%d host_zone=%d)", s,
+                                  (int) owner.tier, (int) owner.host_zone);
+        }
+    }
+    constexpr int                                poison = 0xa5;
+    std::vector<std::pair<uintptr_t, uintptr_t>> poisoned;
+    if (!fx.poison_weight_zone({ staged, 64 * 1024, 4 * 1024, 256 }, poison, poisoned)) {
+        return "the poisoned WEIGHT zone's room did not come back within 2 s";
+    }
+
+    const auto                             published = ::ggml_sycl_global_plan_snapshot();
+    const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const uint64_t                 staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    // Both ends of each copy are typed owners, so the copy path takes the direct DMA, never the staged branch: that is
+    // a synchronous bounce the boundary thread would wait on.
+    if (const uint64_t copies = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; copies != 0) {
+        return test_loan_fail("the admit took %llu staged host-to-device copies, not the direct DMA",
+                              (unsigned long long) copies);
+    }
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        result.bytes_admitted != 3 * staged || std::strcmp(result.reason, "OK") != 0 || result.admitted.size() != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit of one padded triplet answered " + test_admit_answer(code, result);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    if (!now || now.get() == published.get()) {
+        return "the accepted admit published no plan";
+    }
+    // A named move keeps no ledger and counts nothing on the teardown line.
+    if (g_sycl_expert_lent_count[fx.device].load() != 0 || g_sycl_expert_lent_bytes[fx.device].load() != 0 ||
+        g_sycl_expert_lent_total[fx.device].load() != 0 || g_sycl_expert_readmitted_total[fx.device].load() != 0) {
+        return "the admit wrote the lent ledger or the teardown counts";
+    }
+
+    const std::vector<uint8_t> zeros(staged - bytes, 0);
+    for (int s = 0; s < 3; ++s) {
+        // The record covers the tensor's bytes per expert, as direct staging's does; the entry is longer.
+        const auto * record = fx.extras[s]->find_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, fx.device);
+        if (!record || record->logical_offset != 0 || record->logical_bytes != bytes) {
+            return test_loan_fail("slot %d's device record does not cover the %zu host bytes from offset 0", s, bytes);
+        }
+        const expert_resolve_result resolved = fx.resolve(0, s, 1);
+        if (!resolved || resolved.location != cache_location::DEVICE || resolved.size != staged) {
+            return test_loan_fail("slot %d does not resolve to a %zu-byte device copy", s, staged);
+        }
+        // The control: the tail lay in poisoned storage, so only the admit's fill can have zeroed it.
+        const uintptr_t tail = reinterpret_cast<uintptr_t>(resolved.ptr) + bytes;
+        if (!test_admit_covered(poisoned, tail, tail + (staged - bytes))) {
+            return test_loan_fail("the control: slot %d's tail was not poisoned, so a missing fill would not show", s);
+        }
+        if (record->has_ready_event) {
+            sycl::event ready = record->ready_event;
+            ready.wait_and_throw();
+        }
+        mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, staged);
+        if (!readback.valid()) {
+            return "no pinned host storage for the readback";
+        }
+        mem_copy_async(readback, record->handle, staged, *fx.queue).wait_and_throw();
+        const uint8_t * copy = static_cast<const uint8_t *>(readback.resolve().ptr);
+        if (std::memcmp(copy, fx.bytes[fx.index(0, s, 1)].data(), bytes) != 0) {
+            return test_loan_fail("slot %d's device copy differs from the host bytes", s);
+        }
+        if (std::memcmp(copy + bytes, zeros.data(), zeros.size()) != 0) {
+            return test_loan_fail("slot %d's padded tail does not read zero (its first byte is 0x%02x)", s,
+                                  (unsigned) copy[bytes]);
+        }
+    }
+    if (std::string why = fx.readmitted(0, 1); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_admit_refuses_a_file_mapped_member() {
+    // An admit copies only from a whole pinned host copy in a host zone. A member served in place from a file mapping
+    // refuses its triplet "host copy not pinned", REFUSED, and the triplet stays on the host as it was: its host
+    // entries, its extras' host records, and the WEIGHT zone room the transaction minted for it. The refusal is that
+    // triplet's alone, so a pinned triplet named after it moves.
+#    if defined(_WIN32)
+    // No file-mapping tier on this platform, so no host copy is served from a mapping.
+    return {};
+#    else
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/2, /*model_id=*/0x61646d7402ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    // Layer 0's gate copy is the mapping's and its up and down copies are pinned; layer 1's triplet is pinned whole.
+    if (std::string why = fx.map_host_copy(0, 0, 1); !why.empty()) {
+        return why;
+    }
+    for (int s = 1; s < 3; ++s) {
+        if (std::string why = fx.pin_host_copy(0, s, 1); !why.empty()) {
+            return why;
+        }
+    }
+    if (std::string why = fx.pin_host_triplet(1, 1); !why.empty()) {
+        return why;
+    }
+    // The control: the gate's host entry holds the mapping, so the refusal below is the mapping's.
+    if (const alloc_metadata owner = fx.host_copy_owner(0, 0, 1); owner.tier != alloc_tier::FILE_MAPPED) {
+        return test_loan_fail("layer 0's gate host copy holds a tier %d owner, not FILE_MAPPED", (int) owner.tier);
+    }
+
+    const auto                             published = ::ggml_sycl_global_plan_snapshot();
+    const size_t                           room      = fx.cache->zone_available(vram_zone_id::WEIGHT);
+    const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    request.admit.push_back({ /*layer_id=*/1, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        result.bytes_admitted != 3 * bytes || std::strcmp(result.reason, "host copy not pinned") != 0 ||
+        result.admitted.size() != 2 ||
+        !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::REFUSED, "host copy not pinned") ||
+        !test_admit_outcome_is(result.admitted[1], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit of a mapped and a pinned triplet answered " + test_admit_answer(code, result) +
+               ", not the mapped one refused and the pinned one moved";
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    if (!now || !now->plan || now.get() == published.get() || test_loan_fixture::triplet_on_device(*now, 0, 1) != 0) {
+        return "the admit did not publish a plan that keeps layer 0 expert 1 on the host";
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!fx.host_entry_present(0, s, 1) || fx.host_entry_retired(0, s, 1) || fx.device_entry_present(0, s, 1) ||
+            !fx.extras[s]->find_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE) ||
+            fx.extras[s]->find_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, fx.device)) {
+            return test_loan_fail("the refused triplet's slot %d did not stay on the host as it was", s);
+        }
+    }
+    // The zone keeps the moved triplet's three copies and nothing of the refused one's.
+    if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) + 3 * bytes >= room; })) {
+        return test_loan_fail("the WEIGHT zone has %zu bytes of room, not the %zu before the admit less one triplet",
+                              fx.cache->zone_available(vram_zone_id::WEIGHT), room - 3 * bytes);
+    }
+    if (std::string why = fx.readmitted(1, 1); !why.empty()) {
+        return "the pinned triplet named after the refused one: " + why;
+    }
+    return {};
+#    endif
+}
+
+std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full() {
+    // Two BUSY refusals that leave no state. While a loan is outstanding a named move is refused "loans outstanding":
+    // the lent triplets come back through the refill, which finds them by the ledger. With WEIGHT zone room for one
+    // member of the three the admit is refused "WEIGHT zone full" and gives back the member it minted. Neither
+    // publishes a plan or moves a copy. Once the refill has emptied the ledger and the room is back the same admit
+    // moves the triplet, and the teardown counts stay the loan's and the refill's.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x61646d7403ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    if (std::string why = fx.pin_host_triplet(0, 3); !why.empty()) {
+        return why;
+    }
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/3 });
+    auto refused_busy = [&](const char * reason, const char * when) -> std::string {
+        const auto                     published = ::ggml_sycl_global_plan_snapshot();
+        ::ggml_sycl_expert_move_result result;
+        const ::ggml_sycl_txn_result   code =
+            ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+        if (code != ::ggml_sycl_txn_result::BUSY || result.accepted || result.n_admitted != 0 ||
+            result.bytes_admitted != 0 || std::strcmp(result.reason, reason) != 0 || result.admitted.size() != 1 ||
+            !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::BUSY, reason)) {
+            return test_loan_fail("%s, the admit answered %s, not BUSY \"%s\"", when,
+                                  test_admit_answer(code, result).c_str(), reason);
+        }
+        if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+            return test_loan_fail("%s, the refused admit published a plan", when);
+        }
+        for (int s = 0; s < 3; ++s) {
+            if (!fx.host_entry_present(0, s, 3) || fx.host_entry_retired(0, s, 3) || fx.device_entry_present(0, s, 3) ||
+                !fx.extras[s]->find_moe_storage_handle_on_device(3, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE)) {
+                return test_loan_fail("%s, the refused admit moved slot %d", when, s);
+            }
+        }
+        return {};
+    };
+
+    const size_t charge = placement_vram_charge_bytes(bytes);
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/3);
+    if (std::string why = refused_busy("loans outstanding", "with a loan outstanding"); !why.empty()) {
+        return why;
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return test_loan_fail("the admit a loan refused left the ledger counting %u lent triplets, not 1",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    if (std::string why = fx.lent_bytes_are(lent, "after the admit a loan refused"); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_expert_loan_result refill;
+    const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &refill);
+    if (!refill.accepted || refill.n_triplets != 1 || remaining != 0 ||
+        g_sycl_expert_lent_count[fx.device].load() != 0) {
+        return test_loan_fail("the refill re-admitted %u triplets with %u remaining (%s), not the one lent and 0",
+                              refill.n_triplets, remaining, refill.reason);
+    }
+
+    // Room for one member: fillers take the zone, and one goes back. Every other free block is then smaller than a
+    // member, so the one block that holds a member cannot hold all three.
+    const size_t            unfilled = fx.cache->zone_available(vram_zone_id::WEIGHT);
+    std::vector<mem_handle> fillers;
+    constexpr size_t        max_fillers = 16384;
+    while (fillers.size() < max_fillers) {
+        mem_handle filler = ::ggml_sycl_device_expert_alloc(fx.device, bytes);
+        if (!filler.valid()) {
+            break;
+        }
+        fillers.push_back(std::move(filler));
+    }
+    if (fillers.empty() || fillers.size() == max_fillers) {
+        return test_loan_fail("the WEIGHT zone took %zu fillers of %zu bytes", fillers.size(), bytes);
+    }
+    fillers.pop_back();
+    if (!fx.reclaim_until([&] { return fx.cache->zone_largest_free(vram_zone_id::WEIGHT) >= bytes; })) {
+        return "the filler handed back did not return its room within 2 s";
+    }
+    const size_t room    = fx.cache->zone_available(vram_zone_id::WEIGHT);
+    const size_t largest = fx.cache->zone_largest_free(vram_zone_id::WEIGHT);
+    if (largest >= 3 * bytes) {
+        return test_loan_fail("the control: the zone's largest free block is %zu bytes, room for the whole triplet",
+                              largest);
+    }
+    if (std::string why = refused_busy("WEIGHT zone full", "with room for one member"); !why.empty()) {
+        return why;
+    }
+    if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= room; })) {
+        return test_loan_fail("the admit the full zone refused kept %zu of its %zu bytes of room",
+                              room - fx.cache->zone_available(vram_zone_id::WEIGHT), room);
+    }
+
+    fillers.clear();
+    if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= unfilled; })) {
+        return "the fillers' WEIGHT zone room did not come back within 2 s";
+    }
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        result.bytes_admitted != 3 * bytes ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit with the ledger empty and the room back answered " + test_admit_answer(code, result);
+    }
+    if (std::string why = fx.readmitted(0, 3); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    if (g_sycl_expert_lent_total[fx.device].load() != 1 || g_sycl_expert_readmitted_total[fx.device].load() != 1) {
+        return test_loan_fail("the teardown counts read %u/%u, not the loan's and the refill's 1/1",
+                              g_sycl_expert_readmitted_total[fx.device].load(),
+                              g_sycl_expert_lent_total[fx.device].load());
+    }
+    return {};
+}
+
+std::string test_expert_admit_returns_the_host_zone_bytes() {
+    // The admit withdraws the host copies it moved. Once the copies reading them complete and the deferred-free pass
+    // erases the retired entries, nothing holds their pinned storage, and the WEIGHT host zone has its bytes back.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7404ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 6 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    // Settled first, so the zone's use moves only with this case's host copies.
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the host copies were pinned";
+    }
+    fx.cache->process_deferred_frees_public();
+    const size_t used_before = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+    // The control: the zone counts the three host copies, so their return can show.
+    const size_t used_pinned = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+    if (used_pinned < used_before + 3 * bytes) {
+        return test_loan_fail("the WEIGHT host zone went from %zu to %zu bytes used for three %zu-byte host copies",
+                              used_before, used_pinned, bytes);
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit answered " + test_admit_answer(code, result);
+    }
+    auto host_entries = [&] {
+        int n = 0;
+        for (int s = 0; s < 3; ++s) {
+            n += fx.host_entry_present(0, s, 1) ? 1 : 0;
+        }
+        return n;
+    };
+    if (!fx.reclaim_until(
+            [&] { return host_entries() == 0 && fx.cache->host_zone_used(host_zone_id::WEIGHT) <= used_before; })) {
+        return test_loan_fail(
+            "2 s after the admit %d host entries remain and the WEIGHT host zone uses %zu bytes, not the %zu it used "
+            "before the copies were pinned",
+            host_entries(), fx.cache->host_zone_used(host_zone_id::WEIGHT), used_before);
+    }
+    if (std::string why = fx.readmitted(0, 1); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_admit_completes_a_block_read_through_its_table() {
+    // The admit that brings a block's last host triplet onto the device leaves the whole block resident, and the first
+    // MUL_MAT_ID after it serves the admitted expert from the card: the selected-ids pointer table it builds
+    // (ggml_sycl_update_moe_ptr_table) names each admitted device copy, its upload is ordered on the copy's ready
+    // event, and a kernel behind the upload on the same in-order stream reads the original bytes through the table.
+    // Nothing between the admit and that kernel waits. The decode direct route's table has its own case,
+    // test_expert_admit_completes_a_block_the_direct_route_serves.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7405ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+    // The control: before the admit the block is incomplete, expert 0 on the device and expert 1 on the host.
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+    if (!published || !published->plan || test_loan_fixture::triplet_on_device(*published, 0, 0) != 1 ||
+        test_loan_fixture::triplet_on_device(*published, 0, 1) != 0) {
+        return "the plan before the admit does not have expert 0 on the device and expert 1 on the host";
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit that completes the block answered " + test_admit_answer(code, result);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    for (int e = 0; e < fx.n_experts; ++e) {
+        if (!now || !now->plan || test_loan_fixture::triplet_on_device(*now, 0, e) != 1) {
+            return test_loan_fail("block 0's expert %d is not on the device after the admit", e);
+        }
+    }
+
+    // The layer's three tables, each built as a MUL_MAT_ID builds one for a ubatch that routes expert 1 alone, right
+    // after the admit. Each upload must chain the admitted copy's ready event.
+    ggml_tensor tensors[3];
+    for (int s = 0; s < 3; ++s) {
+        fx.bind_tensor(tensors[s], 0, s);
+    }
+    ggml_backend_sycl_context  ctx(fx.device);
+    const std::vector<int32_t> routed = { 1 };
+    ggml_tensor                ids{};
+    sycl::event                table_events[3];
+    for (int s = 0; s < 3; ++s) {
+        g_test_moe_ptr_table_ready_event_deps.store(0, std::memory_order_relaxed);
+        if (!ggml_sycl_update_moe_ptr_table(ctx, &tensors[s], &ids, GGML_LAYOUT_AOS, &table_events[s],
+                                            moe_ptr_table_coverage::SELECTED_IDS, &routed,
+                                            /*skip_device_copy=*/false,
+                                            /*force_cache_aos=*/false,
+                                            /*skip_cpu_routed_experts=*/false,
+                                            /*exact_layout_required=*/false)) {
+            return test_loan_fail("slot %d's pointer table was not built", s);
+        }
+        if (g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed) == 0) {
+            return test_loan_fail("slot %d's table upload chained no ready event", s);
+        }
+    }
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 1);
+        if (!resolved || resolved.location != cache_location::DEVICE || !fx.device_table_valid(0, s) ||
+            fx.extras[s]->weight_ext->moe_expert_ptr_payload[fx.device][1] != resolved.ptr) {
+            return test_loan_fail("slot %d's table does not name the admitted device copy", s);
+        }
+    }
+
+    // The read: one kernel per table, behind its upload, copying expert 1's bytes through the table's own entry.
+    mem_handle      out = ::ggml_sycl_device_expert_alloc(fx.device, 3 * bytes);
+    uint8_t * const dst = out.valid() ? static_cast<uint8_t *>(out.resolve(fx.device).ptr) : nullptr;
+    if (!dst) {
+        return "no WEIGHT zone room for the read's output";
+    }
+    for (int s = 0; s < 3; ++s) {
+        const void * const * table = static_cast<const void * const *>(fx.extras[s]->moe_ptrs_ptr(fx.device));
+        if (!table) {
+            return test_loan_fail("slot %d has no device pointer table", s);
+        }
+        uint8_t * const slot_out = dst + static_cast<size_t>(s) * bytes;
+        ctx.stream()->submit([&](sycl::handler & h) {
+            h.depends_on(table_events[s]);
+            h.parallel_for(sycl::range<1>(bytes), [=](sycl::id<1> i) {
+                const size_t k = i[0];
+                slot_out[k]    = static_cast<const uint8_t *>(table[1])[k];
+            });
+        });
+    }
+    mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, 3 * bytes);
+    if (!readback.valid()) {
+        return "no pinned host storage for the readback";
+    }
+    mem_copy_async(readback, out, 3 * bytes, *ctx.stream()).wait_and_throw();
+    const uint8_t * copy = static_cast<const uint8_t *>(readback.resolve().ptr);
+    for (int s = 0; s < 3; ++s) {
+        if (std::memcmp(copy + static_cast<size_t>(s) * bytes, fx.bytes[fx.index(0, s, 1)].data(), bytes) != 0) {
+            return test_loan_fail("slot %d's bytes read through the table differ from the original", s);
+        }
+    }
+    return {};
+}
+
+std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy() {
+    // An expert's size is its tensor's, never its host copy's. A host copy can be longer than the expert, as a copy of
+    // a padded device entry is. The admit copies only the tensor's bytes per expert from offset 0, mints the device
+    // copy at their staged size, zero-fills the tail, records the tensor's bytes as the record's range, and returns
+    // the whole host copy to its zone. Sized from the host copy instead, the device copy would carry a second tail
+    // on top of the first, the host copy's tail would be read into it, and the record's range would not be the
+    // tensor's, so a later reader would not resolve it. Here each host copy is one staged tail longer than the
+    // expert, and that tail holds 0x5a.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7406ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes     = test_loan_expert_bytes();
+    fx.resolved_type       = GGML_TYPE_Q4_0;
+    fx.resolved_ncols      = 640;
+    const size_t staged    = staged_expert_bytes(GGML_LAYOUT_AOS, fx.resolved_type, fx.resolved_ncols, bytes);
+    // The control: sized from the longer host copy, the device copy would be longer than the tensor's staged size.
+    const size_t from_host = staged_expert_bytes(GGML_LAYOUT_AOS, fx.resolved_type, fx.resolved_ncols, staged);
+    if (staged != bytes + 216 || from_host <= staged) {
+        return test_loan_fail("the control: the staged sizes of %zu and %zu bytes are %zu and %zu", bytes, staged,
+                              staged, from_host);
+    }
+    fx.staged_bytes = staged;
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 6 * from_host)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    // Settled first, so the zone's use moves only with this case's host copies.
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the host copies were pinned";
+    }
+    fx.cache->process_deferred_frees_public();
+    const size_t  used_before = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+    constexpr int host_tail   = 0x5a;
+    if (std::string why = fx.pin_host_triplet(0, 1, staged, host_tail); !why.empty()) {
+        return why;
+    }
+    if (const size_t used = fx.cache->host_zone_used(host_zone_id::WEIGHT); used < used_before + 3 * staged) {
+        return test_loan_fail("the control: the WEIGHT host zone went from %zu to %zu bytes for three %zu-byte copies",
+                              used_before, used, staged);
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        result.bytes_admitted != 3 * staged || std::strcmp(result.reason, "OK") != 0 || result.admitted.size() != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit from longer host copies answered " + test_admit_answer(code, result);
+    }
+    const std::vector<uint8_t> zeros(staged - bytes, 0);
+    for (int s = 0; s < 3; ++s) {
+        const auto * record = fx.extras[s]->find_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, fx.device);
+        if (!record || record->logical_offset != 0 || record->logical_bytes != fx.resolved_logical) {
+            return test_loan_fail("slot %d's device record does not cover the tensor's %zu bytes from offset 0", s,
+                                  fx.resolved_logical);
+        }
+        const expert_resolve_result resolved = fx.resolve(0, s, 1);
+        if (!resolved || resolved.location != cache_location::DEVICE || resolved.size != staged) {
+            return test_loan_fail("slot %d does not resolve to a %zu-byte device copy (it resolves to %zu bytes)", s,
+                                  staged, resolved ? resolved.size : 0);
+        }
+        if (record->has_ready_event) {
+            sycl::event ready = record->ready_event;
+            ready.wait_and_throw();
+        }
+        mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, staged);
+        if (!readback.valid()) {
+            return "no pinned host storage for the readback";
+        }
+        mem_copy_async(readback, record->handle, staged, *fx.queue).wait_and_throw();
+        const uint8_t * copy = static_cast<const uint8_t *>(readback.resolve().ptr);
+        if (std::memcmp(copy, fx.bytes[fx.index(0, s, 1)].data(), bytes) != 0) {
+            return test_loan_fail("slot %d's device copy differs from the expert's bytes", s);
+        }
+        if (std::memcmp(copy + bytes, zeros.data(), zeros.size()) != 0) {
+            return test_loan_fail(
+                "slot %d's tail does not read zero (its first byte is 0x%02x; the host copy's tail holds 0x%02x)", s,
+                (unsigned) copy[bytes], (unsigned) host_tail);
+        }
+    }
+    auto host_entries = [&] {
+        int n = 0;
+        for (int s = 0; s < 3; ++s) {
+            n += fx.host_entry_present(0, s, 1) ? 1 : 0;
+        }
+        return n;
+    };
+    if (!fx.reclaim_until(
+            [&] { return host_entries() == 0 && fx.cache->host_zone_used(host_zone_id::WEIGHT) <= used_before; })) {
+        return test_loan_fail(
+            "2 s after the admit %d host entries remain and the WEIGHT host zone uses %zu bytes, not the %zu it used "
+            "before the longer copies were pinned",
+            host_entries(), fx.cache->host_zone_used(host_zone_id::WEIGHT), used_before);
+    }
+    if (std::string why = fx.readmitted(0, 1); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor() {
+    // The admit reads the tensor's bytes per expert from offset 0 of the host copy, so a host copy that holds fewer is
+    // refused "host copy size", REFUSED, by the cache under its locks, after the transaction has minted the device
+    // storage. Nothing moves and nothing is published: the triplet stays on the host as it was, and the storage minted
+    // for it goes back to the WEIGHT zone. The resolver reports a tensor 4 KiB longer per expert than the host copies.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7407ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes  = test_loan_expert_bytes();
+    fx.resolved_logical = bytes + 4096;
+    fx.resolved_ncols   = static_cast<int64_t>(fx.resolved_logical / sizeof(float));
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 6 * fx.resolved_logical)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+
+    const auto                             published = ::ggml_sycl_global_plan_snapshot();
+    const size_t                           room      = fx.cache->zone_available(vram_zone_id::WEIGHT);
+    const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::REFUSED || result.accepted || result.n_admitted != 0 ||
+        result.bytes_admitted != 0 || std::strcmp(result.reason, "host copy size") != 0 ||
+        result.admitted.size() != 1 ||
+        !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::REFUSED, "host copy size")) {
+        return "the admit from host copies shorter than the tensor answered " + test_admit_answer(code, result) +
+               ", not REFUSED \"host copy size\"";
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "the refused admit published a plan";
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!fx.host_entry_present(0, s, 1) || fx.host_entry_retired(0, s, 1) || fx.device_entry_present(0, s, 1) ||
+            !fx.extras[s]->find_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE) ||
+            fx.extras[s]->find_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, fx.device)) {
+            return test_loan_fail("the refused triplet's slot %d did not stay on the host as it was", s);
+        }
+    }
+    if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= room; })) {
+        return test_loan_fail("the refused admit kept %zu of the WEIGHT zone's %zu bytes of room",
+                              room - fx.cache->zone_available(vram_zone_id::WEIGHT), room);
+    }
+    return {};
+}
+
+std::string test_expert_admit_completes_a_block_the_direct_route_serves() {
+    // The decode direct route serves a batch-1 MUL_MAT_ID from one table covering every expert of the tensor on the
+    // device, and refuses while any of them is on the host. It refuses the block while expert 1 is on the host. The
+    // admit remembers each device copy, which bumps the tensor's storage generation, so the route decides again: its
+    // table then names each admitted device copy, its upload counts the admitted copy's ready event among those it
+    // waits for, and a kernel behind the table's upload reads the bytes through it.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7408ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+
+    // The route takes only layouts the batched decode kernel reads, which f32 rows are not, so the layer's tensors are
+    // bound as Q4_0 over the fixture's records: on AOS the route sizes an expert by nb[2], the fixture's, and nothing
+    // here reads a byte as a quantized block. The route serves a single routable device and this run may see both
+    // cards, so its calls run with the device info narrowed to device 0, which holds everything here.
+    ggml_tensor tensors[3];
+    for (int s = 0; s < 3; ++s) {
+        fx.bind_tensor(tensors[s], 0, s);
+        tensors[s].type = GGML_TYPE_Q4_0;
+    }
+    ggml_sycl_device_info one_card = ggml_sycl_info();
+    one_card.device_count          = 1;
+    one_card.total_gpu_count       = 1;
+    ggml_backend_sycl_context ctx(fx.device);
+    {
+        test_sycl_info_override_guard single_card(one_card);
+        for (int s = 0; s < 3; ++s) {
+            layout_mode layout = GGML_LAYOUT_AOS;
+            if (::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout)) {
+                return test_loan_fail("the direct route served slot %d while expert 1 was on the host", s);
+            }
+        }
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.admit.push_back({ /*layer_id=*/0, /*expert_id=*/1 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit that completes the block answered " + test_admit_answer(code, result);
+    }
+
+    // The ordering. The copy has long finished by the time a kernel reads it, so the bytes alone cannot show that the
+    // table's upload is behind it. The route's upload counts one dependency for each expert record in its table that
+    // carries a ready event. Expert 0's record, read by the resolver the route uses, gives the count it alone adds;
+    // the admitted record carries the copy and fill's event, so the upload must count exactly one more.
+    const void * const * tables[3] = { nullptr, nullptr, nullptr };
+    {
+        test_sycl_info_override_guard single_card(one_card);
+        for (int s = 0; s < 3; ++s) {
+            const size_t expert_bytes = ::ggml_sycl_moe_expert_layout_bytes(&tensors[s], GGML_LAYOUT_AOS, fx.device);
+            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
+            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record admitted{};
+            if (!fx.extras[s]->resolve_moe_storage_record(0, GGML_LAYOUT_AOS, fx.device, expert_bytes, &expert0) ||
+                !fx.extras[s]->resolve_moe_storage_record(1, GGML_LAYOUT_AOS, fx.device, expert_bytes, &admitted) ||
+                !admitted.has_ready_event) {
+                return test_loan_fail("slot %d's admitted device record does not resolve with a ready event", s);
+            }
+            const uint64_t expert0_alone = expert0.has_ready_event ? 1 : 0;
+            g_test_moe_ptr_table_ready_event_deps.store(0, std::memory_order_relaxed);
+            layout_mode layout = GGML_LAYOUT_SOA;
+            tables[s]          = ::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout);
+            if (!tables[s] || layout != GGML_LAYOUT_AOS) {
+                return test_loan_fail("the direct route did not serve slot %d from its AOS copies after the admit", s);
+            }
+            const uint64_t chained = g_test_moe_ptr_table_ready_event_deps.load(std::memory_order_relaxed);
+            if (chained != expert0_alone + 1) {
+                return test_loan_fail(
+                    "slot %d's direct table upload chained %llu ready events where expert 0 alone "
+                    "chains %llu: the admitted copy's was not counted once",
+                    s, static_cast<unsigned long long>(chained), static_cast<unsigned long long>(expert0_alone));
+            }
+        }
+    }
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 1);
+        if (!resolved || resolved.location != cache_location::DEVICE ||
+            fx.extras[s]->weight_ext->moe_expert_ptr_payload[fx.device][1] != resolved.ptr) {
+            return test_loan_fail("slot %d's direct table does not name the admitted device copy", s);
+        }
+    }
+
+    // The read: one kernel per table, behind the table's upload on the context's in-order stream, copying expert 1's
+    // bytes through the table's own entry.
+    mem_handle      out = ::ggml_sycl_device_expert_alloc(fx.device, 3 * bytes);
+    uint8_t * const dst = out.valid() ? static_cast<uint8_t *>(out.resolve(fx.device).ptr) : nullptr;
+    if (!dst) {
+        return "no WEIGHT zone room for the read's output";
+    }
+    for (int s = 0; s < 3; ++s) {
+        const void * const * table    = tables[s];
+        uint8_t * const      slot_out = dst + static_cast<size_t>(s) * bytes;
+        ctx.stream()->submit([&](sycl::handler & h) {
+            h.parallel_for(sycl::range<1>(bytes), [=](sycl::id<1> i) {
+                const size_t k = i[0];
+                slot_out[k]    = static_cast<const uint8_t *>(table[1])[k];
+            });
+        });
+    }
+    mem_handle readback = ::ggml_sycl_host_expert_alloc(fx.device, 3 * bytes);
+    if (!readback.valid()) {
+        return "no pinned host storage for the readback";
+    }
+    mem_copy_async(readback, out, 3 * bytes, *ctx.stream()).wait_and_throw();
+    const uint8_t * copy = static_cast<const uint8_t *>(readback.resolve().ptr);
+    for (int s = 0; s < 3; ++s) {
+        if (std::memcmp(copy + static_cast<size_t>(s) * bytes, fx.bytes[fx.index(0, s, 1)].data(), bytes) != 0) {
+            return test_loan_fail("slot %d's bytes read through the direct table differ from the original", s);
+        }
+    }
+    return {};
+}
+
+std::string test_expert_evict_moves_a_resident_triplet() {
+    // A named evict moves a resident triplet to pinned host storage through the loan's cache body: the call is
+    // accepted with its outcome "OK" and three device entries' bytes to give back, a new plan has each member on the
+    // host with no target device and a pinned host copy as its backing, each member resolves to a host copy of its
+    // original bytes, and nothing writes the ledger or the teardown counts. The retired device entries stay until a
+    // deferred-free pass reaps them, and then the WEIGHT zone has their room. The control: before the call each member
+    // resolves on the device.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637401ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+    // Each result's lease goes with it at the end of its iteration, so the evict meets entries held by their records
+    // alone, as an evict without this control would.
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 0);
+        if (!resolved || resolved.location != cache_location::DEVICE) {
+            return test_loan_fail("before the evict slot %d expert 0 does not resolve on the device", s);
+        }
+    }
+    const auto before = fx.sample();
+
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, test_no_triplet, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_evicted != 1 ||
+        result.n_admitted != 0 || result.bytes_evicted != 3 * fx.staged_bytes || result.bytes_admitted != 0 ||
+        std::strcmp(result.reason, "OK") != 0 || result.evicted.size() != 1 || !result.admitted.empty() ||
+        !test_admit_outcome_is(result.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict of one resident triplet answered " + test_admit_answer(code, result);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {
+        return "the evict published no plan";
+    }
+    // Nothing has run a deferred-free pass since the call, so its retired device entries are all still there.
+    if (test_evict_device_entries(fx, 0, 0) != 3) {
+        return test_loan_fail("%d of the evicted triplet's 3 device entries remain before any deferred-free pass",
+                              test_evict_device_entries(fx, 0, 0));
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet: " + why;
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 0 || g_sycl_expert_lent_total[fx.device].load() != 0 ||
+        g_sycl_expert_readmitted_total[fx.device].load() != 0) {
+        return test_loan_fail("the evict wrote the ledger: %u lent, teardown counts %u/%u",
+                              g_sycl_expert_lent_count[fx.device].load(), g_sycl_expert_lent_total[fx.device].load(),
+                              g_sycl_expert_readmitted_total[fx.device].load());
+    }
+    if (test_evict_device_entries(fx, 0, 1) != 3) {
+        return "a device entry of the resident triplet the evict did not name is gone";
+    }
+    if (!fx.reclaim_until([&] {
+            return test_evict_device_entries(fx, 0, 0) == 0 && fx.returned_since(before) >= 3 * fx.staged_bytes;
+        })) {
+        return test_loan_fail(
+            "2 s after the evict %d of its device entries remain and the device got back %zu of %zu bytes",
+            test_evict_device_entries(fx, 0, 0), fx.returned_since(before), 3 * fx.staged_bytes);
+    }
+    return {};
+}
+
+std::string test_expert_evict_is_not_refilled() {
+    // The refill re-admits what a loan lent, found by the ledger, and an evict writes no ledger. After an evict and a
+    // one-triplet loan of another triplet, one decode boundary's refill, allowed four triplets, re-admits the lent one
+    // alone, and the evicted triplet stays on the host.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x6576637402ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    ::ggml_sycl_expert_move_result evicted;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || evicted.n_evicted != 1) {
+        return "the evict answered " + test_admit_answer(code, evicted);
+    }
+    // Reaped first, so the loan's reclaim check meets only the entries the loan retired.
+    if (!fx.reclaim_until([&] { return test_evict_device_entries(fx, 0, 0) == 0; })) {
+        return "the evicted triplet's device entries were not reaped within 2 s";
+    }
+    const size_t charge = placement_vram_charge_bytes(bytes);
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    if (g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return test_loan_fail("the ledger counts %u lent triplets after the evict and a one-triplet loan, not 1",
+                              g_sycl_expert_lent_count[fx.device].load());
+    }
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         refill;
+    const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/4, &resolver, &refill);
+    if (!refill.accepted || refill.n_triplets != 1 || remaining != 0 ||
+        g_sycl_expert_lent_count[fx.device].load() != 0) {
+        return test_loan_fail("the refill re-admitted %u triplets with %u remaining (%s), not the one lent and 0",
+                              refill.n_triplets, remaining, refill.reason);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    for (int e = 0; e < 3; ++e) {
+        const int on   = now && now->plan ? test_loan_fixture::triplet_on_device(*now, 0, e) : -1;
+        const int want = e == 0 ? 0 : 1;
+        if (on != want) {
+            return test_loan_fail("after the refill expert %d reads %d on the device in the published plan, not %d", e,
+                                  on, want);
+        }
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet after the refill: " + why;
+    }
+    if (g_sycl_expert_lent_total[fx.device].load() != 1 || g_sycl_expert_readmitted_total[fx.device].load() != 1) {
+        return test_loan_fail("the teardown counts read %u/%u, not the loan's and the refill's 1/1",
+                              g_sycl_expert_lent_total[fx.device].load(),
+                              g_sycl_expert_readmitted_total[fx.device].load());
+    }
+    return {};
+}
+
+std::string test_expert_evict_refuses_shared_storage() {
+    // Two layers of a pair with expert 1 on the host: layer 0 bulk-staged, so expert 0's entries there are views into
+    // each tensor's one allocation and retiring them would free nothing, and layer 1 staged per expert. One call names
+    // both expert 0 triplets in its evict list, the bulk one first. The loan's cache body refuses the bulk one REFUSED
+    // "shared storage", and it stays on the device; the classification is per triplet, so the refusal does not end the
+    // list, and the triplet staged per expert, the control, moves in the same call. A call that moved anything is
+    // accepted, with the refusal as its reason, and publishes the one move.
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/2, /*model_id=*/0x6576637403ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_bulk(/*only_layer=*/0); !why.empty()) {
+        return why;
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1, /*only_layer=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    const auto                             published = ::ggml_sycl_global_plan_snapshot();
+    const ::ggml_sycl_expert_loan_resolver resolver  = fx.resolver();
+    ::ggml_sycl_expert_move_request        request;
+    request.evict.push_back({ 0, 0 });
+    request.evict.push_back({ 1, 0 });
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_evicted != 1 ||
+        result.bytes_evicted != 3 * fx.staged_bytes || std::strcmp(result.reason, "shared storage") != 0 ||
+        result.evicted.size() != 2 || !result.admitted.empty() ||
+        !test_admit_outcome_is(result.evicted[0], false, ::ggml_sycl_txn_result::REFUSED, "shared storage") ||
+        !test_admit_outcome_is(result.evicted[1], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evicts of a bulk-staged and a per-expert triplet answered " + test_admit_answer(code, result);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    if (now.get() == published.get() || !now || !now->plan || test_loan_fixture::triplet_on_device(*now, 0, 0) != 1) {
+        return "the call published no plan, or one without the refused triplet on the device";
+    }
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 0);
+        if (!fx.device_entry_present(0, s, 0) ||
+            !fx.extras[s]->find_moe_storage_handle_on_device(0, GGML_LAYOUT_AOS, fx.device) || !resolved ||
+            resolved.location != cache_location::DEVICE) {
+            return test_loan_fail("the refused evict moved layer 0 slot %d expert 0 off the device", s);
+        }
+    }
+    if (std::string why = test_evict_landed(fx, 1, 0); !why.empty()) {
+        return "the per-expert triplet evicted beside the refused one: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_evict_is_busy_right_after_an_admit() {
+    // Right after an admit the triplet's retired host entries are still in the cache until a deferred-free pass reaps
+    // them, and the admit's copy may still hold its device storage, so an evict of it is BUSY ("storage still
+    // referenced" or "host entry retiring"), moves nothing and publishes nothing. Once the copy's retention has drained
+    // only the retired host entries hold it, and nothing here runs the pass, so the evict is BUSY "host entry
+    // retiring" whatever the timing. Once the pass has reaped them, the same evict moves it.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x6576637405ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_expert_move_result admitted;
+    ::ggml_sycl_txn_result         code = test_named_move(fx, test_no_triplet, { 0, 1 }, admitted);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
+        return "the admit answered " + test_admit_answer(code, admitted);
+    }
+
+    const auto                     published = ::ggml_sycl_global_plan_snapshot();
+    ::ggml_sycl_expert_move_result early;
+    code = test_named_move(fx, { 0, 1 }, test_no_triplet, early);
+
+    // Which of the two holds the admit leaves is met first depends on whether the copy's retention has drained yet.
+    const char * reason = early.evicted.size() == 1 ? early.evicted[0].reason : nullptr;
+    const bool   held   = reason && (std::strcmp(reason, "storage still referenced") == 0 ||
+                                 std::strcmp(reason, "host entry retiring") == 0);
+    if (code != ::ggml_sycl_txn_result::BUSY || early.accepted || early.n_evicted != 0 || !held ||
+        !test_admit_outcome_is(early.evicted[0], false, ::ggml_sycl_txn_result::BUSY, reason)) {
+        return "the evict right after the admit answered " + test_admit_answer(code, early);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "the evict the admit's leftovers refused published a plan";
+    }
+    if (test_evict_device_entries(fx, 0, 1) != 3) {
+        return "the evict the admit's leftovers refused moved a device entry";
+    }
+
+    if (!drain_retained_handles(true, 5000)) {
+        return "the admit's retained copies did not drain";
+    }
+    if (test_evict_host_entries(fx, 0, 1) != 3) {
+        return test_loan_fail("%d of the admit's 3 retired host entries remain before any deferred-free pass",
+                              test_evict_host_entries(fx, 0, 1));
+    }
+    ::ggml_sycl_expert_move_result retiring;
+    code = test_named_move(fx, { 0, 1 }, test_no_triplet, retiring);
+    if (code != ::ggml_sycl_txn_result::BUSY || retiring.accepted || retiring.evicted.size() != 1 ||
+        !test_admit_outcome_is(retiring.evicted[0], false, ::ggml_sycl_txn_result::BUSY, "host entry retiring")) {
+        return "the evict after the drain answered " + test_admit_answer(code, retiring);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {
+        return "the evict the retiring host entries refused published a plan";
+    }
+
+    if (!fx.reclaim_until([&] { return test_evict_host_entries(fx, 0, 1) == 0; })) {
+        return test_loan_fail("2 s after the admit %d of its retired host entries remain",
+                              test_evict_host_entries(fx, 0, 1));
+    }
+    ::ggml_sycl_expert_move_result later;
+    code = test_named_move(fx, { 0, 1 }, test_no_triplet, later);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || later.n_evicted != 1 ||
+        !test_admit_outcome_is(later.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict after the reclaim answered " + test_admit_answer(code, later);
+    }
+    if (std::string why = test_evict_landed(fx, 0, 1); !why.empty()) {
+        return "the evicted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_evict_is_busy_while_lent() {
+    // While a loan is outstanding a named move is BUSY "loans outstanding" before it looks at a triplet: the lent
+    // triplets come back through the refill, which finds them by the ledger. The evict moves and publishes nothing,
+    // and after the refill the same evict moves.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x6576637406ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    if (std::string why = fx.lend(3 * placement_vram_charge_bytes(bytes), 1, /*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    // The loan walks the plan from its tail, so expert 0, the one evicted below, is not the lent one.
+    if (std::string why = fx.still_lent(0, 2); !why.empty()) {
+        return "the loan: " + why;
+    }
+
+    const auto                     published = ::ggml_sycl_global_plan_snapshot();
+    ::ggml_sycl_expert_move_result result;
+    ::ggml_sycl_txn_result         code = test_named_move(fx, { 0, 0 }, test_no_triplet, result);
+    if (code != ::ggml_sycl_txn_result::BUSY || result.accepted || result.n_evicted != 0 ||
+        std::strcmp(result.reason, "loans outstanding") != 0 || result.evicted.size() != 1 ||
+        !test_admit_outcome_is(result.evicted[0], false, ::ggml_sycl_txn_result::BUSY, "loans outstanding")) {
+        return "the evict with a loan outstanding answered " + test_admit_answer(code, result);
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get() || test_evict_device_entries(fx, 0, 0) != 3 ||
+        g_sycl_expert_lent_count[fx.device].load() != 1) {
+        return "the evict a loan refused published a plan, moved a device entry or changed the ledger";
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         refill;
+    const uint32_t remaining = fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &refill);
+    if (!refill.accepted || refill.n_triplets != 1 || remaining != 0) {
+        return test_loan_fail("the refill re-admitted %u triplets with %u remaining (%s), not the one lent and 0",
+                              refill.n_triplets, remaining, refill.reason);
+    }
+    ::ggml_sycl_expert_move_result after;
+    code = test_named_move(fx, { 0, 0 }, test_no_triplet, after);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || after.n_evicted != 1 ||
+        !test_admit_outcome_is(after.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict after the refill answered " + test_admit_answer(code, after);
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_evict_and_admit_swap_in_one_call() {
+    // A swap: one call evicts a resident triplet and admits a host one, the evicts first, and one plan publishes
+    // both, so the block keeps its number of resident triplets. The admit takes three staged sizes of the WEIGHT zone
+    // now and the evict gives three back once the deferred-free pass reaps its entries, so the zone then has the room
+    // it had before the call.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637407ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    if (std::string why = fx.pin_host_triplet(0, 2); !why.empty()) {
+        return why;
+    }
+    // Settled first, so the zone's room moves only with the swap.
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the swap";
+    }
+    fx.cache->process_deferred_frees_public();
+    const size_t room = fx.cache->zone_available(vram_zone_id::WEIGHT);
+
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, { 0, 2 }, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || std::strcmp(result.reason, "OK") != 0 ||
+        result.n_evicted != 1 || result.n_admitted != 1 || result.bytes_evicted != 3 * fx.staged_bytes ||
+        result.bytes_admitted != 3 * fx.staged_bytes || result.evicted.size() != 1 || result.admitted.size() != 1 ||
+        !test_admit_outcome_is(result.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK") ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the swap answered " + test_admit_answer(code, result);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    for (int e = 0; e < 3; ++e) {
+        const int on   = now && now->plan ? test_loan_fixture::triplet_on_device(*now, 0, e) : -1;
+        const int want = e == 0 ? 0 : 1;
+        if (on != want) {
+            return test_loan_fail("after the swap expert %d reads %d on the device in the published plan, not %d", e,
+                                  on, want);
+        }
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet: " + why;
+    }
+    if (std::string why = fx.readmitted(0, 2); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    if (!fx.reclaim_until([&] {
+            return test_evict_device_entries(fx, 0, 0) == 0 && fx.cache->zone_available(vram_zone_id::WEIGHT) >= room;
+        })) {
+        return test_loan_fail(
+            "2 s after the swap %d evicted device entries remain and the WEIGHT zone has %zu of the "
+            "%zu bytes it had before",
+            test_evict_device_entries(fx, 0, 0), fx.cache->zone_available(vram_zone_id::WEIGHT), room);
+    }
+    return {};
+}
+
+std::string test_expert_evict_and_admit_cycles_return_the_room() {
+    // Four cycles of one triplet: evicted, then admitted back once the deferred-free pass has reaped its device
+    // entries, while a second triplet stays on the device. The fixture's plan holds expert entries only, so the
+    // resident triplets are all that makes it use the card, and a publication gives the card's cache the plan only
+    // while the plan uses the card: with no triplet left there, every copy back would be refused "plan not
+    // coherent". In a model's plan a card that runs a block also holds that block's dense weights, so its evicts do
+    // not take the card out of the plan. After every accepted evict and admit the cache holds the published
+    // plan. Right after the first evict an admit is BUSY "device entry exists": the retired entries are still in
+    // the cache. After each cycle, once its host entries are reaped too, the WEIGHT zone and the WEIGHT host zone are
+    // where they started, so no cycle keeps storage on either side; at the end the triplet's bytes are the originals.
+    // The control, in every cycle: right after the evict, before any reap, the WEIGHT host zone holds the three pinned
+    // copies on top of what it held right before the evict, and once the device entries are reaped, before the admit,
+    // the WEIGHT zone has their three entries' room on top of where it started. Without it, both "where they started"
+    // checks would pass for a move that never reached either zone. The sizes are exact lower bounds: the TLSF allocator
+    // behind each zone counts a block at its size, the request rounded up to the allocator's block size, and keeps no
+    // header in the zone; the copies are minted at fx.resolved_logical, the bytes per expert the fixture's resolver
+    // reports in place of the tensor's nb[2] the registered resolver reads, and the fixture sets it to its expert's
+    // bytes, so the two are equal by construction; the entries were staged and are admitted at the staged size, each a
+    // multiple of that block size. A cycle starts with the WEIGHT zone at least where it started, which the previous
+    // cycle's last check holds, so the reaped room's bound holds in every cycle.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637408ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the cycles";
+    }
+    fx.cache->process_deferred_frees_public();
+    const size_t room      = fx.cache->zone_available(vram_zone_id::WEIGHT);
+    const size_t host_used = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+    // What the fixture's resolver reports as each member's bytes per expert, the size each pinned copy is minted at.
+    const size_t copy_bytes = fx.resolved_logical;
+
+    constexpr int cycles = 4;
+    for (int c = 0; c < cycles; ++c) {
+        // The evict's own copies, measured from right before it: the case's start would credit the evict with storage
+        // the zone held or gave back for anything else between the two.
+        const size_t                   host_before = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+        ::ggml_sycl_expert_move_result evicted;
+        ::ggml_sycl_txn_result         code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
+        if (code != ::ggml_sycl_txn_result::ACCEPTED || evicted.n_evicted != 1) {
+            return test_loan_fail("cycle %d's evict answered %s", c, test_admit_answer(code, evicted).c_str());
+        }
+        if (!test_move_cache_coherent(fx)) {
+            return test_loan_fail("after cycle %d's evict the device's cache does not hold the published plan", c);
+        }
+        if (fx.cache->host_zone_used(host_zone_id::WEIGHT) < host_before + 3 * copy_bytes) {
+            return test_loan_fail(
+                "right after cycle %d's evict the WEIGHT host zone uses %zu bytes, not at least the %zu it used right "
+                "before + 3 x %zu for its pinned copies",
+                c, fx.cache->host_zone_used(host_zone_id::WEIGHT), host_before, copy_bytes);
+        }
+        if (c == 0) {
+            ::ggml_sycl_expert_move_result early;
+            code = test_named_move(fx, test_no_triplet, { 0, 0 }, early);
+            if (code != ::ggml_sycl_txn_result::BUSY || early.n_admitted != 0 || early.admitted.size() != 1 ||
+                !test_admit_outcome_is(early.admitted[0], false, ::ggml_sycl_txn_result::BUSY, "device entry exists")) {
+                return "the admit right after the evict answered " + test_admit_answer(code, early);
+            }
+        }
+        // Waited for with the reaping, since the pass that reaps the entries returns their room. The bound counts none
+        // of the device storage cycle 0's BUSY admit minted, which goes back with its refusal.
+        if (!fx.reclaim_until([&] {
+                return test_evict_device_entries(fx, 0, 0) == 0 &&
+                       fx.cache->zone_available(vram_zone_id::WEIGHT) >= room + 3 * fx.staged_bytes;
+            })) {
+            return test_loan_fail(
+                "2 s after cycle %d's evict %d of its device entries remain and the WEIGHT zone has %zu bytes, not at "
+                "least %zu + 3 x %zu",
+                c, test_evict_device_entries(fx, 0, 0), fx.cache->zone_available(vram_zone_id::WEIGHT), room,
+                fx.staged_bytes);
+        }
+        ::ggml_sycl_expert_move_result admitted;
+        code = test_named_move(fx, test_no_triplet, { 0, 0 }, admitted);
+        if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
+            return test_loan_fail("cycle %d's admit answered %s", c, test_admit_answer(code, admitted).c_str());
+        }
+        if (!test_move_cache_coherent(fx)) {
+            return test_loan_fail("after cycle %d's admit the device's cache does not hold the published plan", c);
+        }
+        if (!fx.reclaim_until([&] {
+                return test_evict_host_entries(fx, 0, 0) == 0 &&
+                       fx.cache->zone_available(vram_zone_id::WEIGHT) >= room &&
+                       fx.cache->host_zone_used(host_zone_id::WEIGHT) <= host_used;
+            })) {
+            return test_loan_fail(
+                "after cycle %d: %d host entries remain, the WEIGHT zone has %zu of %zu bytes, and the WEIGHT host "
+                "zone uses %zu, not %zu",
+                c, test_evict_host_entries(fx, 0, 0), fx.cache->zone_available(vram_zone_id::WEIGHT), room,
+                fx.cache->host_zone_used(host_zone_id::WEIGHT), host_used);
+        }
+    }
+    if (std::string why = fx.readmitted(0, 0); !why.empty()) {
+        return "the triplet after the cycles: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_evict_refusal_leaves_the_admit_list_alone() {
+    // Each list answers for its own triplets. An evict of a triplet the plan keeps on the host is REFUSED "not on
+    // device" in the evict list, and the admit named beside it moves: the call is accepted with the refusal as its
+    // reason, nothing evicted and one triplet admitted.
+    test_loan_fixture fx(/*layers=*/2, /*experts=*/2, /*model_id=*/0x6576637409ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(1, 1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 1 }, { 1, 1 }, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted ||
+        std::strcmp(result.reason, "not on device") != 0 || result.n_evicted != 0 || result.n_admitted != 1 ||
+        result.bytes_evicted != 0 || result.bytes_admitted != 3 * fx.staged_bytes || result.evicted.size() != 1 ||
+        result.admitted.size() != 1 ||
+        !test_admit_outcome_is(result.evicted[0], false, ::ggml_sycl_txn_result::REFUSED, "not on device") ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the call with a refused evict and an admit answered " + test_admit_answer(code, result);
+    }
+    const auto now = ::ggml_sycl_global_plan_snapshot();
+    if (!now || !now->plan || test_loan_fixture::triplet_on_device(*now, 0, 1) != 0) {
+        return "the refused evict's triplet is not on the host in the published plan";
+    }
+    if (std::string why = fx.readmitted(1, 1); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_evict_room_is_not_an_admit_in_the_same_call() {
+    // An evict's device storage comes back only when a deferred-free pass reaps the entries it retired, never to an
+    // admit in the same call. With the WEIGHT zone full, one call evicts expert 0 and names expert 2 to admit: the
+    // evict moves, the admit is BUSY "WEIGHT zone full", and right after the call the zone still has no room for one
+    // member. Once the pass has reaped expert 0's entries, a later call admits expert 2 into the room they gave back.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x657663740aull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    if (std::string why = fx.pin_host_triplet(0, 2); !why.empty()) {
+        return why;
+    }
+
+    // Fillers take the zone until it has no room for one member.
+    std::vector<mem_handle> fillers;
+    constexpr size_t        max_fillers = 16384;
+    while (fillers.size() < max_fillers) {
+        mem_handle filler = ::ggml_sycl_device_expert_alloc(fx.device, bytes);
+        if (!filler.valid()) {
+            break;
+        }
+        fillers.push_back(std::move(filler));
+    }
+    if (fillers.empty() || fillers.size() == max_fillers) {
+        return test_loan_fail("the WEIGHT zone took %zu fillers of %zu bytes", fillers.size(), bytes);
+    }
+    if (fx.cache->zone_largest_free(vram_zone_id::WEIGHT) >= bytes) {
+        return test_loan_fail("the control: the filled zone's largest free block is %zu bytes, room for a member",
+                              fx.cache->zone_largest_free(vram_zone_id::WEIGHT));
+    }
+
+    ::ggml_sycl_expert_move_result result;
+    ::ggml_sycl_txn_result         code = test_named_move(fx, { 0, 0 }, { 0, 2 }, result);
+
+    // Read before anything below can run a deferred-free pass.
+    const size_t largest_after = fx.cache->zone_largest_free(vram_zone_id::WEIGHT);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted ||
+        std::strcmp(result.reason, "WEIGHT zone full") != 0 || result.n_evicted != 1 || result.n_admitted != 0 ||
+        result.bytes_evicted != 3 * fx.staged_bytes || result.bytes_admitted != 0 || result.evicted.size() != 1 ||
+        result.admitted.size() != 1 ||
+        !test_admit_outcome_is(result.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK") ||
+        !test_admit_outcome_is(result.admitted[0], false, ::ggml_sycl_txn_result::BUSY, "WEIGHT zone full")) {
+        return "the evict and the admit into a full zone answered " + test_admit_answer(code, result);
+    }
+    if (largest_after >= bytes) {
+        return test_loan_fail("right after the call the zone's largest free block is %zu bytes, room for a member",
+                              largest_after);
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet: " + why;
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!fx.host_entry_present(0, s, 2) || fx.host_entry_retired(0, s, 2) || fx.device_entry_present(0, s, 2)) {
+            return test_loan_fail("the admit the full zone refused moved slot %d", s);
+        }
+    }
+
+    if (!fx.reclaim_until([&] {
+            return test_evict_device_entries(fx, 0, 0) == 0 &&
+                   fx.cache->zone_largest_free(vram_zone_id::WEIGHT) >= bytes;
+        })) {
+        return test_loan_fail(
+            "2 s after the call %d evicted device entries remain and the largest free block is %zu "
+            "bytes",
+            test_evict_device_entries(fx, 0, 0), fx.cache->zone_largest_free(vram_zone_id::WEIGHT));
+    }
+    ::ggml_sycl_expert_move_result later;
+    code = test_named_move(fx, test_no_triplet, { 0, 2 }, later);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || later.n_admitted != 1 ||
+        !test_admit_outcome_is(later.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit after the reclaim answered " + test_admit_answer(code, later);
+    }
+    if (std::string why = fx.readmitted(0, 2); !why.empty()) {
+        return "the admitted triplet: " + why;
+    }
+    return {};
+}
+
+std::string test_expert_evict_takes_a_block_off_the_direct_route() {
+    // The decode direct route serves a batch-1 MUL_MAT_ID from one table covering every expert of the tensor on the
+    // device, and keeps that decision while the tensor's storage generation stands. The control: once an admit has
+    // completed the block, the route serves each tensor from its table. An evict out of the block drops each extra's
+    // views of the withdrawn device copy and remembers the host copy, which moves the generation, so the route decides
+    // again and refuses the block: it never serves it from the old table, which names retired storage.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x657663740bull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+
+    // Bound as the admit's route case binds them: Q4_0, a layout the route takes, sized by the fixture's nb[2], and
+    // each route call with the device info narrowed to device 0, which holds everything here.
+    ggml_tensor tensors[3];
+    for (int s = 0; s < 3; ++s) {
+        fx.bind_tensor(tensors[s], 0, s);
+        tensors[s].type = GGML_TYPE_Q4_0;
+    }
+    ggml_sycl_device_info one_card = ggml_sycl_info();
+    one_card.device_count          = 1;
+    one_card.total_gpu_count       = 1;
+    ggml_backend_sycl_context ctx(fx.device);
+
+    ::ggml_sycl_expert_move_result admitted;
+    ::ggml_sycl_txn_result         code = test_named_move(fx, test_no_triplet, { 0, 1 }, admitted);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
+        return "the admit that completes the block answered " + test_admit_answer(code, admitted);
+    }
+    uint64_t generation[3] = { 0, 0, 0 };
+    {
+        test_sycl_info_override_guard single_card(one_card);
+        for (int s = 0; s < 3; ++s) {
+            layout_mode layout = GGML_LAYOUT_SOA;
+            if (!::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout) ||
+                layout != GGML_LAYOUT_AOS) {
+                return test_loan_fail("the control: the direct route did not serve slot %d once the block was whole",
+                                      s);
+            }
+            generation[s] = fx.extras[s]->weight().moe_expert_storage_generation;
+        }
+    }
+
+    ::ggml_sycl_expert_move_result evicted;
+    code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || evicted.n_evicted != 1) {
+        return "the evict out of the served block answered " + test_admit_answer(code, evicted);
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (fx.extras[s]->weight().moe_expert_storage_generation == generation[s]) {
+            return test_loan_fail("the evict left slot %d's storage generation at %llu", s,
+                                  static_cast<unsigned long long>(generation[s]));
+        }
+    }
+    {
+        test_sycl_info_override_guard single_card(one_card);
+        for (int s = 0; s < 3; ++s) {
+            layout_mode layout = GGML_LAYOUT_AOS;
+            if (::ggml_sycl_moe_decode_direct_table(ctx, &tensors[s], /*selected_rows=*/1, &layout)) {
+                return test_loan_fail("the direct route served slot %d with expert 0 evicted to the host", s);
+            }
+        }
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet: " + why;
     }
     return {};
 }
@@ -34589,6 +36777,10 @@ static void ggml_check_sycl() try {
             // The planner's pin of a mapping load's routed host experts, likewise overwritten from its one reader,
             // which the planner calls on every plan.
             { ggml_sycl::MOE_PIN_HOST_EXPERTS_ENV, &g_ggml_sycl_moe_pin_host_experts, 1 },
+#if GGML_SYCL_DNNL
+            // The deterministic attribute on every oneDNN primitive, likewise overwritten from its one reader.
+            { GGML_SYCL_ONEDNN_DETERMINISTIC_ENV, &g_ggml_sycl_onednn_deterministic, 1 },
+#endif
             // clang-format on
         };
 
@@ -34602,6 +36794,9 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
         g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
         g_ggml_sycl_moe_pin_host_experts         = ggml_sycl::placement_pin_host_experts_enabled() ? 1 : 0;
+#if GGML_SYCL_DNNL
+        g_ggml_sycl_onednn_deterministic = ggml_sycl_onednn_deterministic_enabled() ? 1 : 0;
+#endif
 
         // Safe mode forces per-op queue drains (see ggml_sycl_compute_forward),
         // which makes graph replay meaningless — the graph is submitted as a
@@ -34738,6 +36933,7 @@ static void ggml_check_sycl() try {
         }
 #if GGML_SYCL_DNNL
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
+        GGML_LOG_INFO("  GGML_SYCL_ONEDNN_DETERMINISTIC: %d\n", g_ggml_sycl_onednn_deterministic);
 #else
 
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
@@ -41243,6 +43439,7 @@ static sycl::event ggml_sycl_fill_onednn_packed(sycl::queue &                   
         const dnnl::memory::desc c_md({ ctx->pack_m, ctx->nrows }, dtype, { ctx->nrows, 1 });
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_md, b_any_md, c_md, attr);
         auto packed_md = matmul_pd.weights_desc();
@@ -42522,173 +44719,6 @@ static void ggml_sycl_moe_exec_copy_probe(int                           device,
     } catch (const std::exception & e) {
         GGML_LOG_WARN("[MOE-EXEC] host-expert copy probe device %d failed: %s\n", device, e.what());
     }
-}
-
-static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, layout_mode layout) {
-    if (!src0 || device < 0 || device >= ggml_sycl_info().device_count) {
-        return false;
-    }
-    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra || !src0->data) {
-        return false;
-    }
-    sycl::queue &              stream = ggml_sycl_get_device(device).default_queue();
-    ggml_sycl::unified_cache * cache  = ggml_sycl::get_unified_cache(stream);
-    if (!cache) {
-        return false;
-    }
-    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
-    ggml_sycl::scoped_planned_materialization planned_materialization(cache, "S1-PRELOAD/MoE-experts");
-    const int64_t                             n_experts   = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    const size_t                              expert_size = src0->nb[2];
-
-    const int64_t ncols = src0->ne[0];
-
-    const int64_t nrows               = src0->ne[1];
-    size_t        expert_layout_bytes = expert_size;
-    if (layout == GGML_LAYOUT_AOS) {
-        expert_layout_bytes = ggml_sycl_get_padded_weight_bytes(src0->type, ncols, expert_size);
-    } else {
-        const size_t layout_bytes = ggml_sycl_layout_bytes_for_dims(src0->type, ncols, nrows, layout, device);
-        if (layout_bytes != 0) {
-            expert_layout_bytes = layout_bytes;
-        }
-    }
-
-    ggml_sycl::cache_layout_xmx_info xmx_info{};
-    ggml_sycl_reorder_fill_ctx       reorder_ctx{};
-    ggml_sycl_xmx_tiled_fill_ctx     tiled_ctx{};
-
-    if (layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
-#if SYCL_XMX_MOE_AVAILABLE
-        const auto cfg      = moe_xmx_fused::MXFPXMXConfig::from_device(device);
-        const auto info     = moe_xmx_fused::MXFPXMXLayoutInfo::compute(nrows, ncols, cfg);
-        expert_layout_bytes = layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 ?
-                                  ggml_sycl_xmx_tiled_bundle4_bytes_for_info(info) :
-                                  static_cast<size_t>(info.total_bytes);
-        if (expert_layout_bytes == 0) {
-            return false;
-        }
-        xmx_info.tile_n = info.tile_n_total;
-        xmx_info.tile_k = info.tiles_k_per_group;
-
-        xmx_info.n_tile_groups = info.n_tile_groups_k * info.n_tile_groups_n;
-        tiled_ctx.info         = info;
-        tiled_ctx.n_experts    = 1;
-        tiled_ctx.bundle4      = layout == GGML_LAYOUT_XMX_TILED_BUNDLE4;
-#else
-        return false;
-#endif
-    }
-    const bool src0_is_device = ggml_sycl_get_alloc_type(src0->data) == sycl::usm::alloc::device;
-    if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
-        layout == GGML_LAYOUT_MXFP4_DPAS) {
-        reorder_ctx.type  = src0->type;
-        reorder_ctx.ncols = ncols;
-
-        reorder_ctx.nrows            = nrows;
-        reorder_ctx.nbytes           = expert_size;
-        reorder_ctx.dst_bytes        = expert_layout_bytes;
-        reorder_ctx.layout           = layout;
-        reorder_ctx.src_is_device    = src0_is_device;
-        reorder_ctx.device_id        = device;
-        reorder_ctx.source_device_id = ggml_sycl_device_owner_for_ptr(src0->data, src0_is_device);
-    }
-    const int layer_id        = ggml_sycl_tp_extract_layer_number(src0->name);
-    size_t    cached          = 0;
-    size_t    host_registered = 0;
-
-    size_t            failed = 0;
-    const std::string tname(src0->name ? src0->name : "");
-    const bool        src0_host_accessible = src0->buffer && ggml_backend_buffer_is_host(src0->buffer);
-    for (int64_t e = 0; e < n_experts; ++e) {
-        ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
-        if (!base_key.valid) {
-            failed++;
-            continue;
-        }
-
-        // Skip host staging for device-resident experts — they are already on device.
-        if (!src0_host_accessible) {
-            continue;
-        }
-
-        const uint8_t * expert_aos = static_cast<const uint8_t *>(src0->data) + e * expert_size;
-        if (!expert_aos) {
-            failed++;
-            continue;
-        }
-
-        if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {
-            const auto placement =
-                (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));
-            if (!placement.found()) {
-                continue;
-            }
-            if (placement.on_device && placement.target_device != device) {
-                continue;
-            }
-            if (!placement.on_device) {
-                // expert_aos already lives in the model's host-pinned buffer
-                // (allocated by ggml_backend_sycl_host_buffer_type_alloc_buffer at model load).
-                // Register in-place — no second allocation, no memcpy.
-                ggml_sycl::mem_handle handle;
-                if (!cache->register_host_expert(base_key, const_cast<void *>(static_cast<const void *>(expert_aos)),
-                                                 expert_size, GGML_LAYOUT_AOS, &handle) ||
-                    !handle.resolve().ptr) {
-                    throw std::runtime_error("SYCL host expert registration failed during preload");
-                }
-                if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS, std::move(handle),
-                                                        nullptr, /*logical_offset=*/0, expert_size)) {
-                    (void) cache->retire_expert_entry_exact(
-                        base_key, GGML_LAYOUT_AOS, "host-preload-publish-rejected");
-                    cache->process_deferred_frees_public();
-                    throw std::runtime_error("SYCL host expert logical range publication failed during preload");
-                }
-                host_registered++;
-                continue;
-            }
-        }
-
-        // Determine fill function for layout conversion
-        ggml_sycl::cache_layout_fill_fn fill_fn  = nullptr;
-        const void *                    fill_ctx = nullptr;
-        if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED || layout == GGML_LAYOUT_MXFP4_I8 ||
-            layout == GGML_LAYOUT_MXFP4_DPAS) {
-            fill_fn  = ggml_sycl_fill_reordered_host;
-            fill_ctx = &reorder_ctx;
-        } else if (layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
-#if SYCL_XMX_MOE_AVAILABLE
-            fill_fn  = ggml_sycl_fill_xmx_tiled;
-            fill_ctx = &tiled_ctx;
-#endif
-        }
-        // Route H2D to BCS (copy engine) to keep CCS free during MoE preload.
-        sycl::queue *         bcs_q = &cache->get_bcs_queue();
-        ggml_sycl_cache_id    key   = ggml_sycl_layout_specific_moe_expert_cache_key(base_key, layout);
-        ggml_sycl::mem_handle handle;
-        auto                  result = ggml_sycl::unified_cache_direct_stage_expert(
-            device, key, expert_aos, expert_size, expert_layout_bytes, layout, fill_fn, fill_ctx, bcs_q, &handle);
-
-        if (result.ok && result.ptr && handle.resolve().ptr) {
-            const size_t logical_bytes = layout == GGML_LAYOUT_AOS ? expert_size : expert_layout_bytes;
-            if (extra->remember_moe_storage_handle(static_cast<int>(e), layout, std::move(handle), &result.event,
-                                                   /*logical_offset=*/0, logical_bytes)) {
-                cached++;
-            } else {
-                ggml_sycl_reject_expert_publication(
-                    cache, key, layout, result.event, "preload-publish-rejected");
-                failed++;
-            }
-        } else {
-            failed++;
-        }
-    }
-    if (g_ggml_sycl_debug && (cached > 0 || host_registered > 0 || failed > 0)) {
-        GGML_SYCL_DEBUG("[MODEL-PRELOAD] MoE device=%zu host=%zu failed=%zu for %s layout=%s\n", cached,
-                        host_registered, failed, src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(layout));
-    }
-    return cached > 0 || host_registered > 0;
 }
 
 static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_sycl::mem_handle * out);
@@ -67132,6 +69162,7 @@ static size_t ggml_sycl_layout_bytes_onednn_packed_for_dims(ggml_type type,
         const dnnl::memory::desc c_md({ batch_m, nrows }, dtype, { nrows, 1 });
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_md, b_any_md, c_md, attr);
         return matmul_pd.weights_desc().get_size();
@@ -69972,6 +72003,10 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         return true;
     };
 
+    // Reached only outside graph recording: each caller of this function checks the flag or runs before a recording
+    // starts. A recorded command cannot depend on an event from outside the graph, so a route's ready event can be
+    // chained here only on an eager stream. A caller added under recording must take the branch the transient table
+    // upload takes instead: ask the event's status and refuse the table while the copy is in flight.
     auto install_table_route = [&](int64_t e, moe_expert_route & route, const char * debug_tag) -> bool {
         if (!route.ptr) {
             return false;
@@ -70688,9 +72723,9 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         sycl::event table_event;
 
         if (table_payload_changed || !table_deps.empty()) {
-            // BCS/DMA queues are drained at the top of ggml_sycl_mul_mat_id, so
-            // cross-queue event deps in table_deps are already satisfied.
-            // Use depends_on for in-queue ordering of any remaining CCS events.
+            // The dependency list orders the copy on the context's in-order stream: it runs after every event in
+            // table_deps, each expert's ready event, which may come from the copy queue of the same context, and the
+            // kernels queued after it on the stream run after it.
             if (table_payload_changed) {
                 if (!extra->weight().moe_expert_ptrs_handle[device].valid()) {
                     return false;

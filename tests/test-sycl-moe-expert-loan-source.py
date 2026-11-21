@@ -33,9 +33,10 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     allocations come before the first triplet is lent, each extra's device lease is dropped before anything that
     allocates, a lent triplet is flipped in the plan whatever followed, the loop stops, and the exception is rethrown
     after the inventory lock is released, on each of the three exits;
-  - an existing host entry is never replaced (c-mwmr-3): any entry under a host id, idle or not, refuses the triplet
-    as "host entry exists", the registration is asked not to replace one and refuses when it would, and the refusal
-    reason reaches the transaction's refusal WARN;
+  - an existing host entry is never replaced: any entry under a host id, idle or not, refuses the triplet, as
+    "host entry retiring" while that entry is retired and waits for the deferred-free pass and as "host entry exists"
+    while it is live, the registration is asked not to replace one and refuses when it would, and the refusal reason
+    reaches the transaction's refusal WARN;
   - g_sycl_graph_compute_mutex is never named in the loan code;
   - lock order: the host storage is minted before g_tensor_inventory_mutex is taken, and the cache is asked to lend
     under it; the cache takes direct_stage_mutex_ and rw_mutex_ together, with std::lock;
@@ -117,17 +118,18 @@ What this gate pins for it:
     move, so at more than one per call each moved triplet is counted, its bytes summed, and the next is checked
     against the ledger's new back.
 
-Both directions size their copies from the cache entry the copy will hold (llama.cpp-pu8v). Direct staging pads an AOS
-quantized expert's tail to MATRIX_ROW_PADDING columns and the plan's dst_size does not count it, so a copy minted from
-dst_size is short and the cache refuses it ("host storage too small", or the final "device storage size"). What this
-gate pins:
-  - the preparation asks the cache for each member's size (the AOS device entry for a loan, the lent host copy for a
-    refill), stops with the refusal the cache would give when there is none, and mints from that size, never from
-    dst_size;
-  - each query reads its entry under direct_stage_mutex_ and rw_mutex_, shared, taken together with std::lock, and
-    returns the entry's own size;
-  - the cache's checks stay as the guards: a host copy smaller than its device entry, and device storage not exactly
-    the lent copy's size, are still refused.
+Both directions size their copies from the expert's tensor, never from a cache entry. Direct staging pads an AOS
+quantized expert's tail to MATRIX_ROW_PADDING columns and the plan's dst_size does not count it, so an entry's size can
+be larger than the expert and dst_size smaller than its staged size. What this gate pins:
+  - the preparation asks the cache only whether the entry to copy from is there (the AOS device entry for a loan, the
+    lent host copy for a refill), stops with the refusal the cache would give when there is none, and mints a loan's
+    host copy at the tensor's bytes per expert and a refill's device storage at the staged size the layout gives
+    those bytes, never from an entry's size or from dst_size;
+  - the query reads its entry under direct_stage_mutex_ and rw_mutex_, shared, taken together with std::lock, and
+    returns only whether the entry is there, not retired;
+  - the cache's checks stay as the guards: a loan's device entry or host copy shorter than the expert, and a refill's
+    host copy shorter than the expert or device storage not exactly the staged size, are still refused. So an expert
+    that goes to the host and back does not grow.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, where a
 guard on g_tensor_inventory_mutex reads the same with or without its template argument, and has a mutant that must make
@@ -273,7 +275,7 @@ def claim_loan_never_waits(cache: str, sycl: str) -> bool:
 # --- the device free is gated on the copy event ---------------------------------------------------------------------
 
 SRC_IS_OWNER = "src_owner[i] = e.direct_alloc_owner;"
-COPY = "out.copy_events[i] = mem_copy_async(members[i].host_owner, src_owner[i], bytes[i], dq, deps[i]);"
+COPY = "out.copy_events[i] = mem_copy_async(members[i].owner, src_owner[i], bytes[i], dq, deps[i]);"
 DMA_QUEUE = "sycl::queue & dq = get_dma_queue();"
 DEPS = ("if (e.has_write_event) { deps[i].push_back(e.last_write_event); }",
         "if (e.has_ready_event) { deps[i].push_back(e.ready_event); }")
@@ -283,7 +285,7 @@ HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_ent
 ENTRY_CHANGED = '{ refusal = "entry changed"; break; }'
 DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
-            "k == 0 ? &out.host_handles[i] : nullptr, m.host_owner, &out.copy_events[i], false)")
+            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false)")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
 
 
@@ -381,8 +383,9 @@ def claim_registration_catches_everything(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_EXISTS = ("if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) "
-               '{ refusal = "host entry exists"; break; }')
+HOST_EXISTS = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+               "if (host != entries_.end()) { "
+               'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
 
 
@@ -428,19 +431,44 @@ def claim_graph_mutex_untouched(cache: str, sycl: str) -> bool:
 
 # --- lock order -----------------------------------------------------------------------------------------------------
 
-HOST_ALLOC = "ggml_sycl::mem_handle host = ggml_sycl_host_expert_alloc(device, bytes);"
+# Each triplet's storage is minted in the preparation, which the transaction runs for every triplet before it takes
+# the inventory lock; the preparation never names that lock, and the transaction mints nothing itself.
+PREP_SIG = "static const char * ggml_sycl_expert_prepare_triplet("
+PREPARE = ("stop = ggml_sycl_expert_prepare_triplet(*cache, device, *current->plan, &keys[3 * t], *resolver, triplet, "
+           "&transient);")
+HOST_ALLOC = "storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);"
+MINT_CALLS = ("ggml_sycl_host_expert_alloc(", "ggml_sycl_device_expert_alloc(")
 INVENTORY_LOCK = "std::unique_lock lock(g_tensor_inventory_mutex);"
-LEND = "loaned = cache->loan_expert_triplet(triplet.members, record);"
+# One statement moves each triplet, the cache body picked by a switch on its kind with no default, so a new kind is a
+# compile warning rather than a move through another kind's body.
+MOVE_CALL = ("switch (triplet.kind) { case ggml_sycl_expert_move_kind::LOAN: case ggml_sycl_expert_move_kind::EVICT: "
+             "loaned = cache->loan_expert_triplet(triplet.members, record); break; "
+             "case ggml_sycl_expert_move_kind::ADMIT: loaned = cache->admit_host_triplet(triplet.members, record); "
+             "break; case ggml_sycl_expert_move_kind::REFILL: "
+             "loaned = cache->refill_lent_triplet(triplet.members, record); break; }")
+LEND = "cache->loan_expert_triplet(triplet.members, record)"
 CACHE_LOCKS = ("std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                "std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
                "std::lock(direct_lock, cache_lock);")
 
 
+def claim_storage_minted_before_the_inventory_lock(sycl: str) -> bool:
+    """Minting can allocate and wait on the pool; under the inventory lock it would hold every other expert move and
+    every tensor lookup behind it. So the preparation, which mints, runs before the lock and never names it, and the
+    transaction itself mints nothing."""
+    s = norm(sycl)
+    txn = body(s, TXN_SIG)
+    prep = body(s, PREP_SIG)
+    return (bool(prep) and txn.count(PREPARE) == 1 and not any(m in txn for m in MINT_CALLS)
+            and "g_tensor_inventory_mutex" not in prep and txn.find("g_tensor_inventory_mutex") > txn.find(PREPARE))
+
+
 def claim_lock_order(cache: str, sycl: str) -> bool:
     txn = body(norm(sycl), TXN_SIG)
+    prep = body(norm(sycl), PREP_SIG)
     loan = body(norm(cache), LOAN_SIG)
-    return (txn.count(INVENTORY_LOCK) == 1 and txn.count(HOST_ALLOC) == 1
-            and ordered(txn, HOST_ALLOC, INVENTORY_LOCK, LEND)
+    return (txn.count(INVENTORY_LOCK) == 1 and prep.count(HOST_ALLOC) == 1 and txn.count(MOVE_CALL) == 1
+            and claim_storage_minted_before_the_inventory_lock(sycl) and ordered(txn, PREPARE, INVENTORY_LOCK, LEND)
             and "g_tensor_inventory_mutex" not in loan and loan.count(CACHE_LOCKS) >= 3
             and "std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);" not in loan)
 
@@ -484,7 +512,7 @@ def claim_busy_reposts_the_request(sycl: str) -> bool:
 
 STREAK_SLOTS = "static std::atomic<uint32_t> g_sycl_expert_loan_busy_streak[GGML_SYCL_MAX_DEVICES];"
 TXN_WARN_BUSY = "ggml_sycl_expert_loan_result * out, bool warn_busy = true) {"
-REFUSE_GATE = "if (!probe_mode && !refill && (warn_busy || code != ggml_sycl_txn_result::BUSY)) { " + \
+REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) { " + \
     'GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\\n", device, reason); }'
 BUSY_EVERY = "constexpr uint32_t warn_every = 64;"
 BUSY_COUNT = "const uint32_t n = busy_streak.fetch_add(1, std::memory_order_relaxed) + 1;"
@@ -566,7 +594,7 @@ def claim_a_loan_without_host_zones_is_refused(cache: str, sycl: str) -> bool:
     txn = body(norm(sycl), TXN_SIG)
     alloc = body(norm(cache), UNIFIED_ALLOC_SIG)
     return (txn.count(ZONES_REFUSAL) == 1 and txn.count("host_zones_configured(") == 1
-            and ordered(txn, INVALID_ARGS, ZONES_REFUSAL, GRAPH_ACTIVE, LOAN_SELECT, PROBE, LEASE, HOST_ALLOC,
+            and ordered(txn, INVALID_ARGS, ZONES_REFUSAL, GRAPH_ACTIVE, LOAN_SELECT, PROBE, LEASE, PREPARE,
                         INVENTORY_LOCK, LEND)
             and alloc.count(PINNED_ZONE_BRANCH) == 1)
 
@@ -632,13 +660,17 @@ PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_free
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
 DROP = "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);"
-REMEMBER = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
-            "std::move(record.host_handles[r]), &record.copy_events[r], 0, logical);")
-FLIP = "(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, refill, refill ? device : -1);"
-# A lent member's host bytes are the pinned copy the transaction minted; a re-admitted one is staged from the load's
-# own source again, the mapping when the load maps files. The ring's plan index reads the backing.
+# Every direction remembers each new copy with the tensor's bytes per expert as its range, never a copy's size.
+REMEMBER = ("(void) triplet.extras[r]->remember_moe_storage_handle(triplet.members[r].placement.expert_id, "
+            "GGML_LAYOUT_AOS, std::move(record.handles[r]), &record.copy_events[r], 0, "
+            "triplet.members[r].logical_bytes);")
+# A triplet goes to the device (a refill or an admit) or to the host (a loan or an evict); the flip follows that direction.
+FLIP = ("(void) next_plan->update_expert_placement(k.layer_id, k.expert_id, k.role, to_device, "
+        "to_device ? device : -1);")
+# A lent member's host bytes are the pinned copy the transaction minted; one moved to the device is staged from the
+# load's own source again, the mapping when the load maps files. The ring's plan index reads the backing.
 BACKING = ("(void) next_plan->set_expert_host_backing(k.layer_id, k.expert_id, k.role, "
-           "refill && next_plan->host_backing_maps_files ? ggml_sycl::placement_host_backing::FILE_MAPPED : "
+           "to_device && next_plan->host_backing_maps_files ? ggml_sycl::placement_host_backing::FILE_MAPPED : "
            "ggml_sycl::placement_host_backing::PINNED);")
 PUBLISH = "ggml_sycl_publish_prepared_plan_locked(prepared_publication);"
 EPOCH = "ggml_sycl_optional_layouts_retired();"
@@ -648,7 +680,7 @@ UNLOCK = "} lock.unlock(); warn_dropped(); if (!swapped) {"
 def claim_probe_changes_nothing_and_a_loan_publishes_once(sycl: str) -> bool:
     b = body(norm(sycl), TXN_SIG)
     return (b.count(PROBE) == 1 and b.count(PUBLISH) == 1 and b.count(FLIP) == 1 and b.count(BACKING) == 1
-            and ordered(b, PROBE, LEASE, HOST_ALLOC, INVENTORY_LOCK, LEND, DROP, FORGET, REMEMBER, FLIP, BACKING,
+            and ordered(b, PROBE, LEASE, PREPARE, INVENTORY_LOCK, LEND, DROP, FORGET, REMEMBER, FLIP, BACKING,
                         PUBLISH,
                         EPOCH, UNLOCK))
 
@@ -728,10 +760,10 @@ def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
 
 HOIST_SNAPSHOT = "auto next = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);"
 HOIST_PLAN = "auto next_plan = std::make_shared<ggml_sycl::placement_plan>(*current->plan);"
-FORGET_LOOP_END = FORGET + " } for (int r = 0; r < 3; ++r) {"
+FORGET_LOOP_END = FORGET + " } } for (int r = 0; r < 3; ++r) {"
 CATCH_LENDING = ('} catch (const ggml_sycl_fallback_error &) { throw; } catch (...) { '
                  'escaped = std::current_exception(); '
-                 'stop = refill ? "exception while refilling" : "exception while lending"; }')
+                 'stop = ggml_sycl_expert_move_texts_of(triplet.kind).exception; }')
 FLIP_IF_LOANED = "if (loaned) { const ggml_sycl::expert_placement_key placed[3] = {"
 BREAK_ESCAPED = "if (escaped) { break; }"
 RETHROW = "if (escaped) { std::rethrow_exception(escaped); }"
@@ -783,8 +815,13 @@ def claim_device_test_registration(cmake: str) -> bool:
 # --- the refill (llama.cpp-sif1, plan Task 12) ----------------------------------------------------------------------
 
 REFILL_SIG = "bool unified_cache::refill_lent_triplet("
+# The refill and the named admit share one cache body; the refill runs it with admit false, which keeps every refill
+# check the refill had: admit only changes the source rule, a whole pinned host copy that is a host-zone slice. Both
+# size the copy from the tensor and mint the device storage at the staged size.
+REFILL_BODY_SIG = "bool unified_cache::copy_host_triplet_to_device("
+REFILL_WRAP = "{ return copy_host_triplet_to_device(members, false, out); }"
 SELECT_SIG = "static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_select("
-FINAL_SIG = "static bool ggml_sycl_expert_refill_refusal_is_final(const char * reason)"
+FINAL_SIG = "static bool ggml_sycl_expert_move_refusal_is_final(const char * reason)"
 DEVICE_ALLOC_SIG = "static ggml_sycl::mem_handle ggml_sycl_device_expert_alloc(int device, size_t size)"
 REFILL_RUN_SIG = "static uint32_t ggml_sycl_expert_refill_transaction_run("
 ARM_SIG = "static void ggml_sycl_expert_refill_set_armed(int device, bool armed)"
@@ -802,30 +839,45 @@ def refill_bodies(cache: str, sycl: str) -> list[str]:
     """The refill code, cache side and backend side; the shared transaction body is in loan_bodies()."""
     c = norm(cache)
     s = norm(sycl)
-    return [body(c, REFILL_SIG), body(s, SELECT_SIG), body(s, FINAL_SIG), body(s, DEVICE_ALLOC_SIG),
+    return [body(c, REFILL_SIG), body(c, REFILL_BODY_SIG), body(s, SELECT_SIG), body(s, FINAL_SIG),
+            body(s, DEVICE_ALLOC_SIG),
             body(s, REFILL_RUN_SIG), body(s, ARM_SIG), body(s, BOUNDARY_DEVICE_SIG), body(s, BOUNDARY_SIG),
             body(s, LEDGER_SIG)]
 
 
-DIRECTION_ENUM = "enum class ggml_sycl_expert_txn_direction { LOAN, REFILL, };"
+DIRECTION_ENUM = "enum class ggml_sycl_expert_txn_direction { LOAN, REFILL, NAMED, };"
 LOAN_ENTRY = ("return ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::LOAN, device, bytes_wanted, slot_bytes, "
               "probe_mode, resolver, out, warn_busy);")
 REFILL_ENTRY = ("const ggml_sycl_txn_result answer = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::REFILL, "
                 "device, max_triplets, 0, false, resolver, result, false);")
+NAMED_ENTRY = ("const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::NAMED, device, "
+               "moves.size(), 0, false, resolver, &answer, false, &moves);")
+MOVE_TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run("
 REFILL_FLAG = "const bool refill = direction == ggml_sycl_expert_txn_direction::REFILL;"
-REFILL_CALL = "loaned = cache->refill_lent_triplet(triplet.refill_members, refilled);"
+REFILL_CALL = "cache->refill_lent_triplet(triplet.members, record)"
+# Each triplet's kind picks the cache body that moves it and the words its refusals use; the call's direction picks
+# the kind of every triplet it prepares.
+KIND_ENUM = "enum class ggml_sycl_expert_move_kind { LOAN, REFILL, ADMIT, EVICT, };"
+KIND_OF_CALL = ("const ggml_sycl_expert_move_kind kind = refill ? ggml_sycl_expert_move_kind::REFILL : named ? "
+                "ggml_sycl_expert_move_kind::ADMIT : ggml_sycl_expert_move_kind::LOAN;")
+KIND_TO_DEVICE = "const bool to_device = ggml_sycl_expert_move_to_device(triplet.kind);"
 
 
-def claim_one_body_two_directions(sycl: str) -> bool:
-    """One body runs both directions: the loan's entry and the refill's call it with their direction, and its lock,
-    its publication and its epoch bump are the one copy both share."""
+def claim_one_body_every_direction(sycl: str) -> bool:
+    """One body runs every direction: the loan's entry, the refill's and the named move's call it with their
+    direction, and its lock, its publication and its epoch bump are the one copy all share. One statement moves every
+    triplet, its cache body picked by the triplet's kind."""
     s = norm(sycl)
     txn = body(s, TXN_SIG)
-    return (s.count(DIRECTION_ENUM) == 1 and s.count("ggml_sycl_expert_txn_run(") == 3
+    return (s.count(DIRECTION_ENUM) == 1 and s.count(KIND_ENUM) == 1 and s.count("ggml_sycl_expert_txn_run(") == 4
             and body(s, LOAN_TXN_SIG).count(LOAN_ENTRY) == 1 and body(s, REFILL_RUN_SIG).count(REFILL_ENTRY) == 1
-            and txn.count(REFILL_FLAG) == 1 and txn.count(LEND) == 1 and txn.count(REFILL_CALL) == 1
+            and body(s, MOVE_TXN_SIG).count(NAMED_ENTRY) == 1
+            and txn.count(REFILL_FLAG) == 1 and txn.count(KIND_OF_CALL) == 1 and txn.count(KIND_TO_DEVICE) == 1
+            and txn.count(MOVE_CALL) == 1 and txn.count("loan_expert_triplet(") == 1
+            and txn.count("refill_lent_triplet(") == 1 and txn.count("admit_host_triplet(") == 1
             and txn.count(INVENTORY_LOCK) == 1 and txn.count(PUBLISH) == 1 and txn.count(EPOCH) == 1
-            and ordered(txn, REFILL_FLAG, INVENTORY_LOCK, REFILL_CALL, LEND, PUBLISH, EPOCH))
+            and ordered(txn, REFILL_FLAG, KIND_OF_CALL, PREPARE, INVENTORY_LOCK, KIND_TO_DEVICE, MOVE_CALL, PUBLISH,
+                        EPOCH))
 
 
 def claim_refill_never_waits(cache: str, sycl: str) -> bool:
@@ -834,9 +886,9 @@ def claim_refill_never_waits(cache: str, sycl: str) -> bool:
 
 
 REFILL_SRC = "src_owner[i] = e.direct_alloc_owner;"
-REFILL_COPY = "out.copy_events[i] = mem_copy_async(members[i].device_owner, src_owner[i], bytes[i], bq, deps[i]);"
+REFILL_COPY = "out.copy_events[i] = mem_copy_async(members[i].owner, src_owner[i], bytes[i], bq, deps[i]);"
 BCS_QUEUE = "sycl::queue & bq = get_bcs_queue();"
-ENTRY_OWNER = "entry.direct_alloc_owner = members[i].device_owner;"
+ENTRY_OWNER = "entry.direct_alloc_owner = members[i].owner;"
 ENTRY_EVENTS = ("entry.state = cache_entry_state::IN_PROGRESS;", "entry.has_ready_event = true;",
                 "entry.ready_event = out.copy_events[i];", "entry.last_write_event = out.copy_events[i];",
                 "entry.has_write_event = true;")
@@ -846,7 +898,7 @@ def claim_refill_copy_is_owner_to_owner_on_the_copy_engine(cache: str) -> bool:
     """The copy reads the host copy's own typed owner and writes the caller's device owner, so mem_copy_async takes
     the direct DMA and retains both until it completes; it runs on the BCS queue behind the host copy's writes, and
     the device entry is published IN_PROGRESS with the copy as its ready event and its last write."""
-    b = body(norm(cache), REFILL_SIG)
+    b = body(norm(cache), REFILL_BODY_SIG)
     return (all(b.count(x) == 1 for x in (REFILL_SRC, REFILL_COPY, BCS_QUEUE, ENTRY_OWNER) + ENTRY_EVENTS)
             and all(d in b for d in DEPS) and "make_copy_handle_for_raw_ptr(" not in b and "host_task" not in b
             and ordered(b, REFILL_SRC, BCS_QUEUE, REFILL_COPY, ENTRY_OWNER))
@@ -855,7 +907,7 @@ def claim_refill_copy_is_owner_to_owner_on_the_copy_engine(cache: str) -> bool:
 EMPLACE = "entries_.emplace(device_key, device_entry[i]);"
 MINT_MIRROR = ("device_mirror[i].handle = make_direct_entry_handle(device_key, cache_device, stored, "
                '"expert_refill/mirror");')
-MINT_OUT = ("out.device_handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr, "
+MINT_OUT = ("out.handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr, "
             "stored.layout, true, &stored);")
 SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);"
 REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
@@ -872,7 +924,7 @@ def claim_refill_allocates_before_it_changes_anything(cache: str) -> bool:
     before anything already published changes; a throw there withdraws the inserted entries (nothing resolves them
     yet). From the mirror swap on, nothing builds a node or allocates, so the host copies cannot be left half
     retired. The vector the host retires hand their nodes back into is sized before the locks."""
-    b = body(norm(cache), REFILL_SIG)
+    b = body(norm(cache), REFILL_BODY_SIG)
     swap_at = b.find(SWAP_MIRROR)
     tail = b[swap_at:b.find("} } } ", swap_at) + 6] if swap_at >= 0 else ""
     needles = (EMPLACE, MINT_MIRROR, MINT_OUT, SWAP_MIRROR, REMAP_ID, HOST_RETIRE, PUBLICATION_FAILED, REFILL_CATCH,
@@ -883,13 +935,13 @@ def claim_refill_allocates_before_it_changes_anything(cache: str) -> bool:
                         PUBLICATION_FAILED, SWAP_MIRROR, REMAP_ID, HOST_RETIRE))
 
 
-REFILL_SESSION = 'scoped_planned_materialization materialization(this, "expert refill");'
+REFILL_SESSION = 'scoped_planned_materialization materialization(this, admit ? "expert admit" : "expert refill");'
 
 
 def claim_refill_publishes_in_a_planned_materialization(cache: str) -> bool:
     """The device entries are published inside a planned materialization session, as the loan registers its host copies
     in one: the session opens after the copy is submitted and before the locks the publication takes."""
-    b = body(norm(cache), REFILL_SIG)
+    b = body(norm(cache), REFILL_BODY_SIG)
     return (b.count(REFILL_SESSION) == 1 and b.count("begin_planned_materialization(") == 0
             and ordered(b, REFILL_COPY, REFILL_SESSION, RELEASED_SIZED, CACHE_LOCKS, EMPLACE))
 
@@ -913,14 +965,15 @@ def claim_a_retired_host_entry_does_not_shadow_the_refill(cache: str) -> bool:
 def claim_refill_retires_the_host_copy_exactly(cache: str) -> bool:
     """The host copy is withdrawn entry by entry under the loan's host ids, only while each still names the lent
     storage, after the device entry has taken the mirror and the id mapping over; never by the id-wide retire."""
-    b = body(norm(cache), REFILL_SIG)
+    b = body(norm(cache), REFILL_BODY_SIG)
     return (b.count(HOST_RETIRE) == 1 and "retire_expert_entry_exact(" not in b
             and ordered(b, SWAP_MIRROR, REMAP_ID, HOST_RETIRE))
 
 
-REFILL_CHECKS = ('refusal = "not lent";', 'refusal = "layout";', 'refusal = "not a lent copy";',
+REFILL_CHECKS = ('refusal = admit ? "not on host" : "not lent";', 'refusal = "layout";',
+                 'refusal = admit ? "host copy not pinned" : "not a lent copy";',
                  'refusal = "host copy not published";', 'refusal = "device entry exists";',
-                 'refusal = "device storage size";')
+                 'refusal = "host copy size";', 'refusal = "device storage size";')
 REFILL_LOAD_EFFECT = ('const cache_load_effect load_effect = acquire_bound_load_effect(); if (load_effect.failed()) '
                       '{ out.reason = "load effect unavailable"; return false; }')
 
@@ -928,39 +981,54 @@ REFILL_LOAD_EFFECT = ('const cache_load_effect load_effect = acquire_bound_load_
 def claim_refill_checks_before_copying(cache: str) -> bool:
     """What would make the publication wrong is checked, all three members, before anything is copied: the load effect,
     the plan coherence, that each host copy is a loan's and is what resolves its id, that no device entry is in the
-    way, and that the device storage is exactly the host copy's size."""
-    b = body(norm(cache), REFILL_SIG)
-    return (all(b.count(x) == 1 for x in (REFILL_LOAD_EFFECT, COHERENCE, REFUSE_EARLY) + REFILL_CHECKS)
+    way, and that the device storage is exactly the host copy's size. The refill runs the shared body with admit
+    false, so each check is the refill's."""
+    b = body(norm(cache), REFILL_BODY_SIG)
+    return (body(norm(cache), REFILL_SIG) == REFILL_WRAP
+            and all(b.count(x) == 1 for x in (REFILL_LOAD_EFFECT, COHERENCE, REFUSE_EARLY) + REFILL_CHECKS)
             and ordered(b, REFILL_LOAD_EFFECT, COHERENCE, *REFILL_CHECKS, REFILL_SRC, REFUSE_EARLY, REFILL_COPY))
 
 
-DEVICE_ALLOC = "ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, bytes);"
+# A move to the device mints its storage at the staged size the layout gives the expert's tensor's bytes per expert,
+# refill and admit alike, never at a host copy's size.
+DEVICE_BYTES = ("const size_t staged = ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, "
+                "target.logical_bytes);")
+DEVICE_ALLOC = "storage = ggml_sycl_device_expert_alloc(device, staged);"
 ZONE_ALLOC = ("ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(device, "
               "ggml_sycl::vram_zone_id::WEIGHT, size);")
 
 
 def claim_refill_lock_order(cache: str, sycl: str) -> bool:
-    """The device storage is minted owner-first from the WEIGHT zone before g_tensor_inventory_mutex is taken, and the
-    cache is asked to re-admit under it; the cache takes direct_stage_mutex_ and rw_mutex_ together, with std::lock,
-    and never the inventory mutex; no refill code names g_sycl_graph_compute_mutex."""
+    """The device storage is minted owner-first from the WEIGHT zone, in the preparation, before
+    g_tensor_inventory_mutex is taken, and the cache is asked to re-admit under it; the cache takes direct_stage_mutex_
+    and rw_mutex_ together, with std::lock, and never the inventory mutex; no refill code names
+    g_sycl_graph_compute_mutex."""
     txn = body(norm(sycl), TXN_SIG)
-    refill = body(norm(cache), REFILL_SIG)
+    prep = body(norm(sycl), PREP_SIG)
+    refill = body(norm(cache), REFILL_BODY_SIG)
     alloc = body(norm(sycl), DEVICE_ALLOC_SIG)
-    return (txn.count(DEVICE_ALLOC) == 1 and alloc.count(ZONE_ALLOC) == 1
-            and ordered(txn, DEVICE_ALLOC, INVENTORY_LOCK, REFILL_CALL)
+    return (prep.count(DEVICE_ALLOC) == 1 and alloc.count(ZONE_ALLOC) == 1
+            and claim_storage_minted_before_the_inventory_lock(sycl)
+            and ordered(txn, PREPARE, INVENTORY_LOCK, REFILL_CALL)
             and "g_tensor_inventory_mutex" not in refill and refill.count(CACHE_LOCKS) >= 2
             and "std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_);" not in refill
             and not any("g_sycl_graph_compute_mutex" in b for b in refill_bodies(cache, sycl)))
 
 
-FORGET_HOST = ("(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, "
-               "ggml_sycl::mem_handle::HOST_DEVICE);")
-REMEMBER_DEVICE = ("(void) extra->remember_moe_storage_handle(k.expert_id, GGML_LAYOUT_AOS, "
-                   "std::move(refilled.device_handles[r]), &refilled.copy_events[r], 0, logical);")
-# Each lent triplet's device bytes sit beside it in the ledger and move with it (llama.cpp-7999).
-POP_READMITTED = ("if (refill) { ledger.triplets.pop_back(); ledger.triplet_bytes.pop_back(); } "
-                  "else { ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); "
-                  "ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)); }")
+FORGET_HOST = ("(void) triplet.extras[r]->forget_moe_storage_handle_on_device(triplet.members[r].placement.expert_id, "
+               "GGML_LAYOUT_AOS, ggml_sycl::mem_handle::HOST_DEVICE);")
+# A move to the device drops the host copy's records; a loan drops the device copy's views and records.
+FORGET_BY_DIRECTION = ("if (to_device) { for (int r = 0; r < 3; ++r) { " + FORGET_HOST + " } } else {")
+# Each lent triplet's device bytes sit beside it in the ledger and move with it; a named move keeps no ledger,
+# its admits and evicts alike marked moved with their device bytes for the caller's sums.
+POP_READMITTED = ("switch (triplet.kind) { case ggml_sycl_expert_move_kind::LOAN: "
+                  "ledger.triplets.push_back({ placed[0], placed[1], placed[2] }); "
+                  "ledger.triplet_bytes.push_back(ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)); break; "
+                  "case ggml_sycl_expert_move_kind::REFILL: ledger.triplets.pop_back(); "
+                  "ledger.triplet_bytes.pop_back(); break; "
+                  "case ggml_sycl_expert_move_kind::ADMIT: case ggml_sycl_expert_move_kind::EVICT: "
+                  "(*named_moves)[triplet.named].moved = true; "
+                  "(*named_moves)[triplet.named].device_bytes = record.device_bytes; break; }")
 
 
 def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:
@@ -968,8 +1036,9 @@ def claim_refill_flips_back_and_forgets_the_host_copy(sycl: str) -> bool:
     behind its copy event; the plan flips the triplet back on the device; the ledger loses it; the plan is published
     once, then the exec-graph epoch is bumped."""
     b = body(norm(sycl), TXN_SIG)
-    return (b.count(FORGET_HOST) == 1 and b.count(REMEMBER_DEVICE) == 1 and b.count(POP_READMITTED) == 1
-            and ordered(b, REFILL_CALL, FORGET_HOST, REMEMBER_DEVICE, LEND, CATCH_LENDING, FLIP_IF_LOANED, FLIP,
+    return (b.count(FORGET_HOST) == 1 and b.count(FORGET_BY_DIRECTION) == 1 and b.count(REMEMBER) == 1
+            and b.count(POP_READMITTED) == 1
+            and ordered(b, MOVE_CALL, FORGET_BY_DIRECTION, FORGET, REMEMBER, CATCH_LENDING, FLIP_IF_LOANED, FLIP,
                         BACKING, POP_READMITTED, PUBLISH, EPOCH))
 
 
@@ -978,7 +1047,7 @@ CANCELLED = '"cancelled by a loan";'
 SELECT_ARMED = "if (ledger.refill_armed) {"
 SELECT_REMAINING = "*remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;"
 TXN_REMAINING = "result.n_remaining = ledger.refill_armed ? static_cast<uint32_t>(ledger.triplets.size()) : 0;"
-RESERVE = ("if (!refill) { ledger.triplets.reserve(ledger.triplets.size() + prepared.size()); "
+RESERVE = ("if (!refill && !named) { ledger.triplets.reserve(ledger.triplets.size() + prepared.size()); "
            "ledger.triplet_bytes.reserve(ledger.triplet_bytes.size() + prepared.size()); }")
 
 
@@ -991,7 +1060,7 @@ def claim_a_loan_cancels_the_refills(sycl: str) -> bool:
     select = body(s, SELECT_SIG)
     return (txn.count(DISARM) == 1 and txn.count(CANCELLED) == 1 and txn.count(TXN_REMAINING) == 1
             and select.count(SELECT_ARMED) == 1 and select.count(SELECT_REMAINING) == 1
-            and ordered(txn, HOIST_PLAN, RESERVE, CANCELLED, REFILL_CALL, LEND, POP_READMITTED, DISARM, TXN_REMAINING,
+            and ordered(txn, HOIST_PLAN, RESERVE, CANCELLED, MOVE_CALL, POP_READMITTED, DISARM, TXN_REMAINING,
                         PUBLISH))
 
 
@@ -1122,30 +1191,47 @@ def claim_refill_warn_formats(sycl: str) -> bool:
             and not any("g_sycl_expert_loan_busy_streak" in b for b in refill_bodies("", sycl)[1:]))
 
 
-FINAL_REASONS = ("invalid member", "not lent", "layout", "not a lent copy", "host copy not published",
+FINAL_REASONS = ("invalid arguments", "invalid member", "device storage not owned", "not lent", "not on host", "layout",
+                 "not a lent copy", "host copy not pinned", "host copy not published", "host copy size",
                  "device storage size")
-FINAL_POP = ("stop = refilled.reason; transient = !ggml_sycl_expert_refill_refusal_is_final(stop); "
-             "if (!transient) { drop_back(stop); } break;")
+# Where the shared cache body returns each: a refusal the refill and the admit name differently is one ternary.
+FINAL_REFUSALS = {
+    "invalid arguments": 'out.reason = "invalid arguments";',
+    "invalid member": 'refusal = "invalid member";',
+    "device storage not owned": 'refusal = "device storage not owned";',
+    "not lent": 'refusal = admit ? "not on host" : "not lent";',
+    "not on host": 'refusal = admit ? "not on host" : "not lent";',
+    "layout": 'refusal = "layout";',
+    "not a lent copy": 'refusal = admit ? "host copy not pinned" : "not a lent copy";',
+    "host copy not pinned": 'refusal = admit ? "host copy not pinned" : "not a lent copy";',
+    "host copy not published": 'refusal = "host copy not published";',
+    "host copy size": 'refusal = "host copy size";',
+    "device storage size": 'refusal = "device storage size";',
+}
+FINAL_POP = ("stop = record.reason; if (triplet.kind == ggml_sycl_expert_move_kind::REFILL) { "
+             "transient = !ggml_sycl_expert_move_refusal_is_final(stop); if (!transient) { drop_back(stop); } } break;")
 
 
 def claim_final_refusals_name_the_cache_refusals(cache: str, sycl: str) -> bool:
-    """Each reason the transaction treats as final (the triplet leaves the ledger rather than being retried at every
-    decode graph) is a refusal the cache's refill really returns, so a renamed refusal cannot silently turn final into
-    retried forever."""
-    refill = body(norm(cache), REFILL_SIG)
+    """Each reason the transaction treats as final (a refill's triplet leaves the ledger rather than being retried at
+    every decode graph; a named triplet is answered REFUSED) is a refusal the cache's shared body really returns, so a
+    renamed refusal cannot silently turn final into retried forever."""
+    refill = body(norm(cache), REFILL_BODY_SIG)
     final = body(norm(sycl), FINAL_SIG)
     return (all(('"%s"' % r) in final for r in FINAL_REASONS)
-            and all(('refusal = "%s";' % r) in refill for r in FINAL_REASONS)
+            and all(FINAL_REFUSALS[r] in refill for r in FINAL_REASONS)
             and body(norm(sycl), TXN_SIG).count(FINAL_POP) == 1)
 
 
 # --- a lent triplet the refill can never prepare leaves the ledger, WARNed (llama.cpp-sif1) -------------------------
 
-RESOLVE_FAILED = ("if (!e || !(*resolver)(*e, target) || !target.extra) { "
-                  'stop = refill ? "no tensor for a lent expert" : "no tensor for a selected expert"; break; }')
-ARENA_TOLD_APART = ("const bool arena = cache->arena_active() && "
-                    "cache->zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0; "
-                    'stop = arena ? "WEIGHT zone full" : "no WEIGHT arena"; transient = arena; break;')
+RESOLVE_FAILED = "if (!e || !resolver(*e, target) || !target.extra) { return texts.no_tensor; }"
+# The refill's row of the kind table: the words its preparation and its log use.
+REFILL_TEXTS = ('case ggml_sycl_expert_move_kind::REFILL: return { "no tensor for a lent expert", "not lent", '
+                '"exception while refilling", "refill" };')
+ARENA_TOLD_APART = ("const bool arena = cache.arena_active() && "
+                    "cache.zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0; *transient = arena; "
+                    'return arena ? "WEIGHT zone full" : "no WEIGHT arena";')
 UNPREPARABLE = ("} else if (refill && !transient) { unpreparable = { keys[3 * t], keys[3 * t + 1], keys[3 * t + 2] }; "
                 "unpreparable_reason = stop; }")
 EARLY_REFUSAL = "if (prepared.empty() && !unpreparable_reason) {"
@@ -1162,14 +1248,16 @@ def claim_an_unpreparable_triplet_leaves_the_ledger(sycl: str) -> bool:
     arena, told apart from a full zone, which stays transient) does not return early: under the inventory lock, once
     the publication is checked unchanged, the triplet leaves the ledger if it is the back by then (every triplet
     selected before it moved), and the ledger count is stored after. Left there, it would stop every later refill at
-    the same triplet (llama.cpp-sif1)."""
-    b = body(norm(sycl), TXN_SIG)
-    needles = (RESOLVE_FAILED, ARENA_TOLD_APART, UNPREPARABLE, EARLY_REFUSAL, DROP_AT_BACK, DROP_COUNTED,
-               LENT_COUNT_STORE)
-    return (all(b.count(x) == 1 for x in needles)
-            and ordered(b, RESOLVE_FAILED, DEVICE_ALLOC, ARENA_TOLD_APART, UNPREPARABLE, EARLY_REFUSAL, INVENTORY_LOCK,
-                        PLAN_CHANGED, LEDGER_IN_TXN, REFILL_CALL, POP_READMITTED, DROP_AT_BACK, DROP_COUNTED,
-                        LENT_COUNT_STORE))
+    the same triplet. The preparation tells the two apart and the transaction records the triplet."""
+    s = norm(sycl)
+    b = body(s, TXN_SIG)
+    prep = body(s, PREP_SIG)
+    needles = (UNPREPARABLE, EARLY_REFUSAL, DROP_AT_BACK, DROP_COUNTED, LENT_COUNT_STORE)
+    return (all(b.count(x) == 1 for x in needles) and s.count(REFILL_TEXTS) == 1
+            and prep.count(RESOLVE_FAILED) == 1 and prep.count(ARENA_TOLD_APART) == 1
+            and ordered(prep, RESOLVE_FAILED, DEVICE_ALLOC, ARENA_TOLD_APART)
+            and ordered(b, PREPARE, UNPREPARABLE, EARLY_REFUSAL, INVENTORY_LOCK, PLAN_CHANGED, LEDGER_IN_TXN, MOVE_CALL,
+                        POP_READMITTED, DROP_AT_BACK, DROP_COUNTED, LENT_COUNT_STORE))
 
 
 DROP_BACK = ("auto drop_back = [&](const char * reason) { GGML_ASSERT(n_dropped < dropped.size()); "
@@ -1205,21 +1293,21 @@ ONCE_PER_GRAPH = ("if (refilled_at->exchange(decode_graphs, std::memory_order_re
 SKIP_REASON = 'result->reason = "no decode graph since the last refill"; return result->n_remaining; }'
 
 
-MOVE_LOOP_SIG = "for (prepared_triplet & triplet : prepared)"
-LOOP_TAIL = "++lent; freed += refill ? refilled.bytes_readmitted : record.bytes_freed; } if (escaped) { break; } }"
-LOOP_STOPS = ("transient = ledger.refill_armed; break; }", FINAL_POP, "stop = record.reason; break; }",
-              "if (escaped) { break; }")
+MOVE_LOOP_SIG = "for (ggml_sycl_expert_prepared_triplet & triplet : prepared)"
+LOOP_TAIL = "++lent; (to_device ? taken : freed) += record.device_bytes; } if (escaped) { break; } }"
+LOOP_STOPS = ("transient = ledger.refill_armed; break; }", FINAL_POP, "if (escaped) { break; }")
 
 
 def claim_the_move_loop_moves_every_prepared_triplet(sycl: str) -> bool:
     """The move loop stops only where a triplet did not move: the cursor no longer holds it at its back (cancelled by a
-    loan, or changed), the cache refuses it (refill or loan), or an exception escaped. After a triplet moves, the
-    loop counts it, sums its bytes and goes on, so a refill of more than one per call checks the next triplet against
-    the back the first one's pop left (llama.cpp-sif1)."""
+    loan, or changed), the cache refuses a loan or a refill, or an exception escaped. A switch case's break leaves the
+    switch, not the loop. After a triplet moves, the loop counts it, sums its device bytes in its direction and goes
+    on, so a refill of more than one per call checks the next triplet against the back the first one's pop left."""
     loop = body(body(norm(sycl), TXN_SIG), MOVE_LOOP_SIG)
-    return (loop.count("break;") == len(LOOP_STOPS) and all(loop.count(x) == 1 for x in LOOP_STOPS)
+    return (loop.count("break;") == len(LOOP_STOPS) + POP_READMITTED.count("break;") + MOVE_CALL.count("break;")
+            and all(loop.count(x) == 1 for x in LOOP_STOPS) and loop.count(POP_READMITTED) == 1
             and loop.endswith(LOOP_TAIL)
-            and ordered(loop, CANCELLED, REFILL_CALL, FINAL_POP, POP_READMITTED, LOOP_TAIL))
+            and ordered(loop, CANCELLED, MOVE_CALL, FINAL_POP, POP_READMITTED, LOOP_TAIL))
 
 
 def claim_one_decode_graph_admits_one_refill(sycl: str, common: str, sources: list[str]) -> bool:
@@ -1432,39 +1520,54 @@ def claim_debt_lines_score_as_the_gate_reads_them(sycl: str, gate: str) -> bool:
 
 # --- positive tests -------------------------------------------------------------------------------------------------
 
-# --- copies are sized from the cache entry they will hold (llama.cpp-pu8v) ------------------------------------------
+# --- copies are sized from the tensor, never from a cache entry -----------------------------------------------------
 
-COPY_SIZE = ("const size_t bytes = refill ? cache->refill_copy_bytes(target.key) : "
-             "cache->loan_copy_bytes(target.key);")
-COPY_SIZE_MISSING = 'if (bytes == 0) { stop = refill ? "not lent" : "not resident"; break; }'
-LOAN_BYTES_SIG = "size_t unified_cache::loan_copy_bytes(ggml_sycl_cache_id key) const"
-REFILL_BYTES_SIG = "size_t unified_cache::refill_copy_bytes(ggml_sycl_cache_id key) const"
+# The preparation asks the cache only whether the entry to copy from is there: an entry's size, which direct staging
+# may have padded, decides nothing.
+SOURCE_CHECK = "if (!cache.has_expert_source(target.key, to_device)) { return texts.no_source; }"
+SOURCE_SIG = "bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool to_device) const"
 SHARED_CACHE_LOCKS = ("std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                       "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
                       "std::lock(direct_lock, cache_lock);")
-LOAN_BYTES_FIND = ("const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, "
-                   "GGML_LAYOUT_AOS));")
-REFILL_BYTES_FIND = "const auto it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });"
-BYTES_RETURN = "return it != entries_.end() && !it->second.retired ? it->second.size : 0;"
-LOAN_SIZE_GUARD = 'if (host_md[i].size < e.size) { refusal = "host storage too small"; break; }'
-REFILL_SIZE_GUARD = 'if (device_size[i] != e.size) { refusal = "device storage size"; break; }'
+SOURCE_FIND = ("const auto it = entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, "
+               "-1 } : make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));")
+SOURCE_RETURN = "return it != entries_.end() && !it->second.retired;"
+# A loan copies the expert's own bytes from offset 0 of the device entry, which must hold them, into a host copy that
+# holds them too; the entry's padded tail stays on the device.
+LOAN_ENTRY_GUARD = 'if (e.size < members[i].logical_bytes) { refusal = "device entry size"; break; }'
+LOAN_SIZE_GUARD = 'if (host_md[i].size < members[i].logical_bytes) { refusal = "host storage too small"; break; }'
+LOAN_COPY_BYTES = "bytes[i] = members[i].logical_bytes; device_size[i] = e.size;"
+# A refill and an admit copy the expert's own bytes from a host copy that holds them, into device storage of exactly
+# the staged size of those bytes.
+REFILL_SIZE_GUARD = ('const size_t logical = members[i].logical_bytes; if (e.size < logical) { '
+                     'refusal = "host copy size"; break; } const size_t staged = staged_expert_bytes(e.layout, '
+                     "members[i].type, members[i].ncols, logical); if (device_size[i] != staged || "
+                     'staged < logical) { refusal = "device storage size"; break; }')
 
 
-def claim_copies_are_sized_from_the_entry(cache: str, sycl: str) -> bool:
-    """The preparation mints each member's copy at the size of the cache entry it will hold, which the cache reads
-    under its two locks, and never at the plan's dst_size; the cache's size checks stay as the guards."""
-    txn = body(norm(sycl), TXN_SIG)
+def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
+    """The preparation mints each member's copy from its tensor's bytes per expert, never from a cache entry's size
+    or the plan's dst_size: a loan's host copy at those bytes, a refill's and an admit's device storage at the staged
+    size the layout gives them. The cache is asked only whether the source entry is there, under its two locks, and
+    the cache's size checks stay as the guards: a loan's against the device entry and the host copy, a refill's against
+    the host copy and the device storage. So an expert that goes to the host and back does not grow."""
+    s = norm(sycl)
+    txn = body(s, TXN_SIG)
+    prep = body(s, PREP_SIG)
     c = norm(cache)
-    loan_bytes = body(c, LOAN_BYTES_SIG)
-    refill_bytes = body(c, REFILL_BYTES_SIG)
-    return (txn.count(COPY_SIZE) == 1 and txn.count(COPY_SIZE_MISSING) == 1
-            and txn.count(HOST_ALLOC) == 1 and txn.count(DEVICE_ALLOC) == 1
-            and ordered(txn, COPY_SIZE, COPY_SIZE_MISSING, DEVICE_ALLOC, HOST_ALLOC)
-            and "_expert_alloc(device, e->dst_size)" not in txn
-            and all(b.count(SHARED_CACHE_LOCKS) == 1 and b.count(BYTES_RETURN) == 1
-                    and ordered(b, SHARED_CACHE_LOCKS, BYTES_RETURN) for b in (loan_bytes, refill_bytes))
-            and loan_bytes.count(LOAN_BYTES_FIND) == 1 and refill_bytes.count(REFILL_BYTES_FIND) == 1
-            and body(c, LOAN_SIG).count(LOAN_SIZE_GUARD) == 1 and body(c, REFILL_SIG).count(REFILL_SIZE_GUARD) == 1)
+    source = body(c, SOURCE_SIG)
+    loan = body(c, LOAN_SIG)
+    return (prep.count(SOURCE_CHECK) == 1 and prep.count(DEVICE_BYTES) == 1 and prep.count(DEVICE_ALLOC) == 1
+            and prep.count(HOST_ALLOC) == 1
+            and ordered(prep, RESOLVE_FAILED, SOURCE_CHECK, DEVICE_BYTES, DEVICE_ALLOC, HOST_ALLOC)
+            and "dst_size" not in prep and "staged_expert_bytes(" not in txn
+            and source.count(SHARED_CACHE_LOCKS) == 1 and source.count(SOURCE_FIND) == 1
+            and source.count(SOURCE_RETURN) == 1 and ordered(source, SHARED_CACHE_LOCKS, SOURCE_FIND, SOURCE_RETURN)
+            and ".size" not in source
+            and "loan_copy_bytes(" not in c and "refill_copy_bytes(" not in c
+            and loan.count(LOAN_ENTRY_GUARD) == 1 and loan.count(LOAN_SIZE_GUARD) == 1
+            and loan.count(LOAN_COPY_BYTES) == 1 and ordered(loan, LOAN_ENTRY_GUARD, LOAN_SIZE_GUARD, LOAN_COPY_BYTES)
+            and body(c, REFILL_BODY_SIG).count(REFILL_SIZE_GUARD) == 1)
 
 
 def test_loan_never_waits():
@@ -1571,8 +1674,8 @@ def test_device_test_registration():
     assert claim_device_test_registration(SYCL_CMAKE)
 
 
-def test_one_body_two_directions():
-    assert claim_one_body_two_directions(SYCL)
+def test_one_body_every_direction():
+    assert claim_one_body_every_direction(SYCL)
 
 
 def test_refill_never_waits():
@@ -1772,8 +1875,8 @@ def test_mutant_copy_not_behind_the_fill_fails():
 def test_mutant_host_copy_published_ready_fails():
     """The host entry published READY while its copy is still in flight: a reader could see stale bytes."""
     assert not claim_device_free_gated_on_the_copy(
-        _once(CACHE, REGISTER, REGISTER.replace(", m.host_owner, &out.copy_events[i], false)",
-                                                ", m.host_owner, nullptr, false)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false)",
+                                                ", m.owner, nullptr, false)")), SYCL)
 
 
 def test_mutant_loan_uses_the_id_wide_retire_fails():
@@ -1817,11 +1920,20 @@ def test_mutant_existing_host_entry_unchecked_fails():
 
 
 def test_mutant_idle_host_entry_let_through_fails():
-    """c-mwmr-3: refusing only a retired or leased host entry lets an idle one through to be replaced, storage and
-    all, by a registration the loan could not undo."""
-    busy_only = ("if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) "
-                 '{ refusal = "host entry exists"; break; }')
+    """Refusing only a retired or leased host entry lets an idle one through to be replaced, storage and all, by a
+    registration the loan could not undo."""
+    busy_only = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+                 "if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) { "
+                 'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
     assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, busy_only), SYCL)
+
+
+def test_mutant_retiring_host_entry_named_as_live_fails():
+    """A retired host entry refused as "host entry exists": the transaction would answer a refusal that clears by
+    itself as final, and a named evict right after an admit would never be tried again."""
+    alike = HOST_EXISTS.replace('host->second.retired ? "host entry retiring" : "host entry exists"',
+                                '"host entry exists"')
+    assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, alike), SYCL)
 
 
 def test_mutant_loan_registration_may_replace_fails():
@@ -1921,9 +2033,24 @@ def test_mutant_pending_runner_takes_the_graph_mutex_fails():
 
 
 def test_mutant_allocates_under_the_inventory_lock_fails():
+    """The preparation, which mints, run with the inventory lock already held."""
     n = _once_in(SYCL, TXN_SIG, INVENTORY_LOCK, "")
-    n = _once_in(n, TXN_SIG, HOST_ALLOC, INVENTORY_LOCK + " " + HOST_ALLOC)
+    n = _once_in(n, TXN_SIG, PREPARE, INVENTORY_LOCK + " " + PREPARE)
+    assert not claim_storage_minted_before_the_inventory_lock(n)
     assert not claim_lock_order(CACHE, n)
+
+
+def test_mutant_transaction_mints_under_the_inventory_lock_fails():
+    """A host copy minted by the transaction itself, under the lock, beside the preparation's."""
+    n = _once_in(SYCL, TXN_SIG, INVENTORY_LOCK,
+                 INVENTORY_LOCK + " ggml_sycl::mem_handle spare = ggml_sycl_host_expert_alloc(device, 64);")
+    assert not claim_storage_minted_before_the_inventory_lock(n)
+    assert not claim_lock_order(CACHE, n)
+
+
+def test_mutant_preparation_takes_the_inventory_lock_fails():
+    n = _once_in(SYCL, PREP_SIG, HOST_ALLOC, "std::lock_guard held(g_tensor_inventory_mutex); " + HOST_ALLOC)
+    assert not claim_storage_minted_before_the_inventory_lock(n)
 
 
 def test_mutant_lends_without_the_inventory_lock_fails():
@@ -2040,8 +2167,8 @@ def test_mutant_transaction_ignores_warn_busy_fails():
     assert not claim_busy_warn_is_rate_limited(
         _once_in(SYCL, TXN_SIG, REFUSE_GATE,
                  REFUSE_GATE.replace(
-                     "if (!probe_mode && !refill && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {",
-                     "if (!probe_mode && !refill) {")))
+                     "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {",
+                     "if (!probe_mode && !refill && !named) {")))
 
 
 def test_mutant_busy_warn_drops_the_count_fails():
@@ -2294,11 +2421,11 @@ def test_mutant_registration_wrong_label_fails():
 
 
 def test_mutant_refill_runs_the_loan_direction_fails():
-    assert not claim_one_body_two_directions(_once(SYCL, REFILL_ENTRY, REFILL_ENTRY.replace("::REFILL,", "::LOAN,")))
+    assert not claim_one_body_every_direction(_once(SYCL, REFILL_ENTRY, REFILL_ENTRY.replace("::REFILL,", "::LOAN,")))
 
 
 def test_mutant_refill_publishes_twice_fails():
-    assert not claim_one_body_two_directions(_once_in(SYCL, TXN_SIG, REFILL_CALL, REFILL_CALL + " " + PUBLISH))
+    assert not claim_one_body_every_direction(_once_in(SYCL, TXN_SIG, REFILL_CALL, REFILL_CALL + " " + PUBLISH))
 
 
 def test_mutant_refill_waits_on_its_copy_fails():
@@ -2310,7 +2437,7 @@ def test_mutant_refill_boundary_drains_the_queue_fails():
 
 
 def test_mutant_refill_copies_from_a_raw_pointer_fails():
-    mutant = _once_in(CACHE, REFILL_SIG, REFILL_SRC,
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, REFILL_SRC,
                       "src_owner[i] = make_copy_handle_for_raw_ptr(e.device_ptr, e.size);")
     assert not claim_refill_copy_is_owner_to_owner_on_the_copy_engine(mutant)
 
@@ -2321,7 +2448,7 @@ def test_mutant_refill_copies_on_the_compute_queue_fails():
 
 
 def test_mutant_refill_publishes_the_device_entry_ready_fails():
-    mutant = _once_in(CACHE, REFILL_SIG, ENTRY_EVENTS[0], "entry.state = cache_entry_state::READY;")
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, ENTRY_EVENTS[0], "entry.state = cache_entry_state::READY;")
     assert not claim_refill_copy_is_owner_to_owner_on_the_copy_engine(mutant)
 
 
@@ -2343,8 +2470,8 @@ def test_mutant_refill_builds_a_mapping_node_after_the_swap_fails():
 
 
 def test_mutant_refill_sizes_the_nodes_under_the_locks_fails():
-    sized = _once_in(CACHE, REFILL_SIG, RELEASED_SIZED, "std::vector<expert_retire_nodes> host_nodes;")
-    mutant = _once_in(sized, REFILL_SIG, EMPLACE, RELEASED_SIZED + " " + EMPLACE)
+    sized = _once_in(CACHE, REFILL_BODY_SIG, RELEASED_SIZED, "std::vector<expert_retire_nodes> host_nodes;")
+    mutant = _once_in(sized, REFILL_BODY_SIG, EMPLACE, RELEASED_SIZED + " " + EMPLACE)
     assert not claim_refill_allocates_before_it_changes_anything(mutant)
 
 
@@ -2359,7 +2486,7 @@ def test_mutant_refill_publishes_outside_a_planned_materialization_fails():
 
 def test_mutant_refill_opens_its_session_after_the_locks_fails():
     moved = _once(CACHE, REFILL_SESSION, ";")
-    mutant = _once_in(moved, REFILL_SIG, EMPLACE, REFILL_SESSION + " " + EMPLACE)
+    mutant = _once_in(moved, REFILL_BODY_SIG, EMPLACE, REFILL_SESSION + " " + EMPLACE)
     assert not claim_refill_publishes_in_a_planned_materialization(mutant)
 
 
@@ -2390,19 +2517,20 @@ def test_mutant_refill_skips_the_device_entry_check_fails():
 
 
 def test_mutant_refill_skips_the_coherence_check_fails():
-    mutant = _once_in(CACHE, REFILL_SIG, COHERENCE, ";")
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, COHERENCE, ";")
     assert not claim_refill_checks_before_copying(mutant)
 
 
 def test_mutant_refill_refuses_after_the_copy_fails():
-    early = _once_in(CACHE, REFILL_SIG, REFUSE_EARLY, ";")
+    early = _once_in(CACHE, REFILL_BODY_SIG, REFUSE_EARLY, ";")
     mutant = _once(early, REFILL_COPY, REFILL_COPY + " " + REFUSE_EARLY)
     assert not claim_refill_checks_before_copying(mutant)
 
 
 def test_mutant_refill_allocates_under_the_inventory_lock_fails():
-    moved = _once_in(SYCL, TXN_SIG, DEVICE_ALLOC, "ggml_sycl::mem_handle storage;")
-    mutant = _once_in(moved, TXN_SIG, INVENTORY_LOCK, INVENTORY_LOCK + " " + DEVICE_ALLOC)
+    moved = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC, "storage = ggml_sycl::mem_handle{};")
+    mutant = _once_in(moved, TXN_SIG, INVENTORY_LOCK,
+                      INVENTORY_LOCK + " ggml_sycl::mem_handle storage = ggml_sycl_device_expert_alloc(device, 64);")
     assert not claim_refill_lock_order(CACHE, mutant)
 
 
@@ -2428,13 +2556,14 @@ def test_mutant_refill_leaves_the_plan_on_the_host_fails():
 
 
 def test_mutant_refill_keeps_the_triplet_in_the_ledger_fails():
-    readmit = "if (refill) { ledger.triplets.pop_back(); ledger.triplet_bytes.pop_back(); } else "
-    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace(readmit, "if (!refill) "))
+    readmit = ("case ggml_sycl_expert_move_kind::REFILL: ledger.triplets.pop_back(); ledger.triplet_bytes.pop_back(); "
+               "break;")
+    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace(readmit, "case ggml_sycl_expert_move_kind::REFILL: break;"))
     assert not claim_refill_flips_back_and_forgets_the_host_copy(mutant)
 
 
 def test_mutant_refill_keeps_the_triplets_bytes_in_the_ledger_fails():
-    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace("ledger.triplet_bytes.pop_back(); } else", "} else"))
+    mutant = _once(SYCL, POP_READMITTED, POP_READMITTED.replace("ledger.triplet_bytes.pop_back(); break;", "break;"))
     assert not claim_refill_flips_back_and_forgets_the_host_copy(mutant)
 
 
@@ -2476,7 +2605,7 @@ def test_templated_inventory_guards_pass():
     assert claim_a_loan_without_host_zones_is_refused(CACHE, sycl)
     assert claim_probe_changes_nothing_and_a_loan_publishes_once(sycl)
     assert claim_exception_publishes_what_was_lent(sycl)
-    assert claim_one_body_two_directions(sycl)
+    assert claim_one_body_every_direction(sycl)
     assert claim_refill_lock_order(CACHE, sycl)
     assert claim_ledger_is_guarded_by_the_inventory_mutex(sycl)
     assert claim_an_unpreparable_triplet_leaves_the_ledger(sycl)
@@ -2568,7 +2697,8 @@ def test_mutant_refill_resets_the_loan_busy_streak_fails():
 
 
 def test_mutant_renamed_refusal_turns_final_into_retried_fails():
-    mutant = _once_in(CACHE, REFILL_SIG, 'refusal = "not lent";', 'refusal = "not on loan";')
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, 'refusal = admit ? "not on host" : "not lent";',
+                      'refusal = admit ? "not on host" : "not on loan";')
     assert not claim_final_refusals_name_the_cache_refusals(mutant, SYCL)
 
 
@@ -2757,69 +2887,110 @@ def test_mutant_refill_runs_before_the_count_is_checked_fails():
     assert not claim_one_decode_graph_admits_one_refill(mutant, COMMON, [mutant, COMMON])
 
 
-def test_copies_are_sized_from_the_entry():
-    assert claim_copies_are_sized_from_the_entry(CACHE, SYCL)
+def test_copies_are_sized_from_the_tensor():
+    assert claim_copies_are_sized_from_the_tensor(CACHE, SYCL)
+
+
+def test_storage_minted_before_the_inventory_lock():
+    assert claim_storage_minted_before_the_inventory_lock(SYCL)
 
 
 def test_mutant_loan_copy_sized_from_dst_size_fails():
-    """The defect (llama.cpp-pu8v): the host copy minted from the plan's dst_size, short of a padded entry."""
-    mutant = _once_in(SYCL, TXN_SIG, HOST_ALLOC, HOST_ALLOC.replace("(device, bytes)", "(device, e->dst_size)"))
-    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+    """The host copy minted from the plan's dst_size, short of a padded entry's expert or long past it."""
+    mutant = _once_in(SYCL, PREP_SIG, HOST_ALLOC, HOST_ALLOC.replace("(device, target.logical_bytes)",
+                                                                     "(device, e->dst_size)"))
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
 
 
 def test_mutant_refill_storage_sized_from_dst_size_fails():
-    mutant = _once_in(SYCL, TXN_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, bytes)", "(device, e->dst_size)"))
-    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, staged)", "(device, e->dst_size)"))
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_refill_device_bytes_from_the_host_copy_fails():
+    """The device size taken from the host copy's bytes rather than staged from them: the padded tail the kernels
+    read past an expert's own bytes is missing."""
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_BYTES, "const size_t staged = target.logical_bytes;")
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_refill_copies_the_host_copy_whole_fails():
+    """The refill copying and sizing from the host copy whole, as it did before every direction sized from the tensor:
+    a host copy minted larger than the expert would grow it on the way back."""
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, "const size_t logical = members[i].logical_bytes;",
+                      "const size_t logical = e.size;")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
+
+
+def test_mutant_refill_runs_the_admit_checks_fails():
+    """The refill's wrapper passing admit true: any pinned host copy, not only a loan's, would be re-admitted."""
+    mutant = _once_in(CACHE, REFILL_SIG, "(members, false, out)", "(members, true, out)")
+    assert not claim_refill_checks_before_copying(mutant)
 
 
 def test_mutant_missing_entry_does_not_stop_fails():
-    """No entry to size from must stop the preparation with the cache's refusal, not mint a zero-byte copy."""
-    mutant = _once_in(SYCL, TXN_SIG, COPY_SIZE_MISSING, "")
-    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+    """No entry to copy from must stop the preparation with the cache's refusal, not mint a copy of nothing."""
+    mutant = _once_in(SYCL, PREP_SIG, SOURCE_CHECK, "")
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
 
 
-def test_mutant_loan_query_sizes_a_retired_entry_fails():
-    mutant = _once_in(CACHE, LOAN_BYTES_SIG, BYTES_RETURN, "return it != entries_.end() ? it->second.size : 0;")
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+def test_mutant_source_query_finds_a_retired_entry_fails():
+    mutant = _once_in(CACHE, SOURCE_SIG, SOURCE_RETURN, "return it != entries_.end();")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
-def test_mutant_refill_query_sizes_a_retired_entry_fails():
-    mutant = _once_in(CACHE, REFILL_BYTES_SIG, BYTES_RETURN, "return it != entries_.end() ? it->second.size : 0;")
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+def test_mutant_source_query_reads_one_side_fails():
+    """Both directions looking up the same key: a refill would ask for the device entry, a loan for the host's."""
+    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? unified_cache_key{", "!to_device ? unified_cache_key{")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
-def test_mutant_refill_query_reads_the_device_entry_fails():
-    mutant = _once_in(CACHE, REFILL_BYTES_SIG, REFILL_BYTES_FIND, LOAN_BYTES_FIND)
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+def test_mutant_source_query_sizes_the_copy_fails():
+    """The query handing back the entry's size, which direct staging may have padded, for the preparation to mint."""
+    mutant = _once_in(CACHE, SOURCE_SIG, SOURCE_RETURN,
+                      "return it != entries_.end() && !it->second.retired && it->second.size != 0;")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
-def test_mutant_copy_minted_before_the_size_query_fails():
-    """The copies minted first and the size asked after: the order the claim pins, witnessed."""
-    query = COPY_SIZE + " " + COPY_SIZE_MISSING
-    mutant = _once_in(SYCL, TXN_SIG, query, "")
-    mutant = _once_in(mutant, TXN_SIG, HOST_ALLOC, HOST_ALLOC + " " + query)
-    assert not claim_copies_are_sized_from_the_entry(CACHE, mutant)
+def test_mutant_copy_minted_before_the_source_query_fails():
+    """The copies minted first and the source asked after: the order the claim pins, witnessed."""
+    mutant = _once_in(SYCL, PREP_SIG, SOURCE_CHECK, "")
+    mutant = _once_in(mutant, PREP_SIG, HOST_ALLOC, HOST_ALLOC + " " + SOURCE_CHECK)
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
 
 
-def test_mutant_loan_query_reads_the_host_entry_fails():
-    mutant = _once_in(CACHE, LOAN_BYTES_SIG, LOAN_BYTES_FIND, REFILL_BYTES_FIND)
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+def test_mutant_transaction_sizes_a_copy_fails():
+    mutant = _once_in(SYCL, TXN_SIG, PREPARE, "(void) ggml_sycl::staged_expert_bytes(GGML_LAYOUT_AOS, "
+                      "GGML_TYPE_Q4_0, 32, 18); " + PREPARE)
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
 
 
 def test_mutant_query_without_the_direct_stage_lock_fails():
-    mutant = _once_in(CACHE, REFILL_BYTES_SIG, SHARED_CACHE_LOCKS,
-                      "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_);")
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+    mutant = _once_in(CACHE, SOURCE_SIG, SHARED_CACHE_LOCKS, "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_);")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
+
+
+def test_mutant_loan_entry_guard_removed_fails():
+    """A device entry shorter than the expert's bytes copied past its end."""
+    mutant = _once_in(CACHE, LOAN_SIG, LOAN_ENTRY_GUARD, "")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
 def test_mutant_loan_size_guard_removed_fails():
     mutant = _once_in(CACHE, LOAN_SIG, LOAN_SIZE_GUARD, "")
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
+
+
+def test_mutant_loan_copies_the_device_entry_whole_fails():
+    """The loan copying the device entry whole, its padded tail with it, into a host copy minted at the expert's bytes:
+    past the copy's end, and an expert that comes back grows."""
+    mutant = _once_in(CACHE, LOAN_SIG, LOAN_COPY_BYTES, "bytes[i] = e.size; device_size[i] = e.size;")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
 def test_mutant_refill_size_guard_removed_fails():
-    mutant = _once_in(CACHE, REFILL_SIG, REFILL_SIZE_GUARD, "")
-    assert not claim_copies_are_sized_from_the_entry(mutant, SYCL)
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, REFILL_SIZE_GUARD, "")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
 # llama.cpp-7999: the lent ledger follows the publication. A plan published under another identity, or no plan, empties

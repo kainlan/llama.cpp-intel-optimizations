@@ -18,6 +18,7 @@
 
 #if GGML_SYCL_DNNL
 
+#    include "dnnl-deterministic.hpp"
 #    include "dnnl-ops.hpp"
 #    include "dnnl.hpp"
 #    include "dnnl_sycl.hpp"
@@ -384,22 +385,23 @@ class DnnlGemmWrapper {
         dnnl::memory::dims c_strides = { static_cast<dnnl_dim_t>(ldc) * n, 1, ldc };
         const auto         c_md      = dnnl::memory::desc(c_dims, ct, c_strides);
 
-        dnnl::primitive_attr primitive_attr;
-        primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
 #    ifdef GGML_SYCL_F16
-        primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
 #    endif
 
         // Get or create cached primitive
         auto &                      cache  = get_dnnl_primitive_cache();
-        const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_in_md, b_in_md, c_md, primitive_attr);
+        const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_in_md, b_in_md, c_md, attr);
 
         if (!cached) {
             // Fallback: create primitive directly if caching fails
             auto         a_mem           = dnnl::memory(a_in_md, eng, const_cast<void *>(a));
             auto         b_mem           = dnnl::memory(b_in_md, eng, const_cast<void *>(b));
-            auto         matmul_pd       = dnnl::matmul::primitive_desc(eng, a_in_md, b_in_md, c_md, primitive_attr);
+            auto         matmul_pd       = dnnl::matmul::primitive_desc(eng, a_in_md, b_in_md, c_md, attr);
             auto         c_mem           = dnnl::memory(matmul_pd.dst_desc(), eng, c);
             auto         scratchpad_md   = matmul_pd.scratchpad_desc();
             const size_t scratchpad_size = scratchpad_md.get_size();
@@ -583,6 +585,7 @@ class DnnlGemmWrapper {
         const dnnl::memory::desc s_md({ groups, n }, dt::f16, { n, 1 });
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         const int mask = (1 << 0) | (1 << 1);
         attr.set_scales(DNNL_ARG_WEIGHTS, mask, { group_size, 1 }, dt::f16);
@@ -721,6 +724,7 @@ class DnnlGemmWrapper {
 
     static dnnl::primitive_attr woq_mxfp4_2d_attr(int64_t group_size) {
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         dnnl::memory::dims group_dims = { group_size, 1 };
         attr.set_scales(DNNL_ARG_WEIGHTS, woq_mxfp4_2d_scale_mask, group_dims, dt::e8m0);
@@ -785,6 +789,7 @@ class DnnlGemmWrapper {
         const dnnl::memory::desc b_any_md({ k, n }, dt::s4, tag::any);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         const int   mask       = (1 << 0) | (1 << 1);
         dnnl_dims_t group_dims = { group_size, 1 };
@@ -1009,6 +1014,7 @@ class DnnlGemmWrapper {
         const auto c_md = dnnl::memory::desc(c_dims, ct, c_strides);
 
         dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         // Handle alpha and beta via post-ops if not 1.0/0.0
@@ -1346,6 +1352,7 @@ class DnnlGemmWrapper {
 
         if (pp_woq_3d_enabled && tri_state[dev_id].load(std::memory_order_acquire) >= 0) {
             dnnl::primitive_attr attr3d;
+            ggml_sycl_dnnl_attr_set_reproducible(attr3d);
             attr3d.set_scratchpad_mode(dnnl::scratchpad_mode::user);
             const int          mask3d       = (1 << 0) | (1 << 1) | (1 << 2);
             dnnl::memory::dims group_dims3d = { 1, group_size, 1 };
