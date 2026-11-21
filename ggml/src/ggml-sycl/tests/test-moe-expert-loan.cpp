@@ -65,12 +65,14 @@
 //                           six entries' bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
 //                           to a device entry IN_PROGRESS behind its copy, and the third stays lent until the next
 //                           decode boundary re-admits it. The teardown counts read 3/3.
-//   loan_sizes_its_copies_from_the_entry
-//                           llama.cpp-pu8v: each device entry 72 bytes past the plan's dst_size, as S1-PRELOAD pads a
-//                           Q4_0 expert whose rows are not a multiple of MATRIX_ROW_PADDING. A host copy minted at the
-//                           plan's size is refused "host storage too small" and moves nothing; then the loan lends two
-//                           triplets, each host copy the entry's size with its zero tail, reporting exactly the six
-//                           entries' sizes freed, and one decode boundary re-admits both, reporting the same bytes.
+//   loan_and_refill_size_from_the_tensor
+//                           Each device entry staged as a Q4_0 expert of 640 columns, 216 bytes past the tensor's
+//                           bytes per expert. Host storage short of those bytes is refused "host storage too small",
+//                           and an expert longer than its entry "device entry size", each moving nothing. The loan
+//                           lends two triplets, each host copy and record the tensor's bytes, reporting the six
+//                           entries' whole sizes freed. Over a poisoned WEIGHT zone, one decode boundary re-admits
+//                           both at the staged size, records over the tensor's bytes, each tail in poisoned storage
+//                           reading zero.
 //   loan_and_refill_stop_on_a_missing_entry
 //                           llama.cpp-pu8v: a one-triplet loan whose down member has no device entry stops "not
 //                           resident" (its refusal WARNed once): nothing lent, published or re-posted. After a
@@ -234,7 +236,7 @@ int main() {
     ok &= run_case("refill_runs_once_per_decode_graph", ggml_sycl::test_expert_refill_runs_once_per_decode_graph);
     ok &= run_case("refill_drops_an_unpreparable_triplet", ggml_sycl::test_expert_refill_drops_an_unpreparable_triplet);
     ok &= run_case("refill_moves_two_triplets_per_call", ggml_sycl::test_expert_refill_moves_two_triplets_per_call);
-    ok &= run_case("loan_sizes_its_copies_from_the_entry", ggml_sycl::test_expert_loan_sizes_its_copies_from_the_entry);
+    ok &= run_case("loan_and_refill_size_from_the_tensor", ggml_sycl::test_expert_loan_and_refill_size_from_the_tensor);
     ok &= run_case("loan_and_refill_stop_on_a_missing_entry",
                    ggml_sycl::test_expert_loan_and_refill_stop_on_a_missing_entry);
     ok &= run_case("loan_reclaims_pointer_table_leases", ggml_sycl::test_expert_loan_reclaims_pointer_table_leases);

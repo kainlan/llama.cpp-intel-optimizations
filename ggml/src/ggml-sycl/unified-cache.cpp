@@ -11405,22 +11405,16 @@ void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exa
     }
 }
 
-// llama.cpp-pu8v: one source for each copy's size, the entry the copy will hold. A copy minted from the plan's dst_size
-// is short of an entry whose quantized tail direct staging padded, and the transaction refuses it.
-size_t unified_cache::loan_copy_bytes(ggml_sycl_cache_id key) const {
+// Presence only: the transaction sizes each copy from the member's tensor, so no entry's size, which direct staging may
+// have padded, decides how much is minted or moved.
+bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool to_device) const {
     std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
     std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
     std::lock(direct_lock, cache_lock);
-    const auto it = entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
-    return it != entries_.end() && !it->second.retired ? it->second.size : 0;
-}
-
-size_t unified_cache::refill_copy_bytes(ggml_sycl_cache_id key) const {
-    std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
-    std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
-    std::lock(direct_lock, cache_lock);
-    const auto it = entries_.find({ cache_entry_type::MOE_EXPERT, key, -1, -1 });
-    return it != entries_.end() && !it->second.retired ? it->second.size : 0;
+    const auto it =
+        entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 } :
+                                  make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    return it != entries_.end() && !it->second.retired;
 }
 
 // llama.cpp-mwmr, c-tdra: lend one resident expert triplet to the host for a prompt phase. The order keeps every
@@ -11429,8 +11423,8 @@ size_t unified_cache::refill_copy_bytes(ggml_sycl_cache_id key) const {
 // that reads it. The device entry is withdrawn exactly, its host copy is published behind the copy event, and only
 // then does the transaction drop the lease that held the withdrawn entry in place. Nothing here waits or asks an
 // event's status.
-bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out) {
-    out = expert_loan_record{};
+bool unified_cache::loan_expert_triplet(const expert_move_member members[3], expert_move_record & out) {
+    out = expert_move_record{};
     if (!members) {
         out.reason = "invalid arguments";
         return false;
@@ -11455,14 +11449,16 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     mem_handle               src_owner[3];
     uint64_t                 src_control[3] = { 0, 0, 0 };
     size_t                   bytes[3]       = { 0, 0, 0 };
+    size_t                   device_size[3] = { 0, 0, 0 };
     std::vector<sycl::event> deps[3];
     alloc_metadata           host_md[3];
     const char *             refusal = nullptr;
     for (int i = 0; i < 3 && !refusal; ++i) {
-        const expert_loan_member & m = members[i];
-        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key)) {
+        const expert_move_member & m = members[i];
+        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key) ||
+            m.logical_bytes == 0) {
             refusal = "invalid member";
-        } else if (!m.host_owner.valid() || !m.host_owner.owner_metadata(&host_md[i]) ||
+        } else if (!m.owner.valid() || !m.owner.owner_metadata(&host_md[i]) ||
                    host_md[i].tier != alloc_tier::HOST_PINNED) {
             refusal = "host storage not pinned";
         }
@@ -11510,7 +11506,14 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
                 refusal = "storage still referenced";
                 break;
             }
-            if (host_md[i].size < e.size) {
+            // The loan moves the expert's own bytes, its tensor's bytes per expert, from offset 0 of the entry: a
+            // padded entry's tail stays on the device, so an expert that goes to the host and back does not grow. An
+            // entry shorter than them is not this expert's whole weight.
+            if (e.size < members[i].logical_bytes) {
+                refusal = "device entry size";
+                break;
+            }
+            if (host_md[i].size < members[i].logical_bytes) {
                 refusal = "host storage too small";
                 break;
             }
@@ -11528,7 +11531,8 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
             }
             src_owner[i]   = e.direct_alloc_owner;
             src_control[i] = e.direct_alloc_owner.owner_control_id();
-            bytes[i]       = e.size;
+            bytes[i]       = members[i].logical_bytes;
+            device_size[i] = e.size;
             if (e.has_write_event) {
                 deps[i].push_back(e.last_write_event);
             }
@@ -11548,12 +11552,12 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     try {
         sycl::queue & dq = get_dma_queue();
         for (int i = 0; i < 3; ++i) {
-            out.copy_events[i] = mem_copy_async(members[i].host_owner, src_owner[i], bytes[i], dq, deps[i]);
+            out.copy_events[i] = mem_copy_async(members[i].owner, src_owner[i], bytes[i], dq, deps[i]);
         }
     } catch (const ggml_sycl_fallback_error &) {
         throw;
     } catch (...) {
-        out        = expert_loan_record{};
+        out        = expert_move_record{};
         out.reason = "copy submit failed";
         return false;
     }
@@ -11598,7 +11602,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         }
     }
     if (refusal) {
-        out        = expert_loan_record{};
+        out        = expert_move_record{};
         out.reason = refusal;
         return false;
     }
@@ -11608,18 +11612,18 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
     int                            registered[3] = { 0, 0, 0 };
     bool                           failed        = false;
     for (int i = 0; i < 3 && !failed; ++i) {
-        const expert_loan_member & m        = members[i];
-        void *                     host_ptr = m.host_owner.resolve().ptr;
+        const expert_move_member & m        = members[i];
+        void *                     host_ptr = m.owner.resolve().ptr;
         for (size_t k = 0; k < m.host_keys.size(); ++k) {
             // The registration undoes and reports its own failures. Anything it throws (the typed wrapper's owner
             // copy, which comes before anything is registered, is the one allocation it does not catch) fails the
             // registration like a refusal, and the rollback below runs, with the device entries already withdrawn.
             bool published = false;
             try {
-                published = host_ptr && register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
-                                                                   k == 0 ? &out.host_handles[i] : nullptr,
-                                                                   m.host_owner, &out.copy_events[i],
-                                                                   /*replace_existing=*/false);
+                published = host_ptr &&
+                            register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
+                                                       k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i],
+                                                       /*replace_existing=*/false);
             } catch (const ggml_sycl_fallback_error &) {
                 // G-CATCH requires this clause before catch (...). Nothing in a host registration throws the op
                 // fallback (dispatch control flow), so no loan is stranded by it (llama.cpp-mwmr).
@@ -11649,7 +11653,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
             std::lock(direct_lock, cache_lock);
             size_t r = 0;
             for (int i = 0; i < 3; ++i) {
-                const uint64_t host_control = members[i].host_owner.owner_control_id();
+                const uint64_t host_control = members[i].owner.owner_control_id();
                 for (int k = 0; k < registered[i]; ++k) {
                     const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 };
                     const auto              host = entries_.find(host_key);
@@ -11668,7 +11672,7 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         for (std::shared_ptr<mem_handle> & lease : held) {
             lease.reset();
         }
-        out        = expert_loan_record{};
+        out        = expert_move_record{};
         out.reason = "host registration failed";
         return false;
     }
@@ -11684,34 +11688,36 @@ bool unified_cache::loan_expert_triplet(const expert_loan_member members[3], exp
         }
     }
 
+    // The device storage the entries give back is their whole size, the padded tail with it, once the deferred-free
+    // pass reaps each entry.
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_freed += bytes[i];
+        out.device_bytes += device_size[i];
     }
     return true;
 }
 
-bool unified_cache::refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out) {
+bool unified_cache::refill_lent_triplet(const expert_move_member members[3], expert_move_record & out) {
     return copy_host_triplet_to_device(members, /*admit=*/false, out);
 }
 
-bool unified_cache::admit_host_triplet(const expert_refill_member members[3], expert_refill_record & out) {
+bool unified_cache::admit_host_triplet(const expert_move_member members[3], expert_move_record & out) {
     return copy_host_triplet_to_device(members, /*admit=*/true, out);
 }
 
 // Move one triplet from its host copies to the device, loan_expert_triplet() inverted; a refill takes
 // back a loan's host copy, an admit any pinned host copy in a host zone. The copies go first, from each host copy's
 // typed pinned owner into the caller's device owner, so the copy path takes the direct DMA and both owners stay
-// retained until it completes; an admit's storage is longer by the padded tail, which is zero-filled behind the copy.
+// retained until it completes; the device storage is longer by the padded tail, which is zero-filled behind the copy.
 // Each device entry is then published behind its last write and takes over the direct mirror and the id mapping from
 // the host copy, which is withdrawn exactly; a host copy still leased (an extra's record, a ring copy reading it) stays
 // retired until its last lease goes, and its pinned storage until the copies reading it complete. Nothing here waits
 // or asks an event's status.
-bool unified_cache::copy_host_triplet_to_device(const expert_refill_member members[3],
-                                                bool                       admit,
-                                                expert_refill_record &     out) {
-    out = expert_refill_record{};
+bool unified_cache::copy_host_triplet_to_device(const expert_move_member members[3],
+                                                bool                     admit,
+                                                expert_move_record &     out) {
+    out = expert_move_record{};
     if (!members) {
         out.reason = "invalid arguments";
         return false;
@@ -11739,12 +11745,13 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
     std::vector<sycl::event> deps[3];
     const char *             refusal = nullptr;
     for (int i = 0; i < 3 && !refusal; ++i) {
-        const expert_refill_member & m = members[i];
-        alloc_metadata               md{};
-        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key)) {
+        const expert_move_member & m = members[i];
+        alloc_metadata             md{};
+        if (!m.key.valid || m.host_keys.empty() || !detail::cache_id_equal(m.host_keys.front(), m.key) ||
+            m.logical_bytes == 0) {
             refusal = "invalid member";
-        } else if (!m.device_owner.valid() || !m.device_owner.owner_metadata(&md) || !md.ptr ||
-                   md.tier != alloc_tier::DEVICE_VRAM || md.cache_backing || md.device != cache_device) {
+        } else if (!m.owner.valid() || !m.owner.owner_metadata(&md) || !md.ptr || md.tier != alloc_tier::DEVICE_VRAM ||
+                   md.cache_backing || md.device != cache_device) {
             refusal = "device storage not owned";
         } else {
             device_ptr[i]  = md.ptr;
@@ -11784,8 +11791,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
             // at, which is the entry's for a loan's copy and for a preloaded one, so an owner wider than its entry may
             // hold another expert's bytes (expert 0 of a bulk allocation starts at the owner's base), and retiring the
             // entry would not give back the zone bytes the admit counts as moved. A refill keeps the loan's own bound:
-            // a loan refuses only a host owner smaller than the entry it copies and registers its copy at that entry's
-            // size, so nothing makes a lent copy's owner exactly its entry, and a refill reads only the entry's bytes.
+            // a loan refuses only a host owner smaller than the bytes it copies and registers its copy at those bytes,
+            // so nothing makes a lent copy's owner exactly its entry, and a refill reads only the entry's bytes.
             alloc_metadata md{};
             if (e.location != cache_location::HOST_PINNED || !e.host_resident ||
                 !e.direct_alloc_owner.owner_metadata(&md) || md.ptr != e.device_ptr ||
@@ -11808,19 +11815,18 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
                 refusal = "device entry exists";
                 break;
             }
-            // A refill copies the lent copy whole. An admit copies the expert's own bytes, its tensor's bytes per
-            // expert, from offset 0 of a host copy that holds at least them: a padded copy's tail is never read, so an
-            // expert that goes to the host and back does not grow, and its record keeps resolving.
-            const size_t logical = admit ? members[i].logical_bytes : e.size;
+            // Both directions copy the expert's own bytes, its tensor's bytes per expert, from offset 0 of a host copy
+            // that holds at least them: a padded copy's tail is never read, so an expert that goes to the host and
+            // back does not grow, and its record keeps resolving.
+            const size_t logical = members[i].logical_bytes;
             if (e.size < logical) {
                 refusal = "host copy size";
                 break;
             }
-            // A refill's storage is exactly the lent copy's size: a loan that later lends this entry again requires
-            // its owner to be its whole allocation. An admit's is the size direct staging gives the expert, its bytes
-            // and the padded tail the copy below zero-fills, asked of the layout; never less than its bytes.
-            const size_t staged =
-                admit ? staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical) : e.size;
+            // The storage is the size direct staging gives the expert, its bytes and the padded tail the copy below
+            // zero-fills, asked of the layout; never less than its bytes. The entry is published at that size, so it
+            // owns its whole allocation, which a loan that later lends it again requires.
+            const size_t staged = staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical);
             if (device_size[i] != staged || staged < logical) {
                 refusal = "device storage size";
                 break;
@@ -11847,11 +11853,11 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
     try {
         sycl::queue & bq = get_bcs_queue();
         for (int i = 0; i < 3; ++i) {
-            out.copy_events[i] = mem_copy_async(members[i].device_owner, src_owner[i], bytes[i], bq, deps[i]);
-            // An admit's tail past the expert's bytes reads as zero, as direct staging leaves it. The fill runs behind
-            // the copy on the same queue, and its event becomes the entry's ready event and last write.
+            out.copy_events[i] = mem_copy_async(members[i].owner, src_owner[i], bytes[i], bq, deps[i]);
+            // The tail past the expert's bytes reads as zero, as direct staging leaves it. The fill runs behind the
+            // copy on the same queue, and its event becomes the entry's ready event and last write.
             if (device_size[i] > bytes[i]) {
-                out.copy_events[i] = mem_fill_async(members[i].device_owner, bytes[i], 0, device_size[i] - bytes[i], bq,
+                out.copy_events[i] = mem_fill_async(members[i].owner, bytes[i], 0, device_size[i] - bytes[i], bq,
                                                     { out.copy_events[i] });
             }
         }
@@ -11860,7 +11866,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
         // control flow), so no refill is stranded by it (llama.cpp-sif1).
         throw;
     } catch (...) {
-        out        = expert_refill_record{};
+        out        = expert_move_record{};
         out.reason = "copy submit failed";
         return false;
     }
@@ -11889,7 +11895,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
         entry.location              = cache_location::DEVICE;
         entry.owner_device          = cache_device;
         entry.pool_allocated        = false;
-        entry.direct_alloc_owner    = members[i].device_owner;
+        entry.direct_alloc_owner    = members[i].owner;
         entry.last_write_event      = out.copy_events[i];
         entry.has_write_event       = true;
         stamp_pending_owner(entry, load_effect);
@@ -11950,8 +11956,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
                     stored.in_use_count.fetch_add(1);
                     stored.debug_last_lease_site = "expert_refill/out_handle";
                     stored.record_lease_event(true, "expert_refill/out_handle");
-                    out.device_handles[i] = mem_handle::from_weight_lease_locked(
-                        device_key, cache_device, stored.device_ptr, stored.layout, true, &stored);
+                    out.handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr,
+                                                                          stored.layout, true, &stored);
                 }
             } catch (const ggml_sycl_fallback_error &) {
                 // G-CATCH requires this clause before catch (...). Nothing here throws the op fallback (dispatch
@@ -12003,10 +12009,10 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
     }
     host_nodes.clear();
     if (refusal) {
-        for (mem_handle & lease : out.device_handles) {
+        for (mem_handle & lease : out.handles) {
             lease = {};
         }
-        out        = expert_refill_record{};
+        out        = expert_move_record{};
         out.reason = refusal;
         return false;
     }
@@ -12014,7 +12020,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_refill_member membe
     out.accepted = true;
     out.reason   = "OK";
     for (int i = 0; i < 3; ++i) {
-        out.bytes_readmitted += device_size[i];
+        out.device_bytes += device_size[i];
     }
     return true;
 }

@@ -3737,67 +3737,48 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
            status == expert_retire_status::NOT_FOUND;
 }
 
-// One member of a resident expert triplet lent to the host for a prompt phase (llama.cpp-mwmr). key is the cache id the
-// member's AOS device entry was direct-staged under. host_keys are the ids the host copy is registered under, the set
-// S1-PRELOAD registers a host-planned expert under; the first must equal key, and its lease is the one returned.
-// host_owner is pinned host storage minted owner-first (unified_allocate_owner) by the caller before it took any listed
-// lock, so no allocation runs under one; its size must hold the device entry's (loan_copy_bytes()).
-struct expert_loan_member {
+// One member of an expert triplet moved between the device and pinned host storage: to the host by
+// loan_expert_triplet(), lent for a prompt phase, or back to the device by refill_lent_triplet() or
+// admit_host_triplet(). key is the cache id the member's AOS device entry is direct-staged under and its host copy is
+// published under. host_keys are every id the host copy is published under, the set S1-PRELOAD registers a host-planned
+// expert under, key first; the lease on key's entry is the one returned. owner is the destination storage, minted
+// owner-first by the caller before it took any listed lock, so no allocation for the bytes runs under one: pinned host
+// storage that holds logical_bytes for a move to the host, and WEIGHT zone storage on the device for a move to the
+// device, exactly staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes.
+// type, ncols and logical_bytes are the weight's type, row width and bytes per expert (nb[2]), which the caller
+// resolves from its tensor. An expert's size is a fact of its tensor, never of a cache entry, whose storage may be
+// padded: each direction copies logical_bytes from offset 0 of its source, so a padded device entry's tail never
+// reaches the host, and a host copy's tail never reaches the device, where the tail is zero-filled instead.
+struct expert_move_member {
     expert_placement_key            placement;
     ggml_sycl_cache_id              key;
     std::vector<ggml_sycl_cache_id> host_keys;
-    mem_handle                      host_owner;
-};
-
-// What one loan did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
-// loan carries the device storage it returns, the three device entries' sizes (llama.cpp-pu8v: an entry can exceed the
-// plan's charge by the quantized tail direct staging pads), a lease on each member's host entry (whose bytes are valid
-// once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
-// status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
-// leases are gone and behind the copy, which is the entry's last write. device_keys[i] is the key that device entry
-// was retired under: the caller drops every view it holds on the entry by that key, since a retired entry refuses the
-// resolve a view would otherwise be matched by once the cache generation moves (llama.cpp-6aj4).
-struct expert_loan_record {
-    bool                 accepted    = false;
-    const char *         reason      = "none";
-    size_t               bytes_freed = 0;
-    mem_handle           host_handles[3];
-    sycl::event          copy_events[3];
-    expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
-                                              expert_retire_status::INVALID };
-    unified_cache_key    device_keys[3]   = {};
-};
-
-// One member of a triplet moved from its host copy to the device: a lent triplet re-admitted after a prompt phase, the
-// loan's member inverted, or a host triplet admitted by name. key is the cache id the member's AOS device entry is
-// staged under and its host copy is published under; host_keys are every id the host copy is published under, key
-// first. device_owner is the member's device storage, minted owner-first by the caller from the WEIGHT zone before it
-// took any listed lock, so no allocation for the bytes runs under one. A refill's must be the host copy's size
-// (refill_copy_bytes()), and a refill reads none of the three fields below. An admit's must be the staged size,
-// staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes: the weight's type,
-// row width and bytes per expert (nb[2]) the caller resolved from its tensor. The expert's size is a fact of its
-// tensor, never of the host copy, which a padded copy exceeds; the admit copies logical_bytes from offset 0 of the host
-// copy and refuses one that holds fewer.
-struct expert_refill_member {
-    expert_placement_key            placement;
-    ggml_sycl_cache_id              key;
-    std::vector<ggml_sycl_cache_id> host_keys;
-    mem_handle                      device_owner;
+    mem_handle                      owner;
     ggml_type                       type          = GGML_TYPE_COUNT;
     int64_t                         ncols         = 0;
     size_t                          logical_bytes = 0;
 };
 
-// What one refill or admit did. A refusal changes nothing: reason names why and every other field keeps its default.
-// An accepted one carries the device storage its entries take, and a lease on each member's new device entry, whose
-// bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its last write:
-// the copy, or the zero fill of an admit's padded tail behind it).
-struct expert_refill_record {
-    bool         accepted         = false;
-    const char * reason           = "none";
-    size_t       bytes_readmitted = 0;
-    mem_handle   device_handles[3];
-    sycl::event  copy_events[3];
+// What one move of a triplet did. A refusal changes nothing: reason names why and every other field keeps its
+// default. An accepted move carries device_bytes, the device storage its three device entries gave back (a move to
+// the host: the entries' sizes, which can exceed the plan's charge by the quantized tail direct staging pads) or took
+// (a move to the device: the staged sizes), and a lease on each member's new entry in handles[i], whose bytes are
+// valid once copy_events[i] completes; the entry carries that event as its ready event, and on the device as its last
+// write too, the copy or the zero fill of the padded tail behind it. A move to the host also reports each device
+// entry's retire status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after
+// the entry's leases are gone and behind the copy, which is the entry's last write, and in device_keys[i] the key the
+// device entry was retired under: the caller drops every view it holds on the entry by that key, since a retired
+// entry refuses the resolve a view would otherwise be matched by once the cache generation moves. A move to the
+// device leaves both at their defaults.
+struct expert_move_record {
+    bool                 accepted     = false;
+    const char *         reason       = "none";
+    size_t               device_bytes = 0;
+    mem_handle           handles[3];
+    sycl::event          copy_events[3];
+    expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
+                                              expert_retire_status::INVALID };
+    unified_cache_key    device_keys[3]   = {};
 };
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -4543,60 +4524,61 @@ class unified_cache {
                                                    ggml_layout_mode   layout,
                                                    const char *       reason = nullptr);
 
-    // Lend one resident expert triplet to the host (llama.cpp-mwmr). Each member's device entry must own its storage
-    // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
-    // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
-    // the host registration would refuse for is checked too, and a host id that already has an entry, idle or not,
-    // refuses the triplet as "host entry exists": the registration never replaces one, since a failed loan could not
-    // put a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
-    // behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
-    // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
-    // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned
-    // carrying its copy as the ready event. A registration that fails anyway puts the device entries back. Nothing
-    // here waits and nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of
-    // the device lease, and flips the plan.
-    bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
+    // Lend one resident expert triplet to the host. Each member's device entry must own its storage exactly: an AOS
+    // entry on the device, since only that layout keeps an expert's bytes contiguous from offset 0, not retired, whose
+    // direct_alloc_owner is its whole allocation and not a view into a bulk tensor's shared one, not cache backing,
+    // and held by nothing but the entry. What the host registration would refuse for is checked too, and a host id
+    // that already has an entry, idle or not, refuses the triplet as "host entry exists": the registration never
+    // replaces one, since a failed loan could not put a replaced entry back. One member that fails refuses the
+    // triplet with a reason and leaves no state behind. Each member's device entry must hold its logical_bytes
+    // ("device entry size" otherwise) and its owner must hold them too ("host storage too small"). Otherwise the
+    // three D2H copies go on the DMA queue, each moving the member's logical_bytes from offset 0 of its device entry,
+    // so a padded entry's tail stays behind, and each retaining its two owners until it completes; each device
+    // entry's last write becomes its copy, so its storage is freed behind the copy; each device entry is retired
+    // exactly; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy as
+    // the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
+    // entries' whole size, which the deferred-free pass gives back once each entry is reaped. Nothing here waits and
+    // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the device
+    // lease, and flips the plan.
+    bool loan_expert_triplet(const expert_move_member members[3], expert_move_record & out);
 
-    // The size each direction's copy must be minted at (llama.cpp-pu8v): the size of the entry it will hold, which
-    // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
-    // a loan copies whole; refill_copy_bytes() is the host copy published under key, a loan's, which a refill's device
-    // storage must equal. An admit asks it only whether there is a host copy, since it sizes from the tensor. Each can
-    // exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to MATRIX_ROW_PADDING columns,
-    // which dst_size leaves out and the plan's VRAM charge counts. Read under direct_stage_mutex_ and rw_mutex_,
-    // shared; the transaction checks again under its own locks, so an entry that changes in between is refused there.
-    // 0 when there is no such entry, or it is retired.
-    size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
-    size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
+    // Whether the cache holds the entry a move copies from, not retired: for a move to the host, the AOS device entry
+    // direct staging filed under key; for a move to the device, the host copy published under key. The transaction
+    // asks before it mints a member's storage, so a missing source stops it with the refusal the cache would give.
+    // Only presence is asked: the storage is sized from the member's tensor, never from an entry, which may be padded.
+    // Read under direct_stage_mutex_ and rw_mutex_, shared; the move checks again under its own locks, so an entry
+    // that changes in between is refused there.
+    bool has_expert_source(ggml_sycl_cache_id key, bool to_device) const;
 
-    // Re-admit one lent triplet to the device (llama.cpp-sif1), the inverse of loan_expert_triplet(). Each member's
-    // host copy must be the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is
-    // its whole pinned storage, which the direct mirror and the id mapping both name, with no device entry under the
-    // member's direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry
-    // exists", so a later boundary retries). One member that fails refuses the triplet with a reason and leaves no
-    // state behind. Otherwise the three H2D copies go on the BCS queue behind the host copy's writes, each retaining
-    // its two owners until it completes, so the pinned storage outlives the read whatever happens to its entry. Under
-    // direct_stage_mutex_ and rw_mutex_, all three or none, each device entry is published IN_PROGRESS behind its copy
-    // and takes over the direct mirror and the id mapping, then each host copy is retired exactly under every host id
-    // still naming its storage; what follows the device entries' insertion allocates nothing. Nothing here waits and
-    // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the host lease,
-    // remembers the device lease, and flips the plan.
-    bool refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out);
+    // Re-admit one lent triplet to the device, the inverse of loan_expert_triplet(). Each member's host copy must be
+    // the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is its whole pinned
+    // storage, which the direct mirror and the id mapping both name, with no device entry under the member's
+    // direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry exists",
+    // so a later boundary retries). A missing host copy refuses as "not lent", and one holding fewer than the member's
+    // logical_bytes as "host copy size". Each member's owner must be exactly staged_expert_bytes() of the host copy's
+    // layout and the member's type, ncols and logical_bytes, never less than logical_bytes ("device storage size").
+    // One member that fails refuses the triplet with a reason and leaves no state behind. Otherwise the three H2D
+    // copies go on the BCS queue behind the host copy's writes, each moving logical_bytes from offset 0 of the host
+    // copy and retaining its two owners until it completes, so the pinned storage outlives the read whatever happens to
+    // its entry; the tail past them is zero-filled on the same queue behind the copy, so the device entry, sized as its
+    // storage and published behind the fill, reads as direct staging leaves an expert. Under direct_stage_mutex_ and
+    // rw_mutex_, all three or none, each device entry is published IN_PROGRESS behind its last write and takes over
+    // the direct mirror and the id mapping, then each host copy is retired exactly under every host id still naming
+    // its storage; what follows the device entries' insertion allocates nothing. Nothing here waits and nothing asks
+    // an event's status. The caller holds the inventory mutex, forgets its own record of the host lease, remembers the
+    // device lease, and flips the plan.
+    bool refill_lent_triplet(const expert_move_member members[3], expert_move_record & out);
 
     // Admit one host triplet to the device by name: refill_lent_triplet() with any pinned host copy as the source, not
-    // only a loan's, and the device storage at the staged size. Each member's host copy must be a live AOS entry under
-    // key whose direct_alloc_owner is its whole pinned storage, the same base and the same size, so retiring the entry
-    // gives back exactly its bytes, and a slice of a host zone, the provenance the copy path proves host USM by, so the
-    // copy is a direct DMA. Any other is refused "host copy not pinned": an owner wider than its entry, or a copy that
-    // is no host-zone slice, such as one served in place from a file mapping, which would bounce through a synchronous
-    // staged copy. A missing host copy refuses as "not on host", and one holding fewer than the member's logical_bytes
-    // as "host copy size". Each member's device_owner must be exactly staged_expert_bytes() of the host copy's layout
-    // and the member's type, ncols and logical_bytes, never less than logical_bytes ("device storage size"). The copy
-    // moves logical_bytes from offset 0 of the host copy, so a padded copy's tail is never read; the tail past them is
-    // zero-filled on the same queue behind the copy, so the device entry, sized as its storage and published behind the
-    // fill, reads as direct staging leaves an expert. The whole host entry is retired, its storage with it. The rest is
-    // the refill's: the same checks before anything is copied, all three or none, and nothing waits or asks an event's
+    // only a loan's. Each member's host copy must be a live AOS entry under key whose direct_alloc_owner is its whole
+    // pinned storage, the same base and the same size, so retiring the entry gives back exactly its bytes, and a slice
+    // of a host zone, the provenance the copy path proves host USM by, so the copy is a direct DMA. Any other is
+    // refused "host copy not pinned": an owner wider than its entry, or a copy that is no host-zone slice, such as one
+    // served in place from a file mapping, which would bounce through a synchronous staged copy. A missing host copy
+    // refuses as "not on host". The whole host entry is retired, its storage with it. The rest is the refill's: the
+    // sizes, the same checks before anything is copied, all three or none, and nothing waits or asks an event's
     // status.
-    bool admit_host_triplet(const expert_refill_member members[3], expert_refill_record & out);
+    bool admit_host_triplet(const expert_move_member members[3], expert_move_record & out);
 
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
@@ -7504,11 +7486,10 @@ class unified_cache {
     // restore_expert_entry_at_locked(). Allocates nothing. Callers hold direct_stage_mutex_ and rw_mutex_.
     expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes * released);
 
-    // The body refill_lent_triplet() and admit_host_triplet() share: one set of checks, copies and publication, so the
-    // two cannot drift apart. `admit` widens the source from a loan's host copy to any pinned host copy in a host zone
-    // that holds the member's logical_bytes, copies only those, and sizes the device storage at their staged size,
-    // whose tail the copy zero-fills; it never loosens the refill.
-    bool copy_host_triplet_to_device(const expert_refill_member members[3], bool admit, expert_refill_record & out);
+    // The body refill_lent_triplet() and admit_host_triplet() share: one set of checks, sizes, copies and publication,
+    // so the two cannot drift apart. `admit` widens the source from a loan's host copy to any pinned host copy in a
+    // host zone, sized exactly as its entry; it never loosens the refill.
+    bool copy_host_triplet_to_device(const expert_move_member members[3], bool admit, expert_move_record & out);
 
     // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of
     // the retired entries, and each node retire took re-inserted unless another entry has published its own under the

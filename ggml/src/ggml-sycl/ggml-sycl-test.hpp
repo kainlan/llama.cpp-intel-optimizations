@@ -641,10 +641,11 @@ std::string test_expert_refill_cancelled_by_a_loan();
 std::string test_expert_refill_runs_once_per_decode_graph();
 std::string test_expert_refill_drops_an_unpreparable_triplet();
 std::string test_expert_refill_moves_two_triplets_per_call();
-// The loan and the refill size their copies from the cache entry, which can exceed the plan's dst_size by the tail
-// S1-PRELOAD pads, and a host copy smaller than its entry is still refused (llama.cpp-pu8v).
-std::string test_expert_loan_sizes_its_copies_from_the_entry();
-// With no entry to size a copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
+// The loan and the refill size their copies from the tensor, never from a padded cache entry: the loan's host copy
+// holds the expert's own bytes, and the refill's device copy is the staged size with its tail zero-filled. Host
+// storage that cannot hold the bytes, and an expert longer than its device entry, are refused.
+std::string test_expert_loan_and_refill_size_from_the_tensor();
+// With no entry to copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
 // ledger's back, and either moves and publishes nothing (llama.cpp-pu8v).
 std::string test_expert_loan_and_refill_stop_on_a_missing_entry();
 // A loan leaves no lease on a withdrawn device entry in the pointer tables a prompt graph's preload built, and marks
