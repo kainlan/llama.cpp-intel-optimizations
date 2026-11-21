@@ -931,6 +931,14 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-token-start-stamps-source.py --self-test)
     set_tests_properties(test-sycl-token-start-stamps-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The decode prologue memo of a graph llama reuses (GGML_SYCL_GRAPH_PROLOGUE_MEMO): its key, the uid-0 rule,
+    # mode 0 as the full walks, the prestage replay and its failure handling, every invalidation point, the verify
+    # comparison and the teardown line. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-graph-prologue-memo-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-prologue-memo-source.py --self-test)
+    set_tests_properties(test-sycl-graph-prologue-memo-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # CPU expert job joins go on the cache's join-only queue behind GGML_SYCL_MOE_JOIN_QUEUE, after the latest
     # recorded host task, and the scatter still depends on them (llama.cpp-wfsl). Run WITH --self-test so each
     # pin is proven to catch its mutant.
