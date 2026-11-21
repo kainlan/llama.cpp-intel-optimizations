@@ -304,7 +304,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         # anywhere else in the loop body (pre-filter or after the arms are combined) would skip Route A's nodes.
         results["the walk's pre-filter does not drop a node on precision"] = \
             dq_walk.count("op_params[0]") == 1 and \
-            re.search(r"const bool\s+prec_default\s*=\s*node->op_params\[0\]\s*==\s*GGML_PREC_DEFAULT;", dq_walk) is not None
+            re.search(r"const bool\s+prec_default\s*=\s*node->op_params\[0\]\s*==\s*GGML_PREC_UNDEFINED;", dq_walk) is not None
     results["the walk combines the two arms through the pure verdict"] = "zone_walk_f16_node_draws(" in dq_walk
 
     # ---- the walk asks the router, the admission and the supplies question once per node ----
@@ -657,11 +657,11 @@ if args.self_test and not failed:
          (mutate_in_func(backend, walk_sig, "&pp_candidate)", "nullptr)"), cache, cache_hpp)),
         ("walk filters on precision again", "the walk's pre-filter does not drop a node on precision",
          (mutate_in_func(backend, walk_sig, "!ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1",
-                         "!ggml_is_contiguous(src0) || node->op_params[0] != GGML_PREC_DEFAULT || ggml_nrows(src1) <= 1"),
+                         "!ggml_is_contiguous(src0) || node->op_params[0] != GGML_PREC_UNDEFINED || ggml_nrows(src1) <= 1"),
           cache, cache_hpp)),
         ("walk filters on precision late", "the walk's pre-filter does not drop a node on precision",
          (mutate_in_func(backend, walk_sig, "if (!ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {",
-                         "if (node->op_params[0] != GGML_PREC_DEFAULT || !ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {"),
+                         "if (node->op_params[0] != GGML_PREC_UNDEFINED || !ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {"),
           cache, cache_hpp)),
         ("walk ignores the pure arm combination", "the walk combines the two arms through the pure verdict",
          (mutate_in_func(backend, walk_sig, "zone_walk_f16_node_draws(", "zone_XXXX("), cache, cache_hpp)),

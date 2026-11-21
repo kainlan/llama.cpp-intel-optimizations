@@ -151,6 +151,8 @@ INSTALL_REFUSAL_TAIL = (
     "                    host_tenants_installed.device = backend_ctx->device;\n")
 DTOR_SIG = r"\bllama_context::~llama_context\s*\("
 REIMPL_SIG = r"\bsched_reserve_result\s+llama_context::sched_reserve_impl\s*\("
+# the one place llama_context constructs a scheduler (the upstream-sync refactor: reserve and measure both call it)
+SCHED_NEW_SIG = r"\bvoid\s+llama_context::sched_new\s*\("
 SYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_synchronize\s*\("
 SET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_set_tensor_async\s*\("
 SUPPORTS_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_device_supports_buft\s*\("
@@ -620,14 +622,19 @@ def free_path_pins(source, freeb, fails):
         r"if \(ggml_backend_dev_type\(ggml_backend_get_device\(backend_cpu\)\) != GGML_BACKEND_DEVICE_TYPE_CPU\) \{\s*"
         r"throw std::runtime_error\(\"the last backend of a measure-only context must be the CPU backend\"\);",
         "L4 free path: a measure-only context no longer requires the CPU backend last")
+    sched_new_body = function_body(source, SCHED_NEW_SIG)
     if reimpl is not None:
-        built = len(re.findall(r"ggml_backend_sched_new\(", reimpl))
-        over_all = len(re.findall(
-            r"state\.sched\.reset\(ggml_backend_sched_new\(backend_ptrs\.data\(\), backend_buft\.data\(\), backend_ptrs\.size\(\),\s*max_nodes,",
-            reimpl))
-        if built == 0 or built != over_all:
+        # sched_reserve_impl no longer constructs a scheduler itself: it must go through sched_new
+        if re.search(r"ggml_backend_sched_new\(", reimpl) or not re.search(r"\bsched_new\(", reimpl):
             fails.append("L4 free path: a scheduler sched_reserve_impl builds is no longer built over every backend of the "
-                         "context (backend_ptrs)")
+                         "context (backend_ptrs): it does not go through llama_context::sched_new")
+    built = len(re.findall(r"ggml_backend_sched_new\(", sched_new_body or ""))
+    over_all = len(re.findall(
+        r"state\.sched\.reset\(ggml_backend_sched_new\(backend_ptrs\.data\(\), backend_buft\.data\(\), backend_ptrs\.size\(\),\s*params\.max_nodes,",
+        sched_new_body or ""))
+    if built != 1 or built != over_all:
+        fails.append("L4 free path: a scheduler sched_reserve_impl builds is no longer built over every backend of the "
+                     "context (backend_ptrs)")
     for sig, what in ((SET_ASYNC_SIG, "set_tensor_async"), (GET_ASYNC_SIG, "get_tensor_async")):
         body = function_body(source, sig)
         pin(fails, body, r"GGML_ASSERT\(\(buf->buft == ggml_backend_sycl_buffer_type\(sycl_ctx->device\) \|\|\s*"
@@ -1476,8 +1483,8 @@ def mutations(header_raw, source):
         ("the execution queue ignores the TP queue", "execution queue is no longer the TP queue or the unified cache's own queue", EXEC_QUEUE_SIG,
          "        return tp_queue;\n", "        return nullptr;\n"),
         # ---- the upstream premises: scheduler and allocator synchronize before they free
-        ("the scheduler is built over one backend fewer", "no longer built over every backend of the context", REIMPL_SIG,
-         re.compile(r"backend_ptrs\.size\(\), max_nodes,"), "backend_ptrs.size() - 1, max_nodes,"),
+        ("the scheduler is built over one backend fewer", "no longer built over every backend of the context", SCHED_NEW_SIG,
+         re.compile(r"backend_ptrs\.size\(\),\s*params\.max_nodes,"), "backend_ptrs.size() - 1, params.max_nodes,"),
         ("ggml_backend_sched_reserve does not synchronize", "ggml_backend_sched_reserve no longer synchronizes", SCHED_RESERVE_SIG,
          "    ggml_backend_sched_synchronize(sched);\n", ""),
         ("ggml_backend_sched_reserve synchronizes under if (false)", "ggml_backend_sched_reserve no longer synchronizes", SCHED_RESERVE_SIG,

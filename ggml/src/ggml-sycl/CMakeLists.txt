@@ -1009,6 +1009,10 @@ if (GGML_SYCL_F16)
     target_compile_definitions(ggml PUBLIC GGML_SYCL_F16)
 endif()
 
+if (GGML_SYCL_SUPPORT_XMX)
+    add_compile_definitions(GGML_SYCL_SUPPORT_XMX)
+endif()
+
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     # AOT (Battlemage) + JIT fallback, or JIT-only, per the GGML_SYCL_BMG_AOT
     # decision computed above (GGML_SYCL_INTEL_TARGETS). AOT avoids runtime JIT

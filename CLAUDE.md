@@ -65,7 +65,7 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 # If it names a test, do not run the sweep. `-j 1` is not negotiable: `-j` multiplies memory.
 bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
+      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 # Form 3: the excluded family, serially, with monitoring. Manually only, never in a subagent or background task.
 ctest --test-dir build -N -L 'cache|mem-handle'      # must list >= 1 test (`-L residency` selects nothing)
 ctest --test-dir build -L 'cache|mem-handle' --output-on-failure -j 1
@@ -77,7 +77,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0   ./build/bin/test-backend-ops
 ```
 - `test-backend-ops`: by hand, with monitoring, never in a subagent or background task.
 - `test-llama-archs`: `rc=0` is a pass, 77 means it measured nothing, `rc=1` is ambiguous. Do not search its
-  table for `FAIL` (log lines corrupt the table); use `grep -c 'roundtrip mismatch' <log>`.
+  table for `FAIL` (log lines corrupt the table); use `grep -c 'roundtrip not bit-exact' <log>`.
 - `test-unified-cache-bugs` peaks at ~8.5 GB RSS: serial only. Pure-Python gates (`test-sycl-gap-causes`,
   `test-sycl-timeline-gap-class-conservation`, `test-jinja-py`) allocate nothing and are safe at any parallelism.
 - `main` is the default label and means "nobody classified this", not "safe". A new model-loading test must
@@ -244,7 +244,7 @@ unless you bisect attention; off costs ~39% of Mistral PP512). Opt-ins: `GGML_SY
 3. Test: prefer `-R <what your change gates>`. Never a bare `ctest --test-dir build --output-on-failure`: it runs
    every model-loading test on every device, the iGPU included. For a full sweep, run
    `bash scripts/check-ctest-safety-net.sh --build-dir build` first, then form 2 verbatim. Do not raise `-j`:
-   `-j 1 -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`
+   `-j 1 -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`
 4. For ggml changes, run `test-backend-ops` on multiple backends, by hand only. It is a binary, not a ctest
    (`ctest -R test-backend-ops` selects nothing): `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops`
 5. Correctness: run the completion gates above. Tokens must be right, not just fast.

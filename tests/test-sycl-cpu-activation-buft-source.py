@@ -34,6 +34,7 @@
 # reads and must flip to RED, so a check whose anchor silently stopped matching
 # real code cannot pass vacuously.
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -54,6 +55,10 @@ PLAN_HELPER = "ggml_sycl_plan_cpu_work_reason"
 CTX_PRED = "llama_context_sycl_plan_has_cpu_work"
 CTX_SELECT = "llama_context_cpu_compute_buft"
 NEW_CALL = "ggml_backend_sched_new(backend_ptrs"
+# Since the 19bc41dbb merge the one NEW_CALL lives in llama_context::sched_new, and each reserve builds its scheduler
+# by calling it on its state: SCHED_CALL is the construction point inside a reserve.
+SCHED_NEW_SIG = "void llama_context::sched_new(sched_reserve_state & state, const sched_params & params) {"
+SCHED_CALL = "sched_new(state, {"
 # The re-selection is one helper over (model, backends, bufts); the allocating and the measuring reserve both
 # call it right before they build their scheduler, so a MEASURE plans against the buft its ALLOC will use.
 RESELECT = "llama_context_cpu_compute_buft_reselect"
@@ -117,6 +122,7 @@ texts = {
     "sched_measure_fn": function_window(
         ctx_cpp, "sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & state) {", window=40000),
     "reselect_fn": function_window(ctx_cpp, "static void " + RESELECT + "(", window=3000),
+    "sched_new_fn": function_window(ctx_cpp, SCHED_NEW_SIG, window=3000),
 }
 
 
@@ -262,7 +268,7 @@ def witness_vii(t):
 
 # --- (viii) the selection is GATED by the predicate (backend plan OR partial
 # offload), so a constant-true / constant-false gate is RED; and it is re-made
-# before each ggml_backend_sched_new() in sched_reserve(), after the resyncs.
+# before each reserve's scheduler construction (its sched_new call), after the resyncs.
 def check_viii_selection_is_gated(t):
     fn = t["ctx_select_fn"]
     sched = t["sched_reserve_fn"]
@@ -271,9 +277,9 @@ def check_viii_selection_is_gated(t):
     if not fn or not sched or not meas or not resel:
         return False
     gate = fn.split("llama_context_sycl_cpu_activation_buft(", 1)[0]
-    new_idx = sched.find("ggml_backend_sched_new(")
+    new_idx = sched.find(SCHED_CALL)
     sel_idx = sched.find(RESELECT + "(")
-    mnew_idx = meas.find("ggml_backend_sched_new(")
+    mnew_idx = meas.find(SCHED_CALL)
     msel_idx = meas.find(RESELECT + "(")
     return (CTX_PRED + "(" in gate
             and "n_gpu_layers()" in gate
@@ -295,21 +301,20 @@ def witness_viii_order(t):
 
 
 # --- (ix) the selection is the LAST thing that can see a stale plan: the only
-# scheduler constructions are inside sched_reserve(), no plan-mutating call sits
-# between the selection and the first one, and the narrow flash-attn recheck
+# scheduler constructions are the reserves' sched_new calls, no plan-mutating call
+# sits between the selection and the first one, and the narrow flash-attn recheck
 # (allow_replan=false) comes only after it. The plan mutators -- the constructor,
 # candidate and settle resyncs -- all run in callers, before sched_reserve().
 def check_ix_selection_follows_last_plan_mutation(t):
     sched = t["sched_reserve_fn"]
-    ctx = t["ctx_cpp"]
-    if not sched:
-        return False
     meas = t["sched_measure_fn"]
+    if not sched or not meas:
+        return False
     sel = sched.find(RESELECT + "(")
-    new = sched.find(NEW_CALL)
+    new = sched.find(SCHED_CALL)
     between = sched[sel:new] if 0 <= sel < new else None
     msel = meas.find(RESELECT + "(")
-    mnew = meas.find(NEW_CALL)
+    mnew = meas.find(SCHED_CALL)
     mbetween = meas[msel:mnew] if 0 <= msel < mnew else None
     recheck = sched.find("\n    resolve_fused_ops(state, mctx.get(), n_seqs);")
     mutators = ("sycl_resync_runtime_context_flash_attn(", "ggml_backend_sycl_set_runtime_context",
@@ -317,15 +322,47 @@ def check_ix_selection_follows_last_plan_mutation(t):
     return (between is not None
             and mbetween is not None
             and not any(m in between or m in mbetween for m in mutators)
-            and sched.count(NEW_CALL) >= 1
-            and ctx.count(NEW_CALL) == sched.count(NEW_CALL) + meas.count(NEW_CALL)
             and recheck > new)
 
 
 def witness_ix(t):
     sched = t["sched_reserve_fn"]
     t["sched_reserve_fn"] = sched.replace(
-        NEW_CALL, "sycl_resync_runtime_context_flash_attn(); " + NEW_CALL, 1)
+        SCHED_CALL, "sycl_resync_runtime_context_flash_attn(); " + SCHED_CALL, 1)
+    return t
+
+
+# --- (ix-b) the one NEW_CALL is in sched_new, and the reserves are sched_new's only
+# callers, so no scheduler is built anywhere the selection does not precede.
+_SCHED_NEW_CALL_RE = re.compile(r"(?<![\w:])sched_new\(")
+_LEXEME_RE = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.DOTALL)
+
+
+def strip_comments(src):
+    """Comments blanked, string and character literals kept (a comment may name sched_new() in prose)."""
+    return _LEXEME_RE.sub(lambda m: " " if m.group(0).startswith("/") else m.group(0), src)
+
+
+def check_ix_one_construction_site(t):
+    ctx = strip_comments(t["ctx_cpp"])
+    fn = strip_comments(t["sched_new_fn"])
+    sched = strip_comments(t["sched_reserve_fn"])
+    meas = strip_comments(t["sched_measure_fn"])
+    if not fn or not sched or not meas:
+        return False
+    calls = [m.start() for m in _SCHED_NEW_CALL_RE.finditer(ctx)]
+    spans = [(ctx.find(b), ctx.find(b) + len(b)) for b in (sched, meas)]
+    return (ctx.count(NEW_CALL) == 1
+            and fn.count(NEW_CALL) == 1
+            and sched.count(SCHED_CALL) >= 1
+            and meas.count(SCHED_CALL) == 1
+            and all(lo >= 0 for lo, _hi in spans)
+            and len(calls) == sched.count(SCHED_CALL) + meas.count(SCHED_CALL)
+            and all(any(lo <= c < hi for lo, hi in spans) for c in calls))
+
+
+def witness_ix_b(t):
+    t["ctx_cpp"] = t["ctx_cpp"] + "\nvoid llama_context::sched_reserve() { sched_reserve_state s = member_reserve_state(); sched_new(s, {}); }\n"
     return t
 
 
@@ -346,10 +383,12 @@ checks = [
      check_vii_context_predicate_both_arms, witness_vii),
     ("viii-a: the buft selection is gated by (plan predicate OR partial offload)",
      check_viii_selection_is_gated, witness_viii_gate),
-    ("viii-b: the selection is re-made before ggml_backend_sched_new() in sched_reserve()",
+    ("viii-b: the selection is re-made before each reserve's sched_new() (its ggml_backend_sched_new)",
      check_viii_selection_is_gated, witness_viii_order),
-    ("ix: the selection follows the last plan mutation (only sched constructions are in sched_reserve)",
+    ("ix: the selection follows the last plan mutation (before each reserve's sched_new call)",
      check_ix_selection_follows_last_plan_mutation, witness_ix),
+    ("ix-b: the one ggml_backend_sched_new is in sched_new, called only from the ALLOC and MEASURE reserves",
+     check_ix_one_construction_site, witness_ix_b),
 ]
 
 failed = [name for name, check, _w in checks if not check(texts)]

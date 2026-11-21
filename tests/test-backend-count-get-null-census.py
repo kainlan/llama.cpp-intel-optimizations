@@ -21,7 +21,12 @@ EXPECTED_BY_FILE = {
     "src/llama-context.cpp": 1,
     "src/llama-model.cpp": 3,
     "src/llama.cpp": 3,
-    "tests/test-backend-ops.cpp": 1,
+    "tests/test-backend-ops.cpp": 2,
+    # upstream's new device-enumerating tests: each walks 0..count and the
+    # fork null-checks every get (a disabled device slot reads back as null)
+    "tests/test-backend-sched.cpp": 1,
+    "tests/test-backend-tensor.cpp": 1,
+    "tests/test-fp8.cpp": 1,
     "tests/test-gguf.cpp": 1,
     "tests/test-llama-archs.cpp": 1,
     "tests/test-opt.cpp": 1,
@@ -32,6 +37,7 @@ EXPECTED_BY_FILE = {
     # the single pinned GPU device to call
     # ggml_backend_sycl_probe_runtime_context_for_model() against).
     "tests/test-sycl-runtime-context-probe.cpp": 1,
+    "tests/test-sleep.cpp": 1,
     "tests/test-thread-safety.cpp": 1,
     "tools/llama-bench/llama-bench.cpp": 4,
     "tools/rpc/rpc-server.cpp": 2,
@@ -119,14 +125,16 @@ if unsafe:
 
 expected_classes = Counter({
     # llama.cpp-tsfl: the harness's own null check (see EXPECTED_BY_FILE
-    # above) is a 27th null-checked-consumer.
-    "null-checked-consumer": 27,
+    # above) is a 27th null-checked-consumer; the five device-enumerating
+    # tests added by the upstream sync (backend-ops, sched, tensor, fp8, sleep)
+    # make it 32.
+    "null-checked-consumer": 32,
     "comparison-only": 9,
 })
 if classified != expected_classes:
     fail(f"classification drifted: {dict(classified)}")
-if sum(classified.values()) != 36:
-    fail(f"expected 36 classified calls, found {sum(classified.values())}")
+if sum(classified.values()) != 41:
+    fail(f"expected 41 classified calls, found {sum(classified.values())}")
 if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
     relative
     for relative, text, match, line in calls
@@ -136,5 +144,5 @@ if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
 
 print(
     "backend count/get census: PASS "
-    "(36/36 classified: 27 null-checked, 9 comparison-only; unsafe 0)"
+    "(41/41 classified: 32 null-checked, 9 comparison-only; unsafe 0)"
 )

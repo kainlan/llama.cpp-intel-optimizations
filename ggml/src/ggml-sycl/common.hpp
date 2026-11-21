@@ -50,6 +50,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -263,6 +264,68 @@ sycl::queue * ggml_sycl_get_tp_queue(int device);
 
 // Get platform default context for TP mode (returns nullptr if not in TP mode)
 sycl::context * ggml_sycl_get_tp_context();
+
+// Upstream's XMX dequant-GEMM (fused-gemm.cpp, fused-gemm-esimd.cpp; upstream 847f447c3, 418fe97b5, 18c5a95e2). In this
+// fork only the device-built MUL_MAT_ID schedule reaches it (GGML_SYCL_MMID_SCHED, default 0). The names, values and
+// defaults are upstream's; the globals are defined in mmid-sched.cpp.
+extern int g_ggml_sycl_enable_esimd;
+extern int g_ggml_sycl_mmid_esimd;
+
+// Which quantized weight formats may take the XMX dequant-GEMM paths. A bitmask rather than one
+// flag per path, so a format can be enabled or measured on its own and adding a format is one bit.
+enum ggml_sycl_xmx_gather_type {
+    GGML_SYCL_XMX_GATHER_IQ4_NL   = 1 << 0,
+    GGML_SYCL_XMX_GATHER_IQ3_S    = 1 << 1,
+    GGML_SYCL_XMX_GATHER_IQ4_XS   = 1 << 2,
+    GGML_SYCL_XMX_GATHER_IQ3_XXS  = 1 << 3,
+    GGML_SYCL_XMX_GATHER_IQ2_XXS  = 1 << 4,
+    GGML_SYCL_XMX_GATHER_IQ2_XS   = 1 << 5,
+    GGML_SYCL_XMX_GATHER_IQ2_S    = 1 << 6,
+    GGML_SYCL_XMX_GATHER_IQ1_S    = 1 << 7,
+    GGML_SYCL_XMX_GATHER_IQ1_M    = 1 << 8,
+    GGML_SYCL_XMX_GATHER_Q8_0     = 1 << 9,
+    GGML_SYCL_XMX_GATHER_Q4_K     = 1 << 10,
+    GGML_SYCL_XMX_GATHER_Q5_K     = 1 << 11,
+    GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
+    GGML_SYCL_XMX_GATHER_Q2_K     = 1 << 13,
+    GGML_SYCL_XMX_GATHER_Q3_K     = 1 << 14,
+};
+static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
+extern int g_ggml_sycl_xmx_gather_types;
+
+enum ggml_sycl_mmid_sched_bit {
+    GGML_SYCL_MMID_SCHED_DEVICE    = 1 << 0,
+    GGML_SYCL_MMID_SCHED_UNBOUNDED = 1 << 1,
+};
+extern int g_ggml_sycl_mmid_sched;
+// Which joint_matrix combinations the XMX dequant-GEMM paths may use, one bit each (see fused-gemm.cpp).
+// GGML_SYCL_DYNAMIC_PRECISION picks the operand type, this mask the combinations of that type.
+static constexpr int GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT = 0xff;
+extern int g_ggml_sycl_xmx_gather_shapes;
+
+// Operand type of the XMX dequant-GEMM paths (upstream's GGML_SYCL_DYNAMIC_PRECISION). F32 turns them off. A src1
+// precision request of an op [TAG_GGML_PREC] is always met.
+enum ggml_sycl_dynamic_precision {
+    GGML_SYCL_DYNAMIC_PRECISION_F16,
+    GGML_SYCL_DYNAMIC_PRECISION_BF16,
+    GGML_SYCL_DYNAMIC_PRECISION_TF32,
+    GGML_SYCL_DYNAMIC_PRECISION_F32,
+};
+#ifdef GGML_SYCL_F16
+static constexpr int GGML_SYCL_DYNAMIC_PRECISION_DEFAULT = GGML_SYCL_DYNAMIC_PRECISION_F16;
+#else
+static constexpr int GGML_SYCL_DYNAMIC_PRECISION_DEFAULT = GGML_SYCL_DYNAMIC_PRECISION_F32;
+#endif
+extern int g_ggml_sycl_dynamic_precision;
+// The XMX type an F32 src1 request may run on instead of f32 (upstream's GGML_SYCL_DYNAMIC_REQUIRED_PRECISION: TF32,
+// or BF16 which also allows tf32). F32: none. F16: src1 requests are ignored.
+extern int g_ggml_sycl_dynamic_required_precision;
+
+// [TAG_GGML_PREC] src1 precision request of the MUL_MAT/MUL_MAT_ID op dst
+static inline int32_t ggml_sycl_src1_prec(const ggml_tensor * dst) {
+    return g_ggml_sycl_dynamic_required_precision == GGML_SYCL_DYNAMIC_PRECISION_F16 ? GGML_PREC_UNDEFINED :
+                                                                                       ggml_prec_get_src(dst, 1);
+}
 
 // TP staging cache: stages mmap'd data to USM memory for shared-context access
 // Per-device staging: each device gets its own device-local copy
@@ -1067,6 +1130,9 @@ int  get_current_device_id();
 // test TUs see only one of the two.
 int  ggml_sycl_map_device_id(int device);
 void ggml_sycl_set_device_map(const int * device_ids, int device_count);
+// Thread-local copy of dpct's per-thread selected device (upstream a0ad695cb), -1 until first read. Every switch goes
+// through ggml_sycl_set_device() or ggml_sycl_select_dpct_device(), which keep the copy in step with dpct.
+extern thread_local int g_sycl_current_device_id;
 
 inline int ggml_sycl_get_device() {
     return get_current_device_id();
@@ -1122,11 +1188,23 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
         return 0;
     }
 
-    return CHECK_TRY_ERROR(dpct::select_device(mapped_device));
+    const dpct::err0 err = CHECK_TRY_ERROR(dpct::select_device(mapped_device));
+    if (err == dpct::success) {
+        g_sycl_current_device_id = mapped_device;
+    }
+    return err;
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     crash();
     std::exit(1);
+}
+
+// Selects dpct device `dpct_device` as it is (no ggml_sycl_map_device_id) and keeps g_sycl_current_device_id in step.
+// For the places that restore a device id read from get_current_device_id(); a bare dpct::select_device() would leave
+// the cached copy stale and make the next ggml_sycl_set_device() skip a switch it needs.
+inline void ggml_sycl_select_dpct_device(int dpct_device) {
+    dpct::select_device(static_cast<unsigned int>(dpct_device));
+    g_sycl_current_device_id = dpct_device;
 }
 
 //////////////////////
@@ -6267,6 +6345,19 @@ inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
 // Kernel name of the marker that gates the release of a staging buffer a size change displaced.
 struct graph_input_staging_retire_marker {};
 
+// One routed row of a MUL_MAT_ID: slot i1 of token i2.
+struct mmid_row_mapping {
+    int32_t i1;
+    int32_t i2;
+};
+
+// One BN-wide tile of a grouped MUL_MAT_ID GEMM: rows [n0, n1) of expert `expert` (fused-gemm.cpp).
+struct ggml_sycl_grouped_gemm_tile {
+    int32_t expert;
+    int32_t n0;
+    int32_t n1;
+};
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -8381,8 +8472,11 @@ static __dpct_inline__ float get_alibi_slope(const float    max_bias,
     return dpct::pow(base, exph);
 }
 
-static const sycl::uint3 init_fastdiv_values(uint32_t d) {
-    GGML_ASSERT(d != 0);
+static const sycl::uint3 init_fastdiv_values(uint64_t d_64) {
+    GGML_ASSERT(d_64 != 0);
+    GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
+
+    const uint32_t d = (uint32_t) d_64;
 
     uint32_t L = 0;
     while (L < 32 && (uint32_t{ 1 } << L) < d) {

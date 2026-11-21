@@ -2708,6 +2708,13 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // Upstream's ggml_flash_attn_ext_rows puts a K/V row list in src[5]. No route here reads one: the dispatch takes
+    // src[5] as q_seq_ids, which nothing in this tree sets. Declining keeps llama_context's fused_kv_rows probe off on
+    // SYCL, so a row list never reaches a kernel that would read it as sequence ids.
+    if (dst->src[5] != nullptr) {
+        return false;
+    }
+
     // q4_0 / q8_0 K/V: admitted only through the DPAS route, which carries its own type, shape and device screen
     if (ggml_sycl_fattn_dpas_supported(dst)) {
         return true;

@@ -657,7 +657,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
 
     // Per-lane accumulator. `Acc_t` is a template parameter set by the
     // dispatcher: `float` on GGML_PREC_F32 (matches CUDA's KQ_acc_t=float
-    // branch) and `afloat` on GGML_PREC_DEFAULT (picks up the SYCL-F16 build
+    // branch) and `afloat` on GGML_PREC_UNDEFINED (picks up the SYCL-F16 build
     // flag — see ggml-sycl/common.hpp). `KQ_max` / `KQ_sum` stay in full
     // float: online-softmax state is precision-critical (the
     // exp(max_old - max_new) rescale cancels rapidly if the running max is

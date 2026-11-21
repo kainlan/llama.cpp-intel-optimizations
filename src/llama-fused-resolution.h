@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-// The outcome of resolving the auto fused ops (flash attention, gated delta net, lightning
-// indexer, the DeepSeek V4 HC ops), and the pure functions that print it.
+// The outcome of resolving the auto fused ops (flash attention, flash attention over K/V rows,
+// the DeepSeek V4 HC ops, the top-k mask), and the pure functions that print it.
 //
 // A MEASURE resolves into a scratch cparams copy, so the lines `resolve_fused_ops` used to
 // log at the point of resolution would repeat once per measure and describe tenants nobody
@@ -15,22 +15,20 @@
 // at the publish attempt that applies it. These helpers touch no context, scheduler or log:
 // tests/test-fused-resolution-report.cpp executes them on the host.
 //
-//   fused_resolution               the record: ten entries, in the order they resolve;
+//   fused_resolution               the record: eight entries, in the order they resolve;
 //   fused_resolution_emit()        renders the present entries and hands each to a sink, with
 //                                  a per-entry printed mark so a retry never prints one twice;
 //   fused_resolution_unwind_guard  reports a record only while an exception is leaving a scope.
 
 enum fused_resolution_entry : int {
     FUSED_RESOLUTION_ENTRY_FA,          // the flash attention probe (no header)
-    FUSED_RESOLUTION_ENTRY_GDN_HEADER,  // "resolving fused Gated Delta Net support:"
-    FUSED_RESOLUTION_ENTRY_GDN_AR,      // the autoregressive probe
-    FUSED_RESOLUTION_ENTRY_GDN_CH,      // the chunked probe
-    FUSED_RESOLUTION_ENTRY_LID_HEADER,  // "resolving fused Lightning Indexer support:"
-    FUSED_RESOLUTION_ENTRY_LID,
+    FUSED_RESOLUTION_ENTRY_KV_ROWS,     // flash attention over the K/V rows of a unified cache (no header)
     FUSED_RESOLUTION_ENTRY_HC_HEADER,   // "resolving fused DeepSeek V4 HC support:"
     FUSED_RESOLUTION_ENTRY_HC_PRE,
     FUSED_RESOLUTION_ENTRY_HC_COMB,
     FUSED_RESOLUTION_ENTRY_HC_POST,
+    FUSED_RESOLUTION_ENTRY_TKM_HEADER,  // "resolving fused top-k mask support:"
+    FUSED_RESOLUTION_ENTRY_TKM,
     FUSED_RESOLUTION_N_ENTRIES,
 };
 

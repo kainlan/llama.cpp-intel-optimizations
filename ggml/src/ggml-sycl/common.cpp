@@ -144,8 +144,16 @@ void ggml_sycl_layout_ptr_stats_dump() {
             static_cast<unsigned long long>(g_layout_ptr_host_arena_miss.load(std::memory_order_relaxed)));
 }
 
+// Thread-local copy of dpct's selected device (upstream a0ad695cb): get_current_device_id() runs on every
+// ggml_sycl_set_device(), and dpct's own lookup takes the device manager's mutex and searches its thread map.
+thread_local int g_sycl_current_device_id = -1;
+
 int get_current_device_id() {
-    return dpct::dev_mgr::instance().current_device_id();
+    if (g_sycl_current_device_id >= 0) {
+        return g_sycl_current_device_id;
+    }
+    g_sycl_current_device_id = static_cast<int>(dpct::dev_mgr::instance().current_device_id());
+    return g_sycl_current_device_id;
 }
 
 // Cached queues for TP mode (use platform default context — all L0 GPUs share it)

@@ -425,7 +425,7 @@ static void k_bin_bcast(const src0_t *           src0,
                         int                      ne1,
                         int                      ne2,
                         int                      ne3,
-                        int                      ne10,
+                        const sycl::uint3        ne10_fd,
                         int                      ne11,
                         int                      ne12,
                         int                      ne13,
@@ -461,7 +461,7 @@ static void k_bin_bcast(const src0_t *           src0,
     dst_t *        dst_row  = dst + i_dst;
 
     for (int i0 = i0s; i0 < ne0; i0 += item_ct1.get_local_range(2) * item_ct1.get_group_range(2)) {
-        const int i10 = i0 % ne10;
+        const int i10 = (int) fast_div_modulo((uint32_t) i0, ne10_fd).y();
         dst_row[i0]   = (dst_t) bin_op(src0 ? (float) src0_row[i0] : 0.0f, (float) src1_row[i10]);
     }
 }
@@ -474,7 +474,7 @@ static void k_bin_bcast_unravel(const src0_t *           src0,
                                 int                      ne1,
                                 int                      ne2,
                                 int                      ne3,
-                                int                      ne10,
+                                const sycl::uint3        ne10_fd,
                                 int                      ne11,
                                 int                      ne12,
                                 int                      ne13,
@@ -511,7 +511,7 @@ static void k_bin_bcast_unravel(const src0_t *           src0,
     const src1_t * src1_row = src1 + i_src1;
     dst_t *        dst_row  = dst + i_dst;
 
-    const int i10 = i0 % ne10;
+    const int i10 = (int) fast_div_modulo((uint32_t) i0, ne10_fd).y();
     dst_row[i0]   = (dst_t) bin_op(src0 ? (float) src0_row[i0] : 0.0f, (float) src1_row[i10]);
 }
 
@@ -606,7 +606,9 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
             int64_t ne2 = cne[2];
             int64_t ne3 = cne[3];
 
-            int64_t ne10 = cne1[0];
+            // fast division for the per-element i0 % ne10; init_fastdiv_values rejects a divisor past 32 bits
+            const sycl::uint3 ne10_fd = init_fastdiv_values((uint64_t) cne1[0]);
+
             int64_t ne11 = cne1[1];
             int64_t ne12 = cne1[2];
             int64_t ne13 = cne1[3];
@@ -690,7 +692,7 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                                 sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
                                                   sycl::range<3>(1, 1, block_size)),
                                 [=](sycl::nd_item<3> item_ct1) {
-                                    k_bin_bcast_unravel<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10,
+                                    k_bin_bcast_unravel<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10_fd,
                                                                 ne11, ne12, ne13, s1, s2, s3, s01, s02, s03, s11, s12,
                                                                 s13, item_ct1);
                                 });
@@ -712,7 +714,7 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                     [&](sycl::queue & profiled_queue) {
                         return profiled_queue.parallel_for(
                             sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                                k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11, ne12,
+                                k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10_fd, ne11, ne12,
                                                     ne13, s1, s2, s3, s01, s02, s03, s11, s12, s13, item_ct1);
                             });
                     },

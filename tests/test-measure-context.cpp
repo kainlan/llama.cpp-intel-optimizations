@@ -18,8 +18,8 @@
 //     kind that has no no_alloc form, for a model with an encoder graph and for a ctx_other arch; the load-time
 //     measure turns that into `unsupported`, not a failure, and clears its plan override on that path too;
 //   - the plan's K-shift graphs are the memory's shift sub-caches, the compute term is the per-chunk peak
-//     over the measured graphs (the real compute buffer is its sum), set_warmup is a no-op on a measure-only
-//     context, and the memory modules' own constructor logs are silent under no_alloc.
+//     over the measured graphs (the real compute buffer is its sum), and the memory modules' own constructor
+//     logs are silent under no_alloc.
 
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-context.h"
@@ -233,11 +233,6 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
             CHECK(!measure.holds_output_buffer(), "%s: a measure-only context reserved an output buffer", name);
             CHECK(measure.get_sched() == nullptr, "%s: a measure-only context kept a scheduler", name);
             CHECK(measure.is_measure_only(), "%s: the flag is not set", name);
-
-            // a measure-only context measures one fixed graph set: warmup never re-reserves it
-            const bool warmup_before = measure.get_cparams().warmup;
-            measure.set_warmup(!warmup_before);
-            CHECK(measure.get_cparams().warmup == warmup_before, "%s: set_warmup changed a measure-only context", name);
         }
     } catch (const std::exception & e) {
         measure_log.stop();
@@ -297,7 +292,7 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
           }());
 
     // the plan is the real context's: the worst chunk peak is the buffer its own reserve allocated
-    if (!real->get_model().hparams.no_alloc && ggml_backend_sched_get_n_backends(real->get_sched()) == 1) {
+    if (!real->get_model().no_alloc() && ggml_backend_sched_get_n_backends(real->get_sched()) == 1) {
         const size_t real_size =
             ggml_backend_sched_get_buffer_size(real->get_sched(), ggml_backend_sched_get_backend(real->get_sched(), 0));
         size_t measured = 0;

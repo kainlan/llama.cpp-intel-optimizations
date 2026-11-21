@@ -104,6 +104,7 @@
 #include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fattn.hpp"
+#include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -32382,6 +32383,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_probe_buffer_interface = {
 
     /* .clear           = */ NULL,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 static ggml_backend_buffer_t ggml_backend_sycl_probe_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -32414,9 +32418,11 @@ static bool ggml_backend_sycl_probe_buffer_type_is_host(ggml_backend_buffer_type
 static const ggml_backend_buffer_type_i ggml_backend_sycl_probe_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_sycl_probe_buffer_type_get_name,
     /* .alloc_buffer   = */ ggml_backend_sycl_probe_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n = */ NULL,
     /* .get_alignment  = */ ggml_backend_sycl_probe_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_sycl_probe_buffer_type_get_max_size,
     /* .get_alloc_size = */ NULL,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host        = */ ggml_backend_sycl_probe_buffer_type_is_host,
 
 };
@@ -34054,6 +34060,9 @@ static void ggml_check_sycl() try {
             { "GGML_SYCL_PRIORITIZE_DMMV",  &g_ggml_sycl_prioritize_dmmv,  0  },
             { "GGML_SYCL_KQV_FORCE_SIMPLE", &g_ggml_sycl_kqv_force_simple, 0  },
             { "GGML_SYCL_KQV_DISABLE_FP16", &g_ggml_sycl_kqv_disable_fp16, 0  },
+            // Upstream's device-built MUL_MAT_ID schedule (18c5a95e2). Upstream defaults it to 1, this fork to 0
+            // (owner decision 2026-11-21); the bits are masked after the loop, as upstream does.
+            { "GGML_SYCL_MMID_SCHED",       &g_ggml_sycl_mmid_sched,       0  },
 #ifdef GGML_SYCL_XMX_GEMM
             { "GGML_SYCL_USE_XMX_GEMM",     &g_ggml_sycl_use_xmx_gemm,     0  },
             // 64 is the ONLY statement of the XMX batch threshold's default;
@@ -34090,6 +34099,7 @@ static void ggml_check_sycl() try {
         for (const sycl_env_setting & setting : sycl_env_settings) {
             *setting.dest = get_sycl_env(setting.name, setting.default_value);
         }
+        g_ggml_sycl_mmid_sched &= GGML_SYCL_MMID_SCHED_DEVICE | GGML_SYCL_MMID_SCHED_UNBOUNDED;
         g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
         g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
 
@@ -35251,8 +35261,14 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                                 extra->data_device_ptr(dev_id));
             }
         }
-    } else if (ggml_sycl_soa_reorder_supported_type(tensor->type) &&
+    } else if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+               ggml_sycl_soa_reorder_supported_type(tensor->type) &&
                (ggml_sycl_reorder_enabled() || ggml_sycl_unified_kernel_requires_aos(tensor->type))) {
+        // A compute-buffer copy of a host weight (the scheduler's upload of an op it gave this device) is
+        // refilled in the plain layout before every run, so it takes no reorder record: it falls through to
+        // the plain extra below and is read as the AOS bytes it holds (upstream 18c5a95e2, "stop
+        // erroneously reordering host-offloaded tensors").
+        //
         // Reuse an existing extra if present.  Do NOT overwrite it or we lose the
         // model_id for unified cache lookups.
         //
@@ -36364,7 +36380,7 @@ static bool ggml_sycl_dense_f16_arm_serves_pp(const ggml_tensor * src0,
         !ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)) {
         return false;
     }
-    if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {
+    if (!dst || dst->op_params[0] != GGML_PREC_UNDEFINED) {
         return false;
     }
     if (src0->buffer &&
@@ -46600,6 +46616,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
 
     /* .reset           = */ ggml_backend_sycl_buffer_reset,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_buffer_get_caps,
 
 };
@@ -47998,10 +48017,12 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface 
 
     /* .get_name         = */ ggml_backend_sycl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
 
     /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
 };
 
@@ -48874,6 +48895,9 @@ static const ggml_backend_buffer_i tiered_kv_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ tiered_kv_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 // Buffer type: allocates tiered buffer with hot (device) + cold (host pinned) regions
@@ -49668,9 +49692,11 @@ static size_t tiered_kv_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 static const ggml_backend_buffer_type_i tiered_kv_buft_interface = {
     /* .get_name         = */ tiered_kv_buft_get_name,
     /* .alloc_buffer     = */ tiered_kv_buft_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ tiered_kv_buft_get_alignment,
     /* .get_max_size     = */ tiered_kv_buft_get_max_size,
     /* .get_alloc_size   = */ NULL,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
 };
 
@@ -50090,6 +50116,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_split_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_split_buffer_clear,
 
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_split_buffer_get_caps,
 };
 
@@ -50201,10 +50230,12 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
 
     /* .get_name         = */ ggml_backend_sycl_split_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_split_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_split_buffer_type_get_alignment,
     /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
 
     /* .get_alloc_size   = */ ggml_backend_sycl_split_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ ggml_backend_sycl_split_buffer_type_is_host,
     /* .get_caps         = */ ggml_backend_sycl_split_buffer_type_get_caps,
 };
@@ -50857,6 +50888,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_tp_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_sycl_tp_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_tp_buffer_get_caps,
 };
 
@@ -50961,9 +50995,11 @@ static uint32_t ggml_backend_sycl_tp_buffer_type_get_caps(ggml_backend_buffer_ty
 static const ggml_backend_buffer_type_i ggml_backend_sycl_tp_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_sycl_tp_buffer_type_name,
     /* .alloc_buffer   = */ ggml_backend_sycl_tp_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n = */ NULL,
     /* .get_alignment  = */ ggml_backend_sycl_tp_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_sycl_tp_buffer_type_get_max_size,
     /* .get_alloc_size = */ ggml_backend_sycl_tp_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host        = */ ggml_backend_sycl_tp_buffer_type_is_host,
     /* .get_caps       = */ ggml_backend_sycl_tp_buffer_type_get_caps,
 };
@@ -52859,10 +52895,12 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
         /* .iface    = */ {
                            /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
                            /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n   = */ NULL,
 
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                            /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
                            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n = */ NULL,
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
@@ -52880,9 +52918,11 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing()
         /* .iface    = */ {
                            /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
                            /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n   = */ NULL,
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                            /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
                            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n = */ NULL,
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
@@ -53093,9 +53133,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
 static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_host_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_host_compute_buffer_alloc,  // Per-device buffer for TP
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,  // Not a CPU host buffer - it's SYCL host memory
 };
 
@@ -53224,9 +53266,11 @@ static size_t ggml_backend_sycl_cpu_offload_compute_get_max_size(ggml_backend_bu
 static const ggml_backend_buffer_type_i ggml_backend_sycl_cpu_offload_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_cpu_offload_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_sycl_cpu_offload_compute_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ ggml_backend_sycl_cpu_offload_compute_is_host,
 };
 
@@ -55077,23 +55121,6 @@ __dpct_inline__ static void k_argsort_f32_i32(const float * x,
     }
 }
 
-static void diag_mask_inf_f32(const float *            x,
-                              float *                  dst,
-                              const int                ncols,
-                              const int                rows_per_channel,
-                              const int                n_past,
-                              const sycl::nd_item<3> & item_ct1) {
-    const int col = item_ct1.get_local_range(1) * item_ct1.get_group(1) + item_ct1.get_local_id(1);
-    const int row = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
-    if (col >= ncols) {
-        return;
-    }
-    const int i = row * ncols + col;
-    //dst[i] = col > (n_past + row % rows_per_channel) ? -INFINITY : x[i];
-    //dst[i] = x[i] - (col > n_past + row % rows_per_channel) * INT_MAX; // equivalent within rounding error but slightly faster on GPU
-    dst[i]      = x[i] - (col > n_past + row % rows_per_channel) * FLT_MAX;
-}
-
 static void scale_f32(const float *            x,
                       float *                  dst,
                       const float              scale,
@@ -55487,22 +55514,6 @@ static void topk_f32_i32_sycl(const float * x,
                 }
             });
         });
-    });
-}
-
-static void diag_mask_inf_f32_sycl(const float * x,
-                                   float *       dst,
-                                   const int     ncols_x,
-                                   const int     nrows_x,
-                                   const int     rows_per_channel,
-                                   const int     n_past,
-
-                                   queue_ptr stream) {
-    const sycl::range<3> block_dims(1, SYCL_DIAG_MASK_INF_BLOCK_SIZE, 1);
-    const int            block_num_x = (ncols_x + SYCL_DIAG_MASK_INF_BLOCK_SIZE - 1) / SYCL_DIAG_MASK_INF_BLOCK_SIZE;
-    const sycl::range<3> block_nums(1, block_num_x, nrows_x);
-    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-        diag_mask_inf_f32(x, dst, ncols_x, rows_per_channel, n_past, item_ct1);
     });
 }
 
@@ -55961,7 +55972,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
     // for why and what it does not (yet) cover.
     const layout_mode q8_0_dense_planned_layout = ggml_sycl_q8_0_dense_planned_layout(src0, ctx.device);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+        row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_UNDEFINED) {
         sycl::half * src0_pp_scratch = nullptr;
         sycl::half * src1_pp_scratch = nullptr;
 #if GGML_SYCL_DNNL
@@ -56736,24 +56747,6 @@ inline void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
             GGML_ABORT("[TOP_K] no SYCL path for ncols=%lld k=%lld; supports_op should have declined it",
                        (long long) ncols, (long long) k);
     }
-}
-
-inline void ggml_sycl_op_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    auto src0 = dst.src(0);
-    GGML_ASSERT(src0.type() == GGML_TYPE_F32);
-    GGML_ASSERT(dst.type() == GGML_TYPE_F32);
-    dpct::queue_ptr main_stream = ctx.stream();
-    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-
-    const float * src0_dd = src0.resolve_as<const float>();
-    float *       dst_dd  = dst.resolve_as<float>();
-    const int64_t ne00    = src0.ne(0);
-    const int64_t ne01    = src0.ne(1);
-
-    const int    nrows0 = ggml_nrows(src0.raw());
-    const auto * params = static_cast<const int32_t *>(dst.op_params());
-    const int    n_past = params ? params[0] : 0;
-    diag_mask_inf_f32_sycl(src0_dd, dst_dd, ne00, nrows0, ne01, n_past, main_stream);
 }
 
 inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -62508,7 +62501,7 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *            
 }
 
 static bool ggml_sycl_simple_consumer_op(enum ggml_op op) {
-    return op == GGML_OP_ADD || op == GGML_OP_ADD1 || op == GGML_OP_MUL || op == GGML_OP_CONT || op == GGML_OP_DUP ||
+    return op == GGML_OP_ADD || op == GGML_OP_MUL || op == GGML_OP_CONT || op == GGML_OP_DUP ||
            op == GGML_OP_CPY || op == GGML_OP_SOFT_MAX || op == GGML_OP_ROPE || op == GGML_OP_NORM ||
            op == GGML_OP_RMS_NORM || op == GGML_OP_ARGSORT || op == GGML_OP_TOP_K || op == GGML_OP_GET_ROWS ||
            op == GGML_OP_GLU;
@@ -63362,7 +63355,7 @@ static bool ggml_sycl_try_route_simple_consumer(ggml_backend_sycl_context & ctx,
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -63739,7 +63732,7 @@ static bool ggml_sycl_try_cross_device_f16_attention(ggml_backend_sycl_context &
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -63944,7 +63937,7 @@ static bool ggml_sycl_try_route_flash_attn_ext(ggml_backend_sycl_context & ctx, 
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -64170,7 +64163,7 @@ static bool ggml_sycl_try_route_mul_mat_weight_owner(ggml_backend_sycl_context &
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -64403,7 +64396,7 @@ static bool ggml_sycl_try_route_mul_mat_activation(ggml_backend_sycl_context & c
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -77372,11 +77365,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     }
 }
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
 struct fused_moe_route_validation {
     bool                               ok     = false;
     const char *                       reason = "not-validated";
@@ -83627,6 +83615,41 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     return true;
 }
 
+// The device-built MUL_MAT_ID schedule (upstream 18c5a95e2, fused-gemm.cpp), GGML_SYCL_MMID_SCHED, default 0. It takes
+// a prompt op whose experts are all planned on this device in the AOS layout, in upstream's f32/i32 layout. Its four
+// scratch tables must fit ceilings the planner names for them (mmid-sched-admission.hpp). The planner reserves no such
+// tables yet, so every eligible call is refused MISSING_PLAN, reported once, and the op takes its planned MoE route.
+// Admission refusing before anything is allocated or queued is the contract that later wiring keeps.
+static bool ggml_sycl_mul_mat_id_device_sched(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (!src0 || !src1 || !ids || src1->ne[2] == 1 || !ggml_is_contiguous(src0) || ids->type != GGML_TYPE_I32 ||
+        ids->nb[0] != sizeof(int32_t) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->nb[1] != sizeof(float) * src1->ne[0] || dst->nb[1] != sizeof(float) * dst->ne[0] ||
+        ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    // Layout follows residency: the schedule reads AOS expert slices from this device, so it is asked only when the plan
+    // put every expert here in that layout. Upstream's kernel reads the experts at base + e * nb02; the fork keeps each
+    // expert in its own cache entry, so a launch also needs the kernel to read a per-expert pointer table.
+    layout_mode planned_layout = GGML_LAYOUT_AOS;
+    if (!ggml_sycl_moe_tensor_plan_primary_layout(src0, ctx.device, &planned_layout) ||
+        planned_layout != GGML_LAYOUT_AOS) {
+        return false;
+    }
+    ggml_sycl::mmid_sched_scratch_shape required;
+    if (!ggml_sycl_grouped_dequant_gemm_device_scratch(src0->type, /*reordered=*/false, ggml_sycl_src1_prec(dst),
+                                                       src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0],
+                                                       ctx.stream(), &required)) {
+        return false;
+    }
+    const ggml_sycl::mmid_sched_scratch_admission admission =
+        ggml_sycl::mmid_sched_preflight_scratch(/*planned=*/nullptr, required);
+    ggml_sycl::mmid_sched_warn_refusal_once(admission);
+    return false;
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
@@ -83884,6 +83907,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    /* use_tensor_data_ptr = */ false);
         std::lock_guard<std::mutex> lock(s_mul_mat_id_extras_mutex);
         s_mul_mat_id_extras.push_back(std::move(new_extra));
+    }
+
+    // GGML_SYCL_MMID_SCHED (default 0): the device-built prompt schedule. A refusal falls through to the planned routes.
+    if ((g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_DEVICE) && ggml_sycl_mul_mat_id_device_sched(ctx, dst)) {
+        return;
     }
 
     // llama.cpp-yx28: batch-1 decode with every expert resident on this
@@ -93340,11 +93368,6 @@ static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_ten
     ggml_sycl_op_scale(ctx, dst);
 }
 
-static void ggml_sycl_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
-    ggml_sycl_op_diag_mask_inf(ctx, dst);
-}
-
 static void ggml_sycl_pool2d(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
     ggml_sycl_op_pool2d(ctx, dst);
@@ -93395,12 +93418,13 @@ static void ggml_sycl_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_ten
 }
 
 static void ggml_sycl_set_main_device(const int main_device) try {
-    if (dpct::get_current_device_id() == static_cast<unsigned int>(main_device)) {
+    // The thread's cached device id (upstream f3d7725a7): this runs at the start of every graph compute.
+    if (get_current_device_id() == main_device) {
         return;
     }
     check_allow_gpu_index(main_device);
 
-    dpct::select_device(main_device);
+    ggml_sycl_select_dpct_device(main_device);
     if (g_ggml_sycl_debug) {
         dpct::device_info prop;
 
@@ -96008,14 +96032,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
             }
             ggml_sycl_add(ctx, safe_dst);
             break;
-        case GGML_OP_ADD1:
-            if (g_ggml_sycl_debug) {
-                ggml_sycl_debug_dump_tensor_meta("ADD1 dst", dst);
-                ggml_sycl_debug_dump_tensor_meta("ADD1 src0", dst->src[0]);
-                ggml_sycl_debug_dump_tensor_meta("ADD1 src1", dst->src[1]);
-            }
-            ggml_sycl_add1(ctx, safe_dst);
-            break;
         case GGML_OP_ADD_ID:
             // Skip residual MoE ADD_ID bias nodes only when a fused/direct producer
             // has already applied their semantics. FIRST_SAVED phase alone is NOT
@@ -96262,9 +96278,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_TRANSPOSE:
             GGML_SYCL_DEBUG("%s: Tensor NO-OP\n", __func__);
 
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_sycl_diag_mask_inf(ctx, safe_dst);
             break;
 
         case GGML_OP_SOFT_MAX:
@@ -102144,7 +102157,7 @@ struct ggml_sycl_block_exec_device_scope {
     ~ggml_sycl_block_exec_device_scope() {
         if (prev_dpct_device >= 0) {
             try {
-                dpct::select_device(static_cast<unsigned int>(prev_dpct_device));
+                ggml_sycl_select_dpct_device(prev_dpct_device);
             } catch (...) {
             }
         }
@@ -112504,7 +112517,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         }
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
-        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_DEFAULT, the unified kernel's
+        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_UNDEFINED, the unified kernel's
         // oneDNN f16 route has none, so each arm's own condition is applied below.
         if (!src0 || !src1 || !(src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) ||
             !ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1) {
@@ -112532,7 +112545,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         // The unified kernel's own oneDNN f16 route (Route A) draws them too for an op the scratch does not supply,
         // whatever its precision. The router is asked once per node and its answer shared by both arms.
         const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);
-        const bool                      prec_default = node->op_params[0] == GGML_PREC_DEFAULT;
+        const bool                      prec_default = node->op_params[0] == GGML_PREC_UNDEFINED;
         const bool legacy_draws = prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
         const bool unified_draws =
             ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied);
@@ -123242,6 +123255,25 @@ static bool ggml_sycl_norm_rows_supported(const ggml_tensor * t) {
     return t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
 }
 
+// Upstream ggml widened these ops past what the SYCL kernels compute; a node that uses the wider form runs
+// elsewhere. supports_op and the capability query ask it before the shared impl. It stays out of the impl's prologue
+// and per-op cases, and ahead of the MUL_MAT type helper, because those are pinned by source contracts
+// (tests/test-sycl-op-support-predicates.py, tests/test-sycl-supports-op-indexed-moe-source.py).
+//   ROPE    the kernels are instantiated for f32/f16 sources (ggml_rope accepts BF16 since upstream 7fce5439f).
+//           rope.cpp passes the node's truncate flag (upstream 1fa7f1c48) to the YaRN correction dims itself.
+//   MUL_MAT [TAG_GGML_PREC] every route converts src1 below f32 (q8_1 for MMVQ/MMQ, f16 for the oneDNN and
+//           dequant routes), so a node whose src1 precision forbids that is declined (upstream 494d0f47b).
+static bool ggml_sycl_op_core_semantics_supported(const ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_ROPE:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
+        case GGML_OP_MUL_MAT:
+            return ggml_prec_get_src(op, 1) != GGML_PREC_BF16 && ggml_prec_get_src(op, 1) != GGML_PREC_F32;
+        default:
+            return true;
+    }
+}
+
 static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
     // The one list lives in unified-types.hpp: the zone planner asks it too.
     return ggml_sycl::dense_mul_mat_type_supported(type);
@@ -123270,10 +123302,14 @@ static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
 // supports_op is "is there a kernel for this op, type and shape" AND "is the data placed where this device runs it".
 // The second half is the placement declines below (host-demoted KV, planner-on-host); `placement_declines` switches
 // exactly those off, which is what ggml_backend_sycl_supports_op_capability() does, so the capability answer is
-// this same body and cannot drift from supports_op.
+// this same body and cannot drift from supports_op. Both entries also ask ggml_sycl_op_core_semantics_supported()
+// first: the impl's prologue and cases are pinned by source contracts, and that check is a kernel question too.
 static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines);
 
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (!ggml_sycl_op_core_semantics_supported(op)) {
+        return false;
+    }
     return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/true);
 }
 
@@ -123784,8 +123820,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         case GGML_OP_DIV:
             // The other four bin_bcast consumers; see
             // ggml_sycl_binbcast_layout_supported and the REPEAT case above.
-            // ADD1 (k_add1), ADD_ID and COUNT_EQUAL have their own kernels and
-            // stay in the unconditional group below.
+            // ADD_ID and COUNT_EQUAL have their own kernels and stay in the
+            // unconditional group below.
             return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
             // Layout is genuinely handled: concat.cpp:119-153 has a fully
@@ -123804,7 +123840,6 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD1:
         case GGML_OP_ADD_ID:
         case GGML_OP_COUNT_EQUAL:
             return true;
@@ -123881,12 +123916,12 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                    ggml_sycl_norm_rows_supported(op);
 
         case GGML_OP_SCALE:
-            return true;
+            // ggml_sycl_op_scale asserts f32 on both sides and reads src0 flat; ggml_scale now accepts
+            // non-contiguous views, which that flat read would mis-address
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
 
         case GGML_OP_CONT:
             return op->src[0]->type != GGML_TYPE_BF16;
-        case GGML_OP_DIAG_MASK_INF:
-            return true;
         case GGML_OP_SOFT_MAX:
             return true;
         case GGML_OP_SOFT_MAX_BACK:
@@ -124005,9 +124040,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 return false;
             }
         case GGML_OP_FILL:
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_CUMSUM:
         case GGML_OP_DIAG:
-            return true;
+            // the kernels are f32 only; the ops accept BF16 now
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_ROLL:
@@ -124037,7 +124074,7 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
 // DSV4_HC_*); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks of their
 // own that this does not neutralise.
 bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (dev == nullptr || op == nullptr) {
+    if (dev == nullptr || op == nullptr || !ggml_sycl_op_core_semantics_supported(op)) {
         return false;
     }
 

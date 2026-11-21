@@ -363,7 +363,7 @@ def structural(raw: str):
     # the destructor
     dtor = byname["llama_context::~llama_context"][0]
     dbody = " ".join(m[dtor.body_start:dtor.end + 1].split())
-    if "if (!measure_only && !model.hparams.no_alloc && !opt_ctx) {" not in dbody:
+    if "if (!measure_only && !model.no_alloc() && !opt_ctx) {" not in dbody:
         bad.append("the destructor's buffer-size comparison must carry !measure_only in its own if")
     if "if (!measure_only && sycl_exec_context_bound && sycl_exec_context.value != 0) {" not in dbody:
         bad.append("the destructor's SYCL drain block must carry !measure_only in its own if")
@@ -614,7 +614,7 @@ def test_mutants_each_clause_fails():
             "    GGML_ASSERT(n_outputs >= 1);\n",
             '    GGML_ASSERT(n_outputs >= 1);\n    LLAMA_LOG_DEBUG("%s: hi\\n", __func__);\n'),
         "the destructor comparison loses its guard": _mut(
-            "if (!measure_only && !model.hparams.no_alloc && !opt_ctx) {", "if (!model.hparams.no_alloc && !opt_ctx) {"),
+            "if (!measure_only && !model.no_alloc() && !opt_ctx) {", "if (!model.no_alloc() && !opt_ctx) {"),
         "the destructor drain loses its guard": _mut(
             "if (!measure_only && sycl_exec_context_bound && sycl_exec_context.value != 0) {",
             "if (sycl_exec_context_bound && sycl_exec_context.value != 0) {"),

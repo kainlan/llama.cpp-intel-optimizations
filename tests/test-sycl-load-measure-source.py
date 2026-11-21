@@ -518,8 +518,11 @@ def needs_other_ok(code: str) -> bool:
         "if (llama_model_needs_ctx_other(model)) { if (params.ctx_other == nullptr) { throw std::runtime_error("
     ) not in z(ctor):
         return False
+    # the write closes the predicate's own block, right after the throw: a later block (upstream's DFlash one also
+    # writes ctx_other) must not satisfy it
     after = z(ctor).split(z("if (llama_model_needs_ctx_other(model)) {"), 1)[1]
-    if z("cparams.ctx_other = params.ctx_other; }") not in after.split(z("if (params.ctx_other == nullptr) {"), 1)[1]:
+    block = after.split(z("if (params.ctx_other == nullptr) {"), 1)[1]
+    if not re.match(r"throw std::runtime_error\([^;]*\);\}" + re.escape(z("cparams.ctx_other = params.ctx_other; }")), block):
         return False
     return True
 
@@ -778,7 +781,10 @@ def test_needs_ctx_other_is_one_predicate():
     reason = function_body(code, _REASON)
     assert not needs_other_ok(code.replace(reason, mutate(reason, "llama_model_needs_ctx_other(model)", "false"), 1))
     ctor = ctor_body(code)
-    assert not needs_other_ok(code.replace(ctor, mutate(ctor, "llama_model_needs_ctx_other(model)", "(model.arch == LLM_ARCH_EAGLE3)"), 1))
+    # the constructor asks the predicate twice since the 19bc41dbb merge (the throw block, and the flash-attn follow
+    # of a model that shares ctx_other's KV); the mutants anchor on the throw block
+    guard = "if (llama_model_needs_ctx_other(model)) { if (params.ctx_other == nullptr) {"
+    assert not needs_other_ok(code.replace(ctor, mutate(ctor, guard, "if ((model.arch == LLM_ARCH_EAGLE3)) { if (params.ctx_other == nullptr) {"), 1))
     pred = function_body(code, _NEEDS_OTHER)
     assert not needs_other_ok(code.replace(pred, mutate(pred, "LLM_ARCH_GEMMA4_ASSISTANT", "LLM_ARCH_GEMMA4"), 1))
     # the inner or, the arch list and the outer or are each pinned
@@ -787,7 +793,8 @@ def test_needs_ctx_other_is_one_predicate():
     assert not needs_other_ok(code.replace(pred, mutate(pred, "LLM_ARCH_GEMMA4_ASSISTANT ||", "LLM_ARCH_GEMMA4_ASSISTANT &&"), 1))
     # the constructor's throw and the ctx_other it hands the graph
     assert not needs_other_ok(code.replace(ctor, mutate(ctor, "if (params.ctx_other == nullptr) {", "if (false) {"), 1))
-    assert not needs_other_ok(code.replace(ctor, mutate(ctor, "cparams.ctx_other = params.ctx_other;", "cparams.ctx_other = nullptr;"), 1))
+    handed = '(this warning is normal during memory fitting)"); } cparams.ctx_other = params.ctx_other; }'
+    assert not needs_other_ok(code.replace(ctor, mutate(ctor, handed, handed.replace("= params.ctx_other;", "= nullptr;")), 1))
 
 
 def test_the_measure_asks_the_unsupported_question_before_any_backend():

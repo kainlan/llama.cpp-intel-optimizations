@@ -6085,7 +6085,7 @@ static bool cpu_rope(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t d03 = dst->nb[3] / sizeof(float);
 
     float corr_dims[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst), corr_dims);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 

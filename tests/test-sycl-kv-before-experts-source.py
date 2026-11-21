@@ -342,10 +342,10 @@ def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
 COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
                "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
-COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
+COMMON_FIT = "common_fit_params(params.model.get_paths(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
-COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
+COMMON_LOAD = "llama_model * model = common_model_load(params.model.get_paths(), mparams);"
 
 
 def claim_common_hands_the_requested_context(common: str) -> bool:
@@ -360,8 +360,9 @@ def claim_common_hands_the_requested_context(common: str) -> bool:
 
 
 BENCH_CTX = "uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }"
-BENCH_FIT = ("cparams.n_ctx = std::max(cparams.n_ctx, inst.n_ctx());",
-             "common_fit_params(inst.model.c_str(), &mparams, &cparams,", FIT_REFRESH,
+BENCH_FIT = ("uint32_t n_ctx_needed = std::max<uint32_t>(inst.n_ctx(), inst.fit_min_ctx);",
+             "cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);",
+             "common_fit_params({ inst.model }, &mparams, &cparams,", FIT_REFRESH,
              "lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);")
 
 

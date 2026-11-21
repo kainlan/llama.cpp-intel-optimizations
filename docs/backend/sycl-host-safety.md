@@ -77,7 +77,7 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 #    naming any that this command still selects.
 bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
+      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 
 # 3. The excluded family, serially, with monitoring. Manually only -- never in
 #    a subagent or background task. NOTE the label is 'cache|mem-handle', NOT

@@ -51,9 +51,10 @@ enum llama_memory_kind {
 // callbacks capture the model and values copied out of the caller's arguments, never the arguments
 // themselves, so a policy outlives the call that made it.
 //
-//   KV, ISWA          filter, and for ISWA also reuse, share and mem_other
+//   KV, ISWA          filter, and for ISWA also reuse, share and mem_other; KV also swa_type (the
+//                     model's, or a single sliding-window cache for a model that masks every layer)
 //   MSA               filter_idx
-//   DSA, DSA_ISWA     filter (the MLA cache) and filter_aux (the indexer cache)
+//   DSA, DSA_ISWA     filter (the MLA cache) and filter_aux (the indexer cache); DSA also reuse
 //   RECURRENT         none: every layer
 //   HYBRID*           filter (attention), filter_aux (recurrent), and for HYBRID_IDX filter_idx
 struct llama_memory_policy {
@@ -65,10 +66,12 @@ struct llama_memory_policy {
     llama_memory_i::layer_reuse_cb  reuse;
     llama_memory_i::layer_share_cb  share;
     llama_memory_t                  mem_other = nullptr;
+    llama_swa_type                  swa_type  = LLAMA_SWA_TYPE_NONE;
 };
 
-// Non-null for a kind the shape structs cannot describe, and that create_memory cannot build without
-// allocating (no_alloc): the name a refusal quotes. Null for every kind that has both forms.
+// Non-null for a kind the shape structs cannot describe, which create_memory's measure form (its no_alloc
+// argument) refuses too: the name a refusal quotes. Null for every kind that has both forms. These kinds
+// still build on dummy buffers for a model loaded with llama_model_params::no_alloc (params.no_alloc).
 const char * llama_memory_kind_unsupported(llama_memory_kind kind);
 
 // The hparams llama_memory_hybrid_idx's indexer key cache is built with: one key head of indexer_head_size per

@@ -92,6 +92,10 @@ _GRAPH_RESERVE = "ggml_cgraph * llama_context::graph_reserve(sched_reserve_state
 _RESOLVE = "void llama_context::resolve_fused_ops(sched_reserve_state & state, const llama_memory_context_i * mctx, uint32_t n_seqs)"
 _WRAPPER = "void llama_context::sched_reserve()"
 _MEMBER_STATE = "sched_reserve_state llama_context::member_reserve_state()"
+_MEASURE = "sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & state)"
+# Since the 19bc41dbb merge the reserves build their scheduler through sched_new, which holds the one
+# ggml_backend_sched_new call and writes only the state it is handed.
+_SCHED_NEW = "void llama_context::sched_new(sched_reserve_state & state, const sched_params & params)"
 
 # Context members a MEASURE must not write, so none may be named bare.
 _MEMBER_RE = re.compile(
@@ -106,6 +110,7 @@ def bodies(raw: str = CONTEXT_CPP):
         "impl": function_body(code, _IMPL),
         "graph_reserve": function_body(code, _GRAPH_RESERVE),
         "resolve_fused_ops": function_body(code, _RESOLVE),
+        "sched_new": function_body(code, _SCHED_NEW),
     }
 
 
@@ -137,7 +142,9 @@ def test_reserve_bodies_touch_only_the_state():
 def test_purity_mutants():
     bs = bodies()
     mutants = [
-        ("impl writes the member scheduler", "impl", "state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, state.cparams.pipeline_parallel, state.cparams.op_offload));", "sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, state.cparams.pipeline_parallel, state.cparams.op_offload));"),
+        ("sched_new writes the member scheduler", "sched_new", "state.sched.reset(ggml_backend_sched_new(", "sched.reset(ggml_backend_sched_new("),
+        ("sched_new hands the member scheduler its callbacks", "sched_new", "ggml_backend_sched_set_copy_callback(state.sched.get(),", "ggml_backend_sched_set_copy_callback(sched.get(),"),
+        ("impl builds on the member scheduler", "impl", "sched_new(state, { max_nodes, state.cparams.pipeline_parallel,", "sched.reset(); sched_new(state, { max_nodes, state.cparams.pipeline_parallel,"),
         ("impl writes member cparams on the PP retry", "impl", "state.cparams.pipeline_parallel = false;", "cparams.pipeline_parallel = false;"),
         ("impl reads member cparams", "impl", "const uint32_t n_seqs = state.cparams.n_seq_max;", "const uint32_t n_seqs = cparams.n_seq_max;"),
         ("impl clears the member arena", "impl", "for (auto & res : state.gf_res_prev) {", "for (auto & res : gf_res_prev) {"),
@@ -147,12 +154,77 @@ def test_purity_mutants():
         ("graph_reserve builds into the member result", "graph_reserve", "auto * res = state.gf_res_reserve.get();", "auto * res = gf_res_reserve.get();"),
         ("graph_reserve writes the member n_input_tensors", "graph_reserve", "state.n_input_tensors = llama_graph_n_input_tensors(gf, !measure_only);", "n_input_tensors = llama_graph_n_input_tensors(gf, !measure_only);"),
         ("resolve_fused_ops probes on the member scheduler", "resolve_fused_ops", "ggml_backend_sched_get_tensor_backend(state.sched.get(), node.tensor)", "ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor)"),
-        ("resolve_fused_ops writes member cparams", "resolve_fused_ops", "state.cparams.auto_fgdn = false;", "cparams.auto_fgdn = false;"),
+        ("resolve_fused_ops writes member cparams", "resolve_fused_ops", "state.cparams.auto_fkvr = false;", "cparams.auto_fkvr = false;"),
     ]
     for name, which, old, new in mutants:
         mutated = dict(bs)
         mutated[which] = mutate(bs[which], old, new)
         assert not pure_ok(mutated), f"mutant {name!r} slipped through the purity gate"
+
+
+# --- the one scheduler construction --------------------------------------------
+
+# a call by any spelling (bare, this->, c->, c.); the definition's llama_context::sched_new( and the longer
+# ggml_backend_sched_new( are not calls of it
+_SCHED_NEW_CALL_RE = re.compile(r"(?<![\w:])sched_new\(")
+_SCHED_NEW_DECL = z("void sched_new(sched_reserve_state & state, const sched_params & params);")
+
+
+def src_texts() -> dict:
+    return {
+        str(p.relative_to(ROOT)): code_of(p.read_text(errors="replace"))
+        for p in sorted((ROOT / "src").rglob("*"))
+        if p.is_file() and p.suffix in {".cpp", ".h"}
+    }
+
+
+def sched_new_ok(texts: dict) -> bool:
+    """ggml_backend_sched_new is called once in src/, inside sched_new, and sched_new is called only from the
+    ALLOC reserve (sched_reserve_impl) and the MEASURE (sched_measure_impl)."""
+    ctx = texts["src/llama-context.cpp"]
+    n = function_body(ctx, _SCHED_NEW)
+    if sum(t.count("ggml_backend_sched_new(") for t in texts.values()) != 1 or n.count("ggml_backend_sched_new(") != 1:
+        return False
+    spans = []
+    for sig in (_IMPL, _MEASURE):
+        b = function_body(ctx, sig)
+        spans.append((ctx.index(b), ctx.index(b) + len(b)))
+    for path, t in texts.items():
+        if path == "src/llama-context.h":
+            t = t.replace(_SCHED_NEW_DECL, "", 1)
+        for m in _SCHED_NEW_CALL_RE.finditer(t):
+            if path != "src/llama-context.cpp" or not any(lo <= m.start() < hi for lo, hi in spans):
+                return False
+    # each caller builds through it: the ALLOC on the state's pipeline flag (its PP retry is the measure gate's), the
+    # MEASURE once
+    alloc = z("sched_new(state, { max_nodes, state.cparams.pipeline_parallel, state.cparams.op_offload, });")
+    return function_body(ctx, _IMPL).count(alloc) == 1 and function_body(ctx, _MEASURE).count(z("sched_new(state, {")) == 1
+
+
+def test_sched_new_is_the_one_scheduler_construction():
+    assert sched_new_ok(src_texts()), (
+        "the one ggml_backend_sched_new call in src/ must be in llama_context::sched_new, and sched_new must be "
+        "called only from sched_reserve_impl and sched_measure_impl"
+    )
+
+
+def test_sched_new_mutants():
+    texts = src_texts()
+    ctx = texts["src/llama-context.cpp"]
+    wrapper = function_body(ctx, _WRAPPER)
+    impl = function_body(ctx, _IMPL)
+    mutants = [
+        ("a second construction in the reserve", ctx.replace(impl, mutate(impl, "sched_new(state, { max_nodes, state.cparams.pipeline_parallel,", "state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, false)); sched_new(state, { max_nodes, state.cparams.pipeline_parallel,"), 1)),
+        ("sched_new called from the wrapper", ctx.replace(wrapper, wrapper[:-1] + z("sched_reserve_state s = member_reserve_state(); sched_new(s, {});") + "}", 1)),
+        ("the reserve builds its own scheduler", ctx.replace(impl, mutate(impl, "sched_new(state, { max_nodes, state.cparams.pipeline_parallel,", "llama_context::sched_new_direct(state, { max_nodes, state.cparams.pipeline_parallel,"), 1)),
+    ]
+    for name, mutated in mutants:
+        t = dict(texts)
+        t["src/llama-context.cpp"] = mutated
+        assert mutated != ctx and not sched_new_ok(t), f"mutant {name!r} slipped through the sched_new gate"
+    elsewhere = dict(texts)
+    elsewhere["src/llama-graph.cpp"] = texts["src/llama-graph.cpp"] + z("static void f(llama_context * c) { c->sched_new(s, {}); }")
+    assert not sched_new_ok(elsewhere), "mutant 'sched_new called from another file' slipped through the sched_new gate"
 
 
 # --- the member-backed state and the wrapper ----------------------------------
@@ -290,10 +362,30 @@ def test_compute_print_mutants():
 # --- graph_params -------------------------------------------------------------
 
 
+# Since the 19bc41dbb merge the params carry the model itself (upstream dropped the arch, hparams and prec_policy
+# fields), and every cparams read of the initialiser, the layer-input and nextn sources included, comes from the
+# state's cparams.
 _GP_INIT = (
-    "return { model.arch, model.hparams, @CP@, ubatch, gtype, @SC@, backend_cpu, cvec.get(), loras.get(), mctx, "
-    "&cross, &model.prec_policy, sampling.samplers, @NO@, graph_get_cb(@SC@), res, };"
+    "return { &model, @CP@, ubatch, gtype, @SC@, backend_cpu, cvec.get(), loras.get(), mctx, &cross, "
+    "moe_cache.get(), layer_inp_dev, supports_embd_row() ? @CP@.ctx_other->get_layer_inp_dev() : nullptr, "
+    "@CP@.embeddings_nextn_dev ? h_nextn_dev : nullptr, "
+    "supports_state_row() ? @CP@.ctx_state_src->get_h_nextn_dev() : nullptr, "
+    "sampling.samplers, @NO@, graph_get_cb(@SC@), res, };"
 )
+
+# The precision policy the fork's graphs apply reaches the graph through that model: the graph context binds it
+# from the model the params carry (before the merge the initialiser passed &model.prec_policy itself).
+GRAPH_CPP = (ROOT / "src/llama-graph.cpp").read_text()
+_GRAPH_CTOR = "llm_graph_context::llm_graph_context(const llm_graph_params & params) :"
+_GRAPH_PREC = ("model (*params.model),", "prec_policy (model.prec_policy),")
+
+
+def graph_prec_ok(code: str) -> bool:
+    c = z(_GRAPH_CTOR)
+    if code.count(c) != 1:
+        return False
+    init = code[code.index(c) : code.index("{", code.index(c))]
+    return all(init.count(z(x)) == 1 for x in _GRAPH_PREC)
 
 
 def gp(cp: str, sc: str, no: str) -> str:
@@ -320,6 +412,19 @@ def graph_params_ok(code: str) -> bool:
 
 def test_graph_params_takes_the_state_values():
     assert graph_params_ok(code_of(CONTEXT_CPP))
+
+
+def test_graph_binds_the_precision_policy_from_the_params_model():
+    assert graph_prec_ok(code_of(GRAPH_CPP))
+
+
+def test_graph_prec_mutants():
+    code = code_of(GRAPH_CPP)
+    for name, old, new in (
+        ("the policy bound from elsewhere", "prec_policy (model.prec_policy),", "prec_policy (llama_prec_policy_default()),"),
+        ("the model not the params' one", "model (*params.model),", "model (*default_model),"),
+    ):
+        assert not graph_prec_ok(mutate(code, old, new)), f"mutant {name!r} slipped through the precision-policy gate"
 
 
 def test_graph_params_mutants():
