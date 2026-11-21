@@ -19,6 +19,10 @@ EXPECTED_BY_FILE = {
     "common/common.cpp": 1,
     "examples/llama.android/lib/src/main/cpp/ai_chat.cpp": 1,
     "src/llama-context.cpp": 1,
+    # The SYCL lazy-storage adapter's registry walk: it reads the device, takes
+    # its backend reg only when the device is non-null (`dev ? ... : nullptr`),
+    # and stops at the first reg named "SYCL".
+    "src/llama-lazy-storage.cpp": 1,
     "src/llama-model.cpp": 3,
     "src/llama.cpp": 3,
     "tests/test-backend-ops.cpp": 1,
@@ -119,14 +123,15 @@ if unsafe:
 
 expected_classes = Counter({
     # llama.cpp-tsfl: the harness's own null check (see EXPECTED_BY_FILE
-    # above) is a 27th null-checked-consumer.
-    "null-checked-consumer": 27,
+    # above) is a 27th null-checked-consumer; the lazy-storage adapter's
+    # `dev ? ... : nullptr` registry walk is the 28th.
+    "null-checked-consumer": 28,
     "comparison-only": 9,
 })
 if classified != expected_classes:
     fail(f"classification drifted: {dict(classified)}")
-if sum(classified.values()) != 36:
-    fail(f"expected 36 classified calls, found {sum(classified.values())}")
+if sum(classified.values()) != 37:
+    fail(f"expected 37 classified calls, found {sum(classified.values())}")
 if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
     relative
     for relative, text, match, line in calls
@@ -136,5 +141,5 @@ if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
 
 print(
     "backend count/get census: PASS "
-    "(36/36 classified: 27 null-checked, 9 comparison-only; unsafe 0)"
+    "(37/37 classified: 28 null-checked, 9 comparison-only; unsafe 0)"
 )
