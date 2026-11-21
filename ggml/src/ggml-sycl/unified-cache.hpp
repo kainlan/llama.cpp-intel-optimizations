@@ -124,7 +124,8 @@ struct vram_zone {
     size_t              size  = 0;  // Total zone capacity
     std::atomic<size_t> used{ 0 };  // Bytes currently allocated (from TLSF)
 
-    // TLSF O(1) sub-allocator for this zone.
+    // TLSF sub-allocator for this zone: O(1) free, and O(1) allocation unless it
+    // walks the request's own size class (see tlsf_allocator::allocate).
     // Nullptr for WEIGHT zone in single-chunk mode (delegates to KV allocator).
     std::unique_ptr<tlsf_allocator> allocator;
     std::mutex                      alloc_mutex;  // Serialize concurrent alloc/free
