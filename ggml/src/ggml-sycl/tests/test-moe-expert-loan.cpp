@@ -22,9 +22,11 @@
 //   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_replacing_a_host_entry
-//                           c-mwmr-3: a host entry planted under the selected expert's host id, checked live and idle
-//                           (no lease, not retired) before the loan, is refused with "host entry exists"; nothing
-//                           is copied or published and the planted entry keeps its storage.
+//                           A host entry planted under the selected expert's host id, checked live and idle (no
+//                           lease, not retired) before the loan, refuses the loan with "host entry exists" and a
+//                           named evict of the same triplet with REFUSED "host entry exists", since a live entry
+//                           never goes by itself; nothing is copied or published and the planted entry keeps its
+//                           storage.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
 //                           storage"; nothing is copied or published.
 //   direct_stage_outside_a_load_copies_through_staging
@@ -196,8 +198,9 @@
 //                           reason.
 //   evict_is_busy_right_after_an_admit
 //                           Right after an admit the evict of that triplet is BUSY ("storage still referenced" or
-//                           "host entry exists") and changes nothing; once the host entries are reaped and the copy's
-//                           retention drained, it moves.
+//                           "host entry retiring") and changes nothing; once the copy's retention has drained it is
+//                           BUSY "host entry retiring", whatever the timing, until the host entries are reaped; then
+//                           it moves.
 //   evict_is_busy_while_lent
 //                           With a loan outstanding the evict is BUSY "loans outstanding" and changes nothing; after
 //                           the refill it moves.

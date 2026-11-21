@@ -33,9 +33,10 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     allocations come before the first triplet is lent, each extra's device lease is dropped before anything that
     allocates, a lent triplet is flipped in the plan whatever followed, the loop stops, and the exception is rethrown
     after the inventory lock is released, on each of the three exits;
-  - an existing host entry is never replaced (c-mwmr-3): any entry under a host id, idle or not, refuses the triplet
-    as "host entry exists", the registration is asked not to replace one and refuses when it would, and the refusal
-    reason reaches the transaction's refusal WARN;
+  - an existing host entry is never replaced: any entry under a host id, idle or not, refuses the triplet, as
+    "host entry retiring" while that entry is retired and waits for the deferred-free pass and as "host entry exists"
+    while it is live, the registration is asked not to replace one and refuses when it would, and the refusal reason
+    reaches the transaction's refusal WARN;
   - g_sycl_graph_compute_mutex is never named in the loan code;
   - lock order: the host storage is minted before g_tensor_inventory_mutex is taken, and the cache is asked to lend
     under it; the cache takes direct_stage_mutex_ and rw_mutex_ together, with std::lock;
@@ -117,17 +118,18 @@ What this gate pins for it:
     move, so at more than one per call each moved triplet is counted, its bytes summed, and the next is checked
     against the ledger's new back.
 
-Both directions size their copies from the cache entry the copy will hold (llama.cpp-pu8v). Direct staging pads an AOS
-quantized expert's tail to MATRIX_ROW_PADDING columns and the plan's dst_size does not count it, so a copy minted from
-dst_size is short and the cache refuses it ("host storage too small", or the final "device storage size"). What this
-gate pins:
-  - the preparation asks the cache for each member's size (the AOS device entry for a loan, the lent host copy for a
-    refill), stops with the refusal the cache would give when there is none, and mints from that size, never from
-    dst_size;
-  - each query reads its entry under direct_stage_mutex_ and rw_mutex_, shared, taken together with std::lock, and
-    returns the entry's own size;
-  - the cache's checks stay as the guards: a host copy smaller than its device entry, and device storage not exactly
-    the lent copy's size, are still refused.
+Both directions size their copies from the expert's tensor, never from a cache entry. Direct staging pads an AOS
+quantized expert's tail to MATRIX_ROW_PADDING columns and the plan's dst_size does not count it, so an entry's size can
+be larger than the expert and dst_size smaller than its staged size. What this gate pins:
+  - the preparation asks the cache only whether the entry to copy from is there (the AOS device entry for a loan, the
+    lent host copy for a refill), stops with the refusal the cache would give when there is none, and mints a loan's
+    host copy at the tensor's bytes per expert and a refill's device storage at the staged size the layout gives
+    those bytes, never from an entry's size or from dst_size;
+  - the query reads its entry under direct_stage_mutex_ and rw_mutex_, shared, taken together with std::lock, and
+    returns only whether the entry is there, not retired;
+  - the cache's checks stay as the guards: a loan's device entry or host copy shorter than the expert, and a refill's
+    host copy shorter than the expert or device storage not exactly the staged size, are still refused. So an expert
+    that goes to the host and back does not grow.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, where a
 guard on g_tensor_inventory_mutex reads the same with or without its template argument, and has a mutant that must make
@@ -381,8 +383,9 @@ def claim_registration_catches_everything(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_EXISTS = ("if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) "
-               '{ refusal = "host entry exists"; break; }')
+HOST_EXISTS = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+               "if (host != entries_.end()) { "
+               'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
 
 
@@ -436,9 +439,13 @@ PREPARE = ("stop = ggml_sycl_expert_prepare_triplet(*cache, device, *current->pl
 HOST_ALLOC = "storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);"
 MINT_CALLS = ("ggml_sycl_host_expert_alloc(", "ggml_sycl_device_expert_alloc(")
 INVENTORY_LOCK = "std::unique_lock lock(g_tensor_inventory_mutex);"
-# One statement moves each triplet, the cache body picked by its kind.
-MOVE_CALL = ("loaned = !to_device ? cache->loan_expert_triplet(triplet.members, record) : admit ? "
-             "cache->admit_host_triplet(triplet.members, record) : cache->refill_lent_triplet(triplet.members, record);")
+# One statement moves each triplet, the cache body picked by a switch on its kind with no default, so a new kind is a
+# compile warning rather than a move through another kind's body.
+MOVE_CALL = ("switch (triplet.kind) { case ggml_sycl_expert_move_kind::LOAN: case ggml_sycl_expert_move_kind::EVICT: "
+             "loaned = cache->loan_expert_triplet(triplet.members, record); break; "
+             "case ggml_sycl_expert_move_kind::ADMIT: loaned = cache->admit_host_triplet(triplet.members, record); "
+             "break; case ggml_sycl_expert_move_kind::REFILL: "
+             "loaned = cache->refill_lent_triplet(triplet.members, record); break; }")
 LEND = "cache->loan_expert_triplet(triplet.members, record)"
 CACHE_LOCKS = ("std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                "std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
@@ -809,7 +816,8 @@ def claim_device_test_registration(cmake: str) -> bool:
 
 REFILL_SIG = "bool unified_cache::refill_lent_triplet("
 # The refill and the named admit share one cache body; the refill runs it with admit false, which keeps every refill
-# check the refill had: admit only adds the host-zone check and the staged size.
+# check the refill had: admit only changes the source rule, a whole pinned host copy that is a host-zone slice. Both
+# size the copy from the tensor and mint the device storage at the staged size.
 REFILL_BODY_SIG = "bool unified_cache::copy_host_triplet_to_device("
 REFILL_WRAP = "{ return copy_host_triplet_to_device(members, false, out); }"
 SELECT_SIG = "static std::vector<ggml_sycl::expert_placement_key> ggml_sycl_expert_refill_select("
@@ -1286,17 +1294,17 @@ SKIP_REASON = 'result->reason = "no decode graph since the last refill"; return 
 
 
 MOVE_LOOP_SIG = "for (ggml_sycl_expert_prepared_triplet & triplet : prepared)"
-LOOP_TAIL = "++lent; freed += record.device_bytes; } if (escaped) { break; } }"
+LOOP_TAIL = "++lent; (to_device ? taken : freed) += record.device_bytes; } if (escaped) { break; } }"
 LOOP_STOPS = ("transient = ledger.refill_armed; break; }", FINAL_POP, "if (escaped) { break; }")
 
 
 def claim_the_move_loop_moves_every_prepared_triplet(sycl: str) -> bool:
     """The move loop stops only where a triplet did not move: the cursor no longer holds it at its back (cancelled by a
     loan, or changed), the cache refuses a loan or a refill, or an exception escaped. A switch case's break leaves the
-    switch, not the loop. After a triplet moves, the loop counts it, sums its device bytes and goes on, so a refill of
-    more than one per call checks the next triplet against the back the first one's pop left."""
+    switch, not the loop. After a triplet moves, the loop counts it, sums its device bytes in its direction and goes
+    on, so a refill of more than one per call checks the next triplet against the back the first one's pop left."""
     loop = body(body(norm(sycl), TXN_SIG), MOVE_LOOP_SIG)
-    return (loop.count("break;") == len(LOOP_STOPS) + POP_READMITTED.count("break;")
+    return (loop.count("break;") == len(LOOP_STOPS) + POP_READMITTED.count("break;") + MOVE_CALL.count("break;")
             and all(loop.count(x) == 1 for x in LOOP_STOPS) and loop.count(POP_READMITTED) == 1
             and loop.endswith(LOOP_TAIL)
             and ordered(loop, CANCELLED, MOVE_CALL, FINAL_POP, POP_READMITTED, LOOP_TAIL))
@@ -1912,11 +1920,20 @@ def test_mutant_existing_host_entry_unchecked_fails():
 
 
 def test_mutant_idle_host_entry_let_through_fails():
-    """c-mwmr-3: refusing only a retired or leased host entry lets an idle one through to be replaced, storage and
-    all, by a registration the loan could not undo."""
-    busy_only = ("if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) "
-                 '{ refusal = "host entry exists"; break; }')
+    """Refusing only a retired or leased host entry lets an idle one through to be replaced, storage and all, by a
+    registration the loan could not undo."""
+    busy_only = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+                 "if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) { "
+                 'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
     assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, busy_only), SYCL)
+
+
+def test_mutant_retiring_host_entry_named_as_live_fails():
+    """A retired host entry refused as "host entry exists": the transaction would answer a refusal that clears by
+    itself as final, and a named evict right after an admit would never be tried again."""
+    alike = HOST_EXISTS.replace('host->second.retired ? "host entry retiring" : "host entry exists"',
+                                '"host entry exists"')
+    assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, alike), SYCL)
 
 
 def test_mutant_loan_registration_may_replace_fails():

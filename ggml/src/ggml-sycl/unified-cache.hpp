@@ -4528,7 +4528,8 @@ class unified_cache {
     // entry on the device, since only that layout keeps an expert's bytes contiguous from offset 0, not retired, whose
     // direct_alloc_owner is its whole allocation and not a view into a bulk tensor's shared one, not cache backing,
     // and held by nothing but the entry. What the host registration would refuse for is checked too, and a host id
-    // that already has an entry, idle or not, refuses the triplet as "host entry exists": the registration never
+    // that already has an entry, idle or not, refuses the triplet, as "host entry retiring" while that entry is
+    // retired and waits for the deferred-free pass and as "host entry exists" while it is live: the registration never
     // replaces one, since a failed loan could not put a replaced entry back. One member that fails refuses the
     // triplet with a reason and leaves no state behind. Each member's device entry must hold its logical_bytes
     // ("device entry size" otherwise) and its owner must hold them too ("host storage too small"). Otherwise the

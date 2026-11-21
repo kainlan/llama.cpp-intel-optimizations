@@ -340,15 +340,19 @@ pinned host storage for the tensor's bytes per expert, and the loan's cache body
 device entry and retires the entry. Its refusals are the loan's. REFUSED:
 "host storage not pinned", "not resident", "not on device", "layout",
 "shared storage" (a view into a bulk tensor's one allocation),
-"device entry size" and "host storage too small". BUSY:
-"storage still referenced" and "host entry exists" (what a recent admit leaves
-until the deferred-free pass reaps it), and an exhausted pinned pool.
-Each extra then drops its views of the withdrawn device entry and remembers the
-host copy, as a loan's extras do. Every drop and remember moves the tensor's
-storage generation, so a decode direct route that served the block from a
-full-coverage table decides again and never serves it from the old table, which
-names retired storage. An evicted triplet comes back only through a later admit:
-it is in no ledger, so the refill never re-admits it.
+"device entry size", "host storage too small" and "host entry exists" (a live
+entry under one of the host ids, another owner's, which the evict never
+replaces). BUSY: "storage still referenced", "host entry retiring" (the retired
+host entry a recent admit leaves until the deferred-free pass reaps it) and an
+exhausted pinned pool. Each extra then drops its views of the withdrawn device
+entry and remembers the host copy, as a loan's extras do. Every drop and
+remember moves the tensor's storage generation, so a decode direct route that
+served the block from a full-coverage table decides again and never serves it
+from the old table, which names retired storage. The plan then places the expert
+on the host, so a CPU job serves it, and that job takes the host record's copy
+event as an input, so it never reads the pinned copy before the copy lands. An
+evicted triplet comes back only through a later admit: it is in no ledger, so
+the refill never re-admits it.
 
 An evict's device bytes come back only when `finalize_retired_entries_locked`
 reaps the entries it retired. A named move waits for nothing: the views it

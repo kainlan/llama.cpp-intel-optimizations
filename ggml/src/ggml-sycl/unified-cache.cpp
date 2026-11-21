@@ -11517,12 +11517,16 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
                 refusal = "host storage too small";
                 break;
             }
-            // c-mwmr-3: a host id that already has an entry, idle or not, refuses the triplet. Replacing it would free
-            // its storage with it, and a loan that then failed could not put it back. The registration below refuses
-            // the same, so an entry that appears after this check fails the loan whole instead of being replaced.
+            // A host id that already has an entry, idle or not, refuses the triplet. Replacing it would free its
+            // storage with it, and a loan that then failed could not put it back. A retired entry only waits for the
+            // deferred-free pass to erase it, so "host entry retiring" clears by itself; a live one is another
+            // owner's and stays until that owner withdraws it, so "host entry exists" comes back at every retry. The
+            // registration below refuses the same, so an entry that appears after this check fails the loan whole
+            // instead of being replaced.
             for (const ggml_sycl_cache_id & host_key : members[i].host_keys) {
-                if (entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }) != entries_.end()) {
-                    refusal = "host entry exists";
+                const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 });
+                if (host != entries_.end()) {
+                    refusal = host->second.retired ? "host entry retiring" : "host entry exists";
                     break;
                 }
             }

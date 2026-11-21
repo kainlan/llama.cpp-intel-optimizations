@@ -737,15 +737,14 @@ INTERNAL_WRAPPER_SITES = {
         "const auto snapshot = ggml_sycl_global_plan_snapshot();": 2,
         "found = ::ggml_sycl_global_plan_snapshot();": 1,
         "ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());": 1,
-        # llama.cpp-sif1 took this from 4 to 6: the refill cases show a refill with nothing to do, and one cancelled
-        # by a loan, published nothing. It then took it to 7: a loan refused without host zones published nothing. It
-        # then took it to 9: a boundary with no decode graph since the refill, and a refill whose only triplet was
-        # dropped, published nothing. 9 -> 10: the busy admit case shows each BUSY admit published nothing. 10 -> 11:
-        # the case that admits from a host copy shorter than the tensor shows that refusal published nothing.
-        # 11 -> 13: the shared-storage evict case shows its refused evict, and the just-admitted evict case each of
-        # its BUSY evicts, published nothing. 13 -> 12: the shared-storage case's refused evict now shares its call
-        # with an evict that moves, so that call publishes, and the case reads the new plan instead.
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 12,
+        # One check per call that must publish nothing, that it left the publication in place: the loan refused
+        # without host zones, the loan refused inside a graph, the probe, the loan and the evict refused under a live
+        # host entry (one check after both calls), the loan refused for shared storage, the refill with nothing to do,
+        # the refill a loan cancelled, a boundary with no decode graph since the refill, a refill whose only triplet
+        # was dropped, the busy admit case's BUSY admits (one check in its helper), the admit from a host copy shorter
+        # than the tensor, and the two BUSY evicts right after an admit, the first for whichever hold it meets and
+        # the second, after the copy's retention drained, for the retiring host entries alone.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 13,
         # An accepted evict publishes a plan with the triplet on the host, so the case that evicts one resident
         # triplet shows the publication changed.
         "if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {": 1,
