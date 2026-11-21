@@ -66,6 +66,8 @@ struct table {
     std::vector<std::vector<uint64_t>> decode;
     std::vector<std::vector<uint64_t>> prompt;
     std::vector<std::vector<uint8_t>>  resident;
+    std::vector<std::vector<uint8_t>>  admissible;  // handed to the policy only when use_admissible is set
+    bool                               use_admissible = false;
     std::vector<uint8_t>               eligible;
     std::vector<moe_swap_block_input>  in;
 
@@ -75,6 +77,7 @@ struct table {
         decode(static_cast<size_t>(nb), std::vector<uint64_t>(static_cast<size_t>(ne), 0)),
         prompt(static_cast<size_t>(nb), std::vector<uint64_t>(static_cast<size_t>(ne), 0)),
         resident(static_cast<size_t>(nb), std::vector<uint8_t>(static_cast<size_t>(ne), 0)),
+        admissible(static_cast<size_t>(nb), std::vector<uint8_t>(static_cast<size_t>(ne), 1)),
         eligible(static_cast<size_t>(nb), 1),
         in(static_cast<size_t>(nb)) {}
 
@@ -99,6 +102,7 @@ struct table {
             in[b].prompt_counts = prompt[b].data();
             in[b].resident      = resident[b].data();
             in[b].eligible      = eligible[b] != 0;
+            in[b].admissible    = use_admissible ? admissible[b].data() : nullptr;
         }
         return in.data();
     }
@@ -118,7 +122,8 @@ static moe_swap_status step(moe_swap_state &                 s,
                             std::vector<moe_swap_proposal> & out,
                             bool                             in_flight    = false,
                             bool                             after_prompt = false,
-                            int                              n_tokens     = 1) {
+                            int                              n_tokens     = 1,
+                            double                           prompt_gate  = 0.0) {
     moe_swap_call c;
     c.blocks       = t.blocks();
     c.n_blocks     = t.n_blocks;
@@ -126,7 +131,27 @@ static moe_swap_status step(moe_swap_state &                 s,
     c.n_tokens     = n_tokens;
     c.in_flight    = in_flight;
     c.after_prompt = after_prompt;
+    c.prompt_gate  = prompt_gate;
     return moe_swap_step(s, p, c, out);
+}
+
+// One decode call with the prompt gate K, as the driver makes it after a prompt pass.
+static moe_swap_status step_gated(moe_swap_state &                 s,
+                                  const moe_swap_params &          p,
+                                  table &                          t,
+                                  std::vector<moe_swap_proposal> & out,
+                                  double                           prompt_gate,
+                                  bool                             in_flight = false) {
+    return step(s, p, t, out, in_flight, /*after_prompt=*/false, /*n_tokens=*/1, prompt_gate);
+}
+
+static bool admits(const std::vector<moe_swap_proposal> & out, int expert) {
+    for (const moe_swap_proposal & q : out) {
+        if (q.admit_expert == expert) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // One period of decode tokens, one call each; the result is the last call's, the period boundary. The state's token
@@ -1005,6 +1030,289 @@ static void test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bou
     CHECK(boundary_us + other_us < 2.0e6);  // all 1024 calls together under two seconds: a gross regression only
 }
 
+// ---- The prompt boundary --------------------------------------------------------------------------------------------
+// With a gate K > 0 (the driver's 2 x cpu_expert_gbps / h2d_gbps), the first decode call after one or more prompt
+// passes is taken at once: no period wait, no decay, and the gate max(margin, K) in place of min_usage, margin and
+// max_swaps.
+
+// The first decode call after a prompt pass is the prompt boundary, one token in, far from the period.
+static void test_the_first_decode_call_after_a_prompt_is_a_prompt_boundary() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.prompt[0][0] = 1;    // the resident experts saw little: expert 0 once, 1 to 3 never
+    t.prompt[0][5] = 100;  // two host experts the prompt routed to
+    t.prompt[0][6] = 10;
+    CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(out.empty());
+    CHECK(s.prompt_pending);
+
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(s.tokens == 1);
+    CHECK(!s.prompt_pending);
+    CHECK(out.size() == 2);
+    if (out.size() == 2) {
+        CHECK(out[0].admit_expert == 5 && out[0].evict_expert == 1 && near(out[0].gain, 100.0));
+        CHECK(out[1].admit_expert == 6 && out[1].evict_expert == 2 && near(out[1].gain, 10.0));
+    }
+    CHECK(near(s.usage_of(0, 5), 100.0));  // no decay at the prompt boundary
+    CHECK(near(s.usage_of(0, 0), 1.0));
+}
+
+// Every pair at or above max(margin, K) is proposed and none below it, with neither the decode cap nor its floor.
+static void test_the_prompt_boundary_takes_every_pair_at_the_gate_and_none_below_without_a_cap() {
+    moe_swap_params p;
+    p.max_swaps = 2;     // the decode rule's cap, which the prompt boundary does not apply
+    p.min_usage = 50.0;  // nor its floor
+    table                          t(1, 16);
+    moe_swap_state                 s(1, 16);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 8);                           // the resident experts saw nothing
+    const uint64_t host[6] = { 20, 19, 18, 6, 5, 4 };  // experts 8 to 13; K = 5 takes the first five
+    for (int i = 0; i < 6; ++i) {
+        t.prompt[0][static_cast<size_t>(8 + i)] = host[i];
+    }
+    CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(out.size() == 5);  // more than max_swaps, and the pair exactly at the gate is in
+    for (int e = 8; e <= 12; ++e) {
+        CHECK(admits(out, e));
+    }
+    CHECK(!admits(out, 13));  // 4 - 0 is below the gate
+
+    // A margin above K is the gate.
+    moe_swap_params pm;
+    pm.margin = 7.0;
+    moe_swap_state s2(1, 16);
+    CHECK(step(s2, pm, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(step_gated(s2, pm, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(out.size() == 3);
+    CHECK(admits(out, 8) && admits(out, 9) && admits(out, 10) && !admits(out, 11));
+}
+
+// A prompt boundary skipped while swaps or loans are in flight stays pending, absorbs nothing, and the next call takes
+// it, whatever the period says.
+static void test_an_in_flight_skip_keeps_the_prompt_boundary_pending() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.prompt[0][5] = 100;
+    CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+
+    t.decode[0][5] = 3;  // a decode count the skipped boundary does not absorb
+    CHECK(step_gated(s, p, t, out, 5.0, /*in_flight=*/true) == MOE_SWAP_STATUS_IN_FLIGHT);
+    CHECK(out.empty());
+    CHECK(s.prompt_pending);
+    CHECK(near(s.usage_of(0, 5), 100.0));
+
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);  // the second token
+    CHECK(s.tokens == 2);
+    CHECK(!s.prompt_pending);
+    CHECK(out.size() == 1);
+    CHECK(near(s.usage_of(0, 5), 103.0));  // absorbed now, and still not decayed
+}
+
+// After the prompt boundary the decode rule runs unchanged: the period, the cap and the decay.
+static void test_the_boundary_after_the_prompt_boundary_uses_the_decode_rule_and_its_cap() {
+    moe_swap_params p;
+    p.max_swaps = 1;
+    table                          t(1, 16);
+    moe_swap_state                 s(1, 16);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 8);
+    t.prompt[0][8] = 20;
+    t.prompt[0][9] = 19;
+    CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);  // token 1
+    CHECK(out.size() == 2);                                           // uncapped
+    t.apply(out);                                                     // 8 and 9 in, 0 and 1 out
+
+    t.decode[0][10] = 30;
+    t.decode[0][11] = 30;
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_WAITING);  // token 2: the gate no longer applies
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_WAITING);  // token 3
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);  // token 4: the period boundary
+    CHECK(out.size() == 1);                                           // the decode rule's cap
+    if (out.size() == 1) {
+        CHECK(out[0].admit_expert == 10 && out[0].evict_expert == 2);
+    }
+    CHECK(near(s.usage_of(0, 10), 21.0));  // 30 * 0.7: the decode boundary decays
+    CHECK(near(s.usage_of(0, 8), 14.0));   // 20 * 0.7: the prompt boundary had not
+}
+
+// K = 0 (an unprobed device), a negative K and a NaN K give the decode rule, and the first decode call spends the
+// prompt boundary: a gate that arrives later finds none.
+static void test_a_zero_negative_or_nan_gate_gives_the_decode_rule() {
+    const double gates[3] = { 0.0, -1.0, std::numeric_limits<double>::quiet_NaN() };
+    for (double k : gates) {
+        const moe_swap_params          p;
+        table                          t(1, 8);
+        moe_swap_state                 s(1, 8);
+        std::vector<moe_swap_proposal> out;
+        t.resident_prefix(0, 4);
+        t.prompt[0][5] = 100;
+        CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+        CHECK(step_gated(s, p, t, out, k) == MOE_SWAP_STATUS_WAITING);
+        CHECK(!s.prompt_pending);
+        CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_WAITING);
+        CHECK(step_gated(s, p, t, out, k) == MOE_SWAP_STATUS_WAITING);
+        CHECK(step_gated(s, p, t, out, k) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.size() == 1);
+        CHECK(near(s.usage_of(0, 5), 70.0));
+    }
+}
+
+// A prompt pass still only seeds, whatever gate the call carries.
+static void test_a_prompt_pass_alone_proposes_nothing_whatever_the_gate() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.prompt[0][5] = 100;
+    CHECK(step(s, p, t, out, false, true, 1, 5.0) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(out.empty());
+    t.prompt[0][6] = 50;
+    CHECK(step(s, p, t, out, false, true, 1, 5.0) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(out.empty());
+    CHECK(s.tokens == 0);
+    CHECK(s.prompt_pending);
+}
+
+// A host expert whose admissible flag is 0 is no candidate under either rule; a resident expert's flag is not read.
+static void test_the_admissible_flags_keep_a_host_expert_out_of_both_rules() {
+    const moe_swap_params p;
+    {
+        table                          t(1, 8);
+        moe_swap_state                 s(1, 8);
+        std::vector<moe_swap_proposal> out;
+        t.resident_prefix(0, 4);
+        t.use_admissible   = true;
+        t.admissible[0][5] = 0;
+        t.admissible[0][0] = 0;  // a resident expert: still the coldest, still evicted
+        t.decode[0][5]     = 100;
+        t.decode[0][6]     = 10;
+        CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.size() == 1);
+        if (out.size() == 1) {
+            CHECK(out[0].admit_expert == 6 && out[0].evict_expert == 0);
+        }
+    }
+    {
+        table                          t(1, 8);
+        moe_swap_state                 s(1, 8);
+        std::vector<moe_swap_proposal> out;
+        t.resident_prefix(0, 4);
+        t.use_admissible   = true;
+        t.admissible[0][5] = 0;
+        t.prompt[0][5]     = 100;
+        t.prompt[0][6]     = 10;
+        CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+        CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.size() == 1);
+        CHECK(admits(out, 6) && !admits(out, 5));
+    }
+    {
+        // Nothing admissible: the boundary is still taken, absorbs and decays, and proposes nothing.
+        table                          t(1, 8);
+        moe_swap_state                 s(1, 8);
+        std::vector<moe_swap_proposal> out;
+        t.resident_prefix(0, 4);
+        t.use_admissible = true;
+        for (int e = 0; e < 8; ++e) {
+            t.admissible[0][static_cast<size_t>(e)] = 0;
+        }
+        t.decode[0][5] = 100;
+        CHECK(run_period(s, p, t, out) == MOE_SWAP_STATUS_ADAPTED);
+        CHECK(out.empty());
+        CHECK(near(s.usage_of(0, 5), 70.0));
+    }
+}
+
+// One call checked both ways: the peek changes nothing and allocates nothing, and answers the status the step then
+// returns, with whether an ADAPTED step is the prompt boundary.
+static void check_peek(moe_swap_state &                 s,
+                       const moe_swap_params &          p,
+                       table &                          t,
+                       std::vector<moe_swap_proposal> & out,
+                       bool                             in_flight,
+                       bool                             after_prompt,
+                       int                              n_tokens,
+                       double                           gate,
+                       bool                             want_prompt) {
+    moe_swap_call c;
+    c.blocks       = t.blocks();
+    c.n_blocks     = t.n_blocks;
+    c.n_experts    = t.n_experts;
+    c.n_tokens     = n_tokens;
+    c.in_flight    = in_flight;
+    c.after_prompt = after_prompt;
+    c.prompt_gate  = gate;
+
+    const uint64_t        tokens  = s.tokens;
+    const bool            pending = s.prompt_pending;
+    const size_t          allocs  = g_allocs;
+    bool                  prompt  = !want_prompt;
+    const moe_swap_status peeked  = ggml_sycl::moe_swap_peek(s, p, c, &prompt);
+    CHECK(g_allocs == allocs);
+    CHECK(s.tokens == tokens && s.prompt_pending == pending);
+    const moe_swap_status got = moe_swap_step(s, p, c, out);
+    CHECK(peeked == got);
+    CHECK(prompt == want_prompt);
+}
+
+static void test_peek_answers_what_the_step_does() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.prompt[0][5] = 100;
+    check_peek(s, p, t, out, false, true, 1, 5.0, false);   // SEEDED
+    check_peek(s, p, t, out, true, false, 1, 5.0, false);   // token 1, IN_FLIGHT: the prompt boundary is kept
+    check_peek(s, p, t, out, false, false, 1, 5.0, true);   // token 2, ADAPTED by the prompt rule
+    check_peek(s, p, t, out, false, false, 1, 5.0, false);  // token 3, WAITING
+    check_peek(s, p, t, out, false, false, 0, 0.0, false);  // no token, WAITING
+    check_peek(s, p, t, out, false, false, 1, 0.0, false);  // token 4, ADAPTED by the decode rule
+    check_peek(s, p, t, out, false, false, 3, 0.0, false);  // token 7, WAITING
+    check_peek(s, p, t, out, true, false, 1, 0.0, false);   // token 8, IN_FLIGHT
+    moe_swap_params bad;
+    bad.decay = 2.0;
+    check_peek(s, bad, t, out, false, false, 1, 0.0, false);  // REJECTED
+}
+
+// A driver that could move only part of a prompt boundary's batch defers the boundary: the next decode call takes it
+// again with the prompt rule, and once one is taken whole the decode rule follows.
+static void test_a_deferred_prompt_boundary_is_taken_again() {
+    const moe_swap_params          p;
+    table                          t(1, 8);
+    moe_swap_state                 s(1, 8);
+    std::vector<moe_swap_proposal> out;
+    t.resident_prefix(0, 4);
+    t.prompt[0][5] = 100;
+    t.prompt[0][6] = 50;
+    CHECK(step(s, p, t, out, false, true) == MOE_SWAP_STATUS_SEEDED);
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);
+    CHECK(out.size() == 2);
+    if (out.size() != 2) {
+        return;
+    }
+    const std::vector<moe_swap_proposal> taken(out.begin(), out.begin() + 1);
+    t.apply(taken);
+    ggml_sycl::moe_swap_prompt_boundary_defer(s);
+    CHECK(s.prompt_pending);
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_ADAPTED);  // token 2: the prompt boundary again
+    CHECK(out.size() == 1);
+    if (out.size() == 1) {
+        CHECK(out[0].admit_expert == 6);
+    }
+    CHECK(step_gated(s, p, t, out, 5.0) == MOE_SWAP_STATUS_WAITING);  // token 3: the decode rule from here
+}
+
 int main() {
     test_defaults();
     test_candidate_below_min_usage_is_not_proposed();
@@ -1029,6 +1337,15 @@ int main() {
     test_null_counts_mean_unchanged_and_a_block_without_residency_is_skipped();
     test_a_negative_max_swaps_proposes_nothing();
     test_replay_at_the_size_of_a_48_by_512_model_stays_within_a_time_bound();
+    test_the_first_decode_call_after_a_prompt_is_a_prompt_boundary();
+    test_the_prompt_boundary_takes_every_pair_at_the_gate_and_none_below_without_a_cap();
+    test_an_in_flight_skip_keeps_the_prompt_boundary_pending();
+    test_the_boundary_after_the_prompt_boundary_uses_the_decode_rule_and_its_cap();
+    test_a_zero_negative_or_nan_gate_gives_the_decode_rule();
+    test_a_prompt_pass_alone_proposes_nothing_whatever_the_gate();
+    test_the_admissible_flags_keep_a_host_expert_out_of_both_rules();
+    test_peek_answers_what_the_step_does();
+    test_a_deferred_prompt_boundary_is_taken_again();
 
     if (g_failed != 0) {
         std::printf("test-sycl-moe-swap-policy: %d check(s) failed\n", g_failed);

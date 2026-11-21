@@ -709,6 +709,9 @@ std::string test_expert_evict_and_admit_cycles_return_the_room();
 std::string test_expert_evict_refusal_leaves_the_admit_list_alone();
 std::string test_expert_evict_room_is_not_an_admit_in_the_same_call();
 std::string test_expert_evict_takes_a_block_off_the_direct_route();
+// A named evict's host copies never grow the pinned host zone: into a full host WEIGHT zone it is BUSY "host pinned
+// pool exhausted" and the zone's capacity is unchanged; once the room is back the same evict moves.
+std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone();
 #endif
 
 }  // namespace ggml_sycl

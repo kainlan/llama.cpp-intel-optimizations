@@ -4,12 +4,15 @@
 //            down entry, expert 6 with no down entry, expert 7 on device 0 with a SOA up entry (Q4_0: no inverse).
 //   layer 1: experts 0-1 on device 0, experts 2-3 on the host, expert 4 split: its gate on device 0, up and down on
 //            the host.
+// The swap driver's view of a plan (moe_swap_plan_view_build) is checked on a second plan, described at
+// make_swap_plan.
 
 #include "ggml-sycl/moe-stream-plan.hpp"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -217,6 +220,119 @@ void test_evict_only_answers_in_order() {
     CHECK(c.net_by_layer == want);
 }
 
+// ---- The swap driver's view of the plan -----------------------------------------------------------------------------
+// Four layers of four experts, all AOS, queried for device 0:
+//   layer 0: experts 0-1 on device 0, experts 2-3 on the host in pinned storage.
+//   layer 1: the same, with the host experts file-mapped (a mapping load whose pin was withdrawn).
+//   layer 2: experts 0-1 on device 0, expert 2 split (its gate on device 0), expert 3 on the host.
+//   layer 3: every expert on device 0, so each tensor is bulk-staged and no triplet of it is individually owned.
+// With dense_on_device, a non-expert entry holds device 0 as well.
+placement_plan make_swap_plan(bool dense_on_device) {
+    placement_plan plan{};
+    plan.multi_device = false;
+    for (int layer = 0; layer < 4; ++layer) {
+        for (int e = 0; e < 4; ++e) {
+            for (int r = 0; r < 3; ++r) {
+                int target = e < 2 ? 0 : -1;
+                if ((layer == 2 && e == 2 && r == 0) || layer == 3) {
+                    target = 0;
+                }
+                placement_entry pe = make_entry(layer, e, r, target);
+                if (layer == 1 && target < 0) {
+                    pe.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+                }
+                plan.entries.push_back(pe);
+            }
+        }
+    }
+    if (dense_on_device) {
+        plan.entries.emplace_back("blk.0.attn_q.weight", 8192, 8192, 0, placement_priority::MOE_UP, 0, -1,
+                                  expert_tensor_role::UNKNOWN, true, 0);
+    }
+    plan.build_index();
+    return plan;
+}
+
+ggml_sycl::moe_swap_plan_view swap_view(const placement_plan & plan, int n_blocks, int n_experts) {
+    std::unordered_map<uint64_t, bool> memo;
+    ggml_sycl::moe_swap_plan_view      view;
+    ggml_sycl::moe_swap_plan_view_build(plan, /*device=*/0, n_blocks, n_experts, memo, view);
+    return view;
+}
+
+uint8_t at(const std::vector<uint8_t> & v, int n_experts, int block, int expert) {
+    return v[static_cast<size_t>(block) * static_cast<size_t>(n_experts) + static_cast<size_t>(expert)];
+}
+
+// Resident: the whole triplet on this card. Admissible: the whole triplet on the host, pinned, in a layout an admit
+// stages. Eligible: every triplet whole on one side and every resident one individually owned.
+void test_swap_view_reads_residency_admissibility_and_eligibility() {
+    const placement_plan                plan = make_swap_plan(/*dense_on_device=*/true);
+    const ggml_sycl::moe_swap_plan_view v    = swap_view(plan, 4, 4);
+    CHECK(v.n_blocks == 4 && v.n_experts == 4);
+    CHECK(v.resident.size() == 16 && v.admissible.size() == 16 && v.eligible.size() == 4 && v.pair_bytes.size() == 4);
+    if (v.resident.size() != 16 || v.admissible.size() != 16 || v.eligible.size() != 4 || v.pair_bytes.size() != 4) {
+        return;
+    }
+    for (int b = 0; b < 4; ++b) {
+        CHECK(at(v.resident, 4, b, 0) == 1 && at(v.resident, 4, b, 1) == 1);
+    }
+    CHECK(at(v.resident, 4, 0, 2) == 0 && at(v.resident, 4, 2, 2) == 0 && at(v.resident, 4, 3, 3) == 1);
+    CHECK(at(v.admissible, 4, 0, 2) == 1 && at(v.admissible, 4, 0, 3) == 1);
+    CHECK(at(v.admissible, 4, 1, 2) == 0 && at(v.admissible, 4, 1, 3) == 0);  // file-mapped
+    CHECK(at(v.admissible, 4, 2, 2) == 0 && at(v.admissible, 4, 2, 3) == 1);  // the split one is neither
+    CHECK(at(v.admissible, 4, 0, 0) == 0);                                    // a resident triplet is not admitted
+    CHECK(v.eligible[0] == 1);
+    CHECK(v.eligible[1] == 1);  // consistent, with residents; its host side is only not admissible
+    CHECK(v.eligible[2] == 0);  // the split triplet
+    CHECK(v.eligible[3] == 0);  // bulk-staged
+    CHECK(v.file_mapped == 2);  // layer 1's two host triplets
+    CHECK(v.pair_bytes[0] == 3 * 4096);
+    CHECK(v.device_held && v.single_device);
+}
+
+// The card is held only when something other than an expert lives there, and a plan across cards is reported.
+void test_swap_view_reads_the_card_hold_and_the_device_span() {
+    const placement_plan experts_only = make_swap_plan(/*dense_on_device=*/false);
+    CHECK(!swap_view(experts_only, 4, 4).device_held);
+    placement_plan spread = make_swap_plan(/*dense_on_device=*/true);
+    spread.multi_device   = true;
+
+    const ggml_sycl::moe_swap_plan_view v = swap_view(spread, 4, 4);
+    CHECK(v.device_held && !v.single_device);
+}
+
+// A route table larger than the plan: the blocks or experts the plan does not have make their blocks not eligible.
+void test_swap_view_of_a_larger_route_table() {
+    const placement_plan                plan  = make_swap_plan(/*dense_on_device=*/true);
+    const ggml_sycl::moe_swap_plan_view wider = swap_view(plan, 5, 4);
+    CHECK(wider.eligible.size() == 5);
+    if (wider.eligible.size() == 5) {
+        CHECK(wider.eligible[0] == 1 && wider.eligible[4] == 0);
+        CHECK(at(wider.resident, 4, 4, 0) == 0 && at(wider.admissible, 4, 4, 0) == 0);
+    }
+    const ggml_sycl::moe_swap_plan_view deeper = swap_view(plan, 4, 5);
+    CHECK(deeper.eligible.size() == 4);
+    for (uint8_t e : deeper.eligible) {
+        CHECK(e == 0);  // expert 4 has no entry in any layer
+    }
+}
+
+// The bulk answers are memoised across builds, and a second build with the memo gives the same view.
+void test_swap_view_memoises_the_bulk_answers() {
+    const placement_plan               plan = make_swap_plan(/*dense_on_device=*/true);
+    std::unordered_map<uint64_t, bool> memo;
+    ggml_sycl::moe_swap_plan_view      first;
+    ggml_sycl::moe_swap_plan_view      second;
+    ggml_sycl::moe_swap_plan_view_build(plan, 0, 4, 4, memo, first);
+    CHECK(!memo.empty());
+    const size_t answers = memo.size();
+    ggml_sycl::moe_swap_plan_view_build(plan, 0, 4, 4, memo, second);
+    CHECK(memo.size() == answers);
+    CHECK(first.resident == second.resident && first.admissible == second.admissible);
+    CHECK(first.eligible == second.eligible && first.file_mapped == second.file_mapped);
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +344,10 @@ int main() {
     test_duplicate_keys_refused();
     test_net_count_per_block();
     test_evict_only_answers_in_order();
+    test_swap_view_reads_residency_admissibility_and_eligibility();
+    test_swap_view_reads_the_card_hold_and_the_device_span();
+    test_swap_view_of_a_larger_route_table();
+    test_swap_view_memoises_the_bulk_answers();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-move-validate: %d failure(s)\n", failures);

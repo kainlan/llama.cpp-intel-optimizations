@@ -46,8 +46,9 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       strict ("not lent", "not a lent copy"), admit_host_triplet passes true, and an admit's host copy must be pinned
       storage it owns whole, its owner exactly the entry's base and size, and a host-zone slice ("host copy not
       pinned" otherwise), while a refill's owner need only hold the entry, as the loan that lent it requires;
-  A9  a named move WARNs nothing (its refusals skip the loan's WARN, its result line is DEBUG), and nothing but the
-      private test fixtures calls the entry;
+  A9  a named move WARNs nothing (its refusals skip the loan's WARN, its result line is DEBUG), and outside the
+      private test fixtures the entry has exactly one caller, the decode-boundary swap driver
+      (ggml_sycl_run_expert_swap_at_boundary), which calls it once;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
       lets through;
   A11 every refusal either cache body assigns, the copy to the device and the loan's copy to the host, is classed
@@ -331,6 +332,8 @@ REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggm
 NAMED_DEBUG = ('GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
                '(%s)\\n"')
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
+# The entry's one production caller: the swap driver at the synchronize boundary.
+DRIVER_SIG = "static void ggml_sycl_run_expert_swap_at_boundary("
 
 VALIDATE = ("const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, "
             "admit);")
@@ -551,11 +554,20 @@ def check(raw: dict[str, str]) -> None:
     if txn.count(REFUSE_GATE) != 1 or txn.count(NAMED_DEBUG) != 1:
         fail("A9", "a named move's refusal or result is logged above DEBUG")
     private = _private_testing_lines(raw["sycl"])
-    lines = strip_comments(raw["sycl"]).split("\n")
+    stripped = strip_comments(raw["sycl"])
+    lines = stripped.split("\n")
+    d_start, d_end = body_span(stripped, DRIVER_SIG)
+    d_first = stripped.count("\n", 0, d_start) if d_start >= 0 else -1
+    d_last = stripped.count("\n", 0, d_end) if d_start >= 0 else -1
+    production = []
     for k, line in enumerate(lines):
-        if ENTRY_NAME in line and ENTRY_SIG.rstrip("(") not in re.sub(r"\s+", " ", line):
-            if not private[k]:
-                fail("A9", f"line {k + 1} calls the named move outside the private test fixtures")
+        if ENTRY_NAME in line and ENTRY_SIG.rstrip("(") not in re.sub(r"\s+", " ", line) and not private[k]:
+            production.append(k)
+    for k in production:
+        if not d_first <= k <= d_last:
+            fail("A9", f"line {k + 1} calls the named move outside the swap driver and the private test fixtures")
+    if len(production) != 1:
+        fail("A9", f"the swap driver calls the named move {len(production)} times, not once")
 
     # A10 --------------------------------------------------------------------------------------------------------------
     if select.count(VALIDATE) != 1 or select.count(VERDICT) != 1 or txn.count(SELECT_CALL) != 1:
@@ -806,6 +818,10 @@ def self_test(raw: dict[str, str]) -> int:
                                              "static void ggml_sycl_admit_everything(int d) {\n"
                                              "    (void) ggml_sycl_expert_move_transaction_run(d, {}, nullptr, nullptr);"
                                              "\n}\n\n" + ENTRY_SIG)])
+    driver_call = "ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result)"
+    expect_fail("driver-calls-twice", "A9", [("sycl", DRIVER_SIG, driver_call + ";",
+                                              driver_call + ";\n        (void) " + driver_call + ";")])
+    expect_fail("driver-drops-its-call", "A9", [("sycl", DRIVER_SIG, driver_call, "ggml_sycl_txn_result::BUSY")])
     expect_fail("verdict-ignored", "A10", [("sycl", SELECT_SIG, "if (verdict) {", "if (false) {")])
     expect_fail("final-refusal-misspelled-in-cache", "A11", [("cache", COPY_SIG, 'refusal = "device storage not owned";',
                                                               'refusal = "device storage not own";')])

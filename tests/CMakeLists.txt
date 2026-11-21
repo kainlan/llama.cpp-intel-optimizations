@@ -544,6 +544,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-swap-policy PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The decode-boundary swap driver of the MoE expert cache: the policy, the pending admits, the restores and open
+# slots, the host-room trim and the two summary lines, against a fake transaction. ggml-sycl/moe-swap-driver.hpp
+# includes only the policy header and the standard library, so this loads no model and needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-swap-driver.cpp)
+    set_tests_properties(test-sycl-moe-swap-driver PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-swap-driver PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
 # no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
 # graphs on a no-alloc ggml context, so it needs no device.
@@ -1031,9 +1040,16 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-policy-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-policy-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # The swap driver runs once per synchronize boundary, after the refill and gated, never waits and never holds a
+    # lock across its policy; its switch is read once, its summaries log at WARN, and a named evict's host copy never
+    # grows the pinned host zone. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
+    add_test(NAME test-sycl-moe-swap-driver-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-driver-source.py --self-test)
+    set_tests_properties(test-sycl-moe-swap-driver-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
     # The named expert move's admit: no wait, the device storage minted at the staged size before the inventory lock,
-    # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and no
-    # production caller yet. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
+    # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and one
+    # production caller, the swap driver. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
     add_test(NAME test-sycl-moe-expert-admit-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-admit-source.py --self-test)
     set_tests_properties(test-sycl-moe-expert-admit-source PROPERTIES

@@ -228,6 +228,10 @@
 //                           The control: once an admit completes the block, the decode direct route serves each tensor
 //                           from AOS. The evict of expert 0 moves each tensor's storage generation, and the route then
 //                           refuses the block rather than serve its old table.
+//   evict_without_host_room_is_busy_and_keeps_the_zone
+//                           The control: fillers that never grow the host WEIGHT zone fill it. The evict of expert 0 is
+//                           then BUSY "host pinned pool exhausted", moves nothing and leaves the zone's capacity as it
+//                           was; once the fillers go, the same evict moves, still without growing the zone.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -333,6 +337,8 @@ int main() {
                    ggml_sycl::test_expert_evict_room_is_not_an_admit_in_the_same_call);
     ok &= run_case("evict_takes_a_block_off_the_direct_route",
                    ggml_sycl::test_expert_evict_takes_a_block_off_the_direct_route);
+    ok &= run_case("evict_without_host_room_is_busy_and_keeps_the_zone",
+                   ggml_sycl::test_expert_evict_without_host_room_is_busy_and_keeps_the_zone);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

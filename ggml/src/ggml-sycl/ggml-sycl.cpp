@@ -27326,6 +27326,95 @@ std::string test_expert_evict_takes_a_block_off_the_direct_route() {
     return {};
 }
 
+std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone() {
+    // A named evict runs at a decode boundary, where growing the pinned host pool would take host memory the plan did
+    // not size, so its host copies never grow the zone: with the host WEIGHT zone full the evict is BUSY "host pinned
+    // pool exhausted", moves and publishes nothing, and the zone's capacity is what it was. Once the fillers go, the
+    // same evict moves into the room they gave back, and the capacity is still what it was. The control: the fill
+    // ends at a filler the zone has no room for, without growing it.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x657663740cull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    if (!fx.cache->host_zones_configured()) {
+        return "the host zones are not configured";
+    }
+
+    const size_t capacity  = fx.cache->host_zone_capacity(host_zone_id::WEIGHT);
+    const size_t used_from = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+
+    // Fillers take the host WEIGHT zone, never growing it, until it has no room for one member's copy.
+    std::vector<mem_handle> fillers;
+    constexpr size_t        max_fillers = 16384;
+    while (fillers.size() < max_fillers) {
+        alloc_request req{};
+        req.device                                     = fx.device;
+        req.size                                       = bytes;
+        req.intent.role                                = alloc_role::WEIGHT;
+        req.intent.constraints.must_host_pinned        = true;
+        req.intent.constraints.use_pinned_pool         = true;
+        req.intent.constraints.forbid_host_zone_growth = true;
+        req.suppress_failure_log                       = true;
+        allocation_result allocation                   = unified_allocate_owner(req);
+        if (!allocation) {
+            break;
+        }
+        fillers.push_back(mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS));
+    }
+    if (fillers.size() == max_fillers) {
+        return test_loan_fail("the host WEIGHT zone took %zu fillers of %zu bytes", fillers.size(), bytes);
+    }
+    if (fx.cache->host_zone_capacity(host_zone_id::WEIGHT) != capacity) {
+        return test_loan_fail("the control: the fill grew the host WEIGHT zone from %zu to %zu bytes", capacity,
+                              fx.cache->host_zone_capacity(host_zone_id::WEIGHT));
+    }
+
+    const auto                     published = ::ggml_sycl_global_plan_snapshot();
+    ::ggml_sycl_expert_move_result result;
+    ::ggml_sycl_txn_result         code = test_named_move(fx, { 0, 0 }, test_no_triplet, result);
+    if (code != ::ggml_sycl_txn_result::BUSY || result.accepted || result.n_evicted != 0 ||
+        std::strcmp(result.reason, "host pinned pool exhausted") != 0 || result.evicted.size() != 1 ||
+        !test_admit_outcome_is(result.evicted[0], false, ::ggml_sycl_txn_result::BUSY, "host pinned pool exhausted")) {
+        return "the evict into a full host zone answered " + test_admit_answer(code, result);
+    }
+    if (fx.cache->host_zone_capacity(host_zone_id::WEIGHT) != capacity) {
+        return test_loan_fail("the evict grew the host WEIGHT zone from %zu to %zu bytes", capacity,
+                              fx.cache->host_zone_capacity(host_zone_id::WEIGHT));
+    }
+    if (::ggml_sycl_global_plan_snapshot().get() != published.get() || test_evict_device_entries(fx, 0, 0) != 3 ||
+        test_evict_host_entries(fx, 0, 0) != 0) {
+        return "the evict the full host zone refused published a plan or moved an entry";
+    }
+
+    fillers.clear();
+    if (!fx.reclaim_until([&] { return fx.cache->host_zone_used(host_zone_id::WEIGHT) <= used_from; })) {
+        return test_loan_fail("2 s after the fillers went the host WEIGHT zone holds %zu bytes, not %zu",
+                              fx.cache->host_zone_used(host_zone_id::WEIGHT), used_from);
+    }
+    ::ggml_sycl_expert_move_result after;
+    code = test_named_move(fx, { 0, 0 }, test_no_triplet, after);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || after.n_evicted != 1 ||
+        !test_admit_outcome_is(after.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict after the fillers went answered " + test_admit_answer(code, after);
+    }
+    if (fx.cache->host_zone_capacity(host_zone_id::WEIGHT) != capacity) {
+        return test_loan_fail("the evict with room grew the host WEIGHT zone from %zu to %zu bytes", capacity,
+                              fx.cache->host_zone_capacity(host_zone_id::WEIGHT));
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the evicted triplet: " + why;
+    }
+    return {};
+}
+
 }  // namespace ggml_sycl
 #endif  // GGML_SYCL_PRIVATE_TESTING
 
