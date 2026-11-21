@@ -285,7 +285,7 @@ HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_ent
 ENTRY_CHANGED = '{ refusal = "entry changed"; break; }'
 DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
-            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false)")
+            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false, &out.device_keys[i])")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
 
 
@@ -398,10 +398,11 @@ def claim_registration_checked_before_the_copies(cache: str) -> bool:
 # --- an existing host entry is never replaced (c-mwmr-3) ------------------------------------------------------------
 
 OWNED_SIG = "bool unified_cache::register_host_expert_owned("
-REG_BODY_SIG = "const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing)"
+REG_BODY_SIG = ("const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing, "
+                "const unified_cache_key * moved_from)")
 NO_REPLACE = "if (old != entries_.end()) { if (!replace_existing) { return false; }"
 REPLACE = "erase_entry_locked(old);"
-FORWARD = "ready_event, replace_existing);"
+FORWARD = "ready_event, replace_existing, moved_from);"
 STOP_FROM_RECORD = "stop = record.reason;"
 REFUSE_STOP = "return refuse(stop_code, stop);"
 # A loan never sets `transient`, so its refusals stay REFUSED; only a refill's transient refusal is BUSY.
@@ -1570,6 +1571,46 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
             and body(c, REFILL_BODY_SIG).count(REFILL_SIZE_GUARD) == 1)
 
 
+# --- a moved copy belongs to its source's models --------------------------------------------------------------------
+
+# Only a model load's end tags an entry with its owners, and a model teardown never reclaims an untagged entry, so a copy
+# a move publishes after the load would outlive its model. Each copy takes the owners of the entry it replaces, through
+# one helper: the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces
+# and before it is inserted, its mirror keeping the entry's pending load; and the host copy a loan or an evict
+# registers, from the device entry the loan retired and holds in place, before the registration inserts it.
+INHERIT_DEF = ("void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept { "
+               "dst.owner_mask |= src.owner_mask; dst.owner_tagged = dst.owner_tagged || src.owner_tagged; "
+               "if (dst.pending_load_txn_id == 0) { dst.pending_load_txn_id = src.pending_load_txn_id; } }")
+ADMIT_INHERIT = ("} else { inherit_entry_ownership(device_entry[i], it->second); "
+                 "device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id; }")
+REGISTER_BODY_SIG = ("bool unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, size_t size, "
+                     "ggml_layout_mode layout, mem_handle * out_handle, std::shared_ptr<void> allocation_owner, "
+                     "const mem_handle & typed_owner,")
+REGISTER_OWNED_SIG = "bool unified_cache::register_host_expert_owned("
+REGISTER_STAMP = "stamp_pending_owner(cache_entry, load_effect_guard);"
+REGISTER_INHERIT = ("if (moved_from) { const auto source = entries_.find(*moved_from); "
+                    "if (source != entries_.end()) { inherit_entry_ownership(cache_entry, source->second); "
+                    "mirror_pending_txn = cache_entry.pending_load_txn_id; } }")
+REGISTER_INSERT = "entries_[cache_key] = cache_entry;"
+REGISTER_MIRROR_TXN = "entry.pending_load_txn_id = mirror_pending_txn;"
+LOAN_DEVICE_KEY = "out.device_keys[i] = device_key;"
+
+
+def claim_a_moved_copy_belongs_to_its_sources_models(cache: str) -> bool:
+    c = norm(cache)
+    admit = body(c, REFILL_BODY_SIG)
+    reg = body(c, REGISTER_BODY_SIG)
+    owned = body(c, REGISTER_OWNED_SIG)
+    loan = body(c, LOAN_SIG)
+    return (c.count(INHERIT_DEF) == 1 and c.count("inherit_entry_ownership(") == 3
+            and admit.count(ADMIT_INHERIT) == 1
+            and ordered(admit, REFILL_SESSION, CACHE_LOCKS, ADMIT_INHERIT, EMPLACE, SWAP_MIRROR)
+            and reg.count(REGISTER_INHERIT) == 1 and reg.count(REGISTER_MIRROR_TXN) == 1
+            and ordered(reg, REGISTER_STAMP, REGISTER_INHERIT, REGISTER_INSERT, REGISTER_MIRROR_TXN)
+            and owned.count(FORWARD) == 2
+            and loan.count(REGISTER) == 1 and ordered(loan, LOAN_DEVICE_KEY, REGISTER))
+
+
 def test_loan_never_waits():
     assert claim_loan_never_waits(CACHE, SYCL)
 
@@ -1875,8 +1916,8 @@ def test_mutant_copy_not_behind_the_fill_fails():
 def test_mutant_host_copy_published_ready_fails():
     """The host entry published READY while its copy is still in flight: a reader could see stale bytes."""
     assert not claim_device_free_gated_on_the_copy(
-        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false)",
-                                                ", m.owner, nullptr, false)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false,",
+                                                ", m.owner, nullptr, false,")), SYCL)
 
 
 def test_mutant_loan_uses_the_id_wide_retire_fails():
@@ -1938,7 +1979,7 @@ def test_mutant_retiring_host_entry_named_as_live_fails():
 
 def test_mutant_loan_registration_may_replace_fails():
     assert not claim_existing_host_entry_never_replaced(
-        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false)", "&out.copy_events[i], true)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false,", "&out.copy_events[i], true,")), SYCL)
 
 
 def test_mutant_registration_ignores_replace_existing_fails():
@@ -1948,7 +1989,7 @@ def test_mutant_registration_ignores_replace_existing_fails():
 
 def test_mutant_typed_registration_drops_replace_existing_fails():
     owned = body(norm(CACHE), OWNED_SIG)
-    dropped = owned.replace(FORWARD, "ready_event);")
+    dropped = owned.replace(FORWARD, "ready_event, moved_from);")
     assert not claim_existing_host_entry_never_replaced(norm(CACHE).replace(owned, dropped, 1), SYCL)
 
 
@@ -3436,6 +3477,62 @@ def test_mutant_between_contexts_line_reads_as_the_exit_report_fails():
     mutant = _once_in(SYCL, BETWEEN_SIG, "(the context that lent them ended)",
                       "(the context that lent them ended) [MOE-EXEC] refill device 0: 0/0 triplets re-admitted")
     assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)
+
+
+# --- a moved copy belongs to its source's models: mutants -----------------------------------------------------------
+
+def test_a_moved_copy_belongs_to_its_sources_models():
+    assert claim_a_moved_copy_belongs_to_its_sources_models(CACHE)
+
+
+def test_mutant_helper_drops_the_tag_fails():
+    """Owners copied without the tag: a copy whose owners all die reads as never attributed and is kept forever."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, "dst.owner_tagged = dst.owner_tagged || src.owner_tagged; ", ""))
+
+
+def test_mutant_admit_publishes_untagged_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, ADMIT_INHERIT, "}"))
+
+
+def test_mutant_admit_tags_after_the_insert_fails():
+    """The inserted entry is a copy of device_entry[i]: tagging the local after the insert tags nothing."""
+    moved = _once(CACHE, ADMIT_INHERIT, "}")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(moved, EMPLACE, EMPLACE + " inherit_entry_ownership(device_entry[i], it->second);"))
+
+
+def test_mutant_admit_mirror_keeps_the_stamp_fails():
+    """A mirror whose pending load differs from its entry's survives that load's abort, naming a retired entry."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, " device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;", ""))
+
+
+def test_mutant_registration_ignores_the_source_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, REGISTER_INHERIT, ""))
+
+
+def test_mutant_registration_tags_after_the_insert_fails():
+    moved = _once(CACHE, REGISTER_INHERIT, "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once_in(moved, REGISTER_BODY_SIG, REGISTER_INSERT, REGISTER_INSERT + " " + REGISTER_INHERIT))
+
+
+def test_mutant_registration_mirror_keeps_the_stamp_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, REGISTER_MIRROR_TXN, "entry.pending_load_txn_id = load_effect_guard.load_txn_id();"))
+
+
+def test_mutant_owned_registration_drops_the_source_fails():
+    """The typed overload forwards to the body without the source: every loan's host copy is published untagged."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, "allocation_owner, ready_event, replace_existing, moved_from);",
+              "allocation_owner, ready_event, replace_existing);"))
+
+
+def test_mutant_loan_names_no_source_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, REGISTER, REGISTER.replace(", &out.device_keys[i])", ", nullptr)")))
 
 
 if __name__ == "__main__":

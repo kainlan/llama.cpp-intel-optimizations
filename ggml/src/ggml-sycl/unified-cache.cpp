@@ -142,6 +142,18 @@ void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & 
     }
 }
 
+// A copy a move publishes (an admit's or a refill's device entry, a loan's or an evict's host copy) holds the same
+// weight as the entry it replaces, so it belongs to the same models: it takes that entry's owners, and its pending
+// load where the copy's own stamp left none. Only a load's end tags an entry, and a model teardown never reclaims an
+// untagged one, so a copy published after the load without this would outlive its model.
+void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept {
+    dst.owner_mask |= src.owner_mask;
+    dst.owner_tagged = dst.owner_tagged || src.owner_tagged;
+    if (dst.pending_load_txn_id == 0) {
+        dst.pending_load_txn_id = src.pending_load_txn_id;
+    }
+}
+
 // A staged or published plan's record (th32 §3.3): the immutable snapshot every reader shares, and the ring lease the
 // record holds while it is staged or published. The lease never enters the snapshot, so a reader that copies the
 // snapshot takes no reference on the IO pool. Every function that displaces or erases a record moves its lease into a
@@ -11649,7 +11661,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
                 published = host_ptr &&
                             register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
                                                        k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i],
-                                                       /*replace_existing=*/false);
+                                                       /*replace_existing=*/false, &out.device_keys[i]);
             } catch (const ggml_sycl_fallback_error &) {
                 // G-CATCH requires this clause before catch (...). Nothing in a host registration throws the op
                 // fallback (dispatch control flow), so no loan is stranded by it (llama.cpp-mwmr).
@@ -11959,6 +11971,11 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
                     entries_.end()) {
                 refusal = "entry changed";
+            } else {
+                // The device entry replaces this host copy, so it belongs to the copy's models as they are now,
+                // under the locks, and its mirror carries the entry's pending load.
+                inherit_entry_ownership(device_entry[i], it->second);
+                device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;
             }
         }
         // The allocations: insert each device entry, then mint its mirror's lease and the caller's. A throw withdraws
@@ -12518,34 +12535,36 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
     return register_host_expert(key, ptr, size, layout, out_handle, std::move(allocation_owner), mem_handle{});
 }
 
-bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id  key,
-                                               void *              ptr,
-                                               size_t              size,
-                                               ggml_layout_mode    layout,
-                                               mem_handle *        out_handle,
-                                               const mem_handle &  allocation_owner,
-                                               const sycl::event * ready_event,
-                                               bool                replace_existing) {
+bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id        key,
+                                               void *                    ptr,
+                                               size_t                    size,
+                                               ggml_layout_mode          layout,
+                                               mem_handle *              out_handle,
+                                               const mem_handle &        allocation_owner,
+                                               const sycl::event *       ready_event,
+                                               bool                      replace_existing,
+                                               const unified_cache_key * moved_from) {
     if (!allocation_owner.valid()) {
-        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event,
-                                    replace_existing);
+        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event, replace_existing,
+                                    moved_from);
     }
     // The storage owner is a copy of the typed owner, aliased to ptr as the
     // legacy owner wrapper was, so the entry releases exactly as before.
     auto storage_owner = std::make_shared<mem_handle>(allocation_owner);
     return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>(storage_owner, ptr),
-                                allocation_owner, ready_event, replace_existing);
+                                allocation_owner, ready_event, replace_existing, moved_from);
 }
 
-bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
-                                         void *                ptr,
-                                         size_t                size,
-                                         ggml_layout_mode      layout,
-                                         mem_handle *          out_handle,
-                                         std::shared_ptr<void> allocation_owner,
-                                         const mem_handle &    typed_owner,
-                                         const sycl::event *   ready_event,
-                                         bool                  replace_existing) {
+bool unified_cache::register_host_expert(ggml_sycl_cache_id        key,
+                                         void *                    ptr,
+                                         size_t                    size,
+                                         ggml_layout_mode          layout,
+                                         mem_handle *              out_handle,
+                                         std::shared_ptr<void>     allocation_owner,
+                                         const mem_handle &        typed_owner,
+                                         const sycl::event *       ready_event,
+                                         bool                      replace_existing,
+                                         const unified_cache_key * moved_from) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -12569,7 +12588,8 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
 
     std::shared_ptr<mem_handle> direct_handle;
     std::shared_ptr<mem_handle> replaced_direct_handle;
-    bool                        cache_inserted = false;
+    bool                        cache_inserted     = false;
+    uint64_t                    mirror_pending_txn = load_effect_guard.load_txn_id();
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -12639,6 +12659,15 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.non_owning_external_host = !allocation_owner;
         cache_entry.direct_alloc_owner       = typed_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
+        // A host copy a move publishes in place of a device entry belongs to that entry's models. The mover holds the
+        // retired entry in place until its registrations are done, so it is read here, under the locks.
+        if (moved_from) {
+            const auto source = entries_.find(*moved_from);
+            if (source != entries_.end()) {
+                inherit_entry_ownership(cache_entry, source->second);
+                mirror_pending_txn = cache_entry.pending_load_txn_id;
+            }
+        }
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
                 throw std::bad_alloc();
@@ -12679,7 +12708,7 @@ publish_host_expert_direct:
         entry.has_ready_event       = ready_event != nullptr;
         entry.ready_event           = ready_event ? *ready_event : sycl::event{};
         entry.handle                = std::move(direct_handle);
-        entry.pending_load_txn_id = load_effect_guard.load_txn_id();
+        entry.pending_load_txn_id   = mirror_pending_txn;
         auto old_direct = direct_expert_entries_.find(key);
         if (old_direct != direct_expert_entries_.end()) {
             replaced_direct_handle = std::move(old_direct->second.handle);

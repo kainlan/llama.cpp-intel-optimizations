@@ -4068,6 +4068,8 @@ struct unified_cache_entry {
     // decisions actually need.  owner_tagged distinguishes "no owner left"
     // (reclaimable) from "never attributed to any model" (e.g. materialized at
     // runtime, outside a load) -- the latter is kept while any model is live.
+    // A model load's end sets both; a copy an expert move publishes after it
+    // takes them from the entry it replaces (inherit_entry_ownership).
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
     uint64_t              pending_load_txn_id   = 0;
@@ -4690,14 +4692,19 @@ class unified_cache {
     // replace_existing = false refuses when the key already has an entry, of
     // any state, instead of replacing an idle one with its storage: a loan
     // must be able to undo every registration it made (c-mwmr-3).
-    bool register_host_expert_owned(ggml_sycl_cache_id  key,
-                                    void *              ptr,
-                                    size_t              size,
-                                    ggml_layout_mode    layout,
-                                    mem_handle *        out_handle,
-                                    const mem_handle &  allocation_owner,
-                                    const sycl::event * ready_event      = nullptr,
-                                    bool                replace_existing = true);
+    // A non-null moved_from names the entry a move publishes this copy in
+    // place of: a new entry takes that entry's model ownership, read under the
+    // registration's locks, since the copy holds the same weight. The caller
+    // keeps that entry in place until the registration returns.
+    bool register_host_expert_owned(ggml_sycl_cache_id        key,
+                                    void *                    ptr,
+                                    size_t                    size,
+                                    ggml_layout_mode          layout,
+                                    mem_handle *              out_handle,
+                                    const mem_handle &        allocation_owner,
+                                    const sycl::event *       ready_event      = nullptr,
+                                    bool                      replace_existing = true,
+                                    const unified_cache_key * moved_from       = nullptr);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -7502,15 +7509,17 @@ class unified_cache {
     // the entry's direct_alloc_owner. A non-null ready_event publishes the
     // entry IN_PROGRESS behind that event (the copy still filling it).
     // replace_existing = false refuses any key that already has an entry.
-    bool register_host_expert(ggml_sycl_cache_id    key,
-                              void *                ptr,
-                              size_t                size,
-                              ggml_layout_mode      layout,
-                              mem_handle *          out_handle,
-                              std::shared_ptr<void> storage_owner,
-                              const mem_handle &    typed_owner,
-                              const sycl::event *   ready_event      = nullptr,
-                              bool                  replace_existing = true);
+    // A non-null moved_from gives a new entry that entry's model ownership.
+    bool register_host_expert(ggml_sycl_cache_id        key,
+                              void *                    ptr,
+                              size_t                    size,
+                              ggml_layout_mode          layout,
+                              mem_handle *              out_handle,
+                              std::shared_ptr<void>     storage_owner,
+                              const mem_handle &        typed_owner,
+                              const sycl::event *       ready_event      = nullptr,
+                              bool                      replace_existing = true,
+                              const unified_cache_key * moved_from       = nullptr);
 
     // What retire_expert_entry_at_locked() takes out of the lookup maps, kept as the maps' own nodes, so that
     // restore_expert_entry_at_locked() puts them back without building new ones and a loan's rollback allocates no
