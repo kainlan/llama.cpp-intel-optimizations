@@ -9085,6 +9085,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         if (q->type == k_vec_dot_type) {
             // already in the form kq_vec_dot consumes - take the row as it is
             memcpy(Q_q, pq, ggml_row_size(k_vec_dot_type, DK));
+        } else if (q->type == GGML_TYPE_F16 && k_vec_dot_type == GGML_TYPE_F32) {
+            // upstream's F16 K now dots against an F32 Q (ggml_vec_dot_f16_f32, vec_dot_type F32), so an F16 Q
+            // from the SYCL graph-build cast is no longer "already in the vec_dot form": widen the row
+            ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) pq, (float *) Q_q, DK);
         } else {
             GGML_ASSERT(q->type == GGML_TYPE_F32 && "fattn: unsupported Q-type");
             q_to_vec_dot((const float *) pq, Q_q, DK);

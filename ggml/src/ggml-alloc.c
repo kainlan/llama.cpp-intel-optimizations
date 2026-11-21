@@ -817,6 +817,26 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             }
             AT_PRINTF("\n");
         }
+
+        // a node that is not computed and that nothing consumes (the dead end of an unselected
+        // ggml_build_forward_select branch) never needs its memory: nothing frees a node without consumers,
+        // so it would stay allocated to the end of the graph and pin the buffer layout, which grows the
+        // peak by far more than its own size when a larger tensor later has to be placed past it
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+            if (hn->n_children == 0 && hn->n_views == 0) {
+                if (ggml_impl_is_view(node)) {
+                    struct ggml_tensor * view_src    = node->view_src;
+                    struct hash_node *   view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+                    view_src_hn->n_views -= 1;
+                    if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
+                        ggml_gallocr_free_node(galloc, view_src);
+                    }
+                } else if (hn->allocated) {
+                    ggml_gallocr_free_node(galloc, node);
+                }
+            }
+        }
     }
 }
 

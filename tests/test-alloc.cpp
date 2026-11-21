@@ -470,6 +470,31 @@ static void test_reuse_and_free() {
     GGML_ASSERT(backend.context->allocated_total() <= 40 + 32 + 32);
 }
 
+// the dead end of an unselected ggml_build_forward_select branch has no consumer and is not computed. Nothing frees a
+// node without consumers, so it used to stay allocated to the end of the graph and pin the buffer layout: the memory
+// freed around it could not host a later, larger tensor, and the buffer grew past the sum of the live tensors.
+static void test_unselected_branch_is_not_pinned() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * in    = make_input_with_size(ctx, 32);
+    ggml_tensor * mix   = make_input_with_size(ctx, 8);
+    ggml_tensor * tok   = ggml_scale(ctx, in, 2.0f);   // selected branch, 32 bytes
+    ggml_tensor * dead  = ggml_scale(ctx, mix, 2.0f);  // unselected branch: no consumer, not computed
+    ggml_tensor * br[2] = { tok, dead };
+    ggml_tensor * cur   = ggml_build_forward_select(graph, br, 2, 0);
+    ggml_tensor * t1    = ggml_scale(ctx, cur, 3.0f);     // 32 bytes, frees tok
+    ggml_tensor * t2    = ggml_scale(ctx, t1, 4.0f);      // 32 bytes, frees t1
+    ggml_tensor * big   = ggml_pad(ctx, t2, 4, 0, 0, 0);  // 48 bytes, needs the space the early tensors left
+    assign_names(ctx);
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, big, &backend.buffer_type);
+    check_all_allocated(graph);
+    check_no_overlap(graph);
+    // live at the peak: t2 (32) and big (48); 88 bytes mean the dead end stayed allocated and pinned the layout
+    GGML_ASSERT(backend.context->allocated_total() <= 80);
+}
+
 static void test_merge_free_block(size_t max_buffer_size) {
     dummy_backend backend      = dummy_backend_init(max_buffer_size);
     auto [ctx, graph, ctx_ptr] = make_context();
@@ -1212,6 +1237,7 @@ int main() {
     run("test_fill_leftover_space", test_fill_leftover_space);
     run("test_view_inplace", test_view_inplace);
     run("test_reuse_and_free", test_reuse_and_free);
+    run("test_unselected_branch_is_not_pinned", test_unselected_branch_is_not_pinned);
     run("test_merge_free_block(32)", []() { test_merge_free_block(32); });
     run("test_merge_free_block(SIZE_MAX)", []() { test_merge_free_block(SIZE_MAX); });
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);

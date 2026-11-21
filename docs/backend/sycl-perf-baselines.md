@@ -1658,7 +1658,7 @@ Active regression-hunt state (commit deltas, suspect changes) lives in the
 codescout task tracker. Find it with `task_search` (pass `semantic=false` — the
 semantic path times out on this store); there is no single standing task id.
 
-## 2026-11-21 upstream sync (19bc41dbb): first measurements and one open regression
+## 2026-11-21 upstream sync (19bc41dbb): first measurements and one resolved regression
 
 Tree `278a6e4a3` (merge of ggml-org/master `19bc41dbb` into `a450d2c81`), driver 26.44, `llama-bench -fa 1 -v`, one
 model load per command, pinned selector, under `GPU.lock`. Another session ran about 32 compiler processes during the
@@ -1670,9 +1670,9 @@ at or above the table above. Mistral gate and GPT-OSS gate pass on both cards (`
 | Mistral 7B Q4_0 | B70 | 3228.8 ± 26.8 | 4228.8 ± 8.5 | 109.2 ± 0.9 (`-p 0 -r 8`); 92.3 ± 7.7 in the mixed run |
 | Mistral 7B Q4_0 | B50 | 1329.0 ± 3.5 | 1636.7 ± 2.3 | 44.1 ± 1.7 |
 | GPT-OSS 20B MXFP4 | B70 | 1628.9 ± 36.8 | 1180.9 ± 146.2 | 36.4 ± 3.8 (mixed run); 51.2 ± 1.2 (`-p 0`, tiny context, not comparable) |
-| GPT-OSS 20B MXFP4 | B50 | 552, 497, 448 at **ub 256** | context refused | **no row: the tg128 context is refused** |
+| GPT-OSS 20B MXFP4 | B50 | 550.3 ± 5.4 at ub 256 (after the fix below) | not measured | 34.69 ± 0.19 (after the fix below) |
 
-**B50 GPT-OSS (open).** Paired ABBA against `a450d2c81` (pre-merge, own worktree, `-p 512 -n 128 -r 3`):
+**B50 GPT-OSS (resolved).** Paired ABBA against `a450d2c81` (pre-merge, own worktree, `-p 512 -n 128 -r 3`):
 
 | arm | n_ubatch chosen | pp512 | tg128 | worst case at ub 512 | compute probe at n_ctx 131072 |
 |---|---:|---:|---:|---:|---:|
@@ -1682,12 +1682,22 @@ at or above the table above. Mistral gate and GPT-OSS gate pass on both cards (`
 - The drop from `n_ubatch` 512 to 256 on this card is **not** from the merge: the pre-merge fork does it too (the card
   has about 1.6 GB free for compute after the planned zones). The B50 GPT-OSS figures near 870 pp512 above were measured
   at ub 512 on an earlier tree and no longer describe HEAD.
-- What the merge adds: the load-time compute probe (`stage=probe`, n_ctx 131072, ub 512, same graph shape, 93 splits)
-  measures 543.3 MiB on SYCL0 instead of 404.0 MiB (+139.3 MiB); the real context grows 5.62 MiB on SYCL0 and on the
-  host (one F32 `[2880, 512]` tensor each). The RUNTIME zone rises 1919 -> 2059 MB, the weight zone shrinks, and 8 MoE
-  expert layers (100.9 MB) are placed on the host that were all on the device before. At ub 128 the context then needs
-  1198.9 MB with 167.7 MB free, under the 256 MB driver headroom, and creation fails (the pre-merge tree creates it and
-  decodes at 34.7 t/s).
-- Not the cause: `LLAMA_KV_ROWS_DISABLE=1` and `LLAMA_GRAPH_REUSE_DISABLE=1` (probe stays 543.3 MiB; `kv_unified=0`).
-  Candidates still to test: the activation tensors kept alive by upstream's MTP/DFlash hidden-state reads
-  (a8fad21e9, 2cbca389f) and anything that scales with n_ctx in the measure graph.
+- What the merge added: the load-time compute probe (`stage=probe`, n_ctx 131072, ub 512, 93 splits) measured 543.3 MiB
+  on SYCL0 instead of 404.0 MiB (+139.3 MiB). The RUNTIME zone rose 1919 -> 2059 MB, the weight zone shrank, 8 MoE
+  expert layers (100.9 MB) moved to the host, and at ub 128 the context needed 1198.9 MB with 167.7 MB free, under the
+  256 MB driver headroom, so creation failed.
+- Cause: upstream 0bb496dbd (mixed token and embedding batches) makes the input select 3-way. The unselected branch
+  ends in a node with no consumer that is never computed (`DUP` then `SET_ROWS` of `[2880, 512]`). `ggml-alloc` frees a
+  node only when a consumer finishes, so that block stayed allocated to the end of the graph, next to the 128 MiB
+  attention-mask copy. When the mask was freed the hole was too small for the 392 MiB logits tensor, which went above
+  it: +128 MiB mask hole plus two 5.62 MiB blocks. Found by diffing the node lists of both trees (they differ only in the
+  mixed path) and by disabling the mixed path (probe back to 404.0 MiB).
+- Fix: `ggml_gallocr_alloc_graph_impl` frees a node that is not computed, not an output and has no consumers or views as
+  soon as it is allocated. With the mixed path on, the probe is 404.0 MiB, the tg128 context is created again and tg128
+  is 34.69 ± 0.19 (pre-merge 34.7). B70 tg128 after the fix: Mistral 109.5 ± 1.0 (`-p 0 -r 8`), GPT-OSS 53.3 ± 1.8
+  (`-p 0`, tiny context, not comparable). Regression test: `test_unselected_branch_is_not_pinned` in
+  `tests/test-alloc.cpp` (80 bytes with the fix, 88 without).
+- Also fixed in the merge: CPU flash attention aborted on the F16 Q that the SYCL graph casts (`GGML_SYCL_FATTN_Q_TYPE`)
+  once upstream gave F16 an F32 `vec_dot_type`; `ggml_compute_forward_flash_attn_ext_f16_one_chunk` widens an F16 Q row,
+  and the SYCL baseline trait table in `cpu-traits-support.cpp` follows upstream's F16 entry.
+- Gates after the fix: Mistral and GPT-OSS completion gates pass on both cards (`scripts/sycl-canonical-gates.sh`).
