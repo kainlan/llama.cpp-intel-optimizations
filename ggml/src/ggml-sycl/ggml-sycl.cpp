@@ -23232,25 +23232,7 @@ struct test_loan_fixture {
         if (!cache) {
             return;
         }
-        for (size_t t = 0; t < extras.size(); ++t) {
-            for (int e = 0; e < n_experts; ++e) {
-                (void) extras[t]->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_AOS, device);
-                (void) extras[t]->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE);
-            }
-        }
-        // A case that built pointer tables leaves their views on the extras: they go with the records, so no lease on
-        // the case's entries outlives the deferred-free pass below (llama.cpp-6aj4).
-        for (const auto & extra : extras) {
-            if (extra->weight_ext) {
-                ggml_tensor_extra_gpu_weight_ext & w = *extra->weight_ext;
-                w.moe_expert_ptrs_leases[device].clear();
-                w.moe_expert_handles[device].clear();
-                w.moe_expert_ptr_payload[device].clear();
-                w.moe_route_tables[device].invalidate();
-                w.moe_hybrid_decode[device].reset();
-                w.moe_device_table_valid[device] = false;
-            }
-        }
+        drop_records();
         for (const ggml_sycl_cache_id & key : keys) {
             (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/expert loan cleanup");
         }
@@ -23272,6 +23254,29 @@ struct test_loan_fixture {
         g_sycl_expert_lent_total[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_readmitted_total[device].store(0, std::memory_order_relaxed);
         g_sycl_expert_refill_refusal_streak[device].store(0, std::memory_order_relaxed);
+    }
+
+    // Every lease the extras hold on the case's entries, device and host: the storage records, and the views a case
+    // that built pointer tables leaves on them, so no lease on the case's entries outlives the deferred-free pass or a
+    // model release that follows.
+    void drop_records() {
+        for (size_t t = 0; t < extras.size(); ++t) {
+            for (int e = 0; e < n_experts; ++e) {
+                (void) extras[t]->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_AOS, device);
+                (void) extras[t]->forget_moe_storage_handle_on_device(e, GGML_LAYOUT_AOS, mem_handle::HOST_DEVICE);
+            }
+        }
+        for (const auto & extra : extras) {
+            if (extra->weight_ext) {
+                ggml_tensor_extra_gpu_weight_ext & w = *extra->weight_ext;
+                w.moe_expert_ptrs_leases[device].clear();
+                w.moe_expert_handles[device].clear();
+                w.moe_expert_ptr_payload[device].clear();
+                w.moe_route_tables[device].invalidate();
+                w.moe_hybrid_decode[device].reset();
+                w.moe_device_table_valid[device] = false;
+            }
+        }
     }
 
     // The device's host zones, sized for these cases, configured unless something already did; whether they are.
@@ -27753,6 +27758,199 @@ std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone() {
     }
     if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
         return "the evicted triplet: " + why;
+    }
+    return {};
+}
+
+// The model the ownership cases claim their entries for: a slot no live model holds, so the release that ends each
+// case reclaims only what the case claimed.
+constexpr uint32_t test_move_owner_slot = 31;
+
+// Each of layer 0's `experts`, its three entries, device or host, claimed as a model load claims what it staged:
+// marked pending under txn, then owned by test_move_owner_slot when the load ends. Each must have one entry to mark,
+// and the load's end must tag exactly them.
+std::string test_move_claim(test_loan_fixture & fx, uint64_t txn, const std::vector<int> & experts) {
+    if ((fx.cache->live_model_mask() & (1u << test_move_owner_slot)) != 0) {
+        return test_loan_fail("model slot %u is live before the case claims it", test_move_owner_slot);
+    }
+    const size_t tagged_before = fx.cache->owner_tagged_entry_count();
+    for (const int e : experts) {
+        for (int s = 0; s < 3; ++s) {
+            if (!fx.cache->test_mark_entry_touched_by_load(fx.keys[fx.index(0, s, e)], GGML_LAYOUT_AOS, txn)) {
+                return test_loan_fail("slot %d expert %d has no entry to claim", s, e);
+            }
+        }
+    }
+    fx.cache->note_model_load_end(test_move_owner_slot, txn);
+    const size_t tagged = fx.cache->owner_tagged_entry_count() - tagged_before;
+    if (tagged != 3 * experts.size()) {
+        return test_loan_fail("the load's end tagged %zu entries, not the %zu claimed", tagged, 3 * experts.size());
+    }
+    return {};
+}
+
+// The claiming model's release, in a teardown's order: the model's tensors go first, so the extras' records and table
+// views drop their leases and the copies' retained owners drain, and then the slot is released.
+void test_move_release(test_loan_fixture & fx) {
+    fx.drop_records();
+    fx.queue->wait();
+    (void) drain_retained_handles(true, 5000);
+    fx.cache->process_deferred_frees_public();
+    (void) fx.cache->release_model_slot(test_move_owner_slot);
+}
+
+std::string test_expert_admit_belongs_to_the_host_copys_model() {
+    // An admitted device entry holds the same weight as the host copy it replaces, so it belongs to the model that
+    // owned that copy, and that model's release reclaims it. A model claims expert 1's host copies and expert 0's
+    // device entries; expert 2 stays unclaimed. After the admit of expert 1 and the model's release, expert 1's device
+    // entries and expert 0's are gone and the WEIGHT zone has the admitted triplet's room back. The control: expert
+    // 2's entries, which no model ever owned, stay, since a release keeps an entry it cannot attribute.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6f776e7201ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/1); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/1));
+    if (std::string why = fx.pin_host_triplet(0, 1); !why.empty()) {
+        return why;
+    }
+    if (std::string why = test_move_claim(fx, 0x6f776e7201ull, { 0, 1 }); !why.empty()) {
+        return why;
+    }
+    const auto before = fx.sample();
+
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, test_no_triplet, { 0, 1 }, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||
+        !test_admit_outcome_is(result.admitted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the admit answered " + test_admit_answer(code, result);
+    }
+    test_move_release(fx);
+    if (!fx.reclaim_until([&] {
+            return test_evict_device_entries(fx, 0, 1) == 0 && test_evict_device_entries(fx, 0, 0) == 0 &&
+                   test_evict_host_entries(fx, 0, 1) == 0 && fx.returned_since(before) >= 3 * fx.staged_bytes;
+        })) {
+        return test_loan_fail(
+            "2 s after the model's release %d admitted and %d unmoved device entries remain, %d host copies, and the "
+            "device got back %zu of the admitted triplet's %zu bytes",
+            test_evict_device_entries(fx, 0, 1), test_evict_device_entries(fx, 0, 0), test_evict_host_entries(fx, 0, 1),
+            fx.returned_since(before), 3 * fx.staged_bytes);
+    }
+    if (test_evict_device_entries(fx, 0, 2) != 3) {
+        return test_loan_fail("the release reclaimed %d of the unclaimed expert's 3 device entries",
+                              3 - test_evict_device_entries(fx, 0, 2));
+    }
+    return {};
+}
+
+std::string test_expert_evict_host_copy_belongs_to_the_device_entrys_model() {
+    // An evicted triplet's host copies hold the same weights as the device entries they replace, so they belong to the
+    // model that owned those entries, and that model's release reclaims them and gives their pinned storage back to
+    // the host WEIGHT zone. A model claims experts 0 and 1; expert 2 stays unclaimed. After the evict of expert 0 and
+    // the reaping of its withdrawn device entries, the model's release reclaims expert 0's host copies and expert 1's
+    // device entries. The control: expert 2's entries, which no model ever owned, stay.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/0x6f776e7202ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    if (std::string why = test_move_claim(fx, 0x6f776e7202ull, { 0, 1 }); !why.empty()) {
+        return why;
+    }
+
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, test_no_triplet, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_evicted != 1 ||
+        !test_admit_outcome_is(result.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict answered " + test_admit_answer(code, result);
+    }
+    if (!fx.reclaim_until([&] { return test_evict_device_entries(fx, 0, 0) == 0; })) {
+        return "the evicted triplet's device entries were not reaped within 2 s";
+    }
+    if (test_evict_host_entries(fx, 0, 0) != 3) {
+        return test_loan_fail("the evicted triplet has %d host copies, not 3", test_evict_host_entries(fx, 0, 0));
+    }
+    const size_t host_used = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+    if (host_used < 3 * bytes) {
+        return test_loan_fail("the host WEIGHT zone holds %zu bytes, less than the three %zu-byte host copies",
+                              host_used, bytes);
+    }
+    test_move_release(fx);
+    if (!fx.reclaim_until([&] {
+            return test_evict_host_entries(fx, 0, 0) == 0 && test_evict_device_entries(fx, 0, 1) == 0 &&
+                   fx.cache->host_zone_used(host_zone_id::WEIGHT) <= host_used - 3 * bytes;
+        })) {
+        return test_loan_fail(
+            "2 s after the model's release %d evicted host copies and %d unmoved device entries remain, and the host "
+            "WEIGHT zone holds %zu bytes, not at most %zu",
+            test_evict_host_entries(fx, 0, 0), test_evict_device_entries(fx, 0, 1),
+            fx.cache->host_zone_used(host_zone_id::WEIGHT), host_used - 3 * bytes);
+    }
+    if (test_evict_device_entries(fx, 0, 2) != 3) {
+        return test_loan_fail("the release reclaimed %d of the unclaimed expert's 3 device entries",
+                              3 - test_evict_device_entries(fx, 0, 2));
+    }
+    return {};
+}
+
+std::string test_expert_refill_belongs_to_the_lending_model() {
+    // A loan and its refill move a triplet to the host and back, and each copy belongs to the model that owned the
+    // one it replaced: the re-admitted device entries are still that model's, and its release reclaims them. A model
+    // claims experts 0 and 1, the only ones on the device, so the loan lends one of them; once it is refilled, the
+    // model's release reclaims both triplets' device entries and the withdrawn host copies.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6f776e7203ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    if (std::string why = test_move_claim(fx, 0x6f776e7203ull, { 0, 1 }); !why.empty()) {
+        return why;
+    }
+    const size_t charge = placement_vram_charge_bytes(test_loan_expert_bytes());
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    const std::vector<std::pair<int, int>> lent = fx.lent_triplets(/*host_expert=*/2);
+    if (lent.size() != 1) {
+        return test_loan_fail("the published plan has %zu lent triplets, not 1", lent.size());
+    }
+
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    ::ggml_sycl_expert_loan_result         result;
+    (void) fx.boundary_after_graph(/*decode=*/true, /*max_triplets=*/1, &resolver, &result);
+    if (!result.accepted || result.n_triplets != 1) {
+        return test_loan_fail("the refill re-admitted %u triplets (%s), not 1", result.n_triplets, result.reason);
+    }
+    test_move_release(fx);
+    const int lent_expert = lent[0].second;
+    if (!fx.reclaim_until([&] {
+            return test_evict_device_entries(fx, 0, 0) == 0 && test_evict_device_entries(fx, 0, 1) == 0 &&
+                   test_evict_host_entries(fx, 0, lent_expert) == 0;
+        })) {
+        return test_loan_fail(
+            "2 s after the model's release expert 0 has %d device entries, expert 1 %d, and the refilled expert %d "
+            "has %d host copies",
+            test_evict_device_entries(fx, 0, 0), test_evict_device_entries(fx, 0, 1), lent_expert,
+            test_evict_host_entries(fx, 0, lent_expert));
     }
     return {};
 }

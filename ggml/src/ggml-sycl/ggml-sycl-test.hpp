@@ -712,6 +712,12 @@ std::string test_expert_evict_takes_a_block_off_the_direct_route();
 // A named evict's host copies never grow the pinned host zone: into a full host WEIGHT zone it is BUSY "host pinned
 // pool exhausted" and the zone's capacity is unchanged; once the room is back the same evict moves.
 std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone();
+// Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
+// it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
+// no model ever owned stays through the release.
+std::string test_expert_admit_belongs_to_the_host_copys_model();
+std::string test_expert_evict_host_copy_belongs_to_the_device_entrys_model();
+std::string test_expert_refill_belongs_to_the_lending_model();
 #endif
 
 }  // namespace ggml_sycl

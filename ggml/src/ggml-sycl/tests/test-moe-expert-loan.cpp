@@ -233,6 +233,24 @@
 //                           then BUSY "host pinned pool exhausted", moves nothing and leaves the zone's capacity as it
 //                           was; once the fillers go, the same evict moves, still without growing the zone.
 //
+// Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
+// releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
+// device cache:
+//
+//   admit_belongs_to_the_host_copys_model
+//                           A model claims expert 1's host copies and expert 0's device entries. After the admit of
+//                           expert 1 and the release, expert 1's device entries and expert 0's are gone and the WEIGHT
+//                           zone has the admitted triplet's room back. The control: expert 2, never claimed, keeps
+//                           its device entries, since a release keeps an entry it cannot attribute.
+//   evict_host_copy_belongs_to_the_device_entrys_model
+//                           A model claims experts 0 and 1. After the evict of expert 0 and the reaping of its device
+//                           entries, the release reclaims expert 0's host copies, with their room in the host WEIGHT
+//                           zone, and expert 1's device entries. The control: expert 2, never claimed, stays.
+//   refill_belongs_to_the_lending_model
+//                           A model claims experts 0 and 1, the only ones on the device; one is lent and refilled.
+//                           The release reclaims both triplets' device entries and the withdrawn host copies. No
+//                           unclaimed control: the loan picks its own triplet, which must be a claimed one.
+//
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
 // without staging. Every lend in the refill cases checks it. The zones cannot be unconfigured, so the one case that
@@ -339,6 +357,12 @@ int main() {
                    ggml_sycl::test_expert_evict_takes_a_block_off_the_direct_route);
     ok &= run_case("evict_without_host_room_is_busy_and_keeps_the_zone",
                    ggml_sycl::test_expert_evict_without_host_room_is_busy_and_keeps_the_zone);
+    // Last: each releases a model slot, a teardown scan of the whole device cache.
+    ok &=
+        run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);
+    ok &= run_case("evict_host_copy_belongs_to_the_device_entrys_model",
+                   ggml_sycl::test_expert_evict_host_copy_belongs_to_the_device_entrys_model);
+    ok &= run_case("refill_belongs_to_the_lending_model", ggml_sycl::test_expert_refill_belongs_to_the_lending_model);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;
