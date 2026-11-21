@@ -32,7 +32,8 @@ struct ggml_sycl_prestage_facts {
     bool is_input           = false;  // the tensor, or a tensor it views, carries GGML_TENSOR_FLAG_INPUT
     bool is_kv_host         = false;  // its bytes live in the KV-host buft
     bool root_is_op_output  = false;  // ggml_sycl_prestage_root_is_op_output
-    bool root_is_graph_node = false;  // the view root is a node of the graph being staged
+    bool root_is_graph_node = false;  // the view root is a node of the graph being staged (asked only when the
+                                      // rule reads it: a host op output no earlier class claims)
 };
 
 // The tensor whose storage `tensor` views, or `tensor` itself.

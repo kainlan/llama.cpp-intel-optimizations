@@ -116824,7 +116824,8 @@ static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tens
     return buf ? buf->buft : nullptr;
 }
 
-// The nodes of one graph, collected on first use: only a host op output asks, so a graph with none never builds it.
+// The nodes of one graph, collected on first use. Only a host op output that no earlier class claims asks
+// (ggml_sycl_prestage_facts_of), so a graph whose intermediates and inputs live on the device never builds it.
 struct ggml_sycl_graph_node_set {
     // `cgraph` is non-null: the pre-stage and the refresh return on a null graph before they construct one.
     explicit ggml_sycl_graph_node_set(const ggml_cgraph * cgraph) : cgraph(cgraph) {}
@@ -116858,8 +116859,12 @@ static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of(const ggml_tensor * 
     facts.is_input          = graph_tensor_is_input(tensor);
     facts.is_kv_host        = src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
     facts.root_is_op_output = ggml_sycl_prestage_root_is_op_output(tensor);
+    // The rule reads the graph-node fact only for a host op output no earlier class claims; asking for any other
+    // tensor would build the node set for every device intermediate of every walk.
+    const bool reaches_rule = facts.root_is_op_output && !facts.is_control && !facts.is_weight && !facts.is_device &&
+                              !facts.is_input && !facts.is_kv_host;
     facts.root_is_graph_node =
-        facts.root_is_op_output && (!graph_nodes || graph_nodes->contains(ggml_sycl_prestage_view_root(tensor)));
+        reaches_rule && (!graph_nodes || graph_nodes->contains(ggml_sycl_prestage_view_root(tensor)));
     return facts;
 }
 

@@ -304,7 +304,9 @@ def evaluate(backend, common, memo_hdr, class_hdr=None):
     # Without a node set the producer is unknown, and the fact says "this graph's own": the conservative answer (COPY,
     # the class every host op output had before), which the bytes predicate does not depend on.
     results["the graph-node fact asks the graph's node set, and a caller with none gets this graph's own"] = \
-        re.search(r"facts\.root_is_graph_node\s*=\s*facts\.root_is_op_output\s*&&\s*"
+        re.search(r"const bool reaches_rule\s*=\s*facts\.root_is_op_output\s*&&\s*!facts\.is_control\s*&&\s*"
+                  r"!facts\.is_weight\s*&&\s*!facts\.is_device\s*&&\s*!facts\.is_input\s*&&\s*!facts\.is_kv_host\s*;\s*"
+                  r"facts\.root_is_graph_node\s*=\s*reaches_rule\s*&&\s*"
                   r"\(\s*!graph_nodes\s*\|\|\s*graph_nodes->contains\(ggml_sycl_prestage_view_root\(tensor\)\)\s*\)\s*;",
                   facts_fn) is not None
     node_set = function_body(backend, r"bool\s+contains\(const ggml_tensor \* tensor\)\s*\{") or ""
@@ -923,6 +925,9 @@ if args.self_test:
                          "graph_nodes->contains(ggml_sycl_prestage_view_root(tensor))", "false"), common, mem_)),
         ("a caller with no node set gets another split's activation", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
          (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "(!graph_nodes ||", "(graph_nodes &&"), common, mem_)),
+        ("every op output asks the node set", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "!facts.is_device &&", ""),
+          common, mem_)),
         ("the node set is empty", "the node set holds the graph's nodes",
          (mutate_in_func(backend, r"bool\s+contains\(const ggml_tensor \* tensor\)\s*\{", "nodes.insert(cgraph->nodes[i]);", "(void) i;"),
           common, mem_)),
