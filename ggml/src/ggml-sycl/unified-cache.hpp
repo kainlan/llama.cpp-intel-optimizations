@@ -4600,8 +4600,8 @@ class unified_cache {
     // gives back exactly its bytes, and a slice of a host zone, the provenance the copy path proves host USM by, so the
     // copy is a direct DMA. Any other is refused "host copy not pinned": an owner wider than its entry, or a copy that
     // is no host-zone slice, such as one served in place from a file mapping, which would bounce through a synchronous
-    // staged copy. A missing host copy refuses as "not
-    // on host", and one holding fewer than the member's logical_bytes as "host copy size". Each member's device_owner
+    // staged copy. A missing host copy refuses as "not on host", and one holding fewer than the member's logical_bytes
+    // as "host copy size". Each member's device_owner
     // must be exactly staged_expert_bytes() of the host copy's layout and the member's type, ncols and logical_bytes,
     // never less than logical_bytes ("device storage size"). The copy moves logical_bytes from offset 0 of the host
     // copy, so a padded copy's tail is never read; the tail past them is zero-filled on the same queue behind the

@@ -27989,7 +27989,8 @@ std::string test_expert_admit_completes_a_block_read_through_its_table() {
     // MUL_MAT_ID after it serves the admitted expert from the card: the selected-ids pointer table it builds
     // (ggml_sycl_update_moe_ptr_table) names each admitted device copy, its upload is ordered on the copy's ready
     // event, and a kernel behind the upload on the same in-order stream reads the original bytes through the table.
-    // Nothing between the admit and that kernel waits. The decode direct route's table is the next case's.
+    // Nothing between the admit and that kernel waits. The decode direct route's table has its own case,
+    // test_expert_admit_completes_a_block_the_direct_route_serves.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/2, /*model_id=*/0x61646d7405ull);
     if (!fx.cache) {
         return "no unified cache for device 0";

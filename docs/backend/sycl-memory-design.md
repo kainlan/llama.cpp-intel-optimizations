@@ -348,10 +348,16 @@ the device entry is published behind the fill, and the extra's record covers
 `nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
 The admit gives back the whole host entry, all of its zone bytes. A Q4_0
 expert 640 columns wide gains 216 bytes. The first graph after the publish
-serves the admitted expert from the card. The selected-ids pointer table
-(`ggml_sycl_update_moe_ptr_table`) orders its upload behind the entry's ready
-event on the context's in-order stream, so nothing waits on the host, and that
-graph queues behind at most the admitted triplets' copy and fill. The decode
+serves the admitted expert from the card. Outside graph recording, the
+selected-ids pointer table (`ggml_sycl_update_moe_ptr_table`) orders its
+upload behind the entry's ready event on the context's in-order stream, so
+nothing waits on the host, and that graph queues behind at most the admitted
+triplets' copy and fill. The publish bumps the exec-graph epoch, so the first
+graph after it is recorded again, and a recorded command cannot depend on an
+event outside the graph: while a graph records, the table upload
+(`ggml_sycl_upload_moe_transient_ptr_table`, which the decode direct route's
+table goes through) chains no ready event; it asks each slot's event for its
+status and refuses the table while a slot's copy is still in flight. The decode
 direct route (`ggml_sycl_moe_decode_direct_table`) keeps its decision per
 storage generation, and the admit's device records bump the tensor's
 generation, so the route decides again and serves a block the admit completed
