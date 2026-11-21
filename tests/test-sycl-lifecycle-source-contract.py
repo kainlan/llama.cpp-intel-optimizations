@@ -714,7 +714,10 @@ INTERNAL_WRAPPER_SITES = {
         # 2 -> 5: the padded, file-mapped and block-completing admit cases read the plan an accepted admit published.
         # 5 -> 8: the evict cases that refill after an evict, swap in one call and refuse an evict beside an admit
         # read the plan the call published, to show which side each triplet ended on.
-        "const auto now = ::ggml_sycl_global_plan_snapshot();": 8,
+        # 8 -> 10: the evict landing helper reads each evicted member's target and host backing in the current plan,
+        # and the shared-storage case reads the plan its call published to show the refused triplet still on the
+        # device.
+        "const auto now = ::ggml_sycl_global_plan_snapshot();": 10,
         # 14 -> 15: the fixture's lent_bytes_are helper reads the current plan to show which bytes are lent.
         # 15 -> 16: test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned reads the published plan in
         # its members_read helper, to show each lent member's backing and the plan's mapped staging source before the
@@ -723,8 +726,8 @@ INTERNAL_WRAPPER_SITES = {
         # and the busy admit case's refusal check reads the one a refused admit must leave in place.
         # 20 -> 21: the case that admits from a host copy shorter than the tensor reads the publication its refusal
         # must leave in place.
-        # 21 -> 25: the evict cases read the publication a call starts from: one shows an accepted evict replaced
-        # it, and the shared-storage, just-admitted and lent cases show a refused or BUSY evict left it in place.
+        # 21 -> 25: the evict cases read the publication a call starts from: the one-evict and shared-storage cases
+        # show an accepted call replaced it, and the just-admitted and lent cases show a BUSY evict left it in place.
         "const auto published = ::ggml_sycl_global_plan_snapshot();": 25,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
@@ -740,8 +743,9 @@ INTERNAL_WRAPPER_SITES = {
         # dropped, published nothing. 9 -> 10: the busy admit case shows each BUSY admit published nothing. 10 -> 11:
         # the case that admits from a host copy shorter than the tensor shows that refusal published nothing.
         # 11 -> 13: the shared-storage evict case shows its refused evict, and the just-admitted evict case each of
-        # its BUSY evicts, published nothing.
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 13,
+        # its BUSY evicts, published nothing. 13 -> 12: the shared-storage case's refused evict now shares its call
+        # with an evict that moves, so that call publishes, and the case reads the new plan instead.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 12,
         # An accepted evict publishes a plan with the triplet on the host, so the case that evicts one resident
         # triplet shows the publication changed.
         "if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {": 1,

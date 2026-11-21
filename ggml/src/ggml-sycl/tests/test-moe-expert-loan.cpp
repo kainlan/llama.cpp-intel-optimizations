@@ -180,17 +180,20 @@
 // The named move's evict, through the same transaction:
 //
 //   evict_moves_a_resident_triplet
-//                           One evict: accepted "OK", three staged sizes to give back, a new plan with the triplet on
-//                           the host, each member resolving to a pinned host copy of its original bytes, no ledger or
-//                           teardown count written. Its three device entries are all still there right after the call,
-//                           and a deferred-free pass reaps them and returns their room.
+//                           One evict: accepted "OK", three staged sizes to give back, a new plan with each member on
+//                           the host, no target device and PINNED backing, each member resolving to a pinned host copy
+//                           of its original bytes, no ledger or teardown count written. The control: each member
+//                           resolved on the device before the call. Its three device entries are all still there right
+//                           after the call, and a deferred-free pass reaps them and returns their room.
 //   evict_is_not_refilled
 //                           An evict, then a one-triplet loan of another: one decode boundary's refill, allowed four,
 //                           re-admits the lent triplet alone, the evicted one stays on the host, and the teardown
 //                           counts read 1/1.
 //   evict_refuses_shared_storage
-//                           A bulk-staged pair's expert 0 is REFUSED "shared storage", nothing published, the triplet
-//                           left on the device. The control, the same evict of a pair staged per expert, moves.
+//                           One call evicts expert 0 of a bulk-staged layer and of a layer staged per expert: the
+//                           bulk one is REFUSED "shared storage" and left on the device, and the control, the one
+//                           staged per expert, moves in the same call, which is accepted with "shared storage" as its
+//                           reason.
 //   evict_is_busy_right_after_an_admit
 //                           Right after an admit the evict of that triplet is BUSY ("storage still referenced" or
 //                           "host entry exists") and changes nothing; once the host entries are reaped and the copy's
@@ -205,7 +208,10 @@
 //   evict_and_admit_cycles_return_the_room
 //                           Four evict and admit cycles of one triplet. Right after the first evict an admit is BUSY
 //                           "device entry exists"; after each cycle's reaping the WEIGHT zone and the WEIGHT host zone
-//                           are where they started, and the bytes at the end are the originals.
+//                           are where they started, and the bytes at the end are the originals. The control, in every
+//                           cycle: right after the evict the WEIGHT host zone holds the three pinned copies on top of
+//                           where it started, and once the device entries are reaped the WEIGHT zone has their room on
+//                           top of where it started.
 //   evict_refusal_leaves_the_admit_list_alone
 //                           An evict of a host triplet is REFUSED "not on device" in its list while the admit beside it
 //                           moves: accepted with that refusal as the reason, none evicted, one admitted.
