@@ -28691,16 +28691,19 @@ struct moe_token_enqueue_event {
 };
 
 // A graph compute's stamps.  `valid` is set by the compute's entry and `readbacks_seen` by an expert-id readback
-// during the compute.  The times are raw clock readings, 0 for a stamp not taken: the backend's entry, just before the
-// segment slot replay (0 when the compute replayed no slot), the first storage gather's start and the last one's
-// return since the previous entry with their summed time, and the last staged readback after the compute.  A gather
-// read counts the waiters submitted for the misses: rows of one block share a read.
+// during the compute.  The times are raw clock readings, 0 for a stamp not taken: the backend's entry, just before
+// and just after the segment slot replay (0 when the compute replayed no slot), the compute's final return, the
+// first storage gather's start and the last one's return since the previous entry with their summed time, and the
+// last staged readback after the compute.  A gather read counts the waiters submitted for the misses: rows of one
+// block share a read.
 struct moe_token_stamps {
     bool                    valid               = false;
     bool                    readbacks_seen      = false;
     bool                    printed             = false;
     int64_t                 t_gc_enter_ns       = 0;
     int64_t                 t_replay_ns         = 0;
+    int64_t                 t_replay_end_ns     = 0;
+    int64_t                 t_return_ns         = 0;
     int64_t                 t_ple_begin_ns      = 0;
     int64_t                 t_ple_end_ns        = 0;
     int64_t                 ple_busy_ns         = 0;
@@ -28767,6 +28770,8 @@ static void moe_token_stamps_enter() {
     rec.printed             = false;
     rec.t_gc_enter_ns       = now_ns;
     rec.t_replay_ns         = 0;
+    rec.t_replay_end_ns     = 0;
+    rec.t_return_ns         = 0;
     rec.t_ple_begin_ns      = p.t_ple_begin_ns.exchange(0, std::memory_order_relaxed);
     rec.t_ple_end_ns        = p.t_ple_end_ns.exchange(0, std::memory_order_relaxed);
     rec.ple_busy_ns         = p.ple_busy_ns.exchange(0, std::memory_order_relaxed);
@@ -28785,6 +28790,17 @@ static void moe_token_stamps_enter() {
 // Just before the segment slot replay call: this minus the entry is the prologue the replay path pays.
 static void moe_token_stamps_note_replay() {
     moe_token_stamps_current().t_replay_ns = ggml_sycl::cpu_expert_pool_trace_now_ns();
+}
+
+// Just after the segment slot replay call returned: this minus the replay's start is the host's whole enqueue time.
+static void moe_token_stamps_note_replay_end() {
+    moe_token_stamps_current().t_replay_end_ns = ggml_sycl::cpu_expert_pool_trace_now_ns();
+}
+
+// The graph compute's final return.  Every path that falls out of the segment/graph selection reaches it, the slot
+// replay path included; the early returns before that selection are other paths and are not stamped.
+static void moe_token_stamps_note_return() {
+    moe_token_stamps_current().t_return_ns = ggml_sycl::cpu_expert_pool_trace_now_ns();
 }
 
 // The record the replay loop stamps its enqueues into: null unless the flag is on and the level is 2 or more.
@@ -28871,12 +28887,17 @@ static void moe_token_stamps_print(uint64_t token, moe_token_stamps & rec, int64
     const int64_t t0_ns = job_t0_ns != 0 ? job_t0_ns : rec.t_gc_enter_ns;
     char          gc_enter[24];
     char          replay[24];
+    char          replay_end[24];
+    char          gc_return[24];
     char          prologue[24];
+    char          enqueue[24];
     char          ple_begin[24];
     char          ple_end[24];
     char          logits_ret[24];
     moe_token_stamps_rel(gc_enter, sizeof(gc_enter), rec.t_gc_enter_ns, t0_ns);
     moe_token_stamps_rel(replay, sizeof(replay), rec.t_replay_ns, t0_ns);
+    moe_token_stamps_rel(replay_end, sizeof(replay_end), rec.t_replay_end_ns, t0_ns);
+    moe_token_stamps_rel(gc_return, sizeof(gc_return), rec.t_return_ns, t0_ns);
     moe_token_stamps_rel(ple_begin, sizeof(ple_begin), rec.t_ple_begin_ns, t0_ns);
     moe_token_stamps_rel(ple_end, sizeof(ple_end), rec.t_ple_end_ns, t0_ns);
     moe_token_stamps_rel(logits_ret, sizeof(logits_ret), rec.t_logits_ns, t0_ns);
@@ -28885,16 +28906,22 @@ static void moe_token_stamps_print(uint64_t token, moe_token_stamps & rec, int64
     } else {
         snprintf(prologue, sizeof(prologue), "-");
     }
+    if (rec.t_replay_ns != 0 && rec.t_replay_end_ns != 0) {
+        snprintf(enqueue, sizeof(enqueue), "%.0fus", (double) (rec.t_replay_end_ns - rec.t_replay_ns) / 1000.0);
+    } else {
+        snprintf(enqueue, sizeof(enqueue), "-");
+    }
     const uint64_t ple_misses = rec.ple_rows > rec.ple_hits ? rec.ple_rows - rec.ple_hits : 0;
     GGML_LOG_WARN(
-        "[MOE-TOKEN-START] token=%llu t0=%s gc_enter=%s replay_begin=%s prologue=%s ple_begin=%s ple_end=%s "
+        "[MOE-TOKEN-START] token=%llu t0=%s gc_enter=%s replay_begin=%s replay_end=%s gc_return=%s prologue=%s "
+        "enqueue=%s ple_begin=%s ple_end=%s "
         "ple_busy=%.0fus ple_calls=%llu ple_rows=%llu ple_hits=%llu ple_misses=%llu ple_reads=%llu "
         "logits_ret=%s logits_staged=%llu logits_calls=%llu events=%d events_dropped=%d\n",
-        (unsigned long long) token, job_t0_ns != 0 ? "job" : "entry", gc_enter, replay, prologue, ple_begin, ple_end,
-        (double) rec.ple_busy_ns / 1000.0, (unsigned long long) rec.ple_calls, (unsigned long long) rec.ple_rows,
-        (unsigned long long) rec.ple_hits, (unsigned long long) ple_misses, (unsigned long long) rec.ple_reads,
-        logits_ret, (unsigned long long) rec.logits_staged, (unsigned long long) rec.logits_calls, rec.n_events,
-        rec.events_dropped);
+        (unsigned long long) token, job_t0_ns != 0 ? "job" : "entry", gc_enter, replay, replay_end, gc_return, prologue,
+        enqueue, ple_begin, ple_end, (double) rec.ple_busy_ns / 1000.0, (unsigned long long) rec.ple_calls,
+        (unsigned long long) rec.ple_rows, (unsigned long long) rec.ple_hits, (unsigned long long) ple_misses,
+        (unsigned long long) rec.ple_reads, logits_ret, (unsigned long long) rec.logits_staged,
+        (unsigned long long) rec.logits_calls, rec.n_events, rec.events_dropped);
     if (enqueue_lines) {
         for (int i = 0; i < rec.n_events; ++i) {
             const moe_token_enqueue_event & ev = rec.events[i];
@@ -123526,6 +123553,9 @@ normal_dispatch:
                                 moe_token_stamps_note_replay();
                             }
                             moe_graph_replay_segment_slot(sycl_ctx, cgraph, *slot);
+                            if (moe_hostpath_waits_enabled()) {
+                                moe_token_stamps_note_replay_end();
+                            }
                             graph_executed = true;
                         }
                     } else if (!sycl_ctx->moe_segment_slots.state(slot_key)) {
@@ -124035,6 +124065,10 @@ normal_dispatch:
                 can_defer_exit_wait ? 1 : 0);
     }
 
+    // The final return, which the slot replay path takes: the early returns above are other paths.
+    if (moe_hostpath_waits_enabled()) {
+        moe_token_stamps_note_return();
+    }
     return GGML_STATUS_SUCCESS;
 }
 

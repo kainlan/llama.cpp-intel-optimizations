@@ -4,7 +4,7 @@
 THE GAP.  The per-job stamps of the trace start at the token's first job submit.  On Qwen3.8 decode the device idles
 for about 10 ms before it, while the host prepares the token (llama's inputs, including the PLE storage gather),
 runs the backend's prologue (about twenty walks of a 6783-node graph, two of them full hashes) and enqueues the
-blocks that come before the first host expert.  Six stamps, kept raw and printed relative to that first job submit,
+blocks that come before the first host expert.  Eight stamps, kept raw and printed relative to that first job submit,
 split the time.  They add no work to the untraced path and change nothing the traced path submits or waits.
 
 THE CONTRACT.  With comments blanked, in ggml-sycl.cpp:
@@ -13,6 +13,10 @@ THE CONTRACT.  With comments blanked, in ggml-sycl.cpp:
           as the first statement (the backend entry);
        b. `if (moe_hostpath_waits_enabled()) { moe_token_stamps_note_replay(); }` right before
           moe_graph_replay_segment_slot(sycl_ctx, cgraph, *slot) (the replay begin);
+       b2. `if (moe_hostpath_waits_enabled()) { moe_token_stamps_note_replay_end(); }` right after that call (the
+          replay end, so replay_end - replay_begin is the host's enqueue time);
+       b3. `if (moe_hostpath_waits_enabled()) { moe_token_stamps_note_return(); }` right before the compute's final
+          `return GGML_STATUS_SUCCESS;`, which the replay path takes (gc_return);
        c. moe_graph_replay_segment_slot: two moe_token_stamps_note_enqueue calls, each inside `if (enqueue_stamps)`,
           the segment one right before graph_exec_submit; enqueue_stamps comes from
           moe_token_stamps_enqueue_target(), which returns null unless the flag is on and the level is 2 or more;
@@ -56,14 +60,15 @@ ENV_NAME = "GGML_SYCL_MOE_IDS_COPY_TRACE"
 # How many times the backend reads the variable: the cached flag, the cached level, and the lazy tracer's own read.
 ENV_READS = 3
 
-TOKEN_FIELDS = ("token", "t0", "gc_enter", "replay_begin", "prologue", "ple_begin", "ple_end", "ple_busy",
-                "ple_calls", "ple_rows", "ple_hits", "ple_misses", "ple_reads", "logits_ret", "logits_staged",
-                "logits_calls", "events", "events_dropped")
+TOKEN_FIELDS = ("token", "t0", "gc_enter", "replay_begin", "replay_end", "gc_return", "prologue", "enqueue",
+                "ple_begin", "ple_end", "ple_busy", "ple_calls", "ple_rows", "ple_hits", "ple_misses", "ple_reads",
+                "logits_ret", "logits_staged", "logits_calls", "events", "events_dropped")
 ENQUEUE_FIELDS = ("token", "i", "kind", "node", "layer", "t")
 
 # The helpers whose bodies must hold no wait, no event query, no allocation and no lock.
 HELPERS = ("moe_token_stamps_current", "moe_token_stamps_enter", "moe_token_stamps_note_replay",
-           "moe_token_stamps_enqueue_target", "moe_token_stamps_layer_of", "moe_token_stamps_note_enqueue",
+           "moe_token_stamps_note_replay_end", "moe_token_stamps_note_return", "moe_token_stamps_enqueue_target",
+           "moe_token_stamps_layer_of", "moe_token_stamps_note_enqueue",
            "moe_token_stamps_note_ple", "moe_token_stamps_note_d2h", "moe_token_stamps_rel",
            "moe_token_stamps_print")
 FORBIDDEN = (
@@ -186,6 +191,20 @@ def check_sites(code: str) -> None:
                     tail):
         fail("G", "the replay-begin stamp is not right before moe_graph_replay_segment_slot(sycl_ctx, cgraph, *slot)")
 
+    # b2. the replay end, right after the slot replay call.
+    sites = guarded_call(code, "moe_token_stamps_note_replay_end", FLAG_GUARD, "G", "replay end")
+    head = code[max(0, sites[0].start() - 260) : sites[0].start()]
+    if not re.search(r"moe_graph_replay_segment_slot\s*\(\s*sycl_ctx\s*,\s*cgraph\s*,\s*\*slot\s*\)\s*;\s*"
+                     r"if\s*\(\s*" + FLAG_GUARD + r"\s*\)\s*\{\s*$", head):
+        fail("G", "the replay-end stamp is not right after moe_graph_replay_segment_slot(sycl_ctx, cgraph, *slot)")
+
+    # b3. the final return of the compute, which the replay path takes.
+    sites = guarded_call(code, "moe_token_stamps_note_return", FLAG_GUARD, "G", "compute return")
+    if not re.match(r"[^;]*;\s*\}\s*return\s+GGML_STATUS_SUCCESS\s*;\s*\}", code[sites[0].end() : sites[0].end() + 120]):
+        fail("G", "the return stamp is not right before the compute's final `return GGML_STATUS_SUCCESS;`")
+    if sites[0].start() < code.index("static ggml_status ggml_backend_sycl_graph_compute_unchecked"):
+        fail("G", "the return stamp is outside ggml_backend_sycl_graph_compute_unchecked")
+
     # c. the per-block enqueue stamps, in the replay loop.
     replay = body_of(code, r"\bstatic\s+void\s+moe_graph_replay_segment_slot\s*\([^)]*\)\s*\{", "G")
     if not re.search(r"moe_token_stamps\s*\*\s*const\s+enqueue_stamps\s*=\s*moe_token_stamps_enqueue_target\s*\(\s*\)\s*;",
@@ -262,8 +281,8 @@ def check_clock(code: str) -> None:
         body = body_of(code, def_sig(name), "K")
         if re.search(r"steady_clock|high_resolution_clock|system_clock|clock_gettime|rdtsc", body):
             fail("K", f"{name} reads a clock of its own")
-    for name in ("moe_token_stamps_enter", "moe_token_stamps_note_replay", "moe_token_stamps_note_enqueue",
-                 "moe_token_stamps_note_d2h"):
+    for name in ("moe_token_stamps_enter", "moe_token_stamps_note_replay", "moe_token_stamps_note_replay_end",
+                 "moe_token_stamps_note_return", "moe_token_stamps_note_enqueue", "moe_token_stamps_note_d2h"):
         if "ggml_sycl::cpu_expert_pool_trace_now_ns()" not in body_of(code, def_sig(name), "K"):
             fail("K", f"{name} does not read the job stamps' clock, ggml_sycl::cpu_expert_pool_trace_now_ns()")
 
@@ -326,7 +345,8 @@ def parse_line(line: str, tag: str, fields: tuple[str, ...], times: tuple[str, .
 
 
 SAMPLES = {
-    "token": "7", "t0": "job", "gc_enter": "-10532us", "replay_begin": "-9400us", "prologue": "1132us",
+    "token": "7", "t0": "job", "gc_enter": "-10532us", "replay_begin": "-9400us", "replay_end": "-2000us",
+    "gc_return": "36000us", "prologue": "1132us", "enqueue": "7400us",
     "ple_begin": "-12000us", "ple_end": "-11000us", "ple_busy": "1000", "ple_calls": "1", "ple_rows": "16",
     "ple_hits": "2", "ple_misses": "14", "ple_reads": "14", "logits_ret": "38000us", "logits_staged": "1",
     "logits_calls": "1", "events": "3", "events_dropped": "0",
@@ -358,17 +378,21 @@ def check_lines(code: str) -> None:
     line = synthesize(full[0])
     try:
         got = parse_line(line, "MOE-TOKEN-START", TOKEN_FIELDS,
-                         ("gc_enter", "replay_begin", "prologue", "ple_begin", "ple_end", "ple_busy", "logits_ret"),
+                         ("gc_enter", "replay_begin", "replay_end", "gc_return", "prologue", "enqueue",
+                          "ple_begin", "ple_end", "ple_busy", "logits_ret"),
                          ("token", "ple_calls", "ple_rows", "ple_hits", "ple_misses", "ple_reads", "logits_staged",
                           "logits_calls", "events", "events_dropped"))
     except ValueError as exc:
         fail("L", f"the [MOE-TOKEN-START] format does not parse: {exc}")
     if got["prologue"] != got["replay_begin"] - got["gc_enter"]:
         fail("L", "the synthetic prologue is not replay_begin - gc_enter")
+    if got["enqueue"] != got["replay_end"] - got["replay_begin"]:
+        fail("L", "the synthetic enqueue is not replay_end - replay_begin")
     # A stamp not taken parses as None.
-    nt = parse_line(line.replace("replay_begin=-9400us", "replay_begin=-").replace("prologue=1132us", "prologue=-"),
-                    "MOE-TOKEN-START", TOKEN_FIELDS, ("replay_begin", "prologue"), ())
-    if nt["replay_begin"] is not None or nt["prologue"] is not None:
+    nt = parse_line(line.replace("replay_begin=-9400us", "replay_begin=-").replace("prologue=1132us", "prologue=-")
+                    .replace("replay_end=-2000us", "replay_end=-").replace("enqueue=7400us", "enqueue=-"),
+                    "MOE-TOKEN-START", TOKEN_FIELDS, ("replay_begin", "replay_end", "prologue", "enqueue"), ())
+    if any(nt[k] is not None for k in ("replay_begin", "replay_end", "prologue", "enqueue")):
         fail("L", "a stamp not taken does not parse as absent")
 
     eq_fmt = format_of(code, "[MOE-TOKEN-ENQUEUE]")
@@ -382,6 +406,8 @@ def check_lines(code: str) -> None:
     printer = body_of(code, def_sig("moe_token_stamps_print"), "L")
     if not re.search(r"rec\.t_replay_ns\s*-\s*rec\.t_gc_enter_ns", printer):
         fail("L", "prologue is not computed from t_replay_ns - t_gc_enter_ns")
+    if not re.search(r"rec\.t_replay_end_ns\s*-\s*rec\.t_replay_ns", printer):
+        fail("L", "enqueue is not computed from t_replay_end_ns - t_replay_ns")
     if not re.search(r"rec\.ple_rows\s*>\s*rec\.ple_hits\s*\?\s*rec\.ple_rows\s*-\s*rec\.ple_hits", printer):
         fail("L", "ple_misses is not rows - hits")
     enq = [m.start() for m in re.finditer(r"\[MOE-TOKEN-ENQUEUE\]", printer)]
@@ -445,6 +471,24 @@ def mutants(code: str, doc: str):
     yield "replay-begin stamp unguarded", "G", sub1(
         code, r"if\s*\(\s*" + G + r"\s*\)\s*\{\s*moe_token_stamps_note_replay\(\);\s*\}",
         "moe_token_stamps_note_replay();"), doc
+    yield "replay-end stamp unguarded", "G", sub1(
+        code, r"if\s*\(\s*" + G + r"\s*\)\s*\{\s*moe_token_stamps_note_replay_end\(\);\s*\}",
+        "moe_token_stamps_note_replay_end();"), doc
+    yield "replay-end stamp before the replay", "G", sub1(
+        code, r"(moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);)(\s*if \(" + G + r"\) \{\s*"
+        r"moe_token_stamps_note_replay_end\(\);\s*\})", r"\2 \1"), doc
+    yield "return stamp unguarded", "G", sub1(
+        code, r"if\s*\(\s*" + G + r"\s*\)\s*\{\s*moe_token_stamps_note_return\(\);\s*\}",
+        "moe_token_stamps_note_return();"), doc
+    yield "return stamp away from the return", "G", sub1(
+        code, r"(if \(" + G + r"\) \{\s*moe_token_stamps_note_return\(\);\s*\})(\s*return GGML_STATUS_SUCCESS;)",
+        r"\2 \1 int g_pad = 0;"), doc
+    yield "a wait in the return stamp", "N", sub1(
+        code, r"static void moe_token_stamps_note_return\(\) \{",
+        "static void moe_token_stamps_note_return() {\n    sycl::queue().wait();"), doc
+    yield "enqueue not replay_end - replay_begin", "L", sub1(
+        code, r"rec\.t_replay_end_ns - rec\.t_replay_ns", "rec.t_replay_ns - rec.t_replay_end_ns"), doc
+    yield "the enqueue field dropped", "L", sub1(code, r"enqueue=%s ", ""), doc
     yield "segment stamp unguarded", "G", sub1(
         code, r"if \(enqueue_stamps\) \{\s*(moe_token_stamps_note_enqueue\([^;]*MOE_TOKEN_ENQUEUE_SEGMENT[^;]*;)\s*\}",
         "moe_token_stamps_note_enqueue(*enqueue_stamps, MOE_TOKEN_ENQUEUE_SEGMENT, 0, nullptr);"), doc
