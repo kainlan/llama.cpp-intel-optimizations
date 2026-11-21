@@ -22,9 +22,11 @@
 //   probe_changes_nothing   c-tdra first: inside a graph the transaction refuses "graph active" and a request waits.
 //                           Then the same plan probed: the selection is reported and nothing is copied or published.
 //   refuses_replacing_a_host_entry
-//                           c-mwmr-3: a host entry planted under the selected expert's host id, checked live and idle
-//                           (no lease, not retired) before the loan, is refused with "host entry exists"; nothing
-//                           is copied or published and the planted entry keeps its storage.
+//                           A host entry planted under the selected expert's host id, checked live and idle (no
+//                           lease, not retired) before the loan, refuses the loan with "host entry exists" and a
+//                           named evict of the same triplet with REFUSED "host entry exists", since a live entry
+//                           never goes by itself; nothing is copied or published and the planted entry keeps its
+//                           storage.
 //   refuses_shared_storage  c-sepd: a bulk-staged pair with expert 1 flipped to the host is refused with "shared
 //                           storage"; nothing is copied or published.
 //   direct_stage_outside_a_load_copies_through_staging
@@ -65,12 +67,14 @@
 //                           six entries' bytes, 1 remaining, no staged copy), each re-admitted id resolves right away
 //                           to a device entry IN_PROGRESS behind its copy, and the third stays lent until the next
 //                           decode boundary re-admits it. The teardown counts read 3/3.
-//   loan_sizes_its_copies_from_the_entry
-//                           llama.cpp-pu8v: each device entry 72 bytes past the plan's dst_size, as S1-PRELOAD pads a
-//                           Q4_0 expert whose rows are not a multiple of MATRIX_ROW_PADDING. A host copy minted at the
-//                           plan's size is refused "host storage too small" and moves nothing; then the loan lends two
-//                           triplets, each host copy the entry's size with its zero tail, reporting exactly the six
-//                           entries' sizes freed, and one decode boundary re-admits both, reporting the same bytes.
+//   loan_and_refill_size_from_the_tensor
+//                           Each device entry staged as a Q4_0 expert of 640 columns, 216 bytes past the tensor's
+//                           bytes per expert. Host storage short of those bytes is refused "host storage too small",
+//                           and an expert longer than its entry "device entry size", each moving nothing. The loan
+//                           lends two triplets, each host copy and record the tensor's bytes, reporting the six
+//                           entries' whole sizes freed. Over a poisoned WEIGHT zone, one decode boundary re-admits
+//                           both at the staged size, records over the tensor's bytes, each tail in poisoned storage
+//                           reading zero.
 //   loan_and_refill_stop_on_a_missing_entry
 //                           llama.cpp-pu8v: a one-triplet loan whose down member has no device entry stops "not
 //                           resident" (its refusal WARNed once): nothing lent, published or re-posted. After a
@@ -131,6 +135,100 @@
 //                           FILE_MAPPED on the device before the loan. Then the same on a plan that maps nothing,
 //                           PINNED throughout.
 //
+// The named move's admit, through the same transaction, each host triplet copied to the pinned pool and registered
+// as S1-PRELOAD registers an expert the plan keeps on the host:
+//
+//   admit_zero_fills_a_padded_tail
+//                           The resolver reports Q4_0 rows of 640 columns, so each device copy is minted 216 bytes
+//                           past the host bytes. With the free WEIGHT zone poisoned first (each tail checked to lie in
+//                           poisoned storage), one admit moves the triplet: accepted with its outcome "OK", three
+//                           staged sizes admitted, no staged copy, a new plan, no ledger or teardown count written.
+//                           Each record covers the tensor's bytes from offset 0, each entry resolves on the device at
+//                           the staged size, the payload equals the host bytes and the tail reads zero.
+//   admit_refuses_a_file_mapped_member
+//                           A triplet whose gate copy is served from a file mapping, named before a pinned triplet:
+//                           the first is REFUSED "host copy not pinned" and stays on the host with its entries and
+//                           records, the second moves, the call is accepted with the refusal as its reason, and the
+//                           WEIGHT zone keeps nothing of the refused triplet.
+//   admit_is_busy_while_lent_or_the_zone_is_full
+//                           With a loan outstanding the admit is BUSY "loans outstanding"; after the refill, with room
+//                           for one member, BUSY "WEIGHT zone full" and the room comes back. Neither publishes or
+//                           moves anything. With the room back the admit moves the triplet, and the teardown counts
+//                           stay the loan's and the refill's, 1/1.
+//   admit_returns_the_host_zone_bytes
+//                           The WEIGHT host zone counts the three pinned host copies, and within 2 s of the admit their
+//                           host entries are gone and the zone uses what it did before they were pinned.
+//   admit_completes_a_block_read_through_its_table
+//                           The admit of a block's only host triplet leaves every expert of the block on the device.
+//                           The three selected-ids pointer tables ggml_sycl_update_moe_ptr_table builds right after
+//                           it, with no wait, for a ubatch routing that expert each chain a ready event and name the
+//                           admitted device copy, and a kernel behind each upload on the same stream reads the
+//                           original bytes through the table.
+//   admit_reads_the_tensor_bytes_from_a_longer_host_copy
+//                           Each host copy is one staged tail longer than the Q4_0 expert, its tail 0x5a. The admit
+//                           mints the tensor's staged size, not the longer copy's, admits three of them, records the
+//                           tensor's bytes from offset 0, reads the payload equal and the tail zero, and the WEIGHT
+//                           host zone gets the whole longer copies' bytes back.
+//   admit_refuses_a_host_copy_shorter_than_the_tensor
+//                           The resolver reports a tensor 4 KiB longer per expert than the host copies. The cache
+//                           refuses the triplet REFUSED "host copy size", nothing is published, the triplet stays on
+//                           the host with its entries and records, and the minted storage's room comes back.
+//   admit_completes_a_block_the_direct_route_serves
+//                           With the tensors bound Q4_0 and the device info narrowed to device 0, the decode direct
+//                           route (ggml_sycl_moe_decode_direct_table) refuses the block while expert 1 is on the host.
+//                           After the admit it decides again and serves each tensor from AOS, its table names the
+//                           admitted device copy, and a kernel behind the upload reads the bytes through the table.
+//
+// The named move's evict, through the same transaction:
+//
+//   evict_moves_a_resident_triplet
+//                           One evict: accepted "OK", three staged sizes to give back, a new plan with each member on
+//                           the host, no target device and PINNED backing, each member resolving to a pinned host copy
+//                           of its original bytes, no ledger or teardown count written. The control: each member
+//                           resolved on the device before the call. Its three device entries are all still there right
+//                           after the call, and a deferred-free pass reaps them and returns their room.
+//   evict_is_not_refilled
+//                           An evict, then a one-triplet loan of another: one decode boundary's refill, allowed four,
+//                           re-admits the lent triplet alone, the evicted one stays on the host, and the teardown
+//                           counts read 1/1.
+//   evict_refuses_shared_storage
+//                           One call evicts expert 0 of a bulk-staged layer and of a layer staged per expert: the
+//                           bulk one is REFUSED "shared storage" and left on the device, and the control, the one
+//                           staged per expert, moves in the same call, which is accepted with "shared storage" as its
+//                           reason.
+//   evict_is_busy_right_after_an_admit
+//                           Right after an admit the evict of that triplet is BUSY ("storage still referenced" or
+//                           "host entry retiring") and changes nothing; once the copy's retention has drained it is
+//                           BUSY "host entry retiring", whatever the timing, until the host entries are reaped; then
+//                           it moves.
+//   evict_is_busy_while_lent
+//                           With a loan outstanding the evict is BUSY "loans outstanding" and changes nothing; after
+//                           the refill it moves.
+//   evict_and_admit_swap_in_one_call
+//                           One call evicts expert 0 and admits expert 2: both "OK" with three staged sizes each, the
+//                           block's resident count unchanged, and once the evicted entries are reaped the WEIGHT zone
+//                           has the room it had before the call.
+//   evict_and_admit_cycles_return_the_room
+//                           Four evict and admit cycles of one triplet while a second triplet stays on the device, so
+//                           the plan keeps using the card and its cache keeps the plan after every accepted evict and
+//                           admit. Right after the first evict an admit is BUSY "device entry exists"; after each
+//                           cycle's reaping the WEIGHT zone and the WEIGHT host zone are where they started, and the
+//                           bytes at the end are the originals. The control, in every cycle: right after the evict the
+//                           WEIGHT host zone holds the three pinned copies on top of where it started, and once the
+//                           device entries are reaped the WEIGHT zone has their room on top of where it started.
+//   evict_refusal_leaves_the_admit_list_alone
+//                           An evict of a host triplet is REFUSED "not on device" in its list while the admit beside it
+//                           moves: accepted with that refusal as the reason, none evicted, one admitted.
+//   evict_room_is_not_an_admit_in_the_same_call
+//                           With the WEIGHT zone full (the control: no room for one member), one call evicts expert 0
+//                           and admits expert 2: the evict moves, the admit is BUSY "WEIGHT zone full", and right after
+//                           the call the zone still has no member's room. Once expert 0's entries are reaped, a later
+//                           call admits expert 2.
+//   evict_takes_a_block_off_the_direct_route
+//                           The control: once an admit completes the block, the decode direct route serves each tensor
+//                           from AOS. The evict of expert 0 moves each tensor's storage generation, and the route then
+//                           refuses the block rather than serve its old table.
+//
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
 // without staging. Every lend in the refill cases checks it. The zones cannot be unconfigured, so the one case that
@@ -190,7 +288,7 @@ int main() {
     ok &= run_case("refill_runs_once_per_decode_graph", ggml_sycl::test_expert_refill_runs_once_per_decode_graph);
     ok &= run_case("refill_drops_an_unpreparable_triplet", ggml_sycl::test_expert_refill_drops_an_unpreparable_triplet);
     ok &= run_case("refill_moves_two_triplets_per_call", ggml_sycl::test_expert_refill_moves_two_triplets_per_call);
-    ok &= run_case("loan_sizes_its_copies_from_the_entry", ggml_sycl::test_expert_loan_sizes_its_copies_from_the_entry);
+    ok &= run_case("loan_and_refill_size_from_the_tensor", ggml_sycl::test_expert_loan_and_refill_size_from_the_tensor);
     ok &= run_case("loan_and_refill_stop_on_a_missing_entry",
                    ggml_sycl::test_expert_loan_and_refill_stop_on_a_missing_entry);
     ok &= run_case("loan_reclaims_pointer_table_leases", ggml_sycl::test_expert_loan_reclaims_pointer_table_leases);
@@ -208,6 +306,33 @@ int main() {
                    ggml_sycl::test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph);
     ok &= run_case("loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned",
                    ggml_sycl::test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned);
+    ok &= run_case("admit_zero_fills_a_padded_tail", ggml_sycl::test_expert_admit_zero_fills_a_padded_tail);
+    ok &= run_case("admit_refuses_a_file_mapped_member", ggml_sycl::test_expert_admit_refuses_a_file_mapped_member);
+    ok &= run_case("admit_is_busy_while_lent_or_the_zone_is_full",
+                   ggml_sycl::test_expert_admit_is_busy_while_lent_or_the_zone_is_full);
+    ok &= run_case("admit_returns_the_host_zone_bytes", ggml_sycl::test_expert_admit_returns_the_host_zone_bytes);
+    ok &= run_case("admit_completes_a_block_read_through_its_table",
+                   ggml_sycl::test_expert_admit_completes_a_block_read_through_its_table);
+    ok &= run_case("admit_reads_the_tensor_bytes_from_a_longer_host_copy",
+                   ggml_sycl::test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy);
+    ok &= run_case("admit_refuses_a_host_copy_shorter_than_the_tensor",
+                   ggml_sycl::test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor);
+    ok &= run_case("admit_completes_a_block_the_direct_route_serves",
+                   ggml_sycl::test_expert_admit_completes_a_block_the_direct_route_serves);
+    ok &= run_case("evict_moves_a_resident_triplet", ggml_sycl::test_expert_evict_moves_a_resident_triplet);
+    ok &= run_case("evict_is_not_refilled", ggml_sycl::test_expert_evict_is_not_refilled);
+    ok &= run_case("evict_refuses_shared_storage", ggml_sycl::test_expert_evict_refuses_shared_storage);
+    ok &= run_case("evict_is_busy_right_after_an_admit", ggml_sycl::test_expert_evict_is_busy_right_after_an_admit);
+    ok &= run_case("evict_is_busy_while_lent", ggml_sycl::test_expert_evict_is_busy_while_lent);
+    ok &= run_case("evict_and_admit_swap_in_one_call", ggml_sycl::test_expert_evict_and_admit_swap_in_one_call);
+    ok &= run_case("evict_and_admit_cycles_return_the_room",
+                   ggml_sycl::test_expert_evict_and_admit_cycles_return_the_room);
+    ok &= run_case("evict_refusal_leaves_the_admit_list_alone",
+                   ggml_sycl::test_expert_evict_refusal_leaves_the_admit_list_alone);
+    ok &= run_case("evict_room_is_not_an_admit_in_the_same_call",
+                   ggml_sycl::test_expert_evict_room_is_not_an_admit_in_the_same_call);
+    ok &= run_case("evict_takes_a_block_off_the_direct_route",
+                   ggml_sycl::test_expert_evict_takes_a_block_off_the_direct_route);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

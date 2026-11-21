@@ -877,6 +877,12 @@ SEG_FLUSH_CALLS = {
     "keyed record": "moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);",
     "keyed replay": "moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);",
 }
+# The keyed replay's segment enqueue trace stamp: the sole statement of its `if (enqueue_stamps)` guard, which records a
+# clock and changes no control flow. It may sit between the flush and the submission and nothing else may.
+SEG_ENQUEUE_STAMP = (r"if \(enqueue_stamps\) \{\s*moe_token_stamps_note_enqueue\("
+                     r"\*enqueue_stamps, MOE_TOKEN_ENQUEUE_SEGMENT,\s*seg\.start_node,\s*"
+                     r"cgraph->nodes\[seg\.start_node\]\);\s*\}")
+SEG_SUBMIT = r"ggml_sycl::graph_exec_submit\(\*stream, \*seg\.exec_graph\);"
 
 
 def check_segment_boundary_flush(code: str) -> list:
@@ -976,6 +982,8 @@ def check_segment_boundary_flush(code: str) -> list:
     elif not (graphed < flush < submit < leave):
         problems.append("keyed replay: the flush must precede the recorded segment's submission "
                         "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
+    elif not re.search(re.escape(call) + r"\s*(?:" + SEG_ENQUEUE_STAMP + r"\s*)?" + SEG_SUBMIT, keyed_replay):
+        problems.append("keyed replay: only the segment's enqueue stamp may sit between the flush and the submission")
     return problems
 
 
@@ -994,15 +1002,22 @@ with gate('segment-boundary-flush'):
     _record_drain = _rec_indent + "moe_graph_segment_record_drain(*stream);\n"
     _record_flush = _rec_indent + _rcall + "\n" + _record_drain + _rec_indent + "const size_t retained_baseline"
     _replay_flush = "                " + _pcall + "\n                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"
-    # The legacy replay is the first of the two replay sites; the keyed replay is the second.
-    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
+    # The legacy replay is the first of the two replay sites and submits right after its flush; the keyed replay is the
+    # second and takes its segment enqueue stamp between the two.
+    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 1
     _begin = _rec_indent + "    seg_graph.begin_recording(*stream);\n"
     _keyed_record = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
     _keyed_replay = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
     _keyed_flush = "        " + _kcall + "\n"
     _keyed_begin = "            seg_graph.begin_recording(*stream);\n            end_guard.open = true;\n"
     assert _keyed_record.count(_keyed_flush) == 1 and _keyed_record.count(_keyed_begin) == 1
-    assert _keyed_replay.count(_replay_flush) == 1
+    _keyed_replay_flush = re.search(
+        "                " + re.escape(_pcall) + r"\n {16}" + SEG_ENQUEUE_STAMP + r"\n {16}" + SEG_SUBMIT,
+        _keyed_replay).group(0)
+    assert _keyed_replay.count(_keyed_replay_flush) == 1 and RUNTIME_CODE.count(_keyed_replay_flush) == 1
+    assert _keyed_replay.count(_replay_flush) == 0
+    # What follows the flush in the keyed replay: the stamp, then the submission.
+    _keyed_after_flush = _keyed_replay_flush.split("\n", 1)[1]
     _helper = region(RUNTIME_CODE, SEG_FLUSH_DEF, "\n}\n")
 
     def _in_keyed(body, old, new):
@@ -1031,10 +1046,13 @@ with gate('segment-boundary-flush'):
                 _keyed_begin, _keyed_begin + "            " + _kcall + "\n", 1), 1),
         "keyed record flush covers another segment": _in_keyed(
             _keyed_record, _kcall, _kcall.replace("item.start, item.end", "0, item.end")),
-        "keyed replay flush dropped": _in_keyed(
-            _keyed_replay, _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"),
+        "keyed replay flush dropped": _in_keyed(_keyed_replay, _keyed_replay_flush, _keyed_after_flush),
         "keyed replay flush after the submission": _in_keyed(
-            _keyed_replay, _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);\n                " + _pcall),
+            _keyed_replay, _keyed_replay_flush, _keyed_after_flush + "\n                " + _pcall),
+        "keyed replay flush hidden in the stamp's guard": _in_keyed(
+            _keyed_replay, _keyed_replay_flush,
+            _keyed_after_flush.replace("if (enqueue_stamps) {\n",
+                                       "if (enqueue_stamps) {\n                    " + _pcall + "\n", 1)),
         "attention slot not checked": _in_helper("        flush_pending_attn_if_consumed(node, device);\n", ""),
         "CPU scatter slots not checked": _in_helper("        flush_pending_cpu_scatter_if_consumed(node, device);\n", ""),
         "helper walks the whole graph": _in_helper("for (int i = start; i < end; ++i) {",
@@ -1515,7 +1533,8 @@ def check_keyed_slot_input_staging(code: str, common: str) -> list:
     if not re.search(r"\}\s*else if \(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{\s*"
                      r"GGML_SYCL_DEBUG\([^\n]*\);\s*sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*"
                      r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);"
-                     r"\s*moe_graph_replay_segment_slot\(", compute):
+                     r"\s*(?:if \(moe_hostpath_waits_enabled\(\)\) \{\s*moe_token_stamps_note_replay\(\);\s*\}\s*)?"
+                     r"moe_graph_replay_segment_slot\(", compute):
         problems.append("a replay does not drop a slot whose inputs stage elsewhere, then refresh its inputs, "
                         "before replaying it")
     return problems
@@ -1538,6 +1557,9 @@ with gate('keyed-slot-input-staging'):
         ("check ignores identity", "runtime", r" \|\|\s*\(rec\.valid\(\) && !rec\.stable_identity_equal\(now\)\)", ""),
         ("replay without the input refresh", "runtime",
          r"(compute_impl_unlocked\(\);\s*\}\s*else\s*\{)\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);", r"\1"),
+        ("refresh hidden in the replay stamp's guard", "runtime",
+         r"(moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);)(\s*)(if \(moe_hostpath_waits_enabled\(\)\) \{)"
+         r"(\s*moe_token_stamps_note_replay\(\);)", r"\2\3\1\4"),
         ("capture holds nothing", "runtime", r"slot\.input_staging\.push_back\(moe_segment_slot_input_staging\(",
          "(void) (moe_segment_slot_input_staging("),
         ("check reads without the size guard", "runtime",

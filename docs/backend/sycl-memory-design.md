@@ -42,7 +42,8 @@ canonical contract §1 for the formal version):
    owner* of backend memory. Holds the tiered weight cache (device VRAM / pinned
    host / mmap, LRU eviction), the VRAM arena and its zones, the host pinned
    pool, and all runtime/scratch/KV allocations. Enforces the VRAM budget
-   (`min(total*pct, free_at_init)`) and does ref-counted eviction.
+   (`min(total*pct, free_at_init)` with the free reading rounded down to
+   64 MiB, less the external headroom) and does ref-counted eviction.
 
 3. **`mem_handle`** (`ggml_sycl::mem_handle`) — the *ownership and lifetime
    token*. A lightweight, copyable, ref-counted handle that resolves to the
@@ -61,7 +62,9 @@ runs in exactly one direction:
 
 Placement is chosen for fit and for where execution will be most optimal — e.g.
 **dense weights fill VRAM first, before MoE experts are placed there** — and
-that decision is made once, in the planning pass. The dispatcher never
+that decision is made in the planning pass and revised only by the plan
+transaction at a graph boundary (the loan, the refill and the named move,
+below), which republishes the plan the next graph reads. The dispatcher never
 re-litigates it at op time. Two symmetric failure modes are therefore forbidden:
 
 - **No GPU "zero-copy" reads of host memory.** Feeding a host-pinned pointer to
@@ -302,6 +305,125 @@ first graph entry, before any MUL_MAT_ID, returns them in one transaction. A
 process that exits after its last context pays nothing. The fit's
 ring term charges the ring bytes that neither the room nor a loan would cover to
 the rung's demand, so a rung that needs them is refused with a figure.
+
+**The named move.** A third plan transaction moves named triplets between the
+card and pinned host storage at a graph boundary.
+`ggml_sycl_expert_move_transaction_run` takes a request listing (block, expert)
+triplets to evict and to admit and runs the NAMED direction of
+`ggml_sycl_expert_txn_run`, the loan's and the refill's body: lease, mint
+outside the locks, inventory mutex, the cache's lock pair, plan flip, one CAS,
+one publish and the unconditional epoch bump. It keeps no ledger. The evicts go
+first in the one list the body runs. Each triplet is checked against the
+published plan by `moe_expert_move_validate` ("incomplete triplet", "duplicate
+triplet", "wrong device", "not on host" for an admit, "not on device" for an
+evict, "layout") and moves whole or not at all. A refused triplet leaves the
+others to move, and every triplet gets an outcome in its own list: moved, or
+refused with its reason and a BUSY or REFUSED class. One list of final refusals
+(`ggml_sycl_expert_move_refusal_is_final`) serves both cache bodies, and every
+other refusal is BUSY. An exception inside the transaction propagates out of
+the call, as the loan's and the refill's do, and the caller gets no outcome
+list. The triplets moved before it are published first, as they would have
+been without it, and stay published and resolvable, so the published plan, not
+the outcome list, is then the record of what moved. A named move runs only
+while nothing is lent: with a
+loan outstanding the request is refused "loans outstanding", BUSY, because lent
+triplets come back through the refill, which finds them by the ledger. An
+admit's source is a whole pinned host copy that is a slice of a host zone. Whole
+means its owner has the entry's base and the entry's size, so retiring the entry
+gives back exactly its bytes; an owner wider than its entry may hold another
+expert. A copy served in place from a file mapping, or one whose owner is wider
+than its entry, is refused "host copy not pinned", REFUSED, and stays on the
+host.
+
+An evict is the loan's move under the named move's rules. The preparation mints
+pinned host storage for the tensor's bytes per expert, and the loan's cache body
+(`unified_cache::loan_expert_triplet`) copies those bytes from offset 0 of the
+device entry and retires the entry. Its refusals are the loan's. REFUSED:
+"host storage not pinned", "not resident", "not on device", "layout",
+"shared storage" (a view into a bulk tensor's one allocation),
+"device entry size", "host storage too small" and "host entry exists" (a live
+entry under one of the host ids, another owner's, which the evict never
+replaces). BUSY: "storage still referenced", "host entry retiring" (the retired
+host entry a recent admit leaves until the deferred-free pass reaps it) and an
+exhausted pinned pool. Each extra then drops its views of the withdrawn device
+entry and remembers the host copy, as a loan's extras do. Every drop and
+remember moves the tensor's storage generation, so a decode direct route that
+served the block from a full-coverage table decides again and never serves it
+from the old table, which names retired storage. The plan then places the expert
+on the host, so a CPU job serves it, and that job takes the host record's copy
+event as an input, so it never reads the pinned copy before the copy lands. An
+evicted triplet comes back only through a later admit: it is in no ledger, so
+the refill never re-admits it.
+
+An evict's device bytes come back only when `finalize_retired_entries_locked`
+reaps the entries it retired. A named move waits for nothing: the views it
+dropped stay leased until the device queue passes a barrier, the background
+worker then releases them, and a later deferred-free pass erases the entries and
+returns their room to the WEIGHT zone. So an admit in the same call never gets
+an evict's room: in a full zone the admit is BUSY "WEIGHT zone full" beside the
+evict that moved, and moves at a later boundary, after the pass.
+
+A move to the device needs a card the published plan uses. A publication gives a
+card's cache the plan only while the plan places something there (an entry, a
+layer, the KV or a layer block) and leaves every other card's cache without one,
+and a copy to a card whose cache holds no plan is refused "plan not coherent",
+BUSY, until a plan uses the card again. In a model's plan a card that runs a
+block holds that block's dense weights, so evicts there never take the card out
+of the plan. A card that holds nothing of the model but experts would leave the
+plan with its last evict, and no admit could bring those experts back.
+
+An expert's size is a fact of its tensor, never of a cache entry: the
+transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
+width, and hands the three to the cache. The device copy is minted from the
+WEIGHT zone through `ggml_sycl_device_expert_alloc` at `staged_expert_bytes()`,
+the size direct staging gives the expert, never at the host copy's size. For
+AOS that is `aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight
+gets a tail that completes its last row to a multiple of `MATRIX_ROW_PADDING`
+columns, which the quantized kernels may read. The size is asked of the
+layout, so a layout that stages another way adds its own case in one place. A
+host copy may be longer than the expert when another writer padded it; a loan
+or an evict copies only the expert's bytes, so the host copies they make hold
+exactly `nb[2]` and a padded device entry's tail stays on the card. The copy
+moves exactly `nb[2]` bytes from the host copy's offset 0 and never reads past
+them, so an expert that goes to the host and back does not grow. A host copy
+shorter than `nb[2]` is refused "host copy size", REFUSED. The cache requires
+the device size to equal the staged size and to be at least `nb[2]`. The tail
+is zero-filled behind the copy on the same queue, the device entry is published
+behind the fill, and the extra's record covers
+`nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
+The admit gives back the whole host entry, all of its zone bytes. A Q4_0
+expert 640 columns wide gains 216 bytes. The first graph after the publish
+serves the admitted expert from the card. The selected-ids pointer table
+(`ggml_sycl_update_moe_ptr_table`) is built only outside graph recording: each
+of its callers checks the flag or runs before a recording starts. It orders
+its upload behind the entry's ready event on the context's in-order stream, so
+nothing waits on the host, and that graph queues behind at most the admitted
+triplets' copy and fill. The decode direct route
+(`ggml_sycl_moe_decode_direct_table`) keeps its decision per storage
+generation, and the admit's device records bump the tensor's generation, so
+the route decides again and serves a block the admit completed from its
+full-coverage table. Outside recording, that table's upload
+(`ggml_sycl_upload_moe_transient_ptr_table`) chains each slot's ready event in
+the same way. The publish bumps the exec-graph epoch, so the first graph after
+it is recorded again, and a recorded command cannot depend on an event outside
+the graph: while a graph records, the direct route's upload chains no ready
+event; it asks each slot's event for its status and refuses the table while a
+slot's copy is still in flight.
+
+The named move bounds memory as follows. An evict mints its pinned host copy
+before it retires the device copy, so a boundary evicts only as many triplets as
+the pinned pool has room for; the rest are BUSY "host pinned pool exhausted".
+The admit returns each admitted triplet's pinned
+host copy once that copy's last lease drains, so the experts' host pinned use
+stays within the triplets not on the card times the triplet size. It mints its
+device copies before it frees anything, so a boundary admits only as many
+triplets as the WEIGHT zone has room for. A triplet the zone cannot hold is
+refused "WEIGHT zone full", BUSY, after giving back what its other members
+minted, and the plan the transaction publishes leaves it on the host; when no
+triplet fits, nothing is published. The caller retries at a later boundary.
+Planned headroom in the zone is the planner's job, not the transaction's. Only
+the private fixtures call the named move for now; the boundary driver that
+will name triplets is not yet written.
 
 **Gates.** Three gates keep the rule enforceable.
 
@@ -2207,16 +2329,41 @@ sides. This is the same *disagreeing-independent-computations* disease as the
 **The fix is structural, not a bigger constant.** `compute_vram_budget_authority()`
 (`unified-cache.cpp`, declared in `unified-cache.hpp`) is now the **only**
 function that parses `GGML_SYCL_VRAM_BUDGET_PCT`, derives the host-unified-
-adjusted device total, caps to pre-probe free VRAM, and computes the external
+adjusted device total, caps to pre-probe free VRAM (rounded down to a 64 MiB
+grid, see below), and computes the external
 headroom (via `unified_cache_max_external_headroom()`, itself a composition
 of the arena's own device-proportional term and the oneDNN batched-pipeline-
 aware floor from `vram-headroom.hpp`, conservatively assuming the pipeline
 *is* planned since this authority runs before that flag is decided for the
 current model). It returns a `vram_budget_authority` struct — `budget_pct`,
-`base_mem`, `free_mem`, `external_headroom`, `budget_bytes` — and
+`base_mem`, `external_headroom`, `budget_bytes`, `free_floored` and
+`free_reading` — and
 `create_cache_for_device()` **publishes** that result onto the `unified_cache`
 instance it constructs (`budget_pct()`, `external_headroom()`,
 `authority_base_mem()` getters, alongside the pre-existing `base_budget()`).
+
+**The free reading is floored to a 64 MiB grid (llama.cpp-h3t5).** The cap
+used the driver's free figure as read when the cache was made. That figure
+moves by under 0.1 MB between runs on an otherwise idle card, and on the B70
+(total 32656 MiB, free 31947.9 or 31948.0 MiB, 2048 MiB headroom) the budget
+it gave sat exactly on the arena's 2 MiB rounding step: the arena came out
+29898 or 29900 MB, about three experts (0.88 MB each) moved between host and
+device, and because placement decides the executor a different kernel
+computed them and the generated text parted. Four Qwen3.8 runs gave two
+outcomes, predicted 4 of 4 by the arena size. The authority now rounds the
+reading down to `k_vram_budget_free_grid` (64 MiB, `unified-cache.cpp`)
+before it caps the budget. A reading below one step is used as it is, since
+0 means "no reading" to the cap and would switch it off. The cost is at most
+one step of the card left out of the plan (12 MiB on the B70 at the readings
+above, which floor to 31936 MiB); the gain is that jitter of size j crosses a
+step with odds j/64 MiB instead of j/2 MiB. The struct carries the floored
+figure as `free_floored` and the reading it came from as `free_reading` (the
+cache hint's reading at init when there is one, else the caller's free
+figure; both set by the authority only, so a budget read off a live cache
+leaves them 0). The `[UNIFIED-CACHE] Device N budget authority:` line prints
+`free=` from `free_reading` and `free_floored=` right after it, so the
+megabytes left out are visible whichever reading was used. Host
+cases: `run_vram_budget_free_floor_test` in `tests/test-sycl-layout-choice.cpp`.
 
 Every other site now either calls `compute_vram_budget_authority()` directly
 (only when no cache exists yet for the device in question — a defensive,

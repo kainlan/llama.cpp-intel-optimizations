@@ -5817,6 +5817,34 @@ set_tests_properties(sycl-moe-expert-loan-select PROPERTIES
     TIMEOUT 60
 )
 
+# The plan transaction's named moves (an evict list and an admit list of expert triplets) checked against a hand-built
+# plan before anything moves. Host-only, built exactly like test-moe-expert-loan-select above.
+add_executable(test-moe-expert-move-validate
+    tests/test-moe-expert-move-validate.cpp
+)
+target_include_directories(test-moe-expert-move-validate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-expert-move-validate PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-expert-move-validate PRIVATE "-fsycl")
+target_compile_definitions(test-moe-expert-move-validate PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-expert-move-validate PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-expert-move-validate PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-expert-move-validate COMMAND test-moe-expert-move-validate)
+set_tests_properties(sycl-moe-expert-move-validate PROPERTIES
+    LABELS "sycl;moe;ring;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
 # The placement plan's per-(layer, role) residency summary agrees with the
 # per-expert sweep it replaced (llama.cpp-5tdy). Host-only: synthetic plans, no
 # queue, no device, no model.

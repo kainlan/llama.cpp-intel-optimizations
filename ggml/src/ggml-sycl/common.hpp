@@ -8368,9 +8368,10 @@ size_t ggml_sycl_get_available_system_memory_bytes();
 // an integrated GPU a 53 GB arena against the B70's 31.9 GB), so the cap
 // must not scale with host RAM. For discrete devices (the common case),
 // returns raw_total_mem unchanged: this is a no-op on the existing,
-// documented-correct `min(total*pct, free_at_init)` discrete-GPU budget
-// path, and GGML_SYCL_VRAM_BUDGET_PCT continues to apply (by both call
-// sites, unchanged) on top of whatever this function returns.
+// documented-correct `min(total*pct, free_at_init floored to 64 MiB)`
+// discrete-GPU budget path, and GGML_SYCL_VRAM_BUDGET_PCT continues to
+// apply (by both call sites, unchanged) on top of whatever this function
+// returns.
 size_t ggml_sycl_vram_budget_base_mem(bool host_unified, size_t raw_total_mem);
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
