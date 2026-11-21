@@ -11520,7 +11520,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             alloc_metadata md{};
             if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) ||
                 md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) {
-                refusal = "shared storage";
+                refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;
                 break;
             }
             // Held by the entry alone: anything else retaining the owner shares the storage with the loan.
@@ -21025,11 +21025,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     // fall through to host_pool_alloc below.
                     return nullptr;
                 }
-                if (req.intent.constraints.forbid_host_zone_growth) {
-                    const size_t reserved = ucache->host_zone_reserved_capacity(zone);
-                    if (reserved > 0 && ucache->host_zone_used(zone) + alloc_size > reserved) {
-                        return nullptr;
-                    }
+                if (req.intent.constraints.forbid_host_zone_growth &&
+                    alloc_size > ucache->host_zone_no_growth_room(zone)) {
+                    return nullptr;
                 }
                 const size_t alignment = req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT;
                 void * p = ucache->host_zone_alloc(zone, alloc_size, alignment);
@@ -26751,6 +26749,19 @@ size_t unified_cache::host_zone_reserved_capacity(host_zone_id zone) const {
         return 0;
     }
     return host_zone_reserved_bytes_[zi];
+}
+
+size_t unified_cache::host_zone_no_growth_room(host_zone_id zone) const {
+    if (!host_arena_ || !host_arena_->zones_configured()) {
+        return 0;
+    }
+    // A zone may have grown past what the plan reserved for it; growth is what a no-growth request may not take, so
+    // the reserved figure caps the room. A zone with no reserved figure is capped by its capacity alone.
+    const size_t capacity = host_arena_->zone_capacity(zone);
+    const size_t reserved = host_zone_reserved_capacity(zone);
+    const size_t limit    = reserved > 0 ? std::min(capacity, reserved) : capacity;
+    const size_t used     = host_arena_->zone_used(zone);
+    return limit > used ? limit - used : 0;
 }
 
 size_t unified_cache::host_zone_largest_free_block(host_zone_id zone) const {

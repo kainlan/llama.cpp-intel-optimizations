@@ -5883,6 +5883,9 @@ class unified_cache {
     size_t host_zone_used(host_zone_id zone) const;
     size_t host_zone_capacity(host_zone_id zone) const;
     size_t host_zone_reserved_capacity(host_zone_id zone) const;
+    // The bytes `zone` can still hand out without growing: its capacity, capped at its reserved figure when it has
+    // one, less what it holds, never below zero. A request that forbids host-zone growth is refused past it.
+    size_t host_zone_no_growth_room(host_zone_id zone) const;
     // Largest single-chunk contiguous free block in `zone`. Used by callers
     // that must hand out a contiguous pointer (the SYCL host buffer type)
     // and therefore cannot consume a fragmented multi-segment allocation.
