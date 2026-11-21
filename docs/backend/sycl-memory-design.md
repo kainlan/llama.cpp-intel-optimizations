@@ -2215,7 +2215,8 @@ of the arena's own device-proportional term and the oneDNN batched-pipeline-
 aware floor from `vram-headroom.hpp`, conservatively assuming the pipeline
 *is* planned since this authority runs before that flag is decided for the
 current model). It returns a `vram_budget_authority` struct — `budget_pct`,
-`base_mem`, `external_headroom`, `budget_bytes` and `free_floored` — and
+`base_mem`, `external_headroom`, `budget_bytes`, `free_floored` and
+`free_reading` — and
 `create_cache_for_device()` **publishes** that result onto the `unified_cache`
 instance it constructs (`budget_pct()`, `external_headroom()`,
 `authority_base_mem()` getters, alongside the pre-existing `base_budget()`).
@@ -2235,9 +2236,12 @@ before it caps the budget. A reading below one step is used as it is, since
 one step of the card left out of the plan (12 MiB on the B70 at the readings
 above, which floor to 31936 MiB); the gain is that jitter of size j crosses a
 step with odds j/64 MiB instead of j/2 MiB. The struct carries the floored
-figure as `free_floored` (set by the authority only; a budget read off a live
-cache leaves it 0), and the `[UNIFIED-CACHE] Device N budget authority:` line
-prints it right after `free=`, so the megabytes left out are visible. Host
+figure as `free_floored` and the reading it came from as `free_reading` (the
+cache hint's reading at init when there is one, else the caller's free
+figure; both set by the authority only, so a budget read off a live cache
+leaves them 0). The `[UNIFIED-CACHE] Device N budget authority:` line prints
+`free=` from `free_reading` and `free_floored=` right after it, so the
+megabytes left out are visible whichever reading was used. Host
 cases: `run_vram_budget_free_floor_test` in `tests/test-sycl-layout-choice.cpp`.
 
 Every other site now either calls `compute_vram_budget_authority()` directly

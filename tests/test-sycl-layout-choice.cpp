@@ -4423,19 +4423,59 @@ static bool run_vram_budget_free_floor_test() {
     }
 
     // A host-unified device keeps its own base (a fixed modest share of host memory); only the reading that caps it
-    // is floored.
+    // is floored. That base follows this host's available memory, so the reading is placed halfway between the
+    // headroom and the base, off the grid: then the floored reading caps the budget and the floor changes it. If the
+    // host leaves too little room for that, the case says NOT TESTED rather than passing on equal budgets.
     {
         constexpr size_t raw_total = 231700ull * mib;
-        constexpr size_t reading   = 3000ull * mib + 12345ull;
-        constexpr size_t on_grid   = 2944ull * mib;
-        const auto       a         = authority_at(true, raw_total, reading);
-        if (a.base_mem == raw_total) {
+        const auto       probe     = authority_at(true, raw_total, 0);
+        if (probe.base_mem == raw_total) {
             printf("FAIL: free grid: a host-unified device's base passed the raw total through\n");
             return false;
         }
-        if (a.free_floored != on_grid || a.budget_bytes != unfloored_budget(a.base_mem, on_grid)) {
-            printf("FAIL: free grid: host-unified floored %zu budget %zu, expected %zu and %zu\n", a.free_floored,
-                   a.budget_bytes, on_grid, unfloored_budget(a.base_mem, on_grid));
+        const size_t probe_headroom = ggml_sycl::unified_cache_max_external_headroom(probe.base_mem);
+        const size_t room           = probe.base_mem > probe_headroom ? probe.base_mem - probe_headroom : 0;
+        const size_t reading        = probe_headroom + room / 2 + 12345ull;
+        const size_t on_grid        = reading / grid * grid;
+        const auto   a              = authority_at(true, raw_total, reading);
+        const size_t headroom       = ggml_sycl::unified_cache_max_external_headroom(a.base_mem);
+        if (reading % grid == 0 || reading >= a.base_mem || on_grid <= headroom) {
+            printf(
+                "NOT TESTED: free grid: host-unified base %zu with headroom %zu leaves no reading the floor would "
+                "change (reading %zu)\n",
+                a.base_mem, headroom, reading);
+        } else {
+            if (a.free_floored != on_grid || a.budget_bytes != unfloored_budget(a.base_mem, on_grid)) {
+                printf("FAIL: free grid: host-unified floored %zu budget %zu, expected %zu and %zu\n", a.free_floored,
+                       a.budget_bytes, on_grid, unfloored_budget(a.base_mem, on_grid));
+                return false;
+            }
+            if (a.budget_bytes >= unfloored_budget(a.base_mem, reading)) {
+                printf("FAIL: free grid: host-unified budget %zu was not lowered by the floor\n", a.budget_bytes);
+                return false;
+            }
+        }
+    }
+
+    // The authority reports the reading it floored: the init reading when there is one, else the free figure.
+    {
+        constexpr size_t total    = 32656ull * mib;
+        constexpr size_t live     = 30000ull * mib + 777ull;
+        constexpr size_t at_init  = 31000ull * mib + 555ull;
+        const auto       hinted   = ggml_sycl::compute_vram_budget_authority(false, total, live, at_init, 100);
+        const auto       unhinted = ggml_sycl::compute_vram_budget_authority(false, total, live, 0, 100);
+        if (hinted.free_reading != at_init || hinted.free_floored != at_init / grid * grid) {
+            printf(
+                "FAIL: free grid: with an init reading the authority reported free %zu floored %zu, expected %zu "
+                "and %zu\n",
+                hinted.free_reading, hinted.free_floored, at_init, at_init / grid * grid);
+            return false;
+        }
+        if (unhinted.free_reading != live || unhinted.free_floored != live / grid * grid) {
+            printf(
+                "FAIL: free grid: without an init reading the authority reported free %zu floored %zu, expected "
+                "%zu and %zu\n",
+                unhinted.free_reading, unhinted.free_floored, live, live / grid * grid);
             return false;
         }
     }

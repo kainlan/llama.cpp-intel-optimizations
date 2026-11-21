@@ -2124,6 +2124,7 @@ vram_budget_authority compute_vram_budget_authority(bool   host_unified,
     // floored to k_vram_budget_free_grid so that sub-megabyte jitter of the
     // driver's reading between runs does not move the plan.
     const size_t clean_free = free_vram_at_init_in > 0 ? free_vram_at_init_in : free_mem_in;
+    result.free_reading     = clean_free;
     result.free_floored     = vram_budget_free_floor(clean_free);
     if (result.free_floored > 0 && budget > result.free_floored) {
         budget = result.free_floored;
@@ -2160,8 +2161,8 @@ static vram_budget_authority device_budget_authority_from(unified_cache * cache,
                                                           size_t          free_mem,
                                                           int             default_pct) {
     if (cache && cache->authority_resolved()) {
-        // The cache publishes the budget, not the free reading that capped it, so free_floored stays 0 here: it is
-        // the log's figure at cache creation, and no reader of a published authority uses it.
+        // The cache publishes the budget, not the free reading that capped it, so free_reading and free_floored stay
+        // 0 here: they are the log's figures at cache creation, and no reader of a published authority uses them.
         vram_budget_authority result;
         result.budget_pct        = cache->budget_pct();
         result.base_mem          = cache->authority_base_mem();
@@ -19771,12 +19772,12 @@ static unified_cache * create_cache_for_device(int                     device_id
         const size_t base_mem = authority.base_mem;
         budget                = authority.budget_bytes;
 
-        // free_floored is the reading that caps the budget, on the authority's 64 MiB grid. With no init reading in the
-        // hint that reading is free, so free minus free_floored is what the grid leaves out of the plan.
+        // free is the reading the authority rounded (the hint's init reading when there is one, else free_mem) and
+        // free_floored the figure that caps the budget, so free minus free_floored is what the grid leaves out.
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Device %d budget authority: base=%.1f MB free=%.1f MB free_floored=%.1f MB pct=%d%% "
             "external_headroom=%.1f MB budget=%.1f MB\n",
-            device_id, base_mem / (1024.0 * 1024.0), free_mem / (1024.0 * 1024.0),
+            device_id, base_mem / (1024.0 * 1024.0), authority.free_reading / (1024.0 * 1024.0),
             authority.free_floored / (1024.0 * 1024.0), resolved_budget_pct, resolved_headroom / (1024.0 * 1024.0),
             budget / (1024.0 * 1024.0));
 

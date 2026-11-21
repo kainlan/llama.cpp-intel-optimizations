@@ -9907,6 +9907,9 @@ struct vram_budget_authority {
     // figure does not move the plan; a reading below one step is kept as it is, and 0 means no reading (no cap).
     // Set by compute_vram_budget_authority() only: a budget read off a live cache leaves it 0.
     size_t free_floored      = 0;
+    // The reading free_floored was taken from: the hint's reading at init when it has one, else the caller's free
+    // figure. Set with free_floored, so the log states the figure that was rounded, whichever caller supplied it.
+    size_t free_reading      = 0;
 };
 
 // llama.cpp-o3h1 quality review (final batch, F2/F4): the shared entry
