@@ -192,6 +192,10 @@ NAMED_OWNER_FIRST_SITES = (
      "unified_alloc; the expert registers with this typed owner so its leases report HOST_PINNED/WEIGHT through "
      "owner_metadata() and the prefill ring copies from it directly; refuses on failure, handed over via "
      "from_owned_alloc"),
+    ("ggml_sycl_host_expert_alloc_no_growth",
+     "the same pinned-pool WEIGHT storage for a named evict's host copy, with forbid_host_zone_growth so a decode "
+     "boundary never grows the host zone the plan sized, and its miss kept out of the error log (the evict answers "
+     "BUSY and the swap driver counts it); refuses on failure, handed over via from_owned_alloc"),
 )
 
 

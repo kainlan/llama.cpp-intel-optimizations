@@ -6862,6 +6862,14 @@ struct ggml_backend_sycl_context {
     std::atomic<uint64_t> decode_graph_count{ 0 };
     std::atomic<uint64_t> refill_decode_graph{ 0 };
 
+    // The expert swap driver's marks (GGML_SYCL_MOE_SWAP=1), read and written only by this context's synchronize:
+    // graph_compute_seq at the last boundary it counted, run or not, and decode_graph_count and graph_compute_seq
+    // when it last ran, so a boundary stands for every graph since then and a graph that was not a decode one says a
+    // prompt pass ran.
+    uint64_t swap_seen_seq     = 0;
+    uint64_t swap_decode_graph = 0;
+    uint64_t swap_graph_seq    = 0;
+
     uint64_t test_graph_replay_count  = 0;
 
     // One published retention epoch owns every MMID graphlet currently cached

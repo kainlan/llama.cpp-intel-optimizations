@@ -685,8 +685,8 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
-    expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(\n",
-                                         "ggml_sycl_txn_result ggml_sycl_expert_move_run(\n")])
+    expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int ",
+                                         "ggml_sycl_txn_result ggml_sycl_expert_move_run(int ")])
     expect_fail("fill-waited", "A1", [("cache", COPY_SIG, "bq,\n                                                    "
                                        "{ out.copy_events[i] });",
                                        "bq,\n                                                    "

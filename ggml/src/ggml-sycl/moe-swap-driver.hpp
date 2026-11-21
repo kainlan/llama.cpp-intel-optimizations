@@ -134,7 +134,9 @@ inline uint64_t moe_swap_reason_count_of(const std::vector<moe_swap_reason_count
     return 0;
 }
 
-// Everything the summary lines print. Cumulative over the driver's life.
+// Everything the summary lines print. Cumulative over the driver's life. The accepted transactions are counted apart
+// from the triplets they moved: each one publishes a plan, and a published plan drops every context's recorded graphs
+// on every device, so it is the transactions, not the triplets, that cost decode tokens their replay.
 struct moe_swap_driver_stats {
     uint64_t                           boundaries               = 0;
     uint64_t                           boundaries_off           = 0;
@@ -148,6 +150,8 @@ struct moe_swap_driver_stats {
     uint64_t                           admits                   = 0;
     uint64_t                           admit_bytes              = 0;
     uint64_t                           restores                 = 0;
+    uint64_t                           transactions_evict       = 0;  // accepted transactions of evicts
+    uint64_t                           transactions_admit       = 0;  // accepted transactions of admits and restores
     uint64_t                           prompt_boundaries        = 0;
     uint64_t                           prompt_proposals         = 0;
     uint64_t                           prompt_admits            = 0;
@@ -209,16 +213,20 @@ enum moe_swap_driver_status {
     MOE_SWAP_DRIVER_OFF,   // the plan does not allow the driver: nothing read, nothing sent
 };
 
-// A boundary the caller did not run the driver at, because another graph was in flight or the instance was claimed.
-inline void moe_swap_driver_note_skipped(moe_swap_driver_state & d) {
-    ++d.stats.boundaries;
-    ++d.stats.boundaries_skipped;
+// `n` boundaries the caller did not run the driver at, because another graph was in flight or the instance was
+// claimed.
+inline void moe_swap_driver_note_skipped(moe_swap_driver_state & d, uint64_t n = 1) {
+    d.stats.boundaries += n;
+    d.stats.boundaries_skipped += n;
 }
 
-// A boundary the caller turned the driver off at, with why (multithreaded graphs, say).
-inline void moe_swap_driver_note_off(moe_swap_driver_state & d, const char * reason) {
-    ++d.stats.boundaries;
-    ++d.stats.boundaries_off;
+// `n` boundaries the caller turned the driver off at, with why (multithreaded graphs, say).
+inline void moe_swap_driver_note_off(moe_swap_driver_state & d, const char * reason, uint64_t n = 1) {
+    if (n == 0) {
+        return;
+    }
+    d.stats.boundaries += n;
+    d.stats.boundaries_off += n;
     d.stats.off_reason = reason;
 }
 
@@ -388,6 +396,9 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             }
         }
         d.pending.resize(kept);
+        if (d.last_boundary_moved) {
+            ++st.transactions_admit;
+        }
         return MOE_SWAP_DRIVER_SENT;
     }
 
@@ -459,6 +470,9 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             d.latched[static_cast<size_t>(q.block)] = 1;
         }
     }
+    if (d.last_boundary_moved) {
+        ++st.transactions_evict;
+    }
     st.pending_high_water = std::max(st.pending_high_water, static_cast<uint32_t>(d.pending.size()));
     return MOE_SWAP_DRIVER_SENT;
 }
@@ -507,7 +521,8 @@ inline std::string moe_swap_driver_summary_moves(const moe_swap_driver_stats & s
     return line;
 }
 
-// The second summary line: what the driver could not do, and why.
+// The second summary line: the accepted transactions beside the decode graphs they cost replays in (a round is two,
+// and each drops every recorded graph), then what the driver could not do, and why.
 inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & st, int device) {
     using ull = unsigned long long;
     char room[64];
@@ -522,12 +537,14 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
     } else {
         std::snprintf(off, sizeof(off), "none");
     }
-    char head[512];
+    char head[640];
     std::snprintf(head, sizeof(head),
-                  "[MOE-SWAP] device %d: open slots %llu; deferred for host room %llu (%s); no admissible host expert "
-                  "at %llu boundaries (%llu file-mapped triplets passed over); off: %s",
-                  device, (ull) st.open_slots, (ull) st.deferred_room, room, (ull) st.boundaries_no_admissible,
-                  (ull) st.file_mapped_passed, off);
+                  "[MOE-SWAP] device %d: accepted transactions %llu (evict %llu, admit %llu) over %llu decode graphs; "
+                  "open slots %llu; deferred for host room %llu (%s); no admissible host expert at %llu boundaries "
+                  "(%llu file-mapped triplets passed over); off: %s",
+                  device, (ull) (st.transactions_evict + st.transactions_admit), (ull) st.transactions_evict,
+                  (ull) st.transactions_admit, (ull) st.decode_graphs, (ull) st.open_slots, (ull) st.deferred_room,
+                  room, (ull) st.boundaries_no_admissible, (ull) st.file_mapped_passed, off);
     return std::string(head) + "; refused: " + moe_swap_detail::moe_swap_reason_list(st.refused) +
            "; busy: " + moe_swap_detail::moe_swap_reason_list(st.busy) +
            "; dropped pending: " + moe_swap_detail::moe_swap_reason_list(st.dropped);

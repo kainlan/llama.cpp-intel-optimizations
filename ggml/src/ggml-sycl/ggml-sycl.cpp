@@ -418,6 +418,9 @@ int g_ggml_sycl_moe_exec_decline_layer       = -1;
 // GGML_SYCL_MOE_PIN_HOST_EXPERTS as the report's integer, SET from ggml_sycl::placement_pin_host_experts_enabled()
 // after the table parse: 1 pins a mapping load's routed host experts for the window ring, 0 keeps them mapped.
 int g_ggml_sycl_moe_pin_host_experts         = 1;
+// GGML_SYCL_MOE_SWAP as the report's integer, SET from ggml_sycl_moe_swap_enabled() after the table parse: 1 runs the
+// decode-boundary expert swap driver, 0 leaves the experts where the load placed them.
+int g_ggml_sycl_moe_swap                     = 0;
 
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
@@ -21140,6 +21143,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 // ---------------------------------------------------------------------------------------------------------------------
 
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size);
+static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc_no_growth(int device, size_t size);
 
 // A partial loan (a later triplet refused after earlier ones were lent) is accepted: accepted=true and ACCEPTED, with
 // `reason` holding the refusal that stopped it, not "OK". A partial refill reports the same way. An accepted move
@@ -21586,7 +21590,14 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
                 return arena ? "WEIGHT zone full" : "no WEIGHT arena";
             }
         } else {
-            storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);
+            // An evict's copy stays inside the pinned host zone the plan sized: a decode boundary must not grow it. A
+            // loan's copy keeps the growing mint: its ring needs the device room now, and its triplets come back at the
+            // refill.
+            if (out.kind == ggml_sycl_expert_move_kind::EVICT) {
+                storage = ggml_sycl_host_expert_alloc_no_growth(device, target.logical_bytes);
+            } else {
+                storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);
+            }
             if (!storage.valid()) {
                 // An evict is tried again at a later boundary, by when an admit's or a refill's host copy may have
                 // gone back to the pool. A loan refuses: its ring asks again at its next shortfall.
@@ -22240,19 +22251,18 @@ struct ggml_sycl_expert_move_result {
 };
 
 // The named move: each named triplet moved on its own, everything that moved published in one plan. It runs between
-// graphs; its caller is a boundary driver, and the private device tests call it with their own resolver. Until that
-// driver lands only the private device tests call it, so a build without them does not.
+// graphs; its caller is the swap driver's boundary (GGML_SYCL_MOE_SWAP=1, below), and the private device tests call it
+// with their own resolver.
 // An exception inside the body propagates out of this call, as it does out of the loan's and the refill's, and *out is
 // left unwritten. The body publishes what it moved before the exception, as it would have without one, and only then
 // rethrows, so those triplets stay published and resolvable where they moved: an admitted triplet's device entries are
 // in the cache and the plan places it on the card; an evicted triplet's host copy is registered behind its copy event,
 // its device entries are retired, and the plan places it on the host. The published plan, not an outcome list, is
 // then the record of what moved.
-[[maybe_unused]] static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(
-    int                                    device,
-    const ggml_sycl_expert_move_request &  request,
-    const ggml_sycl_expert_loan_resolver * resolver,
-    ggml_sycl_expert_move_result *         out) {
+static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int                                    device,
+                                                                  const ggml_sycl_expert_move_request &  request,
+                                                                  const ggml_sycl_expert_loan_resolver * resolver,
+                                                                  ggml_sycl_expert_move_result *         out) {
     // One list, the evicts first, as the plan judges them and the body moves them.
     const size_t                               n_evict = request.evict.size();
     std::vector<ggml_sycl_expert_move_outcome> moves(n_evict + request.admit.size());
@@ -22698,6 +22708,269 @@ static void ggml_sycl_run_expert_refill_at_boundary(ggml_backend_t backend) {
             ctx->decode_graph_count.load(std::memory_order_relaxed), &ctx->refill_decode_graph,
             ggml_sycl_moe_refill_per_graph(), nullptr, nullptr);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The decode-boundary expert swap driver (GGML_SYCL_MOE_SWAP=1). At a synchronize boundary after a graph, the swap
+// policy (moe-swap-policy.hpp) picks which resident triplet of a block leaves for which host triplet, and the driver
+// (moe-swap-driver.hpp, a pure function of what the caller below reads) sends the evicts through the named move, and
+// their admits at the next boundary. The caller reads, without a wait: the route counters, the published plan, the
+// host WEIGHT zone's free bytes, the device's loans and its deferred frees.
+//
+// Cost: each accepted transaction publishes a plan, and a published plan bumps the exec-graph epoch
+// (ggml_sycl_optional_layouts_retired), so every context on every device drops its recorded graphs at its next graph
+// compute; a keyed decode segment then runs direct once, records once, and replays only after that. A round is two
+// transactions, the evicts at one boundary and their admits at the next, so about three decode tokens run without a
+// replay after each round. The policy's margin and decay are what keep rounds rare once the routing settles.
+// ---------------------------------------------------------------------------------------------------------------------
+
+// The switch, read once. Off by default until the device step has verified the driver.
+static bool ggml_sycl_moe_swap_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv(ggml_sycl::MOE_SWAP_ENV);
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The driver's instance on one device. It lives where the route counters it reads live: one table per device, shared
+// by every context on the card and replaced when a model installs its own (moe_route_counts_install,
+// expert-prefetch.cpp). So two contexts on one card drive one policy, not two that each move the same experts, and a
+// new table starts a new driver. A boundary claims the instance before it touches more than the two counters of the
+// boundaries it could not run at, and a boundary that finds it claimed is skipped. The instance owns neither the table
+// nor the plan: weak references say which ones it was built from, so it keeps neither alive.
+struct ggml_sycl_moe_swap_instance {
+    std::atomic<bool>                                       claimed{ false };
+    std::atomic<uint64_t>                                   skipped{ 0 };            // a graph in flight, or claimed
+    std::atomic<uint64_t>                                   off_multithreaded{ 0 };  // boundaries after the latch
+    std::weak_ptr<ggml_sycl::moe_route_counts>              counts;                  // the table the driver reads
+    std::unique_ptr<ggml_sycl::moe_swap_driver_state>       driver;
+    std::weak_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;                // the plan the view was built from
+    uint64_t                                                model_id    = 0;  // the load the bulk answers are for
+    uint64_t                                                load_txn_id = 0;
+    ggml_sycl::moe_swap_plan_view                           view;
+    std::unordered_map<uint64_t, bool>                      bulk_memo;
+    double                                                  prompt_gate = 0.0;  // K
+    char                                                    k_text[96]  = "not read";
+    uint64_t                                                reported    = 0;  // the boundaries the last report covered
+};
+
+// Never destroyed, by this file's leak idiom: backend free reports from it, and no static destructor should run after
+// the caches are gone.
+static auto * const g_sycl_moe_swap = new ggml_sycl_moe_swap_instance[GGML_SYCL_MAX_DEVICES];
+
+// Releases an instance's claim on every way out, an exception's included.
+struct ggml_sycl_moe_swap_claim_release {
+    std::atomic<bool> & claimed;
+
+    ~ggml_sycl_moe_swap_claim_release() { claimed.store(false, std::memory_order_release); }
+};
+
+// The boundaries counted before a claim, into the driver's figures. Under the claim.
+static void ggml_sycl_moe_swap_fold(ggml_sycl_moe_swap_instance & inst) {
+    if (!inst.driver) {
+        return;
+    }
+    ggml_sycl::moe_swap_driver_note_skipped(*inst.driver, inst.skipped.exchange(0, std::memory_order_relaxed));
+    ggml_sycl::moe_swap_driver_note_off(*inst.driver, "multithreaded graphs",
+                                        inst.off_multithreaded.exchange(0, std::memory_order_relaxed));
+}
+
+// The two summary lines, when the driver met a boundary since the last report. Under the claim.
+static void ggml_sycl_moe_swap_report(ggml_sycl_moe_swap_instance & inst, int device) {
+    ggml_sycl_moe_swap_fold(inst);
+    if (!inst.driver || inst.driver->stats.boundaries == inst.reported) {
+        return;
+    }
+    const ggml_sycl::moe_swap_driver_stats & st = inst.driver->stats;
+    inst.reported                               = st.boundaries;
+    GGML_LOG_WARN("%s\n", ggml_sycl::moe_swap_driver_summary_moves(st, device, inst.k_text).c_str());
+    GGML_LOG_WARN("%s\n", ggml_sycl::moe_swap_driver_summary_faults(st, device).c_str());
+}
+
+// Backend free's report for `device`. A boundary another thread is running holds the claim; that context's free
+// reports.
+static void ggml_sycl_moe_swap_report_at_free(int device) {
+    if (!ggml_sycl_moe_swap_enabled() || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    ggml_sycl_moe_swap_instance & inst     = g_sycl_moe_swap[device];
+    bool                          expected = false;
+    if (inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        const ggml_sycl_moe_swap_claim_release release{ inst.claimed };
+        ggml_sycl_moe_swap_report(inst, device);
+    }
+}
+
+// K, the prompt boundary's gate (moe-swap-policy.hpp): 2 x the CPU's rate for the eligible blocks' routed experts over
+// the device's probed host-to-device rate, so a pair that clears it costs the CPU more over a generation as long as the
+// prompt than its two copies cost once. An evict is priced at the admit's rate until a device-to-host rate is
+// measured. The CPU rate is the planner's (kv_room_expert_rate_for over the plan's own kv_info). An unprobed device
+// gives 0, the decode rule, and the summary says so.
+static void ggml_sycl_moe_swap_price_gate(ggml_sycl_moe_swap_instance &              inst,
+                                          const ggml_sycl::lifecycle_plan_snapshot & snap,
+                                          int                                        device) {
+    ggml_sycl::kv_room_expert_types types;
+    const size_t                    nb = inst.view.eligible.size();
+    for (const ggml_sycl::placement_entry & e : snap.plan->entries) {
+        if (e.expert_id >= 0 && ggml_sycl::detail::moe_expert_role_is_triplet(e.expert_role) && e.layer_id >= 0 &&
+            static_cast<size_t>(e.layer_id) < nb && inst.view.eligible[static_cast<size_t>(e.layer_id)] != 0) {
+            types.add(e.type, e.src_size);
+        }
+    }
+    const ggml_sycl::kv_room_expert_rate cpu = ggml_sycl::kv_room_expert_rate_for(
+        types, snap.kv_info.cpu_expert_gbps, snap.kv_info.cpu_expert_gbps_set, /*n_ctx_context_is_default=*/false);
+    const double h2d = ggml_sycl_h2d_probed_gbps(device);
+    if (h2d > 0.0 && cpu.gbps > 0.0) {
+        inst.prompt_gate = 2.0 * cpu.gbps / h2d;
+        std::snprintf(inst.k_text, sizeof(inst.k_text), "%.2f (CPU %.1f GB/s, h2d %.1f GB/s)", inst.prompt_gate,
+                      cpu.gbps, h2d);
+    } else {
+        inst.prompt_gate = 0.0;
+        std::snprintf(inst.k_text, sizeof(inst.k_text), "off (%s, decode rule)",
+                      h2d > 0.0 ? "no CPU expert rate" : "h2d unprobed");
+    }
+}
+
+// A named move's answer for one triplet, as the driver reads it: BUSY may go again at a later boundary, and any other
+// refusal is final.
+static ggml_sycl::moe_swap_move_outcome ggml_sycl_moe_swap_outcome_of(bool moved, ggml_sycl_txn_result code) {
+    if (moved) {
+        return ggml_sycl::MOE_SWAP_MOVE_MOVED;
+    }
+    return code == ggml_sycl_txn_result::BUSY ? ggml_sycl::MOE_SWAP_MOVE_BUSY : ggml_sycl::MOE_SWAP_MOVE_REFUSED;
+}
+
+// The host room an evict batch may take: the pinned host WEIGHT zone's free bytes, which an evict's copies may not
+// grow past (ggml_sycl_host_expert_alloc_no_growth). The host arena answers from its own counters, without a wait.
+static size_t ggml_sycl_moe_swap_host_room(const ggml_sycl::unified_cache * cache) {
+    if (!cache || !cache->host_zones_configured()) {
+        return 0;
+    }
+    const size_t capacity = cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
+    const size_t used     = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
+    return capacity > used ? capacity - used : 0;
+}
+
+// ggml_backend_sycl_synchronize() calls this after the refill: the graph's work is done, its compute flag is cleared,
+// and the loan's boundary and the deferred-free pass have run. The named move checks "graph active" only on entry, so
+// the boundary runs only while no graph computes anywhere, and once graphs have run on two threads at once, never.
+static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
+    if (!ggml_sycl_moe_swap_enabled()) {
+        return;
+    }
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES ||
+        ctx->graph_compute_seq == ctx->swap_seen_seq) {
+        return;  // no graph since this context's last boundary: the synchronize of a copy or a load
+    }
+    ctx->swap_seen_seq                   = ctx->graph_compute_seq;  // a boundary is counted once, run or not
+    const int                     device = ctx->device;
+    ggml_sycl_moe_swap_instance & inst   = g_sycl_moe_swap[device];
+    if (g_sycl_graph_multithreaded.load(std::memory_order_relaxed)) {
+        inst.off_multithreaded.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (ggml_sycl::unified_cache_is_graph_compute_active() || ggml_sycl_graph_inflight_count() != 0) {
+        inst.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    bool expected = false;
+    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        inst.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const ggml_sycl_moe_swap_claim_release release{ inst.claimed };
+
+    // The graphs this boundary stands for: every one since the driver last ran for this context, so a skipped
+    // boundary's graphs count at the next one that runs.
+    const uint64_t decode_now = ctx->decode_graph_count.load(std::memory_order_relaxed);
+    const uint64_t decodes    = decode_now - ctx->swap_decode_graph;
+    const uint64_t graphs     = ctx->graph_compute_seq - ctx->swap_graph_seq;
+    ctx->swap_decode_graph    = decode_now;
+    ctx->swap_graph_seq       = ctx->graph_compute_seq;
+
+    const std::shared_ptr<ggml_sycl::moe_route_counts> table = ggml_sycl::moe_route_counts_current(device);
+    if (!table || table->n_blocks() == 0) {
+        return;  // no MoE model on this device, or a table that refuses every count
+    }
+    if (!inst.driver || inst.counts.owner_before(table) || table.owner_before(inst.counts)) {
+        ggml_sycl_moe_swap_report(inst, device);  // the replaced table's driver, if it met a boundary
+        inst.driver   = std::make_unique<ggml_sycl::moe_swap_driver_state>(table->n_blocks(), table->n_experts());
+        inst.counts   = table;
+        inst.reported = 0;
+        inst.snapshot.reset();
+    }
+    ggml_sycl_moe_swap_fold(inst);
+    ggml_sycl::moe_swap_driver_state & d = *inst.driver;
+
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snap = ggml_sycl_global_plan_snapshot();
+    if (!snap || !snap->plan) {
+        ggml_sycl::moe_swap_driver_note_off(d, "no plan published");
+        return;
+    }
+    if (inst.snapshot.owner_before(snap) || snap.owner_before(inst.snapshot)) {
+        // A publication the view was not built from, a move's included. The bulk answers hold for one load.
+        if (snap->model_id != inst.model_id || snap->load_txn_id != inst.load_txn_id) {
+            inst.bulk_memo.clear();
+            inst.model_id    = snap->model_id;
+            inst.load_txn_id = snap->load_txn_id;
+        }
+        ggml_sycl::moe_swap_plan_view_build(*snap->plan, device, d.policy.n_blocks, d.policy.n_experts, inst.bulk_memo,
+                                            inst.view);
+        ggml_sycl_moe_swap_price_gate(inst, *snap, device);
+        inst.snapshot = snap;
+    }
+
+    ggml_sycl::unified_cache *      cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    ggml_sycl::moe_swap_driver_call call;
+    call.after_prompt      = graphs > decodes;
+    call.n_tokens          = static_cast<int>(std::min<uint64_t>(decodes, std::numeric_limits<int>::max()));
+    call.loans_outstanding = g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0;
+    call.cache_settled     = !call.loans_outstanding && !(cache && cache->has_pending_deferred_frees());
+    call.prompt_gate       = inst.prompt_gate;
+    const int nb           = d.policy.n_blocks;
+    const int ne           = d.policy.n_experts;
+    (void) ggml_sycl::moe_swap_driver_step(
+        d, inst.view, call,
+        [&](uint64_t * decode, uint64_t * prompt) {
+            for (int b = 0; b < nb; ++b) {
+                for (int e = 0; e < ne; ++e) {
+                    const size_t cell = static_cast<size_t>(b) * static_cast<size_t>(ne) + static_cast<size_t>(e);
+                    decode[cell]      = table->decode_count(b, e);
+                    prompt[cell]      = table->prompt_count(b, e);
+                }
+            }
+        },
+        [&]() { return ggml_sycl_moe_swap_host_room(cache); },
+        [&](std::vector<ggml_sycl::moe_swap_move> & batch) {
+            ggml_sycl_expert_move_request request;
+            for (const ggml_sycl::moe_swap_move & m : batch) {
+                auto & list = m.kind == ggml_sycl::MOE_SWAP_MOVE_EVICT ? request.evict : request.admit;
+                list.push_back({ m.block, m.expert });
+            }
+            ggml_sycl_expert_move_result result;
+            const ggml_sycl_txn_result code = ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result);
+
+            // Each move's answer comes back in its own list, in list order. The call answers every triplet it was
+            // given; a move it did not answer takes the call's own answer.
+            size_t next_evict = 0;
+            size_t next_admit = 0;
+            for (ggml_sycl::moe_swap_move & m : batch) {
+                const bool                                         evict   = m.kind == ggml_sycl::MOE_SWAP_MOVE_EVICT;
+                const std::vector<ggml_sycl_expert_move_outcome> & answers = evict ? result.evicted : result.admitted;
+                size_t &                                           next    = evict ? next_evict : next_admit;
+                if (next >= answers.size()) {
+                    m.outcome = ggml_sycl_moe_swap_outcome_of(false, code);
+                    m.reason  = result.reason;
+                    continue;
+                }
+                const ggml_sycl_expert_move_outcome & o = answers[next++];
+                m.outcome                               = ggml_sycl_moe_swap_outcome_of(o.moved, o.code);
+                m.reason                                = o.reason;
+                m.bytes                                 = o.device_bytes;
+            }
+        });
 }
 
 // The refill's teardown line, beside the [MOE-EXEC] summary: per device that lent or re-admitted triplets since it
@@ -27351,23 +27624,16 @@ std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone() {
     const size_t capacity  = fx.cache->host_zone_capacity(host_zone_id::WEIGHT);
     const size_t used_from = fx.cache->host_zone_used(host_zone_id::WEIGHT);
 
-    // Fillers take the host WEIGHT zone, never growing it, until it has no room for one member's copy.
+    // Fillers take the host WEIGHT zone through the evict's own mint, which never grows it, until it has no room for
+    // one member's copy.
     std::vector<mem_handle> fillers;
     constexpr size_t        max_fillers = 16384;
     while (fillers.size() < max_fillers) {
-        alloc_request req{};
-        req.device                                     = fx.device;
-        req.size                                       = bytes;
-        req.intent.role                                = alloc_role::WEIGHT;
-        req.intent.constraints.must_host_pinned        = true;
-        req.intent.constraints.use_pinned_pool         = true;
-        req.intent.constraints.forbid_host_zone_growth = true;
-        req.suppress_failure_log                       = true;
-        allocation_result allocation                   = unified_allocate_owner(req);
-        if (!allocation) {
+        mem_handle filler = ::ggml_sycl_host_expert_alloc_no_growth(fx.device, bytes);
+        if (!filler.valid()) {
             break;
         }
-        fillers.push_back(mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS));
+        fillers.push_back(std::move(filler));
     }
     if (fillers.size() == max_fillers) {
         return test_loan_fail("the host WEIGHT zone took %zu fillers of %zu bytes", fillers.size(), bytes);
@@ -36545,6 +36811,9 @@ static void ggml_check_sycl() try {
             // The planner's pin of a mapping load's routed host experts, likewise overwritten from its one reader,
             // which the planner calls on every plan.
             { ggml_sycl::MOE_PIN_HOST_EXPERTS_ENV, &g_ggml_sycl_moe_pin_host_experts, 1 },
+            // The decode-boundary expert swap driver's switch (moe-swap-driver.hpp's one spelling), likewise
+            // overwritten from its one reader, which reads it once.
+            { ggml_sycl::MOE_SWAP_ENV, &g_ggml_sycl_moe_swap, 0 },
 #if GGML_SYCL_DNNL
             // The deterministic attribute on every oneDNN primitive, likewise overwritten from its one reader.
             { GGML_SYCL_ONEDNN_DETERMINISTIC_ENV, &g_ggml_sycl_onednn_deterministic, 1 },
@@ -36562,6 +36831,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
         g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
         g_ggml_sycl_moe_pin_host_experts         = ggml_sycl::placement_pin_host_experts_enabled() ? 1 : 0;
+
+        g_ggml_sycl_moe_swap = ggml_sycl_moe_swap_enabled() ? 1 : 0;
 #if GGML_SYCL_DNNL
         g_ggml_sycl_onednn_deterministic = ggml_sycl_onednn_deterministic_enabled() ? 1 : 0;
 #endif
@@ -44416,6 +44687,26 @@ static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
     ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return {};
+    }
+    return ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+}
+
+// The same storage for a named evict's host copy, except that it never grows the pinned host zone. An evict runs at a
+// decode boundary, where a new pinned chunk would take host memory the plan did not size, so a zone without room
+// refuses it, and the evict answers BUSY "host pinned pool exhausted" for a later boundary. That miss is the swap
+// driver's to count, not an allocation failure to log. Returns an invalid handle when the zone has no room.
+static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc_no_growth(int device, size_t size) {
+    ggml_sycl::alloc_request req{};
+    req.device                                     = device;
+    req.size                                       = size;
+    req.intent.role                                = ggml_sycl::alloc_role::WEIGHT;
+    req.intent.constraints.must_host_pinned        = true;
+    req.intent.constraints.use_pinned_pool         = true;
+    req.intent.constraints.forbid_host_zone_growth = true;
+    req.suppress_failure_log                       = true;
+    ggml_sycl::allocation_result allocation        = ggml_sycl::unified_allocate_owner(req);
     if (!allocation) {
         return {};
     }
@@ -99932,6 +100223,9 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     }
     ggml_sycl_moe_exec_log_report();       // the [MOE-EXEC] summary line, if any layer was consulted (llama.cpp-36j0)
     ggml_sycl_expert_refill_log_report();  // the [MOE-EXEC] refill line, if any triplet was lent (llama.cpp-sif1)
+    if (sycl_ctx) {
+        ggml_sycl_moe_swap_report_at_free(sycl_ctx->device);  // the two [MOE-SWAP] lines, if the driver ran here
+    }
     // Flush any deferred CPU scatter before tearing down SYCL resources.
     // Without this, the thread_local g_pending_scatter may hold a
     // sycl::context reference that outlives the SYCL runtime, causing
@@ -100413,6 +100707,10 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         // After a prompt phase, each decode graph's boundary re-admits lent triplets, behind the deferred-free pass
         // that reclaims the loan's withdrawn device entries and the zone room the ring released (llama.cpp-sif1).
         ggml_sycl_run_expert_refill_at_boundary(backend);
+        // GGML_SYCL_MOE_SWAP=1: the swap policy's evicts, or the admits they left pending, after the refill. A round is
+        // not free: each accepted transaction drops every context's recorded graphs, so about three decode tokens of a
+        // round (evict here, admit at the next boundary) run without a replay.
+        ggml_sycl_run_expert_swap_at_boundary(backend);
 
         if (ggml_sycl::unified_alloc_strict_mode()) {
             (void) ggml_sycl::unified_alloc_validate_registry(sycl_ctx->device, "post_synchronize");

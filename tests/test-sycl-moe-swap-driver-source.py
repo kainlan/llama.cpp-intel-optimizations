@@ -23,6 +23,8 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       the accessor's static initializer; the settings table names it once and its row is overwritten from the
       accessor after the parse, so the non-default report says what is in effect;
   D7  each summary line reaches the log at WARN: every summary call is an argument of GGML_LOG_WARN, and both exist;
+      the second line names the accepted transactions, evicts and admits apart, beside the decode graphs, and the
+      step counts each direction's accepted transaction once (each one drops every recorded graph);
   D8  the driver header is plain host code: it includes the policy header and a short list of standard headers, and
       keeps no state outside the caller's struct (no static, thread_local, extern, mutable or volatile, no inline
       variable, no atomic or lock), and reaches no device, cache, log or environment;
@@ -74,6 +76,11 @@ ROW_OVERWRITE = re.compile(r"g_ggml_sycl_moe_swap\s*=\s*ggml_sycl_moe_swap_enabl
 PARSE_LOOP = "*setting.dest = get_sycl_env(setting.name, setting.default_value);"
 ENV_SPELLING = re.compile(r"MOE_SWAP_ENV\[\]\s*=\s*\"GGML_SYCL_MOE_SWAP\"\s*;")
 SUMMARIES = ("moe_swap_driver_summary_moves(", "moe_swap_driver_summary_faults(")
+FAULTS_SIG = "inline std::string moe_swap_driver_summary_faults("
+FAULTS_FIELDS = ("accepted transactions %llu (evict %llu, admit %llu) over %llu decode graphs",
+                 "(ull) (st.transactions_evict + st.transactions_admit), (ull) st.transactions_evict,",
+                 "(ull) st.transactions_admit, (ull) st.decode_graphs,")
+TXN_COUNTS = ("++st.transactions_evict;", "++st.transactions_admit;")
 EVICT_MINT = re.compile(r"if\s*\(\s*out\.kind\s*==\s*ggml_sycl_expert_move_kind::EVICT\s*\)\s*\{\s*"
                         r"storage\s*=\s*ggml_sycl_host_expert_alloc_no_growth\(\s*device\s*,\s*target\.logical_bytes\s*\)"
                         r"\s*;\s*\}\s*else\s*\{\s*storage\s*=\s*ggml_sycl_host_expert_alloc\(\s*device\s*,\s*"
@@ -83,7 +90,7 @@ NO_GROWTH_FIELDS = ("req.intent.role = ggml_sycl::alloc_role::WEIGHT;", "req.int
                     "req.intent.constraints.forbid_host_zone_growth = true;", "req.suppress_failure_log = true;")
 
 WAITS = re.compile(
-    r"\.\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
+    r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
     r"\bget_info\s*<|\bevent_status\b|\bsynchronize\s*\(|\bsleep_for\b|\bsleep_until\b|\bcondition_variable\b"
 )
 LOCK_DECL = re.compile(r"\bstd::(?:lock_guard|unique_lock|scoped_lock)\b")
@@ -119,13 +126,15 @@ def fail(pin: str, what: str) -> None:
 
 
 def strip_comments(src: str) -> str:
-    """Comments blanked to their newlines, literals kept."""
+    """Comments blanked to spaces with their newlines kept, literals kept. The length is kept too, so an offset in the
+    stripped text is the same offset in the source: a mutant finds its body in the stripped text, where an apostrophe in
+    a comment cannot open a character literal, and edits the source there."""
 
     def repl(m: re.Match) -> str:
         tok = m.group(0)
         if tok[0] in "\"'":
             return tok
-        return "\n" * tok.count("\n")
+        return re.sub(r"[^\n]", " ", tok)
 
     return _LEXEME_RE.sub(repl, src)
 
@@ -316,6 +325,12 @@ def check(raw: dict[str, str]) -> None:
             if not any(s <= at < e for s, e in warn_spans):
                 line = sycl.count("\n", 0, at) + 1
                 fail("D7", f"`{summary[:-1]}` at line {line} is not an argument of GGML_LOG_WARN")
+    faults = norm(body(driver, FAULTS_SIG))
+    if not faults or not all(f in faults for f in FAULTS_FIELDS):
+        fail("D7", "the second summary line does not name the accepted transactions, evicts and admits apart, "
+                   "beside the decode graphs")
+    if any(driver.count(c) != 1 for c in TXN_COUNTS):
+        fail("D7", "the step does not count each direction's accepted transaction exactly once")
 
     # D8 ---------------------------------------------------------------------------------------------------------------
     includes = INCLUDE.findall(driver)
@@ -367,12 +382,13 @@ def _helper_body(sycl: str, name: str) -> str:
 
 def mutate(raw: dict[str, str], edits: list[tuple[str, str, str, str]]) -> dict[str, str]:
     """Apply (file, signature, old, new) edits. With a signature the anchor must appear exactly once inside that body;
-    with an empty one, once in the whole file."""
+    with an empty one, once in the whole file. The body is found in the comment-stripped text, whose offsets are the
+    source's."""
     out = dict(raw)
     for key, sig, old, new in edits:
         text = out[key]
         if sig:
-            start, end = body_span(text, sig)
+            start, end = body_span(strip_comments(text), sig)
             if start < 0:
                 raise MutantNotApplied(f"NOT APPLIED: no body for {sig!r}")
         else:
@@ -417,7 +433,7 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("driver-called-from-elsewhere", "D1",
                 [("sycl", "", SYNC_SIG, "static void ggml_sycl_swap_twice(ggml_backend_t backend) {\n    "
                   + CALLER_CALL + "\n}\n\n" + SYNC_SIG)])
-    expect_fail("step-run-twice", "D2", [("sycl", CALLER_SIG, STEP_CALL, STEP_CALL.replace("(", "_twice(") + "x);\n"
+    expect_fail("step-run-twice", "D2", [("sycl", CALLER_SIG, STEP_CALL, STEP_CALL + "d, inst.view, call, c, r, t);\n"
                                           "    (void) ggml_sycl::" + STEP_CALL)])
     expect_fail("driver-waits-on-the-queue", "D3",
                 [("sycl", CALLER_SIG, "if (!ggml_sycl_moe_swap_enabled()) {",
@@ -452,6 +468,9 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("summary-at-info", "D7",
                 [("sycl", "", "GGML_LOG_WARN(\"%s\\n\", ggml_sycl::moe_swap_driver_summary_moves(",
                   "GGML_LOG_INFO(\"%s\\n\", ggml_sycl::moe_swap_driver_summary_moves(")])
+    expect_fail("summary-drops-the-admits", "D7",
+                [("driver", FAULTS_SIG, "(ull) st.transactions_admit, (ull) st.decode_graphs,", "(ull) st.decode_graphs,")])
+    expect_fail("step-forgets-the-evict-transaction", "D7", [("driver", "", "++st.transactions_evict;", "")])
     expect_fail("header-includes-the-cache", "D8",
                 [("driver", "", "#include \"moe-swap-policy.hpp\"",
                   "#include \"moe-swap-policy.hpp\"\n#include \"unified-cache.hpp\"")])

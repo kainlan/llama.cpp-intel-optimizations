@@ -732,7 +732,8 @@ INTERNAL_WRAPPER_SITES = {
         # must leave in place.
         # 21 -> 25: the evict cases read the publication a call starts from: the one-evict and shared-storage cases
         # show an accepted call replaced it, and the just-admitted and lent cases show a BUSY evict left it in place.
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 25,
+        # 25 -> 26: the evict into a host zone without room reads the publication its BUSY refusal must leave in place.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 26,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
@@ -753,9 +754,12 @@ INTERNAL_WRAPPER_SITES = {
         # triplet shows the publication changed.
         "if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {": 1,
         # The evict a loan made BUSY published nothing, kept the triplet's device entries and left the ledger alone,
-        # in one condition.
+        # in one condition. 1 -> 2: the evict into a host zone without room, BUSY, shows the same in one condition.
         ("if (::ggml_sycl_global_plan_snapshot().get() != published.get() || "
-         "test_evict_device_entries(fx, 0, 0) != 3 ||"): 1,
+         "test_evict_device_entries(fx, 0, 0) != 3 ||"): 2,
+        # The expert swap driver's boundary reads the published plan once, to rebuild its view of the plan when a
+        # publication it was not built from appears: the snapshot the named move publishes, so no new reader kind.
+        "const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snap = ggml_sycl_global_plan_snapshot();": 1,
         # llama.cpp-pu8v: test_expert_loan_and_refill_stop_on_a_missing_entry checks, in one condition each, that the
         # refused loan and the refill that dropped a triplet published nothing and left the request and the ledger
         # as they must be.

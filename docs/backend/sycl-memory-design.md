@@ -411,8 +411,11 @@ event; it asks each slot's event for its status and refuses the table while a
 slot's copy is still in flight.
 
 The named move bounds memory as follows. An evict mints its pinned host copy
-before it retires the device copy, so a boundary evicts only as many triplets as
-the pinned pool has room for; the rest are BUSY "host pinned pool exhausted".
+before it retires the device copy, and mints it without growing the pinned host
+WEIGHT zone (`ggml_sycl_host_expert_alloc_no_growth`): a decode boundary must not
+take host memory the plan did not size. So a boundary evicts only as many
+triplets as the zone has free room for; the rest are BUSY "host pinned pool
+exhausted". A loan's host copy keeps the growing mint.
 The admit returns each admitted triplet's pinned
 host copy once that copy's last lease drains, so the experts' host pinned use
 stays within the triplets not on the card times the triplet size. It mints its
@@ -421,9 +424,32 @@ triplets as the WEIGHT zone has room for. A triplet the zone cannot hold is
 refused "WEIGHT zone full", BUSY, after giving back what its other members
 minted, and the plan the transaction publishes leaves it on the host; when no
 triplet fits, nothing is published. The caller retries at a later boundary.
-Planned headroom in the zone is the planner's job, not the transaction's. Only
-the private fixtures call the named move for now; the boundary driver that
-will name triplets is not yet written.
+Planned headroom in the zone is the planner's job, not the transaction's.
+
+**The swap driver** (`GGML_SYCL_MOE_SWAP=1`, opt-in) is the named move's one
+production caller. At each synchronize after a graph, behind the refill, it asks
+the swap policy (`moe-swap-policy.hpp`) which resident triplet of a block leaves
+for which host triplet, from the route counters, and sends the answer through the
+named move (`moe-swap-driver.hpp` holds the rules, as a pure function of what the
+caller reads). One boundary sends one transaction at most: the evicts, and at the
+next boundary their admits, since an evict's device room comes back only when a
+deferred-free pass reaps the entries it retired. The evict batch is trimmed to
+the host zone's free bytes, read without a wait. The driver waits for nothing and
+holds no lock across the policy step; it runs only while no graph computes on any
+device, and never once graphs have run on two threads at once. Its state is one
+instance per device, keyed on the route table it reads, since that table is one
+per device and shared by every context on the card.
+
+A round is not free. Each accepted transaction publishes a plan, and a published
+plan bumps the exec-graph epoch, so every context on every device drops its
+recorded graphs at its next graph compute. A round is two transactions, the
+evicts at one boundary and their admits at the next, so after each round about
+three decode tokens run without a replay: one direct after the evict, one direct
+after the admit, and one that records. That is the mechanism read from the code;
+no measured figure exists yet. The second `[MOE-SWAP]` summary line puts the
+accepted transactions, evicts and admits apart, beside the decode graphs they
+cost replays in, and the policy's margin and decay are what keep rounds rare once
+the routing settles.
 
 **Gates.** Three gates keep the rule enforceable.
 

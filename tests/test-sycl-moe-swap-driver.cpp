@@ -291,6 +291,7 @@ static void test_a_refused_evict_makes_no_pending_admit_and_latches_its_block() 
         CHECK(r.d.pending.empty());
         CHECK(r.d.latched[0] != 0);
         CHECK(reasons(r.d.stats.refused, "shared storage") == 1);
+        CHECK(r.d.stats.transactions_evict == 0);  // a transaction that moved nothing published nothing
         r.decode[r.index(0, 5)] = 40;
         r.to_period();
         CHECK(r.calls.size() == 1);  // the latched block is not proposed again
@@ -303,10 +304,12 @@ static void test_a_refused_evict_makes_no_pending_admit_and_latches_its_block() 
         CHECK(r.d.pending.empty());
         CHECK(r.d.latched[0] == 0);
         CHECK(reasons(r.d.stats.busy, "host pinned pool exhausted") == 1);
+        CHECK(r.d.stats.transactions_evict == 0);
         r.decode[r.index(0, 5)] = 40;
         CHECK(r.to_period() == MOE_SWAP_DRIVER_SENT);
         CHECK(r.calls.size() == 2 && r.last()[0].kind == MOE_SWAP_MOVE_EVICT && r.last()[0].expert == 0);
         CHECK(r.d.pending.size() == 1);
+        CHECK(r.d.stats.transactions_evict == 1 && r.d.stats.transactions_admit == 0);
     }
 }
 
@@ -581,7 +584,8 @@ static void test_no_admissible_host_expert_proposes_nothing_and_says_so() {
     CHECK(contains(faults, "no admissible host expert at 4 boundaries (4 file-mapped triplets passed over)"));
 }
 
-// The decode graphs that ran after a boundary that moved something are counted, so their tokens can be timed.
+// The decode graphs that ran after a boundary that moved something are counted, so their tokens can be timed, and so
+// are the accepted transactions, one per direction of the round: each one drops every recorded graph.
 static void test_decode_graphs_after_a_move_are_counted() {
     rig r(1, 8, 4);
     r.decode[r.index(0, 5)] = 10;
@@ -591,6 +595,9 @@ static void test_decode_graphs_after_a_move_are_counted() {
     r.boundary(2);  // 2 graphs after a boundary that moved nothing
     CHECK(r.d.stats.graphs_after_move == 8);
     CHECK(r.d.stats.decode_graphs == 14);
+    CHECK(r.d.stats.transactions_evict == 1 && r.d.stats.transactions_admit == 1);
+    const std::string faults = ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0);
+    CHECK(contains(faults, "accepted transactions 2 (evict 1, admit 1) over 14 decode graphs"));
 }
 
 // The two summary lines carry every figure: moves, prompt boundaries, K, open slots, deferrals, file-mapped triplets,
@@ -618,6 +625,8 @@ static void test_the_summary_lines_name_every_figure() {
     CHECK(contains(moves, "prompt boundaries 0"));
     CHECK(contains(moves, "K off (h2d unprobed, decode rule)"));
     CHECK(contains(faults, "[MOE-SWAP] device 1: "));
+    // The evict moved; the admit refused finally and the busy restore moved nothing, so neither published.
+    CHECK(contains(faults, "accepted transactions 1 (evict 1, admit 0) over 9 decode graphs"));
     CHECK(contains(faults, "open slots 1"));
     CHECK(contains(faults, "deferred for host room 0"));
     CHECK(contains(faults, "off: none"));
