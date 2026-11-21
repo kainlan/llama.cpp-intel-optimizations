@@ -1031,6 +1031,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-policy-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-policy-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # The named expert move's admit: no wait, the device storage minted at the staged size before the inventory lock,
+    # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and no
+    # production caller yet. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
+    add_test(NAME test-sycl-moe-expert-admit-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-admit-source.py --self-test)
+    set_tests_properties(test-sycl-moe-expert-admit-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
     # Every dnnl::primitive_attr the backend builds goes through the one helper that asks oneDNN for a deterministic
     # implementation, behind one default-ON switch read once (GGML_SYCL_ONEDNN_DETERMINISTIC). Without it identical
     # inputs gave different bits run to run. Run WITH --self-test so each mutant is caught by the pin it names. Text
