@@ -6363,7 +6363,7 @@ inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
 struct graph_input_staging_retire_marker {};
 
 // The decode prologue memo a backend context keeps (graph-prologue-memo.hpp).
-using ggml_sycl_prologue_memo = ggml_sycl::graph_prologue_memo::memo<ggml_tensor, ggml_backend_buffer_t>;
+using graph_prologue_memo = ggml_sycl::graph_prologue_memo::memo<ggml_tensor, ggml_backend_buffer_t>;
 
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
@@ -8140,7 +8140,7 @@ struct ggml_backend_sycl_context {
     // The signature, slot key and prestage effect list of the keyed decode graph this context last computed, served
     // again while llama hands it the same graph (GGML_SYCL_GRAPH_PROLOGUE_MEMO). A member, so it dies with the
     // context; invalidate_moe_segments() clears it.
-    ggml_sycl_prologue_memo     prologue_memo;
+    graph_prologue_memo         prologue_memo;
 
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;

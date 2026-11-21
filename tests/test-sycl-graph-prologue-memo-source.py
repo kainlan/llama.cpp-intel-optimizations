@@ -4,15 +4,19 @@
 THE COST.  On a replayed keyed decode token the backend walks the graph three times before the device has anything
 queued: the structural signature, the keyed segment slot key and the input prestage. llama reuses the graph on almost
 every decode token, and a reused split keeps its ggml_cgraph::uid, its tensor structs, buffers and data pointers, so
-graph-prologue-memo.hpp serves those walks from the first full pass under the same key. The memo's state machine is
+graph-prologue-memo.hpp serves those walks from the first full pass under the same key. The memo's own behaviour (the
+switch values, the key equality, arming, what is served and recorded, clear, drop_parts, the verify bookkeeping) is
 unit-tested on the host (ggml/src/ggml-sycl/tests/test-graph-prologue-memo.cpp); this pins how the backend uses it.
 
 THE CONTRACT.  With comments blanked:
   K. The key: graph_prologue_memo_key fills uid, n_nodes, n_leafs from the graph, the device from the context, the
-     phase from its caller and the tenant publish generation from ggml_sycl_tenant_publish_gen(); the header's key
-     equality compares all six.
-  U. uid 0 never hits: begin() arms the memo only for a key with a uid and drops every part otherwise, every part is
-     served only while the memo is armed, and nothing is recorded while it is not.
+     phase from its caller and the tenant publish generation from ggml_sycl_tenant_publish_gen().
+  U. Every wrapper starts its call, right after its mode-0 return and before it reads a part, with
+     graph_prologue_memo_begin under the key of its graph and the phase it was given (the prestage: the phase
+     graph_compute stored at its entry), and that helper hands begin() the key.
+  A. The memo arms only where nothing rewrites a graph tensor's data under an unchanged key: the helper hands begin()
+     graph_prologue_memo_may_arm, which answers no while the cross-card expert path is requested and otherwise yes on
+     one routable device or under a plan that keeps the context on its own device; begin() is called nowhere else.
   M. Mode 0 calls the three full functions unconditionally: the switch is read once, each wrapper's first decision
      returns its full function when the mode is OFF (the signature also when the call is not on the keyed decode
      path), before it touches the memo, and the call sites go through the wrappers (the keyed slot's prestage alone,
@@ -20,22 +24,27 @@ THE CONTRACT.  With comments blanked:
   R. The effect list is replayed in order with the failure handling: graph_prestage_leaf_tensors with a replay list
      runs stage_effect for exactly its entries, in order, and returns all_staged before the walk; stage_tensor reaches
      a stage action only through stage_effect; stage_effect records each tensor once, before its action, and keeps the
-     three actions with their failure handling; a replay that fails drops the list.
-  N. A pass that did not stage everything is not memoized: record_prestage drops instead of storing, and the wrapper
-     records with the pass's own answer.
+     three actions with their failure handling; a hit replays the held list and a replay that fails drops it.
+  N. A pass that did not stage everything is not memoized: the wrapper records with the pass's own answer.
+  C. A miss builds the record containers only when the memo is armed: the slot key's buffer list and the prestage's
+     effect list (and with it the walk's set of recorded tensors) are handed to the full function only past an
+     armed() check.
   I. Every invalidation point clears the memo: invalidate_moe_segments first of all, graph_staging_swap_retire
      through its unconditional invalidate_moe_segments, the optional-layout epoch path unconditionally, and the
      context's teardown (the report, then invalidate_moe_segments); the memo is a by-value member of the context.
   S. The slot key is served only while its distinct buffers keep the identity and base the full walk read, and the
-     full walk hands those buffers out as it read them.
-  V. The verify comparison covers all three parts, and a difference logs the mismatch line, which names the part.
+     full walk hands those buffers out as it read them; a held key whose check fails drops every part (the key stays
+     armed) before the full walk records afresh.
+  V. The verify comparison covers all three parts, and a difference logs the mismatch line, which names the part. A
+     prestage hit in verify mode runs the replay first, then the full pass, and compares the replay's answer and the
+     held list with the pass's answer and list.
   T. The teardown line, its exact text, and when it prints (modes 1 and 2, under the trace switch or in mode 2).
   D. docs/backend/sycl-env-vars.md documents the switch, the teardown line and the mismatch line.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and requires each to fail the named
 pin, then requires the unmodified tree to pass.
 
-RED on the tree before the change: every pin fails (the header, the wrappers and the docs row do not exist).
+RED on the tree before the change: every pin fails (the wrappers and the docs row do not exist).
 """
 
 from __future__ import annotations
@@ -48,12 +57,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SYCL = ROOT / "ggml" / "src" / "ggml-sycl"
 BACKEND = SYCL / "ggml-sycl.cpp"
 COMMON = SYCL / "common.hpp"
-HEADER = SYCL / "graph-prologue-memo.hpp"
 DOC = ROOT / "docs" / "backend" / "sycl-env-vars.md"
 
 ENV_NAME = "GGML_SYCL_GRAPH_PROLOGUE_MEMO"
 TEARDOWN_LINE = "[PROLOGUE-MEMO] device %d: hits=%llu misses=%llu verified=%llu mismatches=%llu\\n"
 MISMATCH_TAG = "[PROLOGUE-MEMO] mismatch"
+PRESTAGE_PHASE = r"ctx->graph_phase_is_decode\.load\(std::memory_order_relaxed\)"
 
 # Comments blank to spaces, keeping offsets; strings and char literals are matched first so a comment marker inside
 # one is not taken for a comment.
@@ -110,9 +119,11 @@ def top_level(body: str, at: int) -> bool:
 
 SIG = {
     "key": r"static ggml_sycl::graph_prologue_memo::key graph_prologue_memo_key\([^)]*\)\s*\{",
-    "mode": r"static ggml_sycl::graph_prologue_memo::mode ggml_sycl_graph_prologue_memo_mode\(\)\s*\{",
+    "mode": r"static ggml_sycl::graph_prologue_memo::mode graph_prologue_memo_mode\(\)\s*\{",
     "mismatch": r"static void graph_prologue_memo_mismatch\([^)]*\)\s*\{",
-    "report": r"static void ggml_sycl_graph_prologue_memo_report\([^)]*\)\s*\{",
+    "report": r"static void graph_prologue_memo_report\([^)]*\)\s*\{",
+    "may_arm": r"static bool graph_prologue_memo_may_arm\([^)]*\)\s*\{",
+    "begin": r"static void graph_prologue_memo_begin\([^)]*\)\s*\{",
     "signature": r"static uint64_t graph_prologue_memo_signature\([^)]*\)\s*\{",
     "slot_key": r"static ggml_sycl::graph_segment_cache::key graph_prologue_memo_slot_key\([^)]*\)\s*\{",
     "prestage": r"static bool graph_prologue_memo_prestage\([^)]*\)\s*\{",
@@ -123,9 +134,31 @@ SIG = {
     "compute": r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{",
     "dtor": r"ggml_backend_sycl_context::~ggml_backend_sycl_context\(\)\s*\{",
 }
+SIG_PIN = {"signature": "M", "slot_key": "M", "prestage": "M", "mode": "M", "key": "K", "walk": "R", "mismatch": "V",
+           "report": "T", "may_arm": "A", "begin": "U"}
+
+# Each wrapper's opening, normalized: the switch, then the mode-0 return of its full function.
+FIRST = {
+    "signature": r"\{ namespace gpm = ggml_sycl::graph_prologue_memo; "
+                 r"const gpm::mode mode = graph_prologue_memo_mode\(\); "
+                 r"if \(mode == gpm::mode::OFF \|\| !moe_segment_keyed_mode\(ctx, is_decode\)\) \{ "
+                 r"return ggml_sycl_graph_signature\(cgraph\); \}",
+    "slot_key": r"\{ namespace gpm = ggml_sycl::graph_prologue_memo; "
+                r"const gpm::mode mode = graph_prologue_memo_mode\(\); "
+                r"if \(mode == gpm::mode::OFF\) \{ return moe_segment_slot_key\(ctx, cgraph, signature, is_decode\); \}",
+    "prestage": r"\{ namespace gpm = ggml_sycl::graph_prologue_memo; "
+                r"const gpm::mode mode = graph_prologue_memo_mode\(\); "
+                r"if \(mode == gpm::mode::OFF\) \{ return graph_prestage_leaf_tensors\(ctx, cgraph\); \}",
+}
+PHASE = {"signature": "is_decode", "slot_key": "is_decode", "prestage": PRESTAGE_PHASE}
+
+# A prestage hit: the replay runs before the mode decides anything, so verify mode exercises it too.
+PRESTAGE_HIT = (r"if \(held\) \{ memo\.note_hit\(\); "
+                r"const bool replayed = graph_prestage_leaf_tensors\(ctx, cgraph, held\); "
+                r"if \(mode == gpm::mode::ON\) \{ if \(!replayed\) \{ memo\.drop_prestage\(\); \} return replayed; \}")
 
 
-def check(backend: str, common: str, header: str, doc: str) -> list[str]:
+def check(backend: str, common: str, doc: str) -> list[str]:
     """Every failed pin as 'X: reason'. The sources are comment-blanked already (the doc is not)."""
     out: list[str] = []
 
@@ -135,13 +168,10 @@ def check(backend: str, common: str, header: str, doc: str) -> list[str]:
 
     bodies = {name: body_of(backend, sig) for name, sig in SIG.items()}
     for name, body in bodies.items():
-        need("M" if name in ("signature", "slot_key", "prestage", "mode") else "K" if name == "key" else
-             "R" if name == "walk" else "V" if name == "mismatch" else "T" if name == "report" else "I",
-             body is not None, f"no definition of {name} ({SIG[name]})")
+        need(SIG_PIN.get(name, "I"), body is not None, f"no definition of {name} ({SIG[name]})")
     if any(b is None for b in bodies.values()):
         return out
     b = {name: norm(body) for name, body in bodies.items()}
-    h = norm(header)
     c = norm(common)
 
     # --- K: the key ----------------------------------------------------------------------------------------------
@@ -150,47 +180,33 @@ def check(backend: str, common: str, header: str, doc: str) -> list[str]:
                          ("tenant_gen", "ggml_sycl_tenant_publish_gen()")):
         need("K", re.search(r"\bk\.%s = %s;" % (field, re.escape(value)), b["key"]) is not None,
              f"the key does not take {field} from {value}")
-    eq = body_of(header, r"inline bool operator==\(const key & a, const key & b\)\s*\{")
-    need("K", eq is not None and all(f"a.{f} == b.{f}" in eq for f in
-                                     ("uid", "n_nodes", "n_leafs", "device", "is_decode", "tenant_gen")),
-         "the header's key equality does not compare all six fields")
 
-    # --- U: uid 0 never hits --------------------------------------------------------------------------------------
-    begin = body_of(header, r"void begin\(const key & k\)\s*\{")
-    need("U", begin is not None and re.fullmatch(
-        r"\{ if \(k\.uid != 0 && armed_ && key_ == k\) \{ return; \} clear\(\); "
-        r"if \(k\.uid != 0\) \{ key_ = k; armed_ = true; \} \}", norm(begin)) is not None,
-        "begin() does not arm only a key with a uid, dropping every part otherwise")
-    for part in ("signature_", "slot_key_", "prestage_"):
-        need("U", re.search(r"return armed_ && has_%s \?" % part, h) is not None,
-             f"the {part.rstrip('_')} part is served while the memo is not armed")
-    for record in ("record_signature", "record_slot_key", "record_prestage"):
-        rb = body_of(header, r"void %s\([^)]*\)\s*\{" % record)
-        need("U", rb is not None and "if (!armed_) { return; }" in norm(rb), f"{record} records while not armed")
-    clear = body_of(header, r"void clear\(\)\s*\{")
-    need("U", clear is not None and all(t in norm(clear) for t in
-                                        ("armed_ = false;", "has_signature_ = false;", "has_slot_key_ = false;",
-                                         "has_prestage_ = false;")),
-         "clear() does not disarm and drop every part")
+    # --- U: every wrapper begins under its graph's key and phase --------------------------------------------------
+    for name, phase in PHASE.items():
+        need("U", re.match(FIRST[name] + r" auto & memo = ctx->prologue_memo; graph_prologue_memo_begin\(ctx, cgraph, "
+                           r"%s\); const " % phase, b[name]) is not None,
+             f"the {name} wrapper does not begin() under its graph's key and phase before it reads a part")
+    need("U", b["begin"].startswith("{ ctx->prologue_memo.begin(graph_prologue_memo_key(ctx, cgraph, is_decode), "),
+         "graph_prologue_memo_begin does not hand begin() the key of its graph and phase")
+
+    # --- A: the arming condition ------------------------------------------------------------------------------------
+    need("A", re.fullmatch(r"\{ ctx->prologue_memo\.begin\(graph_prologue_memo_key\(ctx, cgraph, is_decode\), "
+                           r"\[ctx\] \{ return graph_prologue_memo_may_arm\(ctx\); \}\); \}", b["begin"]) is not None,
+         "begin() is not handed graph_prologue_memo_may_arm as its arming condition")
+    need("A", re.fullmatch(r"\{ if \(ggml_sycl_moe_multi_gpu_requested\(\)\) \{ return false; \} "
+                           r"return ggml_sycl_routable_device_count\(\) <= 1 \|\| "
+                           r"ggml_sycl_current_plan_is_single_device_for_graph\(ctx->device\); \}", b["may_arm"])
+         is not None,
+         "the arming condition is not: no cross-card expert path, and one routable device or a single-device plan")
+    need("A", len(re.findall(r"\b(?:prologue_memo|memo) ?\. ?begin\(", norm(backend))) == 1,
+         "begin() is called outside graph_prologue_memo_begin, without the arming condition")
 
     # --- M: mode 0 is today's path --------------------------------------------------------------------------------
     need("M", re.search(r"static const ggml_sycl::graph_prologue_memo::mode mode = "
                         r"ggml_sycl::graph_prologue_memo::mode_parse\(std::getenv\(\"%s\"\)\); return mode;" % ENV_NAME,
                         b["mode"]) is not None, "the switch is not read once through mode_parse")
     need("M", backend.count('"%s"' % ENV_NAME) == 1, "the switch is read at more than one site")
-    first = {
-        "signature": r"\{ namespace gpm = ggml_sycl::graph_prologue_memo; "
-                     r"const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode\(\); "
-                     r"if \(mode == gpm::mode::OFF \|\| !moe_segment_keyed_mode\(ctx, is_decode\)\) \{ "
-                     r"return ggml_sycl_graph_signature\(cgraph\); \}",
-        "slot_key": r"\{ namespace gpm = ggml_sycl::graph_prologue_memo; "
-                    r"const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode\(\); "
-                    r"if \(mode == gpm::mode::OFF\) \{ return moe_segment_slot_key\(ctx, cgraph, signature, is_decode\); \}",
-        "prestage": r"\{ namespace gpm = ggml_sycl::graph_prologue_memo; "
-                    r"const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode\(\); "
-                    r"if \(mode == gpm::mode::OFF\) \{ return graph_prestage_leaf_tensors\(ctx, cgraph\); \}",
-    }
-    for name, pattern in first.items():
+    for name, pattern in FIRST.items():
         need("M", re.match(pattern, b[name]) is not None,
              f"the {name} wrapper does not return its full function first when the mode is OFF")
     compute = b["compute"]
@@ -240,17 +256,24 @@ def check(backend: str, common: str, header: str, doc: str) -> list[str]:
              re.search(r"ggml_sycl_get_staged_ptr_device\([^;]*; if \(staged\) \{[^{}]*\} else \{[^{}]*"
                        r"all_staged = false; \}", se) is not None,
              "stage_effect does not keep the three actions with their failure handling")
-    need("R", re.search(r"if \(held && mode == gpm::mode::ON\) \{ memo\.note_hit\(\); "
-                        r"const bool staged = graph_prestage_leaf_tensors\(ctx, cgraph, held\); "
-                        r"if \(!staged\) \{ memo\.drop_prestage\(\); \} return staged; \}", b["prestage"]) is not None,
+    need("R", re.search(PRESTAGE_HIT, b["prestage"]) is not None,
          "a hit does not replay the held list, or a failed replay keeps it")
 
     # --- N: a not-all-staged pass is not memoized ---------------------------------------------------------------------
-    rp = body_of(header, r"void record_prestage\(bool all_staged, std::vector<effect> && effects\)\s*\{")
-    need("N", rp is not None and re.match(r"\{ if \(!all_staged\) \{ drop_prestage\(\); return; \}", norm(rp))
-         is not None, "record_prestage stores a pass that did not stage everything")
-    need("N", re.search(r"memo\.note_miss\(\); memo\.record_prestage\(staged, std::move\(effects\)\); return staged;",
-                        b["prestage"]) is not None, "a miss does not record with the pass's own answer")
+    need("N", re.search(r"const bool staged = graph_prestage_leaf_tensors\(ctx, cgraph, nullptr, &effects\); "
+                        r"memo\.record_prestage\(staged, std::move\(effects\)\); return staged; \}$", b["prestage"])
+         is not None, "a miss does not record with the pass's own answer")
+
+    # --- C: record containers only when armed ---------------------------------------------------------------------
+    need("C", re.search(r"memo\.note_miss\(\); if \(!memo\.armed\(\)\) \{ "
+                        r"return moe_segment_slot_key\(ctx, cgraph, signature, is_decode\); \} "
+                        r"std::vector<graph_prologue_memo::identity> buffers;", b["slot_key"]) is not None and
+         b["slot_key"].count("&buffers") == 1,
+         "a slot key miss builds its buffer list without the memo armed")
+    need("C", re.search(r"memo\.note_miss\(\); if \(!memo\.armed\(\)\) \{ "
+                        r"return graph_prestage_leaf_tensors\(ctx, cgraph\); \} "
+                        r"std::vector<graph_prologue_memo::effect> effects;", b["prestage"]) is not None,
+         "a prestage miss builds its effect list without the memo armed")
 
     # --- I: invalidation -----------------------------------------------------------------------------------------------
     inv = body_of(common, r"\bbool invalidate_moe_segments\(\)\s*\{")
@@ -265,13 +288,13 @@ def check(backend: str, common: str, header: str, doc: str) -> list[str]:
                         r"if \(sycl_ctx->exec_graph", compute) is not None,
          "the optional-layout epoch path does not clear the memo unconditionally")
     dtor = b["dtor"]
-    report_at = dtor.find("ggml_sycl_graph_prologue_memo_report(*this);")
+    report_at = dtor.find("graph_prologue_memo_report(*this);")
     inv_at = dtor.find("invalidate_moe_segments();", max(report_at, 0))
     need("I", report_at >= 0 and inv_at > report_at, "the teardown does not report, then invalidate_moe_segments")
-    need("I", re.search(r"\bggml_sycl_prologue_memo prologue_memo;", c) is not None and
+    need("I", re.search(r"\bgraph_prologue_memo prologue_memo;", c) is not None and
          re.search(r"(static|thread_local|\*|unique_ptr|shared_ptr)[^;]*\bprologue_memo\b\s*;", c) is None,
          "the memo is not a by-value member of the context")
-    need("I", "using ggml_sycl_prologue_memo = ggml_sycl::graph_prologue_memo::memo<ggml_tensor, ggml_backend_buffer_t>;"
+    need("I", "using graph_prologue_memo = ggml_sycl::graph_prologue_memo::memo<ggml_tensor, ggml_backend_buffer_t>;"
          in c, "the context's memo type is not memo<ggml_tensor, ggml_backend_buffer_t>")
 
     # --- S: the slot key's buffers ------------------------------------------------------------------------------------
@@ -280,27 +303,31 @@ def check(backend: str, common: str, header: str, doc: str) -> list[str]:
          full_key.find("if (buffers_out)") > full_key.find("mix_tensor(node->src[j]);") and
          "seen.push_back({ t->buffer, moe_segment_buffer_identity(t->buffer), moe_segment_buffer_base(t->buffer) });"
          in full_key, "the full slot key walk does not hand out the distinct buffers as it read them")
-    need("S", re.search(r"if \(held && held->signature == signature && held->is_decode == is_decode && "
+    need("S", re.search(r"if \(held\) \{ if \(held->signature == signature && held->is_decode == is_decode && "
                         r"memo\.slot_key_buffers_unchanged\(moe_segment_buffer_identity, moe_segment_buffer_base\)\) \{",
                         b["slot_key"]) is not None,
          "the slot key is served without checking every buffer's identity and base")
-    need("S", re.search(r"moe_segment_slot_key\(ctx, cgraph, signature, is_decode, &buffers\); memo\.note_miss\(\); "
-                        r"memo\.record_slot_key\(full, std::move\(buffers\)\);", b["slot_key"]) is not None,
+    need("S", re.search(r"return full; \} memo\.drop_parts\(\); \} memo\.note_miss\(\);", b["slot_key"]) is not None,
+         "a held slot key whose check fails keeps the other parts")
+    need("S", re.search(r"const ggml_sycl::graph_segment_cache::key full = "
+                        r"moe_segment_slot_key\(ctx, cgraph, signature, is_decode, &buffers\); "
+                        r"memo\.record_slot_key\(full, std::move\(buffers\)\); return full; \}$", b["slot_key"]) is not None,
          "a slot key miss does not record the full walk's key with its buffers")
 
     # --- V: verify -----------------------------------------------------------------------------------------------------
     for name, compare, part in (("signature", "signature == *held", "SIGNATURE"),
-                                ("slot_key", "full == *held", "SLOT_KEY"),
-                                ("prestage", "staged && effects == *held", "PRESTAGE")):
+                                ("slot_key", "full == *held", "SLOT_KEY")):
         need("V", re.search(r"if \(!memo\.note_verified\(%s\)\) \{ graph_prologue_memo_mismatch\(ctx, gpm::part::%s\); \}"
                             % (re.escape(compare), part), b[name]) is not None,
              f"the {name} wrapper does not compare its full result with the held one in verify mode")
+    need("V", re.search(PRESTAGE_HIT + r" std::vector<graph_prologue_memo::effect> effects; "
+                        r"const bool staged = graph_prestage_leaf_tensors\(ctx, cgraph, nullptr, &effects\); "
+                        r"if \(!memo\.note_verified\(replayed == staged && effects == \*held\)\) \{ "
+                        r"graph_prologue_memo_mismatch\(ctx, gpm::part::PRESTAGE\); \}", b["prestage"]) is not None,
+         "a verify-mode prestage hit does not run the replay, then the full pass, and compare both answers and lists")
     need("V", MISMATCH_TAG in b["mismatch"] and "GGML_LOG_WARN(" in b["mismatch"] and
          "ggml_sycl::graph_prologue_memo::part_name(which)" in b["mismatch"],
          "the mismatch line is not a WARN naming the part")
-    nv = body_of(header, r"bool note_verified\(bool same\)\s*\{")
-    need("V", nv is not None and re.search(r"if \(!same\) \{ stats_\.mismatches\+\+; clear\(\); \}", norm(nv))
-         is not None, "a difference does not clear the memo")
 
     # --- T: the teardown line -------------------------------------------------------------------------------------------
     need("T", re.search(r"if \(mode == gpm::mode::OFF \|\| "
@@ -315,10 +342,9 @@ def check(backend: str, common: str, header: str, doc: str) -> list[str]:
     return out
 
 
-def load() -> tuple[str, str, str, str]:
-    header = blank_comments(HEADER.read_text()) if HEADER.exists() else ""
+def load() -> tuple[str, str, str]:
     doc = DOC.read_text() if DOC.exists() else ""
-    return blank_comments(BACKEND.read_text()), blank_comments(COMMON.read_text()), header, doc
+    return blank_comments(BACKEND.read_text()), blank_comments(COMMON.read_text()), doc
 
 
 def sub1(src: str, pattern: str, repl: str) -> str:
@@ -328,30 +354,36 @@ def sub1(src: str, pattern: str, repl: str) -> str:
     return out
 
 
-def mutants(backend: str, common: str, header: str, doc: str):
+def mutants(backend: str, common: str, doc: str):
     """(name, pin it must fail, sources) for each mutant."""
     def be(p, r):
-        return (sub1(backend, p, r), common, header, doc)
+        return (sub1(backend, p, r), common, doc)
 
     def co(p, r):
-        return (backend, sub1(common, p, r), header, doc)
-
-    def hd(p, r):
-        return (backend, common, sub1(header, p, r), doc)
+        return (backend, sub1(common, p, r), doc)
 
     yield "the key drops the publish generation", "K", be(r"k\.tenant_gen\s*= ggml_sycl_tenant_publish_gen\(\);", "")
     yield "the key takes the node count from the context", "K", be(r"k\.n_nodes\s*= cgraph->n_nodes;",
                                                                    "k.n_nodes = 0;")
-    yield "the key equality ignores the uid", "K", hd(r"a\.uid == b\.uid && ", "")
-    yield "the key equality ignores n_leafs", "K", hd(r"a\.n_leafs == b\.n_leafs && ", "")
-    yield "begin() arms a uid-0 key", "U", hd(r"if \(k\.uid != 0\) \{(\s*key_\s*= k;)", r"{\1")
-    yield "begin() keeps the parts for a uid-0 key", "U", hd(r"if \(k\.uid != 0 && armed_ && key_ == k\)",
-                                                             "if (armed_ && key_ == k)")
-    yield "the signature is served unarmed", "U", hd(r"return armed_ && has_signature_ \?", "return has_signature_ ?")
-    yield "the prestage list records unarmed", "U", hd(
-        r"(void record_prestage\(bool all_staged, std::vector<effect> && effects\) \{[^}]*\}\s*)if \(!armed_\) \{\s*"
-        r"return;\s*\}", r"\1")
-    yield "clear() keeps the slot key", "U", hd(r"has_slot_key_\s*= false;\n(\s*has_prestage_)", r"\1")
+    yield "the signature wrapper does not begin()", "U", be(
+        r"(return ggml_sycl_graph_signature\(cgraph\);\s*\}\s*auto & memo = ctx->prologue_memo;)\s*"
+        r"graph_prologue_memo_begin\(ctx, cgraph, is_decode\);", r"\1")
+    yield "the slot key wrapper does not begin()", "U", be(
+        r"(return moe_segment_slot_key\(ctx, cgraph, signature, is_decode\);\s*\}\s*auto & memo = ctx->prologue_memo;)\s*"
+        r"graph_prologue_memo_begin\(ctx, cgraph, is_decode\);", r"\1")
+    yield "the prestage wrapper does not begin()", "U", be(r"graph_prologue_memo_begin\(ctx, cgraph, %s\);" % PRESTAGE_PHASE,
+                                                           "")
+    yield "the prestage wrapper flips the phase", "U", be(r"graph_prologue_memo_begin\(ctx, cgraph, ctx->graph_phase",
+                                                          "graph_prologue_memo_begin(ctx, cgraph, !ctx->graph_phase")
+    yield "the memo arms without its condition", "A", be(r"\[ctx\]\s*\{\s*return graph_prologue_memo_may_arm\(ctx\);\s*\}",
+                                                         "[] { return true; }")
+    yield "the arming condition ignores the cross-card expert path", "A", be(
+        r"if \(ggml_sycl_moe_multi_gpu_requested\(\)\) \{\s*return false;\s*\}", "")
+    yield "the arming condition ignores the plan", "A", be(
+        r"\|\|\s*ggml_sycl_current_plan_is_single_device_for_graph\(ctx->device\);", "|| true;")
+    yield "a wrapper arms the memo by itself", "A", be(
+        r"(auto & memo = ctx->prologue_memo;\s*)graph_prologue_memo_begin\(ctx, cgraph, is_decode\);",
+        r"\1memo.begin(graph_prologue_memo_key(ctx, cgraph, is_decode), [] { return true; });")
     yield "the switch is read on every call", "M", be(r"static const ggml_sycl::graph_prologue_memo::mode mode =",
                                                       "const ggml_sycl::graph_prologue_memo::mode mode =")
     yield "mode 0 serves the signature memo", "M", be(
@@ -385,11 +417,13 @@ def mutants(backend: str, common: str, header: str, doc: str):
     yield "the staging-cache failure no longer clears all_staged", "R", be(
         r"(Failed to stage %s tensor %s \(data=%p, %zu bytes\)\\n\", source_desc,\s*tensor->name, tensor->data, "
         r"nbytes\);)\s*all_staged = false;", r"\1")
-    yield "a failed replay keeps the list", "R", be(r"if \(!staged\) \{\s*memo\.drop_prestage\(\);\s*\}", "")
-    yield "record_prestage stores a failed pass", "N", hd(r"if \(!all_staged\) \{\s*drop_prestage\(\);\s*return;\s*\}",
-                                                          "")
+    yield "a failed replay keeps the list", "R", be(r"if \(!replayed\) \{\s*memo\.drop_prestage\(\);\s*\}", "")
     yield "a miss records as staged", "N", be(r"memo\.record_prestage\(staged, std::move\(effects\)\);",
                                               "memo.record_prestage(true, std::move(effects));")
+    yield "a slot key miss builds its buffers unarmed", "C", be(
+        r"if \(!memo\.armed\(\)\) \{\s*return moe_segment_slot_key\(ctx, cgraph, signature, is_decode\);\s*\}", "")
+    yield "a prestage miss builds its effect list unarmed", "C", be(
+        r"if \(!memo\.armed\(\)\) \{\s*return graph_prestage_leaf_tensors\(ctx, cgraph\);\s*\}", "")
     yield "invalidate_moe_segments forgets the memo", "I", co(r"prologue_memo\.clear\(\);\s*(if \(!ggml_sycl_retire)",
                                                               r"\1")
     yield "invalidate_moe_segments clears after a failure can return", "I", co(
@@ -400,38 +434,44 @@ def mutants(backend: str, common: str, header: str, doc: str):
         "const bool segments_retired = ctx->exec_graph ? ctx->invalidate_moe_segments() : true;")
     yield "the optional-layout path clears only with a graph", "I", be(
         r"sycl_ctx->prologue_memo\.clear\(\);\s*(if \(sycl_ctx->exec_graph \|\|)", r"\1")
-    yield "the teardown does not report", "I", be(
-        r"ggml_sycl_graph_prologue_memo_report\(\*this\);", "")
-    yield "the memo is a pointer member", "I", co(r"\bggml_sycl_prologue_memo\s+prologue_memo;",
-                                                 "ggml_sycl_prologue_memo * prologue_memo = nullptr;")
+    yield "the teardown does not report", "I", be(r"graph_prologue_memo_report\(\*this\);", "")
+    yield "the memo is a pointer member", "I", co(r"\bgraph_prologue_memo\s+prologue_memo;",
+                                                 "graph_prologue_memo * prologue_memo = nullptr;")
     yield "the slot key walk keeps its buffers", "S", be(r"if \(buffers_out\) \{\s*\*buffers_out = std::move\(seen\);\s*\}",
                                                          "")
     yield "the slot key is served without the buffer check", "S", be(
         r"&& held->is_decode == is_decode &&\s*memo\.slot_key_buffers_unchanged\(moe_segment_buffer_identity, "
         r"moe_segment_buffer_base\)", "&& held->is_decode == is_decode")
+    yield "a failed buffer check keeps the other parts", "S", be(r"memo\.drop_parts\(\);", "")
     yield "a slot key miss records no buffers", "S", be(r"memo\.record_slot_key\(full, std::move\(buffers\)\);",
                                                         "memo.record_slot_key(full, {});")
     yield "verify skips the signature compare", "V", be(
         r"if \(!memo\.note_verified\(signature == \*held\)\)", "if (!memo.note_verified(true))")
     yield "verify skips the slot key compare", "V", be(
         r"if \(!memo\.note_verified\(full == \*held\)\)", "if (!memo.note_verified(true))")
-    yield "verify compares the prestage list but not the answer", "V", be(
-        r"if \(!memo\.note_verified\(staged && effects == \*held\)\)", "if (!memo.note_verified(effects == *held))")
+    yield "verify does not run the replay", "V", be(
+        r"const bool replayed = graph_prestage_leaf_tensors\(ctx, cgraph, held\);\s*if \(mode == gpm::mode::ON\) \{",
+        "if (mode == gpm::mode::ON) { const bool replayed = graph_prestage_leaf_tensors(ctx, cgraph, held);")
+    yield "verify compares the prestage list but not the replay's answer", "V", be(
+        r"if \(!memo\.note_verified\(replayed == staged && effects == \*held\)\)",
+        "if (!memo.note_verified(effects == *held))")
+    yield "verify compares the answers but not the prestage list", "V", be(
+        r"if \(!memo\.note_verified\(replayed == staged && effects == \*held\)\)",
+        "if (!memo.note_verified(replayed == staged))")
     yield "the mismatch line is DEBUG", "V", be(r"GGML_LOG_WARN\(\s*\"\[PROLOGUE-MEMO\] mismatch",
                                                 'GGML_LOG_DEBUG("[PROLOGUE-MEMO] mismatch')
-    yield "a difference keeps the memo", "V", hd(r"stats_\.mismatches\+\+;\s*clear\(\);", "stats_.mismatches++;")
     yield "the teardown line prints in mode 0", "T", be(r"if \(mode == gpm::mode::OFF \|\| \(", "if ((")
     yield "the teardown line prints without the trace", "T", be(r" && !moe_hostpath_waits_enabled\(\)\)\)", " && false))")
     yield "the teardown line drops a counter", "T", be(r"verified=%llu mismatches=%llu", "mismatches=%llu")
-    yield "the docs lose the teardown line", "D", (backend, common, header, doc.replace("hits=%llu", "hits=%u"))
+    yield "the docs lose the teardown line", "D", (backend, common, doc.replace("hits=%llu", "hits=%u"))
 
 
 def main() -> int:
-    backend, common, header, doc = load()
+    backend, common, doc = load()
     if "--self-test" in sys.argv[1:]:
         bad = []
         n = 0
-        for name, pin, sources in mutants(backend, common, header, doc):
+        for name, pin, sources in mutants(backend, common, doc):
             n += 1
             fired = [f for f in check(*sources) if f.startswith(pin + ":")]
             print(("PASS" if fired else "FAIL") + f": mutant '{name}' fails pin {pin}")
@@ -441,7 +481,7 @@ def main() -> int:
             print(f"self-test: {len(bad)} of {n} mutants not caught: {bad}")
             return 1
         print(f"self-test: all {n} mutants caught")
-    failures = check(backend, common, header, doc)
+    failures = check(backend, common, doc)
     for f in failures:
         print("FAIL [pin " + f.replace(":", "]:", 1))
     if failures:

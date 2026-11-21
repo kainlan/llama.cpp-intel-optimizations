@@ -55032,7 +55032,7 @@ void ggml_backend_sycl_context::log_planned_scratch_stats() {
 // GGML_SYCL_GRAPH_PROLOGUE_MEMO, read once (graph-prologue-memo.hpp). Unset or 1 serves the keyed decode prologue's
 // signature, slot key and prestage from the first full pass over a graph llama reuses; 0 runs the full walks on every
 // call; 2 runs them as well on every hit and compares.
-static ggml_sycl::graph_prologue_memo::mode ggml_sycl_graph_prologue_memo_mode() {
+static ggml_sycl::graph_prologue_memo::mode graph_prologue_memo_mode() {
     static const ggml_sycl::graph_prologue_memo::mode mode =
         ggml_sycl::graph_prologue_memo::mode_parse(std::getenv("GGML_SYCL_GRAPH_PROLOGUE_MEMO"));
     return mode;
@@ -55064,9 +55064,9 @@ static void graph_prologue_memo_mismatch(const ggml_backend_sycl_context *    ct
 
 // The teardown summary of a context's memo, in modes 1 and 2, when the trace switch is on or the mode is 2. It is
 // the positive control of a verify run: mismatches=0 shows nothing unless hits and verified are above zero beside it.
-static void ggml_sycl_graph_prologue_memo_report(const ggml_backend_sycl_context & ctx) {
+static void graph_prologue_memo_report(const ggml_backend_sycl_context & ctx) {
     namespace gpm        = ggml_sycl::graph_prologue_memo;
-    const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode();
+    const gpm::mode mode = graph_prologue_memo_mode();
     if (mode == gpm::mode::OFF || (mode != gpm::mode::VERIFY && !moe_hostpath_waits_enabled())) {
         return;
     }
@@ -55130,7 +55130,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     runtime_tensor_extras.clear();
 
     // The prologue memo's counters die with the context, so its teardown reports them; the clear below keeps them.
-    ggml_sycl_graph_prologue_memo_report(*this);
+    graph_prologue_memo_report(*this);
 #ifdef GGML_SYCL_GRAPH
     // Command graphs bake USM pointers. Destroy executable graph objects before
     // retiring backend-owned host-control allocations they may reference.
@@ -111878,15 +111878,15 @@ static const char * moe_segment_buffer_base(ggml_backend_buffer_t buffer) {
 // buffer plus its offset from the buffer's base. The base is read only to take that difference. With buffers_out,
 // the distinct buffers the walk met are handed out with the identity and base it read, for the prologue memo.
 static ggml_sycl::graph_segment_cache::key moe_segment_slot_key(
-    const ggml_backend_sycl_context *                ctx,
-    const ggml_cgraph *                              cgraph,
-    uint64_t                                         signature,
-    bool                                             is_decode,
-    std::vector<ggml_sycl_prologue_memo::identity> * buffers_out = nullptr) {
+    const ggml_backend_sycl_context *            ctx,
+    const ggml_cgraph *                          cgraph,
+    uint64_t                                     signature,
+    bool                                         is_decode,
+    std::vector<graph_prologue_memo::identity> * buffers_out = nullptr) {
     ggml_sycl::graph_segment_cache::key_hasher names;
     ggml_sycl::graph_segment_cache::key_hasher storage;
 
-    using seen_buffer = ggml_sycl_prologue_memo::identity;
+    using seen_buffer = graph_prologue_memo::identity;
 
     std::vector<seen_buffer> seen;  // this call only, unless handed out
     auto                     mix_tensor = [&](const ggml_tensor * t) {
@@ -111937,6 +111937,32 @@ static ggml_sycl::graph_segment_cache::key moe_segment_slot_key(
     return k;
 }
 
+// Whether the prologue memo may arm for this context. Two statements rewrite a graph tensor's data in place under an
+// unchanged uid, buffer and publish generation, after which a served part no longer equals its full walk:
+// ggml_sycl_publish_existing_storage_handle_for_device and ggml_sycl_publish_f16_attention_dst_handle. The first
+// publishes the cross-card MoE scatter, which runs only while the cross-card expert path is latched on (every latch
+// writer requires GGML_SYCL_MOE_MULTI_GPU), and the layer-block executors' planned outputs, which need a layer block
+// on another device. The second publishes the routed simple-consumer, attention and matmul results, each of which
+// needs a target or an owner on another routable device or a plan that uses one, and the f16 fallback's result on
+// the context's own device only for a destination outside device memory, where this backend's graph nodes never are.
+// So: no cross-card expert path, and one routable device or a plan that keeps this context on its own device. The
+// expert-path term does not consult the plan because the plan test does not look at alternate layouts.
+// Asked when the memo arms for a key, never on a hit: the plan is the published one, and a publication bumps the
+// tenant generation that is in the key, so a matching key read the same plan; the switch and the device count are
+// fixed for the process.
+static bool graph_prologue_memo_may_arm(const ggml_backend_sycl_context * ctx) {
+    if (ggml_sycl_moe_multi_gpu_requested()) {
+        return false;
+    }
+    return ggml_sycl_routable_device_count() <= 1 || ggml_sycl_current_plan_is_single_device_for_graph(ctx->device);
+}
+
+// Starts a wrapper's call on the memo under the key of `cgraph` and the caller's phase, with the arming condition.
+static void graph_prologue_memo_begin(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, bool is_decode) {
+    ctx->prologue_memo.begin(graph_prologue_memo_key(ctx, cgraph, is_decode),
+                             [ctx] { return graph_prologue_memo_may_arm(ctx); });
+}
+
 // The keyed decode path's graph signature, through the prologue memo; the whole-graph and prompt paths call
 // ggml_sycl_graph_signature as before. The signature hashes structure only, and a graph llama reuses has the
 // structure it was recorded from, so a hit serves the recorded one.
@@ -111944,12 +111970,12 @@ static uint64_t graph_prologue_memo_signature(ggml_backend_sycl_context * ctx,
                                               const ggml_cgraph *         cgraph,
                                               bool                        is_decode) {
     namespace gpm        = ggml_sycl::graph_prologue_memo;
-    const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode();
+    const gpm::mode mode = graph_prologue_memo_mode();
     if (mode == gpm::mode::OFF || !moe_segment_keyed_mode(ctx, is_decode)) {
         return ggml_sycl_graph_signature(cgraph);
     }
     auto & memo = ctx->prologue_memo;
-    memo.begin(graph_prologue_memo_key(ctx, cgraph, is_decode));
+    graph_prologue_memo_begin(ctx, cgraph, is_decode);
     const uint64_t * held = memo.signature();
     if (held && mode == gpm::mode::ON) {
         memo.note_hit();
@@ -111971,34 +111997,42 @@ static uint64_t graph_prologue_memo_signature(ggml_backend_sycl_context * ctx,
 // The keyed slot key, through the prologue memo. A hit serves the recorded key while every distinct buffer the full
 // walk met keeps the identity and the base it had: the names and the signature are the graph's structure, and each
 // tensor's buffer and offset are fixed while the uid matches, so the storage half is then bit-equal to a full walk.
-// A changed identity or base takes the full walk, so the key changes exactly as it does without the memo.
+// A changed identity or base takes the full walk, so the key changes exactly as it does without the memo. It also
+// drops the other two parts and keeps the key armed: something outside the key moved storage the prestage list was
+// classified from, so every part is taken afresh.
 static ggml_sycl::graph_segment_cache::key graph_prologue_memo_slot_key(ggml_backend_sycl_context * ctx,
                                                                         const ggml_cgraph *         cgraph,
                                                                         uint64_t                    signature,
                                                                         bool                        is_decode) {
     namespace gpm        = ggml_sycl::graph_prologue_memo;
-    const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode();
+    const gpm::mode mode = graph_prologue_memo_mode();
     if (mode == gpm::mode::OFF) {
         return moe_segment_slot_key(ctx, cgraph, signature, is_decode);
     }
     auto & memo = ctx->prologue_memo;
-    memo.begin(graph_prologue_memo_key(ctx, cgraph, is_decode));
+    graph_prologue_memo_begin(ctx, cgraph, is_decode);
     const ggml_sycl::graph_segment_cache::key * held = memo.slot_key();
-    if (held && held->signature == signature && held->is_decode == is_decode &&
-        memo.slot_key_buffers_unchanged(moe_segment_buffer_identity, moe_segment_buffer_base)) {
-        memo.note_hit();
-        if (mode == gpm::mode::ON) {
-            return *held;
+    if (held) {
+        if (held->signature == signature && held->is_decode == is_decode &&
+            memo.slot_key_buffers_unchanged(moe_segment_buffer_identity, moe_segment_buffer_base)) {
+            memo.note_hit();
+            if (mode == gpm::mode::ON) {
+                return *held;
+            }
+            const ggml_sycl::graph_segment_cache::key full = moe_segment_slot_key(ctx, cgraph, signature, is_decode);
+            if (!memo.note_verified(full == *held)) {
+                graph_prologue_memo_mismatch(ctx, gpm::part::SLOT_KEY);
+            }
+            return full;
         }
-        const ggml_sycl::graph_segment_cache::key full = moe_segment_slot_key(ctx, cgraph, signature, is_decode);
-        if (!memo.note_verified(full == *held)) {
-            graph_prologue_memo_mismatch(ctx, gpm::part::SLOT_KEY);
-        }
-        return full;
+        memo.drop_parts();
     }
-    std::vector<ggml_sycl_prologue_memo::identity> buffers;
-    const ggml_sycl::graph_segment_cache::key full = moe_segment_slot_key(ctx, cgraph, signature, is_decode, &buffers);
     memo.note_miss();
+    if (!memo.armed()) {
+        return moe_segment_slot_key(ctx, cgraph, signature, is_decode);
+    }
+    std::vector<graph_prologue_memo::identity> buffers;
+    const ggml_sycl::graph_segment_cache::key  full = moe_segment_slot_key(ctx, cgraph, signature, is_decode, &buffers);
     memo.record_slot_key(full, std::move(buffers));
     return full;
 }
@@ -114873,12 +114907,12 @@ static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int
 // wait is illegal inside a recording.
 //
 // The decode prologue memo (graph_prologue_memo_prestage) passes `record` to list, in first-visit order, each tensor
-// that reached a stage action, or `replay` to run such a list again in place of the walk. A null pair is the full
-// pass as it always was.
-static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *                          ctx,
-                                        const ggml_cgraph *                                  cgraph,
-                                        const std::vector<ggml_sycl_prologue_memo::effect> * replay = nullptr,
-                                        std::vector<ggml_sycl_prologue_memo::effect> *       record = nullptr) {
+// that reached a stage action (only while it is armed for the graph), or `replay` to run such a list again in place
+// of the walk. A null pair is the full pass as it always was.
+static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *                      ctx,
+                                        const ggml_cgraph *                              cgraph,
+                                        const std::vector<graph_prologue_memo::effect> * replay = nullptr,
+                                        std::vector<graph_prologue_memo::effect> *       record = nullptr) {
     GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] Entering: cgraph=%p n_nodes=%d n_leafs=%d\n", (void *) cgraph,
                     cgraph ? cgraph->n_nodes : -1, cgraph ? cgraph->n_leafs : -1);
     if (!cgraph || cgraph->n_nodes == 0) {
@@ -114965,6 +114999,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
     };
 
     using prestage_arm = ggml_sycl::graph_prologue_memo::prestage_arm;
+    // Filled only on a recording pass; an empty set allocates nothing.
     std::unordered_set<const ggml_tensor *> recorded;
 
     // The stage action for a tensor that needs a device copy: the INPUT arm, or the unified cache with the staging
@@ -115171,39 +115206,48 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
 }
 
 // The keyed slot's prestage through the decode prologue memo. A hit replays the stage actions the first full pass of
-// this graph listed; a miss runs the full pass and keeps its list when it staged everything. Nothing a stage action
-// does clears the memo while the held list is replayed: the swap retire that does runs after this returns
-// (graph_prestage_or_decline). In verify mode a hit runs the full pass instead and compares its answer and list
-// with the held ones; a full pass that fails differs from a held list, which only an all-staged pass leaves.
+// this graph listed; a miss runs the full pass and, with the memo armed, keeps its list when it staged everything.
+// Nothing a stage action does clears the memo while the held list is replayed: the swap retire that does runs after
+// this returns (graph_prestage_or_decline). In verify mode a hit replays the list as mode 1 does, then runs the full
+// pass and compares the replay's answer and the held list with the pass's answer and list; the caller gets the
+// pass's answer. Running the actions twice is safe: a second INPUT stage copies into the buffer the first one left,
+// and the cache paths validate content.
 static bool graph_prologue_memo_prestage(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph) {
     namespace gpm        = ggml_sycl::graph_prologue_memo;
-    const gpm::mode mode = ggml_sycl_graph_prologue_memo_mode();
+    const gpm::mode mode = graph_prologue_memo_mode();
     if (mode == gpm::mode::OFF) {
         return graph_prestage_leaf_tensors(ctx, cgraph);
     }
     auto & memo = ctx->prologue_memo;
-    memo.begin(graph_prologue_memo_key(ctx, cgraph, ctx->graph_phase_is_decode.load(std::memory_order_relaxed)));
-    const std::vector<ggml_sycl_prologue_memo::effect> * held = memo.prestage_effects();
-    if (held && mode == gpm::mode::ON) {
+    graph_prologue_memo_begin(ctx, cgraph, ctx->graph_phase_is_decode.load(std::memory_order_relaxed));
+    const std::vector<graph_prologue_memo::effect> * held = memo.prestage_effects();
+    if (held) {
         memo.note_hit();
-        const bool staged = graph_prestage_leaf_tensors(ctx, cgraph, held);
-        if (!staged) {
-            // The same actions failed this time: the next pass is a full one, re-decided from the walk.
+        const bool replayed = graph_prestage_leaf_tensors(ctx, cgraph, held);
+        if (mode == gpm::mode::ON) {
+            if (!replayed) {
+                // The same actions failed this time: the next pass is a full one, re-decided from the walk.
+                memo.drop_prestage();
+            }
+            return replayed;
+        }
+        std::vector<graph_prologue_memo::effect> effects;
+
+        const bool staged = graph_prestage_leaf_tensors(ctx, cgraph, nullptr, &effects);
+        if (!memo.note_verified(replayed == staged && effects == *held)) {
+            graph_prologue_memo_mismatch(ctx, gpm::part::PRESTAGE);
+        } else if (!staged) {
             memo.drop_prestage();
         }
         return staged;
     }
-    std::vector<ggml_sycl_prologue_memo::effect> effects;
+    memo.note_miss();
+    if (!memo.armed()) {
+        return graph_prestage_leaf_tensors(ctx, cgraph);
+    }
+    std::vector<graph_prologue_memo::effect> effects;
 
     const bool staged = graph_prestage_leaf_tensors(ctx, cgraph, nullptr, &effects);
-    if (held) {
-        memo.note_hit();
-        if (!memo.note_verified(staged && effects == *held)) {
-            graph_prologue_memo_mismatch(ctx, gpm::part::PRESTAGE);
-        }
-        return staged;
-    }
-    memo.note_miss();
     memo.record_prestage(staged, std::move(effects));
     return staged;
 }

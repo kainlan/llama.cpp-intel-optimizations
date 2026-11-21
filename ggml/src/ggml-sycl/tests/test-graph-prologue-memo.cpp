@@ -3,9 +3,9 @@
 //
 // The decode prologue walks the graph three times on every token: the structural signature, the keyed segment slot
 // key and the input prestage. A graph llama reuses comes back with the same ggml_cgraph::uid and the same tensors, so
-// the memo serves those walks from the first full pass under the same key. This pins the memo's switch, its key,
-// what each part records and serves, the uid-0 rule, invalidation and the verify comparison. Host-only: the header
-// includes no SYCL header and names no ggml type.
+// the memo serves those walks from the first full pass under the same key. This pins the memo's switch, its key, the
+// arming answer, what each part records and serves, the uid-0 rule, invalidation and the verify comparison. Host-only:
+// the header includes no SYCL header and names no ggml type.
 //
 // MIT license
 // Copyright (C) 2024-2026 Intel Corporation
@@ -76,6 +76,22 @@ const char * base_of(const fake_buffer * b) {
     return b->base;
 }
 
+// The backend's answer to "may the memo arm for this key": these checks are about the memo, so it says yes.
+bool arm_always() {
+    return true;
+}
+
+// An answer that counts how often begin() asks.
+struct arm_counter {
+    bool answer = true;
+    int  asked  = 0;
+
+    bool operator()() {
+        asked++;
+        return answer;
+    }
+};
+
 }  // namespace
 
 int main() {
@@ -93,10 +109,10 @@ int main() {
     // A part recorded under a key is served under the same key, on the next call too.
     {
         fake_memo memo;
-        memo.begin(make_key(5));
+        memo.begin(make_key(5), arm_always);
         CHECK(memo.signature() == nullptr, "nothing is served before a record");
         memo.record_signature(42);
-        memo.begin(make_key(5));
+        memo.begin(make_key(5), arm_always);
         CHECK(memo.signature() != nullptr && *memo.signature() == 42, "the same key serves the recorded signature");
     }
 
@@ -104,7 +120,7 @@ int main() {
     {
         for (int field = 0; field < 6; ++field) {
             fake_memo memo;
-            memo.begin(make_key(5));
+            memo.begin(make_key(5), arm_always);
             memo.record_signature(42);
             gpm::key other = make_key(5);
             switch (field) {
@@ -128,9 +144,9 @@ int main() {
                     break;
             }
             CHECK(!(other == make_key(5)), "the key compares the changed field");
-            memo.begin(other);
+            memo.begin(other, arm_always);
             CHECK(memo.signature() == nullptr, "a key that differs in one field drops the parts");
-            memo.begin(make_key(5));
+            memo.begin(make_key(5), arm_always);
             CHECK(memo.signature() == nullptr, "and they do not come back when the old key returns");
         }
     }
@@ -138,36 +154,108 @@ int main() {
     // uid 0 means "not set": it never hits and records nothing, and it drops what an earlier key recorded.
     {
         fake_memo memo;
-        memo.begin(make_key(0));
+        memo.begin(make_key(0), arm_always);
         memo.record_signature(42);
         memo.record_slot_key(make_slot_key(1), std::vector<fake_ident>());
         memo.record_prestage(true, std::vector<fake_effect>(1, fake_effect{}));
-        memo.begin(make_key(0));
+        memo.begin(make_key(0), arm_always);
         CHECK(memo.signature() == nullptr, "uid 0 records no signature");
         CHECK(memo.slot_key() == nullptr, "uid 0 records no slot key");
         CHECK(memo.prestage_effects() == nullptr, "uid 0 records no prestage list");
 
-        memo.begin(make_key(5));
+        memo.begin(make_key(5), arm_always);
         memo.record_signature(42);
-        memo.begin(make_key(0));
+        memo.begin(make_key(0), arm_always);
         CHECK(memo.signature() == nullptr, "a uid-0 call drops the parts of the key before it");
+    }
+
+    // The arming answer: asked when the memo arms for a key, never on a call under the same key, and kept for the key.
+    {
+        fake_memo   memo;
+        arm_counter yes;
+        memo.begin(make_key(5), yes);
+        CHECK(yes.asked == 1 && memo.armed(), "a new key asks once and arms on yes");
+        memo.record_signature(42);
+        memo.begin(make_key(5), yes);
+        memo.begin(make_key(5), yes);
+        CHECK(yes.asked == 1, "a call under the same key does not ask again");
+        CHECK(memo.signature() != nullptr, "and is served");
+        memo.begin(make_key(6), yes);
+        CHECK(yes.asked == 2, "another key asks again");
+        memo.begin(make_key(0), yes);
+        CHECK(yes.asked == 2 && !memo.armed(), "a uid-0 key does not ask and does not arm");
+    }
+
+    // Not armed: nothing is served and nothing is recorded, and the refusal holds for the key.
+    {
+        fake_tensor a{ 1 };
+        fake_buffer x{ 100, reinterpret_cast<const char *>(0x1000) };
+        fake_memo   memo;
+        arm_counter no;
+        no.answer = false;
+        memo.begin(make_key(5), no);
+        CHECK(no.asked == 1 && !memo.armed(), "a no leaves the memo unarmed");
+        memo.record_signature(42);
+        memo.record_slot_key(make_slot_key(9), std::vector<fake_ident>(1, fake_ident{ &x, 100, x.base }));
+        memo.record_prestage(true, std::vector<fake_effect>(1, fake_effect{ &a, gpm::prestage_arm::INPUT, "leaf" }));
+        CHECK(memo.signature() == nullptr, "no signature is recorded or served");
+        CHECK(memo.slot_key() == nullptr && memo.slot_key_buffers().empty(), "no slot key is recorded or served");
+        CHECK(memo.prestage_effects() == nullptr, "no prestage list is recorded or served");
+        memo.begin(make_key(5), no);
+        CHECK(no.asked == 1 && !memo.armed(), "the same key does not ask again and stays unarmed");
+        memo.record_signature(43);
+        CHECK(memo.signature() == nullptr, "and still records nothing");
+        arm_counter yes;
+        memo.begin(make_key(6), yes);
+        CHECK(yes.asked == 1 && memo.armed(), "another key asks afresh");
     }
 
     // clear() drops every part and disarms until the next begin(); the counters survive it.
     {
-        fake_memo memo;
-        memo.begin(make_key(5));
+        fake_tensor a{ 1 };
+        fake_memo   memo;
+        memo.begin(make_key(5), arm_always);
         memo.record_signature(42);
+        memo.record_slot_key(make_slot_key(9), std::vector<fake_ident>());
+        memo.record_prestage(true, std::vector<fake_effect>(1, fake_effect{ &a, gpm::prestage_arm::INPUT, "leaf" }));
         memo.note_hit();
         memo.clear();
+        CHECK(!memo.armed(), "clear disarms");
         CHECK(memo.signature() == nullptr, "clear drops the signature");
+        CHECK(memo.slot_key() == nullptr, "clear drops the slot key");
+        CHECK(memo.prestage_effects() == nullptr, "clear drops the prestage list");
         memo.record_signature(43);
-        CHECK(memo.signature() == nullptr, "a cleared memo records nothing before the next begin");
-        memo.begin(make_key(5));
+        memo.record_slot_key(make_slot_key(9), std::vector<fake_ident>());
+        memo.record_prestage(true, std::vector<fake_effect>(1, fake_effect{ &a, gpm::prestage_arm::INPUT, "leaf" }));
+        CHECK(memo.signature() == nullptr, "a cleared memo records no signature before the next begin");
+        CHECK(memo.slot_key() == nullptr, "a cleared memo records no slot key before the next begin");
+        CHECK(memo.prestage_effects() == nullptr, "a cleared memo records no prestage list before the next begin");
+        arm_counter yes;
+        memo.begin(make_key(5), yes);
+        CHECK(yes.asked == 1, "the next begin under the old key asks again");
         CHECK(memo.signature() == nullptr, "the next begin starts empty");
         memo.record_signature(44);
         CHECK(memo.signature() != nullptr && *memo.signature() == 44, "and records again");
         CHECK(memo.stats().hits == 1, "clear keeps the counters");
+    }
+
+    // drop_parts() drops every part and keeps the key armed: the caller records afresh under the same key.
+    {
+        fake_tensor a{ 1 };
+        fake_memo   memo;
+        arm_counter yes;
+        memo.begin(make_key(5), yes);
+        memo.record_signature(42);
+        memo.record_slot_key(make_slot_key(9), std::vector<fake_ident>());
+        memo.record_prestage(true, std::vector<fake_effect>(1, fake_effect{ &a, gpm::prestage_arm::INPUT, "leaf" }));
+        memo.drop_parts();
+        CHECK(memo.signature() == nullptr && memo.slot_key() == nullptr && memo.prestage_effects() == nullptr,
+              "drop_parts drops all three parts");
+        CHECK(memo.armed(), "and keeps the memo armed");
+        memo.begin(make_key(5), yes);
+        CHECK(yes.asked == 1, "under the same key, without asking again");
+        memo.record_slot_key(make_slot_key(10), std::vector<fake_ident>());
+        CHECK(memo.slot_key() != nullptr && *memo.slot_key() == make_slot_key(10), "and records again");
     }
 
     // The prestage list is recorded only for a pass that staged everything, and is served in its order.
@@ -176,7 +264,7 @@ int main() {
         fake_tensor b{ 2 };
         fake_tensor c{ 3 };
         fake_memo   memo;
-        memo.begin(make_key(5));
+        memo.begin(make_key(5), arm_always);
         const fake_effect effect_a{ &a, gpm::prestage_arm::INPUT, "leaf" };
         const fake_effect effect_b{ &b, gpm::prestage_arm::CACHE, "node_src" };
         const fake_effect effect_c{ &c, gpm::prestage_arm::CACHE, "node_src" };
@@ -221,7 +309,7 @@ int main() {
         fake_buffer x{ 100, reinterpret_cast<const char *>(0x1000) };
         fake_buffer y{ 200, reinterpret_cast<const char *>(0x2000) };
         fake_memo   memo;
-        memo.begin(make_key(5));
+        memo.begin(make_key(5), arm_always);
         std::vector<fake_ident> met;
         met.push_back(fake_ident{ &x, 100, x.base });
         met.push_back(fake_ident{ &y, 200, y.base });
@@ -241,13 +329,24 @@ int main() {
     // Verify: a comparison that agrees counts and keeps the memo; one that differs counts a mismatch and clears it.
     {
         fake_memo memo;
-        memo.begin(make_key(5));
+        memo.begin(make_key(5), arm_always);
         memo.record_signature(42);
         CHECK(memo.note_verified(true), "an agreeing comparison answers true");
         CHECK(memo.signature() != nullptr, "and keeps the memo");
         CHECK(!memo.note_verified(false), "a differing comparison answers false");
         CHECK(memo.signature() == nullptr, "and clears the memo");
         CHECK(memo.stats().verified == 2 && memo.stats().mismatches == 1, "both are counted, the difference apart");
+
+        // The caller then uses the full result; nothing it records before the next begin() is kept.
+        fake_tensor a{ 1 };
+        memo.record_signature(43);
+        memo.record_slot_key(make_slot_key(9), std::vector<fake_ident>());
+        memo.record_prestage(true, std::vector<fake_effect>(1, fake_effect{ &a, gpm::prestage_arm::INPUT, "leaf" }));
+        CHECK(memo.signature() == nullptr && memo.slot_key() == nullptr && memo.prestage_effects() == nullptr,
+              "a record between a difference and the next begin records nothing");
+        memo.begin(make_key(5), arm_always);
+        memo.record_signature(44);
+        CHECK(memo.signature() != nullptr && *memo.signature() == 44, "the next begin records afresh");
     }
 
     // The counters the teardown summary prints.
