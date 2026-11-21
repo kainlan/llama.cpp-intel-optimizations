@@ -936,6 +936,22 @@ if (Python3_Interpreter_FOUND)
     # TIMEOUT: its mutant self-test took 29.5 s wall at host load 43, against the old 30 s.
     set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The token-start stamps of a replayed MoE decode token (backend entry, replay begin, per-block enqueue, PLE
+    # gather, logits wait) sit inside the trace flag's branch, add no wait, event query or allocation, and keep the
+    # per-block stamps in a fixed buffer. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-token-start-stamps-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-token-start-stamps-source.py --self-test)
+    set_tests_properties(test-sycl-token-start-stamps-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The decode prologue memo of a graph llama reuses (GGML_SYCL_GRAPH_PROLOGUE_MEMO): its key, the uid-0 rule,
+    # mode 0 as the full walks, the prestage replay and its failure handling, every invalidation point, the verify
+    # comparison and the teardown line. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-graph-prologue-memo-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-prologue-memo-source.py --self-test)
+    set_tests_properties(test-sycl-graph-prologue-memo-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # CPU expert job joins go on the cache's join-only queue behind GGML_SYCL_MOE_JOIN_QUEUE, after the latest
     # recorded host task, and the scatter still depends on them (llama.cpp-wfsl). Run WITH --self-test so each
     # pin is proven to catch its mutant.
@@ -1072,6 +1088,15 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
             --self-test)
     set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The opt-in spread order of routed experts: both orders go through one comparator, the switch is read once and
+    # reaches the planner only through the inventory intake, the planner writes no popularity rank, the spread sort runs
+    # before the ring room and the pack, and the swap headroom is a WEIGHT zone term. Run WITH --self-test so each
+    # mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-spread-placement-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-spread-placement-source.py
+            --self-test)
+    set_tests_properties(test-sycl-moe-spread-placement-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The q8_0 matvec's column-split form: production asks the shape rule with the card's compute units, the row form
     # still launches unchanged for every other shape, and the split kernels keep the barrier-before-sum order a single

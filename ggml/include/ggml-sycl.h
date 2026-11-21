@@ -2137,7 +2137,8 @@ typedef struct ggml_sycl_plan_dry_run_opts {
 // One plan's host terms, each the plan's own field: the WEIGHT zone's terms (placement_plan_host_weight_zone_terms),
 // the commit terms (placement_plan_host_zone_commit_terms), expected_host (host_planned_bytes), the residency of the
 // plan's host entries by backing, and weight_host_bytes, the plan's charge for its PINNED and HOST_CPU entries, which
-// the residency of those two backings must equal (the dry run warns where it does not).
+// the residency of those two backings must equal (the dry run warns where it does not). The WEIGHT term swap_headroom
+// is not exported: the dry run prints it on its own line, and zone_weight and expected_host already count it.
 typedef struct ggml_sycl_plan_dry_run_plan {
     int32_t  device;        // the plan's device_id, the device the planner's own lines name
     uint32_t multi_device;  // 1: one plan over every physical device
