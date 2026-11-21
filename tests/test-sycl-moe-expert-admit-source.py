@@ -204,7 +204,7 @@ RESOLVED_TYPE = "out.type = tensor->type;"
 RESOLVED_NCOLS = "out.ncols = tensor->ne[0];"
 RESOLVED_LOGICAL = "out.logical_bytes = tensor->nb[2];"
 STAGED_GUARD = "if (layout != GGML_LAYOUT_AOS ||"
-STAGED_AOS = "return aos_staged_weight_bytes(type, ncols, host_bytes);"
+STAGED_AOS = "return aos_staged_weight_bytes(type, ncols, expert_bytes);"
 CACHE_LOGICAL = "const size_t logical = admit ? members[i].logical_bytes : e.size;"
 HOST_SIZE_GUARD = 'if (e.size < logical) { refusal = "host copy size"; break; }'
 CACHE_STAGED = ("const size_t staged = admit ? "
@@ -496,7 +496,7 @@ def self_test(raw: dict[str, str]) -> int:
                                                       "bytes[i]       = e.size;")])
     expect_fail("helper-ignores-layout", "A4", [("pad", STAGED_SIG, "layout != GGML_LAYOUT_AOS || ", "")])
     expect_fail("helper-computed-for-iq4-nl", "A4", [("pad", STAGED_SIG, "    return aos_staged_weight_bytes(",
-                                                      "    if (type == GGML_TYPE_IQ4_NL) {\n        return host_bytes "
+                                                      "    if (type == GGML_TYPE_IQ4_NL) {\n        return expert_bytes "
                                                       "+ 216;\n    }\n    return aos_staged_weight_bytes(")])
     expect_fail("width-not-resolved", "A4", [("sycl", RESOLVE_SIG, "    out.ncols         = tensor->ne[0];\n", "")])
     expect_fail("entry-sized-at-host-bytes", "A4", [("cache", COPY_SIG, "entry.size                  = device_size[i];",
