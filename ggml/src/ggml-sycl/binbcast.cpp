@@ -417,6 +417,27 @@ bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, 
     return ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device);
 }
 
+static void * ggml_sycl_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
+                                                        const ggml_tensor *         tensor,
+                                                        size_t                      span_bytes,
+                                                        int                         device,
+                                                        ggml_sycl::mem_handle *     out_handle) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(span_bytes);
+    GGML_UNUSED(device);
+    GGML_UNUSED(out_handle);
+    return nullptr;
+}
+
+void * ggml_sycl_test_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
+                                                      const ggml_tensor *         tensor,
+                                                      size_t                      span_bytes,
+                                                      int                         device) {
+    ggml_sycl::mem_handle handle;
+    return ggml_sycl_binbcast_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &handle);
+}
+
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
 static void k_bin_bcast(const src0_t *           src0,
                         const src1_t *           src1,
