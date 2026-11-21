@@ -9,22 +9,31 @@ depends on how the work is scheduled, so identical inputs give different bits fr
 decoding parts where two candidates nearly tie. The attribute forbids those implementations. It only works if every
 attribute object the backend builds carries it, so this gate holds that, and holds the one switch that turns it off:
 
-  D1  dnnl-ops.hpp defines the helper ggml_sycl_dnnl_attr_set_reproducible(dnnl::primitive_attr & attr) once, and its
-      body is exactly: when the switch is on, attr.set_deterministic(true);
-  D2  the switch GGML_SYCL_ONEDNN_DETERMINISTIC is ON by default: its one accessor returns true when the variable is
-      unset, its report row in ggml_check_sycl() has default 1, and the row's integer is overwritten from the
-      accessor after the table parse, so the report says what is in effect;
+  D1  dnnl-deterministic.hpp defines the helper ggml_sycl_dnnl_attr_set_reproducible(dnnl::primitive_attr & attr)
+      once, and its body is exactly: when the switch is on, attr.set_deterministic(true); no other code calls
+      set_deterministic, in the C++ API or the C API;
+  D2  the switch GGML_SYCL_ONEDNN_DETERMINISTIC is ON by default and only the exact value "0" turns it off: its one
+      accessor returns true when the variable is unset or is anything but "0" (an empty value, "false", "off" or a
+      typo keeps the reproducible mode, the safe side of a mistyped variable, where std::atoi would read 0), its
+      report row in ggml_check_sycl() has default 1, and the row's integer is overwritten from the accessor after the
+      table parse, so the report says what is in effect;
   D3  every dnnl::primitive_attr the backend constructs is handed to the helper in the very next statement, or is
       initialised from a function that returns one (whose own construction is held by this pin); no other way of
       making an attribute object (a temporary, the C API, the type named without dnnl::) appears;
-  D4  the variable is read once: its name is spelled once (the constant beside the accessor), and the constant is
-      used only by its definition, the accessor's getenv and the report row;
+  D4  the variable is read in exactly two places, and the accessor's read is the one that decides: its name is
+      spelled once (the constant beside the accessor), and the constant is used only by its definition, the
+      accessor's getenv and the report row. The report row is the second read: the startup table reads every row's
+      name with the generic integer parser, and this row's result is then overwritten from the accessor (D2), so it
+      never decides anything. Any third read fails;
   D5  every primitive descriptor is built with an attribute: its last argument names an attribute object of the
-      file (one D3 holds, or a const reference parameter that carries one);
-  D6  docs/backend/sycl-env-vars.md has the variable's row, default ON.
+      file (one D3 holds, or a const reference parameter that carries one), whether it is built with parentheses or
+      braces; no descriptor is built through the C API, where a null attribute would pass unseen;
+  D6  docs/backend/sycl-env-vars.md has the variable's row, default ON, stating that only the exact value 0 turns
+      it off.
 
-The scan covers every .cpp/.hpp/.h under ggml/src/ggml-sycl except its tests/ directory, which holds a standalone
-benchmark (bench-dnnl-ops.cpp) that does not link the backend and cannot see the helper.
+The scan covers every .cpp/.hpp/.h under ggml/src/ggml-sycl except its tests/ directory, plus the standalone oneDNN
+benchmark tests/bench-dnnl-ops.cpp there, which includes dnnl-deterministic.hpp so that it times the implementation
+the backend runs.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
@@ -45,6 +54,8 @@ BACKEND_DIR = ROOT / "ggml/src/ggml-sycl"
 DOCS = ROOT / "docs/backend/sycl-env-vars.md"
 
 DNNL_OPS = "ggml/src/ggml-sycl/dnnl-ops.hpp"
+HDR = "ggml/src/ggml-sycl/dnnl-deterministic.hpp"
+BENCH = "ggml/src/ggml-sycl/tests/bench-dnnl-ops.cpp"
 GGML_SYCL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 DOCS_KEY = "docs/backend/sycl-env-vars.md"
 
@@ -59,12 +70,13 @@ HELPER_BODY = f"{{ if ({ACCESSOR}()) {{ attr.set_deterministic(true); }} }}"
 ACCESSOR_DEF = f"inline bool {ACCESSOR}() {{"
 ACCESSOR_BODY = (
     f"{{ static const bool enabled = [] {{ const char * env = std::getenv({ENV_CONST}); "
-    "return env == nullptr || std::atoi(env) != 0; }(); return enabled; }"
+    'return env == nullptr || std::strcmp(env, "0") != 0; }(); return enabled; }'
 )
 CONST_DEF = f'static constexpr const char * {ENV_CONST} = "{ENV_NAME}";'
 REPORT_ROW = f"{{ {ENV_CONST}, &{REPORT_GLOBAL}, 1 }},"
 REPORT_SET = f"{REPORT_GLOBAL} = {ACCESSOR}() ? 1 : 0;"
 DOCS_ROW = f"| `{ENV_NAME}=0` | ON |"
+DOCS_STRICT = "Only the exact value `0` turns the attribute off"
 
 ATTR_TYPE = re.compile(r"\bdnnl::primitive_attr\b")
 DECL_PLAIN = re.compile(r"dnnl::primitive_attr\s+([A-Za-z_]\w*)\s*;")
@@ -73,7 +85,9 @@ FACTORY_DEF = re.compile(r"dnnl::primitive_attr\s+([A-Za-z_]\w*)\s*\([^;{)]*\)\s
 PARAM_REF = re.compile(r"(?:const\s+)?dnnl::primitive_attr\s*&\s*([A-Za-z_]\w*)\s*[,)]")
 BARE_TYPE = re.compile(r"(?<![\w:])primitive_attr\s+[A-Za-z_]\w*\s*[;={(]")
 C_API_CREATE = re.compile(r"\bdnnl_primitive_attr_(?:create|clone)\s*\(")
-PD_CALL = re.compile(r"\bprimitive_desc\s*\(|\bprimitive_desc\s+[A-Za-z_]\w*\s*\(")
+PD_CALL = re.compile(r"\bprimitive_desc\s*[({]|\bprimitive_desc\s+[A-Za-z_]\w*\s*[({]")
+C_API_PD = re.compile(r"\bdnnl_\w*primitive_desc_create\s*\(")
+SET_DETERMINISTIC = re.compile(r"set_deterministic\s*\(")
 ENV_READ = re.compile(r"\b(?:std::)?(?:getenv|secure_getenv|get_sycl_env)\s*\(\s*([^,)]*)")
 
 
@@ -178,16 +192,20 @@ def check(files: dict[str, str]) -> None:
 
     # D1 ---------------------------------------------------------------------------------------------------------------
     for rel, code in sources.items():
-        if rel != DNNL_OPS and re.search(rf"\b{HELPER}\s*\([^;)]*&", code):
+        if rel != HDR and re.search(rf"\b{HELPER}\s*\([^;)]*&", code):
             raise ContractError(f"FAIL [pin D1]: {rel} defines a second {HELPER}")
-    body = definition_body(sources, DNNL_OPS, HELPER_DEF, "D1")
+    body = definition_body(sources, HDR, HELPER_DEF, "D1")
     if body != HELPER_BODY:
         raise ContractError(f"FAIL [pin D1]: the helper's body is `{body}`, not `{HELPER_BODY}`")
+    calls = [(rel, line_of(code, m.start())) for rel, code in sources.items() for m in SET_DETERMINISTIC.finditer(code)]
+    if len(calls) != 1 or calls[0][0] != HDR:
+        raise ContractError(f"FAIL [pin D1]: set_deterministic is called at {calls}; only the helper may call it")
 
     # D2 ---------------------------------------------------------------------------------------------------------------
-    body = definition_body(sources, DNNL_OPS, ACCESSOR_DEF, "D2")
+    body = definition_body(sources, HDR, ACCESSOR_DEF, "D2")
     if body != squash(ACCESSOR_BODY):
-        raise ContractError(f"FAIL [pin D2]: the accessor's body is `{body}`, not the default-ON reader")
+        raise ContractError(f"FAIL [pin D2]: the accessor's body is `{body}`, not the default-ON reader that only "
+                            "\"0\" turns off")
     main_sq = squash(sources[GGML_SYCL])
     for want, what in ((REPORT_ROW, "the report row with default 1"), (REPORT_SET, "the report's overwrite")):
         n = main_sq.count(want)
@@ -253,8 +271,8 @@ def check(files: dict[str, str]) -> None:
         raw_count += code.count(f'"{ENV_NAME}"')
     if raw_count != 1:
         raise ContractError(f"FAIL [pin D4]: the name \"{ENV_NAME}\" is spelled {raw_count} times, not once")
-    if squash(sources[DNNL_OPS]).count(CONST_DEF) != 1:
-        raise ContractError(f"FAIL [pin D4]: dnnl-ops.hpp does not define `{CONST_DEF}` once")
+    if squash(sources[HDR]).count(CONST_DEF) != 1:
+        raise ContractError(f"FAIL [pin D4]: dnnl-deterministic.hpp does not define `{CONST_DEF}` once")
     uses = []
     for rel, code in sources.items():
         for m in re.finditer(rf"\b{ENV_CONST}\b", code):
@@ -262,25 +280,31 @@ def check(files: dict[str, str]) -> None:
     by_file = {}
     for rel, _ in uses:
         by_file[rel] = by_file.get(rel, 0) + 1
-    if by_file != {DNNL_OPS: 2, GGML_SYCL: 1}:
+    if by_file != {HDR: 2, GGML_SYCL: 1}:
         raise ContractError(
             f"FAIL [pin D4]: {ENV_CONST} is used at {uses}; it belongs to its definition, the accessor and the "
-            "report row only"
+            "one report row only"
         )
     for rel, code in sources.items():
         for m in ENV_READ.finditer(code):
             arg = m.group(1).strip()
-            if f'"{ENV_NAME}"' in arg or (re.search(rf"\b{ENV_CONST}\b", arg) and rel != DNNL_OPS):
+            if f'"{ENV_NAME}"' in arg or (re.search(rf"\b{ENV_CONST}\b", arg) and rel != HDR):
                 raise ContractError(f"FAIL [pin D4]: {rel}:{line_of(code, m.start())}: a second reader of {ENV_NAME}")
-    accessor_reads = sum(1 for m in ENV_READ.finditer(sources[DNNL_OPS]) if m.group(1).strip() == ENV_CONST)
+    accessor_reads = sum(1 for m in ENV_READ.finditer(sources[HDR]) if m.group(1).strip() == ENV_CONST)
     if accessor_reads != 1:
-        raise ContractError(f"FAIL [pin D4]: dnnl-ops.hpp reads {ENV_CONST} {accessor_reads} times, not once")
+        raise ContractError(f"FAIL [pin D4]: dnnl-deterministic.hpp reads {ENV_CONST} {accessor_reads} times, not once")
 
     # D5 ---------------------------------------------------------------------------------------------------------------
     n_pd = 0
     for rel, code in sources.items():
+        m = C_API_PD.search(code)
+        if m:
+            raise ContractError(
+                f"FAIL [pin D5]: {rel}:{line_of(code, m.start())}: a primitive descriptor is built through the C API, "
+                "whose attribute argument (null included) this pin does not hold"
+            )
         for m in PD_CALL.finditer(code):
-            open_at = code.find("(", m.start())
+            open_at = m.end() - 1  # the `(` or `{` the pattern ended on
             args = paren_args(code, open_at)
             n_pd += 1
             last = args[-1] if args else ""
@@ -293,8 +317,11 @@ def check(files: dict[str, str]) -> None:
         raise ContractError("FAIL [pin D5]: no primitive descriptor found, so the pin read the wrong text")
 
     # D6 ---------------------------------------------------------------------------------------------------------------
-    if files[DOCS_KEY].count(DOCS_ROW) != 1:
+    rows = [line for line in files[DOCS_KEY].splitlines() if line.startswith(DOCS_ROW)]
+    if len(rows) != 1:
         raise ContractError(f"FAIL [pin D6]: {DOCS_KEY} has no single row starting `{DOCS_ROW}`")
+    if DOCS_STRICT not in rows[0]:
+        raise ContractError(f"FAIL [pin D6]: the {ENV_NAME} row does not say `{DOCS_STRICT}`")
 
 
 def load() -> dict[str, str]:
@@ -303,7 +330,7 @@ def load() -> dict[str, str]:
         if path.suffix not in (".cpp", ".hpp", ".h") or not path.is_file():
             continue
         rel = path.relative_to(ROOT).as_posix()
-        if rel.startswith("ggml/src/ggml-sycl/tests/"):
+        if rel.startswith("ggml/src/ggml-sycl/tests/") and rel != BENCH:
             continue
         raws[rel] = path.read_text(errors="replace")
     raws[DOCS_KEY] = DOCS.read_text()
@@ -356,7 +383,7 @@ def self_test(raws: dict[str, str]) -> int:
     softmax_bare = "        dnnl::primitive_attr attr;\n        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);\n" \
                    "\n        auto softmax_pd"
     det_call = "        attr.set_deterministic(true);\n"
-    accessor_ret = "        return env == nullptr || std::atoi(env) != 0;\n"
+    accessor_ret = '        return env == nullptr || std::strcmp(env, "0") != 0;\n'
 
     # (a) an attribute built without the helper.
     expect_fail("helper-call-removed", "D3", DNNL_OPS, [(softmax_decl, softmax_bare)])
@@ -388,29 +415,64 @@ def self_test(raws: dict[str, str]) -> int:
     # A default-constructed temporary in the call is a construction the helper never saw.
     expect_fail("pd-with-default-attr", "D3", DNNL_OPS,
                 [("            src_md, dst_md, 1, attr);", "            src_md, dst_md, 1, dnnl::primitive_attr());")])
+    expect_fail("pd-brace-initialised-without-attr", "D5", DNNL_OPS,
+                [(softmax_decl, softmax_decl.replace(
+                    "        auto softmax_pd",
+                    "        dnnl::softmax_forward::primitive_desc extra_pd{ eng, dnnl::prop_kind::forward_inference,\n"
+                    "            dnnl::algorithm::softmax_accurate, src_md, dst_md, 1 };\n        auto softmax_pd"))])
+    expect_fail("pd-through-c-api-with-null-attr", "D5", DNNL_OPS,
+                [(softmax_decl, softmax_decl.replace(
+                    "        auto softmax_pd",
+                    "        dnnl_primitive_desc_t raw_pd = nullptr;\n"
+                    "        dnnl_softmax_forward_primitive_desc_create(&raw_pd, eng.get(), dnnl_forward_inference,\n"
+                    "            dnnl_softmax_accurate, src_md.get(), dst_md.get(), 1, nullptr);\n"
+                    "        auto softmax_pd"))])
+    # The benchmark builds its descriptors through the helper too.
+    expect_fail("bench-attr-without-helper", "D3", BENCH,
+                [("    dnnl::primitive_attr attr;\n    ggml_sycl_dnnl_attr_set_reproducible(attr);\n"
+                  "    auto binary_pd",
+                  "    dnnl::primitive_attr attr;\n    auto binary_pd")])
+    expect_fail("bench-pd-without-attr", "D5", BENCH,
+                [("dst_md, eps, flags::use_scale, attr);", "dst_md, eps, flags::use_scale);")])
     # (b) the helper stops asking for determinism.
-    expect_fail("helper-no-longer-deterministic", "D1", DNNL_OPS, [(det_call, "        (void) attr;\n")])
-    expect_fail("helper-asks-false", "D1", DNNL_OPS, [(det_call, "        attr.set_deterministic(false);\n")])
-    expect_fail("helper-ignores-the-switch", "D1", DNNL_OPS,
+    expect_fail("helper-no-longer-deterministic", "D1", HDR, [(det_call, "        (void) attr;\n")])
+    expect_fail("helper-asks-false", "D1", HDR, [(det_call, "        attr.set_deterministic(false);\n")])
+    expect_fail("helper-ignores-the-switch", "D1", HDR,
                 [(f"    if ({ACCESSOR}()) {{\n" + det_call + "    }\n", "    " + det_call.strip() + "\n")])
     expect_fail("second-helper", "D1", "ggml/src/ggml-sycl/common.hpp",
                 [("#endif  // GGML_SYCL_COMMON_HPP",
                   f"inline void {HELPER}(int & attr) {{ (void) attr; }}\n#endif  // GGML_SYCL_COMMON_HPP")])
-    # (c) the default flips to off.
-    expect_fail("default-off", "D2", DNNL_OPS,
-                [(accessor_ret, "        return env != nullptr && std::atoi(env) != 0;\n")])
+    # (c) set_deterministic called anywhere but the helper, through either API.
+    expect_fail("set-deterministic-outside-helper", "D1", gemm,
+                [("        attr.set_scales(DNNL_ARG_WEIGHTS, mask, { group_size, 1 }, dt::f16);",
+                  "        attr.set_scales(DNNL_ARG_WEIGHTS, mask, { group_size, 1 }, dt::f16);\n"
+                  "        attr.set_deterministic(false);")])
+    expect_fail("set-deterministic-through-c-api", "D1", DNNL_OPS,
+                [(softmax_decl, softmax_decl + "\n        dnnl_primitive_attr_set_deterministic(attr.get(), 0);\n")])
+    # (d) the default flips to off, or something other than exactly "0" turns it off.
+    expect_fail("default-off", "D2", HDR,
+                [(accessor_ret, '        return env != nullptr && std::strcmp(env, "0") != 0;\n')])
+    expect_fail("parse-by-atoi", "D2", HDR,
+                [(accessor_ret, "        return env == nullptr || std::atoi(env) != 0;\n")])
+    expect_fail("empty-value-turns-off", "D2", HDR,
+                [(accessor_ret, '        return env == nullptr || (env[0] != 0 && std::strcmp(env, "0") != 0);\n')])
+    expect_fail("prefix-zero-turns-off", "D2", HDR,
+                [(accessor_ret, '        return env == nullptr || std::strncmp(env, "0", 1) != 0;\n')])
     expect_fail("report-default-off", "D2", GGML_SYCL, [(REPORT_ROW, REPORT_ROW.replace(", 1 }", ", 0 }"))])
     expect_fail("report-not-overwritten", "D2", GGML_SYCL, [(REPORT_SET, "")])
-    # (d) a second reader of the variable.
+    # (e) a third read of the variable (the accessor and the report row are the two allowed).
     expect_fail("second-reader-literal", "D4", GGML_SYCL,
                 [(REPORT_SET, REPORT_SET + f'\n        (void) std::getenv("{ENV_NAME}");')])
     expect_fail("second-reader-constant", "D4", GGML_SYCL,
                 [(REPORT_SET, REPORT_SET + f"\n        (void) get_sycl_env({ENV_CONST}, 1);")])
-    expect_fail("second-read-in-accessor-file", "D4", DNNL_OPS,
+    expect_fail("second-read-in-accessor-file", "D4", HDR,
                 [(HELPER_DEF, f"inline bool other_reader() {{ return std::getenv({ENV_CONST}) != nullptr; }}\n\n"
                               + HELPER_DEF)])
+    expect_fail("second-report-row", "D4", GGML_SYCL, [(REPORT_ROW, REPORT_ROW + "\n            " + REPORT_ROW.replace(
+        f"&{REPORT_GLOBAL}", "&g_ggml_sycl_disable_dnn"))])
     # the documentation row.
     expect_fail("docs-row-missing", "D6", DOCS_KEY, [(DOCS_ROW, "| `GGML_SYCL_ONEDNN_DETERMINISTIC_X=0` | ON |")])
+    expect_fail("docs-row-without-the-parse-rule", "D6", DOCS_KEY, [(DOCS_STRICT, "Only the value `0` turns it off")])
 
     try:
         mutate(raws, DNNL_OPS, [("this anchor is in no source", "x")])
