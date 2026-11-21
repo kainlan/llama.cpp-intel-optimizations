@@ -871,8 +871,10 @@ struct recording_this_thread_scope {
 static bool test_binbcast_reads_staged_graph_input_while_recording() {
     printf("\n=== Test: binbcast reads a staged graph input while recording ===\n");
 
-    alignas(64) std::uint8_t raw_host[4096]   = {};
-    alignas(64) std::uint8_t staged_fake[256] = {};  // never dereferenced: the lookup only resolves the handle
+    alignas(64) std::uint8_t raw_host[4096]       = {};
+    alignas(64) std::uint8_t staged_fake[256]     = {};  // never dereferenced: the lookup only resolves the handle
+    // The view's own entry: a lookup keyed on the view's root would answer staged_fake instead.
+    alignas(64) std::uint8_t staged_view_fake[64] = {};
 
     ggml_tensor bias;
     init_tensor(bias, "leaf_115");
@@ -922,7 +924,7 @@ static bool test_binbcast_reads_staged_graph_input_while_recording() {
         bias_bytes);
     ctx->graph_input_staging_adopt_for_test(
         &view,
-        ggml_sycl::mem_handle::from_direct(staged_fake, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0,
+        ggml_sycl::mem_handle::from_direct(staged_view_fake, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0,
                                            ggml_nbytes(&view)),
         ggml_nbytes(&view));
 
@@ -944,8 +946,9 @@ static bool test_binbcast_reads_staged_graph_input_while_recording() {
             ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &not_input, ggml_nbytes(&not_input), 0) == nullptr,
             "a host tensor without the INPUT flag must not read a staging entry keyed by its pointer");
 
-        TEST_ASSERT(ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &view, ggml_nbytes(&view), 0) == staged_fake,
-                    "a view of an INPUT is that input: the pre-stage stages it under its own pointer");
+        TEST_ASSERT(
+            ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &view, ggml_nbytes(&view), 0) == staged_view_fake,
+            "a view of an INPUT reads its own entry: the pre-stage stages it under its own pointer");
 
         const char saved_first = bias.name[0];
         bias.name[0]           = '\0';

@@ -60,7 +60,12 @@ def helper_body(code: str) -> str:
 
 def main() -> int:
     code = strip_comments(BINBCAST.read_text(encoding="utf-8"))
-    body = lambda_body(code)
+    try:
+        body = lambda_body(code)
+        helper = helper_body(code)
+    except ValueError:
+        print("FAIL: binbcast.cpp no longer has stage_raw_host_source or " + HELPER.rstrip("("))
+        return 1
     failures = []
 
     call = body.find(HELPER)
@@ -98,7 +103,6 @@ def main() -> int:
         if "return" not in hit:
             failures.append("a staged-input hit must return the staged pointer")
 
-    helper = helper_body(code)
     if "ggml_sycl_graph_recording_this_thread()" not in helper:
         failures.append("the helper must answer only while this thread records")
     if "graph_input_stage_lookup(" not in helper:
