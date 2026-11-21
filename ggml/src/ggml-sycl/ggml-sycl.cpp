@@ -418,6 +418,10 @@ int g_ggml_sycl_moe_exec_decline_layer       = -1;
 // GGML_SYCL_MOE_PIN_HOST_EXPERTS as the report's integer, SET from ggml_sycl::placement_pin_host_experts_enabled()
 // after the table parse: 1 pins a mapping load's routed host experts for the window ring, 0 keeps them mapped.
 int g_ggml_sycl_moe_pin_host_experts         = 1;
+// GGML_SYCL_MOE_SPREAD_PLACEMENT as the report's integer, SET from ggml_sycl::placement_moe_spread_enabled() after the
+// table parse: 1 walks a single-device plan's routed experts in the spread order when they do not all fit, 0 keeps
+// the layer-first order.
+int g_ggml_sycl_moe_spread_placement         = 0;
 
 int g_ggml_sycl_disable_dnn      = 0;
 int g_ggml_sycl_prioritize_dmmv  = 0;
@@ -15792,6 +15796,9 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     kv.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();
     kv.moe_stream_group_cap    = ggml_sycl_moe_pp_f16_group_experts_max();
     kv.n_expert_used           = inventory->n_expert_used;
+    // Which order the single-device planner packs routed experts in when they do not all fit: read here, the one
+    // intake, so a test can set the field directly and the planner never reads the environment itself.
+    kv.moe_spread              = ggml_sycl::placement_moe_spread_enabled();
     // The lazy tables (th32 §4.1), an inventory class of their own: copied here, the one intake, and never into the
     // tensor rows, so no table enters g_tensor_inventory_detail and no zone maximum the rows size ever counts it. Every
     // entry point refuses a count with no array (ggml_sycl_inventory_malformed), so the copy reads what the count
@@ -17681,9 +17688,11 @@ static void ggml_sycl_plan_dry_run_lazy(uint32_t                                
 }
 
 // Reports plan `index`: every host term from the plan's own record, each printed on its own line under its name. The
-// WEIGHT terms are the walk populate_host_zone_sizing() sized the zone with; the commit terms are the configure step's
-// sizing (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan()
-// summed, with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
+// WEIGHT terms are the finished plan's: the walk populate_host_zone_sizing() sized the zone with, plus the swap
+// headroom record_host_ledger_plan() held after it, which the [HOST-PLAN] line never shows (it prints before the hold),
+// so this report prints it; the result struct does not carry it. The commit terms are the configure step's sizing
+// (ggml_sycl_configure_host_zones_for_plan) over the inputs the plan recorded, which record_host_ledger_plan() summed,
+// with the lazy tables' part, into host_planned_bytes; expected_host is that figure.
 static void ggml_sycl_plan_dry_run_record(uint32_t                                                  index,
                                           const ggml_sycl::placement_plan &                         plan,
                                           bool                                                      multi_device,
@@ -17736,6 +17745,7 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                              
     line("WEIGHT", "host_compute_reserve", out.weight_host_compute_reserve);
     line("WEIGHT", "layout_copies", out.weight_layout_copies);
     line("WEIGHT", "tlsf_bound", out.weight_tlsf_bound);
+    line("WEIGHT", "swap_headroom", weight.swap_headroom);
     line("ZONE", "weight", out.zone_weight);
     line("ZONE", "kv", out.zone_kv);
     line("ZONE", "staging", out.zone_staging);
@@ -36777,6 +36787,8 @@ static void ggml_check_sycl() try {
             // The planner's pin of a mapping load's routed host experts, likewise overwritten from its one reader,
             // which the planner calls on every plan.
             { ggml_sycl::MOE_PIN_HOST_EXPERTS_ENV, &g_ggml_sycl_moe_pin_host_experts, 1 },
+            // The planner's spread order for routed experts, likewise overwritten from its one reader.
+            { ggml_sycl::MOE_SPREAD_PLACEMENT_ENV, &g_ggml_sycl_moe_spread_placement, 0 },
 #if GGML_SYCL_DNNL
             // The deterministic attribute on every oneDNN primitive, likewise overwritten from its one reader.
             { GGML_SYCL_ONEDNN_DETERMINISTIC_ENV, &g_ggml_sycl_onednn_deterministic, 1 },
@@ -36794,6 +36806,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_moe_pp_f16_group_experts_max = static_cast<int>(ggml_sycl_moe_pp_f16_group_experts_max());
         g_ggml_sycl_moe_exec_decline_layer       = ggml_sycl_moe_exec_decline_layer();
         g_ggml_sycl_moe_pin_host_experts         = ggml_sycl::placement_pin_host_experts_enabled() ? 1 : 0;
+        g_ggml_sycl_moe_spread_placement         = ggml_sycl::placement_moe_spread_enabled() ? 1 : 0;
 #if GGML_SYCL_DNNL
         g_ggml_sycl_onednn_deterministic = ggml_sycl_onednn_deterministic_enabled() ? 1 : 0;
 #endif

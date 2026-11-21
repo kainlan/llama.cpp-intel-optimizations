@@ -536,7 +536,9 @@ void residency_from_the_plan_fields(arm_result & r) {
 // (b) The printout names every term on its own line, and each figure is the plan's. The planner prints the plan's own
 // record of each term: the WEIGHT zone's terms on its [HOST-PLAN] line, the commit terms, host_planned_bytes and the
 // budget the plan recorded on its [HOST-LEDGER] plan line. The dry run prints each on a line of its own, under the
-// term's name, and each must equal the planner's. The dry run logs no [PLAN-DRY-RUN-BUG] line for these plans. The
+// term's name, and each must equal the planner's. The WEIGHT term swap_headroom is printed and not exported: it is
+// held after the [HOST-PLAN] line, so its planner figure is the bytes on the spread plan's headroom line, and 0 for a
+// plan that prints none. The dry run logs no [PLAN-DRY-RUN-BUG] line for these plans. The
 // PINNED and HOST_CPU residency is scored against the plan: those are the entries the WEIGHT walk counts, so their
 // count is its blocks, and their bytes are the plan's own charge for them, weight_host_bytes, which the result
 // carries. The shaped inventory maps no file (use_mmap_resolved is false), so its plan keeps every host entry PINNED,
@@ -549,7 +551,8 @@ void residency_from_the_plan_fields(arm_result & r) {
 // the DST sums of their entries.
 // Mutants: a figure printed from a recomputed value (it differs from the planner's record: a rounding from another
 // chunk, a WEIGHT total re-summed, a budget re-sampled, a residency byte figure re-summed per entry on either basis); a
-// term not printed, or two terms on one line (the line count for that term is not 1); a residency line walking another
+// term not printed, or two terms on one line (the line count for that term is not 1), the swap headroom among them; a
+// swap headroom printed from another figure than the planner's line; a residency line walking another
 // set of entries; PINNED and HOST_CPU bytes that part from the plan's weight_host_bytes, or a result that does not
 // carry that field; the disagreement WARN dropped, or raised on an agreeing plan.
 arm_result arm_b_every_term_printed_from_the_plan() {
@@ -599,6 +602,12 @@ arm_result arm_b_every_term_printed_from_the_plan() {
         { "expected_host",        "host_planned_bytes",   true,  &dry_plan::expected_host               },
         { "host_budget",          "host_budget",          true,  &dry_plan::host_budget                 },
     };
+    // The swap headroom is printed and not exported. The planner's figure is its headroom line, one per spread plan;
+    // a plan that does not spread prints none and holds none, so its printed term is 0.
+    const std::vector<std::string> headroom = lines_with("[PLACEMENT-MOE] spread swap headroom: ");
+    expect(r, headroom.empty() || headroom.size() == res->n_plans,
+           "the planner printed " + num(headroom.size()) + " swap headroom lines for " + num(res->n_plans) +
+               " plans, want none or one a plan");
     for (uint32_t i = 0; i < res->n_plans; ++i) {
         const ggml_sycl_plan_dry_run_plan & p = res->plans[i];
         for (const term & t : terms) {
@@ -612,6 +621,11 @@ arm_result arm_b_every_term_printed_from_the_plan() {
                    "plan " + num(i) + ": the result's " + t.printed_name + " is " + num(p.*(t.field)) +
                        ", the plan's " + num(planner));
         }
+        const size_t swap_planned = i < headroom.size() ? printed(headroom[i], "bytes") : 0;
+        const size_t swap_shown   = dry_run_figure(r, i, "swap_headroom");
+        expect(r, swap_shown == swap_planned,
+               "plan " + num(i) + ": printed swap_headroom=" + num(swap_shown) + ", the planner's headroom line " +
+                   num(swap_planned));
         const uint64_t zone_count = p.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +
                                     p.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU];
         const uint64_t zone_bytes = p.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +

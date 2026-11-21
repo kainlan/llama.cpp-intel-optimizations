@@ -32509,6 +32509,72 @@ static bool moe_triplet_complete(const moe_triplet_group & group) {
     return (group.role_mask & all_roles) == all_roles;
 }
 
+// The two orders the routed-expert pack walks the triplet groups in.
+//
+// LAYER_FIRST, the default. With popularity ranks, the ranked groups come first by rank and the rest after them;
+// without, the order is (block, expert). Under pressure that keeps the early MoE blocks wholly on the device, so their
+// expert tensors stage in bulk (try_bulk_stage_moe_tensor takes a tensor only when every expert of it is on the
+// device). With no swap to trade experts between blocks, the spread order was measured level with this one in coverage
+// of the routed traffic, and it makes every block mixed-resident, which loses that bulk staging.
+//
+// SPREAD, which GGML_SYCL_MOE_SPREAD_PLACEMENT asks for, is rank-major over every block: (rank, block, expert), where a
+// group's rank is its popularity rank when it has one and its expert index otherwise. Each block's device slots hold
+// its most popular experts, or its lowest-numbered ones when it has no ranks, so a swap can later trade one block's
+// device expert for another without starving any block. When every triplet charges the same, every block gets an
+// equal share of the slots, within one. The pack is the same first fit by bytes in either order, so a mixed-quant
+// pack, or one type carrying a PP-SOA alternate charge, gives the blocks whose triplets charge less more slots. Only
+// the single-device builder takes it: the multi-device pack picks each expert's card by its layer, so a rank-major
+// order there would not give the blocks an even share.
+enum class moe_triplet_order {
+    LAYER_FIRST,
+    SPREAD,
+};
+
+// A group's rank in the spread order. The one rank writer (ggml_sycl_update_moe_hotset) ranks every expert of a block,
+// so a ranked block's ranks and an unranked block's expert indices both run over 0..n_experts-1, and every block has
+// one group at each rank.
+static int moe_triplet_spread_rank(const moe_triplet_group & group) {
+    return group.popularity_rank >= 0 ? group.popularity_rank : group.expert_id;
+}
+
+// The one comparator of the triplet orders. `ranked` says some group has a popularity rank, which the layer-first
+// order puts first; the spread order needs no such flag.
+static bool moe_triplet_group_before(const moe_triplet_group & a,
+                                     const moe_triplet_group & b,
+                                     moe_triplet_order         order,
+                                     bool                      ranked) {
+    if (order == moe_triplet_order::SPREAD) {
+        const int a_rank = moe_triplet_spread_rank(a);
+        const int b_rank = moe_triplet_spread_rank(b);
+        if (a_rank != b_rank) {
+            return a_rank < b_rank;
+        }
+    } else if (ranked) {
+        const int a_rank = a.popularity_rank >= 0 ? a.popularity_rank : std::numeric_limits<int>::max();
+        const int b_rank = b.popularity_rank >= 0 ? b.popularity_rank : std::numeric_limits<int>::max();
+        if (a_rank != b_rank) {
+            return a_rank < b_rank;
+        }
+    }
+    if (a.layer_id != b.layer_id) {
+        return a.layer_id < b.layer_id;
+    }
+    if (a.expert_id != b.expert_id) {
+        return a.expert_id < b.expert_id;
+    }
+    return a.bytes > b.bytes;
+}
+
+// Sorts `groups` into `order` through the one comparator: the layer-first order for both builders, the spread order
+// for the single-device builder.
+static void sort_moe_triplet_groups(std::vector<moe_triplet_group> & groups, moe_triplet_order order) {
+    const bool ranked = std::any_of(groups.begin(), groups.end(),
+                                    [](const moe_triplet_group & group) { return group.popularity_rank >= 0; });
+    std::sort(groups.begin(), groups.end(), [order, ranked](const moe_triplet_group & a, const moe_triplet_group & b) {
+        return moe_triplet_group_before(a, b, order, ranked);
+    });
+}
+
 static std::vector<moe_triplet_group> build_moe_triplet_groups(const placement_plan &      plan,
                                                                const std::vector<size_t> & moe_indices,
                                                                const char **               hotness_source) {
@@ -32550,28 +32616,37 @@ static std::vector<moe_triplet_group> build_moe_triplet_groups(const placement_p
         *hotness_source = has_ranked_groups ? "routing-popularity" : "static(layer,expert)";
     }
 
-    // When routing/popularity data is available, place hot routed triplets
-    // first. Otherwise use the layer-first fallback: it preserves fully
-    // device-resident early MoE layers under pressure and avoids making every
-    // layer mixed-resident based on an unproven expert-ID prior.
-    std::sort(groups.begin(), groups.end(),
-              [has_ranked_groups](const moe_triplet_group & a, const moe_triplet_group & b) {
-                  if (has_ranked_groups) {
-                      const int a_rank = a.popularity_rank >= 0 ? a.popularity_rank : std::numeric_limits<int>::max();
-                      const int b_rank = b.popularity_rank >= 0 ? b.popularity_rank : std::numeric_limits<int>::max();
-                      if (a_rank != b_rank) {
-                          return a_rank < b_rank;
-                      }
-                  }
-                  if (a.layer_id != b.layer_id) {
-                      return a.layer_id < b.layer_id;
-                  }
-                  if (a.expert_id != b.expert_id) {
-                      return a.expert_id < b.expert_id;
-                  }
-                  return a.bytes > b.bytes;
-              });
+    sort_moe_triplet_groups(groups, moe_triplet_order::LAYER_FIRST);
     return groups;
+}
+
+// The spread order's one switch point, in the single-device builder, called after every group's charge is final and
+// before anything predicts the pack. With the switch on and more routed-expert charge than `remaining`, the room the
+// device has left for the experts, the groups are sorted into the spread order and the plan records it. Experts that
+// all fit keep the layer-first order: a first-fit pack places every group in either order, so the plan of a model
+// that fits is the plan the switch off gives. The multi-device builder does not call it and keeps the layer-first
+// order, so its plan is the same with the switch on.
+static void moe_spread_order_groups(placement_plan &                 plan,
+                                    std::vector<moe_triplet_group> & groups,
+                                    const placement_kv_info &        kv_info,
+                                    size_t                           remaining,
+                                    const char **                    hotness_source) {
+    plan.moe_spread = false;
+    if (!kv_info.moe_spread) {
+        return;
+    }
+    size_t charge = 0;
+    for (const moe_triplet_group & group : groups) {
+        charge += group.charge_bytes;
+    }
+    if (charge <= remaining) {
+        return;
+    }
+    sort_moe_triplet_groups(groups, moe_triplet_order::SPREAD);
+    plan.moe_spread = true;
+    if (hotness_source != nullptr) {
+        *hotness_source = "spread(rank,layer,expert)";
+    }
 }
 
 static int moe_materialization_role_order(expert_tensor_role role) {
@@ -32665,6 +32740,75 @@ static void log_moe_triplet_pack_stats(const char * tag, const moe_triplet_pack_
         tag, stats.groups, stats.complete_groups, stats.incomplete_groups, stats.device_groups, stats.host_groups,
         stats.device_entries, stats.device_bytes / (1024.0 * 1024.0), stats.host_entries,
         stats.host_bytes / (1024.0 * 1024.0), remaining / (1024.0 * 1024.0), stats.hotness);
+}
+
+// Each block's share of the device expert slots, from the groups the pack walked, so it runs before the
+// materialization reorder moves the entries the groups index. A group holds a slot when every entry of it is on a
+// device.
+static void record_moe_block_device_slots(placement_plan & plan, const std::vector<moe_triplet_group> & groups) {
+    std::map<int, placement_moe_block_slots> blocks;
+    for (const moe_triplet_group & group : groups) {
+        placement_moe_block_slots & block = blocks[group.layer_id];
+        const bool                  on_device =
+            !group.indices.empty() && std::all_of(group.indices.begin(), group.indices.end(), [&plan](size_t idx) {
+                return idx < plan.entries.size() && plan.entries[idx].on_device;
+            });
+        block.layer_id = group.layer_id;
+        block.experts++;
+        block.device_slots += on_device ? 1 : 0;
+        block.ranked = block.ranked || group.popularity_rank >= 0;
+    }
+    plan.moe_block_device_slots.clear();
+    for (const auto & [layer_id, block] : blocks) {
+        GGML_UNUSED(layer_id);
+        plan.moe_block_device_slots.push_back(block);
+    }
+}
+
+// The order line, a WARN beside the pack's line whenever the switch is on, so a run that asked for the spread order
+// sees which order the plan took and how evenly the blocks share the device slots: the fewest and the most slots a
+// block holds, each with the number of blocks that hold that many. `layer_first_reason` says why a plan kept the
+// layer-first order.
+static void log_moe_spread_placement(const char *              tag,
+                                     const placement_plan &    plan,
+                                     const placement_kv_info & kv_info,
+                                     const char *              hotness,
+                                     const char *              layer_first_reason) {
+    if (!kv_info.moe_spread || plan.moe_block_device_slots.empty()) {
+        return;
+    }
+    size_t device_slots  = 0;
+    size_t ranked_blocks = 0;
+    size_t min_slots     = SIZE_MAX;
+    size_t max_slots     = 0;
+    size_t n_min         = 0;
+    size_t n_max         = 0;
+    for (const placement_moe_block_slots & block : plan.moe_block_device_slots) {
+        device_slots += block.device_slots;
+        ranked_blocks += block.ranked ? 1 : 0;
+        if (block.device_slots < min_slots) {
+            min_slots = block.device_slots;
+            n_min     = 0;
+        }
+        if (block.device_slots > max_slots) {
+            max_slots = block.device_slots;
+            n_max     = 0;
+        }
+        n_min += block.device_slots == min_slots ? 1 : 0;
+        n_max += block.device_slots == max_slots ? 1 : 0;
+    }
+    const std::string note = plan.moe_spread ? std::string() :
+                                               std::string("; the switch is on, but ") + layer_first_reason +
+                                                   ", so the order stays layer-first";
+
+    const auto blocks = [](size_t n) {
+        return n == 1 ? "block" : "blocks";
+    };
+    GGML_LOG_WARN(
+        "[%s] expert order: mode=%s hotness=%s blocks=%zu ranked_blocks=%zu device_slots=%zu per_block_min=%zu (%zu "
+        "%s) per_block_max=%zu (%zu %s)%s\n",
+        tag, plan.moe_spread ? "spread" : "layer-first", hotness, plan.moe_block_device_slots.size(), ranked_blocks,
+        device_slots, min_slots, n_min, blocks(n_min), max_slots, n_max, blocks(n_max), note.c_str());
 }
 
 static void log_moe_device_policy(const char * tag,
@@ -35645,6 +35789,13 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     // The pinned pool's TLSF hands out whole grains and keeps its metadata outside the managed region, so a block
     // occupies at most its bytes plus one grain.
     terms.tlsf_bound           = terms.blocks * tlsf_allocator::block_grain;
+    // A spread plan's room for the triplets a swap moves to the host: 0 while populate_host_zone_sizing() sizes the
+    // zones, then set by the ledger record once the lazy tables are decided
+    // (placement_plan_hold_moe_swap_host_headroom), and kept by every later re-record of the same plan. Like the
+    // HOST_COMPUTE reserve it is not earmarked: it is the figure planned at load, any role-WEIGHT host allocation takes
+    // from the same room, a prompt-phase loan's host copies included, and the loan's republish of the plan does not
+    // update it. What a swap can use is the zone's free bytes when it runs.
+    terms.swap_headroom        = plan.moe_swap_host_headroom_bytes;
     return terms;
 }
 
@@ -35758,6 +35909,53 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
     return -1;
 }
 
+// The room a host plan keeps (th32 §4.3): step 3 holds back the host reserve and the context envelope, and P3 leaves
+// MemAvailable_pre its floor plus a runtime allowance above expected_host (expected_host + 29 GiB <= MemAvailable_pre).
+// A term that keeps both rooms beside a plan displaces nothing: the residency decision admits each lazy table within
+// them, and the spread plan's swap headroom takes only what they leave after the tables.
+struct host_plan_room_rule {
+    size_t reserve    = 0;  // step 3: host_reserve, 1% of the budget and 2 GiB at least
+    size_t envelope   = 0;  // step 3: the context envelope, 0 while no planned term exists for it
+    size_t p3_floor   = 0;  // P3: the MemAvailable a load must leave
+    size_t p3_runtime = 0;  // P3: the runtime allowance above expected_host
+
+    // What the budget holds past `planned`, the reserve and the envelope.
+    size_t fit_room(size_t budget, size_t planned) const {
+        return host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
+    }
+
+    // What MemAvailable_pre holds past `planned` and P3's margin.
+    size_t p3_room(size_t mem_available_pre, size_t planned) const {
+        return host_ledger_sat_sub(mem_available_pre, host_ledger_sat_add(planned, p3_floor + p3_runtime));
+    }
+
+    // Whether a plan of `planned` bytes keeps the budget's reserve and envelope.
+    bool keeps_fit(size_t budget, size_t planned) const {
+        return host_ledger_sat_add(planned, reserve + envelope) <= budget;
+    }
+
+    // Whether a plan of `planned` bytes keeps P3's margin below MemAvailable_pre.
+    bool keeps_p3(size_t mem_available_pre, size_t planned) const {
+        return host_ledger_sat_add(planned, p3_floor + p3_runtime) <= mem_available_pre;
+    }
+
+    // Whether a plan of `planned` bytes keeps both rooms.
+    bool admits(size_t budget, size_t mem_available_pre, size_t planned) const {
+        return keeps_fit(budget, planned) && keeps_p3(mem_available_pre, planned);
+    }
+};
+
+static host_plan_room_rule host_plan_room_rule_for(size_t budget) {
+    constexpr size_t    reserve_floor = 2ull << 30;  // host_reserve's floor
+    constexpr size_t    reserve_pct   = 1;           // host_reserve's share of the budget, in percent
+    host_plan_room_rule rule;
+    rule.reserve    = std::max<size_t>(reserve_floor, budget / 100 * reserve_pct);
+    rule.envelope   = 0;
+    rule.p3_floor   = 24ull << 30;
+    rule.p3_runtime = 5ull << 30;
+    return rule;
+}
+
 // The lazy tables' residency (th32 §4.3 step 4), decided once the zone terms are set, so their total is step 2. Step 3
 // sets aside the context envelope, a named 0 until the SYCL_Host compute buffer is a planned tenant, and host_reserve =
 // max(2 GiB, 1% of the budget). The tables are taken in ascending consumer_layer (ties to the larger table, then the
@@ -35780,13 +35978,6 @@ static int lazy_consumer_device(const placement_plan & plan, int32_t consumer_la
 static void placement_plan_decide_lazy_residency(placement_plan &          plan,
                                                  const placement_kv_info & kv_info,
                                                  const ring_lease *        coverage_pin) {
-    constexpr size_t p3_floor   = 24ull << 30;            // P3: the MemAvailable a load must leave
-    constexpr size_t p3_runtime = 5ull << 30;             // P3's runtime allowance above expected_host
-    constexpr size_t p3_margin  = p3_floor + p3_runtime;  // expected_host + 29 GiB <= MemAvailable_pre
-    constexpr size_t envelope   = 0;                      // step 3's context envelope: no planned term exists yet
-
-    constexpr size_t reserve_floor = 2ull << 30;          // step 3: host_reserve's floor
-    constexpr size_t reserve_pct   = 1;                   // step 3: host_reserve's share of the budget, in percent
     plan.lazy_tables.clear();
     plan.lazy_refusal.clear();
     plan.lazy_refusal_detail.clear();
@@ -35801,10 +35992,10 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
 
     const size_t   step2      = plan.host_zone_terms.total();
     const size_t   budget     = plan.host_budget;
-    const size_t   reserve    = std::max<size_t>(reserve_floor, budget / 100 * reserve_pct);
+    const auto     rule       = host_plan_room_rule_for(budget);
     const size_t   mem_pre    = kv_info.host_mem_available_pre;
-    const size_t   fit_room   = host_ledger_sat_sub(budget, host_ledger_sat_add(step2, reserve + envelope));
-    const size_t   p3_room    = host_ledger_sat_sub(mem_pre, host_ledger_sat_add(step2, p3_margin));
+    const size_t   fit_room   = rule.fit_room(budget, step2);
+    const size_t   p3_room    = rule.p3_room(mem_pre, step2);
 
     std::vector<size_t> order(kv_info.lazy_tables.size());
     for (size_t i = 0; i < order.size(); ++i) {
@@ -35952,7 +36143,7 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
     // refusal through placement_lazy_refusal_text, the formatters the dry run prints with; output_slot, landing and
     // cold_set wait for the rows that add them.
     const size_t planned       = plan.host_planned_bytes;
-    const size_t leftover      = host_ledger_sat_sub(budget, host_ledger_sat_add(planned, reserve + envelope));
+    const size_t leftover      = rule.fit_room(budget, planned);
     size_t       lazy_resident = 0;
     size_t       yieldable     = 0;
     size_t       n_host        = 0;
@@ -35986,16 +36177,133 @@ static void placement_plan_decide_lazy_residency(placement_plan &          plan,
         "caches_carving=%zu envelope=%zu lazy_resident=%zu ring=%zu reserve=%zu leftover=%zu mem_available_pre=%zu "
         "p3_post_load=%zu yieldable=%zu tables=%zu host=%zu storage=%zu refusal=%s\n",
         plan.device_id, budget, kv_info.host_budget_overridden ? "GGML_SYCL_HOST_RESERVE_MB" : "computed", planned,
-        weight_terms.host_weights, named_terms, plan.host_zone_terms.kv, step2, caches_carving, envelope, lazy_resident,
-        plan.block_ring_charge, reserve, leftover, mem_pre,
-        host_ledger_sat_sub(mem_pre, host_ledger_sat_add(planned, p3_runtime)), yieldable, kv_info.lazy_tables.size(),
-        n_host, plan.lazy_tables.size() - n_host, refusal.c_str());
+        weight_terms.host_weights, named_terms, plan.host_zone_terms.kv, step2, caches_carving, rule.envelope,
+        lazy_resident, plan.block_ring_charge, rule.reserve, leftover, mem_pre,
+        host_ledger_sat_sub(mem_pre, host_ledger_sat_add(planned, rule.p3_runtime)), yieldable,
+        kv_info.lazy_tables.size(), n_host, plan.lazy_tables.size() - n_host, refusal.c_str());
+}
+
+// A spread plan's swap headroom in the host WEIGHT zone. A swap copies a device triplet to the host before the host
+// triplet that takes its slot leaves, so every device expert slot can need one extra triplet on the host at once: the
+// room is planned for as many triplets as the device holds slots. Each is sized at the largest device triplet's bound,
+// its members' device charge, at least the copy a loan or an evict mints at the cache entry's size, plus one TLSF grain
+// per member, as tlsf_bound counts a block. The room is the zone's swap_headroom term, written into the zone as its
+// terms' total(), and is held only within the rooms the host plan keeps after its lazy tables (host_plan_room_rule),
+// so it displaces nothing at load: a plan that cannot afford every triplet holds the most it can, none included, and
+// its line says what capped it. A plan whose routed host experts stay mapped holds none, since no swap can be issued
+// there. record_host_ledger_plan calls it once the lazy tables are decided and before its ledger line, so that line,
+// its would-refuse check and every reader of the finished plan count the room. It re-records the ledger it grows, and
+// its own line prints the WEIGHT zone total and host_planned_bytes as they stand after it. The figures it sets are
+// the room planned at load, not a reservation: any role-WEIGHT host allocation takes from it, a prompt-phase loan's
+// host copies included, and the loan's republish does not update them (host_weight_zone_terms::swap_headroom). Only
+// the single-device builder spreads, so a layer-first plan, every multi-device plan among them, holds none.
+static void placement_plan_hold_moe_swap_host_headroom(placement_plan & plan, const placement_kv_info & kv_info) {
+    plan.moe_swap_host_headroom_triplets = 0;
+    plan.moe_swap_host_headroom_bytes    = 0;
+    if (!plan.moe_spread) {
+        return;
+    }
+    std::map<std::pair<int, int>, size_t> device_triplets;  // (block, expert) -> the triplet's bound on the host
+    for (const placement_entry & entry : plan.entries) {
+        if (entry.expert_id < 0 || !entry.on_device) {
+            continue;
+        }
+        const size_t charge =
+            entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
+        device_triplets[{ entry.layer_id, entry.expert_id }] += charge + tlsf_allocator::block_grain;
+    }
+    size_t triplet_bytes = 0;
+    for (const auto & [key, bytes] : device_triplets) {
+        GGML_UNUSED(key);
+        triplet_bytes = std::max(triplet_bytes, bytes);
+    }
+    const size_t wanted = device_triplets.size();
+
+    // Routed host experts go back to the mapping all of them or none, and a swap can admit only a pinned host triplet,
+    // so a plan whose host experts stay mapped can issue no swap: room held for one would only shrink the room the
+    // mapped working set has. A mapping load marks its device entries FILE_MAPPED too, so only host entries count.
+    const bool host_experts_mapped =
+        std::any_of(plan.entries.begin(), plan.entries.end(), [](const placement_entry & e) {
+            return e.expert_id >= 0 && !e.on_device && e.host_backing == placement_host_backing::FILE_MAPPED;
+        });
+    if (host_experts_mapped) {
+        GGML_LOG_WARN(
+            "[PLACEMENT-MOE] spread swap headroom: triplets=0 bytes=0 (0.0 MB) in the host WEIGHT zone for %zu device "
+            "expert slots at %zu bytes a triplet; weight_zone_total=%zu host_planned_bytes=%zu; none held: the routed "
+            "host experts stay mapped, and a swap can admit only a pinned host triplet\n",
+            wanted, triplet_bytes, plan.host_zone_weight_bytes, plan.host_planned_bytes);
+        return;
+    }
+
+    // Holds `n` triplets and says whether the plan keeps both rooms with them. The commit terms round the zones up to
+    // whole chunks, so a count is tested on the re-recorded figure itself, which only grows with the count.
+    const host_plan_room_rule rule    = host_plan_room_rule_for(plan.host_budget);
+    const size_t              budget  = plan.host_budget;
+    const size_t              mem_pre = kv_info.host_mem_available_pre;
+    const auto                hold    = [&](size_t n) {
+        plan.moe_swap_host_headroom_triplets = n;
+        plan.moe_swap_host_headroom_bytes    = n * triplet_bytes;
+        plan.host_zone_weight_bytes          = placement_plan_host_weight_zone_terms(plan).total();
+        placement_plan_rerecord_host_zone_terms(plan);
+        return rule.admits(budget, mem_pre, plan.host_planned_bytes);
+    };
+    // The rooms the host plan as it stands takes, which names what left none or capped the count.
+    const auto rooms_taken = [&]() -> const char * {
+        const bool fit_kept = rule.keeps_fit(budget, plan.host_planned_bytes);
+        const bool p3_kept  = rule.keeps_p3(mem_pre, plan.host_planned_bytes);
+        if (!fit_kept && !p3_kept) {
+            return "the host budget's reserve and P3's margin";
+        }
+        return fit_kept ? "P3's margin" : "the host budget's reserve";
+    };
+    const bool   fits_bare = hold(0);
+    const char * taken     = fits_bare ? "" : rooms_taken();
+    size_t       held      = 0;
+    if (fits_bare) {
+        size_t most = wanted;
+        while (held < most) {
+            const size_t mid = held + (most - held + 1) / 2;
+            if (hold(mid)) {
+                held = mid;
+            } else {
+                most = mid - 1;
+            }
+        }
+    }
+    // A capped count names the room one more triplet would take.
+    if (fits_bare && held < wanted) {
+        hold(held + 1);
+        taken = rooms_taken();
+    }
+    hold(held);
+
+    // fit_room and p3_room at the held count, so a cap by the budget's reserve reads apart from one by P3's margin.
+    const std::string rooms = " (host_budget=" + std::to_string(budget) + " reserve=" + std::to_string(rule.reserve) +
+                              " mem_available_pre=" + std::to_string(mem_pre) +
+                              " fit_room=" + std::to_string(rule.fit_room(budget, plan.host_planned_bytes)) +
+                              " p3_room=" + std::to_string(rule.p3_room(mem_pre, plan.host_planned_bytes)) + ")";
+    std::string cap;
+    if (!fits_bare && wanted > 0) {
+        cap = mem_pre == 0 ? std::string("; none held: no MemAvailable sample, so P3's margin cannot be kept") :
+                             std::string("; none held: the host plan without headroom already takes ") + taken;
+        cap += rooms;
+    } else if (held < wanted) {
+        cap = "; capped from " + std::to_string(wanted) + " triplets (" + std::to_string(wanted * triplet_bytes) +
+              " bytes): one more would take " + taken + rooms;
+    }
+    GGML_LOG_WARN(
+        "[PLACEMENT-MOE] spread swap headroom: triplets=%zu bytes=%zu (%.1f MB) in the host WEIGHT zone for %zu device "
+        "expert slots at %zu bytes a triplet, pinned when the load configures the host zones; "
+        "weight_zone_total=%zu host_planned_bytes=%zu%s\n",
+        held, plan.moe_swap_host_headroom_bytes, plan.moe_swap_host_headroom_bytes / (1024.0 * 1024.0), wanted,
+        triplet_bytes, plan.host_zone_weight_bytes, plan.host_planned_bytes, cap.c_str());
 }
 
 // Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms, and
 // host_planned_bytes, their total plus the lazy tables' terms the residency decision sets, read once
-// populate_host_zone_sizing() has set every term. The budget is an input, never read here: a load
-// passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
+// populate_host_zone_sizing() has set every term. A spread plan's swap headroom is held next, after the lazy tables and
+// within the rooms they leave, so the line and the check below count it. The budget is an input, never read here: a
+// load passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
 // line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
 // whole: phase (a) of th32 T2 refuses nothing. The cache supplies the live oneDNN scratch and the chunk size, which
 // the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
@@ -36013,6 +36321,7 @@ static void record_host_ledger_plan(placement_plan &          plan,
     plan.host_budget     = host_budget;
     plan.host_zone_terms = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
     placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
+    placement_plan_hold_moe_swap_host_headroom(plan, kv_info);
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
         "[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu "
@@ -36098,6 +36407,14 @@ static void placement_mark_device_entries_file_mapped(placement_plan & plan) {
 bool placement_pin_host_experts_enabled() {
     const char * env = std::getenv(MOE_PIN_HOST_EXPERTS_ENV);
     return env == nullptr || std::strcmp(env, "0") != 0;
+}
+
+bool placement_moe_spread_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv(MOE_SPREAD_PLACEMENT_ENV);
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
 }
 
 // Marks every routed expert PINNED on a load that maps files, before the window ring's room is sized and before any
@@ -36861,6 +37178,11 @@ static void populate_host_zone_sizing(placement_plan &                          
 
     // --- Host zone sizing (uses inference category fields computed above) ---
 
+    // The zones are sized without a spread plan's swap headroom: record_host_ledger_plan holds it after the lazy
+    // tables, so a plan sized again, the pinned plan's withdrawal among them, drops the room its first record held.
+    plan.moe_swap_host_headroom_triplets = 0;
+    plan.moe_swap_host_headroom_bytes    = 0;
+
     // WEIGHT: exact bytes plus named terms. The host weights are summed from the entries, the bytes the cache
     // materializes; weight_host_bytes is the plan's running total of the same bytes, so a difference means a writer
     // charged something the entries do not hold, and the zone is sized from the entries. It warns rather than aborts:
@@ -37012,11 +37334,14 @@ static void placement_plan_size_host_side(placement_plan &                      
         why +=
             (over_budget ? ", and a lazy table refuses it: " : "a lazy table refuses the pinned plan: ") + lazy_refusal;
     }
+    // Only a spread plan prints a swap-headroom line, so only its WARN names that line among the ones not kept.
+    const char * described =
+        plan.moe_spread ? "host-ledger, lazy-table and swap-headroom lines" : "host-ledger and lazy-table lines";
     GGML_LOG_WARN(
         "[PLACEMENT] routed host experts stay mapped, so prompts run them on the CPU: %s. %.1f MB of experts go back "
-        "to the mapping, and %.1f MB of window-ring room stays held. The host-ledger and lazy-table lines above "
-        "describe the pinned plan, which is not kept; the lines after this one describe the plan kept\n",
-        why.c_str(), moved / mb, plan.moe_stream_ring_reserve_bytes / mb);
+        "to the mapping, and %.1f MB of window-ring room stays held. The %s above describe the pinned plan, which is "
+        "not kept; the lines after this one describe the plan kept\n",
+        why.c_str(), moved / mb, plan.moe_stream_ring_reserve_bytes / mb, described);
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info, envelope);
     record_host_ledger_plan(plan, kv_info, host_budget, coverage_pin);
 }
@@ -38180,6 +38505,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 "no_layout_bytes=%zu\n",
                 device_id, pp_alt_groups, pp_alt_entries, pp_alt_charge / (1024.0 * 1024.0), pp_alt_no_layout_bytes);
         }
+        // The order the pack walks, once every group's charge is final and before the ring's room predicts the pack.
+        moe_spread_order_groups(plan, moe_groups, kv_info, remaining, &hotness_source);
         // The window ring's room, the last term held before the pack: the ring is sized over the host experts the pack
         // leaves, so the room is sized over the pack it predicts, after every group's charge is final. On a load that
         // maps files the routed experts are marked PINNED first, since the ring streams only pinned experts.
@@ -38278,6 +38605,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
+        record_moe_block_device_slots(plan, moe_groups);
+        log_moe_spread_placement("PLACEMENT-MOE", plan, kv_info, stats.hotness, "every routed expert fits");
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
     plan.kv_context_room_displaced_bytes = room.displaced_bytes();
@@ -39863,6 +40192,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
         const char * hotness_source = nullptr;
         const auto   moe_groups     = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
+        record_moe_block_device_slots(plan, moe_groups);
+        log_moe_spread_placement("PLACEMENT-MOE-MULTI", plan, kv_info, hotness_source,
+                                 "without a direct peer path the multi-device plan places whole layers");
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     } else {
         for (size_t idx : standalone_dense_indices) {
@@ -40318,6 +40650,14 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             }
             const size_t total_remaining = std::accumulate(remaining.begin(), remaining.end(), size_t(0));
             log_moe_triplet_pack_stats("PLACEMENT-MOE-MULTI", stats, total_remaining);
+            record_moe_block_device_slots(plan, moe_groups);
+            // This pack keeps the layer-first order whatever the switch says: it picks each expert's card by its layer
+            // (the layer's own card in LAYER and HYBRID mode, a whole-layer target in EXPERT mode) and holds the room
+            // per card, so a rank-major order would not give the blocks an even share.
+            log_moe_spread_placement("PLACEMENT-MOE-MULTI", plan, kv_info, stats.hotness,
+                                     mode == multi_gpu_mode::EXPERT ?
+                                         "the multi-device pack gives complete layers to one card first" :
+                                         "the multi-device pack puts each expert on its layer's card first");
             reorder_plan_entries_for_moe_materialization(plan, moe_groups);
         }
     }
