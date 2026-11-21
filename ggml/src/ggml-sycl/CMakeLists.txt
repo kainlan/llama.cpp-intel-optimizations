@@ -8156,6 +8156,25 @@ set_tests_properties(sycl-graph-recorder-scope PROPERTIES
     TIMEOUT 30
 )
 
+# What a graph prestage does with one source tensor: the class rule, and the view-root walk that decides whether a
+# host-resident tensor is an op output (a CPU-produced activation the prestage stages as an INPUT). The header reads
+# only ggml.h's types and fields, so this target takes no -fsycl and links nothing.
+add_executable(test-sycl-prestage-class
+    tests/test-sycl-prestage-class.cpp
+)
+target_include_directories(test-sycl-prestage-class PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+set_target_properties(test-sycl-prestage-class PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-prestage-class COMMAND test-sycl-prestage-class)
+set_tests_properties(sycl-prestage-class PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
+    LABELS "sycl;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # test-sycl-pp-moe-scratch-lifecycle was DELETED by llama.cpp-u2mz. It was
 # described as "the only executable proof of the claim/release protocol", but it
 # included ZERO project headers and its target had one source plus

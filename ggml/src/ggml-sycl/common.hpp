@@ -5036,9 +5036,10 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
 // Bytes a graph prestage copies to `device` for `tensor`, or 0 when it makes no
 // copy: weights, control-vector storage, device USM, INPUT tensors (their own
-// stable staging) and anything in the KV-host buft count 0. `src_buft` is the
-// buffer type the tensor lives in. The prestage and the resolver counter below
-// both read this one predicate.
+// stable staging) and anything in the KV-host buft count 0. INPUT includes a
+// host-resident op output, which another split produced for this one
+// (prestage-class.hpp). `src_buft` is the buffer type the tensor lives in. The
+// prestage and the resolver counter below both read this one predicate.
 size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
                                             ggml_backend_buffer_type_t src_buft,
                                             int                        device);

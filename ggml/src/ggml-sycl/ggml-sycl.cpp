@@ -139,6 +139,7 @@
 #include "ggml-sycl/orchestrator.hpp"
 #include "ggml-sycl/pool-legacy-release.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/prestage-class.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/residency-probe.hpp"
@@ -116813,20 +116814,6 @@ static bool graph_tensor_is_input(const ggml_tensor * tensor) {
     return false;
 }
 
-// What a graph prestage does with one source tensor. The first three classes
-// are decided without copying; COPY is the only class whose bytes the
-// predicate reports. INPUT and KV_HOST are not counted but still reach the
-// prestage's copy path: INPUT has its own stable staging, and a KV-host source
-// is staged as before.
-enum class ggml_sycl_prestage_class {
-    CONTROL,
-    WEIGHT,
-    DEVICE,
-    INPUT,
-    KV_HOST,
-    COPY,
-};
-
 // The buffer type `tensor`'s bytes live in. A view lives in its source's buffer.
 static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tensor * tensor) {
     if (!tensor) {
@@ -116837,25 +116824,18 @@ static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tens
     return buf ? buf->buft : nullptr;
 }
 
-// Requires tensor->data: a tensor with no storage yet has nothing to classify.
+// Requires tensor->data: a tensor with no storage yet has nothing to classify. The facts are gathered here and the
+// rule is ggml_sycl_prestage_class_of (prestage-class.hpp).
 static ggml_sycl_prestage_class ggml_sycl_prestage_classify(const ggml_tensor *        tensor,
                                                             ggml_backend_buffer_type_t src_buft) {
-    if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
-        return ggml_sycl_prestage_class::CONTROL;
-    }
-    if (ggml_sycl_tensor_is_weight(tensor)) {
-        return ggml_sycl_prestage_class::WEIGHT;
-    }
-    if (ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device) {
-        return ggml_sycl_prestage_class::DEVICE;
-    }
-    if (graph_tensor_is_input(tensor)) {
-        return ggml_sycl_prestage_class::INPUT;
-    }
-    if (src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
-        return ggml_sycl_prestage_class::KV_HOST;
-    }
-    return ggml_sycl_prestage_class::COPY;
+    ggml_sycl_prestage_facts facts;
+    facts.is_control        = ggml_sycl_tensor_uses_cross_device_control_storage(tensor);
+    facts.is_weight         = ggml_sycl_tensor_is_weight(tensor);
+    facts.is_device         = ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device;
+    facts.is_input          = graph_tensor_is_input(tensor);
+    facts.is_kv_host        = src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
+    facts.root_is_op_output = ggml_sycl_prestage_root_is_op_output(tensor);
+    return ggml_sycl_prestage_class_of(facts);
 }
 
 size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
@@ -117544,7 +117524,11 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         if (ggml_nbytes(tensor) == 0) {
             return;
         }
-        if (!graph_tensor_is_input(tensor)) {
+        // A host-resident op output the pre-stage stages as an INPUT is refreshed like one: a replay that does not run
+        // the pre-stage first would otherwise read the bytes of the token that recorded it.
+        if (!(graph_tensor_is_input(tensor) ||
+              ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor)) ==
+                  ggml_sycl_prestage_class::INPUT)) {
             if (dkw0_input_list_on && dkw0_skipped_seen.insert(tensor).second) {
                 fprintf(stderr,
                         "[DKW0-INPUT-LIST] SKIPPED name=%s tensor=%p op=%s type=%d ne=[%lld,%lld,%lld,%lld] "
