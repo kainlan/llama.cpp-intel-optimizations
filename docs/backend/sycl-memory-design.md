@@ -348,20 +348,22 @@ the device entry is published behind the fill, and the extra's record covers
 `nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
 The admit gives back the whole host entry, all of its zone bytes. A Q4_0
 expert 640 columns wide gains 216 bytes. The first graph after the publish
-serves the admitted expert from the card. Outside graph recording, the
-selected-ids pointer table (`ggml_sycl_update_moe_ptr_table`) orders its
-upload behind the entry's ready event on the context's in-order stream, so
+serves the admitted expert from the card. The selected-ids pointer table
+(`ggml_sycl_update_moe_ptr_table`) is built only outside graph recording: each
+of its callers checks the flag or runs before a recording starts. It orders
+its upload behind the entry's ready event on the context's in-order stream, so
 nothing waits on the host, and that graph queues behind at most the admitted
-triplets' copy and fill. The publish bumps the exec-graph epoch, so the first
-graph after it is recorded again, and a recorded command cannot depend on an
-event outside the graph: while a graph records, the table upload
-(`ggml_sycl_upload_moe_transient_ptr_table`, which the decode direct route's
-table goes through) chains no ready event; it asks each slot's event for its
-status and refuses the table while a slot's copy is still in flight. The decode
-direct route (`ggml_sycl_moe_decode_direct_table`) keeps its decision per
-storage generation, and the admit's device records bump the tensor's
-generation, so the route decides again and serves a block the admit completed
-from its full-coverage table.
+triplets' copy and fill. The decode direct route
+(`ggml_sycl_moe_decode_direct_table`) keeps its decision per storage
+generation, and the admit's device records bump the tensor's generation, so
+the route decides again and serves a block the admit completed from its
+full-coverage table. Outside recording, that table's upload
+(`ggml_sycl_upload_moe_transient_ptr_table`) chains each slot's ready event in
+the same way. The publish bumps the exec-graph epoch, so the first graph after
+it is recorded again, and a recorded command cannot depend on an event outside
+the graph: while a graph records, the direct route's upload chains no ready
+event; it asks each slot's event for its status and refuses the table while a
+slot's copy is still in flight.
 
 The admit bounds memory as follows. It returns each admitted triplet's pinned
 host copy once that copy's last lease drains, so the experts' host pinned use

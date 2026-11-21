@@ -73088,6 +73088,10 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         return true;
     };
 
+    // Reached only outside graph recording: each caller of this function checks the flag or runs before a recording
+    // starts. A recorded command cannot depend on an event from outside the graph, so a route's ready event can be
+    // chained here only on an eager stream. A caller added under recording must take the branch the transient table
+    // upload takes instead: ask the event's status and refuse the table while the copy is in flight.
     auto install_table_route = [&](int64_t e, moe_expert_route & route, const char * debug_tag) -> bool {
         if (!route.ptr) {
             return false;
@@ -73803,9 +73807,9 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         sycl::event table_event;
 
         if (table_payload_changed || !table_deps.empty()) {
-            // BCS/DMA queues are drained at the top of ggml_sycl_mul_mat_id, so
-            // cross-queue event deps in table_deps are already satisfied.
-            // Use depends_on for in-queue ordering of any remaining CCS events.
+            // The dependency list orders the copy on the context's in-order stream: it runs after every event in
+            // table_deps, each expert's ready event, which may come from the copy queue of the same context, and the
+            // kernels queued after it on the stream run after it.
             if (table_payload_changed) {
                 if (!extra->weight().moe_expert_ptrs_handle[device].valid()) {
                     return false;

@@ -4601,13 +4601,13 @@ class unified_cache {
     // copy is a direct DMA. Any other is refused "host copy not pinned": an owner wider than its entry, or a copy that
     // is no host-zone slice, such as one served in place from a file mapping, which would bounce through a synchronous
     // staged copy. A missing host copy refuses as "not on host", and one holding fewer than the member's logical_bytes
-    // as "host copy size". Each member's device_owner
-    // must be exactly staged_expert_bytes() of the host copy's layout and the member's type, ncols and logical_bytes,
-    // never less than logical_bytes ("device storage size"). The copy moves logical_bytes from offset 0 of the host
-    // copy, so a padded copy's tail is never read; the tail past them is zero-filled on the same queue behind the
-    // copy, so the device entry, sized as its storage and published behind the fill, reads as direct staging leaves an
-    // expert. The whole host entry is retired, its storage with it. The rest is the refill's: the same checks before
-    // anything is copied, all three or none, and nothing waits or asks an event's status.
+    // as "host copy size". Each member's device_owner must be exactly staged_expert_bytes() of the host copy's layout
+    // and the member's type, ncols and logical_bytes, never less than logical_bytes ("device storage size"). The copy
+    // moves logical_bytes from offset 0 of the host copy, so a padded copy's tail is never read; the tail past them is
+    // zero-filled on the same queue behind the copy, so the device entry, sized as its storage and published behind the
+    // fill, reads as direct staging leaves an expert. The whole host entry is retired, its storage with it. The rest is
+    // the refill's: the same checks before anything is copied, all three or none, and nothing waits or asks an event's
+    // status.
     bool admit_host_triplet(const expert_refill_member members[3], expert_refill_record & out);
 
     // Optional layout copies (unified_cache_entry::optional_layout).
