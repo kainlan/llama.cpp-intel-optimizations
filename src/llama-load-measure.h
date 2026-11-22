@@ -476,6 +476,40 @@ inline llama_load_probe_reservations llama_load_probe_reserve(const llama_sycl_l
     return out;
 }
 
+// One SYCL device's total memory, by the post-selector device index the measure reports.
+struct llama_load_device_capacity {
+    int32_t  device;
+    uint64_t total_bytes;  // 0 = unknown: the device is not judged
+};
+
+// A measured compute term larger than its device's total memory can never be reserved, whatever the placement: the
+// load is refused by this text before any reservation. Empty when every device can hold its term or cannot be judged.
+// The comparison is against the total, never the free memory, which reads low after a device context is destroyed.
+// A term below the total can still be more than the zones can give; the backend's zone sizing answers that.
+inline std::string llama_load_probe_unfundable_text(const std::vector<llama_load_measure_device> &  devices,
+                                                    const std::vector<llama_load_device_capacity> & capacities,
+                                                    uint32_t                                        n_ctx) {
+    const double mib = 1024.0 * 1024.0;
+    for (const llama_load_measure_device & d : devices) {
+        if (d.host) {
+            continue;
+        }
+        for (const llama_load_device_capacity & c : capacities) {
+            if (c.device != d.device || c.total_bytes == 0 || d.total <= c.total_bytes) {
+                continue;
+            }
+            char text[512];
+            snprintf(text, sizeof(text),
+                     "[LOAD-PLAN] load refused: the compute buffer measured at n_ctx %u needs %.1f MiB on SYCL device "
+                     "%d, and that device has %.1f MiB in total; request a context that fits with -c (with no -c the "
+                     "context is the model's training context)",
+                     n_ctx, d.total / mib, (int) d.device, c.total_bytes / mib);
+            return text;
+        }
+    }
+    return {};
+}
+
 llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,
                                                uint32_t                                       n_ctx,
                                                struct ggml_sycl_load_txn                      txn,

@@ -1067,6 +1067,73 @@ static void test_state_excess() {
     CHECK(llama_context_state_excess_text(0, 4, 0, 0).empty(), "no state and no term warned");
 }
 
+// A compute term larger than its device's total memory is refused by name, before any reservation; a term that
+// fits, the host tier and a device of unknown capacity are not judged.
+static void test_probe_unfundable_text() {
+    const size_t              mib = 1024 * 1024;
+    llama_load_measure_device big;
+    big.device      = 0;
+    big.chunk_bytes = { 1024 * mib, 2048 * mib, 49152 * mib, 49152 * mib, 49152 * mib };
+    big.total       = 150528 * mib;
+    llama_load_measure_device host;
+    host.host  = true;
+    host.total = 900000 * mib;
+
+    std::vector<llama_load_device_capacity> caps;
+    caps.push_back({ 0, 32656ull * mib });
+    caps.push_back({ 1, 16304ull * mib });
+
+    const std::string refused = llama_load_probe_unfundable_text({ host, big }, caps, 1048576);
+    CHECK(refused.rfind("[LOAD-PLAN] load refused", 0) == 0, "no tagged refusal for a 150 GiB term on a 32 GiB device");
+    CHECK(refused.find("n_ctx 1048576") != std::string::npos, "the refusal does not name the context");
+    CHECK(refused.find("device 0") != std::string::npos, "the refusal does not name the device");
+    CHECK(refused.find("needs 150528.0 MiB") != std::string::npos, "the refusal does not name the term: %s",
+          refused.c_str());
+    CHECK(refused.find("has 32656.0 MiB in total") != std::string::npos,
+          "the refusal does not name the device total: %s", refused.c_str());
+    CHECK(refused.find("-c") != std::string::npos, "the refusal does not name the remedy");
+
+    llama_load_measure_device fits = big;
+    fits.total                     = 1052 * mib;
+    CHECK(llama_load_probe_unfundable_text({ fits }, caps, 8192).empty(), "a term that fits was refused");
+    CHECK(llama_load_probe_unfundable_text({ host }, caps, 1048576).empty(), "the host tier was judged");
+    // a host entry whose index collides with a listed device is still the host tier
+    llama_load_measure_device host0 = host;
+    host0.device                    = 0;
+    CHECK(llama_load_probe_unfundable_text({ host0 }, caps, 1048576).empty(), "a host entry was judged as device 0");
+    // a term equal to the device's total fits
+    llama_load_measure_device exact = big;
+    exact.total                     = 32656ull * mib;
+    CHECK(llama_load_probe_unfundable_text({ exact }, caps, 1048576).empty(), "a term equal to the total was refused");
+    llama_load_measure_device unknown = big;
+    unknown.device                    = 7;
+    CHECK(llama_load_probe_unfundable_text({ unknown }, caps, 1048576).empty(), "an unknown device was refused");
+    std::vector<llama_load_device_capacity> zero_caps;
+    zero_caps.push_back({ 0, 0 });
+    CHECK(llama_load_probe_unfundable_text({ big }, zero_caps, 1048576).empty(), "a zero capacity was trusted");
+
+    // the second device is the unfundable one, and the capacities are listed in the other order
+    llama_load_measure_device first  = big;
+    first.total                      = 1052 * mib;
+    llama_load_measure_device second = big;
+    second.device                    = 1;
+    second.total                     = 20000 * mib;
+    std::vector<llama_load_device_capacity> swapped;
+    swapped.push_back({ 1, 16304ull * mib });
+    swapped.push_back({ 0, 32656ull * mib });
+    const std::string refused1 = llama_load_probe_unfundable_text({ first, second }, swapped, 4096);
+    CHECK(refused1.find("device 1") != std::string::npos, "the second device was not judged: %s", refused1.c_str());
+    CHECK(refused1.find("needs 20000.0 MiB") != std::string::npos, "the second device's term is not named: %s",
+          refused1.c_str());
+    CHECK(refused1.find("has 16304.0 MiB in total") != std::string::npos, "the second device's total is not named: %s",
+          refused1.c_str());
+    // and with the capacities in the devices' order, where the unfundable device is not the first capacity listed
+    const std::string refused2 = llama_load_probe_unfundable_text({ first, second }, caps, 4096);
+    CHECK(refused2.find("device 1") != std::string::npos &&
+              refused2.find("has 16304.0 MiB in total") != std::string::npos,
+          "the second capacity was not consulted: %s", refused2.c_str());
+}
+
 int main() {
     test_guard();
     test_dummies();
@@ -1084,6 +1151,7 @@ int main() {
     test_probe_reserve();
     test_state_terms();
     test_state_excess();
+    test_probe_unfundable_text();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;
