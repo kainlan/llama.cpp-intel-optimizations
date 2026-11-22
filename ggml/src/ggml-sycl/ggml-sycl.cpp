@@ -25338,8 +25338,8 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
         }
         if (ggml_sycl::moe_mmid_reconcile_retires(outcome, status)) {
             // An in-place rebind re-keyed the publication to the live identity: retire what the registry holds now.
-            retire_own_publication(ggml_sycl::moe_mmid_reconcile_retire_identity(outcome, published->version,
-                                                                                 live ? live->version : 0));
+            retire_own_publication(
+                ggml_sycl::moe_mmid_reconcile_retire_identity(outcome, published->version, live ? live->version : 0));
         }
         ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
                                           refusal, token, live ? live : published);
