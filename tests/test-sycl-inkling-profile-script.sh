@@ -18,8 +18,9 @@ export INKLING_PROMPT_FILE="$T/prompt.txt"
 export INKLING_SETVARS="$T/setvars-ok.sh"
 export INKLING_MEMINFO="$T/meminfo"
 export INKLING_SETTLE_SECONDS=0
+export INKLING_LOCK_VERIFY_SECONDS=0
 export STUB_LOG="$T/stub.log"
-unset ONEAPI_DEVICE_SELECTOR INKLING_RUN_TIMEOUT INKLING_KILL_SECONDS INKLING_LOCK_WAIT_SECONDS INKLING_SHMEM_WAIT_SECONDS
+unset INKLING_LOCK_POLL_SECONDS ONEAPI_DEVICE_SELECTOR INKLING_RUN_TIMEOUT INKLING_KILL_SECONDS INKLING_LOCK_WAIT_SECONDS INKLING_SHMEM_WAIT_SECONDS
 printf 'Shmem:              1000 kB\n' > "$INKLING_MEMINFO"
 # Reads an unset variable: it ends a shell that runs under set -u unless the runner relaxes it around the source.
 # shellcheck disable=SC2016  # the file must contain the literal $ expression
@@ -191,6 +192,41 @@ else
     fail "(real: overlapping runs) tool ran $runs times, rc=$rk1/$rk2; k1: $(cat "$T/k1.out") k2: $(cat "$T/k2.out") log: $(cat "$STUB_LOG")"
 fi
 
+# k2. the result must not depend on mkdir: 40 iterations of two runners started together on a fresh lock. The system
+# mkdir here is the racy one, so any use of it in the lock path shows up as a double run.
+bad=""
+for i in $(seq 1 40); do
+    : > "$STUB_LOG"; K="$T/kk$i"
+    env STUB_MODE=ok INKLING_LOCK_POLL_SECONDS=0.05 timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" \
+        --build-dir "$BR" >/dev/null 2>&1 &
+    P1=$!
+    env STUB_MODE=ok INKLING_LOCK_POLL_SECONDS=0.05 timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" \
+        --build-dir "$BR" >/dev/null 2>&1 &
+    P2=$!
+    r1=0; wait "$P1" || r1=$?
+    r2=0; wait "$P2" || r2=$?
+    runs="$(wc -l < "$STUB_LOG")"
+    [ "$runs" -eq 1 ] && [ $((r1 + r2)) -eq 1 ] || bad="$bad [iter $i: runs=$runs rc=$r1/$r2]"
+    [ ! -e "$T/lock" ] || { bad="$bad [iter $i: lock left]"; rmdir "$T/lock" 2>/dev/null; }
+done
+if [ -z "$bad" ]; then pass "(real: 40 paired races, the tool ran exactly once each time)"; else fail "(real: lock race)$bad"; fi
+
+# n. a co-taker that overwrites holder inside our verify window owns the lock: no run, nothing removed.
+: > "$STUB_LOG"; Nn="$T/n"
+( while [ ! -e "$T/lock/holder" ]; do sleep 0.01; done; echo "foreign taker" > "$T/lock/holder" ) &
+WP=$!
+env STUB_MODE=ok INKLING_LOCK_VERIFY_SECONDS=2 INKLING_LOCK_WAIT_SECONDS=4 timeout 60 bash "$S" --setup b70 \
+    --phase e2e-decode --out "$Nn" --build-dir "$BR" >/dev/null 2>&1
+rn=$?
+wait "$WP"
+if [ "$rn" -eq 3 ] && [ ! -s "$STUB_LOG" ] && [ -d "$T/lock" ] && [ "$(cat "$T/lock/holder" 2>/dev/null)" = "foreign taker" ] \
+   && [ -e "$Nn/$TAG.fail" ]; then
+    pass "(real: a co-taker's holder is respected: no run, exit 3, lock and holder untouched)"
+else
+    fail "(real: co-taker) rc=$rn log: $(cat "$STUB_LOG") holder: $(cat "$T/lock/holder" 2>&1)"
+fi
+rm -f "$T/lock/holder"; rmdir "$T/lock" 2>/dev/null
+
 # e. setvars fails.
 : > "$STUB_LOG"; printf 'return 3\n' > "$T/setvars-bad.sh"; XENV=(INKLING_SETVARS="$T/setvars-bad.sh"); E="$T/e"
 rr "$E"
@@ -241,5 +277,8 @@ if bash "$S" --help 2>&1 | grep -q 'set -u'; then fail "(--help leaks the set -u
 # i. an option with no value must not loop.
 rc=0; timeout 5 bash "$S" --setup b70 --phase bench --out >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 1 ]; then pass "(--out with no value exits 1)"; else fail "(--out with no value) rc=$rc"; fi
+
+# no sibling take-file protocol: nothing named *.take may exist anywhere under the test root
+if [ -z "$(find "$T" -name '*.take')" ]; then pass "(no .take file was created)"; else fail "(a .take file exists)"; fi
 
 [ "$n_fail" -eq 0 ] || exit 1

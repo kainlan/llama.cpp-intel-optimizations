@@ -2,7 +2,8 @@
 # sycl-inkling-profile.sh -- ONE profiled or benchmark run of Inkling-2-Mini on one setup. Lead-only: it loads a
 # 22.9 GB model onto a GPU. It holds GPU.lock for the run and waits for Shmem < 30 GB first. A model-loading run is
 # never repeated: a tag whose .done, .out or tuning directory already exists is refused, before and again after the
-# lock is taken.
+# lock is taken. The lock directory is made with mkdir(2) through python3, not the mkdir command: the system mkdir
+# on this host reports success when a directory already exists, so two takers can both win.
 #
 #   sycl-inkling-profile.sh --setup b70|b50|both --phase bench|kprof-prompt|kprof-decode|e2e-decode|census
 #                           --out DIR [--ctx N] [--build-dir DIR] [--dry-run]
@@ -16,10 +17,11 @@
 # Environment overrides (the test drives the real path through them; defaults are the production values):
 #   INKLING_MODEL INKLING_PROMPT_FILE INKLING_GPU_LOCK INKLING_SETVARS INKLING_MEMINFO INKLING_SETTLE_SECONDS (12)
 #   INKLING_RUN_TIMEOUT (900) INKLING_KILL_SECONDS (30) INKLING_LOCK_WAIT_SECONDS (2400) INKLING_SHMEM_WAIT_SECONDS (600)
+#   INKLING_LOCK_POLL_SECONDS (1) INKLING_LOCK_VERIFY_SECONDS (1)
 set -u
 
 usage() {
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,6 +36,8 @@ RUN_TIMEOUT="${INKLING_RUN_TIMEOUT:-900}"
 KILL_AFTER="${INKLING_KILL_SECONDS:-30}"
 LOCK_WAIT="${INKLING_LOCK_WAIT_SECONDS:-2400}"
 SHMEM_WAIT="${INKLING_SHMEM_WAIT_SECONDS:-600}"
+LOCK_POLL="${INKLING_LOCK_POLL_SECONDS:-1}"
+LOCK_VERIFY="${INKLING_LOCK_VERIFY_SECONDS:-1}"
 
 need_value() { [ "$2" -ge 2 ] || { echo "sycl-inkling-profile: $1 needs a value" >&2; exit 1; }; }
 while [ $# -gt 0 ]; do
@@ -116,7 +120,7 @@ refuse_rerun() {
 refuse_rerun
 rm -f "${OUT:?}/${TAG:?}.fail"
 
-LOCK_HELD=0 CHILD="" SIGNALLED=0
+LOCK_HELD=0 CHILD="" SIGNALLED=0 MINE=
 die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this process holds
     printf 'tag=%s rc=%s reason=%s\n' "$TAG" "$1" "$2" > "$OUT/$TAG.fail"
     echo "sycl-inkling-profile: $2" >&2
@@ -125,9 +129,12 @@ die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this proce
 # shellcheck disable=SC2329  # installed through trap
 lock_release() {
     [ "$LOCK_HELD" = 1 ] || return 0
-    # rmdir cannot remove a lock directory that still holds the holder file, so remove it first.
-    rm -f "${LOCK:?}/holder"
-    rmdir "$LOCK" 2>/dev/null
+    # Only our own holder and directory: a co-taker that overwrote the holder owns the lock now. rmdir cannot remove
+    # a lock directory that still holds the holder file, so remove it first.
+    if [ "$(cat "$LOCK/holder" 2>/dev/null)" = "$MINE" ]; then
+        rm -f "${LOCK:?}/holder"
+        rmdir "$LOCK" 2>/dev/null
+    fi
     LOCK_HELD=0
 }
 # Signals are deferred: the handler only records the signal and forwards TERM to a running child. It never exits or
@@ -146,6 +153,7 @@ trap lock_release EXIT
 trap on_signal TERM INT HUP
 
 # Preflight before the lock, so a missing file never holds the GPU.
+command -v python3 >/dev/null 2>&1 || die 1 "preflight: python3 is required for the lock and was not found"
 [ -x "$BIN" ] || die 1 "preflight: $BIN is not an executable"
 [ -f "$MODEL" ] || die 1 "preflight: model file $MODEL not found"
 if [ "$NEED_PROMPT" = 1 ] && [ ! -f "$PROMPT_FILE" ]; then die 1 "preflight: prompt file $PROMPT_FILE not found"; fi
@@ -153,25 +161,27 @@ if [ "$NEED_PROMPT" = 1 ] && [ ! -f "$PROMPT_FILE" ]; then die 1 "preflight: pro
 
 meminfo_shmem_gb() { awk '/^Shmem:/ { printf "%d", $2 / 1048576 }' "$MEMINFO"; }
 
-# Two concurrent mkdir calls can both succeed here (uutils mkdir is not atomic under a race), so a sibling file made
-# with noclobber (O_EXCL, atomic in bash) serialises the mkdir. A stale .take file only makes the lock time out.
-take_lock() {
-    ( set -C; : > "$LOCK.take" ) 2>/dev/null || return 1
-    local got=1
-    mkdir "$LOCK" 2>/dev/null && got=0
-    rm -f "${LOCK:?}.take"
-    return "$got"
+# mkdir(2) fails with EEXIST; the mkdir command here does not.
+lock_mkdir() { python3 -c 'import os,sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null; }
+# Take the lock directory and prove it is ours. Other scripts still take GPU.lock with a plain mkdir and then
+# overwrite holder, so the holder is created with noclobber and re-read after a short wait: a foreign or changed
+# holder means a co-taker owns the lock, and we neither run nor remove anything.
+try_lock() {
+    lock_mkdir "$LOCK" || return 1
+    MINE="sycl-inkling-profile pid=$$ tag=$TAG start=$(date +%FT%T)"
+    ( set -C; echo "$MINE" > "$LOCK/holder" ) 2>/dev/null || return 1
+    sleep "$LOCK_VERIFY"
+    [ "$(cat "$LOCK/holder" 2>/dev/null)" = "$MINE" ]
 }
 # Failing to get the lock in time exits without running.
-waited=0
+lock_start=$SECONDS
 check_signal
-until take_lock; do
-    sleep 1; waited=$((waited + 1))
+until try_lock; do
+    sleep "$LOCK_POLL"
     check_signal
-    [ "$waited" -lt "$LOCK_WAIT" ] || die 3 "GPU.lock not acquired in ${LOCK_WAIT}s"
+    [ $((SECONDS - lock_start)) -lt "$LOCK_WAIT" ] || die 3 "GPU.lock not acquired in ${LOCK_WAIT}s"
 done
 LOCK_HELD=1
-printf 'sycl-inkling-profile pid=%s tag=%s start=%s\n' "$$" "$TAG" "$(date +%FT%T)" > "$LOCK/holder"
 check_signal
 refuse_rerun
 
