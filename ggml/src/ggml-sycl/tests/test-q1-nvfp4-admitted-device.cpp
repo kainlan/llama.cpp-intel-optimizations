@@ -1112,8 +1112,10 @@ int main() {
                     successful_reuse_case(life, type, ne11, "prompt-ids-view", input_rows::DENSE, 33,
                                           ids_layout::VIEW);
                     successful_reuse_case(life, type, ne11, "prompt-tokens-strided", input_rows::TOKENS_STRIDED, 33);
+                    // With ne11 == 1 the one row's stride is the token stride, so nb12 == ne11 * nb11 holds for
+                    // tokens a stride apart: only a token stride compared with ne11 rows of row bytes copies them.
+                    successful_reuse_case(life, type, ne11, "prompt-rows-strided", input_rows::STRIDED, 33);
                 }
-                successful_reuse_case(life, type, route_top_k, "prompt-rows-strided", input_rows::STRIDED, 33);
                 // Decode on the same fixture, ids as a view: the route reads the view, it does not write it.
                 successful_reuse_case(life, type, 1, "decode-ids-view", input_rows::DENSE, 1, ids_layout::VIEW);
             }

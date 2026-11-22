@@ -11971,10 +11971,12 @@ bool ggml_sycl_q1_nvfp4_test_completion_held() {
 // B70 validation. Opened 2026-11-22: sycl-q1-nvfp4-admitted-device passed on the B70 and the B50 on driver 26.44
 // (docs/backend/data/inkling2/t7a-oracle-b70.txt, t7a-oracle-b50.txt), with both input shapes a MoE decode gives
 // MUL_MAT_ID: one src1 row every selected expert shares (ne11 == 1, gate/up) and one row per selected expert
-// (ne11 == top_k, down). The admission takes both, since every decode layer runs one of each. Hoisted to file scope
-// so the admission gate (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind) read ONE
-// constant and cannot drift apart -- materializing a pool for a route that cannot execute reserves VRAM nothing will
-// ever consume, and refusing to materialize one the route CAN execute is a silent performance cliff.
+// (ne11 == top_k, down). The admission takes both, since every decode layer runs one of each. A prompt's rows take the
+// same route, every token in one submit, refused by name above the planned workspace capacity; the same device test
+// carries their cases. Hoisted to file scope so the admission gate (ggml_sycl_mul_mat_id) and the materialization
+// gate (load_end / context bind) read ONE constant and cannot drift apart -- materializing a pool for a route that
+// cannot execute reserves VRAM nothing will ever consume, and refusing to materialize one the route CAN execute is a
+// silent performance cliff.
 constexpr bool k_moe_mmid_direct_route_validated = true;
 
 // Compile-time reachability: the validated route, or a route-testing build. With the route validated it is true in
@@ -36699,8 +36701,10 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
 
     if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) {
         // Recipe availability is narrower than executor capability. It merely
-        // lets an exact primary decode candidate reach DIRECT admission;
-        // choose_moe_batch_executor still requires the admitted bundle.
+        // lets an exact primary candidate reach DIRECT admission, for a decode
+        // token and a prompt's rows alike: the direct route submits a whole
+        // batch in one kernel; choose_moe_batch_executor still requires the
+        // admitted bundle.
         //
         // Whether the lease can be bound is the binder's question, so ask the
         // binder. A handle-kind test here was a second, narrower answer: every
@@ -36709,8 +36713,7 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // DIRECT-only test closed the route on every card (llama.cpp-1sxq).
         const int64_t qk = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
         const bool    static_candidate =
-            phase == moe_route_phase::DECODE && rows == 1 && layout == GGML_LAYOUT_AOS &&
-            route_device == submit_device && direct_recipe_candidate &&
+            layout == GGML_LAYOUT_AOS && route_device == submit_device && direct_recipe_candidate &&
             ggml_sycl::moe::canonical_allocation_integration::exact_identity(*direct_recipe_candidate).has_value() &&
             K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         // Authority belongs to the invocation that is building this batch.
@@ -36745,11 +36748,11 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // Admitting here does NOT mean the generic executor runs Q1_0/NVFP4.
         // choose_moe_batch_executor() in moe-resolved-batch.hpp rejects a device
         // recipe for them unconditionally; they execute only through the direct
-        // block in ggml_sycl_mul_mat_id (decode rows, primary card, AoS). The gate
-        // has two askers: the hybrid decode record build, before the direct block,
-        // for a layer with host experts (its refusal hands the tensor back to the
-        // retained route), and the retained route core, after the direct block, for
-        // an operand that fell through it, which refuses with
+        // block in ggml_sycl_mul_mat_id (primary card, AoS, a decode token or a
+        // prompt's rows). The gate has two askers: the hybrid decode record build,
+        // before the direct block, for a layer with host experts (its refusal hands
+        // the tensor back to the retained route), and the retained route core, after
+        // the direct block, for an operand that fell through it, which refuses with
         // reason=capability_unsupported and capability=local-mmvq from right here.
         // That is deliberate, not a bug in either layer.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
@@ -67598,8 +67601,8 @@ static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_
 }
 
 // The ids tensor's own device storage, or nullptr when it is not resident on
-// ctx.device. It never stages a host copy, so the decode direct route takes
-// no H2D and no host wait for ids; ggml_sycl_get_moe_ids_device_ptr_exact()
+// ctx.device. It never stages a host copy, so the direct routes take no H2D
+// and no host wait for ids; ggml_sycl_get_moe_ids_device_ptr_exact()
 // tries it before staging one. out_handle, when given, receives the storage
 // handle the pointer was resolved from.
 static const int32_t * ggml_sycl_moe_ids_device_resident_ptr(ggml_backend_sycl_context & ctx,
@@ -79511,7 +79514,6 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
 
 struct moe_direct_bundle_completion {
     ggml_sycl::moe_admitted_workspace_bundle bundle;
-    std::shared_ptr<const std::vector<int32_t>> retained_ids;
 };
 
 struct moe_direct_submit_failure final {};
@@ -83956,6 +83958,24 @@ static bool ggml_sycl_mul_mat_id_device_sched(ggml_backend_sycl_context & ctx, c
     return false;
 }
 
+// The exact queue capability that lets a Q1_0/NVFP4 batch build mint the direct recipe: the invocation's own queue,
+// proved against the live plan snapshot and the context's current owner. Invalid when any of those is missing, and the
+// build then mints none. One answer for both admissions, a decode token's and a prompt's.
+static ggml_sycl::moe_mmid_queue_capability ggml_sycl_moe_direct_queue_capability(ggml_backend_sycl_context & ctx) {
+    ggml_sycl::moe_mmid_queue_capability capability;
+    sycl::queue *                        queue = ctx.stream();
+    auto *                               cache = queue ? ggml_sycl::get_unified_cache(*queue) : nullptr;
+    const auto                           plan  = cache ? cache->get_placement_plan_snapshot() : nullptr;
+    const auto                           exec  = ggml_sycl_take_execution_state_snapshot(&ctx);
+    ggml_sycl::lifecycle::ModelToken     root{};
+    if (queue && plan && plan->plan && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
+        exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root)) {
+        capability = ggml_sycl::unified_cache_moe_mmid_exact_queue(
+            { root.model.value, root.load.value, root.owner.generation }, plan, ctx.device, ctx.device, queue);
+    }
+    return capability;
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
@@ -84344,6 +84364,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // sibling dispatch. Routeeval reads this instead of recomputing.
     bool                                               retained_prompt_roles_bundle_validated = false;
     layout_mode                                        retained_prompt_layout                 = GGML_LAYOUT_AOS;
+    // The Q1_0/NVFP4 direct recipe's queue capability for a prompt, asked once at the top of the prompt admission and
+    // handed to every prompt build that can supply this op's batch: the three pair roles (a reused role batch is the
+    // prompt's batch) and the prompt's own build. It opens nothing for any other type.
+    ggml_sycl::moe_mmid_queue_capability               prompt_queue_capability;
 #if GGML_SYCL_DNNL
     host_phase_mark(&mxfp4_pp_batched_profile_accum::host_entry_us, &mxfp4_pp_batched_profile_accum::host_entry_calls);
 #endif
@@ -84352,6 +84376,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         if (g_ggml_sycl_graph_recording) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt batch cannot enter graph sink");
         }
+        prompt_queue_capability = ggml_sycl_moe_direct_queue_capability(ctx);
         // The gate/up/down MUL_MAT_ID nodes of a single PP layer share the
         // identical `ids` tensor and its device contents don't change within
         // one graph-compute pass. Reuse the same graph-local D2H cache the
@@ -84646,16 +84671,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     &mxfp4_pp_batched_profile_accum::host_admit_resolve_layout_calls);
 #endif
                     // The invocation's context and queue reach the resolver so a staged ring slot can answer
-                    // (STAGED_RING, llama.cpp-o9uw); queue_capability stays null, as it was.
+                    // (STAGED_RING, llama.cpp-o9uw). The direct queue capability goes too: a reused role batch is
+                    // this prompt's batch, and only the capability lets a Q1_0/NVFP4 role admit the direct recipe.
                     auto gate_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
                         pair.gate_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
-                        static_cast<size_t>(ids->ne[0]), gate_layout, /*allow_materialize=*/false, &ctx, ctx.stream());
+                        static_cast<size_t>(ids->ne[0]), gate_layout, /*allow_materialize=*/false, &ctx, ctx.stream(),
+                        prompt_queue_capability.valid() ? &prompt_queue_capability : nullptr);
                     auto up_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
                         pair.up_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
-                        static_cast<size_t>(ids->ne[0]), up_layout, /*allow_materialize=*/false, &ctx, ctx.stream());
+                        static_cast<size_t>(ids->ne[0]), up_layout, /*allow_materialize=*/false, &ctx, ctx.stream(),
+                        prompt_queue_capability.valid() ? &prompt_queue_capability : nullptr);
                     auto down_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
                         pair.down_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
-                        static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false, &ctx, ctx.stream());
+                        static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false, &ctx, ctx.stream(),
+                        prompt_queue_capability.valid() ? &prompt_queue_capability : nullptr);
 #if GGML_SYCL_DNNL
                     host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_batch_us,
                                     &mxfp4_pp_batched_profile_accum::host_admit_resolve_batch_calls);
@@ -85471,7 +85500,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
                 src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                 static_cast<size_t>(ids->ne[0]), retained_prompt_layout, /*allow_materialize=*/false, &ctx,
-                ctx.stream());
+                ctx.stream(), prompt_queue_capability.valid() ? &prompt_queue_capability : nullptr);
 #if GGML_SYCL_DNNL
             if (host_phase_profile) {
                 ++g_mxfp4_pp_batched_profile.fastpath_rebuild_built_count;
@@ -87294,18 +87323,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_decode_canonical_publish_diagnostics,
                                                           "MOE-DECODE-CANONICAL", src0, canonical_published,
                                                           published_kind, published_stable);
-        const auto recipe_exec = ggml_sycl_take_execution_state_snapshot(&ctx);
-        ggml_sycl::lifecycle::ModelToken recipe_root{};
-        const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
         sycl::queue * recipe_queue = ctx.stream();
-        ggml_sycl::moe_mmid_queue_capability recipe_queue_capability;
-        if (recipe_queue && recipe_plan && recipe_plan->plan && recipe_exec.context_id && recipe_exec.session_id &&
-            recipe_exec.reset_epoch && recipe_exec.graph_epoch && recipe_exec.invocation_id &&
-            ggml_sycl_execution_current_owner(&ctx, recipe_root)) {
-            recipe_queue_capability = ggml_sycl::unified_cache_moe_mmid_exact_queue(
-                { recipe_root.model.value, recipe_root.load.value, recipe_root.owner.generation }, recipe_plan,
-                ctx.device, ctx.device, recipe_queue);
-        }
+        const ggml_sycl::moe_mmid_queue_capability recipe_queue_capability = ggml_sycl_moe_direct_queue_capability(ctx);
         retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, ids_host.data(), ids_host.size(), static_cast<size_t>(n_ids), route_layout,
             /*allow_materialize=*/false, &ctx, recipe_queue,
@@ -87323,17 +87342,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
 
-    // The production DIRECT authority for decode Q1/NVFP4 (decode rows, primary
-    // residency, AoS). Prompt rows, host-resident experts and secondary residency
-    // remain outside this route. All fall-throughs are pre-submit refusals; once
-    // marked, the exact queue is drained/recovered.
-    // It takes both input shapes a MoE decode gives MUL_MAT_ID: one src1 row that
+    // The production DIRECT authority for Q1/NVFP4 (primary residency, AoS): a
+    // decode token from the decode admission's batch, a prompt's ne12 tokens
+    // from the prompt admission's batch, every token in one submit. Host-resident
+    // experts and secondary residency remain outside this route. All
+    // fall-throughs are pre-submit refusals; once marked, the exact queue is
+    // drained/recovered.
+    // It takes both input shapes a MoE layer gives MUL_MAT_ID: one src1 row that
     // every selected expert shares (ne11 == 1, the gate/up or fused gate_up
     // projection) and one row per selected expert (ne11 == ids->ne[0], the down
     // projection). The kernel reads row id % ne11 and the workspace is planned for
-    // top_k rows, so both are the kernel's own shapes, not a conversion. Rows are
-    // copied as one block when adjacent and one by one when a view strides them;
-    // elements that are not adjacent inside a row are not admitted.
+    // top_k rows per token, so both are the kernel's own shapes, not a conversion.
+    // src1 is copied into the dense [token][row] slice in as few pieces as its
+    // strides allow (all of it, one token's rows, or one row at a time); elements
+    // that are not adjacent inside a row are not admitted. The kernel reads the
+    // ids tensor in place with its own strides: an op does not write its input.
     // One definition, shared with the materialization gate: see
     // k_moe_mmid_direct_route_validated. Do not re-spell this as a literal --
     // the two gates drifting is how a pool gets allocated for a route that
@@ -87344,36 +87367,69 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #else
     constexpr bool q1_nvfp4_private_test_authorized = false;
 #endif
-    if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1 &&
-        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) && route_layout == GGML_LAYOUT_AOS &&
-        retained_decode_batch_result) {
+    // A decode token reads the decode admission's batch and layout, a prompt the prompt admission's.
+    const ggml_sycl::moe_resolved_batch_result & direct_admission =
+        ne12 == 1 ? retained_decode_batch_result : retained_prompt_batch_result;
+    const layout_mode direct_layout = ne12 == 1 ? route_layout : retained_prompt_layout;
+    if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&
+        (src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) && direct_layout == GGML_LAYOUT_AOS &&
+        direct_admission) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
         g_q1_nvfp4_test_candidate.fetch_add(1, std::memory_order_relaxed);
 #endif
-        const auto & decode = retained_decode_batch_result.batch;
-        bool all_primary = !decode.operands.empty();
-        for (const auto & operand : decode.operands) {
+        const auto & direct_batch = direct_admission.batch;
+        bool all_primary = !direct_batch.operands.empty();
+        for (const auto & operand : direct_batch.operands) {
             all_primary = all_primary && operand.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE &&
                           operand.owning_device() == ctx.device && operand.actual_layout() == GGML_LAYOUT_AOS;
         }
         const auto exec = ggml_sycl_take_execution_state_snapshot(&ctx);
         ggml_sycl::lifecycle::ModelToken root{};
         const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
+
+        // The kernel reads the ids where they are: this device's own storage of the tensor, view offset included.
+        const int32_t * ids_device = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);
         if (all_primary && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
             exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root) && plan_snapshot &&
-            plan_snapshot->plan && ids->ne[0] > 0 && ids->ne[1] == 1 && (ne11 == 1 || ne11 == ids->ne[0]) &&
-            nb10 == sizeof(float) && nb1 == static_cast<size_t>(ne01) * sizeof(float)) {
+            plan_snapshot->plan && ids->ne[0] > 0 && (ne11 == 1 || ne11 == ids->ne[0]) && ids_device &&
+            ids->nb[0] == sizeof(int32_t) && src1->type == GGML_TYPE_F32 && nb10 == sizeof(float) &&
+            nb2 == static_cast<size_t>(ne1) * nb1 && nb1 == static_cast<size_t>(ne01) * sizeof(float)) {
+            // A batch above the workspace the plan holds for this device is refused by name here, before admission:
+            // the plan's own sizing function asked for this batch's ne12 tokens, held against that slot by the
+            // comparison admission makes. With no slot for this device there is nothing to admit into, and
+            // admission refuses below.
+            const ggml_sycl::moe_mmid_workspace_geometry * planned_slot = nullptr;
+            for (const auto & workspace : plan_snapshot->plan->moe_mmid_workspaces) {
+                if (workspace.valid && workspace.owner_device == ctx.device && !workspace.secondary_owner) {
+                    planned_slot = &workspace.slot;
+                    break;
+                }
+            }
+            ggml_sycl::moe_mmid_workspace_geometry needed;
+            if (planned_slot && (!ggml_sycl::moe_mmid_plan_workspace(
+                                     { static_cast<size_t>(ne10), static_cast<size_t>(ne01), static_cast<size_t>(ne11),
+                                       static_cast<size_t>(ids->ne[0]), static_cast<size_t>(ne12) },
+                                     false, &needed) ||
+                                 !ggml_sycl::moe_mmid_workspace_geometry_holds(*planned_slot, needed))) {
+                GGML_LOG_ERROR("[%s] tensor=%s reason=workspace_capacity tokens=%lld capacity=%zu\n",
+                               ne12 == 1 ? "MOE-DECODE-REFUSAL" : "MOE-PROMPT-REFUSAL", src0->name ? src0->name : "?",
+                               static_cast<long long>(ne12),
+                               planned_slot->occurrences / static_cast<size_t>(ids->ne[0]));
+                ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
+                throw ggml_sycl_fallback_error("MUL_MAT_ID direct route batch exceeds its planned MMID workspace");
+            }
             auto retained_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
-                ctx, src0, decode, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
+                ctx, src0, direct_batch, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
             const void * const * table_ptr = retained_table.resolve_abi(ctx.device);
             auto bindings = std::make_shared<std::vector<ggml_sycl::moe::mmid_batch_binding>>();
             std::vector<ggml_sycl::moe::retained_allocation_owner> table_entries;
-            bindings->reserve(decode.operands.size());
-            table_entries.reserve(decode.operands.size() + 1);
+            bindings->reserve(direct_batch.operands.size());
+            table_entries.reserve(direct_batch.operands.size() + 1);
             bool canonical = table_ptr != nullptr && retained_table.valid();
-            for (size_t i = 0; canonical && i < decode.operands.size(); ++i) {
+            for (size_t i = 0; canonical && i < direct_batch.operands.size(); ++i) {
                 auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(
-                    decode.operands[i].lease(), static_cast<uint64_t>(GGML_LAYOUT_AOS) + 1, static_cast<uint32_t>(i));
+                    direct_batch.operands[i].lease(), static_cast<uint64_t>(GGML_LAYOUT_AOS) + 1,
+                    static_cast<uint32_t>(i));
                 canonical = binding.has_value();
                 if (binding) {
                     table_entries.push_back(binding->owner);
@@ -87393,8 +87449,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // The direct recipe and exact queue capability were proven together
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
-            auto          queue_cap   = decode.operands.front().recipe_queue_capability();
-            for (const auto & operand : decode.operands) {
+            auto          queue_cap   = direct_batch.operands.front().recipe_queue_capability();
+            for (const auto & operand : direct_batch.operands) {
                 if (!operand.recipe_queue_capability().valid() ||
                     operand.recipe_queue_capability().cookie() != queue_cap.cookie() ||
                     operand.recipe_queue_capability().owner_device() != queue_cap.owner_device()) {
@@ -87408,14 +87464,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 execution_registry.mint_authoritative_invocation_snapshot(
                     { exec.context_id }, { exec.session_id }, { exec.reset_epoch }, { exec.graph_epoch },
                     { exec.invocation_id }, root, &invocation) == ggml_sycl::execution::error::OK;
-            // Every fallible owner needed after admission is prepared first.
-            // In particular the adapter's host upload source is immutable and
-            // retained by the final host task, never borrowed from a local batch.
-            auto retained_ids = snapshot_ok ?
-                std::make_shared<const std::vector<int32_t>>(decode.expert_ids) : nullptr;
-            auto terminal = snapshot_ok && retained_ids ? std::make_shared<moe_direct_event_terminal>() : nullptr;
+            // Every fallible owner needed after admission is prepared first. The
+            // ids need none: the kernel reads the tensor in place, and the adapter
+            // reads the batch's host snapshot only in its checks before it submits.
+            auto terminal   = snapshot_ok ? std::make_shared<moe_direct_event_terminal>() : nullptr;
             auto completion = terminal ? std::make_shared<moe_direct_bundle_completion>() : nullptr;
-            if (completion) completion->retained_ids = retained_ids;
             ggml_sycl::workspace_admission_authority authority;
             std::vector<ggml_sycl::moe_mmid_admission_owner> owners;
             std::vector<ggml_sycl::moe_mmid_queue_capability> queues;
@@ -87434,7 +87487,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl_moe_mark_direct_authority_pre_admission(src0);
                 ggml_sycl::moe_mmid_authoritative_admission_request request;
                 request.authority = std::move(authority);
-                request.shape = { static_cast<size_t>(ids->ne[0]), static_cast<size_t>(ne11), ne00, ne01,
+                request.shape = { static_cast<size_t>(ids->ne[0]), static_cast<size_t>(ne11), ne10, ne01,
                                   static_cast<int32_t>(src0->type) };
                 auto admitted = ggml_sycl::unified_cache_admit_moe_mmid_workspace(std::move(request));
                 if (admitted.status == ggml_sycl::moe_mmid_lease_status::ACQUIRED && admitted.bundle.valid()) {
@@ -87455,14 +87508,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif
                     const auto & slices = lease[0].slices();
                     auto * activation = static_cast<float *>(slices.activation_f32.ptr);
-                    auto * ids_device = static_cast<int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
-                    const size_t activation_bytes = static_cast<size_t>(ne00) * static_cast<size_t>(ne11) * sizeof(float);
-                    const size_t output_bytes = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ne01) * sizeof(float);
-                    const size_t activation_row_bytes = static_cast<size_t>(ne00) * sizeof(float);
-                    // A view can place src1's rows a stride apart; one block of ne11 rows would then read the bytes
-                    // between them.
-                    const bool   src1_rows_adjacent   = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);
-                    if (activation && ids_device && src1_device_base && dst_device_base &&
+                    // The slices are sized for this batch's ne12 tokens, so every byte count covers them all.
+                    const size_t activation_row_bytes = static_cast<size_t>(ne10) * sizeof(float);
+                    const size_t activation_bytes =
+                        activation_row_bytes * static_cast<size_t>(ne11) * static_cast<size_t>(ne12);
+                    const size_t output_bytes = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ne01) *
+                                                static_cast<size_t>(ne12) * sizeof(float);
+                    // A view can place src1's rows, or its tokens, a stride apart; one block would then read the
+                    // bytes between them. The copy goes in the largest pieces src1 holds adjacent: the whole input,
+                    // one token's rows, or one row. Tokens are adjacent when the next token starts one token's rows
+                    // of row bytes on, which a lone row's nb11 does not tell (with ne11 == 1 it can be any stride).
+                    const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);
+                    const bool src1_tokens_adjacent =
+                        ne12 == 1 || nb12 == static_cast<size_t>(ne11) * activation_row_bytes;
+                    const int64_t activation_piece_rows = !src1_rows_adjacent  ? 1 :
+                                                          src1_tokens_adjacent ? ne11 * ne12 :
+                                                                                 ne11;
+                    const int64_t activation_pieces     = ne11 * ne12 / activation_piece_rows;
+                    const size_t  activation_piece_bytes =
+                        static_cast<size_t>(activation_piece_rows) * activation_row_bytes;
+                    if (activation && src1_device_base && dst_device_base &&
                         slices.activation_f32.bytes == activation_bytes && slices.output_f32.bytes == output_bytes &&
                         completion->bundle.mark_possible_submit()) {
                         try {
@@ -87471,28 +87536,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 throw moe_direct_submit_failure{};
                             }
 #endif
-                            // Adjacent rows go as one block. Strided rows go one by one into the dense slice, each
-                            // copy depending on the one before, so the kernel's one dependency, the last copy, covers
-                            // every row.
+                            // Each piece lands at its own place in the dense [token][row] slice, each copy depending
+                            // on the one before, so the kernel's one dependency, the last copy, covers every piece. A
+                            // dense src1 is one piece, and the loop never runs.
                             sycl::event dependency = ggml_sycl::mem_copy_ptr_async(
-                                activation, src1_device_base,
-                                src1_rows_adjacent ? activation_bytes : activation_row_bytes, *exact_queue,
+                                activation, src1_device_base, activation_piece_bytes, *exact_queue,
                                 retained_table.has_ready_event ? std::vector<sycl::event>{ retained_table.ready_event }
                                                                : std::vector<sycl::event>{});
-                            for (int64_t row = 1; !src1_rows_adjacent && row < ne11; ++row) {
-                                dependency = ggml_sycl::mem_copy_ptr_async(
-                                    activation + row * ne00, src1_device_base + row * nb11, activation_row_bytes,
-                                    *exact_queue, std::vector<sycl::event>{ dependency });
+                            for (int64_t piece = 1; piece < activation_pieces; ++piece) {
+                                const int64_t first_row = piece * activation_piece_rows;
+                                dependency              = ggml_sycl::mem_copy_ptr_async(
+                                    activation + first_row * ne10,
+                                    src1_device_base + (first_row / ne11) * nb12 + (first_row % ne11) * nb11,
+                                    activation_piece_bytes, *exact_queue, std::vector<sycl::event>{ dependency });
                             }
                             mmvq_q1_nvfp4_admitted_buffers buffers{
                                 slices.activation_q8.ptr, slices.activation_q8.bytes,
                                 static_cast<float *>(slices.output_f32.ptr), slices.output_f32.bytes };
                             sycl::event kernel;
+                            // The kernel reads the ids tensor in place with its own strides. The batch's host snapshot
+                            // was read from the same storage once its producer had completed, and nothing writes that
+                            // storage before the kernel runs; the snapshot stays the authority for which experts the
+                            // batch resolved and leased, and the adapter range-checks it before it submits.
                             if (!mmvq_submit_q1_nvfp4_aos_id_admitted(
                                     *exact_queue, src0->type, GGML_LAYOUT_AOS, table_ptr, activation, ids_device,
-                                    completion->retained_ids->data(), static_cast<int>(n_experts), static_cast<int>(ne00),
-                                    static_cast<int>(ne01), static_cast<int>(ids->ne[0]), 1, static_cast<int>(ne11),
-                                    sizeof(int32_t), ids->ne[0] * sizeof(int32_t), buffers, &dependency, &kernel)) {
+                                    direct_batch.expert_ids.data(), static_cast<int>(n_experts), static_cast<int>(ne10),
+                                    static_cast<int>(ne01), static_cast<int>(ids->ne[0]), static_cast<int>(ne12),
+                                    static_cast<int>(ne11), ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)) {
                                 throw moe_direct_submit_failure{};
                             }
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
@@ -88718,15 +88788,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
                 // Admission already retained the exact capability-derived recipe
                 // and bound its signature to this lease. Never fabricate a second
-                // argument-less capability query at fallback/partition time.
-                (void) phase;
+                // argument-less capability query at fallback/partition time. The
+                // phase only names the refusal: a prompt and a decode token share this partition.
                 (void) rows;
                 const auto choice = ggml_sycl::choose_moe_batch_executor(operand, ctx.device, queue_available,
                                                                          operand.recipe().workspace.total_bytes);
                 if (!choice) {
                     GGML_LOG_ERROR(
-                        "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s "
+                        "[%s] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s "
                         "type=%s layout=%s kernel=%s capability=%s queue_ready=%d\n",
+                        phase == moe_route_phase::PROMPT ? "MOE-PROMPT-REFUSAL" : "MOE-DECODE-REFUSAL",
                         src0->name ? src0->name : "?", operand.occurrence, operand.expert_id, operand.owning_device(),
                         ggml_sycl::moe_batch_reject_reason_name(choice.reject), ggml_type_name(src0->type),
                         ggml_sycl_layout_mode_name(operand.actual_layout()),

@@ -1466,6 +1466,17 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     return out;
 }
 
+bool moe_mmid_workspace_geometry_holds(const moe_mmid_workspace_geometry & available,
+                                       const moe_mmid_workspace_geometry & needed) noexcept {
+    return available.activation_rows >= needed.activation_rows && available.occurrences >= needed.occurrences &&
+           available.q8_ne10_row_bytes >= needed.q8_ne10_row_bytes &&
+           available.q8_ne01_row_bytes >= needed.q8_ne01_row_bytes &&
+           available.activation_f32_bytes >= needed.activation_f32_bytes &&
+           available.activation_q8_bytes >= needed.activation_q8_bytes &&
+           available.output_f32_bytes >= needed.output_f32_bytes &&
+           available.output_q8_bytes >= needed.output_q8_bytes && available.host_slot_bytes >= needed.host_slot_bytes;
+}
+
 moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     moe_mmid_authoritative_admission_request && request) noexcept {
     moe_mmid_admitted_result out;
@@ -1556,13 +1567,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
             if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.shape.K), static_cast<size_t>(request.shape.N),
                                             request.shape.ne11, request.shape.top_k, capacity },
                                           wanted.owner_device != authority->submit_device, &needed) ||
-                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
-                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
-                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
-                available.activation_f32_bytes < needed.activation_f32_bytes ||
-                available.activation_q8_bytes < needed.activation_q8_bytes ||
-                available.output_f32_bytes < needed.output_f32_bytes || available.output_q8_bytes < needed.output_q8_bytes ||
-                available.host_slot_bytes < needed.host_slot_bytes) return out;
+                !moe_mmid_workspace_geometry_holds(available, needed)) return out;
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out; order[r] = r;

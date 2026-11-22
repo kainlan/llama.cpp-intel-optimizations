@@ -167,6 +167,11 @@ inline bool plan_moe_host_workspace(const moe_route_request & request,
 
 // Device recipes are deliberately bounded: prompt execution reuses one chunk
 // of AoS Q8_1/output/descriptor scratch instead of reserving the whole prompt.
+// Nothing allocates this size. The one route that runs a Q1_0/NVFP4 device
+// recipe, the MMID direct route in ggml_sycl_mul_mat_id, takes its scratch
+// from the planned MMID workspace (moe_mmid_plan_workspace), sized for every
+// token of the batch and refused by name above it. Here the size only binds
+// the recipe, which validate_moe_execution_recipe() re-derives and compares.
 inline bool plan_moe_q1_nvfp4_device_workspace(const moe_route_request & request,
                                                 size_t                    q8_row_bytes,
                                                 size_t                    max_chunk_rows,
@@ -831,19 +836,19 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
                                  moe_type_needs_direct_kernel(operand.recipe().request.type);
     if (direct_q1_nvfp4) {
         // Q1_0/NVFP4 run on a device only through the MMID direct route in
-        // ggml_sycl_mul_mat_id (decode rows on the primary card, AoS, with an
-        // admitted workspace bundle); that route is open since the B70 and B50
-        // oracle runs of 2026-11-22. No generic executor runs these types, so a
-        // device recipe for them is refused here. Two callers ask this gate:
+        // ggml_sycl_mul_mat_id (a decode token or a prompt's rows on the primary
+        // card, AoS, with an admitted workspace bundle); that route is open since
+        // the B70 and B50 oracle runs of 2026-11-22. No generic executor runs these
+        // types, so a device recipe for them is refused here. Two callers ask this gate:
         //  - the hybrid decode record build (ggml_sycl_moe_hybrid_decode_record_build),
         //    for every expert of a layer with host experts, BEFORE the direct block
         //    runs. Its refusal is not fatal: the hybrid route declines the layer and
         //    the retained route keeps the tensor, so the op still reaches the direct
         //    block;
         //  - the retained route core, AFTER the direct block, for an operand that fell
-        //    through it: prompt rows, a secondary card, a layout other than AoS, a
-        //    selection that mixes host and device experts, or an authority or bundle
-        //    the route could not obtain.
+        //    through it: a secondary card, a layout other than AoS, a selection that
+        //    mixes host and device experts, ids or an input the route cannot read
+        //    where they are, or an authority or bundle the route could not obtain.
         // A host-resident expert carries a HOST_CPU recipe, runs on the CPU, and is not
         // refused by this gate.
         //

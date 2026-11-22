@@ -733,9 +733,11 @@ def direct_route_input_shape_violations(direct: str) -> list[str]:
     if not has_tokens(pre_mark,
                       "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);"):
         failures.append("rows-adjacent: no pre-mark src1_rows_adjacent from nb11 == ne10 * sizeof(float)")
-    if not has_tokens(pre_mark,
-                      "const bool src1_tokens_adjacent = ne12 == 1 || nb12 == static_cast<size_t>(ne11) * nb11;"):
-        failures.append("tokens-adjacent: no pre-mark src1_tokens_adjacent from nb12 == ne11 * nb11")
+    # Tokens are adjacent when the next one starts ne11 rows of row bytes on. With ne11 == 1 the lone row's nb11 can be
+    # any stride, so ne11 * nb11 would take tokens a stride apart for adjacent ones.
+    if not has_tokens(pre_mark, "const bool src1_tokens_adjacent = ne12 == 1 || "
+                                "nb12 == static_cast<size_t>(ne11) * activation_row_bytes;"):
+        failures.append("tokens-adjacent: no pre-mark src1_tokens_adjacent from nb12 == ne11 rows of row bytes")
     if not has_tokens(pre_mark, "const size_t activation_row_bytes = static_cast<size_t>(ne10) * sizeof(float);"):
         failures.append("row-bytes: no pre-mark activation_row_bytes of one row")
     # A piece is the whole input when rows and tokens are adjacent, one token's rows when only the rows are, one row
@@ -805,8 +807,10 @@ def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
          "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);",
          "const bool src1_rows_adjacent = true;", "rows-adjacent"),
         ("tokens-always-adjacent",
-         "const bool src1_tokens_adjacent = ne12 == 1 || nb12 == static_cast<size_t>(ne11) * nb11;",
+         "const bool src1_tokens_adjacent = ne12 == 1 || nb12 == static_cast<size_t>(ne11) * activation_row_bytes;",
          "const bool src1_tokens_adjacent = true;", "tokens-adjacent"),
+        ("tokens-adjacent-by-row-stride", "nb12 == static_cast<size_t>(ne11) * activation_row_bytes;",
+         "nb12 == static_cast<size_t>(ne11) * nb11;", "tokens-adjacent"),
         ("pieces-ignore-tokens", "src1_tokens_adjacent ? ne11 * ne12 : ne11;", "ne11 * ne12;", "pieces"),
         ("dense-split-per-token", "src1_tokens_adjacent ? ne11 * ne12 : ne11;", "src1_tokens_adjacent ? ne11 : ne11;",
          "dense-one-copy"),
@@ -884,7 +888,9 @@ def direct_prompt_parts(source: str, workspace: str, mmvq_cpp: str, mmvq_hpp: st
         "helper": optional_definition(
             source, "static ggml_sycl::moe_mmid_queue_capability ggml_sycl_moe_direct_queue_capability("),
         "holds": optional_definition(workspace, "bool moe_mmid_workspace_geometry_holds("),
-        "admit": optional_definition(workspace, "moe_mmid_admitted_result moe_mmid_workspace_registry::admit("),
+        # The authoritative overload, the admission the direct route's request reaches; the other serves the legacy
+        # graph-shaped request, which cannot mint DIRECT authority, and also weighs a secondary owner's bounce slices.
+        "admit": optional_definition(workspace, "moe_mmid_authoritative_admission_request && request) noexcept"),
         "adapter": optional_definition(mmvq_cpp, "bool mmvq_submit_q1_nvfp4_aos_id_admitted("),
         "declared": declared[:declared.index(";")],
         "mmvq_cpp": normalized_code(mmvq_cpp),
@@ -915,8 +921,8 @@ def direct_prompt_violations(parts: dict[str, str]) -> list[str]:
     # Every prompt build that can supply the route's batch gets it: the three pair roles (a reused role batch is the
     # prompt's batch, so building one without the capability would build a batch only to discard it) and the
     # prompt's own build. Decode keeps its own.
-    if not has_tokens(mmid, "const ggml_sycl::moe_mmid_queue_capability prompt_queue_capability = "
-                            "ggml_sycl_moe_direct_queue_capability(ctx);"):
+    if not has_tokens(mmid, "ggml_sycl::moe_mmid_queue_capability prompt_queue_capability;") or \
+            not has_tokens(mmid, "prompt_queue_capability = ggml_sycl_moe_direct_queue_capability(ctx);"):
         failures.append("prompt-capability: the prompt admission does not ask the helper for the capability")
     for layout in PROMPT_BUILD_LAYOUTS:
         if not has_tokens(mmid, f"static_cast<size_t>(ids->ne[0]), {layout}, /*allow_materialize=*/false, &ctx, "
