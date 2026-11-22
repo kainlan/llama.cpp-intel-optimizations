@@ -174,7 +174,7 @@ static void ggml_sycl_init_tp_shared_queues() {
         int          dev_id = g_sycl_tp_config.devices[i];
         sycl::device dev    = ggml_sycl_get_device(dev_id);
         if (g_tp_shared_queues[dev_id] == nullptr) {
-            g_tp_shared_queues[dev_id] = new sycl::queue(dev, default_queue_properties());
+            g_tp_shared_queues[dev_id] = new sycl::queue(ggml_sycl_make_queue(dev, dev_id, default_queue_properties()));
             GGML_SYCL_DEBUG("SYCL TP: Created queue for device %d at %p (platform default context)\n", dev_id,
                             (void *) g_tp_shared_queues[dev_id]);
         }
