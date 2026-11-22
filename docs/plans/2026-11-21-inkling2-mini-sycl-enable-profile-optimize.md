@@ -1573,7 +1573,9 @@ The implementer verifies each name against the tree (`data_handle`, `kind()`, `d
 
 **Acceptance (lead runs the GPU arms, once each, B50):**
 - [ ] The source contract passes, and each of its six mutants fails it.
-- [ ] The A3 case prints OK.
+- [ ] The A3 case prints OK. **Moved to Task 6f-7 (2026-11-22):** with this task the case runs to its comparison
+      with no abort and no refusal, and then fails on `CPU=-nan`: the CPU reference is built from `get_tensor`,
+      which returns plane-ordered bytes for a reordered weight. This task's criterion is "no abort, no refusal".
 - [ ] `test-backend-ops -o MUL_MAT` runs to the end with no `-p` filter and no abort.
 - [ ] Mistral gates on both cards and the GPT-OSS B50 gate pass (a q6_K model weight still takes the cache lease:
       `GGML_SYCL_ONEDNN_PP_TRACE=1` on a Q4_K_M file would witness it, and none is required here because the
@@ -1584,6 +1586,48 @@ The implementer verifies each name against the tree (`data_handle`, `kind()`, `d
 `sycl: the f16 dequant arm takes an SOA plane from the owner the resolver names`, then
 `sycl: a refusal inside MUL_MAT's op call fails the graph instead of aborting`. Path-scoped, never amended.
 
+**DONE 2026-11-22, merged as `b2250b420`** (task commits `a691e98f2..f5b729bdf`, logs `5e4b2ccc0`). Three fix
+rounds. Spec review PASS after round 1; quality review FAIL on the contract (the C++ was correct), re-review PASS
+WITH FINDINGS on the contract again. A narrow re-review of round 3 PASSED: it applied the six edits itself and each fails the contract. It found one more limit, accepted: a char literal holding a double quote, followed by a string on the same line, hides the code between them from the token count; the function has neither.
+
+*What landed:*
+- The SOA branch of `ggml_sycl_dequant_f16_from_loaded_layout` holds an owner on every path: the cache lease for
+  a `WEIGHT` (unchanged), a copy of the tensor's own handle for a `CHUNK_LEASE` on this device. Anything else is
+  the named refusal. The owner goes to `retain_handles_until_event` with the read's event, as before.
+- *Round 1 (spec review):* the handle-copy branch refuses a resolution that carries its own retention.
+- *Round 2 (quality review):* after the copy the arm checks that the copy resolves to the pointer it reads and
+  refuses when it does not. The proxy (`loaded.retention == nullptr`) stays. The ready-event chain call passes
+  the same-queue identity and the site `GGML_SYCL_READY_QUERY_SITE_MUL_MAT_WEIGHT`, like its peer in
+  `ggml_sycl_op_mul_mat`; the hostpath trace therefore counts the arm's queries with the split mul_mat weight
+  check. The two guarded `op(...)` calls go through one helper, `ggml_sycl_op_mul_mat_call` (its error text now
+  names the helper, not the call site). The false comment about other handle kinds is corrected, as is the
+  ruling above.
+- *The contract, three rounds.* `tests/test-sycl-f16-arm-owner-source.py` ends with 19 claims and 32 mutants,
+  each mutant required to fail its own claim. The first version (14 claims) passed on seven edits that read the
+  plane unowned, the literal pre-task line among them; the second passed when the owner was moved or swapped out
+  instead of assigned, and when the `WEIGHT` branch read the resolver's pointer. It now allowlists every
+  occurrence of the token `owner` (six forms, each once, counted with comments and string literals blanked),
+  pins where each branch's plane comes from, and compares the handle-copy condition with one exact string.
+  Accepted as limits of a text contract: `#if 0` around the copy, `if (false)` before the identity check.
+- `tests/test-sycl-chain-same-queue-source.py` (pin E, the census of chain calls) gained the arm's call. The arm
+  had failed that gate since its first code commit; nobody had run it (see Task 7f, the sweep).
+- `tests/test-sycl-dequant-f16-aos-plan-source.py` rejects the pre-task declaration line.
+- The `loaded.layout == GGML_LAYOUT_SOA` conjunct is redundant (the function refuses any other layout before the
+  branches). Kept as a pinned restatement (lead).
+
+*Device results, one run per arm, B50 unless said, zero kernel fault lines, `Shmem` 8 GB.* At `659b71ba0` and
+again at `15b61e99a` (the build with the identity check; round 3 changes one Python file):
+- A3 alone: rc 1, 0 abort lines, 0 refusals, `NaN ... CPU=-nan` (Task 6f-7). The identity check does not refuse
+  the case, so the copied handle does resolve to the pointer the kernel reads.
+- `test-backend-ops -o MUL_MAT`, every case: 1994 of 1996, 0 abort lines, 0 refusals. The second failure is the
+  large f16 case (`n=2105344`, status -2), the same as before this task.
+- Mistral gate on both cards: pass. GPT-OSS gate, no `-c`: rc 0, one answer line, no device loss.
+
+*State a refusal leaves behind (quality review, traced from the code):* nothing new. The two known items are
+recorded under Task 6f-5 below.
+
+*Not taken:* a new query-site enum member for the arm; the call site's line in the helper's error text.
+
 ---
 
 ### Task 6f-5: An unwind out of the per-expert prompt loop keeps its leases until the submitted kernels finish (recorded 2026-11-22)
@@ -1591,6 +1635,17 @@ The implementer verifies each name against the tree (`data_handle`, `kind()`, `d
 **Track:** F, after Task 6f-3 (same file). **Depends on:** Tasks 6f-2, 6f-3. **Not a Stage 1 exit gate.**
 **Status:** recorded from Task 6f-2's step 5 and its spec review; written out to the Task Detail Standard before it
 starts.
+**Also in scope (recorded 2026-11-22 from Task 6f-3's quality review, traced from the code, not run):**
+- A refusal that unwinds out of MUL_MAT's op call leaves the weight entry's per-op pin flag set
+  (`entry.pinned = true` in `unified-cache.cpp`) until the next successful unpin of that entry.
+  `weight_entry_reclaimable` does not read the flag, so teardown still reclaims the entry; what is lost is the
+  entry's evictability in between. Nothing is corrupted.
+- `g_mul_mat_exc_ctx.active` stays set after such an unwind. It is thread-local, every entry of
+  `ggml_sycl_op_mul_mat` resets it and only that function's own `sycl::exception` handler reads it, so nothing
+  carries into the next graph. A scope guard would make both exact.
+- `mem_handle`'s copy of a non-owning `DIRECT` handle is a silent non-owning copy: the type gives a caller no
+  way to ask "does this copy hold the bytes" short of knowing the kind. Task 6f-3's arm refuses the kind by
+  name; a query on the handle (`owns_allocation()` exists for `DIRECT`) would let callers ask.
 **What is known (at `8a1de2f51`, Task 6f-2's branch):**
 - Task 6f-2 turned the first prompt-staging failure in `ggml_sycl_mul_mat_id` into a refusal. That site runs
   before any expert kernel is submitted.
