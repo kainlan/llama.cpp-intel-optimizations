@@ -38,9 +38,10 @@ when the DMA runs.  Each mem_copy_async site whose host endpoint can be in scope
     WEIGHT, and the SYCL_Host buffer's in-scope owner is held only as the buffer's identity, never as a copy endpoint.
     llama.cpp-36j0 admits WEIGHT: a device buffer that fell back to host-pinned weight memory is then in scope, which
     is safe because its set and get copies are host to host and an async copy into it is complete only once the
-    caller synchronises. One SYCL_Host owner leaves its buffer (llama.cpp-cg69): ggml_sycl_loader_buffer_owner hands
-    the loader's chunk of a model load (lifetime MODEL, role WEIGHT, unclaimed) to S1-PRELOAD, which serves a host
-    expert from it in place, so the prefill ring copies from it directly, as from any pinned-pool weight: a weight is
+    caller synchronises. One SYCL_Host owner leaves its buffer, because the plan charges the loader's buffer and
+    gives the experts it serves no block: ggml_sycl_loader_buffer_owner hands the loader's chunk of a model load
+    (lifetime MODEL, minted by that load, role WEIGHT, unclaimed) to S1-PRELOAD, which serves a host expert from it in
+    place, so the prefill ring copies from it directly, as from any pinned-pool weight: a weight is
     written only while the model loads;
   - segment graph recording relied on the staged H2D's host wait as an ordering assumption (pin D): the boundary
     flush ran just before begin_recording, and its staged copy left everything earlier on the in-order stream
