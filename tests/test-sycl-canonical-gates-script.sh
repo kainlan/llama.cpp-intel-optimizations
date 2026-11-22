@@ -34,8 +34,8 @@
 #   (gptoss argv) the GPT-OSS gate's llama-cli argv has no -ngl and no -c
 #        (--reasoning-budget 0 is the positive control)
 #   (inkling-pass/-wrong/-no-model) opt-in inkling gate: PASS, wrong tokens
-#        -> FAIL, model file absent -> rc 77; argv has -c 8192, no -ngl and
-#        GGML_SYCL_MOE_MULTI_GPU=0 in the child environment;
+#        -> FAIL, model file absent -> rc 77; argv has -c 8192 and -no-cnv,
+#        no -ngl, and GGML_SYCL_MOE_MULTI_GPU=0 in the child environment;
 #        --gate all never runs it
 #
 # Run directly: bash tests/test-sycl-canonical-gates-script.sh; echo rc=$?
@@ -591,11 +591,12 @@ out="$(STUB_ARGV_FILE="$case_ink_dir/argv" STUB_MISTRAL_MODE=pass run_gates "$ca
 rc=$?
 expect_gate "inkling pass" 0 "$out" "$rc" '^GATE inkling PASS rc=0 '
 if grep -qE -- '(^| )-c 8192( |$)' "$case_ink_dir/argv" \
+    && grep -qE -- '(^| )-no-cnv( |$)' "$case_ink_dir/argv" \
     && ! grep -qE -- '(^| )-ngl( |$)' "$case_ink_dir/argv" \
     && grep -qx 'MULTI_GPU=0' "$case_ink_dir/argv"; then
-    echo "PASS: (inkling argv) -c 8192, no -ngl, GGML_SYCL_MOE_MULTI_GPU=0 in the child environment"
+    echo "PASS: (inkling argv) -c 8192, -no-cnv, no -ngl, GGML_SYCL_MOE_MULTI_GPU=0 in the child environment"
 else
-    fail "(inkling argv) expected -c 8192, no -ngl and MULTI_GPU=0; got: $(cat "$case_ink_dir/argv" 2>/dev/null)"
+    fail "(inkling argv) expected -c 8192, -no-cnv, no -ngl and MULTI_GPU=0; got: $(cat "$case_ink_dir/argv" 2>/dev/null)"
 fi
 
 out="$(STUB_MISTRAL_MODE=wrong run_gates "$case_ink_dir" inkling)"

@@ -410,6 +410,11 @@ run_gptoss() {
 # the regex checks the first ten numbers only, as the Mistral gate does. The
 # gate names -c 8192: the model's default context is its 1,048,576-token
 # training context, which the load refuses by name on these cards.
+# The gate names -no-cnv: the file carries a chat template, so llama-completion
+# would enter conversation mode by itself, and this template is not one of its
+# built-in formats ("this custom template is not supported, try using --jinja",
+# an uncaught throw, rc 134). The gate scores a raw continuation, as the CPU
+# reference did, so a chat turn would be the wrong vehicle either way.
 # GGML_SYCL_MOE_MULTI_GPU=0 is set for every selector, so a two-card run takes
 # the scheduler split and the script never reads the selector.
 run_inkling() {
@@ -426,7 +431,7 @@ run_inkling() {
     sample_mem "inkling pre"
     local rc=0
     GGML_SYCL_MOE_MULTI_GPU=0 timeout 900 "$BIN_DIR/llama-completion" \
-        -m "$INKLING_MODEL" -c 8192 -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
+        -m "$INKLING_MODEL" -c 8192 -no-cnv -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
         >"$out" 2>"$err" || rc=$?
     sleep "$SETTLE_SECONDS"
     sample_mem "inkling post"
