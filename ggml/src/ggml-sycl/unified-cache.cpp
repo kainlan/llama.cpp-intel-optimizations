@@ -35774,13 +35774,17 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
 
     // The host weights are summed here and nowhere else. Which entries count is the plan's own charge rule, so this
     // sum plus loader_served and weight_host_bytes cover the same entries.
+    // A multi-device plan charges no loader term. Each card has its own cache and pinned pool, and every card's host
+    // zones are sized and pre-allocated from its snapshot of this one whole-model plan, so the term would pin the whole
+    // loader buffer on every card while each card's pool holds only its own layers' chunks.
+    const bool             charge_loader = plan.loader_holds_weights && !plan.multi_device;
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
         // The loader's SYCL_Host buffer holds every weight the plan places, on the device or not, for the model's
         // life. ggml-alloc places each tensor at the CPU buffer type's TENSOR_ALIGNMENT, which SYCL_Host inherits, so
         // a dense weight's bytes round up to it exactly; an expert entry is a slice of its tensor, and rounding each
         // slice bounds the tensor's own rounding from above.
-        if (plan.loader_holds_weights) {
+        if (charge_loader) {
             const size_t a = TENSOR_ALIGNMENT;
             terms.loader_residency += (entry.src_size + a - 1) / a * a;
         }
@@ -37225,7 +37229,9 @@ static void populate_host_zone_sizing(placement_plan &                          
     const char * loader_role =
         !plan.loader_holds_weights      ? "the loader binds no SYCL_Host buffer for weights" :
         plan.loader_serves_host_experts ? "the loader's SYCL_Host buffer, serving the host experts in place" :
-                                          "the loader's SYCL_Host buffer, the host experts copied out of it";
+                                          "the loader's SYCL_Host buffer, not charged: this multi-device plan sizes "
+                                          "every card's zones and the buffer is split across the cards; the host "
+                                          "weights are copied out of it";
     GGML_LOG_INFO(
         "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu loader_residency=%zu loader_served=%zu "
         "host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu total=%zu (%.1f MB); loader_residency: %s\n",

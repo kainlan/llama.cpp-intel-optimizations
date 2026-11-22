@@ -27,9 +27,10 @@
 // loader's SYCL_Host buffer, which holds every weight the loader reads (role WEIGHT, lifetime MODEL, category HOST_COMPUTE, from the buffer type the loader
 // adds to a SYCL device's list when weights are evictable; the buffer type asks role WEIGHT only under the model-load
 // flag, and a SYCL_Host buffer made after the load, the context's compute and output buffers, routes to SCRATCH).
-// The plan charges it when the load maps no file and its weights are evictable (placement_loader_fact_for), and on a
-// single-device plan S1-PRELOAD then serves each host expert from it in place: the expert is counted once, inside
-// loader_residency, as loader_served, and takes no block. Arm 1c asserts that on both builders. Arms 1 and 2 plan
+// A single-device plan charges it when the load maps no file and its weights are evictable
+// (placement_loader_fact_for), and S1-PRELOAD then serves each host expert from it in place: the expert is counted
+// once, inside loader_residency, as loader_served, and takes no block. A multi-device plan charges no loader term,
+// because every card's zones are sized from that one plan. Arm 1c asserts both builders. Arms 1 and 2 plan
 // with weights that are not evictable, so their plans charge no loader buffer and arm 2's census measures the
 // loader's buffer as residency the plan did not charge. Which buffer the loader binds is the plan's fact, not the
 // build's: on a load whose plan maps files the loader binds
@@ -540,14 +541,16 @@ void arm1b_walk_counts_only_weight_zone_backings(const placement_plan & built) {
     check(mis_charged_differs, "a host expert re-backed without moving its charge makes the figures differ");
 }
 
-// Arm 1c: on a load that maps no file with evictable weights, the plan charges the loader's SYCL_Host buffer.
+// Arm 1c: on a load that maps no file with evictable weights, the single-device plan charges the loader's SYCL_Host
+// buffer.
 //
-// The loader then keeps every weight the plan places in that buffer for the model's life, so the WEIGHT zone holds it
-// as loader_residency: each entry's src_size rounded up to the loader's tensor alignment. On the single-device plan
+// The loader then keeps every weight the plan places in that buffer for the model's life, so the single-device plan's
+// WEIGHT zone holds it as loader_residency: each entry's src_size rounded up to the loader's tensor alignment.
 // S1-PRELOAD serves each host expert from that buffer in place, so the expert is loader_served and holds no block; a
-// host dense weight is still copied into a block. The multi-device plan charges the buffer and copies every host
-// weight. The oracle is written out from the entries, not asked of the terms function. Arm 1's fact-false plans are
-// the control: the same entries charge no loader buffer and copy every host weight.
+// host dense weight is still copied into a block. The multi-device plan charges no loader term, since every card's
+// zones are sized from that one plan, and copies every host weight. The oracle is written out from the entries, not
+// asked of the terms function. Arm 1's fact-false plans are the control: the same entries charge no loader buffer and
+// copy every host weight.
 struct loader_oracle {
     size_t residency = 0;  // every entry, at the loader's alignment
     size_t experts   = 0;  // host experts backed PINNED, the ones the single-device plan serves in place
@@ -584,7 +587,9 @@ void check_loader_charge(const char *           builder,
     const loader_oracle          o     = derive_loader(plan);
     const host_weight_zone_terms terms = placement_plan_host_weight_zone_terms(plan);
     check(o.experts > 0 && o.residency > o.experts, "the plan has host experts and device weights for the loader term");
-    check_eq("loader_residency is every entry at the loader's alignment", terms.loader_residency, o.residency);
+    check_eq(serves ? "loader_residency is every entry at the loader's alignment" :
+                      "the multi-device plan charges no loader term",
+             terms.loader_residency, serves ? o.residency : 0);
     check_eq("loader_served", terms.loader_served, serves ? o.experts : 0);
     check_eq("host_weights", terms.host_weights, serves ? o.dense : o.dense + o.experts);
     check_eq("host_weights + loader_served == weight_host_bytes", terms.host_weights + terms.loader_served,
@@ -608,13 +613,15 @@ void check_loader_charge(const char *           builder,
         check_eq("[HOST-PLAN] total", printed_term(line, "total"), terms.total());
         const char * role = serves ?
                                 "loader_residency: the loader's SYCL_Host buffer, serving the host experts in place" :
-                                "loader_residency: the loader's SYCL_Host buffer, the host experts copied out of it";
+                                "loader_residency: the loader's SYCL_Host buffer, not charged: this multi-device plan";
         check(line.find(role) != std::string::npos, "[HOST-PLAN] says how the loader's buffer is used");
     }
 }
 
 void arm1c_loader_buffer_is_charged(const std::vector<placement_tensor_info> & inventory) {
-    std::printf("(1c) evictable weights on a load that maps no file: the loader's SYCL_Host buffer is charged\n");
+    std::printf(
+        "(1c) evictable weights on a load that maps no file: the single-device plan charges the loader's SYCL_Host "
+        "buffer\n");
     placement_kv_info kv{};
     kv.load_weights_evictable = true;
 

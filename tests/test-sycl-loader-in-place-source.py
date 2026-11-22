@@ -247,6 +247,9 @@ def clause_c1_terms(t: dict) -> list:
                    "terms.loader_residency", "terms.loader_served"):
         if needle not in terms:
             problems.append(f"placement_plan_host_weight_zone_terms does not use {needle}")
+    # Every card's host zones are sized from a multi-device plan, so its loader term would pin the buffer on each card.
+    if not re.search(r"plan\.loader_holds_weights\s*&&\s*!\s*plan\.multi_device", terms):
+        problems.append("placement_plan_host_weight_zone_terms charges the loader term on a multi-device plan")
     populate = fn(t, UCC, "populate_host_zone_sizing")
     if not re.search(r"!\s*weight_terms\.matches_charge\s*\(\s*plan\.weight_host_bytes\s*\)", populate):
         problems.append("populate_host_zone_sizing does not compare the terms through matches_charge")
@@ -330,6 +333,8 @@ MUTANTS = [
                                            r"\1host_owner = {};\n\2")),
     ("loader-term-unchecked", "P3", mutate(GS, LOADER_BUG_FMT, '"[HOST-PLAN] device=%d holds %zu B')),
     ("terms-ignore-alignment", "C1", mutate(UCC, "TENSOR_ALIGNMENT", "1")),
+    ("multi-device-charges-loader", "C1", mutate_re(UCC, r"plan\.loader_holds_weights\s*&&\s*!\s*plan\.multi_device",
+                                                    "plan.loader_holds_weights")),
     ("plain-charge-compare", "C1", mutate_re(UCC, r"!\s*weight_terms\.matches_charge\s*\(\s*plan\.weight_host_bytes\s*\)",
                                              "weight_terms.host_weights != plan.weight_host_bytes")),
     ("fact-ignores-evictable", "C2", mutate(UCC, "info.load_weights_evictable", "true")),

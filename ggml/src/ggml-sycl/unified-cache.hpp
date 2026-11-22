@@ -1176,9 +1176,10 @@ struct placement_plan {
     bool host_backing_maps_files = false;
     bool host_mapped_locked      = false;
     // The loader's SYCL_Host buffer as the plan's fact (placement_loader_fact_for, copied with the fact above).
-    // loader_holds_weights: the buffer holds every weight the plan places, so the host WEIGHT zone charges it as its
-    // loader_residency term. loader_serves_host_experts: S1-PRELOAD serves each host-planned PINNED expert from that
-    // buffer in place, under the buffer's owner, so such an expert takes no block of its own.
+    // loader_holds_weights: the buffer holds every weight the plan places, so a single-device plan's host WEIGHT zone
+    // charges it as its loader_residency term (a multi-device plan's does not: every card's zones are sized from it).
+    // loader_serves_host_experts: S1-PRELOAD serves each host-planned PINNED expert from that buffer in place, under
+    // the buffer's owner, so such an expert takes no block of its own.
     bool loader_holds_weights       = false;
     bool loader_serves_host_experts = false;
 
@@ -2336,12 +2337,15 @@ struct placement_plan {
 // zone again once it holds the room. swap_headroom is not on the [HOST-PLAN] line, which prints before it is held;
 // the hold's own [PLACEMENT-MOE] line prints it.
 //
-// The model loader's SYCL_Host buffer is a term when the plan's loader holds weights (placement_loader_fact_for): on a
-// load that does not map files, with evictable weights, the loader binds that buffer for every weight the plan places
-// (role WEIGHT, lifetime MODEL), device-planned ones included, and keeps it for the model's life. On a load that maps
-// files the loader binds SYCL_Mapped instead, whose bytes are the file's pages outside every host zone, and the term
-// is 0. A single-device plan also serves its host-planned PINNED experts from that buffer in place, so those experts
-// are counted once, inside loader_residency, and reported as loader_served instead of taking blocks.
+// The model loader's SYCL_Host buffer is a term when the plan's loader holds weights (placement_loader_fact_for) and
+// the plan is single-device: on a load that does not map files, with evictable weights, the loader binds that buffer
+// for every weight the plan places (role WEIGHT, lifetime MODEL), device-planned ones included, and keeps it for the
+// model's life. On a load that maps files the loader binds SYCL_Mapped instead, whose bytes are the file's pages
+// outside every host zone, and the term is 0. It is 0 on a multi-device plan too: each card has its own pinned pool,
+// every card's zones are sized from the one whole-model plan, and the buffer is split across the cards by layer, so
+// the term would pin all of it on each card. A single-device plan also serves its host-planned PINNED experts from
+// that buffer in place, so those experts are counted once, inside loader_residency, and reported as loader_served
+// instead of taking blocks.
 struct host_weight_zone_terms {
     size_t host_weights         = 0;  // placement_entry_host_weight_bytes() over the entries that hold a block here
     size_t blocks               = 0;  // the pinned allocations those weights take: one per entry that holds a block
@@ -2387,8 +2391,8 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 // The terms over the host-planned entries of `plan` whose backing placement_plan::host_backing_sizes_weight_zone()
 // accepts, the entries charge_host_weight() charges to weight_host_bytes: a FILE_MAPPED entry is served from the
 // file's mapping and a CPU_OWNED one is held by ggml-cpu, so neither takes a block here. Under the plan's
-// loader_holds_weights the loader's buffer is the loader_residency term, and under loader_serves_host_experts a
-// PINNED host expert is loader_served rather than a block. The one function both planner builders size the WEIGHT
+// loader_holds_weights, on a single-device plan, the loader's buffer is the loader_residency term, and under
+// loader_serves_host_experts a PINNED host expert is loader_served rather than a block. The one function both planner builders size the WEIGHT
 // zone through, by way of populate_host_zone_sizing(), and the one place the host weights are summed.
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
 

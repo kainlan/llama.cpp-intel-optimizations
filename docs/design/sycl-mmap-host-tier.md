@@ -1210,13 +1210,13 @@ two facts with one source, `placement_loader_fact_for(load_maps_files,
 load_weights_evictable, multi_device)` in `placement_plan_copy_host_backing_fact`
 (`kv_info.load_weights_evictable` comes from
 `ggml_backend_sycl_weights_evictable()`):
-- `loader_holds_weights` (no mapping, evictable weights). The WEIGHT zone
-  charges the buffer as the term `loader_residency`: every entry's `src_size`
-  rounded up to the loader's tensor alignment, exact for a dense weight and a
-  bound for an expert slice. The term reaches `host_planned_bytes` through the
-  zone. It covers the device-planned weights' host bytes too, which the loader
-  keeps after staging (22.9 GB on the Qwen3.8 B70 `-lm none` load); releasing
-  them after staging is a separate ticket.
+- `loader_holds_weights` (no mapping, evictable weights). A single-device
+  plan's WEIGHT zone charges the buffer as the term `loader_residency`: every
+  entry's `src_size` rounded up to the loader's tensor alignment, exact for a
+  dense weight and a bound for an expert slice. The term reaches
+  `host_planned_bytes` through the zone. It covers the device-planned weights'
+  host bytes too, which the loader keeps after staging (22.9 GB on the Qwen3.8
+  B70 `-lm none` load); releasing them after staging is a separate ticket.
 - `loader_serves_host_experts` (the same, on a single-device plan). S1-PRELOAD
   registers each host expert backed `PINNED` in place: its lease is the
   expert's bytes inside the loader's chunk, its owner a copy of that chunk's
@@ -1232,9 +1232,17 @@ not a claimed tenant slot, has lifetime `MODEL`, holds the expert's bytes, and
 whose owner the ring copies from on that device. A refusal logs one
 `[MOE-LAYOUT]` WARN per tensor and copies the expert into a block the plan did
 not size. The limits:
-- Single-device, evictable, non-mapping plans only. A multi-device plan charges
-  the buffer and still copies every host expert, so it holds them twice, and
-  says so in the charge.
+- Single-device, evictable, non-mapping plans only. A multi-device plan
+  charges no loader term and copies every host expert into a block, as before
+  this change, so the buffer stays outside its plan. On two or more GPUs each
+  card has its own cache and pinned pool (`PER_DEVICE`), and every card's host
+  zones are sized and pre-allocated from its snapshot of the one whole-model
+  plan (`ggml_sycl_configure_host_zones_for_plan`), while the buffer is split
+  across the cards by layer. Charging the whole buffer there would pin all of
+  it on each card. Its `[HOST-PLAN]` line says so ("not charged: this
+  multi-device plan"). A per-card share of the buffer, and of the host weights,
+  which that whole-plan sizing also gives each card in full, is a separate
+  ticket.
 - An in-place expert's owner is wider than its entry, so the named move's admit
   refuses it ("host copy not pinned", REFUSED) and a swap cannot move it to the
   device: it stays on the host for the model's life (`sycl-memory-design.md`,
@@ -1266,7 +1274,7 @@ CPU_OWNED }` for every entry. The planner derives it once from
 | `host_cpu_owned_bytes` | `CPU_OWNED` entries | yes (anonymous memory, P3 counts it) | nothing: not in the zone (today they inflate it) |
 | `host_mapped_bytes` | host-executed `FILE_MAPPED` entries | only when locked (§4.5) | nothing |
 | `host_mapped_source_bytes` | device-planned `FILE_MAPPED` sources | no | nothing (transient page cache during staging) |
-| `loader_residency` (a WEIGHT zone term, not a plan field) | every entry at the loader's alignment, when `loader_holds_weights` | through the WEIGHT zone | the WEIGHT zone; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
+| `loader_residency` (a WEIGHT zone term, not a plan field) | every entry at the loader's alignment, when `loader_holds_weights` on a single-device plan | through the WEIGHT zone | the WEIGHT zone; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
 
 Every accumulation site of `weight_host_bytes` in the planner
 (`uc:25928`, `:25933`, `:28136`, `:28196`, `:28230`, `:28322`, `:29554`,
