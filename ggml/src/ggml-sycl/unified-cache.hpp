@@ -2428,6 +2428,24 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 // summed.
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
 
+// What the WEIGHT-zone line says the loader_residency term is, from the plan's loader facts and `terms`, the terms
+// placement_plan_host_weight_zone_terms() computed for it.
+inline const char * placement_plan_loader_role(const placement_plan & plan, const host_weight_zone_terms & terms) {
+    GGML_UNUSED(terms);
+    if (!plan.loader_holds_weights) {
+        return "the loader binds no SYCL_Host buffer for weights";
+    }
+    if (plan.loader_device < 0) {
+        return "the loader's SYCL_Host buffer, not charged: the scheduler sees more than one device, so the buffer is "
+               "split across their pools by layer; the host weights are copied out of it";
+    }
+    if (plan.loader_serves_host_experts) {
+        return "the loader's SYCL_Host buffer, serving the host experts in place";
+    }
+    return "the loader's SYCL_Host buffer, charged once, in loader_device's pool; the host weights are copied out of "
+           "it";
+}
+
 // The loader's SYCL_Host buffers in a fresh pinned pool of `chunk`-byte chunks. ggml-alloc splits the loader's tensors
 // into buffers of at most `max_size` bytes, next-fit in their order, and the pool serves each buffer from one chunk
 // segment of the WEIGHT zone, the first with room, so a buffer never spans two segments.

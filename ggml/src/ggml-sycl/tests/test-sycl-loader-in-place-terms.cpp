@@ -282,6 +282,36 @@ void check_mapped_expert_is_neither() {
     }
 }
 
+bool role_says(const placement_plan & plan, const char * text) {
+    const std::string role =
+        ggml_sycl::placement_plan_loader_role(plan, ggml_sycl::placement_plan_host_weight_zone_terms(plan));
+    return role.find(text) != std::string::npos;
+}
+
+void check_loader_role_follows_what_it_serves() {
+    // The WEIGHT-zone line names the loader's buffer as serving host experts in place only when the terms serve some
+    // (loader_served > 0). A plan made for loader_device whose host weights are all dense, a dense model's, serves
+    // none, so its line says the buffer is charged and serves nothing in place.
+    constexpr const char * kServing = "serving the host experts in place";
+    constexpr const char * kCharged = "charged once, in loader_device's pool";
+    CHECK(role_says(make_plan(true, 0, 0), kServing));
+
+    placement_plan dense = make_plan(true, 0, 0);
+    dense.entries.erase(std::remove_if(dense.entries.begin(), dense.entries.end(),
+                                       [](const ggml_sycl::placement_entry & e) { return e.expert_id >= 0; }),
+                        dense.entries.end());
+    dense.build_index();
+    CHECK(dense.loader_serves_host_experts);
+    CHECK(ggml_sycl::placement_plan_host_weight_zone_terms(dense).loader_served == 0);
+    CHECK(!role_says(dense, kServing));
+    CHECK(role_says(dense, kCharged));
+
+    // The other roles follow their facts as before.
+    CHECK(role_says(make_plan(true, 0, 1), kCharged));
+    CHECK(role_says(make_plan(true, -1, 0), "not charged"));
+    CHECK(role_says(make_plan(false, 0, 0), "binds no SYCL_Host buffer"));
+}
+
 // ---- The loader's buffers in the pinned pool ----
 
 constexpr size_t kMiB       = 1024 * 1024;
@@ -601,6 +631,7 @@ int main() {
     check_other_device_plan_copies_host_experts();
     check_split_loader_charges_nothing();
     check_mapped_expert_is_neither();
+    check_loader_role_follows_what_it_serves();
     check_pool_oracle_reproduces_the_device_log();
     check_loader_footprint_is_the_pools();
     check_oversize_buffer_grows_a_planned_chunk();

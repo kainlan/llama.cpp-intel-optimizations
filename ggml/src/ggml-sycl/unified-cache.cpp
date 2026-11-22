@@ -37254,18 +37254,7 @@ static void populate_host_zone_sizing(placement_plan &                          
         }
     }
 
-    const char * loader_role = "the loader binds no SYCL_Host buffer for weights";
-    if (plan.loader_holds_weights && plan.loader_device < 0) {
-        loader_role =
-            "the loader's SYCL_Host buffer, not charged: the scheduler sees more than one device, so the buffer is "
-            "split across their pools by layer; the host weights are copied out of it";
-    } else if (plan.loader_serves_host_experts) {
-        loader_role = "the loader's SYCL_Host buffer, serving the host experts in place";
-    } else if (plan.loader_holds_weights) {
-        loader_role =
-            "the loader's SYCL_Host buffer, charged once, in loader_device's pool; the host weights are copied out of "
-            "it";
-    }
+    const char * loader_role = placement_plan_loader_role(plan, weight_terms);
     GGML_LOG_INFO(
         "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu loader_residency=%zu loader_served=%zu "
         "loader_device=%d "
