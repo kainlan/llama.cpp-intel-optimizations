@@ -506,7 +506,9 @@ void check_admitted_plan_grows_nothing_unplanned() {
     CHECK(was.weight == kQwenWeight && was.total() == 79456897344);
     constexpr long long kQwenBudget  = 85755396096;  // host_budget
     constexpr long long kQwenReserve = 2147483648;   // the room rule's reserve
-    constexpr long long kQwenFloor   = 2149580800;   // the lazy table's floor and ring
+    // What the lazy-table decision must fit: the STORAGE table's cache at its floor, its logged resident bytes less
+    // the yieldable share handed out above the floor (2147483648 - 1721761792), and the block ring's charge (2097152).
+    constexpr long long kQwenFloor   = 427819008;
     std::printf(
         "Qwen B70 WEIGHT zone: %zu bytes (%.1f MB) for the loader's 37 buffers, loader_zone=%zu loader_grown=%zu; "
         "raw bytes charged %zu (%.1f MB)\n",

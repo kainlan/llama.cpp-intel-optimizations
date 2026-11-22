@@ -1268,9 +1268,11 @@ The host ledger only warns until it enforces (th32 T2 phase (b)), so a plan
 over its budget is refused at plan time only where the lazy-table decision
 refuses it: the larger zone takes its tables' room. The Qwen3.8 load above has
 a lazy table, and its honest plan (commit total 83751864768 B against
-79456897344 B) leaves the table's 2149580800 B floor a fit room of
--143952320 B at its logged budget, so it is refused as
-`lazy-table-cache-below-floor` with `fit_room=0`. A model with no lazy table
+79456897344 B) leaves the table's floor and ring, 427819008 B, a fit room
+of -143952320 B at its logged budget, so it is refused as
+`lazy-table-cache-below-floor` with `fit_room=0`. It is 571771328 B short:
+the budget is `MemAvailable` less the headroom, so the same load admits on a
+sample about 0.57 GB higher. A model with no lazy table
 over its budget proceeds on the would-refuse WARN and can still meet
 `grow_zone`'s refusal. Its limits:
 - The replay assumes the WEIGHT zone is empty when the loader allocates, which
