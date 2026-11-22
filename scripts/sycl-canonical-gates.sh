@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # scripts/sycl-canonical-gates.sh (llama.cpp-rou3)
 #
-# One executable runner for the two canonical SYCL correctness gates
-# documented in CLAUDE.md ("Verification Commands & Correctness Gates"): the
-# Mistral completion gate and the GPT-OSS chat gate. See
+# One executable runner for the canonical SYCL correctness gates documented
+# in CLAUDE.md ("Verification Commands & Correctness Gates"): the Mistral
+# completion gate and the GPT-OSS chat gate, plus an opt-in Inkling gate that
+# is never part of `all`. See
 # docs/backend/gpt-oss-testing.md for the narrative rationale behind the
 # GPT-OSS command line.
 #
@@ -69,7 +70,8 @@ Usage: sycl-canonical-gates.sh [--build-dir DIR] [--gate mistral|gptoss|inkling|
 Runs the canonical SYCL correctness gates documented in CLAUDE.md
 ("Verification Commands & Correctness Gates"): the Mistral completion gate
 and/or the GPT-OSS chat gate, exactly once each, with the device selector
-pinned.
+pinned. The opt-in Inkling gate runs only with --gate inkling and is never
+part of all.
 
 Options and their defaults:
   --build-dir DIR   Build directory to read binaries/CMakeCache from and
@@ -402,10 +404,13 @@ run_gptoss() {
     gate_verdict gptoss "$out" "$err" "$rc" '^1, 2, 3, 4, 5[[:space:]]*$'
 }
 
-# Inkling-2-Mini (inkling2_loop, NVFP4 experts, BF16 dense). Scored against the CPU reference of 2026-11-21
-# (--device none printed "1, 2, 3, ... 13,"). The gate names -c 8192: the model's default context is its
-# 1,048,576-token training context, which the load refuses by name on these cards. GGML_SYCL_MOE_MULTI_GPU=0 is set
-# for every selector, so a two-card run takes the scheduler split and the script never reads the selector.
+# Inkling-2-Mini (inkling2_loop, NVFP4 experts, BF16 dense). Scored against
+# the CPU reference of 2026-11-21 (--device none printed "1, 2, ... 13,");
+# the regex checks the first ten numbers only, as the Mistral gate does. The
+# gate names -c 8192: the model's default context is its 1,048,576-token
+# training context, which the load refuses by name on these cards.
+# GGML_SYCL_MOE_MULTI_GPU=0 is set for every selector, so a two-card run takes
+# the scheduler split and the script never reads the selector.
 run_inkling() {
     if [ -n "$NO_DEVICE_REASON" ]; then
         gate_skip inkling "$NO_DEVICE_REASON"

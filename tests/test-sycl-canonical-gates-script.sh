@@ -5,8 +5,8 @@
 # is CPU-only: it never touches a GPU and never loads a real model. All
 # "binaries" are shell scripts controlled by this file, wired through the
 # script's SYCL_GATES_* overrides (SYCL_GATES_BIN_DIR, _CMAKE_CACHE, _LDD_CMD,
-# _MISTRAL_MODEL, _GPTOSS_MODEL, _SKIP_ONEAPI_SOURCE, _SETTLE_SECONDS,
-# _SETVARS).
+# _MISTRAL_MODEL, _GPTOSS_MODEL, _INKLING_MODEL, _SKIP_ONEAPI_SOURCE,
+# _SETTLE_SECONDS, _SETVARS).
 #
 # Cases, matching the task spec plus discriminators added on review:
 #   (a)  correct digits                              -> PASS rc=0
@@ -32,7 +32,8 @@
 #   (stderr-only-mistral) correct digits on STDERR only -> FAIL
 #   (stderr-only-gptoss)  same, GPT-OSS side            -> FAIL
 #   (inkling-pass/-wrong/-no-model) opt-in inkling gate: PASS, wrong tokens
-#        -> FAIL, model file absent -> rc 77; argv has -c 8192 and no -ngl;
+#        -> FAIL, model file absent -> rc 77; argv has -c 8192, no -ngl and
+#        GGML_SYCL_MOE_MULTI_GPU=0 in the child environment;
 #        --gate all never runs it
 #
 # Run directly: bash tests/test-sycl-canonical-gates-script.sh; echo rc=$?
@@ -168,7 +169,10 @@ if [ "${1:-}" = "--list-devices" ]; then
     esac
 fi
 if [ -n "${STUB_ARGV_FILE:-}" ]; then
-    printf "%s\n" "$*" > "$STUB_ARGV_FILE"
+    printf "%s\nMULTI_GPU=%s\n" "$*" "${GGML_SYCL_MOE_MULTI_GPU-unset}" > "$STUB_ARGV_FILE"
+fi
+if [ -n "${STUB_ARGV_LOG:-}" ]; then
+    printf "%s\n" "$*" >> "$STUB_ARGV_LOG"
 fi
 case "${STUB_MISTRAL_MODE:-pass}" in
     pass)
@@ -556,17 +560,20 @@ expect_gate "stderr-only-gptoss" 1 "$out" "$rc" '^GATE gptoss FAIL rc=0 '
 
 # --- (inkling) the opt-in Inkling gate --------------------------------------
 # The same llama-completion stub serves it (STUB_MISTRAL_MODE shapes the
-# output); STUB_ARGV_FILE records the arguments the gate passed.
+# output); STUB_ARGV_FILE records the last invocation's arguments and the
+# GGML_SYCL_MOE_MULTI_GPU it saw, STUB_ARGV_LOG appends every invocation.
 case_ink_dir="$TMP/inkling"
 setup_case_dir "$case_ink_dir"
 touch_fake_models "$case_ink_dir"
 out="$(STUB_ARGV_FILE="$case_ink_dir/argv" STUB_MISTRAL_MODE=pass run_gates "$case_ink_dir" inkling)"
 rc=$?
 expect_gate "inkling pass" 0 "$out" "$rc" '^GATE inkling PASS rc=0 '
-if grep -q -- '-c 8192' "$case_ink_dir/argv" && ! grep -q -- '-ngl' "$case_ink_dir/argv"; then
-    echo "PASS: (inkling argv) -c 8192 present, no -ngl"
+if grep -qE -- '(^| )-c 8192( |$)' "$case_ink_dir/argv" \
+    && ! grep -qE -- '(^| )-ngl( |$)' "$case_ink_dir/argv" \
+    && grep -qx 'MULTI_GPU=0' "$case_ink_dir/argv"; then
+    echo "PASS: (inkling argv) -c 8192, no -ngl, GGML_SYCL_MOE_MULTI_GPU=0 in the child environment"
 else
-    fail "(inkling argv) expected -c 8192 and no -ngl; got: $(cat "$case_ink_dir/argv" 2>/dev/null)"
+    fail "(inkling argv) expected -c 8192, no -ngl and MULTI_GPU=0; got: $(cat "$case_ink_dir/argv" 2>/dev/null)"
 fi
 
 out="$(STUB_MISTRAL_MODE=wrong run_gates "$case_ink_dir" inkling)"
@@ -580,8 +587,10 @@ expect_gate "inkling no model" 77 "$out" "$rc" '^GATE inkling SKIP rc=77 ' "$TMP
 
 # --gate all must not run inkling (a 22.9 GB model stays out of every default run).
 : > "$case_ink_dir/fake-inkling.gguf"
-out="$(run_gates "$case_ink_dir" all 2>"$TMP/inkling-all.err")"
-if printf '%s\n' "$out" | grep -q '^GATE inkling'; then
+rm -f "$case_ink_dir/argv.log"
+out="$(STUB_ARGV_LOG="$case_ink_dir/argv.log" run_gates "$case_ink_dir" all 2>"$TMP/inkling-all.err")"
+if printf '%s\n' "$out" | grep -q '^GATE inkling' \
+    || grep -q 'fake-inkling' "$case_ink_dir/argv.log"; then
     fail "(inkling all) --gate all ran the inkling gate"
 else
     echo "PASS: (inkling all) --gate all does not run inkling"
