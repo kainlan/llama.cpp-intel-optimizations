@@ -386,10 +386,26 @@ def violations(files):
         returns = list(re.finditer(r"\breturn\b[^;]*;", body))
         if len(returns) < 4:
             out.append("%s: only %d returns in graph_compute; the gate would pass vacuously" % (MAIN, len(returns)))
+        # The entry refusal of a context whose device delivered an asynchronous failure returns before the graph opens
+        # anything the exit hooks close, and a flush there would wait on the failed device's queue. It is admitted
+        # only before the dispatch-owner scope, after the failure test, right behind the report, and only once.
+        owner_at = body.find("ggml_sycl_dispatch_owner_scope dispatch_owner(")
+        entry_refusals = 0
         for m in returns:
             stmt = m.group()
             if "ggml_sycl_graph_compute_exit_status(" in stmt:
                 continue
+            if re.fullmatch(r"return\s+GGML_STATUS_FAILED\s*;", stmt) and 0 <= m.start() < owner_at and \
+                    "ggml_sycl_async_failure_since(" in body[:m.start()]:
+                prev_end = body.rfind(";", 0, m.start())
+                prev_start = max(body.rfind(c, 0, prev_end) for c in ";{}") + 1
+                if prev_end >= 0 and not re.search(r"[{}]", body[prev_end:m.start()]) and \
+                        body[prev_start:prev_end].strip().startswith("ggml_sycl_async_failure_report("):
+                    entry_refusals += 1
+                    if entry_refusals == 1:
+                        continue
+                    bad(MAIN, main, base + m.start(), "a second graph_compute entry refusal; only one may skip the exit hooks")
+                    continue
             catch_at = body.rfind("catch", 0, m.start())
             seg = body[catch_at:m.start()] if catch_at >= 0 else ""
             if catch_at < 0 or not ("ggml_sycl_graph_compute_exception_exit(" in seg or
@@ -604,6 +620,18 @@ def mutants(files):
     yield ("a graph_compute return that skips the exit hooks",
            edit(files, M, "return ggml_sycl_graph_compute_exit_status(backend, ggml_backend_sycl_graph_compute_unchecked(backend, cgraph),\n                                                   record_begins_before, exec_submits_before);",
                 "return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);", "k18"), "skips the exit hooks")
+    refusal = ("if (auto * failed_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;\n"
+               "        failed_ctx && ggml_sycl_async_failure_since(failed_ctx->async_failure_cursor)) {\n"
+               "        ggml_sycl_async_failure_report(failed_ctx, \"graph_compute\");\n"
+               "        return GGML_STATUS_FAILED;\n"
+               "    }")
+    owner = ("ggml_sycl_dispatch_owner_scope dispatch_owner(\n"
+             "        backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr);")
+    yield ("the entry refusal moved behind the dispatch-owner scope",
+           edit(edit(files, M, refusal, "", "k18a"), M, owner, owner + "\n    " + refusal, "k18a"),
+           "skips the exit hooks")
+    yield ("a second bare return ahead of the entry refusal",
+           edit(files, M, refusal, "return GGML_STATUS_FAILED;\n    " + refusal, "k18b"), "skips the exit hooks")
     yield ("an exit without the eager flush",
            edit(files, M, "            ggml_sycl_cpu_tg_flush_pending();\n        }\n        ggml_sycl_moe_ids_cache_new_graph();",
                 "        }\n        ggml_sycl_moe_ids_cache_new_graph();", "k19"), "does not call ggml_sycl_cpu_tg_flush_pending(")
