@@ -36385,17 +36385,19 @@ static void placement_plan_log_working_set(const char *              tag,
 
 // The load's fact onto the plan (design 5efe §4.4), the one place either builder copies it, before it makes any entry.
 // The lock follows the mapping: a load that maps nothing locks nothing. The loader's SYCL_Host buffer follows it too:
-// a load that maps no file binds that buffer for its weights when they are evictable, and `multi_device` names the
-// builder, whose plan alone decides whether host experts are served from it in place.
+// a load that maps no file binds that buffer for its weights when they are evictable, in the pool of the device the
+// load names, and `plan_device`, the builder's device (-1 for the multi-device builder), decides with it whether host
+// experts are served from it in place.
 static void placement_plan_copy_host_backing_fact(placement_plan &          plan,
                                                   const placement_kv_info & info,
-                                                  bool                      multi_device) {
-    plan.host_backing_maps_files = info.load_maps_files;
-    plan.host_mapped_locked      = info.load_maps_files && info.load_locks_files;
-    const placement_loader_fact loader =
-        placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable, multi_device);
-    plan.loader_holds_weights       = loader.holds_weights;
-    plan.loader_serves_host_experts = loader.serves_host_experts;
+                                                  int                       plan_device) {
+    plan.host_backing_maps_files       = info.load_maps_files;
+    plan.host_mapped_locked            = info.load_maps_files && info.load_locks_files;
+    const placement_loader_fact loader = placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable,
+                                                                   info.load_loader_device, plan_device);
+    plan.loader_holds_weights          = loader.holds_weights;
+    plan.loader_device                 = loader.device;
+    plan.loader_serves_host_experts    = loader.serves_host_experts;
 }
 
 // A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
@@ -38118,7 +38120,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_envelope_fa_name(envelope->flash_attn_type));
     }
     placement_plan plan;
-    placement_plan_copy_host_backing_fact(plan, kv_info, /*multi_device=*/false);
+    placement_plan_copy_host_backing_fact(plan, kv_info, device_id);
     bool host_experts_pinned                 = false;
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
@@ -39608,7 +39610,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     const size_t n_devs = device_budgets.size();
 
     placement_plan plan;
-    placement_plan_copy_host_backing_fact(plan, kv_info, /*multi_device=*/true);
+    placement_plan_copy_host_backing_fact(plan, kv_info, /*plan_device=*/-1);
     plan.device_id                = -1;  // Multi-device
     plan.multi_device             = true;
     plan.vram_bytes               = 0;

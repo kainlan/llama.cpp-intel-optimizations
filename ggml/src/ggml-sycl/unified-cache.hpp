@@ -740,6 +740,11 @@ struct placement_kv_info {
     // ggml_backend_sycl_weights_evictable(), the answer libllama's prefer_host_weights reads. With load_maps_files it
     // decides placement_loader_fact_for(). Unstaged it is false: no loader buffer is charged.
     bool                  load_weights_evictable   = false;
+    // The device whose cache's pinned pool holds that buffer: the one device the backend scheduler sees, whose
+    // SYCL_Host buffer type libllama binds for every SYCL layer, so every chunk of the buffer comes from that device's
+    // cache. -1 when the scheduler sees more than one device: libllama then binds each layer's device's buffer type, so
+    // the buffer is split across their pools by layer. Unstaged it is -1: no pool is known to hold it.
+    int                   load_loader_device       = -1;
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
     // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
     // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
@@ -1176,11 +1181,13 @@ struct placement_plan {
     bool host_backing_maps_files = false;
     bool host_mapped_locked      = false;
     // The loader's SYCL_Host buffer as the plan's fact (placement_loader_fact_for, copied with the fact above).
-    // loader_holds_weights: the buffer holds every weight the plan places, so a single-device plan's host WEIGHT zone
-    // charges it as its loader_residency term (a multi-device plan's does not: every card's zones are sized from it).
-    // loader_serves_host_experts: S1-PRELOAD serves each host-planned PINNED expert from that buffer in place, under
-    // the buffer's owner, so such an expert takes no block of its own.
+    // loader_holds_weights: the buffer holds every weight the plan places. loader_device: the device whose pinned pool
+    // holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its loader_residency term once,
+    // host-wide, when one does, and only that device's zone commits it. loader_serves_host_experts: S1-PRELOAD serves
+    // each host-planned PINNED expert from that buffer in place, under the buffer's owner, so such an expert takes no
+    // block of its own.
     bool loader_holds_weights       = false;
+    int  loader_device              = -1;
     bool loader_serves_host_experts = false;
 
     size_t                       kv_vram_bytes;      // KV bytes on device(s)
@@ -1296,6 +1303,9 @@ struct placement_plan {
     size_t                                     host_budget                = 0;
     size_t                                     host_planned_bytes         = 0;
     host_zone_commit_terms                     host_zone_terms;
+    // The loader_residency term inside host_zone_weight_bytes, which populate_host_zone_sizing records with it: the
+    // bytes only loader_device's pool commits (placement_plan_host_zone_commit_terms_on_device).
+    size_t                                     host_zone_loader_bytes = 0;
     // th32 §3.3, §4.3 step 4: the lazy tables' residency and the block ring their STORAGE reads need. The ring is
     // sized after the residency pass over the tables that stayed STORAGE: block_ring_need = block_ring_qd x
     // block_ring_span_max, and block_ring_charge is its mapped size when the live ring the coverage pin reads is
@@ -2372,14 +2382,17 @@ struct host_weight_zone_terms {
 // device, and a chunk is ring-streamable only on the device whose cache queue allocated it.
 struct placement_loader_fact {
     bool holds_weights       = false;
+    int  device              = -1;
     bool serves_host_experts = false;
 };
 
 static constexpr placement_loader_fact placement_loader_fact_for(bool maps_files,
                                                                  bool weights_evictable,
-                                                                 bool multi_device) noexcept {
+                                                                 int  loader_device,
+                                                                 int  plan_device) noexcept {
+    (void) loader_device;
     const bool holds = !maps_files && weights_evictable;
-    return { holds, holds && !multi_device };
+    return { holds, -1, holds && plan_device >= 0 };
 }
 
 // The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
@@ -2440,6 +2453,15 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
     const size_t committed = n_chunks * (chunk_bytes + align);
     terms.rounding         = committed - terms.zones() - terms.runtime;
+    return terms;
+}
+
+// `plan`'s commit terms `terms` on `device`'s pinned pool.
+inline host_zone_commit_terms placement_plan_host_zone_commit_terms_on_device(const placement_plan &         plan,
+                                                                              const host_zone_commit_terms & terms,
+                                                                              int                            device) {
+    (void) plan;
+    (void) device;
     return terms;
 }
 
