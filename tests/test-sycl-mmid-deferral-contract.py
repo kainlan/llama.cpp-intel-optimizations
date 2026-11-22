@@ -53,21 +53,59 @@ def check_load_end_defers(text):
     return True, "load_end defers instead of throwing"
 
 
-def check_tripwire_present(text):
-    # The bind reports from more than one site (a refused materialization, a refused reconcile, an exception). Every
-    # site that names the tripwire must report through REPORT_FN, and the poison removes them all: removing only the
-    # first left the others to pass the check, so the control was void.
-    sites = []
-    at = text.find(TRIPWIRE_SITE)
+BIND_FN = "static void ggml_sycl_bind_materialize_live_mmid_workspaces("
+REPORT_CALL = REPORT_FN + "(" + TRIPWIRE_SITE
+
+# The bind's three tripwire sites, each named by the argument only it passes: a refused materialization reports the
+# registry's own detail, a refused reconcile the reconcile's refusal, and the catch-all EXCEPTION.
+TRIPWIRE_SITES = [
+    ("materialize-refused", ", detail,"),
+    ("reconcile-refused", "refusal, token"),
+    ("exception", "moe_mmid_materialize_refusal::EXCEPTION"),
+]
+
+
+def bind_body(text):
+    at = text.find(BIND_FN)
+    if at < 0:
+        return None
+    end = text.find("\n}\n", at)
+    return text[at: end if end >= 0 else len(text)]
+
+
+def tripwire_calls(body):
+    """Every REPORT_FN call in the bind that names the tripwire, as (start, end) of the call statement."""
+    calls = []
+    at = body.find(REPORT_CALL)
     while at >= 0:
-        sites.append(at)
-        at = text.find(TRIPWIRE_SITE, at + 1)
-    if not sites:
-        return False, "context-bind tripwire site not found"
-    for at in sites:
-        if REPORT_FN not in text[max(0, at - 400): at]:
-            return False, "a context-bind site no longer reports through %s" % REPORT_FN
-    return True, "context-bind tripwire reports refusals at %d sites" % len(sites)
+        end = body.find(");", at)
+        calls.append((at, end + 2 if end >= 0 else len(body)))
+        at = body.find(REPORT_CALL, at + 1)
+    return calls
+
+
+def check_tripwire_present(text):
+    # Every named site must report the tripwire through REPORT_FN. The check names the missing site, so one site's
+    # removal cannot hide behind the other two still reporting.
+    body = bind_body(text)
+    if body is None:
+        return False, "context-bind function not found (renamed?)"
+    calls = [body[s:e] for s, e in tripwire_calls(body)]
+    missing = [name for name, marker in TRIPWIRE_SITES if not any(marker in call for call in calls)]
+    if missing:
+        return False, "context-bind tripwire missing at: %s" % ", ".join(missing)
+    return True, "context-bind tripwire reports refusals at %d sites" % len(TRIPWIRE_SITES)
+
+
+def poison_one_site(text, marker):
+    """Delete the one tripwire report call that carries `marker`, leaving the other sites in place."""
+    body = bind_body(text)
+    if body is None:
+        return text
+    for s, e in tripwire_calls(body):
+        if marker in body[s:e]:
+            return text.replace(body, body[:s] + body[e:], 1)
+    return text
 
 
 CHECKS = [
@@ -134,6 +172,23 @@ def main():
             ok, _ = check(poisoned)
             print("%-20s %s  poisoned source" % (name, "VOID (still passed!)" if ok else "red as required"))
             if ok:
+                failures += 1
+
+        # One control per tripwire site: that site's report deleted, the other two left. Red is required, and the
+        # failure must name that site.
+        for name, marker in TRIPWIRE_SITES:
+            label = "tripwire:" + name
+            poisoned = poison_one_site(text, marker)
+            if poisoned == text:
+                print("%-20s VOID  poison did not modify the source" % label)
+                failures += 1
+                continue
+            ok, detail = check_tripwire_present(poisoned)
+            named = not ok and name in detail and all(other not in detail for other, _ in TRIPWIRE_SITES
+                                                      if other != name)
+            print("%-20s %s  one site deleted" % (label, "red as required, named" if named else
+                                                   "VOID (still passed!)" if ok else "VOID (red, site not named)"))
+            if not named:
                 failures += 1
 
         # A missing source must FAIL and say so (sycl_gate.run_without_source): 77 is ctest's skip, which reads as green.
