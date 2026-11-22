@@ -81,6 +81,7 @@ of `1dcdf49b1`): `git -C <wt> switch -c feat/inkling2 master`. Implementers work
 | C (planner rate, docs) | 13, 16 | Profile document; measured CPU expert rate row |
 | D (backend failure path) | 7a, 7d, 7b, 7c | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21); a failed context gives its device back |
 | E (inherited regression) | 6c, 6d | GPT-OSS 20B at the default context loses the B50: spike, then the COMPUTE-flag fix (found 2026-11-21). 6e, the exit path, is on Track D |
+| F (`test-backend-ops`, inherited) | 6f-1, 6f-2, 6f-3, 6f-4, 6g | The suite aborts on the B50 and one case writes out of bounds (found 2026-11-22 by Task 6d's acceptance run). 6f-1 touches four kernel files only and runs beside Track D; 6f-2 and 6f-3 queue on `ggml-sycl.cpp` |
 
 **Amended 2026-11-21, after Task 1 ran and the two spikes concluded.** Task 1 ended red at an old defect
 (llama.cpp-kjoc), so Tasks 7a and 7b now precede the route's opening, and Task 7c follows 7b. Task 4's spike produced Task 4b. Task 6b was
@@ -88,6 +89,7 @@ found in review of Task 6. Their full specifications are separate files beside t
 `2026-11-21-inkling2-task-4b-zone-sizing-refusal.md` and `2026-11-21-inkling2-task-7a-7b-async-failure.md`.
 Task 10b was found in review of Task 10: this host's `mkdir` is not atomic, so `GPU.lock` can be taken twice.
 Task 7d was found by Task 7a's first oracle run, and Task 6c by the first real run of the GPT-OSS gate without `-c`.
+Tasks 6f-1 to 6f-4 and 6g were found on 2026-11-22 by Task 6d's `test-backend-ops` acceptance run.
 
 ### Dependency Graph
 
@@ -105,6 +107,11 @@ digraph dependencies {
     6c [label="T6c spike: GPT-OSS default context loses the B50"];
     6d [label="T6d not-computed nodes are not executed"];
     6e [label="T6e lost device exits cleanly"];
+    6f1 [label="T6f-1 four kernels outside ggml-sycl.cpp"];
+    6f2 [label="T6f-2 supports_op tells the truth; staging refusal"];
+    6f3 [label="T6f-3 q6_K f16 arm uses the plane it resolved"];
+    6f4 [label="T6f-4 trustworthy census (lead)"];
+    6g [label="T6g skipped expert ids; f16 src1 tiling"];
     7a [label="T7a async error fails the boundary"];
     7d [label="T7d failed context gives its device back"];
     7b [label="T7b every queue has the handler"];
@@ -123,6 +130,7 @@ digraph dependencies {
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
+    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -147,6 +155,9 @@ digraph dependencies {
 | `ggml/src/ggml-sycl/device-pool.hpp`, `layer-streaming.cpp`, `l2-prefetch.hpp`, `dense-scheduler.cpp`, `tests/test-sycl-async-drain-source.py` | 7c | None |
 | `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp` | 7a, then 7d | Sequential (Track D) |
 | `ggml/src/ggml-sycl/zone-sizing.{hpp,cpp}`, `tests/test-zone-sizing.cpp` | 4b | None |
+| `ggml/src/ggml-sycl/tsembd.cpp`, `pad_reflect_1d.cpp`, `gated_delta_net.cpp`, `fattn.cpp` | 6f-1 | None (no other task of this plan touches them) |
+| `ggml/src/ggml-sycl/binbcast.cpp`, `binbcast.hpp`, `tests/test-sycl-op-support-predicates.py` | 6f-2 | None |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp`, the `supports_op` switch, the MoE prompt staging aborts and the f16 dequant arm | 6f-2, then 6f-3 | Disjoint from Track D's regions; the lead orders the merges and builds after each |
 | `ggml/src/ggml-sycl/moe-resolved-batch.hpp` | gap tasks from 8 | Sequential |
 | `scripts/sycl-inkling-profile.sh`, `tests/test-sycl-inkling-profile-script.sh` | 10 | None |
 | `scripts/sycl-lock.sh`, `tests/test-sycl-lock.sh` | 10 (creates), 10b (reads) | Sequential (Track B) |
@@ -993,6 +1004,366 @@ end state and belongs with the async-failure latch of Tasks 7a to 7c: a synchron
 into the same latch and the boundary reports it. Which of the two this task does is decided when it is written.
 **Also in scope:** detached workers stop calling SYCL once shutdown begins; `watchdog_start` refuses after its
 guard has run. A normal exit has the same race.
+
+---
+
+### Task 6f: `test-backend-ops` on the B50 neither aborts nor writes out of bounds (found 2026-11-22)
+
+**Track:** F. **Depends on:** Task 6d (merged; its census is the RED). **Blocks:** nothing in Stage 1. Task 9 records
+its state.
+
+**Why it is in this plan.** Task 6d's acceptance asked for `test-backend-ops` on the B50. The suite aborted, on the
+fix build and identically on the parent build, so none of it comes from Task 6d and none of it is about Inkling. It
+is here because of the standing rule (owner, 2026-11-16): an abort is a broken part, and an abort we meet is fixed,
+not only filed. The out-of-bounds device write (F3) is fixed for the same reason. The two cheap wrong-result
+kernels (F4, F5) are fixed because each is a few lines in a file that Task 6f-1 opens anyway. The two larger gaps
+(F1, F2) are Task 6g.
+
+**What was measured.** B50 (`ONEAPI_DEVICE_SELECTOR=level_zero:1`), one process per op name, the 130 names of
+`--list-ops`, once on the fix build (`9013f01c2`) and once on the parent build (`1ce4cd442`). The two runs agree on
+return code, OK count, FAIL count and unsupported count for all 130 ops. 101 ops end rc 0; 22 end rc 1, 19 of them
+because no test case has that op name; 7 abort. The full-suite run aborts on an eighth case (A4) that the per-op
+census cannot reach. Summary: `docs/backend/data/inkling2/bops-census-b50.tsv` (committed with Task 6d).
+
+| item | first case that shows it | what happens | cause | fixed by |
+|---|---|---|---|---|
+| A1 | `ADD(type=bf16,ne=[1,1,8,1],nr=[1,1,1,1],nf=1,perm1=0,src_overlap=0)`, same for SUB, MUL, DIV | abort, `binbcast.cpp:989` | `supports_op` checks layout only; the kernel's type chain has no bf16 arm. The upstream sync dropped upstream's two bf16 arms | 6f-2 |
+| A2 | `GATED_DELTA_NET(...,padded_q=1,permuted_k=0)` | abort, `gated_delta_net.cpp:335` | the kernel addresses k with q's strides and asserts they are equal | 6f-1 |
+| A3 | `MUL_MAT(type_a=q6_K,type_b=f32,m=1000,n=21,k=4608,...,weights=1)` | abort through `SYCL_CHECK` at `ggml-sycl.cpp:58188` | the f16 dequant arm resolves the SoA plane, then asks for it a second time through a stricter lookup that refuses it | 6f-3 |
+| A4 | `CONV_1D_DW(ne_input=[64,16,1,1],ne_kernel=[3,1,16,1],type_kernel=bf16,stride=1,padding=0,dilation=1)` | abort, `ggml-sycl.cpp:57051` | `supports_op` never checks the type of MUL_MAT's src1; no route reads a bf16 src1 | 6f-2 |
+| A5 | `MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0)` | abort, `ggml-sycl.cpp:92331` | a 1 GiB activation staging allocation fails and the caller aborts instead of refusing | 6f-2 |
+| F1 | `MUL_MAT_ID(...,skip=1)`, 15 cases, and one q4_K case with `m_v=80` | FAIL (graph compute returns FAILED) | an expert id of -1 means "skip this slot, zero the row" upstream; the fork's resolver throws on it. The `m_v` case is an expert table inside a strided view | 6g; the `m_v` decline is in 6f-2 |
+| F2 | `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,...)` | FAIL (graph refused before submission) | the f16 arm sizes one f16 copy of the whole src1; without a model plan the runtime zone cannot hold 128.5 MB | 6g |
+| F3 | `FLASH_ATTN_EXT` with `hsk=64,hsv=72` and with `hsk=128,hsv=96` | FAIL; the second case **writes past dst** (sentinel mismatch) | the support predicate checks only the key head size; the kernels index V with it | 6f-1 |
+| F4 | `PAD_REFLECT_1D(type=f32,ne_a=[2,16777217,1,1],pad_0=1,pad_1=1,view=0)` | FAIL, one row written | `dpct::dim3` multiplies in `unsigned`: 16777217 x 256 wraps to 256 work-items | 6f-1 |
+| F5 | `TIMESTEP_EMBEDDING(type=f32,ne_a=[65,1,1,1],dim=1,max_period=10000)` | FAIL, dst never written | the launcher computes `dim / 2` blocks; for `dim=1` that is zero | 6f-1 |
+
+Upstream `19bc41dbb` has A2, F4 and F5 as well (same code), and admits A4. The others are the fork's.
+
+**How to read a `test-backend-ops` log** (this cost one wrong attribution on 2026-11-22):
+- The console printer flushes stdout after every result line, and `ggml_abort` flushes stdout before it prints. So
+  in an abort log the aborting case is the next case in list order after the last printed result line, and a stderr
+  line belongs to the case whose result line comes after it.
+- `-o` takes comma-separated entries. An entry with a `(` is compared exactly with the full case string. An entry
+  matching `[A-Z0-9_]+` is an exact op-name compare. Anything else is a regex over the op name only.
+- About 40 composite tests override the printed name (`CONV_1D_DW`, `LLAMA`, `TOPK_MOE`, `MUL_MAT_ID_FUSION`,
+  ...). None of those names is in `--list-ops`, so a census driven from that list never runs them.
+- `-p` is an ECMAScript regex over the parameter string, applied to every op. A negative lookahead steps past a
+  known abort: `-o MUL_MAT_ID -p '^(?!.*,n=65536,)'`.
+- `test-backend-ops support -b SYCL0` lists every case string without computing anything. It omits the whole-graph
+  (fusion) cases.
+
+**Every run of the binary is a GPU run:** the lead runs them, one at a time, pinned, under `GPU.lock`. An
+implementer builds and runs host tests only.
+
+---
+
+### Task 6f-1: Four kernels outside `ggml-sycl.cpp` (A2, F3, F4, F5)
+
+**Track:** F. **Depends on:** Task 6d merged. **Parallel with:** Track D (no shared file).
+**Workspace:** its own worktree and branch `task/inkling2-t6f1`, cut from `feat/inkling2`.
+**File scope (four commits, one per file):**
+- Modify: `ggml/src/ggml-sycl/tsembd.cpp:45-46`
+- Modify: `ggml/src/ggml-sycl/fattn.cpp`, `ggml_sycl_flash_attn_ext_supported`, after the head-dimension check
+  (`:2752-2756`)
+- Modify: `ggml/src/ggml-sycl/gated_delta_net.cpp:26-28, 81-82, 110-111, 242-244, 270, 335, 342-344, 362-378`
+- Modify: `ggml/src/ggml-sycl/pad_reflect_1d.cpp:3-20, 68-98`
+
+**RED (exists; the lead ran it 2026-11-22):** the four case strings in the table above fail or abort on
+`9013f01c2` and on `1ce4cd442`. No new test file: `test-backend-ops` is the test.
+
+**GREEN 1, `tsembd.cpp` (F5).** Replace lines 45-46:
+```cpp
+    // One work-item per frequency, plus the item at j == dim / 2 that zeroes the last element of an odd dim.
+    int half_ceil = (dim + 1) / 2;
+```
+The kernel already handles `j == half` for an odd `dim` (`:26-28`); the launcher never launched that item when
+`dim / 2` was a multiple of the block size (0 for `dim=1`, 256 for `dim=513`).
+Commit: `sycl: timestep embedding launches the work-item that zeroes an odd dim's last element`.
+
+**GREEN 2, `fattn.cpp` (F3).** Directly after the `if (!fattn_vec_supports_head_dim(D) && ...) { return false; }`
+block:
+```cpp
+    // The vec and tile kernels are templated on one head size and index V with it. A value head size that differs
+    // from the key head size leaves part of each dst row unwritten (DV > D) or writes past dst (DV < D). The D=512
+    // routes pin DV in their own admissibility functions.
+    if (D != 512 && V->ne[0] != D) {
+        return false;
+    }
+```
+Before you commit, read the two D=512 admissibility functions and confirm each rejects `V->ne[0] != 512` (the
+checks were at `:2446` and `:2569`). If one does not, report it to the lead and do not widen this task.
+This is a decline, and upstream declines the same shapes (`19bc41dbb:ggml/src/ggml-sycl/fattn.cpp:195-212`). No
+model this fork runs has a value head size different from its key head size; a kernel for that shape is a gap to
+write when one appears.
+Commit: `sycl: flash attention declines a value head size its kernels do not index`.
+
+**GREEN 3, `gated_delta_net.cpp` (A2).** k gets its own strides, as the CPU reference has
+(`ggml/src/ggml-cpu/ops.cpp:11355`):
+- Kernel parameters (`:26-28`): after `int64_t sq3,` add `int64_t sk1, int64_t sk2, int64_t sk3,`.
+- `:82`: `const float * kp = k + iq3 * sk3 + iq1 * sk1 + lane;`
+- `:111`: `kp += sk2;`
+- `launch_gated_delta_net` (`:242-244` and the kernel call at `:270`): the same three parameters, passed through.
+- `ggml_sycl_op_gated_delta_net`: delete `GGML_ASSERT(ggml_are_same_stride(src_q, src_k));` (`:335`); after
+  `sq3` add
+  ```cpp
+      const int64_t sk1 = nbk1 / sizeof(float);
+      const int64_t sk2 = nbk2 / sizeof(float);
+      const int64_t sk3 = nbk3 / sizeof(float);
+  ```
+  and pass `sk1, sk2, sk3` after `sq3` in the four `launch_gated_delta_net` calls (`:362-378`).
+- Then search the file for every other read of `k` (`cat ggml/src/ggml-sycl/gated_delta_net.cpp | grep -n 'kp\|k_d\|k +'`).
+  Each must use the k strides. The chunked path (`n_seq_tokens=65`) hits the same assert today.
+Commit: `sycl: gated delta net addresses k with k's own strides`.
+
+**GREEN 4, `pad_reflect_1d.cpp` (F4).** The launch is capped so the global range fits in an `int`, and each
+work-group strides over the row tiles the cap left out.
+- Kernel: add a parameter `const int64_t n_groups0` before `item_ct1`. Replace the head (`:11-20`) and the early
+  return with a loop; `return` inside the old body becomes `continue`:
+  ```cpp
+      const int64_t i3 = item_ct1.get_group(0);
+      const int64_t i2 = item_ct1.get_group(1);
+      if (i2 >= ne02 || i3 >= ne03) {
+          return;
+      }
+      // The launcher caps dimension 2. A work-group serves every row tile congruent to its own index.
+      for (int64_t g = item_ct1.get_group(2); g < n_groups0; g += (int64_t) item_ct1.get_group_range(2)) {
+          const sycl::uint2 div_mod_packed = fast_div_modulo((uint32_t) g, ne01);
+          const int64_t     i1             = div_mod_packed.y();
+          const int64_t     i0 = item_ct1.get_local_id(2) + div_mod_packed.x() * item_ct1.get_local_range(2);
+          if (i0 >= ne0 || i1 >= ne01.z()) {
+              continue;
+          }
+          // ... the existing body, unchanged, from `const char *src0_ptr` to the store into dst ...
+      }
+  ```
+- Launcher: replace `grid_dims`, `block_dims` and the `nd_range` built from their product:
+  ```cpp
+      const int64_t n_groups0 = ne01 * tiles0;
+      // A global range must fit in an int (the DPC++ default), and dpct::dim3 multiplies in unsigned: 16777217 rows
+      // times 256 wrapped to 256 work-items and one row was written. Launch at most max_groups0 groups along
+      // dimension 2; the kernel strides over the rest.
+      const int64_t        max_groups0 = std::max<int64_t>(1, (int64_t) INT_MAX / (bx * ne02 * ne03));
+      const int64_t        launched0   = std::min(n_groups0, max_groups0);
+      const sycl::range<3> local_range(1, 1, (size_t) bx);
+      const sycl::range<3> global_range((size_t) ne03, (size_t) ne02, (size_t) (launched0 * bx));
+  ```
+  and `cgh.parallel_for(sycl::nd_range<3>(global_range, local_range), ...)` with `n_groups0` passed to the kernel.
+- For every shape that fitted before, `launched0 == n_groups0` and the loop runs once: no extra work.
+Commit: `sycl: pad_reflect_1d launches a range that fits in an int and strides over the rest`.
+
+**Acceptance:**
+- [ ] `./scripts/sycl-build.sh test-backend-ops` is rc 0 (`TMPDIR` on the root disk).
+- [ ] `clang-format-19 --dry-run -Werror` reports nothing new on the lines you changed (compare with the same
+      command on the parent commit; never `clang-format-19 -i`).
+- [ ] Lead, one run per case string, B50: the four RED cases print OK (F4, F5, A2) or `not supported` (the two F3
+      cases); plus `-o GATED_DELTA_NET`, `-o FLASH_ATTN_EXT`, `-o PAD_REFLECT_1D`, `-o TIMESTEP_EMBEDDING` once
+      each: rc 0, and no OK count lower than in `bops-census-b50.tsv`.
+- [ ] Lead, once each: Mistral B70 gate (flash attention is on its path) and the Qwen 3.5 gate if a gated-delta-net
+      model is staged in `/models/`; otherwise say that no model exercised GREEN 3.
+
+**Gotchas:**
+- `fast_div_modulo` takes a `uint32_t` (`common.hpp:8527`). A tile count above 2^32 was already truncated by the
+  old `(unsigned)` cast and needs a tensor larger than either card; say so in the comment, add no assert.
+- Confirm the "fits in an int" rule against the DPC++ source you build with before relying on it: the check is
+  `checkValueRange` in `sycl/handler.hpp`, and it covers the product of the dimensions, not each one alone.
+- `gated_delta_net.cpp` reads `src->data` directly. Do not change how it resolves pointers in this task.
+- Four commits, each path-scoped (`git commit -F msgfile -- <one file>`), never amended.
+
+---
+
+### Task 6f-2: `supports_op` says what the kernels can do, and a staging failure is a refusal (A1, A4, A5, F1's view case)
+
+**Track:** F, on the `ggml-sycl.cpp` queue (the lead orders the merge). **Depends on:** Task 6d merged.
+**Workspace:** its own worktree and branch `task/inkling2-t6f2`, cut from `feat/inkling2`.
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/binbcast.cpp` (the type chain near `:961-989`), `binbcast.hpp`
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: `ggml_backend_sycl_device_supports_op`, the cases `REPEAT`,
+  `ADD/SUB/MUL/DIV` (near `:123867-123892` at `3f1cb2f45`), `MUL_MAT` (near `:123622`), `MUL_MAT_ID`; and the
+  three `GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging ...")` sites (near `:92331`, `:93026`,
+  `:93038`)
+- Modify: `tests/test-sycl-op-support-predicates.py`
+
+**Rule this task enforces:** `supports_op` returning true is a promise that a kernel exists. An op it admits must
+not reach a `GGML_ABORT`. Where the kernel is missing and cheap to restore, restore it; otherwise decline.
+
+**Step 1, A1: one predicate beside the type chain.** In `binbcast.cpp`, next to `ggml_sycl_op_bin_bcast`, and
+declared in `binbcast.hpp`:
+```cpp
+// The (src0, src1, dst) type triples ggml_sycl_op_bin_bcast has a kernel for. It lists exactly the arms of that
+// function's type chain: supports_op asks it, so an op it admits cannot reach the chain's abort.
+bool ggml_sycl_bin_bcast_types_supported(ggml_type src0, ggml_type src1, ggml_type dst) {
+    if (src0 == src1 && src1 == dst) {
+        return dst == GGML_TYPE_F32 || dst == GGML_TYPE_F16 || dst == GGML_TYPE_I32 || dst == GGML_TYPE_I16;
+    }
+    return src0 == GGML_TYPE_F16 && src1 == GGML_TYPE_F32 && dst == GGML_TYPE_F16;
+}
+```
+In `supports_op`: `ADD/SUB/MUL/DIV` return
+`ggml_sycl_bin_bcast_types_supported(op->src[0]->type, op->src[1]->type, op->type) && ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op)`;
+`REPEAT` replaces its hand-written type list with
+`ggml_sycl_bin_bcast_types_supported(op->type, op->src[0]->type, op->type)` (REPEAT hands `(dst, src, dst)` to the
+kernel) and keeps its layout call. Update REPEAT's comment: the list now lives in `binbcast.cpp`.
+
+**Step 2, A1: restore upstream's two bf16 arms.** `git show 19bc41dbb:ggml/src/ggml-sycl/binbcast.cpp` lines
+294-305 has `(bf16, bf16, bf16)` and `(bf16, f32, bf16)` under `#ifdef GGML_SYCL_HAS_BF16`, and
+`git show 19bc41dbb:ggml/src/ggml-sycl/common.hpp` lines 36-41 defines that macro. The fork has the macro only in
+`convert.cpp:18-23`. Add the two arms to the fork's chain in the fork's calling convention (the fork's `op()`
+returns an event and takes resolved pointers; copy the shape of the F16 arms), define the macro where both files
+see it, and extend the predicate with the two triples under the same `#ifdef`. If the fork's `op()` template
+cannot take `sycl::ext::oneapi::bfloat16` without changes outside `binbcast.cpp`, stop: land step 1 alone and
+report what blocked the port.
+
+**Step 3, A4: MUL_MAT's src1 type.** Read first, change second:
+- `ggml_sycl_op_mul_mat` asserts `src1` is F32 or 2-D (`:57051`) and then reads it as `float *` except in the one
+  arm that special-cases F16 (`:57836`). So a bf16 src1 has no reader.
+- The three `CONV_1D_DW` cases with `type_kernel=f16` pass today: there both operands are F16 and the op takes
+  another route. Find that route (follow `GGML_OP_MUL_MAT` in `ggml_sycl_compute_forward_impl`) and write down,
+  in the commit message, which `(src0 type, src1 type, src1 rank)` combinations each route reads.
+- In the `MUL_MAT` case of `supports_op`, after the `ne[3]` check, decline every src1 type that no route reads.
+  Starting point, to be corrected by what you found:
+  ```cpp
+                  // src1 is read as float by every route except the F16 x F16 one; nothing reads a BF16 src1.
+                  if (b->type != GGML_TYPE_F32 &&
+                      (b->type != GGML_TYPE_F16 || ((b->ne[2] != 1 || b->ne[3] != 1) && a->type != GGML_TYPE_F16))) {
+                      return false;
+                  }
+  ```
+- Ruling (lead, 2026-11-22): this is a decline, not a kernel, because the fork has no bf16-src1 reader of any
+  kind and neither model that could produce one (`src/models/wavtokenizer-dec.cpp:223`,
+  `tools/mtmd/models/chatterbox-gen.cpp:234`, both only with a BF16 depthwise-conv weight) is in this plan. It is
+  recorded under Known limits as a kernel to write.
+
+**Step 4, F1's view case: MUL_MAT_ID over a strided expert table.** In the `MUL_MAT_ID` case of `supports_op`
+add `if (!ggml_is_contiguous(op->src[0])) { return false; }` with the comment
+`// Expert routes are resolved per contiguous expert table; a strided view of one has no route.` Real expert
+weights are contiguous; the case is `m_v=80` in the test.
+
+**Step 5, A5: the staging failure is a refusal.** The first site (near `:92331`) runs before any per-expert
+kernel is submitted. Replace its `GGML_ABORT` with
+```cpp
+            GGML_LOG_ERROR("[MoE] prompt F32 activation staging refused for %s rows=%zu row_bytes=%zu\n",
+                           src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
+            throw ggml_sycl_fallback_error("MUL_MAT_ID prompt activation staging does not fit");
+```
+(`ggml_sycl_fallback_error` keeps the pointer, so the reason must be a string literal.) The resolver's throw at
+the batch build already travels this way and ends in `GGML_STATUS_FAILED`.
+The two sites inside the per-expert loop (near `:93026` and `:93038`) can fire after earlier experts' kernels were
+submitted. Before you change them, name the owner that keeps each staged buffer alive until those kernels finish
+when the scope unwinds (the scoped temporaries' destructors and what they chain on). If every buffer is held by a
+handle that outlives its events, make the same replacement. If not, leave those two sites, and report exactly
+which buffer would be released early: that is a lifetime defect for the lead to rule on, not something to
+improvise.
+
+**RED, host-only (`tests/test-sycl-op-support-predicates.py`, with its self-test).** Read the file first and add
+claims in its style:
+- the `ADD/SUB/MUL/DIV` case and the `REPEAT` case of `supports_op` each call
+  `ggml_sycl_bin_bcast_types_supported`;
+- every `src0->type == ... && src1->type == ... && dst->type == ...` arm of the chain in `binbcast.cpp` has its
+  triple in the predicate, and the predicate has no triple without an arm (parse both, compare the sets);
+- the `MUL_MAT` case tests `b->type`; the `MUL_MAT_ID` case tests `ggml_is_contiguous(op->src[0])`;
+- no `GGML_ABORT` carries the text `Failed to allocate PP F32 activation staging` at the first site.
+Mutants: the predicate call removed from `ADD`; a chain arm added without a predicate triple; the `b->type` test
+removed; the first abort restored. The claims fail before the change.
+
+**Acceptance:**
+- [ ] The contract passes plain and with its self-test; `./scripts/sycl-build.sh` builds `test-backend-ops`,
+      `llama-cli`, `llama-completion` and `llama-bench`, rc 0.
+- [ ] Lead, one run per case, B50: the A1 case prints OK (or `not supported` if step 2 was blocked); the A4 case
+      prints `not supported`; the A5 case prints FAIL without an abort and the process exits; the `m_v=80` case
+      prints `not supported`.
+- [ ] Lead, once each: `-o ADD`, `-o SUB`, `-o MUL`, `-o DIV`, `-o REPEAT`, `-o MUL_MAT`
+      (`-p '^(?!.*weights=1$)'` until Task 6f-3 lands), `-o CONV_1D_DW`: no abort, and no OK count lower than in
+      `bops-census-b50.tsv`.
+- [ ] Lead, once each: Mistral gates on both cards, the GPT-OSS B50 gate (it runs `MUL_MAT_ID` prompt staging).
+
+**Gotchas:**
+- A decline in `supports_op` sends the node to the CPU backend. That is correct only for a shape no kernel reads.
+  Do not decline a shape that passes today: the census OK counts are the guard.
+- The A5 case stages about 1.2 GiB of host and device memory. It is run once, with a `Shmem` reading before and
+  after.
+- `supports_op` cannot see expert id values. Negative ids are Task 6g, not this task.
+
+**Commit:** two commits. `sycl: binary broadcast admits exactly the type triples it has kernels for (bf16 restored)`
+(`binbcast.cpp`, `binbcast.hpp`, `ggml-sycl.cpp`, the contract) and
+`sycl: MUL_MAT and MUL_MAT_ID decline what no route reads; prompt staging refuses instead of aborting`
+(`ggml-sycl.cpp`, the contract).
+
+---
+
+### Task 6f-3: The q6_K f16 arm converts from the plane it resolved (A3)
+
+**Track:** F, after Task 6f-2 (same file). **Depends on:** Task 6f-2.
+**Status:** recorded 2026-11-22; written out to the Task Detail Standard after the one diagnostic run below, because
+which of three checks refuses is not known from the source.
+**What is known (at `9013f01c2`):**
+- The router admits the case correctly: an SoA f16 converter exists for q6_K (`ggml-sycl.cpp:36400`).
+- The arm resolves the weight with `ggml_sycl_resolve`, which reports `loaded soa`, and then fetches the plane a
+  second time through `ggml_sycl_acquire_weight_layout` (`:45097-45117`, into `unified-cache.cpp:12848-12882`).
+  The second lookup is stricter in three ways: it returns empty while the entry's ready event is pending
+  (`:12876-12880`), and `acquire_entry_lease` requires a retention identity (`:12612`, `:12638`) that
+  `get_weight_ptr` (`:12438-12490`) does not ask for.
+- The refusal throws `ggml_sycl_fallback_error` (`:55881-55885`, `:55922`), and the call site wraps the op in
+  `SYCL_CHECK(CHECK_TRY_ERROR(...))` (`:58188-58190`), which turns any `std::exception` into `GGML_ABORT`.
+- The log line: `f16 dequant arm refused a (q6_K, loaded soa): the SOA plane is not staged on this device`.
+**The one diagnostic run (lead, B50):** the A3 case string with `GGML_SYCL_HANDLE_TRACE=1`, to see which check
+refuses. A Mistral B50 health arm before it.
+**Direction (lead ruling):** two changes. The arm converts from the plane it already resolved: its pointer, its
+retention kept alive, the conversion chained on its ready event with `ggml_sycl_chain_ready_event_if_needed`
+(`common.hpp:817`); no host wait. And a `ggml_sycl_fallback_error` thrown under the `:58188` call site reaches the
+graph boundary as a failed status, as it does on every other dispatch path (`ggml_sycl_compute_forward` rethrows
+it first), instead of being swallowed by `CHECK_TRY_ERROR`.
+**Why it matters beyond the test:** Q4_K_M models carry q6_K weights that take this arm in prompt processing. In a
+normal load the planes are staged long before use, so the pending-event window is small, but the retention
+asymmetry does not depend on timing.
+**Done when:** the A3 case prints OK on the B50; `-o MUL_MAT` runs to the end with no `-p` filter; a source
+contract pins that the arm does not call `ggml_sycl_acquire_weight_layout` for a plane it holds a resolution of.
+
+---
+
+### Task 6f-4: A census that reaches every case (lead)
+
+**Track:** F (lead, GPU). **Depends on:** Tasks 6f-1, 6f-2, 6f-3 merged.
+**Steps:**
+1. `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-backend-ops support -b SYCL0 > cases.txt`, then the
+   printed names: `sed -E 's/^  ([A-Z0-9_]+)\(.*/\1/' cases.txt | sort -u`. Drive the per-op loop from that list,
+   not from `--list-ops`, so the composite tests run.
+2. One process per name, `timeout 600`, a 15 s settle and a `Shmem` reading between processes, `ulimit -c 0`,
+   kernel fault lines counted per op. Whole-graph cases, which `support` omits, run once more in test mode.
+3. An op that still aborts is re-run with `-p` stepping past the abort, so the rest of its cases are measured.
+4. The same on the B70 (`level_zero:0`), once. `CLAUDE.md` asks for more than one backend on a ggml change.
+5. Commit both summaries to `docs/backend/data/inkling2/` and replace this task's text with the result: remaining
+   aborts (must be zero), remaining FAIL cases with their Task 6g item, and the unsupported counts.
+**Done when:** zero aborts on both cards, the only failing cases are F1 and F2, and the summary is committed.
+
+---
+
+### Task 6g: Skipped expert ids and a src1 larger than the f16 buffer (F1, F2)
+
+**Track:** F. **Depends on:** Task 6f-4. **Not a Stage 1 exit gate**, unless step 1 below says a real model reaches
+F1.
+**Status:** recorded 2026-11-22; written out to the Task Detail Standard before it starts.
+**F1, what is known:** upstream `701fd25b3` (#26631) gave `MUL_MAT_ID` a meaning for a negative id: skip the slot,
+and the output row is zero (`ggml.h:1385`, `ggml.c:3423`, CPU `ggml-cpu.c:1696-1700`). Upstream's SYCL backend
+implements it (`k_zero_dst_rows`, skipped rows in `mmid_counting_sort_rows`). The fork's
+`build_moe_resolved_batch` (`moe-resolved-batch.hpp:1013`) passes -1 to the resolver, which throws
+(`ggml-sycl.cpp:85192`), and the graph fails. The only producer of -1 ids found is
+`src/llama-moe-cache.cpp:940-958` (`cpu_ids`, upstream's MoE cache).
+**Step 1 (read-only, before anything else):** does this fork ever enable `llama_moe_cache`, and can a graph it
+builds reach the SYCL `MUL_MAT_ID` executor? If yes, F1 is reachable with a real model and this task moves ahead
+of Task 9.
+**F1, direction:** the batch builder records occurrences with a negative id in a skip list and never asks the
+resolver or the memo about them; the executor zeroes those destination rows with one kernel on the stream,
+event-chained; the token-generation id kernels are audited for the same rule (`mmvq.cpp:7963`, `:9056` skip a
+negative id; whether every route also zeroes the row is not verified).
+**F2, what is known:** the graph-entry walk sizes an f16 copy of the whole src1 (`ggml-sycl.cpp:112571-112575`)
+and refuses the graph when the runtime zone cannot hold it (`:112612-112632`). A decode never reaches this:
+`n_ubatch` bounds src1. An unplanned graph (a multimodal encoder) might.
+**F2, direction:** tile the f16 arm over src1 columns so each tile fits the planned f16 buffer or the zone's free
+space, and size the walk's demand by one tile. The same tiling answers A5 properly: Task 6f-2 only turns that
+abort into a refusal.
+**Not verified:** whether the fork enables `llama_moe_cache`; whether every token-generation id kernel zeroes a
+skipped row; whether any multimodal encoder graph reaches F2.
 
 ---
 
@@ -2502,6 +2873,11 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
   decode. One limit is accepted and stated in Task 7a: one token can be sampled from the failed graph. The second,
   a failed bundle quarantined until process exit, was withdrawn on 2026-11-21 when the first GPU run showed it left
   the card owned by the failed context (Task 7a commit 4, Task 7d).
+- **`test-backend-ops` aborts on the B50 on this branch and on `master`** (Task 6f, found 2026-11-22): seven ops
+  in a per-op census and an eighth case in the full run, all inherited. Tasks 6f-1 to 6f-3 fix the aborts and one
+  out-of-bounds device write. Two things stay open after them and are stated, not hidden: a MUL_MAT whose src1 is
+  BF16 is declined to the CPU backend (no route reads one; a kernel to write when a model needs it), and Task 6g's
+  two failing cases (negative expert ids, a src1 larger than the f16 buffer).
 - **The GPT-OSS gate without `-c` faults the B50 on this branch and on `master`** (Task 6c, found 2026-11-21). It is
   a regression inherited from `master`, hidden there by a `-c 4096` pin. It blocks the Stage 1 exit (Task 9) and is
   not yet diagnosed. The command in `CLAUDE.md` is that command: on the B50 it resets the engine each time.
