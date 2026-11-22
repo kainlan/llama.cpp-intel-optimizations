@@ -77,6 +77,13 @@ XMXConfig XMXConfig::from_device(int /*device_id*/) {
 }
 }  // namespace ggml_sycl_unified
 
+// dpct/helper.hpp's device_ext installs the backend's async-failure handler (common.cpp) on every queue it creates.
+// That code is emitted here because the headers instantiate dev_mgr, but this test never creates a dpct queue, so the
+// seam only has to link; reaching it would mean the test touched a device.
+sycl::async_handler ggml_sycl_async_handler(int /*slot*/) {
+    GGML_ABORT("test-esimd-dpas-gate created a dpct queue");
+}
+
 int main() {
     // ---- Names that must reach the unified kernel ------------------------
     // The reported names of the Battlemage parts this fork runs on, plus the
