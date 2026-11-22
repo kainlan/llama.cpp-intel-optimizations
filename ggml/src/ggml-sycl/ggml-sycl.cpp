@@ -84002,34 +84002,6 @@ static const char * ggml_sycl_moe_mmid_lease_status_name(ggml_sycl::moe_mmid_lea
     return "?";
 }
 
-static const char * ggml_sycl_execution_error_name(ggml_sycl::execution::error error) {
-    switch (error) {
-        case ggml_sycl::execution::error::OK:
-            return "ok";
-        case ggml_sycl::execution::error::STALE:
-            return "stale";
-        case ggml_sycl::execution::error::MISMATCH:
-            return "mismatch";
-        case ggml_sycl::execution::error::OVERFLOW:
-            return "overflow";
-        case ggml_sycl::execution::error::DEVICE_BUSY:
-            return "device_busy";
-        case ggml_sycl::execution::error::BUSY:
-            return "busy";
-        case ggml_sycl::execution::error::NULL_OUTPUT:
-            return "null_output";
-        case ggml_sycl::execution::error::FOREIGN_BACKEND:
-            return "foreign_backend";
-        case ggml_sycl::execution::error::NOT_FOUND:
-            return "not_found";
-        case ggml_sycl::execution::error::ALLOCATION_FAILED:
-            return "allocation_failed";
-        case ggml_sycl::execution::error::LOCK_HELD_ALLOCATION:
-            return "lock_held_allocation";
-    }
-    return "?";
-}
-
 // A batch whose experts are all host-resident runs on the CPU (HOST_CPU recipes): the direct route was never its
 // route, so declining it there is not a refusal and prints nothing.
 static bool ggml_sycl_moe_direct_batch_all_host(const ggml_sycl::moe_resolved_batch & batch) {
@@ -84061,7 +84033,7 @@ static void ggml_sycl_moe_direct_log_decline(const ggml_tensor * src0,
     vsnprintf(detail, sizeof(detail), fmt, args);
     va_end(args);
     GGML_LOG_ERROR("[%s] tensor=%s route=direct step=%s %s\n", ne12 == 1 ? "MOE-DECODE-REFUSAL" : "MOE-PROMPT-REFUSAL",
-                   src0 && src0->name ? src0->name : "?", step, detail);
+                   src0 ? src0->name : "?", step, detail);
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
