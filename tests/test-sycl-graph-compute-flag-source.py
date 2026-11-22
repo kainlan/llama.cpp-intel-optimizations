@@ -18,10 +18,12 @@ Checks:
   * ggml_sycl_is_noop is true for a node the graph does not compute. The executors pinned here ask it: the node
     loop of graph_compute_impl, the segment dispatch (moe_graph_dispatch_direct_node), the MoE block graphs, the
     layer-block dispatch, and the Q8_1 src1 planner that sizes what those dispatches draw;
-  * the walkers that choose what runs leave an uncomputed node before they read it: every node loop of the MoE
-    topology scan (g_moe_gate_up_pairs) and of the MoE dispatch list (whose dispatch_indices the segment recorder,
-    the block graphs, the graphlets and the decode analysis take), the layer-block pre-block copy, and the persistent
-    TG plan's fast path and full walk (an unselected branch's DUP no longer declines the plan);
+  * the walkers that choose, stage or plan what runs leave an uncomputed node before they read it: every node loop
+    of the MoE topology scan (g_moe_gate_up_pairs) and of the MoE dispatch list (whose dispatch_indices the segment
+    recorder, the block graphs, the graphlets and the decode analysis take); the layer-block pre-block copy, the
+    layer-block plan's source scan and its alias publication; the persistent TG plan's fast path and full walk, the
+    split plan's weight list, and the eligibility checks before them (decode, architecture, op support, MoE probe,
+    policy summary), so an unselected branch's DUP no longer declines persistent TG;
   * a fusion that also runs a node it looked ahead to asks the rule of that node: the TG router and MUL_MAT+ADD
     fusions, ADD+RMS_NORM, MUL+ADD, the FFN fusion, the MoE down-sum chain and its weighted MUL, and the persistent
     plan's RMS_NORM+MUL. The two CPU-path fusions ask ggml_sycl_is_noop of the next node. The RMS_NORM fusions that
@@ -199,6 +201,24 @@ NODE_WALKS = {
         (PERSISTENT_PLAN,
          r"for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*cgraph->n_nodes\s*;\s*i\+\+\s*\)\s*\{\s*"
          r"ggml_tensor\s*\*\s*node\s*=\s*cgraph->nodes\[i\]\s*;\s*const\s+int\s+ops_before\b", 1),
+    "the persistent split plan's weight list":
+        (r"static bool extract_persistent_plan_split\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the persistent TG decode check":
+        (r"static bool is_decode_phase_graph\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the persistent TG architecture check":
+        (r"static bool has_supported_architecture\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the persistent TG op check":
+        (r"static bool graph_has_only_persistent_ops\([^)]*\)\s*\{", ZERO_TO_N_NODES, 2),
+    "the persistent TG MoE probe":
+        (r"static persistent_moe_graph_probe persistent_tg_probe_moe_graph\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the persistent TG policy summary":
+        (r"static persistent_tg_policy_summary persistent_tg_summarize_policy\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the layer-block plan's source scan":
+        (r"static bool ggml_sycl_block_exec_prepare_context\([^)]*\)\s*\{",
+         r"for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*cgraph->n_nodes\s*;\s*\+\+i\s*\)\s*\{\s*"
+         r"const\s+ggml_tensor\s*\*\s*dst\s*=\s*cgraph->nodes\[i\]\s*;", 1),
+    "the layer-block alias publication":
+        (r"static bool ggml_sycl_block_exec_publish_aliases\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
 }
 
 GRAPH_COMPUTE = r"static void ggml_backend_sycl_graph_compute_impl\([^)]*\)\s*\{"

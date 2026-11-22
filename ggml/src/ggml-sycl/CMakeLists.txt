@@ -1070,8 +1070,9 @@ if (BUILD_TESTING)
             --self-test)
     set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
     # An unselected ggml_build_forward_select branch carries no GGML_TENSOR_FLAG_COMPUTE: the executors the test names
-    # skip it through ggml_sycl_is_noop; the source readers, the MoE dispatch walkers, the persistent TG plan and the
-    # fusions that run a look-ahead node ask the rule directly. --self-test: the single-rule check is absence-based.
+    # skip it through ggml_sycl_is_noop; the source readers, the MoE dispatch walkers, the persistent TG checks and
+    # plan, and the fusions that run a look-ahead node ask the rule directly. --self-test: the single-rule check is
+    # absence-based.
     add_test(NAME sycl-graph-compute-flag-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-compute-flag-source.py
             --self-test)

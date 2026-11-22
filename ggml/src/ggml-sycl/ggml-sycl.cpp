@@ -105167,7 +105167,11 @@ static bool ggml_sycl_block_exec_publish_aliases(ggml_backend_sycl_context &    
     exec_ctx.alias_publications.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        // an uncomputed node has no output to alias: nothing writes it, and nothing computed reads it
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -105277,7 +105281,8 @@ static bool ggml_sycl_block_exec_prepare_context(ggml_backend_sycl_context &    
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * dst = cgraph->nodes[i];
-        if (!dst) {
+        // the block dispatch does not run an uncomputed node, so its sources plan no copy and no edge
+        if (!dst || !ggml_sycl_graph_node_is_computed(dst)) {
             continue;
         }
         const int dst_block = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -122732,7 +122737,11 @@ static bool extract_persistent_plan_split(ggml_sycl::UnifiedKernel &           p
     std::vector<const ggml_tensor *> matmul_weight_tensors;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0]) {
+        // the plan holds no op for an uncomputed node, so the list skips the same nodes to stay index-aligned
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
             matmul_weight_tensors.push_back(node->src[0]);
         }
     }
@@ -123107,6 +123116,9 @@ static bool is_decode_phase_graph(ggml_cgraph * cgraph) {
     bool found_mul_mat = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             found_mul_mat = true;
             // src[1] is the activation tensor, ne[1] is the M dimension (batch size)
@@ -123442,6 +123454,9 @@ static bool has_supported_architecture(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         if (node->op == GGML_OP_RMS_NORM) {
             has_rms_norm = true;
         }
@@ -123525,7 +123540,7 @@ static persistent_moe_graph_probe persistent_tg_probe_moe_graph(const ggml_cgrap
     std::unordered_map<int, persistent_moe_layer_probe> layers;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         if (persistent_tg_is_moe_router_argsort(node)) {
@@ -123633,7 +123648,8 @@ static persistent_tg_policy_summary persistent_tg_summarize_policy(ggml_cgraph *
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // the plan skips an uncomputed node, so its op is no blocker
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         switch (node->op) {
@@ -123759,7 +123775,10 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
             static bool logged_f16_matmul_once = false;
             if (!logged_f16_matmul_once) {
                 GGML_LOG_INFO(
@@ -123773,6 +123792,10 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
+        // the plan skips an uncomputed node: the unselected input-embedding branch's DUP declines nothing
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         switch (node->op) {
             case GGML_OP_GET_ROWS:
             case GGML_OP_RMS_NORM:
