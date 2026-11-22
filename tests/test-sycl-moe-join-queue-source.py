@@ -43,9 +43,11 @@ THE CONTRACT.  With comments blanked:
      a join that falls back to the stream is itself recorded; cpu_submit_async records
      its submissions on a non-CPU queue (all host tasks); and every host_task in the
      backend sources is the join, or goes through cpu_submit_async, or is exempt for a
-     stated reason that the gate also pins (host_task_mode is only ever set false; the
-     Q1/NVFP4 direct route is not validated; a test hook; dpct's host_buffer, which no
-     backend source reaches).  The test programs under ggml-sycl/tests are not backend
+     stated reason that the gate also pins (host_task_mode is only ever set false; a test
+     hook; dpct's host_buffer, which no backend source reaches).  The Q1/NVFP4 direct
+     route's host tasks on its exact queue (the stream) are recorded: each submit is
+     assigned to an event, and the statement right after it is
+     unified_cache_note_host_task(*exact_queue, <that event>).  The test programs under ggml-sycl/tests are not backend
      code and are not censused.
   L. (unified-cache.cpp) the latch: a host task or a join on a queue that is not a
      cache's queue_, or on a second cache, refuses the join queue for the process, as
@@ -308,6 +310,37 @@ def classify_host_task(name: str, heads: list[str]) -> str | None:
     return None
 
 
+Q1_DIRECT_SUBMIT = "exact_queue->submit("
+
+
+def check_q1_direct_recorded(code: str, host_task_pos: int) -> None:
+    """The direct route's host task at `host_task_pos` is recorded right after its submit returns."""
+    at = code.rfind(Q1_DIRECT_SUBMIT, 0, host_task_pos)
+    line = line_of(code, host_task_pos)
+    target = re.search(r"(?:sycl::event\s+)?(\w+)\s*=\s*$", code[max(0, at - 200) : at])
+    if at < 0 or not target:
+        fail("G", f"the Q1/NVFP4 direct host task at ggml-sycl.cpp:{line} is not submitted into an event, so its "
+             "event cannot be recorded for the join queue's guard")
+    flat = strip_strings(code)
+    open_paren = at + len(Q1_DIRECT_SUBMIT) - 1
+    depth = 0
+    close = -1
+    for j in range(open_paren, len(flat)):
+        if flat[j] == "(":
+            depth += 1
+        elif flat[j] == ")":
+            depth -= 1
+            if depth == 0:
+                close = j
+                break
+    event = target.group(1)
+    rest = code[close + 1 :] if close >= 0 else ""
+    note = r"\s*;\s*ggml_sycl::unified_cache_note_host_task\s*\(\s*\*\s*exact_queue\s*,\s*" + re.escape(event) + r"\s*\)\s*;"
+    if close < 0 or not re.match(note, rest):
+        fail("G", f"the Q1/NVFP4 direct host task at ggml-sycl.cpp:{line} is not recorded on its stream right after its "
+             f"submit returns (want unified_cache_note_host_task(*exact_queue, {event}) as the next statement)")
+
+
 def check_census(sources: dict) -> None:
     kinds = set()
     for name, text in sorted(sources.items()):
@@ -316,6 +349,8 @@ def check_census(sources: dict) -> None:
         code = blank_comments(text)
         for m in re.finditer(r"\bhost_task\s*\(\s*\[", code):
             kind = classify_host_task(name, enclosing_headers(code, m.start()))
+            if kind == "q1-direct":
+                check_q1_direct_recorded(code, m.start())
             if kind is None:
                 fail("G", f"host_task at {name}:{line_of(code, m.start())} is not recorded for the join queue's guard; "
                      "submit it through cpu_submit_async or record its event with unified_cache_note_host_task")
@@ -336,10 +371,6 @@ def check_census(sources: dict) -> None:
         if not backend_calls or any(arg != "false" for _, arg in backend_calls):
             fail("G", "ggml_sycl_host_task_mode_set is called with something other than false, so cpu-dispatch's "
                  "host_task_mode branches can run and their host tasks are not recorded")
-    if "q1-direct" in kinds:
-        backend = blank_comments(sources["ggml-sycl.cpp"])
-        if not re.search(r"constexpr\s+bool\s+k_moe_mmid_direct_route_validated\s*=\s*false\s*;", backend):
-            fail("G", "the Q1/NVFP4 direct route is validated, so its terminal host task runs and is not recorded")
     if "dpct-host-buffer" in kinds:
         for name, text in sources.items():
             if name.startswith("dpct/") or "dpct_memcpy" not in text:
@@ -587,9 +618,16 @@ def self_test(s: dict) -> int:
              r"\1\n    ggml_sycl_get_cpu_queue()->submit([&](sycl::handler & cgh) { cgh.host_task([]() {}); });")),
         ("G", "backend", "host_task_mode switched on", sub(r"ggml_sycl_host_task_mode_set\(false\);",
                                                           "ggml_sycl_host_task_mode_set(true);")),
-        ("G", "backend", "Q1/NVFP4 direct route validated",
-         sub(r"constexpr bool k_moe_mmid_direct_route_validated = false;",
-             "constexpr bool k_moe_mmid_direct_route_validated = true;")),
+        ("G", "backend", "Q1/NVFP4 direct terminal not recorded",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);", ";")),
+        ("G", "backend", "Q1/NVFP4 direct terminal recorded on another queue",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);",
+             "ggml_sycl::unified_cache_note_host_task(*ctx.stream(), terminal_task);")),
+        ("G", "backend", "Q1/NVFP4 direct terminal records another event",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);",
+             "ggml_sycl::unified_cache_note_host_task(*exact_queue, final);")),
+        ("G", "backend", "Q1/NVFP4 injected terminal not recorded",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, final\);", ";")),
         ("L", "cache_cpp", "latch accepts any queue",
          sub(r"cache && cache->get_queue\(\) == q \? cache : nullptr", "cache")),
         ("L", "cache_cpp", "refusal not sticky",

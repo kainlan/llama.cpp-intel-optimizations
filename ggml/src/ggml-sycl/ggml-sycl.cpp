@@ -87373,11 +87373,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         throw std::runtime_error("injected Q1/NVFP4 asynchronous terminal failure");
                                     });
                                 });
+                                // A host task on the stream like the terminal below, recorded for the same reason.
+                                ggml_sycl::unified_cache_note_host_task(*exact_queue, final);
                             }
                             ggml_sycl_q1_nvfp4_test_retain_completion(completion);
 #endif
                             terminal->arm(final);
-                            exact_queue->submit([completion, final](sycl::handler & h) {
+                            sycl::event terminal_task = exact_queue->submit([completion, final](sycl::handler & h) {
                                 h.depends_on(final);
                                 // Runs once the route's commands have finished, whatever their outcome, and releases
                                 // the finished bundle. It does not ask whether the work succeeded: a wait of its own
@@ -87411,6 +87413,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};
                                 });
                             });
+                            // Recorded on the submitting thread, right after the submit returns. A CPU expert job's
+                            // join on the join-only queue waits only for the latest RECORDED host task of this
+                            // stream; an unrecorded one could be posted behind a join that holds the runtime's one
+                            // host-task thread while its job's inputs wait, on this in-order stream, for it.
+                            ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);
                             // No diagnostics or ownership construction is allowed
                             // after admission. The B70 validation gate remains shut,
                             // so a future enabling commit must place its marker before
