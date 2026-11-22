@@ -399,7 +399,9 @@ def self_test(raws: dict[str, str]) -> int:
                    "&hotness_source);\n")
     hold_call = "    placement_plan_hold_moe_swap_host_headroom(plan, kv_info);\n"
     single_host_side = "                                  host_experts_pinned);\n"
-    ledger_check = "        t.rounding);\n    if (plan.host_planned_bytes > plan.host_budget) {\n"
+    ledger_check = (
+        "        t.loader_zone, t.loader_grown, t.rounding);\n    if (plan.host_planned_bytes > plan.host_budget) {\n"
+    )
 
     expect_fail("layer-first-sorts-with-its-own-lambda", "S1", CACHE_CPP, build_sort, own_sort)
     expect_fail("spread-sorts-with-its-own-lambda", "S1", CACHE_CPP, spread_sort, own_sort)
