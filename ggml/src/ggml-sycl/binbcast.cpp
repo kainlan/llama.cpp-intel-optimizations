@@ -745,11 +745,11 @@ bool ggml_sycl_bin_bcast_types_supported(ggml_type src0, ggml_type src1, ggml_ty
     };
 
     static constexpr type_triple supported[] = {
-        { GGML_TYPE_F32,  GGML_TYPE_F32, GGML_TYPE_F32  },
-        { GGML_TYPE_F16,  GGML_TYPE_F16, GGML_TYPE_F16  },
-        { GGML_TYPE_F16,  GGML_TYPE_F32, GGML_TYPE_F16  },
-        { GGML_TYPE_I32,  GGML_TYPE_I32, GGML_TYPE_I32  },
-        { GGML_TYPE_I16,  GGML_TYPE_I16, GGML_TYPE_I16  },
+        { GGML_TYPE_F32,  GGML_TYPE_F32,  GGML_TYPE_F32  },
+        { GGML_TYPE_F16,  GGML_TYPE_F16,  GGML_TYPE_F16  },
+        { GGML_TYPE_F16,  GGML_TYPE_F32,  GGML_TYPE_F16  },
+        { GGML_TYPE_I32,  GGML_TYPE_I32,  GGML_TYPE_I32  },
+        { GGML_TYPE_I16,  GGML_TYPE_I16,  GGML_TYPE_I16  },
 #ifdef GGML_SYCL_HAS_BF16
         { GGML_TYPE_BF16, GGML_TYPE_BF16, GGML_TYPE_BF16 },
         { GGML_TYPE_BF16, GGML_TYPE_F32,  GGML_TYPE_BF16 },
@@ -1023,17 +1023,17 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                             ggml_is_contiguous(dst), main_stream, file, line, function);
 #ifdef GGML_SYCL_HAS_BF16
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
-        kernel_event = op()((const sycl::ext::oneapi::bfloat16 *) src0_d, (const sycl::ext::oneapi::bfloat16 *) src1_d,
-                            (sycl::ext::oneapi::bfloat16 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0,
-                            ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-                            ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream,
-                            file, line, function);
+        kernel_event =
+            op()((const sycl::ext::oneapi::bfloat16 *) src0_d, (const sycl::ext::oneapi::bfloat16 *) src1_d,
+                 (sycl::ext::oneapi::bfloat16 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2,
+                 ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0),
+                 ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line, function);
     } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
-        kernel_event = op()((const sycl::ext::oneapi::bfloat16 *) src0_d, (const float *) src1_d,
-                            (sycl::ext::oneapi::bfloat16 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0,
-                            ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3,
-                            ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream,
-                            file, line, function);
+        kernel_event =
+            op()((const sycl::ext::oneapi::bfloat16 *) src0_d, (const float *) src1_d,
+                 (sycl::ext::oneapi::bfloat16 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2,
+                 ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0),
+                 ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line, function);
 #endif
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__, ggml_type_name(dst->type),

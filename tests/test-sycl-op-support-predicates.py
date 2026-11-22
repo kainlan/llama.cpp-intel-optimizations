@@ -553,7 +553,8 @@ def _bin_bcast_chain_arms(text: str) -> List[Tuple[str, str, str, bool]]:
     chain = text[start:end]
     arms = _guarded_matches(chain, _BIN_BCAST_ARM)
     # One kernel launch per arm, so an arm the parse misses (or a launch outside an arm) shows here.
-    assert chain.count("kernel_event = op()(") == len(arms), "chain arms and kernel launches disagree"
+    launches = len(re.findall(r"kernel_event\s*=\s*op\(\)\(", chain))
+    assert launches == len(arms), "chain arms and kernel launches disagree"
     return arms
 
 
@@ -609,7 +610,7 @@ def test_bin_bcast_mutations_are_detected() -> None:
     )
     assert _contract_rejects(_assert_bin_bcast_type_contract, binbcast[:last_arm] + added_arm + binbcast[last_arm:])
     # A predicate triple without a chain arm.
-    triple = "        { GGML_TYPE_I16,  GGML_TYPE_I16, GGML_TYPE_I16  },\n"
+    triple = "        { GGML_TYPE_I16,  GGML_TYPE_I16,  GGML_TYPE_I16  },\n"
     assert binbcast.count(triple) == 1
     widened = binbcast.replace(triple, triple + "        { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32 },\n", 1)
     assert _contract_rejects(_assert_bin_bcast_type_contract, widened)
