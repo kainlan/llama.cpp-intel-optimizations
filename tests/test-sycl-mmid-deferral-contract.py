@@ -54,12 +54,20 @@ def check_load_end_defers(text):
 
 
 def check_tripwire_present(text):
+    # The bind reports from more than one site (a refused materialization, a refused reconcile, an exception). Every
+    # site that names the tripwire must report through REPORT_FN, and the poison removes them all: removing only the
+    # first left the others to pass the check, so the control was void.
+    sites = []
     at = text.find(TRIPWIRE_SITE)
-    if at < 0:
+    while at >= 0:
+        sites.append(at)
+        at = text.find(TRIPWIRE_SITE, at + 1)
+    if not sites:
         return False, "context-bind tripwire site not found"
-    if REPORT_FN not in text[max(0, at - 400): at]:
-        return False, "context-bind site no longer reports through %s" % REPORT_FN
-    return True, "context-bind tripwire reports refusals"
+    for at in sites:
+        if REPORT_FN not in text[max(0, at - 400): at]:
+            return False, "a context-bind site no longer reports through %s" % REPORT_FN
+    return True, "context-bind tripwire reports refusals at %d sites" % len(sites)
 
 
 CHECKS = [
@@ -92,7 +100,7 @@ POISONS = {
         lambda t: t.replace(ADMISSION_INIT + " " + SHARED_CONST, ADMISSION_INIT + " false"),
     "load-end-defers": poison_load_end,
     "tripwire-present":
-        lambda t: t.replace(TRIPWIRE_SITE, '"context-bind-REMOVED"', 1),
+        lambda t: t.replace(TRIPWIRE_SITE, '"context-bind-REMOVED"'),
 }
 
 
