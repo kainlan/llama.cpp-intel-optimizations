@@ -713,6 +713,16 @@ uint64_t moe_mmid_reconcile_retire_identity(moe_mmid_reconcile_outcome outcome,
 // The refusal detail a reconcile outcome names (NONE for the three that leave the live snapshot followed).
 moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outcome outcome) noexcept;
 
+// Whether the context bind reports a refused materialization as a tripwire. An expert loan or refill can rebind the
+// published context in place to a new snapshot of the same identity while the bind holds the older one; the bind's
+// attempt then meets that context as SAME_IDENTITY_OTHER_PLAN although the context follows the live snapshot. So
+// that refusal is reported only when `follows` says no context accepts for `live`, the snapshot the bind re-reads
+// under g_tensor_inventory_mutex and asks this under it. A `follows` that throws answers no. Every other refusal is
+// reported.
+bool moe_mmid_materialize_refusal_reported(moe_mmid_materialize_refusal                           refusal,
+                                           const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+                                           const moe_mmid_follows_fn &                            follows) noexcept;
+
 #ifdef GGML_SYCL_RETENTION_TESTING
 class moe_mmid_queue_capability_test_factory final {
   public:

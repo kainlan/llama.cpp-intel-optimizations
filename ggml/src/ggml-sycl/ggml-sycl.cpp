@@ -25283,6 +25283,10 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
             return ggml_sycl::lifecycle_select_placement_plan(token.model.value, token.load.value, token.owner.slot,
                                                               token.owner.generation);
         };
+        const ggml_sycl::moe_mmid_follows_fn follows =
+            [&](const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+                return ggml_sycl_mmid_workspaces_follow(token, snapshot);
+            };
         {
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
             published = select_live();
@@ -25290,7 +25294,17 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
         ggml_sycl::moe_mmid_materialize_reason  reason = ggml_sycl::moe_mmid_materialize_reason::OK;
         ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
         if (!ggml_sycl_materialize_published_mmid_workspaces(token, published, &reason, &detail, &status)) {
-            ggml_sycl_moe_mmid_report_refusal("context-bind", reason, detail, token, published);
+            // A loan or refill may have rebound the published context in place to a newer snapshot of the same
+            // identity: the refusal then names a context that follows the live snapshot, which is asked under the
+            // mutex every plan replacement CASes under.
+            bool reported = true;
+            {
+                std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+                reported = ggml_sycl::moe_mmid_materialize_refusal_reported(detail, select_live(), follows);
+            }
+            if (reported) {
+                ggml_sycl_moe_mmid_report_refusal("context-bind", reason, detail, token, published);
+            }
             return;
         }
         if (reason == ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE) {
@@ -25303,11 +25317,8 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
             live              = select_live();
             const bool stable = live && live->plan && published->plan &&
                                 ggml_sycl::moe_mmid_same_workspace_plan(*published->plan, *live->plan);
-            outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(
-                published, live, live ? live->version : 0, stable,
-                [&](const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
-                    return ggml_sycl_mmid_workspaces_follow(token, snapshot);
-                });
+            outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(published, live, live ? live->version : 0,
+                                                                             stable, follows);
         }
         const ggml_sycl::moe_mmid_materialize_refusal refusal = ggml_sycl::moe_mmid_reconcile_refusal(outcome);
         if (refusal == ggml_sycl::moe_mmid_materialize_refusal::NONE) {

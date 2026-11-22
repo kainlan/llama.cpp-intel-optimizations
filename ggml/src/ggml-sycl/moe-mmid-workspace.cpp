@@ -1881,6 +1881,19 @@ moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outco
     return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
 }
 
+bool moe_mmid_materialize_refusal_reported(moe_mmid_materialize_refusal                           refusal,
+                                           const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+                                           const moe_mmid_follows_fn &                            follows) noexcept {
+    if (refusal != moe_mmid_materialize_refusal::SAME_IDENTITY_OTHER_PLAN) {
+        return true;
+    }
+    try {
+        return !(live && follows && follows(live));
+    } catch (...) {
+        return true;
+    }
+}
+
 bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uint64_t plan_identity) noexcept {
     if (!token.valid()) {
         return false;

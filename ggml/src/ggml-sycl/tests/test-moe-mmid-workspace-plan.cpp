@@ -1844,6 +1844,51 @@ static void registry_existing_answer_allocates_nothing() {
     check(registry.published_contexts() == 1, "an answered attempt changed the published contexts");
 }
 
+// The context bind's refused materialization. An expert loan rebinds the published context in place (S1 -> S2, the
+// same identity) while the bind holds S1; the bind's attempt for S1 then meets that context as
+// same-identity-other-plan. Nothing is unresolved: the context follows the live snapshot, so the refusal is not a
+// tripwire. `follows` is computed as the backend computes it: exact_queue on the live snapshot.
+static void registry_bind_refusal_answered_by_live() {
+    using S = moe_mmid_materialize_status;
+    using R = moe_mmid_materialize_refusal;
+    const moe_mmid_model_token token{ 4601, 4602, 4603 };
+    std::atomic<int>           destroyed{ 0 };
+    auto                       allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int  queue_object           = 0;
+    auto owner                  = owner_plan(0, 4604);
+    owner.queue_capability      = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 4604);
+    constexpr uint64_t identity = 46;
+
+    moe_mmid_workspace_registry registry;
+    const moe_mmid_follows_fn   follows = [&](const std::shared_ptr<const lifecycle_plan_snapshot> & plan) {
+        return registry.exact_queue(token, plan, 0, 0, &queue_object).valid();
+    };
+    const auto first  = std::make_shared<const lifecycle_plan_snapshot>();
+    const auto second = std::make_shared<const lifecycle_plan_snapshot>();
+    const auto other  = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, identity, first, 0, { owner }, allocator) == S::PUBLISHED,
+          "the bind's publication failed");
+    check(registry.replace_plan(first, second, identity, /*stable_geometry=*/true), "the loan's rebind was refused");
+    R detail = R::NONE;
+    check(registry.materialize(token, identity, first, 0, { owner }, allocator, &detail) == S::INVALID &&
+              detail == R::SAME_IDENTITY_OTHER_PLAN,
+          "the late attempt after the rebind was not refused as same-identity-other-plan");
+    check(!moe_mmid_materialize_refusal_reported(detail, second, follows),
+          "a same-identity-other-plan refusal whose context follows the live snapshot was reported");
+    check(moe_mmid_materialize_refusal_reported(detail, other, follows),
+          "a same-identity-other-plan refusal whose context does not follow the live snapshot was not reported");
+    check(moe_mmid_materialize_refusal_reported(detail, nullptr, follows),
+          "a same-identity-other-plan refusal with no live snapshot was not reported");
+    const moe_mmid_follows_fn throws = [](const std::shared_ptr<const lifecycle_plan_snapshot> &) -> bool {
+        throw std::runtime_error("follows threw");
+    };
+    check(moe_mmid_materialize_refusal_reported(detail, second, throws), "a follows that threw answered yes");
+    check(moe_mmid_materialize_refusal_reported(R::PUBLICATION_RACED, second, follows),
+          "a refusal other than same-identity-other-plan was not reported");
+}
+
 // The context bind's reconcile (moe_mmid_reconcile_live_plan) after it published for snapshot S outside the plan
 // lock and finds P live. `followed` is computed as the backend computes it: exact_queue on the live snapshot.
 static void registry_bind_reconcile_follows_live() {
@@ -2050,6 +2095,7 @@ int main() {
         registry_publish_after_stable_replace_follows_live();
         registry_existing_answer_allocates_nothing();
         registry_bind_reconcile_follows_live();
+        registry_bind_refusal_answered_by_live();
         owner_admissible_only_on_an_exposed_device();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();

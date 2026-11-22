@@ -433,6 +433,14 @@
       "function": "lambda in moe_mmid_reconcile_live_plan",
       "count": 1,
       "reason": "moe_mmid_reconcile_live_plan is noexcept and the lambda's try wraps only the caller's follows callable, which the backend answers with a read-only exact-queue lookup in the MMID registry for each workspace owner: no allocation, no op execution, so no ggml_sycl_fallback_error. The handler answers 'does not follow', which the reconcile reports as a refusal that retires the bind's own publication. A rethrow would std::terminate through the noexcept boundary, and the registry translation unit is host-linkable without the backend's common header that defines the fallback error. Permanent."
+    },
+    {
+      "code": "G-CATCH",
+      "count": 1,
+      "file": "moe-mmid-workspace.cpp",
+      "function": "moe_mmid_materialize_refusal_reported",
+      "id": "E-MMID-REFUSAL-FOLLOWS-CATCH",
+      "reason": "moe_mmid_materialize_refusal_reported is noexcept and its try wraps only the caller's follows callable, which the backend answers with a read-only exact-queue lookup in the MMID registry for each workspace owner: no allocation, no op execution, so no ggml_sycl_fallback_error. The handler answers 'reported', so the context bind's tripwire still fires. A rethrow would std::terminate through the noexcept boundary, and the registry translation unit is host-linkable without the backend's common header that defines the fallback error. Permanent."
     }
   ]
 }
