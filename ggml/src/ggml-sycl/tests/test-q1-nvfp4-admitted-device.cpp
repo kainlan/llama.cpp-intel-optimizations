@@ -208,9 +208,11 @@ struct lifecycle_fixture {
     bool scope_minted = false;
     // Every case marker from this index on was published while this fixture was alive: the cases its teardown names.
     size_t first_case = g_case_markers.size();
+    route_authorization authorization = route_authorization::TEST_SCOPE;  // named in each passing case's line
 
     explicit lifecycle_fixture(backend_order       order         = backend_order::BEFORE_LOAD_END,
-                               route_authorization authorization = route_authorization::TEST_SCOPE) {
+                               route_authorization requested     = route_authorization::TEST_SCOPE) :
+        authorization(requested) {
         try {
             const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
             if (begin_result != GGML_SYCL_LIFECYCLE_OK) {
@@ -537,6 +539,15 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     return c;
 }
 
+// One stdout line per passing case, naming what ran, so a PASS log shows which cases it covers; a failure throws
+// before it and prints its own FAIL line instead.
+void report_pass(const std::string & name, ggml_type type, int ne11, input_rows rows,
+                 route_authorization authorization) {
+    std::cout << "PASS: " << name << " type=" << ggml_type_name(type) << " ne11=" << ne11
+              << " rows=" << (rows == input_rows::STRIDED ? "strided" : "dense") << " authorization="
+              << (authorization == route_authorization::PRODUCTION ? "production" : "test-scope") << std::endl;
+}
+
 // `graph` tags the graph in every label, so graph A and graph B of one churn regression stay distinguishable.
 void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph,
                            input_rows rows = input_rows::DENSE) {
@@ -588,6 +599,7 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
         after.recycle < before.recycle + 2) {
         fail_stages("two-submit lifecycle counters did not prove slot reuse" + observed_slots(), before);
     }
+    report_pass("successful_reuse_case (graph=" + std::string(graph) + ")", type, ne11, rows, life.authorization);
 }
 
 void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) {
@@ -634,6 +646,7 @@ void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_
     require_stages(after.submit == before.submit, "injected failure reached kernel submit", before);
     require_stages(after.quarantine == before.quarantine + (expect_quarantine ? 1 : 0),
                    "failure quarantine delta was not exact", before);
+    report_pass(scope.marker->name, GGML_TYPE_Q1_0, 1, input_rows::DENSE, life.authorization);
 }
 
 // Arms the second holder of the route's completion object for one case, and releases it when the case ends, by return
@@ -697,6 +710,7 @@ void injected_async_terminal_failure_case() {
     ggml_sycl_q1_nvfp4_test_counters_read(&refused);
     require_stages(refused.candidate == after.candidate && refused.submit == after.submit,
                    "the refused graph reached the route", before);
+    report_pass(scope.marker->name, GGML_TYPE_Q1_0, 1, input_rows::DENSE, life.authorization);
 }
 
 // A context's execution state, as a failure message names it.
@@ -748,6 +762,7 @@ void refused_graph_then_synchronize_case() {
         synced.invocation_id.value == 0 && synced.busy_device_count == 0,
         "the synchronize after a refused graph did not release the graph submitted before it" + observed(synced),
         before);
+    report_pass(scope.marker->name, GGML_TYPE_Q1_0, 1, input_rows::DENSE, life.authorization);
 }
 
 // Where a drained case started: its device, that device's delivered asynchronous errors, and the route counters.
@@ -806,6 +821,9 @@ void failed_graph_then_drain_case() {
                    "failed_graph_then_drain_case: the injected asynchronous failure was delivered " +
                        std::to_string(delivered) + " times, not once",
                    start.counters);
+    // Its fixture is gone by now; failed_graph_then_drain_steps() builds it with the default (test-scope) authorization.
+    report_pass("failed_graph_then_drain_case", GGML_TYPE_Q1_0, 1, input_rows::DENSE,
+                route_authorization::TEST_SCOPE);
 }
 
 // A completion task that did not release its bundle, its release refused or skipped; whether one can still be pending
@@ -856,6 +874,7 @@ void unreleased_graph_then_drain_case(bool hold_completion) {
                    "the completion task released its bundle although the failpoint skipped the release", before);
     require_stages(!ggml_sycl_async_failure_since(failure_cursor),
                    "an asynchronous failure was recorded although none was injected", before);
+    report_pass(scope.marker->name, GGML_TYPE_Q1_0, 1, input_rows::DENSE, life.authorization);
 }
 } // namespace
 
