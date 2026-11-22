@@ -1,8 +1,10 @@
-// DSV4_HC_PRE / _COMB / _POST and LIGHTNING_INDEXER kernels against an independent oracle (llama.cpp-pmzl).
+// DSV4_HC_PRE / _COMB / _POST, LIGHTNING_INDEXER and TOP_K_MASK kernels against an independent oracle
+// (llama.cpp-pmzl).
 //
 // Host-only: the kernels run on the opencl:cpu SYCL device. No GPU, no model, no unified cache, no ggml graph.
-// It compiles the SAME header-only kernels dsv4-hc.cpp / lightning-indexer.cpp launch
-// (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp), so the code under test is the shipped code.
+// It compiles the SAME header-only kernels dsv4-hc.cpp / lightning-indexer.cpp / top-k-mask.cpp launch
+// (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp, top-k-mask-kernel.hpp), so the code under test is the shipped
+// code.
 //
 // The oracle is written here, in double precision, from the op definitions in ggml.h -- it does not call
 // the kernels, the backend, or the CPU backend's implementation. K for the quantized indexer cases is
@@ -11,8 +13,9 @@
 //
 // Every check that matters has a control: `controls` runs the SAME kernel output against an oracle that
 // is wrong in exactly the way a plausible kernel bug would be (sigmoid dropped, null comb mistaken for a
-// zero comb, one Sinkhorn iteration short, ReLU dropped, mask dropped) and requires the comparison to
-// REJECT it. A comparison that cannot reject those is decoration.
+// zero comb, one Sinkhorn iteration short, ReLU dropped, mask dropped; for the top-k mask: score liveness ignored,
+// extra cells dropped, the mask's broadcast index dropped) and requires the comparison to REJECT it. A comparison that
+// cannot reject those is decoration.
 //
 // Run: ONEAPI_DEVICE_SELECTOR=opencl:cpu ./build/bin/test-sycl-dsv4-hc-kernels
 // Exit 77 (ctest SKIP) when no opencl:cpu device is visible -- a skip is not a pass.
@@ -21,6 +24,8 @@
 #include "../dsv4-hc-predicates.hpp"
 #include "../lightning-indexer-kernel.hpp"
 #include "../lightning-indexer-predicate.hpp"
+#include "../top-k-mask-kernel.hpp"
+#include "../top-k-mask-predicate.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <algorithm>
@@ -61,6 +66,10 @@ constexpr double NMSE_REJECTS = 1e-4;  // a control oracle must be at least this
 // to be added or reorganised and still trips when a whole loop stops running.
 constexpr int MIN_PREDICATE_CHECKS = 150;
 constexpr int MIN_KERNEL_CHECKS    = 150;
+// The top-k mask's own share of each half, by the same three-quarters rule, so its loops cannot stop running behind
+// the totals of the older families. Its kernel checks are device-independent (no sub-group size is required).
+constexpr int MIN_TOP_K_MASK_PREDICATE_CHECKS = 32;
+constexpr int MIN_TOP_K_MASK_KERNEL_CHECKS    = 60;
 
 std::mt19937 g_rng(20261003);
 
@@ -725,6 +734,331 @@ void test_lightning_indexer_dims() {
            0.0);
 }
 
+// ---- TOP_K_MASK ------------------------------------------------------------------------------------------------
+//
+// The kernel moves raw cell patterns, so the oracle does too and the comparison is bit-exact: a kept cell is the mask's
+// own pattern and every other cell is the -inf pattern of the dst type. Cells and picks are drawn partly out of range,
+// scores partly -inf and NaN, so every skip rule of the op is exercised.
+
+template <typename T> struct ubuf {
+    sycl::queue * q = nullptr;
+    T *           p = nullptr;
+    size_t        n = 0;
+
+    ubuf(sycl::queue & q, size_t n) : q(&q), p(sycl::malloc_shared<T>(n ? n : 1, q)), n(n) {}
+
+    ubuf(const ubuf &)             = delete;
+    ubuf & operator=(const ubuf &) = delete;
+
+    ~ubuf() { sycl::free(p, *q); }
+};
+
+// A logical 4-D view with element strides, packed or with every row and plane padded.
+struct view4 {
+    int64_t ne[4];
+    int64_t s[4];
+
+    size_t span() const {
+        int64_t last = 0;
+        for (int d = 0; d < 4; ++d) {
+            last += (ne[d] - 1) * s[d];
+        }
+        return (size_t) (last + 1);
+    }
+
+    size_t at(int64_t i0, int64_t i1, int64_t i2, int64_t i3) const {
+        return (size_t) (i0 * s[0] + i1 * s[1] + i2 * s[2] + i3 * s[3]);
+    }
+};
+
+view4 make_view4(int64_t n0, int64_t n1, int64_t n2, int64_t n3, bool pad) {
+    view4 v = {};
+    v.ne[0] = n0;
+    v.ne[1] = n1;
+    v.ne[2] = n2;
+    v.ne[3] = n3;
+    v.s[0]  = 1;
+    v.s[1]  = n0 + (pad ? 3 : 0);
+    v.s[2]  = v.s[1] * n1 + (pad ? 5 : 0);
+    v.s[3]  = v.s[2] * n2 + (pad ? 7 : 0);
+    return v;
+}
+
+struct top_k_mask_case {
+    const char * what;
+    int64_t      n_kv;
+    int64_t      n_blk;  // 0: no blocks, a pick is a cell
+    int64_t      n_pick;
+    int64_t      n_top;
+    int64_t      n_extra;  // 0: no extra cells
+    bool         score;
+    int64_t      ne1, ne2, ne3;
+    int64_t      m1, m2, m3;  // the mask's extents, broadcast to the rows
+    bool         pad = false;
+};
+
+// The result the op defines, cell by cell. `wrong` selects a control: 0 the op itself, 1 every pick live (score
+// ignored), 2 the extra cells dropped, 3 every row reading the first mask row (the broadcast index dropped).
+template <typename T>
+std::vector<T> top_k_mask_oracle(const top_k_mask_case & c,
+                                 T                       ninf,
+                                 const ubuf<T> &         mask,
+                                 const view4 &           vm,
+                                 const ubuf<int32_t> &   top_k,
+                                 const view4 &           vk,
+                                 const ubuf<float> *     score,
+                                 const view4 &           vs,
+                                 const ubuf<int32_t> *   blocks,
+                                 const view4 &           vb,
+                                 const ubuf<int32_t> *   extra,
+                                 const view4 &           ve,
+                                 int                     wrong) {
+    const int64_t  n_pick = c.n_blk > 0 ? c.n_pick : c.score ? c.n_pick : c.n_kv;
+    std::vector<T> out;
+    for (int64_t i3 = 0; i3 < c.ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < c.ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < c.ne1; ++i1) {
+                std::vector<T> row(c.n_kv, ninf);
+                const int64_t  r1   = wrong == 3 ? 0 : i1 % c.m1;
+                const int64_t  r2   = wrong == 3 ? 0 : i2 % c.m2;
+                const int64_t  r3   = wrong == 3 ? 0 : i3 % c.m3;
+                auto           keep = [&](int64_t cell) {
+                    if (cell >= 0 && cell < c.n_kv) {
+                        row[cell] = mask.p[vm.at(cell, r1, r2, r3)];
+                    }
+                };
+                for (int64_t j = 0; j < c.n_top; ++j) {
+                    const int64_t p = top_k.p[vk.at(j, i1, i2, i3)];
+                    if (p < 0 || p >= n_pick) {
+                        continue;
+                    }
+                    if (score && wrong != 1) {
+                        const float s = score->p[vs.at(p, i1, i2, i3)];
+                        if (std::isnan(s) || s == -INFINITY) {
+                            continue;
+                        }
+                    }
+                    if (!blocks) {
+                        keep(p);
+                        continue;
+                    }
+                    for (int64_t k = 0; k < c.n_blk; ++k) {
+                        keep(blocks->p[vb.at(k, p, 0, 0)]);
+                    }
+                }
+                if (extra && wrong != 2) {
+                    for (int64_t j = 0; j < c.n_extra; ++j) {
+                        keep(extra->p[ve.at(j, i1, i2, i3)]);
+                    }
+                }
+                out.insert(out.end(), row.begin(), row.end());
+            }
+        }
+    }
+    return out;
+}
+
+template <typename T> int64_t count_mismatches(const std::vector<T> & got, const std::vector<T> & want) {
+    int64_t n = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        n += got[i] != want[i];
+    }
+    return n;
+}
+
+// An index drawn from [0, n) with about one in eight out of range (-1 or n), which the op must skip.
+int32_t rnd_index(int64_t n) {
+    const uint32_t r = g_rng() % 16;
+    if (r == 0) {
+        return -1;
+    }
+    if (r == 1) {
+        return (int32_t) n;
+    }
+    return (int32_t) (g_rng() % (uint32_t) n);
+}
+
+template <typename T> void test_top_k_mask(sycl::queue & q, const top_k_mask_case & c) {
+    constexpr bool f16 = std::is_same<T, uint16_t>::value;
+    const T ninf = f16 ? (T) ggml_sycl_top_k_mask::TOP_K_MASK_NINF_F16 : (T) ggml_sycl_top_k_mask::TOP_K_MASK_NINF_F32;
+    const int64_t n_pick = c.n_blk > 0 ? c.n_pick : c.score ? c.n_pick : c.n_kv;
+
+    const view4 vm = make_view4(c.n_kv, c.m1, c.m2, c.m3, c.pad);
+    const view4 vk = make_view4(c.n_top, c.ne1, c.ne2, c.ne3, c.pad);
+    const view4 vs = make_view4(n_pick, c.ne1, c.ne2, c.ne3, c.pad);
+    const view4 vb = make_view4(std::max<int64_t>(c.n_blk, 1), n_pick, 1, 1, c.pad);
+    const view4 ve = make_view4(std::max<int64_t>(c.n_extra, 1), c.ne1, c.ne2, c.ne3, c.pad);
+    const view4 vd = make_view4(c.n_kv, c.ne1, c.ne2, c.ne3, c.pad);
+
+    ubuf<T>       mask(q, vm.span());
+    ubuf<int32_t> top_k(q, vk.span());
+    ubuf<float>   score(q, c.score ? vs.span() : 1);
+    ubuf<int32_t> blocks(q, c.n_blk > 0 ? vb.span() : 1);
+    ubuf<int32_t> extra(q, c.n_extra > 0 ? ve.span() : 1);
+    ubuf<T>       dst(q, vd.span());
+
+    for (size_t i = 0; i < mask.n; ++i) {
+        const float v = g_rng() % 4 == 0 ? -INFINITY : rnd(-1.0f, 1.0f);
+        if constexpr (f16) {
+            mask.p[i] = ggml_fp32_to_fp16(v);
+        } else {
+            std::memcpy(&mask.p[i], &v, sizeof(v));
+        }
+    }
+    for (size_t i = 0; i < top_k.n; ++i) {
+        top_k.p[i] = rnd_index(n_pick);
+    }
+    for (size_t i = 0; i < score.n; ++i) {
+        const uint32_t r = g_rng() % 8;
+        score.p[i]       = r == 0 ? -INFINITY : r == 1 ? NAN : rnd(-1.0f, 1.0f);
+    }
+    for (size_t i = 0; i < blocks.n; ++i) {
+        blocks.p[i] = rnd_index(c.n_kv);
+    }
+    for (size_t i = 0; i < extra.n; ++i) {
+        extra.p[i] = rnd_index(c.n_kv);
+    }
+    // padding and every cell start as a pattern that is neither -inf nor a mask value
+    const T sentinel = (T) 0x1234;
+    for (size_t i = 0; i < dst.n; ++i) {
+        dst.p[i] = sentinel;
+    }
+
+    ggml_sycl_top_k_mask::top_k_mask_args a = {};
+    a.mask                                  = mask.p;
+    a.top_k                                 = top_k.p;
+    a.score                                 = c.score ? score.p : nullptr;
+    a.blocks                                = c.n_blk > 0 ? blocks.p : nullptr;
+    a.extra                                 = c.n_extra > 0 ? extra.p : nullptr;
+    a.dst                                   = dst.p;
+    a.type                                  = f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    a.n_kv                                  = c.n_kv;
+    a.ne1                                   = c.ne1;
+    a.ne2                                   = c.ne2;
+    a.ne3                                   = c.ne3;
+    a.m1                                    = c.m1;
+    a.m2                                    = c.m2;
+    a.m3                                    = c.m3;
+    a.n_top                                 = c.n_top;
+    a.n_pick                                = n_pick;
+    a.n_blk                                 = c.n_blk > 0 ? c.n_blk : 1;
+    a.n_extra                               = c.n_extra;
+    a.sm1                                   = vm.s[1];
+    a.sm2                                   = vm.s[2];
+    a.sm3                                   = vm.s[3];
+    a.sd1                                   = vd.s[1];
+    a.sd2                                   = vd.s[2];
+    a.sd3                                   = vd.s[3];
+    a.sk0                                   = vk.s[0];
+    a.sk1                                   = vk.s[1];
+    a.sk2                                   = vk.s[2];
+    a.sk3                                   = vk.s[3];
+    a.ss0                                   = vs.s[0];
+    a.ss1                                   = vs.s[1];
+    a.ss2                                   = vs.s[2];
+    a.ss3                                   = vs.s[3];
+    a.sb0                                   = vb.s[0];
+    a.sb1                                   = vb.s[1];
+    a.se0                                   = ve.s[0];
+    a.se1                                   = ve.s[1];
+    a.se2                                   = ve.s[2];
+    a.se3                                   = ve.s[3];
+
+    const std::string name = std::string("top_k_mask ") + (f16 ? "f16 " : "f32 ") + c.what;
+    if (!ggml_sycl_top_k_mask::top_k_mask_launch(q, a)) {
+        report(name + " launches", false, 0.0);
+        return;
+    }
+    q.wait();
+
+    std::vector<T> got;
+    for (int64_t i3 = 0; i3 < c.ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < c.ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < c.ne1; ++i1) {
+                for (int64_t i0 = 0; i0 < c.n_kv; ++i0) {
+                    got.push_back(dst.p[vd.at(i0, i1, i2, i3)]);
+                }
+            }
+        }
+    }
+
+    auto oracle = [&](int wrong) {
+        return top_k_mask_oracle<T>(c, ninf, mask, vm, top_k, vk, c.score ? &score : nullptr, vs,
+                                    c.n_blk > 0 ? &blocks : nullptr, vb, c.n_extra > 0 ? &extra : nullptr, ve, wrong);
+    };
+    const std::vector<T> want = oracle(0);
+    int64_t              kept = 0;
+    for (T v : want) {
+        kept += v != ninf;
+    }
+    const int64_t bad = count_mismatches(got, want);
+    report(name + " is bit-exact", bad == 0, (double) bad);
+    // a case that keeps nothing would pass against an all -inf kernel
+    report(name + " keeps some finite cells", kept > 0, (double) kept);
+
+    if (c.pad) {
+        std::vector<char> logical(dst.n, 0);
+        for (int64_t i3 = 0; i3 < c.ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < c.ne2; ++i2) {
+                for (int64_t i1 = 0; i1 < c.ne1; ++i1) {
+                    for (int64_t i0 = 0; i0 < c.n_kv; ++i0) {
+                        logical[vd.at(i0, i1, i2, i3)] = 1;
+                    }
+                }
+            }
+        }
+        int64_t touched = 0;
+        for (size_t i = 0; i < dst.n; ++i) {
+            touched += !logical[i] && dst.p[i] != sentinel;
+        }
+        report(name + " leaves the padding untouched", touched == 0, (double) touched);
+    }
+
+    // controls: the same output against an oracle wrong in one way the kernel could be
+    if (c.score) {
+        const int64_t n = count_mismatches(got, oracle(1));
+        report("control: " + name + " with every pick live is rejected", n > 0, (double) n);
+    }
+    if (c.n_extra > 0) {
+        const int64_t n = count_mismatches(got, oracle(2));
+        report("control: " + name + " without the extra cells is rejected", n > 0, (double) n);
+    }
+    if (c.m1 * c.m2 * c.m3 > 1) {
+        const int64_t n = count_mismatches(got, oracle(3));
+        report("control: " + name + " with every row reading the first mask row is rejected", n > 0, (double) n);
+    }
+}
+
+void test_top_k_mask_all(sycl::queue & q) {
+    // clang-format off
+    const top_k_mask_case cases[] = {
+        // qwen4exp indexer: one 1-D mask for every row, kpool blocks with scores and the tail as extra cells
+        { "qwen4exp decode",                       4096, 4, 1024, 512, 3, true,  1,     1, 1,  1, 1, 1 },
+        { "qwen4exp prefill",                      4096, 4, 1024, 512, 3, true,  37,    1, 1,  1, 1, 1 },
+        // DSA: the picks are cells, no score, no blocks, no extra, one KQ mask row per token and stream
+        { "dsa cells, per-row mask",               1001, 0, 0,    64,  0, false, 7,     1, 3,  7, 1, 3 },
+        { "dsa cells, mask shared by streams",     1001, 0, 0,    64,  0, false, 7,     1, 3,  7, 1, 1 },
+        // blocks picked per head, the mask broadcast over the heads
+        { "blocks per head",                       512,  16, 32,  4,   0, true,  6,     4, 1,  6, 1, 1 },
+        { "cells with scores and extra cells",     512,  0, 32,   32,  5, true,  9,     1, 1,  9, 1, 1 },
+        // more picks than work-items, so each work-item takes several
+        { "picks past the work-group size",        1500, 2, 600,  300, 5, true,  3,     1, 2,  1, 1, 2 },
+        // every operand strided
+        { "every operand padded",                  777,  4, 70,   16,  3, true,  5,     2, 2,  5, 1, 2, true },
+        { "dsa padded",                            300,  0, 0,    40,  0, false, 4,     1, 1,  1, 1, 1, true },
+        // more rows than the launch has work-groups, so groups walk several rows
+        { "rows past the group cap",               16,   0, 0,    4,   1, false, 70001, 1, 1,  1, 1, 1 },
+    };
+    // clang-format on
+    for (const top_k_mask_case & c : cases) {
+        test_top_k_mask<uint16_t>(q, c);
+        test_top_k_mask<uint32_t>(q, c);
+    }
+    // the case above only means something when its rows really exceed the cap
+    const int64_t groups = ggml_sycl_top_k_mask::top_k_mask_groups(70001);
+    report("control: 70001 rows exceed the top-k mask group cap", groups < 70001, (double) groups);
+}
+
 // ---- supports_op predicates ------------------------------------------------------------------------------------
 //
 // The predicates ggml_backend_sycl_device_supports_op asks are pure ggml, so they run here over REAL op nodes built
@@ -1113,11 +1447,113 @@ void test_predicates_indexer() {
     expect_pred("indexer fed another op", pred(other_op), false);
 }
 
+void test_predicates_top_k_mask() {
+    using ggml_sycl_top_k_mask::op_supported;
+    // the three forms the models build: qwen4exp (1-D mask, blocks, score, extra), DSA (cells only, a per-token KQ mask
+    // over streams), and per-head picks over a mask broadcast across the heads
+    auto build_qwen = [](ggml_type mt) {
+        return [mt](node_ctx & n) {
+            return ggml_top_k_mask(n.c, n.t(mt, 256), n.t(GGML_TYPE_I32, 16, 3), n.t(GGML_TYPE_F32, 64, 3),
+                                   n.t(GGML_TYPE_I32, 4, 64), n.t(GGML_TYPE_I32, 3, 3));
+        };
+    };
+    auto build_dsa = [](ggml_type mt) {
+        return [mt](node_ctx & n) {
+            return ggml_top_k_mask(n.c, n.t(mt, 256, 3, 1, 2), n.t(GGML_TYPE_I32, 16, 3, 1, 2), nullptr, nullptr,
+                                   nullptr);
+        };
+    };
+    auto build_heads = [](ggml_type mt) {
+        return [mt](node_ctx & n) {
+            return ggml_top_k_mask(n.c, n.t(mt, 256, 3), n.t(GGML_TYPE_I32, 4, 3, 4), n.t(GGML_TYPE_F32, 32, 3, 4),
+                                   n.t(GGML_TYPE_I32, 8, 32), nullptr);
+        };
+    };
+    for (ggml_type mt : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        const std::string tn = mt == GGML_TYPE_F16 ? "f16" : "f32";
+        node_ctx          n1, n2, n3;
+        expect_pred("top_k_mask " + tn + " qwen4exp form", op_supported(build_qwen(mt)(n1)), true);
+        expect_pred("top_k_mask " + tn + " dsa form", op_supported(build_dsa(mt)(n2)), true);
+        expect_pred("top_k_mask " + tn + " per-head form", op_supported(build_heads(mt)(n3)), true);
+    }
+
+    // operands: 0 mask, 1 top_k, 2 score, 3 blocks, 4 extra; every edit is on the f16 qwen4exp form, which has all five
+    // clang-format off
+    const std::vector<mut> declined = {
+        mut::type("mask F32 under an f16 dst", 0, GGML_TYPE_F32),
+        mut::type("dst F32 over an f16 mask", DST, GGML_TYPE_F32),
+        mut::type("top_k I16", 1, GGML_TYPE_I16),
+        mut::type("score F16", 2, GGML_TYPE_F16),
+        mut::type("blocks I16", 3, GGML_TYPE_I16),
+        mut::type("extra I16", 4, GGML_TYPE_I16),
+        mut::nb("mask nb[0] not one element", 0, 0, 4),
+        mut::nb("dst nb[0] not one element", DST, 0, 4),
+        mut::nb_add("mask row stride off an element", 0, 1, 1),
+        mut::nb_add("dst row stride off an element", DST, 1, 1),
+        mut::nb_add("dst plane stride off an element", DST, 3, 1),
+        mut::nb_add("top_k row stride off an element", 1, 1, 2),
+        mut::nb("top_k pick stride off an element", 1, 0, 2),
+        mut::nb_add("score row stride off an element", 2, 1, 2),
+        mut::nb_add("blocks pick stride off an element", 3, 1, 2),
+        mut::nb_add("extra row stride off an element", 4, 1, 2),
+        mut::ne_add("dst n_kv wrong", DST, 0, 1),
+        mut::ne_add("dst rows differ from top_k", DST, 1, 1),
+        mut::ne("dst has a plane top_k lacks", DST, 2, 2),
+        mut::ne("mask with no rows to broadcast", 0, 1, 0),
+        mut::ne("mask with no streams to broadcast", 0, 3, 0),
+        mut::ne_add("score rows differ from top_k", 2, 1, 1),
+        mut::ne_add("extra rows differ from top_k", 4, 1, 1),
+        mut::ne("blocks has a plane", 3, 2, 2),
+        mut::ne("blocks has a 4th dim", 3, 3, 2),
+        mut::ne_add("score picks differ from blocks", 2, 0, 1),
+    };
+    // a strided mask, dst or blocks in whole elements is admitted: the kernel walks element strides
+    const std::vector<mut> admitted = {
+        mut::nb_add("mask rows padded by whole elements", 0, 1, 4),
+        mut::nb_add("blocks picks padded by whole elements", 3, 1, 8),
+        mut::nb_add("extra rows padded by whole elements", 4, 1, 8),
+    };
+    // clang-format on
+    expect_edits("top_k_mask f16 qwen4exp form:", build_qwen(GGML_TYPE_F16), op_supported, declined, false);
+    expect_edits("top_k_mask f16 qwen4exp form:", build_qwen(GGML_TYPE_F16), op_supported, admitted, true);
+    // a mask and dst of the same type outside the two the kernel copies
+    expect_edits_together("top_k_mask with a BF16 mask and dst", build_qwen(GGML_TYPE_F16), op_supported,
+                          { mut::type("mask", 0, GGML_TYPE_BF16), mut::type("dst", DST, GGML_TYPE_BF16) }, false);
+
+    // each optional operand may be absent on its own; without blocks the score may be wider than the cells
+    for (int i : { 2, 3, 4 }) {
+        node_ctx      n;
+        ggml_tensor * op = build_qwen(GGML_TYPE_F16)(n);
+        op->src[i]       = nullptr;
+        expect_pred("top_k_mask qwen4exp form without src " + std::to_string(i), op_supported(op), true);
+    }
+    // the two required operands may not
+    for (int i : { 0, 1 }) {
+        node_ctx      n;
+        ggml_tensor * op = build_qwen(GGML_TYPE_F16)(n);
+        op->src[i]       = nullptr;
+        expect_pred("top_k_mask qwen4exp form without src " + std::to_string(i), op_supported(op), false);
+    }
+    expect_pred("top_k_mask null op", op_supported(nullptr), false);
+    node_ctx      n;
+    ggml_tensor * other = build_qwen(GGML_TYPE_F16)(n);
+    other->op           = GGML_OP_TOP_K;
+    expect_pred("top_k_mask fed a top_k node", op_supported(other), false);
+}
+
 void test_predicates() {
     test_predicates_pre();
     test_predicates_comb();
     test_predicates_post();
     test_predicates_indexer();
+    const int before_top_k_mask = g_cases;
+    test_predicates_top_k_mask();
+    if (g_cases - before_top_k_mask < MIN_TOP_K_MASK_PREDICATE_CHECKS) {
+        ++g_cases;
+        ++g_failed;
+        printf("FAIL: only %d top-k mask predicate checks ran, fewer than the %d its decline matrix produces\n",
+               g_cases - 1 - before_top_k_mask, MIN_TOP_K_MASK_PREDICATE_CHECKS);
+    }
 }
 
 bool sub_group_supported(const sycl::device & dev, size_t n) {
@@ -1154,7 +1590,8 @@ int main() {
     const std::vector<sycl::device> devs = cpu_devices();
     if (devs.empty()) {
         fprintf(stderr,
-                "SKIP: no SYCL CPU device visible; this run proves NOTHING about the DSv4 HC / indexer kernels.\n"
+                "SKIP: no SYCL CPU device visible; this run proves NOTHING about the DSv4 HC / indexer / top-k mask "
+                "kernels.\n"
                 "      Source oneAPI and run with ONEAPI_DEVICE_SELECTOR=opencl:cpu.\n");
         return g_failed == 0 ? SYCL_TEST_SKIP : 1;
     }
@@ -1243,6 +1680,19 @@ int main() {
         printf("FAIL: the device offers neither sub-group size 16 nor 32, the indexer ran nowhere\n");
     } else {
         printf("PASS: the indexer ran at %d sub-group size(s)\n", lanes_run);
+    }
+
+    // --- TOP_K_MASK: the qwen4exp, DSA and per-head forms, f16 and f32 cells, strided operands, more rows than groups
+    const int before_top_k_mask = g_cases;
+    test_top_k_mask_all(q);
+    const int top_k_mask_checks = g_cases - before_top_k_mask;
+    ++g_cases;
+    if (top_k_mask_checks < MIN_TOP_K_MASK_KERNEL_CHECKS) {
+        ++g_failed;
+        printf("FAIL: only %d top-k mask kernel checks ran, fewer than the %d its cases produce\n", top_k_mask_checks,
+               MIN_TOP_K_MASK_KERNEL_CHECKS);
+    } else {
+        printf("PASS: %d top-k mask kernel checks ran\n", top_k_mask_checks);
     }
 
     printf("\n%d checks, %d failed\n", g_cases, g_failed);

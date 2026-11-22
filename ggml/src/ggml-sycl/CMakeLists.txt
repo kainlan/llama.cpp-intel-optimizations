@@ -1049,6 +1049,10 @@ if (BUILD_TESTING)
     # llama.cpp-pmzl: DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER have a SYCL arm in both the executor switch and
     # supports_op, supports_op asks the one predicate each executor asserts, and the op sources allocate nothing
     # and never block the host. Numbers: test-sycl-dsv4-hc-kernels (host) and test-backend-ops (device).
+    # TOP_K_MASK joins them on the same terms, plus: the capability query llama's fused-op resolver asks is
+    # supports_op's body with only the placement declines off, the op reads a graph input through the pre-stage's
+    # device copy while recording and never throws, and its kernel has a barrier between the -inf fill and the
+    # kept cells.
     # --self-test: the allocation and host-wait checks are absence-based and pass on a tree that never had them.
     add_test(NAME sycl-dsv4-ops-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dsv4-ops-source.py
@@ -2500,11 +2504,12 @@ set_tests_properties(sycl-bf16-mul-mat PROPERTIES
 )
 
 # DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER kernels against an independent double-precision oracle
-# (llama.cpp-pmzl). Host-only: the kernels run on the opencl:cpu device, so no GPU, no model and no unified
-# cache is touched. The kernels are header-only (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp) and the test
-# compiles the SAME headers dsv4-hc.cpp / lightning-indexer.cpp launch; it links ggml-base only, for the
-# reference quantizers that build the indexer's K. -fsycl without an AOT target list: the device image is JIT
-# compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
+# (llama.cpp-pmzl), and TOP_K_MASK against a bit-exact one. Host-only: the kernels run on the opencl:cpu device, so
+# no GPU, no model and no unified cache is touched. The kernels are header-only (dsv4-hc-kernels.hpp,
+# lightning-indexer-kernel.hpp, top-k-mask-kernel.hpp) and the test compiles the SAME headers dsv4-hc.cpp /
+# lightning-indexer.cpp / top-k-mask.cpp launch; it links ggml-base only, for the reference quantizers that build
+# the indexer's K and the f16 conversion of the top-k mask's cells. -fsycl without an AOT target list: the device
+# image is JIT compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
 add_executable(test-sycl-dsv4-hc-kernels
     tests/test-dsv4-hc-kernels.cpp
 )
