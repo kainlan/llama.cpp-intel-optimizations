@@ -26,9 +26,14 @@ Ownership and teardown (gs = ggml-sycl.cpp)
 The preload
   P1. register_host_aos_expert serves a host-planned PINNED expert in place when the plan's loader serves host experts,
       through ggml_sycl_loader_buffer_owner, which accepts only a SYCL_Host chunk (its free_buffer) with no claim,
-      lifetime MODEL, the expert inside the chunk, and an owner moe_stream_owner_streamable() accepts for the device.
+      lifetime MODEL, a chunk a model's load minted (model_id != 0), the expert inside the chunk, and an owner
+      moe_stream_owner_streamable() accepts for the device.
   P2. No silent degrade: a host expert with no owner is counted, never registered, and the load refuses after the
       sweep with one ERROR line naming the count and the bytes, and a runtime_error.
+  P4. No copy fallback: when the plan serves an expert from the loader's chunk and the gate refuses it, the plan sized
+      no block for a copy, so the expert is counted with the gate's reason and returns before any room is asked
+      (ggml_sycl_host_expert_alloc), and the load refuses after the sweep with one ERROR line naming the count, the
+      bytes and the gate's reason, and a runtime_error.
   P3. The plan's loader term is checked against what the load holds: when one pool holds the loader's buffer
       (loader_device >= 0), a [HOST-PLAN-BUG] WARN when the model's live SYCL_Host bytes on loader_device exceed
       loader_residency.
@@ -148,6 +153,9 @@ REFUSAL_FMT = '"[S1-PRELOAD] %zu host-planned experts (%.1f MB) have no owner'
 REFUSAL_THROW = 'throw std::runtime_error("S1 preload planned host experts have no owner");'
 LOADER_BUG_FMT = "\"[HOST-PLAN-BUG] device=%d the loader's SYCL_Host buffer holds %zu B"
 LOADER_DROP_FMT = "\"[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer"
+GATE_REFUSAL_FMT = "\"[S1-PRELOAD] %zu host experts (%.1f MB) the plan serves from the loader's SYCL_Host buffer"
+GATE_REFUSAL_THROW = 'throw std::runtime_error("S1 preload in-place host experts were refused by the loader buffer gate");'
+GATE_REFUSAL_BLOCK = r"if\s*\(\s*loader_serves\s*&&\s*!\s*loader_in_place\s*\)\s*\{"
 
 
 # ---- ownership and teardown ----
@@ -229,6 +237,7 @@ def clause_p1_in_place_gate(t: dict) -> list:
         ("ggml_backend_sycl_host_buffer_free_buffer", "the SYCL_Host identity"),
         ("ctx->claim", "the claim refusal"),
         ("alloc_lifetime::MODEL", "the lifetime check"),
+        ("ctx->model_id == 0", "model_id check"),
         ("moe_stream_owner_streamable(", "the streamable owner check"),
         ("ctx->size", "the bounds check"),
     ):
@@ -249,6 +258,35 @@ def clause_p2_no_silent_degrade(t: dict) -> list:
         problems.append("the preload has no single refusal line for host experts with no owner")
     if not ordered(body, REFUSAL_FMT, REFUSAL_THROW):
         problems.append("the refusal line is not followed by the load's refusal")
+    return problems
+
+
+def clause_p4_gate_refusal_refuses_the_load(t: dict) -> list:
+    problems = []
+    lam = register_lambda(t)
+    if not lam:
+        return ["register_host_aos_expert not found"]
+    hit = re.search(GATE_REFUSAL_BLOCK, lam)
+    if not hit:
+        problems.append("the preload has no branch for an in-place expert the loader gate refused")
+    else:
+        block = balanced(lam, hit.end() - 1)
+        if "host_expert_loader_refused_count" not in block or "host_expert_loader_refused_reason" not in block:
+            problems.append("a refused in-place expert is not counted with the gate's reason")
+        if not re.search(r"\breturn\s+false\s*;", block):
+            problems.append("a refused in-place expert falls through to the copy")
+        alloc = lam.find("ggml_sycl_host_expert_alloc(")
+        if alloc >= 0 and alloc < hit.start():
+            problems.append("room is asked for an in-place expert before the gate's refusal returns")
+    if "did not size" in lam:
+        problems.append("a refused in-place expert is still copied into a block the plan did not size")
+    body = fn(t, GS, "ggml_sycl_preload_model_weights")
+    if body.count(GATE_REFUSAL_FMT) != 1:
+        problems.append("the preload has no single refusal line for in-place experts the gate refused")
+    if not ordered(body, GATE_REFUSAL_FMT, GATE_REFUSAL_THROW):
+        problems.append("the gate's refusal line is not followed by the load's refusal")
+    if "host_expert_loader_refused_reason[" not in body:
+        problems.append("the gate's refusal line does not name the gate's reason")
     return problems
 
 
@@ -421,6 +459,7 @@ CLAUSES = [
     ("P1 the preload serves a host expert from the loader's chunk", clause_p1_in_place_gate),
     ("P2 a host expert with no owner refuses the load", clause_p2_no_silent_degrade),
     ("P3 the loader term is checked against the load", clause_p3_loader_term_checked),
+    ("P4 an in-place expert the gate refuses refuses the load", clause_p4_gate_refusal_refuses_the_load),
     ("C1 the WEIGHT zone charges the loader's buffer once, in its pool", clause_c1_terms),
     ("C2 the loader fact has one source", clause_c2_one_fact),
     ("C3 the loader's buffers are charged as the pool holds them", clause_c3_pool_footprint),
@@ -472,6 +511,12 @@ MUTANTS = [
     ("refusal-dropped", "P2", mutate(GS, REFUSAL_THROW, "(void) 0;")),
     ("unowned-registered", "P2", mutate_re(GS, r"(auto register_host_aos_expert = .*?)(bool remembered_handle)",
                                            r"\1host_owner = {};\n\2")),
+    ("gate-accepts-unminted", "P1", mutate_re(GS, r"(static bool ggml_sycl_loader_buffer_owner\(.*?)ctx->model_id\s*==\s*0",
+                                              r"\1false")),
+    ("gate-refusal-copies", "P4", mutate_re(GS, GATE_REFUSAL_BLOCK + r".*?return\s+false\s*;\s*\}", "")),
+    ("gate-refusal-falls-through", "P4", mutate_re(GS, "(" + GATE_REFUSAL_BLOCK + r".*?)return\s+false\s*;(\s*\})",
+                                                   r"\1\2")),
+    ("gate-refusal-unthrown", "P4", mutate(GS, GATE_REFUSAL_THROW, "(void) 0;")),
     ("loader-term-unchecked", "P3", mutate(GS, LOADER_BUG_FMT, '"[HOST-PLAN] device=%d holds %zu B')),
     ("p3-counts-plan-device", "P3", mutate_re(
         GS, r"ggml_sycl_model_host_chunk_bytes\s*\(\s*model_id\s*,\s*global_plan->loader_device\s*\)",
