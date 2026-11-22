@@ -2832,8 +2832,10 @@ Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
-holds the compute term the load measured at its planning shape, `n_ctx_train`
-and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
+holds the compute term the load measured at the context the caller requested
+(the `n_ctx` hint; `n_ctx_train` when none was named) and ubatch 512 (the
+caller's `-ub` does not reach the load, `llama.cpp-fkpg`), and the placed
+micro-batch's ring and dense
 scratch sit beside it. So once the plan has placed the micro-batch, the
 hold-spill fit credits a compute buffer of that rung no larger than the term,
 whole or nothing (`placement_explicit_ubatch_compute_room()` and
@@ -3350,8 +3352,9 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 **Limits.**
 
-- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
-  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
+- The term is measured at the context the caller requested from the load (the `n_ctx` hint, padded like the context;
+  `n_ctx_train` when none was named) and ubatch 512: the caller's `-ub` does not reach the load (`llama.cpp-fkpg`). A
+  context created smaller than the hint (a llama-bench model reused for a smaller test) and `-ub 256` both
   over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
   `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
   climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
@@ -3363,7 +3366,8 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
   a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
   of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
-  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+  auto pick's. The caller's `-c` reaches the measure as the `n_ctx` hint; `llama.cpp-fkpg` (a) still has to transport
+  its `-ub`.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
   and the late check all build their measure context from the default parameters. So the state term holds one sequence's
   state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
@@ -3377,7 +3381,7 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
   placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
   neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
-  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
+  measure, the same gap `llama.cpp-fkpg` records for `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
   summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in

@@ -418,7 +418,8 @@ def stage_order_ok(code: str) -> bool:
     """The loader's order (llama.cpp-p6i0): the tensors exist, the probe bound is measured and handed to the planner,
     the late inventory packs, c(P) is measured and recorded at the admitted placement, the dev_layer sync runs, and
     the late check compares. Each new call is made once, with the same n_ctx and transaction the late check passes,
-    and each refusal is thrown."""
+    and each refusal is thrown. That n_ctx is the context the caller requested from the load (the resolved hint,
+    llama_load_measure_request_n_ctx), never the placement envelope's."""
     c = code
     done = c.find(z("ml.done_getting_tensors();"))
     probe = c.find(z("llama_load_probe_bound("))
@@ -434,13 +435,19 @@ def stage_order_ok(code: str) -> bool:
         return False
     if c.count(z("llama_model_sycl_set_late_inventory(ml, *this, __func__);")) != 1:
         return False
-    args = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    request = z(
+        "const uint32_t load_measure_n_ctx = llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);"
+    )
+    if c.count(request) != 2 or not (c.find(request) < probe < c.rfind(request) < late):
+        return False
+    args = z("load_measure_n_ctx, sycl_model_loading_guard.txn,")
     probe_seg = c[probe:late_inv]
     admit_seg = c[admit:sync]
     unsupported = block_after(probe_seg, "if (!probe.unsupported.empty())")
     return (
         args in c[probe : probe + 300]
         and args in c[admit : admit + 300]
+        and args in c[late : late + 300]
         and z("admitted_weights, probe);") in c[admit : admit + 400]
         and "LLAMA_LOG_WARN(" in unsupported
         and "unplanned path" in unsupported
@@ -1059,6 +1066,24 @@ def test_stage_order_mutants():
     assert not stage_order_ok(code.replace(z("if (probe.measured)"), z("if (true)"), 1))
     # a second probe call
     assert not stage_order_ok(code + z("llama_load_probe_bound(*this, 0, sycl_model_loading_guard.txn, w);"))
+
+
+def test_mutant_measure_rides_the_envelope_again_fails():
+    """A measure fed the envelope's n_ctx (0, the training context) instead of the load's requested context."""
+    code = code_of(MODEL_CPP)
+    new = z("load_measure_n_ctx, sycl_model_loading_guard.txn,")
+    old = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    assert code.count(new) == 3, "the probe, admitted and late calls must each carry the requested n_ctx"
+    at = -1
+    for site in ("probe", "admitted", "late"):
+        at = code.index(new, at + 1)
+        mutant = code[:at] + old + code[at + len(new) :]
+        assert not stage_order_ok(mutant), f"the {site} measure on the envelope's n_ctx slipped through"
+    # the local itself read from the envelope again
+    request = "llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);"
+    assert not stage_order_ok(
+        code.replace(z(request), z("llama_model_sycl_make_placement_envelope().n_ctx;"), 1)
+    ), "the requested n_ctx read from the envelope slipped through"
 
 
 if __name__ == "__main__":

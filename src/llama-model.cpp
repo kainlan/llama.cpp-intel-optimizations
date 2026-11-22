@@ -443,8 +443,8 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // the one place the hint is resolved. With no hint at all (0, a caller that never sets the field) no room is held,
     // and the KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
     // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
-    // dense weights and their KV leave. Only the room reads the hint: the planning shape above and the load measures
-    // (the placement envelope's n_ctx, still 0) keep their inputs.
+    // dense weights and their KV leave. The room and the load measures (llama_load_measure_request_n_ctx) read the
+    // hint; the planning shape above keeps its inputs (the placement envelope's n_ctx, still 0).
     const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);
     inventory.n_ctx_context                    = ctx_room.n_ctx_context;
     inventory.n_ctx_context_is_default         = ctx_room.is_default;
@@ -2944,14 +2944,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (sycl_model_backend) {
         // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
         // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
-        // its room. It is measured at n_ctx_train and ubatch 512: the caller's -c and -ub do not reach the load
-        // (fkpg (a)), so the term is that shape's, not the context's. A dense model's default auto ubatch climbs
-        // above 512 into whatever room is left; that part is not reserved.
+        // its room. It is measured at the context the caller requested from the load (the n_ctx hint; the training
+        // context when none was named) and ubatch 512: the caller's -ub does not reach the load (fkpg (a)). A dense
+        // model's default auto ubatch climbs above 512 into whatever room is left; that part is not reserved.
+        const uint32_t load_measure_n_ctx = llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);
         const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
 
         const int64_t                 probe_t0 = ggml_time_us();
-        const llama_load_probe_result probe    = llama_load_probe_bound(
-            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
+        const llama_load_probe_result probe =
+            llama_load_probe_bound(*this, load_measure_n_ctx, sycl_model_loading_guard.txn, probe_weights);
         const int64_t probe_ms = (ggml_time_us() - probe_t0) / 1000;
         if (!probe.unsupported.empty()) {
             // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
@@ -2971,9 +2972,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const std::vector<llama_measure_dummy_entry> admitted_weights = llama_model_measure_weights(ml);
 
             const int64_t                     admitted_t0 = ggml_time_us();
-            const llama_admitted_check_result admitted =
-                llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
-                                          sycl_model_loading_guard.txn, admitted_weights, probe);
+            const llama_admitted_check_result admitted    = llama_load_admitted_check(
+                *this, load_measure_n_ctx, sycl_model_loading_guard.txn, admitted_weights, probe);
             const int64_t admitted_ms = (ggml_time_us() - admitted_t0) / 1000;
             if (!admitted.unsupported.empty()) {
                 LLAMA_LOG_WARN("%s: admitted compute-slot measure skipped, the load continues: %s\n", __func__,
@@ -2985,8 +2985,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const llama_admitted_term & t : admitted.terms) {
                 LLAMA_LOG_WARN(
                     "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
-                    "%zu recorded); measured at n_ctx %u ubatch %u, the caller's -c and -ub are not transported "
-                    "(fkpg); measure %lld ms probe, %lld ms admitted\n",
+                    "%zu recorded); measured at n_ctx %u ubatch %u, n_ctx is the load's requested context, the "
+                    "caller's -ub is not transported (fkpg); measure %lld ms probe, %lld ms admitted\n",
                     __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
                     t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
                     t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
@@ -3164,9 +3164,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (c) the late measure: the final placement's compute term, over stand-ins for the weights
         // that are not yet allocated, handed to the backend to compare with the term it admitted.
         // Inert until the backend exports the L4 entry points; a refusal is the load's.
+        const uint32_t load_measure_n_ctx = llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);
         const std::vector<llama_measure_dummy_entry> late_weights = llama_model_measure_weights(ml);
-        const llama_late_check_result late = llama_load_late_check(
-            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
+        const llama_late_check_result                late =
+            llama_load_late_check(*this, load_measure_n_ctx, sycl_model_loading_guard.txn, late_weights);
         if (!late.unsupported.empty()) {
             // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
             LLAMA_LOG_WARN("%s: late compute-slot check skipped, the load continues on the unplanned path: %s\n",

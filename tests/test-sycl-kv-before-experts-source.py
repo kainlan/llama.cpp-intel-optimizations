@@ -27,8 +27,8 @@ The fix this gate pins:
     training context (llama.cpp-7fmt), and llama-bench from its test's context), padded the way llama_context pads
     n_ctx for a single sequence, or 0 when no request reached the load (a caller that never sets the field), which
     holds no room. The hint is resolved in one place, src/llama-n-ctx-hint.h, whose default-context rule
-    test-sycl-ctx-hint-default-source pins. The placement envelope's n_ctx stays 0, so the load measures and the
-    planning shape keep their inputs.
+    test-sycl-ctx-hint-default-source pins. The placement envelope's n_ctx stays 0, so the planning shape keeps its
+    inputs; the load measures read the resolved hint (llama_load_measure_request_n_ctx).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -325,8 +325,8 @@ def claim_hint_is_padded_like_the_context(resolver: str, context: str) -> bool:
 
 
 def claim_envelope_keeps_no_context(model: str) -> bool:
-    """The hint reaches the room only: the placement envelope still carries n_ctx 0, so the probe, admitted and late
-    measures (llama_load_measure_n_ctx of the envelope's n_ctx) and the planning shape keep n_ctx_train and 512."""
+    """The envelope still carries n_ctx 0, so the planning shape keeps n_ctx_train and 512; the probe, admitted and
+    late measures read the resolved hint (llama_load_measure_request_n_ctx)."""
     env = body(norm(model), ENVELOPE_SIG)
     return bool(env) and "envelope.n_ctx = 0;" in env and "n_ctx_hint" not in env
 
