@@ -15,10 +15,17 @@ that runs it reads indices nobody wrote and writes through them.
 Checks:
   * one rule: ggml_sycl_graph_node_is_computed (prestage-class.hpp) tests the flag, and ggml-sycl.cpp tests it
     nowhere else;
-  * ggml_sycl_is_noop, the predicate every executor already asks, is true for a node the graph does not compute.
-    The executors pinned here ask it: the node loop of graph_compute_impl, the segment dispatch
-    (moe_graph_dispatch_direct_node), the MoE block graphs, the layer-block dispatch, and the Q8_1 src1 planner that
-    sizes what those dispatches draw;
+  * ggml_sycl_is_noop is true for a node the graph does not compute. The executors pinned here ask it: the node
+    loop of graph_compute_impl, the segment dispatch (moe_graph_dispatch_direct_node), the MoE block graphs, the
+    layer-block dispatch, and the Q8_1 src1 planner that sizes what those dispatches draw;
+  * the walkers that choose what runs leave an uncomputed node before they read it: every node loop of the MoE
+    topology scan (g_moe_gate_up_pairs) and of the MoE dispatch list (whose dispatch_indices the segment recorder,
+    the block graphs, the graphlets and the decode analysis take), the layer-block pre-block copy, and the persistent
+    TG plan's fast path and full walk (an unselected branch's DUP no longer declines the plan);
+  * a fusion that also runs a node it looked ahead to asks the rule of that node: the TG router and MUL_MAT+ADD
+    fusions, ADD+RMS_NORM, MUL+ADD, the FFN fusion, the MoE down-sum chain and its weighted MUL, and the persistent
+    plan's RMS_NORM+MUL. The two CPU-path fusions ask ggml_sycl_is_noop of the next node. The RMS_NORM fusions that
+    go through ggml_can_fuse_subgraph are covered by it: it refuses an uncomputed node;
   * the four input readers (the pre-stage, its diagnostic source count, the replay refresh's discovery and the
     segment slot's input list) read a node's sources only when the graph computes that node, so an input that only
     an uncomputed node reads is neither staged, refreshed nor listed, and the four give one answer. A recorded kernel
@@ -123,6 +130,28 @@ def skips_uncomputed_before_sources(loop):
     return m is not None and first_src > m.end()
 
 
+def loops_in(body, header):
+    """(start, end) of the body of every loop in `body` whose header matches `header`."""
+    spans = []
+    if body is None:
+        return spans
+    for m in re.finditer(header, body):
+        start = body.find("{", m.start())
+        block = balanced(body, start) if start >= 0 else None
+        if block is not None:
+            spans.append((start, start + len(block)))
+    return spans
+
+
+def leaves_uncomputed_first(loop):
+    """The loop leaves an uncomputed node before it reads anything of that node."""
+    m = SKIP_UNCOMPUTED.search(loop)
+    if m is None:
+        return False
+    first_read = re.search(r"\b" + m.group(1) + r"->", loop)
+    return first_read is None or first_read.start() > m.end()
+
+
 WALKERS = {
     "the pre-stage": r"static bool graph_prestage_leaf_tensors\([^)]*\)\s*\{",
     "the pre-stage source count": r"static size_t ggml_sycl_graph_stage_source_count\([^)]*\)\s*\{",
@@ -152,6 +181,58 @@ EXECUTORS = {
          r"node->op\s*!=\s*GGML_OP_MUL_MAT\s*\|\|\s*ggml_sycl_is_noop\(node\)", "node->op != GGML_OP_MUL_MAT"),
 }
 
+ZERO_TO_N_NODES = r"for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*cgraph->n_nodes\s*;[^)]*\)\s*\{"
+PERSISTENT_PLAN = r"static bool extract_persistent_plan\([^)]*\)\s*\{"
+
+# name -> (signature, the header of each loop that must leave an uncomputed node first, the least number of such loops)
+NODE_WALKS = {
+    "the MoE topology scan":
+        (r"static void moe_layer_scan_graph_topology\([^)]*\)\s*\{", ZERO_TO_N_NODES, 4),
+    "the MoE dispatch list":
+        (r"static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices\([^)]*\)\s*\{", ZERO_TO_N_NODES, 4),
+    "the layer-block pre-block copy":
+        (r"static bool ggml_sycl_block_exec_stage_preblock_inputs\([^)]*\)\s*\{",
+         r"for\s*\(\s*int\s+i\s*=\s*exec_ctx\.block_first\[block_idx\]\s*;", 1),
+    "the persistent plan's fast path":
+        (PERSISTENT_PLAN, r"for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*cgraph->n_nodes\s*&&\s*fast_path_ok\s*;", 1),
+    "the persistent plan's full walk":
+        (PERSISTENT_PLAN,
+         r"for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*cgraph->n_nodes\s*;\s*i\+\+\s*\)\s*\{\s*"
+         r"ggml_tensor\s*\*\s*node\s*=\s*cgraph->nodes\[i\]\s*;\s*const\s+int\s+ops_before\b", 1),
+}
+
+GRAPH_COMPUTE = r"static void ggml_backend_sycl_graph_compute_impl\([^)]*\)\s*\{"
+
+# name -> (signature, the check of the look-ahead node, the same text without it for the self-test, least count)
+LOOKAHEADS = {
+    "the TG router fusion":
+        (r"static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort\([^)]*\)\s*\{",
+         r"!ggml_sycl_graph_node_is_computed\(add\)\s*\|\|\s*!ggml_sycl_graph_node_is_computed\(sort\)", "false", 1),
+    "the TG MUL_MAT+ADD fusion":
+        (r"static bool ggml_sycl_try_fuse_tg_mul_mat_add\([^)]*\)\s*\{",
+         r"!ggml_sycl_graph_node_is_computed\(add\)\s*\|\|\s*mul->op\b", "mul->op", 1),
+    "the ADD+RMS_NORM fusion":
+        (GRAPH_COMPUTE, r"ggml_sycl_graph_node_is_computed\(next\)\s*&&\s*next->op\s*==\s*GGML_OP_RMS_NORM\b",
+         "next->op == GGML_OP_RMS_NORM", 1),
+    "the MUL+ADD fusion":
+        (GRAPH_COMPUTE, r"ggml_sycl_graph_node_is_computed\(next\)\s*&&\s*next->op\s*==\s*GGML_OP_ADD\b",
+         "next->op == GGML_OP_ADD", 1),
+    "the FFN fusion":
+        (GRAPH_COMPUTE, r"glu_info\.glu\s*!=\s*nullptr\s*&&\s*ggml_sycl_graph_node_is_computed\(glu_info\.glu\)",
+         "glu_info.glu != nullptr", 1),
+    "each of the two CPU-path fusions":
+        (GRAPH_COMPUTE, r"next\s*&&\s*!ggml_sycl_is_noop\(next\)", "next", 2),
+    "the MoE down-sum chain":
+        (r"static int ggml_sycl_match_moe_down_sum_chain\([^)]*\)\s*\{",
+         r"!ggml_sycl_graph_node_is_computed\(add\)\s*\|\|\s*add->op\s*!=\s*GGML_OP_ADD\b", "add->op != GGML_OP_ADD", 1),
+    "the MoE down-sum weighted MUL":
+        (r"static bool ggml_sycl_try_fuse_moe_down_weighted_sum\([^)]*\)\s*\{",
+         r"!ggml_sycl_graph_node_is_computed\(mul\)\s*\|\|\s*mul->op\s*!=\s*GGML_OP_MUL\b", "mul->op != GGML_OP_MUL", 1),
+    "the persistent plan's RMS_NORM+MUL fusion":
+        (PERSISTENT_PLAN, r"ggml_sycl_graph_node_is_computed\(next\)\s*&&\s*next->op\s*==\s*GGML_OP_MUL\b",
+         "next->op == GGML_OP_MUL", 1),
+}
+
 
 def evaluate(backend, class_hdr):
     results = {}
@@ -179,6 +260,17 @@ def evaluate(backend, class_hdr):
         leafs = loop_body(body, "n_leafs")
         results[f"{name} keeps every leaf (a leaf never carries the flag)"] = \
             leafs is not None and "ggml_sycl_graph_node_is_computed" not in leafs
+
+    for name, (sig, header, least) in NODE_WALKS.items():
+        body = function_body(backend, sig)
+        spans = loops_in(body, header)
+        results[f"{name} leaves an uncomputed node before it reads it"] = \
+            len(spans) >= least and all(leaves_uncomputed_first(body[a:b]) for a, b in spans)
+
+    for name, (sig, pattern, _, least) in LOOKAHEADS.items():
+        body = function_body(backend, sig)
+        results[f"{name} asks the rule of the node it looks ahead to"] = \
+            body is not None and len(re.findall(pattern, body)) >= least
 
     return results
 
@@ -249,6 +341,33 @@ if args.self_test:
                                         "for (int i = 0; i < cgraph->n_leafs; ++i) {\n"
                                         "        if (!cgraph->leafs[i] || !ggml_sycl_graph_node_is_computed(cgraph->leafs[i])) { continue; }"),
                          class_hdr)))
+    def mutate_loop(src, sig_regex, header, k):
+        """Drop the uncomputed-node skip from the k-th loop matching `header` in the function matching `sig_regex`."""
+        m = re.search(sig_regex, src)
+        start = src.find("{", m.end() - 1) if m else -1
+        body = balanced(src, start) if start >= 0 else None
+        spans = loops_in(body, header)
+        skip = SKIP_UNCOMPUTED.search(body, spans[k][0], spans[k][1]) if k < len(spans) else None
+        if not skip:
+            print(f"FAIL: self-test anchor missing: {sig_regex!r} loop {k}")
+            failed.append(f"self-test anchor {sig_regex} loop {k}")
+            return src
+        return src[:start + skip.start()] + src[start + skip.end():]
+
+    for name, (sig, header, least) in NODE_WALKS.items():
+        for k in range(least):
+            mutants.append((f"{name} reads an uncomputed node (loop {k + 1})",
+                            f"{name} leaves an uncomputed node before it reads it",
+                            (mutate_loop(backend, sig, header, k), class_hdr)))
+    mutants.append(("the persistent full walk reads the node before the skip",
+                    "the persistent plan's full walk leaves an uncomputed node before it reads it",
+                    (mutate_in_func(backend, PERSISTENT_PLAN, r"const\s+int\s+ops_before\s*=\s*ops_added\s*;",
+                                    "const int ops_before = ops_added + (node->op == GGML_OP_NONE);"), class_hdr)))
+    for name, (sig, pattern, without, least) in LOOKAHEADS.items():
+        mutants.append((f"{name} fuses an uncomputed look-ahead node",
+                        f"{name} asks the rule of the node it looks ahead to",
+                        (mutate_in_func(backend, sig, pattern, without), class_hdr)))
+
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
 

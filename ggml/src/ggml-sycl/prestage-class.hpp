@@ -69,9 +69,12 @@ static inline bool ggml_sycl_prestage_is_input(const ggml_tensor * tensor) {
 // frees such a node's output at once when nothing consumes it, so running it reads indices nobody wrote and writes
 // through them into memory another tensor owns. A leaf never carries the flag: ask this of nodes only.
 //
-// One rule for the executors (through ggml_sycl_is_noop) and for every reader of a node's sources: the pre-stage, its
-// refresh and the segment slot's input list. An input that only an uncomputed node reads is not staged, and no kernel
-// asks for its staged copy, because only a computed node runs.
+// One rule for every walker that runs, stages or plans a node. The executors ask it through ggml_sycl_is_noop. The
+// readers of a node's sources (the pre-stage, its refresh, the segment slot's input list, the layer-block pre-block
+// copy), the walkers that choose nodes to run (the MoE topology scan and dispatch list, the persistent TG plan) and
+// the fusions that also run a look-ahead node ask it directly. tests/test-sycl-graph-compute-flag-source.py names
+// each one, and a new walker must ask it too. An input that only an uncomputed node reads is not staged, and no
+// kernel asks for its staged copy, because only a computed node runs.
 static inline bool ggml_sycl_graph_node_is_computed(const ggml_tensor * node) {
     return (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
 }
