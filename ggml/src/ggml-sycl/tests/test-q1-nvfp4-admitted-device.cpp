@@ -640,6 +640,13 @@ void injected_async_terminal_failure_case() {
                    "the refused graph reached the route", before);
 }
 
+// A context's execution state, as a failure message names it.
+std::string observed(const ggml_sycl_execution_snapshot & state) {
+    return " (invocation=" + std::to_string(state.invocation_id.value) +
+           " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+           " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+}
+
 // The scheduler can call graph_compute for the next split before it synchronizes the last one, so a refusal can be the
 // first boundary to see a failure. The synchronize after it must still clean up and release the graph submitted
 // before the failure was seen; the refusal itself must leave that graph alone.
@@ -657,11 +664,6 @@ void refused_graph_then_synchronize_case() {
         require_stages(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
                        std::string("context snapshot unavailable ") + when, before);
         return state;
-    };
-    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
-        return " (invocation=" + std::to_string(state.invocation_id.value) +
-               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
-               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
     };
     // The asynchronous form, as the scheduler calls it: ggml_backend_graph_compute synchronizes before it returns, which
     // would release the graph here, before the failure.
@@ -709,11 +711,6 @@ drained_case_start failed_graph_then_drain_steps() {
     ggml_sycl_q1_nvfp4_test_counters_read(&before);
     const case_scope scope("failed_graph_then_drain_case", before);
 
-    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
-        return " (invocation=" + std::to_string(state.invocation_id.value) +
-               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
-               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
-    };
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
     // The asynchronous form: ggml_backend_graph_compute would synchronize, and the synchronize would clean up.
     require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) == GGML_STATUS_SUCCESS,
@@ -771,11 +768,6 @@ void unreleased_graph_then_drain_case(bool hold_completion) {
 
     const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(life.backend_device);
 
-    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
-        return " (invocation=" + std::to_string(state.invocation_id.value) +
-               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
-               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
-    };
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE);
     const completion_hold hold(hold_completion);
     require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) == GGML_STATUS_SUCCESS,
@@ -839,12 +831,14 @@ int main() {
             unreleased_graph_then_drain_case(hold_completion);
             require_clean_teardown();
             // And after a context drained while its completion task had not released.
-            lifecycle_fixture life;
-            successful_reuse_case(
-                life, GGML_TYPE_Q1_0, 1,
-                hold_completion ? "after-unreleased-drain (completion held)" : "after-unreleased-drain");
+            {
+                lifecycle_fixture life;
+                successful_reuse_case(
+                    life, GGML_TYPE_Q1_0, 1,
+                    hold_completion ? "after-unreleased-drain (completion held)" : "after-unreleased-drain");
+            }
+            require_clean_teardown();
         }
-        require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
         std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';

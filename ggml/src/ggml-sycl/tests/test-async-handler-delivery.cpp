@@ -125,11 +125,14 @@ int probe_delivery_in_flight(const sycl::device & dev, const sycl::property_list
         b_done.store(true, std::memory_order_release);
     });
     if (!wait_for([&] { return b_done.load(std::memory_order_acquire); }, 5)) {
+        const int calls_blocked = handler_calls.load(std::memory_order_acquire);
         finish();
         b.join();
         std::fprintf(stderr,
-                     "FAIL: (i) the second thread's wait blocked behind the delivery in flight: the runtime now holds "
-                     "the queue's error list while it calls the handler\n");
+                     "FAIL: (i) the second thread's wait blocked while the first delivery was in flight "
+                     "(handler_calls=%d): 1 means the runtime holds the queue's error list while it calls the "
+                     "handler, 2 means the second wait delivered the error again and blocked in the handler\n",
+                     calls_blocked);
         return 1;
     }
     b.join();

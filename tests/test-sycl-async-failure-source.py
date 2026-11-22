@@ -75,6 +75,7 @@ RETAIN_BLOCK = "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n" + RETAIN_LINE + "#end
 # Both drain twins: a wait that threw goes straight to the abort, else release, else recover and release.
 TWIN_CONDITION = (r"if \(!waited \|\|\s*\(!ggml_sycl_execution_release_graph\({ctx}\) &&\s*"
                   r"!ggml_sycl_execution_recover_and_release_graph\({ctx}\)\)\) \{{")
+D_HELPER = "static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept"
 D_OWN = "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {"
 D_CTX = "static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {"
 STD_CATCH = "catch (const std::exception & e)"
@@ -168,7 +169,7 @@ def claims(cache, sycl, common):
     t_ready = body(t, "bool ready() const noexcept override")
     h = body(common, "sycl::async_handler ggml_sycl_async_handler(int slot)")
     b = body(sycl, "h.host_task([completion")[1:-1].rstrip()
-    d = body(sycl, "static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept")
+    d = body(sycl, D_HELPER)
     d_own = body(sycl, D_OWN)
     d_ctx = body(sycl, D_CTX)
     d_dtor = body(sycl, "ggml_backend_sycl_context::~ggml_backend_sycl_context() {")
@@ -237,7 +238,7 @@ def claims(cache, sycl, common):
         "K the route hands its completion to the seam before it arms the terminal": 0 <= route.find(
             "completion->bundle.mark_possible_submit()") < route.find(RETAIN) < route.find(
             "terminal->arm(final);") < route.find("h.host_task([completion"),
-        "T route arms with its final event": "terminal->arm(final);" in sycl,
+        "T route arms with its final event": "terminal->arm(final);" in route,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
                                                       r"std::string|\bnew\b", h.replace("rethrow_exception", "")),
     }
@@ -298,6 +299,8 @@ def main():
             "completion task keeps the bundle": (cache, sycl.replace(BUNDLE_DROP, "", 1), common),
             "completion task drops the bundle first": (cache, sycl.replace(BUNDLE_DROP, "", 1).replace(
                 RELEASE, BUNDLE_DROP + " " + RELEASE, 1), common),
+            "helper recovers without waiting": (cache, splice(sycl, (D_HELPER,), "stream->wait_and_throw();", ""),
+                                                common),
             "helper releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(ctx);\n    return ggml_sycl_execution_release_graph(ctx);",
                 "return ggml_sycl_execution_release_graph(ctx);", 1), common),
