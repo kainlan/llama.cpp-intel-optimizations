@@ -40,6 +40,63 @@ bool moe_mmid_materialize_reason_is_refusal(moe_mmid_materialize_reason reason) 
     return reason != moe_mmid_materialize_reason::OK && reason != moe_mmid_materialize_reason::NOT_APPLICABLE;
 }
 
+const char * moe_mmid_materialize_refusal_name(moe_mmid_materialize_refusal refusal) noexcept {
+    using R = moe_mmid_materialize_refusal;
+    switch (refusal) {
+        case R::NONE:
+            return "none";
+        case R::SNAPSHOT_MISSING:
+            return "snapshot-missing";
+        case R::SNAPSHOT_NO_VERSION:
+            return "snapshot-no-version";
+        case R::SNAPSHOT_MODEL_MISMATCH:
+            return "snapshot-model-mismatch";
+        case R::SNAPSHOT_LOAD_MISMATCH:
+            return "snapshot-load-mismatch";
+        case R::PLAN_POOL_REJECTED:
+            return "plan-pool-rejected";
+        case R::PLAN_NO_IDENTITY:
+            return "plan-no-identity";
+        case R::PLAN_NO_SUBMIT_DEVICE:
+            return "plan-no-submit-device";
+        case R::PLAN_NO_WORKSPACES:
+            return "plan-no-workspaces";
+        case R::WORKSPACE_INVALID:
+            return "workspace-invalid";
+        case R::WORKSPACE_NO_BINDING:
+            return "workspace-no-binding";
+        case R::TOKEN_INVALID:
+            return "token-invalid";
+        case R::NO_ALLOCATOR:
+            return "no-allocator";
+        case R::OWNER_DEVICE_INVALID:
+            return "owner-device-invalid";
+        case R::OWNER_NO_QUEUE_COOKIE:
+            return "owner-no-queue-cookie";
+        case R::OWNER_QUEUE_CAPABILITY_INVALID:
+            return "owner-queue-capability-invalid";
+        case R::OWNER_GEOMETRY_INVALID:
+            return "owner-geometry-invalid";
+        case R::OWNER_POOL_BYTES_OVERFLOW:
+            return "owner-pool-bytes-overflow";
+        case R::OWNER_POOL_BYTES_MISMATCH:
+            return "owner-pool-bytes-mismatch";
+        case R::PUBLICATION_RACED:
+            return "publication-raced";
+        case R::SAME_IDENTITY_OTHER_PLAN:
+            return "same-identity-other-plan";
+        case R::DEVICE_POOL_ALLOCATION_FAILED:
+            return "device-pool-allocation-failed";
+        case R::HOST_POOL_ALLOCATION_FAILED:
+            return "host-pool-allocation-failed";
+        case R::SLICE_FAILED:
+            return "slice-failed";
+        case R::EXCEPTION:
+            return "exception";
+    }
+    return "unknown";
+}
+
 namespace {
 
 bool checked_add(size_t a, size_t b, size_t * out) noexcept {
@@ -971,19 +1028,53 @@ moe_mmid_workspace_registry::moe_mmid_workspace_registry() : state_(std::make_sh
 moe_mmid_workspace_registry::~moe_mmid_workspace_registry() = default;
 
 moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
-    const moe_mmid_model_token & token, uint64_t plan_identity, int submit_device,
+    const moe_mmid_model_token &                          token,
+    uint64_t                                              plan_identity,
+    int                                                   submit_device,
     const std::vector<moe_mmid_materialized_owner_plan> & owners,
-    const moe_mmid_blob_allocator & allocator) noexcept {
-    return materialize(token, plan_identity, {}, submit_device, owners, allocator);
+    const moe_mmid_blob_allocator &                       allocator,
+    moe_mmid_materialize_refusal *                        refusal) noexcept {
+    return materialize(token, plan_identity, {}, submit_device, owners, allocator, refusal);
 }
 
 moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
-    const moe_mmid_model_token & token, uint64_t plan_identity,
-    std::shared_ptr<const lifecycle_plan_snapshot> exact_plan, int submit_device,
+    const moe_mmid_model_token &                          token,
+    uint64_t                                              plan_identity,
+    std::shared_ptr<const lifecycle_plan_snapshot>        exact_plan,
+    int                                                   submit_device,
     const std::vector<moe_mmid_materialized_owner_plan> & owners,
-    const moe_mmid_blob_allocator & allocator) noexcept {
-    if (!token.valid() || plan_identity == 0 || submit_device < 0 || owners.empty() || !allocator) {
-        return moe_mmid_materialize_status::INVALID;
+    const moe_mmid_blob_allocator &                       allocator,
+    moe_mmid_materialize_refusal *                        refusal) noexcept {
+    using R           = moe_mmid_materialize_refusal;
+    const auto refuse = [refusal](moe_mmid_materialize_status status, R why) {
+        if (refusal) {
+            *refusal = why;
+        }
+        return status;
+    };
+    const auto invalid = [&](R why) {
+        return refuse(moe_mmid_materialize_status::INVALID, why);
+    };
+    const auto alloc_failed = [&](R why) {
+        return refuse(moe_mmid_materialize_status::ALLOCATION_FAILED, why);
+    };
+    if (refusal) {
+        *refusal = R::NONE;
+    }
+    if (!token.valid()) {
+        return invalid(R::TOKEN_INVALID);
+    }
+    if (plan_identity == 0) {
+        return invalid(R::PLAN_NO_IDENTITY);
+    }
+    if (submit_device < 0) {
+        return invalid(R::PLAN_NO_SUBMIT_DEVICE);
+    }
+    if (owners.empty()) {
+        return invalid(R::PLAN_NO_WORKSPACES);
+    }
+    if (!allocator) {
+        return invalid(R::NO_ALLOCATOR);
     }
     try {
         uint64_t generation_ticket = 0;
@@ -1002,14 +1093,25 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         for (const auto & owner : owners) {
             size_t expected_device = 0, expected_host = 0;
             const uint64_t queue_cookie = owner.queue_capability.valid() ? owner.queue_capability.cookie() : owner.queue_cookie;
-            if (owner.owner_device < 0 || queue_cookie == 0 ||
-                (candidate->exact_plan && (!owner.queue_capability.valid() ||
-                 owner.queue_capability.owner_device() != owner.owner_device)) ||
-                !moe_mmid_validate_workspace_geometry(owner.geometry, owner.secondary_owner) ||
-                !moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
-                                             &expected_host) ||
-                owner.device_pool_bytes != expected_device || owner.host_pool_bytes != expected_host) {
-                return moe_mmid_materialize_status::INVALID;
+            if (owner.owner_device < 0) {
+                return invalid(R::OWNER_DEVICE_INVALID);
+            }
+            if (queue_cookie == 0) {
+                return invalid(R::OWNER_NO_QUEUE_COOKIE);
+            }
+            if (candidate->exact_plan &&
+                (!owner.queue_capability.valid() || owner.queue_capability.owner_device() != owner.owner_device)) {
+                return invalid(R::OWNER_QUEUE_CAPABILITY_INVALID);
+            }
+            if (!moe_mmid_validate_workspace_geometry(owner.geometry, owner.secondary_owner)) {
+                return invalid(R::OWNER_GEOMETRY_INVALID);
+            }
+            if (!moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
+                                             &expected_host)) {
+                return invalid(R::OWNER_POOL_BYTES_OVERFLOW);
+            }
+            if (owner.device_pool_bytes != expected_device || owner.host_pool_bytes != expected_host) {
+                return invalid(R::OWNER_POOL_BYTES_MISMATCH);
             }
             auto pool           = std::make_shared<registry_pool_state>();
             pool->owner_device  = owner.owner_device;
@@ -1022,13 +1124,13 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             if (!pool->device_pool.valid() || pool->device_pool.host_pinned ||
                 pool->device_pool.bytes != expected_device || pool->device_pool.device != owner.owner_device ||
                 reinterpret_cast<uintptr_t>(pool->device_pool.ptr) % MOE_MMID_DEVICE_ALIGNMENT != 0) {
-                return moe_mmid_materialize_status::ALLOCATION_FAILED;
+                return alloc_failed(R::DEVICE_POOL_ALLOCATION_FAILED);
             }
             if (expected_host != 0) {
                 pool->host_pool = allocator(true, owner.owner_device, expected_host, alignof(moe_mmid_descriptor));
                 if (!pool->host_pool.valid() || !pool->host_pool.host_pinned ||
                     pool->host_pool.bytes != expected_host) {
-                    return moe_mmid_materialize_status::ALLOCATION_FAILED;
+                    return alloc_failed(R::HOST_POOL_ALLOCATION_FAILED);
                 }
             }
             // Build every authority and retained offset view before publication.
@@ -1053,7 +1155,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
                 if (!authority->slices.activation_f32.valid() || !authority->slices.activation_q8.valid() ||
                     !authority->slices.output_f32.valid() || !authority->slices.output_q8.valid() ||
                     (pool->geometry.host_slot_bytes != 0 && !authority->slices.host.valid())) {
-                    return moe_mmid_materialize_status::ALLOCATION_FAILED;
+                    return alloc_failed(R::SLICE_FAILED);
                 }
                 candidate->authorities.push_back(std::move(authority));
             }
@@ -1061,7 +1163,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         }
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (generation_ticket != model_publication_generation(*state_, token))
-            return moe_mmid_materialize_status::INVALID;
+            return invalid(R::PUBLICATION_RACED);
         bool has_active = false;
         for (const auto & existing : state_->contexts) {
             if (!same_token(existing->token, token) || existing->submit_device != submit_device) continue;
@@ -1069,7 +1171,8 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
                 return moe_mmid_materialize_status::ALREADY_PUBLISHED;
             if (existing->plan_identity == plan_identity)
                 return !candidate->exact_plan && !existing->exact_plan ?
-                    moe_mmid_materialize_status::ALREADY_PUBLISHED : moe_mmid_materialize_status::INVALID;
+                           moe_mmid_materialize_status::ALREADY_PUBLISHED :
+                           invalid(R::SAME_IDENTITY_OTHER_PLAN);
             if (candidate->exact_plan) has_active |= existing->accepting && existing->exact_plan != nullptr;
         }
         // A second authoritative exact plan is a prepared replacement. Legacy
@@ -1078,7 +1181,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         state_->contexts.push_back(std::move(candidate));
         return moe_mmid_materialize_status::PUBLISHED;
     } catch (...) {
-        return moe_mmid_materialize_status::ALLOCATION_FAILED;
+        return alloc_failed(R::EXCEPTION);
     }
 }
 

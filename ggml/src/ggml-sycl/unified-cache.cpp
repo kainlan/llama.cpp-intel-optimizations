@@ -20474,15 +20474,34 @@ static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry() {
 }
 
 static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
-    const moe_mmid_model_token & token,
-    uint64_t plan_identity,
+    const moe_mmid_model_token &                   token,
+    uint64_t                                       plan_identity,
     std::shared_ptr<const lifecycle_plan_snapshot> exact_plan,
-    const placement_plan & plan,
-    int submit_device,
-    const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    if (!plan.moe_mmid_workspace_valid || plan_identity == 0 || submit_device < 0 ||
-        plan.moe_mmid_workspaces.empty()) {
+    const placement_plan &                         plan,
+    int                                            submit_device,
+    const std::vector<moe_mmid_queue_binding> &    bindings,
+    moe_mmid_materialize_refusal *                 refusal) noexcept {
+    using R            = moe_mmid_materialize_refusal;
+    const auto invalid = [refusal](R why) {
+        if (refusal) {
+            *refusal = why;
+        }
         return moe_mmid_materialize_status::INVALID;
+    };
+    if (refusal) {
+        *refusal = R::NONE;
+    }
+    if (!plan.moe_mmid_workspace_valid) {
+        return invalid(R::PLAN_POOL_REJECTED);
+    }
+    if (plan_identity == 0) {
+        return invalid(R::PLAN_NO_IDENTITY);
+    }
+    if (submit_device < 0) {
+        return invalid(R::PLAN_NO_SUBMIT_DEVICE);
+    }
+    if (plan.moe_mmid_workspaces.empty()) {
+        return invalid(R::PLAN_NO_WORKSPACES);
     }
     try {
         std::vector<moe_mmid_materialized_owner_plan> owners;
@@ -20491,8 +20510,11 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == workspace.owner_device;
         });
-        if (!workspace.valid || binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
-            return moe_mmid_materialize_status::INVALID;
+        if (!workspace.valid) {
+            return invalid(R::WORKSPACE_INVALID);
+        }
+        if (binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
+            return invalid(R::WORKSPACE_NO_BINDING);
         }
         moe_mmid_materialized_owner_plan owner;
         owner.owner_device      = workspace.owner_device;
@@ -20545,27 +20567,55 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         blob.host_pinned = host_pinned;
         return blob;
     };
-        return exact_plan ? unified_cache_moe_mmid_registry().materialize(
-                                token, plan_identity, std::move(exact_plan), submit_device, owners, allocator) :
-                            unified_cache_moe_mmid_registry().materialize(
-                                token, plan_identity, submit_device, owners, allocator);
+    return exact_plan ? unified_cache_moe_mmid_registry().materialize(token, plan_identity, std::move(exact_plan),
+                                                                      submit_device, owners, allocator, refusal) :
+                        unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners,
+                                                                      allocator, refusal);
     } catch (...) {
+        if (refusal) {
+            *refusal = R::EXCEPTION;
+        }
         return moe_mmid_materialize_status::ALLOCATION_FAILED;
     }
 }
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token, uint64_t plan_identity, const placement_plan & plan,
-    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings);
+    const moe_mmid_model_token &                token,
+    uint64_t                                    plan_identity,
+    const placement_plan &                      plan,
+    int                                         submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings,
+    moe_mmid_materialize_refusal *              refusal) noexcept {
+    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings, refusal);
 }
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token, const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
-    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    if (!plan || !plan->plan || plan->version == 0 || plan->model_id != token.model_id ||
-        plan->load_txn_id != token.load_txn_id) return moe_mmid_materialize_status::INVALID;
-    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings);
+    const moe_mmid_model_token &                           token,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+    int                                                    submit_device,
+    const std::vector<moe_mmid_queue_binding> &            bindings,
+    moe_mmid_materialize_refusal *                         refusal) noexcept {
+    using R            = moe_mmid_materialize_refusal;
+    const auto invalid = [refusal](R why) {
+        if (refusal) {
+            *refusal = why;
+        }
+        return moe_mmid_materialize_status::INVALID;
+    };
+    if (!plan || !plan->plan) {
+        return invalid(R::SNAPSHOT_MISSING);
+    }
+    if (plan->version == 0) {
+        return invalid(R::SNAPSHOT_NO_VERSION);
+    }
+    if (plan->model_id != token.model_id) {
+        return invalid(R::SNAPSHOT_MODEL_MISMATCH);
+    }
+    if (plan->load_txn_id != token.load_txn_id) {
+        return invalid(R::SNAPSHOT_LOAD_MISMATCH);
+    }
+    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings,
+                                                refusal);
 }
 
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(

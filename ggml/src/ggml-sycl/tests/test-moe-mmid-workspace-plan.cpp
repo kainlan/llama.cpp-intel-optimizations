@@ -1374,6 +1374,204 @@ static void materialize_reason_contract() {
           "NO_BACKEND_CONTEXT name changed -- the gate grep for it would fail open");
 }
 
+// The registry's refusal detail is what the WARN line prints after reason=registry-invalid or
+// registry-allocation-failed: every condition names itself, distinctly, and NONE is the only value a success leaves.
+static void materialize_refusal_names() {
+    using R       = moe_mmid_materialize_refusal;
+    const R all[] = {
+        R::NONE,
+        R::SNAPSHOT_MISSING,
+        R::SNAPSHOT_NO_VERSION,
+        R::SNAPSHOT_MODEL_MISMATCH,
+        R::SNAPSHOT_LOAD_MISMATCH,
+        R::PLAN_POOL_REJECTED,
+        R::PLAN_NO_IDENTITY,
+        R::PLAN_NO_SUBMIT_DEVICE,
+        R::PLAN_NO_WORKSPACES,
+        R::WORKSPACE_INVALID,
+        R::WORKSPACE_NO_BINDING,
+        R::TOKEN_INVALID,
+        R::NO_ALLOCATOR,
+        R::OWNER_DEVICE_INVALID,
+        R::OWNER_NO_QUEUE_COOKIE,
+        R::OWNER_QUEUE_CAPABILITY_INVALID,
+        R::OWNER_GEOMETRY_INVALID,
+        R::OWNER_POOL_BYTES_OVERFLOW,
+        R::OWNER_POOL_BYTES_MISMATCH,
+        R::PUBLICATION_RACED,
+        R::SAME_IDENTITY_OTHER_PLAN,
+        R::DEVICE_POOL_ALLOCATION_FAILED,
+        R::HOST_POOL_ALLOCATION_FAILED,
+        R::SLICE_FAILED,
+        R::EXCEPTION,
+    };
+    constexpr size_t count = sizeof(all) / sizeof(all[0]);
+    check(static_cast<size_t>(R::EXCEPTION) + 1 == count, "a refusal value is missing from the name contract");
+    for (size_t i = 0; i < count; ++i) {
+        const char * name = moe_mmid_materialize_refusal_name(all[i]);
+        check(name != nullptr && name[0] != '\0', "a materialize refusal has no name");
+        check(std::strcmp(name, "unknown") != 0, "a declared refusal fell through to the unknown arm");
+        for (size_t j = i + 1; j < count; ++j) {
+            check(std::strcmp(name, moe_mmid_materialize_refusal_name(all[j])) != 0,
+                  "two materialize refusals share a name -- a log line could not distinguish them");
+        }
+    }
+    check(std::strcmp(moe_mmid_materialize_refusal_name(R::SAME_IDENTITY_OTHER_PLAN), "same-identity-other-plan") == 0,
+          "SAME_IDENTITY_OTHER_PLAN name changed -- the gate grep for it would fail open");
+}
+
+// One case per condition the registry can be driven into without a device. Each asserts the status AND the detail,
+// and that the refused attempt published nothing. The snapshot and plan checks of
+// unified_cache_materialize_moe_mmid_workspaces() run in the backend, which this target does not link.
+static void registry_refusal_detail_per_condition() {
+    using R = moe_mmid_materialize_refusal;
+    using S = moe_mmid_materialize_status;
+    std::atomic<int> destroyed{ 0 };
+    auto             allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    const auto owner  = owner_plan(0, 4100);
+    // `attempt` takes the detail out-parameter, so the status and the detail are read after the call returns.
+    const auto expect = [&](const char * what, moe_mmid_workspace_registry & registry, const auto & attempt, S want,
+                            R want_detail, size_t published) {
+        R       detail = R::EXCEPTION;
+        const S status = attempt(&detail);
+        if (status != want || detail != want_detail || registry.published_contexts() != published) {
+            std::cerr << what << ": status=" << static_cast<int>(status)
+                      << " detail=" << moe_mmid_materialize_refusal_name(detail)
+                      << " published=" << registry.published_contexts() << '\n';
+            check(false, "a refusal did not name its own condition");
+        }
+    };
+    const moe_mmid_model_token token{ 4101, 4102, 4103 };
+
+    {
+        moe_mmid_workspace_registry registry;
+        expect(
+            "token", registry,
+            [&](R * d) { return registry.materialize({ 0, 4102, 4103 }, 1, 0, { owner }, allocator, d); }, S::INVALID,
+            R::TOKEN_INVALID, 0);
+        expect(
+            "identity", registry, [&](R * d) { return registry.materialize(token, 0, 0, { owner }, allocator, d); },
+            S::INVALID, R::PLAN_NO_IDENTITY, 0);
+        expect(
+            "submit device", registry,
+            [&](R * d) { return registry.materialize(token, 1, -1, { owner }, allocator, d); }, S::INVALID,
+            R::PLAN_NO_SUBMIT_DEVICE, 0);
+        expect(
+            "no owners", registry, [&](R * d) { return registry.materialize(token, 1, 0, {}, allocator, d); },
+            S::INVALID, R::PLAN_NO_WORKSPACES, 0);
+        expect(
+            "no allocator", registry,
+            [&](R * d) { return registry.materialize(token, 1, 0, { owner }, moe_mmid_blob_allocator{}, d); },
+            S::INVALID, R::NO_ALLOCATOR, 0);
+
+        auto bad_device         = owner;
+        bad_device.owner_device = -1;
+        expect(
+            "owner device", registry,
+            [&](R * d) { return registry.materialize(token, 1, 0, { bad_device }, allocator, d); }, S::INVALID,
+            R::OWNER_DEVICE_INVALID, 0);
+        auto no_cookie         = owner;
+        no_cookie.queue_cookie = 0;
+        expect(
+            "owner cookie", registry,
+            [&](R * d) { return registry.materialize(token, 1, 0, { no_cookie }, allocator, d); }, S::INVALID,
+            R::OWNER_NO_QUEUE_COOKIE, 0);
+        // An exact plan needs the owner's exact-queue capability; the legacy cookie alone does not carry one.
+        const auto exact = std::make_shared<const lifecycle_plan_snapshot>();
+        expect(
+            "owner capability", registry,
+            [&](R * d) { return registry.materialize(token, 1, exact, 0, { owner }, allocator, d); }, S::INVALID,
+            R::OWNER_QUEUE_CAPABILITY_INVALID, 0);
+        auto overlap                       = owner;
+        overlap.geometry.output_f32_offset = overlap.geometry.activation_f32_offset;
+        expect(
+            "owner geometry", registry,
+            [&](R * d) { return registry.materialize(token, 1, 0, { overlap }, allocator, d); }, S::INVALID,
+            R::OWNER_GEOMETRY_INVALID, 0);
+        auto too_small = owner;
+        --too_small.device_pool_bytes;
+        expect(
+            "owner pool bytes", registry,
+            [&](R * d) { return registry.materialize(token, 1, 0, { too_small }, allocator, d); }, S::INVALID,
+            R::OWNER_POOL_BYTES_MISMATCH, 0);
+    }
+
+    {
+        moe_mmid_workspace_registry registry;
+        auto                        no_device = [&](bool host, int device, size_t bytes, size_t) {
+            return host ? fake_blob(host, device, bytes, &destroyed) : moe_mmid_blob{};
+        };
+        expect(
+            "device pool", registry, [&](R * d) { return registry.materialize(token, 1, 0, { owner }, no_device, d); },
+            S::ALLOCATION_FAILED, R::DEVICE_POOL_ALLOCATION_FAILED, 0);
+        auto no_host = [&](bool host, int device, size_t bytes, size_t) {
+            return host ? moe_mmid_blob{} : fake_blob(host, device, bytes, &destroyed);
+        };
+        expect(
+            "host pool", registry, [&](R * d) { return registry.materialize(token, 1, 0, { owner }, no_host, d); },
+            S::ALLOCATION_FAILED, R::HOST_POOL_ALLOCATION_FAILED, 0);
+        auto null_slice = [&](bool host, int device, size_t bytes, size_t) {
+            auto blob        = fake_blob(host, device, bytes, &destroyed);
+            blob.slice_owner = [](size_t, size_t) -> std::shared_ptr<void> {
+                return nullptr;
+            };
+            return blob;
+        };
+        expect(
+            "slice", registry, [&](R * d) { return registry.materialize(token, 1, 0, { owner }, null_slice, d); },
+            S::ALLOCATION_FAILED, R::SLICE_FAILED, 0);
+        // A throwing slice owner is caught inside the slice and reads as slice-failed; a throwing allocator reaches
+        // the registry's own handler.
+        auto throwing = [&](bool, int, size_t, size_t) -> moe_mmid_blob {
+            throw std::bad_alloc();
+        };
+        expect(
+            "exception", registry, [&](R * d) { return registry.materialize(token, 1, 0, { owner }, throwing, d); },
+            S::ALLOCATION_FAILED, R::EXCEPTION, 0);
+    }
+
+    // The condition a real load's second context bind hit: a context of this token and submit device already holds
+    // the plan identity for one exact snapshot, and the attempt names another snapshot of the same identity.
+    {
+        moe_mmid_workspace_registry registry;
+        int                         queue_object = 0;
+        auto                        exact_owner  = owner;
+        exact_owner.queue_capability             = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 4100);
+        const auto published                     = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto other                         = std::make_shared<const lifecycle_plan_snapshot>();
+        expect(
+            "baseline", registry,
+            [&](R * d) { return registry.materialize(token, 7, published, 0, { exact_owner }, allocator, d); },
+            S::PUBLISHED, R::NONE, 1);
+        expect(
+            "same snapshot", registry,
+            [&](R * d) { return registry.materialize(token, 7, published, 0, { exact_owner }, allocator, d); },
+            S::ALREADY_PUBLISHED, R::NONE, 1);
+        expect(
+            "same identity, other snapshot", registry,
+            [&](R * d) { return registry.materialize(token, 7, other, 0, { exact_owner }, allocator, d); }, S::INVALID,
+            R::SAME_IDENTITY_OTHER_PLAN, 1);
+
+        // A replace of the published plan while the attempt allocates moves the model's publication generation.
+        const auto replacement = std::make_shared<const lifecycle_plan_snapshot>();
+        bool       replaced    = false;
+        auto       racing      = [&](bool host, int device, size_t bytes, size_t) {
+            if (!replaced) {
+                replaced = registry.replace_plan(published, replacement, 7, /*stable_geometry=*/true);
+            }
+            return fake_blob(host, device, bytes, &destroyed);
+        };
+        const auto next = std::make_shared<const lifecycle_plan_snapshot>();
+        expect(
+            "publication raced", registry,
+            [&](R * d) { return registry.materialize(token, 8, next, 0, { exact_owner }, racing, d); }, S::INVALID,
+            R::PUBLICATION_RACED, 1);
+        check(replaced, "the racing replace did not run");
+    }
+}
+
 // llama.cpp-n8da: a workspace is admitted only by a backend context on its owner device, and a backend context exists
 // only for a device the registry exposes. With two physical GPUs the backend exposes device 0 alone by default, so the
 // planner may place experts on device 1 but must not plan an MMID workspace there: nothing can bind or admit it, and
@@ -1403,6 +1601,8 @@ static void owner_admissible_only_on_an_exposed_device() {
 int main() {
     try {
         materialize_reason_contract();
+        materialize_refusal_names();
+        registry_refusal_detail_per_condition();
         owner_admissible_only_on_an_exposed_device();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();

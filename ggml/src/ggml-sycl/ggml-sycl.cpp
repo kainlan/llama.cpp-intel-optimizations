@@ -13948,31 +13948,46 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
 // Report a materialization refusal.  WARN and never INFO: common_get_verbosity()
 // maps GGML_LOG_INFO below the default threshold, so an INFO diagnostic here
 // would never reach a log -- which is how this failure stayed invisible.
-static void ggml_sycl_moe_mmid_report_refusal(const char *                           site,
-                                              ggml_sycl::moe_mmid_materialize_reason reason,
-                                              int                                    device,
-                                              size_t                                 device_pool_bytes,
-                                              size_t                                 host_pool_bytes) {
+// `detail` names the registry's condition behind REGISTRY_INVALID / REGISTRY_ALLOCATION_FAILED ("none" for the
+// backend's own reasons). The token's and the snapshot's model and load ids, and the snapshot's version, are printed
+// because two of those conditions are identity mismatches and one is a plan identity held for another snapshot.
+static void ggml_sycl_moe_mmid_report_refusal(
+    const char *                                                      site,
+    ggml_sycl::moe_mmid_materialize_reason                            reason,
+    ggml_sycl::moe_mmid_materialize_refusal                           detail,
+    const ggml_sycl::lifecycle::ModelToken &                          token,
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
     if (!ggml_sycl::moe_mmid_materialize_reason_is_refusal(reason)) {
         return;
     }
+    const ggml_sycl::placement_plan * plan = snapshot ? snapshot->plan.get() : nullptr;
     GGML_LOG_WARN(
-        "[SYCL] MoE MMID workspace materialization refused at %s: reason=%s device=%d "
-        "device_pool=%.1f MB host_pool=%.1f MB\n",
-        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), device, device_pool_bytes / (1024.0 * 1024.0),
-        host_pool_bytes / (1024.0 * 1024.0));
+        "[SYCL] MoE MMID workspace materialization refused at %s: reason=%s detail=%s device=%d "
+        "device_pool=%.1f MB host_pool=%.1f MB token=%llu/%llu/%llu snapshot=%llu/%llu version=%llu\n",
+        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), ggml_sycl::moe_mmid_materialize_refusal_name(detail),
+        plan ? plan->device_id : -1, (plan ? plan->moe_mmid_device_pool_bytes : 0) / (1024.0 * 1024.0),
+        (plan ? plan->moe_mmid_host_pool_bytes : 0) / (1024.0 * 1024.0), (unsigned long long) token.model.value,
+        (unsigned long long) token.load.value, (unsigned long long) token.owner.generation,
+        (unsigned long long) (snapshot ? snapshot->model_id : 0),
+        (unsigned long long) (snapshot ? snapshot->load_txn_id : 0),
+        (unsigned long long) (snapshot ? snapshot->version : 0));
 }
 
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken &                          token,
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot,
-    ggml_sycl::moe_mmid_materialize_reason *                          out_reason = nullptr) {
+    ggml_sycl::moe_mmid_materialize_reason *                          out_reason = nullptr,
+    ggml_sycl::moe_mmid_materialize_refusal *                         out_detail = nullptr) {
     const auto set_reason = [&](ggml_sycl::moe_mmid_materialize_reason reason) {
         if (out_reason) {
             *out_reason = reason;
         }
     };
     set_reason(ggml_sycl::moe_mmid_materialize_reason::OK);
+    ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+    if (out_detail) {
+        *out_detail = detail;
+    }
     if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
         set_reason(ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE);
         return true;
@@ -14023,8 +14038,11 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     }
     const ggml_sycl::moe_mmid_model_token owner{
         token.model.value, token.load.value, token.owner.generation };
-    const auto result = ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(
-        owner, snapshot, submit_device, bindings);
+    const auto result =
+        ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(owner, snapshot, submit_device, bindings, &detail);
+    if (out_detail) {
+        *out_detail = detail;
+    }
     if (result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
         result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED) {
         return true;
@@ -14143,14 +14161,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         // context the bind hook and the runtime transaction would not. The
         // build-level half is the predicate the planner charges the pools on.
         if (ggml_sycl_moe_mmid_route_reachable_in_build()) {
-            ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-            if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason)) {
+            ggml_sycl::moe_mmid_materialize_reason  mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+            ggml_sycl::moe_mmid_materialize_refusal mmid_detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+            if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason,
+                                                                 &mmid_detail)) {
                 // Deferred, not failed. Silent at INFO-and-below on purpose: the
                 // expected reason here is NO_BACKEND_CONTEXT on every first load,
                 // and a WARN on every load is noise. The bind hook reports if it
                 // is STILL unresolved once a context exists.
-                GGML_SYCL_DEBUG("[SYCL] MoE MMID workspaces deferred at load_end: reason=%s\n",
-                                ggml_sycl::moe_mmid_materialize_reason_name(mmid_reason));
+                GGML_SYCL_DEBUG("[SYCL] MoE MMID workspaces deferred at load_end: reason=%s detail=%s\n",
+                                ggml_sycl::moe_mmid_materialize_reason_name(mmid_reason),
+                                ggml_sycl::moe_mmid_materialize_refusal_name(mmid_detail));
             }
         }
         ggml_sycl_prepared_plan_publication prepared_publication;
@@ -20986,11 +21007,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
         return refuse("publication ID exhausted");
     }
-    ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+    ggml_sycl::moe_mmid_materialize_reason  mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+    ggml_sycl::moe_mmid_materialize_refusal mmid_detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
     if (!stable_mmid && mmid_route_reachable &&
-        !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
-        ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, next->plan->device_id,
-                                          next->plan->moe_mmid_device_pool_bytes, next->plan->moe_mmid_host_pool_bytes);
+        !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason, &mmid_detail)) {
+        ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, mmid_detail, current_token, next);
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         // Same rollback as the publication-ID-exhaustion path above.
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
@@ -25453,18 +25474,16 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     // pending and stays silent: that failure has its own error surface, and a
     // tripwire on top of it would blame the wrong mechanism.
     if (inner_ok && bound_snapshot && backend_ctx && ggml_sycl_moe_mmid_route_reachable(*backend_ctx)) {
-        ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-        if (!ggml_sycl_materialize_published_mmid_workspaces(token, bound_snapshot, &mmid_reason)) {
+        ggml_sycl::moe_mmid_materialize_reason  mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+        ggml_sycl::moe_mmid_materialize_refusal mmid_detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+        if (!ggml_sycl_materialize_published_mmid_workspaces(token, bound_snapshot, &mmid_reason, &mmid_detail)) {
             // TRIPWIRE. The route IS executable here and a planned pool is
             // still unmaterialized at the point it should have resolved.
             // Consequence is a silent performance cliff rather than wrong
             // results -- admission simply falls through to the generic MoE
             // dispatch -- which is exactly why it has to be loud: nothing
             // downstream would ever report it.
-            ggml_sycl_moe_mmid_report_refusal(
-                "context-bind", mmid_reason, bound_snapshot->plan ? bound_snapshot->plan->device_id : -1,
-                bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_device_pool_bytes : 0,
-                bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_host_pool_bytes : 0);
+            ggml_sycl_moe_mmid_report_refusal("context-bind", mmid_reason, mmid_detail, token, bound_snapshot);
         }
     }
     // PLAN_REJECTED, not BUSY. The inner refusal is deterministic -- the same

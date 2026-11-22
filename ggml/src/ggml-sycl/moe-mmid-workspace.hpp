@@ -321,6 +321,51 @@ using moe_mmid_blob_allocator =
 
 enum class moe_mmid_materialize_status : uint8_t { PUBLISHED, ALREADY_PUBLISHED, INVALID, ALLOCATION_FAILED };
 
+// The condition behind an INVALID or ALLOCATION_FAILED status. The status alone could not name it: a real model
+// load's context-bind refusal read "registry-invalid" with a dozen conditions behind it and no way to tell which. One
+// value per condition that refuses in unified_cache_materialize_moe_mmid_workspaces() (the snapshot and plan checks)
+// and moe_mmid_workspace_registry::materialize() (the token, owner, publication and allocation checks); NONE when the
+// status is PUBLISHED or ALREADY_PUBLISHED.
+enum class moe_mmid_materialize_refusal : uint8_t {
+    NONE,
+    // The snapshot form: no snapshot or no plan in it, no publication version, or a snapshot of another model or load
+    // than the token names.
+    SNAPSHOT_MISSING,
+    SNAPSHOT_NO_VERSION,
+    SNAPSHOT_MODEL_MISMATCH,
+    SNAPSHOT_LOAD_MISMATCH,
+    // The plan: its pool was rejected at planning, it has no identity or submit device, it plans no workspace, a
+    // workspace is invalid, or an owner device has no queue binding.
+    PLAN_POOL_REJECTED,
+    PLAN_NO_IDENTITY,
+    PLAN_NO_SUBMIT_DEVICE,
+    PLAN_NO_WORKSPACES,
+    WORKSPACE_INVALID,
+    WORKSPACE_NO_BINDING,
+    // The registry's own arguments and owners.
+    TOKEN_INVALID,
+    NO_ALLOCATOR,
+    OWNER_DEVICE_INVALID,
+    OWNER_NO_QUEUE_COOKIE,
+    OWNER_QUEUE_CAPABILITY_INVALID,
+    OWNER_GEOMETRY_INVALID,
+    OWNER_POOL_BYTES_OVERFLOW,
+    OWNER_POOL_BYTES_MISMATCH,
+    // Publication: the model's publication generation moved while the pools were allocated (a plan replace or an
+    // invalidation ran), or a context of this token and submit device already holds this plan identity for another
+    // exact plan snapshot.
+    PUBLICATION_RACED,
+    SAME_IDENTITY_OTHER_PLAN,
+    // Allocation: the device pool, the host pool, or a slot slice of either; or an exception.
+    DEVICE_POOL_ALLOCATION_FAILED,
+    HOST_POOL_ALLOCATION_FAILED,
+    SLICE_FAILED,
+    EXCEPTION,
+};
+
+// Stable, distinct, never-null name for logs.
+const char * moe_mmid_materialize_refusal_name(moe_mmid_materialize_refusal refusal) noexcept;
+
 // Why a materialization attempt did not publish a pool.  The backend collapsed
 // every one of these into a bare `false`, which the caller turned into an
 // unnamed throw -- a failed load reported "result=16" and nothing else.  The
@@ -557,17 +602,20 @@ class moe_mmid_workspace_registry {
     moe_mmid_workspace_registry(const moe_mmid_workspace_registry &)             = delete;
     moe_mmid_workspace_registry & operator=(const moe_mmid_workspace_registry &) = delete;
 
+    // `refusal`, when given, names the condition behind an INVALID or ALLOCATION_FAILED status (NONE otherwise).
     moe_mmid_materialize_status    materialize(const moe_mmid_model_token &                          token,
                                                uint64_t                                              plan_identity,
                                                int                                                   submit_device,
                                                const std::vector<moe_mmid_materialized_owner_plan> & owners,
-                                               const moe_mmid_blob_allocator &                       allocator) noexcept;
-    moe_mmid_materialize_status    materialize(const moe_mmid_model_token & token,
-                                               uint64_t plan_identity,
-                                               std::shared_ptr<const lifecycle_plan_snapshot> plan,
-                                               int submit_device,
+                                               const moe_mmid_blob_allocator &                       allocator,
+                                               moe_mmid_materialize_refusal * refusal = nullptr) noexcept;
+    moe_mmid_materialize_status    materialize(const moe_mmid_model_token &                          token,
+                                               uint64_t                                              plan_identity,
+                                               std::shared_ptr<const lifecycle_plan_snapshot>        plan,
+                                               int                                                   submit_device,
                                                const std::vector<moe_mmid_materialized_owner_plan> & owners,
-                                               const moe_mmid_blob_allocator & allocator) noexcept;
+                                               const moe_mmid_blob_allocator &                       allocator,
+                                               moe_mmid_materialize_refusal * refusal = nullptr) noexcept;
     moe_mmid_registry_lease_result acquire(const moe_mmid_model_token & token,
                                            uint64_t                     plan_identity,
                                            int                          submit_device,

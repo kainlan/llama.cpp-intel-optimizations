@@ -611,7 +611,7 @@ def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
         "sycl::queue * queue = backend->stream();")
     assert ".default_queue()" not in materialize
     assert "const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot" in materialize
-    assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot, submit_device" in materialize
+    assert "unified_cache_materialize_moe_mmid_workspaces(owner, snapshot, submit_device" in materialize
     assert "snapshot.version, *snapshot.plan" not in materialize
     pre_admit = mmid[:start]
     assert "ggml_sycl_moe_log_canonical_publish_pre_admission" in pre_admit
