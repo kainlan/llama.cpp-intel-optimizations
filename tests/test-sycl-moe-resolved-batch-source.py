@@ -218,7 +218,8 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "NVFP4 decode refusal": "type == GGML_TYPE_NVFP4",
         "Q1/NVFP4 narrow recipe branch":
             "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)",
-        "direct recipe decode-only": "phase == moe_route_phase::DECODE && rows == 1",
+        # Phase-blind since the prompt joined the direct route: direct_prompt_violations() pins the whole candidate.
+        "direct recipe phase-blind": "static_candidate = layout == GGML_LAYOUT_AOS && route_device == submit_device",
         "direct recipe primary-only": "route_device == submit_device && direct_recipe_candidate",
         # The candidate asks the binder whether the lease has an exact allocation identity, the same test
         # bind() applies (llama.cpp-1sxq).
@@ -232,7 +233,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "direct recipe retains exact queue capability":
             "normalized.recipe_queue_capability = *queue_capability",
         "direct admission consumes retained queue capability":
-            "queue_cap = decode.operands.front().recipe_queue_capability",
+            "queue_cap = direct_batch.operands.front().recipe_queue_capability",
         # The operand's retained fields are read through accessors now (value-owned canonical entry).
         "fallback uses retained recipe kernel": "moe_route_kernel_name(operand.recipe().kernel)",
         "fallback uses retained recipe reason": "operand.recipe_reason() ? operand.recipe_reason()",
@@ -550,7 +551,8 @@ def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
     direct = mmid[start:end]
     # Open since the B70 and B50 oracle runs of 2026-11-22; the admission still reads the shared constant (above).
     assert "constexpr bool k_moe_mmid_direct_route_validated = true;" in source
-    assert "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1" in direct
+    # A token and a prompt alike since 2026-11-22; direct_prompt_violations() holds the gate and the batch it reads.
+    assert "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&" in direct
     validator = function_definition(HEADER.read_text(), "inline moe_batch_reject_reason validate_moe_batch_route(")
     assert "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()" in validator
     assert "owned_direct_slice_route_acceptance" in HOST_TEST.read_text()
@@ -565,12 +567,13 @@ def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
         "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
     helper = function_definition(source, "static bool ggml_sycl_publish_mmid_canonical_aos_experts(")
     assert "ggml_sycl_publish_backend_aos_expert_handles(" in helper
-    assert "std::make_shared<const std::vector<int32_t>>(decode.expert_ids)" in direct
-    assert "completion->retained_ids = retained_ids" in direct
+    # The host snapshot used to be copied into the completion because the adapter uploaded it after returning. The
+    # kernel reads the ids tensor in place now and the adapter reads the snapshot only before it submits
+    # (direct_prompt_violations(), snapshot-sync), so the batch's own snapshot is passed and nothing retains a copy.
     move = direct.index("completion->bundle = std::move(admitted.bundle)")
     slices = direct.index("const auto * lease = completion->bundle.owner_leases()")
     assert move < slices
-    assert "completion->retained_ids->data()" in direct
+    assert "direct_batch.expert_ids.data()" in direct
     assert "terminal->confirm_quiescent()" in direct
     assert "unified_cache_recover_moe_mmid_workspaces" in direct
     post_mark = direct[direct.index("completion->bundle.mark_possible_submit()") :]
@@ -628,7 +631,6 @@ def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
         "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
     query = function_definition(source, "static moe_route_capability ggml_sycl_moe_query_route_capability(")
     for witness in (
-        "phase == moe_route_phase::DECODE && rows == 1",
         "layout == GGML_LAYOUT_AOS",
         "route_device == submit_device",
         "ggml_sycl::moe::canonical_allocation_integration::exact_identity(*direct_recipe_candidate).has_value()",
@@ -680,14 +682,16 @@ def parenthesized_after(text: str, anchor: str) -> str:
     raise ValueError(f"unbalanced condition after: {anchor}")
 
 
-# Claims about which inputs the direct route admits and how it copies them (owner ruling 2026-11-22). The route takes
-# both shapes build_moe_ffn gives it in decode: one row every selected expert shares (the fused gate_up, src1
+# Claims about which inputs the direct route admits and how it copies them (owner rulings 2026-11-22). The route takes
+# both shapes build_moe_ffn gives it: one row every selected expert shares (the fused gate_up, src1
 # [n_embd, 1, n_tokens]) and one row per selected expert (down, src1 [n_ff, n_expert_used, n_tokens]); the kernel
-# indexes the row as id % ne11 and the workspace is planned for top_k rows. Each failure message starts with its claim.
+# indexes the row as id % ne11 and the workspace is planned for top_k rows per token. It takes a decode token and a
+# prompt's ne12 tokens alike, in one submit. Each failure message starts with its claim.
 DIRECT_ROUTE_KERNEL_CALL = "mmvq_submit_q1_nvfp4_aos_id_admitted("
-DIRECT_ROUTE_ROW_LOOP = "for (int64_t row = 1; !src1_rows_adjacent && row < ne11; ++row) {"
-DIRECT_ROUTE_ROW_COPY = ("dependency = ggml_sycl::mem_copy_ptr_async(activation + row * ne00, src1_device_base + row "
-                         "* nb11, activation_row_bytes, *exact_queue, std::vector<sycl::event>{ dependency });")
+DIRECT_ROUTE_PIECE_LOOP = "for (int64_t piece = 1; piece < activation_pieces; ++piece) {"
+DIRECT_ROUTE_PIECE_COPY = ("dependency = ggml_sycl::mem_copy_ptr_async(activation + first_row * ne10, src1_device_base "
+                           "+ (first_row / ne11) * nb12 + (first_row % ne11) * nb11, activation_piece_bytes, "
+                           "*exact_queue, std::vector<sycl::event>{ dependency });")
 
 
 def direct_route_input_shape_violations(direct: str) -> list[str]:
@@ -705,9 +709,21 @@ def direct_route_input_shape_violations(direct: str) -> list[str]:
             has_tokens(admission, "q1_nvfp4_private_test_authorized") or
             tokens(code).count("q1_nvfp4_private_test_authorized") != 3):
         failures.append("test-flag: the private test flag is read outside its two definitions and the outer gate")
-    # The copy reads float rows; elements that are not adjacent inside a row are not admitted at all.
+    # The copy and the kernel read float rows: an input of another type is not admitted, said as such, and elements
+    # that are not adjacent inside a row are not admitted at all.
+    if not has_tokens(admission, "src1->type == GGML_TYPE_F32"):
+        failures.append("f32-input: admission does not say the input is F32")
     if not has_tokens(admission, "nb10 == sizeof(float)"):
         failures.append("element-contiguity: admission does not require nb10 == sizeof(float)")
+    # One name for the row length the copy and the kernel share (ne10 == ne00 by the op's contract): two spellings
+    # read as two quantities.
+    if "ne00" in tokens(code):
+        failures.append("one-name: the route spells the row length as both ne00 and ne10")
+    # One output copy covers every token, so only a dst whose tokens follow each other is admitted.
+    if not has_tokens(admission, "nb2 == static_cast<size_t>(ne1) * nb1"):
+        failures.append("dense-dst: admission does not require a dst whose tokens are adjacent")
+    if has_tokens(admission, "ids->ne[1] == 1"):
+        failures.append("token-rows: admission still takes one token only")
     mark = code.find("completion->bundle.mark_possible_submit()")
     if mark < 0:
         return failures + ["mark: mark_possible_submit() was not found"]
@@ -715,30 +731,53 @@ def direct_route_input_shape_violations(direct: str) -> list[str]:
     if not has_tokens(pre_mark,
                       "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);"):
         failures.append("rows-adjacent: no pre-mark src1_rows_adjacent from nb11 == ne10 * sizeof(float)")
-    if not has_tokens(pre_mark, "const size_t activation_row_bytes = static_cast<size_t>(ne00) * sizeof(float);"):
+    if not has_tokens(pre_mark,
+                      "const bool src1_tokens_adjacent = ne12 == 1 || nb12 == static_cast<size_t>(ne11) * nb11;"):
+        failures.append("tokens-adjacent: no pre-mark src1_tokens_adjacent from nb12 == ne11 * nb11")
+    if not has_tokens(pre_mark, "const size_t activation_row_bytes = static_cast<size_t>(ne10) * sizeof(float);"):
         failures.append("row-bytes: no pre-mark activation_row_bytes of one row")
+    # A piece is the whole input when rows and tokens are adjacent, one token's rows when only the rows are, one row
+    # otherwise; the pieces tile the dense [token][row] slice.
+    if not (has_tokens(pre_mark, "const int64_t activation_piece_rows = !src1_rows_adjacent ? 1 : "
+                                 "src1_tokens_adjacent ? ne11 * ne12 : ne11;") and
+            has_tokens(pre_mark, "const int64_t activation_pieces = ne11 * ne12 / activation_piece_rows;") and
+            has_tokens(pre_mark, "const size_t activation_piece_bytes = static_cast<size_t>(activation_piece_rows) "
+                                 "* activation_row_bytes;")):
+        failures.append("pieces: the copy is not cut into whole-input, per-token or per-row pieces")
+    # Every byte count covers the batch's tokens: the admitted slices are sized for ne12 tokens.
+    if not has_tokens(pre_mark, "const size_t activation_bytes = activation_row_bytes * static_cast<size_t>(ne11) * "
+                                "static_cast<size_t>(ne12);"):
+        failures.append("token-bytes: the activation byte count does not cover ne12 tokens")
+    if not has_tokens(pre_mark, "const size_t output_bytes = static_cast<size_t>(ids->ne[0]) * "
+                                "static_cast<size_t>(ne01) * static_cast<size_t>(ne12) * sizeof(float);"):
+        failures.append("token-bytes: the output byte count does not cover ne12 tokens")
     try:
         body = tokens(function_definition(post_mark, "try {"))
     except ValueError:
         return failures + ["try: the submit try body was not found"]
     if not contains_tokens(body, "sycl::event dependency = ggml_sycl::mem_copy_ptr_async(activation, src1_device_base, "
-                                 "src1_rows_adjacent ? activation_bytes : activation_row_bytes, *exact_queue,"):
-        failures.append("first-copy: the first activation copy is not one block when adjacent and one row otherwise")
-    if not contains_tokens(body, DIRECT_ROUTE_ROW_LOOP) or not contains_tokens(body, DIRECT_ROUTE_ROW_COPY):
-        failures.append("row-copies: strided rows are not copied one by one, each after the one before")
+                                 "activation_piece_bytes, *exact_queue,"):
+        failures.append("first-copy: the first activation copy is not the first piece")
+    if not contains_tokens(body, DIRECT_ROUTE_PIECE_LOOP) or not contains_tokens(body, DIRECT_ROUTE_PIECE_COPY) or \
+            not contains_tokens(body, "const int64_t first_row = piece * activation_piece_rows;"):
+        failures.append("piece-copies: the pieces after the first are not copied from their token and row, each "
+                        "after the one before")
     elif not contains_tokens(body, DIRECT_ROUTE_KERNEL_CALL) or token_sequence_index(
-            body, DIRECT_ROUTE_ROW_COPY) > token_sequence_index(body, DIRECT_ROUTE_KERNEL_CALL):
-        failures.append("row-copies: the row copies are not submitted before the kernel")
+            body, DIRECT_ROUTE_PIECE_COPY) > token_sequence_index(body, DIRECT_ROUTE_KERNEL_CALL):
+        failures.append("piece-copies: the piece copies are not submitted before the kernel")
     if body.count("mem_copy_ptr_async") != 3:
-        failures.append("copy-count: the try body is not the first copy, the row copy and the output copy")
+        failures.append("copy-count: the try body is not the first copy, the piece copy and the output copy")
     if not contains_tokens(body, "buffers, &dependency, &kernel)"):
         failures.append("kernel-dependency: the kernel does not wait on the last activation copy")
+    # One submit for the whole batch: the kernel is told the batch's token count.
+    if not contains_tokens(body, "static_cast<int>(ids->ne[0]), static_cast<int>(ne12), static_cast<int>(ne11),"):
+        failures.append("token-count: the kernel is not given ne12 tokens")
     if "wait" in body or "wait_and_throw" in body:
         failures.append("no-host-wait: the submit path waits on the host")
     return failures
 
 
-def test_direct_route_admits_both_decode_input_shapes_and_copies_strided_rows() -> None:
+def test_direct_route_admits_both_input_shapes_and_copies_strided_rows_and_tokens() -> None:
     failures = direct_route_input_shape_violations(direct_route_block(SOURCE.read_text()))
     assert failures == [], failures
 
@@ -751,25 +790,255 @@ def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
          "(ne11 == 1 || (q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]))", "test-flag"),
         ("per-slot-closed", "(ne11 == 1 || ne11 == ids->ne[0])", "ne11 == 1", "per-slot-shape"),
         ("drop-element-contiguity", "nb10 == sizeof(float) &&", "", "element-contiguity"),
+        ("type-by-side-effect", "src1->type == GGML_TYPE_F32 &&", "", "f32-input"),
+        ("two-names", "const size_t activation_row_bytes = static_cast<size_t>(ne10) * sizeof(float);",
+         "const size_t activation_row_bytes = static_cast<size_t>(ne00) * sizeof(float);", "one-name"),
+        ("drop-dense-dst", "nb2 == static_cast<size_t>(ne1) * nb1 &&", "", "dense-dst"),
+        ("one-token-only", "nb10 == sizeof(float) &&", "ids->ne[1] == 1 && nb10 == sizeof(float) &&", "token-rows"),
         ("rows-always-adjacent",
          "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);",
          "const bool src1_rows_adjacent = true;", "rows-adjacent"),
-        ("flat-copy", "src1_rows_adjacent ? activation_bytes : activation_row_bytes", "activation_bytes", "first-copy"),
-        ("row-stride-ignored", "src1_device_base + row * nb11", "src1_device_base + row * ne00 * sizeof(float)",
-         "row-copies"),
-        ("row-copies-unchained", "std::vector<sycl::event>{ dependency }", "std::vector<sycl::event>{}", "row-copies"),
-        ("row-copies-discarded", "dependency = ggml_sycl::mem_copy_ptr_async(activation + row",
-         "(void) ggml_sycl::mem_copy_ptr_async(activation + row", "row-copies"),
-        ("extra-flat-copy", DIRECT_ROUTE_ROW_LOOP,
+        ("tokens-always-adjacent",
+         "const bool src1_tokens_adjacent = ne12 == 1 || nb12 == static_cast<size_t>(ne11) * nb11;",
+         "const bool src1_tokens_adjacent = true;", "tokens-adjacent"),
+        ("pieces-ignore-tokens", "src1_tokens_adjacent ? ne11 * ne12 : ne11;", "ne11 * ne12;", "pieces"),
+        ("activation-one-token", "activation_row_bytes * static_cast<size_t>(ne11) * static_cast<size_t>(ne12);",
+         "activation_row_bytes * static_cast<size_t>(ne11);", "token-bytes"),
+        ("output-one-token", "static_cast<size_t>(ne01) * static_cast<size_t>(ne12) * sizeof(float);",
+         "static_cast<size_t>(ne01) * sizeof(float);", "token-bytes"),
+        ("flat-copy", "src1_device_base, activation_piece_bytes, *exact_queue,",
+         "src1_device_base, activation_bytes, *exact_queue,", "first-copy"),
+        ("token-stride-ignored", "(first_row / ne11) * nb12", "(first_row / ne11) * ne11 * nb11", "piece-copies"),
+        ("row-stride-ignored", "(first_row % ne11) * nb11", "(first_row % ne11) * ne10 * sizeof(float)",
+         "piece-copies"),
+        ("piece-copies-unchained", "std::vector<sycl::event>{ dependency }", "std::vector<sycl::event>{}",
+         "piece-copies"),
+        ("piece-copies-discarded", "dependency = ggml_sycl::mem_copy_ptr_async(activation + first_row",
+         "(void) ggml_sycl::mem_copy_ptr_async(activation + first_row", "piece-copies"),
+        ("extra-flat-copy", DIRECT_ROUTE_PIECE_LOOP,
          "(void) ggml_sycl::mem_copy_ptr_async(activation, src1_device_base, activation_bytes, *exact_queue); "
-         + DIRECT_ROUTE_ROW_LOOP, "copy-count"),
+         + DIRECT_ROUTE_PIECE_LOOP, "copy-count"),
         ("kernel-skips-copies", "buffers, &dependency, &kernel)", "buffers, nullptr, &kernel)", "kernel-dependency"),
-        ("host-wait", DIRECT_ROUTE_ROW_LOOP, "dependency.wait(); " + DIRECT_ROUTE_ROW_LOOP, "no-host-wait"),
+        ("kernel-one-token", "static_cast<int>(ids->ne[0]), static_cast<int>(ne12), static_cast<int>(ne11),",
+         "static_cast<int>(ids->ne[0]), 1, static_cast<int>(ne11),", "token-count"),
+        ("host-wait", DIRECT_ROUTE_PIECE_LOOP, "dependency.wait(); " + DIRECT_ROUTE_PIECE_LOOP, "no-host-wait"),
     ]
     for name, old, new, claim in mutants:
         mutant = direct.replace(old, new, 1)
         assert mutant != direct, f"mutant changed nothing: {name}"
         failures = direct_route_input_shape_violations(mutant)
+        assert any(f.startswith(claim + ":") for f in failures), f"mutant {name} did not fail {claim}: {failures}"
+
+
+# Claims about a prompt reaching the direct route and the ids it reads (owner rulings 2026-11-22): a prompt is admitted
+# from the prompt admission's batch; the capability that opens the direct recipe is the same for both phases and comes
+# from one helper; a batch above the planned workspace is refused by name before admission, by the comparison
+# admission itself makes; a refusal names its phase; and the kernel reads the ids tensor in place with its own strides:
+# an op does not write its input, and nothing asynchronous reads the host snapshot. Each failure message starts with its
+# claim.
+DIRECT_CAPACITY_THROW = ('throw ggml_sycl_fallback_error("MUL_MAT_ID direct route batch exceeds its planned MMID '
+                         'workspace");')
+DIRECT_CAPACITY_LINE = '"[%s] tensor=%s reason=workspace_capacity tokens=%lld capacity=%zu\\n"'
+DIRECT_PRE_ADMISSION = "ggml_sycl_moe_mark_direct_authority_pre_admission(src0)"
+PROMPT_CAPABILITY_ARG = "prompt_queue_capability.valid() ? &prompt_queue_capability : nullptr)"
+PROMPT_BUILD_LAYOUTS = ("gate_layout", "up_layout", "down_layout", "retained_prompt_layout")
+MMID_SLOT_FIELDS = ("activation_rows", "occurrences", "q8_ne10_row_bytes", "q8_ne01_row_bytes", "activation_f32_bytes",
+                    "activation_q8_bytes", "output_f32_bytes", "output_q8_bytes", "host_slot_bytes")
+WORKSPACE_SOURCE = ROOT / "ggml/src/ggml-sycl/moe-mmid-workspace.cpp"
+MMVQ_SOURCE = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
+MMVQ_HEADER = ROOT / "ggml/src/ggml-sycl/mmvq.hpp"
+
+
+def optional_definition(text: str, signature: str) -> str:
+    try:
+        return normalized_code(function_definition(text, signature))
+    except ValueError:
+        return ""
+
+
+def direct_prompt_parts(source: str, workspace: str, mmvq_cpp: str, mmvq_hpp: str) -> dict[str, str]:
+    """The normalized pieces the prompt claims read; a mutant rewrites one piece."""
+    mmid = normalized_code(function_definition(source, "static void ggml_sycl_mul_mat_id("))
+    declared = normalized_code(mmvq_hpp[mmvq_hpp.index("bool mmvq_submit_q1_nvfp4_aos_id_admitted("):])
+    return {
+        "mmid": mmid,
+        "append": optional_definition(mmid, "auto append_retained_operand = [&]("),
+        "direct": normalized_code(direct_route_block(source)),
+        "query": optional_definition(source, "static moe_route_capability ggml_sycl_moe_query_route_capability("),
+        "helper": optional_definition(
+            source, "static ggml_sycl::moe_mmid_queue_capability ggml_sycl_moe_direct_queue_capability("),
+        "holds": optional_definition(workspace, "bool moe_mmid_workspace_geometry_holds("),
+        "admit": optional_definition(workspace, "moe_mmid_admitted_result moe_mmid_workspace_registry::admit("),
+        "adapter": optional_definition(mmvq_cpp, "bool mmvq_submit_q1_nvfp4_aos_id_admitted("),
+        "declared": declared[:declared.index(";")],
+        "mmvq_cpp": normalized_code(mmvq_cpp),
+    }
+
+
+def direct_prompt_violations(parts: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    mmid, direct = parts["mmid"], parts["direct"]
+    try:
+        gate = parenthesized_after(direct, "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized)")
+        admission = parenthesized_after(direct, "if (all_primary &&")
+    except ValueError:
+        return ["prompt-gate: the direct route's gate or admission condition was not found"]
+    if "ne12" in tokens(gate):
+        failures.append("prompt-gate: the outer gate still selects on the token count")
+    if not has_tokens(direct, "const ggml_sycl::moe_resolved_batch_result & direct_admission = "
+                              "ne12 == 1 ? retained_decode_batch_result : retained_prompt_batch_result;") or \
+            not has_tokens(gate, "direct_admission") or \
+            not has_tokens(direct, "const auto & direct_batch = direct_admission.batch;"):
+        failures.append("batch-source: the route does not read the decode batch for a token and the prompt batch "
+                        "for a prompt")
+    # One helper answers for the capability, asked once by each admission.
+    if not has_tokens(parts["helper"], "ggml_sycl::unified_cache_moe_mmid_exact_queue(") or \
+            tokens(mmid).count("ggml_sycl_moe_direct_queue_capability") != 2 or \
+            has_tokens(mmid, "unified_cache_moe_mmid_exact_queue("):
+        failures.append("one-capability: the direct queue capability is not computed by one helper for both phases")
+    # Every prompt build that can supply the route's batch gets it: the three pair roles (a reused role batch is the
+    # prompt's batch, so building one without the capability would build a batch only to discard it) and the
+    # prompt's own build. Decode keeps its own.
+    if not has_tokens(mmid, "const ggml_sycl::moe_mmid_queue_capability prompt_queue_capability = "
+                            "ggml_sycl_moe_direct_queue_capability(ctx);"):
+        failures.append("prompt-capability: the prompt admission does not ask the helper for the capability")
+    for layout in PROMPT_BUILD_LAYOUTS:
+        if not has_tokens(mmid, f"static_cast<size_t>(ids->ne[0]), {layout}, /*allow_materialize=*/false, &ctx, "
+                                f"ctx.stream(), {PROMPT_CAPABILITY_ARG}"):
+            failures.append(f"prompt-capability: the {layout} build is not given the direct queue capability")
+    if not has_tokens(mmid, "const ggml_sycl::moe_mmid_queue_capability recipe_queue_capability = "
+                            "ggml_sycl_moe_direct_queue_capability(ctx);") or \
+            not has_tokens(mmid, "/*allow_materialize=*/false, &ctx, recipe_queue, "
+                                 "recipe_queue_capability.valid() ? &recipe_queue_capability : nullptr)"):
+        failures.append("prompt-capability: the decode build is not given the helper's capability")
+    query = parts["query"]
+    start = query.find("const bool static_candidate =")
+    candidate = query[start:query.find(";", start)] if start >= 0 else ""
+    if not candidate or "phase" in tokens(candidate) or "rows" in tokens(candidate):
+        failures.append("phase-blind: the direct recipe candidate depends on the phase or the row count")
+    # The capacity refusal: the plan's own sizing function asked for ne12 tokens, held against the slot the plan keeps
+    # for this device by the one comparison admission makes, refused by name before the pre-admission mark.
+    if not has_tokens(direct, "ggml_sycl::moe_mmid_plan_workspace({ static_cast<size_t>(ne10), "
+                              "static_cast<size_t>(ne01), static_cast<size_t>(ne11), static_cast<size_t>(ids->ne[0]), "
+                              "static_cast<size_t>(ne12) }, false, &needed)"):
+        failures.append("capacity-plan: the batch's needs are not asked of the plan's sizing function for ne12 tokens")
+    if not has_tokens(direct, "for (const auto & workspace : plan_snapshot->plan->moe_mmid_workspaces)") or \
+            not has_tokens(direct, "workspace.valid && workspace.owner_device == ctx.device && "
+                                   "!workspace.secondary_owner"):
+        failures.append("capacity-plan: the slot is not the one the plan holds for this device")
+    holds = parts["holds"]
+    if not holds or any(not has_tokens(holds, f"available.{field} >= needed.{field}") for field in MMID_SLOT_FIELDS):
+        failures.append("capacity-fields: the comparison does not hold the needs against the slot field by field")
+    if not has_tokens(parts["admit"], "moe_mmid_workspace_geometry_holds(available, needed)") or \
+            has_tokens(parts["admit"], "available.activation_rows < needed.activation_rows") or \
+            not has_tokens(direct, "ggml_sycl::moe_mmid_workspace_geometry_holds(*planned_slot, needed)"):
+        failures.append("one-comparison: admission and the direct route do not make the same comparison")
+    if DIRECT_CAPACITY_LINE not in direct or \
+            not has_tokens(direct, 'ne12 == 1 ? "MOE-DECODE-REFUSAL" : "MOE-PROMPT-REFUSAL"') or \
+            not has_tokens(direct, "planned_slot->occurrences / static_cast<size_t>(ids->ne[0])") or \
+            DIRECT_CAPACITY_THROW not in direct or DIRECT_PRE_ADMISSION not in direct or \
+            direct.index(DIRECT_CAPACITY_THROW) > direct.index(DIRECT_PRE_ADMISSION):
+        failures.append("capacity-refusal: a batch above the planned workspace is not refused by name before "
+                        "admission")
+    # The shared retained partition's refusal line names its phase.
+    append = parts["append"]
+    if not has_tokens(append, 'phase == moe_route_phase::PROMPT ? "MOE-PROMPT-REFUSAL" : "MOE-DECODE-REFUSAL"') or \
+            has_tokens(append, "(void) phase;") or '"[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu' in append:
+        failures.append("phase-label: the shared refusal line does not name its phase")
+    # The ids: this device's own storage, adjacent inside a token, read with the tensor's strides.
+    if not has_tokens(direct, "const int32_t * ids_device = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);") or \
+            has_tokens(direct, "ggml_sycl_resolve_tensor_ptr(ids"):
+        failures.append("ids-resident: the route does not take the ids tensor's own storage on this device")
+    if not has_tokens(admission, "ids_device &&") or not has_tokens(admission, "ids->nb[0] == sizeof(int32_t)"):
+        failures.append("ids-admission: ids that are not resident here, or not adjacent inside a token, are admitted")
+    if not has_tokens(direct, "direct_batch.expert_ids.data(),") or \
+            not has_tokens(direct, "ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)"):
+        failures.append("ids-strides: the kernel is not given the snapshot and the ids tensor's own strides")
+    adapter = parts["adapter"]
+    if not has_tokens(adapter, "const int32_t * ids_device,") or \
+            not has_tokens(parts["declared"], "const int32_t * ids_device,"):
+        failures.append("ids-read-only: the adapter takes the ids as writable")
+    if "mmvq_upload_packed_ids_after" in parts["mmvq_cpp"]:
+        failures.append("ids-read-only: the adapter still uploads the snapshot over the ids")
+    # Apart from its parameter, the host snapshot is read by the null check and the range check, both before anything
+    # is submitted; no copy, kernel or host task reads it after the adapter returns, so the caller's batch may own it.
+    host_reads = adapter.replace("const int32_t * ids_host,", " ", 1).replace("!ids_host", " ", 1)
+    if not adapter or "ids_host" in host_reads.replace("ids_host[i]", " "):
+        failures.append("snapshot-sync: something other than the checks before submit reads the host snapshot")
+    if not has_tokens(adapter, "ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || "
+                               "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))"):
+        failures.append("ids-view: the adapter does not take a view's token stride")
+    if not has_tokens(adapter, "mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, "
+                               "quant_blocks, dependency)"):
+        failures.append("quantize-dependency: quantization does not wait on the caller's dependency")
+    return failures
+
+
+def direct_prompt_source_parts() -> dict[str, str]:
+    return direct_prompt_parts(SOURCE.read_text(), WORKSPACE_SOURCE.read_text(), MMVQ_SOURCE.read_text(),
+                               MMVQ_HEADER.read_text())
+
+
+def test_direct_route_takes_prompt_rows_and_reads_ids_in_place() -> None:
+    failures = direct_prompt_violations(direct_prompt_source_parts())
+    assert failures == [], failures
+
+
+def test_direct_prompt_mutants_each_fail_their_claim() -> None:
+    parts = direct_prompt_source_parts()
+    assert direct_prompt_violations(parts) == []
+    prompt_down_build = f"down_layout, false, &ctx, ctx.stream(), {PROMPT_CAPABILITY_ARG}"
+    mutants = [
+        ("decode-only-gate", "direct", "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&",
+         "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1 &&", "prompt-gate"),
+        ("decode-batch-for-prompt", "direct",
+         "ne12 == 1 ? retained_decode_batch_result : retained_prompt_batch_result;",
+         "ne12 == 1 ? retained_decode_batch_result : retained_decode_batch_result;", "batch-source"),
+        ("second-capability-source", "mmid", "const auto & direct_batch = direct_admission.batch;",
+         "const auto & direct_batch = direct_admission.batch; (void) ggml_sycl::unified_cache_moe_mmid_exact_queue("
+         "{}, nullptr, ctx.device, ctx.device, ctx.stream());", "one-capability"),
+        ("role-build-without-capability", "mmid", prompt_down_build, "down_layout, false, &ctx, ctx.stream())",
+         "prompt-capability"),
+        ("decode-only-candidate", "query", "const bool static_candidate = layout == GGML_LAYOUT_AOS",
+         "const bool static_candidate = phase == moe_route_phase::DECODE && rows == 1 && layout == GGML_LAYOUT_AOS",
+         "phase-blind"),
+        ("capacity-one-token", "direct", "static_cast<size_t>(ne12) }, false, &needed)", "1 }, false, &needed)",
+         "capacity-plan"),
+        ("capacity-any-slot", "direct", "workspace.owner_device == ctx.device &&", "", "capacity-plan"),
+        ("capacity-field-dropped", "holds", "available.host_slot_bytes >= needed.host_slot_bytes", "true",
+         "capacity-fields"),
+        ("admission-own-comparison", "admit", "moe_mmid_workspace_geometry_holds(available, needed)",
+         "available.activation_rows >= needed.activation_rows", "one-comparison"),
+        ("capacity-not-refused", "direct", DIRECT_CAPACITY_THROW, "(void) 0;", "capacity-refusal"),
+        ("capacity-refused-after-mark", "direct", DIRECT_CAPACITY_THROW, "(void) 0;", "capacity-refusal"),
+        ("decode-label-on-prompt", "append",
+         'phase == moe_route_phase::PROMPT ? "MOE-PROMPT-REFUSAL" : "MOE-DECODE-REFUSAL"', '"MOE-DECODE-REFUSAL"',
+         "phase-label"),
+        ("ids-unchecked-residency", "direct", "ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);",
+         "static_cast<const int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));", "ids-resident"),
+        ("ids-any-element-stride", "direct", "ids->nb[0] == sizeof(int32_t) &&", "", "ids-admission"),
+        ("ids-packed-strides", "direct", "ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)",
+         "sizeof(int32_t), ids->ne[0] * sizeof(int32_t), buffers, &dependency, &kernel)", "ids-strides"),
+        ("ids-writable", "declared", "const int32_t * ids_device,", "int32_t * ids_device,", "ids-read-only"),
+        ("snapshot-uploaded", "adapter", "sycl::event quant_event =",
+         "(void) ggml_sycl::mem_copy_ptr_async(nullptr, ids_host, 0, q); sycl::event quant_event =",
+         "snapshot-sync"),
+        ("packed-ids-only", "adapter", "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))",
+         "ids_nb1 != static_cast<int64_t>(sk * sizeof(int32_t))", "ids-view"),
+        ("quantize-unordered", "adapter", "ncols, quant_blocks, dependency)", "ncols, quant_blocks, nullptr)",
+         "quantize-dependency"),
+    ]
+    for name, part, old, new, claim in mutants:
+        mutated = dict(parts)
+        if name == "capacity-refused-after-mark":
+            # The throw moves behind the mark: still present, now after admission began.
+            text = parts[part].replace(DIRECT_CAPACITY_THROW, new, 1)
+            mark = DIRECT_PRE_ADMISSION + ";"
+            mutated[part] = text.replace(mark, mark + " " + DIRECT_CAPACITY_THROW, 1)
+        else:
+            mutated[part] = parts[part].replace(old, new, 1)
+        assert mutated[part] != parts[part], f"mutant changed nothing: {name}"
+        failures = direct_prompt_violations(mutated)
         assert any(f.startswith(claim + ":") for f in failures), f"mutant {name} did not fail {claim}: {failures}"
 
 
@@ -818,8 +1087,10 @@ def test_contract_and_mutation_witnesses() -> None:
         # asserted to have changed its source, below.
         ("slot-zero", re.sub(r"operand\.slot_index\s*=\s*i % slots_per_token;", "operand.slot_index = 0;", header),
          source, host_test, mem_source),
-        ("recipe-allows-prompt", header,
-         source.replace("phase == moe_route_phase::DECODE && rows == 1", "rows >= 1", 1), host_test, mem_source),
+        ("recipe-requires-decode", header,
+         re.sub(r"static_candidate =\s*layout == GGML_LAYOUT_AOS",
+                "static_candidate = phase == moe_route_phase::DECODE && layout == GGML_LAYOUT_AOS", source, count=1),
+         host_test, mem_source),
         ("recipe-allows-secondary", header,
          source.replace("route_device == submit_device && direct_recipe_candidate",
                         "route_device >= 0 && direct_recipe_candidate", 1), host_test, mem_source),
@@ -839,7 +1110,7 @@ def test_contract_and_mutation_witnesses() -> None:
          re.sub(r"canonical_entry->recipe_queue_capability\s*=\s*route\.recipe_queue_capability;", "", header),
          source, host_test, mem_source),
         ("requery-retained-recipe-authority", header,
-         source.replace("(void) phase;", "(void) ggml_sycl_moe_query_route_capability(\n"
+         source.replace("(void) rows;", "(void) ggml_sycl_moe_query_route_capability(\n"
                         "src0->type, operand.actual_layout, phase, src0->ne[0], src0->ne[1], rows,\n"
                         "operand.owning_device, moe_layer_route_residency::DEVICE, ctx.device);", 1),
          host_test, mem_source),
