@@ -44,6 +44,10 @@
 #     llama-cli, and runs nothing; --help names the arms;
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
 #     creates GPU.lock; the lock helper takes, refuses a second take, and releases;
+#   - GPU.lock through scripts/sycl-lock.sh (every case under $WORK): a lock directory that exists refuses the run
+#     even when the mkdir command reports success, a held lock refuses and quotes its holder, a holder replaced during
+#     the run stops it (STOPPED) and is left to its new owner, a TERM during the take's verify window releases the
+#     lock, a bad LLAMA_GPU_LOCK_VERIFY_SECONDS is a usage refusal, and a copy of the gate without the library stops;
 #   - --make-prompt is deterministic and the committed prompt exists;
 #   - oneAPI's setvars.sh overwrites shell variables (the advisor and vtune vars.sh assign BIN_DIR=bin64), which made
 #     the first real run refuse with "no bin64/llama-bench": no bare BIN_DIR=, setvars sourced before the first use of
@@ -75,6 +79,8 @@ for tool in awk md5sum cmp comm journalctl git pgrep timeout; do
 done
 # The gate refuses a real run when a GGML_SYCL_* or LLAMA_ARG_* variable is exported; this test must not inherit one.
 for v in $(compgen -e | grep -E '^(GGML_SYCL_|LLAMA_ARG_)'); do unset "$v"; done
+# Every lock case names a directory under $WORK; a zero verify window keeps each take from waiting a second.
+export LLAMA_GPU_LOCK_VERIFY_SECONDS=0
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/moe-exec-gate-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -153,6 +159,7 @@ expect "controls print ok" "$out" "controls: ok"
 # Each window-ring control must fail when its regex stops discriminating: mutate one regex in a copy of the gate.
 mutate_control() { # <name> <sed expression> [what the mutation breaks]
     mkdir -p "$WORK/mut/scripts"
+    cp -a "$ROOT_DIR/scripts/sycl-lock.sh" "$WORK/mut/scripts/" # the gate stops without the library next to it
     sed -E "$2" "$GATE" > "$WORK/mut/scripts/gate.sh"
     cmp -s "$GATE" "$WORK/mut/scripts/gate.sh" && { fail "control mutation $1 changed nothing"; return; }
     out="$(bash "$WORK/mut/scripts/gate.sh" --check-controls 2>&1)"; rc=$?
@@ -1152,7 +1159,7 @@ expect "--src-dir names the tree the head check reads" "$out" "resets=PASS"
 out="$(rf "$WORK/srcrepo/build" --no-head-check --out-dir "$WORK/rf-nohead" 0000000)"; rc=$?
 expect_rc "--no-head-check is the explicit escape: the wrong head passes" "$rc" 0
 mkdir -p "$WORK/snap/scripts"
-cp -a "$ROOT_DIR/scripts/sycl-moe-exec-gate.sh" "$ROOT_DIR/scripts/sycl-moe-exec-prompts" \
+cp -a "$ROOT_DIR/scripts/sycl-moe-exec-gate.sh" "$ROOT_DIR/scripts/sycl-lock.sh" "$ROOT_DIR/scripts/sycl-moe-exec-prompts" \
     "$ROOT_DIR/scripts/qwen4exp-mtp-prompts" "$WORK/snap/scripts/"
 SNAP="$WORK/snap/scripts/sycl-moe-exec-gate.sh"
 out="$(GATE_UNDER="$SNAP" rf "$WORK/srcrepo/build" --out-dir "$WORK/rf-snap" "$SRC_SHA")"; rc=$?
@@ -1165,6 +1172,65 @@ expect "snapshot prompts resolve next to the script (decode)" "$out" \
     "-f $WORK/snap/scripts/qwen4exp-mtp-prompts/code.txt"
 out="$(bash "$SNAP" --dry-run --build-dir "$WORK/srcrepo/build" 2>&1)"
 expect "the dry-run names the source tree the build's head is read from" "$out" "src-dir: $WORK/srcrepo "
+
+# ---- GPU.lock through scripts/sycl-lock.sh
+# lk <lock dir> <out dir>: a real run of the journal arm that takes the lock (no device, no model)
+lk() { PATH="${LK_PATH:-$WORK/stubbin}:$PATH" bash "$GATE" --lock-dir "$1" --arm resets \
+    --build-dir "$WORK/srcrepo/build" --out-dir "$2" "$SRC_SHA" 2>&1; }
+# a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+mkdir -p "$WORK/shim"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
+    > "$WORK/shim/mkdir"
+chmod +x "$WORK/shim/mkdir"
+mkstub 'exit 0'
+/usr/bin/mkdir "$WORK/pre.lock"
+out="$(LK_PATH="$WORK/shim:$WORK/stubbin" lk "$WORK/pre.lock" "$WORK/lk-pre")"; rc=$?
+expect_rc "a lock directory that exists refuses the run, whatever the mkdir command reports" "$rc" 2
+expect "the refusal names the lock" "$out" "REFUSED: could not take $WORK/pre.lock"
+expect_not "no arm ran without the lock" "$out" "resets="
+if [ -d "$WORK/pre.lock" ]; then pass "a refused take removes nothing"; else fail "a refused take removed the lock"; fi
+echo "someone else" > "$WORK/pre.lock/holder"
+out="$(lk "$WORK/pre.lock" "$WORK/lk-held")"; rc=$?
+expect_rc "a held lock refuses" "$rc" 2
+expect "the refusal quotes the holder" "$out" "held: someone else"
+if [ "$(cat "$WORK/pre.lock/holder")" = "someone else" ]; then
+    pass "a refusal leaves a foreign holder alone"
+else
+    fail "a refusal changed a foreign holder"
+fi
+# a co-taker that replaces the holder during the run: the journal stub plays it
+# (it writes only once the gate has created the lock, in case the gate reads the journal before the take)
+mkstub "[ -d \"$WORK/lost.lock\" ] && echo intruder > \"$WORK/lost.lock/holder\"; exit 0"
+out="$(lk "$WORK/lost.lock" "$WORK/lk-lost")"; rc=$?
+mkstub 'exit 0'
+expect_rc "a lock lost during the run stops the gate" "$rc" 2
+expect "the stop says the holder changed" "$out" "STOPPED: GPU.lock holder is no longer ours (now: intruder)"
+if [ "$(cat "$WORK/lost.lock/holder" 2>/dev/null)" = intruder ]; then
+    pass "a lost lock is left to its new holder"
+else
+    fail "the gate removed a lock it no longer held"
+fi
+# a TERM while the take is still verifying must release the lock the take wins
+LLAMA_GPU_LOCK_VERIFY_SECONDS=3 bash "$GATE" --signal-selftest --lock-dir "$WORK/tk.lock" > "$WORK/tk.out" 2>&1 &
+tpid=$!
+for _ in $(seq 50); do [ -f "$WORK/tk.lock/holder" ] && break; sleep 0.1; done
+kill -TERM "$tpid" 2>/dev/null
+wait "$tpid"; rc=$?
+out="$(cat "$WORK/tk.out")"
+expect_rc "a TERM during the take ends the gate with rc 143" "$rc" 143
+expect_not "the TERM landed before the selftest child started" "$out" "signal-selftest: child="
+if [ -e "$WORK/tk.lock" ]; then fail "a TERM during the take left GPU.lock behind"; else pass "a TERM during the take releases GPU.lock"; fi
+for bad in 08 x -1; do
+    out="$(LLAMA_GPU_LOCK_VERIFY_SECONDS="$bad" bash "$GATE" --lock-dir "$WORK/bad.lock" --lock-selftest 2>&1)"; rc=$?
+    expect_rc "LLAMA_GPU_LOCK_VERIFY_SECONDS=$bad is a usage refusal" "$rc" 2
+    expect "the refusal names the variable ($bad)" "$out" "LLAMA_GPU_LOCK_VERIFY_SECONDS"
+done
+if [ -e "$WORK/bad.lock" ]; then fail "a usage refusal created the lock"; else pass "a usage refusal never creates the lock"; fi
+mkdir -p "$WORK/nolib/scripts"
+cp -a "$GATE" "$WORK/nolib/scripts/"
+out="$(bash "$WORK/nolib/scripts/sycl-moe-exec-gate.sh" --check-controls 2>&1)"; rc=$?
+expect_rc "a copy of the gate without the lock library stops" "$rc" 2
+expect "and says what it could not load" "$out" "cannot load"
 
 # in the real flow journalctl's rc survives into the verdict, and the verdict line carries the builders fields
 mkstub 'exit 7'
