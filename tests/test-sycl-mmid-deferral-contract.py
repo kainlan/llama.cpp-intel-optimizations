@@ -15,7 +15,11 @@ reaching them needs a GPU and a loaded MoE model:
      prepared replacement displaces into a holder declared before the plan
      lock, so the pools' last owners are released after that lock (canonical
      12.5: no final release under a listed lock). The registry side is pinned
-     by the host test's registry lock probe; this pins the caller.
+     by the host test's registry lock probe; this pins the caller;
+  5. one predicate answers "same MMID workspace plan": the context bind's
+     reconcile, the expert loan's assert and the plan CAS all call
+     moe_mmid_same_workspace_plan (unified-cache.cpp), so no site can drift
+     back to a subset of its fields.
 
 EVERY assertion here is checked against a POISONED copy of the source under
 --self-test, and the gate fails if a poisoned variant still passes. A source
@@ -134,12 +138,37 @@ def check_cas_releases_after_plan_lock(cache):
     return True, "plan CAS releases the displaced MMID context after the plan lock"
 
 
+SAME_PLAN = "moe_mmid_same_workspace_plan("
+SAME_PLAN_SYCL_SITES = [
+    ("bind", "ggml_sycl::" + SAME_PLAN + "*published->plan, *live->plan)"),
+    ("loan-assert", "GGML_ASSERT(ggml_sycl::" + SAME_PLAN + "*current->plan, *next_plan))"),
+]
+SAME_PLAN_CAS_SITE = SAME_PLAN + "*expected->plan, *replacement->plan)"
+
+
+def check_same_plan_sycl(text):
+    code = strip_comments(text)
+    missing = [name for name, call in SAME_PLAN_SYCL_SITES if call not in code]
+    if missing:
+        return False, "no longer asks %s at: %s" % (SAME_PLAN.rstrip("("), ", ".join(missing))
+    return True, "bind and loan assert ask the shared same-plan predicate"
+
+
+def check_same_plan_cas(cache):
+    fn = strip_comments(body(cache, CAS_FN))
+    if SAME_PLAN_CAS_SITE not in fn:
+        return False, "plan CAS no longer asks %s for its in-place rebind" % SAME_PLAN.rstrip("(")
+    return True, "plan CAS asks the shared same-plan predicate"
+
+
 # (name, source the check reads, check)
 CHECKS = [
     ("shared-predicate", "sycl", check_shared_predicate),
     ("load-end-defers", "sycl", check_load_end_defers),
     ("tripwire-present", "sycl", check_tripwire_present),
     ("cas-release-order", "cache", check_cas_releases_after_plan_lock),
+    ("same-plan:sycl", "sycl", check_same_plan_sycl),
+    ("same-plan:cas", "cache", check_same_plan_cas),
 ]
 
 def poison_load_end(text):
@@ -180,6 +209,10 @@ POISONS = {
     "tripwire-present":
         lambda t: t.replace(TRIPWIRE_SITE, '"context-bind-REMOVED"'),
     "cas-release-order": poison_cas_holder_under_lock,
+    # The regression: a site going back to a local predicate of its own.
+    "same-plan:sycl": lambda t: t.replace(SAME_PLAN_SYCL_SITES[0][1],
+                                          "ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan)", 1),
+    "same-plan:cas": lambda t: t.replace(SAME_PLAN_CAS_SITE, "same_workspace_locally(*expected->plan, *replacement->plan)", 1),
 }
 
 # A second control for the CAS: the holder kept but not handed to replace_plan.

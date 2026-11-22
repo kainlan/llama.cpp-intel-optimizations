@@ -342,6 +342,23 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
     }
 }
 
+bool moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept {
+    if (a.moe_mmid_workspace_valid != b.moe_mmid_workspace_valid ||
+        a.moe_mmid_workspaces.size() != b.moe_mmid_workspaces.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.moe_mmid_workspaces.size(); ++i) {
+        const auto & x = a.moe_mmid_workspaces[i];
+        const auto & y = b.moe_mmid_workspaces[i];
+        if (x.owner_device != y.owner_device || x.depth != y.depth || x.valid != y.valid ||
+            x.secondary_owner != y.secondary_owner || x.device_pool_bytes != y.device_pool_bytes ||
+            x.host_pool_bytes != y.host_pool_bytes || !moe_mmid_same_workspace_geometry(x.slot, y.slot)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                       const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
     if (!expected || !replacement || expected.get() == replacement.get() || expected->model_id == 0 ||
@@ -364,19 +381,8 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         if (current == model->second.end() || current->second.get() != expected.get()) {
             return false;
         }
-        const auto stable_workspace = [&] {
-            if (!expected->plan || !replacement->plan) return false;
-            const auto & a = expected->plan->moe_mmid_workspaces;
-            const auto & b = replacement->plan->moe_mmid_workspaces;
-            if (a.size() != b.size()) return false;
-            for (size_t i = 0; i < a.size(); ++i) {
-                if (a[i].owner_device != b[i].owner_device || a[i].depth != b[i].depth ||
-                    a[i].valid != b[i].valid || a[i].secondary_owner != b[i].secondary_owner ||
-                    a[i].device_pool_bytes != b[i].device_pool_bytes || a[i].host_pool_bytes != b[i].host_pool_bytes ||
-                    !moe_mmid_same_workspace_geometry(a[i].slot, b[i].slot)) return false;
-            }
-            return true;
-        }();
+        const bool stable_workspace =
+            expected->plan && replacement->plan && moe_mmid_same_workspace_plan(*expected->plan, *replacement->plan);
         if (!unified_cache_moe_mmid_registry().replace_plan(expected, replacement, replacement->version,
                                                             stable_workspace, &displaced_mmid)) {
             return false;

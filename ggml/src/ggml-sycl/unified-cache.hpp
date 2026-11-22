@@ -2008,6 +2008,11 @@ void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) n
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
+// Whether two plans plan the same MMID workspaces: the one answer to "can the pools materialized for `a` serve `b`".
+// It compares the plan-level validity, and per owner the device, depth, validity, secondary role, pool bytes and
+// the whole slot geometry (moe_mmid_same_workspace_geometry). The runtime transaction's stable_mmid, the plan CAS's
+// in-place rebind, the context bind's reconcile and the expert loan's assert all ask it.
+bool   moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
 #endif

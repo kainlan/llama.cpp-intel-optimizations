@@ -13912,32 +13912,6 @@ class ggml_sycl_load_candidate_end_scope {
     bool                             enabled_;
 };
 
-static bool ggml_sycl_same_mmid_workspace_plan(const ggml_sycl::placement_plan & a,
-                                               const ggml_sycl::placement_plan & b) {
-    if (a.moe_mmid_workspace_valid != b.moe_mmid_workspace_valid ||
-        a.moe_mmid_workspaces.size() != b.moe_mmid_workspaces.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.moe_mmid_workspaces.size(); ++i) {
-        const auto & x = a.moe_mmid_workspaces[i];
-        const auto & y = b.moe_mmid_workspaces[i];
-        const auto & gx = x.slot;
-        const auto & gy = y.slot;
-        if (x.owner_device != y.owner_device || x.depth != y.depth || x.valid != y.valid ||
-            x.device_pool_bytes != y.device_pool_bytes || x.host_pool_bytes != y.host_pool_bytes ||
-            gx.valid != gy.valid || gx.activation_rows != gy.activation_rows || gx.occurrences != gy.occurrences ||
-            gx.activation_f32_offset != gy.activation_f32_offset || gx.activation_f32_bytes != gy.activation_f32_bytes ||
-            gx.activation_q8_offset != gy.activation_q8_offset || gx.activation_q8_bytes != gy.activation_q8_bytes ||
-            gx.output_f32_offset != gy.output_f32_offset || gx.output_f32_bytes != gy.output_f32_bytes ||
-            gx.output_q8_offset != gy.output_q8_offset || gx.output_q8_bytes != gy.output_q8_bytes ||
-            gx.device_slot_bytes != gy.device_slot_bytes || gx.descriptor_host_bytes != gy.descriptor_host_bytes ||
-            gx.secondary_bounce_bytes != gy.secondary_bounce_bytes || gx.host_slot_bytes != gy.host_slot_bytes) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static uint64_t ggml_sycl_next_mmid_queue_cookie() {
     static std::atomic<uint64_t> last_issued{ 0 };
     return ggml_sycl::moe_mmid_mint_monotonic_cookie(last_issued);
@@ -20895,7 +20869,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // so they are counted twice, which is conservative), and when no context holds them yet (a load_end deferral the
     // context bind materializes after this transaction returns). Only in a build where the route is reachable, and
     // zero for a model without a Q1_0/NVFP4 expert, which plans no workspace.
-    if (mmid_route_reachable && (!ggml_sycl_same_mmid_workspace_plan(*current->plan, next_plan) ||
+    if (mmid_route_reachable && (!ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, next_plan) ||
                                  !ggml_sycl_mmid_workspaces_follow(current_token, current))) {
         for (const auto & workspace : next_plan.moe_mmid_workspaces) {
             if (workspace.owner_device == ctx->device) {
@@ -21033,7 +21007,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
     next->kv_info       = next_kv_info;
     next->model_n_layer = current->model_n_layer;
-    const bool stable_mmid = ggml_sycl_same_mmid_workspace_plan(*current->plan, *next->plan);
+    const bool stable_mmid = ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next->plan);
     next->version = stable_mmid ? current->version : ggml_sycl::lifecycle_next_plan_publication_id();
     if (next->version == 0) {
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
@@ -21917,8 +21891,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     }
 
     // update_expert_placement() touches no MMID workspace, so the publication keeps the current version, as the
-    // runtime context transaction does when ggml_sycl_same_mmid_workspace_plan() holds.
-    GGML_ASSERT(ggml_sycl_same_mmid_workspace_plan(*current->plan, *next_plan));
+    // runtime context transaction does when ggml_sycl::moe_mmid_same_workspace_plan() holds.
+    GGML_ASSERT(ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next_plan));
     next->plan    = std::move(next_plan);
     next->version = current->version;
 
@@ -25325,7 +25299,7 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
             live              = select_live();
             const bool stable = live && live->plan && published->plan &&
-                                ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan);
+                                ggml_sycl::moe_mmid_same_workspace_plan(*published->plan, *live->plan);
             outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(
                 published, live, live ? live->version : 0, stable,
                 [&](const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {

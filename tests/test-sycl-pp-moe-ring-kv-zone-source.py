@@ -201,7 +201,7 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
         found.append("the MMID pools are materialized for a route that cannot run them")
     # The pools are pending when this transaction materializes them (a changed workspace plan) and when no context
     # holds them yet (a load_end deferral the context bind materializes after this transaction).
-    pending = re.search(r"if\s*\(\s*mmid_route_reachable\s*&&\s*\(\s*!ggml_sycl_same_mmid_workspace_plan\(\s*\*current->plan"
+    pending = re.search(r"if\s*\(\s*mmid_route_reachable\s*&&\s*\(\s*!ggml_sycl::moe_mmid_same_workspace_plan\(\s*\*current->plan"
                         r"\s*,\s*next_plan\s*\)\s*\|\|\s*!ggml_sycl_mmid_workspaces_follow\(\s*current_token\s*,\s*current"
                         r"\s*\)\s*\)\s*\)\s*\{[^{}]*\{\s*if\s*\(\s*workspace\.owner_device\s*==\s*ctx->device"
                         r"\s*\)\s*\{\s*ring_kv_zone\.runtime_pending_bytes\s*\+=\s*workspace\.device_pool_bytes\s*;", txn)
