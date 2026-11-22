@@ -417,6 +417,22 @@
       "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:all#0",
       "count": 1,
       "reason": "The first unguarded catch-all of ggml_backend_sycl_synchronize, which by source order is the one on the drain's try. That try's body is one wait_and_throw on the deferred decode event or on stream 0, which raises no planned refusal. The handler keeps the wait's error in drain_error, and the code after the try records it in the failure latch, so the boundary reports a failed graph and cleans up. A rethrow would skip the CPU-job gate clear that follows the try. Keyed to the handler and not to the function, because the function's other three unguarded handlers (the diagnostic memory read and the outer boundary pair) stay shrink-only debt. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-MMID-BIND-RETIRE-CATCH",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_bind_materialize_live_mmid_workspaces",
+      "count": 1,
+      "reason": "The context bind's MMID deferral resolution runs after the bind's runtime transaction has published and returned OK, so its result is not the bind's. Its try body selects the live plan snapshot under the inventory mutex, materializes the planned MMID pools through the unified cache, asks the MMID registry whether a context follows a snapshot, and reconciles the published context with the live snapshot; none of that is an op execution path, and ggml_sycl_fallback_error is raised only by op execution (compute forward, get_rows, out_prod) when a kernel cannot run, so no planned refusal can reach the handler. The handler retires a context this attempt PUBLISHED and reports the deferral as refused, which leaves it pending; a rethrow ahead of it would skip that retirement and leave a context for a snapshot nothing made it follow. Permanent."
+    },
+    {
+      "id": "E-MMID-RECONCILE-FOLLOWS-CATCH",
+      "code": "G-CATCH",
+      "file": "moe-mmid-workspace.cpp",
+      "function": "lambda in moe_mmid_reconcile_live_plan",
+      "count": 1,
+      "reason": "moe_mmid_reconcile_live_plan is noexcept and the lambda's try wraps only the caller's follows callable, which the backend answers with a read-only exact-queue lookup in the MMID registry for each workspace owner: no allocation, no op execution, so no ggml_sycl_fallback_error. The handler answers 'does not follow', which the reconcile reports as a refusal that retires the bind's own publication. A rethrow would std::terminate through the noexcept boundary, and the registry translation unit is host-linkable without the backend's common header that defines the fallback error. Permanent."
     }
   ]
 }

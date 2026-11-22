@@ -6287,6 +6287,25 @@ static void host_zone_alloc_trace_print(const char * where, host_zone_id zone, v
             largest_free_after);
 }
 
+// A no-growth request refused in a configured host zone. WARN, not INFO, so it reaches a default-verbosity log: the
+// refusal surfaces to its caller only as a miss name, and the zone's configured reservation, its capacity and its use
+// at the refusal are what say whether the planner under-sized the zone or something else filled it.
+static void host_zone_no_growth_refusal_warn(host_zone_alloc_miss  miss,
+                                             host_zone_id          zone,
+                                             const alloc_request & req,
+                                             size_t                size,
+                                             size_t                reserved,
+                                             size_t                capacity,
+                                             size_t                used,
+                                             size_t                largest_free) {
+    GGML_LOG_WARN(
+        "[SYCL] host zone refused a no-growth request: miss=%s zone=%s dev=%d request=%zu reserved=%zu capacity=%zu "
+        "bound=%zu used=%zu largest_free=%zu role=%d category=%d\n",
+        host_zone_alloc_miss_name(miss), host_zone_name(zone), req.device, size, reserved, capacity,
+        host_zone_no_growth_bound(zone, reserved, capacity), used, largest_free, static_cast<int>(req.intent.role),
+        static_cast<int>(req.intent.category));
+}
+
 static bool copy_to_device_sync_enabled() {
     static std::atomic<int> cached{ -1 };
     int                     enabled = cached.load(std::memory_order_acquire);
@@ -19737,12 +19756,23 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     // fall through to host_pool_alloc below.
                     return nullptr;
                 }
+                const auto refuse_no_growth = [&](host_zone_alloc_miss miss) -> void * {
+                    host_miss = miss;
+                    // Only WEIGHT: its no-growth requests are persistent owners the planner sized the zone for, so a
+                    // refusal there is a planning fault. A STAGING miss is back-pressure its caller retries.
+                    if (zone == host_zone_id::WEIGHT) {
+                        host_zone_no_growth_refusal_warn(miss, zone, req, alloc_size,
+                                                         ucache->host_zone_reserved_capacity(zone),
+                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
+                                                         ucache->host_zone_largest_free_block(zone));
+                    }
+                    return nullptr;
+                };
                 if (req.intent.constraints.forbid_host_zone_growth) {
                     const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),
-                                                                                   ucache->host_zone_capacity(zone));
+                                                                   ucache->host_zone_capacity(zone));
                     if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {
-                        host_miss = host_zone_alloc_miss::OVER_NO_GROWTH_BOUND;
-                        return nullptr;
+                        return refuse_no_growth(host_zone_alloc_miss::OVER_NO_GROWTH_BOUND);
                     }
                 }
                 const size_t alignment = req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT;
@@ -19751,8 +19781,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     return p;
                 }
                 if (req.intent.constraints.forbid_host_zone_growth) {
-                    host_miss = host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK;
-                    return nullptr;
+                    return refuse_no_growth(host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK);
                 }
                 // Fragmentation path: the zone has enough aggregate free bytes
                 // somewhere (possibly across multiple chunks) but no single
@@ -20718,9 +20747,9 @@ moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
     const std::shared_ptr<const lifecycle_plan_snapshot> & live,
     uint64_t                                               live_identity,
     bool                                                   stable_geometry,
-    bool                                                   live_followed) noexcept {
+    const moe_mmid_follows_fn &                            follows) noexcept {
     return moe_mmid_reconcile_live_plan(unified_cache_moe_mmid_registry(), published, live, live_identity,
-                                        stable_geometry, live_followed);
+                                        stable_geometry, follows);
 }
 
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept {

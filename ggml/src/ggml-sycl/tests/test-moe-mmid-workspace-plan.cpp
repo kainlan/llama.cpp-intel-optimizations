@@ -1403,6 +1403,7 @@ static void materialize_refusal_names() {
         R::SAME_IDENTITY_OTHER_PLAN,
         R::PLAN_CHANGED_GEOMETRY_UNSTABLE,
         R::PLAN_CHANGED_REBIND_REFUSED,
+        R::PLAN_CHANGED_REBIND_NOT_FOLLOWED,
         R::DEVICE_POOL_ALLOCATION_FAILED,
         R::HOST_POOL_ALLOCATION_FAILED,
         R::HOST_POOL_ZONES_NOT_CONFIGURED,
@@ -1684,8 +1685,12 @@ static void registry_bind_reconcile_follows_live() {
     const auto reconcile = [&](moe_mmid_workspace_registry &                          registry,
                                const std::shared_ptr<const lifecycle_plan_snapshot> & published,
                                const std::shared_ptr<const lifecycle_plan_snapshot> & live, bool stable) {
-        const bool followed = live.get() != published.get() && follows(registry, live);
-        return moe_mmid_reconcile_live_plan(registry, published, live, identity, stable, followed);
+        return moe_mmid_reconcile_live_plan(
+            registry, published, live, identity, stable,
+            [&](const std::shared_ptr<const lifecycle_plan_snapshot> & plan) { return follows(registry, plan); });
+    };
+    const moe_mmid_follows_fn never = [](const std::shared_ptr<const lifecycle_plan_snapshot> &) {
+        return false;
     };
     // The live snapshot is the published one.
     {
@@ -1765,8 +1770,7 @@ static void registry_bind_reconcile_follows_live() {
         check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "first bind failed");
         const S status = registry.materialize(token, identity, s, 0, { owner }, allocator);
         check(status == S::ALREADY_PUBLISHED, "the second bind was not ALREADY_PUBLISHED");
-        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, identity, /*stable_geometry=*/false,
-                                                       /*live_followed=*/false);
+        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, identity, /*stable_geometry=*/false, never);
         check(outcome == O::GEOMETRY_UNSTABLE, "the forced not-stable reconcile did not refuse");
         check(!moe_mmid_reconcile_retires(outcome, status), "a second bind retires an earlier bind's context");
         check(registry.published_contexts() == 1 && follows(registry, s), "the earlier context did not stay");
@@ -1775,10 +1779,38 @@ static void registry_bind_reconcile_follows_live() {
     {
         moe_mmid_workspace_registry registry;
         const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
-        check(moe_mmid_reconcile_live_plan(registry, s, nullptr, identity, true, false) == O::REBIND_REFUSED &&
+        check(moe_mmid_reconcile_live_plan(registry, s, nullptr, identity, true, never) == O::REBIND_REFUSED &&
                   moe_mmid_reconcile_refusal(O::REBIND_REFUSED) ==
                       moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED,
               "a missing live snapshot did not refuse with plan-changed-rebind-refused");
+    }
+    // The published context is gone (retired between the publish and the reconcile) and no context last held S:
+    // replace_plan(S, P) accepts as a swap with nothing to rebind, and nothing follows P. The reconcile must not
+    // call that REBOUND.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s      = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p      = std::make_shared<const lifecycle_plan_snapshot>();
+        const S                     status = registry.materialize(token, identity, s, 0, { owner }, allocator);
+        check(status == S::PUBLISHED, "publish S failed");
+        check(registry.retire(token, identity) && registry.published_contexts() == 0, "the retire found nothing");
+        const O outcome = reconcile(registry, s, p, true);
+        check(outcome == O::REBIND_NOT_FOLLOWED &&
+                  moe_mmid_reconcile_refusal(outcome) == moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_NOT_FOLLOWED,
+              "an accepted rebind nothing follows reconciled as REBOUND");
+        check(moe_mmid_reconcile_retires(outcome, status), "a rebind nothing follows does not retire the publication");
+        check(!follows(registry, p), "the live snapshot is reachable with no context");
+    }
+    // A follows answer that throws answers no.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s      = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p      = std::make_shared<const lifecycle_plan_snapshot>();
+        const moe_mmid_follows_fn   throws = [](const std::shared_ptr<const lifecycle_plan_snapshot> &) -> bool {
+            throw std::runtime_error("follows");
+        };
+        check(moe_mmid_reconcile_live_plan(registry, s, p, identity, true, throws) == O::REBIND_NOT_FOLLOWED,
+              "a throwing follows answer was not taken for no");
     }
 }
 

@@ -89,6 +89,8 @@ const char * moe_mmid_materialize_refusal_name(moe_mmid_materialize_refusal refu
             return "plan-changed-geometry-unstable";
         case R::PLAN_CHANGED_REBIND_REFUSED:
             return "plan-changed-rebind-refused";
+        case R::PLAN_CHANGED_REBIND_NOT_FOLLOWED:
+            return "plan-changed-rebind-not-followed";
         case R::DEVICE_POOL_ALLOCATION_FAILED:
             return "device-pool-allocation-failed";
         case R::HOST_POOL_ALLOCATION_FAILED:
@@ -1793,16 +1795,23 @@ moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
     const std::shared_ptr<const lifecycle_plan_snapshot> & live,
     uint64_t                                               live_identity,
     bool                                                   stable_geometry,
-    bool                                                   live_followed) noexcept {
+    const moe_mmid_follows_fn &                            follows) noexcept {
     if (!published || !live) {
         return moe_mmid_reconcile_outcome::REBIND_REFUSED;
     }
     if (live.get() == published.get()) {
         return moe_mmid_reconcile_outcome::CURRENT;
     }
+    const auto live_followed = [&]() noexcept {
+        try {
+            return follows && follows(live);
+        } catch (...) {
+            return false;
+        }
+    };
     // Checked before replace_plan: after one replace published -> live, the replace's own CAS rebound the context and
     // left previous_plan == published, and replace_plan(published, live) then refuses although nothing is wrong.
-    if (live_followed) {
+    if (live_followed()) {
         return moe_mmid_reconcile_outcome::FOLLOWS_LIVE;
     }
     // Not reachable today: an expert loan or refill, the only replacement that can run while the bind is outside the
@@ -1812,9 +1821,12 @@ moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
     if (!stable_geometry) {
         return moe_mmid_reconcile_outcome::GEOMETRY_UNSTABLE;
     }
-    return registry.replace_plan(published, live, live_identity, /*stable_geometry=*/true) ?
-               moe_mmid_reconcile_outcome::REBOUND :
-               moe_mmid_reconcile_outcome::REBIND_REFUSED;
+    if (!registry.replace_plan(published, live, live_identity, /*stable_geometry=*/true)) {
+        return moe_mmid_reconcile_outcome::REBIND_REFUSED;
+    }
+    // replace_plan also accepts when it found no context to rebind (the published one gone, none that last held
+    // `published`): a swap nothing follows. Only the question decode admission asks says the rebind took.
+    return live_followed() ? moe_mmid_reconcile_outcome::REBOUND : moe_mmid_reconcile_outcome::REBIND_NOT_FOLLOWED;
 }
 
 bool moe_mmid_reconcile_retires(moe_mmid_reconcile_outcome outcome, moe_mmid_materialize_status published) noexcept {
@@ -1832,6 +1844,8 @@ moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outco
             return moe_mmid_materialize_refusal::PLAN_CHANGED_GEOMETRY_UNSTABLE;
         case moe_mmid_reconcile_outcome::REBIND_REFUSED:
             return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
+        case moe_mmid_reconcile_outcome::REBIND_NOT_FOLLOWED:
+            return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_NOT_FOLLOWED;
     }
     return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
 }

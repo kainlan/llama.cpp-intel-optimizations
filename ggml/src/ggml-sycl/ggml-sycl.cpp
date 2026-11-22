@@ -25288,53 +25288,66 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
 // Each refusal is a TRIPWIRE: the route is executable here and a planned pool is still unmaterialized where it
 // should have resolved. Admission then falls through to the retained route, which refuses Q1_0/NVFP4, and nothing
 // downstream names the cause, so the WARN names it.
-static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lifecycle::ModelToken & token) try {
-    const auto select_live = [&]() {
-        return ggml_sycl::lifecycle_select_placement_plan(token.model.value, token.load.value, token.owner.slot,
-                                                          token.owner.generation);
-    };
+static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lifecycle::ModelToken & token) {
+    // Outside the try, so a throw after this bind's own publication can still retire it.
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> published;
-    {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-        published = select_live();
+    ggml_sycl::moe_mmid_materialize_status                    status = ggml_sycl::moe_mmid_materialize_status::INVALID;
+
+    const auto retire_own_publication = [&]() noexcept {
+        if (published && status == ggml_sycl::moe_mmid_materialize_status::PUBLISHED) {
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+                { token.model.value, token.load.value, token.owner.generation }, published->version);
+        }
+    };
+    try {
+        const auto select_live = [&]() {
+            return ggml_sycl::lifecycle_select_placement_plan(token.model.value, token.load.value, token.owner.slot,
+                                                              token.owner.generation);
+        };
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            published = select_live();
+        }
+        ggml_sycl::moe_mmid_materialize_reason  reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+        ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+        if (!ggml_sycl_materialize_published_mmid_workspaces(token, published, &reason, &detail, &status)) {
+            ggml_sycl_moe_mmid_report_refusal("context-bind", reason, detail, token, published);
+            return;
+        }
+        if (reason == ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE) {
+            return;
+        }
+        ggml_sycl::moe_mmid_reconcile_outcome outcome = ggml_sycl::moe_mmid_reconcile_outcome::REBIND_REFUSED;
+        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> live;
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            live              = select_live();
+            const bool stable = live && live->plan && published->plan &&
+                                ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan);
+            outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(
+                published, live, live ? live->version : 0, stable,
+                [&](const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+                    return ggml_sycl_mmid_workspaces_follow(token, snapshot);
+                });
+        }
+        const ggml_sycl::moe_mmid_materialize_refusal refusal = ggml_sycl::moe_mmid_reconcile_refusal(outcome);
+        if (refusal == ggml_sycl::moe_mmid_materialize_refusal::NONE) {
+            return;
+        }
+        if (ggml_sycl::moe_mmid_reconcile_retires(outcome, status)) {
+            retire_own_publication();
+        }
+        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
+                                          refusal, token, live ? live : published);
+    } catch (...) {
+        // A lock or a snapshot copy threw. A context this bind's own attempt PUBLISHED may then be for a snapshot no
+        // reconcile made it follow, and left alone it answers the next bind's attempt as same-identity-other-plan:
+        // retire it, as the refused reconcile does, and leave the deferral pending. The bind's own result is the
+        // transaction's, which already published.
+        retire_own_publication();
+        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
+                                          ggml_sycl::moe_mmid_materialize_refusal::EXCEPTION, token, nullptr);
     }
-    ggml_sycl::moe_mmid_materialize_reason  reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-    ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
-    ggml_sycl::moe_mmid_materialize_status  status = ggml_sycl::moe_mmid_materialize_status::INVALID;
-    if (!ggml_sycl_materialize_published_mmid_workspaces(token, published, &reason, &detail, &status)) {
-        ggml_sycl_moe_mmid_report_refusal("context-bind", reason, detail, token, published);
-        return;
-    }
-    if (reason == ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE) {
-        return;
-    }
-    ggml_sycl::moe_mmid_reconcile_outcome outcome = ggml_sycl::moe_mmid_reconcile_outcome::REBIND_REFUSED;
-    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> live;
-    {
-        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
-        live                = select_live();
-        const bool changed  = live && live.get() != published.get();
-        const bool followed = changed && ggml_sycl_mmid_workspaces_follow(token, live);
-        const bool stable =
-            live && live->plan && published->plan && ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan);
-        outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(published, live, live ? live->version : 0,
-                                                                         stable, followed);
-    }
-    const ggml_sycl::moe_mmid_materialize_refusal refusal = ggml_sycl::moe_mmid_reconcile_refusal(outcome);
-    if (refusal == ggml_sycl::moe_mmid_materialize_refusal::NONE) {
-        return;
-    }
-    if (ggml_sycl::moe_mmid_reconcile_retires(outcome, status)) {
-        (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
-            { token.model.value, token.load.value, token.owner.generation }, published->version);
-    }
-    ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID, refusal,
-                                      token, live ? live : published);
-} catch (...) {
-    // A lock or a snapshot copy threw; nothing was published that the registry does not hold, and the deferral stays
-    // pending. The bind's own result is the transaction's, which already published.
-    ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
-                                      ggml_sycl::moe_mmid_materialize_refusal::EXCEPTION, token, nullptr);
 }
 
 // The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:

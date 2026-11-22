@@ -1903,7 +1903,7 @@ moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
     const std::shared_ptr<const lifecycle_plan_snapshot> & live,
     uint64_t                                               live_identity,
     bool                                                   stable_geometry,
-    bool                                                   live_followed) noexcept;
+    const moe_mmid_follows_fn &                            follows) noexcept;
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept;
 
 // Immutable lifecycle-owned plan snapshots. A null plan with
