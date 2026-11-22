@@ -652,6 +652,8 @@ _BATCHED_SIGNATURES = (
     re.compile(r"\[\[nodiscard\]\]\s+static\s+bool\s+ggml_sycl_mul_mat_batched_sycl\s*\([^)]*\)\s*try\s*\{"),
     re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_batched_f16_fallback\s*\([^)]*\)\s*(?:try\s*)?\{"),
 )
+_UNIFIED_DISPATCH_BLOCK = "if (decision.valid && decision.backend == ggml_sycl::MatmulBackend::UnifiedKernel) {"
+_UNIFIED_FLOAT_READ = "static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device))"
 _BATCHED_NC_CONVERT = "const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);"
 _INDEXED_CONTIGUITY_GUARD = "if(op->op==GGML_OP_MUL_MAT_ID){if(!ggml_is_contiguous(op->src[0])){returnfalse;}"
 _PROMPT_STAGING_SITE = "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {"
@@ -725,11 +727,17 @@ def _assert_mul_mat_src1_contract(full_source: str, route_header: str) -> None:
     op_mul_mat = _function_body(full_source, op_mul_mat_signature)
     assert "GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));" in op_mul_mat
     # The unified-kernel arm is one function: the orchestrator's select takes its arm from it and supports_op asks
-    # it, so the two cannot disagree. Its kernels read src1 through a float pointer.
+    # it, so the two cannot disagree.
     assert _compact(_function_body(full_source, _UNIFIED_ARM_SIGNATURE)) == _UNIFIED_ARM_BODY
     select = _compact(_function_body(full_source, _SELECT_SIGNATURE))
     assert select.count(_SELECT_UNIFIED_ARM) == 1 and "should_use_unified(" not in select, "select's unified arm"
-    assert "static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device))" in full_source
+    # The block the arm's decision leads to reads src1 through a float pointer and never tests its type.
+    assert full_source.count(_UNIFIED_DISPATCH_BLOCK) == 1, "unified dispatch block"
+    block_open = full_source.index(_UNIFIED_DISPATCH_BLOCK) + len(_UNIFIED_DISPATCH_BLOCK) - 1
+    unified_dispatch = full_source[block_open : _matching_close(full_source, block_open)]
+    assert unified_dispatch.count(_UNIFIED_FLOAT_READ) == 1, "the unified dispatch reads src1 as float"
+    assert "f32_to_fp16(src1_data," in unified_dispatch, "its oneDNN prompt path converts src1 from float"
+    assert "src1->type" not in unified_dispatch, "the unified dispatch tests src1's type"
     # Both batched executors convert a non-F16 src1 through the strided converter the helper asks about.
     for signature in _BATCHED_SIGNATURES:
         batched = _function_body(full_source, signature)
@@ -754,6 +762,9 @@ def _assert_prompt_staging_contract(full_source: str) -> None:
     # owners that kernels already submitted still read.
     later = [m.start() for m in re.finditer(re.escape(_PROMPT_STAGING_ABORT), full_source)]
     assert len(later) == 2 and all(position > site for position in later), later
+    abort_call = re.compile(r"GGML_ABORT\(\s*\"\[MoE\] " + re.escape(_PROMPT_STAGING_ABORT))
+    aborts = [m.start() for m in abort_call.finditer(full_source)]
+    assert len(aborts) == 2 and all(position > site for position in aborts), aborts
 
 
 def test_mul_mat_and_mul_mat_id_decline_what_no_route_reads() -> None:
@@ -797,10 +808,13 @@ def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
     select_arm = "    if (allow_unified && ggml_sycl_mul_mat_takes_unified_arm(src0, src1, ctx_.device)) {\n"
     assert rejects_src1(mutate(
         full_source, select_arm,
-        "    if (allow_unified && ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(src0->type)) {\n",
+        "    if (allow_unified && ggml_sycl_unified_dispatch_enabled() && "
+        "ggml_sycl::should_use_unified(src0->type)) {\n",
     ))
     # The batched routes answered as reading every type, including those the strided converter lacks.
-    batched_answer = "            return src1->type == GGML_TYPE_F16 || ggml_get_to_fp16_nc_sycl(src1->type) != nullptr;\n"
+    batched_answer = (
+        "            return src1->type == GGML_TYPE_F16 || ggml_get_to_fp16_nc_sycl(src1->type) != nullptr;\n"
+    )
     assert rejects_src1(mutate(full_source, batched_answer, "            return true;\n"))
     # A route added to the classifier that the helper does not answer.
     assert rejects_src1(full_source, mutate(
@@ -818,10 +832,25 @@ def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
     end = full_source.index(";", throw) + 1
     aborting = full_source[:throw] + 'GGML_ABORT("staging");' + full_source[end:]
     assert _contract_rejects(_assert_prompt_staging_contract, aborting)
-    # A per-expert site turned into a throw (its unwind would release live leases): the census moves.
-    loop_abort = full_source.index(_PROMPT_STAGING_ABORT, site)
-    renamed = full_source[:loop_abort] + "staging refused" + full_source[loop_abort + len(_PROMPT_STAGING_ABORT) :]
-    assert _contract_rejects(_assert_prompt_staging_contract, renamed)
+    # A per-expert site turned into log-and-throw with its message kept (its unwind would release live leases).
+    loop_message = full_source.index(_PROMPT_STAGING_ABORT, site)
+    loop_abort = full_source.rindex("GGML_ABORT(", site, loop_message)
+    loop_end = full_source.index(");", loop_message) + 2
+    thrown = (full_source[:loop_abort] + "GGML_LOG_ERROR(" + full_source[loop_abort + len("GGML_ABORT(") : loop_end]
+              + ' throw ggml_sycl_fallback_error("staging");' + full_source[loop_end:])
+    assert full_source.count(_PROMPT_STAGING_ABORT) == thrown.count(_PROMPT_STAGING_ABORT)
+    assert _contract_rejects(_assert_prompt_staging_contract, thrown)
+
+    # The unified dispatch block gaining a src1 type check, or reading src1 some other way.
+    unified_block = full_source.index(_UNIFIED_DISPATCH_BLOCK)
+    checked = (full_source[: unified_block + len(_UNIFIED_DISPATCH_BLOCK)]
+               + "\n            if (src1->type != GGML_TYPE_F32) { return; }"
+               + full_source[unified_block + len(_UNIFIED_DISPATCH_BLOCK) :])
+    assert rejects_src1(checked)
+    float_read = full_source.index(_UNIFIED_FLOAT_READ, unified_block)
+    float_end = float_read + len(_UNIFIED_FLOAT_READ)
+    reread = full_source[:float_read] + "static_cast<const float *>(src1->data)" + full_source[float_end:]
+    assert rejects_src1(reread)
 
 
 def test_review_mutations_are_detected() -> None:
