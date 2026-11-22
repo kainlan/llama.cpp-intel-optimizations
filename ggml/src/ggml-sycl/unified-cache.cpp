@@ -31985,6 +31985,12 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             item.ne[0] <= 0 || item.ne[1] <= 0) {
             continue;
         }
+        // The pool's only consumer is the direct route, and it admits only the types that need their direct kernel
+        // (Q1_0, NVFP4). An expert of any other type (MXFP4, Q4_0, ...) never draws on a pool, so it neither sizes
+        // one nor names an owner: a model without such an expert plans, charges and materializes nothing.
+        if (!moe_type_needs_direct_kernel(item.type)) {
+            continue;
+        }
         // Only the expert weight matrices are MUL_MAT_ID operands. Per-expert
         // auxiliary tensors (".scale"/".input_scale" fp8 metadata) share the
         // "ffn_*_exps" stem — and legitimately get per-expert placement — but
@@ -32248,7 +32254,9 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
     // plan_moe_mmid_workspaces() planned none there (same bound).
     const int exposed_devices = moe_mmid_exposed_owner_count();
     for (const placement_entry & entry : plan.entries) {
-        if (entry.expert_id < 0) {
+        // Only an expert of a type the direct route admits needs an owner: plan_moe_mmid_workspaces() plans none for
+        // any other type, so requiring one would reject the pool of a model that mixes the two.
+        if (entry.expert_id < 0 || !moe_type_needs_direct_kernel(entry.type)) {
             continue;
         }
         if (entry.on_device && moe_mmid_owner_admissible(entry.target_device, exposed_devices) &&

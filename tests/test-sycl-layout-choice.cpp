@@ -2005,28 +2005,29 @@ static bool run_multi_device_moe_i8_executor_support_test() {
 }
 
 // The synthetic MoE layer both halves of the single-device MoE PP layout test plan and probe: one layer of MXFP4
-// gate/up/down at GPT-OSS's 2880x2880, two experts.
+// gate/up/down at GPT-OSS's 2880x2880, two experts. The MMID pool tests plan the same layer as NVFP4 too (2880 is a
+// multiple of QK_NVFP4), the expert type the direct route admits.
 static constexpr int moe_pp_n_experts = 2;
 static constexpr int moe_pp_ncols     = 2880;
 static constexpr int moe_pp_nrows     = 2880;
 
-static std::vector<ggml_sycl::placement_tensor_info> moe_pp_inventory() {
-    auto make_mxfp4 = [](const char * name) {
+static std::vector<ggml_sycl::placement_tensor_info> moe_pp_inventory(ggml_type type = GGML_TYPE_MXFP4) {
+    auto make_expert = [type](const char * name) {
         ggml_sycl::placement_tensor_info tensor;
         tensor.name  = name;
-        tensor.type  = GGML_TYPE_MXFP4;
+        tensor.type  = type;
         tensor.ne[0] = moe_pp_ncols;
         tensor.ne[1] = moe_pp_nrows;
         tensor.ne[2] = moe_pp_n_experts;
         tensor.ne[3] = 1;
-        tensor.size  = ggml_row_size(GGML_TYPE_MXFP4, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
+        tensor.size  = ggml_row_size(type, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
                       static_cast<size_t>(moe_pp_n_experts);
         return tensor;
     };
     return {
-        make_mxfp4("blk.0.ffn_gate_exps.weight"),
-        make_mxfp4("blk.0.ffn_up_exps.weight"),
-        make_mxfp4("blk.0.ffn_down_exps.weight"),
+        make_expert("blk.0.ffn_gate_exps.weight"),
+        make_expert("blk.0.ffn_up_exps.weight"),
+        make_expert("blk.0.ffn_down_exps.weight"),
     };
 }
 
@@ -2067,10 +2068,10 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
 
     ggml_sycl::test_xmx_tiled_pp_route_override_guard route_guard(xmx_tiled_pp_route_active);
 
-    // The MMID direct route is closed in an ordinary build, so these plans are made as production makes them. This
-    // binary is a route-testing build, where the route compiles in; run_single_device_moe_mmid_pool_charge_test()
-    // plans the open state.
-    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+    // Planned with the MMID direct route reachable. The workspace pool is scoped to the expert types the route admits
+    // (Q1_0, NVFP4), so this MXFP4 layer carries none whether the route is open or not, and the totals below hold in
+    // both states; run_single_device_moe_mmid_pool_charge_test() plans an NVFP4 layer that does carry one.
+    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
 
     const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
 
@@ -2149,7 +2150,7 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
     // Totals both the roomy and the tight plan must satisfy. The layout charge is the sum of every on-device layout the
     // plan holds, so with no gate/up alternates it excludes any SOA copy of an XMX_TILED primary, and it must equal
     // weight_vram_bytes. vram_bytes is the single-device total: weights, KV and the KV context room. No MoE MMID
-    // workspace pool is planned or charged, because no route of this build state can consume one (llama.cpp-84ck).
+    // workspace pool is planned or charged, because the direct route, its only consumer, admits no MXFP4 expert.
     // The pre-pack promotion runs before packing, so both plans carry the arm's moe_pp_soa_promoted.
     auto check_plan_totals = [&](const ggml_sycl::placement_plan & p, size_t budget, const char * arm) {
         const size_t charge    = planned_weight_charge_for_device(p, 0);
@@ -2164,7 +2165,7 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
         }
         if (p.moe_mmid_device_pool_bytes != 0 || p.moe_mmid_host_pool_bytes != 0 || !p.moe_mmid_workspaces.empty()) {
             printf(
-                "FAIL: route %s, %s plan: closed MMID route still planned a workspace pool, device=%zu host=%zu "
+                "FAIL: route %s, %s plan: an MXFP4 expert layer planned an MMID workspace pool, device=%zu host=%zu "
                 "workspaces=%zu\n",
                 route_name, arm, p.moe_mmid_device_pool_bytes, p.moe_mmid_host_pool_bytes,
                 p.moe_mmid_workspaces.size());
@@ -2383,11 +2384,12 @@ static bool run_single_device_moe_pp_layout_test() {
 }
 
 // The MoE MMID workspace pool is planned, charged and re-planned only where the MMID direct route can run
-// (llama.cpp-84ck). Every pool byte the planner charges is a byte no expert can use, so a pool for a closed route moves
-// experts to the host for nothing, and a pool the plan rejected must not drive the runtime re-plan into a growth refusal
-// (which the runtime transaction answers by demoting KV or refusing the context). The fixture is the MXFP4 GPT-OSS-shaped
-// layer of the PP layout test, planned with n_expert_used set, under both answers of
-// ggml_sycl_moe_mmid_route_reachable_in_build().
+// (llama.cpp-84ck): for an expert of a type the route admits (Q1_0, NVFP4), and only when the route is reachable. Every
+// pool byte the planner charges is a byte no expert can use, so a pool nothing consumes moves experts to the host for
+// nothing, and a pool the plan rejected must not drive the runtime re-plan into a growth refusal (which the runtime
+// transaction answers by demoting KV or refusing the context). The fixture is the GPT-OSS-shaped layer of the PP
+// layout test, planned with n_expert_used set: as NVFP4 under both answers of
+// ggml_sycl_moe_mmid_route_reachable_in_build(), and as MXFP4 (GPT-OSS's expert type) with the route open.
 static bool run_single_device_moe_mmid_pool_charge_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -2399,26 +2401,31 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
 
     constexpr int n_expert_used = 4;
 
-    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+    const std::vector<ggml_sycl::placement_tensor_info> inventory       = moe_pp_inventory(GGML_TYPE_NVFP4);
+    const std::vector<ggml_sycl::placement_tensor_info> mxfp4_inventory = moe_pp_inventory(GGML_TYPE_MXFP4);
     ggml_sycl::placement_kv_info                        kv_info{};
     kv_info.n_ubatch      = 512;
     kv_info.n_expert_used = n_expert_used;
 
-    auto plan_on = [&](size_t budget) {
+    auto plan_inventory_on = [&](const std::vector<ggml_sycl::placement_tensor_info> & inv, size_t budget) {
         const std::vector<ggml_sycl::device_budget> devices = {
             { 0, budget, budget, 4.0, true },
         };
-        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+        return ggml_sycl::compute_multi_device_plan(devices, inv, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                     nullptr, moe_pp_n_experts);
+    };
+    auto plan_on = [&](size_t budget) {
+        return plan_inventory_on(inventory, budget);
     };
     auto vram_composed = [](const ggml_sycl::placement_plan & p) {
         return p.weight_vram_bytes + p.kv_vram_bytes + p.kv_context_reserve_bytes + p.moe_mmid_device_pool_bytes;
     };
     // The runtime re-plan of a plan whose KV did not change. It must accept, and leave the plan's charge and pool alone.
-    auto expect_stable_replan = [&](const ggml_sycl::placement_plan & p, const char * arm) {
+    auto expect_stable_replan_of = [&](const ggml_sycl::placement_plan &                     p,
+                                       const std::vector<ggml_sycl::placement_tensor_info> & inv, const char * arm) {
         ggml_sycl::placement_plan          replanned = p;
         ggml_sycl::moe_mmid_runtime_reason reason    = ggml_sycl::moe_mmid_runtime_reason::OK;
-        const bool ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, &reason);
+        const bool ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inv, n_expert_used, &reason);
         if (!ok || reason != ggml_sycl::moe_mmid_runtime_reason::OK || replanned.vram_bytes != p.vram_bytes ||
             replanned.moe_mmid_device_pool_bytes != p.moe_mmid_device_pool_bytes ||
             replanned.moe_mmid_workspaces.size() != p.moe_mmid_workspaces.size()) {
@@ -2432,11 +2439,14 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         }
         return true;
     };
+    auto expect_stable_replan = [&](const ggml_sycl::placement_plan & p, const char * arm) {
+        return expect_stable_replan_of(p, inventory, arm);
+    };
 
     bool ok = true;
 
-    // Route open: the pool is planned and charged on top of weights, KV and room. This is the positive control that
-    // the closed arm's zero is not vacuous: the same fixture does carry a pool when a route can consume it.
+    // Route open: the NVFP4 pool is planned and charged on top of weights, KV and room. This is the positive control
+    // that the zeros below are not vacuous: the same layer does carry a pool when the route can consume it.
     size_t roomy_charge = 0;
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
@@ -2465,7 +2475,35 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         ok = arm_ok && ok;
     }
 
-    // Route closed (an ordinary build): nothing is planned, so nothing is charged, and the plan stays valid.
+    // Route open, MXFP4 experts (GPT-OSS's type): the route admits no MXFP4 operand, so nothing is planned or charged,
+    // and the plan stays valid. Without the planner's type scope this layer carried the same pool as the NVFP4 one.
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
+        const auto plan   = plan_inventory_on(mxfp4_inventory, 1024u * mib);
+        bool       arm_ok = true;
+        if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
+            plan.moe_mmid_host_pool_bytes != 0 || !plan.moe_mmid_workspaces.empty() ||
+            plan.vram_bytes != vram_composed(plan)) {
+            printf(
+                "FAIL: open MMID route, MXFP4 experts: expected no workspace pool, valid=%d device pool=%zu host "
+                "pool=%zu workspaces=%zu vram=%zu want weight=%zu+kv=%zu+room=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_host_pool_bytes,
+                plan.moe_mmid_workspaces.size(), plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
+                plan.kv_context_reserve_bytes);
+            arm_ok = false;
+        }
+        arm_ok = expect_stable_replan_of(plan, mxfp4_inventory, "open MMID route, MXFP4 experts") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: open MMID route, MXFP4 experts: valid with no pool, vram=%zu = weight %zu + kv %zu + room %zu, "
+                "and the runtime re-plan keeps it\n",
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
+    }
+
+    // Route closed: nothing is planned even for NVFP4, so nothing is charged, and the plan stays valid.
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
 
@@ -2555,8 +2593,8 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
 
     if (ok) {
         printf(
-            "PASS: MoE MMID workspace pool is charged only for a reachable route, and a rejected pool stays out of the "
-            "runtime re-plan\n");
+            "PASS: MoE MMID workspace pool is charged only for a reachable route and an expert type it admits, and a "
+            "rejected pool stays out of the runtime re-plan\n");
     }
     return ok;
 }
@@ -2709,18 +2747,51 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
 }
 
 // llama.cpp-n8da: with two physical GPUs the backend exposes only device 0 to the registry by default, yet the
-// multi-device planner budgets both, so experts (or their decode alternates) may land on device 1. An MMID workspace is
-// admitted only by a backend context on its owner, and no backend context can exist for a hidden device, so the plan
-// must not carry a workspace for device 1, nor refuse the pool because device 1's experts have no owner. The second arm
-// exposes both devices (a split mode) and is the control that the rule keys on exposure, not on "secondary".
+// multi-device planner budgets both, so experts may land on device 1. An MMID workspace is admitted only by a backend
+// context on its owner, and no backend context can exist for a hidden device, so the plan must not carry a workspace
+// for device 1, nor refuse the pool because device 1's experts have no owner. The second arm exposes both devices (a
+// split mode) and is the control that the rule keys on exposure, not on "secondary".
+//
+// The experts are NVFP4, a type the direct route admits: no other type draws a pool, so no other type can name an
+// owner at all. The EXPERT split keeps every Q1_0/NVFP4 expert on device 0 (no secondary executor runs them), so the
+// fixture is a LAYER split instead: two layers whose dense weight fits device 1 (the faster one) only once, so layer 0
+// and its experts go to device 1 and layer 1 and its experts spill to device 0.
 static bool run_multi_device_mmid_owner_exposure_test() {
     constexpr size_t mib           = 1024u * 1024u;
     constexpr int    n_expert_used = 4;
+    constexpr int    hidden_dim    = 4096;
+    constexpr int    dense_rows    = 32768;  // 256 MiB of F16 per layer
 
-    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
-    const std::vector<ggml_sycl::device_budget>         devices   = {
-        { 0, 1024u * mib, 1024u * mib, 4.0, true },
-        { 1, 1024u * mib, 1024u * mib, 4.0, true },
+    auto make_dense = [](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_F16;
+        tensor.ne[0] = hidden_dim;
+        tensor.ne[1] = dense_rows;
+        tensor.size  = ggml_row_size(GGML_TYPE_F16, hidden_dim) * static_cast<size_t>(dense_rows);
+        return tensor;
+    };
+    auto make_expert = [](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_NVFP4;
+        tensor.ne[0] = moe_pp_ncols;
+        tensor.ne[1] = moe_pp_nrows;
+        tensor.ne[2] = moe_pp_n_experts;
+        tensor.ne[3] = 1;
+        tensor.size  = ggml_row_size(GGML_TYPE_NVFP4, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
+                      static_cast<size_t>(moe_pp_n_experts);
+        return tensor;
+    };
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = {
+        make_dense("blk.0.attn_q.weight"),       make_expert("blk.0.ffn_gate_exps.weight"),
+        make_expert("blk.0.ffn_up_exps.weight"), make_expert("blk.0.ffn_down_exps.weight"),
+        make_dense("blk.1.attn_q.weight"),       make_expert("blk.1.ffn_gate_exps.weight"),
+        make_expert("blk.1.ffn_up_exps.weight"), make_expert("blk.1.ffn_down_exps.weight"),
+    };
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 1024u * mib, 1024u * mib, 1.0, true },
+        { 1, 400u * mib,  400u * mib,  4.0, true },
     };
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch      = 512;
@@ -2732,7 +2803,7 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         ggml_sycl_device_info info = make_mock_sycl_info(2);
         info.device_count          = exposed;  // total_gpu_count stays 2
         ggml_sycl::test_sycl_info_override_guard info_guard(info);
-        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+        return ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::LAYER, kv_info,
                                                     nullptr, moe_pp_n_experts);
     };
     // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
