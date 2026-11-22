@@ -13678,8 +13678,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {281, 128, 1, 1}, 2, 2));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {257, 7, 1, 1}, 0, 256));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 16777217, 1, 1}, 1, 1));
-    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 8388608, 1}, 1, 1));
-    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 1, 8388608}, 1, 1));
+    // More planes than one SYCL launch covers (8388607 work-groups of 256), on axis 2 and on axis 3. 2^24 planes, not
+    // the smallest count above that bound: the smallest leaves one plane to the stride loop, and a regression that
+    // skips it moves the error only to the NMSE threshold. At 2^24 half the planes depend on the stride loop.
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 16777216, 1}, 1, 1));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 1, 16777216}, 1, 1));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
@@ -14301,6 +14304,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
     // k broadcast over sequences: q and k repeat over v's sequences at different ratios
+    // CUDA asserts nek3 == neq3 (gated_delta_net.cu:308), so a CUDA run aborts on these two unless its supports_op declines them
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, false, 1, false, false, false, false, -20.0f, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  1, false, false, false, false, -20.0f, true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
