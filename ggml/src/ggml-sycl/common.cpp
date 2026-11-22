@@ -2521,7 +2521,7 @@ void ggml_sycl_tp_copy_weight_shard(void *              dst_device,
                                                    shard_row_size);
         }
         // Single wait after all row copies are submitted
-        stream->wait();
+        stream->wait_and_throw();
     } else {
         // Full copy for non-sharded tensors
         size_t size = ggml_nbytes(tensor);

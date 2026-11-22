@@ -16570,10 +16570,10 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     try {
         queue_.wait();
         if (dma_queue_) {
-            dma_queue_->wait();
+            dma_queue_->wait_and_throw();
         }
         if (bcs_queue_) {
-            bcs_queue_->wait();
+            bcs_queue_->wait_and_throw();
         }
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[UNIFIED-CACHE] reclaim_weight_entries queue drain failed: %s\n", e.what());

@@ -4949,7 +4949,7 @@ static void moe_prestage_popular_experts() {
                 return false;
             }
             if (source.has_ready) {
-                source.ready.wait();
+                source.ready.wait_and_throw();
             }
             source_leases.push_back(std::move(source));
             const void * source_ptr = source_leases.back().ptr;
@@ -5108,8 +5108,8 @@ static void moe_prestage_popular_experts() {
             if (expert_groups_staged > 0 && expert_groups_staged % YIELD_BATCH == 0) {
                 try {
                     cache->get_queue().wait();  // CCS compute queue
-                    cache->get_dma_queue().wait();
-                    cache->get_bcs_queue().wait();
+                    cache->get_dma_queue().wait_and_throw();
+                    cache->get_bcs_queue().wait_and_throw();
                     // Process deferred frees NOW — all queues drained, safe to unmap VRAM.
                     // evict_one defers frees to prevent BCS CAT errors during prestage.
                     cache->process_deferred_frees_public();
@@ -5123,8 +5123,8 @@ static void moe_prestage_popular_experts() {
         if (prestaged > 0) {
             try {
                 cache->get_queue().wait();  // CCS compute queue
-                cache->get_dma_queue().wait();
-                cache->get_bcs_queue().wait();
+                cache->get_dma_queue().wait_and_throw();
+                cache->get_bcs_queue().wait_and_throw();
                 // Process any deferred frees accumulated during eviction.
                 cache->process_deferred_frees_public();
             } catch (...) {
@@ -5354,7 +5354,7 @@ static void moe_prestage_popular_experts() {
                     continue;
                 }
                 if (source.has_ready) {
-                    source.ready.wait();
+                    source.ready.wait_and_throw();
                 }
 
                 // Deduct budget eagerly during collection so device selection
@@ -5596,7 +5596,7 @@ static void moe_prestage_popular_experts() {
 
                 for (const auto & b : sec_budgets) {
                     if (b.staged > 0 && b.cache) {
-                        b.cache->get_bcs_queue().wait();
+                        b.cache->get_bcs_queue().wait_and_throw();
                     }
                 }
 
@@ -5862,7 +5862,7 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
         return nullptr;
     }
     if (source.has_ready) {
-        source.ready.wait();
+        source.ready.wait_and_throw();
     }
 
     // Get unified cache for target device
@@ -6413,7 +6413,7 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
         return false;
     }
     if (source.has_ready) {
-        source.ready.wait();
+        source.ready.wait_and_throw();
     }
 
     const size_t layout_bytes = ggml_sycl_layout_bytes_for_dims(meta->type, meta->ne0, meta->ne1, layout, device);
@@ -31491,7 +31491,7 @@ static void pipeline_scatter_background(pipeline_scatter_slot * slot) {
                                               static_cast<int>(e.rows), cols, e.dst_nb1, { h2d });
         }
         // Wait for all H2D copies to land on GPU0 before marking done.
-        slot->copy_queue->wait();
+        slot->copy_queue->wait_and_throw();
     } catch (const std::exception & ex) {
         GGML_LOG_ERROR("[PIPELINE-MOE] Background scatter failed: %s\n", ex.what());
     }
@@ -33227,7 +33227,7 @@ static void ggml_sycl_measure_h2d_pinned(ggml_sycl_device_info & info) {
                 for (size_t off = 0; off < k_bytes; off += k_chunk) {
                     ggml_sycl::mem_copy_async(dst, off, src, off, k_chunk, *q);
                 }
-                q->wait();
+                q->wait_and_throw();
                 const double us =
                     std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 iter_gbps[it] = us > 0.0 ? static_cast<double>(k_bytes) / us / 1e3 : 0.0;
@@ -44264,7 +44264,7 @@ static void ggml_sycl_preload_model_weights() {
             // Safety net: drain all queues in case of untracked submissions
             try {
                 cache->get_queue().wait();
-                cache->get_bcs_queue().wait();
+                cache->get_bcs_queue().wait_and_throw();
                 stream.wait();
             } catch (const sycl::exception & e) {
                 GGML_LOG_ERROR("[S1-PRELOAD] queue.wait() failed: %s\n", e.what());
@@ -51471,7 +51471,7 @@ int32_t ggml_backend_sycl_sample_token_full(ggml_sycl_sampler_t sampler,
     buf_queue.wait();
     // Also sync the device's default queue (used by some copy operations)
     ggml_sycl_set_device(buf_ctx->device);
-    ggml_sycl_get_device(buf_ctx->device).default_queue().wait();
+    ggml_sycl_get_device(buf_ctx->device).default_queue().wait_and_throw();
 
     // Get GPU pointer for logits
     float * logits_gpu = (float *) logits_tensor->data;
@@ -51741,7 +51741,7 @@ int ggml_backend_sycl_verify_speculative_with_tokens(ggml_sycl_sampler_t sampler
     // Also sync the device's default queue
     ggml_sycl_set_device(buf_ctx->device);
     sycl::queue & default_q = ggml_sycl_get_device(buf_ctx->device).default_queue();
-    default_q.wait();
+    default_q.wait_and_throw();
     // Get logits data pointer from tensor
     const float * logits_data = (const float *) all_logits->data;
 
@@ -58891,7 +58891,7 @@ static void tp_device1_worker_thread_func() {
             quantize_row_q8_1_sycl<quantize_q8_1>(work.input_dev1, input_q8_dev, work.K_full, work.batch, K_full_padded,
                                                   stream);
         }
-        stream->wait();  // Add wait to catch any async errors
+        stream->wait_and_throw();  // delivers this queue's asynchronous errors to the latch
 
         // Step 2-3: Gate and Up matmuls
         if (g_ggml_sycl_tp_debug) {
@@ -58900,7 +58900,7 @@ static void tp_device1_worker_thread_func() {
         ggml_sycl::mem_fill_async(bufs->gate_out_handle, 0, hidden_size, *stream);
         ggml_sycl::mem_fill_async(bufs->up_out_handle, 0, hidden_size, *stream);
 
-        stream->wait();
+        stream->wait_and_throw();
         if (g_ggml_sycl_tp_debug) {
             fprintf(stderr, "SYCL TP WORKER: Step 3 - Gate matmul\n");
         }
@@ -58913,7 +58913,7 @@ static void tp_device1_worker_thread_func() {
         }
         ggml_sycl_op_mul_mat_vec_q(ctx, work.weights.up, nullptr, &fake_dst_hidden, (const char *) up_weight_1, nullptr,
                                    input_q8_dev, up_out, 0, N_hidden_shard, work.batch, K_full_padded, stream);
-        stream->wait();
+        stream->wait_and_throw();
 
         // Step 4: SiLU activation and multiply
         const int64_t n_elements = N_hidden_shard * work.batch;
@@ -58944,7 +58944,7 @@ static void tp_device1_worker_thread_func() {
         }
         // Step 6: Down matmul
         ggml_sycl::mem_fill_async(bufs->partial_out_handle, 0, output_size, *stream);
-        stream->wait();
+        stream->wait_and_throw();
         ggml_sycl_op_mul_mat_vec_q(ctx, work.weights.down, nullptr, &fake_dst_out, (const char *) down_weight_1,
                                    nullptr, hidden_q8_dev, partial_out, 0, N_out, work.batch, N_hidden_shard_padded,
                                    stream);
@@ -76723,7 +76723,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                             // device as ctx.stream(), and L0 flushes the dequant writes
                                             // to memory before wait() returns, so the subsequent GEMM
                                             // submission sees the committed data.
-                                            pipe.dma_queue->wait();
+                                            pipe.dma_queue->wait_and_throw();
                                             fp16_weights_ptr =
                                                 static_cast<const sycl::half *>(pipe.scratch_buf[pipe.prefetch_buf]);
                                             pp_pipeline_hit = true;
@@ -76740,7 +76740,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                                    ggml_sycl_tensor_is_weight(src0)) {
                                             // Drain any in-flight pipeline prefetch on miss
                                             if (pipe.enabled && pipe.prefetch_buf >= 0) {
-                                                pipe.dma_queue->wait();
+                                                pipe.dma_queue->wait_and_throw();
                                                 pipe.prefetch_buf  = -1;
                                                 pipe.prefetch_src0 = nullptr;
                                                 pipe.prefetch_type = GGML_TYPE_COUNT;
@@ -76792,7 +76792,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                             // FP16 cache disabled or non-weight: always dequantize
                                             // Drain any in-flight pipeline prefetch first
                                             if (pipe.enabled && pipe.prefetch_buf >= 0) {
-                                                pipe.dma_queue->wait();
+                                                pipe.dma_queue->wait_and_throw();
                                                 pipe.prefetch_buf  = -1;
                                                 pipe.prefetch_src0 = nullptr;
                                                 pipe.prefetch_type = GGML_TYPE_COUNT;
@@ -105447,7 +105447,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                             } catch (...) {
                             }
                         }
-                        cache->get_bcs_queue().wait();
+                        cache->get_bcs_queue().wait_and_throw();
                     } catch (...) {
                     }
                     try {
@@ -105463,7 +105463,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                             } catch (...) {
                             }
                         }
-                        cache->get_dma_queue().wait();
+                        cache->get_dma_queue().wait_and_throw();
                     } catch (...) {
                     }
                 }
@@ -108270,7 +108270,7 @@ gpu_dispatch:
     {
         auto & pipe = g_pp_pipeline;
         if (pipe.enabled && pipe.prefetch_buf >= 0) {
-            pipe.dma_queue->wait();
+            pipe.dma_queue->wait_and_throw();
             pipe.prefetch_buf  = -1;
             pipe.prefetch_src0 = nullptr;
         }
@@ -114264,13 +114264,13 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
         watch.site("a split secondary, merge or coord queue");
         if (g_split_config.enabled) {
             if (g_split_secondary_queue_owner) {
-                g_split_secondary_queue_owner->wait();
+                g_split_secondary_queue_owner->wait_and_throw();
             }
             if (g_split_merge_queue_owner) {
-                g_split_merge_queue_owner->wait();
+                g_split_merge_queue_owner->wait_and_throw();
             }
             if (g_split_coord_queue_owner) {
-                g_split_coord_queue_owner->wait();
+                g_split_coord_queue_owner->wait_and_throw();
             }
         }
         // The MoE shared-context queues.
@@ -114284,23 +114284,23 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
         watch.site("the unified cache's queues");
         if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
             cache->get_queue().wait();
-            cache->get_bcs_queue().wait();
+            cache->get_bcs_queue().wait_and_throw();
         }
         // The CPU-dispatch queue.
         watch.site("the CPU-dispatch queue");
         if (sycl::queue * q = ggml_sycl_get_cpu_queue()) {
-            q->wait();
+            q->wait_and_throw();
         }
         watch.site("a tensor-parallel queue");
         // The TP queues (unreachable under a plan, waited if non-null) and the TP
         // device-1 worker's own queue.
         for (int d = 0; d < total; ++d) {
             if (sycl::queue * q = ggml_sycl_get_tp_queue(d)) {
-                q->wait();
+                q->wait_and_throw();
             }
         }
         if (g_tp_device1_worker_queue) {
-            g_tp_device1_worker_queue->wait();
+            g_tp_device1_worker_queue->wait_and_throw();
         }
         watch.site("a dense block executor copy queue");
         // The dense block executor's copy queues.
@@ -114308,7 +114308,7 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
             std::lock_guard<std::mutex> lock(g_block_exec_copy_queue_mutex);
             for (auto & q : g_block_exec_copy_queues) {
                 if (q) {
-                    q->wait();
+                    q->wait_and_throw();
                 }
             }
         }
@@ -114318,7 +114318,7 @@ bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
             std::lock_guard<std::mutex> lock(g_pipeline_copy_queue_mutex);
             for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
                 if (g_pipeline_copy_queue[d]) {
-                    g_pipeline_copy_queue[d]->wait();
+                    g_pipeline_copy_queue[d]->wait_and_throw();
                 }
             }
         }
@@ -125329,7 +125329,7 @@ void ggml_backend_sycl_shutdown(void) {
                 continue;
             }
             try {
-                queue->wait();
+                queue->wait_and_throw();
             } catch (...) {
             }
             delete queue;
