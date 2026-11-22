@@ -1375,33 +1375,121 @@ removed; the first abort restored. The claims fail before the change.
 
 ---
 
-### Task 6f-3: The q6_K f16 arm converts from the plane it resolved (A3)
+### Task 6f-3: The f16 dequant arm takes an SOA plane from the owner the resolver names (A3)
 
 **Track:** F, after Task 6f-2 (same file). **Depends on:** Task 6f-2.
-**Status:** recorded 2026-11-22; written out to the Task Detail Standard after the one diagnostic run below, because
-which of three checks refuses is not known from the source.
-**What is known (at `9013f01c2`):**
-- The router admits the case correctly: an SoA f16 converter exists for q6_K (`ggml-sycl.cpp:36400`).
-- The arm resolves the weight with `ggml_sycl_resolve`, which reports `loaded soa`, and then fetches the plane a
-  second time through `ggml_sycl_acquire_weight_layout` (`:45097-45117`, into `unified-cache.cpp:12848-12882`).
-  The second lookup is stricter in three ways: it returns empty while the entry's ready event is pending
-  (`:12876-12880`), and `acquire_entry_lease` requires a retention identity (`:12612`, `:12638`) that
-  `get_weight_ptr` (`:12438-12490`) does not ask for.
-- The refusal throws `ggml_sycl_fallback_error` (`:55881-55885`, `:55922`), and the call site wraps the op in
-  `SYCL_CHECK(CHECK_TRY_ERROR(...))` (`:58188-58190`), which turns any `std::exception` into `GGML_ABORT`.
-- The log line: `f16 dequant arm refused a (q6_K, loaded soa): the SOA plane is not staged on this device`.
-**The one diagnostic run (lead, B50):** the A3 case string with `GGML_SYCL_HANDLE_TRACE=1`, to see which check
-refuses. A Mistral B50 health arm before it.
-**Direction (lead ruling):** two changes. The arm converts from the plane it already resolved: its pointer, its
-retention kept alive, the conversion chained on its ready event with `ggml_sycl_chain_ready_event_if_needed`
-(`common.hpp:817`); no host wait. And a `ggml_sycl_fallback_error` thrown under the `:58188` call site reaches the
-graph boundary as a failed status, as it does on every other dispatch path (`ggml_sycl_compute_forward` rethrows
-it first), instead of being swallowed by `CHECK_TRY_ERROR`.
-**Why it matters beyond the test:** Q4_K_M models carry q6_K weights that take this arm in prompt processing. In a
-normal load the planes are staged long before use, so the pending-event window is small, but the retention
-asymmetry does not depend on timing.
-**Done when:** the A3 case prints OK on the B50; `-o MUL_MAT` runs to the end with no `-p` filter; a source
-contract pins that the arm does not call `ggml_sycl_acquire_weight_layout` for a plane it holds a resolution of.
+**Status:** written out 2026-11-22 after the diagnostic run. Find each function by name: Task 6f-2 moves the lines.
+
+**The diagnostic run (lead, B50, once, integration build at `dffdfbedb`; Mistral health arm before it passes):**
+`GGML_SYCL_HANDLE_TRACE=1 test-backend-ops -o MUL_MAT -p 'type_a=q6_K,type_b=f32,m=1000,n=21,k=4608.*weights=1$'`
+ends rc 134. What the trace shows:
+- The weight `a` is not a model weight. No model is loaded: the tensor sits in a plain backend buffer
+  (`tensor usage UNKNOWN: name=a type=q6_K`, `buffer-scoped provenance`), and `set_tensor` laid it out as SOA there.
+- Every resolve of it reads `handle_valid=1 handle_kind=5 handle_device=0`. Kind 5 is `CHUNK_LEASE`
+  (`mem-handle.hpp:162`): a raw pointer plus a lease on its arena chunk. Kind 0, `WEIGHT`, is the cache-managed kind.
+- Then `f16 dequant arm refused a (q6_K, loaded soa): the SOA plane is not staged on this device`, and the abort.
+- No trace line names the check inside `unified_cache::acquire_layout_handle` that refused. It no longer matters:
+  the arm asked the wrong authority.
+
+**Cause:** `ggml_sycl_dequant_f16_from_loaded_layout` resolves the weight, learns it is loaded as SOA, and then asks
+the unified cache for a leased SOA handle under the weight's cache key (`ggml_sycl_acquire_weight_layout`). The cache
+leases only planes it placed. A plane that lives in the tensor's own buffer has an owner too, the tensor's handle
+on that device, and the arm never asks it.
+
+**Ruling (lead, 2026-11-22; it replaces the direction recorded before the run):** the owner of the plane is whoever
+the resolver's handle says it is.
+- Handle kind `WEIGHT`: the cache lease, exactly as today. A miss there is still refused by name. Nothing changes
+  for a model weight, so no Q4_K_M path moves.
+- Handle kind `CHUNK_LEASE` on this device, resolving to SOA: the owner is a copy of that handle (a copy shares the
+  chunk lease, `mem_handle::mem_handle(const mem_handle &)` in `mem-handle.cpp`), and the plane is the pointer the
+  resolver returned. The conversion is chained on the resolution's ready event with
+  `ggml_sycl_chain_ready_event_if_needed` (`common.hpp`), and the copy is retained until the read's event, as the
+  cache lease is today. No host wait.
+- Any other kind (`DIRECT` and the arena kinds carry no lifetime for a reader that outlives the call): refused by
+  name, `f16 dequant arm: the SOA plane has no owner the arm can hold`.
+- The earlier direction said the arm should never call `ggml_sycl_acquire_weight_layout`. Withdrawn: for a
+  cache-managed weight the lease is what stops an eviction under the read, and a plain copy of a `WEIGHT` handle is
+  not known to do that.
+
+**Second change, same task: a refusal fails the graph instead of aborting the process.** The two call sites of
+`op(...)` in `ggml_sycl_op_mul_mat` wrap it in `SYCL_CHECK(CHECK_TRY_ERROR(...))`. `CHECK_TRY_ERROR`
+(`common.hpp:900`) catches every `std::exception`, and `SYCL_CHECK` then calls `GGML_ABORT`. A
+`ggml_sycl_fallback_error` must leave those two sites unchanged, so that it reaches the catch in
+`ggml_backend_sycl_graph_compute` (the `catch (const ggml_sycl_fallback_error & error)` near the end of the
+function), which quarantines the graph and returns a failed status. Use the rethrow-first form the file already
+documents (`catch (const ggml_sycl_fallback_error &) { throw; }` ahead of the general catch, see the comment near
+`ggml_sycl_fallback_error`'s other catch sites); do not change `CHECK_TRY_ERROR` itself, which other files use.
+
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: `ggml_sycl_dequant_f16_from_loaded_layout` (the SOA branch only) and
+  the two `op(...)` call sites in `ggml_sycl_op_mul_mat`.
+- Create: `tests/test-sycl-f16-arm-owner-source.py`, registered beside the other source contracts in
+  `tests/CMakeLists.txt` (pure Python, no GPU, label as its neighbours are).
+- No header changes. `gated_delta_net.cpp`, `binbcast.*` and the unified cache are out of scope.
+
+**RED (already measured, do not rerun):** the diagnostic run above, rc 134. The source contract is the
+implementer's own RED: write it first, run it, and it must fail on the tree before the change.
+
+**Source contract, claims (each with one mutant that must make it fail):**
+1. In `ggml_sycl_dequant_f16_from_loaded_layout`, the call to `ggml_sycl_acquire_weight_layout` sits inside a branch
+   on the handle kind `WEIGHT`.
+2. The `CHUNK_LEASE` branch compares the handle's device with `ctx.device` and the resolved layout with
+   `GGML_LAYOUT_SOA` before it uses the pointer.
+3. The function calls `ggml_sycl_chain_ready_event_if_needed` before the converter on the `CHUNK_LEASE` branch.
+4. Every branch that reaches the converter passes its owner to `retain_handles_until_event`.
+5. The function body contains no `.wait(` and no `wait_and_throw(`.
+6. Both `op(` call sites in `ggml_sycl_op_mul_mat` rethrow `ggml_sycl_fallback_error` before the general catch.
+
+**GREEN, the SOA branch (replace from the `owner` declaration to the alloc-type check; keep everything after it):**
+```cpp
+    // The plane's owner is whoever the resolver's handle says it is. A weight the cache placed (WEIGHT) is read
+    // through a cache lease, which is what stops an eviction under the read. A weight in a plain backend buffer
+    // (CHUNK_LEASE: test-backend-ops, or any graph whose weights were never registered with the cache) is owned by
+    // the tensor's own handle, and a copy of it shares the chunk lease. No other kind carries a lifetime a reader
+    // that outlives this call can hold.
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const ggml_sycl::mem_handle * own =
+        (extra != nullptr && ggml_sycl_valid_device_index(ctx.device)) ? &extra->data_handle[ctx.device] : nullptr;
+    ggml_sycl::mem_handle owner;
+    void *                plane = nullptr;
+    if (own == nullptr || !own->valid() || own->kind() == ggml_sycl::mem_handle_kind::WEIGHT) {
+        owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);
+        plane = owner.resolve(ctx.device).ptr;
+        if (plane == nullptr) {
+            refuse("f16 dequant arm: the SOA plane is not staged on this device");
+        }
+    } else if (own->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE && own->device() == ctx.device &&
+               loaded.layout == GGML_LAYOUT_SOA) {
+        owner = *own;
+        plane = loaded.ptr;
+        ggml_sycl_chain_ready_event_if_needed(*stream, loaded);
+    } else {
+        refuse("f16 dequant arm: the SOA plane has no owner the arm can hold");
+    }
+```
+The implementer verifies each name against the tree (`data_handle`, `kind()`, `device()`, `valid()`,
+`ggml_sycl_valid_device_index`) and reports any that differs instead of guessing.
+
+**Gotchas:**
+- `loaded` is the `resolved_ptr` the function already has. Do not resolve a second time.
+- `refuse` throws: code after it does not run, and `plane` is non-null afterwards.
+- An empty handle on a cache-placed weight is the existing miss path (the first branch), not a new case.
+- With change two in place a refusal no longer aborts, so a wrong branch shows as a `FAIL` line, not rc 134.
+- Never `clang-format-19 -i`; check with `clang-format-19 --dry-run -Werror` and fix by hand only your own lines.
+- Build only when fewer than three `ninja` run; never edit or commit during a build.
+
+**Acceptance (lead runs the GPU arms, once each, B50):**
+- [ ] The source contract passes, and each of its six mutants fails it.
+- [ ] The A3 case prints OK.
+- [ ] `test-backend-ops -o MUL_MAT` runs to the end with no `-p` filter and no abort.
+- [ ] Mistral gates on both cards and the GPT-OSS B50 gate pass (a q6_K model weight still takes the cache lease:
+      `GGML_SYCL_ONEDNN_PP_TRACE=1` on a Q4_K_M file would witness it, and none is required here because the
+      `WEIGHT` branch is unchanged code).
+- [ ] No wait is added.
+
+**Commits:** `tests: the f16 dequant arm's owner contract (RED)`, then
+`sycl: the f16 dequant arm takes an SOA plane from the owner the resolver names`, then
+`sycl: a refusal inside MUL_MAT's op call fails the graph instead of aborting`. Path-scoped, never amended.
 
 ---
 
@@ -1572,6 +1660,14 @@ it is at hand. The seam compiles out of a production build.
   deferred-decode wait allows. `unreleased_graph_then_drain_case` uses it, without and with the second
   holder of Step 0. That case is now the device vehicle for this task's drain retry and for Task 7a's
   commit 5; the held run of case 7 is dropped, because with the release unconditional it shows nothing.
+- *RED, run once on the B50 from the binary built at `df7da66df`:* rc 1, case 7 fails with its own message,
+  `the completion task did not release the finished bundle of a failed terminal` (`recycled=+0
+  quarantined=+1`). The delivery probe with `--gpu` on the B50 prints PASS, as it does on the OpenCL CPU device:
+  fact (i) holds on both. Zero kernel fault lines.
+- *The implementer's refinement of the cause:* the racing wait in case 9 was the deferred-decode branch's
+  `last_graph_event->wait_and_throw()`. `queue::wait_and_throw` waits for every command, the completion task
+  included, before it takes the error list, so it cannot race that task; `event::wait_and_throw` on an event
+  that does not cover the task can, and it takes the whole queue's list.
 - *From the spec review, in the same round:* a drain wait that throws synchronously (a lost device) is recorded
   in the device latch in the helper and in both twins' first wait; the context twin gets the begin-path
   twin's `waited` flag, so a wait that threw is not followed by a second wait on the same queue; contract
