@@ -2429,9 +2429,10 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
 
 // What the WEIGHT-zone line says the loader_residency term is, from the plan's loader facts and `terms`, the terms
-// placement_plan_host_weight_zone_terms() computed for it.
+// placement_plan_host_weight_zone_terms() computed for it. The line says the buffer serves host experts in place only
+// when the terms serve some (loader_served > 0): a plan made for loader_device whose host weights are all dense, a
+// dense model's, serves none, though its fact would let it.
 inline const char * placement_plan_loader_role(const placement_plan & plan, const host_weight_zone_terms & terms) {
-    GGML_UNUSED(terms);
     if (!plan.loader_holds_weights) {
         return "the loader binds no SYCL_Host buffer for weights";
     }
@@ -2439,11 +2440,10 @@ inline const char * placement_plan_loader_role(const placement_plan & plan, cons
         return "the loader's SYCL_Host buffer, not charged: the scheduler sees more than one device, so the buffer is "
                "split across their pools by layer; the host weights are copied out of it";
     }
-    if (plan.loader_serves_host_experts) {
+    if (terms.loader_served > 0) {
         return "the loader's SYCL_Host buffer, serving the host experts in place";
     }
-    return "the loader's SYCL_Host buffer, charged once, in loader_device's pool; the host weights are copied out of "
-           "it";
+    return "the loader's SYCL_Host buffer, charged once, in loader_device's pool; it serves no host weight in place";
 }
 
 // The loader's SYCL_Host buffers in a fresh pinned pool of `chunk`-byte chunks. ggml-alloc splits the loader's tensors
