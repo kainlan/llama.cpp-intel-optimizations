@@ -642,8 +642,8 @@ _SRC1_READER_SIGNATURE = re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_src1_has
 _SRC1_READER_GUARD = "if(b->type!=GGML_TYPE_F32&&!ggml_sycl_mul_mat_src1_has_reader(a,b,op,device)){returnfalse;}"
 _UNIFIED_ARM_SIGNATURE = re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_takes_unified_arm\s*\([^)]*\)\s*\{")
 _UNIFIED_ARM_BODY = (
-    "returnggml_sycl_unified_dispatch_enabled()&&ggml_sycl::is_unified_kernel_enabled_for_device(device)&&"
-    "ggml_sycl::should_use_unified(src0->type)&&ggml_is_contiguous(src1)&&!ggml_is_transposed(src1)&&"
+    "returnggml_sycl::should_use_unified(src0->type)&&ggml_sycl_unified_dispatch_enabled()&&"
+    "ggml_sycl::is_unified_kernel_enabled_for_device(device)&&ggml_is_contiguous(src1)&&!ggml_is_transposed(src1)&&"
     "!ggml_is_permuted(src1);"
 )
 _SELECT_SIGNATURE = re.compile(r"MatmulDecision\s+UnifiedMatmulOrchestrator::select\s*\([^)]*\)\s*const\s*\{")
@@ -804,6 +804,17 @@ def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
     assert rejects_src1(mutate(full_source, none_answer, "            return true;\n"))
     # The unified-kernel arm, which reads src1 as F32, answered as reading a one-plane src1 of any type.
     assert rejects_src1(mutate(full_source, none_answer, "            return src1->ne[2] == 1 && src1->ne[3] == 1;\n"))
+    # The arm asking the uncached device query before the pure weight-type test.
+    arm_order = (
+        "    return ggml_sycl::should_use_unified(src0->type) && ggml_sycl_unified_dispatch_enabled() &&\n"
+        "           ggml_sycl::is_unified_kernel_enabled_for_device(device) && ggml_is_contiguous(src1) &&\n"
+    )
+    assert rejects_src1(mutate(
+        full_source, arm_order,
+        "    return ggml_sycl_unified_dispatch_enabled() && "
+        "ggml_sycl::is_unified_kernel_enabled_for_device(device) &&\n"
+        "           ggml_sycl::should_use_unified(src0->type) && ggml_is_contiguous(src1) &&\n",
+    ))
     # select deciding its unified arm inline again, a second copy supports_op does not ask.
     select_arm = "    if (allow_unified && ggml_sycl_mul_mat_takes_unified_arm(src0, src1, ctx_.device)) {\n"
     assert rejects_src1(mutate(

@@ -9797,9 +9797,10 @@ static bool ggml_sycl_unified_kernel_requires_aos(ggml_type type) {
 // whose unified kernel is enabled, with a dense src1. Every kernel under that arm (the ESIMD kernel, its oneDNN prompt
 // path, the COALESCED fall-through to MMVQ) reads src1 as F32. select and supports_op both ask this one function.
 static bool ggml_sycl_mul_mat_takes_unified_arm(const ggml_tensor * src0, const ggml_tensor * src1, int device) {
-    return ggml_sycl_unified_dispatch_enabled() && ggml_sycl::is_unified_kernel_enabled_for_device(device) &&
-           ggml_sycl::should_use_unified(src0->type) && ggml_is_contiguous(src1) && !ggml_is_transposed(src1) &&
-           !ggml_is_permuted(src1);
+    // The weight type is a pure switch and rules out most calls; the device query is not cached, so it comes last.
+    return ggml_sycl::should_use_unified(src0->type) && ggml_sycl_unified_dispatch_enabled() &&
+           ggml_sycl::is_unified_kernel_enabled_for_device(device) && ggml_is_contiguous(src1) &&
+           !ggml_is_transposed(src1) && !ggml_is_permuted(src1);
 }
 
 static bool ggml_sycl_reorder_guard_enabled() {
@@ -61303,9 +61304,12 @@ bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sy
 // - the f16 chain's p021 and nc kernels read F32 only;
 // - its batched routes (batched oneDNN/oneMath and the scalar fallback) read F16 as it is and convert any other type
 //   with the strided f16 converter, which has F32 and BF16 only;
-// - outside the chain, the orchestrator's unified-kernel arm reads F32 only, and every other arm (the remaining
-//   orchestrator kernels and the generic BLAS fallback) ends in ggml_sycl_op_mul_mat, which reads a src1 that is not
-//   F32 only as one 2-D plane and converts that plane by its type.
+// - outside the chain, the orchestrator's unified-kernel arm reads F32 only; DMMV, MMVQ, MMQ and the generic BLAS
+//   fallback read F32 only, by their own eligibility checks; the oneDNN AoS arm (ggml_sycl_op_mul_mat with
+//   ggml_sycl_op_mul_mat_sycl) reads a src1 that is not F32 as one 2-D plane and converts that plane by its type.
+//   The NONE answer below (not the unified arm, and one plane) is exact for a src0 that is not a weight or is in the
+//   AoS layout; for a weight reordered to COALESCED or SOA it admits more than the kernels read, and such a src1 can
+//   end in "MUL_MAT dispatch failed" (no llama graph builds that shape).
 // The route is the one the dispatch takes, from the same classifier, environment and unified-arm predicate. The
 // environment reads whether src0 is a weight from its buffer's usage, so a caller that asks before the weight buffer
 // is allocated and marked (test-backend-ops does) can see a different route than the dispatch; llama places weights
