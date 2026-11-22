@@ -4695,9 +4695,16 @@ struct ggml_tensor_extra_gpu {
     bool               layout_dirty = false;                // Weight data overwritten; layout must be re-materialized
 
     // The order of the bytes in the tensor's own range (tensor->data). It is written only by code that writes those
-    // bytes (set_tensor, and the in-place reorders reorder_tensor_to_soa and convert_tensor_to_coalesced); a
-    // cache-side copy in another layout never changes it. optimized_feature and layout record what a kernel last
-    // resolved, which may be such a copy. ggml_backend_sycl_buffer_get_tensor decides from this field alone.
+    // bytes (ggml_backend_sycl_buffer_set_tensor, ggml_backend_sycl_set_tensor_async when its write went to the own
+    // range, and the in-place reorders reorder_tensor_to_soa and convert_tensor_to_coalesced); a cache-side copy in
+    // another layout never changes it. optimized_feature and layout record what a kernel last resolved, which may be
+    // such a copy. ggml_backend_sycl_buffer_get_tensor decides from this field alone.
+    // It is not complete. These writers of the own range do not keep it right: the destination of
+    // ggml_backend_sycl_buffer_cpy_tensor and of ggml_backend_sycl_cpy_tensor_async and a partial
+    // ggml_backend_sycl_buffer_memset_tensor do not write it; a partial ggml_backend_sycl_buffer_set_tensor or
+    // ggml_backend_sycl_set_tensor_async records AOS for the whole range; tied-weight aliases share one extra and so
+    // one record.
+    // ggml_backend_sycl_get_tensor_async does not consult it and returns the stored bytes.
     ggml_layout_mode own_data_layout = GGML_LAYOUT_AOS;
 
     tp_layer_type tp_type        = tp_layer_type::TP_NONE;  // Cached TP type (set once, avoids string compare)
