@@ -80,7 +80,7 @@ of `1dcdf49b1`): `git -C <wt> switch -c feat/inkling2 master`. Implementers work
 | B (scripts) | 6, 6b, 10, 10b, 11 | `inkling` gate; GPT-OSS gate without `-ngl`; profile runner; atomic lock takers; scheduler-census parser |
 | C (planner rate, docs) | 13, 16 | Profile document; measured CPU expert rate row |
 | D (backend failure path) | 7a, 7d, 7b, 7c | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21); a failed context gives its device back |
-| E (inherited regression) | 6c | GPT-OSS 20B at the default context loses the B50: spike, then fix tasks (found 2026-11-21) |
+| E (inherited regression) | 6c, 6d | GPT-OSS 20B at the default context loses the B50: spike, then the COMPUTE-flag fix (found 2026-11-21). 6e, the exit path, is on Track D |
 
 **Amended 2026-11-21, after Task 1 ran and the two spikes concluded.** Task 1 ended red at an old defect
 (llama.cpp-kjoc), so Tasks 7a and 7b now precede the route's opening, and Task 7c follows 7b. Task 4's spike produced Task 4b. Task 6b was
@@ -103,6 +103,8 @@ digraph dependencies {
     6  [label="T6 inkling gate script"];
     6b [label="T6b GPT-OSS gate without -ngl"];
     6c [label="T6c spike: GPT-OSS default context loses the B50"];
+    6d [label="T6d not-computed nodes are not executed"];
+    6e [label="T6e lost device exits cleanly"];
     7a [label="T7a async error fails the boundary"];
     7d [label="T7d failed context gives its device back"];
     7b [label="T7b every queue has the handler"];
@@ -120,7 +122,7 @@ digraph dependencies {
     16 [label="T16 rate table row"];
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
-    1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 9;
+    1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -139,7 +141,7 @@ digraph dependencies {
 | `tests/test-sycl-load-measure-source.py`, `tests/test-sycl-kv-before-experts-source.py` | 2 | None |
 | `scripts/sycl-canonical-gates.sh`, `tests/test-sycl-canonical-gates-script.sh` | 6, 6b | Sequential (both merged) |
 | `docs/backend/gpt-oss-testing.md` | 6b | None |
-| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7a, then 7d, then 7 and 7b, then 7c, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 6d (one predicate near `:99182`, disjoint from Track D's regions; merged by the lead between Track D merges), 7a, then 7d, then 7 and 7b, then 7c, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
 | `ggml/src/ggml-sycl/unified-cache.cpp` | 7a, 7b, 7c, 4b | Sequential (lead orders them) |
 | `ggml/src/ggml-sycl/common.cpp`, `common.hpp`, `async-failure.hpp` | 7a, 7b, 7c (`common.cpp` only) | Sequential (Track D) |
 | `ggml/src/ggml-sycl/device-pool.hpp`, `layer-streaming.cpp`, `l2-prefetch.hpp`, `dense-scheduler.cpp`, `tests/test-sycl-async-drain-source.py` | 7c | None |
@@ -844,14 +846,38 @@ each run on a card that had just passed the Mistral gate with zero kernel fault 
 - The device is lost before layer 0's MoE gate, and the error is reported at the first wait. The faulting kernel
   is something submitted before that wait, not necessarily `MUL_MAT_ID`.
 
-**What is not known:** which kernel faults and why its operand is unmapped in this shape; which commit between
-`8b5946b53` and `1dcdf49b1` introduced it (the range holds the upstream sync `3b3962534`).
+**Cause (found 2026-11-21 by the read-only investigation, checked by the lead in the code).** The SYCL backend
+executes graph nodes that do not carry `GGML_TENSOR_FLAG_COMPUTE`.
+- Upstream's input embedding is now a 3-way `ggml_build_forward_select` (`src/llama-graph.cpp:2751-2867`, from
+  `0bb496dbd`). For a token batch the mixed branch, `GET_ROWS(tok_embd, inp_mixed_tokens)` and a `SET_ROWS`, is
+  built and not selected; its inputs are never written (`src/llama-graph.cpp:159`).
+- The scheduler keeps the split-input copy of such an input and does not upload it (`ggml-backend.cpp:2536-2539`,
+  from `806b3c2be`).
+- Every other backend, and upstream's SYCL backend at four sites, skips a node without the flag. The fork's node
+  loop came through the merge without that check: `ggml_sycl_is_noop` (`ggml-sycl.cpp:99182`) tests the op only,
+  and no line under `ggml/src/ggml-sycl/` reads the flag.
+- So the fork gathers token-embedding rows by whatever the copy's memory holds. In the first graph that is fresh
+  memory. In the second it is f32 activations read as int32 row ids, about 3 TB out of bounds.
+- The kernel's page-fault addresses confirm it: 31 read faults on 6 pages that solve exactly as two rows of the
+  Q8_0 token embedding at arena offset 0, with ids 0xC384B8DF and 0x428FD3C1 (f32 -265.44 and 71.91).
+- `-c 4096` passes by luck. With no CPU work in the plan the CPU buffer type is `SYCL_Host`, which the device
+  accepts, so there is no copy and the kernel reads the zeroed host input in place: row 0.
+- The same defect costs every decode of every model three wasted ops, and the unselected `SET_ROWS` is an
+  out-of-bounds write when its stale ids are large.
+- Ruled out by the addresses: the KV clear, a host-tier KV pointer, a stale replay pointer, the expert table.
+
+**The SIGSEGV.** The catch in `ggml_sycl_mul_mat_id` calls `std::exit(1)` on the compute thread
+(`ggml-sycl.cpp:93333-93363`; 31 of the file's 37 `std::exit(1)` calls sit at "Exception caught" sites). Static
+destruction then runs while the detached retained-handle drain worker (`mem-handle.cpp:257-365`) still waits on
+SYCL events, and the kernel log shows a segfault in `libsycl.so` on another thread. Task 6e.
+
+**Result:** Task 6d fixes the device loss. Task 6e fixes the exit. No further diagnostic GPU run is needed.
 
 **Two defects, not one.** The device loss is the first. The second is the SIGSEGV after the device-lost exception
 is caught at `ggml-sycl.cpp:93362`: a lost device must end in an error return or a clean exit, not a core.
 
-**Steps.**
-1. Read-only investigation (running since 2026-11-21 23:10): rank the candidate kernels on the path before layer
+**Steps (1 is done; 2 was not needed; 3 is Tasks 6d and 6e below).**
+1. Read-only investigation: rank the candidate kernels on the path before layer
    0's MoE gate from the code and the verbose log; read the regression range; find why the catch at `:93362`
    ends in a segfault; name at most one diagnostic GPU run.
 2. Lead: that one run, with a Mistral health arm before and after, under `GPU.lock`. A run that passes when the
@@ -865,6 +891,108 @@ written, not routed around.
 **Until it is fixed:** every run of the GPT-OSS gate without `-c` on the B50 faults the card and resets the
 engine. Do not run it as a routine gate. Tasks 7a, 7d, 7b and 7c are accepted on the `-c 4096` arm plus the
 Mistral gate. Task 9's default-context arm stays red until this task's fix lands.
+
+---
+
+### Task 6d: The SYCL backend does not execute a node the graph did not ask for
+
+**Track:** E. **Depends on:** Task 6c (done). **Blocks:** Task 9.
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: `ggml_sycl_is_noop` (`:99182-99185` at `b429f23e4`), and any node
+  walker the audit below finds that dispatches a node without going through it.
+- Create: `ggml/src/ggml-sycl/tests/test-select-unselected-branch.cpp`; Modify: `ggml/src/ggml-sycl/CMakeLists.txt`.
+- Create: `tests/test-sycl-compute-flag-source.py`; Modify: `tests/CMakeLists.txt`.
+- Modify: `docs/backend/sycl-verification-traps.md` (one paragraph: a `-c` pin hid this for a whole sync).
+
+**Description:** one predicate decides what the backend does not run. It gains the flag test, so the main node
+loop, prefix detection, suffix dispatch, the recorder's `is_noop` field and `moe_graph_dispatch_direct_node` all
+skip a not-computed node. The graph signature already mixes `node->flags` (`:113580`), so a recorded graph is
+not replayed for a different selection.
+
+**GREEN (the predicate):**
+```cpp
+// True for a node that generates no work in this backend. A node without GGML_TENSOR_FLAG_COMPUTE is one the graph
+// did not ask for (an unselected branch of ggml_build_forward_select). The scheduler does not upload such a node's
+// inputs (ggml-backend.cpp, hv_tensor_requires_copy), so running it reads memory that nobody wrote.
+// Used by graph_compute_impl, prefix detection, and suffix dispatch.
+static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {
+    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+           node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
+           node->op == GGML_OP_NONE;
+}
+```
+
+**Audit (part of the task, reported in the commit message):**
+- List every place that submits a kernel, or hands a node to the CPU path, for a node of the caller's graph.
+  For each, name the `ggml_sycl_is_noop` call (or flag test) that guards it. A site with none gets the test.
+- List every pattern detector that pairs or fuses nodes (fusions, MoE descriptors, look-ahead for `CPY`, runs of
+  norms). A detector must not pair a computed node with a not-computed one. Upstream guards its two
+  (`19bc41dbb:ggml/src/ggml-sycl/ggml-sycl.cpp:5507` and `:6663`); find the fork's equivalents.
+- List every fork-internal graph or synthetic node that reaches the predicate without having gone through
+  `ggml_build_forward_expand` (which sets the flag, `ggml.c:7303`). Such a node would now be skipped silently.
+  `tests/test-attn-host-flash-attn-identity.cpp:45-85` describes one fixture that had to set the flag by hand.
+  Each one found either sets the flag or is reported to the lead.
+
+**RED 1, host-only source contract** (`tests/test-sycl-compute-flag-source.py`, label `source-contract`, with
+`--self-test`): the body of `ggml_sycl_is_noop` tests `GGML_TENSOR_FLAG_COMPUTE`; `ggml_sycl_graph_signature`
+mixes `node->flags`. Mutants: the flag test removed from the predicate; `mix(...node->flags)` removed from the
+signature. Fails before the change on the first claim.
+
+**RED 2, device test** (`test-sycl-select-unselected-branch`, built by the implementer, run by the lead once per
+card). It must show execution without faulting the card, so it uses no out-of-range id:
+- SYCL backend only, no scheduler, F32 tensors, no model. Exit 77 when no device is found.
+- Graph: `a = ggml_scale(x, 2)`, `b = ggml_scale(x, 3)`, `out = ggml_build_forward_select(gf, {a, b}, 2, 0)`.
+- After allocation and before the compute, write a sentinel into `b`'s buffer with `ggml_backend_tensor_set`.
+- After `ggml_backend_graph_compute` and a synchronize: `a` equals `2 * x` (the positive control: the selected
+  branch ran) and `b` still holds the sentinel. If `b` equals `3 * x`, print
+  `FAIL: the unselected branch was executed` and exit 1.
+- A second graph with index 1 swaps the roles, so a backend that runs nothing cannot pass.
+- If the allocator gives `a` and `b` the same memory (the dead-end early free of `1dcdf49b1`), the test says so
+  and exits 1 instead of passing: the sentinel check needs distinct memory. Read `tests/test-alloc.cpp:473-490`
+  for how that free behaves, and keep both branches alive (for example by making each an output) if needed.
+- Registration: it loads no model. Follow `.claude/rules/ctest-registration.md`.
+
+**Acceptance:**
+- [ ] The source contract passes with `--self-test`; both mutants are caught.
+- [ ] `./scripts/sycl-build.sh` builds `llama-cli`, `llama-completion`, `llama-bench`, `test-backend-ops` and
+      the new test (`TMPDIR` on the root disk).
+- [ ] Lead, once per card: the device test prints PASS; on the tree before the change it prints the FAIL line
+      (run once, B50, as the RED).
+- [ ] Lead, once: the GPT-OSS B50 gate without `-c` passes (`grep -cx '1, 2, 3, 4, 5'` is 1) with zero kernel
+      fault lines, between two Mistral B50 health arms.
+- [ ] Lead, once each: Mistral gates on both cards, the GPT-OSS B70 gate, the GPT-OSS B50 `-c 4096` arm.
+- [ ] Lead, by hand: `test-backend-ops` on the B50.
+- [ ] Lead: an interleaved ABBA `llama-bench -p 512 -n 128` on B50 Mistral against the parent commit, to record
+      what the three skipped ops were costing. A gain is expected; a loss is a finding.
+
+**Gotchas:**
+- The predicate is called from about 25 sites. Read each before you change the predicate: two of them test
+  `!ggml_sycl_is_noop(next)` to look ahead, where "not computed" must also mean "not there".
+- Do not add a bounds check to `k_get_rows_reorder` in this task. An id out of range is a caller defect, and a
+  check in the kernel would hide the next one.
+- Do not make the device accept or refuse a buffer type here. That the no-CPU-work shape reads a `SYCL_Host`
+  input in place is a separate question (Task 6c, cause, sixth bullet).
+
+**Commit:** `sycl: a node without the COMPUTE flag is not executed (unselected select branches)`, paths: the
+five files above.
+
+---
+
+### Task 6e: A lost device ends the process without running static destructors under live workers
+
+**Track:** D, after Task 7c (same file, same failure path). **Depends on:** Task 7c.
+**Status:** recorded 2026-11-21 from Task 6c's finding; written out to the Task Detail Standard before it starts.
+**What is known:** `ggml-sycl.cpp` has 31 "Exception caught" sites that call `std::exit(1)` on the compute
+thread. `std::exit` runs static destructors and `atexit` handlers while the detached drain worker and the CPU
+expert pool keep calling SYCL; the watchdog is even restarted after its shutdown guard ran
+(`mem-handle.cpp:280-283`, `common.cpp:712-716`). The watchdog's own fatal path (`common.cpp:768-781`) already
+does the right thing: signal CPU jobs, flush, `std::_Exit(1)`.
+**Direction (lead ruling):** one fatal helper that the 31 sites call, doing what the watchdog path does, with the
+200 ms settle before `_Exit` (llama.cpp-488x). Returning `GGML_STATUS_FAILED` from a kernel catch is the better
+end state and belongs with the async-failure latch of Tasks 7a to 7c: a synchronous `sycl::exception` records
+into the same latch and the boundary reports it. Which of the two this task does is decided when it is written.
+**Also in scope:** detached workers stop calling SYCL once shutdown begins; `watchdog_start` refuses after its
+guard has run. A normal exit has the same race.
 
 ---
 
@@ -1514,7 +1642,7 @@ Work in three commits. Run no GPU binary; this task needs none.
    # lk <lock dir> <out dir>: a real run of the journal arm that takes the lock (no device, no model)
    lk() { PATH="${LK_PATH:-$WORK/stubbin}:$PATH" bash "$GATE" --lock-dir "$1" --arm resets \
        --build-dir "$WORK/srcrepo/build" --out-dir "$2" "$SRC_SHA" 2>&1; }
-   # a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+   # a mkdir shim that exits 0 for an existing directory, which models the losing side of the system mkdir's check-then-create race
    mkdir -p "$WORK/shim"
    printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
        > "$WORK/shim/mkdir"
@@ -1596,7 +1724,7 @@ Work in three commits. Run no GPU binary; this task needs none.
    out="$(LLAMA_GPU_LOCK="$work/q.lock" "$GATE" --lock-selftest 2>&1)" || fail "--lock-selftest must pass: $out"
    grep -q 'lock-selftest: ok' <<<"$out" || fail "--lock-selftest must print ok: $out"
    [ ! -e "$work/q.lock" ] || fail "--lock-selftest left its lock behind"
-   # a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+   # a mkdir shim that exits 0 for an existing directory, which models the losing side of the system mkdir's check-then-create race
    mkdir -p "$work/shim"
    printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
        >"$work/shim/mkdir"
