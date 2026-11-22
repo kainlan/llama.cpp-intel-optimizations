@@ -663,6 +663,48 @@ void refused_graph_then_synchronize_case() {
         "the synchronize after a refused graph did not release the graph submitted before it" + observed(synced),
         before);
 }
+
+// A caller that stops at the first error tears its context down without another synchronize. llama_context's
+// teardown drains the terminal events first, and that drain must release a graph whose terminal failed: a slot left
+// quarantined keeps the invocation pinned and the device owned by a context nothing computes on.
+void failed_graph_then_drain_case() {
+    lifecycle_fixture                life;
+    std::vector<float>               oracle;
+    size_t                           count = 0;
+    auto                             c     = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope("failed_graph_then_drain_case", before);
+
+    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
+        return " (invocation=" + std::to_string(state.invocation_id.value) +
+               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+    };
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
+    // The asynchronous form: ggml_backend_graph_compute would synchronize, and the synchronize would clean up.
+    require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "async terminal fixture failed before submission", before);
+    ggml_sycl_execution_snapshot submitted{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &submitted) == GGML_SYCL_EXECUTION_OK,
+                   "context snapshot unavailable after the failed graph", before);
+    require_stages(submitted.invocation_id.value != 0 && submitted.busy_device_count != 0,
+                   "graph_compute released its own graph, so this case cannot observe the drain" + observed(submitted),
+                   before);
+    require_stages(ggml_backend_sycl_execution_context_drain_terminal_events(life.context) == GGML_SYCL_EXECUTION_OK,
+                   "the terminal drain was refused", before);
+    ggml_sycl_execution_snapshot drained{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &drained) == GGML_SYCL_EXECUTION_OK,
+                   "context snapshot unavailable after the drain", before);
+    require_stages(drained.invocation_id.value == 0 && drained.busy_device_count == 0,
+                   "the terminal drain did not release the failed graph" + observed(drained), before);
+    ggml_sycl_q1_nvfp4_test_counters after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
+                   "async failpoint did not reach exactly one submitted terminal", before);
+    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
+                   "failed asynchronous terminal recycled its workspace", before);
+}
 } // namespace
 
 int main() {
@@ -683,6 +725,11 @@ int main() {
         injected_async_terminal_failure_case();
         require_clean_teardown();
         refused_graph_then_synchronize_case();
+        require_clean_teardown();
+        failed_graph_then_drain_case();
+        require_clean_teardown();
+        // The card must be usable by a new context after a context that failed and was only drained.
+        { lifecycle_fixture life; successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "after-failed-drain"); }
         require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {

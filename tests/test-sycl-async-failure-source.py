@@ -28,6 +28,11 @@ With comments blanked:
      terminal_release() runs, and a failed terminal never reaches it; the task's event completes only after the body
      returns, so a boundary that waited on that event finds the pin released however long the runtime keeps the
      functor or copies of it.
+  D. (ggml-sycl.cpp) a release refused during a drain is retried after the workspace recovery:
+     ggml_sycl_execution_recover_and_release_graph waits the stream, then calls
+     ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
+     call it before ggml_sycl_execution_abort_and_release_graph; the backend destructor calls the recovery before
+     its abort-and-release.
   H. (common.cpp ggml_sycl_async_handler) the handler body has no throw statement, no GGML_LOG, no lock or mutex, no
      std::string and no new.
 """
@@ -72,6 +77,13 @@ def claims(cache, sycl, common):
     t_success = body(t, "bool observe_success() noexcept")
     h = body(common, "sycl::async_handler ggml_sycl_async_handler(int slot)")
     b = body(sycl, "h.host_task([completion, terminal]")[1:-1].rstrip()
+    d = body(sycl, "static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept")
+    d_own = body(sycl, "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {")
+    d_ctx = body(sycl, "static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {")
+    d_dtor = body(sycl, "ggml_backend_sycl_context::~ggml_backend_sycl_context() {")
+    d_wait = d.find("stream->wait_and_throw();")
+    d_recover = d.find("ggml_sycl_recover_exact_mmid_after_drain(ctx);")
+    d_release = d.find("return ggml_sycl_execution_release_graph(ctx);")
     g_check = g.find("ggml_sycl_async_failure_since(")
     g_first = g.find("ggml_backend_sycl_graph_compute_unchecked(")
     s_since = s.find("ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)")
@@ -100,6 +112,16 @@ def claims(cache, sycl, common):
         "T a throwing observation is latched": "ggml_sycl_async_failure_record(" in body(t_success, "catch (...)"),
         "B the completion task drops the bundle before it returns": b.endswith(BUNDLE_DROP) and
             0 <= b.find("completion->bundle.terminal_release()") < b.rfind(BUNDLE_DROP),
+        "D the helper waits, recovers, then releases": 0 <= d_wait < d_recover < d_release,
+        "D the begin-path twin retries before it aborts": 0 <= d_own.find(
+            "ggml_sycl_execution_recover_and_release_graph(ctx)") < d_own.find(
+            "ggml_sycl_execution_abort_and_release_graph(ctx);"),
+        "D the context twin retries before it aborts": 0 <= d_ctx.find(
+            "ggml_sycl_execution_recover_and_release_graph(backend_ctx)") < d_ctx.find(
+            "ggml_sycl_execution_abort_and_release_graph(backend_ctx);"),
+        "D the destructor recovers before it releases": 0 <= d_dtor.find(
+            "ggml_sycl_recover_exact_mmid_after_drain(this);") < d_dtor.find(
+            "ggml_sycl_execution_abort_and_release_graph(this);"),
         "T route arms with its cursor": "terminal->arm(final, failure_cursor);" in sycl and
             "const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);" in sycl,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
@@ -160,6 +182,13 @@ def main():
             "completion task drops the bundle first": (cache, sycl.replace(BUNDLE_DROP, "", 1).replace(
                 "const bool recycled = terminal->observe_success()",
                 BUNDLE_DROP + " const bool recycled = terminal->observe_success()", 1), common),
+            "helper releases without recovering": (cache, sycl.replace(
+                "ggml_sycl_recover_exact_mmid_after_drain(ctx);\n    return ggml_sycl_execution_release_graph(ctx);",
+                "return ggml_sycl_execution_release_graph(ctx);", 1), common),
+            "context twin aborts without the retry": (cache, re.sub(
+                r"\s*&&\s*!ggml_sycl_execution_recover_and_release_graph\(backend_ctx\)", "", sycl, count=1), common),
+            "destructor releases without recovering": (cache, sycl.replace(
+                "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
             "handler logs": (cache, sycl, common.replace("ggml_sycl_async_failure_record(bound, e.what());",
                                                          "GGML_LOG_ERROR(\"%s\", e.what());", 1)),
         }
