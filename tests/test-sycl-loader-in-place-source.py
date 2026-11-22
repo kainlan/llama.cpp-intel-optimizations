@@ -67,6 +67,15 @@ The charge (ucc = unified-cache.cpp)
       host_budget; ggml_sycl_stage_refuse_loader_pool_plan logs it on one ERROR line, and the stage returns
       GGML_SYCL_LIFECYCLE_PLAN_REJECTED on it in both passes, for each late decision and for the early candidate. A
       plan without the term keeps the ledger's WARN-only check.
+  C5. The term and the replay count exactly the tensors the loader places in its SYCL_Host buffer, through one fact and
+      one per-entry rule. placement_loader_holds_host_dense (hpp) is the fact: the loader holds a host-planned dense
+      weight unless the inventory is unbound (the early pass's and the dry run's, which name every weight of the file)
+      and the host weight layout is not OFF, the layouts that put such a weight in a CPU-owned buffer. The fact copy sets
+      plan.loader_holds_host_dense from info.host_weight_layout and info.load_inventory_unbound;
+      placement_plan_loader_holds_entry (hpp) applies it to an entry (host-planned, dense, not file-mapped); the
+      loader_residency sum and placement_plan_loader_tensor_bytes, the replay's tensors, both ask it; and
+      populate_host_zone_sizing records the replay's tensors from that function. The early pass and the dry run mark
+      their inventory unbound, and the late pass, whose inventory keeps only the tensors on SYCL buffers, marks it bound.
 
 Run: python3 -I tests/test-sycl-loader-in-place-source.py [--self-test]
 """
@@ -309,6 +318,14 @@ def clause_p3_loader_term_checked(t: dict) -> list:
 
 # ---- the charge ----
 
+HOLDS_ENTRY = r"\bplacement_plan_loader_holds_entry\s*\(\s*plan\s*,\s*entry\s*\)"
+UNBOUND_EARLY = r"(int\s+ggml_sycl_compute_placement_plan_early_impl\s*\(.*?populate_inventory_globals\s*\([^;]*\);\s*)" \
+                r"g_placement_kv_info\.load_inventory_unbound\s*=\s*true\s*;"
+UNBOUND_LATE = r"(ggml_sycl_set_tensor_inventory_impl\s*\([^;{]*\)\s*\{.*?populate_inventory_globals\s*\([^;]*\);\s*)" \
+               r"g_placement_kv_info\.load_inventory_unbound\s*=\s*false\s*;"
+UNBOUND_DRY = r"(ggml_sycl_inventory_fill_kv_info\s*\(\s*kv\s*,\s*inventory\s*\)\s*;\s*)" \
+              r"kv\.load_inventory_unbound\s*=\s*true\s*;"
+
 
 def clause_c1_terms(t: dict) -> list:
     problems = []
@@ -400,7 +417,8 @@ def clause_c3_pool_footprint(t: dict) -> list:
         if not re.search(rf"\bon_device\.{field}\s*=\s*0\s*;", share):
             problems.append(f"a card that does not hold the loader's buffer keeps its {field}")
     populate = fn(t, UCC, "populate_host_zone_sizing")
-    if not re.search(r"\bplan\.loader_tensor_bytes\.push_back\s*\(", populate) or "tensor_inventory" not in populate:
+    if not re.search(r"\bplan\.loader_tensor_bytes\s*=\s*placement_plan_loader_tensor_bytes\s*\(", populate) or \
+            "tensor_inventory" not in populate:
         problems.append("populate_host_zone_sizing does not record the loader's tensors from its inventory")
     writers = re.findall(r"(?:\.|->)loader_tensor_bytes\s*(?:=(?!=)|\.push_back|\.clear|\.assign)", t[UCC] + t[GS])
     if len(writers) != len(re.findall(r"(?:\.|->)loader_tensor_bytes\s*(?:=(?!=)|\.push_back|\.clear|\.assign)",
@@ -453,6 +471,40 @@ def clause_c4_loader_pool_refusal(t: dict) -> list:
     return problems
 
 
+def clause_c5_loader_holds_what_it_places(t: dict) -> list:
+    problems = []
+    rule = body_of(t[HPP], r"\bconstexpr\s+bool\s+placement_loader_holds_host_dense\s*\(")
+    if not re.search(r"return\s+!\s*inventory_unbound\s*\|\|\s*host_weight_layout\s*==\s*"
+                     r"GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF\s*;", rule):
+        problems.append("placement_loader_holds_host_dense is not: a bound inventory, or the OFF layout")
+    entry = body_of(t[HPP], r"\binline\s+bool\s+placement_plan_loader_holds_entry\s*\(")
+    for needle in ("plan.loader_holds_host_dense", "entry.on_device", "entry.expert_id", "FILE_MAPPED"):
+        if needle not in entry:
+            problems.append(f"placement_plan_loader_holds_entry does not read {needle}")
+    copy = fn(t, UCC, "placement_plan_copy_host_backing_fact")
+    if not re.search(r"\bplan\.loader_holds_host_dense\s*=\s*placement_loader_holds_host_dense\s*\(\s*"
+                     r"info\.host_weight_layout\s*,\s*info\.load_inventory_unbound\s*\)\s*;", copy):
+        problems.append("the fact copy does not derive loader_holds_host_dense from the layout and the pass")
+    terms = body_of(t[UCC], r"\bhost_weight_zone_terms\s+placement_plan_host_weight_zone_terms\s*\(")
+    if not re.search(r"if\s*\(\s*charge_loader\s*&&\s*" + HOLDS_ENTRY + r"\s*\)", terms):
+        problems.append("the loader_residency sum does not ask placement_plan_loader_holds_entry")
+    replay = body_of(t[UCC], r"std::vector<size_t>\s+placement_plan_loader_tensor_bytes\s*\(")
+    if not re.search(HOLDS_ENTRY, replay):
+        problems.append("the replay's tensors do not ask placement_plan_loader_holds_entry")
+    populate = fn(t, UCC, "populate_host_zone_sizing")
+    if not re.search(r"\bplan\.loader_tensor_bytes\s*=\s*placement_plan_loader_tensor_bytes\s*\(\s*plan\s*,\s*"
+                     r"tensor_inventory\s*\)\s*;", populate):
+        problems.append("populate_host_zone_sizing does not record the replay's tensors from its inventory")
+    for what, pattern in (("the early pass", UNBOUND_EARLY), ("the late pass", UNBOUND_LATE),
+                          ("the dry run", UNBOUND_DRY)):
+        if not re.search(pattern, t[GS], flags=re.DOTALL):
+            problems.append(f"{what} does not mark its inventory as the loader binds it")
+    writes = re.findall(r"(?:\.|->)load_inventory_unbound\s*=(?!=)", t[GS] + t[UCC])
+    if len(writes) != 3:
+        problems.append(f"load_inventory_unbound is written {len(writes)} time(s), want 3")
+    return problems
+
+
 CLAUSES = [
     ("O1 a model owns the SYCL_Host chunks its load mints", clause_o1_model_owns_its_chunks),
     ("O2 the MODEL check runs after the reclaim", clause_o2_model_check_after_reclaim),
@@ -465,6 +517,7 @@ CLAUSES = [
     ("C2 the loader fact has one source", clause_c2_one_fact),
     ("C3 the loader's buffers are charged as the pool holds them", clause_c3_pool_footprint),
     ("C4 a loader pool over the budget refuses the load by name", clause_c4_loader_pool_refusal),
+    ("C5 the term and the replay count what the loader places", clause_c5_loader_holds_what_it_places),
 ]
 
 
@@ -550,7 +603,8 @@ MUTANTS = [
     ("card-sheds-raw", "C3", mutate_re(HPP, r"(on_device\.weight\s*-=\s*std::min\s*\(\s*on_device\.weight\s*,\s*)"
                                             r"terms\.loader_zone", r"\1plan.host_zone_loader_bytes")),
     ("card-keeps-grown", "C3", mutate_re(HPP, r"\bon_device\.loader_grown\s*=\s*0\s*;", "")),
-    ("tensors-unrecorded", "C3", mutate_re(UCC, r"\bplan\.loader_tensor_bytes\.push_back\s*\(", "(void) (")),
+    ("tensors-unrecorded", "C3", mutate_re(UCC, r"\bplan\.loader_tensor_bytes\s*=\s*placement_plan_loader_tensor_bytes\s*\(",
+                                           "(void) (")),
     ("second-tensor-writer", "C3", mutate_re(GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
                                              r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_tensor_bytes.clear();")),
     ("cap-uncopied", "C3", mutate_re(UCC, r"\bplan\.loader_buffer_cap\s*=\s*info\.load_loader_buffer_cap\s*;", "")),
@@ -563,6 +617,15 @@ MUTANTS = [
     ("refusal-for-every-plan", "C4", mutate_re(HPP, r"\bplan\.loader_device\s*>=\s*0", "true")),
     ("refusal-logs-nothing", "C4", mutate_re(GS, r"(static bool ggml_sycl_stage_refuse_loader_pool_plan\b.*?)GGML_LOG_ERROR",
                                              r"\1(void)")),
+    ("late-pass-applies-layout", "C5", mutate_re(GS, UNBOUND_LATE, r"\1g_placement_kv_info.load_inventory_unbound = true;")),
+    ("early-pass-counts-all", "C5", mutate_re(GS, UNBOUND_EARLY, r"\1g_placement_kv_info.load_inventory_unbound = false;")),
+    ("dry-run-counts-all", "C5", mutate_re(GS, UNBOUND_DRY, r"\1kv.load_inventory_unbound = false;")),
+    ("replay-skips-predicate", "C5", mutate_re(UCC, r"(std::vector<size_t>\s+placement_plan_loader_tensor_bytes\s*\(.*?)"
+                                                    + HOLDS_ENTRY, r"\1true")),
+    ("residency-skips-predicate", "C5", mutate_re(UCC, r"(if\s*\(\s*charge_loader\s*&&\s*)" + HOLDS_ENTRY, r"\1true")),
+    ("rule-reads-cpu-only", "C5", mutate_re(HPP, r"host_weight_layout\s*==\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF",
+                                            "host_weight_layout != GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU")),
+    ("fact-ignores-pass", "C5", mutate_re(UCC, r"info\.load_inventory_unbound\s*\)", "true)")),
     ("max-size-restated", "C3", mutate_re(GS, r"ggml_sycl::host_zone_buffer_max_size\s*\(\s*chunk_cap\s*,",
                                           "std::min(chunk_cap, ggml_sycl::pinned_chunk_pool::CHUNK_SIZE) + 0 * (")),
 ]

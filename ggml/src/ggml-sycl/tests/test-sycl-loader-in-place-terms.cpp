@@ -2,12 +2,15 @@
 // expert the loader serves in place takes no block of its own.
 //
 // On a load that does not map files, with evictable weights, the model loader binds the SYCL_Host buffer type for
-// every weight the plan places and keeps that buffer for the model's life. When the backend scheduler sees one device,
+// the weights the plan places and keeps that buffer for the model's life. When the backend scheduler sees one device,
 // every chunk of that buffer comes from that device's pinned pool (the load's loader_device); when it sees more, the
 // buffer is split across their pools by layer and no one pool holds it (loader_device -1). The plan charges the buffer
-// as the loader_residency term once, host-wide, when one pool holds it: every entry's bytes, each rounded up to the
-// loader's tensor alignment (exact for a dense weight, a bound for an expert slice). Every card's host zones are sized
-// from the plan, so only loader_device's commit terms carry the term; every other card's WEIGHT zone leaves it out.
+// as the loader_residency term once, host-wide, when one pool holds it: the bytes of every entry the buffer holds,
+// each rounded up to the loader's tensor alignment (exact for a dense weight, a bound for an expert slice). Every card's
+// host zones are sized from the plan, so only loader_device's commit terms carry the term; every other card's WEIGHT
+// zone leaves it out. The buffer holds every entry of a bound inventory, the late plan's. An unbound inventory, the
+// early plan's, also names the host-planned dense weights the cpu and plain layouts put in a CPU-owned buffer instead,
+// and neither the term nor the replay of the buffers counts those.
 // A plan made for loader_device also serves each host-planned PINNED expert from the buffer in place, under the
 // buffer's owner, so the expert is counted once, inside loader_residency, as loader_served, and holds no block. A
 // dense host weight still holds a block, and so does every host weight of a multi-device plan or of a plan made for
@@ -68,7 +71,8 @@ size_t align_up(size_t n, size_t a) {
 // One dense weight on the device, one on the host, four host experts and one device expert, every backing PINNED as a
 // load that maps no file plans them. The weights are evictable exactly when the loader holds them, the buffer is in
 // `loader_device`'s pool, and the plan is made for `plan_device` (kMultiDevice for the multi-device builder); the
-// loader facts are the ones the builder copies for that load.
+// loader facts are the ones the builder copies for that load. The plan keeps loader_holds_host_dense's default, a bound
+// inventory's, so the loader's buffer holds the host dense weight too.
 placement_plan make_plan(bool holds, int loader_device, int plan_device) {
     placement_plan plan{};
     plan.entries.push_back({ "blk.0.attn_q.weight", kDense, kDense, 0, placement_priority::ATTENTION, 0, -1,
@@ -90,33 +94,28 @@ placement_plan make_plan(bool holds, int loader_device, int plan_device) {
     return plan;
 }
 
-// The loader's tensors in the order the plan made their entries, each padded to the loader's tensor alignment: an
-// expert tensor is the sum of its slices.
-std::vector<size_t> loader_tensors(const placement_plan & plan) {
-    std::vector<std::string> names;
-    std::vector<size_t>      bytes;
+// The inventory make_plan's plan was made from, one row per tensor in the plan's order: an expert tensor is the sum of
+// its slices.
+std::vector<ggml_sycl::placement_tensor_info> inventory_of(const placement_plan & plan) {
+    std::vector<ggml_sycl::placement_tensor_info> rows;
     for (const auto & e : plan.entries) {
-        const auto it = std::find(names.begin(), names.end(), e.name);
-        if (it == names.end()) {
-            names.push_back(e.name);
-            bytes.push_back(e.src_size);
+        const auto it = std::find_if(rows.begin(), rows.end(), [&](const auto & r) { return r.name == e.name; });
+        if (it == rows.end()) {
+            rows.emplace_back(e.name, e.src_size);
         } else {
-            bytes[static_cast<size_t>(it - names.begin())] += e.src_size;
+            it->size += e.src_size;
         }
     }
-    for (size_t & b : bytes) {
-        b = align_up(b, TENSOR_ALIGNMENT);
-    }
-    return bytes;
+    return rows;
 }
 
 // The zone record populate_host_zone_sizing() makes from the terms: the WEIGHT zone's total, its loader term and, with
-// the term, the loader's tensors.
+// the term, the loader's tensors, through the replay's own function.
 void record_weight_zone(placement_plan & plan) {
     const host_weight_zone_terms terms = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
     plan.host_zone_weight_bytes        = terms.total();
     plan.host_zone_loader_bytes        = terms.loader_residency;
-    plan.loader_tensor_bytes           = terms.loader_residency > 0 ? loader_tensors(plan) : std::vector<size_t>{};
+    plan.loader_tensor_bytes           = ggml_sycl::placement_plan_loader_tensor_bytes(plan, inventory_of(plan));
 }
 
 bool same_terms(const host_zone_commit_terms & a, const host_zone_commit_terms & b) {
@@ -125,8 +124,15 @@ bool same_terms(const host_zone_commit_terms & a, const host_zone_commit_terms &
            a.loader_grown == b.loader_grown && a.onednn_live == b.onednn_live && a.chunk == b.chunk;
 }
 
+// The loader's buffer when it holds every entry of make_plan's plan: a bound inventory's, or under the off layout.
 size_t loader_bytes() {
     return align_up(kDense, TENSOR_ALIGNMENT) + kDenseHost + (kHostExperts + 1) * kExpert;
+}
+
+// The same buffer without the host dense weight, which an unbound inventory under the cpu or plain layout names but the
+// loader puts in a CPU-owned buffer.
+size_t loader_bytes_without_host_dense() {
+    return align_up(kDense, TENSOR_ALIGNMENT) + (kHostExperts + 1) * kExpert;
 }
 
 void check_fact_rule() {
@@ -174,7 +180,8 @@ void check_loader_serves_host_experts() {
     CHECK(terms.host_weights == kDenseHost);
     CHECK(terms.blocks == 1);
     CHECK(terms.loader_served == kHostExperts * kExpert);
-    // The loader's buffer holds every weight the plan places, the device-planned ones included.
+    // The loader's buffer of a bound inventory holds every weight the plan places, the device-planned ones and the
+    // host dense one included.
     CHECK(terms.loader_residency == loader_bytes());
     CHECK(terms.tlsf_bound == ggml_sycl::tlsf_allocator::block_grain);
     CHECK(terms.total() == kDenseHost + loader_bytes() + terms.host_compute_reserve + terms.tlsf_bound);
@@ -279,6 +286,58 @@ void check_mapped_expert_is_neither() {
         const host_weight_zone_terms terms = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
         const size_t                 left  = (kHostExperts - 1) * kExpert;
         CHECK(terms.host_weights + terms.loader_served == kDenseHost + left);
+    }
+}
+
+void check_loader_holds_what_it_places() {
+    // The term and the replay count exactly the tensors the loader puts in its SYCL_Host buffer. The early pass plans an
+    // unbound inventory, which names every weight of the file; under the cpu and plain layouts the loader puts the host
+    // dense weight in a CPU-owned buffer, so neither counts it. Under off it stays in SYCL_Host. The late pass plans a
+    // bound inventory, which keeps only the tensors on SYCL buffers, so both count every entry whatever the layout.
+    struct arm {
+        uint8_t layout;
+        bool    unbound;
+        bool    holds_host_dense;
+    };
+
+    const arm arms[] = {
+        { GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU,   true,  false },
+        { GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN, true,  false },
+        { GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF,   true,  true  },
+        { GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU,   false, true  },
+        { GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN, false, true  },
+        { GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF,   false, true  },
+    };
+    for (const arm & a : arms) {
+        const bool holds = ggml_sycl::placement_loader_holds_host_dense(a.layout, a.unbound);
+        if (holds != a.holds_host_dense) {
+            std::fprintf(stderr, "  layout=%u unbound=%d: the loader holds the host dense weight=%d, want %d\n",
+                         (unsigned) a.layout, (int) a.unbound, (int) holds, (int) a.holds_host_dense);
+        }
+        CHECK(holds == a.holds_host_dense);
+        placement_plan plan          = make_plan(true, 0, 0);
+        plan.loader_holds_host_dense = holds;
+        record_weight_zone(plan);
+        const size_t want = a.holds_host_dense ? loader_bytes() : loader_bytes_without_host_dense();
+        CHECK(plan.host_zone_loader_bytes == want);
+        // The replay's tensors, from the plan's inventory: the device dense weight, the expert tensor and, when the
+        // buffer holds it, the host dense weight, each at the loader's alignment.
+        const std::vector<size_t> replay = ggml_sycl::placement_plan_loader_tensor_bytes(plan, inventory_of(plan));
+        CHECK(replay.size() == (a.holds_host_dense ? 3u : 2u));
+        size_t replayed = 0;
+        for (const size_t b : replay) {
+            replayed += b;
+        }
+        CHECK(replayed == want);
+        // The host dense weight is still planned on the host and charged a block: the plan copies it into one.
+        CHECK(ggml_sycl::placement_plan_host_weight_zone_terms(plan).host_weights == kDenseHost);
+    }
+    // A device-planned dense weight and every expert stay in the buffer under every layout and pass.
+    placement_plan plan          = make_plan(true, 0, 0);
+    plan.loader_holds_host_dense = false;
+    for (const auto & e : plan.entries) {
+        const bool host_dense = !e.on_device && e.expert_id < 0;
+        CHECK(ggml_sycl::placement_plan_loader_holds_entry(plan, e) == !host_dense);
     }
 }
 
@@ -632,6 +691,7 @@ int main() {
     check_split_loader_charges_nothing();
     check_mapped_expert_is_neither();
     check_loader_role_follows_what_it_serves();
+    check_loader_holds_what_it_places();
     check_pool_oracle_reproduces_the_device_log();
     check_loader_footprint_is_the_pools();
     check_oversize_buffer_grows_a_planned_chunk();

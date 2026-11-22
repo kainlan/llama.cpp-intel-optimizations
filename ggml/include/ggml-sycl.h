@@ -325,6 +325,14 @@ enum ggml_sycl_kv_layer_kind {
     GGML_SYCL_KV_LAYER_SHARED = 2,  // no K/V of its own -- reuses an earlier layer's, or the KV cache holds none
 };
 
+// The host weight layout libllama resolved GGML_SYCL_HOST_WEIGHT_LAYOUT to, as ggml_sycl_tensor_inventory carries it
+// in one byte. OFF is 0, a zeroed inventory's value, and CPU keeps the 1 the byte held when it was a bool for cpu.
+enum ggml_sycl_host_weight_layout {
+    GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF   = 0,  // the loader binds its usual buffer types for a planner-host weight
+    GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU   = 1,  // a CPU-owned buffer, repacked where ggml-cpu repacks (the default)
+    GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN = 2,  // a CPU-owned buffer in the file layout
+};
+
 struct ggml_sycl_tensor_inventory {
     struct ggml_sycl_tensor_info * tensors;
     size_t                         count;
@@ -451,13 +459,14 @@ struct ggml_sycl_tensor_inventory {
     // in the device set forces it off). use_mlock_resolved: -lm mlock or mmap+mlock. The staging proc derives the fact
     // from them once, load_maps_files = use_mmap_resolved && the file-mapping tier exists in this build, and the plan
     // holds it.
-    // host_weight_layout_cpu: true iff libllama resolved GGML_SYCL_HOST_WEIGHT_LAYOUT to cpu, its default, where
-    // ggml-cpu repacks a planner-host dense weight into a buffer of its own, the state the planner backs CPU_OWNED
-    // (§4.4); false is plain or off. It mirrors libllama's three-valued resolver, host_weight_layout() in
-    // llama-model-loader.cpp, which is that variable's only reader, so the planner takes libllama's answer instead of
-    // reading the environment a second time. A bool suffices: the planner tells apart only a dense weight ggml-cpu
-    // repacks from one the CPU reads in the file layout, and plain and off both read the file layout. They differ only
-    // in the buffer libllama binds on a load that maps no files, where the plan backs every host weight PINNED.
+    // host_weight_layout: the value libllama resolved GGML_SYCL_HOST_WEIGHT_LAYOUT to (enum
+    // ggml_sycl_host_weight_layout), from its three-valued resolver, host_weight_layout() in llama-model-loader.cpp,
+    // which is that variable's only reader, so the planner takes libllama's answer instead of reading the environment a
+    // second time. The planner reads all three values. cpu, the default, is the one layout whose planner-host dense
+    // weights ggml-cpu repacks into a buffer of its own, the state the planner backs CPU_OWNED on a load that maps files
+    // (§4.4). cpu and plain both put a planner-host dense weight of a load that maps no files in a CPU-owned buffer, not
+    // the loader's SYCL_Host buffer, which the loader term counts; off leaves it in SYCL_Host. A zeroed inventory
+    // carries off, and a reader compares the byte with a named value, never tests it as a bool.
     // The three sit in the padding after n_ctx_context_is_default (offsets 185-187), so the struct stays 192 bytes. A
     // libllama built before them leaves those bytes unspecified, which is safe only because the staging proc that reads
     // them is exported under a new name (ggml_backend_sycl_stage_load_inventory_plan): such a libllama resolves the old
@@ -465,7 +474,7 @@ struct ggml_sycl_tensor_inventory {
     // rebuilt together.
     bool                           use_mmap_resolved;
     bool                           use_mlock_resolved;
-    bool                           host_weight_layout_cpu;
+    uint8_t                        host_weight_layout;
     // The micro-batch the caller named for the context it is about to create (llama_model_params::n_ubatch_hint);
     // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
@@ -515,8 +524,7 @@ static_assert(offsetof(ggml_sycl_lazy_table_info, size) == 72, "lazy table size 
 static_assert(offsetof(ggml_sycl_lazy_table_info, storage_only) == 80, "lazy table storage_only moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
-static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
-              "host_weight_layout_cpu left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout) == 187, "host_weight_layout left the padding");
 #endif
 
 // SYCL-side projection of the four placement-envelope fields the llama

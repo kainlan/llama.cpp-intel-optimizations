@@ -15691,8 +15691,7 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
-static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
-              "host_weight_layout_cpu left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout) == 187, "host_weight_layout left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
@@ -15933,7 +15932,7 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     // The largest buffer that buffer type lets ggml-alloc request, before a zone bounds it: the plan splits the
     // loader's tensors into buffers with it, as ggml-alloc does, to charge them as the pinned pool will hold them.
     kv.load_loader_buffer_cap   = ggml_backend_sycl_host_buffer_type_chunk_cap();
-    kv.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
+    kv.host_weight_layout       = inventory->host_weight_layout;
     // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
     // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
     kv.explicit_ubatch          = {};
@@ -17058,6 +17057,9 @@ static int ggml_sycl_compute_placement_plan_early_impl(ggml_backend_t           
     // Under the lock and before the pass publishes, so a failed load puts back only what this pass wrote.
     ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);
     populate_inventory_globals(ctx, inventory);
+    // The early inventory names every weight of the file, the ones the loader will put in a CPU-owned buffer included,
+    // so the loader term applies the host weight layout's rule to it (placement_loader_holds_host_dense).
+    g_placement_kv_info.load_inventory_unbound = true;
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
     int    budget_pct = 0;
     compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem);
@@ -17140,6 +17142,9 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     // ggml_backend_sycl_compute_placement_plan_early() call with the same
     // inventory snapshot.
     populate_inventory_globals(ctx, inventory);
+    // The late inventory keeps only the tensors on SYCL buffers, so every entry the loader term counts is in the
+    // loader's SYCL_Host buffer.
+    g_placement_kv_info.load_inventory_unbound = false;
 
     // Phase B: VRAM budget computation.
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
@@ -18000,6 +18005,8 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // keeps the value a load would plan with.
     ggml_sycl::placement_kv_info                        kv     = g_placement_kv_info;
     ggml_sycl_inventory_fill_kv_info(kv, inventory);
+    // The dry run plans the load's early inventory, every weight of the file, as the early pass does.
+    kv.load_inventory_unbound  = true;
     // P3's reading, the budget's source and its headroom refusal are the dry run's own sample's, the one its budget
     // came from, never the ledger's stored values. The source is the override only when the override is the budget
     // (design 5efe §4.5: it composes); an accepted override above the formula leaves the computed budget.

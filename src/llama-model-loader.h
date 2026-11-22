@@ -321,10 +321,11 @@ struct llama_model_loader {
     // otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
     bool weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const;
 
-    // Whether GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu, the default, where a planner-host dense weight is repacked
-    // into a CPU-owned buffer rather than read in the file layout (=plain, =off). Carried in the inventory, so the
-    // planner charges the backing this loader binds instead of reading the variable itself.
-    static bool host_weight_layout_cpu();
+    // The value GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to, as the SYCL inventory carries it (enum
+    // ggml_sycl_host_weight_layout: off, cpu, the default, where a planner-host dense weight is repacked into a
+    // CPU-owned buffer, or plain, a CPU-owned buffer in the file layout). Carried in the inventory, so the planner
+    // charges the buffers this loader binds instead of reading the variable itself.
+    static uint8_t host_weight_layout_sycl();
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

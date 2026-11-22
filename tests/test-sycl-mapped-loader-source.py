@@ -18,9 +18,12 @@ neither does a transaction store of the fact; F4 pins their absence, and F1, F6 
 replace it (set at both populate sites, read by the planner).
 
 The fact and the ABI
-  F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_weight_layout_cpu in the padding
+  F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_weight_layout in the padding
       after n_ctx_context_is_default (offsets 185-187, so n_ubatch_context stays at 188; the struct is 208 bytes
-      since the lazy tables were appended after it), and both static_assert blocks pin the three offsets;
+      since the lazy tables were appended after it), and both static_assert blocks pin the three offsets.
+      host_weight_layout is one byte holding three values (enum ggml_sycl_host_weight_layout: OFF 0, CPU 1, PLAIN 2),
+      so every read in the backend and libllama compares it with a named value and none tests it as a bool, where
+      PLAIN would read as CPU;
   F2. the four new exports (the renamed staging proc ggml_backend_sycl_stage_load_inventory_plan, planned_host_backing,
       mapped_buffer_type_for_device, mapped_buffer_from_file) are declared in ggml-sycl.h and resolvable through the
       strcmp proc table, the only way a GGML_BACKEND_DL build reaches them;
@@ -38,7 +41,7 @@ The fact and the ABI
   F6. the staging path derives the fact once: ggml_sycl_inventory_fill_kv_info, which fills a plan's kv_info from
       an inventory for the staged load and the plan dry run alike, sets load_maps_files =
       inventory->use_mmap_resolved && file_mapping_supported(), load_locks_files = load_maps_files &&
-      inventory->use_mlock_resolved, and copies host_weight_layout_cpu; populate_inventory_globals fills the staged
+      inventory->use_mlock_resolved, and copies host_weight_layout; populate_inventory_globals fills the staged
       load's kv_info through it; nothing else reads use_mmap_resolved;
   F7. planned_host_backing answers from the bound load's staged plan only: the plan's fact first
       (host_backing_maps_files), then the dense entry's backing, then the transaction default FILE_MAPPED. A plan
@@ -212,10 +215,14 @@ def struct_body(text: str, name: str) -> str:
 # ---- the fact and the ABI ----
 
 
-INVENTORY_FIELDS = ("use_mmap_resolved", "use_mlock_resolved", "host_weight_layout_cpu")
-INVENTORY_OFFSETS = {"use_mmap_resolved": 185, "use_mlock_resolved": 186, "host_weight_layout_cpu": 187}
+INVENTORY_TYPES = {"use_mmap_resolved": "bool", "use_mlock_resolved": "bool", "host_weight_layout": "uint8_t"}
+INVENTORY_FIELDS = tuple(INVENTORY_TYPES)
+INVENTORY_OFFSETS = {"use_mmap_resolved": 185, "use_mlock_resolved": 186, "host_weight_layout": 187}
 # The fact as the builders read it: derived by the staging path, never published.
-KV_FACT_FIELDS = ("load_maps_files", "load_locks_files", "host_weight_layout_cpu")
+KV_FACT_FIELDS = ("load_maps_files", "load_locks_files")
+# Every named value the layout byte may be compared with; a read of the byte that compares it with none of them tests
+# it as a number or a bool.
+LAYOUT_VALUE = r"GGML_SYCL_HOST_WEIGHT_LAYOUT_(?:OFF|CPU|PLAIN)"
 # A second source for the fact: the hook and the transaction store the ruled ABI does without.
 SECOND_SOURCE_NAMES = ("set_load_maps_files", "lifecycle_publish_load_host_backing", "lifecycle_find_load_host_backing",
                        "lifecycle_load_host_backing", "g_lifecycle_load_host_backings")
@@ -226,10 +233,10 @@ def clause_f1_inventory_fields(t: dict) -> list:
     body = struct_body(t[H], "ggml_sycl_tensor_inventory")
     if not body:
         return ["ggml_sycl_tensor_inventory not found in ggml-sycl.h"]
-    order = [m.group(1) for m in re.finditer(r"\b(?:bool|uint32_t)\s+(\w+)\s*;", body)]
-    for field in INVENTORY_FIELDS:
-        if not re.search(rf"\bbool\s+{field}\s*;", body):
-            problems.append(f"the inventory has no `bool {field};`")
+    order = [m.group(1) for m in re.finditer(r"\b(?:bool|uint8_t|uint32_t)\s+(\w+)\s*;", body)]
+    for field, type_name in INVENTORY_TYPES.items():
+        if not re.search(rf"\b{type_name}\s+{field}\s*;", body):
+            problems.append(f"the inventory has no `{type_name} {field};`")
     if all(f in order for f in INVENTORY_FIELDS + ("n_ctx_context_is_default", "n_ubatch_context")):
         idx = [order.index(f) for f in ("n_ctx_context_is_default",) + INVENTORY_FIELDS + ("n_ubatch_context",)]
         if idx != sorted(idx):
@@ -245,6 +252,35 @@ def clause_f1_inventory_fields(t: dict) -> list:
         for field, off in INVENTORY_OFFSETS.items():
             if not re.search(rf"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*{field}\s*\)\s*==\s*{off}\s*,", text):
                 problems.append(f"{rel}: no static_assert pins offsetof({field}) == {off}")
+    for value, number in (("OFF", 0), ("CPU", 1), ("PLAIN", 2)):
+        if not re.search(rf"\bGGML_SYCL_HOST_WEIGHT_LAYOUT_{value}\s*=\s*{number}\s*,", t[H]):
+            problems.append(f"ggml-sycl.h does not name the layout value {value} = {number}")
+    problems += layout_bool_reads(t)
+    return problems
+
+
+def layout_bool_reads(t: dict) -> list:
+    """Each read of the layout byte that is not a copy into another layout field, a comparison with a named value or
+    an argument passed on: a read that tests it as a bool would take PLAIN (2) for CPU (1)."""
+    problems = []
+    for rel in (GS, UCC, UCH, LM, LML):
+        code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', t[rel])
+        for m in re.finditer(r"(?:\.|->)\s*host_weight_layout\b(?!_)", code):
+            after = code[m.end():m.end() + 80]
+            before = code[max(0, m.start() - 80):m.start()]
+            if re.match(r"\s*=(?!=)", after):
+                continue  # a write
+            if re.match(rf"\s*[!=]=\s*{LAYOUT_VALUE}\b", after):
+                continue  # a comparison with a named value
+            call = re.search(r"\b(\w+)\s*\(\s*[\w.>-]*$", before)
+            if re.match(r"\s*[,)]", after) and call and call.group(1) not in ("if", "while", "for", "switch", "return"):
+                continue  # an argument, to a function that names its own comparison
+            if re.search(r"(?:\.|->)\s*host_weight_layout\s*=\s*[\w.>-]*$", before):
+                continue  # the source of a copy
+            if re.search(r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*$", before):
+                continue
+            line = code.count("\n", 0, m.start()) + 1
+            problems.append(f"{rel}:{line}: reads host_weight_layout as a bool or a number, not against a named value")
     return problems
 
 
@@ -351,9 +387,9 @@ def clause_f6_fact_derived_once(t: dict) -> list:
     if not re.search(r"\bkv\s*\.\s*load_locks_files\s*=\s*kv\s*\.\s*load_maps_files\s*"
                      r"&&\s*inventory\s*->\s*use_mlock_resolved\s*;", fill):
         problems.append("the staging path does not derive load_locks_files = load_maps_files && use_mlock_resolved")
-    if not re.search(r"\bkv\s*\.\s*host_weight_layout_cpu\s*=\s*"
-                     r"inventory\s*->\s*host_weight_layout_cpu\s*;", fill):
-        problems.append("the staging path does not copy libllama's resolved host_weight_layout_cpu")
+    if not re.search(r"\bkv\s*\.\s*host_weight_layout\s*=\s*"
+                     r"inventory\s*->\s*host_weight_layout\s*;", fill):
+        problems.append("the staging path does not copy libllama's resolved host_weight_layout")
     # A string literal is not a read: the layout static_assert's message names the field it pins.
     code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', t[GS])
     readers = len(re.findall(r"\buse_mmap_resolved\b", code))
@@ -436,7 +472,7 @@ def clause_l2_inputs_reach_both_inventories(t: dict) -> list:
     for needle, why in (
         (r"inventory\s*\.\s*use_mmap_resolved\s*=\s*ml\s*\.\s*use_mmap\s*;", "the resolved use_mmap"),
         (r"inventory\s*\.\s*use_mlock_resolved\s*=\s*use_mlock\s*;", "the resolved use_mlock"),
-        (r"inventory\s*\.\s*host_weight_layout_cpu\s*=\s*llama_model_loader::host_weight_layout_cpu\s*\(\s*\)\s*;",
+        (r"inventory\s*\.\s*host_weight_layout\s*=\s*llama_model_loader::host_weight_layout_sycl\s*\(\s*\)\s*;",
          "the resolved host weight layout"),
     ):
         if not re.search(needle, setter):
@@ -862,10 +898,12 @@ def clause_p1_derivation_sites(t: dict) -> list:
                      r"load_locks_files\s*;", helper):
         problems.append("placement_plan_copy_host_backing_fact does not lock only a mapping load")
     rule = body_of(ucc, r"static\s+placement_host_backing\s+placement_host_backing_when_host\s*\(")
-    for needle in ("host_weight_layout_cpu", "placement_host_backing::CPU_OWNED",
-                   "placement_host_backing::FILE_MAPPED", "placement_host_backing::PINNED"):
+    for needle in ("placement_host_backing::CPU_OWNED", "placement_host_backing::FILE_MAPPED",
+                   "placement_host_backing::PINNED"):
         if needle not in rule:
             problems.append(f"placement_host_backing_when_host does not read {needle}")
+    if not re.search(r"kv_info\s*\.\s*host_weight_layout\s*!=\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU\b", rule):
+        problems.append("placement_host_backing_when_host does not back only the cpu layout's dense weights CPU_OWNED")
     # One fact, one source: the rule asks the plan's copy, which the builder made before any entry exists.
     if not re.search(r"plan\s*\.\s*host_backing_maps_files", rule):
         problems.append("placement_host_backing_when_host does not read the plan's host_backing_maps_files")
@@ -902,6 +940,8 @@ def clause_p3_readers(t: dict) -> list:
     for field in KV_FACT_FIELDS:
         if not re.search(rf"\bbool\s+{field}\s*=", kv):
             problems.append(f"placement_kv_info has no `{field}`")
+    if not re.search(r"\buint8_t\s+host_weight_layout\s*=\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF\s*;", kv):
+        problems.append("placement_kv_info has no `uint8_t host_weight_layout` defaulting to a zeroed inventory's OFF")
     return problems
 
 
@@ -1026,6 +1066,9 @@ MUTANTS = [
     ("the old stage name returns the staging proc", "F3",
      lambda t: _mut(t, GS, rf'(strcmp\s*\(\s*name\s*,\s*"{STAGE_OLD}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
                            r"return\s*\(\s*void\s*\*\s*\)\s*)\w+", rf"\g<1>{STAGE_NEW}")),
+    ("the layout byte is read as a bool", "F1",
+     lambda t: _mut(t, UCC, r"kv_info\s*\.\s*host_weight_layout\s*!=\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU",
+                    "!kv_info.host_weight_layout")),
     ("libllama's inputs moved past the padding", "F1",
      lambda t: _mut(t, H, r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)\s*==\s*185",
                     "offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 192")),

@@ -181,8 +181,8 @@ void capture_log(ggml_log_level level, const char * text, void * user) {
 }
 
 // The fact as the planner reads it: placement_kv_info's three fields, which the staging proc derives.
-// Each defaults as placement_kv_info does; an arm that models libllama's answer for GGML_SYCL_HOST_WEIGHT_LAYOUT's
-// default, cpu, sets layout_cpu itself.
+// The two bools default as placement_kv_info does. The layout is cpu or not: an arm that models libllama's answer for
+// GGML_SYCL_HOST_WEIGHT_LAYOUT's default, cpu, sets layout_cpu itself, and not cpu is plain (kv_for).
 struct fact {
     bool maps_files  = false;
     bool locks_files = false;
@@ -193,7 +193,8 @@ placement_kv_info kv_for(const fact & f) {
     placement_kv_info kv{};
     kv.load_maps_files        = f.maps_files;
     kv.load_locks_files       = f.locks_files;
-    kv.host_weight_layout_cpu = f.layout_cpu;
+    // Not cpu is plain here, the layout whose byte (2) a reader testing it as a bool would take for cpu (1).
+    kv.host_weight_layout     = f.layout_cpu ? GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU : GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN;
     return kv;
 }
 
@@ -497,12 +498,12 @@ int main() {
     ggml_log_get(&prev_cb, &prev_data);
     ggml_log_set(capture_log, nullptr);
 
-    // host_weight_layout_cpu has one default, the value a zeroed inventory carries (false), held by placement_kv_info
-    // and this file's fact alike.
+    // host_weight_layout has one default, the value a zeroed inventory carries (OFF), held by placement_kv_info; this
+    // file's fact defaults to a layout other than cpu.
     const ggml_sycl_tensor_inventory zeroed_inventory{};
-    check(placement_kv_info{}.host_weight_layout_cpu == zeroed_inventory.host_weight_layout_cpu &&
-              fact{}.layout_cpu == zeroed_inventory.host_weight_layout_cpu && !zeroed_inventory.host_weight_layout_cpu,
-          "host_weight_layout_cpu defaults to a zeroed inventory's false in placement_kv_info and the fact");
+    check(placement_kv_info{}.host_weight_layout == zeroed_inventory.host_weight_layout &&
+              zeroed_inventory.host_weight_layout == GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF && !fact{}.layout_cpu,
+          "host_weight_layout defaults to a zeroed inventory's OFF in placement_kv_info, and the fact to not cpu");
 
     const std::vector<placement_tensor_info> inv    = qwen_inventory();
     const size_t                             budget = arm0_inventory_and_budget(inv);

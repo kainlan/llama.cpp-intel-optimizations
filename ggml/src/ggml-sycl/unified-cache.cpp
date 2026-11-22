@@ -35780,11 +35780,12 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     const bool             charge_loader = plan.loader_holds_weights && plan.loader_device >= 0;
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
-        // The loader's SYCL_Host buffer holds every weight the plan places, on the device or not, for the model's
-        // life. ggml-alloc places each tensor at the CPU buffer type's TENSOR_ALIGNMENT, which SYCL_Host inherits, so
-        // a dense weight's bytes round up to it exactly; an expert entry is a slice of its tensor, and rounding each
+        // The loader's SYCL_Host buffer holds the weights the plan places, on the device or not, for the model's life,
+        // but a host-planned dense weight the layout puts in a CPU-owned buffer (placement_plan_loader_holds_entry).
+        // ggml-alloc places each tensor at the CPU buffer type's TENSOR_ALIGNMENT, which SYCL_Host inherits, so a
+        // dense weight's bytes round up to it exactly; an expert entry is a slice of its tensor, and rounding each
         // slice bounds the tensor's own rounding from above.
-        if (charge_loader) {
+        if (charge_loader && placement_plan_loader_holds_entry(plan, entry)) {
             const size_t a = TENSOR_ALIGNMENT;
             terms.loader_residency += (entry.src_size + a - 1) / a * a;
         }
@@ -35816,6 +35817,31 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     // update it. What a swap can use is the zone's free bytes when it runs.
     terms.swap_headroom        = plan.moe_swap_host_headroom_bytes;
     return terms;
+}
+
+// The tensors the term counts, the ones the loader's buffer holds (placement_plan_loader_holds_entry), each at the
+// loader's alignment as ggml-alloc pads it, in the inventory's order. That is the order the loader creates them in for
+// the late plan's inventory. The early plan's is weights_map's, by layer and then name, so its replay can take a little
+// more or less of the last chunk, and its lazy-table decision can refuse the load on that figure; the late plan
+// configures the zones.
+std::vector<size_t> placement_plan_loader_tensor_bytes(const placement_plan &                     plan,
+                                                       const std::vector<placement_tensor_info> & inventory) {
+    std::vector<size_t> bytes;
+    if (plan.host_zone_loader_bytes == 0) {
+        return bytes;
+    }
+    std::unordered_set<std::string> placed;
+    for (const placement_entry & entry : plan.entries) {
+        if (placement_plan_loader_holds_entry(plan, entry)) {
+            placed.insert(entry.name);
+        }
+    }
+    for (const auto & item : inventory) {
+        if (placed.count(item.name) > 0) {
+            bytes.push_back((item.size + TENSOR_ALIGNMENT - 1) / TENSOR_ALIGNMENT * TENSOR_ALIGNMENT);
+        }
+    }
+    return bytes;
 }
 
 bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after) {
@@ -36404,6 +36430,8 @@ static void placement_plan_copy_host_backing_fact(placement_plan &          plan
     plan.loader_device                 = loader.device;
     plan.loader_serves_host_experts    = loader.serves_host_experts;
     plan.loader_buffer_cap             = info.load_loader_buffer_cap;
+    plan.loader_holds_host_dense =
+        placement_loader_holds_host_dense(info.host_weight_layout, info.load_inventory_unbound);
 }
 
 // A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
@@ -36419,7 +36447,7 @@ static placement_host_backing placement_host_backing_when_host(const placement_p
     if (!plan.host_backing_maps_files) {
         return placement_host_backing::PINNED;
     }
-    if (routed_expert || get_rows_only || !kv_info.host_weight_layout_cpu) {
+    if (routed_expert || get_rows_only || kv_info.host_weight_layout != GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU) {
         return placement_host_backing::FILE_MAPPED;
     }
     return placement_host_backing::CPU_OWNED;
@@ -37235,24 +37263,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     }
     plan.host_zone_weight_bytes = weight_terms.total();
     plan.host_zone_loader_bytes = weight_terms.loader_residency;
-    // The loader's tensors with the term, for the commit terms' replay of its buffers in the pool: the tensors the plan
-    // places, the ones the term counts, each at the loader's alignment as ggml-alloc pads it, in the inventory's order.
-    // That is the order the loader creates them in for the late plan's inventory. The early plan's is weights_map's, by
-    // layer and then name, so its replay can take a little more or less of the last chunk, and its lazy-table decision
-    // can refuse the load on that figure; the late plan configures the zones.
-    plan.loader_tensor_bytes.clear();
-    if (plan.host_zone_loader_bytes > 0) {
-        std::unordered_set<std::string> placed;
-        for (const placement_entry & entry : plan.entries) {
-            placed.insert(entry.name);
-        }
-        for (const auto & item : tensor_inventory) {
-            if (placed.count(item.name) > 0) {
-                plan.loader_tensor_bytes.push_back((item.size + TENSOR_ALIGNMENT - 1) / TENSOR_ALIGNMENT *
-                                                   TENSOR_ALIGNMENT);
-            }
-        }
-    }
+    // The loader's tensors with the term, for the commit terms' replay of its buffers in the pool.
+    plan.loader_tensor_bytes    = placement_plan_loader_tensor_bytes(plan, tensor_inventory);
 
     const char * loader_role = placement_plan_loader_role(plan, weight_terms);
     GGML_LOG_INFO(

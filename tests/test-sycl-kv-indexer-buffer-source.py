@@ -132,7 +132,7 @@ HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == devic
 # test-sycl-explicit-ubatch-placement-source), and the lazy tables last (th32 §4.1) with the measured micro-batch in
 # their padding (pinned by test-sycl-load-measure-source), so the struct no longer ends here.
 FIELD = ("uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; "
-         "bool use_mmap_resolved; bool use_mlock_resolved; bool host_weight_layout_cpu; uint32_t n_ubatch_context; "
+         "bool use_mmap_resolved; bool use_mlock_resolved; uint8_t host_weight_layout; uint32_t n_ubatch_context; "
          "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
          "uint32_t n_ubatch_measure; };")
 # The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses

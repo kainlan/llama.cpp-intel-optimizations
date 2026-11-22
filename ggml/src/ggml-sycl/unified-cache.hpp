@@ -724,18 +724,24 @@ struct placement_kv_info {
     // cpu_expert_gbps (kv_room_expert_rate_for, kv-room-cost.hpp). It never makes a room held.
     bool                  n_ctx_context_is_default = false;
     // The load's host-backing fact (design 5efe §4.3-4.4), which the staging proc derives once from libllama's resolved
-    // inputs in ggml_sycl_tensor_inventory (use_mmap_resolved, use_mlock_resolved, host_weight_layout_cpu); the plan
+    // inputs in ggml_sycl_tensor_inventory (use_mmap_resolved, use_mlock_resolved, host_weight_layout); the plan
     // copies it and is the store every reader asks. load_maps_files: libllama resolved use_mmap and this build has the
     // file-mapping tier, so a host-resident weight is FILE_MAPPED (a routed expert, token_embd, a dense weight read in
     // the file layout) or CPU_OWNED (a dense weight ggml-cpu repacks), and a device-planned weight's staging source is
     // the mapping. false keeps every backing PINNED, today's figures. load_locks_files: -lm mmap+mlock, so the mapped
-    // bytes are locked and charged (§4.5). host_weight_layout_cpu: libllama's answer, copied unchanged, to whether
-    // GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu (its default), the one layout whose dense weights are CPU_OWNED.
-    // Unstaged it is false, a zeroed inventory's value: the rule reads it only under load_maps_files, and the staging
-    // proc writes both together.
+    // bytes are locked and charged (§4.5). host_weight_layout: libllama's resolved GGML_SYCL_HOST_WEIGHT_LAYOUT, copied
+    // unchanged (enum ggml_sycl_host_weight_layout). cpu, its default, is the one layout whose dense weights are
+    // CPU_OWNED; cpu and plain put a host-planned dense weight of a load that maps no files outside the loader's
+    // SYCL_Host buffer (placement_loader_holds_host_dense). Unstaged it is OFF, a zeroed inventory's value.
     bool                  load_maps_files          = false;
     bool                  load_locks_files         = false;
-    bool                  host_weight_layout_cpu   = false;
+    uint8_t               host_weight_layout       = GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF;
+    // Whether the inventory the kv_info was filled from is unbound: it names every weight of the file, the ones the
+    // loader will put outside SYCL buffers included. The load's early pass and the plan dry run plan such an
+    // inventory (libllama's early builder walks weights_map); the late pass plans the one libllama builds once the
+    // tensors are created, which keeps only the tensors on SYCL buffers. Set by the pass that fills the kv_info, not
+    // from the inventory. Unstaged it is false: every entry is counted in the loader's buffer, the safe direction.
+    bool                  load_inventory_unbound   = false;
     // Whether the loader binds the SYCL_Host buffer type for a SYCL layer's weights: the backend's
     // ggml_backend_sycl_weights_evictable(), the answer libllama's prefer_host_weights reads. With load_maps_files it
     // decides placement_loader_fact_for(). Unstaged it is false: no loader buffer is charged.
@@ -1191,15 +1197,18 @@ struct placement_plan {
     bool host_backing_maps_files = false;
     bool host_mapped_locked      = false;
     // The loader's SYCL_Host buffer as the plan's fact (placement_loader_fact_for, copied with the fact above).
-    // loader_holds_weights: the buffer holds every weight the plan places. loader_device: the device whose pinned pool
-    // holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its loader_residency term once,
-    // host-wide, when one does, and only that device's zone commits it. loader_serves_host_experts: S1-PRELOAD serves
-    // each host-planned PINNED expert from that buffer in place, under the buffer's owner, so such an expert takes no
-    // block of its own. loader_buffer_cap: placement_kv_info::load_loader_buffer_cap, the buffer type's chunk cap.
+    // loader_holds_weights: the loader binds the buffer for the weights the plan places. loader_device: the device whose
+    // pinned pool holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its loader_residency
+    // term once, host-wide, when one does, and only that device's zone commits it. loader_serves_host_experts:
+    // S1-PRELOAD serves each host-planned PINNED expert from that buffer in place, under the buffer's owner, so such an
+    // expert takes no block of its own. loader_buffer_cap: placement_kv_info::load_loader_buffer_cap, the buffer type's
+    // chunk cap. loader_holds_host_dense: the buffer holds the plan's host-planned dense weights too
+    // (placement_loader_holds_host_dense); placement_plan_loader_holds_entry() applies it to an entry.
     bool   loader_holds_weights       = false;
     int    loader_device              = -1;
     bool   loader_serves_host_experts = false;
     size_t loader_buffer_cap          = 0;
+    bool   loader_holds_host_dense    = true;
 
     size_t                       kv_vram_bytes;      // KV bytes on device(s)
     size_t                       kv_host_bytes;      // KV bytes on host
@@ -2413,6 +2422,33 @@ static constexpr placement_loader_fact placement_loader_fact_for(bool maps_files
     return { holds, device, device >= 0 && plan_device == device };
 }
 
+// Whether the loader's SYCL_Host buffer holds the host-planned dense weights of the inventory a plan was made from,
+// given the load's GGML_SYCL_HOST_WEIGHT_LAYOUT (enum ggml_sycl_host_weight_layout) and whether that inventory is
+// unbound (placement_kv_info::load_inventory_unbound). Under the cpu and plain layouts the loader puts a dense weight
+// the plan places on the host, on a load that maps no files, in a CPU-owned buffer instead
+// (llama-model-loader.cpp, the planned_target_device() == -1 branch), so that weight is not in the SYCL_Host buffer.
+// Only an unbound inventory names such a weight: the early pass's and the dry run's, which hold every weight of the
+// file (llama-model.cpp's early builder over weights_map). The late pass needs no rule: libllama builds its inventory
+// once the tensors are created and keeps only those whose buffer type is SYCL (llama_model_buft_backend_is_sycl, in
+// llama-model.cpp's late builder), and SYCL_Host is one, a CPU-owned buffer is not. So the late inventory holds
+// exactly the loader's SYCL_Host contents and its plan counts every entry. The off layout leaves the weight in
+// SYCL_Host. A user -ot override the plan does not see is outside this rule.
+static constexpr bool placement_loader_holds_host_dense(uint8_t host_weight_layout, bool inventory_unbound) noexcept {
+    (void) host_weight_layout;
+    (void) inventory_unbound;
+    return true;
+}
+
+// Whether the loader's SYCL_Host buffer holds `entry`'s tensor, for a plan whose loader holds the weights: every entry
+// but a host-planned dense weight the loader puts in a CPU-owned buffer (plan.loader_holds_host_dense false), which is
+// not file-mapped. The loader_residency sum and the replay of the loader's buffers (placement_plan_loader_tensor_bytes)
+// both ask it, so the term and the replay count the same tensors.
+inline bool placement_plan_loader_holds_entry(const placement_plan & plan, const placement_entry & entry) {
+    const bool host_dense =
+        !entry.on_device && entry.expert_id < 0 && entry.host_backing != placement_host_backing::FILE_MAPPED;
+    return plan.loader_holds_host_dense || !host_dense;
+}
+
 // The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
 // padding: a dense weight's copy is ggml_nbytes(tensor) and an expert's is tensor->nb[2], which are the entry's
 // src_size (the inventory's size is ggml_nbytes, and an expert's is that over ne[2]), except an unshaped expert row
@@ -2427,6 +2463,12 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 // builders size the WEIGHT zone through, by way of populate_host_zone_sizing(), and the one place the host weights are
 // summed.
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
+
+// The loader's tensors for the commit terms' replay of its buffers in the pool (plan.loader_tensor_bytes): the tensors
+// of `inventory` the loader's buffer holds (placement_plan_loader_holds_entry over the plan's entries), each at the
+// loader's alignment as ggml-alloc pads it, in the inventory's order. Empty when the plan charges no loader term.
+std::vector<size_t> placement_plan_loader_tensor_bytes(const placement_plan &                     plan,
+                                                       const std::vector<placement_tensor_info> & inventory);
 
 // What the WEIGHT-zone line says the loader_residency term is, from the plan's loader facts and `terms`, the terms
 // placement_plan_host_weight_zone_terms() computed for it. The line says the buffer serves host experts in place only
