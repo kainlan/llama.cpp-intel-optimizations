@@ -33,6 +33,10 @@ const char * moe_mmid_materialize_reason_name(moe_mmid_materialize_reason reason
             return "registry-invalid";
         case moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED:
             return "registry-allocation-failed";
+        case moe_mmid_materialize_reason::RECONCILE_REFUSED:
+            return "reconcile-refused";
+        case moe_mmid_materialize_reason::BIND_EXCEPTION:
+            return "bind-exception";
     }
     return "unknown";
 }
@@ -1839,10 +1843,10 @@ moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
     if (live_followed()) {
         return moe_mmid_reconcile_outcome::FOLLOWS_LIVE;
     }
-    // Not reachable today: an expert loan or refill, the only replacement that can run while the bind is outside the
-    // plan lock, asserts the same MMID workspace plan before its swap, and every other replacement takes the re-plan
-    // token the bind holds. A replacement that changes the geometry would need pools the published ones cannot
-    // stand for.
+    // Not reachable today: an expert loan or refill, the only replacement that can run while the bind is outside
+    // g_tensor_inventory_mutex, asserts the same MMID workspace plan before its swap, and every other replacement
+    // takes the re-plan token the bind holds. A replacement that changes the geometry would need pools the published
+    // ones cannot stand for.
     if (!stable_geometry) {
         return moe_mmid_reconcile_outcome::GEOMETRY_UNSTABLE;
     }

@@ -357,8 +357,9 @@ enum class moe_mmid_materialize_refusal : uint8_t {
     PUBLICATION_RACED,
     SAME_IDENTITY_OTHER_PLAN,
     // The context bind's reconcile (moe_mmid_reconcile_live_plan): the plan was replaced while the bind's workspaces
-    // were allocated outside the plan lock, and the live plan plans another workspace geometry, or the registry
-    // refused to rebind the published context to it, or accepted the rebind with no context then following it.
+    // were allocated outside g_tensor_inventory_mutex, and the live plan plans another workspace geometry, or the
+    // registry refused to rebind the published context to it, or accepted the rebind with no context then following
+    // it.
     PLAN_CHANGED_GEOMETRY_UNSTABLE,
     PLAN_CHANGED_REBIND_REFUSED,
     PLAN_CHANGED_REBIND_NOT_FOLLOWED,
@@ -398,6 +399,11 @@ enum class moe_mmid_materialize_reason : uint8_t {
     NO_QUEUE_LIFETIME,
     REGISTRY_INVALID,
     REGISTRY_ALLOCATION_FAILED,
+    // The context bind's reconcile refused after the registry accepted the bind's attempt
+    // (moe_mmid_reconcile_live_plan): the detail names which reconcile outcome.
+    RECONCILE_REFUSED,
+    // The context bind's own catch-all: a lock or a snapshot copy threw.
+    BIND_EXCEPTION,
 };
 
 // Stable, distinct, never-null name for logs.  OK and NOT_APPLICABLE are not
@@ -667,11 +673,11 @@ class moe_mmid_workspace_registry {
 };
 
 // A context bind publishes the MMID workspaces of a deferred load for the plan snapshot live after its runtime
-// transaction, and allocates them outside the plan lock (canonical 12.5: no allocation under a registry lock). An
-// expert loan or refill can replace that snapshot meanwhile: it swaps the plan at a micro-batch boundary under the
-// plan lock without taking the re-plan token. The bind then takes the plan lock again, reads the live snapshot, and
-// asks this to make the published context follow it. Every plan replacement CASes under that lock, so once this
-// returns under it no snapshot can be live without the context following it. It allocates nothing.
+// transaction, and allocates them outside g_tensor_inventory_mutex (canonical 12.5: no allocation under a registry
+// lock). An expert loan or refill can replace that snapshot meanwhile: it swaps the plan at a graph boundary under
+// g_tensor_inventory_mutex without taking the re-plan token. The bind then takes that mutex again, reads the live
+// snapshot, and asks this to make the published context follow it. Every plan replacement CASes under that mutex, so
+// once this returns under it no snapshot can be live without the context following it. It allocates nothing.
 enum class moe_mmid_reconcile_outcome : uint8_t {
     CURRENT,            // the live snapshot is the published one
     FOLLOWS_LIVE,       // a context already accepts for the live snapshot: a replace's own CAS rebound it

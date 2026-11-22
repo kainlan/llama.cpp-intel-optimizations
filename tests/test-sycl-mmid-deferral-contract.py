@@ -22,7 +22,10 @@ reaching them needs a GPU and a loaded MoE model:
      back to a subset of its fields;
   6. the follows question (ggml_sycl_mmid_workspaces_follow) asks the owner
      device's execution queue, not a backend context: a context pointer read
-     after the lookup mutex is released can be freed under it.
+     after the lookup mutex is released can be freed under it;
+  7. the bind's reconcile and exception reports name what refused
+     (reconcile-refused, bind-exception), not registry-invalid: the registry
+     accepted the bind's attempt on both paths.
 
 EVERY assertion here is checked against a POISONED copy of the source under
 --self-test, and the gate fails if a poisoned variant still passes. A source
@@ -110,6 +113,26 @@ def check_tripwire_present(text):
     return True, "context-bind tripwire reports refusals at %d sites" % len(TRIPWIRE_SITES)
 
 
+# (site, the reason its report must carry)
+SITE_REASONS = [
+    ("reconcile-refused", "moe_mmid_materialize_reason::RECONCILE_REFUSED"),
+    ("exception", "moe_mmid_materialize_reason::BIND_EXCEPTION"),
+]
+
+
+def check_site_reasons(text):
+    body = bind_body(text)
+    if body is None:
+        return False, "context-bind function not found (renamed?)"
+    calls = [body[s:e] for s, e in tripwire_calls(body)]
+    markers = dict(TRIPWIRE_SITES)
+    wrong = [site for site, reason in SITE_REASONS
+             if not any(markers[site] in call and reason in call for call in calls)]
+    if wrong:
+        return False, "context-bind report does not name what refused at: %s" % ", ".join(wrong)
+    return True, "context-bind reconcile and exception reports name their own reason"
+
+
 def poison_one_site(text, marker):
     """Delete the one tripwire report call that carries `marker`, leaving the other sites in place."""
     body = bind_body(text)
@@ -189,6 +212,7 @@ CHECKS = [
     ("same-plan:sycl", "sycl", check_same_plan_sycl),
     ("same-plan:cas", "cache", check_same_plan_cas),
     ("follows-queue", "sycl", check_follows_device_queue),
+    ("site-reasons", "sycl", check_site_reasons),
 ]
 
 def poison_load_end(text):
@@ -232,6 +256,8 @@ POISONS = {
     # The regression: a site going back to a local predicate of its own.
     "same-plan:sycl": lambda t: t.replace(SAME_PLAN_SYCL_SITES[0][1],
                                           "ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan)", 1),
+    # The regression: the reconcile's report back on the registry's reason.
+    "site-reasons": lambda t: t.replace(SITE_REASONS[0][1], "moe_mmid_materialize_reason::REGISTRY_INVALID", 1),
     "follows-queue": lambda t: t.replace(
         "ggml_sycl_execution_queue_for_device(workspace.owner_device) :",
         "ggml_sycl_get_backend_context_for_device(workspace.owner_device)->stream() :", 1),

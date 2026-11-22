@@ -1523,6 +1523,8 @@ static void materialize_reason_contract() {
         moe_mmid_materialize_reason::NO_QUEUE_LIFETIME,
         moe_mmid_materialize_reason::REGISTRY_INVALID,
         moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED,
+        moe_mmid_materialize_reason::RECONCILE_REFUSED,
+        moe_mmid_materialize_reason::BIND_EXCEPTION,
     };
     constexpr size_t count = sizeof(all) / sizeof(all[0]);
 
@@ -1553,10 +1555,17 @@ static void materialize_reason_contract() {
     check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::NO_BACKEND_CONTEXT),
                       "no-backend-context") == 0,
           "NO_BACKEND_CONTEXT name changed -- the gate grep for it would fail open");
+    // The context bind's own refusals: the registry accepted, and the reconcile or the bind itself refused.
+    check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::RECONCILE_REFUSED),
+                      "reconcile-refused") == 0,
+          "RECONCILE_REFUSED name changed -- the gate grep for it would fail open");
+    check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::BIND_EXCEPTION),
+                      "bind-exception") == 0,
+          "BIND_EXCEPTION name changed -- the gate grep for it would fail open");
 }
 
-// The registry's refusal detail is what the WARN line prints after reason=registry-invalid or
-// registry-allocation-failed: every condition names itself, distinctly, and NONE is the only value a success leaves.
+// The refusal detail is what the WARN line prints after reason=registry-invalid, registry-allocation-failed,
+// reconcile-refused or bind-exception: every condition names itself, distinctly, and NONE is the only value a success leaves.
 static void materialize_refusal_names() {
     using R       = moe_mmid_materialize_refusal;
     const R all[] = {

@@ -13922,8 +13922,9 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
 // Report a materialization refusal.  WARN and never INFO: common_get_verbosity()
 // maps GGML_LOG_INFO below the default threshold, so an INFO diagnostic here
 // would never reach a log -- which is how this failure stayed invisible.
-// `detail` names the registry's condition behind REGISTRY_INVALID / REGISTRY_ALLOCATION_FAILED ("none" for the
-// backend's own reasons). The token's and the snapshot's model and load ids, and the snapshot's version, are printed
+// `detail` names the condition behind REGISTRY_INVALID / REGISTRY_ALLOCATION_FAILED (the registry's),
+// RECONCILE_REFUSED (the reconcile outcome) or BIND_EXCEPTION ("exception"), and is "none" for the backend's own
+// reasons. The token's and the snapshot's model and load ids, and the snapshot's version, are printed
 // because two of those conditions are identity mismatches and one is a plan identity held for another snapshot.
 static void ggml_sycl_moe_mmid_report_refusal(
     const char *                                                      site,
@@ -25256,7 +25257,7 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
 // transaction returned.
 //
 // The pools are allocated outside g_tensor_inventory_mutex (canonical 12.5: no allocation under a registry lock), so
-// the snapshot they are published for can be replaced meanwhile: an expert loan or refill swaps it at a micro-batch
+// the snapshot they are published for can be replaced meanwhile: an expert loan or refill swaps it at a graph
 // boundary under that mutex without the re-plan token (ggml_sycl_expert_txn_run). Every plan replacement CASes under
 // that mutex, so the bind takes it again and makes the published context follow the live snapshot
 // (moe_mmid_reconcile_live_plan); once that returns, no snapshot can be live without the context following it. A
@@ -25329,7 +25330,7 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
             retire_own_publication(
                 ggml_sycl::moe_mmid_reconcile_retire_identity(outcome, published->version, live ? live->version : 0));
         }
-        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
+        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::RECONCILE_REFUSED,
                                           refusal, token, live ? live : published);
     } catch (...) {
         // A lock or a snapshot copy threw. A context this bind's own attempt PUBLISHED may then be for a snapshot no
@@ -25337,7 +25338,7 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
         // retire it, as the refused reconcile does, and leave the deferral pending. The bind's own result is the
         // transaction's, which already published.
         retire_own_publication(published ? published->version : 0);
-        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
+        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::BIND_EXCEPTION,
                                           ggml_sycl::moe_mmid_materialize_refusal::EXCEPTION, token, nullptr);
     }
 }
