@@ -1,0 +1,50 @@
+[SYCL] Device 0 alloc caps: raw=32002.9 MB, safe=30352.4 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 31.3 GB (min max_mem_alloc_size across 1 active devices)
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B70 Graphics|   20.2|    256|    1024|   32| 34242M|         1.18.40734+8|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+| 0| [level_zero:gpu:0]|      Y|
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Device 0 budget authority: base=32656.0 MB free=31948.0 MB pct=100% external_headroom=2048.0 MB budget=29900.0 MB
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=31948.0 MB budget=29900.0 MB (100%)
+[VRAM-ARENA] Reserved single chunk: 29900.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=28620.0 MB)
+[VRAM-ARENA] Active on device 0: 1 chunk(s), 29900.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffd55dd7600000 + 512.0 MB (offset 29388.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 94.3 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 94.3 GB budget, committed=0.0 GB (system total=246.9 GB available=102.3 GB reserve=8.0 GB pct=90)
+[SYCL] buffer-scoped provenance: minted first buffer owner id=0x8000000000000002 slot=4294967294
+[SYCL] buffer-scoped provenance: minted first buffer owner id=0x8000000000000002 slot=4294967294
+[SYCL] buffer-scoped provenance: registered first tensor name=x owner=0x8000000000000002 offset=0 nbytes=16384 device=0
+[SYCL] buffer-scoped provenance: registered first tensor name=x owner=0x8000000000000002 offset=0 nbytes=16384 device=0
+[SYCL] tensor usage UNKNOWN: name=x type=f32 ne=[4096,1,1,1]
+[SYCL] tensor usage UNKNOWN: name=a type=f32 ne=[4096,1,1,1]
+[SYCL] tensor usage UNKNOWN: name=b type=f32 ne=[4096,1,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[HOST-ARENA] runtime pinned chunk 1: +2048.0 MB, 2.0 of 94.3 GB committed before host zones exist
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+  ok: idx=0 selected a computed, unselected b kept its sentinel
+  ok: idx=1 selected b computed, unselected a kept its sentinel
+test-sycl-select-unselected-branch: PASS

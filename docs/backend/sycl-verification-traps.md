@@ -370,3 +370,16 @@ comparisons; `--reasoning-format none` is not a substitute for pinning. GPT-OSS
 was trained for OpenAI's Harmony format — wrong formatting causes cascading
 generation failures, and `llama-bench` proves throughput only, never chat
 correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
+
+## 10. A pinned-context arm is a control, never the gate
+
+Added 2026-11-21. The canonical GPT-OSS gate in `scripts/sycl-canonical-gates.sh` carried `-c 4096` from
+`9cf92860b` until `252d8a687`, and the upstream `19bc41dbb` sync (`3b3962534`) passed it with a defect that loses
+the B50. That sync brought a 3-way `ggml_build_forward_select` on the input embedding and a scheduler that does
+not upload the inputs of an unselected branch; the SYCL backend still ran unselected nodes, until
+`ggml_sycl_is_noop` learned to skip a node without `GGML_TENSOR_FLAG_COMPUTE`. At `-c 4096` every KV layer fits
+on the device, the plan has no CPU work, and the token-embedding `GET_ROWS` of the unselected branch read a zeroed
+`SYCL_Host` input in place, an in-range read: no fault, and the selected branch gave the right answer. At the
+default context the KV goes partly to the host tier, the input becomes a device copy nobody wrote, and the gather
+reads activations as row ids: a GPU page fault and a lost device. The gate runs at the context a user gets. A
+pinned `-c` arm is the all-VRAM control for an A/B, and a pass there says nothing about the default context.

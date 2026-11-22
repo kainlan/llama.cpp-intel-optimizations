@@ -6961,6 +6961,28 @@ set_tests_properties(rms-norm-mul-add-broadcast PROPERTIES
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120)
 
+# test-sycl-select-unselected-branch: the backend does not execute a node without GGML_TENSOR_FLAG_COMPUTE (an
+# unselected branch of ggml_build_forward_select, whose inputs the scheduler never uploads). Two F32 scales on one
+# device, a sentinel in each output, no scheduler, no model and a few KB of device memory, so it carries no
+# model/cache/mem-handle label and the sweep runs it. It submits device work, so the registration pins the
+# validation card (level_zero:1); run the binary under level_zero:0 for the B70. Exits 77 when no device is visible.
+add_executable(test-sycl-select-unselected-branch
+    tests/test-select-unselected-branch.cpp
+)
+target_include_directories(test-sycl-select-unselected-branch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_link_libraries(test-sycl-select-unselected-branch PRIVATE ggml-base ggml ggml-sycl)
+set_target_properties(test-sycl-select-unselected-branch PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-select-unselected-branch COMMAND test-sycl-select-unselected-branch)
+set_tests_properties(sycl-select-unselected-branch PROPERTIES
+    LABELS "sycl;graph;device"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 120)
+
 # Persistent-worker graph-boundary reset proof. Pure host C++: it creates two
 # std::threads but no SYCL queue, links no backend library, and takes no -fsycl
 # options. A repeated handoff/reset cycle stress-tests the fixture and TLS reuse.
