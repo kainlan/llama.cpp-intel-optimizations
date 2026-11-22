@@ -57,7 +57,7 @@ _ENV_OF = (
 )
 _SRC1_READER = (
     "static bool ggml_sycl_mul_mat_src1_has_reader(const ggml_tensor * src0, const ggml_tensor * src1, "
-    "const ggml_tensor * dst)"
+    "const ggml_tensor * dst, int device)"
 )
 _ADAPTER = (
     "bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env)"

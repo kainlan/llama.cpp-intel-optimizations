@@ -183,7 +183,7 @@ def expected_pre_guard_decisions():
         ("statement", "structggml_tensor*b=op->src[1]"),
         ("if", "a->ne[3]!=b->ne[3]", reject),
         # A non-F32 src1 is admitted only where a route reads it; the classifier the dispatch uses decides.
-        ("if", "b->type!=GGML_TYPE_F32&&!ggml_sycl_mul_mat_src1_has_reader(a,b,op)", reject),
+        ("if", "b->type!=GGML_TYPE_F32&&!ggml_sycl_mul_mat_src1_has_reader(a,b,op,device)", reject),
         ("statement", "ggml_typea_type=a->type"),
         ("if", "ggml_is_quantized(a_type)&&(ggml_is_permuted(a)||!ggml_is_contiguous(a))", reject),
         ("if", "a_type==GGML_TYPE_Q4_0", (("if", "a->ne[2]!=b->ne[2]||a->ne[2]>2", reject),)),
