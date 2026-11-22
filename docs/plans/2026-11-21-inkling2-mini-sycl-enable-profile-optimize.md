@@ -107,7 +107,7 @@ digraph dependencies {
     8  [label="T8 census + gap tasks (lead)"];
     9  [label="T9 Stage 1 gates (lead)"];
     10 [label="T10 profile runner"];
-    10b [label="T10b atomic lock takers"];
+    10b [label="T10b gates use the lock library"];
     11 [label="T11 sched census parser"];
     12 [label="T12 profile runs (lead)"];
     13 [label="T13 profile document"];
@@ -1243,47 +1243,407 @@ Run: `bash tests/test-sycl-inkling-profile-script.sh` — Expected: all `PASS:`,
 
 ---
 
-### Task 10b: Every lock taker uses an atomic `mkdir` (found 2026-11-21)
+### Task 10b: The two older gate scripts take `GPU.lock` through the lock library (found 2026-11-21)
 
 **Track:** B
-**Depends on:** Task 10 (it creates the lock library). Blocks Task 12: sixteen profile runs take the lock.
+**Depends on:** Task 10 (merged as `e1ddfccb3`; it created `scripts/sycl-lock.sh`). Blocks Task 12: sixteen profile
+runs share `GPU.lock` with every other session that runs these gates.
 **File scope:**
-- Read, not modified: `scripts/sycl-lock.sh` (Task 10 creates it with its own stub test `tests/test-sycl-lock.sh`)
-- Modify: `scripts/sycl-moe-exec-gate.sh` (`lock_take` at :1237, `lock_release` at :1244, and the header line :128
-  that says the lock is `mkdir $LOCK_DIR`), `scripts/sycl-qwen35-ppl-gate.sh` (the `until mkdir` loop at :272 and the
-  bare `rmdir` trap at :277, which writes no `holder` today)
-- Modify: `tests/test-sycl-moe-exec-gate-script.sh`, `tests/test-sycl-qwen35-ppl-gate.sh`;
-  `docs/backend/sycl-host-safety.md` (the `GPU.lock` paragraph at :282-288, which shows `until mkdir GPU.lock`);
-  `CLAUDE.md` (one line in "Running Tests": how a lock is taken)
+- Read, not modified: `scripts/sycl-lock.sh` (the interface is its header, lines 1-26), `tests/test-sycl-lock.sh`
+  (the `mkdir` shim at :15-21), `scripts/sycl-inkling-profile.sh` (:151-214, a reviewed user of the library)
+- Modify: `scripts/sycl-moe-exec-gate.sh`: header :116, :128 and the snapshot form :140-146; defaults :195;
+  `lock_take` and `lock_release` :1237-1249; `--lock-selftest` :1422-1430; `LOCK_HELD=0` at :1481; the take at
+  :1575; the arm loop :1642-1647
+- Modify: `scripts/sycl-qwen35-ppl-gate.sh`: header, usage :65-78, option loop :92-114, the lock block :270-278
+- Modify: `tests/test-sycl-moe-exec-gate-script.sh`, `tests/test-sycl-qwen35-ppl-gate.sh`
+- Modify: `docs/backend/sycl-host-safety.md` (one paragraph after the 2026-11-16 correction that ends at :294),
+  `CLAUDE.md` (one bullet after the `GPU.lock` bullet at :51-53)
+- No CMake change: both stub tests are registered (`tests/CMakeLists.txt:1372`, `:1464`)
 
 **Why:** `/usr/bin/mkdir` on this host is uutils coreutils 0.10.0. It runs `statx(L)`, then `mkdir(L)`, and exits 0
 when that `mkdir` fails with EEXIST on a directory. Two takers that both pass the `statx` both hold the lock.
-Measured: 400 paired races on one path, both succeeded in 173; with GNU `mkdir` (`/usr/bin/gnumkdir`) in 0. A lock
-that is already held is still refused; the hole is two takers arriving together, for example two waiters released by
-one `rmdir`. Two holders of `GPU.lock` are two model loads on one card.
+Measured: 400 paired races on one path, both succeeded in 173; with GNU `mkdir` (`/usr/bin/gnumkdir`) in 0. Two
+holders of `GPU.lock` are two model loads on one card. `scripts/sycl-moe-exec-gate.sh` takes the lock with
+`mkdir "$LOCK_DIR"` (:1238) and releases with `rm -f holder; rmdir` whatever the holder says (:1246-1247).
+`scripts/sycl-qwen35-ppl-gate.sh` polls `until mkdir "$LOCK_DIR"` (:272), writes no holder, and releases with a
+bare `rmdir` (:277). A census of tracked scripts, tests and documents on `e1ddfccb3` finds no third taker.
 
-**Ruling 2026-11-21, after the third quality review of Task 10:** the library is created in Task 10, not here. The
-review showed that the take sequence needs one process for the `mkdir(2)`, the exclusive `holder` write and the
-verify re-read, with TERM, INT and HUP ignored for that span: a shell child between those steps keeps the default
-signal action, and a signal sent to the process group that kills it strands the lock directory. That unit is a
-library with its own deterministic tests (a `mkdir` shim that copies the uutils outcome, a `python3` shim that plants
-a foreign `holder` right after the real `mkdir`), so it is written once, in the task under review, and this task only
-adopts it. Interface: `sycl_lock_take DIR TEXT VERIFY_SECONDS` (0 held; 1 busy; 2 a co-taker's holder, nothing
-removed; 3 directory created but holder not written, remove by hand), `sycl_lock_holder_is DIR TEXT`,
-`sycl_lock_release DIR TEXT` (1 and a stderr line when the holder is foreign or missing, nothing removed).
+**The library, as merged** (read its header before writing anything):
+`sycl_lock_take DIR TEXT VERIFY_SECONDS` returns 0 held and verified; 1 busy (the directory exists); 2 a co-taker's
+holder is there or replaced ours inside the verify window (nothing removed); 3 the directory was created but the
+holder could not be written (remove by hand); 4 the directory could not be created (waiting will not clear it); 5 the
+helper could not start or failed unexpectedly. `sycl_lock_holder_is DIR TEXT` returns 0 when the first line of
+`DIR/holder` equals TEXT. `sycl_lock_release DIR TEXT` removes the holder and the directory only when the holder is
+still TEXT (0), else prints one stderr line and returns 1 (or 5 when the helper could not start).
 
-**Done when:** no tracked script takes a lock with plain `mkdir`; both older gate scripts take and release through
-`scripts/sycl-lock.sh` with a `holder` line that is unique per taker (pid and start time); each script's stub test
-has the deterministic plain-`mkdir` mutant case (lock directory pre-created with no holder, a `mkdir` shim first in
-`PATH` that exits 0 on an existing directory: the script must not run its tool and must not remove the directory);
-the document and `CLAUDE.md` say how to take a lock by hand (`/usr/bin/gnumkdir` on this host) and what a taker
-cannot detect (a co-taker with a non-atomic `mkdir` that writes no `holder`).
+**Rulings for this task** (the implementer makes none of these decisions again):
 
-**Not in this task, recorded here:** `scripts/sycl-qwen35-ppl-gate.sh` still waits for `MemAvailable > 150 GB`
-before its run (:266-268). That half of the settle rule was retired by the ruling of 2026-11-12. It gets its own
-tracker task.
+1. **Source at the top, fail closed.** In the MoE gate, directly after `ROOT_DIR=` (:191):
+   `source "$SCRIPT_DIR/sycl-lock.sh" || { echo "sycl-moe-exec-gate: cannot load $SCRIPT_DIR/sycl-lock.sh" >&2; exit 2; }`.
+   In the Qwen gate, directly after `ROOT_DIR=` (:39), the same with `$ROOT_DIR/scripts/sycl-lock.sh`, the name
+   `sycl-qwen35-ppl-gate` and `exit 1`. A copy of a gate without the library next to it stops there. The MoE test
+   copies the gate alone in two places (`mutate_control` at :154-161 writes `$WORK/mut/scripts/gate.sh`; the
+   snapshot at :1154-1156): both must copy `sycl-lock.sh` next to it. The header's snapshot form (:140-146) must
+   name the library among the files to copy.
+2. **The holder line is unique per taker.** MoE gate:
+   `sycl-moe-exec-gate pid=$$ sha=${EXPECT_SHA:-none} start=$(date +%FT%T)` (today's text, unchanged). Qwen gate:
+   `sycl-qwen35-ppl-gate pid=$$ device=level_zero:$DEVICE start=$(date +%FT%T)`.
+3. **The held flag is set before the take, not after it.** `sycl_lock_take` blocks for the verify window (1 s by
+   default) in a child that ignores TERM, INT and HUP. Bash runs a trap for a signal that arrived during a
+   foreground child only after that child returns, and before the next command. If `LOCK_HELD=1` came after the
+   take, a TERM during that second would run the handler with `LOCK_HELD=0`, exit, and leave a lock whose holder
+   names a dead pid. So, in both scripts:
+   ```bash
+   lock_take() { # 0 held | the sycl_lock_take status; LOCK_RC keeps it for the refusal text
+       [ "$LOCK_HELD" = 0 ] || return 5 # never take twice: the second text would replace the first
+       LOCK_TEXT="<the holder line of ruling 2>"
+       LOCK_HELD=1 # before the take: a signal during it is handled right after it returns, and must release
+       sycl_lock_take "$LOCK_DIR" "$LOCK_TEXT" "$LOCK_VERIFY"
+       LOCK_RC=$?
+       [ "$LOCK_RC" = 0 ] || LOCK_HELD=0
+       return "$LOCK_RC"
+   }
+   ```
+   A release that runs after a failed take is harmless: `sycl_lock_release` removes only a holder that is ours.
+   In the MoE gate `LOCK_HELD=0`, `LOCK_TEXT=""`, `LOCK_RC=0` move to the defaults block (:195) and the assignment at
+   :1481 goes, because `--lock-selftest` (:1422) runs before :1481. The Qwen gate runs under `set -euo pipefail`:
+   write `LOCK_RC=0; sycl_lock_take ... || LOCK_RC=$?` there, and call `sycl_lock_holder_is` only inside `if` or
+   before `||` (a bare failing call would end the script).
+4. **Only the main shell releases, and only its own holder.**
+   ```bash
+   lock_release() {
+       [ "$LOCK_HELD" = 1 ] || return 0
+       [ "$BASHPID" = "$$" ] || return 0 # a subshell inherits LOCK_HELD and must never release the lock
+       LOCK_HELD=0
+       sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" || true # a foreign or missing holder: its stderr line, nothing removed
+   }
+   ```
+5. **One environment variable for the verify window:** `LLAMA_GPU_LOCK_VERIFY_SECONDS` (default 1) in both scripts,
+   next to `LLAMA_GPU_LOCK`. The Qwen gate adds `LLAMA_GPU_LOCK_POLL_SECONDS` (default 15, at least 1) and
+   `LLAMA_GPU_LOCK_WAIT_SECONDS` (default 1800, 0 allowed): its wait loop has fixed literals today and a test cannot
+   wait 30 minutes. Each value must match `^(0|[1-9][0-9]*)$` (a leading zero is an octal error in bash
+   arithmetic); a bad value stops the script right after option parsing, through `die_usage` in the MoE gate
+   (`REFUSED: usage: ...`, rc 2) and `die` in the Qwen gate (rc 1), naming the variable. Both headers list them.
+6. **MoE gate: a failed take is a refusal with its reason, as today.** The gate does not wait for the lock. At
+   :1575 and in the two selftests (:1492, :1498) the refusal text comes from a helper:
+   ```bash
+   lock_why() { # the reason for the last failed take
+       case "$LOCK_RC" in
+           1) echo "held: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo "no holder file")" ;;
+           2) echo "another taker's holder is there: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo none)" ;;
+           3) echo "the directory was created without a holder: remove it by hand" ;;
+           4) echo "the directory cannot be created" ;;
+           *) echo "the lock helper could not run (python3 missing?)" ;;
+       esac
+   }
+   ```
+   used as `lock_take || refuse "could not take $LOCK_DIR ($(lock_why))"`. Do not add `python3` to
+   `require_tools` (:431-432): scoring modes need no lock, and a missing `python3` is status 5 above.
+7. **MoE gate: a lost lock stops the run.** A co-taker that still uses the non-atomic `mkdir` and writes its holder
+   after the verify window is visible only as a holder that is no longer ours.
+   ```bash
+   lock_check() { # refuse when the holder is no longer ours; a run without the lock has nothing to check
+       [ "$LOCK_HELD" = 1 ] || return 0
+       sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" && return 0
+       refuse "GPU.lock holder is no longer ours (now: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo none)):" \
+           "another taker may be on the card"
+   }
+   ```
+   Call it first in the arm loop body (:1642, before `run_arm`) and once after the loop, before `lock_release`
+   (:1647). `refuse` prints `STOPPED:`, the summary over the arms scored so far and exits 2; its `lock_release`
+   removes nothing, because the holder is foreign. The Qwen gate gets no such check in this task: its run path
+   cannot be exercised by a stub test on this host (its settle waits for `MemAvailable > 150 GB`, which this host
+   never reaches; see "Not in this task"). Say so in the Qwen header.
+8. **Qwen gate: the wait loop waits only for what waiting can clear, and a signal during it cannot strand the
+   lock.** The gate has no signal handler, so a TERM would end bash at once while the take's child (which ignores
+   the signal) goes on to create the directory. For the span of the take, signals are only recorded:
+   ```bash
+   LOCK_SIGNALLED=0
+   lock_wait_take() {
+       local waited=0 rc
+       trap 'LOCK_SIGNALLED=1' TERM INT HUP # deferred until the take's child returns; restored below
+       while :; do
+           rc=0
+           lock_take || rc=$?
+           [ "$LOCK_SIGNALLED" = 0 ] || exit 143 # the EXIT trap releases a lock this take won
+           case "$rc" in
+               0) break ;;
+               1 | 2) ;; # busy, or a co-taker won: wait
+               *) die "could not take $LOCK_DIR ($(lock_why)): waiting will not clear it" ;;
+           esac
+           [ "$waited" -lt "$LOCK_WAIT" ] || die "could not take $LOCK_DIR in ${LOCK_WAIT}s ($(lock_why))"
+           sleep "$LOCK_POLL"
+           waited=$((waited + LOCK_POLL))
+       done
+       trap - TERM INT HUP
+   }
+   ```
+   `trap lock_release EXIT` is installed before `lock_wait_take` is called (today it is installed after the take).
+   The Qwen gate defines the same `lock_why` as ruling 6.
+9. **Selftests carry the properties a stub test cannot reach from outside.** MoE gate `--lock-selftest` (:1422),
+   in this order, each failure printing `lock-selftest: <what>` and exiting 1: `lock_take` succeeds;
+   `sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT"` holds; `sycl_lock_take "$LOCK_DIR" "lock-selftest second taker" 0`
+   returns exactly 1; after `( lock_release )` in a subshell the holder is still ours; `lock_release`; the directory
+   is gone; `lock-selftest: ok`. The Qwen gate gets the same mode as a new option `--lock-selftest`, handled right
+   after the environment values are validated and before the oracle default (:116), taking through
+   `lock_wait_take`; failures go through `die`. Add it to the usage text.
 
-**The lead writes this task out to the Task Detail Standard when Task 10 merges**, against the library as reviewed.
+**Acceptance Criteria:**
+
+- [ ] `cat scripts/sycl-moe-exec-gate.sh scripts/sycl-qwen35-ppl-gate.sh | grep -cE '(^|[^_a-z])(mkdir|rmdir) +"\$LOCK_DIR"'`
+      prints 0
+- [ ] Both gates take, check and release only through `sycl_lock_take`, `sycl_lock_holder_is`, `sycl_lock_release`
+- [ ] Every new test case below fails before its change (RED shown in the report with the failing line) and passes
+      after it
+- [ ] Each mutant in the list below makes the named case fail; the report shows each failing line; the tree is
+      restored after each (`git diff --stat` empty against the commit)
+- [ ] `bash tests/test-sycl-moe-exec-gate-script.sh` ends `cases=N fails=0` with N at least 461 plus the new
+      cases; `bash tests/test-sycl-qwen35-ppl-gate.sh` ends `test-sycl-qwen35-ppl-gate: PASS`;
+      `bash tests/test-sycl-lock.sh` still passes (the library is not modified)
+- [ ] `shellcheck scripts/sycl-moe-exec-gate.sh scripts/sycl-qwen35-ppl-gate.sh` reports nothing new compared with
+      `e1ddfccb3` (run it on both commits and diff the output)
+- [ ] No test case touches `/Apps/llama.cpp/GPU.lock`: every MoE case passes `--lock-dir` under `$WORK`, every Qwen
+      case sets `LLAMA_GPU_LOCK` under `$work`
+- [ ] The document and `CLAUDE.md` say how a lock is taken and what a taker cannot detect
+
+**Implementation Guide:**
+
+Work in three commits. Run no GPU binary; this task needs none.
+
+1. **RED, MoE gate.** In `tests/test-sycl-moe-exec-gate-script.sh`, export `LLAMA_GPU_LOCK_VERIFY_SECONDS=0` near
+   the top (after :76), so the existing lock cases do not each wait a second. Add, after the snapshot cases
+   (:1160, where `$WORK/stubbin`, `mkstub`, `$WORK/srcrepo/build` and `$SRC_SHA` exist):
+
+   ```bash
+   # ---- GPU.lock through scripts/sycl-lock.sh
+   # lk <lock dir> <out dir>: a real run of the journal arm that takes the lock (no device, no model)
+   lk() { PATH="${LK_PATH:-$WORK/stubbin}:$PATH" bash "$GATE" --lock-dir "$1" --arm resets \
+       --build-dir "$WORK/srcrepo/build" --out-dir "$2" "$SRC_SHA" 2>&1; }
+   # a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+   mkdir -p "$WORK/shim"
+   printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
+       > "$WORK/shim/mkdir"
+   chmod +x "$WORK/shim/mkdir"
+   mkstub 'exit 0'
+   /usr/bin/mkdir "$WORK/pre.lock"
+   out="$(LK_PATH="$WORK/shim:$WORK/stubbin" lk "$WORK/pre.lock" "$WORK/lk-pre")"; rc=$?
+   expect_rc "a lock directory that exists refuses the run, whatever the mkdir command reports" "$rc" 2
+   expect "the refusal names the lock" "$out" "REFUSED: could not take $WORK/pre.lock"
+   expect_not "no arm ran without the lock" "$out" "resets="
+   if [ -d "$WORK/pre.lock" ]; then pass "a refused take removes nothing"; else fail "a refused take removed the lock"; fi
+   echo "someone else" > "$WORK/pre.lock/holder"
+   out="$(lk "$WORK/pre.lock" "$WORK/lk-held")"; rc=$?
+   expect_rc "a held lock refuses" "$rc" 2
+   expect "the refusal quotes the holder" "$out" "held: someone else"
+   if [ "$(cat "$WORK/pre.lock/holder")" = "someone else" ]; then
+       pass "a refusal leaves a foreign holder alone"
+   else
+       fail "a refusal changed a foreign holder"
+   fi
+   # a co-taker that replaces the holder during the run: the journal stub plays it
+   # (it writes only once the gate has created the lock, in case the gate reads the journal before the take)
+   mkstub "[ -d \"$WORK/lost.lock\" ] && echo intruder > \"$WORK/lost.lock/holder\"; exit 0"
+   out="$(lk "$WORK/lost.lock" "$WORK/lk-lost")"; rc=$?
+   mkstub 'exit 0'
+   expect_rc "a lock lost during the run stops the gate" "$rc" 2
+   expect "the stop says the holder changed" "$out" "STOPPED: GPU.lock holder is no longer ours (now: intruder)"
+   if [ "$(cat "$WORK/lost.lock/holder" 2>/dev/null)" = intruder ]; then
+       pass "a lost lock is left to its new holder"
+   else
+       fail "the gate removed a lock it no longer held"
+   fi
+   # a TERM while the take is still verifying must release the lock the take wins
+   LLAMA_GPU_LOCK_VERIFY_SECONDS=3 bash "$GATE" --signal-selftest --lock-dir "$WORK/tk.lock" > "$WORK/tk.out" 2>&1 &
+   tpid=$!
+   for _ in $(seq 50); do [ -f "$WORK/tk.lock/holder" ] && break; sleep 0.1; done
+   kill -TERM "$tpid" 2>/dev/null
+   wait "$tpid"; rc=$?
+   out="$(cat "$WORK/tk.out")"
+   expect_rc "a TERM during the take ends the gate with rc 143" "$rc" 143
+   expect_not "the TERM landed before the selftest child started" "$out" "signal-selftest: child="
+   if [ -e "$WORK/tk.lock" ]; then fail "a TERM during the take left GPU.lock behind"; else pass "a TERM during the take releases GPU.lock"; fi
+   for bad in 08 x -1; do
+       out="$(LLAMA_GPU_LOCK_VERIFY_SECONDS="$bad" bash "$GATE" --lock-dir "$WORK/bad.lock" --lock-selftest 2>&1)"; rc=$?
+       expect_rc "LLAMA_GPU_LOCK_VERIFY_SECONDS=$bad is a usage refusal" "$rc" 2
+       expect "the refusal names the variable ($bad)" "$out" "LLAMA_GPU_LOCK_VERIFY_SECONDS"
+   done
+   if [ -e "$WORK/bad.lock" ]; then fail "a usage refusal created the lock"; else pass "a usage refusal never creates the lock"; fi
+   mkdir -p "$WORK/nolib/scripts"
+   cp -a "$GATE" "$WORK/nolib/scripts/"
+   out="$(bash "$WORK/nolib/scripts/sycl-moe-exec-gate.sh" --check-controls 2>&1)"; rc=$?
+   expect_rc "a copy of the gate without the lock library stops" "$rc" 2
+   expect "and says what it could not load" "$out" "cannot load"
+   ```
+
+   Run: `bash tests/test-sycl-moe-exec-gate-script.sh 2>&1 | grep -E '^FAIL|^cases='`
+   Expected before the change: `FAIL` lines for the shim case (the arm runs, `resets=PASS`, rc 0, the directory is
+   removed), the lost-lock case (rc 0 and the intruder's holder removed), the TERM case (`child=` is printed
+   because there is no verify window), the three bad-value cases (rc 0) and the no-library case (rc 0).
+   The existing `--lock-selftest` case (:873-875) stays as it is.
+
+2. **GREEN, MoE gate.** Apply rulings 1 to 7 and 9 to `scripts/sycl-moe-exec-gate.sh`; update `mutate_control` and
+   the snapshot `cp` in the test (ruling 1); rewrite the header line :128 as "GPU.lock is taken, checked and
+   released through scripts/sycl-lock.sh (mkdir(2) through python3, a `holder` line unique to this run): the
+   system mkdir command reports success on an existing directory. A holder that is no longer ours stops the run
+   before each arm and after the last." and add `LLAMA_GPU_LOCK_VERIFY_SECONDS` where the header lists the
+   environment. Leave the `MemAvailable` wording and `host_settled` (:1266-1271) alone.
+   Run the test again. Expected: `cases=N fails=0`. The test took 2 min 8 s on `e1ddfccb3`; run it in the
+   background and wait for it if your shell limit is shorter.
+   Commit 1 paths: `scripts/sycl-moe-exec-gate.sh`, `tests/test-sycl-moe-exec-gate-script.sh`.
+
+3. **RED, Qwen gate.** Append to `tests/test-sycl-qwen35-ppl-gate.sh`, before the final `echo` (:115). This test
+   runs under `set -euo pipefail` and its `fail` exits, so capture every status with `|| rc=$?`:
+
+   ```bash
+   # GPU.lock through scripts/sycl-lock.sh. --lock-selftest takes, checks and releases a lock under $work.
+   export LLAMA_GPU_LOCK_VERIFY_SECONDS=0
+   real_py="$(command -v python3)" || fail "python3 is needed for the lock cases"
+   out="$(LLAMA_GPU_LOCK="$work/q.lock" "$GATE" --lock-selftest 2>&1)" || fail "--lock-selftest must pass: $out"
+   grep -q 'lock-selftest: ok' <<<"$out" || fail "--lock-selftest must print ok: $out"
+   [ ! -e "$work/q.lock" ] || fail "--lock-selftest left its lock behind"
+   # a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+   mkdir -p "$work/shim"
+   printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
+       >"$work/shim/mkdir"
+   chmod +x "$work/shim/mkdir"
+   /usr/bin/mkdir "$work/pre.lock"
+   rc=0
+   out="$(PATH="$work/shim:$PATH" LLAMA_GPU_LOCK="$work/pre.lock" LLAMA_GPU_LOCK_WAIT_SECONDS=2 \
+       LLAMA_GPU_LOCK_POLL_SECONDS=1 "$GATE" --lock-selftest 2>&1)" || rc=$?
+   [ "$rc" -eq 1 ] || fail "a lock directory that exists must not be taken (rc $rc): $out"
+   grep -q "could not take $work/pre.lock in 2s" <<<"$out" || fail "the wait bound must be named: $out"
+   [ -d "$work/pre.lock" ] || fail "a failed take removed the lock directory"
+   # a busy lock is waited for
+   echo "someone else" >"$work/pre.lock/holder"
+   (sleep 1.5; rm -f "$work/pre.lock/holder"; rmdir "$work/pre.lock") &
+   out="$(LLAMA_GPU_LOCK="$work/pre.lock" LLAMA_GPU_LOCK_WAIT_SECONDS=20 LLAMA_GPU_LOCK_POLL_SECONDS=1 \
+       "$GATE" --lock-selftest 2>&1)" || fail "a lock released by its holder must be taken: $out"
+   wait
+   # a lock that cannot be created is not waited for
+   rc=0
+   out="$(LLAMA_GPU_LOCK="$work/no-such-parent/q.lock" LLAMA_GPU_LOCK_WAIT_SECONDS=600 \
+       timeout 20 "$GATE" --lock-selftest 2>&1)" || rc=$?
+   [ "$rc" -eq 1 ] || fail "an uncreatable lock must stop at once (rc $rc; 124 means it waited): $out"
+   grep -q 'waiting will not clear it' <<<"$out" || fail "the stop must say waiting does not help: $out"
+   # a TERM before the take's mkdir: the python3 shim delays the take (the program that calls os.mkdir) by 2 s and
+   # leaves the release at full speed, so a gate that dies at once releases nothing and the take then strands the lock
+   mkdir -p "$work/slowpy"
+   printf '#!/bin/sh\ncase "$2" in *os.mkdir*) : > "%s"; sleep 2 ;; esac\nexec "%s" "$@"\n' \
+       "$work/slowpy.started" "$real_py" >"$work/slowpy/python3"
+   chmod +x "$work/slowpy/python3"
+   PATH="$work/slowpy:$PATH" LLAMA_GPU_LOCK="$work/sig.lock" "$GATE" --lock-selftest >"$work/sig.out" 2>&1 &
+   gpid=$!
+   for _ in $(seq 50); do [ -e "$work/slowpy.started" ] && break; sleep 0.1; done
+   [ -e "$work/slowpy.started" ] || fail "the take never started"
+   kill -TERM "$gpid"
+   rc=0
+   wait "$gpid" || rc=$?
+   [ "$rc" -eq 143 ] || fail "a TERM during the take must end the gate with 143 (rc $rc): $(cat "$work/sig.out")"
+   sleep 4 # longer than the shim's delay: a take that outlived the gate would have created the lock by now
+   [ ! -e "$work/sig.lock" ] || fail "a TERM during the take stranded the lock: $(cat "$work/sig.lock/holder" 2>&1)"
+   for bad in LLAMA_GPU_LOCK_VERIFY_SECONDS=08 LLAMA_GPU_LOCK_WAIT_SECONDS=x LLAMA_GPU_LOCK_POLL_SECONDS=0; do
+       rc=0
+       out="$(env "$bad" LLAMA_GPU_LOCK="$work/bad.lock" "$GATE" --lock-selftest 2>&1)" || rc=$?
+       [ "$rc" -eq 1 ] || fail "$bad must be refused (rc $rc)"
+       grep -q "${bad%%=*}" <<<"$out" || fail "the refusal must name ${bad%%=*}: $out"
+   done
+   [ ! -e "$work/bad.lock" ] || fail "a refused value created the lock"
+   ```
+
+   Run: `bash tests/test-sycl-qwen35-ppl-gate.sh; echo "rc=$?"`
+   Expected before the change: `FAIL: --lock-selftest must pass: sycl-qwen35-ppl-gate: unknown option: --lock-selftest`.
+
+4. **GREEN, Qwen gate.** Apply rulings 1 to 5, 8 and 9. The lock block at :270-278 becomes:
+
+   ```bash
+   if [ "$TAKE_LOCK" = 1 ]; then
+       trap lock_release EXIT
+       lock_wait_take
+   fi
+   ```
+
+   with `lock_take`, `lock_release`, `lock_why`, `lock_wait_take` defined once, after `skip()` (:90), so that
+   `--lock-selftest` and the real run share them. Leave `settle()` (:257-268) and `COMMON` (:227) alone.
+   To see each later case fail in turn while the selftest does not exist yet, write the selftest first.
+   Commit 2 paths: `scripts/sycl-qwen35-ppl-gate.sh`, `tests/test-sycl-qwen35-ppl-gate.sh`.
+
+5. **Mutants.** Apply each to the committed file, run the named test, copy the failing line into the report,
+   restore with `git checkout HEAD -- <file>` (your own commit; this restores a mutant, it undoes no progress):
+   - MoE: `lock_take` uses `mkdir "$LOCK_DIR" 2>/dev/null` in place of `sycl_lock_take` and writes the holder
+     itself: the shim case fails.
+   - MoE: `LOCK_HELD=1` moved after the take: "a TERM during the take releases GPU.lock" fails.
+   - MoE: the `$BASHPID` line removed from `lock_release`: the `--lock-selftest` case fails.
+   - MoE: the `lock_check` after the loop removed: "a lock lost during the run stops the gate" fails.
+   - MoE: `lock_release` uses `rm -f "$LOCK_DIR/holder"; rmdir "$LOCK_DIR"`: "a lost lock is left to its new
+     holder" fails.
+   - Qwen: `lock_take` uses plain `mkdir`: the pre-created-directory case fails.
+   - Qwen: the `trap 'LOCK_SIGNALLED=1' TERM INT HUP` line removed: "a TERM during the take stranded the lock".
+   - Qwen: `1 | 2) ;;` widened to `*) ;;`: the uncreatable-lock case fails with rc 124.
+   - Qwen: the `$BASHPID` line removed: `--lock-selftest must pass` fails.
+   A mutant that does not fail its case is a finding: report it, do not weaken the list.
+
+6. **Documents.** In `docs/backend/sycl-host-safety.md`, after the paragraph that ends at :294, add at the same
+   indentation:
+
+   ```markdown
+     Correction, 2026-11-21: `mkdir GPU.lock` is not an exclusive take on this host. `/usr/bin/mkdir` is uutils
+     coreutils 0.10.0: it checks with `statx`, then calls `mkdir(2)`, and exits 0 when that call fails with EEXIST
+     on a directory. Two takers that arrive together both "win" (measured: 173 of 400 paired races; GNU `mkdir`,
+     `/usr/bin/gnumkdir`, 0 of 400). Take every lock through `scripts/sycl-lock.sh`:
+     `source scripts/sycl-lock.sh; sycl_lock_take /Apps/llama.cpp/GPU.lock "<who> pid=$$ start=$(date +%FT%T)" 1`
+     (0 means held and verified), and release with `sycl_lock_release` and the same text. It creates the directory
+     with `mkdir(2)`, writes a `holder` line exclusively, waits, and reads the holder back. For a one-off by hand,
+     `/usr/bin/gnumkdir` plus a `holder` written with `set -C` is the equivalent. What no taker can detect: a
+     co-taker that still uses plain `mkdir` and writes its holder after the verify window is seen only when the
+     holder is read again (the gates read it before each arm and at the end), and one that writes no holder is
+     never seen. A directory left by a killed taker is removed by hand once its holder's pid is confirmed dead.
+   ```
+
+   In `CLAUDE.md`, after the bullet that ends at :53, add:
+
+   ```markdown
+   - Take `GPU.lock` and `BUILD.lock` with `sycl_lock_take` from `scripts/sycl-lock.sh`, never with plain `mkdir`:
+     the system `mkdir` here exits 0 on an existing directory, so two takers can both win (measured 2026-11-21).
+   ```
+
+   Commit 3 paths: `docs/backend/sycl-host-safety.md`, `CLAUDE.md`.
+
+**Commit:**
+
+```bash
+git commit -F <msgfile> -- scripts/sycl-moe-exec-gate.sh tests/test-sycl-moe-exec-gate-script.sh
+git commit -F <msgfile> -- scripts/sycl-qwen35-ppl-gate.sh tests/test-sycl-qwen35-ppl-gate.sh
+git commit -F <msgfile> -- docs/backend/sycl-host-safety.md CLAUDE.md
+```
+
+Subjects: `scripts: the MoE exec gate takes GPU.lock through the lock library`,
+`scripts: the Qwen perplexity gate takes GPU.lock through the lock library`,
+`docs: a lock is taken with sycl_lock_take, not with mkdir`. Write each message to a file (a `-m` string loses
+backticks and `${...}` to the shell). Never amend a reported commit.
+
+**Gotchas:**
+- The MoE gate has no `set -e` and no `set -u`; the Qwen gate has `set -euo pipefail`. The same helper text behaves
+  differently in the two: see ruling 3.
+- `lock_take` must not be called twice by the selftest for its "second take" check: it would overwrite `LOCK_TEXT`,
+  and when the clock second differs the release would then refuse its own holder. Call `sycl_lock_take` directly
+  with another text (ruling 9).
+- The MoE test's `nocmp` case (:1400-1407) builds a `PATH` without `python3`. It runs `--score-arm`, which takes no
+  lock; it must still pass unchanged. If it fails, the gate is running the lock helper in a mode that needs none.
+- Tests call `/usr/bin/mkdir` or `mkdir -p` for their own directories. Where a case puts the shim first on `PATH`,
+  only the gate under test sees it.
+- A hook in this session blocks `grep` and `rg` as the first word of a command on repository files: use
+  `cat FILE | grep -n ...`.
+- `clang-format` does not apply to shell. Do not reformat lines you did not change; both scripts carry long lines
+  on purpose.
+- Other sessions take the real `/Apps/llama.cpp/GPU.lock`. Never name it in a test, and never run either gate
+  without `--lock-dir`, `LLAMA_GPU_LOCK` or a selftest mode while developing.
+
+**Not in this task, recorded here:** both gates still wait for `MemAvailable > 150 GB` before a run
+(`scripts/sycl-moe-exec-gate.sh:1266-1271` and :1309, header :116-119; `scripts/sycl-qwen35-ppl-gate.sh:257-268`).
+That half of the settle rule was retired by the ruling of 2026-11-12, and this host never reaches it, so neither
+gate can start a device arm today. `scripts/sycl-qwen35-ppl-gate.sh:227` also passes `-ngl 99`, against the ruling
+of 2026-10-17. Removing either changes what the gates run and needs a GPU check of its own; each gets a tracker
+task. Until then the Qwen gate's run path has no stub test and no lost-lock check (ruling 7).
 
 ---
 
