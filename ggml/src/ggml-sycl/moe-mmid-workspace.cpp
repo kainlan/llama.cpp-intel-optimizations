@@ -93,6 +93,12 @@ const char * moe_mmid_materialize_refusal_name(moe_mmid_materialize_refusal refu
             return "device-pool-allocation-failed";
         case R::HOST_POOL_ALLOCATION_FAILED:
             return "host-pool-allocation-failed";
+        case R::HOST_POOL_ZONES_NOT_CONFIGURED:
+            return "host-pool-zones-not-configured";
+        case R::HOST_POOL_OVER_NO_GROWTH_BOUND:
+            return "host-pool-over-no-growth-bound";
+        case R::HOST_POOL_NO_CONTIGUOUS_BLOCK:
+            return "host-pool-no-contiguous-block";
         case R::SLICE_FAILED:
             return "slice-failed";
         case R::EXCEPTION:

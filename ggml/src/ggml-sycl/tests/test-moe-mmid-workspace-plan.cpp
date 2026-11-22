@@ -1405,6 +1405,9 @@ static void materialize_refusal_names() {
         R::PLAN_CHANGED_REBIND_REFUSED,
         R::DEVICE_POOL_ALLOCATION_FAILED,
         R::HOST_POOL_ALLOCATION_FAILED,
+        R::HOST_POOL_ZONES_NOT_CONFIGURED,
+        R::HOST_POOL_OVER_NO_GROWTH_BOUND,
+        R::HOST_POOL_NO_CONTIGUOUS_BLOCK,
         R::SLICE_FAILED,
         R::EXCEPTION,
     };

@@ -196,6 +196,7 @@ struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     int backend_device = -1;  // the registry device `backend` was created for
     std::vector<ggml_backend_t> retained_backends;
+    ggml_backend_buffer_t       unplanned_host_weights = nullptr;  // the deferred order's host weights no plan sized
     ggml_sycl_load_txn load{};
     bool load_open = false;
     ggml_sycl_model_token model{};
@@ -310,6 +311,7 @@ struct lifecycle_fixture {
             // A real model load ends before llama_context creates any backend: load_end finds no backend context
             // for the owner device and defers the MMID workspaces to the context bind.
             if (order == backend_order::AFTER_LOAD_END) {
+                place_unplanned_host_weights(plan, primary_device);
                 create_retained_backends();
             }
             require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
@@ -353,6 +355,29 @@ struct lifecycle_fixture {
         }
     }
 
+    // A real load also places host weights the plan never sized, through the SYCL host buffer type, and grows the
+    // WEIGHT host zone for them (Inkling: the plan places no host weight; the load grows WEIGHT from 64 MiB by twelve
+    // 2 GiB chunks). The MMID workspace host pool is a request that may not grow its zone, allocated from WEIGHT at
+    // the context bind, so the deferred order fills WEIGHT past its reservation first, the way such a load leaves it.
+    void place_unplanned_host_weights(const ggml_sycl::placement_plan & plan, int device) {
+        require(plan.moe_mmid_host_pool_bytes > 0, "the candidate plan has no MMID host pool to place");
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        require(cache && cache->host_zones_configured(), "the primary device's host zones are not configured");
+        const size_t reserved = cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT);
+        const size_t used     = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
+        require(reserved > used, "the WEIGHT host zone is already past its reservation");
+        constexpr size_t past_reservation = 1024ull * 1024ull;
+        unplanned_host_weights =
+            ggml_backend_buft_alloc_buffer(ggml_backend_sycl_host_buffer_type(), reserved - used + past_reservation);
+        require(unplanned_host_weights != nullptr, "the unplanned host weight buffer was not allocated");
+        const size_t now_used = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
+        const size_t capacity = cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
+        require(now_used > reserved && capacity > reserved,
+                "the unplanned host weights did not grow the WEIGHT host zone past its reservation");
+        std::cerr << "unplanned host weights: WEIGHT used " << now_used << " of capacity " << capacity
+                  << ", reservation " << reserved << "; MMID host pool " << plan.moe_mmid_host_pool_bytes << " bytes\n";
+    }
+
     void cleanup() noexcept {
         if (scope_minted && backend) {
             ggml_sycl_q1_nvfp4_test_scope_leave(backend, &scope);
@@ -374,6 +399,10 @@ struct lifecycle_fixture {
             ggml_backend_free(*it);
         }
         retained_backends.clear();
+        if (unplanned_host_weights) {
+            ggml_backend_buffer_free(unplanned_host_weights);
+            unplanned_host_weights = nullptr;
+        }
         backend        = nullptr;
         backend_device = -1;
     }

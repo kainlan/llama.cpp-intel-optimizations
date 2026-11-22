@@ -19261,6 +19261,43 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
 // EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
 // released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
 // host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+const char * host_zone_alloc_miss_name(host_zone_alloc_miss miss) noexcept {
+    switch (miss) {
+        case host_zone_alloc_miss::NONE:
+            return "none";
+        case host_zone_alloc_miss::ZONES_NOT_CONFIGURED:
+            return "zones-not-configured";
+        case host_zone_alloc_miss::OVER_NO_GROWTH_BOUND:
+            return "over-no-growth-bound";
+        case host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK:
+            return "no-contiguous-block";
+        case host_zone_alloc_miss::GROWTH_FAILED:
+            return "growth-failed";
+    }
+    return "unknown";
+}
+
+moe_mmid_materialize_refusal moe_mmid_host_pool_refusal(host_zone_alloc_miss miss) noexcept {
+    switch (miss) {
+        case host_zone_alloc_miss::ZONES_NOT_CONFIGURED:
+            return moe_mmid_materialize_refusal::HOST_POOL_ZONES_NOT_CONFIGURED;
+        case host_zone_alloc_miss::OVER_NO_GROWTH_BOUND:
+            return moe_mmid_materialize_refusal::HOST_POOL_OVER_NO_GROWTH_BOUND;
+        case host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK:
+            return moe_mmid_materialize_refusal::HOST_POOL_NO_CONTIGUOUS_BLOCK;
+        case host_zone_alloc_miss::NONE:
+        case host_zone_alloc_miss::GROWTH_FAILED:  // the host pool's request never grows its zone
+            break;
+    }
+    return moe_mmid_materialize_refusal::HOST_POOL_ALLOCATION_FAILED;
+}
+
+size_t host_zone_no_growth_bound(host_zone_id zone, size_t reserved, size_t capacity) noexcept {
+    // The model load grows WEIGHT for host weights no plan sized (see the declaration), so only its capacity says
+    // whether a request fits without growing it. Every other zone's tenants are planned: their reservation stands.
+    return zone == host_zone_id::WEIGHT ? std::max(reserved, capacity) : reserved;
+}
+
 static host_zone_id unified_alloc_host_zone(const alloc_request & req,
                                             runtime_category      cat,
                                             bool                  kv_spill_to_host) noexcept {
@@ -19296,6 +19333,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     }
 
     alloc_request req = req_in;
+    if (req.host_zone_miss != nullptr) {
+        *req.host_zone_miss = host_zone_alloc_miss::NONE;
+    }
     if (req.queue == nullptr && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
         req.queue = &ggml_sycl_get_device(req.device).default_queue();
     }
@@ -19690,15 +19730,18 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // blocked (phase gate or budget exhausted), return a miss. The
             // host-buffer WEIGHT path fails cleanly without a raw malloc_host
             // escape; the separate KV-only pool retry below is not its fallback.
-            auto try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
+            host_zone_alloc_miss host_miss                 = host_zone_alloc_miss::NONE;
+            auto                 try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
                 if (!ucache->host_zones_configured() && req.intent.constraints.use_pinned_pool) {
                     // Zones not yet configured (pre-configure model-load path):
                     // fall through to host_pool_alloc below.
                     return nullptr;
                 }
                 if (req.intent.constraints.forbid_host_zone_growth) {
-                    const size_t reserved = ucache->host_zone_reserved_capacity(zone);
-                    if (reserved > 0 && ucache->host_zone_used(zone) + alloc_size > reserved) {
+                    const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),
+                                                                                   ucache->host_zone_capacity(zone));
+                    if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {
+                        host_miss = host_zone_alloc_miss::OVER_NO_GROWTH_BOUND;
                         return nullptr;
                     }
                 }
@@ -19708,6 +19751,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     return p;
                 }
                 if (req.intent.constraints.forbid_host_zone_growth) {
+                    host_miss = host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK;
                     return nullptr;
                 }
                 // Fragmentation path: the zone has enough aggregate free bytes
@@ -19729,10 +19773,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // max(chunk_size_, align_up(need)); the alignment slack keeps
                 // the aligned request inside the arena.
                 const size_t need = alloc_size + std::max(alignment, pinned_chunk_pool::DEFAULT_ALIGNMENT);
-                if (!ucache->host_zone_grow(zone, need)) {
-                    return nullptr;
+                void *       grown =
+                    ucache->host_zone_grow(zone, need) ? ucache->host_zone_alloc(zone, alloc_size, alignment) : nullptr;
+                if (!grown) {
+                    host_miss = host_zone_alloc_miss::GROWTH_FAILED;
                 }
-                return ucache->host_zone_alloc(zone, alloc_size, alignment);
+                return grown;
             };
             if (req.intent.constraints.use_pinned_pool) {
                 if (!ucache->host_zones_configured()) {
@@ -19796,6 +19842,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
             }
             uses_pinned_pool = (ptr != nullptr);
+            if (!ptr && host_miss == host_zone_alloc_miss::NONE && !ucache->host_zones_configured()) {
+                host_miss = host_zone_alloc_miss::ZONES_NOT_CONFIGURED;
+            }
+            if (req.host_zone_miss != nullptr) {
+                *req.host_zone_miss = ptr ? host_zone_alloc_miss::NONE : host_miss;
+            }
         }
         if (!ptr) {
             // When host zones are configured, a WEIGHT zone miss means the zone is
@@ -20528,6 +20580,8 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         owners.push_back(owner);
     }
 
+    // The host-zone condition the host pool's allocation missed on, if it missed on one.
+    host_zone_alloc_miss host_pool_miss = host_zone_alloc_miss::NONE;
     auto allocator = [&](bool host_pinned, int device, size_t bytes, size_t alignment) -> moe_mmid_blob {
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == device;
@@ -20541,6 +20595,7 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         request.size                 = bytes;
         request.alignment            = alignment;
         request.suppress_failure_log = true;
+        request.host_zone_miss       = host_pinned ? &host_pool_miss : nullptr;
         // The host pool holds the route's CPU-written, GPU-read slot descriptors (and a secondary owner's bounce
         // slices): control data. Its owner is the registry context, which holds it for the model's plan, past every
         // graph, so it is a persistent owner and lands in the WEIGHT host zone, where the planner sized it. In the
@@ -20572,10 +20627,15 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         blob.host_pinned = host_pinned;
         return blob;
     };
-    return exact_plan ? unified_cache_moe_mmid_registry().materialize(token, plan_identity, std::move(exact_plan),
-                                                                      submit_device, owners, allocator, refusal) :
-                        unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners,
-                                                                      allocator, refusal);
+    const moe_mmid_materialize_status status =
+        exact_plan ? unified_cache_moe_mmid_registry().materialize(token, plan_identity, std::move(exact_plan),
+                                                                   submit_device, owners, allocator, refusal) :
+                     unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners,
+                                                                   allocator, refusal);
+    if (refusal && *refusal == moe_mmid_materialize_refusal::HOST_POOL_ALLOCATION_FAILED) {
+        *refusal = moe_mmid_host_pool_refusal(host_pool_miss);
+    }
+    return status;
     } catch (...) {
         if (refusal) {
             *refusal = R::EXCEPTION;

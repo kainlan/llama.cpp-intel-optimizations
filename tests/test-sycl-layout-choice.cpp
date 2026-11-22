@@ -2706,6 +2706,81 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
     return ok;
 }
 
+// The bound unified_alloc() holds a request that may not grow its host zone to (forbid_host_zone_growth: the MMID
+// workspace host pool, the SYCL host pool, the prompt pipeline's stage buffers). The WEIGHT arm is the Inkling B70
+// load: the plan places no host weight, so WEIGHT is reserved at 64 MiB plus the 128 KiB MMID host pool, the model
+// load grows it by twelve 2 GiB chunks for the host weights it places through the SYCL host buffer type, and the
+// pool then asks for 128 KiB of a zone that has 2.77 GB free.
+static bool run_host_zone_no_growth_bound_test() {
+    constexpr size_t mib      = 1024ull * 1024ull;
+    constexpr size_t gib      = 1024ull * mib;
+    constexpr size_t pool     = 128ull * 1024ull;
+    const size_t     reserved = 64ull * mib + pool;
+    const size_t     grown    = reserved + 12ull * 2ull * gib;
+    const size_t     used     = static_cast<size_t>(21.29 * static_cast<double>(gib));
+    bool             ok       = true;
+
+    const size_t weight_bound = ggml_sycl::host_zone_no_growth_bound(ggml_sycl::host_zone_id::WEIGHT, reserved, grown);
+    if (weight_bound == 0 || used + pool > weight_bound) {
+        printf(
+            "FAIL: host zone no-growth bound, WEIGHT grown by the load: want room for the %zu-byte MMID host pool in "
+            "the zone's %zu bytes with %zu used, got bound %zu (reserved %zu)\n",
+            pool, grown, used, weight_bound, reserved);
+        ok = false;
+    }
+    if (ggml_sycl::host_zone_no_growth_bound(ggml_sycl::host_zone_id::WEIGHT, reserved, reserved) != reserved) {
+        printf("FAIL: host zone no-growth bound, WEIGHT not grown: want the reservation\n");
+        ok = false;
+    }
+    // Every tenant of STAGING is planned: a growth-allowed request that grew it does not widen a no-growth request's
+    // room past the plan.
+    const size_t staging_reserved = 2ull * gib;
+    for (const ggml_sycl::host_zone_id zone :
+         { ggml_sycl::host_zone_id::STAGING, ggml_sycl::host_zone_id::SCRATCH, ggml_sycl::host_zone_id::KV }) {
+        const size_t bound =
+            ggml_sycl::host_zone_no_growth_bound(zone, staging_reserved, staging_reserved + 2ull * gib);
+        if (bound != staging_reserved) {
+            printf("FAIL: host zone no-growth bound, %s grown: want the reservation %zu, got %zu\n",
+                   ggml_sycl::host_zone_name(zone), staging_reserved, bound);
+            ok = false;
+        }
+    }
+
+    // The host pool's refusal names the condition its allocation missed on.
+    using M = ggml_sycl::host_zone_alloc_miss;
+    using R = ggml_sycl::moe_mmid_materialize_refusal;
+
+    const struct {
+        M            miss;
+        R            want;
+        const char * name;
+    } cases[] = {
+        { M::NONE,                 R::HOST_POOL_ALLOCATION_FAILED,    "host-pool-allocation-failed"    },
+        { M::ZONES_NOT_CONFIGURED, R::HOST_POOL_ZONES_NOT_CONFIGURED, "host-pool-zones-not-configured" },
+        { M::OVER_NO_GROWTH_BOUND, R::HOST_POOL_OVER_NO_GROWTH_BOUND, "host-pool-over-no-growth-bound" },
+        { M::NO_CONTIGUOUS_BLOCK,  R::HOST_POOL_NO_CONTIGUOUS_BLOCK,  "host-pool-no-contiguous-block"  },
+        { M::GROWTH_FAILED,        R::HOST_POOL_ALLOCATION_FAILED,    "host-pool-allocation-failed"    },
+    };
+
+    for (const auto & c : cases) {
+        const R got = ggml_sycl::moe_mmid_host_pool_refusal(c.miss);
+        if (got != c.want || std::strcmp(ggml_sycl::moe_mmid_materialize_refusal_name(got), c.name) != 0) {
+            printf("FAIL: MMID host pool refusal for miss %s: want %s, got %s\n",
+                   ggml_sycl::host_zone_alloc_miss_name(c.miss), c.name,
+                   ggml_sycl::moe_mmid_materialize_refusal_name(got));
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        printf(
+            "PASS: host zone no-growth bound: WEIGHT grown by the load holds the MMID host pool (bound %zu, used "
+            "%zu), STAGING/SCRATCH/KV keep their reservation, and the pool's refusal names its host-zone miss\n",
+            weight_bound, used);
+    }
+    return ok;
+}
+
 static bool run_moe_decode_down_phase_split_policy_test() {
     ggml_sycl::test_moe_decode_down_layout_policy_input in{};
     in.n_tokens                          = 1;
@@ -4265,6 +4340,7 @@ int main() {
         mock_ok = run_multi_device_moe_i8_executor_support_test() && mock_ok;
         mock_ok = run_single_device_moe_pp_layout_test() && mock_ok;
         mock_ok = run_single_device_moe_mmid_pool_charge_test() && mock_ok;
+        mock_ok = run_host_zone_no_growth_bound_test() && mock_ok;
         mock_ok = run_moe_decode_down_phase_split_policy_test() && mock_ok;
         mock_ok = run_multi_device_no_p2p_cohesive_moe_layer_test() && mock_ok;
         mock_ok = run_regression_guard_policy_test() && mock_ok;

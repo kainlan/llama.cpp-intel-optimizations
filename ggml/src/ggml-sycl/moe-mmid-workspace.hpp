@@ -364,6 +364,13 @@ enum class moe_mmid_materialize_refusal : uint8_t {
     // Allocation: the device pool, the host pool, or a slot slice of either; or an exception.
     DEVICE_POOL_ALLOCATION_FAILED,
     HOST_POOL_ALLOCATION_FAILED,
+    // The host pool's allocation missed on a named host-zone condition (the backend's host_zone_alloc_miss): the
+    // pinned pool had no zones and no room, the request would fill its zone past the bound a request that may not
+    // grow the zone has, or no chunk of the zone had the contiguous room. HOST_POOL_ALLOCATION_FAILED names a miss
+    // the allocator gave no condition for.
+    HOST_POOL_ZONES_NOT_CONFIGURED,
+    HOST_POOL_OVER_NO_GROWTH_BOUND,
+    HOST_POOL_NO_CONTIGUOUS_BLOCK,
     SLICE_FAILED,
     EXCEPTION,
 };
