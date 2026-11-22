@@ -367,23 +367,23 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     if (kda) {
         if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1, sq2,
+                                               sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K,
+                                               stream);
         } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1, sq2,
+                                                sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K,
+                                                stream);
         }
     } else {
         if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1, sq2,
+                                                sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K,
+                                                stream);
         } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1,
+                                                 sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                                                 scale, K, stream);
         }
     }
 }
