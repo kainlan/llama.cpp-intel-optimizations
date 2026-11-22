@@ -3064,7 +3064,7 @@ void llama_context::sycl_select_auto_ubatch() {
                 sycl_host_hooks.commit_host_holders(sb.backend);
             }
         }
-        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.hparams.no_alloc) {
+        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.no_alloc()) {
             sycl_host_compute_bytes =
                 llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, backend_buft);
             llama_context_sycl_notify_checked(
@@ -3582,7 +3582,7 @@ void llama_context::sched_reserve() {
                 sycl_host_hooks.commit_host_holders(backend.get());
             }
         }
-        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.hparams.no_alloc) {
+        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.no_alloc()) {
             sycl_host_compute_bytes =
                 llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, backend_buft);
             llama_context_sycl_notify_checked(
@@ -3612,7 +3612,7 @@ bool llama_context::sched_reserve_nothrow() {
                         sycl_host_hooks.commit_host_holders(backend.get());
                     }
                 }
-                if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.hparams.no_alloc) {
+                if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && !model.no_alloc()) {
                     sycl_host_compute_bytes =
                         llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, backend_buft);
                     llama_context_sycl_notify_checked(sycl_host_hooks.notify_host_buffer_sizes(
@@ -4034,7 +4034,7 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
     bool   sycl_host_measured = false;
     size_t sycl_host_notified = 0;
     auto   sycl_host_measure  = [&]() {
-        if (model.hparams.no_alloc || !sycl_dev0 || !sycl_host_hooks.notify_host_buffer_sizes) {
+        if (model.no_alloc() || !sycl_dev0 || !sycl_host_hooks.notify_host_buffer_sizes) {
             return;
         }
         sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_MARK, state.cparams.n_ubatch);

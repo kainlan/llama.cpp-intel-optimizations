@@ -1693,9 +1693,16 @@ def clause_context_wiring(texts: dict) -> list:
             fails.append(f"context wiring: llama_context does not resolve ggml_backend_sycl_{name}")
     if fails:
         return fails
+    # llama_context::sched_new is where a scheduler is built: it neither reserves nor begins, so its callers are the
+    # creation sites a begin must follow, as a direct ggml_backend_sched_new would be.
+    factory = "llama_context::sched_new"
     for f in s.functions:
         body = s.bare[f["open"]:f["close"]]
-        for m in re.finditer(r"\bggml_backend_sched_new\s*\(", body):
+        if f["name"] == factory:
+            if re.search(r"\bgraph_reserve\s*\(", body):
+                fails.append(f"context wiring: {factory} reserves before any caller can begin")
+            continue
+        for m in re.finditer(r"\b(?:ggml_backend_)?sched_new\s*\(", body):
             nxt_reserve = re.search(r"\bgraph_reserve\s*\(", body[m.end():])
             nxt_begin = re.search(r"\b" + re.escape(ptr["begin_host_holders"]) + r"\s*\(", body[m.end():])
             if not nxt_begin or (nxt_reserve and nxt_reserve.start() < nxt_begin.start()):
@@ -1906,7 +1913,7 @@ def clause_trial_ops(texts: dict) -> list:
     path = _sched_path(texts)
     im = path["reserve"] if path else None
     lo2 = path["reserve_lo"] if path else 0
-    retry = re.search(r"\bpipeline_parallel\s*=\s*false\s*;[^;]*?\bggml_backend_sched_new\s*\(",
+    retry = re.search(r"\bpipeline_parallel\s*=\s*false\s*;[^;]*?\b(?:ggml_backend_)?sched_new\s*\(",
                       code[lo2:im["close"]]) if im else None
     failed = [p for p, _ in _reserves(s, lo2, lo2 + retry.start())] if retry else []
     if not failed:
@@ -2213,7 +2220,7 @@ _CAND_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
                 "            }\n"
                 "        }\n")
 _RENOTIFY = ("        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && "
-             "!model.hparams.no_alloc) {\n"
+             "!model.no_alloc()) {\n"
              "            sycl_host_compute_bytes =\n"
              "                llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, "
              "backend_buft);\n"
@@ -2261,10 +2268,12 @@ _BEGIN = ("    if (sycl_host_hooks.begin_host_holders) {\n"
           "        sycl_host_hooks.begin_host_holders(state.sched.get());\n"
           "    }\n")
 _BEGIN_0_NOTE = "    // scheduler's compute buffers, and the walks of this reserve fill the pending plans afresh.\n"
-_SCHED_NEW_0 = ("    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), "
-                "backend_ptrs.size(), max_nodes,\n"
-                "                                             state.cparams.pipeline_parallel, "
-                "state.cparams.op_offload));\n")
+_SCHED_REALLOC_CB = "    ggml_backend_sched_set_realloc_callback(state.sched.get(), sched_graph_realloc, this);\n"
+_SCHED_NEW_0 = ("    sched_new(state, {\n"
+                "        /*.max_nodes  =*/ max_nodes,\n"
+                "        /*.parallel   =*/ state.cparams.pipeline_parallel,\n"
+                "        /*.op_offload =*/ state.cparams.op_offload,\n"
+                "    });\n")
 _MEASURE_CALL = "    sycl_host_measure();\n\n"
 _MEASURE_NOTIFY = ("        if (!measure_only) {  // a measure-only context resolves no hooks and prints nothing a "
                    "vehicle arm scores\n"
@@ -2539,6 +2548,9 @@ MUTANTS = [
      [(PLAN, _UNPLANNED_POOLS, "        d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);\n"
                                "        return d;\n")],
      "the pools' init is sized from 'd.dims = host_pool_scan("),
+    ("wiring-factory-reserves", "context-wiring",
+     [(LC, _SCHED_REALLOC_CB, _SCHED_REALLOC_CB + "    graph_reserve(state, 1, 1, 1, nullptr);\n")],
+     "llama_context::sched_new reserves before any caller can begin"),
     ("wiring-retry-unbegun", "context-wiring", [(LC, _RETRY_BEGIN, "")],
      "creates a scheduler and reserves before the begin entry"),
     ("wiring-begin-before-creation", "context-wiring",

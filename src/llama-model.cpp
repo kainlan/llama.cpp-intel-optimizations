@@ -987,13 +987,16 @@ bool llama_model_sycl_header_inventory(const char *                         fnam
                               /*param_tensor_buft_overrides_p*/ nullptr);
         ml.lazy.mode = params.lazy_mode;
 
-        std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+        // the model reads no_alloc from its own params, so the copy it is built from carries it
+        llama_model_params mparams = params;
+        mparams.no_alloc           = true;
+
+        std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, mparams));
         auto *                       model = dynamic_cast<llama_model_base *>(model_ptr.get());
         if (model == nullptr) {
             return false;
         }
         model->hparams.vocab_only = false;
-        model->hparams.no_alloc   = true;
         model->load_hparams(ml);
 
         // The load resolves AUTO against its devices, keeping it wherever SYCL owns placement; the dry run plans for
