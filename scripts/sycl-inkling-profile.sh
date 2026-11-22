@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 # sycl-inkling-profile.sh -- ONE profiled or benchmark run of Inkling-2-Mini on one setup. Lead-only: it loads a
 # 22.9 GB model onto a GPU. It holds GPU.lock for the run and waits for Shmem < 30 GB first. A model-loading run is
-# never repeated: a tag whose .done, .out or tuning directory already exists is refused.
+# never repeated: a tag whose .done, .out or tuning directory already exists is refused, before and again after the
+# lock is taken.
 #
 #   sycl-inkling-profile.sh --setup b70|b50|both --phase bench|kprof-prompt|kprof-decode|e2e-decode|census
 #                           --out DIR [--ctx N] [--build-dir DIR] [--dry-run]
 #
-# Markers in DIR: <tag>.done is written only when the tool ran (rc, timed_out, secs, host state); every other exit
-# after argument validation writes <tag>.fail (rc, reason). A waiter can wait for either file.
-# Exit codes: 1 usage, preflight or rerun refusal; 3 lock or Shmem give-up; otherwise the tool's rc (124/137 =
-# timeout). Environment overrides (the test drives the real path through them; defaults are the production values):
+# Markers in DIR: <tag>.done is written only when the tool ran (rc, timed_out, signalled, secs, host state); every
+# other exit after argument validation writes <tag>.fail (rc, reason). Three exits write neither: the rerun refusal
+# (the first run's evidence stays untouched), a failed mkdir of DIR, and a signal before the traps are installed.
+# Exit codes: 1 usage, preflight or rerun refusal; 3 lock or Shmem give-up; 143 signalled before the run; otherwise
+# the tool's rc (124/137 = timeout, unless signalled=yes). Stop a run with TERM: a script started with & from a
+# non-interactive shell has INT ignored and a trap cannot override that.
+# Environment overrides (the test drives the real path through them; defaults are the production values):
 #   INKLING_MODEL INKLING_PROMPT_FILE INKLING_GPU_LOCK INKLING_SETVARS INKLING_MEMINFO INKLING_SETTLE_SECONDS (12)
 #   INKLING_RUN_TIMEOUT (900) INKLING_KILL_SECONDS (30) INKLING_LOCK_WAIT_SECONDS (2400) INKLING_SHMEM_WAIT_SECONDS (600)
 set -u
 
 usage() {
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -60,6 +64,7 @@ esac
 TAG="$SETUP-$PHASE-c$CTX"
 ENVV=("ONEAPI_DEVICE_SELECTOR=$SELECTOR" "GGML_SYCL_MOE_MULTI_GPU=0" "GGML_SYCL_TUNING_CACHE_DIR=$OUT/tuning-$TAG")
 COMPLETION=(llama-completion -m "$MODEL" -c "$CTX" --seed 42 --temp 0)
+DECODE_ARGS=(-p '1, 2, 3, 4, 5,' -n 128 --ignore-eos)
 NEED_PROMPT=0
 # One instrument per run: an instrument's cost must not land in another instrument's numbers.
 case "$PHASE" in
@@ -68,17 +73,19 @@ case "$PHASE" in
         TAG="$SETUP-bench"
         ENVV[2]="GGML_SYCL_TUNING_CACHE_DIR=$OUT/tuning-$TAG"
         CMD=(llama-bench -m "$MODEL" -p 512 -n 128 -r 3) ;;
-    kprof-prompt)
+    kprof-prompt|kprof-decode)
         # The profile needs both the JSON and the CSV, and a run is never repeated; the default format is CSV only.
-        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof" "GGML_SYCL_KERNEL_PROFILE_FORMAT=both")
-        NEED_PROMPT=1
-        CMD=("${COMPLETION[@]}" -f "$PROMPT_FILE" -n 1) ;;
-    kprof-decode)
-        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof" "GGML_SYCL_KERNEL_PROFILE_FORMAT=both")
-        CMD=("${COMPLETION[@]}" -p '1, 2, 3, 4, 5,' -n 128 --ignore-eos) ;;
+        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof"
+               "GGML_SYCL_KERNEL_PROFILE_FORMAT=both")
+        if [ "$PHASE" = kprof-prompt ]; then
+            NEED_PROMPT=1
+            CMD=("${COMPLETION[@]}" -f "$PROMPT_FILE" -n 1)
+        else
+            CMD=("${COMPLETION[@]}" "${DECODE_ARGS[@]}")
+        fi ;;
     e2e-decode)
         ENVV+=("GGML_SYCL_E2E_TG_PROFILE=1")
-        CMD=("${COMPLETION[@]}" -p '1, 2, 3, 4, 5,' -n 128 --ignore-eos) ;;
+        CMD=("${COMPLETION[@]}" "${DECODE_ARGS[@]}") ;;
     census)
         ENVV+=("GGML_SCHED_DEBUG=2" "GGML_SYCL_MUL_MAT_ROUTE_TRACE=1" "GGML_SYCL_MUL_MAT_ROUTE_TRACE_LIMIT=600")
         CMD=("${COMPLETION[@]}" -p '1, 2, 3, 4, 5,' -n 2 -v) ;;
@@ -95,44 +102,45 @@ if [ "$DRY" -eq 1 ]; then
 fi
 
 mkdir -p "$OUT" || { echo "sycl-inkling-profile: cannot create $OUT" >&2; exit 1; }
-# A model-loading run is never repeated, and a second run must not read the first one's tuning cache.
-for stale in "$OUT/$TAG.done" "$OUT/$TAG.out" "$OUT/tuning-$TAG"; do
-    if [ -e "$stale" ]; then
-        echo "sycl-inkling-profile: refusing to repeat $TAG: $stale exists" >&2
-        exit 1
-    fi
-done
-rm -f "$OUT/$TAG.fail"
+# A model-loading run is never repeated, and a second run must not read the first one's tuning cache. Checked again
+# once the lock is held: two runs of one tag can queue behind the same lock.
+refuse_rerun() {
+    local stale
+    for stale in "$OUT/$TAG.done" "$OUT/$TAG.out" "$OUT/tuning-$TAG"; do
+        if [ -e "$stale" ]; then
+            echo "sycl-inkling-profile: refusing to repeat $TAG: $stale exists" >&2
+            exit 1
+        fi
+    done
+}
+refuse_rerun
+rm -f "${OUT:?}/${TAG:?}.fail"
 
-LOCK_HELD=0 CHILD="" RAN=0
-write_fail() { # RC REASON
+LOCK_HELD=0 CHILD="" SIGNALLED=0
+die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this process holds
     printf 'tag=%s rc=%s reason=%s\n' "$TAG" "$1" "$2" > "$OUT/$TAG.fail"
     echo "sycl-inkling-profile: $2" >&2
-}
-die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this process holds
-    write_fail "$1" "$2"
     exit "$1"
 }
 # shellcheck disable=SC2329  # installed through trap
 lock_release() {
     [ "$LOCK_HELD" = 1 ] || return 0
     # rmdir cannot remove a lock directory that still holds the holder file, so remove it first.
-    rm -f "$LOCK/holder"
+    rm -f "${LOCK:?}/holder"
     rmdir "$LOCK" 2>/dev/null
     LOCK_HELD=0
 }
-# A signal must not release the lock while the model-holding child is still running: forward it to the child and
-# let the normal end path wait for the child, settle and release. SIGKILL cannot be trapped: it leaves the lock
-# and the holder file behind, timeout still bounds the child, and the lock must be removed by hand once the holder
-# pid is confirmed dead.
+# Signals are deferred: the handler only records the signal and forwards TERM to a running child. It never exits or
+# releases the lock, so no window between mkdir, LOCK_HELD=1 and the child's launch can strand a lock or leave the
+# model-holding child running unattended. The main path checks SIGNALLED at fixed points. SIGKILL cannot be trapped:
+# it leaves the lock and the holder file behind, timeout still bounds the child, and the lock must be removed by hand
+# once the holder pid is confirmed dead.
 # shellcheck disable=SC2329  # installed through trap
 on_signal() {
-    if [ -n "$CHILD" ]; then
-        kill -TERM "$CHILD" 2>/dev/null
-    elif [ "$RAN" = 0 ]; then
-        die 143 "signal before the run"
-    fi
+    SIGNALLED=1
+    [ -z "$CHILD" ] || kill -TERM "$CHILD" 2>/dev/null
 }
+check_signal() { [ "$SIGNALLED" = 0 ] || die 143 "signal before the run"; }
 # Installed before the lock is taken; lock_release acts only when LOCK_HELD is set, right after the mkdir.
 trap lock_release EXIT
 trap on_signal TERM INT HUP
@@ -141,22 +149,37 @@ trap on_signal TERM INT HUP
 [ -x "$BIN" ] || die 1 "preflight: $BIN is not an executable"
 [ -f "$MODEL" ] || die 1 "preflight: model file $MODEL not found"
 if [ "$NEED_PROMPT" = 1 ] && [ ! -f "$PROMPT_FILE" ]; then die 1 "preflight: prompt file $PROMPT_FILE not found"; fi
+{ [ -r "$MEMINFO" ] && grep -q '^Shmem:' "$MEMINFO"; } || die 1 "preflight: $MEMINFO is unreadable or has no Shmem line"
 
 meminfo_shmem_gb() { awk '/^Shmem:/ { printf "%d", $2 / 1048576 }' "$MEMINFO"; }
 
-# mkdir is the atomic lock; failing to get it in time exits without running.
+# Two concurrent mkdir calls can both succeed here (uutils mkdir is not atomic under a race), so a sibling file made
+# with noclobber (O_EXCL, atomic in bash) serialises the mkdir. A stale .take file only makes the lock time out.
+take_lock() {
+    ( set -C; : > "$LOCK.take" ) 2>/dev/null || return 1
+    local got=1
+    mkdir "$LOCK" 2>/dev/null && got=0
+    rm -f "${LOCK:?}.take"
+    return "$got"
+}
+# Failing to get the lock in time exits without running.
 waited=0
-until mkdir "$LOCK" 2>/dev/null; do
+check_signal
+until take_lock; do
     sleep 1; waited=$((waited + 1))
+    check_signal
     [ "$waited" -lt "$LOCK_WAIT" ] || die 3 "GPU.lock not acquired in ${LOCK_WAIT}s"
 done
 LOCK_HELD=1
 printf 'sycl-inkling-profile pid=%s tag=%s start=%s\n' "$$" "$TAG" "$(date +%FT%T)" > "$LOCK/holder"
+check_signal
+refuse_rerun
 
 # The lock serialises access, not memory recovery: wait for the previous run's Shmem to drain.
 waited=0
 until [ "$(meminfo_shmem_gb)" -lt 30 ] 2>/dev/null; do
     sleep 1; waited=$((waited + 1))
+    check_signal
     [ "$waited" -lt "$SHMEM_WAIT" ] || die 3 "Shmem stayed >= 30 GB for ${SHMEM_WAIT}s"
 done
 
@@ -167,19 +190,26 @@ source "$SETVARS" --force >"$OUT/$TAG.setvars.log" 2>&1
 src_rc=$?
 set -u
 [ "$src_rc" -eq 0 ] || die 1 "setvars failed (rc=$src_rc, see $OUT/$TAG.setvars.log)"
+check_signal
 
 SHMEM_BEFORE="$(meminfo_shmem_gb)"; T0="$(date +%s)"
 LOAD="$(cut -d' ' -f1 /proc/loadavg)"
 BUILDERS=$(( $(pgrep -xc ninja || true) + $(pgrep -xc icpx || true) ))
 "${RUN[@]}" >"$OUT/$TAG.out" 2>"$OUT/$TAG.err" &
 CHILD=$!
+# A signal that arrived before CHILD was set was only recorded: deliver it now.
+[ "$SIGNALLED" = 0 ] || kill -TERM "$CHILD" 2>/dev/null
 wait "$CHILD"; rc=$?
 # A trapped signal makes wait return early while the child lives; keep waiting until it is really gone.
 while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; rc=$?; done
+# The child may have been reaped between the last wait and kill -0: take its real status if bash still holds it.
+wait "$CHILD" 2>/dev/null; r2=$?
+[ "$r2" -eq 127 ] || rc=$r2
 SECS=$(( $(date +%s) - T0 ))
-CHILD=""; RAN=1
-TIMED_OUT=no
-{ [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; } && TIMED_OUT=yes
+CHILD=""
+TIMED_OUT=no SIGNALLED_STR=no
+[ "$SIGNALLED" = 0 ] || SIGNALLED_STR=yes
+{ [ "$SIGNALLED" = 0 ] && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; }; } && TIMED_OUT=yes
 # Settle before the lock is released: a process started right after a fast exit can hang the GT.
 sleep "$SETTLE"
 KLOG_RAW="$(journalctl -k --since "@$T0" --no-pager 2>/dev/null)"; jrc=$?
@@ -188,7 +218,7 @@ if [ "$jrc" -eq 0 ]; then
 else
     KLOG=unreadable
 fi
-echo "tag=$TAG rc=$rc timed_out=$TIMED_OUT secs=$SECS shmem_before=${SHMEM_BEFORE}G shmem_after=$(meminfo_shmem_gb)G" \
-     "kernel_lines=$KLOG load=$LOAD builders=$BUILDERS sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)" \
-     | tee "$OUT/$TAG.done"
+echo "tag=$TAG rc=$rc timed_out=$TIMED_OUT signalled=$SIGNALLED_STR secs=$SECS shmem_before=${SHMEM_BEFORE}G" \
+     "shmem_after=$(meminfo_shmem_gb)G kernel_lines=$KLOG load=$LOAD builders=$BUILDERS" \
+     "sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)" | tee "$OUT/$TAG.done"
 exit "$rc"

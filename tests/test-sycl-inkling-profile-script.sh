@@ -34,6 +34,12 @@ case "${STUB_MODE:-ok}" in
     fail) exit 5 ;;
     hang) trap '' TERM; while :; do sleep 1; done ;;
     sleep) echo $$ > "$STUB_PIDFILE"; exec sleep 30 ;;
+    handshake)
+        # On TERM: announce it, then refuse to exit until the test says so, so the test can look at the lock
+        # while a TERM-stopped child is still alive.
+        echo $$ > "$STUB_PIDFILE"
+        trap 'echo got > "$STUB_TERMFILE"; while [ ! -e "$STUB_LETGO" ]; do sleep 0.1; done; exit 143' TERM
+        while :; do sleep 0.2; done ;;
 esac
 STUB
 chmod +x "$BR/bin/stub"
@@ -129,18 +135,20 @@ fi
 # c. a child that ignores TERM is killed by the escalation; the marker says so.
 : > "$STUB_LOG"; XENV=(STUB_MODE=hang INKLING_RUN_TIMEOUT=1 INKLING_KILL_SECONDS=1); C="$T/c"
 rr "$C"
-if grep -q 'timed_out=yes' "$C/$TAG.done" 2>/dev/null && [ ! -e "$T/lock" ]; then
+if grep -q 'timed_out=yes' "$C/$TAG.done" 2>/dev/null && grep -q 'signalled=no' "$C/$TAG.done" && [ ! -e "$T/lock" ]; then
     pass "(real: a TERM-ignoring child is killed, timed_out=yes, lock released)"
 else
     fail "(real: timeout) rc=$RR_RC out: $RR_OUT; done: $(cat "$C/$TAG.done" 2>&1)"
 fi
 
-# d. TERM to the runner: the child must be gone before the lock is released, and a marker must exist.
-: > "$STUB_LOG"; Dd="$T/d"; rm -f "$T/stub.pid"
-env STUB_MODE=sleep STUB_PIDFILE="$T/stub.pid" timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$Dd" \
+# d. TERM to the runner. The handshake stub keeps running after it sees TERM until the test releases it, so the test
+# can prove the lock is held while the child lives and, with a 2 s settle, until after the child is gone.
+: > "$STUB_LOG"; Dd="$T/d"; rm -f "$T/stub.pid" "$T/got-term" "$T/let-go"
+env STUB_MODE=handshake STUB_PIDFILE="$T/stub.pid" STUB_TERMFILE="$T/got-term" STUB_LETGO="$T/let-go" \
+    INKLING_SETTLE_SECONDS=2 timeout 120 bash "$S" --setup b70 --phase e2e-decode --out "$Dd" \
     --build-dir "$BR" >/dev/null 2>&1 &
 SP=$!
-for _ in $(seq 1 100); do [ -s "$T/stub.pid" ] && break; sleep 0.1; done
+for _ in $(seq 1 500); do [ -s "$T/stub.pid" ] && break; sleep 0.1; done
 if [ ! -s "$T/stub.pid" ]; then
     fail "(real: signal) the stub never started"
     kill "$SP" 2>/dev/null
@@ -148,19 +156,39 @@ else
     STUBPID="$(cat "$T/stub.pid")"
     kill -TERM "$SP"
     bad=""
-    for _ in $(seq 1 150); do
-        if [ ! -d "$T/lock" ]; then
-            kill -0 "$STUBPID" 2>/dev/null && bad="lock released while the child ($STUBPID) was alive"
-            break
-        fi
-        sleep 0.1
-    done
+    for _ in $(seq 1 500); do [ -e "$T/got-term" ] && break; sleep 0.1; done
+    [ -e "$T/got-term" ] || bad="$bad; TERM never reached the child"
+    [ -d "$T/lock" ] || bad="$bad; lock released while the child was alive"
+    : > "$T/let-go"
+    for _ in $(seq 1 100); do kill -0 "$STUBPID" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$STUBPID" 2>/dev/null && bad="$bad; child never exited"
+    [ -d "$T/lock" ] || bad="$bad; lock released before the settle elapsed"
     wait "$SP" 2>/dev/null
-    kill -0 "$STUBPID" 2>/dev/null && bad="$bad; child still alive after the runner exited"
-    [ -d "$T/lock" ] && bad="$bad; lock still held"
-    { [ -e "$Dd/$TAG.done" ] || [ -e "$Dd/$TAG.fail" ]; } || bad="$bad; no marker"
-    if [ -z "$bad" ]; then pass "(real: TERM reaches the child, lock released only after it is gone, marker written)"
-    else fail "(real: signal) $bad"; kill -9 "$STUBPID" 2>/dev/null; fi
+    [ -d "$T/lock" ] && bad="$bad; lock still held after the runner exited"
+    if ! grep -q 'signalled=yes' "$Dd/$TAG.done" 2>/dev/null || ! grep -q 'timed_out=no' "$Dd/$TAG.done"; then
+        bad="$bad; .done lacks signalled=yes timed_out=no: $(cat "$Dd/$TAG.done" 2>&1)"
+    fi
+    if [ -z "$bad" ]; then pass "(real: TERM reaches the child; lock held until the child is gone and the settle elapsed; signalled=yes)"
+    else fail "(real: signal)$bad"; kill -9 "$STUBPID" 2>/dev/null; fi
+fi
+
+# k. two identical runs queued behind a held lock: the tool runs once, the second runner refuses.
+: > "$STUB_LOG"; K="$T/k"; mkdir "$T/lock"
+env STUB_MODE=ok INKLING_LOCK_WAIT_SECONDS=30 timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" \
+    --build-dir "$BR" >"$T/k1.out" 2>&1 &
+K1=$!
+env STUB_MODE=ok INKLING_LOCK_WAIT_SECONDS=30 timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" \
+    --build-dir "$BR" >"$T/k2.out" 2>&1 &
+K2=$!
+# Release between two 1 s lock polls, so the test never removes a lock a runner has just taken.
+sleep 1.5; rmdir "$T/lock"
+rk1=0; wait "$K1" || rk1=$?
+rk2=0; wait "$K2" || rk2=$?
+runs="$(wc -l < "$STUB_LOG")"
+if [ "$runs" -eq 1 ] && { [ "$rk1" -eq 1 ] || [ "$rk2" -eq 1 ]; } && { [ "$rk1" -eq 0 ] || [ "$rk2" -eq 0 ]; } && [ ! -e "$T/lock" ]; then
+    pass "(real: two queued runs of one tag run the tool once, the other exits 1)"
+else
+    fail "(real: overlapping runs) tool ran $runs times, rc=$rk1/$rk2; k1: $(cat "$T/k1.out") k2: $(cat "$T/k2.out") log: $(cat "$STUB_LOG")"
 fi
 
 # e. setvars fails.
@@ -200,6 +228,15 @@ XENV=(INKLING_MODEL="$T/does-not-exist.gguf"); J="$T/j"
 rr "$J"
 if [ "$RR_RC" -eq 1 ] && [ -e "$J/$TAG.fail" ] && [ ! -e "$T/lock" ]; then pass "(real: missing model fails preflight)"
 else fail "(real: preflight) rc=$RR_RC out: $RR_OUT"; fi
+
+# l. an unreadable or malformed meminfo is named as such, not reported as high Shmem.
+printf 'MemFree: 1 kB\n' > "$T/meminfo-bad"; XENV=(INKLING_MEMINFO="$T/meminfo-bad"); Lm="$T/l"
+rr "$Lm"
+if [ "$RR_RC" -eq 1 ] && grep -q 'meminfo-bad' "$Lm/$TAG.fail" 2>/dev/null && [ ! -e "$T/lock" ]; then pass "(real: a meminfo without Shmem fails preflight by name)"
+else fail "(real: bad meminfo) rc=$RR_RC out: $RR_OUT fail: $(cat "$Lm/$TAG.fail" 2>&1)"; fi
+
+# m. --help prints the usage text only, not code.
+if bash "$S" --help 2>&1 | grep -q 'set -u'; then fail "(--help leaks the set -u line)"; else pass "(--help prints no code)"; fi
 
 # i. an option with no value must not loop.
 rc=0; timeout 5 bash "$S" --setup b70 --phase bench --out >/dev/null 2>&1 || rc=$?
