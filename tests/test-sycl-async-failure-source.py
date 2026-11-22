@@ -33,7 +33,8 @@ With comments blanked:
      runtime keeps the functor or copies of it.
   D. (ggml-sycl.cpp) a release refused during a drain is retried after the workspace recovery:
      ggml_sycl_execution_recover_and_release_graph waits the stream, then calls
-     ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
+     ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx), and both catches of
+     its wait return false before that recovery; both drain twins
      call it before ggml_sycl_execution_abort_and_release_graph, with the same condition: a wait that threw
      (waited false) goes straight to the abort, else release, else recover and release; the backend destructor
      calls the recovery before its abort-and-release.
@@ -216,6 +217,8 @@ def claims(cache, sycl, common):
         "B the completion task drops the bundle before it returns": b.endswith(BUNDLE_DROP) and
             0 <= b.find("completion->bundle.terminal_release()") < b.rfind(BUNDLE_DROP),
         "D the helper waits, recovers, then releases": 0 <= d_wait < d_recover < d_release,
+        "D both catches of the helper return before the recovery": all(
+            0 <= d.find(catch) < d_recover and "return false;" in body(d, catch) for catch in (STD_CATCH, ANY_CATCH)),
         "D the begin-path twin retries before it aborts": 0 <= d_own.find(
             "ggml_sycl_execution_recover_and_release_graph(ctx)") < d_own.find(
             "ggml_sycl_execution_abort_and_release_graph(ctx);"),
@@ -299,6 +302,9 @@ def main():
             "completion task keeps the bundle": (cache, sycl.replace(BUNDLE_DROP, "", 1), common),
             "completion task drops the bundle first": (cache, sycl.replace(BUNDLE_DROP, "", 1).replace(
                 RELEASE, BUNDLE_DROP + " " + RELEASE, 1), common),
+            **{f"helper falls through from its {catch}": (cache, splice(sycl, (D_HELPER, catch), "return false;", ""),
+                                                           common)
+               for catch in (STD_CATCH, ANY_CATCH)},
             "helper recovers without waiting": (cache, splice(sycl, (D_HELPER,), "stream->wait_and_throw();", ""),
                                                 common),
             "helper releases without recovering": (cache, sycl.replace(
@@ -345,6 +351,7 @@ def main():
             if not check(*args):
                 print(f"async failure source contract: mutant '{name}' was not caught", file=sys.stderr)
                 return 1
+            print(f"async failure source contract: mutant '{name}' caught")
     print("async failure source contract: PASS")
     return 0
 

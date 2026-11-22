@@ -511,7 +511,7 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
         if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    const auto observed = [&]() {
+    const auto observed_slots = [&]() {
         return label(no_pass) + ": observed first=(slot=" + std::to_string(first.workspace_slot) +
                ", generation=" + std::to_string(first.workspace_generation) +
                ") after=(slot=" + std::to_string(after.workspace_slot) +
@@ -522,12 +522,13 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
         first.workspace_generation == std::numeric_limits<uint64_t>::max() ||
         after.workspace_slot != first.workspace_slot ||
         after.workspace_generation != first.workspace_generation + 1) {
-        fail_stages("second submission did not reuse the same workspace slot at generation+1" + observed(), before);
+        fail_stages("second submission did not reuse the same workspace slot at generation+1" + observed_slots(),
+                    before);
     }
     if (after.candidate < before.candidate + 2 || after.admit < before.admit + 2 ||
         after.submit < before.submit + 2 || after.terminal < before.terminal + 2 ||
         after.recycle < before.recycle + 2) {
-        fail_stages("two-submit lifecycle counters did not prove slot reuse" + observed(), before);
+        fail_stages("two-submit lifecycle counters did not prove slot reuse" + observed_slots(), before);
     }
 }
 
