@@ -2,19 +2,26 @@
 // (a) queue::wait_and_throw delivers to the handler of the queue the command ran on, not its context's, and returns;
 // (b) event::wait_and_throw on the failed event also goes to the queue's handler, once;
 // (c) a queue on the platform default context with a handler on the queue alone receives both;
-// (d) a host task that depends on a failed event still runs, and sees the failure in the latch (the route's terminal
-//     relies on this);
-// (e) a queue built without a handler on a context that has one delivers to the context's handler.
+// (d) a host task that depends on a failed event still runs, and sees the failure in the latch when its own wait is the
+//     one that delivers it (fact (i) shows when it is not);
+// (e) a queue built without a handler on a context that has one delivers to the context's handler;
+// (i) while one thread's wait_and_throw is delivering a queue's errors (its handler has not returned), another thread's
+//     wait_and_throw on an event of the same queue returns at once and delivers nothing: the first wait took the
+//     pending errors before it called the handler. A latch read after a wait therefore says nothing about errors that
+//     another thread's wait is delivering; only a boundary that drained on its own thread may read it. Each error is
+//     still delivered exactly once.
 // Host tasks only: no kernel, no allocation. Without --gpu it needs a CPU SYCL device and skips when there is none.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP
 #include "../async-failure.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <sycl/sycl.hpp>
+#include <thread>
 
 #define CHECK(cond, msg)                                                        \
     do {                                                                        \
@@ -55,6 +62,87 @@ bool waits_without_throwing(sycl::event & e) {
 
 uint64_t count(int slot) {
     return ggml_sycl_async_failure_count(slot);
+}
+
+// Polls `done` for up to `seconds`; true when it held.
+template <typename F> bool wait_for(F done, int seconds) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() >= until) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+// Fact (i). A test-local handler that blocks until released, so one thread's delivery stays in flight while a second
+// thread waits on an event of the same queue. The handler records nothing in the latch: it counts its calls and the
+// errors it was handed.
+int probe_delivery_in_flight(const sycl::device & dev, const sycl::property_list & in_order) {
+    std::atomic<int>  handler_calls{ 0 };
+    std::atomic<int>  delivered{ 0 };
+    std::atomic<bool> release{ false };
+    sycl::queue       q(
+        dev,
+        [&](sycl::exception_list errors) {
+            handler_calls.fetch_add(1, std::memory_order_acq_rel);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            delivered.fetch_add(static_cast<int>(errors.size()), std::memory_order_acq_rel);
+        },
+        in_order);
+    sycl::event bad = submit_throw(q, "probe (i)");
+
+    // Thread A delivers, and its handler blocks. It repeats the wait until it has delivered, in case the error reaches
+    // the queue's list only after the event completes.
+    std::atomic<bool> a_done{ false };
+    std::thread       a([&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        do {
+            (void) waits_without_throwing(q);
+        } while (handler_calls.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < until);
+        a_done.store(true, std::memory_order_release);
+    });
+
+    // Releases the handler and joins thread A, on every exit from here on.
+    const auto finish = [&] {
+        release.store(true, std::memory_order_release);
+        a.join();
+    };
+    if (!wait_for([&] { return handler_calls.load(std::memory_order_acquire) != 0; }, 10)) {
+        finish();
+        std::fprintf(stderr, "FAIL: (i) the first wait never called the handler (a_done=%d)\n", a_done.load() ? 1 : 0);
+        return 1;
+    }
+
+    // Thread B waits on the failed event while A's delivery is in flight.
+    std::atomic<bool> b_done{ false };
+    std::atomic<bool> b_threw{ false };
+    std::thread       b([&] {
+        b_threw.store(!waits_without_throwing(bad), std::memory_order_release);
+        b_done.store(true, std::memory_order_release);
+    });
+    if (!wait_for([&] { return b_done.load(std::memory_order_acquire); }, 5)) {
+        finish();
+        b.join();
+        std::fprintf(stderr,
+                     "FAIL: (i) the second thread's wait blocked behind the delivery in flight: the runtime now holds "
+                     "the queue's error list while it calls the handler\n");
+        return 1;
+    }
+    b.join();
+    const int  calls_during     = handler_calls.load(std::memory_order_acquire);
+    const int  delivered_during = delivered.load(std::memory_order_acquire);
+    const bool a_done_during    = a_done.load(std::memory_order_acquire);
+    finish();
+    CHECK(!b_threw.load(), "(i) the second thread's wait threw");
+    CHECK(calls_during == 1 && delivered_during == 0 && !a_done_during,
+          "(i) the second thread's wait delivered, or the first delivery was no longer in flight");
+    CHECK(handler_calls.load() == 1 && delivered.load() == 1, "(i) the error was not delivered exactly once");
+    CHECK(waits_without_throwing(q) && handler_calls.load() == 1, "(i) a later wait delivered again");
+    return 0;
 }
 }  // namespace
 
@@ -128,6 +216,11 @@ int main(int argc, char ** argv) {
     sycl::event be = submit_throw(qe, "probe (e) event wait");
     CHECK(waits_without_throwing(be) && count(k_context_slot) == nc + 2,
           "(e) event::wait_and_throw on a handlerless queue did not reach its context's handler");
+
+    // (i)
+    if (const int rc = probe_delivery_in_flight(*dev, in_order); rc != 0) {
+        return rc;
+    }
 
     std::puts("async handler delivery: PASS");
     return 0;
