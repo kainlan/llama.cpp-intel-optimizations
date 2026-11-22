@@ -292,6 +292,18 @@ label, so "only `main`" means "nobody classified this", not "this is safe".
   model held in host memory on purpose (55 to 60 GB available with `Shmem` flat). On this host `MemAvailable`
   also idles near 144 GB, so the condition could never be met. Wait on `Shmem < 30 GB` and guard on `Shmem`.
 
+  Correction, 2026-11-21: `mkdir GPU.lock` is not an exclusive take on this host. `/usr/bin/mkdir` is uutils
+  coreutils 0.10.0: it checks with `statx`, then calls `mkdir(2)`, and exits 0 when that call fails with EEXIST
+  on a directory. Two takers that arrive together both "win" (measured: 173 of 400 paired races; GNU `mkdir`,
+  `/usr/bin/gnumkdir`, 0 of 400). Take every lock through `scripts/sycl-lock.sh`:
+  `source scripts/sycl-lock.sh; sycl_lock_take /Apps/llama.cpp/GPU.lock "<who> pid=$$ start=$(date +%FT%T)" 1`
+  (0 means held and verified), and release with `sycl_lock_release` and the same text. It creates the directory
+  with `mkdir(2)`, writes a `holder` line exclusively, waits, and reads the holder back. For a one-off by hand,
+  `/usr/bin/gnumkdir` plus a `holder` written with `set -C` is the equivalent. What no taker can detect: a
+  co-taker that still uses plain `mkdir` and writes its holder after the verify window is seen only when the
+  holder is read again (the gates read it before each arm and at the end), and one that writes no holder is
+  never seen. A directory left by a killed taker is removed by hand once its holder's pid is confirmed dead.
+
   ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
   2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports
   231.7 GB of "VRAM" that is actually system RAM, against a budget defaulting to 100 % (see
