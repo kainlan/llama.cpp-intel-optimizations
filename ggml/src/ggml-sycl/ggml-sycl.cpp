@@ -55850,6 +55850,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_lazy_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_sycl_lazy_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_lazy_buffer_clear,
     /* .reset           = */ nullptr,
+    /* .set_tensor_n    = */ nullptr,  // ggml falls back to the single-tensor entries above
+    /* .get_tensor_n    = */ nullptr,
+    /* .cpy_tensor_n    = */ nullptr,
     /* .get_caps        = */ nullptr,  // the type's: STABLE_BASE, and no host access since is_host is false
 };
 
