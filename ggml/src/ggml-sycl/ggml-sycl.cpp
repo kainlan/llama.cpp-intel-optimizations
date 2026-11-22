@@ -27,6 +27,7 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -16852,9 +16853,9 @@ static void ggml_sycl_async_failure_record_stage(int device, const char * stage,
 
 // The second attempt of a drain whose release was refused. A refusal with the invocation still live usually means a
 // quarantined MoE workspace slot pins it: nothing recycled the slot, because its completion task's terminal_release()
-// was refused or skipped, or because a route catch whose own wait threw left it quarantined. The recovery frees a slot
-// only once its terminal's event is complete. Whether a completion task can still be pending after the caller's
-// deferred-decode wait is unmeasured, so the stream is drained first. Only a refused release pays for this wait and
+// was refused or skipped, or because a route catch whose own wait threw left it quarantined. The recovery frees only
+// the slots whose terminal reports ready() (its event complete, or its quiescence confirmed). Whether a completion task
+// can still be pending after the caller's deferred-decode wait is unmeasured, so the stream is drained first. Only a refused release pays for this wait and
 // for the registry walk; a drain that releases at once does neither. Returns true when the graph was released.
 static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
     if (!ctx || ggml_sycl_take_execution_state_snapshot(ctx).invocation_id == 0) {
