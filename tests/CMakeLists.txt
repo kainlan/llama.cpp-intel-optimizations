@@ -1020,6 +1020,13 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-async-failure-source.py --self-test)
     set_tests_properties(test-sycl-async-failure-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The f16 dequant arm reads an SOA plane through the owner the resolver names, and a refusal inside MUL_MAT's
+    # op call fails the graph instead of aborting. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-f16-arm-owner-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-f16-arm-owner-source.py --self-test)
+    set_tests_properties(test-sycl-f16-arm-owner-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Every synchronous wait mem_copy_submit makes is counted by kind and by the copy's caller under the MoE trace,
     # and the [MOE-HOSTPATH-WAITS] line prints the census (llama.cpp-qwn5). Run WITH --self-test so each pin is
     # proven to catch its mutant.
