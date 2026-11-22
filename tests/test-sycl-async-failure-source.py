@@ -44,7 +44,9 @@ With comments blanked:
      outlives its host task, so the oracle can show that B, not the runtime's functor lifetime, releases the pin) is
      compiled only for route testing: every mention of ggml_sycl_q1_nvfp4_test_retain_completion,
      ggml_sycl_q1_nvfp4_test_hold_completion, ggml_sycl_q1_nvfp4_test_completion_held and the held pointer sits inside
-     an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the route hands its completion to the seam. The same holds
+     an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the direct route in ggml_sycl_mul_mat_id hands its
+     completion to the seam after mark_possible_submit() and before terminal->arm(final) and the completion host
+     task, so the seam holds the completion of the graph it was armed for. The same holds
      for the completion failpoint GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE (a completion task that has
      not released when the context is drained): the host task consumes it before its release, and the build without
      route testing defines skip_release as constexpr false.
@@ -63,6 +65,8 @@ TEST_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_te
              "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE")
 NO_RELEASE = "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE"
 RELEASE = "const bool recycled = !skip_release && completion->bundle.terminal_release();"
+RETAIN = "ggml_sycl_q1_nvfp4_test_retain_completion(completion);"
+RETAIN_BLOCK = "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n                            " + RETAIN + "\n#endif\n"
 # Both drain twins: a wait that threw goes straight to the abort, else release, else recover and release.
 TWIN_CONDITION = (r"if \(!waited \|\|\s*\(!ggml_sycl_execution_release_graph\({ctx}\) &&\s*"
                   r"!ggml_sycl_execution_recover_and_release_graph\({ctx}\)\)\) \{{")
@@ -148,6 +152,7 @@ def claims(cache, sycl, common):
     s_since = s.find("ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)")
     s_clean = s.find('ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, "synchronize"')
     s_release = s.find("(void) ggml_sycl_execution_release_graph(sycl_ctx);")
+    route = body(sycl, "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {")
     bodies = {"d": d, "d_own": d_own, "d_ctx": d_ctx}
     records = {name: record in body(bodies[local], "catch (...)") for name, local, record in DRAIN_RECORDS}
     return records | {
@@ -192,7 +197,9 @@ def claims(cache, sycl, common):
         "K the test seams are compiled only for route testing": test_seam_guarded(sycl),
         "K the completion failpoint is consumed before the release": 0 <= b.find(NO_RELEASE) < b.find(RELEASE) and
             "constexpr bool skip_release = false;" in b,
-        "K the route hands its completion to the seam": "ggml_sycl_q1_nvfp4_test_retain_completion(completion);" in sycl,
+        "K the route hands its completion to the seam before it arms the terminal": 0 <= route.find(
+            "completion->bundle.mark_possible_submit()") < route.find(RETAIN) < route.find(
+            "terminal->arm(final);") < route.find("h.host_task([completion"),
         "T route arms with its final event": "terminal->arm(final);" in sycl,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
                                                       r"std::string|\bnew\b", h.replace("rethrow_exception", "")),
@@ -276,6 +283,9 @@ def main():
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion);",
                 "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n#else\n                            "
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", 1), common),
+            "route hands over its completion after the submit": (cache, sycl.replace(RETAIN_BLOCK, "", 1).replace(
+                BUNDLE_DROP + "\n                                });\n                            });\n",
+                BUNDLE_DROP + "\n                                });\n                            });\n" + RETAIN_BLOCK, 1), common),
             "route does not hand over its completion": (cache, sycl.replace(
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", "", 1), common),
             **{f"{name}: record removed": (cache, sycl.replace(record, "", 1), common)
