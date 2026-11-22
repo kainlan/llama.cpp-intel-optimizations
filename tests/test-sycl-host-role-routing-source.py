@@ -734,8 +734,6 @@ DOC_ROW_MAP = {
 DOC_DRIFT = {
     ("`gs:48244`", "holder"): "the job slot is the TP worker's own w.results[layer], not a g_tp_* global; the TP sync "
                               "still consumes and clears it",
-    ("`gs:42652`, `in_model_load`", "owner"): "the MODEL row carries its weight buffer's BUFFER owner, checked at that "
-                                              "buffer's free_buffer: the deviation ggml_sycl_host_buft_intent records",
     ("`gs:57652`", "row"): "the MoE ids cache makes no host request in this tree",
     ("`cpu-expert-pool.cpp:77`", "row"): "the CpuExpertPool ring is gone: cpu-expert-pool.cpp makes no host request, "
                                          "and the pool holds only its workers",
@@ -911,9 +909,11 @@ def _tree_doc_view(row: dict, cls: str, variant: int):
     n = len(row["role"].split("|"))
     if cls == "CALLERS":
         return {"role": "caller's", "zone": row["zone"], "lifetime": "caller's", "owner": "caller's"}
-    owner = "none until llama.cpp-30r1" if cls == "UNOWNED" else "BUFFER" if cls == "BUILDER" else \
-        _variants(row["owner"], n)[variant]
     lifetime = _variants(row["lifetime"], n)[variant]
+    # The builder's alloc_buffer mints the owner: the loading model's for a model load's chunk, else the buffer's.
+    builder_owner = "MODEL" if lifetime == "MODEL" else "BUFFER"
+    owner = "none until llama.cpp-30r1" if cls == "UNOWNED" else builder_owner if cls == "BUILDER" else \
+        _variants(row["owner"], n)[variant]
     return {"role": row["role"].split("|")[variant], "zone": _variants(row["zone"], n)[variant],
             "lifetime": "GRAPH" if lifetime == "-" else lifetime, "owner": owner}
 
@@ -1009,7 +1009,8 @@ def clause_select_zone(texts: dict) -> list:
 
 
 def clause_owners(texts: dict) -> list:
-    """§7 C4: every non-GRAPH row names an owner; the builder's rows get the buffer's, minted by its alloc_buffer."""
+    """§7 C4: every non-GRAPH row names an owner; the builder's rows get the buffer's, minted by its alloc_buffer,
+    except a model load's SYCL_Host chunk (lifetime MODEL), which gets the loading model's (§4.4 "Lifetimes")."""
     fails = []
     want = table_rows()
     for key, row in sorted(_rows_by_key(texts).items()):
@@ -1026,8 +1027,14 @@ def clause_owners(texts: dict) -> list:
             if owner == "-":
                 fails.append(f"owner: {key} at line {row['line']} is lifetime {life} and names no owner")
     alloc = _body(texts, GS, "ggml_sycl_host_buft_alloc")
-    if not re.search(r"\bintent\s*\.\s*owner\s*=\s*\{\s*(?:ggml_sycl::)?alloc_owner_kind::BUFFER\b", alloc):
-        fails.append("owner: ggml_sycl_host_buft_alloc does not mint the builder rows' BUFFER owner")
+    ref = r"(?:ggml_sycl::)?alloc_owner_ref\s*\{\s*(?:ggml_sycl::)?alloc_owner_kind::"
+    if not re.search(r"\bintent\s*\.\s*owner\s*=\s*model_id\s*!=\s*0\s*\?\s*" + ref + r"MODEL\s*,\s*model_id\s*\}\s*:\s*"
+                     + ref + r"BUFFER\s*,\s*owner_id\s*\}\s*;", alloc):
+        fails.append("owner: ggml_sycl_host_buft_alloc does not mint the builder rows' BUFFER owner, or the loading "
+                     "model's for a model load's chunk")
+    if not re.search(r"\bmodel_id\s*=\s*intent\s*\.\s*lifetime\s*==\s*(?:ggml_sycl::)?alloc_lifetime::MODEL\s*\?\s*"
+                     r"ggml_sycl_loading_model_id\s*\(\s*\)\s*:\s*0\s*;", alloc):
+        fails.append("owner: ggml_sycl_host_buft_alloc names a model owner for a row that is not lifetime MODEL")
     for kind in ("HOST", "KV_HOST"):
         n = len(re.findall(r"ggml_sycl_host_buft_alloc\s*\([^;]*ggml_sycl_host_buft_intent\s*\(\s*"
                            r"ggml_sycl_host_buft_kind::" + kind + r"\s*\)", _src(texts, GS).bare))
@@ -2372,9 +2379,13 @@ MUTANTS = [
     ("owner-dropped", "owners", [(GS, _TENANT_OWNER, "")],
      "('ggml-sycl.cpp', 'ggml_sycl_reserve_host_tenants', 1) at line"),
     ("owner-builder-not-buffer", "owners",
-     [(GS, "    intent.owner                       = { ggml_sycl::alloc_owner_kind::BUFFER, owner_id };\n",
-       "    intent.owner                       = { ggml_sycl::alloc_owner_kind::DEVICE, owner_id };\n")],
+     [(GS, "ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::BUFFER, owner_id };\n",
+       "ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::DEVICE, owner_id };\n")],
      "ggml_sycl_host_buft_alloc does not mint the builder rows' BUFFER owner"),
+    ("owner-builder-model-for-every-row", "owners",
+     [(GS, "model_id = intent.lifetime == ggml_sycl::alloc_lifetime::MODEL ? ggml_sycl_loading_model_id() : 0;\n",
+       "model_id = ggml_sycl_loading_model_id();\n")],
+     "names a model owner for a row that is not lifetime MODEL"),
     ("unowned-row-added", "unowned-ratchet",
      [(GS, _TENANT_LIFETIME + _TENANT_OWNER, _TENANT_LIFETIME.replace("CONTEXT", "UNOWNED") + _TENANT_OWNER)],
      "carries UNOWNED and is not one of the site table's 12 lines"),
