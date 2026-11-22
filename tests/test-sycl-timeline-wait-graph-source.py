@@ -81,7 +81,7 @@ def test_compute_impl_guard_records_timeline_scopes_around_bcs_and_dma_drains() 
         ("bcs", "bcs_queue_drain"),
         ("dma", "dma_queue_drain"),
     ):
-        wait = guard.index(f"cache->get_{queue_name}_queue().wait();")
+        wait = guard.index(f"cache->get_{queue_name}_queue().wait_and_throw();")
         preceding = guard[max(0, wait - 900) : wait]
         following = guard[wait : wait + 120]
 

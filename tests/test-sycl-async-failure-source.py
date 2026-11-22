@@ -155,7 +155,7 @@ def splice(text, signatures, old, new):
     return text[:at] + splice(inner, signatures[1:], old, new) + text[at + len(inner):]
 
 
-def test_seam_guarded(sycl):
+def seam_guarded(sycl):
     inside = route_testing_lines(sycl)
     mentions = [n for n, line in enumerate(sycl.split("\n")) if any(name in line for name in TEST_SEAM)]
     return bool(mentions) and all(n in inside for n in mentions)
@@ -235,7 +235,7 @@ def claims(cache, sycl, common):
         "D the destructor recovers before it releases": 0 <= d_dtor.find(
             "ggml_sycl_recover_exact_mmid_after_drain(this);") < d_dtor.find(
             "ggml_sycl_execution_abort_and_release_graph(this);"),
-        "K the test seams are compiled only for route testing": test_seam_guarded(sycl),
+        "K the test seams are compiled only for route testing": seam_guarded(sycl),
         "K the completion failpoint is consumed before the release": 0 <= b.find(NO_RELEASE) < b.find(RELEASE) and
             "constexpr bool skip_release = false;" in b,
         "K the route hands its completion to the seam before it arms the terminal": 0 <= route.find(

@@ -21,9 +21,10 @@ in-memory copy of the normalized source, never a file:
     other, which turns it off), each of the timeline's recorders returns at once when it is
     disabled, and flush_window_timing prints only at trace level 2, through the decision log's WARN sink (the trace
     sink is INFO, which llama-bench drops without -v);
-  - the cache's copy queue has no profiling at any level: the BCS queue is built in order only, by one assignment,
-    with no trace switch and not from default_queue_properties() (which carries enable_profiling), and the literal
-    enable_profiling appears nowhere in unified-cache.cpp;
+  - the cache's copy queue has no profiling at any level: the BCS queue is built in order only, by one assignment
+    through ggml_sycl_make_queue (which adds the recording async handler and passes the properties on), with no trace
+    switch and not from default_queue_properties() (which carries enable_profiling), and the literal enable_profiling
+    appears nowhere in unified-cache.cpp;
   - the marks: stage_window, at trace level 2 only, submits the window's free and start marks just before its first
     copy (after the read gate is chosen, before the gate joins the copy's dependencies) and its end mark after the
     loop, behind the last copy. The free mark waits on the copy's dependencies without the read gate plus the copy
@@ -44,8 +45,9 @@ in-memory copy of the normalized source, never a file:
     to window_launched after the phase's GEMM stage, on a windowed op only;
   - stage_window records each copy with its bytes, window_begin records the window with the host time it took, and
     begin_ubatch moves the micro-batch key on;
-  - the synchronize boundary flushes the lines after the queue wait and before the expert-loan runner, its only
-    caller in ggml-sycl.cpp, with no lock taken in synchronize ahead of the flush nor in flush_window_timing;
+  - the synchronize boundary flushes the lines after the queue wait, behind the early return of a failed drain or a
+    latched asynchronous failure (so it flushes only after a wait that succeeded), and before the expert-loan runner,
+    its only caller in ggml-sycl.cpp, with no lock taken in synchronize ahead of the flush nor in flush_window_timing;
   - docs/backend/sycl-env-vars.md catalogs the literal; its trace row says the copy queue is never profiled, names the
     marks and the timing queue, records both changes of meaning (the wait counts the region's gate and the host
     entry's ready event; copy_us includes the timing queue's latency at both ends), and settles the status-poll
@@ -241,8 +243,9 @@ def test_trace_gate_mutants():
 
 # ---- the copy queue has no profiling ------------------------------------------------------------------------------
 
-BCS_PLAIN = ("bcs_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), "
-             "sycl::property::queue::in_order{});")
+BCS_PROPS = "sycl::property_list{ sycl::property::queue::in_order{} }"
+BCS_PLAIN = ("bcs_queue_ = std::make_unique<sycl::queue>(ggml_sycl_make_queue(queue_.get_context(), "
+             "queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_), " + BCS_PROPS + "));")
 BCS_ASSIGN_RE = re.compile(r"\bbcs_queue_ =(?!=)")
 
 
@@ -269,12 +272,14 @@ def test_bcs_plain_mutants():
               "sycl::property::queue::in_order{});")
     assert not claim_bcs_plain(mutate(UC_CPP, BCS_PLAIN, switch + traced))
     # profiling at every level
-    profiled = BCS_PLAIN.replace("sycl::property::queue::in_order{});", "sycl::property_list{ "
-                                 "sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} });")
+    profiled = BCS_PLAIN.replace(BCS_PROPS, "sycl::property_list{ sycl::property::queue::in_order{}, "
+                                 "sycl::property::queue::enable_profiling{} }")
+    assert profiled != BCS_PLAIN, "mutant precondition: the property list is spelled as pinned"
     assert not claim_bcs_plain(mutate(UC_CPP, BCS_PLAIN, profiled))
     # the backend's standard properties, which carry enable_profiling out of sight
-    assert not claim_bcs_plain(mutate(UC_CPP, BCS_PLAIN, BCS_PLAIN.replace("sycl::property::queue::in_order{}",
-                                                                           "default_queue_properties()")))
+    standard = BCS_PLAIN.replace(BCS_PROPS, "default_queue_properties()")
+    assert standard != BCS_PLAIN, "mutant precondition: the property list is spelled as pinned"
+    assert not claim_bcs_plain(mutate(UC_CPP, BCS_PLAIN, standard))
     # a second assignment that could rebuild it another way
     assert not claim_bcs_plain(mutate(UC_CPP, BCS_PLAIN, BCS_PLAIN + " bcs_queue_ = nullptr;"))
 
@@ -308,8 +313,9 @@ END_SIG = "void moe_stream_phase::mark_window_end(uint64_t key, const sycl::even
 END_BODY = ("{ window_timing_.ended(key, ggml_sycl_submit_marker<moe_stream_timing_mark>(timing_queue(), "
             "{ last_copy })); }")
 TQ_SIG = "sycl::queue & moe_stream_phase::timing_queue() {"
-TQ_BODY = ("{ if (!timing_queue_) { timing_queue_.emplace(ccs_->get_context(), ccs_->get_device(), "
-           "default_queue_properties()); } return *timing_queue_; }")
+TQ_BODY = ("{ if (!timing_queue_) { timing_queue_.emplace(ggml_sycl_make_queue(ccs_->get_context(), "
+           "ccs_->get_device(), ggml_sycl_get_device_id_from_queue(*ccs_), default_queue_properties())); } "
+           "return *timing_queue_; }")
 PREPARE_SIG = "void moe_stream_phase::prepare("
 NEW_CCS = "if (!same_queue) { ccs_.emplace(ccs); timing_queue_.reset();"
 TQ_MEMBER = "std::optional<sycl::queue> timing_queue_;"
@@ -704,8 +710,12 @@ def test_records_mutants():
 
 # ---- the flush site -----------------------------------------------------------------------------------------------
 
-FLUSH_CALL = "if (err == 0 && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->flush_window_timing(); }"
-WAIT = "CHECK_TRY_ERROR(stream->wait_and_throw());"
+FLUSH_CALL = "if (sycl_ctx->moe_stream) { sycl_ctx->moe_stream->flush_window_timing(); }"
+WAIT = "stream->wait_and_throw();"
+# A failed drain is recorded in the failure latch just before this test, so its early return keeps the flush to a
+# wait that succeeded.
+FAILED_RETURN = "if (ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)) {"
+DRAIN_RECORD = "ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());"
 RUNNER = "const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);"
 SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {"
 FLUSH_FN_SIG = "void moe_stream_phase::flush_window_timing() {"
@@ -714,14 +724,18 @@ LOCKS = ("lock_guard", "unique_lock", "scoped_lock", ".lock()")
 
 def claim_flush_site(sycl: str, plan_cpp: str) -> bool:
     """The synchronize boundary flushes after its queue wait (every mark of a begun window then follows only finished
-    work, so reading its device times does not wait on compute work) and before the expert-loan runner, nothing else in
-    the file flushes, and no lock is taken on the way to the flush (in synchronize ahead of it) or inside it."""
+    work, so reading its device times does not wait on compute work), behind the early return taken when the drain
+    failed or an asynchronous failure was latched, and before the expert-loan runner; nothing else in the file
+    flushes, and no lock is taken on the way to the flush (in synchronize ahead of it) or inside it."""
     n = norm(sycl)
     sync = body(n, SYNC_SIG)
     at = sync.find(FLUSH_CALL)
     ahead = sync[:at]
+    failed = sync.find(FAILED_RETURN)
     flush_fn = body(norm(plan_cpp), FLUSH_FN_SIG)
-    return (sync.count(FLUSH_CALL) == 1 and 0 <= sync.find(WAIT) < at < sync.find(RUNNER)
+    return (sync.count(FLUSH_CALL) == 1 and sync.count(DRAIN_RECORD) == 1
+            and 0 <= sync.find(WAIT) < sync.find(DRAIN_RECORD) < failed < at < sync.find(RUNNER)
+            and sync.count(FAILED_RETURN) == 1 and body(sync[failed:], FAILED_RETURN).endswith(" return; }")
             and n.count("flush_window_timing()") == 1
             and not any(k in ahead for k in LOCKS) and flush_fn != "" and not any(k in flush_fn for k in LOCKS))
 
@@ -742,6 +756,14 @@ def test_flush_site_mutants():
     # after the loan runner
     after = sync.replace(" " + FLUSH_CALL, "").replace(RUNNER, RUNNER + " " + FLUSH_CALL)
     assert not claim_flush_site(n.replace(sync, after), PLAN_CPP)
+    # ahead of the failed-drain return, where it would read the marks of a drain that failed
+    assert sync.count(FAILED_RETURN) == 1, "mutant precondition: one failed-drain return"
+    unguarded = sync.replace(" " + FLUSH_CALL, "").replace(FAILED_RETURN, FLUSH_CALL + " " + FAILED_RETURN)
+    assert not claim_flush_site(n.replace(sync, unguarded), PLAN_CPP)
+    # the drain's error recorded only after the failure test, which then lets a failed drain reach the flush
+    assert sync.count(" " + DRAIN_RECORD) == 1, "mutant precondition: one drain record"
+    late_record = sync.replace(" " + DRAIN_RECORD, "").replace(" " + FLUSH_CALL, " " + DRAIN_RECORD + " " + FLUSH_CALL)
+    assert not claim_flush_site(n.replace(sync, late_record), PLAN_CPP)
     # a lock taken in synchronize ahead of the flush
     locked = sync.replace(head, head + " std::lock_guard<std::mutex> guard(g_sycl_graph_compute_mutex);")
     assert not claim_flush_site(n.replace(sync, locked), PLAN_CPP)

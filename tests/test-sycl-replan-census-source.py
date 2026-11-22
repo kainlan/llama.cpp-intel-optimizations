@@ -378,10 +378,10 @@ QUEUE_CENSUS = {
     "g_shared_ctx_queues":           ("wait", "get_shared_context_queue("),
     "g_recording_queue_ptr":         ("reason", "thread-local alias of the execution queue while a graph records"),
     "g_pipeline_copy_queue":         ("wait", "g_pipeline_copy_queue["),
-    "g_tp_device1_worker_queue":     ("wait", "g_tp_device1_worker_queue"),
-    "g_split_secondary_queue_owner": ("wait", "g_split_secondary_queue_owner"),
-    "g_split_merge_queue_owner":     ("wait", "g_split_merge_queue_owner"),
-    "g_split_coord_queue_owner":     ("wait", "g_split_coord_queue_owner"),
+    "g_tp_device1_worker_queue":     ("wait", "g_tp_device1_worker_queue->wait"),
+    "g_split_secondary_queue_owner": ("wait", "g_split_secondary_queue_owner->wait"),
+    "g_split_merge_queue_owner":     ("wait", "g_split_merge_queue_owner->wait"),
+    "g_split_coord_queue_owner":     ("wait", "g_split_coord_queue_owner->wait"),
     "g_split_merge_queue":           ("reason", "raw alias of g_split_merge_queue_owner"),
     "g_block_exec_copy_queues":      ("wait", "g_block_exec_copy_queues"),
     "qptrs":                         ("wait", "ggml_sycl_execution_queue_for_device("),
@@ -1150,9 +1150,15 @@ def mutants(files):
                 "static std::unique_ptr<sycl::queue> g_split_coord_queue_owner;\nstatic sycl::queue * g_stray_queue = nullptr;", "g30a"),
            "g_stray_queue")
     yield ("a censused queue no longer waited",
-           edit(files, M, "if (g_tp_device1_worker_queue) {\n            g_tp_device1_worker_queue->wait();\n        }",
+           edit(files, M, "if (g_tp_device1_worker_queue) {\n            g_tp_device1_worker_queue->wait_and_throw();\n        }",
                 "", "g30b"),
            "does not wait g_tp_device1_worker_queue")
+    yield ("a censused queue named but no longer waited",
+           edit(files, M, "g_tp_device1_worker_queue->wait_and_throw();", "(void) g_tp_device1_worker_queue;", "g30b2"),
+           "does not wait g_tp_device1_worker_queue")
+    yield ("a split owner named but no longer waited",
+           edit(files, M, "g_split_coord_queue_owner->wait_and_throw();", "(void) g_split_coord_queue_owner;", "g30b3"),
+           "does not wait g_split_coord_queue_owner")
     yield ("a wait before the synchronize flush",
            edit(files, M, "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {",
                 "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {\n    if (backend) { static_cast<ggml_backend_sycl_context *>(backend->context)->stream()->wait(); }", "g30c"),
