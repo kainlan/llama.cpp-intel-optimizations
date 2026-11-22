@@ -62,8 +62,12 @@ positive controls (HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND, HOST_ZONE_SE
 and HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING) move a step in the fixture's model of the order, not in production.
 Where production runs each step is what these pins read, in ggml-sycl.cpp (docs/design/sycl-mmap-host-tier.md §4.4
 "Lifetimes" and "The dispatch counter"):
-  O1. ggml_sycl_release_model_slot_resources runs the MODEL check (alloc_lifetime::MODEL, owner kind MODEL) after
-      ggml_sycl_release_host_weight_extras_for_owner(owner) and ggml_sycl_release_graph_leases_for_owner(owner).
+  O1. The MODEL check (alloc_lifetime::MODEL, owner kind MODEL) is ggml_sycl_model_host_chunks_check, which three
+      functions call, once each: ggml_sycl_release_model_slot_resources after
+      ggml_sycl_release_host_weight_extras_for_owner(owner), ggml_sycl_release_graph_leases_for_owner(owner) and
+      ggml_sycl::unified_cache_release_model_slot(slot) (an expert served in place from a SYCL_Host chunk of the model
+      holds a copy of that chunk's owner until the reclaim), and, for a rolled-back load, the model's chunk record's
+      ggml_sycl_model_host_chunk_freed and ggml_sycl_model_host_chunks_rolled_back, whichever runs last.
   O2. ~ggml_backend_sycl_buffer_context runs the device buffer's check (alloc_lifetime::CONTEXT, owner kind BUFFER)
       after `managed_handle = {};` and the loop that resets every handle in tp_handles.
   O3. ggml_backend_sycl_host_buffer_free_buffer runs the host buffer's check (ctx->lifetime, owner kind BUFFER) after
@@ -122,10 +126,8 @@ INTERCEPT_CALL = re.compile(r"(?:\.|->)\s*intercept\s*\(")
 # O1-O5: each owner check's boundary function, lifetime and owner kind, the statements that release the owner's rows
 # before it, the statements that must follow it, and the `if` it must sit in.  O6 compares the census to this table.
 OWNER_SITES = [
-    # The model's slot release: after its weight buffers' frees, its host-registered extras and its graph leases.
-    ("O1", "ggml_sycl_release_model_slot_resources", "alloc_lifetime::MODEL", "MODEL",
-     ["ggml_sycl_release_host_weight_extras_for_owner(owner);", "ggml_sycl_release_graph_leases_for_owner(owner);"],
-     [], None),
+    # The model's check, which its callers run at the model's boundaries (MODEL_CHECK_CALLERS).
+    ("O1", "ggml_sycl_model_host_chunks_check", "alloc_lifetime::MODEL", "MODEL", [], [], None),
     # A device buffer's destruction, once the shared host allocation's handles are released.
     ("O2", "~ggml_backend_sycl_buffer_context", "alloc_lifetime::CONTEXT", "BUFFER",
      ["managed_handle = {};", "for (auto & handle : tp_handles) { handle = {}; }"], [], None),
@@ -138,6 +140,17 @@ OWNER_SITES = [
     ("O5", "ggml_backend_sycl_free", "alloc_lifetime::DEVICE", "DEVICE", ["delete sycl_ctx;"], [],
      "ggml_sycl::host_zone_device_check_due("),
 ]
+# O1: who runs the model's check, and what each caller releases before it. The slot release runs it after the
+# model's extras, graph leases and cache entries are gone; the chunk record runs it for a rolled-back load once both
+# its rollback and its last SYCL_Host chunk's free have happened.
+MODEL_CHECK_FN = "ggml_sycl_model_host_chunks_check"
+MODEL_CHECK_CALLERS = {
+    "ggml_sycl_release_model_slot_resources": ["ggml_sycl_release_host_weight_extras_for_owner(owner);",
+                                               "ggml_sycl_release_graph_leases_for_owner(owner);",
+                                               "ggml_sycl::unified_cache_release_model_slot(slot);"],
+    "ggml_sycl_model_host_chunk_freed": [],
+    "ggml_sycl_model_host_chunks_rolled_back": [],
+}
 # D1-D2: the op each host-dispatched branch tests and the dispatch it returns.  D3 allows only these two intercepts.
 INTERCEPT_FN = "ggml_sycl_compute_forward_impl"
 INTERCEPT_STMT = "g_attn_host_dispatch_counters->intercept(ctx.device, dst->op);"
@@ -549,6 +562,23 @@ def check_owner_sites(census: dict, fails: list) -> None:
                             "GGML_SYCL_STRICT_LEASES=1"))
 
 
+def check_model_check_callers(census: dict, fails: list) -> None:
+    calls = [c for c in boundary_calls(census, re.compile(r"\b" + MODEL_CHECK_FN + r"\s*\("))
+             if c[0] == FILES["sycl"]]
+    names = sorted(c[1] or "<no function>" for c in calls)
+    if names != sorted(MODEL_CHECK_CALLERS):
+        fails.append(("O1", f"{MODEL_CHECK_FN} is called from [{', '.join(names)}]; want once from each of "
+                            f"[{', '.join(sorted(MODEL_CHECK_CALLERS))}]"))
+    for _, name, open_idx, pos, code in calls:
+        body, start = block_at(code, open_idx)
+        at = pos - start
+        for stmt in MODEL_CHECK_CALLERS.get(name, []):
+            i = find_stmt(body, stmt)
+            if i < 0 or i > at:
+                fails.append(("O1", f"{name}'s MODEL check does not follow `{stmt}`: the check would find the model's "
+                                    "own rows still live and report them as leaked"))
+
+
 def check_intercepts(census: dict, sycl: str, fails: list) -> None:
     body = definition(sycl, r"\bbool\s+" + INTERCEPT_FN + r"\s*\([^)]*\)\s*try\s*\{")
     if body is None:
@@ -596,6 +626,7 @@ def check(sources: dict) -> list:
     check_take(code, fails)
     check_setters(sources["census"], fails)
     check_owner_sites(sources["boundary_census"], fails)
+    check_model_check_callers(sources["boundary_census"], fails)
     check_intercepts(sources["boundary_census"], blank(sources["sycl"]), fails)
     return fails
 
@@ -648,8 +679,8 @@ def then(*edits):
 
 
 SYCL = FILES["sycl"]
-MODEL_CHECK = (r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::MODEL,\s*"
-               r"\{ ggml_sycl::alloc_owner_kind::MODEL, owner\.model\.value \}\);")
+MODEL_CHECK = r"\n\s*ggml_sycl_model_host_chunks_check\(owner\.model\.value\);"
+MODEL_CHECK_TEXT = r"\n    ggml_sycl_model_host_chunks_check(owner.model.value);"
 HOST_BUFFER_CHECK = (r"\n    if \(ctx->owner_id != 0\) \{\n"
                      r"\s*ggml_sycl::unified_cache_host_zone_owner_check\(ctx->lifetime,"
                      r"\s*\{ ggml_sycl::alloc_owner_kind::BUFFER, ctx->owner_id \}\);\n    \}")
@@ -709,14 +740,23 @@ def mutants():
         ("S2", "cache", "the WARN budget is unbounded",
          sub(r"constexpr int warn_budget\s*= 8;", r"constexpr int warn_budget = 1 << 30;")),
         ("O1", SYCL, "the MODEL check is gone", sub(MODEL_CHECK, "")),
+        ("O1", SYCL, "the model's check runs no owner check",
+         sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::MODEL,\s*"
+             r"\{ ggml_sycl::alloc_owner_kind::MODEL, model_id \}\);", "")),
+        ("O1", SYCL, "a rolled-back load loses its MODEL check",
+         sub(r"(static void ggml_sycl_model_host_chunks_rolled_back\(uint64_t model_id\) \{[\s\S]*?)"
+             r"\n\s*ggml_sycl_model_host_chunks_check\(model_id\);", r"\1")),
+        ("O1", SYCL, "the MODEL check runs before the slot reclaim",
+         then(sub(MODEL_CHECK, ""),
+              sub(r"(\n    const size_t\s+reclaimed = ggml_sycl::unified_cache_release_model_slot\(slot\);)",
+                  MODEL_CHECK_TEXT + r"\1"))),
         ("O1", SYCL, "the MODEL check passes the CONTEXT lifetime",
          sub(r"unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::MODEL,",
              r"unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::CONTEXT,")),
         ("O1", SYCL, "the MODEL check runs before the host-registered extras are released",
          then(sub(MODEL_CHECK, ""),
               sub(r"(\n    const size_t\s+rows\s+= ggml_sycl_release_host_weight_extras_for_owner\(owner\);)",
-                  r"\n    ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL, "
-                  r"{ ggml_sycl::alloc_owner_kind::MODEL, owner.model.value });\1"))),
+                  MODEL_CHECK_TEXT + r"\1"))),
         ("O2", SYCL, "the device buffer's check is gone",
          sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::CONTEXT,\s*"
              r"\{ ggml_sycl::alloc_owner_kind::BUFFER, host_owner_id \}\);", "")),
@@ -728,7 +768,7 @@ def mutants():
               sub(r"(\n    ctx->buffer_handle = \{\};)", HOST_BUFFER_CHECK_TEXT + r"\1"))),
         ("O3", SYCL, "the host buffer's check runs after its context is deleted",
          then(sub(HOST_BUFFER_CHECK, ""),
-              sub(r"(\n    ctx->buffer_handle = \{\};(?:\n\s*//[^\n]*)*\n    delete ctx;)",
+              sub(r"(\n    ctx->buffer_handle = \{\};[\s\S]*?\n    delete ctx;)",
                   r"\1" + HOST_BUFFER_CHECK_TEXT))),
         ("O4", SYCL, "the BACKEND check is gone",
          sub(r"\n\s*ggml_sycl::unified_cache_host_zone_owner_check\(ggml_sycl::alloc_lifetime::CONTEXT,\s*"

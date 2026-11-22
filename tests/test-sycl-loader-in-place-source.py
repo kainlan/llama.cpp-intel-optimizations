@@ -313,8 +313,8 @@ def mutate_re(rel: str, pattern: str, new: str):
 
 
 MUTANTS = [
-    ("buffer-owner-kept", "O1", mutate_re(GS, r"alloc_owner_kind::MODEL\s*,\s*model_id\s*\}",
-                                          "alloc_owner_kind::BUFFER, owner_id }")),
+    ("buffer-owner-kept", "O1", mutate_re(GS, r"alloc_owner_ref\{\s*ggml_sycl::alloc_owner_kind::MODEL\s*,\s*model_id\s*\}",
+                                          "alloc_owner_ref{ ggml_sycl::alloc_owner_kind::BUFFER, owner_id }")),
     ("deviation-note-back", "O1", mutate(GS, "static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(",
                                          "// Accepted deviation\nstatic ggml_sycl::alloc_intent "
                                          "ggml_sycl_host_buft_intent(", raw=True)),

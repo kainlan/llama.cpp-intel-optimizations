@@ -10769,6 +10769,119 @@ static void ggml_sycl_release_last_model_effects(const char *                   
     }
 }
 
+// The model a SYCL_Host allocation made now belongs to: the load effect's owner, the one the host-weight registration
+// takes, or 0 outside a bound load.
+static uint64_t ggml_sycl_loading_model_id() {
+    auto & registry = ggml_sycl::lifecycle::global_registry();
+    try {
+        const ggml_sycl::lifecycle::load_effect_lease effect = registry.acquire_load_effect(registry.bound_candidate());
+        return effect ? effect.owner.model.value : 0;
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// The SYCL_Host chunks each model's load minted, so the model's MODEL check runs on every teardown path. A committed
+// model is checked by its slot release, after the reclaim. A rolled-back load's chunks are freed by the model's
+// destructor after its rollback, or by an unwind before it, so its check runs once both the rollback and the last
+// chunk's free have happened. `bytes` is what the model holds on each device now, minted minus freed, so the loader's
+// temporaries count only while they live.
+struct ggml_sycl_model_host_chunk_record {
+    size_t                                    live = 0;
+    std::array<size_t, GGML_SYCL_MAX_DEVICES> bytes{};
+    bool                                      rolled_back = false;
+};
+
+struct ggml_sycl_model_host_chunks_store {
+    std::mutex                                                      mutex;
+    std::unordered_map<uint64_t, ggml_sycl_model_host_chunk_record> records;
+};
+
+// Never destroyed: a model's buffers can be freed from a static destructor at exit.
+static ggml_sycl_model_host_chunks_store & ggml_sycl_model_host_chunks() {
+    static ggml_sycl_model_host_chunks_store * const store = new ggml_sycl_model_host_chunks_store;
+    return *store;
+}
+
+static void ggml_sycl_model_host_chunks_check(uint64_t model_id) {
+    ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL,
+                                                   { ggml_sycl::alloc_owner_kind::MODEL, model_id });
+}
+
+static void ggml_sycl_model_host_chunk_minted(uint64_t model_id, int device, size_t size) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    ggml_sycl_model_host_chunk_record & record = store.records[model_id];
+    record.live++;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        record.bytes[device] += size;
+    }
+}
+
+static void ggml_sycl_model_host_chunk_freed(uint64_t model_id, int device, size_t size) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    bool                                check = false;
+    {
+        std::lock_guard<std::mutex> lock(store.mutex);
+        auto                        it = store.records.find(model_id);
+        if (it == store.records.end()) {
+            return;  // the model's release already checked and forgot it
+        }
+        ggml_sycl_model_host_chunk_record & record = it->second;
+        record.live -= record.live > 0 ? 1 : 0;
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+            record.bytes[device] -= std::min(record.bytes[device], size);
+        }
+        check = record.rolled_back && record.live == 0;
+        if (check) {
+            store.records.erase(it);
+        }
+    }
+    if (check) {
+        ggml_sycl_model_host_chunks_check(model_id);
+    }
+}
+
+// A rolled-back load, after its slot release: the check runs now when no chunk of it is left, else at the last one's
+// free.
+static void ggml_sycl_model_host_chunks_rolled_back(uint64_t model_id) {
+    if (model_id == 0) {
+        return;
+    }
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    bool                                check = false;
+    {
+        std::lock_guard<std::mutex>         lock(store.mutex);
+        ggml_sycl_model_host_chunk_record & record = store.records[model_id];
+        record.rolled_back                         = true;
+        check                                      = record.live == 0;
+        if (check) {
+            store.records.erase(model_id);
+        }
+    }
+    if (check) {
+        ggml_sycl_model_host_chunks_check(model_id);
+    }
+}
+
+static void ggml_sycl_model_host_chunks_forget(uint64_t model_id) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    store.records.erase(model_id);
+}
+
+static size_t ggml_sycl_model_host_chunk_bytes(uint64_t model_id, int device) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    auto                                it = store.records.find(model_id);
+    if (it == store.records.end() || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return it->second.bytes[device];
+}
+
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
@@ -10800,18 +10913,20 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // teardown -- like MID_LOAD_REPLAN -- runs on the same thread that owns
     // this cache's contents, not from an arbitrary other thread.
     ggml_sycl_moe_ids_cache_new_graph();
-    // The MODEL boundary (§4.4 "Lifetimes"): the model's device weight buffers went in pimpl.reset() before this hook,
-    // and its host-registered weight extras and graph leases just above, so no MODEL row it owns may remain. Not at a
-    // weight buffer's free_buffer: one model's weights span several weight buffers that share its model id, and a
-    // host-registered expert's extra is in no device buffer at all.
-    if (owner.model.value != 0) {
-        ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL,
-                                                       { ggml_sycl::alloc_owner_kind::MODEL, owner.model.value });
-    }
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
     ggml_sycl_erase_weight_identities_for_owner(owner);
     const size_t   reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
+    // The MODEL boundary (§4.4 "Lifetimes"): the model's weight buffers went in pimpl.reset() before this hook, its
+    // host-registered weight extras and graph leases above, and its cache entries in the reclaim just above, so no
+    // MODEL row it owns may remain. After the reclaim, not before: a host expert served in place from a SYCL_Host chunk
+    // of the model holds a copy of that chunk's owner in its cache entry until the reclaim drops it. Not at a weight
+    // buffer's free_buffer: one model's weights span several weight buffers that share its model id, and a
+    // host-registered expert's extra is in no device buffer at all.
+    if (owner.model.value != 0) {
+        ggml_sycl_model_host_chunks_check(owner.model.value);
+        ggml_sycl_model_host_chunks_forget(owner.model.value);
+    }
     g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
@@ -11494,6 +11609,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     } catch (...) {
         clean = false;
     }
+    // The rolled-back load keeps its MODEL check: it runs now if the load's SYCL_Host chunks are already freed, else
+    // when the model's destructor frees the last of them. Outside every try stage, like the restore below: it reports
+    // through its own lines, not through `clean`, and aborts only under strict.
+    ggml_sycl_model_host_chunks_rolled_back(owner.model.value);
     // The device-wide terms the aborted load published, where they still hold what it published, go back to what they
     // held before it, so the models on the device plan with their own again. The restore cannot throw and runs outside
     // any try stage.
@@ -15777,6 +15896,9 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     // it, and every entry's host backing, planned_host_backing and the from-file hook read it from the plan.
     kv.load_maps_files          = inventory->use_mmap_resolved && ggml_sycl::file_mapping_supported();
     kv.load_locks_files         = kv.load_maps_files && inventory->use_mlock_resolved;
+    // Whether the loader binds the SYCL_Host buffer type for the weights on a load that maps no file, and keeps that
+    // buffer for the model's life; the plan derives from it whether the WEIGHT zone charges that buffer.
+    kv.load_weights_evictable   = ggml_backend_sycl_weights_evictable();
     kv.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
     // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
     // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
@@ -44753,6 +44875,12 @@ static void ggml_sycl_moe_exec_copy_probe(int                           device,
 }
 
 static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_sycl::mem_handle * out);
+static bool ggml_sycl_loader_buffer_owner(ggml_backend_buffer_t   buffer,
+                                          const void *            data,
+                                          size_t                  bytes,
+                                          int                     device,
+                                          ggml_sycl::mem_handle * out,
+                                          const char **           why);
 
 static void ggml_sycl_preload_model_weights() {
     // Finisher authority keeps B's candidate immutable for the whole preload;
@@ -44838,6 +44966,11 @@ static void ggml_sycl_preload_model_weights() {
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_host_bytes{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_device_count{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_host_count{};
+        // Host-planned experts left with no owner (no pinned room and no buffer to serve them from): the load refuses
+        // once the sweep has counted them.
+        std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_count{};
+        std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_bytes{};
+        std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_unowned_first{};
 
         // Collect all (tensor, device) pairs, grouped by device
         struct preload_item {
@@ -45388,8 +45521,10 @@ static void ggml_sycl_preload_model_weights() {
                         return layout;
                     };
 
-                    // One line per tensor when the pinned room for an expert the plan pinned could not be had.
+                    // One line per tensor when the pinned room for an expert the plan pinned could not be had, and
+                    // one when the loader's chunk could not serve an expert the plan serves from it.
                     bool logged_pin_alloc_failed  = false;
+                    bool logged_loader_refusal    = false;
                     auto register_host_aos_expert = [&](int64_t e, const uint8_t * expert_aos,
                                                         ggml_sycl::placement_host_backing planned_backing,
                                                         const char *                      reason) -> bool {
@@ -45427,17 +45562,38 @@ static void ggml_sycl_preload_model_weights() {
                             !tensor_source_is_device &&
                             !ggml_sycl::placement_plan::host_backing_sizes_weight_zone(planned_backing) &&
                             ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner);
+                        // A pinned host expert the plan serves from the loader's SYCL_Host chunk is registered in
+                        // place with that chunk's owner, which the model holds for its life: the plan charged the
+                        // chunk as loader_residency and gave the expert no block. A chunk the gate refuses is copied
+                        // as before, into room the plan did not size.
+                        const bool loader_serves = !served_in_place && !tensor_source_is_device &&
+                                                   planned_backing == ggml_sycl::placement_host_backing::PINNED &&
+                                                   global_plan != nullptr && global_plan->loader_serves_host_experts;
+                        const char * loader_refusal = nullptr;
+                        const bool   loader_in_place =
+                            loader_serves && ggml_sycl_loader_buffer_owner(tensor->buffer, expert_aos, expert_size,
+                                                                           device, &host_owner, &loader_refusal);
+                        if (loader_serves && !loader_in_place && !logged_loader_refusal) {
+                            GGML_LOG_WARN(
+                                "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: the plan serves its host experts from "
+                                "the loader's SYCL_Host buffer, but %s; copied into a block the plan did not size\n",
+                                tensor->name ? tensor->name : "?", device, static_cast<long long>(e),
+                                loader_refusal ? loader_refusal : "the buffer has no owner");
+                            logged_loader_refusal = true;
+                        }
                         void * host_ptr = nullptr;
-                        if (served_in_place) {
+                        if (served_in_place || loader_in_place) {
                             host_ptr = const_cast<uint8_t *>(expert_aos);
-                        } else {
-                            // The owner handle frees the storage on every early return.
+                        } else if (tensor_source_is_device || host_expert_unowned_count[device] == 0) {
+                            // The owner handle frees the storage on every early return. Once a host expert on this
+                            // device went without an owner the load refuses after the sweep, so no further room is
+                            // asked for one.
                             host_owner = ggml_sycl_host_expert_alloc(device, expert_size);
                             host_ptr   = host_owner.valid() ? host_owner.resolve().ptr : nullptr;
                         }
 
-                        if (served_in_place) {
-                            // registered below with the mapping's owner
+                        if (served_in_place || loader_in_place) {
+                            // registered below with the mapping's or the loader chunk's owner
                         } else if (host_ptr) {
                             if (tensor_source_is_device) {
                                 sycl::queue * source_queue =
@@ -45453,23 +45609,29 @@ static void ggml_sycl_preload_model_weights() {
                             }
                             ggml_sycl::host_mem_ledger_get().host_expert_copy_cumulative_bytes.fetch_add(
                                 expert_size, std::memory_order_relaxed);
-                        } else if (!tensor_source_is_device) {
-                            // No pinned room: the source is served in place. A SYCL_Mapped source keeps its mapping's
-                            // owner, as a planned in-place expert does; the window ring cannot stream this expert, so
-                            // the load says so once per tensor. Any other host source is registered unowned.
-                            host_owner = {};
-                            if (ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner)) {
-                                if (!logged_pin_alloc_failed) {
-                                    GGML_LOG_WARN(
-                                        "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: no pinned room for "
-                                        "%zu bytes the plan pinned; served from the mapping, and the "
-                                        "window ring will not stream it\n",
-                                        tensor->name ? tensor->name : "?", device, static_cast<long long>(e),
-                                        expert_size);
-                                    logged_pin_alloc_failed = true;
-                                }
+                        } else if (!tensor_source_is_device &&
+                                   ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner)) {
+                            // No pinned room: a SYCL_Mapped source is served in place with its mapping's owner, as a
+                            // planned in-place expert is; the window ring cannot stream this expert, so the load says
+                            // so once per tensor.
+                            if (!logged_pin_alloc_failed) {
+                                GGML_LOG_WARN(
+                                    "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: no pinned room for "
+                                    "%zu bytes the plan pinned; served from the mapping, and the "
+                                    "window ring will not stream it\n",
+                                    tensor->name ? tensor->name : "?", device, static_cast<long long>(e), expert_size);
+                                logged_pin_alloc_failed = true;
                             }
                             host_ptr = const_cast<uint8_t *>(expert_aos);
+                        } else if (!tensor_source_is_device) {
+                            // No owner for a host-planned expert: it is never registered unowned (the CPU would read
+                            // memory nothing holds, and the ring would skip it). The load refuses after the sweep.
+                            if (host_expert_unowned_count[device]++ == 0) {
+                                host_expert_unowned_first[device] =
+                                    std::string(tensor->name ? tensor->name : "?") + "[" + std::to_string(e) + "]";
+                            }
+                            host_expert_unowned_bytes[device] += expert_size;
+                            return false;
                         } else {
                             return false;
                         }
@@ -46803,6 +46965,43 @@ static void ggml_sycl_preload_model_weights() {
             // (late MoE experts, warmup conversions) will sub-allocate from
             // existing chunks or fall back to individual allocations.
             ggml_sycl::unified_cache_seal_layout_pool(device);
+        }
+
+        // The plan charged the loader's SYCL_Host buffer to the WEIGHT zone as loader_residency. By now the loader's
+        // temporaries are freed, so what the model still holds in SYCL_Host chunks on the plan's device is that buffer,
+        // and more than the plan charged means the zone was sized short of it.
+        if (global_plan != nullptr && global_plan->loader_holds_weights && !global_plan->multi_device) {
+            const uint64_t model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
+            const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->device_id);
+            const size_t   planned  = ggml_sycl::placement_plan_host_weight_zone_terms(*global_plan).loader_residency;
+            if (held > planned) {
+                GGML_LOG_WARN(
+                    "[HOST-PLAN-BUG] device=%d the loader's SYCL_Host buffer holds %zu B but the plan's "
+                    "loader_residency is %zu B; the host WEIGHT zone is sized %zu B short of it\n",
+                    global_plan->device_id, held, planned, held - planned);
+            }
+        }
+
+        // No silent degrade: a host-planned expert with no owner is not registered, and the load refuses here, once the
+        // sweep has counted every one, as a dense weight that cannot be registered does.
+        size_t      unowned_count = 0;
+        size_t      unowned_bytes = 0;
+        std::string unowned_where;
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (host_expert_unowned_count[d] == 0) {
+                continue;
+            }
+            unowned_count += host_expert_unowned_count[d];
+            unowned_bytes += host_expert_unowned_bytes[d];
+            unowned_where += (unowned_where.empty() ? "" : ", ") + std::string("device ") + std::to_string(d) + ": " +
+                             std::to_string(host_expert_unowned_count[d]) + " from " + host_expert_unowned_first[d];
+        }
+        if (unowned_count > 0) {
+            GGML_LOG_ERROR(
+                "[S1-PRELOAD] %zu host-planned experts (%.1f MB) have no owner: no pinned room for a copy and no "
+                "buffer to serve them from in place (%s); the load refuses rather than register them unowned\n",
+                unowned_count, unowned_bytes / (1024.0 * 1024.0), unowned_where.c_str());
+            throw std::runtime_error("S1 preload planned host experts have no owner");
         }
 
         const auto t_end   = std::chrono::steady_clock::now();
@@ -54703,8 +54902,8 @@ enum class ggml_sycl_host_buft_kind {
 // WEIGHT, lifetime MODEL, only inside a model load. A post-load SYCL_Host buffer (compute, output, inputs, a CPU
 // layer's LoRA or control vector) is a context's: role COMPUTE, lifetime CONTEXT, which select_zone sends to
 // SCRATCH. SYCL_KV_Host is host KV: role KV, cohort kv_host_buffer, lifetime CONTEXT, so the KV zone. The TP
-// HostCompute buffer is a context's compute buffer. The owner is the buffer's own serial, which its alloc_buffer
-// mints.
+// HostCompute buffer is a context's compute buffer. The owner is filled in by ggml_sycl_host_buft_alloc: the loading
+// model's for a SYCL_Host buffer of a model load, the buffer's own serial for every other.
 static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {
     ggml_sycl::alloc_intent intent{};
     intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
@@ -54712,8 +54911,7 @@ static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_ki
     switch (kind) {
         case ggml_sycl_host_buft_kind::HOST:
             if (g_sycl_in_model_load.load(std::memory_order_acquire)) {
-                // Accepted deviation from §4.4's MODEL owner: this MODEL row carries its buffer's BUFFER owner and is
-                // checked at that buffer's free_buffer, the model's weight buffer whose free releases it.
+                // The owner is the loading model's, which ggml_sycl_host_buft_alloc fills in (§4.4 "Lifetimes").
                 intent.role     = ggml_sycl::alloc_role::WEIGHT;
                 intent.lifetime = ggml_sycl::alloc_lifetime::MODEL;
             } else {
@@ -54806,9 +55004,13 @@ struct sycl_host_buf_ctx {
     // the table that carried it.
     std::unique_ptr<ggml_sycl::tenant_claim> claim;
     // The buffer's owner serial and the lifetime its allocation was registered with (§4.4 "Lifetimes"): free_buffer
-    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns.
+    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns, and for
+    // a chunk a model owns.
     uint64_t                                 owner_id = 0;
     ggml_sycl::alloc_lifetime                lifetime = ggml_sycl::alloc_lifetime::GRAPH;
+    // The model whose load minted this chunk, which owns its allocation; 0 for any other buffer. free_buffer reports
+    // the chunk gone to the model's record, and the model's MODEL check is its leak check.
+    uint64_t                                 model_id = 0;
 };
 
 // llama.cpp-30h4: order host-side access to this pinned USM against the GPU
@@ -54924,6 +55126,12 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
         ggml_sycl::unified_cache_host_zone_owner_check(ctx->lifetime,
                                                        { ggml_sycl::alloc_owner_kind::BUFFER, ctx->owner_id });
     }
+    // A model's chunk is checked with the model, not here: an expert served from it in place holds a copy of its owner
+    // until the model's slot is reclaimed. The model's record learns the chunk is gone, so a rolled-back load runs its
+    // MODEL check once its last chunk is.
+    if (ctx->model_id != 0) {
+        ggml_sycl_model_host_chunk_freed(ctx->model_id, ctx->device, ctx->size);
+    }
     delete ctx;
     buffer->context = nullptr;
 }
@@ -55036,7 +55244,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
                                                                 int                                      device,
                                                                 std::unique_ptr<ggml_sycl::tenant_claim> claim,
                                                                 uint64_t                                 owner_id,
-                                                                ggml_sycl::alloc_lifetime                lifetime) {
+                                                                ggml_sycl::alloc_lifetime                lifetime,
+                                                                uint64_t                                 model_id) {
     // Use the wrapper struct as buffer context so free_buffer knows which
     // deallocation path to take.  Override get_base to extract the raw pointer.
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
@@ -55055,6 +55264,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
     ctx->claim    = std::move(claim);
     ctx->owner_id = owner_id;
     ctx->lifetime = lifetime;
+    ctx->model_id = model_id;
 
     if (!ggml_backend_buffer_set_type(buffer, buft)) {
         ggml_backend_buffer_free(buffer);
@@ -55088,7 +55298,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
 
 // The host bufts' one allocation path, over the intent their builder made. The device is the buft's, never the
 // current device's. An allocation is owned by the buffer it backs, so its owner is the buffer's serial, minted here
-// before the allocation and checked at the buffer's free_buffer.
+// before the allocation and checked at the buffer's free_buffer; a SYCL_Host chunk of a model load is the model's.
 static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_t buft,
                                                        size_t                     size,
                                                        ggml_sycl::alloc_intent    intent) {
@@ -55109,13 +55319,21 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
             return nullptr;
         }
         return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr, size, std::move(claimed_handle), exact_device,
-                                                  std::move(claim), 0, intent.lifetime);
+                                                  std::move(claim), 0, intent.lifetime, 0);
     }
     auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
     sycl::queue * exact_queue =
         exact_cache ? &exact_cache->get_queue() : &ggml_sycl_get_device(exact_device).default_queue();
-    const uint64_t owner_id            = ggml_sycl::host_zone_owner_next_id();
-    intent.owner                       = { ggml_sycl::alloc_owner_kind::BUFFER, owner_id };
+    // A SYCL_Host chunk of a model load is the model's (§4.4 "Lifetimes"): S1-PRELOAD serves host experts from it in
+    // place, so the cache's entries hold copies of its owner past the buffer's free_buffer, until the model's slot is
+    // reclaimed, and the model's MODEL check after that reclaim is its leak check. That includes the loader's
+    // temporaries, the pinned upload buffers a load frees before it ends: they lose a check at their own free, and a
+    // leaked one is a MODEL row of this model that outlives the reclaim, which that check reports. With no load effect
+    // to name the model (a fixture that sets the load flag alone), the chunk keeps its buffer's own owner.
+    const uint64_t model_id = intent.lifetime == ggml_sycl::alloc_lifetime::MODEL ? ggml_sycl_loading_model_id() : 0;
+    const uint64_t owner_id = model_id != 0 ? 0 : ggml_sycl::host_zone_owner_next_id();
+    intent.owner = model_id != 0 ? ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::MODEL, model_id } :
+                                   ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::BUFFER, owner_id };
     // When host zones are configured, route through the zone system so allocations are tracked and budgeted; the
     // zone is select_zone()'s answer for this intent. When zones are not configured, use the pinned pool runtime.
     intent.constraints.use_pinned_pool = (exact_cache && exact_cache->host_zones_configured());
@@ -55143,8 +55361,12 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
     ggml_sycl::mem_handle buffer_handle =
         ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_buffer_owner), GGML_LAYOUT_AOS);
 
-    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr,
-                                              owner_id, intent.lifetime);
+    ggml_backend_buffer_t buffer = ggml_backend_sycl_host_buffer_wrap(
+        buft, ptr, size, std::move(buffer_handle), exact_device, nullptr, owner_id, intent.lifetime, model_id);
+    if (buffer != nullptr && model_id != 0) {
+        ggml_sycl_model_host_chunk_minted(model_id, exact_device, size);
+    }
+    return buffer;
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -55470,6 +55692,49 @@ static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_syc
     }
     if (out) {
         *out = ctx->owner;
+    }
+    return true;
+}
+
+// The owner of the loader's SYCL_Host chunk that holds `bytes` at `data`, so S1-PRELOAD serves a host expert from it in
+// place instead of copying it into a block of its own. Only a chunk the loader keeps for the model's life qualifies: a
+// SYCL_Host buffer (its free_buffer) allocated, not claimed, with lifetime MODEL. Its owner must be one the window ring
+// copies from directly on `device`, since the ring streams a host expert from its lease. On a refusal `why` names it.
+static bool ggml_sycl_loader_buffer_owner(ggml_backend_buffer_t   buffer,
+                                          const void *            data,
+                                          size_t                  bytes,
+                                          int                     device,
+                                          ggml_sycl::mem_handle * out,
+                                          const char **           why) {
+    const char * refusal = nullptr;
+    const auto * ctx     = buffer != nullptr && buffer->iface.free_buffer == ggml_backend_sycl_host_buffer_free_buffer ?
+                               static_cast<const sycl_host_buf_ctx *>(buffer->context) :
+                               nullptr;
+    ggml_sycl::alloc_metadata owner_md{};
+    if (ctx == nullptr) {
+        refusal = "the tensor is not in a SYCL_Host buffer";
+    } else if (ctx->claim) {
+        refusal = "its SYCL_Host buffer is a claimed tenant slot";
+    } else if (ctx->lifetime != ggml_sycl::alloc_lifetime::MODEL || !ctx->buffer_handle.valid()) {
+        refusal = "its SYCL_Host buffer is not the model's";
+    } else if (static_cast<const uint8_t *>(data) < static_cast<const uint8_t *>(ctx->ptr) ||
+               static_cast<size_t>(static_cast<const uint8_t *>(data) - static_cast<const uint8_t *>(ctx->ptr)) >
+                   ctx->size ||
+               bytes > ctx->size - static_cast<size_t>(static_cast<const uint8_t *>(data) -
+                                                       static_cast<const uint8_t *>(ctx->ptr))) {
+        refusal = "the expert's bytes are not inside its SYCL_Host buffer";
+    } else if (!ctx->buffer_handle.owner_metadata(&owner_md) ||
+               !ggml_sycl::moe_stream_owner_streamable(owner_md, device)) {
+        refusal = "its SYCL_Host buffer's owner is not a pinned WEIGHT allocation of this device's host zone";
+    }
+    if (refusal != nullptr) {
+        if (why) {
+            *why = refusal;
+        }
+        return false;
+    }
+    if (out) {
+        *out = ctx->buffer_handle;
     }
     return true;
 }

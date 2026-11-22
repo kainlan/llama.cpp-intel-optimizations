@@ -91,7 +91,8 @@ ORDER_LINE_CALL = "log_moe_spread_placement"
 FITS_REASON = '"every routed expert fits"'
 
 TERMS_TOTAL = (
-    "size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound + swap_headroom; }"
+    "size_t total() const { return host_weights + loader_residency + host_compute_reserve + layout_copies + tlsf_bound "
+    "+ swap_headroom; }"
 )
 TERMS_DEF = "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"
 TERMS_SET = "terms.swap_headroom = plan.moe_swap_host_headroom_bytes;"
@@ -392,8 +393,8 @@ def self_test(raws: dict[str, str]) -> int:
     switch = "    if (!kv_info.moe_spread) {\n"
     single_spread = "        moe_spread_order_groups(plan, moe_groups, kv_info, remaining, &hotness_source);\n"
     ring = "        hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining, host_experts_pinned);\n"
-    total = ("    size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound + "
-             "swap_headroom; }")
+    total = ("        return host_weights + loader_residency + host_compute_reserve + layout_copies + tlsf_bound + "
+             "swap_headroom;\n")
     multi_build = ("            const auto             moe_groups     = build_moe_triplet_groups(plan, moe_indices, "
                    "&hotness_source);\n")
     hold_call = "    placement_plan_hold_moe_swap_host_headroom(plan, kv_info);\n"
@@ -433,7 +434,7 @@ def self_test(raws: dict[str, str]) -> int:
                 '"without a direct peer path the multi-device plan places whole layers");\n',
                 '"every routed expert fits");\n')
     expect_fail("headroom-not-in-the-zone-total", "S5", CACHE_HPP, total,
-                "    size_t total() const { return host_weights + host_compute_reserve + layout_copies + tlsf_bound; }")
+                "        return host_weights + loader_residency + host_compute_reserve + layout_copies + tlsf_bound;\n")
     expect_fail("headroom-term-unset", "S5", CACHE_CPP,
                 "    terms.swap_headroom        = plan.moe_swap_host_headroom_bytes;\n", "")
     expect_fail("record-holds-no-headroom", "S5", CACHE_CPP, hold_call, "")
@@ -447,8 +448,9 @@ def self_test(raws: dict[str, str]) -> int:
                 "    plan.moe_swap_host_headroom_triplets = 0;\n    plan.moe_swap_host_headroom_bytes    = 0;\n\n"
                 "    // WEIGHT: exact bytes plus named terms.", "    // WEIGHT: exact bytes plus named terms.")
     expect_fail("weight-zone-line-names-the-headroom", "S5", CACHE_CPP,
-                '"tlsf_bound=%zu total=%zu (%.1f MB); unplanned: ',
-                '"tlsf_bound=%zu swap_headroom=%zu total=%zu (%.1f MB); unplanned: ')
+                '"host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu total=%zu (%.1f MB); loader_residency: ',
+                '"host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu swap_headroom=%zu total=%zu (%.1f MB); '
+                'loader_residency: ')
     expect_fail("headroom-line-drops-the-figures", "S5", CACHE_CPP,
                 '"weight_zone_total=%zu host_planned_bytes=%zu%s\\n",', '"%s\\n",')
     mapped_return = "plan.host_planned_bytes);\n        return;\n    }\n\n    // Holds `n` triplets"

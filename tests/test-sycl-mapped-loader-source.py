@@ -656,8 +656,8 @@ def clause_l11_preload_serves_mapped_in_place(t: dict) -> list:
                          r"\s*&&\s*)?ggml_sycl_mapped_buffer_owner\s*\(", aos)
     if "ggml_sycl_mapped_buffer_owner(" not in aos:
         problems.append("register_host_aos_expert copies a SYCL_Mapped expert instead of registering it in place")
-    elif not in_place or not re.search(rf"if\s*\(\s*{in_place.group(1)}\s*\)\s*\{{\s*\w+\s*=\s*[^;]*\bexpert_aos\b",
-                                       aos):
+    elif not in_place or not re.search(rf"if\s*\(\s*{in_place.group(1)}\s*(?:\|\|\s*\w+\s*)?\)\s*\{{\s*\w+\s*=\s*"
+                                       r"[^;]*\bexpert_aos\b", aos):
         problems.append("register_host_aos_expert's in-place test does not serve the AOS source when it owns the "
                         "mapping")
     dense = between(gs, "if (!dense_planned_on_this_device && !dense_alternate_on_this_device) {",
@@ -839,7 +839,8 @@ def clause_p1_derivation_sites(t: dict) -> list:
         if not re.search(r"\bplacement_plan_size_host_side\s*\(\s*plan\s*,", body):
             problems.append(f"{builder} does not end with placement_plan_size_host_side, which marks its "
                             "device-planned entries FILE_MAPPED")
-        copy = re.search(r"placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*kv_info\s*\)\s*;", body)
+        copy = re.search(r"placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*kv_info\s*(?:,[^;()]*)?\)\s*;",
+                         body)
         first_entry = body.find("placement_host_backing_when_host(")
         if not copy:
             problems.append(f"{builder} does not copy the fact into the plan")
@@ -1097,7 +1098,7 @@ MUTANTS = [
                             r"(populate_host_zone_sizing\s*\([^;]*;)", r"\2 \1")),
     ("one builder skips the fact copy", "P1",
      lambda t: _mut(t, UCC, r"(placement_plan\s+plan\s*;\s*)placement_plan_copy_host_backing_fact\s*\(\s*plan\s*,\s*"
-                            r"kv_info\s*\)\s*;", r"\1")),
+                            r"kv_info\s*(?:,[^;()]*)?\)\s*;", r"\1")),
     ("the fact copy locks a load that maps nothing", "P1",
      lambda t: _mut(t, UCC, r"(plan\s*\.\s*host_mapped_locked\s*=\s*)info\s*\.\s*load_maps_files\s*&&\s*", r"\1")),
     ("one builder's dense site keeps the PINNED default", "P1",

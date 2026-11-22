@@ -35773,10 +35773,25 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     constexpr size_t k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;
 
     // The host weights are summed here and nowhere else. Which entries count is the plan's own charge rule, so this
-    // sum and weight_host_bytes cover the same entries.
+    // sum plus loader_served and weight_host_bytes cover the same entries.
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
+        // The loader's SYCL_Host buffer holds every weight the plan places, on the device or not, for the model's
+        // life. ggml-alloc places each tensor at the CPU buffer type's TENSOR_ALIGNMENT, which SYCL_Host inherits, so
+        // a dense weight's bytes round up to it exactly; an expert entry is a slice of its tensor, and rounding each
+        // slice bounds the tensor's own rounding from above.
+        if (plan.loader_holds_weights) {
+            const size_t a = TENSOR_ALIGNMENT;
+            terms.loader_residency += (entry.src_size + a - 1) / a * a;
+        }
         if (entry.on_device || !placement_plan::host_backing_sizes_weight_zone(entry.host_backing)) {
+            continue;
+        }
+        // S1-PRELOAD serves a host-planned PINNED expert from the loader's buffer in place, under its owner, so the
+        // expert holds no block: its bytes are already in loader_residency. A dense host weight is still copied.
+        if (plan.loader_serves_host_experts && entry.expert_id >= 0 &&
+            entry.host_backing == placement_host_backing::PINNED) {
+            terms.loader_served += placement_entry_host_weight_bytes(entry);
             continue;
         }
         terms.host_weights += placement_entry_host_weight_bytes(entry);
@@ -36365,10 +36380,18 @@ static void placement_plan_log_working_set(const char *              tag,
 }
 
 // The load's fact onto the plan (design 5efe §4.4), the one place either builder copies it, before it makes any entry.
-// The lock follows the mapping: a load that maps nothing locks nothing.
-static void placement_plan_copy_host_backing_fact(placement_plan & plan, const placement_kv_info & info) {
+// The lock follows the mapping: a load that maps nothing locks nothing. The loader's SYCL_Host buffer follows it too:
+// a load that maps no file binds that buffer for its weights when they are evictable, and `multi_device` names the
+// builder, whose plan alone decides whether host experts are served from it in place.
+static void placement_plan_copy_host_backing_fact(placement_plan &          plan,
+                                                  const placement_kv_info & info,
+                                                  bool                      multi_device) {
     plan.host_backing_maps_files = info.load_maps_files;
     plan.host_mapped_locked      = info.load_maps_files && info.load_locks_files;
+    const placement_loader_fact loader =
+        placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable, multi_device);
+    plan.loader_holds_weights       = loader.holds_weights;
+    plan.loader_serves_host_experts = loader.serves_host_experts;
 }
 
 // A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
@@ -37184,26 +37207,31 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.moe_swap_host_headroom_bytes    = 0;
 
     // WEIGHT: exact bytes plus named terms. The host weights are summed from the entries, the bytes the cache
-    // materializes; weight_host_bytes is the plan's running total of the same bytes, so a difference means a writer
-    // charged something the entries do not hold, and the zone is sized from the entries. It warns rather than aborts:
-    // the multi-device builder's MoE group branch still charges a host-spilled group at the device layout's dst_size,
-    // so a padded multi-device load that takes that branch would abort until that charge is the materialized src_size
-    // (llama.cpp-4qdx). Its cohesive host-layer branch already charges a host expert at src_size.
+    // materializes or the loader's buffer serves in place; weight_host_bytes is the plan's running total of the same
+    // bytes, so a difference means a writer charged something the entries do not hold, and the zone is sized from the
+    // entries. It warns rather than aborts: the multi-device builder's MoE group branch still charges a host-spilled
+    // group at the device layout's dst_size, so a padded multi-device load that takes that branch would abort until
+    // that charge is the materialized src_size (llama.cpp-4qdx). Its cohesive host-layer branch already charges a host
+    // expert at src_size.
     const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);
-    if (weight_terms.host_weights != plan.weight_host_bytes) {
+    if (!weight_terms.matches_charge(plan.weight_host_bytes)) {
         GGML_LOG_WARN(
-            "[HOST-PLAN-BUG] device=%d the WEIGHT zone's entries hold %zu B but the plan's weight_host_bytes is %zu B; "
-            "the WEIGHT zone is sized from the entries\n",
-            plan.device_id, weight_terms.host_weights, plan.weight_host_bytes);
+            "[HOST-PLAN-BUG] device=%d the WEIGHT zone's entries hold %zu B (%zu B in blocks, %zu B served from the "
+            "loader's buffer) but the plan's weight_host_bytes is %zu B; the WEIGHT zone is sized from the entries\n",
+            plan.device_id, weight_terms.host_weights + weight_terms.loader_served, weight_terms.host_weights,
+            weight_terms.loader_served, plan.weight_host_bytes);
     }
     plan.host_zone_weight_bytes = weight_terms.total();
+    const char * loader_role =
+        !plan.loader_holds_weights      ? "the loader binds no SYCL_Host buffer for weights" :
+        plan.loader_serves_host_experts ? "the loader's SYCL_Host buffer, serving the host experts in place" :
+                                          "the loader's SYCL_Host buffer, the host experts copied out of it";
     GGML_LOG_INFO(
-        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu host_compute_reserve=%zu layout_copies=%zu "
-        "tlsf_bound=%zu total=%zu (%.1f MB); unplanned: loader_residency (the loader's SYCL_Host buffer, not a "
-        "term)\n",
-        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.host_compute_reserve,
-        weight_terms.layout_copies, weight_terms.tlsf_bound, weight_terms.total(),
-        weight_terms.total() / (1024.0 * 1024.0));
+        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu loader_residency=%zu loader_served=%zu "
+        "host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu total=%zu (%.1f MB); loader_residency: %s\n",
+        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.loader_residency,
+        weight_terms.loader_served, weight_terms.host_compute_reserve, weight_terms.layout_copies,
+        weight_terms.tlsf_bound, weight_terms.total(), weight_terms.total() / (1024.0 * 1024.0), loader_role);
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: S1 preload may keep multiple async H2D/reorder submissions
     // alive. CPU-side layout conversion can hold both the source staging copy
@@ -38084,7 +38112,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_envelope_fa_name(envelope->flash_attn_type));
     }
     placement_plan plan;
-    placement_plan_copy_host_backing_fact(plan, kv_info);
+    placement_plan_copy_host_backing_fact(plan, kv_info, /*multi_device=*/false);
     bool host_experts_pinned                 = false;
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
@@ -39574,7 +39602,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     const size_t n_devs = device_budgets.size();
 
     placement_plan plan;
-    placement_plan_copy_host_backing_fact(plan, kv_info);
+    placement_plan_copy_host_backing_fact(plan, kv_info, /*multi_device=*/true);
     plan.device_id                = -1;  // Multi-device
     plan.multi_device             = true;
     plan.vram_bytes               = 0;
