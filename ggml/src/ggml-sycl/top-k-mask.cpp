@@ -1,7 +1,9 @@
 #include "top-k-mask.hpp"
 
-#include "prestage-class.hpp"
+#include "graph-input-staged.hpp"
 #include "top-k-mask-kernel.hpp"
+
+#include <vector>
 
 using ggml_sycl_top_k_mask::elem_stride;
 
@@ -9,27 +11,26 @@ using ggml_sycl_top_k_mask::elem_stride;
 //
 // The kpool member cells and tail cells (blocks, extra) are graph inputs llama writes on the host every ubatch, and the
 // DSA form's mask is llama's KQ mask input. A recorded kernel bakes the pointers it is given, so while this thread
-// records, such a source is read from the device copy the graph pre-stage made of it for this token
-// (graph_input_staging, keyed by tensor identity and refreshed before every replay), by the pre-stage's own view-aware
-// INPUT rule, as bin-broadcast does. The lookup neither allocates, copies nor waits, so recording never falls back to a
-// direct run for this op. The pre-stage copied ggml_nbytes(src) from the tensor's own data, which is the span the
-// kernel addresses. The staging map owns that copy: a size change that replaces it retires every recorder that baked
-// the old pointer and holds the old buffer until the work submitted before the swap has completed.
-//
-// A miss (an input already on the device, which the pre-stage does not copy, or a second tensor over a range it staged
-// once) and every run outside a recording resolve the tensor as any other op does.
-template <typename T> static T * top_k_mask_src_ptr(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor src) {
+// records, a source is read from the device copy the graph pre-stage made of it for this token, over the
+// ggml_nbytes(src) the pre-stage copied from the tensor's own data, which is the span the kernel addresses; the
+// staging handle joins `owners`, the op's terminal owners. A source with no such copy must be device memory already,
+// or the lookup throws before anything is submitted and the segment runs directly instead (graph-input-staged.hpp).
+// Outside a recording the tensor resolves as it does for any other op.
+template <typename T>
+static T * top_k_mask_src_ptr(ggml_backend_sycl_context &          ctx,
+                              ggml_sycl::sycl_tensor               src,
+                              std::vector<ggml_sycl::mem_handle> & owners) {
     const ggml_tensor * t = src.raw();
     if (t == nullptr) {
         return nullptr;
     }
-    if (ggml_sycl_graph_recording_this_thread() && ggml_sycl_prestage_is_input(t)) {
-        void * staged = nullptr;
-        if (ctx.graph_input_stage_lookup(t, ggml_nbytes(t), ctx.device, nullptr, &staged) && staged != nullptr) {
-            return static_cast<T *>(staged);
-        }
+    ggml_sycl::mem_handle staged;
+    void * ptr = ggml_sycl_graph_input_recordable_ptr(ctx, t, ggml_nbytes(t), ctx.device, staged, "top-k mask");
+    if (staged.valid()) {
+        owners.push_back(std::move(staged));
     }
-    return src.resolve_as<T>();
+    GGML_ASSERT(ptr != nullptr && "top-k mask: source data not resolved");
+    return static_cast<T *>(ptr);
 }
 
 void ggml_sycl_op_top_k_mask(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -45,12 +46,14 @@ void ggml_sycl_op_top_k_mask(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_te
 
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
+    // every source resolves, and may throw, before the kernel is submitted
+    std::vector<ggml_sycl::mem_handle>    owners;
     ggml_sycl_top_k_mask::top_k_mask_args args = {};
-    args.mask                                  = top_k_mask_src_ptr<const void>(ctx, dst.src(0));
-    args.top_k                                 = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(1));
-    args.score                                 = top_k_mask_src_ptr<const float>(ctx, dst.src(2));
-    args.blocks                                = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(3));
-    args.extra                                 = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4));
+    args.mask                                  = top_k_mask_src_ptr<const void>(ctx, dst.src(0), owners);
+    args.top_k                                 = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(1), owners);
+    args.score                                 = top_k_mask_src_ptr<const float>(ctx, dst.src(2), owners);
+    args.blocks                                = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(3), owners);
+    args.extra                                 = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4), owners);
     args.dst                                   = dst.resolve_as<void>();
     args.type                                  = op->type;
     args.n_kv                                  = mask->ne[0];
@@ -91,6 +94,12 @@ void ggml_sycl_op_top_k_mask(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_te
         args.se3 = elem_stride(extra, 3);
     }
 
-    const bool launched = ggml_sycl_top_k_mask::top_k_mask_launch(*ctx.stream(), args);
+    // A recorded kernel can read a staged copy for the recording's lifetime, a direct run until its event completes;
+    // the ticket keeps the staging handles that long.
+    auto        ticket = ggml_sycl::terminal_retention_ticket::prepare({}, std::move(owners));
+    sycl::event done;
+    const bool  launched = ggml_sycl_top_k_mask::top_k_mask_launch(*ctx.stream(), args, &done);
     GGML_ASSERT(launched);
+    ticket.mark_submitted(*ctx.stream());
+    ticket.commit(done);
 }

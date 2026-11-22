@@ -61,10 +61,11 @@ inline int64_t top_k_mask_groups(int64_t n_rows) {
     return std::min(n_rows, TOP_K_MASK_MAX_GROUPS);
 }
 
-template <typename T, T NINF> inline void top_k_mask_submit(sycl::queue & q, const top_k_mask_args & a) {
+// The kernel's event, or a default (complete) event when there are no rows and nothing is submitted.
+template <typename T, T NINF> inline sycl::event top_k_mask_submit(sycl::queue & q, const top_k_mask_args & a) {
     const int64_t n_rows = a.ne1 * a.ne2 * a.ne3;
     if (n_rows <= 0) {
-        return;
+        return sycl::event{};
     }
     const int64_t n_groups   = top_k_mask_groups(n_rows);
     const T *     mask       = static_cast<const T *>(a.mask);
@@ -73,7 +74,7 @@ template <typename T, T NINF> inline void top_k_mask_submit(sycl::queue & q, con
 
     // Every work-item of a group runs the same rows and reaches every barrier: the row loop depends on the group
     // alone and nothing returns early.
-    q.parallel_for(
+    return q.parallel_for(
         sycl::nd_range<1>(sycl::range<1>(n_groups * TOP_K_MASK_BLOCK_SIZE), sycl::range<1>(TOP_K_MASK_BLOCK_SIZE)),
         [=](sycl::nd_item<1> item) {
             const int64_t lid = item.get_local_id(0);
@@ -130,19 +131,24 @@ template <typename T, T NINF> inline void top_k_mask_submit(sycl::queue & q, con
         });
 }
 
-// Submits the kernel for the cell type in a.type. Returns false, submitting nothing, for a type it has no
-// instantiation for (the predicate admits none).
-inline bool top_k_mask_launch(sycl::queue & q, const top_k_mask_args & a) {
+// Submits the kernel for the cell type in a.type, its event in *out_event when given. Returns false, submitting
+// nothing, for a type it has no instantiation for (the predicate admits none).
+inline bool top_k_mask_launch(sycl::queue & q, const top_k_mask_args & a, sycl::event * out_event = nullptr) {
+    sycl::event ev;
     switch (a.type) {
         case GGML_TYPE_F16:
-            top_k_mask_submit<uint16_t, TOP_K_MASK_NINF_F16>(q, a);
-            return true;
+            ev = top_k_mask_submit<uint16_t, TOP_K_MASK_NINF_F16>(q, a);
+            break;
         case GGML_TYPE_F32:
-            top_k_mask_submit<uint32_t, TOP_K_MASK_NINF_F32>(q, a);
-            return true;
+            ev = top_k_mask_submit<uint32_t, TOP_K_MASK_NINF_F32>(q, a);
+            break;
         default:
             return false;
     }
+    if (out_event != nullptr) {
+        *out_event = ev;
+    }
+    return true;
 }
 
 }  // namespace ggml_sycl_top_k_mask

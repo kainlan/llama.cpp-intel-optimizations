@@ -2,8 +2,8 @@
 
 #include "dnnl-ops.hpp"
 #include "ggml.h"
+#include "graph-input-staged.hpp"
 #include "mem-ops.hpp"
-#include "prestage-class.hpp"
 #include "sycl-kernel-profiler.hpp"
 
 #include <cmath>
@@ -418,50 +418,12 @@ bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, 
     return ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device);
 }
 
-// The device copy of a graph input that the graph pre-stage made this token (graph_prestage_leaf_tensors, INPUT arm,
-// keyed by tensor identity in graph_input_staging), or nullptr. A kernel being recorded reads that copy instead of the
-// input's host bytes: raw host staging cannot be recorded, and running the segment directly instead pays a stream
-// drain for the staging copy.
-//
-// The handle comes back in out_handle so the caller can keep it alive for as long as the recorded kernel can read it.
-static void * ggml_sycl_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
-                                                        const ggml_tensor *         tensor,
-                                                        size_t                      span_bytes,
-                                                        int                         device,
-                                                        ggml_sycl::mem_handle *     out_handle) {
-    // Only while this thread records. The staged copy is current only when the pre-stage ran for this token; a direct
-    // run has no such guarantee, and its raw host staging is correct there.
-    if (!ggml_sycl_graph_recording_this_thread() || tensor == nullptr || tensor->name[0] == '\0' || span_bytes == 0) {
-        return nullptr;
-    }
-    // Only a flagged graph input or a view of one, by the pre-stage's own INPUT rule, so this never accepts a tensor
-    // the pre-stage does not stage and refresh. A host op output from another split is staged as an input too, but
-    // this op cannot tell it from an output this graph produces, whose staging entry would predate its producer, so
-    // that case keeps failing closed.
-    if (!ggml_sycl_prestage_is_input(tensor)) {
-        return nullptr;
-    }
-    // The pre-stage stages a source under the tensor pointer it meets, copying ggml_nbytes(tensor) from that tensor's
-    // own data, so the copy starts where this kernel's addressing starts. It stages a storage range once per pass,
-    // keyed by (cache id, device, view offset), so a second tensor over the same range gets no entry of its own: the
-    // lookup then misses and this op fails closed, which costs speed, not correctness. The entry's capacity may exceed
-    // what was copied this token (a reused, larger buffer), so the span must also fit the copied bytes.
-    if (span_bytes > ggml_nbytes(tensor)) {
-        return nullptr;
-    }
-    void * staged_ptr = nullptr;
-    if (!ctx.graph_input_stage_lookup(tensor, span_bytes, device, out_handle, &staged_ptr)) {
-        return nullptr;
-    }
-    return staged_ptr;
-}
-
 void * ggml_sycl_test_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
                                                       const ggml_tensor *         tensor,
                                                       size_t                      span_bytes,
                                                       int                         device) {
     ggml_sycl::mem_handle handle;
-    return ggml_sycl_binbcast_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &handle);
+    return ggml_sycl_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &handle);
 }
 
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
@@ -866,8 +828,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         // baked the old pointer (graph_input_staging_swapped in common.hpp). No wait follows: the pre-stage's copy is
         // ordered ahead on the same stream.
         ggml_sycl::mem_handle graph_input_handle;
-        if (void * staged =
-                ggml_sycl_binbcast_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &graph_input_handle)) {
+        if (void * staged = ggml_sycl_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &graph_input_handle)) {
             ggml_sycl_binbcast_tracef("graph-input-staged tensor=%s bytes=%zu device=%d src=%p dst=%p", tensor->name,
                                       span_bytes, device, source_ptr, staged);
             stage = std::move(graph_input_handle);
