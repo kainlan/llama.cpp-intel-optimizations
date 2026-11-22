@@ -1176,7 +1176,7 @@ PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt
 PER_EXPERT_ANCHOR = "if (try_pp_onednn_f16_batched()) { return; }"
 PER_EXPERT_STEPS = (
     "pp_moe_onednn_scratch_claim pp_moe_onednn_scratch_claim_state;",
-    'GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for',
+    'throw ggml_sycl_fallback_error("MUL_MAT_ID prompt activation staging does not fit");',
     "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
     "moe_expert_route route = retained_prompt_group_route_for_expert(static_cast<int>(i02));",
     "expert_ptr = route.ptr;",
@@ -1195,7 +1195,7 @@ def claim_staged_batch_refused_by_name(sycl: str) -> bool:
     """The non-hybrid retained prompt per-expert path multiplies each expert at the tensor's route_layout from
     route.ptr, which a staged slot (holding its entry's layout) does not match: a batch naming a staged slot throws a
     fallback error directly after the batched executor's try, before the path's scratch setup claims the oneDNN
-    scratch slot, allocates its staging or aborts on a failed allocation, and before its first route.
+    scratch slot, allocates its staging or refuses on a failed allocation, and before its first route.
     try_xmx_sorted_moe reads each expert through a payload with no staged slot: it rejects such a batch at its head,
     before the policy check and before any upload, instead of through the payload's missing entry."""
     n = norm(sycl)
@@ -1223,7 +1223,7 @@ def test_staged_batch_refused_by_name_mutants():
     m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
     m = m.replace(PER_EXPERT_STEPS[-1], PER_EXPERT_STEPS[-1] + " " + PER_EXPERT_REFUSE, 1)
     assert not c(m)
-    # Refused after the scratch setup, where a staged batch can hit the staging allocation's abort first.
+    # Refused after the scratch setup, where a staged batch can hit the staging allocation's refusal first.
     m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
     m = m.replace(PER_EXPERT_STEPS[2], PER_EXPERT_REFUSE + " " + PER_EXPERT_STEPS[2], 1)
     assert not c(m)
