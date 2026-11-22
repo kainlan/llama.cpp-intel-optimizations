@@ -3279,6 +3279,13 @@ failed too. Each script was then run on `master` (`313fa14e4`) and the outputs c
 
 The five that are red on `master` are outside this plan. Until `master` fixes them they are the **known-red baseline**
 of the sweep: a sweep passes when its failed set is exactly those five, or a subset.
+**Corrected 2026-11-22: the baseline is eight.** With Part 5's interpreter the pytest-based contracts execute, and
+three more fail on `master` at `313fa14e4` with the same failures as here (line numbers aside):
+`test-llama-model-lazy-auto-source` (4 failed: the lazy AUTO resolution block is missing from `load_tensors`),
+`test-sycl-runtime-registry-index-source` (5 failed: three unlisted whole-row writes, the first in
+`remap_or_extract_id_mapping_locked`), `test-llama-context-cpu-only-compile` (1 failed: a CPU-only syntax check of
+`src/llama-context.cpp` stops at `llama_context_sycl_device_index` not declared). The last one says a CPU-only
+build of `master` does not compile; it is `master`'s to fix.
 The census also printed `R7 test-sycl-async-drain-source.py is registered ... but is not in the configured build`:
 the merged tree's `build/` was configured before Task 7c merged. That line goes away with the next reconfigure and is
 not part of this task.
@@ -3493,6 +3500,8 @@ label compiled device tests, 163 tests ran four at a time on both cards without 
 `test-moe-mul-mat-id` timed out on the B50 with a GT reset (`06:01:05`, `xe 0000:09:00.0 ... reset done`). No
 process or VRAM was left behind and `Shmem` stayed at 9 GB. Before a selection is changed, list it with
 `--show-only=json-v1` and confirm every command is the Python interpreter.
+**Read the Skipped count of a sweep, not only its failed list** (added 2026-11-22): a contract whose wrapper
+exits 77 is not a pass. A sweep is valid when nothing in it reports Skipped.
 
 #### Acceptance
 - [ ] The three command groups above give the stated results, and Parts 4 and 5 theirs.
@@ -3523,6 +3532,61 @@ process or VRAM was left behind and `Shmem` stayed at 9 GB. Before a selection i
 - `debt.json` is shrink-only by rule. The synchronize re-key is a migration of the same three handlers; say so in the
   commit message so the next reader does not take it for growth.
 - No C++ file changes. If you conclude one is needed, stop and report.
+
+#### Parts 6 and 7 (added 2026-11-22, during the task)
+Part 5 changed what the sweep runs. The interpreter CMake had picked has no `pytest`, so the wrapper of every
+pytest-based contract exited 77 and ctest reported it Skipped: 128 of the first selection's tests had never run in
+any build directory, and `test-sycl-static-storage-audit` in the second skipped for a missing module. With the
+shell's interpreter they execute. Six of the first selection then failed (three on `master` too, see the baseline
+above) and one of the second.
+- **Part 6, three pytest contracts broken by this branch.** `tests/test-sycl-timeline-wait-graph-source.py` (the
+  BCS and DMA drains in the compute-impl guard are `wait_and_throw()` since Task 7c),
+  `tests/test-sycl-h2d-probe-source.py` (the probe's one wait per iteration, the same change) and
+  `tests/test-sycl-moe-exec-window-timing-source.py` (the BCS queue and the timing queue are built through
+  `ggml_sycl_make_queue` since Task 7a/7b; `ggml_backend_sycl_synchronize` tests the failure latch where it tested
+  `err == 0`, Task 7d). Rule given to the implementer: a pin follows moved text only when the property the claim
+  protects still holds; a property that no longer holds is a C++ defect and is reported, not re-pinned. Every
+  property held. The flush claim is stricter than on `master`: the window-timing flush is skipped on any latched
+  failure, not only when the wait's own error is set.
+- **Part 7, the static-storage inventory.** `ff51e943c` (this branch) added three statics for the direct route's
+  test hold (`g_q1_nvfp4_test_hold_mutex`, `g_q1_nvfp4_test_hold_armed`, `g_q1_nvfp4_test_held_completion`)
+  without regenerating `docs/backend/sycl-static-storage-inventory.csv`. The classification columns of that file
+  are generated from name, type and scope and cannot be written by hand; the rows are committed as generated and
+  what the code says is in the commit message: all three and every use sit under
+  `#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING`, which only `ggml-sycl-q1-route-test-objects` and the
+  `ggml-sycl-private-fixtures` interface define, so the product library never compiles them; every access is under
+  the mutex. *Test-only residue:* a test that armed the hold and never released it would keep the completion's
+  workspace leases until static destruction of the test binary, after backend teardown. The one user releases
+  through an RAII guard.
+
+**DONE 2026-11-22, merged as `7f8b118e6`** (task commits `ddd34ce30..9586bef9c`, eight commits, no C/C++ file).
+One combined review, PASS WITH FINDINGS, nothing must-fix, no contract weakened, no C++ defect; one fix round.
+A fresh re-review of the fix round closed all four findings (its sed check, hostile edits against gate (H) and a read of FindPython in CMake 4.1.2 included).
+
+*What landed, beyond the parts above:*
+- Six allowlist entries (`E-KJOC-*`) for the drains' handlers, each reason checked against its handler in review;
+  `G-CATCH` debt 619 to 617 (two entries retired, synchronize's three re-keyed by ordinal).
+- Holder-census gate (H) admits exactly one `return GGML_STATUS_FAILED;` that skips the exit hooks: before the
+  dispatch-owner scope, after the failure test, in a block that is the report and the return alone. The review ran
+  eleven hostile edits; the one it missed (a wait ahead of the report) is closed by the fix round and has a mutant.
+- Replan census: four queue needles now require a wait, not a mention (`g_tp_device1_worker_queue` and the three
+  split owners), with mutants. `g_block_exec_copy_queues` and `g_pipeline_copy_queue` are still matched by name:
+  they are waited through a loop variable and an index.
+- `test-sycl-h2d-probe-source.py` had a claim that was false on the real source but sat behind an earlier failing
+  assert, so its per-chunk mutant passed vacuously; both now fail for the stated reason.
+- The window-timing flush claim also pins that the drain's error is recorded in the latch before the failure test.
+- `scripts/sycl-build.sh` passes `-DPython3_EXECUTABLE=$(command -v python3)` and, since the fix round, forces a
+  configure when a build directory's cache holds another interpreter or none, so no build directory keeps
+  skipping silently. FindPython takes an absolute hint over its cached `_Python3_EXECUTABLE` (read in the CMake
+  4.1.2 module, and seen in `wt-t7a`'s cache).
+
+*Sweep at the last commit, in `inkling/wt-t7a`:* first selection 198 of 206, the failed set exactly the eight of
+the baseline; second selection 22 of 22, the ten alloc-zone tests among them.
+*Merged tree at `7f8b118e6`:* `./scripts/sycl-build.sh` with no flag printed `refreshing cached Python3_EXECUTABLE: <unset> -> .../miniconda3/bin/python3`, reconfigured, and built with rc 0; the cache then held that interpreter in both entries. First selection 199 of 207, the failed set exactly the eight of the baseline; second selection 22 of 22; no test Skipped in either (before the fix: 128 and 4).
+
+*Not taken:* a mutation self-test for `test-sycl-execution-abort-source.py` (it has none; its twin statement in
+`ggml_sycl_execution_drain_context_terminal_events` is not pinned either); needles for the two queues waited
+through a loop variable or an index.
 
 ---
 
