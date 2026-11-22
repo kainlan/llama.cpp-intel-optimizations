@@ -1013,6 +1013,15 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-chain-same-queue-source.py --self-test)
     set_tests_properties(test-sycl-chain-same-queue-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The SYCL backend does not execute a node without GGML_TENSOR_FLAG_COMPUTE (an unselected branch of
+    # ggml_build_forward_select, whose inputs the scheduler never uploads), and the graph signature mixes the flags so
+    # a recorded graph is not replayed for another selection. Run WITH --self-test so each pin is proven to catch its
+    # mutant.
+    add_test(NAME test-sycl-compute-flag-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-compute-flag-source.py --self-test)
+    set_tests_properties(test-sycl-compute-flag-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Every synchronous wait mem_copy_submit makes is counted by kind and by the copy's caller under the MoE trace,
     # and the [MOE-HOSTPATH-WAITS] line prints the census (llama.cpp-qwn5). Run WITH --self-test so each pin is
     # proven to catch its mutant.
