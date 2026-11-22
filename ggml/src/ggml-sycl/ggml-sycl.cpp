@@ -105967,8 +105967,9 @@ static bool ggml_sycl_execution_begin_dispatch_graph(ggml_backend_sycl_context *
 // graphlets -- so an op that takes the invocation's authority (the Q1_0/NVFP4 direct route) finds it open whichever
 // path ran it. Without it, such an op sees no graph (a synchronize at the previous split boundary released it) and
 // the direct route declines with failed=graph_epoch,invocation_id. A scope opened while the backend's graph is still
-// open joins that invocation, so a path that opens one and then falls back to compute_impl runs in one invocation.
-// Submit and release stay where they were: graph_compute's exit and synchronize.
+// open joins that invocation, so a path that opens one and then falls back to compute_impl runs in one invocation,
+// and only the outermost scope seals or quarantines it. Submit and release stay where they were: graph_compute's exit
+// and synchronize.
 struct ggml_sycl_execution_dispatch_scope {
     ggml_backend_sycl_context * ctx;
     bool                        active;
@@ -105987,11 +105988,20 @@ struct ggml_sycl_execution_dispatch_scope {
         if (!active) {
             return;
         }
-        // The depth drops first: the seal or quarantine below is this scope closing its own stretch, not something
-        // ending the graph under it, so it must not trip the wire.
+        // The scope that brings the depth to zero owns the end of the graph. An inner scope returns on a normal exit
+        // and on an unwind alike: the outer scope is still dispatching into the same invocation, and an exception
+        // reaches that scope's destructor by unwinding. One that a caller between the two catches was handled there
+        // (a fallback redoes the stretch), so the outer scope ends the graph by its own exit, not by what passed
+        // through the inner one. Ending the graph here at a nonzero depth would end it under the outer scope, which is
+        // what the tripwire reports. The depth drops before the end below, so the outermost scope closing its own
+        // stretch does not trip it either.
+        bool outermost = false;
         {
             std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
-            --ctx->execution_dispatch_depth;
+            outermost = --ctx->execution_dispatch_depth == 0;
+        }
+        if (!outermost) {
+            return;
         }
         if (std::uncaught_exceptions() > uncaught) {
             ggml_sycl_execution_quarantine_graph(ctx);

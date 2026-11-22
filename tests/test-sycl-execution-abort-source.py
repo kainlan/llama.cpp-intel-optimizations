@@ -461,9 +461,58 @@ def tripwire_violations(source):
         found.append("release passes its caller's site to the clear and the retire")
     scope = slice_between(source, "struct ggml_sycl_execution_dispatch_scope {", "\n};\n")
     if not ordered(scope, "if (active) {", "++ctx->execution_dispatch_depth;", "~ggml_sycl_execution_dispatch_scope()",
-                   "--ctx->execution_dispatch_depth;", "ggml_sycl_execution_quarantine_graph(ctx);",
+                   "--ctx->execution_dispatch_depth", "ggml_sycl_execution_quarantine_graph(ctx);",
                    "ggml_sycl_execution_seal_graph(ctx);"):
         found.append("the scope counts itself in after a begin and out before its own seal or quarantine")
+    return found
+
+
+# The destructor's two pieces, as the source writes them: counting itself out (and returning when an outer scope still
+# holds the graph), then ending the graph. The mutants below are built from them.
+SCOPE_COUNT_OUT = ("        bool outermost = false;\n"
+                   "        {\n"
+                   "            std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);\n"
+                   "            outermost = --ctx->execution_dispatch_depth == 0;\n"
+                   "        }\n"
+                   "        if (!outermost) {\n"
+                   "            return;\n"
+                   "        }\n")
+SCOPE_END = ("        if (std::uncaught_exceptions() > uncaught) {\n"
+             "            ggml_sycl_execution_quarantine_graph(ctx);\n"
+             "        } else {\n"
+             "            ggml_sycl_execution_seal_graph(ctx);\n"
+             "        }\n")
+GRAPH_ENDERS = re.compile(r"\bggml_sycl_execution_(?:seal_graph|quarantine_graph|release_graph|submit_graph|"
+                          r"abort_and_release_graph|clear_graph_tracking|try_retire_terminal|"
+                          r"reset_backend_binding_state)\s*\(")
+
+
+# --- The outermost dispatch scope owns the end of the tracked graph ---
+#
+# Scopes can nest: a scoped path that falls back into compute_impl opens a second one on the same backend. Only the
+# scope that lowers the depth to zero seals or quarantines. An inner scope leaves the graph to the scope that opened
+# it, on a normal exit and on an unwind alike; the exception reaches that scope's destructor by unwinding. An inner
+# scope that ended the graph would do it while the outer one still counts, and the tripwire would report a clean
+# unwind as something ending the graph under a dispatch.
+def scope_end_violations(source):
+    blank = blank_comments_and_literals(source)
+    at = blank.find("~ggml_sycl_execution_dispatch_scope() {")
+    if at < 0:
+        return ["the dispatch scope's destructor was not found"]
+    open_at = blank.find("{", at)
+    dtor = " ".join(blank[open_at:matching_close(blank, open_at) + 1].split())
+    found = []
+    lowered = dtor.find("outermost = --ctx->execution_dispatch_depth == 0;")
+    if lowered < 0 or dtor.count("execution_dispatch_depth") != 1 or not ordered(
+            dtor, "std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);",
+            "outermost = --ctx->execution_dispatch_depth == 0;"):
+        found.append("the destructor lowers the depth and tests it for zero in one expression, under the state lock")
+    guard = dtor.find("if (!outermost) { return; }")
+    enders = [m.start() for m in GRAPH_ENDERS.finditer(dtor)]
+    if guard < 0 or guard < lowered or any(ender < guard for ender in enders):
+        found.append("an inner scope returns before anything in the destructor seals, quarantines or ends the graph")
+    if not enders:
+        found.append("the outermost scope ends the graph")
     return found
 
 
@@ -477,15 +526,7 @@ tripwire_mutants = {
         "        ggml_sycl_execution_try_retire_terminal(ctx, site, line);",
         "                ggml_sycl_execution_clear_graph_tracking(backend_ctx);\n            });\n"
         "        ggml_sycl_execution_try_retire_terminal(ctx, site, line);", 1),
-    "scope-counts-out-late": backend.replace(
-        "            --ctx->execution_dispatch_depth;\n        }\n        if (std::uncaught_exceptions() > uncaught) {\n"
-        "            ggml_sycl_execution_quarantine_graph(ctx);\n        } else {\n"
-        "            ggml_sycl_execution_seal_graph(ctx);\n        }\n",
-        "        }\n        if (std::uncaught_exceptions() > uncaught) {\n"
-        "            ggml_sycl_execution_quarantine_graph(ctx);\n        } else {\n"
-        "            ggml_sycl_execution_seal_graph(ctx);\n        }\n"
-        "        {\n            std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);\n"
-        "            --ctx->execution_dispatch_depth;\n        }\n", 1),
+    "scope-counts-out-late": backend.replace(SCOPE_COUNT_OUT + SCOPE_END, SCOPE_END + SCOPE_COUNT_OUT, 1),
     "tripwire-without-site": backend.replace("while a dispatch scope holds it open: site=%s:%d ",
                                              "while a dispatch scope holds it open: ", 1),
 }
@@ -498,6 +539,35 @@ checks.update({
 })
 if tripwire_found:
     print("tripwire contract: " + "; ".join(tripwire_found), file=sys.stderr)
+
+scope_end_found = scope_end_violations(backend)
+scope_end_mutants = {
+    # The shape before the outermost rule: every scope counts out and then seals or quarantines.
+    "inner-scope-ends-graph": backend.replace(
+        SCOPE_COUNT_OUT,
+        "        {\n"
+        "            std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);\n"
+        "            --ctx->execution_dispatch_depth;\n"
+        "        }\n", 1),
+    # An inner scope that steps aside on a normal exit but still quarantines on an unwind.
+    "inner-scope-quarantines-on-unwind": backend.replace(
+        "        if (!outermost) {\n", "        if (!outermost && std::uncaught_exceptions() <= uncaught) {\n", 1),
+    # The depth tested after the lock is dropped, where another scope can move it between the two.
+    "depth-tested-outside-the-lock": backend.replace(
+        "            outermost = --ctx->execution_dispatch_depth == 0;\n        }\n",
+        "            --ctx->execution_dispatch_depth;\n        }\n"
+        "        outermost = ctx->execution_dispatch_depth == 0;\n", 1),
+}
+checks.update({
+    "only the outermost dispatch scope seals or quarantines the tracked graph": not scope_end_found,
+    **{
+        f"outermost-scope contract witnesses mutation {name}": mutated != backend
+        and bool(scope_end_violations(mutated))
+        for name, mutated in scope_end_mutants.items()
+    },
+})
+if scope_end_found:
+    print("outermost-scope contract: " + "; ".join(scope_end_found), file=sys.stderr)
 
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
