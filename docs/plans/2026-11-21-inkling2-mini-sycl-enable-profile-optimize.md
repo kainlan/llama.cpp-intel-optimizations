@@ -140,8 +140,9 @@ digraph dependencies {
 | `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp` | 7a | None |
 | `ggml/src/ggml-sycl/zone-sizing.{hpp,cpp}`, `tests/test-zone-sizing.cpp` | 4b | None |
 | `ggml/src/ggml-sycl/moe-resolved-batch.hpp` | gap tasks from 8 | Sequential |
-| `scripts/sycl-inkling-profile.sh`, `tests/test-sycl-inkling-profile-script.sh` | 10, 10b | Sequential (Track B) |
-| `scripts/sycl-lock.sh`, `scripts/sycl-moe-exec-gate.sh`, `scripts/sycl-qwen35-ppl-gate.sh`, `docs/backend/sycl-host-safety.md`, `CLAUDE.md` | 10b | None |
+| `scripts/sycl-inkling-profile.sh`, `tests/test-sycl-inkling-profile-script.sh` | 10 | None |
+| `scripts/sycl-lock.sh`, `tests/test-sycl-lock.sh` | 10 (creates), 10b (reads) | Sequential (Track B) |
+| `scripts/sycl-moe-exec-gate.sh`, `scripts/sycl-qwen35-ppl-gate.sh`, their stub tests, `docs/backend/sycl-host-safety.md`, `CLAUDE.md` | 10b | None |
 | `scripts/sycl-sched-census.py` | 11 | None |
 | `ggml/src/ggml-sycl/kv-room-cost.hpp`, `ggml/src/ggml-sycl/tests/test-kv-room-cost.cpp` | 16 | None |
 | `docs/backend/inkling2-profile.md`, `docs/backend/data/inkling2/` | 1, 8, 12, 13 | Lead writes data, T13 writes prose |
@@ -1210,12 +1211,14 @@ Run: `bash tests/test-sycl-inkling-profile-script.sh` — Expected: all `PASS:`,
 ### Task 10b: Every lock taker uses an atomic `mkdir` (found 2026-11-21)
 
 **Track:** B
-**Depends on:** Task 10 (its lock function is the one to share). Blocks Task 12: sixteen profile runs take the lock.
+**Depends on:** Task 10 (it creates the lock library). Blocks Task 12: sixteen profile runs take the lock.
 **File scope:**
-- Create: `scripts/sycl-lock.sh` (sourced helper: the one atomic taker, the holder check, the release)
-- Modify: `scripts/sycl-inkling-profile.sh` (use the helper), `scripts/sycl-moe-exec-gate.sh` (`lock_take`, and the
-  header line that says the lock is `mkdir $LOCK_DIR`), `scripts/sycl-qwen35-ppl-gate.sh` (the `until mkdir` loop)
-- Modify: the stub tests of those three scripts; `docs/backend/sycl-host-safety.md` (the `GPU.lock` paragraph);
+- Read, not modified: `scripts/sycl-lock.sh` (Task 10 creates it with its own stub test `tests/test-sycl-lock.sh`)
+- Modify: `scripts/sycl-moe-exec-gate.sh` (`lock_take` at :1237, `lock_release` at :1244, and the header line :128
+  that says the lock is `mkdir $LOCK_DIR`), `scripts/sycl-qwen35-ppl-gate.sh` (the `until mkdir` loop at :272 and the
+  bare `rmdir` trap at :277, which writes no `holder` today)
+- Modify: `tests/test-sycl-moe-exec-gate-script.sh`, `tests/test-sycl-qwen35-ppl-gate.sh`;
+  `docs/backend/sycl-host-safety.md` (the `GPU.lock` paragraph at :282-288, which shows `until mkdir GPU.lock`);
   `CLAUDE.md` (one line in "Running Tests": how a lock is taken)
 
 **Why:** `/usr/bin/mkdir` on this host is uutils coreutils 0.10.0. It runs `statx(L)`, then `mkdir(L)`, and exits 0
@@ -1224,14 +1227,28 @@ Measured: 400 paired races on one path, both succeeded in 173; with GNU `mkdir` 
 that is already held is still refused; the hole is two takers arriving together, for example two waiters released by
 one `rmdir`. Two holders of `GPU.lock` are two model loads on one card.
 
-**Done when:** no tracked script takes a lock with plain `mkdir`; the helper takes it with a real `mkdir(2)`
-(`python3 -c 'import os,sys; os.mkdir(sys.argv[1])'`), writes `holder` with noclobber, re-reads it after a short wait
-and treats a foreign `holder` as "not mine, do not release"; a race test (two takers started together, many
-iterations, the system `mkdir` first in `PATH`) shows exactly one holder per iteration for each script; the document
-and `CLAUDE.md` say how to take a lock by hand (`/usr/bin/gnumkdir` on this host).
+**Ruling 2026-11-21, after the third quality review of Task 10:** the library is created in Task 10, not here. The
+review showed that the take sequence needs one process for the `mkdir(2)`, the exclusive `holder` write and the
+verify re-read, with TERM, INT and HUP ignored for that span: a shell child between those steps keeps the default
+signal action, and a signal sent to the process group that kills it strands the lock directory. That unit is a
+library with its own deterministic tests (a `mkdir` shim that copies the uutils outcome, a `python3` shim that plants
+a foreign `holder` right after the real `mkdir`), so it is written once, in the task under review, and this task only
+adopts it. Interface: `sycl_lock_take DIR TEXT VERIFY_SECONDS` (0 held; 1 busy; 2 a co-taker's holder, nothing
+removed; 3 directory created but holder not written, remove by hand), `sycl_lock_holder_is DIR TEXT`,
+`sycl_lock_release DIR TEXT` (1 and a stderr line when the holder is foreign or missing, nothing removed).
 
-**The lead writes this task out to the Task Detail Standard when Task 10 merges**, lifting Task 10's reviewed lock
-function into the helper unchanged.
+**Done when:** no tracked script takes a lock with plain `mkdir`; both older gate scripts take and release through
+`scripts/sycl-lock.sh` with a `holder` line that is unique per taker (pid and start time); each script's stub test
+has the deterministic plain-`mkdir` mutant case (lock directory pre-created with no holder, a `mkdir` shim first in
+`PATH` that exits 0 on an existing directory: the script must not run its tool and must not remove the directory);
+the document and `CLAUDE.md` say how to take a lock by hand (`/usr/bin/gnumkdir` on this host) and what a taker
+cannot detect (a co-taker with a non-atomic `mkdir` that writes no `holder`).
+
+**Not in this task, recorded here:** `scripts/sycl-qwen35-ppl-gate.sh` still waits for `MemAvailable > 150 GB`
+before its run (:266-268). That half of the settle rule was retired by the ruling of 2026-11-12. It gets its own
+tracker task.
+
+**The lead writes this task out to the Task Detail Standard when Task 10 merges**, against the library as reviewed.
 
 ---
 
