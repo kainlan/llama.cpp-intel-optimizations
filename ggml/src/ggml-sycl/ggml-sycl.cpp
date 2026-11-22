@@ -16840,6 +16840,16 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
     ggml_sycl_execution_clear_graph_tracking(ctx);
 }
 
+// The record of a drain wait that threw, as "<stage>: <what>". A throw out of a wait bypasses the queue's handler, so
+// the latch has not moved; this records it, as synchronize records a drain that throws, so the context's next boundary
+// fails. The text is formatted into a buffer on the stack and the record copies it, so neither allocates or locks, and
+// this is safe under any lock a caller holds.
+static void ggml_sycl_async_failure_record_stage(int device, const char * stage, const char * what) noexcept {
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: %s", stage, what ? what : "(no message)");
+    ggml_sycl_async_failure_record(device, message);
+}
+
 // The second attempt of a drain whose release was refused. A refusal with the invocation still live usually means a
 // quarantined MoE workspace slot pins it: nothing recycled the slot, because its completion task's terminal_release()
 // was refused or skipped, or because a route catch whose own wait threw left it quarantined. The recovery frees a slot
@@ -16854,12 +16864,13 @@ static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_cont
         if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
             stream->wait_and_throw();
         }
-    } catch (...) {
-        // A throw out of the wait bypasses the queue's handler, so the latch has not moved: record it, as synchronize
-        // records a drain that throws, so the context's next boundary fails. The record is lock-free and
-        // allocation-free, so it is safe under any lock a caller holds.
-        ggml_sycl_async_failure_record(ctx->device, "drain retry wait threw");
+    } catch (const std::exception & e) {
+        ggml_sycl_async_failure_record_stage(ctx->device, "drain retry wait threw", e.what());
         // Enqueue status is unproven: the slot stays quarantined and the caller takes the abort path.
+        return false;
+    } catch (...) {
+        // Nothing to say beyond the stage. The record is lock-free and allocation-free.
+        ggml_sycl_async_failure_record(ctx->device, "drain retry wait threw");
         return false;
     }
     ggml_sycl_recover_exact_mmid_after_drain(ctx);
@@ -16928,14 +16939,15 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
         } else if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
             stream->wait_and_throw();
         }
-    } catch (...) {
-        // A throw out of the wait bypasses the queue's handler, so the latch has not moved: record it, as synchronize
-        // records a drain that throws, so the context's next boundary fails. The record is lock-free and
-        // allocation-free, so it is safe under any lock a caller holds.
-        ggml_sycl_async_failure_record(ctx->device, "begin-path drain wait threw");
+    } catch (const std::exception & e) {
+        ggml_sycl_async_failure_record_stage(ctx->device, "begin-path drain wait threw", e.what());
         // Enqueue status is now uncertain for this device. Fall through to the
         // quarantine path, which retains every root/backing lease instead of
         // releasing on an unproven terminal.
+        waited = false;
+    } catch (...) {
+        // Nothing to say beyond the stage. The record is lock-free and allocation-free.
+        ggml_sycl_async_failure_record(ctx->device, "begin-path drain wait threw");
         waited = false;
     }
     ctx->last_graph_event.reset();
@@ -16979,14 +16991,15 @@ static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_i
                 } else if (const queue_ptr stream = backend_ctx->stream(backend_ctx->device, 0)) {
                     stream->wait_and_throw();
                 }
-            } catch (...) {
-                // A throw out of the wait bypasses the queue's handler, so the latch has not moved: record it, as
-                // synchronize records a drain that throws, so the context's next boundary fails. The record is
-                // lock-free and allocation-free, so it is safe under any lock a caller holds.
-                ggml_sycl_async_failure_record(backend_ctx->device, "context drain wait threw");
+            } catch (const std::exception & e) {
+                ggml_sycl_async_failure_record_stage(backend_ctx->device, "context drain wait threw", e.what());
                 // Enqueue status is now uncertain for this device. Fall through
                 // to the quarantine path, which retains every root/backing lease
                 // instead of releasing on an unproven terminal.
+                waited = false;
+            } catch (...) {
+                // Nothing to say beyond the stage. The record is lock-free and allocation-free.
+                ggml_sycl_async_failure_record(backend_ctx->device, "context drain wait threw");
                 waited = false;
             }
             backend_ctx->last_graph_event.reset();

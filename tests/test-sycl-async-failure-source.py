@@ -38,8 +38,11 @@ With comments blanked:
      (waited false) goes straight to the abort, else release, else recover and release; the backend destructor
      calls the recovery before its abort-and-release.
   W. (ggml-sycl.cpp) a drain wait that throws is recorded in the device latch, as synchronize records one: a
-     synchronous throw (a lost device) bypasses the queue's handler. The catch of the drain retry's wait, and of the
-     first wait of each drain twin, calls ggml_sycl_async_failure_record with that context's device.
+     synchronous throw (a lost device) bypasses the queue's handler. The drain retry's wait, and the first wait of
+     each drain twin, catch const std::exception & first and record "<stage>: <what>" with that context's device
+     through ggml_sycl_async_failure_record_stage, which formats into a char buffer on the stack with snprintf (no
+     allocation, no lock; the record copies the text); the catch (...) after it records the bare stage with
+     ggml_sycl_async_failure_record. Both catches of each twin set waited false.
   K. (ggml-sycl.cpp) the completion-hold test seam (a second holder of the direct route's completion object that
      outlives its host task, so the oracle can show that B, not the runtime's functor lifetime, releases the pin) is
      compiled only for route testing: every mention of ggml_sycl_q1_nvfp4_test_retain_completion,
@@ -71,15 +74,26 @@ RETAIN_BLOCK = "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n                       
 # Both drain twins: a wait that threw goes straight to the abort, else release, else recover and release.
 TWIN_CONDITION = (r"if \(!waited \|\|\s*\(!ggml_sycl_execution_release_graph\({ctx}\) &&\s*"
                   r"!ggml_sycl_execution_recover_and_release_graph\({ctx}\)\)\) \{{")
-# (claim name, function body local, the record call its catch must make)
+D_OWN = "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {"
+D_CTX = "static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {"
+STD_CATCH = "catch (const std::exception & e)"
+ANY_CATCH = "catch (...)"
+STAGE_RECORD = ("static void ggml_sycl_async_failure_record_stage(int device, const char * stage, "
+                "const char * what) noexcept")
+# (claim name, function body local, the context's device, the stage its catches record)
 DRAIN_RECORDS = (
-    ("W the drain retry records a throwing wait", "d",
-     'ggml_sycl_async_failure_record(ctx->device, "drain retry wait threw");'),
-    ("W the begin-path twin records a throwing wait", "d_own",
-     'ggml_sycl_async_failure_record(ctx->device, "begin-path drain wait threw");'),
-    ("W the context twin records a throwing wait", "d_ctx",
-     'ggml_sycl_async_failure_record(backend_ctx->device, "context drain wait threw");'),
+    ("W the drain retry records a throwing wait", "d", "ctx->device", "drain retry wait threw"),
+    ("W the begin-path twin records a throwing wait", "d_own", "ctx->device", "begin-path drain wait threw"),
+    ("W the context twin records a throwing wait", "d_ctx", "backend_ctx->device", "context drain wait threw"),
 )
+
+
+def bare_record(device, stage):
+    return f'ggml_sycl_async_failure_record({device}, "{stage}");'
+
+
+def what_record(device, stage):
+    return f'ggml_sycl_async_failure_record_stage({device}, "{stage}", e.what());'
 
 
 def blank_comments(text):
@@ -126,6 +140,18 @@ def route_testing_lines(text):
     return inside
 
 
+def splice(text, signatures, old, new):
+    """`text` with the first `old` in the body reached through `signatures` (outermost first) replaced by `new`."""
+    if not signatures:
+        return text.replace(old, new, 1)
+    start = text.find(signatures[0])
+    inner = body(text, signatures[0])
+    if start < 0 or not inner:
+        return text
+    at = text.find(inner, start)
+    return text[:at] + splice(inner, signatures[1:], old, new) + text[at + len(inner):]
+
+
 def test_seam_guarded(sycl):
     inside = route_testing_lines(sycl)
     mentions = [n for n, line in enumerate(sycl.split("\n")) if any(name in line for name in TEST_SEAM)]
@@ -142,8 +168,8 @@ def claims(cache, sycl, common):
     h = body(common, "sycl::async_handler ggml_sycl_async_handler(int slot)")
     b = body(sycl, "h.host_task([completion")[1:-1].rstrip()
     d = body(sycl, "static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept")
-    d_own = body(sycl, "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {")
-    d_ctx = body(sycl, "static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {")
+    d_own = body(sycl, D_OWN)
+    d_ctx = body(sycl, D_CTX)
     d_dtor = body(sycl, "ggml_backend_sycl_context::~ggml_backend_sycl_context() {")
     d_wait = d.find("stream->wait_and_throw();")
     d_recover = d.find("ggml_sycl_recover_exact_mmid_after_drain(ctx);")
@@ -155,8 +181,15 @@ def claims(cache, sycl, common):
     s_release = s.find("(void) ggml_sycl_execution_release_graph(sycl_ctx);")
     route = body(sycl, "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {")
     bodies = {"d": d, "d_own": d_own, "d_ctx": d_ctx}
-    records = {name: record in body(bodies[local], "catch (...)") for name, local, record in DRAIN_RECORDS}
+    records = {name: what_record(device, stage) in body(bodies[local], STD_CATCH) and
+               bare_record(device, stage) in body(bodies[local], ANY_CATCH)
+               for name, local, device, stage in DRAIN_RECORDS}
+    stage_record = body(sycl, STAGE_RECORD)
     return records | {
+        "W the stage record formats on the stack": "char message[" in stage_record and
+            "snprintf(message, sizeof(message)," in stage_record and
+            "ggml_sycl_async_failure_record(device, message);" in stage_record and
+            re.search(r"std::string|\bnew\b|malloc|mutex|lock", stage_record) is None,
         "Q execution context has the handler": "ggml_sycl_make_context(dev, device)" in q,
         "Q execution queue has the handler": "ggml_sycl_make_queue(ctx, dev, device," in q,
         "S no abort on a throwing drain": s != "" and "SYCL_CHECK(err)" not in s and "CHECK_TRY_ERROR" not in s,
@@ -187,8 +220,10 @@ def claims(cache, sycl, common):
         "D the begin-path twin skips the release after a throwing wait": re.search(
             TWIN_CONDITION.format(ctx="ctx"), d_own) is not None,
         "D the context twin skips the release after a throwing wait": re.search(
-            TWIN_CONDITION.format(ctx="backend_ctx"), d_ctx) is not None and "waited = false;" in body(
-            d_ctx, "catch (...)"),
+            TWIN_CONDITION.format(ctx="backend_ctx"), d_ctx) is not None and
+            all("waited = false;" in body(d_ctx, catch) for catch in (STD_CATCH, ANY_CATCH)),
+        "D the begin-path twin skips the release after either throwing catch": all(
+            "waited = false;" in body(d_own, catch) for catch in (STD_CATCH, ANY_CATCH)),
         "D the context twin retries before it aborts": 0 <= d_ctx.find(
             "ggml_sycl_execution_recover_and_release_graph(backend_ctx)") < d_ctx.find(
             "ggml_sycl_execution_abort_and_release_graph(backend_ctx);"),
@@ -275,9 +310,10 @@ def main():
             "context twin releases after a throwing wait": (cache, re.sub(
                 r"if \(!waited \|\|\s*(\(!ggml_sycl_execution_release_graph\(backend_ctx\))", r"if (\1", sycl,
                 count=1), common),
-            "context twin forgets the throwing wait": (cache, sycl.replace(
-                'context drain wait threw");', 'context drain wait threw"); waited = true;', 1).replace(
-                "                waited = false;\n            }", "            }", 1), common),
+            **{f"{twin} forgets a throwing wait in its {catch}": (cache, splice(
+                sycl, (signature, catch), "waited = false;", ""), common)
+               for twin, signature in (("context twin", D_CTX), ("begin-path twin", D_OWN))
+               for catch in (STD_CATCH, ANY_CATCH)},
             "destructor releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
             "completion hold outside the testing guard": (cache, sycl.replace(
@@ -294,8 +330,13 @@ def main():
                 BUNDLE_DROP + "\n                                });\n                            });\n" + RETAIN_BLOCK, 1), common),
             "route does not hand over its completion": (cache, sycl.replace(
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", "", 1), common),
-            **{f"{name}: record removed": (cache, sycl.replace(record, "", 1), common)
-               for name, _, record in DRAIN_RECORDS},
+            **{f"{name}: bare record removed": (cache, sycl.replace(bare_record(device, stage), "", 1), common)
+               for name, _, device, stage in DRAIN_RECORDS},
+            **{f"{name}: what dropped": (cache, sycl.replace(what_record(device, stage), bare_record(device, stage),
+                                                             1), common)
+               for name, _, device, stage in DRAIN_RECORDS},
+            "the stage record allocates": (cache, splice(sycl, (STAGE_RECORD,), "char message[256];",
+                                                         "std::string message(256, ' ');"), common),
             "handler logs": (cache, sycl, common.replace("ggml_sycl_async_failure_record(bound, e.what());",
                                                          "GGML_LOG_ERROR(\"%s\", e.what());", 1)),
         }
