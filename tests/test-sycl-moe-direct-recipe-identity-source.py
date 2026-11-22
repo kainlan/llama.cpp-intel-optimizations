@@ -2,7 +2,7 @@
 
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
-The closed Q1_0/NVFP4 decode route binds and retains each expert lease through
+The Q1_0/NVFP4 decode route binds and retains each expert lease through
 moe::canonical_allocation_integration::retain(). Before llama.cpp-1sxq, ggml_sycl_moe_query_route_capability() offered
 the DIRECT recipe only to a lease whose handle kind was mem_handle_kind::DIRECT. That was a second, narrower answer to
 the binder's question "does this lease carry an exact, allocator-minted allocation identity?". Every expert lease

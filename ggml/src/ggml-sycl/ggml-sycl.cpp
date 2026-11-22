@@ -36652,12 +36652,15 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // fall-through is validated for the local executor only.
         //
         // Admitting here does NOT mean the generic executor runs Q1_0/NVFP4.
-        // choose_moe_batch_executor() in moe-resolved-batch.hpp rejects them
-        // unconditionally; they execute only through the direct block in
-        // ggml_sycl_mul_mat_id (decode rows, primary card, AoS), which runs before
-        // it. An operand that falls through that block still refuses one layer down
-        // (reason=capability_unsupported, carrying capability=local-mmvq from right
-        // here). That is deliberate, not a bug in either layer.
+        // choose_moe_batch_executor() in moe-resolved-batch.hpp rejects a device
+        // recipe for them unconditionally; they execute only through the direct
+        // block in ggml_sycl_mul_mat_id (decode rows, primary card, AoS). The gate
+        // has two askers: the hybrid decode record build, before the direct block,
+        // for a layer with host experts (its refusal hands the tensor back to the
+        // retained route), and the retained route core, after the direct block, for
+        // an operand that fell through it, which refuses with
+        // reason=capability_unsupported and capability=local-mmvq from right here.
+        // That is deliberate, not a bug in either layer.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
                                              K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         if (!local_executor_shape_ok) {
@@ -123797,8 +123800,9 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
         // the MMID coverage tables below. Q1_0 and NVFP4 are in them and stay
         // admitted by design: they carry fp16 converters, their decode rows on the
-        // primary card run through the MMID direct route, and the rest are refused
-        // by the runtime route oracle (the sanctioned fail-closed class of c-wps7).
+        // primary card run through the MMID direct route, host-resident experts run
+        // on the CPU, and the remaining device rows are refused by the runtime route
+        // oracle (the sanctioned fail-closed class of c-wps7).
         // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
         // the dense allowlist plus Q1_0/NVFP4, so every other type without a
         // kernel -- upstream b10630's tq2_0 and anything future -- is refused

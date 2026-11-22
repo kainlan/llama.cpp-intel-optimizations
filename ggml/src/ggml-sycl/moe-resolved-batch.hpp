@@ -832,13 +832,20 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     if (direct_q1_nvfp4) {
         // Q1_0/NVFP4 run on a device only through the MMID direct route in
         // ggml_sycl_mul_mat_id (decode rows on the primary card, AoS, with an
-        // admitted workspace bundle), which executes before this choice is asked;
-        // that route is open since the B70 and B50 oracle runs of 2026-11-22. A
-        // device recipe that reaches this gate fell through it -- prompt rows, a
-        // secondary card, a layout other than AoS, an authority or bundle the
-        // route could not obtain -- and no generic executor runs these types, so it
-        // is refused here. A host-resident expert carries a HOST_CPU recipe, runs on
-        // the CPU, and is not refused by this gate.
+        // admitted workspace bundle); that route is open since the B70 and B50
+        // oracle runs of 2026-11-22. No generic executor runs these types, so a
+        // device recipe for them is refused here. Two callers ask this gate:
+        //  - the hybrid decode record build (ggml_sycl_moe_hybrid_decode_record_build),
+        //    for every expert of a layer with host experts, BEFORE the direct block
+        //    runs. Its refusal is not fatal: the hybrid route declines the layer and
+        //    the retained route keeps the tensor, so the op still reaches the direct
+        //    block;
+        //  - the retained route core, AFTER the direct block, for an operand that fell
+        //    through it: prompt rows, a secondary card, a layout other than AoS, a
+        //    selection that mixes host and device experts, or an authority or bundle
+        //    the route could not obtain.
+        // A host-resident expert carries a HOST_CPU recipe, runs on the CPU, and is not
+        // refused by this gate.
         //
         // ggml_sycl_moe_query_route_capability() (ggml-sycl.cpp, the Q1_0/NVFP4
         // fall-through) deliberately ADMITS them as MMVQ_COMPAT, so a reader

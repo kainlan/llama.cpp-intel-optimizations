@@ -1,8 +1,8 @@
-// BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+// BUILD_TESTING-only live regression for the Q1/NVFP4 production MMID route.
 //
 // Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
 // there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
-// off the primary card (to the host or another card), which the closed route cannot reach; SKIP[no-backend] means no
+// off the primary card (to the host or another card), which the route cannot reach; SKIP[no-backend] means no
 // backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
 // the no-GPU skip.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
@@ -242,7 +242,7 @@ struct lifecycle_fixture {
                 }
                 owner_devices.insert(workspace.owner_device);
             }
-            // The closed route admits primary residency only; a selected expert the plan put elsewhere (a secondary
+            // The route admits primary residency only; a selected expert the plan put elsewhere (a secondary
             // card or the host) cannot reach it, so this environment cannot exercise the route.
             for (int expert : route_selected_experts) {
                 bool found = false;
@@ -257,7 +257,7 @@ struct lifecycle_fixture {
                                             (entry.on_device ? "device " + std::to_string(entry.target_device) :
                                                                std::string("the host")) +
                                             ", not primary device " + std::to_string(primary_device) +
-                                            "; the closed route covers primary residency only "
+                                            "; the route covers primary residency only "
                                             "(pin ONEAPI_DEVICE_SELECTOR to one card)");
                     }
                 }
