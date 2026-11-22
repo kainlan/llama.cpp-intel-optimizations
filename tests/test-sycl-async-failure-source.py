@@ -33,6 +33,11 @@ With comments blanked:
      ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
      call it before ggml_sycl_execution_abort_and_release_graph; the backend destructor calls the recovery before
      its abort-and-release.
+  K. (ggml-sycl.cpp) the completion-hold test seam (a second holder of the direct route's completion object that
+     outlives its host task, so the oracle can show that B, not the runtime's functor lifetime, releases the pin) is
+     compiled only for route testing: every mention of ggml_sycl_q1_nvfp4_test_retain_completion,
+     ggml_sycl_q1_nvfp4_test_hold_completion, ggml_sycl_q1_nvfp4_test_completion_held and the held pointer sits inside
+     an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the route hands its completion to the seam.
   H. (common.cpp ggml_sycl_async_handler) the handler body has no throw statement, no GGML_LOG, no lock or mutex, no
      std::string and no new.
 """
@@ -43,6 +48,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 BUNDLE_DROP = "completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};"
+HOLD_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_test_hold_completion",
+             "ggml_sycl_q1_nvfp4_test_completion_held", "g_q1_nvfp4_test_held_completion", "g_q1_nvfp4_test_hold_")
 
 
 def blank_comments(text):
@@ -65,6 +72,34 @@ def body(text, signature):
         if depth == 0:
             return text[open_at:i + 1]
     return ""
+
+
+def route_testing_lines(text):
+    """Indexes of the lines inside the taken branch of an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING."""
+    inside, stack = set(), []
+    for n, line in enumerate(text.split("\n")):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            directive = " ".join(stripped[1:].split())
+            if directive.startswith("if"):
+                stack.append(directive in ("ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING",
+                                           "if defined(GGML_SYCL_Q1_NVFP4_ROUTE_TESTING)"))
+                continue
+            if directive.startswith(("else", "elif")) and stack:
+                stack[-1] = False
+                continue
+            if directive.startswith("endif") and stack:
+                stack.pop()
+                continue
+        if any(stack):
+            inside.add(n)
+    return inside
+
+
+def hold_seam_guarded(sycl):
+    inside = route_testing_lines(sycl)
+    mentions = [n for n, line in enumerate(sycl.split("\n")) if any(name in line for name in HOLD_SEAM)]
+    return bool(mentions) and all(n in inside for n in mentions)
 
 
 def claims(cache, sycl, common):
@@ -122,6 +157,8 @@ def claims(cache, sycl, common):
         "D the destructor recovers before it releases": 0 <= d_dtor.find(
             "ggml_sycl_recover_exact_mmid_after_drain(this);") < d_dtor.find(
             "ggml_sycl_execution_abort_and_release_graph(this);"),
+        "K the completion-hold seam is compiled only for route testing": hold_seam_guarded(sycl),
+        "K the route hands its completion to the seam": "ggml_sycl_q1_nvfp4_test_retain_completion(completion);" in sycl,
         "T route arms with its cursor": "terminal->arm(final, failure_cursor);" in sycl and
             "const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);" in sycl,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
@@ -189,6 +226,17 @@ def main():
                 r"\s*&&\s*!ggml_sycl_execution_recover_and_release_graph\(backend_ctx\)", "", sycl, count=1), common),
             "destructor releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
+            "completion hold outside the testing guard": (cache, sycl.replace(
+                "terminal->arm(final, failure_cursor);",
+                "ggml_sycl_q1_nvfp4_test_retain_completion(completion); terminal->arm(final, failure_cursor);", 1),
+                common),
+            "completion hold under an else branch": (cache, sycl.replace(
+                "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n                            "
+                "ggml_sycl_q1_nvfp4_test_retain_completion(completion);",
+                "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n#else\n                            "
+                "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", 1), common),
+            "route does not hand over its completion": (cache, sycl.replace(
+                "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", "", 1), common),
             "handler logs": (cache, sycl, common.replace("ggml_sycl_async_failure_record(bound, e.what());",
                                                          "GGML_LOG_ERROR(\"%s\", e.what());", 1)),
         }

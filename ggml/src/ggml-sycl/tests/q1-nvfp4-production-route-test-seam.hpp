@@ -54,3 +54,8 @@ GGML_SYCL_Q1_TEST_LOCAL void ggml_sycl_q1_nvfp4_test_counters_read(
     ggml_sycl_q1_nvfp4_test_counters * counters);
 GGML_SYCL_Q1_TEST_LOCAL void ggml_sycl_q1_nvfp4_test_failure_once(
     enum ggml_sycl_q1_nvfp4_test_failure failure);
+// While armed, the direct route's next completion object gets a second holder that outlives its host task, as a copy
+// of the host-task functor kept by the SYCL runtime would. Disarming releases that holder; held reports whether one
+// exists, so a case can show the seam took effect.
+GGML_SYCL_Q1_TEST_LOCAL void ggml_sycl_q1_nvfp4_test_hold_completion(bool hold);
+GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_q1_nvfp4_test_completion_held();

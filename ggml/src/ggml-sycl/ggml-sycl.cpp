@@ -11829,6 +11829,12 @@ std::atomic<uint64_t> g_q1_nvfp4_test_quarantine{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_failure_consumed{ 0 };
 std::atomic<uint32_t> g_q1_nvfp4_test_workspace_slot{ UINT32_MAX };
 std::atomic<uint64_t> g_q1_nvfp4_test_workspace_generation{ 0 };
+// A second holder of the direct route's completion object that outlives the completion host task, as a copy of the
+// host-task functor kept by the SYCL runtime would. Typed void because the completion type is defined further down;
+// the shared pointer still destroys it as what it is.
+std::mutex            g_q1_nvfp4_test_hold_mutex;
+bool                  g_q1_nvfp4_test_hold_armed = false;
+std::shared_ptr<void> g_q1_nvfp4_test_held_completion;
 
 bool ggml_sycl_q1_nvfp4_test_model_matches(ggml_sycl_model_token a, ggml_sycl_model_token b) {
     return a.model_id == b.model_id && a.load_txn_id == b.load_txn_id &&
@@ -11865,6 +11871,14 @@ bool ggml_sycl_q1_nvfp4_test_consume_failure(ggml_sycl_q1_nvfp4_test_failure fai
         expected, GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE, std::memory_order_acq_rel);
     if (consumed) g_q1_nvfp4_test_failure_consumed.fetch_add(1, std::memory_order_relaxed);
     return consumed;
+}
+
+// Keeps the first completion submitted while armed; later ones are not held.
+void ggml_sycl_q1_nvfp4_test_retain_completion(std::shared_ptr<void> completion) {
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
+    if (g_q1_nvfp4_test_hold_armed && !g_q1_nvfp4_test_held_completion) {
+        g_q1_nvfp4_test_held_completion = std::move(completion);
+    }
 }
 } // namespace
 
@@ -11922,6 +11936,23 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
 
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
     g_q1_nvfp4_test_failure.store(static_cast<uint32_t>(failure), std::memory_order_release);
+}
+
+void ggml_sycl_q1_nvfp4_test_hold_completion(bool hold) {
+    std::shared_ptr<void> released;
+    {
+        std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
+        g_q1_nvfp4_test_hold_armed = hold;
+        if (!hold) {
+            released = std::move(g_q1_nvfp4_test_held_completion);
+        }
+    }
+    // The completion is destroyed here, outside the hold mutex: a bundle it still owns takes the workspace locks.
+}
+
+bool ggml_sycl_q1_nvfp4_test_completion_held() {
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
+    return g_q1_nvfp4_test_held_completion != nullptr;
 }
 #endif
 
@@ -87258,6 +87289,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     });
                                 });
                             }
+#endif
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                            ggml_sycl_q1_nvfp4_test_retain_completion(completion);
 #endif
                             terminal->arm(final, failure_cursor);
                             exact_queue->submit([completion, terminal, final](sycl::handler & h) {

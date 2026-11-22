@@ -577,15 +577,47 @@ void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_
                    "failure quarantine delta was not exact", before);
 }
 
-void injected_async_terminal_failure_case() {
+// Arms the second holder of the route's completion object for one case, and releases it when the case ends, by return
+// or by a throw. Declared after the fixture, so the holder is gone before the fixture's teardown drains the context.
+struct completion_hold {
+    explicit completion_hold(bool arm) : armed(arm) {
+        if (armed) {
+            ggml_sycl_q1_nvfp4_test_hold_completion(true);
+        }
+    }
+
+    ~completion_hold() {
+        if (armed) {
+            ggml_sycl_q1_nvfp4_test_hold_completion(false);
+        }
+    }
+
+    completion_hold(const completion_hold &)             = delete;
+    completion_hold & operator=(const completion_hold &) = delete;
+
+    const bool armed;
+};
+
+// With hold_completion, a second holder of the route's completion object outlives the completion host task, as a copy
+// of the host-task functor inside the SYCL runtime would. The end state must not change: the host task empties the
+// shared bundle before it returns, so no holder of the completion object keeps the invocation pinned.
+void injected_async_terminal_failure_case(bool hold_completion) {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
-    const case_scope scope("injected_async_terminal_failure_case", before);
+
+    const case_scope scope(hold_completion ? "injected_async_terminal_failure_case (completion held)" :
+                                             "injected_async_terminal_failure_case",
+                           before);
+
     const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(life.backend_device);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
+    const completion_hold hold(hold_completion);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
                    "async terminal fixture failed before submission", before);
+    // If the seam held nothing, the held run would pass whatever the host task does with the bundle.
+    require_stages(!hold_completion || ggml_sycl_q1_nvfp4_test_completion_held(),
+                   "the route's completion object was not held past its host task", before);
     // ggml_backend_graph_compute ends with the synchronize that reports the failure. Its cleanup must release the
     // failed graph: a failed bundle whose workspace is never recovered keeps the invocation pinned, and the device
     // stays owned by a context that computes nothing more, so the next context's graph fails with DEVICE_BUSY.
@@ -722,7 +754,9 @@ int main() {
         require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         require_clean_teardown();
-        injected_async_terminal_failure_case();
+        injected_async_terminal_failure_case(false);
+        require_clean_teardown();
+        injected_async_terminal_failure_case(true);
         require_clean_teardown();
         refused_graph_then_synchronize_case();
         require_clean_teardown();
