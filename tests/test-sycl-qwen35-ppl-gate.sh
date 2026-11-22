@@ -2,6 +2,9 @@
 # Host-only tests for scripts/sycl-qwen35-ppl-gate.sh (llama.cpp-rb2h): the scoring that decides whether
 # the multi-ubatch qwen35 perplexity runs are deterministic, and the shape of the arms it would run.
 # No GPU and no model: the scoring runs over fixture logs and the arms are read from --dry-run.
+# GPU.lock: --lock-selftest takes, checks and releases a lock under the test's temp dir through the run's wait loop
+# (an existing directory behind a mkdir that reports success, a busy lock waited for, an uncreatable lock not waited
+# for, a TERM during the take, bad LLAMA_GPU_LOCK_* values); no case names the real GPU.lock.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -111,5 +114,59 @@ if "$GATE" --dry-run --corpus /nonexistent/corpus.txt --device 2 >/dev/null 2>&1
 fi
 "$GATE" --dry-run --corpus /nonexistent/corpus.txt --device 2 --oracle none >/dev/null ||
     fail "--oracle none must still allow an unrecorded device"
+
+# GPU.lock through scripts/sycl-lock.sh. --lock-selftest takes, checks and releases a lock under $work.
+export LLAMA_GPU_LOCK_VERIFY_SECONDS=0
+real_py="$(command -v python3)" || fail "python3 is needed for the lock cases"
+out="$(LLAMA_GPU_LOCK="$work/q.lock" "$GATE" --lock-selftest 2>&1)" || fail "--lock-selftest must pass: $out"
+grep -q 'lock-selftest: ok' <<<"$out" || fail "--lock-selftest must print ok: $out"
+[ ! -e "$work/q.lock" ] || fail "--lock-selftest left its lock behind"
+# a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+mkdir -p "$work/shim"
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
+    >"$work/shim/mkdir"
+chmod +x "$work/shim/mkdir"
+/usr/bin/mkdir "$work/pre.lock"
+rc=0
+out="$(PATH="$work/shim:$PATH" LLAMA_GPU_LOCK="$work/pre.lock" LLAMA_GPU_LOCK_WAIT_SECONDS=2 \
+    LLAMA_GPU_LOCK_POLL_SECONDS=1 "$GATE" --lock-selftest 2>&1)" || rc=$?
+[ "$rc" -eq 1 ] || fail "a lock directory that exists must not be taken (rc $rc): $out"
+grep -q "could not take $work/pre.lock in 2s" <<<"$out" || fail "the wait bound must be named: $out"
+[ -d "$work/pre.lock" ] || fail "a failed take removed the lock directory"
+# a busy lock is waited for
+echo "someone else" >"$work/pre.lock/holder"
+(sleep 1.5; rm -f "$work/pre.lock/holder"; rmdir "$work/pre.lock") &
+out="$(LLAMA_GPU_LOCK="$work/pre.lock" LLAMA_GPU_LOCK_WAIT_SECONDS=20 LLAMA_GPU_LOCK_POLL_SECONDS=1 \
+    "$GATE" --lock-selftest 2>&1)" || fail "a lock released by its holder must be taken: $out"
+wait
+# a lock that cannot be created is not waited for
+rc=0
+out="$(LLAMA_GPU_LOCK="$work/no-such-parent/q.lock" LLAMA_GPU_LOCK_WAIT_SECONDS=600 \
+    timeout 20 "$GATE" --lock-selftest 2>&1)" || rc=$?
+[ "$rc" -eq 1 ] || fail "an uncreatable lock must stop at once (rc $rc; 124 means it waited): $out"
+grep -q 'waiting will not clear it' <<<"$out" || fail "the stop must say waiting does not help: $out"
+# a TERM before the take's mkdir: the python3 shim delays the take (the program that calls os.mkdir) by 2 s and
+# leaves the release at full speed, so a gate that dies at once releases nothing and the take then strands the lock
+mkdir -p "$work/slowpy"
+printf '#!/bin/sh\ncase "$2" in *os.mkdir*) : > "%s"; sleep 2 ;; esac\nexec "%s" "$@"\n' \
+    "$work/slowpy.started" "$real_py" >"$work/slowpy/python3"
+chmod +x "$work/slowpy/python3"
+PATH="$work/slowpy:$PATH" LLAMA_GPU_LOCK="$work/sig.lock" "$GATE" --lock-selftest >"$work/sig.out" 2>&1 &
+gpid=$!
+for _ in $(seq 50); do [ -e "$work/slowpy.started" ] && break; sleep 0.1; done
+[ -e "$work/slowpy.started" ] || fail "the take never started"
+kill -TERM "$gpid"
+rc=0
+wait "$gpid" || rc=$?
+[ "$rc" -eq 143 ] || fail "a TERM during the take must end the gate with 143 (rc $rc): $(cat "$work/sig.out")"
+sleep 4 # longer than the shim's delay: a take that outlived the gate would have created the lock by now
+[ ! -e "$work/sig.lock" ] || fail "a TERM during the take stranded the lock: $(cat "$work/sig.lock/holder" 2>&1)"
+for bad in LLAMA_GPU_LOCK_VERIFY_SECONDS=08 LLAMA_GPU_LOCK_WAIT_SECONDS=x LLAMA_GPU_LOCK_POLL_SECONDS=0; do
+    rc=0
+    out="$(env "$bad" LLAMA_GPU_LOCK="$work/bad.lock" "$GATE" --lock-selftest 2>&1)" || rc=$?
+    [ "$rc" -eq 1 ] || fail "$bad must be refused (rc $rc)"
+    grep -q "${bad%%=*}" <<<"$out" || fail "the refusal must name ${bad%%=*}: $out"
+done
+[ ! -e "$work/bad.lock" ] || fail "a refused value created the lock"
 
 echo "test-sycl-qwen35-ppl-gate: PASS"
