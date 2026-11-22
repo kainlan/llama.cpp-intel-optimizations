@@ -12275,10 +12275,10 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 #endif
 }
 
+static void                        ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context * ctx) noexcept;
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
-static void ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context * ctx) noexcept;
 static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
                                                                                      const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept;
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
@@ -16902,8 +16902,7 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
     }
     ctx->last_graph_event.reset();
     ctx->last_graph_event_deferred_decode = false;
-    if (!waited ||
-        (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {
+    if (!waited || (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {
         ggml_sycl_execution_abort_and_release_graph(ctx);
     }
     ggml_sycl_execution_try_retire_terminal(ctx);
