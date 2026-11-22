@@ -37,6 +37,7 @@ void gated_delta_net_sycl(const float *     q,
                           int64_t           sb3,
                           const sycl::uint3 neqk1_magic,
                           const sycl::uint3 rq3_magic,
+                          const sycl::uint3 rk3_magic,
                           float             scale,
                           int               K) {
     auto           item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -49,6 +50,7 @@ void gated_delta_net_sycl(const float *     q,
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+    const uint32_t ik3 = fastdiv(sequence, rk3_magic);
 
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     float *       attn_data        = dst;
@@ -82,7 +84,7 @@ void gated_delta_net_sycl(const float *     q,
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     const float * qp = q + iq3 * sq3 + iq1 * sq1 + lane;
-    const float * kp = k + iq3 * sk3 + iq1 * sk1 + lane;
+    const float * kp = k + ik3 * sk3 + iq1 * sk1 + lane;
     const float * vp = v + sequence * sv3 + h_idx * sv1 + col0;
     const float * bp = beta + sequence * sb3 + h_idx * sb1;
     const float * gp = g + (sequence * sb3 + h_idx * sb1) * (KDA ? S_v : 1);
@@ -256,6 +258,7 @@ static void launch_gated_delta_net(const float *   q_d,
                                    int64_t         sb3,
                                    int64_t         neqk1,
                                    int64_t         rq3,
+                                   int64_t         rk3,
                                    float           scale,
                                    int             K,
                                    dpct::queue_ptr stream) {
@@ -264,6 +267,7 @@ static void launch_gated_delta_net(const float *   q_d,
 
     const sycl::uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const sycl::uint3 rq3_magic   = init_fastdiv_values(rq3);
+    const sycl::uint3 rk3_magic   = init_fastdiv_values(rk3);
 
     auto launch = [&](auto sv_c, auto c_c) {
         constexpr int sv = decltype(sv_c)::value;
@@ -274,7 +278,7 @@ static void launch_gated_delta_net(const float *   q_d,
                              [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                  gated_delta_net_sycl<sv, C, KDA, keep_rs_t>(
                                      q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sk1, sk2,
-                                     sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                     sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, rk3_magic, scale, K);
                              });
     };
     // gdn_cols_wide columns per warp cut the q/k loads but launch fewer warps, so with few heads 1 column is faster.
@@ -324,7 +328,9 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT(neq1 == nek1);
     const int64_t neqk1 = neq1;
 
+    // q and k may repeat over the sequences at different ratios, as in the CPU reference.
     const int64_t rq3 = nev3 / neq3;
+    const int64_t rk3 = nev3 / nek3;
 
     const float * q_d = (const float *) src_q->data;
     const float * k_d = (const float *) src_k->data;
@@ -368,21 +374,21 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
     if (kda) {
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1, sq2,
-                                               sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K,
-                                               stream);
+                                               sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, rk3, scale,
+                                               K, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1, sq2,
-                                                sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K,
-                                                stream);
+                                                sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, rk3,
+                                                scale, K, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1, sq2,
-                                                sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, scale, K,
-                                                stream);
+                                                sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, rk3,
+                                                scale, K, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, S_v, H, n_tokens, n_seqs, sq1,
-                                                 sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                                                 sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3, rk3,
                                                  scale, K, stream);
         }
     }
