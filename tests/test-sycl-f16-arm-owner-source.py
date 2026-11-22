@@ -6,14 +6,19 @@ With comments blanked, in ggml-sycl.cpp, ggml_sycl_dequant_f16_from_loaded_layou
      mem_handle_kind::WEIGHT: the cache lease is asked only for a weight the cache placed.
   D. The function declares owner exactly once (a shadowing declaration in a branch would leave the retained owner
      empty), assigns owner exactly twice (once per owner branch) and plane exactly three times (its declaration and
-     once per owner branch), so nothing reassigns either between the owner branches and the converter.
+     once per owner branch), so nothing reassigns either between the owner branches and the converter. With string
+     literals blanked too, the token owner occurs exactly 6 times, each inside one of six allowed forms used once
+     each: the declaration, the two owner assignments, the WEIGHT branch's plane = owner.resolve(ctx.device).ptr;,
+     the identity check and { std::move(owner) } in the retain call. So nothing moves, swaps or empties owner.
+  W. The WEIGHT branch reads plane = owner.resolve(ctx.device).ptr;: the plane comes from the lease it holds, not
+     from the resolver's answer, whose retention ends at return.
   H. The tensor's handle is &extra->data_handle[ctx.device] and no other data_handle slot is named.
-  2. The branch whose condition names mem_handle_kind::CHUNK_LEASE has no || in its condition, and the condition
-     contains tensor_handle->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE, tensor_handle->device() ==
-     ctx.device, loaded.retention == nullptr (a resolution that carries its own retention, the resolver's fallback
-     to a cache pointer, did not come from the tensor's handle) and loaded.layout == GGML_LAYOUT_SOA. The layout
-     conjunct restates what holds there already (a layout other than SOA is refused before the branches); the claim
-     pins that it stays, it does not make it load-bearing.
+  2. The condition of the branch that names mem_handle_kind::CHUNK_LEASE is, whitespace-normalized, exactly
+     tensor_handle->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE && tensor_handle->device() == ctx.device &&
+     loaded.layout == GGML_LAYOUT_SOA && loaded.retention == nullptr. A resolution that carries its own retention
+     (the resolver's fallback to a cache pointer) did not come from the tensor's handle. The layout conjunct
+     restates what holds there already (a layout other than SOA is refused before the branches); it is pinned as a
+     restatement, not as load-bearing.
   I. In that branch, after owner = *tensor_handle and before plane = loaded.ptr, the copy is tied to the pointer the
      kernel reads: if (owner.resolve(ctx.device).ptr != loaded.ptr) refuses with the named refusal.
   3. That branch chains the ready event with ggml_sycl_chain_ready_event_if_needed(*stream, loaded,
@@ -49,6 +54,14 @@ CONVERTER = "to_fp16(plane, dst_f16, ne, stream);"
 NO_OWNER = 'refuse("f16 dequant arm: the SOA plane has no owner the arm can hold");'
 KIND = "tensor_handle->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE"
 DEVICE = "tensor_handle->device() == ctx.device"
+CHUNK_CONDITION = ("if (" + KIND + " && " + DEVICE + " && loaded.layout == GGML_LAYOUT_SOA && "
+                   "loaded.retention == nullptr)")
+# The six forms the token owner may appear in, each exactly once (string literals blanked).
+OWNER_FORMS = (r"ggml_sycl::mem_handle\s+owner\s*;", r"\bowner\s*=\s*ggml_sycl_acquire_weight_layout\(",
+               r"\bplane\s*=\s*owner\.resolve\(ctx\.device\)\.ptr;", r"\bowner\s*=\s*\*tensor_handle;",
+               r"if\s*\(\s*owner\.resolve\(ctx\.device\)\.ptr\s*!=\s*loaded\.ptr\s*\)",
+               r"retain_handles_until_event\(\s*\{\s*std::move\(owner\)\s*\}")
+WEIGHT_PLANE = r"\bplane\s*=\s*owner\.resolve\(ctx\.device\)\.ptr;"
 IDENTITY = re.compile(r"if \(owner\.resolve\(ctx\.device\)\.ptr != loaded\.ptr\) \{\s*" + re.escape(NO_OWNER) +
                       r"\s*\}")
 CHAIN = re.compile(r"ggml_sycl_chain_ready_event_if_needed\(\*stream,\s*loaded,\s*ggml_sycl_chain_same_queue_identity\("
@@ -64,11 +77,9 @@ CD = "D owner is declared once"
 CA = f"D owner is assigned {OWNER_ASSIGNMENTS} times"
 CP = f"D plane is assigned {PLANE_ASSIGNMENTS} times"
 CH = "H the tensor's handle is data_handle[ctx.device]"
-C2_OR = "2 the CHUNK_LEASE condition has no disjunction"
-C2_KIND = "2 the CHUNK_LEASE condition tests the handle's kind"
-C2_DEV = "2 the CHUNK_LEASE condition tests the handle's device"
-C2_RET = "2 the CHUNK_LEASE condition refuses a resolution that carries its own retention"
-C2_LAYOUT = "2 the CHUNK_LEASE condition restates the loaded layout, and the plane is loaded.ptr"
+CU = "D owner occurs only in its six allowed forms, each once"
+CW = "W the WEIGHT branch reads the plane through the lease it holds"
+C2 = "2 the CHUNK_LEASE condition is exactly: CHUNK_LEASE kind, this device, SOA, no retention of its own"
 CI = "I the handle copy is tied to the pointer the kernel reads"
 C3 = "3 the CHUNK_LEASE branch chains the ready event, same-queue aware, before the converter"
 C4_CHUNK = "4 the CHUNK_LEASE branch takes an owner"
@@ -121,6 +132,23 @@ def branch(text, marker):
     return text[start:open_at], (text[open_at:end] if end >= 0 else "")
 
 
+def blank_strings(text):
+    return re.sub(r'"(?:\\.|[^"\\\n])*"', lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', text)
+
+
+def owner_only_in_forms(f):
+    code = blank_strings(f)
+    spans = []
+    for form in OWNER_FORMS:
+        hits = list(re.finditer(form, code))
+        if len(hits) != 1:
+            return False
+        spans.append(hits[0].span())
+    tokens = [m.start() for m in re.finditer(r"\bowner\b", code)]
+    return len(tokens) == len(OWNER_FORMS) and all(
+        sum(a <= tok < b for a, b in spans) == 1 for tok in tokens)
+
+
 def claims(sycl):
     f = body(sycl, F16_SIG)
     w_cond, w_body = branch(f, "mem_handle_kind::WEIGHT")
@@ -140,12 +168,9 @@ def claims(sycl):
         CA: len(re.findall(r"\bowner\s*=(?!=)", f)) == OWNER_ASSIGNMENTS,
         CP: len(re.findall(r"\bplane\s*=(?!=)", f)) == PLANE_ASSIGNMENTS,
         CH: "&extra->data_handle[ctx.device]" in f and f.count("data_handle[") == 1,
-        C2_OR: c_cond != "" and "||" not in c_cond,
-        C2_KIND: KIND in c_cond,
-        C2_DEV: DEVICE in c_cond,
-        C2_RET: re.search(r"\bloaded\.retention\s*==\s*nullptr\b", c_cond) is not None,
-        C2_LAYOUT: "loaded.layout == GGML_LAYOUT_SOA" in c_cond and plane_read is not None and
-            "loaded.ptr" not in c_cond,
+        CU: owner_only_in_forms(f),
+        CW: re.search(WEIGHT_PLANE, w_body) is not None,
+        C2: " ".join(c_cond.split()) == CHUNK_CONDITION,
         CI: copy is not None and identity is not None and plane_read is not None and
             copy.start() < identity.start() < plane_read.start(),
         C3: CHAIN.search(c_body) is not None and 0 <= c_at < converter_at,
@@ -199,13 +224,25 @@ def mutants(sycl):
         ("plane reassigned before the converter", CP,
          arm(re.escape(CONVERTER), "plane = (void *) src0_dd_i; " + CONVERTER)),
         ("handle taken from data_handle[0]", CH, arm(r"data_handle\[ctx\.device\]", "data_handle[0]")),
-        ("kind widened to DIRECT", C2_OR,
+        ("owner moved out in the CHUNK_LEASE branch", CU,
+         arm(r"\bplane\s*=\s*loaded\.ptr;",
+             "{ ggml_sycl::mem_handle dropped = std::move(owner); } plane = loaded.ptr;")),
+        ("owner moved out in the WEIGHT branch", CU,
+         arm(WEIGHT_PLANE, "plane = owner.resolve(ctx.device).ptr; { auto dropped = std::move(owner); }")),
+        ("owner moved into a temporary before the converter", CU,
+         arm(re.escape(CONVERTER), "(void) ggml_sycl::mem_handle(std::move(owner)); " + CONVERTER)),
+        ("owner swapped with an empty handle", CU,
+         arm(r"\bowner\s*=\s*\*tensor_handle;",
+             "owner = *tensor_handle; { ggml_sycl::mem_handle empty; std::swap(owner, empty); }")),
+        ("WEIGHT branch reads the resolver's pointer", CW, arm(WEIGHT_PLANE, "plane = loaded.ptr;")),
+        ("kind widened to DIRECT", C2,
          arm(re.escape(KIND), f"({KIND} || tensor_handle->kind() == ggml_sycl::mem_handle_kind::DIRECT)")),
-        ("kind negated", C2_KIND, arm(re.escape(KIND), KIND.replace("==", "!="))),
-        ("device test made vacuous", C2_OR, arm(re.escape(DEVICE), f"({DEVICE} || true)")),
-        ("device compare dropped", C2_DEV, arm(re.escape(DEVICE) + r"\s*&&", "")),
-        ("retention test dropped", C2_RET, arm(r"&&\s*loaded\.retention\s*==\s*nullptr", "")),
-        ("layout compare dropped", C2_LAYOUT, arm(r"loaded\.layout == GGML_LAYOUT_SOA\s*&&", "")),
+        ("kind negated", C2, arm(re.escape(KIND), KIND.replace("==", "!="))),
+        ("kind test made vacuous", C2, arm(re.escape(KIND), f"!({KIND} && false)")),
+        ("device test made vacuous", C2, arm(re.escape(DEVICE), f"({DEVICE} || true)")),
+        ("device compare dropped", C2, arm(re.escape(DEVICE) + r"\s*&&", "")),
+        ("retention test dropped", C2, arm(r"&&\s*loaded\.retention\s*==\s*nullptr", "")),
+        ("layout compare dropped", C2, arm(r"loaded\.layout == GGML_LAYOUT_SOA\s*&&", "")),
         ("identity check removed", CI, arm(IDENTITY.pattern, "")),
         ("identity check after the plane read", CI,
          arm(IDENTITY.pattern + r"(\s*)plane(\s*)= loaded\.ptr;", "plane = loaded.ptr; if (owner.resolve(ctx.device)"
