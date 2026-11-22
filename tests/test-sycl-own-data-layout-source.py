@@ -28,9 +28,12 @@ could scramble correct bytes. With comments and string literals blanked:
      vector's resize/data), so no helper can carry the decision out of sight.
   D. set_tensor's reset block (the if (extra) block that calls optimized_feature.reset_reorder) assigns
      own_data_layout = GGML_LAYOUT_AOS.
-  G. ggml_backend_sycl_set_tensor_async assigns it only under if (extra != nullptr && dst_is_own_range), and
-     dst_is_own_range is declared false and set only to true (where the tensor's own storage handle took the write)
-     and to dst_ptr == tensor->data (where it did not): the resolved destination need not be the own range.
+  G. In ggml_backend_sycl_set_tensor_async every own_data_layout write lies in the block of
+     if (extra != nullptr && dst_is_own_range). dst_is_own_range is declared once as bool dst_is_own_range = false;
+     no compound assignment (|=, &=, ...) names it; and it has exactly two other assignments: = true; inside the
+     block of if (ggml_sycl_find_tensor_storage_handle(tensor, owner, &dst_storage) ...) (the tensor's own storage
+     handle took the write), and = (dst_ptr == tensor->data); inside the else block that directly follows it (it did
+     not, and the resolved destination need not be the own range).
 
 --self-test applies at least one mutant per claim and requires each to fail the claim it targets; a mutant whose
 target text is not found fails the self-test.
@@ -65,7 +68,11 @@ MARK_SOA = "extra->optimized_feature.mark_soa_pretransformed(tensor->name);"
 COAL_GUARD = "if (tensor_ptr == tensor->data)"
 ASYNC_GUARD = "if (extra != nullptr && dst_is_own_range)"
 ASYNC_FLAG = re.compile(r"\bdst_is_own_range\s*=(?!=)\s*([^;]*?)\s*;")
-ASYNC_FLAG_VALUES = ["dst_ptr == tensor->data", "false", "true"]
+ASYNC_FLAG_DECL = re.compile(r"\bbool\s+dst_is_own_range\s*=\s*false\s*;")
+ASYNC_FLAG_COMPOUND = re.compile(r"\bdst_is_own_range\s*(?:<<|>>|[-+*/%&|^])=")
+ASYNC_STORAGE_IF = "if (ggml_sycl_find_tensor_storage_handle(tensor, owner, &dst_storage)"
+ASYNC_FLAG_THEN = "true"
+ASYNC_FLAG_ELSE = "(dst_ptr == tensor->data)"
 MEMSET_SIG = "static void ggml_backend_sycl_buffer_memset_tensor("
 ROOT_EXTRA = "static_cast<const ggml_tensor_extra_gpu *>(root->extra)"
 # The forms the token may appear in (R): the declaration, a write through extra->, and the reader's one read.
@@ -207,11 +214,39 @@ def reader_calls_ok(get_body):
         all(name in READER_MEMBER_CALLS for name in member)
 
 
+def in_block_of(text, at, guard):
+    """True when `at` lies in the block opened by some occurrence of `guard`."""
+    for g in re.finditer(re.escape(guard), text):
+        open_at = text.find("{", g.start())
+        if 0 <= open_at < at < block_end(text, open_at):
+            return True
+    return False
+
+
 def async_guard_ok(async_body):
     writes = list(re.finditer(r"\bown_data_layout\s*=(?!=)", async_body))
-    flags = sorted(" ".join(m.group(1).split()) for m in ASYNC_FLAG.finditer(async_body))
-    return len(writes) >= 1 and all(guarded_by(async_body, m.start(), ASYNC_GUARD) for m in writes) and \
-        flags == ASYNC_FLAG_VALUES and re.search(r"\bbool\s+dst_is_own_range\s*=\s*false\s*;", async_body) is not None
+    if not writes or not all(in_block_of(async_body, m.start(), ASYNC_GUARD) for m in writes):
+        return False
+    decls = list(ASYNC_FLAG_DECL.finditer(async_body))
+    if len(decls) != 1 or ASYNC_FLAG_COMPOUND.search(async_body):
+        return False
+    # The storage-handle branch and the else block that directly follows it.
+    if async_body.count(ASYNC_STORAGE_IF) != 1:
+        return False
+    then_open = async_body.find("{", async_body.find(ASYNC_STORAGE_IF))
+    then_end = block_end(async_body, then_open)
+    els = re.compile(r"\s*else\s*\{").match(async_body, then_end) if then_end >= 0 else None
+    if not els:
+        return False
+    else_open = els.end() - 1
+    else_end = block_end(async_body, else_open)
+    decl_start, decl_end = decls[0].span()
+    assigns = [m for m in ASYNC_FLAG.finditer(async_body) if not decl_start <= m.start() < decl_end]
+    if len(assigns) != 2:
+        return False
+    found = {(then_open < m.start() < then_end, else_open < m.start() < else_end, " ".join(m.group(1).split()))
+             for m in assigns}
+    return found == {(True, False, ASYNC_FLAG_THEN), (False, True, ASYNC_FLAG_ELSE)}
 
 
 def claims(files):
@@ -245,7 +280,8 @@ def check(files):
 
 
 def mutate(files, name, signature, pattern, repl, nth=0):
-    """`files` with the `nth` match of `pattern` inside the body after `signature` in `name` replaced by `repl`."""
+    """`files` with the `nth` match of `pattern` inside the body after `signature` in `name` replaced by `repl` (a
+    string, or a function of the match that returns one)."""
     text = files.get(name, "")
     span = body_span(text, signature)
     if span is None:
@@ -256,6 +292,7 @@ def mutate(files, name, signature, pattern, repl, nth=0):
         return files
     hit = matches[nth]
     out = dict(files)
+    repl = repl(hit) if callable(repl) else repl
     out[name] = text[:span[0]] + inner[:hit.start()] + repl + inner[hit.end():] + text[span[1]:]
     return out
 
@@ -299,7 +336,12 @@ def mutants(files):
         ("the async record no longer guarded by the own range", CG,
          s(ASYNC_SIG, re.escape(ASYNC_GUARD), "if (extra != nullptr)")),
         ("the async own-range flag set without the pointer check", CG,
-         s(ASYNC_SIG, r"\bdst_is_own_range\s*=\s*dst_ptr == tensor->data\s*;", "dst_is_own_range = true;")),
+         s(ASYNC_SIG, r"\bdst_is_own_range\s*=\s*\(dst_ptr == tensor->data\)\s*;", "dst_is_own_range = true;")),
+        ("the async own-range flag's branches swapped", CG,
+         s(ASYNC_SIG, r"(?s)\bdst_is_own_range = true;(.*?)\bdst_is_own_range = \(dst_ptr == tensor->data\);",
+           lambda m: "dst_is_own_range = (dst_ptr == tensor->data);" + m.group(1) + "dst_is_own_range = true;")),
+        ("a compound assignment to the async own-range flag", CG,
+         s(ASYNC_SIG, r"\bdst_is_own_range = true;", "dst_is_own_range |= true;")),
         ("the reset block records SOA", CD,
          s(SET_SIG, re.escape(SET_AOS), "extra->own_data_layout = GGML_LAYOUT_SOA;")),
         ("the reset assignment moved out of the reset block", CD,

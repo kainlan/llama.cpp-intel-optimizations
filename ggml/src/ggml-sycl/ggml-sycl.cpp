@@ -97316,7 +97316,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
         dst_is_own_range = true;
     } else {
         dst_handle       = ggml_sycl_copy_handle_for_raw_ptr(dst_ptr, GGML_LAYOUT_AOS, owner);
-        dst_is_own_range = dst_ptr == tensor->data;
+        dst_is_own_range = (dst_ptr == tensor->data);
     }
     auto src_handle = ggml_sycl::mem_handle::from_direct(const_cast<void *>(data), GGML_LAYOUT_AOS, /*on_device=*/false,
                                                          ggml_sycl::mem_handle::HOST_DEVICE, size);
