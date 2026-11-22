@@ -1835,6 +1835,22 @@ if (NOT WIN32)
     )
 endif()
 
+# sycl-inkling-profile-script: --dry-run stub test of the Inkling profile runner
+# (selector map, per-run env, no -ngl, one instrument per run). Never locks the
+# GPU or loads a model.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME sycl-inkling-profile-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-inkling-profile-script.sh
+    )
+    set_tests_properties(sycl-inkling-profile-script PROPERTIES
+        LABELS "sycl;policy"
+        TIMEOUT 120
+    )
+endif()
+
 if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
