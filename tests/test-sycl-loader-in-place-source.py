@@ -45,6 +45,16 @@ The charge (ucc = unified-cache.cpp)
       placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable, info.load_loader_device, <builder's
       device>), and the kv_info fill sets load_weights_evictable from ggml_backend_sycl_weights_evictable() and
       load_loader_device from the scheduler's device count: device 0 when it sees one device, -1 otherwise.
+  C3. The loader's buffers are charged as the pinned pool holds them (hpp = unified-cache.hpp). Once the plan admits,
+      no WEIGHT zone growth for them may fail, so the commit terms size the zone with
+      placement_loader_pool_footprint_for over plan.loader_tensor_bytes, at the buffer type's maximum size
+      (host_zone_buffer_max_size of plan.loader_buffer_cap and the pool's chunk) and the pool's chunk: the WEIGHT
+      zone is the record less host_zone_loader_bytes plus the footprint's zone bytes (loader_zone), and the chunks
+      the pool grows for an oversize buffer are loader_grown, which total() counts. A card that does not hold the
+      buffer sheds both. populate_host_zone_sizing records the tensors from its inventory, the one writer; the fact
+      copy copies the cap from info.load_loader_buffer_cap, which the kv_info fill takes from the buffer type's chunk
+      cap; and ggml_sycl_host_buft_max_size answers through host_zone_buffer_max_size, so the plan and the buffer
+      type share one rule.
 
 Run: python3 -I tests/test-sycl-loader-in-place-source.py [--self-test]
 """
@@ -57,7 +67,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 GS = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 UCC = "ggml/src/ggml-sycl/unified-cache.cpp"
-FILES = (GS, UCC)
+HPP = "ggml/src/ggml-sycl/unified-cache.hpp"
+FILES = (GS, UCC, HPP)
 RAW = "raw:"  # the raw text of a file, for the one clause that reads a comment
 
 _LEXEME_RE = re.compile(
@@ -318,6 +329,51 @@ def clause_c2_one_fact(t: dict) -> list:
     return problems
 
 
+def clause_c3_pool_footprint(t: dict) -> list:
+    problems = []
+    terms = body_of(t[HPP], r"\binline\s+host_zone_commit_terms\s+placement_plan_host_zone_commit_terms\s*\(")
+    if not terms:
+        return ["placement_plan_host_zone_commit_terms not found in unified-cache.hpp"]
+    if not re.search(r"\bplacement_loader_pool_footprint_for\s*\(\s*plan\.loader_tensor_bytes\s*,\s*"
+                     r"host_zone_buffer_max_size\s*\(\s*plan\.loader_buffer_cap\s*,\s*chunk_bytes\s*\)\s*,\s*"
+                     r"chunk_bytes\s*\)", terms):
+        problems.append("the commit terms do not replay the loader's buffers at the buffer type's maximum size")
+    if not re.search(r"\bterms\.loader_zone\s*=\s*\w+\.zone\s*;", terms):
+        problems.append("the commit terms do not take loader_zone from the footprint")
+    if not re.search(r"\bterms\.loader_grown\s*=\s*\w+\.grown\s*;", terms):
+        problems.append("the commit terms do not take loader_grown from the footprint")
+    if not re.search(r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-\s*plan\.host_zone_loader_bytes\s*\+\s*"
+                     r"terms\.loader_zone\s*;", terms):
+        problems.append("the WEIGHT zone does not hold the loader's zone bytes in place of its raw bytes")
+    if not re.search(r"size_t\s+total\s*\(\s*\)\s*const\s*\{\s*return\s+zones\s*\(\s*\)\s*\+\s*runtime\s*\+\s*"
+                     r"rounding\s*\+\s*loader_grown\s*;", t[HPP]):
+        problems.append("host_zone_commit_terms::total() does not count the chunks the loader grows")
+    share = body_of(t[HPP], r"\binline\s+host_zone_commit_terms\s+placement_plan_host_zone_commit_terms_on_device\s*\(")
+    if not re.search(r"\bon_device\.weight\s*-=\s*std::min\s*\(\s*on_device\.weight\s*,\s*terms\.loader_zone\s*\)", share):
+        problems.append("a card that does not hold the loader's buffer does not shed its zone bytes")
+    for field in ("loader_zone", "loader_grown"):
+        if not re.search(rf"\bon_device\.{field}\s*=\s*0\s*;", share):
+            problems.append(f"a card that does not hold the loader's buffer keeps its {field}")
+    populate = fn(t, UCC, "populate_host_zone_sizing")
+    if not re.search(r"\bplan\.loader_tensor_bytes\.push_back\s*\(", populate) or "tensor_inventory" not in populate:
+        problems.append("populate_host_zone_sizing does not record the loader's tensors from its inventory")
+    writers = re.findall(r"(?:\.|->)loader_tensor_bytes\s*(?:=(?!=)|\.push_back|\.clear|\.assign)", t[UCC] + t[GS])
+    if len(writers) != len(re.findall(r"(?:\.|->)loader_tensor_bytes\s*(?:=(?!=)|\.push_back|\.clear|\.assign)",
+                                      populate)):
+        problems.append("the loader's tensors are written outside populate_host_zone_sizing")
+    copy = fn(t, UCC, "placement_plan_copy_host_backing_fact")
+    if not re.search(r"\bplan\.loader_buffer_cap\s*=\s*info\.load_loader_buffer_cap\s*;", copy):
+        problems.append("the fact copy does not copy the buffer type's chunk cap")
+    if not re.search(r"\bkv\.load_loader_buffer_cap\s*=\s*ggml_backend_sycl_host_buffer_type_chunk_cap\s*\(\s*\)\s*;",
+                     t[GS]):
+        problems.append("the kv_info fill does not take the loader's buffer cap from the buffer type")
+    max_size = fn(t, GS, "ggml_sycl_host_buft_max_size")
+    if not re.search(r"\bggml_sycl::host_zone_buffer_max_size\s*\(\s*chunk_cap\s*,", max_size) or \
+            "CHUNK_SIZE" in max_size:
+        problems.append("ggml_sycl_host_buft_max_size states its own rule, not host_zone_buffer_max_size")
+    return problems
+
+
 CLAUSES = [
     ("O1 a model owns the SYCL_Host chunks its load mints", clause_o1_model_owns_its_chunks),
     ("O2 the MODEL check runs after the reclaim", clause_o2_model_check_after_reclaim),
@@ -327,6 +383,7 @@ CLAUSES = [
     ("P3 the loader term is checked against the load", clause_p3_loader_term_checked),
     ("C1 the WEIGHT zone charges the loader's buffer once, in its pool", clause_c1_terms),
     ("C2 the loader fact has one source", clause_c2_one_fact),
+    ("C3 the loader's buffers are charged as the pool holds them", clause_c3_pool_footprint),
 ]
 
 
@@ -397,6 +454,22 @@ MUTANTS = [
     ("kv-fill-pins-loader-device", "C2", mutate_re(GS, r"\bkv\.load_loader_device\s*=[^;]*;", "kv.load_loader_device = 0;")),
     ("second-fact-writer", "C2", mutate_re(GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
                                            r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_holds_weights = true;")),
+    ("footprint-ignored", "C3", mutate_re(HPP, r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-[^;]*;",
+                                          "terms.weight = plan.host_zone_weight_bytes;")),
+    ("footprint-at-chunk", "C3", mutate_re(HPP, r"host_zone_buffer_max_size\s*\(\s*plan\.loader_buffer_cap\s*,\s*"
+                                                r"chunk_bytes\s*\)", "chunk_bytes")),
+    ("grown-uncounted", "C3", mutate_re(HPP, r"(return\s+zones\s*\(\s*\)\s*\+\s*runtime\s*\+\s*rounding)\s*\+\s*"
+                                             r"loader_grown\s*;", r"\1;")),
+    ("card-sheds-raw", "C3", mutate_re(HPP, r"(on_device\.weight\s*-=\s*std::min\s*\(\s*on_device\.weight\s*,\s*)"
+                                            r"terms\.loader_zone", r"\1plan.host_zone_loader_bytes")),
+    ("card-keeps-grown", "C3", mutate_re(HPP, r"\bon_device\.loader_grown\s*=\s*0\s*;", "")),
+    ("tensors-unrecorded", "C3", mutate_re(UCC, r"\bplan\.loader_tensor_bytes\.push_back\s*\(", "(void) (")),
+    ("second-tensor-writer", "C3", mutate_re(GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
+                                             r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_tensor_bytes.clear();")),
+    ("cap-uncopied", "C3", mutate_re(UCC, r"\bplan\.loader_buffer_cap\s*=\s*info\.load_loader_buffer_cap\s*;", "")),
+    ("cap-unfilled", "C3", mutate_re(GS, r"\bkv\.load_loader_buffer_cap\s*=[^;]*;", "")),
+    ("max-size-restated", "C3", mutate_re(GS, r"ggml_sycl::host_zone_buffer_max_size\s*\(\s*chunk_cap\s*,",
+                                          "std::min(chunk_cap, ggml_sycl::pinned_chunk_pool::CHUNK_SIZE) + 0 * (")),
 ]
 
 

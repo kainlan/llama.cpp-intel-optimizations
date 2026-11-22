@@ -745,6 +745,10 @@ struct placement_kv_info {
     // cache. -1 when the scheduler sees more than one device: libllama then binds each layer's device's buffer type, so
     // the buffer is split across their pools by layer. Unstaged it is -1: no pool is known to hold it.
     int                   load_loader_device       = -1;
+    // The SYCL_Host buffer type's chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB): the largest buffer it lets ggml-alloc
+    // request before the WEIGHT zone bounds it (host_weight_buffer_max_size). The plan replays the loader's split of
+    // its tensors into buffers with it. Unstaged it is 0: no cap beyond the zone's.
+    size_t                load_loader_buffer_cap   = 0;
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
     // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
     // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
@@ -1088,15 +1092,21 @@ uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch
 // figure is what the sizing code will commit, not a second estimate of it). The four zones are the sizes
 // ggml_sycl_configure_host_zones_for_plan() hands configure_host_zones(), KV and SCRATCH at their floors; runtime is
 // the RUNTIME pool it pre-allocates; rounding is what growing the pinned pool in whole chunks adds to both, each chunk
-// with its header. total() is the pool's growth from an empty pool. placement_plan_host_zone_commit_terms() computes
-// it, for the planner and for the configure step alike.
+// with its header. loader_grown is what the pool grows while the loader allocates, for a buffer no chunk segment holds.
+// total() is the pool's growth from an empty pool. placement_plan_host_zone_commit_terms() computes it, for the planner
+// and for the configure step alike.
 struct host_zone_commit_terms {
-    size_t weight   = 0;  // host_zone_weight_bytes
+    size_t weight   = 0;  // host_zone_weight_bytes, its loader term as the zone bytes the loader's buffers take
     size_t kv       = 0;  // host_zone_kv_bytes, at least 64 MiB
     size_t staging  = 0;  // host_zone_staging_bytes
     size_t scratch  = 0;  // host_zone_scratch_bytes, at least live oneDNN scratch + max_copied_tensor_bytes + 32 MiB
     size_t runtime  = 0;  // the RUNTIME pool: the oneDNN scratchpad and the DMA staging pool
     size_t rounding = 0;  // the zones and the runtime bytes each grown to whole chunks, chunk headers included
+
+    // The loader's SYCL_Host buffers (placement_loader_pool_footprint): loader_zone is inside weight, loader_grown is
+    // outside the zones. Both are 0 for a plan that charges no loader term and on a card whose pool does not hold it.
+    size_t loader_zone  = 0;
+    size_t loader_grown = 0;
 
     // The inputs the terms were computed from, the live oneDNN scratch and the pool's chunk, so a re-plan re-records
     // from the record's inputs and never from the cache's state at the re-plan.
@@ -1185,10 +1195,11 @@ struct placement_plan {
     // holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its loader_residency term once,
     // host-wide, when one does, and only that device's zone commits it. loader_serves_host_experts: S1-PRELOAD serves
     // each host-planned PINNED expert from that buffer in place, under the buffer's owner, so such an expert takes no
-    // block of its own.
-    bool loader_holds_weights       = false;
-    int  loader_device              = -1;
-    bool loader_serves_host_experts = false;
+    // block of its own. loader_buffer_cap: placement_kv_info::load_loader_buffer_cap, the buffer type's chunk cap.
+    bool   loader_holds_weights       = false;
+    int    loader_device              = -1;
+    bool   loader_serves_host_experts = false;
+    size_t loader_buffer_cap          = 0;
 
     size_t                       kv_vram_bytes;      // KV bytes on device(s)
     size_t                       kv_host_bytes;      // KV bytes on host
@@ -1306,6 +1317,9 @@ struct placement_plan {
     // The loader_residency term inside host_zone_weight_bytes, which populate_host_zone_sizing records with it: the
     // bytes only loader_device's pool commits (placement_plan_host_zone_commit_terms_on_device).
     size_t                                     host_zone_loader_bytes = 0;
+    // Recorded with it, empty when it is 0: the loader's tensors in the order the loader allocates them, each padded to
+    // the loader's tensor alignment, which placement_loader_pool_footprint_for() splits into buffers as ggml-alloc does.
+    std::vector<size_t>                        loader_tensor_bytes;
     // th32 §3.3, §4.3 step 4: the lazy tables' residency and the block ring their STORAGE reads need. The ring is
     // sized after the residency pass over the tables that stayed STORAGE: block_ring_need = block_ring_qd x
     // block_ring_span_max, and block_ring_charge is its mapped size when the live ring the coverage pin reads is
@@ -2413,7 +2427,30 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 // summed.
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
 
-// Sets `terms.rounding`: the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
+// The loader's SYCL_Host buffers in a fresh pinned pool of `chunk`-byte chunks. ggml-alloc splits the loader's tensors
+// into buffers of at most `max_size` bytes, next-fit in their order, and the pool serves each buffer from one chunk
+// segment of the WEIGHT zone, the first with room, so a buffer never spans two segments.
+//   buffers  the buffers ggml-alloc requests
+//   chunks   the chunk segments those buffers take
+//   zone     the WEIGHT zone bytes they need: every segment but the last whole, the last as far as it is filled
+//   grown    the chunks the pool grows for buffers larger than a chunk, each with its header
+struct placement_loader_pool_footprint {
+    size_t buffers = 0;
+    size_t chunks  = 0;
+    size_t zone    = 0;
+    size_t grown   = 0;
+};
+
+inline placement_loader_pool_footprint placement_loader_pool_footprint_for(const std::vector<size_t> & tensor_bytes,
+                                                                           size_t                      max_size,
+                                                                           size_t                      chunk) {
+    (void) tensor_bytes;
+    (void) max_size;
+    (void) chunk;
+    return {};
+}
+
+// Sets `terms.rounding`:the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
 // chunks apart, in whole chunks of terms.chunk, each backed by the chunk plus a header of that same alignment, and the
 // rounding is what that commits beyond the zones and the RUNTIME bytes. terms.chunk is not 0.
 inline void host_zone_commit_terms_round(host_zone_commit_terms & terms) {
@@ -2452,8 +2489,9 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     const auto sat_add = [](size_t a, size_t b) {
         return a > SIZE_MAX - b ? SIZE_MAX : a + b;
     };
-    terms.weight  = plan.host_zone_weight_bytes;
-    terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
+    terms.weight      = plan.host_zone_weight_bytes;
+    terms.loader_zone = plan.host_zone_loader_bytes;
+    terms.kv          = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
     terms.staging = plan.host_zone_staging_bytes;
     terms.scratch =
         std::max(plan.host_zone_scratch_bytes,

@@ -13,14 +13,25 @@
 // dense host weight still holds a block, and so does every host weight of a multi-device plan or of a plan made for
 // another device: S1-PRELOAD copies them.
 //
+// The loader's buffers are charged as the pool holds them. ggml-alloc splits the loader's tensors into buffers no
+// larger than the buffer type's chunk cap, next-fit in their order, and the pinned pool serves each buffer from one
+// chunk segment of the WEIGHT zone, so a chunk holds one buffer of the loader's size and the rest of the chunk is lost
+// to it. The commit terms charge the zone bytes those buffers take (loader_zone) and the chunks the pool grows for a
+// buffer no segment holds (loader_grown): once the plan admits, the loader's WEIGHT zone allocations need no growth the
+// plan did not count. The oracle replays the pool's own rules (configure_host_zones' segments, zone_alloc's first fit,
+// grow_zone's one chunk sized to the request), and it is checked against the B70 Qwen load that admitted a plan
+// charging raw bytes: the zone held 34 of the 37 buffers, and the pool grew two chunks and was refused the third.
+//
 // Host-only: the fact rule is a constexpr function of the load's inputs, and the terms are a pure function of a
 // hand-built plan. No queue, no device, no allocation.
 
 #include "ggml-impl.h"
 #include "ggml-sycl/unified-cache.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -78,16 +89,39 @@ placement_plan make_plan(bool holds, int loader_device, int plan_device) {
     return plan;
 }
 
-// The zone record populate_host_zone_sizing() makes from the terms: the WEIGHT zone's total and its loader term.
+// The loader's tensors in the order the plan made their entries, each padded to the loader's tensor alignment: an
+// expert tensor is the sum of its slices.
+std::vector<size_t> loader_tensors(const placement_plan & plan) {
+    std::vector<std::string> names;
+    std::vector<size_t>      bytes;
+    for (const auto & e : plan.entries) {
+        const auto it = std::find(names.begin(), names.end(), e.name);
+        if (it == names.end()) {
+            names.push_back(e.name);
+            bytes.push_back(e.src_size);
+        } else {
+            bytes[static_cast<size_t>(it - names.begin())] += e.src_size;
+        }
+    }
+    for (size_t & b : bytes) {
+        b = align_up(b, TENSOR_ALIGNMENT);
+    }
+    return bytes;
+}
+
+// The zone record populate_host_zone_sizing() makes from the terms: the WEIGHT zone's total, its loader term and, with
+// the term, the loader's tensors.
 void record_weight_zone(placement_plan & plan) {
     const host_weight_zone_terms terms = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
     plan.host_zone_weight_bytes        = terms.total();
     plan.host_zone_loader_bytes        = terms.loader_residency;
+    plan.loader_tensor_bytes           = terms.loader_residency > 0 ? loader_tensors(plan) : std::vector<size_t>{};
 }
 
 bool same_terms(const host_zone_commit_terms & a, const host_zone_commit_terms & b) {
     return a.weight == b.weight && a.kv == b.kv && a.staging == b.staging && a.scratch == b.scratch &&
-           a.runtime == b.runtime && a.rounding == b.rounding && a.onednn_live == b.onednn_live && a.chunk == b.chunk;
+           a.runtime == b.runtime && a.rounding == b.rounding && a.loader_zone == b.loader_zone &&
+           a.loader_grown == b.loader_grown && a.onednn_live == b.onednn_live && a.chunk == b.chunk;
 }
 
 size_t loader_bytes() {
@@ -177,7 +211,10 @@ void check_multi_device_charges_loader_once() {
     const host_zone_commit_terms card0  = ggml_sycl::placement_plan_host_zone_commit_terms_on_device(plan, record, 0);
     const host_zone_commit_terms card1  = ggml_sycl::placement_plan_host_zone_commit_terms_on_device(plan, record, 1);
     CHECK(same_terms(card0, record));
+    // One buffer smaller than a chunk: the zone bytes it takes are its own.
+    CHECK(record.loader_zone == loader_bytes());
     CHECK(card1.weight == record.weight - loader_bytes());
+    CHECK(card1.loader_zone == 0 && card1.loader_grown == 0);
     CHECK(card1.kv == record.kv && card1.staging == record.staging && card1.scratch == record.scratch);
     CHECK(card1.runtime == record.runtime && card1.onednn_live == record.onednn_live && card1.chunk == record.chunk);
     CHECK(card1.zones() < record.zones());
@@ -186,6 +223,7 @@ void check_multi_device_charges_loader_once() {
     placement_plan without = plan;
     without.host_zone_weight_bytes -= loader_bytes();
     without.host_zone_loader_bytes = 0;
+    without.loader_tensor_bytes.clear();
     CHECK(same_terms(card1, ggml_sycl::placement_plan_host_zone_commit_terms(without, 0, kChunk)));
 }
 
@@ -243,6 +281,230 @@ void check_mapped_expert_is_neither() {
     }
 }
 
+// ---- The loader's buffers in the pinned pool ----
+
+constexpr size_t kMiB       = 1024 * 1024;
+constexpr size_t kPoolChunk = ggml_sycl::pinned_chunk_pool::CHUNK_SIZE;         // the default pool chunk, 2 GiB
+constexpr size_t kHeader    = ggml_sycl::pinned_chunk_pool::DEFAULT_ALIGNMENT;  // a chunk's header, and its alignment
+constexpr size_t kGrain     = ggml_sycl::tlsf_allocator::block_grain;           // a zone segment's allocation grain
+
+// ggml-alloc's split of a buffer type's tensors (ggml_backend_buft_alloc_buffer_n_plan): next-fit in their order, a
+// buffer closed when the next tensor would take it past max_size.
+std::vector<size_t> split_buffers(const std::vector<size_t> & tensors, size_t max_size) {
+    std::vector<size_t> buffers;
+    size_t              cur = 0;
+    for (const size_t t : tensors) {
+        if (cur > 0 && cur + t > max_size) {
+            buffers.push_back(cur);
+            cur = t;
+        } else {
+            cur += t;
+        }
+    }
+    if (cur > 0) {
+        buffers.push_back(cur);
+    }
+    return buffers;
+}
+
+// The largest buffer the SYCL_Host buffer type reports during a load, as ggml_sycl_host_buft_max_size answers it on a
+// fresh WEIGHT zone whose largest free block is a whole chunk: the chunk cap (0: none), never below the default pool
+// chunk, which zone growth can always add.
+size_t load_max_size(size_t cap, size_t chunk) {
+    const size_t optimistic = std::max(chunk, kPoolChunk);
+    return cap == 0 ? optimistic : std::min(cap, optimistic);
+}
+
+struct pool_run {
+    size_t placed       = 0;  // buffers served from the zone's own segments
+    size_t grown_chunks = 0;  // chunks grown for the others
+    size_t grown_bytes  = 0;  // those chunks' backing, headers included
+    size_t short_zone   = 0;  // chunks grown for a buffer one chunk holds: the zone was too small for it
+};
+
+// The loader's buffers allocated into a fresh pool. configure_host_zones carves the WEIGHT zone first, from logical 0,
+// over chunks of `chunk`: whole segments, then what is left. zone_alloc serves each buffer, rounded to the grain, from
+// the first segment with room, and grow_zone adds one chunk sized to a buffer no segment holds.
+pool_run run_pool(const std::vector<size_t> & buffers, size_t weight_zone, size_t chunk) {
+    std::vector<size_t> room(weight_zone / chunk, chunk);
+    if (weight_zone % chunk != 0) {
+        room.push_back(weight_zone % chunk);
+    }
+    pool_run run;
+    for (const size_t buffer : buffers) {
+        const size_t bytes  = align_up(buffer, kGrain);
+        const auto   served = std::find_if(room.begin(), room.end(), [bytes](size_t r) { return r >= bytes; });
+        if (served != room.end()) {
+            *served -= bytes;
+            run.placed++;
+            continue;
+        }
+        const size_t usable = std::max(chunk, align_up(bytes, kHeader));
+        run.grown_chunks++;
+        run.grown_bytes += usable + kHeader;
+        run.short_zone += bytes <= chunk ? 1 : 0;
+        room.push_back(usable - bytes);
+    }
+    return run;
+}
+
+// The 37 buffers the B70 Qwen3.8 IQ4_NL load requested (-lm none, ub 2048): the next-fit split of its 1223 tensors in
+// creation order at a 2 GiB cap, which reproduces every logged request size.
+std::vector<size_t> qwen_b70_buffers() {
+    std::vector<size_t> b = { 1910764416, 2008730496 };
+    for (int i = 0; i < 11; ++i) {
+        b.insert(b.end(), { 2054480768, 1973709696, 1973709696 });
+    }
+    b.insert(b.end(), { 2054480768, 1420810240 });
+    return b;
+}
+
+constexpr size_t kQwenLoader = 73415687680;  // that load's loader_residency
+constexpr size_t kQwenWeight = 73482796544;  // and the WEIGHT zone the plan charged it, 70078.7 MB
+
+// A routed-expert model shaped like that load: two 644 MiB embedding tensors, then per layer a few small tensors and
+// three 450 MiB expert tensors.
+std::vector<size_t> moe_tensors() {
+    std::vector<size_t> t = { 675430400, 675430400 };
+    for (int layer = 0; layer < 48; ++layer) {
+        for (const size_t s : { 13107200, 5242880, 471859200, 2621440, 471859200, 471859200, 10240 }) {
+            t.push_back(align_up(s, TENSOR_ALIGNMENT));
+        }
+    }
+    return t;
+}
+
+// The same tensors in other orders: the plan replays the order the loader allocates in, whatever it is.
+std::vector<std::vector<size_t>> orders_of(const std::vector<size_t> & tensors) {
+    std::vector<size_t> reversed(tensors.rbegin(), tensors.rend());
+    std::vector<size_t> ascending = tensors;
+    std::sort(ascending.begin(), ascending.end());
+    std::vector<size_t> descending(ascending.rbegin(), ascending.rend());
+    return { tensors, reversed, ascending, descending };
+}
+
+size_t sum_of(const std::vector<size_t> & v) {
+    size_t s = 0;
+    for (const size_t x : v) {
+        s += x;
+    }
+    return s;
+}
+
+// A plan made for device 0 whose loader buffer holds `tensors` in device 0's pool, with the zone record the planner
+// makes: the WEIGHT zone is the loader term plus `other_weight` bytes.
+placement_plan make_loader_plan(const std::vector<size_t> & tensors, size_t cap, size_t other_weight) {
+    placement_plan plan         = make_plan(true, 0, 0);
+    plan.loader_buffer_cap      = cap;
+    plan.loader_tensor_bytes    = tensors;
+    plan.host_zone_loader_bytes = sum_of(tensors);
+    plan.host_zone_weight_bytes = plan.host_zone_loader_bytes + other_weight;
+    return plan;
+}
+
+void check_pool_oracle_reproduces_the_device_log() {
+    // The positive control: the oracle must reproduce what the pool did. The plan charged raw bytes, a 70078.7 MB
+    // WEIGHT zone (34 whole chunks and a 446.7 MB rest); the zone held 34 buffers, the pool grew two chunks for the
+    // next two and was refused the third by its budget.
+    const std::vector<size_t> qwen = qwen_b70_buffers();
+    CHECK(qwen.size() == 37);
+    CHECK(sum_of(qwen) == kQwenLoader);
+    // Each buffer is more than half a chunk, so each closes the one before it: the split leaves them as they are.
+    CHECK(split_buffers(qwen, kPoolChunk) == qwen);
+    const pool_run run = run_pool(qwen, kQwenWeight, kPoolChunk);
+    CHECK(run.placed == 34);
+    CHECK(run.grown_chunks == 3 && run.short_zone == 3);
+}
+
+// The footprint is the pool's: with loader_zone bytes of WEIGHT zone every buffer a chunk holds is served without
+// growth, one grain less leaves one short, and the chunks grown are the ones the footprint counts.
+void check_footprint_against_pool(const std::vector<size_t> & tensors, size_t cap, size_t chunk) {
+    const size_t                                     max_size = load_max_size(cap, chunk);
+    const std::vector<size_t>                        buffers  = split_buffers(tensors, max_size);
+    const ggml_sycl::placement_loader_pool_footprint fp =
+        ggml_sycl::placement_loader_pool_footprint_for(tensors, max_size, chunk);
+    CHECK(fp.buffers == buffers.size());
+    const pool_run fits = run_pool(buffers, fp.zone, chunk);
+    CHECK(fits.short_zone == 0);
+    CHECK(fits.grown_bytes == fp.grown);
+    CHECK(fits.placed == fp.buffers - fits.grown_chunks);
+    CHECK(fp.chunks * chunk >= fp.zone && (fp.chunks == 0 || (fp.chunks - 1) * chunk < fp.zone));
+    if (fp.zone >= kGrain) {
+        CHECK(run_pool(buffers, fp.zone - kGrain, chunk).short_zone > 0);
+    }
+}
+
+void check_loader_footprint_is_the_pools() {
+    const std::vector<size_t> qwen = qwen_b70_buffers();
+    check_footprint_against_pool(qwen, kPoolChunk, kPoolChunk);
+    const ggml_sycl::placement_loader_pool_footprint fp =
+        ggml_sycl::placement_loader_pool_footprint_for(qwen, kPoolChunk, kPoolChunk);
+    // 37 chunks, the last filled to its buffer: 36 x 2 GiB + 1355.0 MB.
+    CHECK(fp.buffers == 37 && fp.chunks == 37 && fp.grown == 0);
+    CHECK(fp.zone == 36 * kPoolChunk + align_up(1420810240, kGrain));
+    for (const std::vector<size_t> & order : orders_of(moe_tensors())) {
+        check_footprint_against_pool(order, 0, kPoolChunk);
+        check_footprint_against_pool(order, kPoolChunk, kPoolChunk);
+        check_footprint_against_pool(order, 1024 * kMiB, kPoolChunk);  // a smaller cap: more, smaller buffers
+    }
+    // One buffer smaller than a chunk takes its own bytes, no whole chunk.
+    const std::vector<size_t> small = { 300 * kMiB, 200 * kMiB };
+    CHECK(ggml_sycl::placement_loader_pool_footprint_for(small, kPoolChunk, kPoolChunk).zone == 500 * kMiB);
+    CHECK(ggml_sycl::placement_loader_pool_footprint_for(small, kPoolChunk, kPoolChunk).chunks == 1);
+}
+
+void check_oversize_buffer_grows_a_planned_chunk() {
+    // A tensor larger than a chunk is a buffer of its own that no segment holds: the pool grows one chunk sized to it.
+    const size_t        big     = align_up(2856 * kMiB + 12345, TENSOR_ALIGNMENT);
+    std::vector<size_t> tensors = moe_tensors();
+    tensors.insert(tensors.begin() + 5, big);
+    check_footprint_against_pool(tensors, kPoolChunk, kPoolChunk);
+    const ggml_sycl::placement_loader_pool_footprint fp =
+        ggml_sycl::placement_loader_pool_footprint_for(tensors, kPoolChunk, kPoolChunk);
+    CHECK(fp.grown == align_up(align_up(big, kGrain), kHeader) + kHeader);
+    // A pool chunk smaller than the buffer type's cap: every buffer past a chunk grows its own.
+    for (const std::vector<size_t> & order : orders_of(moe_tensors())) {
+        check_footprint_against_pool(order, kPoolChunk, 1024 * kMiB);
+    }
+    CHECK(ggml_sycl::placement_loader_pool_footprint_for(moe_tensors(), kPoolChunk, 1024 * kMiB).grown > 0);
+}
+
+// What the oracle says of an admitted plan: every chunk the loader grows is one the plan counted.
+void check_admitted_plan(const placement_plan & plan, size_t chunk) {
+    const host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(plan, 0, chunk);
+    const std::vector<size_t>    buffers =
+        split_buffers(plan.loader_tensor_bytes, load_max_size(plan.loader_buffer_cap, chunk));
+    const pool_run run = run_pool(buffers, terms.weight, chunk);
+    CHECK(run.short_zone == 0);
+    CHECK(run.grown_bytes == terms.loader_grown);
+    CHECK(terms.total() == terms.zones() + terms.runtime + terms.rounding + terms.loader_grown);
+    // The WEIGHT zone is the rest of the record plus the loader's zone bytes.
+    CHECK(terms.weight == plan.host_zone_weight_bytes - plan.host_zone_loader_bytes + terms.loader_zone);
+    // Device 1's pool holds none of the buffer: its zone leaves the loader out, and it grows nothing for it.
+    const host_zone_commit_terms card1 = ggml_sycl::placement_plan_host_zone_commit_terms_on_device(plan, terms, 1);
+    CHECK(card1.weight == plan.host_zone_weight_bytes - plan.host_zone_loader_bytes);
+    CHECK(card1.loader_zone == 0 && card1.loader_grown == 0);
+}
+
+void check_admitted_plan_grows_nothing_unplanned() {
+    constexpr size_t kReserve = 64 * kMiB;  // the WEIGHT zone's host_compute_reserve, its only other term here
+
+    // The B70 Qwen load: the plan admits only what its 37 chunks need.
+    const placement_plan qwen = make_loader_plan(qwen_b70_buffers(), kPoolChunk, kQwenWeight - kQwenLoader);
+    check_admitted_plan(qwen, kPoolChunk);
+    const host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(qwen, 0, kPoolChunk);
+    std::printf(
+        "Qwen B70 WEIGHT zone: %zu bytes (%.1f MB) for the loader's 37 buffers; raw bytes charged %zu (%.1f MB)\n",
+        terms.weight, terms.weight / double(kMiB), kQwenWeight, kQwenWeight / double(kMiB));
+    for (const std::vector<size_t> & order : orders_of(moe_tensors())) {
+        check_admitted_plan(make_loader_plan(order, kPoolChunk, kReserve), kPoolChunk);
+        check_admitted_plan(make_loader_plan(order, 0, kReserve), 1024 * kMiB);
+    }
+    std::vector<size_t> oversize = moe_tensors();
+    oversize.insert(oversize.begin() + 5, align_up(2856 * kMiB + 12345, TENSOR_ALIGNMENT));
+    check_admitted_plan(make_loader_plan(oversize, kPoolChunk, kReserve), kPoolChunk);
+}
+
 }  // namespace
 
 int main() {
@@ -253,6 +515,10 @@ int main() {
     check_other_device_plan_copies_host_experts();
     check_split_loader_charges_nothing();
     check_mapped_expert_is_neither();
+    check_pool_oracle_reproduces_the_device_log();
+    check_loader_footprint_is_the_pools();
+    check_oversize_buffer_grows_a_planned_chunk();
+    check_admitted_plan_grows_nothing_unplanned();
     if (failures != 0) {
         std::printf("FAILED: %d check(s)\n", failures);
         return 1;

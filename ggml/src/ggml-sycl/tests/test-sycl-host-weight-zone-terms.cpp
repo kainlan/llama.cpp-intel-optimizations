@@ -622,14 +622,21 @@ void check_loader_charge(const char *           builder,
     check(!log.host_plan_bug, "no [HOST-PLAN-BUG] line was logged");
     check_eq("host_zone_weight_bytes is the terms' total", plan.host_zone_weight_bytes, terms.total());
     check_eq("host_zone_loader_bytes is the loader term", plan.host_zone_loader_bytes, terms.loader_residency);
-    // Each card's share of the plan's record: device 0's pool holds the buffer, device 1's leaves it out.
+    check(plan.loader_tensor_bytes.empty() != charged,
+          "the plan records the loader's tensors exactly when it charges the loader's buffer");
+    // Each card's share of the plan's record: device 0's pool holds the buffer, as the zone bytes its buffers take and
+    // the chunks it grows for them; device 1's leaves it out.
     const host_zone_commit_terms & record = plan.host_zone_terms;
-    check(record.chunk > 0 && record.weight == plan.host_zone_weight_bytes, "the plan recorded its commit terms");
+    check(record.chunk > 0, "the plan recorded its commit terms");
+    check_eq("the recorded WEIGHT zone holds the loader's buffers as the pool places them", record.weight,
+             plan.host_zone_weight_bytes - plan.host_zone_loader_bytes + record.loader_zone);
+    check(charged || (record.loader_zone == 0 && record.loader_grown == 0),
+          "a plan that charges no loader buffer places none");
     check_eq("device 0 commits the record", placement_plan_host_zone_commit_terms_on_device(plan, record, 0).total(),
              record.total());
-    check_eq("device 1's WEIGHT zone leaves the loader's buffer out",
-             placement_plan_host_zone_commit_terms_on_device(plan, record, 1).weight,
-             record.weight - (charged ? terms.loader_residency : 0));
+    const host_zone_commit_terms card1 = placement_plan_host_zone_commit_terms_on_device(plan, record, 1);
+    check_eq("device 1's WEIGHT zone leaves the loader's buffer out", card1.weight, record.weight - record.loader_zone);
+    check_eq("device 1 grows nothing for the loader's buffer", card1.loader_zone + card1.loader_grown, 0);
     // The control: the same inventory planned with weights that are not evictable charges no loader buffer, and its
     // host weights are the same bytes, all in blocks.
     const host_weight_zone_terms bare = placement_plan_host_weight_zone_terms(control);
