@@ -6,6 +6,7 @@
 // backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
 // the no-GPU skip.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "async-failure.hpp"
 #include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
 #include "ggml.h"
@@ -149,6 +150,7 @@ struct synthetic_inventory {
 
 struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
+    int backend_device = -1;  // the registry device `backend` was created for
     std::vector<ggml_backend_t> retained_backends;
     ggml_sycl_load_txn load{};
     bool load_open = false;
@@ -233,7 +235,8 @@ struct lifecycle_fixture {
                 }
                 retained_backends.push_back(retained.get());
                 if (!backend || device == primary_device) {
-                    backend = retained.get();
+                    backend        = retained.get();
+                    backend_device = device;
                 }
                 retained.release();
             }
@@ -310,7 +313,8 @@ struct lifecycle_fixture {
             ggml_backend_free(*it);
         }
         retained_backends.clear();
-        backend = nullptr;
+        backend        = nullptr;
+        backend_device = -1;
     }
 
     ~lifecycle_fixture() { cleanup(); }
@@ -510,6 +514,55 @@ void injected_async_terminal_failure_case() {
     require_stages(refused.candidate == after.candidate && refused.submit == after.submit,
                    "the refused graph reached the route", before);
 }
+
+// The scheduler can call graph_compute for the next split before it synchronizes the last one, so a refusal can be the
+// first boundary to see a failure. The synchronize after it must still clean up and release the graph submitted
+// before the failure was seen; the refusal itself must leave that graph alone.
+void refused_graph_then_synchronize_case() {
+    lifecycle_fixture                life;
+    std::vector<float>               oracle;
+    size_t                           count = 0;
+    auto                             c     = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope("refused_graph_then_synchronize_case", before);
+
+    const auto snapshot = [&](const char * when) {
+        ggml_sycl_execution_snapshot state{};
+        require_stages(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
+                       std::string("context snapshot unavailable ") + when, before);
+        return state;
+    };
+    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
+        return " (invocation=" + std::to_string(state.invocation_id.value) +
+               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+    };
+    // The asynchronous form, as the scheduler calls it: ggml_backend_graph_compute synchronizes before it returns, which
+    // would release the graph here, before the failure.
+    require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "the graph before the failure was not computed", before);
+    const auto submitted = snapshot("after the computed graph");
+    // A decode graph leaves its invocation for synchronize to release. If graph_compute had released it already, the
+    // release checked below would pass without the synchronize doing anything.
+    require_stages(
+        submitted.invocation_id.value != 0 && submitted.busy_device_count != 0,
+        "graph_compute released its own graph, so this case cannot observe the synchronize" + observed(submitted),
+        before);
+    ggml_sycl_async_failure_record(life.backend_device, "injected asynchronous failure after a submitted graph");
+    require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "a graph after an asynchronous failure was computed", before);
+    const auto refused = snapshot("after the refused graph");
+    require_stages(refused.invocation_id.value == submitted.invocation_id.value &&
+                       refused.busy_device_count == submitted.busy_device_count,
+                   "the refusal changed the graph submitted before it" + observed(refused), before);
+    ggml_backend_synchronize(life.backend);
+    const auto synced = snapshot("after synchronize");
+    require_stages(
+        synced.invocation_id.value == 0 && synced.busy_device_count == 0,
+        "the synchronize after a refused graph did not release the graph submitted before it" + observed(synced),
+        before);
+}
 } // namespace
 
 int main() {
@@ -525,6 +578,7 @@ int main() {
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         injected_async_terminal_failure_case();
+        refused_graph_then_synchronize_case();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
         std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';

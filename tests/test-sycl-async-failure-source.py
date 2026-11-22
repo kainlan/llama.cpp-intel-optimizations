@@ -9,6 +9,10 @@ With comments blanked:
      ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor), puts the drain's own error in the
      [SYCL-SYNC-DIAG] line and calls ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, "synchronize", ...)
      before the tail releases the graph.
+  C. (ggml-sycl.cpp) that cleanup is guarded by !sycl_ctx->async_failure_cleaned, and the flag is set immediately
+     before the ggml_backend_sycl_graph_boundary_exception_cleanup call; neither graph_compute nor
+     ggml_sycl_async_failure_report touches the flag, so a refusal that reports the failure first cannot skip the
+     cleanup of the graph the context submitted before it.
   G. (ggml-sycl.cpp ggml_backend_sycl_graph_compute) ggml_sycl_async_failure_since( is tested and GGML_STATUS_FAILED
      returned before the first ggml_backend_sycl_graph_compute_unchecked( call.
   R. (ggml-sycl.cpp ggml_sycl_async_failure_report) the [SYCL-ASYNC-FAILURE] line says the outputs of the context's
@@ -68,6 +72,11 @@ def claims(cache, sycl, common):
         "S a throwing drain is latched": "ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());" in s,
         "S the diag line carries the drain's error": "[SYCL-SYNC-DIAG]" in s and "drain error: %s" in s,
         "S failure branch cleans up before the tail": 0 <= s_since < s_clean < s_release,
+        "C cleanup guarded by the cleaned flag, set before the call": re.search(
+            r"if \(!sycl_ctx->async_failure_cleaned\) \{\s*sycl_ctx->async_failure_cleaned = true;\s*"
+            r"ggml_backend_sycl_graph_boundary_exception_cleanup\(sycl_ctx, \"synchronize\"", s) is not None,
+        "C refusal and report leave the cleaned flag alone": g != "" and r != "" and
+            "async_failure_cleaned" not in g and "async_failure_cleaned" not in r,
         "G refusal before compute": 0 <= g_check < g_first and "GGML_STATUS_FAILED" in g[g_check:g_first],
         "R the report says the last outputs are invalid": "are not valid" in r,
         "T arm takes a cursor": "void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor)" in t,
@@ -99,6 +108,20 @@ def main():
             "synchronize aborts again": (cache, sycl.replace(
                 "ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());", "SYCL_CHECK(err);", 1),
                 common),
+            "cleanup guarded by first_report": (cache, sycl.replace("if (!sycl_ctx->async_failure_cleaned) {",
+                                                                    "if (first_report) {", 1), common),
+            "cleanup guarded by the reported flag": (cache, sycl.replace(
+                "if (!sycl_ctx->async_failure_cleaned) {", "if (!sycl_ctx->async_failure_reported) {", 1), common),
+            "cleaned flag set after the cleanup": (cache, re.sub(
+                r"(sycl_ctx->async_failure_cleaned = true;)(\s*)(ggml_backend_sycl_graph_boundary_exception_cleanup"
+                r"\(sycl_ctx, \"synchronize\",\s*\"[^\"]*\"\);)", r"\3\2\1", sycl, count=1), common),
+            "refusal sets the cleaned flag": (cache, sycl.replace(
+                "ggml_sycl_async_failure_report(failed_ctx, \"graph_compute\");",
+                "failed_ctx->async_failure_cleaned = true; ggml_sycl_async_failure_report(failed_ctx, \"graph_compute\");",
+                1), common),
+            "report sets the cleaned flag": (cache, sycl.replace(
+                "ctx->async_failure_reported = true;",
+                "ctx->async_failure_reported = true; ctx->async_failure_cleaned = true;", 1), common),
             "graph_compute does not refuse": (cache, sycl.replace("ggml_sycl_async_failure_since(failed_ctx->",
                                                                   "false && (failed_ctx->", 1), common),
             "terminal ignores the latch": (cache, sycl.replace("terminal->arm(final, failure_cursor);",

@@ -97167,8 +97167,9 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
             ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());
         }
         if (ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)) {
-            // The first failed synchronize of a context cleans up its graph; later ones have nothing to clean, because
-            // graph_compute refuses this context from now on.
+            // The first failed synchronize of a context cleans up whatever the context submitted before the failure
+            // was seen, whichever boundary logged the failure first; later ones have nothing to clean, because
+            // graph_compute refuses the context before any submission.
             const bool first_report = !sycl_ctx->async_failure_reported;
             if (first_report || !drain_error.empty()) {
                 const int dev          = sycl_ctx->device;
@@ -97195,7 +97196,9 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
                     total_mem / (1024.0 * 1024.0));
             }
             ggml_sycl_async_failure_report(sycl_ctx, "synchronize");
-            if (first_report) {
+            if (!sycl_ctx->async_failure_cleaned) {
+                // Set before the call, so no later synchronize of this context can start the cleanup a second time.
+                sycl_ctx->async_failure_cleaned = true;
                 // Quarantines the invocation and recovers only exact-MMID workspaces whose terminals report success
                 // or quiescence, so a bundle whose terminal failed stays quarantined with its handles.
                 ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, "synchronize",

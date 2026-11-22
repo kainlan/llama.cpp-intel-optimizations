@@ -6517,9 +6517,13 @@ struct ggml_backend_sycl_context {
     // The asynchronous-failure counts when this context was created. Once either moves, this context's graph boundaries
     // fail for the rest of its life: a failed command does not cancel its dependents, so its outputs and the KV rows it
     // wrote may come from work that never ran, and the handler cannot tell whose command failed on a queue every
-    // context of the device shares. A context created later starts from the counts at its creation.
+    // context of the device shares. A context created later starts from the counts at its creation. The two flags are
+    // separate facts: `reported` means the [SYCL-ASYNC-FAILURE] line was logged, by whichever boundary saw the failure
+    // first; `cleaned` means synchronize ran the boundary cleanup for what the context submitted before the failure was
+    // seen. graph_compute never cleans, because it refuses before any submission.
     ggml_sycl_async_failure_cursor async_failure_cursor;
     bool                           async_failure_reported = false;
+    bool                           async_failure_cleaned  = false;
 
     explicit ggml_backend_sycl_context(int device) :
         device(device),
