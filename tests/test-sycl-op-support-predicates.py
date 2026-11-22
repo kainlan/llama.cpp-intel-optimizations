@@ -90,74 +90,181 @@ def _assert_rope_contract(full_source: str) -> None:
             assert actual == expected, (out_of_place, contiguous, rope_expression)
     assert rope_expression == "op->view_src==nullptr||ggml_is_contiguous(op)"
     _assert_expression(_case(source, "IM2COL", "UPSCALE"), "true")
+    # The kernels are instantiated for f32/f16 sources only; the inventory model (_sycl_admits_forward_rope)
+    # relies on this type check, which runs before the impl.
+    _assert_expression(
+        _case(_core_semantics_source(full_source), "ROPE", "MUL_MAT"),
+        "op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16",
+    )
+
+
+def _core_semantics_source(full_source: str) -> str:
+    start = full_source.index("static bool ggml_sycl_op_core_semantics_supported(const ggml_tensor * op) {")
+    return full_source[start : full_source.index("\n}\n", start)]
+
+
+# test_rope's constructor parameters in order, and the defaults of the ones the SYCL decision reads.
+_ROPE_CTOR_PARAMS = (
+    "type", "ne_a", "n_dims", "mode", "n_ctx", "fs", "ef", "af", "ff", "v", "forward", "inplace", "n_offs",
+    "n_ctx_orig", "freq_base", "beta_fast", "truncate",
+)
+_ROPE_CTOR_DEFAULTS = {"type": "GGML_TYPE_F32", "ff": False, "v": 0, "forward": True, "inplace": False, "n_offs": 0}
+_ROPE_LOOP_HEADER = re.compile(r"for\s*\(\s*[\w:]+\s+(\w+)\s*:\s*\{([^}]*)\}\s*\)\s*\{")
+_ROPE_ROW_OPEN = "test_cases.emplace_back(new test_rope("
+
+
+def _matching_close(text: str, open_index: int) -> int:
+    pairs = {"(": ")", "{": "}"}
+    closer = pairs[text[open_index]]
+    depth = 0
+    for index in range(open_index, len(text)):
+        if text[index] == text[open_index]:
+            depth += 1
+        elif text[index] == closer:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError(f"unbalanced {text[open_index]!r} at {open_index}")
+
+
+def _split_top_level_args(args: str) -> List[str]:
+    parts, depth, current = [], 0, ""
+    for char in args:
+        if char in "({":
+            depth += 1
+        elif char in ")}":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current.strip())
+            current = ""
+        else:
+            current += char
+    parts.append(current.strip())
+    return parts
+
+
+def _skip_blank_and_comments(text: str, index: int) -> int:
+    while True:
+        match = re.compile(r"\s+|//[^\n]*").match(text, index)
+        if match is None or match.end() == index:
+            return index
+        index = match.end()
+
+
+def _next_statement(text: str, index: int) -> Tuple[str, int]:
+    """One statement of a loop body: a brace-balanced for-loop or a single test_rope row."""
+    if text.startswith("for", index):
+        header = _ROPE_LOOP_HEADER.match(text, index)
+        assert header is not None, f"unparsed loop header: {text[index:index + 80]!r}"
+        end = _matching_close(text, header.end() - 1) + 1
+        return text[index:end], end
+    if text.startswith(_ROPE_ROW_OPEN, index):
+        close = _matching_close(text, index + len(_ROPE_ROW_OPEN) - 1)
+        end = text.index(";", close) + 1
+        assert text[close + 1 : end] == ");", f"unparsed row ending: {text[close:end]!r}"
+        return text[index:end], end
+    raise AssertionError(f"unparsed ROPE inventory statement: {text[index:index + 80]!r}")
+
+
+def _rope_literal(token: str, env: Dict[str, object]) -> object:
+    if token in env:
+        return env[token]
+    if token in ("true", "false"):
+        return token == "true"
+    if re.fullmatch(r"[-+]?\d+", token):
+        return int(token)
+    return token
+
+
+def _expand_rope_statements(text: str, env: Dict[str, object]) -> List[Dict[str, object]]:
+    """Every test_rope instance the statements in `text` construct, with the loop variables bound."""
+    instances: List[Dict[str, object]] = []
+    index = _skip_blank_and_comments(text, 0)
+    while index < len(text):
+        statement, index = _next_statement(text, index)
+        if statement.startswith("for"):
+            header = _ROPE_LOOP_HEADER.match(statement)
+            body = statement[header.end() : -1]
+            for value in _split_top_level_args(header.group(2)):
+                instances += _expand_rope_statements(body, {**env, header.group(1): _rope_literal(value, env)})
+        else:
+            args = _split_top_level_args(statement[len(_ROPE_ROW_OPEN) : statement.rindex("));")])
+            assert len(args) <= len(_ROPE_CTOR_PARAMS), statement
+            instance = dict(_ROPE_CTOR_DEFAULTS)
+            instance.update({name: _rope_literal(arg, env) for name, arg in zip(_ROPE_CTOR_PARAMS, args)})
+            instances.append(instance)
+        index = _skip_blank_and_comments(text, index)
+    return instances
+
+
+def _rope_inventory_blocks(inventory: str) -> List[str]:
+    """The ROPE inventory from the single-inplace nest on: each top-level statement that constructs a test_rope,
+    up to the first top-level statement that constructs none. Bounded by statement structure, so a block added
+    in the middle is read, and a block that follows (CONCAT's loops) is not."""
+    index = _skip_blank_and_comments(inventory, inventory.index("// single inplace test per type/mode/ff"))
+    blocks = []
+    while True:
+        try:
+            statement, end = _next_statement(inventory, index)
+        except AssertionError:
+            break
+        if _ROPE_ROW_OPEN not in statement:
+            break
+        blocks.append(statement)
+        index = _skip_blank_and_comments(inventory, end)
+    return blocks
+
+
+# What the SYCL backend answers for one forward ROPE node, as ggml_backend_sycl_device_supports_op computes it:
+# ggml_sycl_op_core_semantics_supported (f32/f16 sources), then the impl's n_offs guard, then its in-place
+# predicate. An in-place result is a view of `a`, contiguous exactly when `a` is (v == 0). A backward row builds
+# ROPE_BACK, which this contract does not model.
+def _sycl_admits_forward_rope(instance: Dict[str, object]) -> bool:
+    if instance["type"] not in ("GGML_TYPE_F32", "GGML_TYPE_F16"):
+        return False
+    if instance["n_offs"] != 0:
+        return False
+    return (not instance["inplace"]) or instance["v"] == 0
 
 
 def _assert_rope_inventory_contract(inventory: str) -> None:
-    start = inventory.index("// single inplace test per type/mode/ff")
-    end = inventory.index("for (int v :", start)
-    block = inventory[start:end]
+    blocks = _rope_inventory_blocks(inventory)
+    assert len(blocks) == 8, f"ROPE inventory has {len(blocks)} top-level statements, expected 8"
 
-    def loop_values(declaration: str) -> List[str]:
-        match = re.search(rf"for \({declaration} : \{{([^}}]+)\}}\)", block)
-        assert match is not None
-        return [value.strip() for value in match.group(1).split(",")]
-
-    types = loop_values("ggml_type type")
-    modes = loop_values("int mode")
-    factors = loop_values("bool ff")
-    discovered_rows = re.findall(r"test_cases\.emplace_back\(new test_rope\((.*?)\)\);", block, re.DOTALL)
-    parsed_views = []
-    parsed_offset_views = []
-    skipped_non_inplace = 0
-    skipped_real_model = 0
-    for row in discovered_rows:
-        # original inplace rows: (..., ff, <v>, true, true)
-        match = re.search(r"ff,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
-        if match is not None:
-            parsed_views.append(int(match.group(1)))
-            continue
-        # b10630 rope_set_offset inplace row: (..., <v>, true, true, <n_offs>)
-        # -- outside the type x mode x ff nest, tracked separately from the
-        # nest inventory so the decision arithmetic below stays well-formed.
-        match = re.search(r"([-+]?\d+)\s*,\s*true\s*,\s*true\s*,\s*\d+\s*$", row)
-        if match is not None:
-            parsed_offset_views.append(int(match.group(1)))
-            continue
-        # b10630 rope_set_offset NON-inplace rows: (..., fw, false, <n_offs>) --
-        # outside this contract's inplace inventory, present in the same block.
-        if re.search(r",\s*(?:fw|false|true)\s*,\s*false\s*,\s*\d+\s*$", row):
-            skipped_non_inplace += 1
-            continue
-        # Upstream real-model RoPE rows (hexagon #28628, merged 2026-09-09): literal bool ff, then
-        # (v, forward) and no inplace argument, so they default to out-of-place like the offset rows.
-        if re.search(r",\s*(?:false|true)\s*,\s*\d+\s*,\s*true\s*$", row):
-            skipped_real_model += 1
-            continue
-        raise AssertionError(f"unparsed inplace ROPE inventory row: {row!r}")
-    assert (len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace + skipped_real_model ==
-            len(discovered_rows))
-
-    assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
-    assert modes == [
-        "GGML_ROPE_TYPE_NORMAL",
-        "GGML_ROPE_TYPE_NEOX",
-        "GGML_ROPE_TYPE_MROPE",
-        "GGML_ROPE_TYPE_IMROPE",
-        "GGML_ROPE_TYPE_VISION",
+    nest = blocks[0]
+    headers = _ROPE_LOOP_HEADER.findall(nest)
+    assert [(name, [v.strip() for v in values.split(",")]) for name, values in headers] == [
+        ("type", ["GGML_TYPE_F32", "GGML_TYPE_F16"]),
+        ("mode", [
+            "GGML_ROPE_TYPE_NORMAL",
+            "GGML_ROPE_TYPE_NEOX",
+            "GGML_ROPE_TYPE_MROPE",
+            "GGML_ROPE_TYPE_IMROPE",
+            "GGML_ROPE_TYPE_VISION",
+        ]),
+        ("ff", ["false", "true"]),
     ]
-    assert factors == ["false", "true"]
-    assert parsed_views == [0, 1, 1]
-    # b10630 rope_set_offset block: 4 non-inplace offset rows per fw x ff nest
-    # plus one inplace-with-offset row (view 0), all inside the same window.
-    assert parsed_offset_views == [0]
-    assert skipped_non_inplace == 4
-    # qwen3.5 0.8B/4B and gemma4 E2B/E4B shapes: out-of-place, outside this inplace contract.
-    assert skipped_real_model == 4
+    nest_rows = _expand_rope_statements(nest, {})
+    assert all(row["inplace"] and row["forward"] and row["n_offs"] == 0 for row in nest_rows)
+    assert [row["v"] for row in nest_rows[:3]] == [0, 1, 1]
+    nest_decisions = [_sycl_admits_forward_rope(row) for row in nest_rows]
+    assert len(nest_decisions) == 60
+    assert nest_decisions.count(False) == 40
+    assert nest_decisions.count(True) == 20
 
-    multiplicity = len(types) * len(modes) * len(factors)
-    decisions = [view == 0 for view in parsed_views for _ in range(multiplicity)]
-    assert decisions.count(False) == 40
-    assert decisions.count(True) == 20
+    # Per top-level statement: (forward instances, admitted, backward instances). In order: the single-inplace
+    # nest; the BF16 block (declined by type, its in-place v=0 rows too); the offset block over F32/F16/BF16
+    # (declined by the n_offs guard); the truncate block (its in-place v=1 rows declined); four real-model rows.
+    expected = [(60, 20, 0), (15, 0, 10), (27, 0, 24), (40, 20, 20), (1, 1, 0), (1, 1, 0), (1, 1, 0), (1, 1, 0)]
+    actual = []
+    for block in blocks:
+        rows = _expand_rope_statements(block, {})
+        forward = [row for row in rows if row["forward"]]
+        actual.append((len(forward), sum(_sycl_admits_forward_rope(row) for row in forward), len(rows) - len(forward)))
+    assert actual == expected, actual
+    forward_total = sum(f for f, _, _ in actual)
+    admitted_total = sum(a for _, a, _ in actual)
+    assert (forward_total, admitted_total, forward_total - admitted_total) == (146, 44, 102)
 
 
 def _contract_rejects(oracle, source: str) -> bool:
@@ -459,6 +566,31 @@ def test_review_mutations_are_detected() -> None:
     assert injected_row != row
     mutated_inventory = inventory[:row_end] + "\n" + injected_row + inventory[row_end:]
     assert _contract_rejects(_assert_rope_inventory_contract, mutated_inventory)
+    # A BF16 in-place row turned F16 is admitted, so the BF16 block's admitted count moves.
+    bf16_inplace = (
+        "test_rope(GGML_TYPE_BF16, {128, 32, 2, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true)"
+    )
+    assert inventory.count(bf16_inplace) == 1
+    mutated_inventory = inventory.replace(bf16_inplace, bf16_inplace.replace("GGML_TYPE_BF16", "GGML_TYPE_F16"), 1)
+    assert _contract_rejects(_assert_rope_inventory_contract, mutated_inventory)
+    # A new ROPE block between the offset block and the real-model rows is read, not skipped.
+    real_model = inventory.index("// Real-model RoPE")
+    added_block = "for (bool ff : {false, true}) {\n" + row.strip() + "\n}\n    "
+    assert _contract_rejects(
+        _assert_rope_inventory_contract, inventory[:real_model] + added_block + inventory[real_model:]
+    )
+    # Widening ROPE's type check to BF16 breaks the model the inventory counts rely on.
+    core = _core_semantics_source(full_support)
+    core_start = full_support.index(core)
+    widened = core.replace(
+        "op->src[0]->type == GGML_TYPE_F16;",
+        "op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16;",
+        1,
+    )
+    assert widened != core
+    assert _contract_rejects(
+        _assert_rope_contract, full_support[:core_start] + widened + full_support[core_start + len(core) :]
+    )
 
     support = _supports_source(full_support)
     group = _case(support, "GROUP_NORM", "RMS_NORM_BACK")
