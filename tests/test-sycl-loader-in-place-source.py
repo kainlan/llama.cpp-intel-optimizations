@@ -511,8 +511,8 @@ MUTANTS = [
     ("refusal-dropped", "P2", mutate(GS, REFUSAL_THROW, "(void) 0;")),
     ("unowned-registered", "P2", mutate_re(GS, r"(auto register_host_aos_expert = .*?)(bool remembered_handle)",
                                            r"\1host_owner = {};\n\2")),
-    ("gate-accepts-unminted", "P1", mutate_re(GS, r"(static bool ggml_sycl_loader_buffer_owner\(.*?)ctx->model_id\s*==\s*0",
-                                              r"\1false")),
+    ("gate-accepts-unminted", "P1", mutate_re(GS, r"(static bool ggml_sycl_loader_buffer_owner\([^;{]*\)\s*\{.*?)"
+                                                  r"ctx->model_id\s*==\s*0", r"\1false")),
     ("gate-refusal-copies", "P4", mutate_re(GS, GATE_REFUSAL_BLOCK + r".*?return\s+false\s*;\s*\}", "")),
     ("gate-refusal-falls-through", "P4", mutate_re(GS, "(" + GATE_REFUSAL_BLOCK + r".*?)return\s+false\s*;(\s*\})",
                                                    r"\1\2")),

@@ -45039,6 +45039,12 @@ static void ggml_sycl_preload_model_weights() {
         std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_count{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_bytes{};
         std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_unowned_first{};
+        // Host experts the plan serves from the loader's SYCL_Host chunk whose chunk the gate refused: the plan sized no
+        // block for a copy, so the load refuses once the sweep has counted them, naming the gate's first reason.
+        std::array<size_t, GGML_SYCL_MAX_DEVICES>      host_expert_loader_refused_count{};
+        std::array<size_t, GGML_SYCL_MAX_DEVICES>      host_expert_loader_refused_bytes{};
+        std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_loader_refused_first{};
+        std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_loader_refused_reason{};
 
         // Collect all (tensor, device) pairs, grouped by device
         struct preload_item {
@@ -45589,10 +45595,8 @@ static void ggml_sycl_preload_model_weights() {
                         return layout;
                     };
 
-                    // One line per tensor when the pinned room for an expert the plan pinned could not be had, and
-                    // one when the loader's chunk could not serve an expert the plan serves from it.
+                    // One line per tensor when the pinned room for an expert the plan pinned could not be had.
                     bool logged_pin_alloc_failed  = false;
-                    bool logged_loader_refusal    = false;
                     auto register_host_aos_expert = [&](int64_t e, const uint8_t * expert_aos,
                                                         ggml_sycl::placement_host_backing planned_backing,
                                                         const char *                      reason) -> bool {
@@ -45632,8 +45636,9 @@ static void ggml_sycl_preload_model_weights() {
                             ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner);
                         // A pinned host expert the plan serves from the loader's SYCL_Host chunk is registered in
                         // place with that chunk's owner, which the model holds for its life: the plan charged the
-                        // chunk as loader_residency and gave the expert no block. A chunk the gate refuses is copied
-                        // as before, into room the plan did not size.
+                        // chunk as loader_residency and gave the expert no block. There is no copy fallback: a copy
+                        // would take room no zone was sized for, so an expert the gate refuses is counted, never
+                        // registered, and the load refuses after the sweep.
                         const bool loader_serves = !served_in_place && !tensor_source_is_device &&
                                                    planned_backing == ggml_sycl::placement_host_backing::PINNED &&
                                                    global_plan != nullptr && global_plan->loader_serves_host_experts;
@@ -45641,13 +45646,15 @@ static void ggml_sycl_preload_model_weights() {
                         const bool   loader_in_place =
                             loader_serves && ggml_sycl_loader_buffer_owner(tensor->buffer, expert_aos, expert_size,
                                                                            device, &host_owner, &loader_refusal);
-                        if (loader_serves && !loader_in_place && !logged_loader_refusal) {
-                            GGML_LOG_WARN(
-                                "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: the plan serves its host experts from "
-                                "the loader's SYCL_Host buffer, but %s; copied into a block the plan did not size\n",
-                                tensor->name ? tensor->name : "?", device, static_cast<long long>(e),
-                                loader_refusal ? loader_refusal : "the buffer has no owner");
-                            logged_loader_refusal = true;
+                        if (loader_serves && !loader_in_place) {
+                            if (host_expert_loader_refused_count[device]++ == 0) {
+                                host_expert_loader_refused_first[device] =
+                                    std::string(tensor->name ? tensor->name : "?") + "[" + std::to_string(e) + "]";
+                                host_expert_loader_refused_reason[device] =
+                                    loader_refusal ? loader_refusal : "the gate gave no reason";
+                            }
+                            host_expert_loader_refused_bytes[device] += expert_size;
+                            return false;
                         }
                         void * host_ptr = nullptr;
                         if (served_in_place || loader_in_place) {
@@ -47064,6 +47071,29 @@ static void ggml_sycl_preload_model_weights() {
             unowned_where += (unowned_where.empty() ? "" : ", ") + std::string("device ") + std::to_string(d) + ": " +
                              std::to_string(host_expert_unowned_count[d]) + " from " + host_expert_unowned_first[d];
         }
+        // No copy fallback: an expert the plan serves from the loader's chunk and the gate refused is not registered
+        // either. The plan charged it to the loader's buffer and sized no block for a copy, so the load refuses here
+        // too, naming the gate's reason. Both lines are logged before either refusal throws.
+        size_t      gate_refused_count = 0;
+        size_t      gate_refused_bytes = 0;
+        std::string gate_refused_where;
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (host_expert_loader_refused_count[d] == 0) {
+                continue;
+            }
+            gate_refused_count += host_expert_loader_refused_count[d];
+            gate_refused_bytes += host_expert_loader_refused_bytes[d];
+            gate_refused_where += (gate_refused_where.empty() ? "" : ", ") + std::string("device ") +
+                                  std::to_string(d) + ": " + std::to_string(host_expert_loader_refused_count[d]) +
+                                  " from " + host_expert_loader_refused_first[d] + ", first because " +
+                                  host_expert_loader_refused_reason[d];
+        }
+        if (gate_refused_count > 0) {
+            GGML_LOG_ERROR(
+                "[S1-PRELOAD] %zu host experts (%.1f MB) the plan serves from the loader's SYCL_Host buffer were "
+                "refused by its gate (%s); the plan sized no block for a copy, so the load refuses\n",
+                gate_refused_count, gate_refused_bytes / (1024.0 * 1024.0), gate_refused_where.c_str());
+        }
         if (unowned_count > 0) {
             // The count covers the first unowned expert on a device and every host expert the sweep met after it,
             // for which it asked no room.
@@ -47072,6 +47102,11 @@ static void ggml_sycl_preload_model_weights() {
                 "room for a copy and no buffer to serve it from in place, and no room was asked for those after it "
                 "(%s); the load refuses rather than register them unowned\n",
                 unowned_count, unowned_bytes / (1024.0 * 1024.0), unowned_where.c_str());
+        }
+        if (gate_refused_count > 0) {
+            throw std::runtime_error("S1 preload in-place host experts were refused by the loader buffer gate");
+        }
+        if (unowned_count > 0) {
             throw std::runtime_error("S1 preload planned host experts have no owner");
         }
 
@@ -55764,8 +55799,9 @@ static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_syc
 
 // The owner of the loader's SYCL_Host chunk that holds `bytes` at `data`, so S1-PRELOAD serves a host expert from it in
 // place instead of copying it into a block of its own. Only a chunk the loader keeps for the model's life qualifies: a
-// SYCL_Host buffer (its free_buffer) allocated, not claimed, with lifetime MODEL. Its owner must be one the window ring
-// copies from directly on `device`, since the ring streams a host expert from its lease. On a refusal `why` names it.
+// SYCL_Host buffer (its free_buffer) allocated, not claimed, with lifetime MODEL, and minted by a model's load
+// (model_id != 0), so the model owns it and its leak check covers it. Its owner must be one the window ring copies from
+// directly on `device`, since the ring streams a host expert from its lease. On a refusal `why` names it.
 static bool ggml_sycl_loader_buffer_owner(ggml_backend_buffer_t   buffer,
                                           const void *            data,
                                           size_t                  bytes,
@@ -55783,6 +55819,8 @@ static bool ggml_sycl_loader_buffer_owner(ggml_backend_buffer_t   buffer,
         refusal = "its SYCL_Host buffer is a claimed tenant slot";
     } else if (ctx->lifetime != ggml_sycl::alloc_lifetime::MODEL || !ctx->buffer_handle.valid()) {
         refusal = "its SYCL_Host buffer is not the model's";
+    } else if (ctx->model_id == 0) {
+        refusal = "its SYCL_Host buffer was not minted by a model's load";
     } else if (static_cast<const uint8_t *>(data) < static_cast<const uint8_t *>(ctx->ptr) ||
                static_cast<size_t>(static_cast<const uint8_t *>(data) - static_cast<const uint8_t *>(ctx->ptr)) >
                    ctx->size ||

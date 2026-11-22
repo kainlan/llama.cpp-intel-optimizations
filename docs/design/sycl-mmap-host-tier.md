@@ -1303,10 +1303,14 @@ on a sample about 0.57 GB higher. Its limits:
   decide differently; the late plan configures the zones.
 
 The gate (`ggml_sycl_loader_buffer_owner`) accepts a `SYCL_Host` buffer that is
-not a claimed tenant slot, has lifetime `MODEL`, holds the expert's bytes, and
-whose owner the ring copies from on that device. A refusal logs one
-`[MOE-LAYOUT]` WARN per tensor and copies the expert into a block the plan did
-not size. The limits:
+not a claimed tenant slot, has lifetime `MODEL`, was minted by a model's load
+(`model_id` != 0), holds the expert's bytes, and whose owner the ring copies
+from on that device. There is no copy fallback: the plan charged the expert to
+the loader's buffer and sized no block for it, so a copy would take room no zone
+holds. An expert the gate refuses is counted with the gate's reason and never
+registered, and once the sweep has counted them all the load refuses with one
+`[S1-PRELOAD]` ERROR line naming the count, the bytes and the reason, as it
+does for a host-planned expert with no owner. The limits:
 - In place only on a single-device plan made for `loader_device`. A
   multi-device plan stages its experts for every device, and a chunk is
   ring-streamable only on the device whose cache queue allocated it, so it,
