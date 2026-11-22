@@ -5807,6 +5807,34 @@ set_tests_properties(sycl-moe-stream-phase PROPERTIES
     TIMEOUT 60
 )
 
+# The loader's SYCL_Host buffer as a host WEIGHT zone term, and the host experts it serves in place, over a hand-built
+# plan. Host-only (no queue, no device, no allocation), built exactly like test-moe-stream-plan above.
+add_executable(test-sycl-loader-in-place-terms
+    tests/test-sycl-loader-in-place-terms.cpp
+)
+target_include_directories(test-sycl-loader-in-place-terms PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-loader-in-place-terms PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-loader-in-place-terms PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-loader-in-place-terms PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-loader-in-place-terms PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-loader-in-place-terms PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-loader-in-place-terms COMMAND test-sycl-loader-in-place-terms)
+set_tests_properties(sycl-loader-in-place-terms PROPERTIES
+    LABELS "sycl;planner;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
 # llama.cpp-36j0 Task 11a: loan selection (the lendable tail of the resident expert set) over a hand-built plan. Host-only,
 # built exactly like test-moe-stream-plan above.
 add_executable(test-moe-expert-loan-select
