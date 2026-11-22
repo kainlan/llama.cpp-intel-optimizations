@@ -331,12 +331,28 @@ gate_skip() {
 # Prints the GATE line and records the result. This -- not per-gate
 # duplication -- is where the "STDOUT only, and no abort line" rule lives,
 # so it applies identically to both gates by construction.
+#
+# One line is taken out of ERR before the search. When the backend sees more
+# than one GPU it prints a startup advisory that names the error it warns
+# about ("... Multi-GPU Level Zero contexts trigger DEVICE_LOST on
+# compute-runtime 26.x ..."). Nothing was lost when it prints, and counting it
+# failed every gate under a two-card selector. It is matched on its fixed
+# text, so any other line that mentions DEVICE_LOST still fails the gate. An
+# unreadable ERR is a FAIL: it cannot show that no abort line was printed.
+# The abort lines are counted, not searched with `grep -q`: under `pipefail` a
+# `grep -q` that stops at its first match can kill the filter in front of it
+# with SIGPIPE, and the pipeline would then read as "no match".
+GATE_TWO_GPU_ADVISORY='\[SYCL\] WARNING: [0-9]+ GPUs visible\. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime'
 gate_verdict() {
     local name="$1" out="$2" err="$3" rc="$4" pass_regex="$5"
-    local verdict="FAIL"
+    local verdict="FAIL" abort_lines=""
+    if [ -r "$err" ]; then
+        abort_lines="$(grep -vE "$GATE_TWO_GPU_ADVISORY" "$err" \
+            | grep -cE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' || true)"
+    fi
     if [ "$rc" -eq 0 ] \
         && grep -qE "$pass_regex" "$out" \
-        && ! grep -qE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' "$err"; then
+        && [ "$abort_lines" = "0" ]; then
         verdict="PASS"
     fi
     echo "GATE $name $verdict rc=$rc selector=$SELECTOR sha=$SHA"
