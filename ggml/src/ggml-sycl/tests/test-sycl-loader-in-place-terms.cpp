@@ -527,6 +527,69 @@ void check_admitted_plan_grows_nothing_unplanned() {
     check_admitted_plan(make_loader_plan(oversize, kPoolChunk, kReserve), kPoolChunk);
 }
 
+// `plan` with its commit terms recorded on a fresh pool of `chunk` chunks and a host budget of `budget` bytes, as the
+// planner's ledger record leaves it.
+placement_plan with_budget(placement_plan plan, size_t chunk, size_t budget) {
+    plan.host_zone_terms = ggml_sycl::placement_plan_host_zone_commit_terms(plan, 0, chunk);
+    plan.host_budget     = budget;
+    return plan;
+}
+
+size_t commit_total(const placement_plan & plan, size_t chunk) {
+    return ggml_sycl::placement_plan_host_zone_commit_terms(plan, 0, chunk).total();
+}
+
+bool refused_as_loader_pool(const std::string & refusal) {
+    return refusal.rfind("loader-pool-over-budget", 0) == 0;
+}
+
+bool carries(const std::string & refusal, const std::string & field, size_t value) {
+    return refusal.find(" " + field + "=" + std::to_string(value)) != std::string::npos;
+}
+
+// A load whose loader buffers the pinned pool cannot hold within the host budget fails in grow_zone partway through, so
+// the stage refuses a plan charged the loader term whose commit total, loader_grown included, exceeds its budget, by
+// name and with its figures; it admits one within the budget. A plan without the term keeps the ledger's WARN-only
+// check, however far over its budget it is.
+void check_loader_pool_over_budget_is_refused() {
+    const placement_plan         qwen  = make_loader_plan(qwen_b70_buffers(), kPoolChunk, kQwenWeight - kQwenLoader);
+    const host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(qwen, 0, kPoolChunk);
+    const size_t                 total = terms.total();
+    const std::string over = ggml_sycl::placement_plan_loader_pool_refusal(with_budget(qwen, kPoolChunk, total - 1));
+    CHECK(refused_as_loader_pool(over));
+    CHECK(carries(over, "total", total) && carries(over, "host_budget", total - 1));
+    CHECK(carries(over, "loader_zone", terms.loader_zone) && carries(over, "loader_grown", 0));
+    CHECK(carries(over, "loader_device", 0));
+    std::printf("over budget: %s\n", over.c_str());
+    CHECK(ggml_sycl::placement_plan_loader_pool_refusal(with_budget(qwen, kPoolChunk, total)).empty());
+
+    // loader_grown is in the total the budget is weighed against: a budget that covers everything but the chunk grown
+    // for an oversize buffer refuses.
+    std::vector<size_t> oversize = moe_tensors();
+    oversize.insert(oversize.begin() + 5, align_up(2856 * kMiB + 12345, TENSOR_ALIGNMENT));
+    const placement_plan         big       = make_loader_plan(oversize, kPoolChunk, 64 * kMiB);
+    const host_zone_commit_terms big_terms = ggml_sycl::placement_plan_host_zone_commit_terms(big, 0, kPoolChunk);
+    CHECK(big_terms.loader_grown > 0);
+    const std::string grown = ggml_sycl::placement_plan_loader_pool_refusal(
+        with_budget(big, kPoolChunk, big_terms.total() - big_terms.loader_grown));
+    CHECK(refused_as_loader_pool(grown) && carries(grown, "loader_grown", big_terms.loader_grown));
+    CHECK(ggml_sycl::placement_plan_loader_pool_refusal(with_budget(big, kPoolChunk, big_terms.total())).empty());
+
+    // A plan made for another device is charged the term too, host-wide: it is refused alike.
+    placement_plan other = make_plan(true, 0, 1);
+    record_weight_zone(other);
+    CHECK(refused_as_loader_pool(
+        ggml_sycl::placement_plan_loader_pool_refusal(with_budget(other, kChunk, commit_total(other, kChunk) - 1))));
+
+    // No loader term: no buffer bound (weights not evictable), or a buffer split across the scheduler's devices. Both
+    // keep the WARN-only ledger at any budget.
+    for (placement_plan plan : { make_plan(false, 0, 0), make_plan(true, -1, kMultiDevice) }) {
+        record_weight_zone(plan);
+        CHECK(plan.host_zone_loader_bytes == 0 && commit_total(plan, kChunk) > 0);
+        CHECK(ggml_sycl::placement_plan_loader_pool_refusal(with_budget(plan, kChunk, 0)).empty());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -541,6 +604,7 @@ int main() {
     check_loader_footprint_is_the_pools();
     check_oversize_buffer_grows_a_planned_chunk();
     check_admitted_plan_grows_nothing_unplanned();
+    check_loader_pool_over_budget_is_refused();
     if (failures != 0) {
         std::printf("FAILED: %d check(s)\n", failures);
         return 1;

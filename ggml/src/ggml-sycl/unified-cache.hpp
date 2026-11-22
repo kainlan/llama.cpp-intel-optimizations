@@ -2601,6 +2601,15 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
     return plan.host_zone_terms.total() + placement_plan_lazy_host_bytes(plan);
 }
 
+// The refusal of a plan charged the loader term (the loader holds the weights in loader_device's pool) whose commit
+// total, loader_grown included, exceeds its host budget: "loader-pool-over-budget" followed by total=, host_budget=,
+// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. The stage refuses such a load by
+// that name at plan time; a plan without the loader term keeps the ledger's WARN-only check.
+inline std::string placement_plan_loader_pool_refusal(const placement_plan & plan) {
+    (void) plan;
+    return {};
+}
+
 // One lazy table's fields as every lazy line prints them (th32 §10), so the planner's [PLACEMENT] lazy lines and the
 // dry run's [PLAN-DRY-RUN] LAZY lines name each alike: table=, resident=, cache_slots=, floor_slots= and
 // consumer_device=, the consumer's device or CPU. Given the table's inventory record `info`, it appends what only that

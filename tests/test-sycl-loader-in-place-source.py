@@ -55,6 +55,12 @@ The charge (ucc = unified-cache.cpp)
       copy copies the cap from info.load_loader_buffer_cap, which the kv_info fill takes from the buffer type's chunk
       cap; and ggml_sycl_host_buft_max_size answers through host_zone_buffer_max_size, so the plan and the buffer
       type share one rule.
+  C4. Once the plan admits, no loader pool growth fails. placement_plan_loader_pool_refusal (hpp) names
+      "loader-pool-over-budget" for a plan charged the loader term (loader_holds_weights, loader_device >= 0,
+      host_zone_loader_bytes > 0) whose commit total, loader_grown included (host_zone_terms.total()), exceeds
+      host_budget; ggml_sycl_stage_refuse_loader_pool_plan logs it on one ERROR line, and the stage returns
+      GGML_SYCL_LIFECYCLE_PLAN_REJECTED on it in both passes, for each late decision and for the early candidate. A
+      plan without the term keeps the ledger's WARN-only check.
 
 Run: python3 -I tests/test-sycl-loader-in-place-source.py [--self-test]
 """
@@ -374,6 +380,40 @@ def clause_c3_pool_footprint(t: dict) -> list:
     return problems
 
 
+STAGE_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_stage_load_inventory_plan\s*\([^)]*\)\s*\{"
+LOADER_POOL_LATE = (r"if\s*\(\s*ggml_sycl_stage_refuse_loader_pool_plan\s*\(\s*decision\.snapshot->plan\.get\s*\(\s*\)\s*,"
+                    r"\s*early\s*\)\s*\)\s*\{\s*return\s+GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*;")
+LOADER_POOL_EARLY = (r"if\s*\(\s*early_candidate\s*&&\s*ggml_sycl_stage_refuse_loader_pool_plan\s*\(\s*early_candidate->plan"
+                     r"\.get\s*\(\s*\)\s*,\s*early\s*\)\s*\)\s*\{\s*return\s+GGML_SYCL_LIFECYCLE_PLAN_REJECTED\s*;")
+
+
+def clause_c4_loader_pool_refusal(t: dict) -> list:
+    problems = []
+    rule = body_of(t[HPP], r"\binline\s+std::string\s+placement_plan_loader_pool_refusal\s*\(")
+    if not rule:
+        return ["placement_plan_loader_pool_refusal not found in unified-cache.hpp"]
+    for what, pattern in (
+            ("the loader holding the weights", r"\bplan\.loader_holds_weights\b"),
+            ("a loader_device", r"\bplan\.loader_device\s*>=\s*0"),
+            ("a charged loader term", r"\bplan\.host_zone_loader_bytes\s*>\s*0"),
+            ("the commit total, loader_grown included, against the budget",
+             r"\bplan\.host_zone_terms\.total\s*\(\s*\)\s*>\s*plan\.host_budget\b"),
+            ("the reason's name", r'"loader-pool-over-budget')):
+        if not re.search(pattern, rule):
+            problems.append(f"placement_plan_loader_pool_refusal does not test {what}")
+    helper = fn(t, GS, "ggml_sycl_stage_refuse_loader_pool_plan")
+    if not re.search(r"\bggml_sycl::placement_plan_loader_pool_refusal\s*\(\s*\*plan\s*\)", helper):
+        problems.append("ggml_sycl_stage_refuse_loader_pool_plan does not ask placement_plan_loader_pool_refusal")
+    if helper.count("GGML_LOG_") != 1 or "GGML_LOG_ERROR" not in helper:
+        problems.append("ggml_sycl_stage_refuse_loader_pool_plan does not log the refusal on one ERROR line")
+    stage = body_of(t[GS], STAGE_SIG)
+    if not re.search(LOADER_POOL_LATE, stage):
+        problems.append("the late pass does not refuse a decision's loader pool over the budget")
+    if not re.search(LOADER_POOL_EARLY, stage):
+        problems.append("the early pass does not refuse the candidate's loader pool over the budget")
+    return problems
+
+
 CLAUSES = [
     ("O1 a model owns the SYCL_Host chunks its load mints", clause_o1_model_owns_its_chunks),
     ("O2 the MODEL check runs after the reclaim", clause_o2_model_check_after_reclaim),
@@ -384,6 +424,7 @@ CLAUSES = [
     ("C1 the WEIGHT zone charges the loader's buffer once, in its pool", clause_c1_terms),
     ("C2 the loader fact has one source", clause_c2_one_fact),
     ("C3 the loader's buffers are charged as the pool holds them", clause_c3_pool_footprint),
+    ("C4 a loader pool over the budget refuses the load by name", clause_c4_loader_pool_refusal),
 ]
 
 
@@ -468,6 +509,14 @@ MUTANTS = [
                                              r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_tensor_bytes.clear();")),
     ("cap-uncopied", "C3", mutate_re(UCC, r"\bplan\.loader_buffer_cap\s*=\s*info\.load_loader_buffer_cap\s*;", "")),
     ("cap-unfilled", "C3", mutate_re(GS, r"\bkv\.load_loader_buffer_cap\s*=[^;]*;", "")),
+    ("loader-refusal-late-removed", "C4", mutate_re(GS, LOADER_POOL_LATE, "if (false) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;")),
+    ("loader-refusal-early-removed", "C4", mutate_re(GS, LOADER_POOL_EARLY,
+                                                     "if (false) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;")),
+    ("refusal-ignores-grown", "C4", mutate_re(HPP, r"(\bplan\.host_zone_terms\.)total(\s*\(\s*\)\s*>\s*plan\.host_budget)",
+                                              r"\1zones\2")),
+    ("refusal-for-every-plan", "C4", mutate_re(HPP, r"\bplan\.loader_device\s*>=\s*0", "true")),
+    ("refusal-logs-nothing", "C4", mutate_re(GS, r"(static bool ggml_sycl_stage_refuse_loader_pool_plan\b.*?)GGML_LOG_ERROR",
+                                             r"\1(void)")),
     ("max-size-restated", "C3", mutate_re(GS, r"ggml_sycl::host_zone_buffer_max_size\s*\(\s*chunk_cap\s*,",
                                           "std::min(chunk_cap, ggml_sycl::pinned_chunk_pool::CHUNK_SIZE) + 0 * (")),
 ]
