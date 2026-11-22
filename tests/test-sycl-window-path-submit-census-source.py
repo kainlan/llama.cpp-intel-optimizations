@@ -249,6 +249,11 @@ EXCLUDED_FILES = {
     "moe-mmid-workspace.cpp": "no launch: its .fill( calls are std::array::fill in moe_mmid_workspace_registry::admit",
     "mxfp4-stored-gemm.cpp": "its header mxfp4-stored-gemm.hpp (besides this file): " + NOT_INCLUDED,
     "mmvq-rmsnorm.hpp": NOT_INCLUDED,
+    "fused-gemm.cpp": "upstream's XMX dequant-GEMM: ggml-sycl.cpp calls only its scratch sizing "
+                      "(ggml_sycl_grouped_dequant_gemm_device_scratch), from ggml_sycl_mul_mat_id_device_sched behind "
+                      "opt-in GGML_SYCL_MMID_SCHED, which then declines the op; no launch of the file is reached",
+    "fused-gemm-esimd.cpp": "the ESIMD grouped GEMM of upstream's XMX dequant-GEMM: called only from fused-gemm.cpp's "
+                            "launch entries, which nothing in ggml-sycl.cpp calls",
     "l2-prefetch.hpp": "the L2 prefetch manager (ggml-sycl.cpp makes one only when is_l2_prefetch_enabled(), opt-in "
                        "GGML_SYCL_L2_PREFETCH=1, and calls it only for a one-row src1): decode only",
 }
@@ -407,7 +412,6 @@ ALLOW: dict[str, tuple[int, str]] = {
     "shortcut:element_wise.cpp:acc_f32_sycl": (1, shortcut("ACC")),
     "shortcut:element_wise.cpp:ggml_sycl_op_arange": (1, shortcut("ARANGE")),
     "shortcut:element_wise.cpp:ggml_sycl_op_ceil": (1, shortcut("CEIL")),
-    "shortcut:element_wise.cpp:ggml_sycl_op_clamp": (1, shortcut("CLAMP")),
     "shortcut:element_wise.cpp:ggml_sycl_op_cos": (1, shortcut("COS")),
     "shortcut:element_wise.cpp:ggml_sycl_op_floor": (1, shortcut("FLOOR")),
     "shortcut:element_wise.cpp:ggml_sycl_op_geglu": (1, shortcut("GEGLU")),
@@ -436,7 +440,8 @@ ALLOW: dict[str, tuple[int, str]] = {
     "shortcut:fill.cpp:ggml_sycl_op_fill": (2, shortcut("FILL, two launches")),
     "shortcut:fused-norm-gemm.hpp:quantize_with_rmsnorm_q8_1_sycl":
         (1, shortcut(FUSED_NORM + "its normalize-and-quantize to Q8_1")),
-    "shortcut:gated_delta_net.cpp:launch_gated_delta_net": (4, shortcut("GATED_DELTA_NET, four launches")),
+    "shortcut:gated_delta_net.cpp:launch_gated_delta_net/launch":
+        (1, shortcut("GATED_DELTA_NET, one launch site in the lambda each shape instantiates")),
     "shortcut:getrows.cpp:get_rows_q4_0_coalesced_sycl": (1, shortcut("GET_ROWS of q4_0, coalesced")),
     "shortcut:getrows.cpp:get_rows_q4_k_aos_sycl": (1, shortcut("GET_ROWS of q4_k, aos")),
     "shortcut:getrows.cpp:get_rows_q6_k_aos_sycl": (1, shortcut("GET_ROWS of q6_k, aos")),
@@ -449,7 +454,6 @@ ALLOW: dict[str, tuple[int, str]] = {
     "shortcut:getrows.cpp:get_rows_sycl": (1, shortcut("GET_ROWS of a quantized type, AOS")),
     "shortcut:getrows.cpp:get_rows_sycl_float": (1, shortcut("GET_ROWS of f32 / f16")),
     "shortcut:getrows.cpp:get_rows_sycl_reorder": (1, shortcut("GET_ROWS of a reordered (SOA) quantized type")),
-    "shortcut:ggml-sycl.cpp:diag_mask_inf_f32_sycl": (1, shortcut("DIAG_MASK_INF")),
     "shortcut:ggml-sycl.cpp:ggml_mul_mat_p021_f16_f32_sycl": (1, shortcut("the permuted f16 x f32 MUL_MAT (p021)")),
     "shortcut:ggml-sycl.cpp:ggml_mul_mat_vec_nc_f16_f32_sycl":
         (1, shortcut("the non-contiguous f16 x f32 vector MUL_MAT")),

@@ -52,7 +52,11 @@ def matching_brace(code: str, open_idx: int) -> int:
 
 
 def auto_block(code: str) -> str:
-    m = re.search(r"if\s*\(\s*ml\.lazy\.mode\s*==\s*LLAMA_LAZY_MODE_AUTO\s*\)\s*\{", code)
+    # `&& !ml.use_mmap` (upstream #31943): AUTO with mmap in use stays AUTO without asking the devices, so only a load
+    # that does not map the file reaches the veto this block pins
+    m = re.search(
+        r"if\s*\(\s*ml\.lazy\.mode\s*==\s*LLAMA_LAZY_MODE_AUTO(?:\s*&&\s*!\s*ml\.use_mmap)?\s*\)\s*\{", code
+    )
     assert m, "the lazy AUTO resolution block is missing from load_tensors"
     return norm(code[m.end() - 1 : matching_brace(code, m.end() - 1) + 1])
 
@@ -107,6 +111,16 @@ def test_mutation_witness_dropping_the_off_fallback_is_caught():
     mutated = code.replace("ml.lazy.mode = LLAMA_LAZY_MODE_OFF;", "", 1)
     assert mutated != code, "mutation did not apply"
     assert wiring_problems(mutated) == ["a rejected AUTO no longer resolves to LLAMA_LAZY_MODE_OFF"]
+
+
+def test_mutation_witness_another_condition_on_the_auto_block_is_caught():
+    import pytest
+
+    code = strip_comments(SRC)
+    mutated = code.replace("LLAMA_LAZY_MODE_AUTO && !ml.use_mmap)", "LLAMA_LAZY_MODE_AUTO && ml.use_mmap)", 1)
+    assert mutated != code, "mutation did not apply"
+    with pytest.raises(AssertionError, match="the lazy AUTO resolution block is missing"):
+        wiring_problems(mutated)
 
 
 if __name__ == "__main__":
