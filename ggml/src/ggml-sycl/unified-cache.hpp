@@ -2539,10 +2539,9 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     };
     // The loader's buffers are charged as the pool will hold them, not at their bytes. A plan within its budget then
     // configures a WEIGHT zone whose segments hold every loader buffer a chunk can hold, and the pool's only growth for
-    // the others is loader_grown, which total() counts: once the plan admits, no pool growth for the loader's buffers
-    // is one the plan did not count. Refusing a plan over its budget is not done here: the host ledger only warns
-    // until it enforces, and the lazy-table decision refuses a plan whose zones leave its tables no room. A plan whose
-    // record carries no tensors charges the bytes.
+    // the others is loader_grown, which total() counts. A plan charged this term whose total exceeds its budget is
+    // refused by name at plan time (placement_plan_loader_pool_refusal), so once the plan admits, no loader pool growth
+    // fails. A plan whose record carries no tensors charges the bytes.
     terms.weight      = plan.host_zone_weight_bytes;
     terms.loader_zone = plan.host_zone_loader_bytes;
     if (plan.host_zone_loader_bytes > 0 && !plan.loader_tensor_bytes.empty()) {
@@ -2603,11 +2602,19 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
 
 // The refusal of a plan charged the loader term (the loader holds the weights in loader_device's pool) whose commit
 // total, loader_grown included, exceeds its host budget: "loader-pool-over-budget" followed by total=, host_budget=,
-// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. The stage refuses such a load by
-// that name at plan time; a plan without the loader term keeps the ledger's WARN-only check.
+// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. The term is exact, so such a load
+// would fail in grow_zone partway through; the stage refuses it by that name at plan time instead, and once the plan
+// admits, no loader pool growth fails. A plan without the loader term keeps the ledger's WARN-only check.
 inline std::string placement_plan_loader_pool_refusal(const placement_plan & plan) {
-    (void) plan;
-    return {};
+    const bool charged = plan.loader_holds_weights && plan.loader_device >= 0 && plan.host_zone_loader_bytes > 0;
+    if (!charged || !(plan.host_zone_terms.total() > plan.host_budget)) {
+        return {};
+    }
+    const host_zone_commit_terms & terms = plan.host_zone_terms;
+    return "loader-pool-over-budget total=" + std::to_string(terms.total()) +
+           " host_budget=" + std::to_string(plan.host_budget) + " loader_zone=" + std::to_string(terms.loader_zone) +
+           " loader_grown=" + std::to_string(terms.loader_grown) +
+           " loader_device=" + std::to_string(plan.loader_device);
 }
 
 // One lazy table's fields as every lazy line prints them (th32 §10), so the planner's [PLACEMENT] lazy lines and the

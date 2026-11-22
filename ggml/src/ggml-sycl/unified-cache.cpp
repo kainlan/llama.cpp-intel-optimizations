@@ -36356,9 +36356,13 @@ static void record_host_ledger_plan(placement_plan &          plan,
         GGML_LOG_WARN(
             "[HOST-LEDGER] device=%d would refuse: host-budget-exceeded host_budget=%zu "
             "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu loader_zone=%zu "
-            "loader_grown=%zu rounding=%zu (the plan is kept: the ledger is WARN-only)%s\n",
+            "loader_grown=%zu rounding=%zu (%s)%s\n",
             plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-            t.loader_zone, t.loader_grown, t.rounding, reason.c_str());
+            t.loader_zone, t.loader_grown, t.rounding,
+            // the ledger only warns, but the stage refuses a plan whose loader pool does not fit the budget
+            placement_plan_loader_pool_refusal(plan).empty() ? "the plan is kept: the ledger is WARN-only" :
+                                                               "the stage refuses the load: loader-pool-over-budget",
+            reason.c_str());
     }
 }
 

@@ -17447,6 +17447,26 @@ static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * p
     return true;
 }
 
+// Refuses the load for a plan whose loader buffers the pinned pool cannot hold within the host budget
+// (placement_plan_loader_pool_refusal): logs one ERROR naming the reason and its figures and returns true, and the stage
+// then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. Such a load would fail in grow_zone partway through, so this refuses
+// nothing that could have run, and once the plan admits, no loader pool growth fails. The stage asks it before the
+// lazy-plan refusal, whose room the loader's zone took. Returns false, logging nothing, for any other plan.
+static bool ggml_sycl_stage_refuse_loader_pool_plan(const ggml_sycl::placement_plan * plan, bool early) {
+    if (plan == nullptr) {
+        return false;
+    }
+    const std::string refusal = ggml_sycl::placement_plan_loader_pool_refusal(*plan);
+    if (refusal.empty()) {
+        return false;
+    }
+    GGML_LOG_ERROR(
+        "[HOST-PLAN] load refused: %s (early=%d): the pinned pool cannot hold the loader's SYCL_Host buffers "
+        "within the host budget\n",
+        refusal.c_str(), early ? 1 : 0);
+    return true;
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                        const ggml_sycl_placement_envelope * envelope,
                                                                        bool                                 early) {
@@ -17603,6 +17623,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (ggml_sycl_stage_refuse_cross_card_expert_plan(decision.snapshot->plan.get())) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
+                if (ggml_sycl_stage_refuse_loader_pool_plan(decision.snapshot->plan.get(), early)) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
                 if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
@@ -17629,6 +17652,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         const auto early_candidate =
             early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
         if (early_candidate && ggml_sycl_stage_refuse_cross_card_expert_plan(early_candidate->plan.get())) {
+            return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+        }
+        if (early_candidate && ggml_sycl_stage_refuse_loader_pool_plan(early_candidate->plan.get(), early)) {
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
         if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {

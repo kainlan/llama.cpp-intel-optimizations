@@ -1259,22 +1259,34 @@ the split and the placement (`placement_loader_pool_footprint_for`) at the
 buffer type's maximum size and the pool's chunk. The WEIGHT zone holds the
 footprint's zone bytes (`loader_zone`) in place of `host_zone_loader_bytes`,
 and a buffer larger than a chunk, for which the pool grows a chunk of its own,
-is `loader_grown`, counted by `total()` outside the zones. What this
-guarantees: a plan within its budget configures a WEIGHT zone whose segments
-hold every loader buffer a chunk can hold, and the pool's only growth for the
-others is `loader_grown`, so once the plan admits, no pool growth for the
-loader's buffers is one the plan did not count. It refuses nothing by itself.
-The host ledger only warns until it enforces (th32 T2 phase (b)), so a plan
-over its budget is refused at plan time only where the lazy-table decision
-refuses it: the larger zone takes its tables' room. The Qwen3.8 load above has
-a lazy table, and its honest plan (commit total 83751864768 B against
-79456897344 B) leaves the table's floor and ring, 427819008 B, a fit room
-of -143952320 B at its logged budget, so it is refused as
-`lazy-table-cache-below-floor` with `fit_room=0`. It is 571771328 B short:
-the budget is `MemAvailable` less the headroom, so the same load admits on a
-sample about 0.57 GB higher. A model with no lazy table
-over its budget proceeds on the would-refuse WARN and can still meet
-`grow_zone`'s refusal. Its limits:
+is `loader_grown`, counted by `total()` outside the zones. A plan within its
+budget therefore configures a WEIGHT zone whose segments hold every loader
+buffer a chunk can hold, and the pool's only growth for the others is
+`loader_grown`. A plan charged this term (the loader holds the weights,
+`loader_device >= 0`) whose commit total, `loader_grown` included, exceeds its
+host budget is refused at plan time as `loader-pool-over-budget`:
+`placement_plan_loader_pool_refusal` names it with `total=`, `host_budget=`,
+`loader_zone=`, `loader_grown=` and `loader_device=`,
+`ggml_sycl_stage_refuse_loader_pool_plan` logs it on one `[HOST-PLAN] load
+refused:` ERROR line, and the stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED`
+for each late decision and for the early candidate, before the lazy-table
+refusal. The term is exact, so such a load would otherwise fail in
+`grow_zone` partway through; the refusal refuses nothing that could have run,
+and once the plan admits, no loader pool growth fails. A plan without the term
+keeps the host ledger's WARN-only check (th32 T2 phase (a)), whose would-refuse
+WARN names the loader refusal when it applies. A plan within its budget can
+still be refused where the lazy-table decision refuses it: the larger zone
+takes its tables' room. The Qwen3.8 load above is that case. Its honest plan
+(commit total 83751864768 B against 79456897344 B of raw bytes, under its
+85755396096 B budget) passes the loader check and leaves the table's floor and
+ring, 427819008 B, a fit room of -143952320 B at its logged budget, so it is
+refused as `lazy-table-cache-below-floor` with `fit_room=0`. It is 571771328 B
+short: the budget is `MemAvailable` less the headroom, so the same load admits
+on a sample about 0.57 GB higher. Its limits:
+- The refusal compares the commit total with the plan's host budget, the value
+  the load's transaction stored. `grow_zone` enforces the pool's own budget,
+  set when the pool was created; the invariant holds where the pool's budget is
+  at least the plan's.
 - The replay assumes the WEIGHT zone is empty when the loader allocates, which
   it is (the copies S1-PRELOAD makes come after), and that the zone's largest
   free block then is one chunk, true for a zone of at least one chunk, since

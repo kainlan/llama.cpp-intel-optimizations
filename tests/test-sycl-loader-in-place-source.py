@@ -45,8 +45,8 @@ The charge (ucc = unified-cache.cpp)
       placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable, info.load_loader_device, <builder's
       device>), and the kv_info fill sets load_weights_evictable from ggml_backend_sycl_weights_evictable() and
       load_loader_device from the scheduler's device count: device 0 when it sees one device, -1 otherwise.
-  C3. The loader's buffers are charged as the pinned pool holds them (hpp = unified-cache.hpp), so a plan within its
-      budget counts every pool growth they cause: the commit terms size the zone with
+  C3. The loader's buffers are charged as the pinned pool holds them (hpp = unified-cache.hpp), so once the plan
+      admits, no loader pool growth fails (with C4's refusal): the commit terms size the zone with
       placement_loader_pool_footprint_for over plan.loader_tensor_bytes, at the buffer type's maximum size
       (host_zone_buffer_max_size of plan.loader_buffer_cap and the pool's chunk) and the pool's chunk: the WEIGHT
       zone is the record less host_zone_loader_bytes plus the footprint's zone bytes (loader_zone), and the chunks
