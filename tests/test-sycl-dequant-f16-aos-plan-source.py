@@ -340,7 +340,8 @@ def check(srcs):
                 "if (row_low != 0 || row_diff != ggml_nrows(src0)) {",
                 "ggml_get_to_fp16_sycl_for_layout(src0->type, GGML_LAYOUT_SOA)",
                 "owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
-                "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));"))
+                "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));")) and nows(
+                    "ggml_sycl::mem_handle owner = ggml_sycl_acquire_weight_layout(") not in nows(loaded)
     for what, guard, conversion in REFUSALS:
         guard_at = nows(loaded).find(nows(guard))
         results[refusal_check(what)] = 0 <= guard_at < nows(loaded).find(nows(conversion))
