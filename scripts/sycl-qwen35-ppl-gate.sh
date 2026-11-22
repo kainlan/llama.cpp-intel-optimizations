@@ -27,7 +27,8 @@
 # is printed, so a B50 run shows the decline path was reached. Only the B50 arm discriminates the fix: the B70
 # layout has no overlapping chain, declines 0, and did not race before it either.
 #
-# Exit status: 0 pass, 1 fail, 77 skipped (a precondition is missing, which proves nothing).
+# Exit status: 0 pass, 1 fail, 77 skipped (a precondition is missing, which proves nothing), 143 a signal during the
+# lock take or its wait.
 #
 # --score-logs LOG... scores existing multi-ubatch logs for shape and determinism without running anything.
 # --score-oracle LOG  scores one existing -b 512 log (shape and the --oracle values) without running anything.
@@ -35,12 +36,14 @@
 # --lock-selftest takes, checks and releases the lock through the run's own wait loop and exits (no GPU work).
 #
 # GPU.lock is taken and released through scripts/sycl-lock.sh (mkdir(2) through python3, a `holder` line unique to
-# this run): the system mkdir command reports success on an existing directory. The gate waits for a busy lock (up to
+# this run): the system mkdir command checks, then creates, and exits 0 when the directory appears in between, so two
+# takers that arrive together can both win. The gate waits for a busy lock (up to
 # LLAMA_GPU_LOCK_WAIT_SECONDS, polling every LLAMA_GPU_LOCK_POLL_SECONDS) and stops at once when waiting cannot clear
 # the failure. Each take reads its holder back after LLAMA_GPU_LOCK_VERIFY_SECONDS (default 1). It does not read
 # its holder again during the run: a co-taker that still uses plain mkdir and writes its holder after the verify
 # window goes unseen here. The run path cannot be exercised by a stub test on this host
-# (its settle waits for MemAvailable > 150 GB), so that check waits until it can be tested.
+# (its settle waits for MemAvailable > 150 GB), so that check waits until it can be tested. A signal after the take
+# releases the lock at once and does not stop the model run: stop the run first.
 
 set -euo pipefail
 
@@ -101,7 +104,7 @@ Environment:
   LLAMA_GPU_LOCK_VERIFY_SECONDS   how long a take waits before it reads its holder back (default 1)
   LLAMA_GPU_LOCK_POLL_SECONDS     seconds between takes while the lock is busy (default 15, at least 1)
   LLAMA_GPU_LOCK_WAIT_SECONDS     how long to wait for a busy lock before stopping (default 1800, 0 allowed)
-  Each is a whole number of seconds without a leading zero; anything else stops the gate.
+  Each is a whole number of seconds from 0 to 999999 without a leading zero; anything else stops the gate.
 EOF
 }
 
@@ -118,11 +121,17 @@ skip() {
 # GPU.lock, shared by --lock-selftest and the real run. This script runs under set -e: every call that can fail is
 # guarded by || or if.
 lock_take() { # 0 held | the sycl_lock_take status; LOCK_RC keeps it for the refusal text
-    [ "$LOCK_HELD" = 0 ] || return 5 # never take twice: the second text would replace the first
+    if [ "$LOCK_HELD" != 0 ]; then # never take twice: the second text would replace the first
+        LOCK_RC=5
+        echo "sycl-qwen35-ppl-gate: lock_take called while the lock is held" >&2
+        return 5
+    fi
     LOCK_TEXT="sycl-qwen35-ppl-gate pid=$$ device=level_zero:$DEVICE start=$(date +%FT%T)"
     LOCK_HELD=1 # before the take: a signal during it is handled right after it returns, and must release
     LOCK_RC=0
     sycl_lock_take "$LOCK_DIR" "$LOCK_TEXT" "$LOCK_VERIFY" || LOCK_RC=$?
+    # An unknown status can follow a holder the helper already wrote; after 1 to 4 no holder of ours exists.
+    [ "$LOCK_RC" != 5 ] || sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" 2>/dev/null || true
     [ "$LOCK_RC" = 0 ] || LOCK_HELD=0
     return "$LOCK_RC"
 }
@@ -150,7 +159,9 @@ lock_why() { # the reason for the last failed take
 LOCK_SIGNALLED=0
 lock_wait_take() {
     local waited=0 rc
-    trap 'LOCK_SIGNALLED=1' TERM INT HUP # deferred until the take's child returns; restored below
+    # Deferred until the take's child returns. Reset to the default disposition below: a caller's own trap for these
+    # signals is not restored.
+    trap 'LOCK_SIGNALLED=1' TERM INT HUP
     while :; do
         rc=0
         lock_take || rc=$?
@@ -161,7 +172,11 @@ lock_wait_take() {
             *) die "could not take $LOCK_DIR ($(lock_why)): waiting will not clear it" ;;
         esac
         [ "$waited" -lt "$LOCK_WAIT" ] || die "could not take $LOCK_DIR in ${LOCK_WAIT}s ($(lock_why))"
-        sleep "$LOCK_POLL"
+        # A signal interrupts the wait at once (a foreground sleep would defer the trap until it ends).
+        sleep "$LOCK_POLL" &
+        local slp=$!
+        wait "$slp" || true
+        [ "$LOCK_SIGNALLED" = 0 ] || { kill "$slp" 2>/dev/null || true; exit 143; }
         waited=$((waited + LOCK_POLL))
     done
     trap - TERM INT HUP
@@ -193,11 +208,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# A leading zero would be an octal error in arithmetic; the wait loop adds and compares these values.
+# A leading zero would be an octal error in the wait loop's arithmetic, and a bound keeps a typo from becoming a
+# hang or an overflow (the verify window goes to the helper's sleep).
 for lock_var in "LLAMA_GPU_LOCK_VERIFY_SECONDS=$LOCK_VERIFY" "LLAMA_GPU_LOCK_POLL_SECONDS=$LOCK_POLL" \
     "LLAMA_GPU_LOCK_WAIT_SECONDS=$LOCK_WAIT"; do
-    [[ "${lock_var#*=}" =~ ^(0|[1-9][0-9]*)$ ]] ||
-        die "${lock_var%%=*} must be a whole number of seconds without a leading zero: '${lock_var#*=}'"
+    [[ "${lock_var#*=}" =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+        die "${lock_var%%=*} must be a whole number of seconds from 0 to 999999 without a leading zero:" \
+            "'${lock_var#*=}'"
 done
 [ "$LOCK_POLL" -ge 1 ] || die "LLAMA_GPU_LOCK_POLL_SECONDS must be at least 1: '$LOCK_POLL'"
 
