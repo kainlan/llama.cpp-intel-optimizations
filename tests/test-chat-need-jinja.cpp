@@ -52,8 +52,8 @@ int main() {
         auto tmpls = common_chat_templates_init(/* model= */ nullptr, UNKNOWN_TEMPLATE);
         CHECK(common_chat_templates_need_jinja(tmpls.get()));
 
-        // the jinja engine renders it
-        const auto prompt = common_chat_templates_apply(tmpls.get(), one_user_message(true)).prompt;
+        // the jinja engine renders it; the prompt comes back in parts, and str() is the whole rendered text
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), one_user_message(true)).prompt.str();
         CHECK(prompt.find("hello gemma") != std::string::npos);
         CHECK(prompt.find("<<turn:user>>") != std::string::npos);
 
