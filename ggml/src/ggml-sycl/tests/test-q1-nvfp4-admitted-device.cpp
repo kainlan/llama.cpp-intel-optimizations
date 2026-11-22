@@ -729,7 +729,10 @@ int main() {
         failed_graph_then_drain_case();
         require_clean_teardown();
         // The card must be usable by a new context after a context that failed and was only drained.
-        { lifecycle_fixture life; successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "after-failed-drain"); }
+        {
+            lifecycle_fixture life;
+            successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "after-failed-drain");
+        }
         require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
