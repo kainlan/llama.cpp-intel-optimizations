@@ -42,6 +42,8 @@ Common flags:
 
 **Build time**: ~10 minutes with ccache, ~25 minutes without.
 
+**Python interpreter**: the script passes `-DPython3_EXECUTABLE=$(command -v python3)`, so `ctest` runs the Python contracts with the shell's `python3` (the alloc-zone contract needs its `tree_sitter_language_pack`). A build directory keeps its cached interpreter until it is configured again: after pulling this change, run `./scripts/sycl-build.sh -r` once per build directory.
+
 **`-DGGML_SYCL_F16=ON`** enables 16-bit float arithmetic throughout the SYCL backend:
 - **dmmv dequant** (active today): the `dfloat`/`dfloat2` typedef in `ggml/src/ggml-sycl/common.hpp` pivots to `sycl::half`/`sycl::half2` under the flag.
 - **Attention path**: gates the Q f16 cast and `afloat` accumulator typedef in `fattn-xmx-f16-v2.hpp`; unlocks oneDNN SDPA eligibility on Mistral.

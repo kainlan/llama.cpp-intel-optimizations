@@ -157,10 +157,17 @@ if [[ ! -f "${ONECCL_DIR}/oneCCLConfig.cmake" ]]; then
     exit 1
 fi
 
+PYTHON3="$(command -v python3 || true)"
+if [[ -z "${PYTHON3}" ]]; then
+    echo "error: python3 not found in PATH; ctest runs the Python contracts with it" >&2
+    exit 1
+fi
+
 C_COMPILER="$(command -v icx)"
 CXX_COMPILER="$(command -v icpx)"
 echo "[sycl-build] C compiler: ${C_COMPILER}"
 echo "[sycl-build] C++ compiler: ${CXX_COMPILER}"
+echo "[sycl-build] Python 3: ${PYTHON3}"
 echo "[sycl-build] oneCCL: ${ONECCL_DIR}"
 
 if (( clean_build )); then
@@ -285,6 +292,9 @@ configure_args=(
     '-DCMAKE_INSTALL_RPATH=$ORIGIN'
     -DCMAKE_C_COMPILER=icx
     -DCMAKE_CXX_COMPILER=icpx
+    # ctest must run the Python contracts with the interpreter the developer's shell runs them with; CMake's own
+    # search prefers a versioned name (python3.13), which can be a different installation without their modules.
+    "-DPython3_EXECUTABLE=${PYTHON3}"
 )
 
 compiler_launcher=""
