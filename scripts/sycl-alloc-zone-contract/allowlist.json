@@ -371,6 +371,52 @@
       "function": "unified_cache::loan_expert_triplet",
       "count": 1,
       "reason": "The expert loan's exact-owner check (llama.cpp-mwmr, tracker ruling c-sepd): a resident expert's AOS device entry is lent only when its direct_alloc_owner is held by the entry alone, under direct_stage_mutex_ and rw_mutex_. A count other than 1 means a copy, a recording or a view still retains the storage, so the loan refuses the whole triplet with \"storage still referenced\" before anything is copied or published. The count decides a refusal, never a free: the lent entry is retired, and its storage is released by the deferred-free pass only when its last handle drops, as for any retired entry. This is the residual refusal of the design's replace_within classification (a non-zero residual is SHARED, old unconsumed), applied to a loan."
+    },
+    {
+      "id": "E-KJOC-ASYNC-HANDLER",
+      "code": "G-CATCH",
+      "file": "common.cpp",
+      "function": "lambda in ggml_sycl_async_handler",
+      "count": 2,
+      "reason": "The lambda ggml_sycl_async_handler returns is the SYCL asynchronous-error handler of every backend queue and context, and it is noexcept: the runtime calls it from whichever wait_and_throw delivers, including ones in noexcept code, so a rethrow of any type would std::terminate. Its try body is one std::rethrow_exception of an error the runtime delivered, and both handlers record it in the per-device failure latch, which the graph boundaries read and turn into a failed graph. Nothing is swallowed: an error of any type, a planned refusal thrown inside a host task included, fails the next boundary. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-DRAIN-RETRY-WAIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_execution_recover_and_release_graph",
+      "count": 2,
+      "reason": "ggml_sycl_execution_recover_and_release_graph is noexcept and its try body is one wait_and_throw on the context's stream, which raises no planned refusal: an asynchronous error goes to the queue's recording handler, and what the wait itself throws is a SYCL runtime error. Both handlers record the failed wait in the failure latch and return false, which sends the caller to its abort path with the workspace slot still quarantined; a rethrow would std::terminate through the noexcept boundary. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-BEGIN-DRAIN-WAIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_execution_drain_own_terminal",
+      "count": 2,
+      "reason": "ggml_sycl_execution_drain_own_terminal is noexcept and its one try wraps the wait on the deferred decode event or the context's stream, which raises no planned refusal. Both handlers record the failed wait in the failure latch and fall through to the quarantine path, which retains every root and backing lease instead of releasing on an unproven terminal; a rethrow would std::terminate through the noexcept boundary. The catch-all was shrink-only debt until the std::exception handler joined it; the pair is exempt together because both sit on the same try. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-CONTEXT-DRAIN-WAIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "lambda in ggml_sycl_execution_drain_context_terminal_events",
+      "count": 2,
+      "reason": "The lambda runs once for each backend bound to an ending execution context. Its one try wraps the wait on the deferred decode event or the backend's stream, which raises no planned refusal. Both handlers record the failed wait in the failure latch and fall through to the quarantine path, which retains every root and backing lease instead of releasing on an unproven terminal; a rethrow would leave the remaining bound backends undrained. The catch-all was shrink-only debt until the std::exception handler joined it; the pair is exempt together because both sit on the same try. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-SYNC-DRAIN-WAIT-EXC",
+      "code": "G-CATCH",
+      "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:exception#0",
+      "count": 1,
+      "reason": "The first unguarded std::exception handler of ggml_backend_sycl_synchronize, which by source order is the one on the drain's try. That try's body is one wait_and_throw on the deferred decode event or on stream 0, which raises no planned refusal. The handler keeps the wait's error in drain_error, and the code after the try records it in the failure latch, so the boundary reports a failed graph and cleans up. A rethrow would skip the CPU-job gate clear that follows the try. Keyed to the handler and not to the function, because the function's other three unguarded handlers (the diagnostic memory read and the outer boundary pair) stay shrink-only debt. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-SYNC-DRAIN-WAIT-ALL",
+      "code": "G-CATCH",
+      "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:all#0",
+      "count": 1,
+      "reason": "The first unguarded catch-all of ggml_backend_sycl_synchronize, which by source order is the one on the drain's try. That try's body is one wait_and_throw on the deferred decode event or on stream 0, which raises no planned refusal. The handler keeps the wait's error in drain_error, and the code after the try records it in the failure latch, so the boundary reports a failed graph and cleans up. A rethrow would skip the CPU-job gate clear that follows the try. Keyed to the handler and not to the function, because the function's other three unguarded handlers (the diagnostic memory read and the outer boundary pair) stay shrink-only debt. Permanent; llama.cpp-kjoc."
     }
   ]
 }

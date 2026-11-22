@@ -142,10 +142,13 @@ checks = {
     # exists to prevent, and every other clause here still passes.
     "own-terminal drain marks an unproven wait inside the catch":
         "waited = false;" in catch_block(own_drain_body),
+    # The whole statement is pinned. A refused release gets one recovery attempt
+    # before the abort, but an unproven wait still goes straight to the abort:
+    # `!waited ||` comes first, so neither the release nor the recovery runs on it.
     "own-terminal drain quarantines on an unproven wait": ordered(
         own_drain_body,
         "catch (...)",
-        "if (!waited || !ggml_sycl_execution_release_graph(ctx)) {",
+        "if (!waited || (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {",
         "ggml_sycl_execution_abort_and_release_graph(ctx);",
     ),
     # Only a terminal invocation is drainable, and only this root's own.
