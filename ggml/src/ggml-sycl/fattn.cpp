@@ -2755,10 +2755,11 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
-    // The vec and tile kernels are templated on one head size and index V with it. A value head size that differs
-    // from the key head size leaves part of each dst row unwritten (DV > D) or writes past dst (DV < D). D=512 is
-    // screened by its own admissibility functions above.
-    if (D != 512 && V->ne[0] != D) {
+    // No flash-attention route in this backend is written for a value head size that differs from the key head size:
+    // the vec and tile kernels index V with D, which leaves part of each dst row unwritten (DV > D) or writes past
+    // dst (DV < D). The D=512 tile route checks DV itself, the D=512 oneDNN route does not, so the decline holds for
+    // every D.
+    if (V->ne[0] != D) {
         return false;
     }
 
