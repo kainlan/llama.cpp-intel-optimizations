@@ -1398,6 +1398,21 @@ bundle as its last statement. Verified at `095adc712`, once per arm: oracle on b
 GPT-OSS B50 gate with `-c 4096`, zero kernel fault lines. Logs: `docs/backend/data/inkling2/t7a-oracle-b70.txt`
 and `t7a-oracle-b50.txt`.
 
+**DONE 2026-11-22, merged as `8cc311820`.** Spec review PASS; quality review PASS with findings, closed in
+`5f8e80779`; re-review PASS. What the fix round changed:
+- The terminal's `succeeded_` member is gone: `ready()` is "finished" and reads no latch and waits for nothing
+  (the contract now forbids any `wait...(` call in it), `observe_success()` is "finished and succeeded".
+- A throw out of the terminal's own `wait_and_throw` bypasses the queue's handler, so the latch had not moved.
+  The catch now records into the device latch before it marks the terminal failed (contract claim T).
+- Verified at `5f8e80779`, once per arm: oracle on both cards (PASS, rc 0), Mistral B70 gate, GPT-OSS B50 gate
+  with `-c 4096`, zero kernel fault lines. The committed oracle logs are from this commit.
+
+**Correction to commit `c255ac107`'s message:** the second `[SYCL-ASYNC-FAILURE]` line in the oracle logs is
+case 8's refused `graph_compute`, not a second line from case 7. The commit is not amended; this is the record.
+
+**No device test separates commit 5 from commit 4.** The difference is when the SYCL runtime destroys a
+host-task functor, which the oracle cannot force. Task 7d adds the deterministic test (its step 0 below).
+
 **Runtime facts this design rests on (measured 2026-11-21, B50, `docs/backend/data/inkling2/t7a-runtime-probe-b50.txt`):**
 `queue::wait_and_throw` and `event::wait_and_throw` both deliver to the queue's handler and return; the same holds for
 a queue on the platform default context; a queue without a handler falls back to its context's; a host task that
@@ -1415,6 +1430,14 @@ a handled queue destroyed with an undelivered error drops it silently.
 ---
 
 ### Task 7d: A failed context that is torn down without a synchronize gives its device back
+
+**Step 0, added 2026-11-22 (Task 7a's commit 5 has no device test yet):** behind
+`GGML_SYCL_Q1_NVFP4_ROUTE_TESTING`, a test seam that keeps a second `shared_ptr` to the route's `completion`
+object alive past the host task (what a copied functor would do). The oracle runs case 7 once more with the seam
+armed and asserts the same end state: `invocation_id == 0 && busy_device_count == 0` after the failed
+synchronize. With commit 5 reverted in a scratch build the armed case must fail; the implementer shows that with
+the source-contract mutant, the lead with one B50 run of the scratch binary only if the implementer's build of
+it is at hand. The seam compiles out of a production build.
 
 **Track:** D, after Task 7a and before Task 7b (same file). **Depends on:** Task 7a merged.
 **Written out:** 2026-11-22, against `095adc712`. Line numbers below are from that commit and move by a few lines

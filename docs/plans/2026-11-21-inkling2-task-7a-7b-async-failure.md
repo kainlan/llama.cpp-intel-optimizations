@@ -205,6 +205,9 @@ dependency on SYCL runtime timing that commit 4 left (decision 11, second holder
       `invocation_id == 0` and `busy_device_count == 0` after its first synchronize; no case's teardown reports a
       `begin_drain` or `finish_drain` refusal.
 - [ ] Commit 5: the source contract's claim B passes with its two mutants.
+- [ ] Review fix round (`5f8e80779`): `ready()` contains no wait and reads no latch (mutant "ready waits");
+      a throw out of `observe_success()`'s wait is recorded in the device latch before the terminal is marked
+      failed (claim T and its mutant).
 - [ ] Lead, once each: the Mistral B70 completion gate passes, and the GPT-OSS B50 chat gate passes **with
       `-c 4096`**. Ruled 2026-11-21: the gate without `-c` faults the B50 on this branch with and without Task 7a
       (plan, "GPT-OSS B50 default-context fault"), so it cannot accept or reject this task. The `-c 4096` arm is the
@@ -1160,6 +1163,8 @@ The change:
   name and the error.
 - Do not reorder cases 7 and 8. With case 8 first, its first graph's completion host task would usually run after
   the recorded failure and pin the same way: pass or fail would follow host-task timing.
+  *Superseded 2026-11-22:* after commit 4 (a failed terminal is ready) and commit 5 (the task empties its bundle)
+  the order no longer decides the outcome. The cases keep their order because nothing asks for another.
 
 #### Commit 5: the completion task empties its bundle before it returns (decision 11, second holder)
 
