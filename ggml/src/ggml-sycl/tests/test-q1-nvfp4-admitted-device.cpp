@@ -192,6 +192,10 @@ struct synthetic_inventory {
 // or after it, as a real model load does (load_end defers them to the context bind).
 enum class backend_order { BEFORE_LOAD_END, AFTER_LOAD_END };
 
+// Whether the fixture's context also holds the route-testing build's private authorization. PRODUCTION mints no scope,
+// so the route's admission reads only what a production build reads: the validated gate and the input-shape checks.
+enum class route_authorization { TEST_SCOPE, PRODUCTION };
+
 struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     int backend_device = -1;  // the registry device `backend` was created for
@@ -205,7 +209,8 @@ struct lifecycle_fixture {
     // Every case marker from this index on was published while this fixture was alive: the cases its teardown names.
     size_t first_case = g_case_markers.size();
 
-    explicit lifecycle_fixture(backend_order order = backend_order::BEFORE_LOAD_END) {
+    explicit lifecycle_fixture(backend_order       order         = backend_order::BEFORE_LOAD_END,
+                               route_authorization authorization = route_authorization::TEST_SCOPE) {
         try {
             const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
             if (begin_result != GGML_SYCL_LIFECYCLE_OK) {
@@ -339,14 +344,16 @@ struct lifecycle_fixture {
                             GGML_SYCL_LIFECYCLE_OK,
                         "second model root bind failed");
             }
-            require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
-                    "private scope mint failed");
-            scope_minted = true;
-            auto forged = scope; ++forged.nonce;
-            require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged nonce accepted");
-            forged = scope; ++forged.model.slot_generation;
-            require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged model token accepted");
-            require(ggml_sycl_q1_nvfp4_test_scope_enter(backend, &scope), "private scope enter failed");
+            if (authorization == route_authorization::TEST_SCOPE) {
+                require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
+                        "private scope mint failed");
+                scope_minted = true;
+                auto forged = scope; ++forged.nonce;
+                require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged nonce accepted");
+                forged = scope; ++forged.model.slot_generation;
+                require(!ggml_sycl_q1_nvfp4_test_scope_enter(backend, &forged), "forged model token accepted");
+                require(ggml_sycl_q1_nvfp4_test_scope_enter(backend, &scope), "private scope enter failed");
+            }
         } catch (...) {
             cleanup();
             throw;
@@ -453,25 +460,44 @@ struct graph_case {
     ~graph_case() { for (auto * b : buffers) if (b) ggml_backend_buffer_free(b); if (ctx) ggml_free(ctx); }
 };
 
+// How the activation's rows sit in device memory. DENSE: one tensor, rows adjacent. STRIDED: a view of a wider tensor,
+// so the rows are a fixed stride apart with other values between them; a route that copied ne11 rows as one block would
+// read those values, and they are far enough from the activation's range to fail the oracle.
+enum class input_rows { DENSE, STRIDED };
+constexpr int   strided_row_pad    = 64;  // floats between the end of one row of a strided input and the next row
+constexpr float strided_row_poison = 1000.0f;
+
 graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
-                      std::vector<float> & oracle, size_t & output_count) {
+                      std::vector<float> & oracle, size_t & output_count, input_rows rows = input_rows::DENSE) {
     constexpr int experts = 4, top_k = route_top_k, tokens = 1;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+    const int row_stride = rows == input_rows::STRIDED ? K + strided_row_pad : K;  // in floats
     graph_case c;
     c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
     auto * weights = ggml_new_tensor_3d(c.ctx, type, K, gate_output_n, experts);
-    auto * input = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, K, ne11, tokens);
+    auto * storage = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, row_stride, ne11, tokens);
+    auto * input   = rows == input_rows::STRIDED ?
+                         ggml_view_3d(c.ctx, storage, K, ne11, tokens, storage->nb[1], storage->nb[2], 0) :
+                         storage;
     auto * ids = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, top_k, tokens);
     ggml_set_name(weights, "blk.0.ffn_gate_exps.weight"); ggml_set_name(input, "route_input");
+    if (storage != input) {
+        ggml_set_name(storage, "route_input_storage");
+    }
     ggml_set_name(ids, "route_ids"); c.out = ggml_mul_mat_id(c.ctx, weights, input, ids);
     ggml_set_name(c.out, "route_output");
     auto * buft = ggml_backend_get_default_buffer_type(backend);
     c.buffers = { alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
-                  alloc_tensor(buft, input, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+                  alloc_tensor(buft, storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
                   alloc_tensor(buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
                   alloc_tensor(buft, c.out, GGML_BACKEND_BUFFER_USAGE_COMPUTE) };
     require(std::all_of(c.buffers.begin(), c.buffers.end(), [](auto * b) { return b != nullptr; }),
             "tensor buffer allocation failed");
+    if (storage != input) {
+        require(ggml_backend_view_init(input) == GGML_STATUS_SUCCESS, "strided input view initialization failed");
+        require(input->nb[0] == sizeof(float) && input->nb[1] != static_cast<size_t>(K) * sizeof(float),
+                "the strided input's rows are adjacent");
+    }
     ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
 
     std::vector<float> source(static_cast<size_t>(experts) * gate_output_n * K), dequant(source.size());
@@ -489,9 +515,15 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     }
     std::vector<float> activation(static_cast<size_t>(ne11) * K);
     for (size_t i = 0; i < activation.size(); ++i) activation[i] = 0.2f + float((i * 5) % 19) / 31.0f;
+    // The storage holds the activation's rows row_stride floats apart, poison between them (none when DENSE).
+    std::vector<float> stored(static_cast<size_t>(ne11) * row_stride, strided_row_poison);
+    for (int row = 0; row < ne11; ++row) {
+        std::copy_n(activation.data() + static_cast<size_t>(row) * K, K,
+                    stored.data() + static_cast<size_t>(row) * row_stride);
+    }
     const auto & selected = route_selected_experts;  // an array reference, so sizeof(selected) is the array's size
     ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
-    ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
+    ggml_backend_tensor_set(storage, stored.data(), 0, stored.size() * sizeof(float));
     ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
     c.graph = ggml_new_graph(c.ctx); ggml_build_forward_expand(c.graph, c.out);
     output_count = static_cast<size_t>(gate_output_n) * top_k; oracle.resize(output_count);
@@ -506,8 +538,9 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
 }
 
 // `graph` tags the graph in every label, so graph A and graph B of one churn regression stay distinguishable.
-void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph) {
-    std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
+void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph,
+                           input_rows rows = input_rows::DENSE) {
+    std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count, rows);
     ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     constexpr int no_pass = -1;
     const auto    label   = [&](int pass) {
@@ -835,7 +868,22 @@ int main() {
         { lifecycle_fixture life; graph_churn_regression(life, GGML_TYPE_Q1_0, 1);
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
-          graph_churn_regression(life, GGML_TYPE_NVFP4, 3); }
+          graph_churn_regression(life, GGML_TYPE_NVFP4, 3);
+          // One input row per selected expert, the rows a fixed stride apart (a view of a wider tensor): the route
+          // must read each row where it is, not ne11 rows' worth of bytes from the first.
+          successful_reuse_case(life, GGML_TYPE_Q1_0, route_top_k, "strided", input_rows::STRIDED);
+          successful_reuse_case(life, GGML_TYPE_NVFP4, route_top_k, "strided", input_rows::STRIDED); }
+        require_clean_teardown();
+        // No private authorization: the admission a production build runs must take both input shapes, one row shared
+        // by every selected expert (ne11 == 1) and one row per selected expert (ne11 == top_k), dense or strided.
+        {
+            lifecycle_fixture life(backend_order::BEFORE_LOAD_END, route_authorization::PRODUCTION);
+            for (const ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+                successful_reuse_case(life, type, 1, "production");
+                successful_reuse_case(life, type, route_top_k, "production");
+                successful_reuse_case(life, type, route_top_k, "production-strided", input_rows::STRIDED);
+            }
+        }
         require_clean_teardown();
         // The order a real model load runs in: no backend at load_end, then the context binds twice. The route must
         // admit on the plan snapshot that is live after the second bind.

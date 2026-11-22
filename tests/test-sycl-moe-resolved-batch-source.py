@@ -583,9 +583,12 @@ def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
     # That allocation can throw, which is only acceptable because it sits inside the try whose catch(...) takes
     # the quarantine/recover path. So: allow exactly those two spellings, still forbid every other vector after
     # the mark, and require the try/catch that makes the allowance sound.
+    # The third spelling is the row-by-row activation copy of a src1 whose rows are strided: each row's copy waits on
+    # the one before it, so the kernel's one dependency covers every row (direct_route_input_shape_violations).
     allowed_dependency_vectors = (
         "std::vector<sycl::event>{ retained_table.ready_event }",
         "std::vector<sycl::event>{}",
+        "std::vector<sycl::event>{ dependency }",
     )
     assert post_mark_vector_violations(post_mark, allowed_dependency_vectors) == []
     # Positive controls: the span rule must reject a construction hoisted above the try and one in the handler.
@@ -646,6 +649,128 @@ def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
     assert "ggml_sycl_moe_mark_direct_authority_pre_admission(src0)" in direct
     assert direct.index("ggml_sycl_moe_mark_direct_authority_pre_admission(src0)") < direct.index(
         "unified_cache_admit_moe_mmid_workspace")
+
+
+def direct_route_block(source: str) -> str:
+    """The Q1_0/NVFP4 direct route in ggml_sycl_mul_mat_id: from its gate constant to the hybrid dispatch gate."""
+    mmid = function_definition(source, "static void ggml_sycl_mul_mat_id(")
+    start = mmid.index("constexpr bool q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated")
+    end = mmid.index("// MoE hybrid GPU+CPU dispatch gate", start)
+    return mmid[start:end]
+
+
+def normalized_code(text: str) -> str:
+    """Comments removed, every whitespace run one space and none inside parentheses' edges, so a literal survives
+    re-wrapping by clang-format (a break after '(' or before ')' included)."""
+    text = re.sub(r"\s+", " ", re.sub(r"//.*?$|/\*.*?\*/", " ", text, flags=re.MULTILINE | re.DOTALL))
+    return re.sub(r"\s+\)", ")", re.sub(r"\(\s+", "(", text))
+
+
+def parenthesized_after(text: str, anchor: str) -> str:
+    """The balanced parenthesized expression that starts at the first '(' after anchor."""
+    open_at = text.index("(", text.index(anchor))
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_at:i + 1]
+    raise ValueError(f"unbalanced condition after: {anchor}")
+
+
+# Claims about which inputs the direct route admits and how it copies them (owner ruling 2026-11-22). The route takes
+# both shapes build_moe_ffn gives it in decode: one row every selected expert shares (the fused gate_up, src1
+# [n_embd, 1, n_tokens]) and one row per selected expert (down, src1 [n_ff, n_expert_used, n_tokens]); the kernel
+# indexes the row as id % ne11 and the workspace is planned for top_k rows. Each failure message starts with its claim.
+DIRECT_ROUTE_KERNEL_CALL = "mmvq_submit_q1_nvfp4_aos_id_admitted("
+DIRECT_ROUTE_ROW_LOOP = "for (int64_t row = 1; !src1_rows_adjacent && row < ne11; ++row) {"
+DIRECT_ROUTE_ROW_COPY = ("dependency = ggml_sycl::mem_copy_ptr_async(activation + row * ne00, src1_device_base + row "
+                         "* nb11, activation_row_bytes, *exact_queue, std::vector<sycl::event>{ dependency });")
+
+
+def direct_route_input_shape_violations(direct: str) -> list[str]:
+    code = normalized_code(direct)
+    failures: list[str] = []
+    try:
+        admission = parenthesized_after(code, "if (all_primary &&")
+    except ValueError:
+        return ["admission: the direct route's inner admission condition was not found"]
+    if not has_tokens(admission, "(ne11 == 1 || ne11 == ids->ne[0])"):
+        failures.append("per-slot-shape: admission does not take ne11 == 1 and ne11 == ids->ne[0] alike")
+    # The private test flag opens the whole route in a route-testing build (the outer gate) and nothing else: read
+    # anywhere in the shape conjuncts, a production build would refuse a shape the test build runs.
+    if (has_tokens(code, "q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]") or
+            has_tokens(admission, "q1_nvfp4_private_test_authorized") or
+            tokens(code).count("q1_nvfp4_private_test_authorized") != 3):
+        failures.append("test-flag: the private test flag is read outside its two definitions and the outer gate")
+    # The copy reads float rows; elements that are not adjacent inside a row are not admitted at all.
+    if not has_tokens(admission, "nb10 == sizeof(float)"):
+        failures.append("element-contiguity: admission does not require nb10 == sizeof(float)")
+    mark = code.find("completion->bundle.mark_possible_submit()")
+    if mark < 0:
+        return failures + ["mark: mark_possible_submit() was not found"]
+    pre_mark, post_mark = code[:mark], code[mark:]
+    if not has_tokens(pre_mark,
+                      "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);"):
+        failures.append("rows-adjacent: no pre-mark src1_rows_adjacent from nb11 == ne10 * sizeof(float)")
+    if not has_tokens(pre_mark, "const size_t activation_row_bytes = static_cast<size_t>(ne00) * sizeof(float);"):
+        failures.append("row-bytes: no pre-mark activation_row_bytes of one row")
+    try:
+        body = tokens(function_definition(post_mark, "try {"))
+    except ValueError:
+        return failures + ["try: the submit try body was not found"]
+    if not contains_tokens(body, "sycl::event dependency = ggml_sycl::mem_copy_ptr_async(activation, src1_device_base, "
+                                 "src1_rows_adjacent ? activation_bytes : activation_row_bytes, *exact_queue,"):
+        failures.append("first-copy: the first activation copy is not one block when adjacent and one row otherwise")
+    if not contains_tokens(body, DIRECT_ROUTE_ROW_LOOP) or not contains_tokens(body, DIRECT_ROUTE_ROW_COPY):
+        failures.append("row-copies: strided rows are not copied one by one, each after the one before")
+    elif not contains_tokens(body, DIRECT_ROUTE_KERNEL_CALL) or token_sequence_index(
+            body, DIRECT_ROUTE_ROW_COPY) > token_sequence_index(body, DIRECT_ROUTE_KERNEL_CALL):
+        failures.append("row-copies: the row copies are not submitted before the kernel")
+    if body.count("mem_copy_ptr_async") != 3:
+        failures.append("copy-count: the try body is not the first copy, the row copy and the output copy")
+    if not contains_tokens(body, "buffers, &dependency, &kernel)"):
+        failures.append("kernel-dependency: the kernel does not wait on the last activation copy")
+    if "wait" in body or "wait_and_throw" in body:
+        failures.append("no-host-wait: the submit path waits on the host")
+    return failures
+
+
+def test_direct_route_admits_both_decode_input_shapes_and_copies_strided_rows() -> None:
+    failures = direct_route_input_shape_violations(direct_route_block(SOURCE.read_text()))
+    assert failures == [], failures
+
+
+def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
+    direct = normalized_code(direct_route_block(SOURCE.read_text()))
+    assert direct_route_input_shape_violations(direct) == []
+    mutants = [
+        ("per-slot-test-only", "(ne11 == 1 || ne11 == ids->ne[0])",
+         "(ne11 == 1 || (q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]))", "test-flag"),
+        ("per-slot-closed", "(ne11 == 1 || ne11 == ids->ne[0])", "ne11 == 1", "per-slot-shape"),
+        ("drop-element-contiguity", "nb10 == sizeof(float) &&", "", "element-contiguity"),
+        ("rows-always-adjacent",
+         "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);",
+         "const bool src1_rows_adjacent = true;", "rows-adjacent"),
+        ("flat-copy", "src1_rows_adjacent ? activation_bytes : activation_row_bytes", "activation_bytes", "first-copy"),
+        ("row-stride-ignored", "src1_device_base + row * nb11", "src1_device_base + row * ne00 * sizeof(float)",
+         "row-copies"),
+        ("row-copies-unchained", "std::vector<sycl::event>{ dependency }", "std::vector<sycl::event>{}", "row-copies"),
+        ("row-copies-discarded", "dependency = ggml_sycl::mem_copy_ptr_async(activation + row",
+         "(void) ggml_sycl::mem_copy_ptr_async(activation + row", "row-copies"),
+        ("extra-flat-copy", DIRECT_ROUTE_ROW_LOOP,
+         "(void) ggml_sycl::mem_copy_ptr_async(activation, src1_device_base, activation_bytes, *exact_queue); "
+         + DIRECT_ROUTE_ROW_LOOP, "copy-count"),
+        ("kernel-skips-copies", "buffers, &dependency, &kernel)", "buffers, nullptr, &kernel)", "kernel-dependency"),
+        ("host-wait", DIRECT_ROUTE_ROW_LOOP, "dependency.wait(); " + DIRECT_ROUTE_ROW_LOOP, "no-host-wait"),
+    ]
+    for name, old, new, claim in mutants:
+        mutant = direct.replace(old, new, 1)
+        assert mutant != direct, f"mutant changed nothing: {name}"
+        failures = direct_route_input_shape_violations(mutant)
+        assert any(f.startswith(claim + ":") for f in failures), f"mutant {name} did not fail {claim}: {failures}"
 
 
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
