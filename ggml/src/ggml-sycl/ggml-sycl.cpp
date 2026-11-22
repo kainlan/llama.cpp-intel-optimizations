@@ -101046,6 +101046,10 @@ static std::vector<std::pair<int, ggml_tensor *>> find_mulmat_consumers(const gg
 
     for (int j = start_idx; j < cgraph->n_nodes; j++) {
         ggml_tensor * node = cgraph->nodes[j];
+        // the fusion runs every consumer it returns, so an uncomputed MUL_MAT is not one
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
 
         if (node->op == GGML_OP_MUL_MAT) {
             // MUL_MAT src[1] is the activation input
@@ -110104,7 +110108,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 // 3. Reuses the quantized result for all projections (Q, K, V or gate, up)
                 // This bypasses the ggml_can_fuse_subgraph limitation where shared intermediates fail.
                 // Note: Only triggers for batch size >= 8 to avoid overhead during token generation
-                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes &&
+                    ggml_sycl_graph_node_is_computed(cgraph->nodes[i + 1]) && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     // Check if MUL uses RMS_NORM output
                     if (mul_node->src[0] == node || mul_node->src[1] == node) {

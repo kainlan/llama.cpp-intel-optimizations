@@ -29,9 +29,10 @@ Checks:
     persistent path takes) before the graph is judged. A recipe replay takes each node through one lookup that
     refuses an index outside the graph or an uncomputed node, and such a node fails the replay into a full rebuild;
   * a fusion that also runs a node it looked ahead to asks the rule of that node: the TG router and MUL_MAT+ADD
-    fusions, ADD+RMS_NORM, MUL+ADD, the FFN fusion, the MoE down-sum chain and its weighted MUL, and the persistent
-    plan's RMS_NORM+MUL. The two CPU-path fusions ask ggml_sycl_is_noop of the next node. The RMS_NORM fusions that
-    go through ggml_can_fuse_subgraph are covered by it: it refuses an uncomputed node;
+    fusions, ADD+RMS_NORM, MUL+ADD, the FFN fusion, the per-projection RMS_NORM+MUL (whose consumer scan,
+    find_mulmat_consumers, leaves an uncomputed MUL_MAT out), the MoE down-sum chain and its weighted MUL, and the
+    persistent plan's RMS_NORM+MUL. The two CPU-path fusions ask ggml_sycl_is_noop of the next node. The RMS_NORM
+    fusions that go through ggml_can_fuse_subgraph are covered by it: it refuses an uncomputed node;
   * the four input readers (the pre-stage, its diagnostic source count, the replay refresh's discovery and the
     segment slot's input list) read a node's sources only when the graph computes that node, so an input that only
     an uncomputed node reads is neither staged, refreshed nor listed, and the four give one answer. A recorded kernel
@@ -223,6 +224,9 @@ NODE_WALKS = {
          r"const\s+ggml_tensor\s*\*\s*dst\s*=\s*cgraph->nodes\[i\]\s*;", 1),
     "the layer-block alias publication":
         (r"static bool ggml_sycl_block_exec_publish_aliases\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the per-projection fusion's consumer scan":
+        (r"static std::vector<std::pair<int, ggml_tensor \*>> find_mulmat_consumers\([^)]*\)\s*\{",
+         r"for\s*\(\s*int\s+j\s*=\s*start_idx\s*;", 1),
 }
 
 GRAPH_COMPUTE = r"static void ggml_backend_sycl_graph_compute_impl\([^)]*\)\s*\{"
@@ -244,6 +248,10 @@ LOOKAHEADS = {
     "the FFN fusion":
         (GRAPH_COMPUTE, r"glu_info\.glu\s*!=\s*nullptr\s*&&\s*ggml_sycl_graph_node_is_computed\(glu_info\.glu\)",
          "glu_info.glu != nullptr", 1),
+    "the per-projection RMS_NORM+MUL fusion":
+        (GRAPH_COMPUTE,
+         r"ggml_sycl_graph_node_is_computed\(cgraph->nodes\[i \+ 1\]\)\s*&&\s*"
+         r"cgraph->nodes\[i \+ 1\]->op\s*==\s*GGML_OP_MUL\b", "cgraph->nodes[i + 1]->op == GGML_OP_MUL", 1),
     "each of the two CPU-path fusions":
         (GRAPH_COMPUTE, r"next\s*&&\s*!ggml_sycl_is_noop\(next\)", "next", 2),
     "the MoE down-sum chain":
