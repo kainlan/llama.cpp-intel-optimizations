@@ -26,11 +26,16 @@ Pinned here:
   * the indexer's K-type and elements-per-lane lists exist once (X-macros in the predicate header) and the
     launcher is generated from them; the comb scale index is one named constant;
   * the new op sources allocate nothing and never block the host (graph-recordable);
-  * the top-k mask reads every source through one helper that, while recording, takes the graph pre-stage's device
-    copy of a graph input by the pre-stage's own INPUT rule, and never throws, so recording never falls back to a
-    direct run for it;
+  * the top-k mask reads every source through the staged-input lookup bin-broadcast also uses
+    (graph-input-staged.hpp): while recording, the graph pre-stage's device copy of a graph input by the pre-stage's
+    own INPUT rule, else the tensor's own memory only when that is device USM, else a throw before anything is
+    submitted, so a recording never bakes a host pointer and the segment runs directly instead; the staging handles
+    join a terminal retention ticket committed on the kernel's event;
   * the top-k mask kernel fills a row with -inf, then passes a group barrier, then writes the kept cells, and nothing
-    in it returns before the barrier.
+    in it returns before the barrier;
+  * the host test's top-k mask controls each require the wrong oracle to differ from the kernel's output, and every
+    case with extra cells is seeded, before the launch, with an extra cell no pick keeps, so the extra-cell control
+    cannot compare equal by chance (random extra cells did, in the qwen4exp decode shape).
 
 Run with --self-test to prove every check fires against a mutant of the thing it forbids; a check that
 cannot fail is decoration.
@@ -57,6 +62,8 @@ parser.add_argument("--tkm", default=str(sycl / "top-k-mask.cpp"))
 parser.add_argument("--tkm-header", default=str(sycl / "top-k-mask.hpp"))
 parser.add_argument("--tkm-kernels", default=str(sycl / "top-k-mask-kernel.hpp"))
 parser.add_argument("--tkm-predicates", default=str(sycl / "top-k-mask-predicate.hpp"))
+parser.add_argument("--staged", default=str(sycl / "graph-input-staged.hpp"))
+parser.add_argument("--tkm-test", default=str(sycl / "tests/test-dsv4-hc-kernels.cpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -196,7 +203,7 @@ def lambda_body(source, head_regex):
 
 
 def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header, lid_kernels, lid_predicates,
-             tkm, tkm_header, tkm_kernels, tkm_predicates):
+             tkm, tkm_header, tkm_kernels, tkm_predicates, staged, tkm_test):
     results = {}
     # per op: the source that defines its executor, and the header that defines its predicate inline
     executor_src = {op: hc for op in OPS}
@@ -262,7 +269,8 @@ def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header,
     for label, text in (("dsv4-hc.cpp", hc), ("dsv4-hc-kernels.hpp", hc_kernels), ("dsv4-hc-predicates.hpp", hc_predicates),
                         ("lightning-indexer.cpp", lid), ("lightning-indexer-kernel.hpp", lid_kernels),
                         ("lightning-indexer-predicate.hpp", lid_predicates), ("top-k-mask.cpp", tkm),
-                        ("top-k-mask-kernel.hpp", tkm_kernels), ("top-k-mask-predicate.hpp", tkm_predicates)):
+                        ("top-k-mask-kernel.hpp", tkm_kernels), ("top-k-mask-predicate.hpp", tkm_predicates),
+                        ("graph-input-staged.hpp", staged)):
         results[f"{label} exists and is non-empty"] = len(text.strip()) > 0
         results[f"{label} has no host wait"] = HOST_WAIT.search(text) is None
         results[f"{label} allocates nothing"] = ALLOC.search(text) is None
@@ -294,30 +302,70 @@ def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header,
     results["supports_op TOP_K_MASK arm does not depend on placement"] = \
         tkm_arm is not None and "placement_declines" not in tkm_arm
 
-    # --- the top-k mask reads its sources through the recording-aware helper ----------------------------------------
+    # --- the top-k mask reads its sources through the shared staged-input lookup ------------------------------------
     helper = function_body(tkm, r"\bstatic\s+T\s*\*\s*top_k_mask_src_ptr\s*\([^)]*\)\s*\{")
     results["anchor: top_k_mask_src_ptr exists"] = helper is not None
     helper = helper or ""
-    # only while this thread records: outside a recording the staged copy is not guaranteed current for this token
-    results["top_k_mask_src_ptr looks staging up only while this thread records"] = \
-        "ggml_sycl_graph_recording_this_thread()" in helper
-    # the pre-stage's own rule (a view of an input is that input), never the bare flag, so the op never reads an entry
-    # the pre-stage no longer stages or refreshes
-    results["top_k_mask_src_ptr asks the pre-stage's INPUT rule"] = \
-        "ggml_sycl_prestage_is_input(t)" in helper and "GGML_TENSOR_FLAG_INPUT" not in helper
-    results["top_k_mask_src_ptr reads the pre-stage's copy for the span the pre-stage copied"] = \
-        re.search(r"graph_input_stage_lookup\s*\(\s*t\s*,\s*ggml_nbytes\s*\(\s*t\s*\)", helper) is not None
     results["top_k_mask_src_ptr returns null for an absent operand"] = \
         re.search(r"if\s*\(\s*t\s*==\s*nullptr\s*\)\s*\{\s*return\s+nullptr\s*;", helper) is not None
+    # the span the pre-stage copied from the tensor's own data is the span the kernel addresses
+    results["top_k_mask_src_ptr asks the shared recordable lookup for the span the pre-stage copied"] = \
+        re.search(r"ggml_sycl_graph_input_recordable_ptr\s*\(\s*ctx\s*,\s*t\s*,\s*ggml_nbytes\s*\(\s*t\s*\)", helper) \
+        is not None
+    results["top_k_mask_src_ptr keeps the staging handle in the op's owners"] = \
+        re.search(r"owners\s*\.\s*push_back\s*\(\s*std::move\s*\(\s*staged\s*\)\s*\)", helper) is not None
+    # one lookup for every op, so the top-k mask cannot drift from bin-broadcast or from the pre-stage
+    results["top-k-mask.cpp keeps no staging lookup of its own"] = \
+        "graph_input_stage_lookup" not in tkm and "ggml_sycl_prestage_is_input" not in tkm
     tkm_exec = function_body(tkm, r"\bvoid\s+ggml_sycl_op_top_k_mask\s*\([^)]*\)\s*\{") or ""
     for i in range(5):
         results[f"top-k mask src {i} is read through top_k_mask_src_ptr"] = \
-            re.search(r"top_k_mask_src_ptr\s*<[^>]*>\s*\(\s*ctx\s*,\s*dst\.src\(\s*" + str(i) + r"\s*\)\s*\)",
+            re.search(r"top_k_mask_src_ptr\s*<[^>]*>\s*\(\s*ctx\s*,\s*dst\.src\(\s*" + str(i) + r"\s*\)\s*,\s*owners\s*\)",
                       tkm_exec) is not None
     results["no top-k mask source is resolved around the helper"] = \
         re.search(r"src\s*\(\s*\d\s*\)\s*\.\s*resolve", tkm_exec) is None and "->data" not in tkm
-    # a throw inside a recording turns the whole segment into a direct run with a stream drain
-    results["top-k-mask.cpp never throws"] = re.search(r"\bthrow\b", tkm) is None
+    # a source that throws must do so before the kernel is in the recording
+    launch = tkm_exec.find("top_k_mask_launch(")
+    reads = [m.start() for m in re.finditer(r"top_k_mask_src_ptr\s*<", tkm_exec)]
+    results["every top-k mask source is resolved before the kernel is submitted"] = \
+        launch >= 0 and len(reads) == 5 and max(reads) < launch
+    # the staging handles live as long as the kernel can read them: the recording's lifetime, or the kernel's event
+    prep = re.search(r"terminal_retention_ticket::prepare\s*\(\s*\{\s*\}\s*,\s*std::move\s*\(\s*owners\s*\)\s*\)",
+                     tkm_exec)
+    mark = tkm_exec.find("ticket.mark_submitted(")
+    commit = tkm_exec.find("ticket.commit(done)")
+    results["the staging handles join a retention ticket committed on the kernel's event"] = \
+        prep is not None and 0 <= prep.start() < launch < mark < commit and \
+        re.search(r"top_k_mask_launch\s*\([^;]*&\s*done\s*\)", tkm_exec) is not None
+
+    # --- the shared lookup: the pre-stage's copy while recording, device memory or a throw on a miss ------------------
+    staged_fn = function_body(staged, r"\bstatic\s+inline\s+void\s*\*\s*ggml_sycl_graph_input_staged_ptr\s*\([^)]*\)\s*\{")
+    recordable = function_body(
+        staged, r"\bstatic\s+inline\s+void\s*\*\s*ggml_sycl_graph_input_recordable_ptr\s*\([^)]*\)\s*\{")
+    results["anchor: ggml_sycl_graph_input_staged_ptr exists"] = staged_fn is not None
+    results["anchor: ggml_sycl_graph_input_recordable_ptr exists"] = recordable is not None
+    staged_fn = staged_fn or ""
+    recordable = recordable or ""
+    # only while this thread records: outside a recording the staged copy is not guaranteed current for this token
+    results["the staged lookup answers only while this thread records"] = \
+        re.search(r"if\s*\(\s*!\s*ggml_sycl_graph_recording_this_thread\s*\(\s*\)\s*\|\|", staged_fn) is not None
+    # the pre-stage's own rule (a view of an input is that input), never the bare flag, so no op reads an entry the
+    # pre-stage no longer stages or refreshes
+    results["the staged lookup asks the pre-stage's INPUT rule"] = \
+        "ggml_sycl_prestage_is_input(tensor)" in staged_fn and "GGML_TENSOR_FLAG_INPUT" not in staged_fn
+    results["the staged lookup reads only within the bytes the pre-stage copied"] = \
+        re.search(r"if\s*\(\s*span_bytes\s*>\s*ggml_nbytes\s*\(\s*tensor\s*\)\s*\)\s*\{\s*return\s+nullptr\s*;", staged_fn) \
+        is not None and "graph_input_stage_lookup(" in staged_fn
+    # a miss while recording: a host-pinned pointer would be a GPU read of host memory that goes stale when llama
+    # re-points the input, a non-USM one unreadable; either throws, and the segment runs directly
+    staged_call = recordable.find("ggml_sycl_graph_input_staged_ptr(")
+    guard = re.search(r"if\s*\(\s*ptr\s*==\s*nullptr\s*\|\|\s*ggml_sycl_get_alloc_type\s*\(\s*ptr\s*\)\s*!=\s*"
+                      r"sycl::usm::alloc::device\s*\)\s*\{\s*throw\s+std::runtime_error\s*\(", recordable)
+    results["a recording miss on a source that is not device memory throws"] = \
+        guard is not None and 0 <= staged_call < guard.start()
+    results["outside a recording the recordable lookup resolves as every op does"] = \
+        re.search(r"if\s*\(\s*!\s*ggml_sycl_graph_recording_this_thread\s*\(\s*\)\s*\)\s*\{\s*return\s+"
+                  r"ggml_sycl_resolve_tensor_ptr\s*\(", recordable) is not None
 
     # --- the kernel fills, then barriers, then writes the kept cells; no work-item skips the barrier -------------------
     kern = lambda_body(tkm_kernels, r"\[=\]\s*\(\s*sycl::nd_item<1>\s+item\s*\)") or ""
@@ -328,6 +376,21 @@ def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header,
     results["top-k mask kernel: -inf fill, then a group barrier, then the kept cells"] = \
         0 <= fill < barrier < keep
     results["top-k mask kernel never returns before its barrier"] = len(kern) > 0 and re.search(r"\breturn\b", kern) is None
+
+    # --- the host test's controls can reject: each needs the wrong oracle to differ, and the extra cells are seeded --
+    case = function_body(tkm_test, r"\bvoid\s+test_top_k_mask\s*\(\s*sycl::queue\s*&\s*q\s*,\s*const\s+top_k_mask_case\s*&\s*c\s*\)\s*\{")
+    results["anchor: the host test's test_top_k_mask exists"] = case is not None
+    case = case or ""
+    controls = re.findall(r'report_count\s*\(\s*"control: "\s*\+\s*name\s*\+\s*"[^"]*"\s*,\s*([^,]+),', case)
+    # a control that compared equal and still passed would prove nothing: each passes only on a difference
+    results["every top-k mask control requires its wrong oracle to differ"] = \
+        len(controls) == 3 and all(re.fullmatch(r"\s*n\s*>\s*0\s*", cond) for cond in controls)
+    seed = re.search(r"top_k_mask_seed_uncovered_extra\s*\(", case)
+    host_launch = case.find("top_k_mask_launch(")
+    results["every case with extra cells seeds one no pick keeps, before the launch"] = \
+        seed is not None and 0 <= seed.start() < host_launch and \
+        re.search(r"if\s*\(\s*c\.n_extra\s*>\s*0\s*\)\s*\{[^{}]*top_k_mask_seed_uncovered_extra\s*\(", case) is not None and \
+        re.search(r"seeded\s*==\s*rows", case) is not None
     return results
 
 
@@ -344,11 +407,11 @@ def run(label, sources, expect_fail=None):
 
 
 names = ("backend", "hc", "hc_header", "hc_kernels", "hc_predicates", "lid", "lid_header", "lid_kernels", "lid_predicates",
-         "tkm", "tkm_header", "tkm_kernels", "tkm_predicates")
+         "tkm", "tkm_header", "tkm_kernels", "tkm_predicates", "staged", "tkm_test")
 sources = dict(zip(names, (read(args.backend), read(args.hc), read(args.hc_header), read(args.hc_kernels),
                            read(args.hc_predicates), read(args.lid), read(args.lid_header), read(args.lid_kernels),
                            read(args.lid_predicates), read(args.tkm), read(args.tkm_header), read(args.tkm_kernels),
-                           read(args.tkm_predicates))))
+                           read(args.tkm_predicates), read(args.staged), read(args.tkm_test))))
 failed = run("tree", tuple(sources[k] for k in names))
 
 if args.self_test:
@@ -445,30 +508,63 @@ if args.self_test:
          with_(tkm=mutate(sources["tkm"], "GGML_ASSERT(launched);", "ctx.stream()->wait(); GGML_ASSERT(launched);"))),
         ("top-k mask kernel allocates", "top-k-mask-kernel.hpp allocates nothing",
          with_(tkm_kernels=sources["tkm_kernels"] + "\nvoid * p = sycl::malloc_device(8, q);\n")),
-        ("top-k mask staging looked up outside a recording", "top_k_mask_src_ptr looks staging up only while this thread records",
-         with_(tkm=sources["tkm"].replace("ggml_sycl_graph_recording_this_thread() && ", ""))),
-        ("top-k mask staging keyed on the bare flag", "top_k_mask_src_ptr asks the pre-stage's INPUT rule",
-         with_(tkm=sources["tkm"].replace("ggml_sycl_prestage_is_input(t)", "(t->flags & GGML_TENSOR_FLAG_INPUT)"))),
-        ("top-k mask staging lookup removed", "top_k_mask_src_ptr reads the pre-stage's copy for the span the pre-stage copied",
-         with_(tkm=sources["tkm"].replace("ctx.graph_input_stage_lookup(t, ggml_nbytes(t), ctx.device, nullptr, &staged)",
-                                          "false"))),
+        ("staging looked up outside a recording", "the staged lookup answers only while this thread records",
+         with_(staged=mutate(sources["staged"], "if (!ggml_sycl_graph_recording_this_thread() || tensor == nullptr",
+                             "if (tensor == nullptr"))),
+        ("staging keyed on the bare flag", "the staged lookup asks the pre-stage's INPUT rule",
+         with_(staged=mutate(sources["staged"], "ggml_sycl_prestage_is_input(tensor)",
+                             "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"))),
+        ("staging read past the copied bytes", "the staged lookup reads only within the bytes the pre-stage copied",
+         with_(staged=mutate(sources["staged"], "if (span_bytes > ggml_nbytes(tensor)) {", "if (false) {"))),
+        ("a recording miss bakes whatever resolved", "a recording miss on a source that is not device memory throws",
+         with_(staged=mutate(sources["staged"], "throw std::runtime_error(", "GGML_LOG_WARN(\"%s\", "))),
+        ("a recording miss accepts host memory", "a recording miss on a source that is not device memory throws",
+         with_(staged=mutate(sources["staged"], "!= sycl::usm::alloc::device", "== sycl::usm::alloc::unknown"))),
+        ("a direct run refused a host source", "outside a recording the recordable lookup resolves as every op does",
+         with_(staged=mutate(sources["staged"], "if (!ggml_sycl_graph_recording_this_thread()) {\n        return "
+                             "ggml_sycl_resolve_tensor_ptr(tensor, device);\n    }", ""))),
+        ("top-k mask bypasses the shared lookup", "top_k_mask_src_ptr asks the shared recordable lookup for the span the pre-stage copied",
+         with_(tkm=mutate(sources["tkm"], "ggml_sycl_graph_input_recordable_ptr(ctx, t, ggml_nbytes(t), ctx.device, staged, \"top-k mask\")",
+                          "src.resolve_ptr()"))),
+        ("top-k mask grows a lookup of its own", "top-k-mask.cpp keeps no staging lookup of its own",
+         with_(tkm=sources["tkm"] + "\nstatic void * f(ggml_backend_sycl_context & ctx, const ggml_tensor * t) {"
+                                    " void * p = nullptr; ctx.graph_input_stage_lookup(t, 4, 0, nullptr, &p); return p; }\n")),
+        ("top-k mask drops the staging handle", "top_k_mask_src_ptr keeps the staging handle in the op's owners",
+         with_(tkm=mutate(sources["tkm"], "owners.push_back(std::move(staged));", "(void) staged;"))),
         ("top-k mask resolves an absent operand", "top_k_mask_src_ptr returns null for an absent operand",
-         with_(tkm=sources["tkm"].replace("if (t == nullptr) {\n        return nullptr;\n    }", ""))),
+         with_(tkm=mutate(sources["tkm"], "if (t == nullptr) {\n        return nullptr;\n    }", ""))),
         ("top-k mask blocks resolved directly", "top-k mask src 3 is read through top_k_mask_src_ptr",
-         with_(tkm=sources["tkm"].replace("top_k_mask_src_ptr<const int32_t>(ctx, dst.src(3))",
-                                          "dst.src(3).resolve_as<const int32_t>()"))),
+         with_(tkm=mutate(sources["tkm"], "top_k_mask_src_ptr<const int32_t>(ctx, dst.src(3), owners)",
+                          "dst.src(3).resolve_as<const int32_t>()"))),
         ("top-k mask extra resolved directly", "no top-k mask source is resolved around the helper",
-         with_(tkm=sources["tkm"].replace("top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4))",
-                                          "top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4)) ? dst.src(4).resolve_as<const int32_t>() : nullptr"))),
-        ("top-k mask throws on a miss", "top-k-mask.cpp never throws",
-         with_(tkm=sources["tkm"].replace("    return src.resolve_as<T>();",
-                                          "    if (ggml_sycl_graph_recording_this_thread()) { throw std::runtime_error(\"miss\"); }\n"
-                                          "    return src.resolve_as<T>();"))),
+         with_(tkm=mutate(sources["tkm"], "top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4), owners)",
+                          "top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4), owners) ? dst.src(4).resolve_as<const int32_t>() : nullptr"))),
+        ("top-k mask reads a source's data", "no top-k mask source is resolved around the helper",
+         with_(tkm=sources["tkm"] + "\nstatic const void * f(const ggml_tensor * t) { return t->data; }\n")),
+        ("top-k mask resolves a source after the launch", "every top-k mask source is resolved before the kernel is submitted",
+         with_(tkm=mutate(sources["tkm"], "    GGML_ASSERT(launched);",
+                          "    GGML_ASSERT(launched);\n    args.extra = top_k_mask_src_ptr<const int32_t>(ctx, dst.src(4), owners);"))),
+        ("top-k mask ticket never committed", "the staging handles join a retention ticket committed on the kernel's event",
+         with_(tkm=mutate(sources["tkm"], "ticket.commit(done);", ""))),
+        ("top-k mask ticket holds no owners", "the staging handles join a retention ticket committed on the kernel's event",
+         with_(tkm=mutate(sources["tkm"], "prepare({}, std::move(owners))", "prepare({})"))),
         ("top-k mask barrier removed", "top-k mask kernel: -inf fill, then a group barrier, then the kept cells",
          with_(tkm_kernels=sources["tkm_kernels"].replace("sycl::group_barrier(item.get_group());", ""))),
         ("top-k mask barrier after the writes", "top-k mask kernel: -inf fill, then a group barrier, then the kept cells",
-         with_(tkm_kernels=sources["tkm_kernels"].replace("sycl::group_barrier(item.get_group());", "").replace(
-             "            }\n        });\n}", "            }\n            sycl::group_barrier(item.get_group());\n        });\n}"))),
+         with_(tkm_kernels=mutate(mutate(sources["tkm_kernels"], "sycl::group_barrier(item.get_group());", ""),
+                                  "            }\n        });\n}",
+                                  "            }\n            sycl::group_barrier(item.get_group());\n        });\n}"))),
+        ("a top-k mask control passes when it compares equal", "every top-k mask control requires its wrong oracle to differ",
+         with_(tkm_test=mutate(sources["tkm_test"], '" without the extra cells is rejected", n > 0,',
+                               '" without the extra cells is rejected", n >= 0,'))),
+        ("a top-k mask control dropped", "every top-k mask control requires its wrong oracle to differ",
+         with_(tkm_test=mutate(sources["tkm_test"], 'report_count("control: " + name + " with every pick live is rejected"',
+                               'printf("%s", (name + " with every pick live is rejected").c_str()); (void) ('))),
+        ("the extra cells left to chance", "every case with extra cells seeds one no pick keeps, before the launch",
+         with_(tkm_test=mutate(sources["tkm_test"], "top_k_mask_seed_uncovered_extra(c, ninf, oracle(2), mask, vm, extra, ve)",
+                               "rows"))),
+        ("a row left unseeded passes", "every case with extra cells seeds one no pick keeps, before the launch",
+         with_(tkm_test=mutate(sources["tkm_test"], "seeded == rows", "seeded >= 0"))),
         ("top-k mask kernel returns early", "top-k mask kernel never returns before its barrier",
          with_(tkm_kernels=sources["tkm_kernels"].replace("const int64_t lid = item.get_local_id(0);",
                                                           "const int64_t lid = item.get_local_id(0);\n"

@@ -11488,8 +11488,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // one mask row for all rows and streams (QSA)
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true));
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
-        // the qwen4exp indexer form, one decode row and a short prefill: one mask row, blocks of consecutive cells,
-        // live scores and the tail as extra cells
+    }
+
+    // SYCL fork: the qwen4exp indexer form, one decode row and a short prefill: one mask row, blocks of consecutive
+    // cells, live scores and the tail as extra cells. A loop of its own, so upstream additions to the one above merge
+    // without a conflict.
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         test_cases.emplace_back(new test_top_k_mask(type, 4096, 4, 1024, 512, 3, true, 1, 1, 1, true, true));
         test_cases.emplace_back(new test_top_k_mask(type, 4096, 4, 1024, 512, 3, true, 37, 1, 1, true, true));
     }

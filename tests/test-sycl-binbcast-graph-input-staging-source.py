@@ -18,7 +18,10 @@ cannot reach without a GPU:
     does not set staged_raw_host, whose end-of-op wait is the drain removed;
   - a miss while recording still throws, with the message unchanged;
   - the helper answers only while this thread records, and asks the pre-stage's
-    shared INPUT rule rather than a copy that could drift from it.
+    shared INPUT rule rather than a copy that could drift from it;
+  - the helper is the shared one in graph-input-staged.hpp, which every op that
+    reads a staged graph input calls, and binbcast.cpp keeps no lookup of its
+    own that could drift from it.
 """
 
 from __future__ import annotations
@@ -29,8 +32,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BINBCAST = ROOT / "ggml" / "src" / "ggml-sycl" / "binbcast.cpp"
+STAGED = ROOT / "ggml" / "src" / "ggml-sycl" / "graph-input-staged.hpp"
 
-HELPER = "ggml_sycl_binbcast_graph_input_staged_ptr("
+HELPER = "ggml_sycl_graph_input_staged_ptr("
 THROW = 'throw std::runtime_error("bin-broadcast raw host staging is not graph-recordable");'
 
 
@@ -71,23 +75,38 @@ def lambda_body(code: str) -> str:
 
 
 def helper_body(code: str) -> str:
-    start = code.index("static void * " + HELPER)
+    start = code.index("static inline void * " + HELPER)
     brace = code.index("{", start)
     return code[brace:block_end(code, brace)]
 
 
 def main() -> int:
-    code = strip_comments(BINBCAST.read_text(encoding="utf-8"))
+    raw = BINBCAST.read_text(encoding="utf-8")
+    code = strip_comments(raw)
+    staged = strip_comments(STAGED.read_text(encoding="utf-8")) if STAGED.exists() else ""
     try:
         body = lambda_body(code)
-        helper = helper_body(code)
     except ValueError:
-        print("FAIL: binbcast.cpp no longer has stage_raw_host_source or " + HELPER.rstrip("("))
+        print("FAIL: binbcast.cpp no longer has stage_raw_host_source")
         return 1
     except UnbalancedBraces as exc:
         print(f"FAIL: binbcast.cpp could not be scanned: {exc}")
         return 1
+    try:
+        helper = helper_body(staged)
+    except ValueError:
+        print("FAIL: graph-input-staged.hpp no longer defines " + HELPER.rstrip("("))
+        return 1
+    except UnbalancedBraces as exc:
+        print(f"FAIL: graph-input-staged.hpp could not be scanned: {exc}")
+        return 1
     failures = []
+
+    # one lookup for every op: bin-broadcast calls the shared helper and keeps no copy of it
+    if '#include "graph-input-staged.hpp"' not in raw:
+        failures.append("binbcast.cpp must include graph-input-staged.hpp, the shared staged-input lookup")
+    if "graph_input_stage_lookup(" in code:
+        failures.append("binbcast.cpp looks the staging map up itself; go through " + HELPER.rstrip("("))
 
     call = body.find(HELPER)
     if call < 0:
