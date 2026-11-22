@@ -23,7 +23,8 @@ Checks:
   * the walkers that choose, stage or plan what runs leave an uncomputed node before they read it: every node loop
     of the MoE topology scan (g_moe_gate_up_pairs) and of the MoE dispatch list (whose dispatch_indices the segment
     recorder, the block graphs, the graphlets and the decode analysis take); the layer-block pre-block copy, the
-    layer-block plan's source scan and its alias publication; the persistent TG plan's fast path and full walk, the
+    layer-block plan's source scan and its alias publication, and the three loops of the layer-block runtime probe
+    that mirror them; the persistent TG plan's fast path and full walk, the
     split plan's weight list, and the eligibility checks before them (decode, architecture, op support, MoE probe,
     policy summary), so an unselected branch's DUP no longer declines persistent TG;
   * the persistent TG answer, its plan and the plan's update recipe are keyed on the graph signature, which mixes each
@@ -242,6 +243,10 @@ NODE_WALKS = {
          r"const\s+ggml_tensor\s*\*\s*dst\s*=\s*cgraph->nodes\[i\]\s*;", 1),
     "the layer-block alias publication":
         (r"static bool ggml_sycl_block_exec_publish_aliases\([^)]*\)\s*\{", ZERO_TO_N_NODES, 1),
+    "the layer-block runtime probe (alias, pre-block and missing-input loops)":
+        (r"static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtime_context\([^)]*\)\s*\{",
+         r"for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*cgraph->n_nodes\s*;\s*\+\+i\s*\)\s*\{\s*"
+         r"const\s+ggml_tensor\s*\*\s*node\s*=\s*cgraph->nodes\[i\]\s*;", 3),
     "the per-projection fusion's consumer scan":
         (r"static std::vector<std::pair<int, ggml_tensor \*>> find_mulmat_consumers\([^)]*\)\s*\{",
          r"for\s*\(\s*int\s+j\s*=\s*start_idx\s*;", 1),

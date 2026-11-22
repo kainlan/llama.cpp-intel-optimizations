@@ -71,9 +71,9 @@ static inline bool ggml_sycl_prestage_is_input(const ggml_tensor * tensor) {
 //
 // The executors ask this through ggml_sycl_is_noop: the node loop, the segment recorder, replay and boundary flush,
 // the MoE block graphs, the layer-block dispatch and the src1 planners. The readers of a node's sources (the
-// pre-stage, its refresh, the segment slot's input list, the layer-block copies and plan), the walkers that choose
-// what runs (the MoE topology scan and dispatch list, the persistent TG eligibility checks and plan, the per-projection
-// fusion's consumer scan) and the fusions that also run a look-ahead node ask it directly;
+// pre-stage, its refresh, the segment slot's input list, the layer-block copies, plan and runtime probe), the walkers
+// that choose what runs (the MoE topology scan and dispatch list, the persistent TG eligibility checks and plan, the
+// per-projection fusion's consumer scan) and the fusions that also run a look-ahead node ask it directly;
 // tests/test-sycl-graph-compute-flag-source.py names each one. The node walks it does not name read only shapes,
 // names or op kinds, place or preload weights, or count an uncomputed reader as a reader (the fusions' use scans),
 // which errs toward not fusing. A new walk that runs, stages or plans a node asks it too. An input that only an

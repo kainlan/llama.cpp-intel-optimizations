@@ -104826,7 +104826,11 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        // as in ggml_sycl_block_exec_publish_aliases: an uncomputed node has no output to alias
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -104886,7 +104890,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
     preblock_seen.reserve(8);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // as in the pre-block copy: an uncomputed node's sources are not its block's inputs
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -104943,7 +104948,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // as in the plan's source scan: an input only an uncomputed node reads is not missing
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
