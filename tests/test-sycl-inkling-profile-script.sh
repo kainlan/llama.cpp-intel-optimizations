@@ -298,7 +298,7 @@ await_gone() { # PID SECONDS: wait for a pid to exit, kill it after the bound
     wait "$1" 2>/dev/null; GRC=$?
 }
 # settle: TERM to the process group during the settle must not cut it short. The jitter stub randomises where in the
-# second the settle starts, because the early end a killed sleep causes depends on that; 4 attempts.
+# second the settle starts, because the early end a killed sleep causes depends on that; 4 repetitions, and every one must pass.
 # A journalctl shim keeps the time after the settle small, so the measured hold time is the settle itself.
 JSH="$T/jshim"; mkdir -p "$JSH"; printf '#!/bin/sh\nexit 0\n' > "$JSH/journalctl"; chmod +x "$JSH/journalctl"
 bad=""
@@ -364,6 +364,17 @@ if [ "$RR_RC" -eq 3 ] && [ $((SECONDS - t0)) -lt 8 ] && [ ! -s "$STUB_LOG" ] && 
     pass "(real: an uncreatable lock directory stops the run at once)"
 else
     fail "(real: take rc 4) rc=$RR_RC after $((SECONDS - t0)) s out: $RR_OUT"
+fi
+
+# a lock helper that dies with an unknown status ends the run at once, not after the lock wait.
+BADPY="$T/badpy"; mkdir -p "$BADPY"; printf '#!/bin/sh\nexit 5\n' > "$BADPY/python3"; chmod +x "$BADPY/python3"
+: > "$STUB_LOG"; XENV=(PATH="$BADPY:$PATH" INKLING_LOCK_WAIT_SECONDS=20); R5="$T/r5"; t0=$SECONDS
+rr "$R5"
+if [ "$RR_RC" -eq 3 ] && [ $((SECONDS - t0)) -lt 8 ] && [ ! -s "$STUB_LOG" ] && [ -e "$R5/$TAG.fail" ] \
+   && grep -q 'rc=5' "$R5/$TAG.fail" && printf '%s' "$RR_OUT" | grep -q 'lock take failed'; then
+    pass "(real: a lock helper that fails with an unknown status stops the run at once, .fail written)"
+else
+    fail "(real: take rc 5) rc=$RR_RC after $((SECONDS - t0)) s out: $RR_OUT"
 fi
 
 # group TERM while the done line is being built (a git that takes 3 s): .done is complete and the lock is released by

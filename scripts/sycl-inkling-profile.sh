@@ -157,7 +157,8 @@ die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this proce
 # shellcheck disable=SC2329  # installed through trap
 lock_release() {
     [ "$LOCK_HELD" = 1 ] || return 0
-    # A subshell inherits LOCK_HELD and may run this trap; only the main shell may release the lock.
+    # Defence in depth: no fork left in this script runs the EXIT trap, and this guard does not stand in for keeping
+    # pipelines out of the locked span. A subshell inherits LOCK_HELD; only the main shell may release the lock.
     [ "$BASHPID" = "$MAIN_PID" ] || return 0
     LOCK_HELD=0
     # Removes only a holder that is still ours; a foreign or missing holder is reported and left alone.
@@ -204,7 +205,7 @@ while :; do
         1|2) ;;
         3) die 3 "$LOCK was created but its holder could not be written; remove that directory by hand" ;;
         4) die 3 "cannot create the lock directory $LOCK (see the message above); waiting will not clear it" ;;
-        *) die 3 "the lock take failed unexpectedly (rc=$take_rc, see the message above)" ;;
+        *) die 3 "the lock take failed (rc=$take_rc): the lock helper could not start or failed unexpectedly; its message, if any, is printed above" ;;
     esac
     wait_seconds "$LOCK_POLL"
     check_signal

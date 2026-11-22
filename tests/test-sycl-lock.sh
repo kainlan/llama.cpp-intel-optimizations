@@ -103,6 +103,13 @@ take 0 "PATH=$SHIM:$PATH" SHIM_MODE=boom
 if [ "$TAKE_RC" -eq 5 ] && printf '%s' "$TAKE_ERR" | grep -q 'unexpected failure'; then pass "(take: an unexpected exception is rc 5)"
 else fail "(take rc 5) rc=$TAKE_RC err=$TAKE_ERR"; fi
 
+# a helper that cannot start, or exits with a status of its own, is rc 5, never busy.
+BADPY="$T/badpy"; mkdir -p "$BADPY"; printf '#!/bin/sh\nexit 1\n' > "$BADPY/python3"; chmod +x "$BADPY/python3"
+reset; take 0 "PATH=$BADPY:$PATH"
+if [ "$TAKE_RC" -eq 5 ] && [ ! -e "$L" ]; then pass "(take: a python3 that exits 1 is rc 5, not busy)"; else fail "(take bad python3) rc=$TAKE_RC"; fi
+reset; take 0 PYTHONHOME=/nonexistent
+if [ "$TAKE_RC" -eq 5 ] && [ ! -e "$L" ]; then pass "(take: a python3 that cannot start is rc 5, not busy)"; else fail "(take python start-up failure) rc=$TAKE_RC"; fi
+
 # release with a foreign holder and with no holder: nothing removed, one line on stderr
 reset; mkdir "$L"; echo "foreign taker" > "$L/holder"
 err="$(bash -c 'source "$1"; sycl_lock_release "$2" me' _ "$LIB" "$L" 2>&1)"; rc=$?
@@ -129,5 +136,23 @@ for i in $(seq 1 80); do
 done
 if [ "$left" -eq 0 ]; then pass "(release: a group TERM during start-up never strands our holder, 80 tries)"
 else fail "(release under group TERM) $left of 80 left the directory"; fi
+
+# take under a group TERM sent 3-42 ms after it starts, 80 times. The wrapper bash catches the signal (a caught
+# signal is reset to default in the take's subshell, an ignored one is not), so only the take's own trap protects it:
+# every try must end held, rc 0, with our holder.
+bad=""
+for i in $(seq 1 80); do
+    reset; rm -f "$T/take.rc"
+    # shellcheck disable=SC2016  # the bash -c program expands its own parameters
+    setsid bash -c 'trap : TERM INT HUP; source "$1"; sycl_lock_take "$2" me 0; echo $? > "$3"' _ "$LIB" "$L" "$T/take.rc" >/dev/null 2>&1 &
+    GP=$!
+    sleep "0.$(printf '%03d' $((3 + (i * 7) % 40)))"
+    kill -TERM -- "-$GP" 2>/dev/null
+    wait "$GP" 2>/dev/null
+    rc="$(cat "$T/take.rc" 2>/dev/null)"
+    if [ "$rc" != 0 ] || [ "$(cat "$L/holder" 2>/dev/null)" != me ]; then bad="$bad $i(rc=${rc:-none})"; fi
+done
+if [ -z "$bad" ]; then pass "(take: a group TERM during start-up never kills it, 80 tries)"
+else fail "(take under group TERM) failed tries:$bad"; fi
 
 [ "$n_fail" -eq 0 ] || exit 1
