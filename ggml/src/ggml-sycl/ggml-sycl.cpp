@@ -152,6 +152,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/tenant-claim-scope.hpp"
+#include "ggml-sycl/top-k-mask.hpp"
 #include "ggml-sycl/topk.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
@@ -99524,6 +99525,9 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_sycl_op_lightning_indexer(ctx, safe_dst);
             break;
+        case GGML_OP_TOP_K_MASK:
+            ggml_sycl_op_top_k_mask(ctx, safe_dst);
+            break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
             break;
@@ -128326,6 +128330,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             return ggml_sycl_dsv4_hc_post_supported(op);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_sycl_lightning_indexer_supported(op);
+        case GGML_OP_TOP_K_MASK:
+            return ggml_sycl_top_k_mask_supported(op);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN:
@@ -128381,8 +128387,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
 // ggml_backend_sycl_reg_get_proc_address for callers that must tell a missing kernel from a placement decline
 // (llama_context::resolve_fused_ops): supports_op's "false" covers both, this is false only when there is no
 // kernel. Exact for the fused ops that caller probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER,
-// DSV4_HC_*); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks of their
-// own that this does not neutralise.
+// DSV4_HC_*, TOP_K_MASK); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks
+// of their own that this does not neutralise.
 bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (dev == nullptr || op == nullptr || !ggml_sycl_op_core_semantics_supported(op)) {
         return false;

@@ -107,6 +107,9 @@ FILES = [
     # hc_pre_launch, hc_comb_launch, hc_post_launch, called by dsv4-hc.cpp for DSV4_HC_PRE / DSV4_HC_POST
     # (the qwen4exp graph's ggml_dsv4_hc_pre_gated and ggml_dsv4_hc_post)
     "dsv4-hc-kernels.hpp",
+    # top_k_mask_submit, called by ggml_sycl_op_top_k_mask (top-k-mask.cpp) for TOP_K_MASK (the qwen4exp graph's
+    # ggml_top_k_mask, built when the fused top-k mask resolves to the backend)
+    "top-k-mask-kernel.hpp",
     # ggml_sycl_submit_marker: the window's timing marks (moe-stream-plan.cpp) and the GEMM span marks of the executor
     "common.hpp",
     "binbcast.cpp",  # ADD, MUL, SUB, DIV, REPEAT
@@ -486,6 +489,7 @@ ALLOW: dict[str, tuple[int, str]] = {
     "shortcut:moe-xmx.hpp:extract_q8_0_scales": (1, MOE_XMX),
     "shortcut:pad.cpp:pad_f32_sycl": (1, shortcut("PAD")),
     "shortcut:set.cpp:ggml_sycl_op_set": (1, shortcut("SET")),
+    "shortcut:top-k-mask-kernel.hpp:top_k_mask_submit": (1, shortcut("the top-k sparse attention mask kernel")),
     "shortcut:unified-kernel.cpp:UnifiedKernel::execute_deferred_copies":
         (1, "the unified kernel's deferred copies, queue.memcpy; " + WRAP_USM),
     "shortcut:unified-kernel.cpp:UnifiedKernel::reset_dag_counters":
