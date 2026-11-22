@@ -1,0 +1,131 @@
+op	rc	ok	fail	unsupported	seconds	message
+ABS	0	10	0	4	1	
+ACC	0	3	0	5	1	
+ADD	134	78	0	31	8	
+ADD_ID	0	74	0	0	1	
+ADD_REL_POS	1	0	0	0	1	error: no test case matches the filters
+ALL_REDUCE_SUM	1	0	0	0	0	error: no test case matches the filters
+ARANGE	0	12	0	0	2	
+ARGMAX	0	14	0	0	1	
+ARGSORT	0	80	0	20	5	
+CEIL	0	12	0	11	2	
+CLAMP	0	10	0	4	1	
+COL2IM_1D	0	2	0	38	1	
+CONCAT	0	136	0	102	2	
+CONT	0	87	0	6	6	
+CONV_2D	0	2	0	3144	1	
+CONV_2D_DW	0	2	0	8	1	
+CONV_3D	0	2	0	292	1	
+CONV_TRANSPOSE_1D	0	118	0	0	1	
+CONV_TRANSPOSE_2D	0	2	0	8	1	
+COS	0	8	0	3	1	
+COUNT_EQUAL	0	6	0	0	2	
+CPY	0	289	0	356	5	
+CROSS_ENTROPY_LOSS	0	2	0	2	1	
+CROSS_ENTROPY_LOSS_BACK	0	2	0	2	0	
+CUMSUM	0	17	0	0	2	
+CUSTOM	1	0	0	0	0	error: no test case matches the filters
+DIAG	0	5	0	6	2	
+DIV	134	68	0	24	6	
+DSV4_HC_COMB	0	13	0	0	2	
+DSV4_HC_POST	0	15	0	0	1	
+DSV4_HC_PRE	0	22	0	0	1	
+DUP	0	12	0	0	1	
+ELU	0	10	0	4	1	
+EXP	0	10	0	4	2	
+EXPM1	0	2	0	12	0	
+FILL	0	9	0	0	2	
+FLASH_ATTN_BACK	1	0	0	0	1	error: no test case matches the filters
+FLASH_ATTN_EXT	1	1350	4	4423	73	
+FLOOR	0	12	0	11	1	
+GATED_DELTA_NET	134	45	0	12	7	../ggml/src/ggml-sycl/gated_delta_net.cpp:335: GGML_ASSERT(ggml_are_same_stride(src_q, src_k)) failed
+GATED_LINEAR_ATTN	0	6	0	0	1	
+GEGLU	0	26	0	12	2	
+GEGLU_ERF	0	26	0	12	1	
+GEGLU_QUICK	0	26	0	12	2	
+GELU	0	10	0	4	1	
+GELU_ERF	0	10	0	4	1	
+GELU_QUICK	0	10	0	4	2	
+GET_REL_POS	1	0	0	0	0	error: no test case matches the filters
+GET_ROWS	0	82	0	172	7	
+GET_ROWS_BACK	0	2	0	62	0	
+GLU	1	0	0	0	1	error: no test case matches the filters
+GROUP_NORM	0	4	0	1	1	
+HARDSIGMOID	0	10	0	4	2	
+HARDSWISH	0	10	0	4	1	
+IM2COL	0	115	0	0	3	
+IM2COL_3D	0	2	0	2051	1	
+IM2COL_BACK	1	0	0	0	1	error: no test case matches the filters
+L2_NORM	0	7	0	26	1	
+LEAKY_RELU	0	9	0	3	2	
+LIGHTNING_INDEXER	0	212	0	0	17	
+LOG	0	8	0	3	2	
+MAP_CUSTOM1	1	0	0	0	1	error: no test case matches the filters
+MAP_CUSTOM2	1	0	0	0	0	error: no test case matches the filters
+MAP_CUSTOM3	1	0	0	0	1	error: no test case matches the filters
+MEAN	0	16	0	3	1	
+MUL	134	68	0	24	7	
+MUL_MAT	134	1461	1	246	35	Exception caught at file:../ggml/src/ggml-sycl/ggml-sycl.cpp, line:58190, func:operator()
+MUL_MAT_ID	134	73	16	25	11	[SYCL] recoverable runtime fallback failed: MUL_MAT_ID retained prompt admission failed
+NEG	0	10	0	4	1	
+NORM	0	17	0	46	1	
+OPT_STEP_ADAMW	0	2	0	1	1	
+OPT_STEP_SGD	0	2	0	1	1	
+OUT_PROD	0	2	0	1543	1	
+PAD	0	22	0	17	1	
+PAD_REFLECT_1D	1	6	3	0	3	
+PERMUTE	1	0	0	0	1	error: no test case matches the filters
+POOL_1D	0	2	0	240	0	
+POOL_2D	0	146	0	0	1	
+POOL_2D_BACK	1	0	0	0	0	error: no test case matches the filters
+REGLU	0	26	0	12	2	
+RELU	0	10	0	4	1	
+REPEAT	0	18	0	2	1	
+REPEAT_BACK	0	12	0	0	1	
+RESHAPE	1	0	0	0	0	error: no test case matches the filters
+RMS_NORM	0	20	0	103	2	
+RMS_NORM_BACK	0	7	0	5	1	
+ROLL	0	3	0	1	2	
+ROPE	0	434	0	102	23	
+ROPE_BACK	0	2	0	442	1	
+ROUND	0	12	0	11	1	
+RWKV_WKV6	0	6	0	0	2	
+RWKV_WKV7	0	7	0	0	1	
+SCALE	0	6	0	10	1	
+SET	0	8	0	6	2	
+SET_ROWS	0	137	0	663	2	
+SET_ROWS_PAGED	1	0	0	0	1	error: no test case matches the filters
+SGN	0	10	0	4	1	
+SIGMOID	0	10	0	4	2	
+SILU	0	10	0	4	1	
+SILU_BACK	0	2	0	1	1	
+SIN	0	8	0	3	1	
+SLEEP	0	2	0	3	1	
+SOFTPLUS	0	10	0	4	1	
+SOFT_MAX	0	216	0	0	4	
+SOFT_MAX_BACK	0	26	0	24	2	
+SOLVE_TRI	0	9	0	19	1	
+SQR	0	8	0	3	1	
+SQRT	0	8	0	3	2	
+SSM_CONV	0	77	0	0	1	
+SSM_SCAN	0	10	0	9	2	
+STEP	0	10	0	4	1	
+SUB	134	68	0	24	7	
+SUM	0	6	0	8	1	
+SUM_ROWS	0	7	0	6	2	
+SWIGLU	0	26	0	12	1	
+SWIGLU_CLAMP	0	2	0	12	1	
+SWIGLU_OAI	0	18	0	8	1	
+TANH	0	10	0	4	1	
+TIMESTEP_EMBEDDING	1	5	3	0	3	
+TOP_K	0	576	0	0	8	
+TOP_K_MASK	0	2	0	38	1	
+TRANSPOSE	1	0	0	0	0	error: no test case matches the filters
+TRI	0	2	0	16	1	
+TRUNC	0	12	0	11	1	
+UNARY	1	0	0	0	1	error: no test case matches the filters
+UPSCALE	0	6	0	20	1	
+VIEW	1	0	0	0	0	error: no test case matches the filters
+WIN_PART	1	0	0	0	1	error: no test case matches the filters
+WIN_UNPART	1	0	0	0	0	error: no test case matches the filters
+XIELU	0	2	0	6	1	
