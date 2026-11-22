@@ -76,9 +76,16 @@ of `1dcdf49b1`): `git -C <wt> switch -c feat/inkling2 master`. Implementers work
 | Track | Tasks | Description |
 |-------|-------|-------------|
 | L (lead, GPU-serial) | 1, 4, 7, 8, 9, 12, 14, 15, 17 | Oracle run, spikes, opening the route, census, gates, profile runs, planning |
-| A (`src/` load path) | 2, 3, 5, 4b | Requested context reaches the measures; unfundable term refused; expert names |
-| B (scripts) | 6, 10, 11 | `inkling` gate; profile runner; scheduler-census parser |
+| A (`src/` load path) | 2, 3, 5, 4b | Requested context reaches the measures; unfundable term refused; expert names; zone-sizing refusal |
+| B (scripts) | 6, 6b, 10, 10b, 11 | `inkling` gate; GPT-OSS gate without `-ngl`; profile runner; atomic lock takers; scheduler-census parser |
 | C (planner rate, docs) | 13, 16 | Profile document; measured CPU expert rate row |
+| D (backend failure path) | 7a, 7b | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21) |
+
+**Amended 2026-11-21, after Task 1 ran and the two spikes concluded.** Task 1 ended red at an old defect
+(llama.cpp-kjoc), so Tasks 7a and 7b now precede the route's opening. Task 4's spike produced Task 4b. Task 6b was
+found in review of Task 6. Their full specifications are separate files beside this plan:
+`2026-11-21-inkling2-task-4b-zone-sizing-refusal.md` and `2026-11-21-inkling2-task-7a-7b-async-failure.md`.
+Task 10b was found in review of Task 10: this host's `mkdir` is not atomic, so `GPU.lock` can be taken twice.
 
 ### Dependency Graph
 
@@ -92,10 +99,14 @@ digraph dependencies {
     4b [label="T4b zone-sizing refusal"];
     5  [label="T5 fused expert name"];
     6  [label="T6 inkling gate script"];
+    6b [label="T6b GPT-OSS gate without -ngl"];
+    7a [label="T7a async error fails the boundary"];
+    7b [label="T7b every queue has the handler"];
     7  [label="T7 open NVFP4 direct route"];
     8  [label="T8 census + gap tasks (lead)"];
     9  [label="T9 Stage 1 gates (lead)"];
     10 [label="T10 profile runner"];
+    10b [label="T10b atomic lock takers"];
     11 [label="T11 sched census parser"];
     12 [label="T12 profile runs (lead)"];
     13 [label="T13 profile document"];
@@ -103,10 +114,10 @@ digraph dependencies {
     15 [label="T15 CPU expert rate measure"];
     16 [label="T16 rate table row"];
     17 [label="T17 Stage 3 planning"];
-    2 -> 3; 3 -> 5; 4 -> 4b; 5 -> 4b;
-    1 -> 7; 3 -> 7; 6 -> 7; 7 -> 8;
-    8 -> 9; 6 -> 9; 4b -> 9; 5 -> 9;
-    9 -> 12; 10 -> 12; 11 -> 12;
+    2 -> 3; 3 -> 5; 4 -> 4b; 5 -> 4b; 7 -> 4b;
+    1 -> 7a; 7a -> 7; 7a -> 7b; 3 -> 7; 6 -> 7; 7 -> 8;
+    8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 9;
+    9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
     13 -> 17; 14 -> 17; 16 -> 17;
 }
@@ -117,19 +128,25 @@ digraph dependencies {
 | File/Directory | Tasks | Conflict Risk |
 |----------------|-------|---------------|
 | `src/llama-load-measure.h` | 2, 3 | Sequential (Track A) |
-| `src/llama-model.cpp` | 2, 5, 4b | Sequential (Track A) |
+| `src/llama-model.cpp` | 2, 3, 5, 4b | Sequential (Track A) |
 | `src/llama-context.cpp` | 3 | None |
 | `tests/test-load-measure-guards.cpp` | 2, 3, 5 | Sequential (Track A) |
 | `tests/test-sycl-load-measure-source.py`, `tests/test-sycl-kv-before-experts-source.py` | 2 | None |
-| `scripts/sycl-canonical-gates.sh`, `tests/test-sycl-canonical-gates-script.sh` | 6 | None |
-| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7, then gap tasks from 8, 4b | Sequential (lead orders them) |
+| `scripts/sycl-canonical-gates.sh`, `tests/test-sycl-canonical-gates-script.sh` | 6, 6b | Sequential (both merged) |
+| `docs/backend/gpt-oss-testing.md` | 6b | None |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7a, then 7 and 7b, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 7a, 7b, 4b | Sequential (lead orders them) |
+| `ggml/src/ggml-sycl/common.cpp`, `common.hpp`, `async-failure.hpp` | 7a, 7b | Sequential (Track D) |
+| `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp` | 7a | None |
+| `ggml/src/ggml-sycl/zone-sizing.{hpp,cpp}`, `tests/test-zone-sizing.cpp` | 4b | None |
 | `ggml/src/ggml-sycl/moe-resolved-batch.hpp` | gap tasks from 8 | Sequential |
-| `scripts/sycl-inkling-profile.sh`, `tests/test-sycl-inkling-profile-script.sh` | 10 | None |
+| `scripts/sycl-inkling-profile.sh`, `tests/test-sycl-inkling-profile-script.sh` | 10, 10b | Sequential (Track B) |
+| `scripts/sycl-lock.sh`, `scripts/sycl-moe-exec-gate.sh`, `scripts/sycl-qwen35-ppl-gate.sh`, `docs/backend/sycl-host-safety.md`, `CLAUDE.md` | 10b | None |
 | `scripts/sycl-sched-census.py` | 11 | None |
 | `ggml/src/ggml-sycl/kv-room-cost.hpp`, `ggml/src/ggml-sycl/tests/test-kv-room-cost.cpp` | 16 | None |
 | `docs/backend/inkling2-profile.md`, `docs/backend/data/inkling2/` | 1, 8, 12, 13 | Lead writes data, T13 writes prose |
 | `docs/backend/sycl-perf-baselines.md` | 14 | None |
-| this plan | 4, 8, 17 | Lead only |
+| this plan and the two specification files beside it | 4, 8, 17 | Lead only |
 
 ---
 
@@ -183,8 +200,23 @@ Standard and the route stays closed until it passes. Do not open the route on a 
 
 **Gotchas:**
 - The target only exists with `BUILD_TESTING=ON` and `GGML_BACKEND_DL=OFF` (both true in the integration build).
-- The oracle's seventh case terminates on purpose inside a scoped handler; read the last line, not the first `FAIL`.
+- The oracle's seventh case injects an asynchronous failure. It must end like the other six, with the process alive.
+  A `terminate called` in the log is the defect the result below records, not part of the test's design.
 - 77 is a skip, not a pass. `SKIP[off-primary]` on a pinned card is a regression to read (llama.cpp-n8da).
+
+**Result (2026-11-21, driver 26.44, integration build of `0118d99df`): RED, at an old defect, not at the kernels.**
+- B70 (ctest, rc 8) and B50 (binary, rc 134), one run each: the four graph-churn oracle comparisons (Q1_0, NVFP4 at 1
+  and 3 rows) and the two injected synchronous failures complete. The seventh case,
+  `injected_async_terminal_failure_case`, ends the process: `Default async_handler caught exceptions: injected
+  Q1/NVFP4 asynchronous terminal failure`, then `std::terminate`.
+- Cause: no queue the backend builds carries an `async_handler` (llama.cpp-kjoc, open since 2026-10-10). The SYCL
+  runtime's default handler terminates. This is not specific to NVFP4: any asynchronous error on any model ends the
+  process the same way.
+- Consequence: the route stays closed (`k_moe_mmid_direct_route_validated = false`) until the oracle passes. Tasks 7a
+  and 7b fix the defect; Task 7 opens the route on the oracle run that Task 7a records.
+- Kernel log clean after both runs, Shmem about 7 GB, no VRAM tenant left.
+- Evidence: `docs/backend/data/inkling2/t1-oracle-b70.txt`, `t1-oracle-b50.txt`, `blockers-2026-11-21/` (commit
+  `fa0785d1d`).
 
 ---
 
@@ -260,11 +292,23 @@ Replace `llama_model_sycl_make_placement_envelope().n_ctx` with `load_measure_n_
 load_measure_n_ctx = ...` line again at the top of that block and pass it to `llama_load_late_check(`.
 
 Rewrite the comment at `:2945-2949` so its third sentence reads: "It is measured at the context the caller requested
-from the load (the n_ctx hint; the training context when none was named) and ubatch 512: the caller's -ub does not
-reach the load (fkpg (a))." In the WARN at `:2988` replace `the caller's -c and -ub are not transported (fkpg)` with
-`n_ctx is the load's requested context, the caller's -ub is not transported (fkpg)`. In
-`src/llama-load-measure.h:212` replace the last sentence of the comment with "The caller's -ub does not reach the load
-(fkpg); its -c does, as the hint."
+from the load (the n_ctx hint; the training context when none was named, padded to 256 under the default hint) and
+ubatch 512: the caller's -ub does not reach the measures (fkpg (a))." In the WARN at `:2988` replace `the caller's -c and -ub are not transported (fkpg)`
+with `n_ctx is the load's requested context, the caller's -ub is not transported to the measure (fkpg)`. In
+`src/llama-load-measure.h:212` replace the last sentence of the comment with "The caller's -ub does not reach the
+measures (fkpg); its -c does, as the hint."
+
+**Corrected 2026-11-21 (review of this task).** The first version of this paragraph said the caller's `-ub` "does not
+reach the load". That is false: `common/common.cpp:1759-1764` sets `mparams.n_ubatch_hint` from `-ub`, and the load
+uses it to place the prompt-processing MoE ring. Only the three measures ignore `-ub` and run at ubatch 512. Every
+comment and document the task touches says so.
+
+**Consequence found in review, checked in Task 9.** `llama-bench` passes `n_ctx_hint = n_prompt + n_gen + n_depth`
+(`tools/llama-bench/llama-bench.cpp:1224`, `:1242`). With this task the measures follow that hint, so every bench's
+load changes for every model: the measured compute term drops from the training context to the bench's own (640 for
+`-p 512 -n 128`). The token gates pass no `-c` and do not exercise the change. `equal_mparams` does not compare the
+hint, so a model reused for a later, larger bench instance keeps the smaller measure; the excess takes the KV zone,
+then raw device memory outside the arena (open finding llama.cpp-nkr8).
 
 Run: `./scripts/sycl-build.sh test-load-measure-guards && ctest --test-dir build -R '^test-load-measure-guards$' --output-on-failure`
 Expected: `100% tests passed`.
@@ -506,6 +550,34 @@ travels back to `load_tensors` as a refusal.
 - Another live model's allocations also make sizing fail (the case the comment describes). The refusal text must tell
   the two causes apart.
 
+**Result (2026-11-21): the abort becomes a refusal, through a channel that already exists.** The decision record and
+Task 4b are in `docs/plans/2026-11-21-inkling2-task-4b-zone-sizing-refusal.md`. In short:
+- The loader already calls `ggml_backend_sycl_stage_inventory_plan`, which already returns a lifecycle result with a
+  `GGML_SYCL_LIFECYCLE_PLAN_REJECTED` value. Both abort sites throw a typed exception with the cause's text; the stage
+  entry prints it on its `[SYCL-PLAN]` ERROR line and answers `PLAN_REJECTED`; the loader names the rejection.
+- Lead ruling: no new entry across the backend's dlopen boundary and no thread-local carries the text to the loader.
+  The backend's ERROR line is where the cause is stated.
+- **This task's premise was wrong.** Inkling at `-c 131072` on the B70 does not reach the abort: zone sizing never
+  looks at weights, and an 18.5 GiB RUNTIME zone fits under the B70's 29,472 MiB per-allocation cap. The abort is
+  reachable when a RUNTIME zone exceeds the cap or the arena budget (for Inkling on the B70, above roughly 205k tokens:
+  a linear estimate, not measured), or when live allocations block a rebuild (llama.cpp-ouur, llama.cpp-pgay). Task 9
+  runs `-c 131072` once to see what the planner does with it.
+
+---
+
+### Task 4b: A load whose arena zones cannot be sized is refused by name, not aborted (llama.cpp-ouur)
+
+**Track:** A
+**Depends on:** Task 4 (the decision); Tasks 2, 3 and 5 (same `src/llama-model.cpp`); Task 7 (same `ggml-sycl.cpp`)
+**Full specification:** `docs/plans/2026-11-21-inkling2-task-4b-zone-sizing-refusal.md` (files, RED, GREEN, commands,
+commit, gotchas). Its line numbers are at master `1dcdf49b1`; find each site by its text.
+
+**Done when:** `ggml-sycl.cpp` holds no `GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones`; the new source
+contract and `test-zone-sizing` Case 34 pass; and the lead's one B50 run
+(`GGML_SYCL_RUNTIME_ARENA_MB=40000 ONEAPI_DEVICE_SELECTOR=level_zero:1 timeout 120 ./build/bin/llama-completion -m
+/models/mistral-7b-v0.1.Q4_0.gguf -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0`) exits non-zero with `load refused:
+SYCL device 0 cannot size its arena zones`, names the device's capacity as the cause, and prints no abort line.
+
 ---
 
 ### Task 5: The loader's expert-name check knows the fused gate+up tensor
@@ -678,25 +750,93 @@ Run: `bash tests/test-sycl-canonical-gates-script.sh` — Expected: every line `
 
 ---
 
+### Task 6b: The GPT-OSS gate is the documented command (no `-ngl`, no `-c`) — DONE
+
+**Track:** B
+**Depends on:** Task 6 (same two files)
+**Status:** merged into `feat/inkling2` as `7809ffac8` on 2026-11-21, after spec and quality review.
+
+**Why it exists:** review of Task 6 found that the script's GPT-OSS gate still passed `-ngl 99 -c 4096`. The script
+predates the ruling of 2026-10-17 (no gate passes `-ngl`: the unified cache places every weight, and a layer-count
+flag is a second source for that fact) and the rule that a gate never shrinks the context. The gate is now exactly
+the command in `CLAUDE.md`; a stub case pins its argv; `docs/backend/gpt-oss-testing.md` agrees (`-c 4096` only as the
+all-VRAM control arm of an A/B).
+
+**Not verified yet:** the real GPT-OSS B50 gate has not run since this change. Task 9 runs it once.
+**Left out on purpose:** the other fork scripts and documents that still mention `-ngl`, and the loader knob itself,
+belong to llama.cpp-guwc.
+
+---
+
+### Task 7a: An asynchronous error on the execution queue fails the next graph boundary instead of terminating
+
+**Track:** D (an implementer makes the host-side edits and host tests; the lead runs the GPU checks)
+**Depends on:** Task 1 (its logs are the RED evidence). Blocks Task 7.
+**Full specification:** `docs/plans/2026-11-21-inkling2-task-7a-7b-async-failure.md` (decision record, measured
+runtime facts, files, RED, GREEN, commands, commit, gotchas).
+
+**What it does:** a recording `async_handler` on the execution queue and its context; a per-device latch; a backend
+context that saw a failure is failed for life. `ggml_backend_sycl_synchronize` logs once and cleans up (it no longer
+aborts on a throwing drain either), every later `graph_compute` of that context returns `GGML_STATUS_FAILED`, and the
+route's terminal never reports success after a failure. The success path gains no wait and no submission.
+
+**Done when:** the host tests and the source contract pass; and the lead's runs, once each, show the oracle ending
+`Q1/NVFP4 scoped production-route lifecycle: PASS` on the B70 and `rc=0` on the B50 with no `Default async_handler`
+and no `terminate called`, the delivery probe passing with `--gpu` on the B50, and the Mistral B70 and GPT-OSS B50
+gates passing. The oracle logs are committed as `docs/backend/data/inkling2/t7a-oracle-b70.txt` and
+`t7a-oracle-b50.txt`.
+
+**Runtime facts this design rests on (measured 2026-11-21, B50, `docs/backend/data/inkling2/t7a-runtime-probe-b50.txt`):**
+`queue::wait_and_throw` and `event::wait_and_throw` both deliver to the queue's handler and return; the same holds for
+a queue on the platform default context; a queue without a handler falls back to its context's; a host task that
+depends on a failed event still runs and sees the failure in the latch; a plain `wait()` neither throws nor delivers;
+a handled queue destroyed with an undelivered error drops it silently.
+
+**Accepted limits (lead ruling 2026-11-21, each a follow-up outside this plan):**
+- One token can be sampled from the failed graph: the failure is seen in a `void` synchronize, so
+  `llama_get_logits_ith` returns that graph's logits before the next decode returns an error. Today the process
+  terminates instead. Closing the window needs a status out of the synchronize or poisoned readbacks.
+- A bundle whose terminal failed stays quarantined, with its handles, until the process exits (existing behaviour).
+
+---
+
+### Task 7b: Every backend queue and context carries the async-failure handler
+
+**Track:** D
+**Depends on:** Task 7a merged. May overlap Task 7 in time (disjoint regions of `ggml-sycl.cpp`).
+**Full specification:** `docs/plans/2026-11-21-inkling2-task-7a-7b-async-failure.md`.
+
+**What it does:** every other queue and context the backend builds goes through the same two constructors; dpct's
+print-and-drop handler is removed; the second terminal class (`moe_sycl_event_terminal`) stops treating "complete" as
+success after a latched failure; a source contract with a mutant fails on any new queue built without the handler;
+the llama.cpp-kjoc row of the no-crash census is updated.
+
+**Done when:** the source contract and its mutants pass, the full build succeeds, and the lead's Mistral B70 and
+GPT-OSS B50 gates pass once each.
+
+---
+
 ### Task 7: Open the NVFP4/Q1_0 direct decode route
 
 **Track:** L (lead orders it; an implementer makes the host-side edits, the lead builds and runs)
-**Depends on:** Task 1 (the B70 oracle passed); Tasks 2, 3 and 6 merged (the RED run needs the gate and a loadable model)
+**Depends on:** Task 7a (the oracle passes on both cards); Tasks 2, 3 and 6 merged (the RED run needs the gate and a loadable model)
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp:11928-11934` (the constant and its comment), `:36536-36541` (comment)
 - Modify: `ggml/src/ggml-sycl/moe-resolved-batch.hpp:249-253`, `:829-843` (comments only; the early return stays)
 - Modify: every source contract that pins `k_moe_mmid_direct_route_validated = false`
 - Modify: `docs/backend/sycl-static-storage-inventory.csv` (regenerate; the row at line 234 changes)
 
-**Description:** The route's own ruling names its opening condition: B70 validation. Task 1 recorded it. Flip
+**Description:** The route's own ruling names its opening condition: B70 validation. Task 1's run ended red at
+llama.cpp-kjoc; the passing runs are the ones Task 7a records. Flip
 `k_moe_mmid_direct_route_validated` to `true`. One constant feeds the admission gate, the materialization gate and
 the planner's reachability answer, so the workspace pool is planned, charged and materialized together. The early
 return in `choose_moe_batch_executor` is not removed here: it now refuses only operands that fell through the direct
 block (host-resident experts, a secondary card, prompt rows). Task 8 counts those.
 
 **Acceptance Criteria:**
-- [ ] `constexpr bool k_moe_mmid_direct_route_validated = true;` with a comment that cites the Task 1 evidence files
-      and the date, and states what the route covers (decode rows, primary residency, AoS).
+- [ ] `constexpr bool k_moe_mmid_direct_route_validated = true;` with a comment that cites the passing oracle logs
+      (`t7a-oracle-b70.txt`, `t7a-oracle-b50.txt`) and the date, and states what the route covers (decode rows,
+      primary residency, AoS).
 - [ ] The comments in `moe-resolved-batch.hpp` and at `ggml-sycl.cpp:36536` no longer say NVFP4 never executes.
 - [ ] `ctest --test-dir build -L source-contract -j 4 --output-on-failure` passes (these are pure Python).
 - [ ] The static-storage audit pair passes after the CSV is regenerated.
@@ -713,7 +853,7 @@ block (host-resident experts, a secondary card, prompt rows). Task 8 counts thos
 ```cpp
 // The MoE MMID direct route (Q1_0/NVFP4 decode rows on the primary card, AoS) was fail-closed by owner ruling until
 // B70 validation. Opened 2026-11-<day>: sycl-q1-nvfp4-admitted-device passed on the B70 and the B50 on driver 26.44
-// (docs/backend/data/inkling2/t1-oracle-b70.txt, t1-oracle-b50.txt). Hoisted to file scope so the admission gate
+// (docs/backend/data/inkling2/t7a-oracle-b70.txt, t7a-oracle-b50.txt). Hoisted to file scope so the admission gate
 // (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind) read ONE constant and cannot drift
 // apart -- materializing a pool for a route that cannot execute reserves VRAM nothing will ever consume, and refusing
 // to materialize one the route CAN execute is a silent performance cliff.
@@ -792,9 +932,9 @@ done
 ### Task 9: Stage 1 exit gates
 
 **Track:** L (lead; GPU)
-**Depends on:** Tasks 4b, 5, 6, 8 and every gap task Task 8 wrote
+**Depends on:** Tasks 4b, 5, 6, 6b, 7b, 8 and every gap task Task 8 wrote
 **File scope:**
-- Create: `docs/backend/data/inkling2/t9-gates.txt`
+- Create: `docs/backend/data/inkling2/t9-gates.txt`, `docs/backend/data/inkling2/t9-bench-ab.txt`
 
 **Description:** The Stage 1 done-condition, run once each, in this order, under `GPU.lock`.
 
@@ -807,6 +947,27 @@ done
 - [ ] No-`-c` refusal, B70: `ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 300 ./build/bin/llama-completion -m /models/Inkling-2-Mini-UD-Q8_K_XL.gguf -p 'x' -n 1` exits non-zero, stderr has `load refused: the compute buffer measured at n_ctx 1048576`, and has no `GGML_ABORT`, no `ggml-sycl.cpp:[0-9]+:` line and no core.
 - [ ] `journalctl -k --since "2 hours ago" --no-pager | grep -ciE 'GT reset|guc_id|GPU hang|CAT error'` prints `0`.
 - [ ] `grep -c 'MOE-DECODE-REFUSAL' build/gates/inkling.err` is `0` for each Inkling run.
+
+**Added 2026-11-21 (each line is still one run; none is repeated):**
+- [ ] The `--gate all` run on the B50 above is the first real run of the GPT-OSS gate without `-c` and without `-ngl`
+      (Task 6b). Record its `[LOAD-PLAN]` n_ctx line and its `[LOAD-PLAN] compute slot` line beside the verdict.
+- [ ] Control arms, B50: the GPT-OSS gate command with `-c 4096` added, and the Mistral gate command with `-c 4096`
+      added. Each must pass and print `[LOAD-PLAN]` with `n_ctx 4096` (Task 2: the measure follows the request).
+- [ ] Throughput A/B for the whole stage (Task 2 changes every bench's load; Task 7a changes how the execution queue
+      is built). Two builds: the commit just before Task 2 (`0118d99df`) and the stage tip, each in its own tree,
+      built the same way. `llama-bench -p 512 -n 128 -v` in ABBA order, one model load per arm run, on B50 GPT-OSS
+      and on B70 Mistral. Record per run the `[LOAD-PLAN]` n_ctx and probe-bound MiB and the PP/TG pair in
+      `t9-bench-ab.txt`. The verdict is the paired difference; neither arm's absolute number becomes a baseline.
+      A drop on the B50 of more than a few percent, or on the B70 of more than ~10%, is a regression to explain
+      before Stage 2, against `docs/backend/sycl-perf-baselines.md`.
+- [ ] Mixed-context bench, B50 GPT-OSS, stage tip only: `llama-bench -p 512 -n 128 -d 0,8192 -v`. Read the later
+      instance's compute-buffer `zone=` line. If it is not RUNTIME, the reused model was under-reserved
+      (llama.cpp-nkr8): record it and write the follow-up (the hint as the maximum over the instances that share a
+      model, or `equal_mparams` comparing the hint). It does not block Stage 2.
+- [ ] Inkling at `-c 131072`, B70, once: `--gate inkling` with the context overridden. Record whether it loads, what
+      the `[LOAD-PLAN]` and `[PLACEMENT]` lines say, and the verdict. Task 4's corrected premise predicts a load with
+      most experts tiered to the host, not an abort and not a refusal.
+- [ ] Task 4b's capacity vehicle on the B50 (the command in Task 4b's section) ends in the named refusal.
 
 **Gotchas:**
 - A pass on one card covers that card's placement class only (memory: a-token-gate-covers-placement-classes-not-cards).
@@ -1009,6 +1170,34 @@ Run: `bash tests/test-sycl-inkling-profile-script.sh` — Expected: all `PASS:`,
 - `llama-bench` discards log lines without `-v`; the bench phase is for the table row only.
 - A foreground run longer than 10 minutes is killed by the harness: the lead starts each run in the background and
   waits for its `.done` file.
+
+---
+
+### Task 10b: Every lock taker uses an atomic `mkdir` (found 2026-11-21)
+
+**Track:** B
+**Depends on:** Task 10 (its lock function is the one to share). Blocks Task 12: sixteen profile runs take the lock.
+**File scope:**
+- Create: `scripts/sycl-lock.sh` (sourced helper: the one atomic taker, the holder check, the release)
+- Modify: `scripts/sycl-inkling-profile.sh` (use the helper), `scripts/sycl-moe-exec-gate.sh` (`lock_take`, and the
+  header line that says the lock is `mkdir $LOCK_DIR`), `scripts/sycl-qwen35-ppl-gate.sh` (the `until mkdir` loop)
+- Modify: the stub tests of those three scripts; `docs/backend/sycl-host-safety.md` (the `GPU.lock` paragraph);
+  `CLAUDE.md` (one line in "Running Tests": how a lock is taken)
+
+**Why:** `/usr/bin/mkdir` on this host is uutils coreutils 0.10.0. It runs `statx(L)`, then `mkdir(L)`, and exits 0
+when that `mkdir` fails with EEXIST on a directory. Two takers that both pass the `statx` both hold the lock.
+Measured: 400 paired races on one path, both succeeded in 173; with GNU `mkdir` (`/usr/bin/gnumkdir`) in 0. A lock
+that is already held is still refused; the hole is two takers arriving together, for example two waiters released by
+one `rmdir`. Two holders of `GPU.lock` are two model loads on one card.
+
+**Done when:** no tracked script takes a lock with plain `mkdir`; the helper takes it with a real `mkdir(2)`
+(`python3 -c 'import os,sys; os.mkdir(sys.argv[1])'`), writes `holder` with noclobber, re-reads it after a short wait
+and treats a foreign `holder` as "not mine, do not release"; a race test (two takers started together, many
+iterations, the system `mkdir` first in `PATH`) shows exactly one holder per iteration for each script; the document
+and `CLAUDE.md` say how to take a lock by hand (`/usr/bin/gnumkdir` on this host).
+
+**The lead writes this task out to the Task Detail Standard when Task 10 merges**, lifting Task 10's reviewed lock
+function into the helper unchanged.
 
 ---
 
@@ -1395,7 +1584,22 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
   a 1,048,576-token training context makes the old bound unusable; every place that states the old design is updated
   in that task.
 - **Task 7 opens a route an earlier ruling closed.** It does so on the condition that ruling named (B70 validation),
-  and only if Task 1 records a pass.
+  and only on the passing oracle runs that Task 7a records. Task 1's own run was red.
+- **Tasks 7a and 7b change how the whole backend meets an asynchronous error** (2026-11-21). Before them the process
+  terminates. After them the context that saw the error is failed for life and the caller gets an error from its next
+  decode. Two limits are accepted and stated in Task 7a: one token can be sampled from the failed graph, and a failed
+  bundle stays quarantined until the process exits.
+- **Task 2 moves every `llama-bench` load** (the measure follows the bench's own context). Throughput for every model
+  can move; Task 9's A/B is where that is measured. No number taken before Task 2 is comparable to one taken after it
+  without that A/B.
+- **`-ngl` still exists** in older fork scripts, some upstream documents and the loader. This plan removes it from the
+  gate script (Task 6b) and passes it nowhere; the rest belongs to llama.cpp-guwc.
+- **The lock every session relies on was not exclusive** (Task 10b). Until that task merges, a lock taken with plain
+  `mkdir` can be shared by two takers that arrive together. The lead's own GPU scripts take it with `/usr/bin/gnumkdir`
+  from 2026-11-21 on. Other sessions' scripts are not changed by this plan beyond the three tracked ones.
+- **`docs/backend/gpt-oss-testing.md` still quotes an old ctest exclusion list**, and the `sycl-canonical-gates`
+  ctest label (`gpu;model-loading`) may not be excluded by the documented sweep. Both belong to the test-hygiene epic
+  llama.cpp-97yn; neither is touched here.
 - **Task 16's rate is a measurement** and appears in the plan as the value of a named file, not as a number.
 - **Tracker:** the codescout `task_*` tools were not reachable in the planning session (missing index root). The lead
   files one tracker task per plan task, with `task_dep` edges from the graph above, as the first step of execution.
