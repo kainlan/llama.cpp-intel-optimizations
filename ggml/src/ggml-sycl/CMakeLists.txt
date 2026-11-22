@@ -6984,18 +6984,28 @@ set_tests_properties(sycl-select-unselected-branch PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 120)
 
-# test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set was given,
-# also for a weight the backend stores reordered (SOA), and again after one MUL_MAT that uses the weight. Set, get
-# and one small MUL_MAT graph per case: no scheduler, no model, at most 34 MB of device memory per case, so it carries
-# no model/cache/mem-handle label and the sweep runs it. It submits device work, so the registration pins the
-# validation card (level_zero:1); run the binary under level_zero:0 for the B70. Exits 77 when no device is visible.
+# test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set (or
+# ggml_backend_tensor_set_async) was given, also for a weight the backend stores reordered (SOA), and again after one
+# MUL_MAT that uses the weight, including a weight whose reorder record says SOA while its own range holds ggml order.
+# Set, get and one small MUL_MAT graph per case: no scheduler, no model, at most 34 MB of device memory per case, so
+# it carries no model/cache/mem-handle label and the sweep runs it. It links the shipped ggml-sycl and reads the
+# layout records through the read-only seam ggml_sycl::test_get_tensor_layout_records (ggml-sycl-test.hpp, which
+# needs the SYCL headers, hence -fsycl). It submits device work, so the registration pins the validation card
+# (level_zero:1); run the binary under level_zero:0 for the B70. Exits 77 when no device is visible.
 add_executable(test-sycl-weight-readback-layout
     tests/test-weight-readback-layout.cpp
 )
 target_include_directories(test-sycl-weight-readback-layout PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include ${SYCL_INCLUDE_DIR})
+target_compile_options(test-sycl-weight-readback-layout PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-weight-readback-layout PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-weight-readback-layout PRIVATE
+    GGML_SYCL_WARP_SIZE=32 GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 target_link_libraries(test-sycl-weight-readback-layout PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-weight-readback-layout PRIVATE IntelSYCL::SYCL_CXX)
+endif()
 set_target_properties(test-sycl-weight-readback-layout PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-weight-readback-layout COMMAND test-sycl-weight-readback-layout)

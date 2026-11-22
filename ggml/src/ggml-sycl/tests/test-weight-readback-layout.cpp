@@ -14,7 +14,13 @@
 // The last case is larger than one readback chunk (32 MiB), so the chunk walk is covered.
 // Every case then runs one MUL_MAT with the weight as src0 and reads the whole weight again: a layout the backend
 // resolves for a kernel (a reorder in place, a cache copy) does not change what a read returns. That step prints
-// its own ok line, and the final line counts them, so a run that skipped it cannot print the same output.
+// its own ok line with the two layout records of the weight (the reorder record, what a kernel last resolved, and
+// the order of the bytes in the weight's own range), and the final line counts them, so a run that skipped it
+// cannot print the same output.
+// The *-set-async cases upload with ggml_backend_tensor_set_async, which never reorders, so the own range holds
+// ggml order. Their MUL_MAT kernel takes SOA, so the backend resolves an SOA copy elsewhere and the reorder record
+// says SOA while the own range is still AOS: the case a reader that trusted the reorder record would scramble. They
+// require the own range to be AOS before and after the MUL_MAT and the reorder record to be SOA after it.
 //
 // SYCL backend only, no scheduler, no model; one MUL_MAT graph per case. Exit 77 when no SYCL device is visible.
 //
@@ -22,11 +28,13 @@
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-sycl-test.hpp"  // ggml_sycl::test_get_tensor_layout_records: a read-only seam in the shipped library
 #include "ggml-sycl.h"
 #include "ggml.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -39,21 +47,56 @@ constexpr int64_t N_COLS     = 4608;  // the weight shape of the test-backend-op
 constexpr size_t  GUARD      = 64;
 constexpr uint8_t GUARD_BYTE = 0xA5;
 
+enum upload_kind {
+    UPLOAD_SET,        // ggml_backend_tensor_set: the backend may reorder the weight's own range
+    UPLOAD_SET_ASYNC,  // ggml_backend_tensor_set_async + synchronize: the own range keeps ggml order
+};
+
 struct type_case {
     ggml_type    type;
     const char * name;
     int64_t      n_rows;
+    upload_kind  upload;
 };
 
 const type_case CASES[] = {
-    { GGML_TYPE_F32,   "f32",             1000 },
-    { GGML_TYPE_Q4_0,  "q4_0",            1000 },
-    { GGML_TYPE_Q8_0,  "q8_0",            1000 },
-    { GGML_TYPE_Q4_K,  "q4_K",            1000 },
-    { GGML_TYPE_Q6_K,  "q6_K",            1000 },
-    { GGML_TYPE_MXFP4, "mxfp4",           1000 },
-    { GGML_TYPE_Q6_K,  "q6_K-two-chunks", 9000 }, // 34.0 MB: more than one 32 MiB readback chunk
+    { GGML_TYPE_F32,   "f32",             1000, UPLOAD_SET       },
+    { GGML_TYPE_Q4_0,  "q4_0",            1000, UPLOAD_SET       },
+    { GGML_TYPE_Q8_0,  "q8_0",            1000, UPLOAD_SET       },
+    { GGML_TYPE_Q4_K,  "q4_K",            1000, UPLOAD_SET       },
+    { GGML_TYPE_Q6_K,  "q6_K",            1000, UPLOAD_SET       },
+    { GGML_TYPE_MXFP4, "mxfp4",           1000, UPLOAD_SET       },
+    { GGML_TYPE_Q6_K,  "q6_K-two-chunks", 9000, UPLOAD_SET       }, // 34.0 MB: more than one 32 MiB readback chunk
+    { GGML_TYPE_Q4_0,  "q4_0-set-async",  1000, UPLOAD_SET_ASYNC },
+    { GGML_TYPE_Q6_K,  "q6_K-set-async",  1000, UPLOAD_SET_ASYNC },
 };
+
+// For a *-set-async case: true when the weight's own range is recorded as AOS and, after the MUL_MAT, the reorder
+// record says SOA. Prints a FAIL line naming what it found otherwise.
+bool records_match(const ggml_tensor * w, const type_case & tc, bool after_mul_mat) {
+    const char * when = after_mul_mat ? "after the MUL_MAT" : "after the upload";
+
+    const ggml_sycl::test_tensor_layout_records r = ggml_sycl::test_get_tensor_layout_records(w);
+    if (!r.has_extra) {
+        std::fprintf(stderr, "FAIL: %s, %s: the weight has no SYCL extra, so it has no layout records\n", tc.name,
+                     when);
+        return false;
+    }
+    if (r.own_range_layout != GGML_LAYOUT_AOS) {
+        std::fprintf(stderr,
+                     "FAIL: %s, %s: the own range is recorded as %s, want aos (the async upload never reorders)\n",
+                     tc.name, when, ggml_sycl::test_layout_name(r.own_range_layout));
+        return false;
+    }
+    if (after_mul_mat && std::strcmp(r.reorder_record, "soa") != 0) {
+        std::fprintf(stderr,
+                     "FAIL: %s, after the MUL_MAT: the reorder record is %s, want soa; the kernel did not resolve an "
+                     "SOA copy, so this case does not reach a record that disagrees with the own range\n",
+                     tc.name, r.reorder_record);
+        return false;
+    }
+    return true;
+}
 
 // Reads [offset, offset + size) of t and compares it with want. Returns true on a match.
 bool read_matches(const ggml_tensor * t,
@@ -83,7 +126,9 @@ bool read_matches(const ggml_tensor * t,
 // The positive control for "a kernel's layout resolution does not change what a read returns": one MUL_MAT with w as
 // src0 on the same backend (the backend may reorder w in place or resolve a cache copy for it), then w is read again
 // and must hold the bytes that were set. Returns true on a match.
-bool read_after_mul_mat_matches(ggml_backend_t backend, ggml_tensor * w, const uint8_t * want, const char * case_name) {
+bool read_after_mul_mat_matches(ggml_backend_t backend, ggml_tensor * w, const uint8_t * want, const type_case & tc) {
+    const char * case_name = tc.name;
+
     ggml_init_params params = {
         /*.mem_size   =*/ggml_tensor_overhead() * 4 + ggml_graph_overhead(),
         /*.mem_buffer =*/nullptr,
@@ -114,10 +159,13 @@ bool read_after_mul_mat_matches(ggml_backend_t backend, ggml_tensor * w, const u
         if (status != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "FAIL: %s, after a MUL_MAT: graph compute returned %d\n", case_name, (int) status);
         } else {
-            ok = read_matches(w, 0, ggml_nbytes(w), want, case_name, "whole tensor after a MUL_MAT");
+            const bool records_ok = tc.upload != UPLOAD_SET_ASYNC || records_match(w, tc, /*after_mul_mat=*/true);
+            ok = read_matches(w, 0, ggml_nbytes(w), want, case_name, "whole tensor after a MUL_MAT") && records_ok;
             if (ok) {
+                const ggml_sycl::test_tensor_layout_records r = ggml_sycl::test_get_tensor_layout_records(w);
                 ++g_reads_after_mul_mat;
-                std::fprintf(stderr, "  ok: %s, read after MUL_MAT (%zu bytes)\n", case_name, ggml_nbytes(w));
+                std::fprintf(stderr, "  ok: %s, read after MUL_MAT (%zu bytes, record=%s own=%s)\n", case_name,
+                             ggml_nbytes(w), r.reorder_record, ggml_sycl::test_layout_name(r.own_range_layout));
             }
         }
         ggml_backend_buffer_free(buf);
@@ -159,19 +207,23 @@ int run_case(ggml_backend_t backend, const type_case & tc) {
         s = s * 1664525u + 1013904223u;
         b = (uint8_t) (s >> 24);
     }
-    ggml_backend_tensor_set(w, want.data(), 0, want.size());
+    if (tc.upload == UPLOAD_SET_ASYNC) {
+        ggml_backend_tensor_set_async(backend, w, want.data(), 0, want.size());
+    } else {
+        ggml_backend_tensor_set(w, want.data(), 0, want.size());
+    }
     ggml_backend_synchronize(backend);
 
     const size_t block_bytes = ggml_type_size(tc.type);
     const size_t win_offset  = row_bytes + 5;
     const size_t win_size    = 3 * block_bytes + 7;
-    bool         ok          = true;
+    bool         ok          = tc.upload != UPLOAD_SET_ASYNC || records_match(w, tc, /*after_mul_mat=*/false);
     ok                       = read_matches(w, 0, want.size(), want.data(), tc.name, "whole tensor") && ok;
     ok = read_matches(w, 3 * row_bytes, row_bytes, want.data() + 3 * row_bytes, tc.name, "row 3") && ok;
     ok = read_matches(w, win_offset, win_size, want.data() + win_offset, tc.name, "window inside blocks") && ok;
     ok = read_matches(w, want.size() - 3, 3, want.data() + want.size() - 3, tc.name, "last three bytes") && ok;
     ok = read_matches(rows, 0, ggml_nbytes(rows), want.data() + 2 * row_bytes, tc.name, "view of rows 2 to 4") && ok;
-    ok = read_after_mul_mat_matches(backend, w, want.data(), tc.name) && ok;
+    ok = read_after_mul_mat_matches(backend, w, want.data(), tc) && ok;
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);

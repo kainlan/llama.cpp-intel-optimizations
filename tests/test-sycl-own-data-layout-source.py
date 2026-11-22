@@ -12,8 +12,10 @@ could scramble correct bytes. With comments and string literals blanked:
      ggml_backend_sycl_set_tensor_async, GGML_LAYOUT_AOS once; in reorder_tensor_to_soa, GGML_LAYOUT_SOA once; in
      convert_tensor_to_coalesced (mmvq.cpp), GGML_LAYOUT_COALESCED once.
   R. Every other occurrence of the token own_data_layout is one of an explicit list of forms: the declaration, a
-     write spelled extra->own_data_layout = <value>; and the reader's one read
-     extra ? extra->own_data_layout : GGML_LAYOUT_AOS. A reference, a pointer or any other read of the field fails.
+     write spelled extra->own_data_layout = <value>; the reader's one read
+     extra ? extra->own_data_layout : GGML_LAYOUT_AOS; and the read-only test seam's one copy
+     records.own_range_layout = extra->own_data_layout; in ggml_sycl::test_get_tensor_layout_records. A reference, a
+     pointer or any other read of the field fails.
   M. In set_tensor's "mark as reordered" block, the branch that calls mark_coalesced_pretransformed assigns
      COALESCED and the branch that calls mark_soa_pretransformed assigns SOA.
   K. convert_tensor_to_coalesced assigns it only under if (tensor_ptr == tensor->data): the conversion writes in place
@@ -49,6 +51,7 @@ SOA_SIG = "bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_pt
 COAL_SIG = "bool convert_tensor_to_coalesced(const ggml_tensor * tensor, dpct::queue_ptr stream, const char * caller) {"
 CACHE_SIG = "static void ggml_sycl_update_layout_from_cache("
 GET_SIG = "static void ggml_backend_sycl_buffer_get_tensor("
+SEAM_SIG = "test_tensor_layout_records test_get_tensor_layout_records(const ggml_tensor * tensor) {"
 EXTRA_SIG = "struct ggml_tensor_extra_gpu {"
 
 # A write: the token, =, and the whole right-hand side up to the ;.
@@ -68,6 +71,7 @@ ROOT_EXTRA = "static_cast<const ggml_tensor_extra_gpu *>(root->extra)"
 # The forms the token may appear in (R): the declaration, a write through extra->, and the reader's one read.
 WRITE_FORM = re.compile(r"\bextra->own_data_layout\s*=(?!=)\s*[^;]*;")
 READ_FORM = re.compile(r"\bextra\s*\?\s*extra->own_data_layout\s*:\s*GGML_LAYOUT_AOS\s*;")
+SEAM_FORM = re.compile(r"\brecords\.own_range_layout\s*=\s*extra->own_data_layout\s*;")
 # The calls the reader may make (C). Member calls are on the scratch vector only.
 READER_CALLS = {"ggml_sycl_buffer_read_stored_bytes", "ggml_sycl_warn_stored_order_read",
                 "ggml_sycl_soa_plane_table_for_type", "ggml_sycl_soa_to_aos_window", "ggml_nbytes", "GGML_ASSERT",
@@ -87,7 +91,7 @@ SITES = (
 )
 
 CA = "A own_data_layout is assigned only at the named sites, with the named values"
-CR = "R the token appears only as the declaration, an extra-> write or the reader's one read"
+CR = "R the token appears only as the declaration, an extra-> write, the reader's one read or the seam's one copy"
 CM = "M set_tensor's mark block assigns the layout it marks, per branch"
 CK = "K the coalesced conversion assigns only when it wrote tensor->data"
 CB = "B update_layout_from_cache does not name own_data_layout"
@@ -172,8 +176,10 @@ def census_ok(files):
 
 
 def token_forms_ok(files):
-    """Every occurrence of the token sits inside the declaration, an extra-> write, or the reader's one read."""
+    """Every occurrence of the token sits inside the declaration, an extra-> write, the reader's one read, or the
+    test seam's one copy."""
     reads = 0
+    seam_reads = 0
     for name, text in files.items():
         spans = [m.span() for m in WRITE_FORM.finditer(text)]
         if name == COMMON:
@@ -183,10 +189,15 @@ def token_forms_ok(files):
             for m in READ_FORM.finditer(text, reader[0], reader[1]):
                 spans.append(m.span())
                 reads += 1
+        seam = body_span(text, SEAM_SIG) if name == SYCL else None
+        if seam:
+            for m in SEAM_FORM.finditer(text, seam[0], seam[1]):
+                spans.append(m.span())
+                seam_reads += 1
         for tok in TOKEN.finditer(text):
             if sum(a <= tok.start() < b for a, b in spans) != 1:
                 return False
-    return reads == 1
+    return reads == 1 and seam_reads == 1
 
 
 def reader_calls_ok(get_body):
@@ -280,6 +291,8 @@ def mutants(files):
         ("a pointer taken to the record", CR,
          s(ASYNC_SIG, r"\bextra->own_data_layout = GGML_LAYOUT_AOS;",
            "extra->own_data_layout = GGML_LAYOUT_AOS; (void) &extra->own_data_layout;")),
+        ("the test seam takes a reference to the record", CR,
+         s(SEAM_SIG, SEAM_FORM.pattern, "const auto & own = extra->own_data_layout; records.own_range_layout = own;")),
         ("the reader takes the view's extra", CC, s(GET_SIG, r"\(root->extra\)", "(tensor->extra)")),
         ("the reader's decision moved into a helper", CC,
          s(GET_SIG, READ_FORM.pattern, "ggml_sycl_stored_layout_of(root);")),

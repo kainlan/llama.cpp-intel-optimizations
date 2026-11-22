@@ -10806,6 +10806,34 @@ size_t test_layout_bytes(const ggml_tensor * tensor, ggml_layout_mode layout, in
 const char * test_layout_name(ggml_layout_mode layout) {
     return ggml_sycl_layout_mode_name(layout);
 }
+
+test_tensor_layout_records test_get_tensor_layout_records(const ggml_tensor * tensor) {
+    test_tensor_layout_records records;
+    const auto *               extra = tensor ? static_cast<const ggml_tensor_extra_gpu *>(tensor->extra) : nullptr;
+    if (extra == nullptr) {
+        return records;
+    }
+    records.has_extra = true;
+    switch (extra->optimized_feature.get_reorder()) {
+        case reorder_mode::NONE:
+            records.reorder_record = "none";
+            break;
+        case reorder_mode::SOA:
+            records.reorder_record = "soa";
+            break;
+        case reorder_mode::COALESCED:
+            records.reorder_record = "coalesced";
+            break;
+        case reorder_mode::XMX_COALESCED:
+            records.reorder_record = "xmx_coalesced";
+            break;
+        case reorder_mode::XMX_GEMM_TILED:
+            records.reorder_record = "xmx_gemm_tiled";
+            break;
+    }
+    records.own_range_layout = extra->own_data_layout;
+    return records;
+}
 }  // namespace ggml_sycl
 
 bool ggml_sycl_reorder_enabled() {
