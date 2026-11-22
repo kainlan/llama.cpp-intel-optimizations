@@ -3,7 +3,8 @@
 # 22.9 GB model onto a GPU. It holds GPU.lock for the run and waits for Shmem < 30 GB first. A model-loading run is
 # never repeated: a tag whose .done, .out or tuning directory already exists is refused, before and again after the
 # lock is taken. The lock is the library scripts/sycl-lock.sh (mkdir(2) through python3, because the system mkdir
-# on this host reports success when a directory already exists).
+# on this host checks, then creates, and exits 0 when the directory appears in between, so two takers that arrive
+# together can both win).
 #
 #   sycl-inkling-profile.sh --setup b70|b50|both --phase bench|kprof-prompt|kprof-decode|e2e-decode|census
 #                           --out DIR [--ctx N] [--build-dir DIR] [--dry-run]

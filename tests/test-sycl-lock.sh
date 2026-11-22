@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Stub test of scripts/sycl-lock.sh: the take/holder/release contract, driven against a fake lock directory under a
-# temp dir and through PATH shims that reproduce the system mkdir's success-on-EEXIST and a racing foreign holder.
+# temp dir and through PATH shims: a mkdir that exits 0 for an existing directory (the outcome the system mkdir gives
+# only when the directory appears between its check and its mkdir(2)) and a racing foreign holder.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIB="$ROOT/scripts/sycl-lock.sh"
@@ -12,7 +13,8 @@ pass() { echo "PASS: $*"; }
 
 REAL_PY="$(command -v python3)"
 [ -n "$REAL_PY" ] || { echo "SKIP: python3 not found"; exit 77; }
-# PATH shims. mkdir: success when the target exists (what the system mkdir does here), else the real mkdir.
+# PATH shims. mkdir: exit 0 when the target exists (what the system mkdir does only when the directory appears between
+# its check and its mkdir(2)), else the real mkdir.
 SHIM="$T/shim"; mkdir -p "$SHIM"
 cat > "$SHIM/mkdir" <<SH
 #!/usr/bin/env bash
@@ -55,11 +57,12 @@ if bash -c 'source "$1"; sycl_lock_holder_is "$2" other' _ "$LIB" "$L"; then fai
 err="$(bash -c 'source "$1"; sycl_lock_release "$2" me' _ "$LIB" "$L" 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && [ ! -e "$L" ] && [ -z "$err" ]; then pass "(release: ours is removed)"; else fail "(release ours) rc=$rc err=$err"; fi
 
-# busy, with the plain-mkdir shim first on PATH: an existing directory must still be busy (mutant: take via mkdir).
+# busy, with the mkdir shim (exit 0 for an existing directory) first on PATH: an existing directory must still be busy
+# (mutant: take via mkdir).
 reset; mkdir "$L"
 take 0 "PATH=$SHIM:$PATH"
-if [ "$TAKE_RC" -eq 1 ] && [ -d "$L" ] && [ ! -e "$L/holder" ]; then pass "(take: an existing directory is busy even when mkdir lies)"
-else fail "(take busy under the lying mkdir) rc=$TAKE_RC holder: $(cat "$L/holder" 2>&1)"; fi
+if [ "$TAKE_RC" -eq 1 ] && [ -d "$L" ] && [ ! -e "$L/holder" ]; then pass "(take: an existing directory is busy even when the mkdir shim exits 0 for it)"
+else fail "(take busy under the mkdir shim) rc=$TAKE_RC holder: $(cat "$L/holder" 2>&1)"; fi
 rmdir "$L"
 
 # O_EXCL: a foreign holder appears right after our mkdir; we must see rc 2 and leave it intact (mutant: no O_EXCL).
