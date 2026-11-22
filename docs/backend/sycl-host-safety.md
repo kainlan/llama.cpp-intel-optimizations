@@ -295,14 +295,17 @@ label, so "only `main`" means "nobody classified this", not "this is safe".
   Correction, 2026-11-21: `mkdir GPU.lock` is not an exclusive take on this host. `/usr/bin/mkdir` is uutils
   coreutils 0.10.0: it checks with `statx`, then calls `mkdir(2)`, and exits 0 when that call fails with EEXIST
   on a directory. Two takers that arrive together both "win" (measured: 173 of 400 paired races; GNU `mkdir`,
-  `/usr/bin/gnumkdir`, 0 of 400). Take every lock through `scripts/sycl-lock.sh`:
-  `source scripts/sycl-lock.sh; sycl_lock_take /Apps/llama.cpp/GPU.lock "<who> pid=$$ start=$(date +%FT%T)" 1`
-  (0 means held and verified), and release with `sycl_lock_release` and the same text. It creates the directory
-  with `mkdir(2)`, writes a `holder` line exclusively, waits, and reads the holder back. For a one-off by hand,
-  `/usr/bin/gnumkdir` plus a `holder` written with `set -C` is the equivalent. What no taker can detect: a
-  co-taker that still uses plain `mkdir` and writes its holder after the verify window is seen only when the
-  holder is read again (the gates read it before each arm and at the end), and one that writes no holder is
-  never seen. A directory left by a killed taker is removed by hand once its holder's pid is confirmed dead.
+  `/usr/bin/gnumkdir`, 0 of 400). Take every lock through `scripts/sycl-lock.sh`, and keep the holder text in a
+  variable so the release uses the same string:
+  `source scripts/sycl-lock.sh; t="<who> pid=$$ start=$(date +%FT%T)"; sycl_lock_take /Apps/llama.cpp/GPU.lock "$t" 1`
+  (0 means held and verified), then, when done, `sycl_lock_release /Apps/llama.cpp/GPU.lock "$t"`. It creates
+  the directory with `mkdir(2)`, writes a `holder` line exclusively, waits, and reads the holder back. For a
+  one-off by hand, `/usr/bin/gnumkdir` plus a `holder` written with `set -C` is the equivalent. What no taker can
+  detect: a co-taker that still uses plain `mkdir` and writes its holder after the verify window is seen only when
+  the holder is read again, and one that writes no holder is never seen. `scripts/sycl-moe-exec-gate.sh` reads
+  its holder again before each arm, before each device launch and at the end; `scripts/sycl-qwen35-ppl-gate.sh`
+  does not read it again; `scripts/sycl-inkling-profile.sh` reads it once at the end and records `lock=lost`. A
+  directory left by a killed taker is removed by hand once its holder's pid is confirmed dead.
 
   ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
   2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports

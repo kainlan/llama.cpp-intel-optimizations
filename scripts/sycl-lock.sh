@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sycl-lock.sh -- sourced library: take and release a lock DIRECTORY with the mkdir(2) system call. Sourcing it has
-# no side effects. The system mkdir command on this host reports success when the directory already exists, so two
-# takers could both win with it; python3 os.mkdir fails with EEXIST.
+# no side effects. The system mkdir command on this host checks, then creates, and exits 0 when the directory appears
+# in between, so two takers that arrive together can both win with it; python3 os.mkdir fails with EEXIST.
 #
 #   sycl_lock_take DIR TEXT VERIFY_SECONDS
 #       0 held and verified
