@@ -3878,6 +3878,29 @@ converted, re-routed or sent to the CPU, and `choose_moe_batch_executor` stays a
   and script that searches for the old string on a prompt batch moves with it.
 - Speed is not this task. The kernel is a row kernel; what it costs on 512 tokens is Stage 2's measurement.
 
+**Added at the checkpoint (2026-11-22), a defect the implementer found and its ruling:** the block passes the
+ids tensor's own storage as the adapter's upload target, and the adapter writes the packed `[token][top_k]`
+snapshot there. In a model, ids is the `ggml_argsort_top_k` view with `nb1 = n_expert * 4`. For one token the
+write puts the same values in the same places. For a prompt, token `t` lands at `t * top_k` instead of
+`t * n_expert`, and from `top_k * ne12 > n_expert` on (Inkling: 17 tokens) it overwrites later tokens' ids,
+which the down `MUL_MAT_ID` and the routing-weight `get_rows` read afterwards. The test fixture builds ids
+contiguous, so no fixture run could show it.
+- *Ruling:* an op does not write its input. The kernel reads the ids tensor in place with its own strides, as
+  every other device MoE path here does (`ggml_sycl_get_moe_ids_device_ptr_exact`), and the upload is removed.
+  The host snapshot stays the authority for which experts are resolved and leased; the adapter keeps its range
+  check over it. What replaces "the kernel reads the snapshot": the snapshot was read from that storage, its
+  producer has completed, and nothing writes it before the kernel.
+- *Not taken:* a planned ids pool in the MMID workspace (a second copy of bytes already on the device, in a
+  geometry Task 7 is editing); admitting only contiguous ids (refuses the real model).
+- File scope gains `ggml/src/ggml-sycl/mmvq.cpp`, `mmvq.hpp` and
+  `ggml/src/ggml-sycl/tests/test-q1-nvfp4-adapter-device.cpp`. Both device tests get a strided-ids case that
+  asserts the ids bytes are unchanged after the compute.
+- Expected side effect, not measured: one host-to-device copy less per `MUL_MAT_ID` in decode.
+- Also ruled: the capability arm's widening must not steer a prompt operand with a host-resident or
+  secondary-card expert into an abort; both end in a named refusal. Recorded as debt, not fixed here: for a
+  direct recipe `recipe.workspace` (the 32-row chunk plan) is a size nothing allocates, a second figure for one
+  thing.
+
 **Checkpoint before any GREEN code (report to the lead, then wait):**
 1. Where the prompt operand for the direct block comes from: pass the queue capability to the prompt build, or
    build the block's operand the same way for every `ne12`. Say which and why.
