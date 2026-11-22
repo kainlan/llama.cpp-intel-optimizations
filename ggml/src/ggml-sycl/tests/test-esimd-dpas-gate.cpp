@@ -56,12 +56,15 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using ggml_sycl::sycl_gpu_family;
 
 // ---- Link seams -------------------------------------------------------------
-// dispatch.hpp's gate needs exactly two symbols from the backend library:
-// ggml_sycl_map_device_id (common.cpp) and XMXConfig::from_device
-// (unified-kernel.cpp). Defining them here instead of linking libggml-sycl is
-// what keeps this test host-only — the library would bring in dpct::dev_mgr,
-// whose first use enumerates every SYCL device on the machine, which is far
-// more than a unit test should do and has hung this host in the past.
+// This file defines three symbols of the backend library. dispatch.hpp's gate
+// needs exactly two: ggml_sycl_map_device_id (common.cpp) and
+// XMXConfig::from_device (unified-kernel.cpp). The third,
+// ggml_sycl_async_handler (common.cpp), is referenced by dpct/helper.hpp's
+// device_ext, whose code the headers emit here but this test never runs.
+// Defining them here instead of linking libggml-sycl is what keeps this test
+// host-only — the library would bring in dpct::dev_mgr, whose first use
+// enumerates every SYCL device on the machine, which is far more than a unit
+// test should do and has hung this host in the past.
 //
 // The cost is stated plainly: the section below covers the gate and its
 // diagnostic, NOT the real XMXConfig::from_device capability query.
