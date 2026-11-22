@@ -589,7 +589,11 @@ expect_gate "inkling no model" 77 "$out" "$rc" '^GATE inkling SKIP rc=77 ' "$TMP
 : > "$case_ink_dir/fake-inkling.gguf"
 rm -f "$case_ink_dir/argv.log"
 out="$(STUB_ARGV_LOG="$case_ink_dir/argv.log" run_gates "$case_ink_dir" all 2>"$TMP/inkling-all.err")"
-if printf '%s\n' "$out" | grep -q '^GATE inkling' \
+# Positive control: the log must show the Mistral invocation, or an empty log
+# would pass the absence check below without proving anything.
+if ! grep -q 'fake-mistral' "$case_ink_dir/argv.log" 2>/dev/null; then
+    fail "(inkling all) no Mistral invocation in the argv log; the absence check proves nothing"
+elif printf '%s\n' "$out" | grep -q '^GATE inkling' \
     || grep -q 'fake-inkling' "$case_ink_dir/argv.log"; then
     fail "(inkling all) --gate all ran the inkling gate"
 else
