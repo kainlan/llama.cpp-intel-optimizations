@@ -282,7 +282,7 @@ def claim_effects_check_the_last_snapshot(gs: str) -> bool:
         and ordered(loop, 'if (!effects_are_current()) { throw std::runtime_error("stale host provisioning candidate '
                     'before allocation"); }', "ggml_sycl_run_inventory_effects(decision.effects);",
                     "ggml_sycl::get_unified_cache_for_device(decision.device);",
-                    "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);",
+                    "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);",
                     'if (!effects_are_current()) { throw std::runtime_error("stale host provisioning candidate after '
                     'allocation"); }')
     )
@@ -445,8 +445,9 @@ def test_witness_effects_check_their_own_snapshot():
 
 
 def test_witness_effects_configure_from_the_last_snapshot():
-    mutated = mutate_in(GS, STAGE_SIG, "ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);",
-                        "ggml_sycl_configure_host_zones_for_plan(cache, staged->plan);")
+    mutated = mutate_in(GS, STAGE_SIG,
+                        "ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);",
+                        "ggml_sycl_configure_host_zones_for_plan(cache, decision.device, staged->plan);")
     assert not claim_effects_check_the_last_snapshot(mutated)
 
 

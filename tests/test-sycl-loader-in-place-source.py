@@ -37,9 +37,10 @@ The charge (ucc = unified-cache.cpp)
   C1. placement_plan_host_weight_zone_terms reads the loader facts, charges loader_residency only when one pool holds
       the buffer (loader_holds_weights && loader_device >= 0), sums it at TENSOR_ALIGNMENT and reports loader_served;
       populate_host_zone_sizing compares through matches_charge(plan.weight_host_bytes) and records the term as
-      host_zone_loader_bytes. Each card's pool commits its own share: the zone configuration sizes the zones and
-      checks its growth through placement_plan_host_zone_commit_terms_on_device(..., cache->device()), and names a
-      card that leaves the term out on a WARN line.
+      host_zone_loader_bytes. Each card's pool commits its own share: the zone configuration takes the card from its
+      caller (int device), sizes the zones and checks its growth through
+      placement_plan_host_zone_commit_terms_on_device(..., device), and names a card that leaves the term out on a
+      WARN line.
   C2. The fact has one source: placement_plan_copy_host_backing_fact sets the loader facts from
       placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable, info.load_loader_device, <builder's
       device>), and the kv_info fill sets load_weights_evictable from ggml_backend_sycl_weights_evictable() and
@@ -268,20 +269,21 @@ def clause_c1_terms(t: dict) -> list:
         problems.append("populate_host_zone_sizing does not compare the terms through matches_charge")
     if not re.search(r"\bplan\.host_zone_loader_bytes\s*=\s*weight_terms\.loader_residency\s*;", populate):
         problems.append("populate_host_zone_sizing does not record the loader term beside the WEIGHT zone")
-    writes = re.findall(r"\bhost_zone_loader_bytes\s*=(?!=)", t[UCC]) + re.findall(r"\bhost_zone_loader_bytes\s*=(?!=)",
-                                                                                     t[GS])
+    writes = re.findall(r"(?:\.|->)host_zone_loader_bytes\s*=(?!=)", t[UCC] + t[GS])
     if len(writes) != 1:
         problems.append(f"host_zone_loader_bytes is written {len(writes)} time(s), want 1")
     # Every card's zones are configured from the one plan, and only loader_device's pool holds the buffer.
-    configure = body_of(t[GS], r"\bstatic\s+void\s+ggml_sycl_configure_host_zones_for_plan\s*\([^;{]*plan_owner\s*\)\s*\{")
+    configure = body_of(t[GS], r"\bstatic\s+void\s+ggml_sycl_configure_host_zones_for_plan\s*\([^;{]*\bint\s+device\s*,"
+                               r"[^;{]*plan_owner\s*\)\s*\{")
     if not configure:
-        return problems + ["the plan-owner overload of ggml_sycl_configure_host_zones_for_plan not found"]
-    per_card = re.findall(r"placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,[^;]*?,\s*cache->device\(\)\s*\)",
+        return problems + ["the plan-owner overload of ggml_sycl_configure_host_zones_for_plan, taking the card from "
+                           "its caller, not found"]
+    per_card = re.findall(r"placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,[^;]*?,\s*device\s*\)",
                           configure)
     if len(per_card) != 2:
         problems.append(f"the zone configuration takes {len(per_card)} of its two figures (the zones it sizes and the "
                         "growth it checks) as this card's share, want 2")
-    if not re.search(r"host_zone_commit_check\s*\(\s*cache->device\(\)\s*,\s*ggml_sycl::"
+    if not re.search(r"host_zone_commit_check\s*\(\s*device\s*,\s*ggml_sycl::"
                      r"placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,\s*plan\.host_zone_terms\s*,",
                      configure):
         problems.append("the commit check does not compare this card's growth with its share of the plan's record")
@@ -308,7 +310,8 @@ def clause_c2_one_fact(t: dict) -> list:
                      r"\s*-1\s*;", t[GS]):
         problems.append("the kv_info fill does not take load_loader_device from the scheduler's device count")
     for rel in (GS, UCC):
-        writes = re.findall(r"\bloader_(?:holds_weights|device|serves_host_experts)\s*=(?!=)", t[rel])
+        # A member write: the [HOST-PLAN] line's "loader_device=%d" is a string, not a write.
+        writes = re.findall(r"(?:\.|->)loader_(?:holds_weights|device|serves_host_experts)\s*=(?!=)", t[rel])
         allowed = 3 if rel == UCC else 0
         if len(writes) != allowed:
             problems.append(f"{rel} writes a loader fact {len(writes)} time(s), want {allowed}")
@@ -381,11 +384,11 @@ MUTANTS = [
     ("loader-bytes-unrecorded", "C1", mutate_re(UCC, r"\bplan\.host_zone_loader_bytes\s*=\s*weight_terms\.loader_residency\s*;",
                                                 "")),
     ("configure-sizes-plan-device", "C1", mutate_re(
-        GS, r"(placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,[^;]*?,\s*)cache->device\(\)",
+        GS, r"(placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,[^;]*?,\s*)device(?=\s*\))",
         r"\1plan.device_id")),
     ("check-host-wide-record", "C1", mutate_re(
         GS, r"ggml_sycl::placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,\s*plan\.host_zone_terms\s*,"
-            r"\s*cache->device\(\)\s*\)\.total\(\)", "plan.host_zone_terms.total()")),
+            r"\s*device\s*\)\.total\(\)", "plan.host_zone_terms.total()")),
     ("loader-drop-silent", "C1", mutate(GS, LOADER_DROP_FMT, '"[HOST-PLAN] device=%d WEIGHT zone: the buffer')),
     ("plain-charge-compare", "C1", mutate_re(UCC, r"!\s*weight_terms\.matches_charge\s*\(\s*plan\.weight_host_bytes\s*\)",
                                              "weight_terms.host_weights != plan.weight_host_bytes")),

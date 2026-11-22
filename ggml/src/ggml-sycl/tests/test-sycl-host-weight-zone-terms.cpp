@@ -27,10 +27,11 @@
 // loader's SYCL_Host buffer, which holds every weight the loader reads (role WEIGHT, lifetime MODEL, category HOST_COMPUTE, from the buffer type the loader
 // adds to a SYCL device's list when weights are evictable; the buffer type asks role WEIGHT only under the model-load
 // flag, and a SYCL_Host buffer made after the load, the context's compute and output buffers, routes to SCRATCH).
-// A single-device plan charges it when the load maps no file and its weights are evictable
-// (placement_loader_fact_for), and S1-PRELOAD then serves each host expert from it in place: the expert is counted
-// once, inside loader_residency, as loader_served, and takes no block. A multi-device plan charges no loader term,
-// because every card's zones are sized from that one plan. Arm 1c asserts both builders. Arms 1 and 2 plan
+// A plan charges it once, host-wide, when the load maps no file, its weights are evictable and one device's pool holds
+// the buffer (placement_loader_fact_for: loader_device >= 0), and only that device's commit terms carry it. A plan made
+// for that device also has S1-PRELOAD serve each host expert from it in place: the expert is counted once, inside
+// loader_residency, as loader_served, and takes no block. A multi-device plan copies its host experts. A buffer split
+// across the scheduler's devices (loader_device -1) is charged nowhere. Arm 1c asserts both builders. Arms 1 and 2 plan
 // with weights that are not evictable, so their plans charge no loader buffer and arm 2's census measures the
 // loader's buffer as residency the plan did not charge. Which buffer the loader binds is the plan's fact, not the
 // build's: on a load whose plan maps files the loader binds
@@ -541,16 +542,18 @@ void arm1b_walk_counts_only_weight_zone_backings(const placement_plan & built) {
     check(mis_charged_differs, "a host expert re-backed without moving its charge makes the figures differ");
 }
 
-// Arm 1c: on a load that maps no file with evictable weights, the single-device plan charges the loader's SYCL_Host
-// buffer.
+// Arm 1c: on a load that maps no file with evictable weights, the plan charges the loader's SYCL_Host buffer once, in
+// the pool that holds it.
 //
-// The loader then keeps every weight the plan places in that buffer for the model's life, so the single-device plan's
-// WEIGHT zone holds it as loader_residency: each entry's src_size rounded up to the loader's tensor alignment.
-// S1-PRELOAD serves each host expert from that buffer in place, so the expert is loader_served and holds no block; a
-// host dense weight is still copied into a block. The multi-device plan charges no loader term, since every card's
-// zones are sized from that one plan, and copies every host weight. The oracle is written out from the entries, not
-// asked of the terms function. Arm 1's fact-false plans are the control: the same entries charge no loader buffer and
-// copy every host weight.
+// The loader then keeps every weight the plan places in that buffer for the model's life. When one device's pool holds
+// it (loader_device 0, the scheduler seeing one device), both builders' WEIGHT zones hold it as loader_residency: each
+// entry's src_size rounded up to the loader's tensor alignment, recorded as host_zone_loader_bytes; device 0's commit
+// terms are the plan's record, and device 1's leave the buffer out. The single-device plan, made for device 0, also has
+// S1-PRELOAD serve each host expert from that buffer in place, so the expert is loader_served and holds no block; a
+// host dense weight is still copied into a block, and the multi-device plan copies every host weight. When the
+// scheduler sees more than one device (loader_device -1) the buffer is split across their pools, and the plan charges
+// none of it and serves nothing from it. The oracle is written out from the entries, not asked of the terms function.
+// Arm 1's fact-false plans are the control: the same entries charge no loader buffer and copy every host weight.
 struct loader_oracle {
     size_t residency = 0;  // every entry, at the loader's alignment
     size_t experts   = 0;  // host experts backed PINNED, the ones the single-device plan serves in place
@@ -575,21 +578,42 @@ loader_oracle derive_loader(const placement_plan & plan) {
     return o;
 }
 
+// How a plan uses the loader's buffer: charged (one pool holds it) and, when made for that pool's device, serving the
+// host experts in place.
+enum class loader_use { SERVED, CHARGED, SPLIT };
+
+const char * loader_use_role(loader_use use) {
+    switch (use) {
+        case loader_use::SERVED:
+            return "loader_residency: the loader's SYCL_Host buffer, serving the host experts in place";
+        case loader_use::CHARGED:
+            return "loader_residency: the loader's SYCL_Host buffer, charged once, in loader_device's pool";
+        case loader_use::SPLIT:
+            return "loader_residency: the loader's SYCL_Host buffer, not charged: the scheduler sees more than one "
+                   "device";
+    }
+    return "";
+}
+
 void check_loader_charge(const char *           builder,
                          const placement_plan & plan,
                          const captured_log &   log,
-                         bool                   serves,
+                         loader_use             use,
                          const placement_plan & control) {
-    std::printf("  [%s, weights evictable]\n", builder);
+    const bool charged = use != loader_use::SPLIT;
+    const bool serves  = use == loader_use::SERVED;
+    std::printf("  [%s, weights evictable, loader_device=%d]\n", builder, plan.loader_device);
     check(plan.loader_holds_weights, "the plan says the loader holds the weights");
-    check(plan.loader_serves_host_experts == serves, serves ? "the single-device plan serves host experts in place" :
-                                                              "the multi-device plan copies its host experts");
+    check(plan.loader_device == (charged ? 0 : -1), "loader_device names the pool that holds the buffer, or none");
+    check(plan.loader_serves_host_experts == serves, serves ? "the plan made for the loader's device serves host "
+                                                              "experts in place" :
+                                                              "the plan copies its host experts");
     const loader_oracle          o     = derive_loader(plan);
     const host_weight_zone_terms terms = placement_plan_host_weight_zone_terms(plan);
     check(o.experts > 0 && o.residency > o.experts, "the plan has host experts and device weights for the loader term");
-    check_eq(serves ? "loader_residency is every entry at the loader's alignment" :
-                      "the multi-device plan charges no loader term",
-             terms.loader_residency, serves ? o.residency : 0);
+    check_eq(charged ? "loader_residency is every entry at the loader's alignment" :
+                       "a buffer split across the devices is charged nowhere",
+             terms.loader_residency, charged ? o.residency : 0);
     check_eq("loader_served", terms.loader_served, serves ? o.experts : 0);
     check_eq("host_weights", terms.host_weights, serves ? o.dense : o.dense + o.experts);
     check_eq("host_weights + loader_served == weight_host_bytes", terms.host_weights + terms.loader_served,
@@ -597,6 +621,15 @@ void check_loader_charge(const char *           builder,
     check(terms.matches_charge(plan.weight_host_bytes), "the terms match the plan's charge");
     check(!log.host_plan_bug, "no [HOST-PLAN-BUG] line was logged");
     check_eq("host_zone_weight_bytes is the terms' total", plan.host_zone_weight_bytes, terms.total());
+    check_eq("host_zone_loader_bytes is the loader term", plan.host_zone_loader_bytes, terms.loader_residency);
+    // Each card's share of the plan's record: device 0's pool holds the buffer, device 1's leaves it out.
+    const host_zone_commit_terms & record = plan.host_zone_terms;
+    check(record.chunk > 0 && record.weight == plan.host_zone_weight_bytes, "the plan recorded its commit terms");
+    check_eq("device 0 commits the record", placement_plan_host_zone_commit_terms_on_device(plan, record, 0).total(),
+             record.total());
+    check_eq("device 1's WEIGHT zone leaves the loader's buffer out",
+             placement_plan_host_zone_commit_terms_on_device(plan, record, 1).weight,
+             record.weight - (charged ? terms.loader_residency : 0));
     // The control: the same inventory planned with weights that are not evictable charges no loader buffer, and its
     // host weights are the same bytes, all in blocks.
     const host_weight_zone_terms bare = placement_plan_host_weight_zone_terms(control);
@@ -611,36 +644,45 @@ void check_loader_charge(const char *           builder,
         check_eq("[HOST-PLAN] loader_served", printed_term(line, "loader_served"), terms.loader_served);
         check_eq("[HOST-PLAN] blocks", printed_term(line, "blocks"), terms.blocks);
         check_eq("[HOST-PLAN] total", printed_term(line, "total"), terms.total());
-        const char * role = serves ?
-                                "loader_residency: the loader's SYCL_Host buffer, serving the host experts in place" :
-                                "loader_residency: the loader's SYCL_Host buffer, not charged: this multi-device plan";
-        check(line.find(role) != std::string::npos, "[HOST-PLAN] says how the loader's buffer is used");
+        if (charged) {
+            check_eq("[HOST-PLAN] loader_device", printed_term(line, "loader_device"),
+                     static_cast<size_t>(plan.loader_device));
+        }
+        check(line.find(loader_use_role(use)) != std::string::npos, "[HOST-PLAN] says how the loader's buffer is used");
     }
 }
 
 void arm1c_loader_buffer_is_charged(const std::vector<placement_tensor_info> & inventory) {
     std::printf(
-        "(1c) evictable weights on a load that maps no file: the single-device plan charges the loader's SYCL_Host "
-        "buffer\n");
+        "(1c) evictable weights on a load that maps no file: the plan charges the loader's SYCL_Host buffer once, in "
+        "the pool that holds it\n");
     placement_kv_info kv{};
     kv.load_weights_evictable = true;
+    kv.load_loader_device     = 0;
+    placement_kv_info split   = kv;
+    split.load_loader_device  = -1;
 
     ggml_log_callback prev_cb   = nullptr;
     void *            prev_data = nullptr;
     ggml_log_get(&prev_cb, &prev_data);
     ggml_log_set(capture_log, nullptr);
-    g_log                            = {};
-    const placement_plan single      = plan_q2k(inventory, kv);
-    const captured_log   single_log  = g_log;
-    g_log                            = {};
-    const placement_plan multi       = plan_q2k_two_devices(inventory, k_starved_vram_budget, kv);
-    const captured_log   multi_log   = g_log;
-    const placement_plan single_bare = plan_q2k(inventory);
-    const placement_plan multi_bare  = plan_q2k_two_devices(inventory);
+    g_log                             = {};
+    const placement_plan single       = plan_q2k(inventory, kv);
+    const captured_log   single_log   = g_log;
+    g_log                             = {};
+    const placement_plan multi        = plan_q2k_two_devices(inventory, k_starved_vram_budget, kv);
+    const captured_log   multi_log    = g_log;
+    g_log                             = {};
+    const placement_plan single_split = plan_q2k(inventory, split);
+    const captured_log   split_log    = g_log;
+    const placement_plan single_bare  = plan_q2k(inventory);
+    const placement_plan multi_bare   = plan_q2k_two_devices(inventory);
     ggml_log_set(prev_cb, prev_data);
 
-    check_loader_charge("compute_placement_plan", single, single_log, /*serves=*/true, single_bare);
-    check_loader_charge("compute_multi_device_plan", multi, multi_log, /*serves=*/false, multi_bare);
+    check_loader_charge("compute_placement_plan", single, single_log, loader_use::SERVED, single_bare);
+    check_loader_charge("compute_multi_device_plan", multi, multi_log, loader_use::CHARGED, multi_bare);
+    check_loader_charge("compute_placement_plan, buffer split", single_split, split_log, loader_use::SPLIT,
+                        single_bare);
 }
 
 // --- arm 4: a host-kept gather-only table sizes no zone that holds copies ---

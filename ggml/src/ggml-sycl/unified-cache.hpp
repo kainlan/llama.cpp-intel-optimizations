@@ -2347,15 +2347,16 @@ struct placement_plan {
 // zone again once it holds the room. swap_headroom is not on the [HOST-PLAN] line, which prints before it is held;
 // the hold's own [PLACEMENT-MOE] line prints it.
 //
-// The model loader's SYCL_Host buffer is a term when the plan's loader holds weights (placement_loader_fact_for) and
-// the plan is single-device: on a load that does not map files, with evictable weights, the loader binds that buffer
-// for every weight the plan places (role WEIGHT, lifetime MODEL), device-planned ones included, and keeps it for the
-// model's life. On a load that maps files the loader binds SYCL_Mapped instead, whose bytes are the file's pages
-// outside every host zone, and the term is 0. It is 0 on a multi-device plan too: each card has its own pinned pool,
-// every card's zones are sized from the one whole-model plan, and the buffer is split across the cards by layer, so
-// the term would pin all of it on each card. A single-device plan also serves its host-planned PINNED experts from
-// that buffer in place, so those experts are counted once, inside loader_residency, and reported as loader_served
-// instead of taking blocks.
+// The model loader's SYCL_Host buffer is a term when the plan's loader holds weights in one device's pinned pool
+// (placement_loader_fact_for: loader_device >= 0): on a load that does not map files, with evictable weights, the
+// loader binds that buffer for every weight the plan places (role WEIGHT, lifetime MODEL), device-planned ones
+// included, and keeps it for the model's life. The term is charged once, host-wide, whichever builder made the plan;
+// every card's zones are sized from the plan, and only loader_device's commits the term
+// (placement_plan_host_zone_commit_terms_on_device). On a load that maps files the loader binds SYCL_Mapped instead,
+// whose bytes are the file's pages outside every host zone, and the term is 0. It is 0 too when the scheduler sees more
+// than one device (loader_device -1): the buffer is then split across their pools by layer, and no one pool holds it.
+// A plan made for loader_device also serves its host-planned PINNED experts from that buffer in place, so those experts
+// are counted once, inside loader_residency, and reported as loader_served instead of taking blocks.
 struct host_weight_zone_terms {
     size_t host_weights         = 0;  // placement_entry_host_weight_bytes() over the entries that hold a block here
     size_t blocks               = 0;  // the pinned allocations those weights take: one per entry that holds a block
@@ -2375,14 +2376,16 @@ struct host_weight_zone_terms {
     bool matches_charge(size_t weight_host_bytes) const { return host_weights + loader_served == weight_host_bytes; }
 };
 
-// The loader's SYCL_Host buffer as a plan fact, from the load's inputs (placement_kv_info::load_maps_files and
-// load_weights_evictable) and the builder. The loader binds that buffer for a SYCL layer's weights only when weights
-// are evictable and the load does not map files, and then it holds every weight the plan places. A host-planned
-// expert is served from it in place only on a single-device plan: a multi-device plan's experts are staged for every
-// device, and a chunk is ring-streamable only on the device whose cache queue allocated it.
+// The loader's SYCL_Host buffer as a plan fact, from the load's inputs (placement_kv_info::load_maps_files,
+// load_weights_evictable and load_loader_device) and the builder's device, `plan_device` (-1 for the multi-device
+// builder). The loader binds that buffer for a SYCL layer's weights only when weights are evictable and the load does
+// not map files, and then it holds every weight the plan places, in loader_device's pool, or split across the
+// scheduler's devices when that is -1. A host-planned expert is served from it in place only by a plan made for
+// loader_device: a multi-device plan's experts are staged for every device, and a chunk is ring-streamable only on
+// the device whose cache queue allocated it.
 struct placement_loader_fact {
     bool holds_weights       = false;
-    int  device              = -1;
+    int  device              = -1;  // the device whose pinned pool holds the buffer; -1 when there is none or no one
     bool serves_host_experts = false;
 };
 
@@ -2390,9 +2393,9 @@ static constexpr placement_loader_fact placement_loader_fact_for(bool maps_files
                                                                  bool weights_evictable,
                                                                  int  loader_device,
                                                                  int  plan_device) noexcept {
-    (void) loader_device;
-    const bool holds = !maps_files && weights_evictable;
-    return { holds, -1, holds && plan_device >= 0 };
+    const bool holds  = !maps_files && weights_evictable;
+    const int  device = holds ? loader_device : -1;
+    return { holds, device, device >= 0 && plan_device == device };
 }
 
 // The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
@@ -2404,10 +2407,30 @@ size_t placement_entry_host_weight_bytes(const placement_entry & entry);
 // The terms over the host-planned entries of `plan` whose backing placement_plan::host_backing_sizes_weight_zone()
 // accepts, the entries charge_host_weight() charges to weight_host_bytes: a FILE_MAPPED entry is served from the
 // file's mapping and a CPU_OWNED one is held by ggml-cpu, so neither takes a block here. Under the plan's
-// loader_holds_weights, on a single-device plan, the loader's buffer is the loader_residency term, and under
-// loader_serves_host_experts a PINNED host expert is loader_served rather than a block. The one function both planner builders size the WEIGHT
-// zone through, by way of populate_host_zone_sizing(), and the one place the host weights are summed.
+// loader_holds_weights, with a loader_device, the loader's buffer is the loader_residency term, and under
+// loader_serves_host_experts a PINNED host expert is loader_served rather than a block. The one function both planner
+// builders size the WEIGHT zone through, by way of populate_host_zone_sizing(), and the one place the host weights are
+// summed.
 host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
+
+// Sets `terms.rounding`: the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
+// chunks apart, in whole chunks of terms.chunk, each backed by the chunk plus a header of that same alignment, and the
+// rounding is what that commits beyond the zones and the RUNTIME bytes. terms.chunk is not 0.
+inline void host_zone_commit_terms_round(host_zone_commit_terms & terms) {
+    const size_t chunk_bytes = terms.chunk;
+    const size_t align       = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    const auto   align_up    = [align](size_t bytes) {
+        return (bytes + align - 1) & ~(align - 1);
+    };
+    const auto chunks_for = [chunk_bytes](size_t bytes) {
+        return (bytes + chunk_bytes - 1) / chunk_bytes;
+    };
+    const size_t zone_bytes =
+        align_up(terms.weight) + align_up(terms.kv) + align_up(terms.staging) + align_up(terms.scratch);
+    const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
+    const size_t committed = n_chunks * (chunk_bytes + align);
+    terms.rounding         = committed - terms.zones() - terms.runtime;
+}
 
 // The host bytes configuring `plan`'s zones commits on a fresh pinned pool of `chunk_bytes` chunks, with
 // `onednn_live_bytes` of oneDNN scratch already reserved (the SCRATCH zone's floor), and those two inputs. All zero but
@@ -2438,31 +2461,26 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     // The PP pipeline scratch and the PP MoE oneDNN ring are VRAM allocations, so neither host pool carries them
     // (§4.4 "The runtime pre-allocate stops carrying the same two terms").
     terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
-
-    // The pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME chunks apart, in
-    // whole chunks, each backed by the chunk plus a header of that same alignment.
-    const size_t align    = pinned_chunk_pool::DEFAULT_ALIGNMENT;
-    const auto   align_up = [align](size_t bytes) {
-        return (bytes + align - 1) & ~(align - 1);
-    };
-    const auto chunks_for = [chunk_bytes](size_t bytes) {
-        return (bytes + chunk_bytes - 1) / chunk_bytes;
-    };
-    const size_t zone_bytes =
-        align_up(terms.weight) + align_up(terms.kv) + align_up(terms.staging) + align_up(terms.scratch);
-    const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
-    const size_t committed = n_chunks * (chunk_bytes + align);
-    terms.rounding         = committed - terms.zones() - terms.runtime;
+    host_zone_commit_terms_round(terms);
     return terms;
 }
 
-// `plan`'s commit terms `terms` on `device`'s pinned pool.
+// `plan`'s commit terms `terms` (placement_plan_host_zone_commit_terms(), or the plan's record of them) on `device`'s
+// pinned pool. Every card's zones are configured from the one plan, and every card has its own pool, but the loader's
+// SYCL_Host buffer is in one of them, plan.loader_device's. So on every other device the WEIGHT zone leaves out the
+// host_zone_loader_bytes the plan charged for it, and the rounding is recomputed for the smaller zone. On the loader's
+// device, and for a plan that charged no loader term, they are `terms`. The other terms stay whole-model on every
+// device, the host weights among them, though each pool materializes only its own share.
 inline host_zone_commit_terms placement_plan_host_zone_commit_terms_on_device(const placement_plan &         plan,
                                                                               const host_zone_commit_terms & terms,
                                                                               int                            device) {
-    (void) plan;
-    (void) device;
-    return terms;
+    if (device == plan.loader_device || plan.host_zone_loader_bytes == 0 || terms.chunk == 0) {
+        return terms;
+    }
+    host_zone_commit_terms on_device = terms;
+    on_device.weight -= std::min(on_device.weight, plan.host_zone_loader_bytes);
+    host_zone_commit_terms_round(on_device);
+    return on_device;
 }
 
 // The lazy tables' part of host_planned_bytes (th32 §4.3 step 4): each table's host_resident_bytes and the block ring's
@@ -8728,7 +8746,7 @@ std::vector<void *> unified_alloc_registry_host_cpu_ptrs_for_test();
 
 // Configures `cache`'s host zones for `plan` as a model load does (ggml-sycl.cpp), so a test can measure the pool's
 // growth against the plan's host bytes.
-void configure_host_zones_for_plan_for_testing(unified_cache * cache, const placement_plan & plan);
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, int device, const placement_plan & plan);
 
 // How often unified_free_record reached ::free and sycl::free, so a test can tell a file mapping that was
 // unmapped from one that fell through to another branch.

@@ -1186,7 +1186,7 @@ copied into a cache allocation at load.
 |---|---|---|---|---|
 | device-planned dense or expert | GPU | per-device (SOA, XMX, WOQ...) | `FILE_MAPPED` (its staging source) | `DEVICE_VRAM`, staged once from the mapping (§5.3); the mapped pages are dropped after staging (§4.6) |
 | host MoE expert, AOS | CPU (`CpuExpertPool`) | AOS = file | `FILE_MAPPED`; `PINNED`, copied from the mapping by the preload, when the plan holds window-ring room, the host plan fits and no lazy table refuses | **`FILE_MAPPED`, served in place**; when `PINNED`, the pinned copy, which the window ring streams to the device for prompts |
-| host MoE expert, AOS, under `-lm none` (a load that maps no file) with evictable weights | CPU (`CpuExpertPool`) | AOS = file | `PINNED` | **`SYCL_Host`, served in place** from the loader's buffer with that buffer's owner (lifetime `MODEL`, owned by the model), ring-streamable; single-device plans only, a multi-device plan copies it into a pinned block ("The loader's `SYCL_Host` buffer" below) |
+| host MoE expert, AOS, under `-lm none` (a load that maps no file) with evictable weights | CPU (`CpuExpertPool`) | AOS = file | `PINNED` | **`SYCL_Host`, served in place** from the loader's buffer with that buffer's owner (lifetime `MODEL`, owned by the model), ring-streamable; only a single-device plan made for the device whose pool holds the buffer (`loader_device`), every other plan copies it into a pinned block ("The loader's `SYCL_Host` buffer" below) |
 | host MoE expert needing a CPU reorder (`register_host_aos_expert`'s SOA/XMX branch) | CPU | reordered | `FILE_MAPPED` source | copied: into `HOST_CPU` once th32 T1 lands, pinned until then |
 | planner-host dense, `GGML_SYCL_HOST_WEIGHT_LAYOUT=cpu` (default) | ggml-cpu | `CPU_REPACK` | `CPU_OWNED` | copied by ggml-cpu, outside the cache (ticket below) |
 | planner-host dense, `=plain` | ggml-cpu | file | `FILE_MAPPED` | `FILE_MAPPED` (`is_host`, so the CPU backend runs it) |
@@ -1206,18 +1206,30 @@ exps-IQ4_NL pack. Otherwise `PINNED` host backing survives only when
 **The loader's `SYCL_Host` buffer** (llama.cpp-cg69). On a load that maps no
 file, with evictable weights, the loader binds `SYCL_Host` for every weight the
 plan places and keeps that buffer for the model's life. The plan states it as
-two facts with one source, `placement_loader_fact_for(load_maps_files,
-load_weights_evictable, multi_device)` in `placement_plan_copy_host_backing_fact`
-(`kv_info.load_weights_evictable` comes from
-`ggml_backend_sycl_weights_evictable()`):
-- `loader_holds_weights` (no mapping, evictable weights). A single-device
-  plan's WEIGHT zone charges the buffer as the term `loader_residency`: every
+three facts with one source, `placement_loader_fact_for(load_maps_files,
+load_weights_evictable, load_loader_device, plan_device)` in
+`placement_plan_copy_host_backing_fact` (`kv_info.load_weights_evictable` comes
+from `ggml_backend_sycl_weights_evictable()`, `kv_info.load_loader_device` from
+the scheduler's device count, and `plan_device` is the builder's device, -1 for
+the multi-device builder):
+- `loader_holds_weights` (no mapping, evictable weights).
+- `loader_device`: the device whose cache's pinned pool holds the buffer, -1
+  when no one pool does. The buffer's chunks come from the cache of the device
+  whose `SYCL_Host` buffer type libllama binds for a layer. When the backend
+  scheduler sees one device (one GPU selected, or several collapsed to device 0
+  because no split is asked for) that is device 0 for every layer, so
+  `loader_device` is 0. When it sees more (`GGML_SYCL_SPLIT_RATIO` or
+  `GGML_SYCL_TENSOR_SPLIT`) the buffer is split across their pools by layer,
+  and `loader_device` is -1. When it is a device, the plan's WEIGHT zone
+  charges the buffer once, host-wide, as the term `loader_residency`: every
   entry's `src_size` rounded up to the loader's tensor alignment, exact for a
   dense weight and a bound for an expert slice. The term reaches
-  `host_planned_bytes` through the zone. It covers the device-planned weights'
-  host bytes too, which the loader keeps after staging (22.9 GB on the Qwen3.8
-  B70 `-lm none` load); releasing them after staging is a separate ticket.
-- `loader_serves_host_experts` (the same, on a single-device plan). S1-PRELOAD
+  `host_planned_bytes` through the zone, and the plan records it as
+  `host_zone_loader_bytes`. It covers the device-planned weights' host bytes
+  too, which the loader keeps after staging (22.9 GB on the Qwen3.8 B70
+  `-lm none` load); releasing them after staging is `llama.cpp-ne2m`.
+- `loader_serves_host_experts` (the same, on a single-device plan made for
+  `loader_device`). S1-PRELOAD
   registers each host expert backed `PINNED` in place: its lease is the
   expert's bytes inside the loader's chunk, its owner a copy of that chunk's
   owner, which `moe_stream_owner_streamable` accepts, so the window ring
@@ -1232,17 +1244,28 @@ not a claimed tenant slot, has lifetime `MODEL`, holds the expert's bytes, and
 whose owner the ring copies from on that device. A refusal logs one
 `[MOE-LAYOUT]` WARN per tensor and copies the expert into a block the plan did
 not size. The limits:
-- Single-device, evictable, non-mapping plans only. A multi-device plan
-  charges no loader term and copies every host expert into a block, as before
-  this change, so the buffer stays outside its plan. On two or more GPUs each
-  card has its own cache and pinned pool (`PER_DEVICE`), and every card's host
-  zones are sized and pre-allocated from its snapshot of the one whole-model
-  plan (`ggml_sycl_configure_host_zones_for_plan`), while the buffer is split
-  across the cards by layer. Charging the whole buffer there would pin all of
-  it on each card. Its `[HOST-PLAN]` line says so ("not charged: this
-  multi-device plan"). A per-card share of the buffer, and of the host weights,
-  which that whole-plan sizing also gives each card in full, is a separate
-  ticket.
+- In place only on a single-device plan made for `loader_device`. A
+  multi-device plan stages its experts for every device, and a chunk is
+  ring-streamable only on the device whose cache queue allocated it, so it,
+  and a plan made for another device, copies every host expert into a block.
+- Only `loader_device`'s pool commits the term. On two or more GPUs each card
+  has its own cache and pinned pool (`PER_DEVICE`), and every card's host zones
+  are sized and pre-allocated from its snapshot of the one plan
+  (`ggml_sycl_configure_host_zones_for_plan`). That step takes each card's
+  share through `placement_plan_host_zone_commit_terms_on_device(plan, terms,
+  cache->device())`: every card but `loader_device` leaves
+  `host_zone_loader_bytes` out of its WEIGHT zone, and its chunk rounding
+  follows. The zone check compares the card's growth with its share of the
+  plan's record. A card that leaves the term out logs one
+  `[HOST-PLAN] device=N WEIGHT zone: loader_residency=0` WARN naming the pool
+  that holds the buffer.
+- A buffer split across the scheduler's devices (`loader_device` -1) is not
+  charged on any card: each card's share of it is the layers it runs, which the
+  plan does not know. Each configured card names it on the same WARN line
+  ("split across the scheduler's devices"), and the plan's `[HOST-PLAN]` line
+  says "not charged". The host weights have the same gap the other way: every
+  card's zones hold the whole model's `host_weights`, though each pool
+  materializes only its own share. That is `llama.cpp-r8ls`.
 - An in-place expert's owner is wider than its entry, so the named move's admit
   refuses it ("host copy not pinned", REFUSED) and a swap cannot move it to the
   device: it stays on the host for the model's life (`sycl-memory-design.md`,
@@ -1253,9 +1276,9 @@ not size. The limits:
   them too. The load logs one
   `[S1-PRELOAD] ... host-planned experts (... MB) have no owner` ERROR line
   and refuses, as a dense weight that cannot be registered does.
-- The preload compares what the model still holds in `SYCL_Host` chunks on the
-  plan's device with `loader_residency`, and logs a `[HOST-PLAN-BUG]` WARN
-  when it holds more.
+- When the plan charges the term, the preload compares what the model still
+  holds in `SYCL_Host` chunks in `loader_device`'s pool with
+  `loader_residency`, and logs a `[HOST-PLAN-BUG]` WARN when it holds more.
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),
@@ -1274,7 +1297,7 @@ CPU_OWNED }` for every entry. The planner derives it once from
 | `host_cpu_owned_bytes` | `CPU_OWNED` entries | yes (anonymous memory, P3 counts it) | nothing: not in the zone (today they inflate it) |
 | `host_mapped_bytes` | host-executed `FILE_MAPPED` entries | only when locked (§4.5) | nothing |
 | `host_mapped_source_bytes` | device-planned `FILE_MAPPED` sources | no | nothing (transient page cache during staging) |
-| `loader_residency` (a WEIGHT zone term, not a plan field) | every entry at the loader's alignment, when `loader_holds_weights` on a single-device plan | through the WEIGHT zone | the WEIGHT zone; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
+| `loader_residency` (a WEIGHT zone term, recorded as `host_zone_loader_bytes`) | every entry at the loader's alignment, when `loader_holds_weights` and `loader_device >= 0`, once host-wide | through the WEIGHT zone | `loader_device`'s WEIGHT zone only; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
 
 Every accumulation site of `weight_host_bytes` in the planner
 (`uc:25928`, `:25933`, `:28136`, `:28196`, `:28230`, `:28322`, `:29554`,

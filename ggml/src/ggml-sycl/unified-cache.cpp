@@ -35774,10 +35774,10 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
 
     // The host weights are summed here and nowhere else. Which entries count is the plan's own charge rule, so this
     // sum plus loader_served and weight_host_bytes cover the same entries.
-    // A multi-device plan charges no loader term. Each card has its own cache and pinned pool, and every card's host
-    // zones are sized and pre-allocated from its snapshot of this one whole-model plan, so the term would pin the whole
-    // loader buffer on every card while each card's pool holds only its own layers' chunks.
-    const bool             charge_loader = plan.loader_holds_weights && !plan.multi_device;
+    // The loader term is charged once, host-wide, when one device's pool holds the whole buffer, whichever builder made
+    // the plan: every card's zones are sized from this plan, and only loader_device's commits the term. A buffer split
+    // across the scheduler's devices by layer is in no one pool, so no zone can hold it.
+    const bool             charge_loader = plan.loader_holds_weights && plan.loader_device >= 0;
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
         // The loader's SYCL_Host buffer holds every weight the plan places, on the device or not, for the model's
@@ -37228,17 +37228,26 @@ static void populate_host_zone_sizing(placement_plan &                          
             weight_terms.loader_served, plan.weight_host_bytes);
     }
     plan.host_zone_weight_bytes = weight_terms.total();
-    const char * loader_role =
-        !plan.loader_holds_weights      ? "the loader binds no SYCL_Host buffer for weights" :
-        plan.loader_serves_host_experts ? "the loader's SYCL_Host buffer, serving the host experts in place" :
-                                          "the loader's SYCL_Host buffer, not charged: this multi-device plan sizes "
-                                          "every card's zones and the buffer is split across the cards; the host "
-                                          "weights are copied out of it";
+    plan.host_zone_loader_bytes = weight_terms.loader_residency;
+
+    const char * loader_role = "the loader binds no SYCL_Host buffer for weights";
+    if (plan.loader_holds_weights && plan.loader_device < 0) {
+        loader_role =
+            "the loader's SYCL_Host buffer, not charged: the scheduler sees more than one device, so the buffer is "
+            "split across their pools by layer; the host weights are copied out of it";
+    } else if (plan.loader_serves_host_experts) {
+        loader_role = "the loader's SYCL_Host buffer, serving the host experts in place";
+    } else if (plan.loader_holds_weights) {
+        loader_role =
+            "the loader's SYCL_Host buffer, charged once, in loader_device's pool; the host weights are copied out of "
+            "it";
+    }
     GGML_LOG_INFO(
         "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu loader_residency=%zu loader_served=%zu "
+        "loader_device=%d "
         "host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu total=%zu (%.1f MB); loader_residency: %s\n",
         plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.loader_residency,
-        weight_terms.loader_served, weight_terms.host_compute_reserve, weight_terms.layout_copies,
+        weight_terms.loader_served, plan.loader_device, weight_terms.host_compute_reserve, weight_terms.layout_copies,
         weight_terms.tlsf_bound, weight_terms.total(), weight_terms.total() / (1024.0 * 1024.0), loader_role);
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: S1 preload may keep multiple async H2D/reorder submissions

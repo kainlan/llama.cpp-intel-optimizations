@@ -4606,8 +4606,12 @@ static void moe_decode_route_census_maybe_print() {
 }
 
 namespace ggml_sycl {
+// `device` is the card whose pool `cache` is: a cache does not record its device index, and a multi-device plan's
+// device_id is -1, so only the caller can say which card's share of the plan this is.
 static void ggml_sycl_configure_host_zones_for_plan(
-    ggml_sycl::unified_cache * cache, const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
+    ggml_sycl::unified_cache *                               cache,
+    int                                                      device,
+    const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
     if (!cache || !plan_owner || plan_owner->entries.empty()) {
         return;
     }
@@ -4621,10 +4625,27 @@ static void ggml_sycl_configure_host_zones_for_plan(
     // The zone sizes come from the function the plan's host figure comes from (th32 §4.2), so what this step commits
     // is what the planner counted: the KV zone at its 64 MiB floor (KV is co-located with attention weights, so
     // plan.host_zone_kv_bytes already counts the host layers' KV), the SCRATCH zone at least the live oneDNN scratch
-    // plus the largest tensor plus headroom, and the RUNTIME pool's bytes.
-    const ggml_sycl::host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(
-        plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
-        cache->pinned_pool_chunk_size());
+    // plus the largest tensor plus headroom, and the RUNTIME pool's bytes. Every card's zones are configured from the
+    // one plan, so they are this card's share of it: the loader's SYCL_Host buffer is in loader_device's pool only.
+    const ggml_sycl::host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms_on_device(
+        plan,
+        ggml_sycl::placement_plan_host_zone_commit_terms(
+            plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
+            cache->pinned_pool_chunk_size()),
+        device);
+    if (plan.loader_holds_weights && device != plan.loader_device) {
+        if (plan.loader_device >= 0) {
+            GGML_LOG_WARN(
+                "[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer is in device "
+                "%d's pool, which commits its %zu B; this card's zones leave it out\n",
+                device, plan.loader_device, plan.host_zone_loader_bytes);
+        } else {
+            GGML_LOG_WARN(
+                "[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer is split across "
+                "the scheduler's devices by layer, so the plan charges it to no card's zones\n",
+                device);
+        }
+    }
     const size_t committed_before = cache->pinned_pool_committed();
 
     // Zone-config preflight: grow the pinned-pool to total capacity before configure_host_zones()
@@ -4669,8 +4690,9 @@ static void ggml_sycl_configure_host_zones_for_plan(
     // The pool grows by at most what the plan counts: its recorded terms, which a re-plan that moves a term re-records,
     // never this step's own recomputation, so a chunk committed here that the plan does not count is named (th32 §4.2,
     // §10's ledger check).
-    (void) ggml_sycl::host_zone_commit_check(plan.device_id, plan.host_zone_terms.total(), committed_before,
-                                             cache->pinned_pool_committed());
+    (void) ggml_sycl::host_zone_commit_check(
+        device, ggml_sycl::placement_plan_host_zone_commit_terms_on_device(plan, plan.host_zone_terms, device).total(),
+        committed_before, cache->pinned_pool_committed());
 
     if (cache->host_zones_configured()) {
         GGML_LOG_INFO("[HOST-ARENA] Zones configured: WEIGHT=%.1f MB KV=%.1f MB STAGING=%.1f MB SCRATCH=%.1f MB\n",
@@ -4687,15 +4709,15 @@ static void ggml_sycl_configure_host_zones_for_plan(
 
 // S1 preload retains its existing current-plan behavior. The guarded inventory
 // path instead passes the exact candidate captured while inventory was locked.
-static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache) {
+static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache, int device) {
     if (cache) {
-        ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));
+        ggml_sycl_configure_host_zones_for_plan(cache, device, ggml_sycl_cache_plan_owner(cache));
     }
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void configure_host_zones_for_plan_for_testing(unified_cache * cache, const placement_plan & plan) {
-    ggml_sycl_configure_host_zones_for_plan(cache, std::make_shared<const placement_plan>(plan));
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, int device, const placement_plan & plan) {
+    ggml_sycl_configure_host_zones_for_plan(cache, device, std::make_shared<const placement_plan>(plan));
 }
 #endif
 
@@ -15899,6 +15921,10 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     // Whether the loader binds the SYCL_Host buffer type for the weights on a load that maps no file, and keeps that
     // buffer for the model's life; the plan derives from it whether the WEIGHT zone charges that buffer.
     kv.load_weights_evictable   = ggml_backend_sycl_weights_evictable();
+    // Which pool holds that buffer: libllama binds the SYCL_Host buffer type of each layer's scheduler device, and a
+    // buffer's chunks come from that device's cache. With one device visible to the scheduler (one GPU selected, or
+    // several collapsed to device 0) that is device 0 for every layer; with more, the buffer is split across them.
+    kv.load_loader_device       = ggml_backend_sycl_get_device_count() == 1 ? 0 : -1;
     kv.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
     // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
     // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
@@ -17648,7 +17674,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 ggml_sycl_run_inventory_effects(decision.effects);
                 if (!decision.snapshot->explicit_no_plan) {
                     auto * cache = ggml_sycl::get_unified_cache_for_device(decision.device);
-                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);
+                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);
                 }
                 if (!effects_are_current()) {
                     // Detection, not atomic competing-provisioning or backing
@@ -45271,7 +45297,7 @@ static void ggml_sycl_preload_model_weights() {
             // Part A: configure the host arena once the placement plan is known.
             // This partitions the pre-allocated pinned pool into persistent and
             // resettable host zones so inference uses bump/reset only.
-            ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
+            ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, device);
             ggml_sycl::scoped_planned_materialization planned_materialization(cache, "S1-PRELOAD/bulk");
 
             // Submit all H2D copies for this device without waiting
@@ -46971,18 +46997,18 @@ static void ggml_sycl_preload_model_weights() {
             ggml_sycl::unified_cache_seal_layout_pool(device);
         }
 
-        // The plan charged the loader's SYCL_Host buffer to the WEIGHT zone as loader_residency. By now the loader's
-        // temporaries are freed, so what the model still holds in SYCL_Host chunks on the plan's device is that buffer,
-        // and more than the plan charged means the zone was sized short of it.
-        if (global_plan != nullptr && global_plan->loader_holds_weights && !global_plan->multi_device) {
+        // The plan charged the loader's SYCL_Host buffer to loader_device's WEIGHT zone as loader_residency. By now the
+        // loader's temporaries are freed, so what the model still holds in SYCL_Host chunks in that device's pool is
+        // that buffer, and more than the plan charged means the zone was sized short of it.
+        if (global_plan != nullptr && global_plan->loader_holds_weights && global_plan->loader_device >= 0) {
             const uint64_t model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
-            const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->device_id);
+            const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->loader_device);
             const size_t   planned  = ggml_sycl::placement_plan_host_weight_zone_terms(*global_plan).loader_residency;
             if (held > planned) {
                 GGML_LOG_WARN(
                     "[HOST-PLAN-BUG] device=%d the loader's SYCL_Host buffer holds %zu B but the plan's "
                     "loader_residency is %zu B; the host WEIGHT zone is sized %zu B short of it\n",
-                    global_plan->device_id, held, planned, held - planned);
+                    global_plan->loader_device, held, planned, held - planned);
             }
         }
 
