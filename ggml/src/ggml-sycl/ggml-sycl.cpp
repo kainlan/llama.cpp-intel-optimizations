@@ -79218,6 +79218,10 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
                                                           allow_cpu_fallback, ptr);
 }
 
+// The direct route's terminal says when the route's work is finished, and nothing else. Whether that work succeeded is
+// the asynchronous-failure latch's to say, and only a boundary that drained on its own thread may read it: a wait on
+// another thread, such as the completion host task's, can return while a boundary's wait is still delivering the error
+// to the handler, so a latch read after it can miss the failure.
 class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
     // The work is finished, whatever its outcome. The slot-release sites read this as "may be released", so success
@@ -79243,68 +79247,24 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
         }
     }
 
-    // The work finished and succeeded; the completion host task recycles the slot only on true. A terminal confirmed
-    // quiescent is not a success: the route's catch confirms it when its commands never ran or a submission failed,
-    // and that catch has already recovered the slot.
-    bool observe_success() noexcept {
-        std::optional<sycl::event>     event;
-        ggml_sycl_async_failure_cursor cursor{};
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (failed_ || quiescent_ || !event_) {
-                return false;
-            }
-            event  = event_;
-            cursor = cursor_;
-        }
-        try {
-            if (event->get_info<sycl::info::event::command_execution_status>() !=
-                sycl::info::event_command_status::complete) {
-                return false;
-            }
-            // Delivers a pending error to the queue's handler; it does not block, the event is complete.
-            event->wait_and_throw();
-            // The backend's handler records instead of throwing, so a failure shows only in the latch. Any failure on
-            // this device since the route's first submission denies success: the terminal cannot tell whose it was,
-            // and a failed command does not stop the commands after it.
-            if (ggml_sycl_async_failure_since(cursor)) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                failed_ = true;
-                return false;
-            }
-            return true;
-        } catch (...) {
-            // A throw here bypasses the handler, so the latch has not moved: the boundaries would take their normal
-            // path, and the release would be refused by the pin of a slot nobody recovers. Record it, as synchronize
-            // records a drain that throws. The record is lock-free and allocation-free, so a host-task worker may call
-            // it; mutex_ is not held.
-            ggml_sycl_async_failure_record(cursor.device, "direct-route terminal wait threw");
-            std::lock_guard<std::mutex> lock(mutex_);
-            failed_ = true;
-            return false;
-        }
-    }
     void wait() noexcept override {
         std::optional<sycl::event> event;
         { std::lock_guard<std::mutex> lock(mutex_); event = event_; }
         try { if (event) event->wait_and_throw(); } catch (...) {}
     }
 
-    void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor) noexcept {
+    void arm(sycl::event event) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        event_  = std::move(event);
-        cursor_ = cursor;
+        event_ = std::move(event);
     }
     void confirm_quiescent() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         quiescent_ = true;
     }
   private:
-    mutable std::mutex mutex_;
+    mutable std::mutex         mutex_;
     std::optional<sycl::event> event_;
-    ggml_sycl_async_failure_cursor cursor_{};
-    bool quiescent_ = false;
-    bool failed_ = false;
+    bool                       quiescent_ = false;
 };
 
 struct moe_direct_bundle_completion {
@@ -87179,8 +87139,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const ggml_sycl::moe_mmid_model_token model_token{
                 root.model.value, root.load.value, root.owner.generation };
             sycl::queue * exact_queue = ctx.stream();
-            // Taken before the route's first submission: a failure delivered after it denies the terminal success.
-            const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);
             // The direct recipe and exact queue capability were proven together
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
@@ -87293,25 +87251,38 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             ggml_sycl_q1_nvfp4_test_retain_completion(completion);
 #endif
-                            terminal->arm(final, failure_cursor);
-                            exact_queue->submit([completion, terminal, final](sycl::handler & h) {
+                            terminal->arm(final);
+                            exact_queue->submit([completion, final](sycl::handler & h) {
                                 h.depends_on(final);
-                                h.host_task([completion, terminal] {
+                                // Runs once the route's commands have finished, whatever their outcome, and releases
+                                // the finished bundle. It does not ask whether the work succeeded: its own wait could
+                                // return while a boundary's wait is still delivering the error, and the failure is the
+                                // boundary's to report. terminal_release() fails closed when a recovery already freed
+                                // the slot.
+                                h.host_task([completion] {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                                     g_q1_nvfp4_test_terminal.fetch_add(1, std::memory_order_relaxed);
+                                    // Stands for a completion task that has not released yet when the context is
+                                    // drained.
+                                    const bool skip_release = ggml_sycl_q1_nvfp4_test_consume_failure(
+                                        GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE);
+#else
+                                    constexpr bool skip_release = false;
 #endif
-                                    const bool recycled = terminal->observe_success() &&
-                                                          completion->bundle.terminal_release();
+                                    const bool recycled = !skip_release && completion->bundle.terminal_release();
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
-                                    if (recycled) g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
+                                    if (recycled) {
+                                        g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
+                                    }
 #endif
                                     // The bundle holds the admission authority, and with it the invocation pin, until
-                                    // terminal_release() resets it, which a failed terminal never reaches. Empty it as
-                                    // the body's last statement, through the shared completion object rather than this
-                                    // functor's reference to it, so no copy of the functor keeps the pin. The event of a
-                                    // host task cannot complete before its body returns, so a boundary that waited on
-                                    // that event finds the bundle gone whatever the runtime does with the functor
-                                    // afterwards. A quarantined slot keeps its own reference, for recovery.
+                                    // terminal_release() resets it, which a refused or skipped release never does.
+                                    // Empty it as the body's last statement, through the shared completion object
+                                    // rather than this functor's reference to it, so no copy of the functor keeps the
+                                    // pin. The event of a host task cannot complete before its body returns, so a
+                                    // boundary that waited on that event finds the bundle gone whatever the runtime
+                                    // does with the functor afterwards. A quarantined slot keeps its own reference,
+                                    // for recovery.
                                     completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};
                                 });
                             });
