@@ -10,8 +10,8 @@
 [VRAM-ARENA] Scratch zone: 0xffffe39279a00000 + 512.0 MB (offset 13780.0 MB from base)
 [UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
 [UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
-[SYCL] Pinned chunk pool created with 107.1 GB budget, committed=0.0 GB (chunk=2048.0 MB)
-[HOST-ARENA] Created with 107.1 GB budget, committed=0.0 GB (system total=246.9 GB available=115.1 GB reserve=8.0 GB pct=90)
+[SYCL] Pinned chunk pool created with 105.7 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 105.7 GB budget, committed=0.0 GB (system total=246.9 GB available=113.7 GB reserve=8.0 GB pct=90)
 Running with Environment Variables:
   GGML_SYCL_DEBUG: 0
   GGML_SYCL_DEBUG_SYNC: 0
@@ -82,7 +82,7 @@ SYCL Optimization Feature:
 [SYCL] Pinned pool pre_allocate: grew 1 chunks for 256.0 MB working set (total=2.0 GB)
 [HOST-ARENA] configured zones: WEIGHT=64.0 MB  KV=64.0 MB  STAGING=64.0 MB  SCRATCH=64.0 MB  (total-cap=2048.0 MB)
 [HOST-ARENA] Zones configured: WEIGHT=64.0 MB KV=64.0 MB STAGING=64.0 MB SCRATCH=64.0 MB
-[HOST-ARENA] Committed 2048.0 MB in 1 chunk(s) after plan pre-size (budget=109665.2 MB)
+[HOST-ARENA] Committed 2048.0 MB in 1 chunk(s) after plan pre-size (budget=108193.8 MB)
 [S1-PRELOAD] 0 host-registered weights found for preload
 [MOE-EXEC] h2d probe device 0: 26.6 GB/s (tuning cache)
 synthetic lifecycle load_end result=0
@@ -121,23 +121,23 @@ synthetic lifecycle load_end result=0
 [MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers (device=0, tables=1, experts=4)
 check_graph_compatibility: disabling whole-graph SYCL capture for MUL_MAT_ID (type=q1_0, ne12=1); segmented replay can still run it as a direct boundary
 [SYCL-SEG] MUL_MAT_ID cannot be recorded on device 0; decode splits replay per-split segments with MoE ops as direct boundaries
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=1, oldest live epoch=0, 1 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=1
 [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=1
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=2, oldest live epoch=0, 2 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=2
 [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=2
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=3, oldest live epoch=0, 3 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=3
 [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=3
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7a1e37800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+[UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x77efc3800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=4, oldest live epoch=0, 4 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=4
 [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=4

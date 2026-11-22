@@ -21,15 +21,15 @@ test 341
 341: [SYCL] Device 0 caps: CU=256, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
 341: [SYCL] Host malloc per-allocation limit: 31.3 GB (min max_mem_alloc_size across 1 active devices)
 341: [PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
-341: [UNIFIED-CACHE] Device 0 budget authority: base=32656.0 MB free=31947.9 MB pct=100% external_headroom=2048.0 MB budget=29899.9 MB
-341: [UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=31947.9 MB budget=29899.9 MB (100%)
-341: [VRAM-ARENA] Reserved single chunk: 29898.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=28618.0 MB)
-341: [VRAM-ARENA] Active on device 0: 1 chunk(s), 29898.0 MB total
-341: [VRAM-ARENA] Scratch zone: 0xffffd55dd7400000 + 512.0 MB (offset 29386.0 MB from base)
+341: [UNIFIED-CACHE] Device 0 budget authority: base=32656.0 MB free=31948.0 MB pct=100% external_headroom=2048.0 MB budget=29900.0 MB
+341: [UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B70 Graphics): total=32656.0 MB free=31948.0 MB budget=29900.0 MB (100%)
+341: [VRAM-ARENA] Reserved single chunk: 29900.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=28620.0 MB)
+341: [VRAM-ARENA] Active on device 0: 1 chunk(s), 29900.0 MB total
+341: [VRAM-ARENA] Scratch zone: 0xffffd55dd7600000 + 512.0 MB (offset 29388.0 MB from base)
 341: [UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
 341: [UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
-341: [SYCL] Pinned chunk pool created with 107.1 GB budget, committed=0.0 GB (chunk=2048.0 MB)
-341: [HOST-ARENA] Created with 107.1 GB budget, committed=0.0 GB (system total=246.9 GB available=115.1 GB reserve=8.0 GB pct=90)
+341: [SYCL] Pinned chunk pool created with 101.9 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+341: [HOST-ARENA] Created with 101.9 GB budget, committed=0.0 GB (system total=246.9 GB available=109.9 GB reserve=8.0 GB pct=90)
 341: Running with Environment Variables:
 341:   GGML_SYCL_DEBUG: 0
 341:   GGML_SYCL_DEBUG_SYNC: 0
@@ -57,22 +57,22 @@ test 341
 341: [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 0.0 MB (0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-PLAN] dense f16 dequant scratch: 0.0 MB (weights 0.0 MB + 0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-BUDGET] MoE model detected: 4 experts, 3 active, 0.0 MB expert weights
-341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29899.9 MB (free=2046.1 MB), arena_zones=1280.0 MB, weight_budget=28619.9 MB, model_size=0.0 MB, exceeds_budget=false
-341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30609.9 MB, headroom=0.0 MB
-341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29899.9 MB, model_size=0.0 MB
-341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29899.9 MB budget (100%)
+341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29900.0 MB (free=2044.1 MB), arena_zones=1280.0 MB, weight_budget=28620.0 MB, model_size=0.0 MB, exceeds_budget=false
+341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30611.9 MB, headroom=0.0 MB
+341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29900.0 MB, model_size=0.0 MB
+341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29900.0 MB budget (100%)
 341: [VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
 341: [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.0 MB total)  [priority 2]
 341: [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
-341: [VRAM-BUDGET]   Available:       29899.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
-341: [SYCL] Plan budget tied to arena: 29898.0 MB arena (shared zone 28618.0 MB after 1280.0 MB zones)
+341: [VRAM-BUDGET]   Available:       29900.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+341: [SYCL] Plan budget tied to arena: 29900.0 MB arena (shared zone 28620.0 MB after 1280.0 MB zones)
 341: [PLACEMENT] envelope (from sycl-snapshot): n_ctx=2 n_ubatch=2 n_seq_max=1 flash_attn_type=AUTO
-341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29898.0 MB, weight zone=28618.0 MB)
-341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29898.0 MB weight_budget=28618.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29898.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
-341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28618.0 MB
+341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29900.0 MB, weight zone=28620.0 MB)
+341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29900.0 MB weight_budget=28620.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29900.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28620.0 MB
 341: [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
 341: [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
-341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28618.0 MB hotness=static(layer,expert)
+341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28620.0 MB hotness=static(layer,expert)
 341: [PLACEMENT] no KV context room on device 0: no requested n_ctx reached the load (planner n_ctx=2); KV beyond it is placed at context creation
 341: [SYCL-PLAN] inventory top-8 of 3 tensors (total 0.0 MB): blk.0.ffn_gate_exps.weight=0.0MB(t41,128x96) blk.0.ffn_up_exps.weight=0.0MB(t41,128x96) blk.0.ffn_down_exps.weight=0.0MB(t41,96x128)
 341: [SYCL-PLAN] inventory groups: 2 distinct (type,ne) groups over 3 tensors; cardinality histogram: 1x1 2x1; largest card>=4: none; largest card<=2: blk.0.ffn_gate_exps.weight 0.0MB (card=2)
@@ -91,7 +91,7 @@ test 341
 341: [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
 341: [PLACEMENT] KV sizing: n_layer=1 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=2 (conservative) kv_per_layer=0.0 MB
 341: [PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
-341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29898.0 MB)
+341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29900.0 MB)
 341: [SYCL] Placement plan computed: 12 entries, 0.0 MB device + 0.0 MB host
 341: [PLACE-4] device weight zone: 0.0 MB (12 tensors), host arena: 0.0 MB (0 tensors)
 341: [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
@@ -100,7 +100,7 @@ test 341
 341: [SYCL] Pinned pool pre_allocate: grew 1 chunks for 256.0 MB working set (total=2.0 GB)
 341: [HOST-ARENA] configured zones: WEIGHT=64.0 MB  KV=64.0 MB  STAGING=64.0 MB  SCRATCH=64.0 MB  (total-cap=2048.0 MB)
 341: [HOST-ARENA] Zones configured: WEIGHT=64.0 MB KV=64.0 MB STAGING=64.0 MB SCRATCH=64.0 MB
-341: [HOST-ARENA] Committed 2048.0 MB in 1 chunk(s) after plan pre-size (budget=109670.0 MB)
+341: [HOST-ARENA] Committed 2048.0 MB in 1 chunk(s) after plan pre-size (budget=104326.4 MB)
 341: [S1-PRELOAD] 0 host-registered weights found for preload
 341: [MOE-EXEC] h2d probe device 0: 26.0 GB/s (tuning cache)
 341: synthetic lifecycle load_end result=0
@@ -121,7 +121,7 @@ test 341
 341: [MOE-HYBRID] Expert metadata stored: 4 entries for post-warmup pre-staging
 341: [MOE-HYBRID] Expert group registry: 4 groups (0 complete with gate+up+down), 4 entries registered
 341: [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
-341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29899.9 MB, expert total=0.0 MB -> all on GPU0 (fits)
+341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29900.0 MB, expert total=0.0 MB -> all on GPU0 (fits)
 341: [MOE-LAYOUT] tensor=blk.0.ffn_gate_exps.weight device=0 residency=host-source-planned type=q1_0 shape=[128,96,4] layout=aos reason=default-policy executor=cpu-island xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
 341: [MOE-HYBRID] Phase 2 verify: GPU0=4 GPU1=0 CPU=0 (planner-direct-cache)
 341: [MOE-HYBRID] First tensor L1876883677: GPU0 experts=[0,1,2,3,] (4), GPU1 experts=0
@@ -139,23 +139,23 @@ test 341
 341: [MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers (device=0, tables=1, experts=4)
 341: check_graph_compatibility: disabling whole-graph SYCL capture for MUL_MAT_ID (type=q1_0, ne12=1); segmented replay can still run it as a direct boundary
 341: [SYCL-SEG] MUL_MAT_ID cannot be recorded on device 0; decode splits replay per-split segments with MoE ops as direct boundaries
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 341: [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=1, oldest live epoch=0, 1 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 341: [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=1
 341: [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=1
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 341: [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=2, oldest live epoch=0, 2 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 341: [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=2
 341: [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=2
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 341: [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=3, oldest live epoch=0, 3 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 341: [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=3
 341: [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=3
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
-341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x7385ab800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
+341: [UNIFIED-ALLOC] host-zone-reset live allocation at reset ptr=0x785807800040 alloc_id=4 size=192 device=0 tier=host_pinned role=3 category=2 vram_zone=5 host_zone=2 zone_managed=1 cohort=moe_mmid_workspace
 341: [UNIFIED-CACHE] refusing STAGING host_zone_boundary_check with 1 live registered allocations (epoch=4, oldest live epoch=0, 4 boundaries stale); owners must release their mem_handles instead of resetting the shared allocator
 341: [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=4
 341: [MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=blk.0.ffn_gate_exps.weight seq=4
@@ -195,22 +195,22 @@ test 341
 341: [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 0.0 MB (0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-PLAN] dense f16 dequant scratch: 0.0 MB (weights 0.0 MB + 0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-BUDGET] MoE model detected: 4 experts, 3 active, 0.0 MB expert weights
-341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29899.9 MB (free=1943.5 MB), arena_zones=1280.0 MB, weight_budget=28619.9 MB, model_size=0.0 MB, exceeds_budget=false
-341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30712.5 MB, headroom=0.0 MB
-341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29899.9 MB, model_size=0.0 MB
-341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29899.9 MB budget (100%)
+341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29900.0 MB (free=1941.5 MB), arena_zones=1280.0 MB, weight_budget=28620.0 MB, model_size=0.0 MB, exceeds_budget=false
+341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30714.5 MB, headroom=0.0 MB
+341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29900.0 MB, model_size=0.0 MB
+341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29900.0 MB budget (100%)
 341: [VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
 341: [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.0 MB total)  [priority 2]
 341: [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
-341: [VRAM-BUDGET]   Available:       29899.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
-341: [SYCL] Plan budget tied to arena: 29898.0 MB arena (shared zone 28618.0 MB after 1280.0 MB zones)
+341: [VRAM-BUDGET]   Available:       29900.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+341: [SYCL] Plan budget tied to arena: 29900.0 MB arena (shared zone 28620.0 MB after 1280.0 MB zones)
 341: [PLACEMENT] envelope (from sycl-snapshot): n_ctx=2 n_ubatch=2 n_seq_max=1 flash_attn_type=AUTO
-341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29898.0 MB, weight zone=28618.0 MB)
-341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29898.0 MB weight_budget=28618.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29898.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
-341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28618.0 MB
+341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29900.0 MB, weight zone=28620.0 MB)
+341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29900.0 MB weight_budget=28620.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29900.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28620.0 MB
 341: [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
 341: [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
-341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28618.0 MB hotness=static(layer,expert)
+341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28620.0 MB hotness=static(layer,expert)
 341: [PLACEMENT] no KV context room on device 0: no requested n_ctx reached the load (planner n_ctx=2); KV beyond it is placed at context creation
 341: [SYCL-PLAN] inventory top-8 of 3 tensors (total 0.0 MB): blk.0.ffn_gate_exps.weight=0.0MB(t41,128x96) blk.0.ffn_up_exps.weight=0.0MB(t41,128x96) blk.0.ffn_down_exps.weight=0.0MB(t41,96x128)
 341: [SYCL-PLAN] inventory groups: 2 distinct (type,ne) groups over 3 tensors; cardinality histogram: 1x1 2x1; largest card>=4: none; largest card<=2: blk.0.ffn_gate_exps.weight 0.0MB (card=2)
@@ -229,7 +229,7 @@ test 341
 341: [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
 341: [PLACEMENT] KV sizing: n_layer=1 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=2 (conservative) kv_per_layer=0.0 MB
 341: [PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
-341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29898.0 MB)
+341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29900.0 MB)
 341: [SYCL] Placement plan computed: 12 entries, 0.0 MB device + 0.0 MB host
 341: [PLACE-4] device weight zone: 0.0 MB (12 tensors), host arena: 0.0 MB (0 tensors)
 341: [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
@@ -247,7 +247,7 @@ test 341
 341: [MOE-HYBRID] Expert metadata stored: 4 entries for post-warmup pre-staging
 341: [MOE-HYBRID] Expert group registry: 4 groups (0 complete with gate+up+down), 4 entries registered
 341: [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
-341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29899.9 MB, expert total=0.0 MB -> all on GPU0 (fits)
+341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29900.0 MB, expert total=0.0 MB -> all on GPU0 (fits)
 341: [MOE-HYBRID] Phase 2 verify: GPU0=4 GPU1=0 CPU=0 (planner-direct-cache)
 341: [MOE-HYBRID] First tensor L1876883677: GPU0 experts=[0,1,2,3,] (4), GPU1 experts=0
 341: [MOE-HYBRID] Expert distribution: GPU0=4(cache) (4 total, 1.7 KB/expert)
@@ -270,22 +270,22 @@ test 341
 341: [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 0.0 MB (0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-PLAN] dense f16 dequant scratch: 0.0 MB (weights 0.0 MB + 0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-BUDGET] MoE model detected: 4 experts, 3 active, 0.0 MB expert weights
-341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29899.9 MB (free=1943.5 MB), arena_zones=1280.0 MB, weight_budget=28619.9 MB, model_size=0.0 MB, exceeds_budget=false
-341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30712.5 MB, headroom=0.0 MB
-341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29899.9 MB, model_size=0.0 MB
-341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29899.9 MB budget (100%)
+341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29900.0 MB (free=1941.5 MB), arena_zones=1280.0 MB, weight_budget=28620.0 MB, model_size=0.0 MB, exceeds_budget=false
+341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30714.5 MB, headroom=0.0 MB
+341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29900.0 MB, model_size=0.0 MB
+341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29900.0 MB budget (100%)
 341: [VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
 341: [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.0 MB total)  [priority 2]
 341: [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
-341: [VRAM-BUDGET]   Available:       29899.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
-341: [SYCL] Plan budget tied to arena: 29898.0 MB arena (shared zone 28618.0 MB after 1280.0 MB zones)
+341: [VRAM-BUDGET]   Available:       29900.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+341: [SYCL] Plan budget tied to arena: 29900.0 MB arena (shared zone 28620.0 MB after 1280.0 MB zones)
 341: [PLACEMENT] envelope (from sycl-snapshot): n_ctx=2 n_ubatch=2 n_seq_max=1 flash_attn_type=AUTO
-341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29898.0 MB, weight zone=28618.0 MB)
-341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29898.0 MB weight_budget=28618.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29898.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
-341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28618.0 MB
+341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29900.0 MB, weight zone=28620.0 MB)
+341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29900.0 MB weight_budget=28620.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29900.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28620.0 MB
 341: [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
 341: [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
-341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28618.0 MB hotness=static(layer,expert)
+341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28620.0 MB hotness=static(layer,expert)
 341: [PLACEMENT] no KV context room on device 0: no requested n_ctx reached the load (planner n_ctx=2); KV beyond it is placed at context creation
 341: [SYCL-PLAN] inventory top-8 of 3 tensors (total 0.0 MB): blk.0.ffn_gate_exps.weight=0.0MB(t41,128x96) blk.0.ffn_up_exps.weight=0.0MB(t41,128x96) blk.0.ffn_down_exps.weight=0.0MB(t41,96x128)
 341: [SYCL-PLAN] inventory groups: 2 distinct (type,ne) groups over 3 tensors; cardinality histogram: 1x1 2x1; largest card>=4: none; largest card<=2: blk.0.ffn_gate_exps.weight 0.0MB (card=2)
@@ -304,7 +304,7 @@ test 341
 341: [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
 341: [PLACEMENT] KV sizing: n_layer=1 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=2 (conservative) kv_per_layer=0.0 MB
 341: [PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
-341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29898.0 MB)
+341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29900.0 MB)
 341: [SYCL] Placement plan computed: 12 entries, 0.0 MB device + 0.0 MB host
 341: [PLACE-4] device weight zone: 0.0 MB (12 tensors), host arena: 0.0 MB (0 tensors)
 341: [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
@@ -322,7 +322,7 @@ test 341
 341: [MOE-HYBRID] Expert metadata stored: 4 entries for post-warmup pre-staging
 341: [MOE-HYBRID] Expert group registry: 4 groups (0 complete with gate+up+down), 4 entries registered
 341: [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
-341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29899.9 MB, expert total=0.0 MB -> all on GPU0 (fits)
+341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29900.0 MB, expert total=0.0 MB -> all on GPU0 (fits)
 341: [MOE-HYBRID] Phase 2 verify: GPU0=4 GPU1=0 CPU=0 (planner-direct-cache)
 341: [MOE-HYBRID] First tensor L1876883677: GPU0 experts=[0,1,2,3,] (4), GPU1 experts=0
 341: [MOE-HYBRID] Expert distribution: GPU0=4(cache) (4 total, 1.7 KB/expert)
@@ -345,22 +345,22 @@ test 341
 341: [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 0.0 MB (0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-PLAN] dense f16 dequant scratch: 0.0 MB (weights 0.0 MB + 0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-BUDGET] MoE model detected: 4 experts, 3 active, 0.0 MB expert weights
-341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29899.9 MB (free=1943.5 MB), arena_zones=1280.0 MB, weight_budget=28619.9 MB, model_size=0.0 MB, exceeds_budget=false
-341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30712.5 MB, headroom=0.0 MB
-341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29899.9 MB, model_size=0.0 MB
-341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29899.9 MB budget (100%)
+341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29900.0 MB (free=1941.5 MB), arena_zones=1280.0 MB, weight_budget=28620.0 MB, model_size=0.0 MB, exceeds_budget=false
+341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30714.5 MB, headroom=0.0 MB
+341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29900.0 MB, model_size=0.0 MB
+341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29900.0 MB budget (100%)
 341: [VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
 341: [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.0 MB total)  [priority 2]
 341: [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
-341: [VRAM-BUDGET]   Available:       29899.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
-341: [SYCL] Plan budget tied to arena: 29898.0 MB arena (shared zone 28618.0 MB after 1280.0 MB zones)
+341: [VRAM-BUDGET]   Available:       29900.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+341: [SYCL] Plan budget tied to arena: 29900.0 MB arena (shared zone 28620.0 MB after 1280.0 MB zones)
 341: [PLACEMENT] envelope (from sycl-snapshot): n_ctx=2 n_ubatch=2 n_seq_max=1 flash_attn_type=AUTO
-341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29898.0 MB, weight zone=28618.0 MB)
-341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29898.0 MB weight_budget=28618.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29898.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
-341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28618.0 MB
+341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29900.0 MB, weight zone=28620.0 MB)
+341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29900.0 MB weight_budget=28620.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29900.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28620.0 MB
 341: [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
 341: [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
-341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28618.0 MB hotness=static(layer,expert)
+341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28620.0 MB hotness=static(layer,expert)
 341: [PLACEMENT] no KV context room on device 0: no requested n_ctx reached the load (planner n_ctx=2); KV beyond it is placed at context creation
 341: [SYCL-PLAN] inventory top-8 of 3 tensors (total 0.0 MB): blk.0.ffn_gate_exps.weight=0.0MB(t41,128x96) blk.0.ffn_up_exps.weight=0.0MB(t41,128x96) blk.0.ffn_down_exps.weight=0.0MB(t41,96x128)
 341: [SYCL-PLAN] inventory groups: 2 distinct (type,ne) groups over 3 tensors; cardinality histogram: 1x1 2x1; largest card>=4: none; largest card<=2: blk.0.ffn_gate_exps.weight 0.0MB (card=2)
@@ -379,7 +379,7 @@ test 341
 341: [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
 341: [PLACEMENT] KV sizing: n_layer=1 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=2 (conservative) kv_per_layer=0.0 MB
 341: [PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
-341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29898.0 MB)
+341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29900.0 MB)
 341: [SYCL] Placement plan computed: 12 entries, 0.0 MB device + 0.0 MB host
 341: [PLACE-4] device weight zone: 0.0 MB (12 tensors), host arena: 0.0 MB (0 tensors)
 341: [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
@@ -397,7 +397,7 @@ test 341
 341: [MOE-HYBRID] Expert metadata stored: 4 entries for post-warmup pre-staging
 341: [MOE-HYBRID] Expert group registry: 4 groups (0 complete with gate+up+down), 4 entries registered
 341: [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
-341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29899.9 MB, expert total=0.0 MB -> all on GPU0 (fits)
+341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29900.0 MB, expert total=0.0 MB -> all on GPU0 (fits)
 341: [MOE-HYBRID] Phase 2 verify: GPU0=4 GPU1=0 CPU=0 (planner-direct-cache)
 341: [MOE-HYBRID] First tensor L1876883677: GPU0 experts=[0,1,2,3,] (4), GPU1 experts=0
 341: [MOE-HYBRID] Expert distribution: GPU0=4(cache) (4 total, 1.7 KB/expert)
@@ -411,7 +411,7 @@ test 341
 341: [MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers (device=0, tables=1, experts=4)
 341: [SYCL-SEG] MUL_MAT_ID cannot be recorded on device 0; decode splits replay per-split segments with MoE ops as direct boundaries
 341: [MOE-DECODE-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=1 kind=2 stable=1 seq=19
-341: [SYCL-SYNC-DIAG] failed drain on device 0: drain error: none (an asynchronous error was delivered to the handler); cache_used=0.0 MB, cache_budget=29899.9 MB, L0_free=1943.5 MB, L0_total=32656.0 MB
+341: [SYCL-SYNC-DIAG] failed drain on device 0: drain error: none (an asynchronous error was delivered to the handler); cache_used=0.0 MB, cache_budget=29900.0 MB, L0_free=1941.5 MB, L0_total=32656.0 MB
 341: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
 341: [SYCL] synchronize failed: asynchronous SYCL failure latched
 341: [SYCL] model slot 0 released: 0 registry rows, 0 cache entries reclaimed
@@ -422,22 +422,22 @@ test 341
 341: [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 0.0 MB (0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-PLAN] dense f16 dequant scratch: 0.0 MB (weights 0.0 MB + 0 B/token x n_ubatch=2, RUNTIME zone)
 341: [SYCL-BUDGET] MoE model detected: 4 experts, 3 active, 0.0 MB expert weights
-341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29899.9 MB (free=1943.5 MB), arena_zones=1280.0 MB, weight_budget=28619.9 MB, model_size=0.0 MB, exceeds_budget=false
-341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30712.5 MB, headroom=0.0 MB
-341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29899.9 MB, model_size=0.0 MB
-341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29899.9 MB budget (100%)
+341: [SYCL-BUDGET] budget_pct=100%, vram_budget=29900.0 MB (free=1941.5 MB), arena_zones=1280.0 MB, weight_budget=28620.0 MB, model_size=0.0 MB, exceeds_budget=false
+341: [SYCL-BUDGET] base_mem=32656.0 MB, already_allocated=30714.5 MB, headroom=0.0 MB
+341: [SYCL-BUDGET] vram_budget_base=32656.0 MB, final_budget=29900.0 MB, model_size=0.0 MB
+341: [VRAM-BUDGET] Device 0: 32656.0 MB total, 29900.0 MB budget (100%)
 341: [VRAM-BUDGET]   Weights (dense): 0.0 MB  [priority 1]
 341: [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (0.0 MB total)  [priority 2]
 341: [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
-341: [VRAM-BUDGET]   Available:       29899.9 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
-341: [SYCL] Plan budget tied to arena: 29898.0 MB arena (shared zone 28618.0 MB after 1280.0 MB zones)
+341: [VRAM-BUDGET]   Available:       29900.0 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+341: [SYCL] Plan budget tied to arena: 29900.0 MB arena (shared zone 28620.0 MB after 1280.0 MB zones)
 341: [PLACEMENT] envelope (from sycl-snapshot): n_ctx=2 n_ubatch=2 n_seq_max=1 flash_attn_type=AUTO
-341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29898.0 MB, weight zone=28618.0 MB)
-341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29898.0 MB weight_budget=28618.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29898.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
-341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28618.0 MB
+341: [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=512.0 MB (arena=29900.0 MB, weight zone=28620.0 MB)
+341: [MOE-POLICY] device=0 total=32656.0 MB free_init=31949.9 MB plan_budget=29900.0 MB weight_budget=28620.0 MB max_alloc=32002.9 MB safe_alloc=30352.4 MB arena=29900.0 MB zones(scratch/runtime/onednn)=512.0/512.0/256.0 MB cu=256 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+341: [MOE-LAYOUT] gateup-i8 device=0 n_experts=4 considered=8 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=4 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=8 skip_executor=0 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=aos granted_up=aos remaining=28620.0 MB
 341: [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_unsupported=8.
 341: [MOE-LAYOUT] summary device=0 gate=aos(4) up=aos(4) down=aos(4) gate_up=none(0)
-341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28618.0 MB hotness=static(layer,expert)
+341: [PLACEMENT-MOE] triplet packing: groups=4 complete=4 incomplete=0 device_groups=4 host_groups=0 device_entries=12 (0.0 MB) host_entries=0 (0.0 MB) remaining=28620.0 MB hotness=static(layer,expert)
 341: [PLACEMENT] no KV context room on device 0: no requested n_ctx reached the load (planner n_ctx=2); KV beyond it is placed at context creation
 341: [SYCL-PLAN] inventory top-8 of 3 tensors (total 0.0 MB): blk.0.ffn_gate_exps.weight=0.0MB(t41,128x96) blk.0.ffn_up_exps.weight=0.0MB(t41,128x96) blk.0.ffn_down_exps.weight=0.0MB(t41,96x128)
 341: [SYCL-PLAN] inventory groups: 2 distinct (type,ne) groups over 3 tensors; cardinality histogram: 1x1 2x1; largest card>=4: none; largest card<=2: blk.0.ffn_gate_exps.weight 0.0MB (card=2)
@@ -456,7 +456,7 @@ test 341
 341: [PLACEMENT] MoE experts: 12 on device, 0 on host (of 12 total)
 341: [PLACEMENT] KV sizing: n_layer=1 n_embd_k_gqa=0 n_embd_v_gqa=0 n_ctx=2 (conservative) kv_per_layer=0.0 MB
 341: [PLACEMENT] Totals: weights=0.0 MB device + 0.0 MB host, kv=0.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
-341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29898.0 MB)
+341: [PLACEMENT] Total: 0.0 MB device + 0.0 MB host (budget=29900.0 MB)
 341: [SYCL] Placement plan computed: 12 entries, 0.0 MB device + 0.0 MB host
 341: [PLACE-4] device weight zone: 0.0 MB (12 tensors), host arena: 0.0 MB (0 tensors)
 341: [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
@@ -474,7 +474,7 @@ test 341
 341: [MOE-HYBRID] Expert metadata stored: 4 entries for post-warmup pre-staging
 341: [MOE-HYBRID] Expert group registry: 4 groups (0 complete with gate+up+down), 4 entries registered
 341: [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
-341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29899.9 MB, expert total=0.0 MB -> all on GPU0 (fits)
+341: [MOE-HYBRID] Phase 1: GPU0 cache budget=29900.0 MB, expert total=0.0 MB -> all on GPU0 (fits)
 341: [MOE-HYBRID] Phase 2 verify: GPU0=4 GPU1=0 CPU=0 (planner-direct-cache)
 341: [MOE-HYBRID] First tensor L1876883677: GPU0 experts=[0,1,2,3,] (4), GPU1 experts=0
 341: [MOE-HYBRID] Expert distribution: GPU0=4(cache) (4 total, 1.7 KB/expert)
@@ -495,7 +495,7 @@ test 341
 341: [SYCL] Expert prefetcher shut down (prefetched=0)
 341: [CPU-EXPERT-POOL] Shut down
 341: Q1/NVFP4 scoped production-route lifecycle: PASS
-1/1 Test #341: sycl-q1-nvfp4-admitted-device ....   Passed    1.49 sec
+1/1 Test #341: sycl-q1-nvfp4-admitted-device ....   Passed    1.54 sec
 
 The following tests passed:
 	sycl-q1-nvfp4-admitted-device
@@ -503,13 +503,13 @@ The following tests passed:
 100% tests passed, 0 tests failed out of 1
 
 Label Time Summary:
-B50                 =   1.49 sec*proc (1 test)
-B70                 =   1.49 sec*proc (1 test)
-device              =   1.49 sec*proc (1 test)
-mmvq                =   1.49 sec*proc (1 test)
-moe                 =   1.49 sec*proc (1 test)
-production-route    =   1.49 sec*proc (1 test)
-sycl                =   1.49 sec*proc (1 test)
+B50                 =   1.54 sec*proc (1 test)
+B70                 =   1.54 sec*proc (1 test)
+device              =   1.54 sec*proc (1 test)
+mmvq                =   1.54 sec*proc (1 test)
+moe                 =   1.54 sec*proc (1 test)
+production-route    =   1.54 sec*proc (1 test)
+sycl                =   1.54 sec*proc (1 test)
 
-Total Test time (real) =   1.49 sec
+Total Test time (real) =   1.56 sec
 rc=0
