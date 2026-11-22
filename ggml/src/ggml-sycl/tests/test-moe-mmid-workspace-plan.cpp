@@ -1572,6 +1572,59 @@ static void registry_refusal_detail_per_condition() {
     }
 }
 
+// A real load defers its workspaces (no backend context at load_end), so the first context bind publishes them after
+// its runtime transaction has replaced the plan snapshot. A stable replace with no context publishes nothing and
+// returns true, so only a publication for the snapshot live after the replace is reachable by decode. The defect
+// sequence a real load ran is pinned too: publishing the pre-replace snapshot leaves the live plan with no context,
+// and the next bind's publication of its own pre-replace snapshot is refused as the same identity for another plan.
+static void registry_publish_after_stable_replace_follows_live() {
+    using S = moe_mmid_materialize_status;
+    const moe_mmid_model_token token{ 4301, 4302, 4303 };
+    std::atomic<int>           destroyed{ 0 };
+    auto                       allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int  queue_object           = 0;
+    auto owner                  = owner_plan(0, 4304);
+    owner.queue_capability      = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 4304);
+    constexpr uint64_t identity = 43;  // a stable replace keeps the plan version, so every snapshot carries it
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  loaded = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  live   = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.replace_plan(loaded, live, identity, /*stable_geometry=*/true),
+              "a stable replace with no context was refused");
+        check(registry.published_contexts() == 0, "a stable replace with no context published one");
+        check(registry.materialize(token, identity, live, 0, { owner }, allocator) == S::PUBLISHED,
+              "publication for the live snapshot failed");
+        check(registry.exact_queue(token, live, 0, 0, &queue_object).valid(),
+              "the live snapshot's publication is not reachable by exact_queue");
+        check(!registry.exact_queue(token, loaded, 0, 0, &queue_object).valid(),
+              "the replaced snapshot is reachable by exact_queue");
+    }
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  loaded = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  first  = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  second = std::make_shared<const lifecycle_plan_snapshot>();
+        // First bind: its transaction replaces loaded -> first, then it publishes the snapshot it read before.
+        check(registry.replace_plan(loaded, first, identity, true), "first bind's replace was refused");
+        check(registry.materialize(token, identity, loaded, 0, { owner }, allocator) == S::PUBLISHED,
+              "the defect sequence's stale publication was refused");
+        check(!registry.exact_queue(token, first, 0, 0, &queue_object).valid(),
+              "a stale publication made the live snapshot reachable");
+        // Second bind: first -> second finds no context for `first` and returns true; its stale publication of
+        // `first` meets the context holding the same identity for `loaded`.
+        check(registry.replace_plan(first, second, identity, true), "second bind's replace was refused");
+        moe_mmid_materialize_refusal detail = moe_mmid_materialize_refusal::NONE;
+        check(registry.materialize(token, identity, first, 0, { owner }, allocator, &detail) == S::INVALID &&
+                  detail == moe_mmid_materialize_refusal::SAME_IDENTITY_OTHER_PLAN,
+              "the second bind's stale publication was not refused as same-identity-other-plan");
+        check(!registry.exact_queue(token, second, 0, 0, &queue_object).valid(),
+              "the defect sequence left the live snapshot reachable");
+    }
+}
+
 // llama.cpp-n8da: a workspace is admitted only by a backend context on its owner device, and a backend context exists
 // only for a device the registry exposes. With two physical GPUs the backend exposes device 0 alone by default, so the
 // planner may place experts on device 1 but must not plan an MMID workspace there: nothing can bind or admit it, and
@@ -1603,6 +1656,7 @@ int main() {
         materialize_reason_contract();
         materialize_refusal_names();
         registry_refusal_detail_per_condition();
+        registry_publish_after_stable_replace_follows_live();
         owner_admissible_only_on_an_exposed_device();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();

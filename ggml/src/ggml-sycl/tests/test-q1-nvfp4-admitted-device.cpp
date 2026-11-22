@@ -188,6 +188,10 @@ struct synthetic_inventory {
     }
 };
 
+// When the fixture creates the backends it binds: before load_end (load_end materializes the MMID workspaces itself),
+// or after it, as a real model load does (load_end defers them to the context bind).
+enum class backend_order { BEFORE_LOAD_END, AFTER_LOAD_END };
+
 struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     int backend_device = -1;  // the registry device `backend` was created for
@@ -201,7 +205,7 @@ struct lifecycle_fixture {
     // Every case marker from this index on was published while this fixture was alive: the cases its teardown names.
     size_t first_case = g_case_markers.size();
 
-    lifecycle_fixture() {
+    explicit lifecycle_fixture(backend_order order = backend_order::BEFORE_LOAD_END) {
         try {
             const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
             if (begin_result != GGML_SYCL_LIFECYCLE_OK) {
@@ -267,28 +271,34 @@ struct lifecycle_fixture {
             // Inventory staging uses temporary backends. Create fresh retained
             // backends afterwards, one per unique owner device, so load_end's
             // exact-queue lookup cannot observe a transient context that was cleared.
-            retained_backends.reserve(owner_devices.size());
-            for (int device : owner_devices) {
-                using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
-                backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
-                if (retained == nullptr) {
-                    throw test_skip("no-backend", "no backend for candidate owner device " + std::to_string(device) +
-                                                      " (ggml_backend_sycl_init returned null)");
+            const auto create_retained_backends = [&]() {
+                retained_backends.reserve(owner_devices.size());
+                for (int device : owner_devices) {
+                    using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
+                    backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
+                    if (retained == nullptr) {
+                        throw test_skip("no-backend", "no backend for candidate owner device " +
+                                                          std::to_string(device) +
+                                                          " (ggml_backend_sycl_init returned null)");
+                    }
+                    retained_backends.push_back(retained.get());
+                    if (!backend || device == primary_device) {
+                        backend        = retained.get();
+                        backend_device = device;
+                    }
+                    retained.release();
                 }
-                retained_backends.push_back(retained.get());
-                if (!backend || device == primary_device) {
-                    backend        = retained.get();
-                    backend_device = device;
-                }
-                retained.release();
-            }
-            require(backend != nullptr, "no primary candidate owner backend");
+                require(backend != nullptr, "no primary candidate owner backend");
 
-            // Same-device registry is a stack: a short-lived newer backend B
-            // must not erase the retained backend A selected above.
-            ggml_backend_t shadow = ggml_backend_sycl_init(primary_device);
-            require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
-            ggml_backend_free(shadow);
+                // Same-device registry is a stack: a short-lived newer backend B
+                // must not erase the retained backend A selected above.
+                ggml_backend_t shadow = ggml_backend_sycl_init(primary_device);
+                require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
+                ggml_backend_free(shadow);
+            };
+            if (order == backend_order::BEFORE_LOAD_END) {
+                create_retained_backends();
+            }
 
             const auto commit_result = ggml_backend_sycl_model_load_end(load, true, &model);
             if (commit_result != GGML_SYCL_LIFECYCLE_BUSY) load_open = false;
@@ -296,6 +306,11 @@ struct lifecycle_fixture {
             if (commit_result != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error("synthetic lifecycle load commit result=" +
                                          std::to_string(static_cast<int>(commit_result)));
+            }
+            // A real model load ends before llama_context creates any backend: load_end finds no backend context
+            // for the owner device and defers the MMID workspaces to the context bind.
+            if (order == backend_order::AFTER_LOAD_END) {
+                create_retained_backends();
             }
             require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
                     "plan activation failed");
@@ -314,6 +329,16 @@ struct lifecycle_fixture {
                                                                 /*swa_full=*/false,
                                                                 /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
                 "model root bind failed");
+            // The deferred order binds twice, as a real load does: each bind runs a runtime transaction that
+            // replaces the plan snapshot (a stable replace keeps the version), and the route must then admit on the
+            // snapshot that is live after the second.
+            if (order == backend_order::AFTER_LOAD_END) {
+                require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
+                                                                        /*swa_full=*/false,
+                                                                        /*flash_attn_enabled=*/true) ==
+                            GGML_SYCL_LIFECYCLE_OK,
+                        "second model root bind failed");
+            }
             require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
                     "private scope mint failed");
             scope_minted = true;
@@ -811,6 +836,14 @@ int main() {
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 3); }
+        require_clean_teardown();
+        // The order a real model load runs in: no backend at load_end, then the context binds twice. The route must
+        // admit on the plan snapshot that is live after the second bind.
+        {
+            lifecycle_fixture life(backend_order::AFTER_LOAD_END);
+            successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "deferred-bind");
+            successful_reuse_case(life, GGML_TYPE_NVFP4, 1, "deferred-bind");
+        }
         require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
         require_clean_teardown();
