@@ -97274,6 +97274,10 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     auto src_handle = ggml_sycl::mem_handle::from_direct(const_cast<void *>(data), GGML_LAYOUT_AOS, /*on_device=*/false,
                                                          ggml_sycl::mem_handle::HOST_DEVICE, size);
     (void) ggml_sycl::mem_copy_async(dst_handle, dst_base_offset + offset, src_handle, 0, size, *stream);
+    // The tensor's range now holds ggml-order bytes: record it on the extra set_tensor records it on.
+    if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+        extra->own_data_layout = GGML_LAYOUT_AOS;
+    }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
 

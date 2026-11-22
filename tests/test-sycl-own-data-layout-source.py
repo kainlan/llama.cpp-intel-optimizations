@@ -7,7 +7,8 @@ record (optimized_feature) and extra->layout say what a kernel last resolved, wh
 a reader that inferred the own range's order from them could scramble correct bytes. With comments blanked:
   A. Under ggml/src/ggml-sycl (tests/ excluded), own_data_layout is assigned exactly at these sites and nowhere else:
      the declaration in common.hpp (= GGML_LAYOUT_AOS); in ggml_backend_sycl_buffer_set_tensor, AOS once, SOA once and
-     COALESCED once; in reorder_tensor_to_soa, SOA once; in convert_tensor_to_coalesced (mmvq.cpp), COALESCED once.
+     COALESCED once; in ggml_backend_sycl_set_tensor_async, AOS once; in reorder_tensor_to_soa, SOA once; in
+     convert_tensor_to_coalesced (mmvq.cpp), COALESCED once.
   M. In set_tensor's "mark as reordered" block, the branch that calls mark_coalesced_pretransformed assigns
      COALESCED and the branch that calls mark_soa_pretransformed assigns SOA.
   K. convert_tensor_to_coalesced assigns it only under if (tensor_ptr == tensor->data): the conversion writes in place
@@ -32,6 +33,7 @@ MMVQ = "mmvq.cpp"
 COMMON = "common.hpp"
 
 SET_SIG = "static void ggml_backend_sycl_buffer_set_tensor("
+ASYNC_SIG = "static void ggml_backend_sycl_set_tensor_async("
 SOA_SIG = "bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, const char * caller) {"
 COAL_SIG = "bool convert_tensor_to_coalesced(const ggml_tensor * tensor, dpct::queue_ptr stream, const char * caller) {"
 CACHE_SIG = "static void ggml_sycl_update_layout_from_cache("
@@ -50,6 +52,7 @@ COAL_GUARD = "if (tensor_ptr == tensor->data)"
 SITES = (
     (COMMON, EXTRA_SIG, ["GGML_LAYOUT_AOS"]),
     (SYCL, SET_SIG, ["GGML_LAYOUT_AOS", "GGML_LAYOUT_COALESCED", "GGML_LAYOUT_SOA"]),
+    (SYCL, ASYNC_SIG, ["GGML_LAYOUT_AOS"]),
     (SYCL, SOA_SIG, ["GGML_LAYOUT_SOA"]),
     (MMVQ, COAL_SIG, ["GGML_LAYOUT_COALESCED"]),
 )
