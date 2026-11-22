@@ -3724,6 +3724,57 @@ Gotchas below.
 - `GGML_SYCL_Q1_NVFP4_ROUTE_TESTING` builds keep working: `q1_nvfp4_private_test_authorized` is an `||` operand.
 - Edit `ggml-sycl.cpp` by exact-string replacement; it is 97k lines and other sessions' branches touch it.
 
+**DONE 2026-11-22, merged as `ce8a3f27f`** (code freeze `0cbe9b572`; the section 12.5 completion `d72c0bf97`
+merged as `d2ac34ce1`). The task grew from one constant to twenty-six commits, because opening the route
+showed four defects the closed route had hidden. Reviews: spec, spec re-review, a whole-range quality review,
+and a fresh re-review of both fix rounds; the last is PASS WITH FINDINGS, nothing must-fix.
+
+*What landed, in order:*
+- `5b51abc41` the planner charges an MMID pool only for a model that holds Q1_0 or NVFP4 experts;
+  `3f2548276` the join-queue host task; `79d54a811` the fixture; `fe7e2ee5c` the flip;
+  `cfab28c94` named refusals; `c67c34928` comments; `47bf6b5cf` tests for the deferred bind order.
+- **The context bind** (`c1628c576`, hardened in `7ce1b01b7`, `b794ea4df`, `35e0fd7cc`). At `fe7e2ee5c` a real
+  load printed eleven false context-bind WARN lines and no pool existed when decode asked for one: the load
+  defers materialization to the bind, and the bind published against a plan snapshot that a later swap had
+  replaced. `ggml_sycl_bind_materialize_live_mmid_workspaces` now publishes for the live snapshot and
+  reconciles (`CURRENT`, `FOLLOWS_LIVE`, `REBOUND`, `REBIND_NOT_FOLLOWED`, `GEOMETRY_UNSTABLE`,
+  `REBIND_REFUSED`, `EXCEPTION`); a refused in-place rebind retires the context under the identity the
+  registry holds; a `SAME_IDENTITY_OTHER_PLAN` answer is reported only when the context does not follow the
+  live snapshot. The bar for a device run is 0 context-bind lines, not a passing oracle: a passing oracle hid
+  the eleven.
+  `cfefd737e` and `dbf37608e` are the deferral contract: every report site named and controlled alone.
+- **The host pool** (`defec841d`, `72889ec99`, `d09fe07a8`). `unified_alloc`'s no-growth pre-check
+  compared `used + size` with the zone's reservation (about 64 MiB for Inkling) although llama's host compute
+  buffers had grown the WEIGHT zone to 24 GB, so the 192-byte MMID host pool was refused.
+  `host_zone_no_growth_bound(zone, reserved, capacity)` is `max(reserved, capacity)` for WEIGHT and the
+  reservation for STAGING, SCRATCH and KV; the refusal names which of three causes applied.
+- **Lock ranks** (`3802933d4`, `5e97a3f5c`, `786057358`, `7a00eb08a`, `d72c0bf97`). Section 12.5 of
+  `docs/design/sycl-canonical-memory-architecture.md` ranks `g_lifecycle_plan_mutex` L3, the MMID registry
+  mutex L4 and the pool mutexes L5, and lists what does not conform. Lead ruling 2026-11-22: graph compute
+  takes the tensor-inventory lock (L1) under the graph-compute locks (L2, L3) at the into-empty republication
+  and at four other sites; no rank removes that, so the ranks stand for every other path and the inversion is
+  a recorded non-conformance. Two independent searches (implementer, reviewer) found no holder of L1 that takes
+  L2 or L3, so it cannot close a cycle today. Both searches are by name, not a proof.
+- **Release after the lock** (`7cd8aeaf4`). `retire`, `recover_quarantined` and `replace_plan` decide under the
+  registry mutex and drop the erased contexts, and so the last pool owners, after it; `replace_plan` hands the
+  displaced context out so it dies after the plan mutex too.
+- **One predicate** (`f0976d787`): `ggml_sycl::moe_mmid_same_workspace_plan` answers "same MMID workspace plan"
+  for the bind, the loan assert and the plan CAS. `30a653c94`: the follows question asks the device-global
+  execution queue and reads no backend context. `0cbe9b572`: reconcile refusals print `reconcile-refused`, the
+  bind's catch-all `bind-exception`.
+
+*Device results at `0cbe9b572`, one run per arm, zero kernel fault lines, `Shmem` 10 to 11 GB:* route oracle
+B70 and B50 pass, adapter test B70 passes, 0 context-bind lines; Mistral B70 gate prints `1, 2, ... 10`;
+GPT-OSS B50 gate one answer line, no device loss; the `[LOAD-PLAN]` and `[PLACEMENT]` lines of both differ
+from the run before the task only in a 2 MB free-VRAM reading; Inkling loads on the B70, the B50 and both
+cards with 0 context-bind lines and 0 host-pool refusals. The Inkling token gate fails at this commit on the
+down projection (Task 8a) and the prompt (Task 8b).
+*Merged tree, `d2ac34ce1` (Task 7, Task 8a and the 12.5 completion), one build (`[713/713]`), one run per arm:* route oracle B70 and B50 pass (28 `PASS:` lines each, 0 context-bind lines), adapter test B70 passes, Mistral B70 gate passes, GPT-OSS B50 gate one answer line and no device loss, zero kernel fault lines. Sweep: first selection fails exactly the eight of the known-red baseline, second selection passes entirely, none skipped.
+
+*Not taken (lead):* `unified_cache_note_host_task` is not `noexcept` inside the direct block's try; the bind's
+catch-all retires conservatively; several intermediate commits fail the allocation-zone contract that the tip
+passes (a bisect across this range must skip them); 136-column lines left by `8f1cabe52`.
+
 ---
 
 ### Task 8: Census — what still refuses with the route open, and the gap tasks
@@ -3817,7 +3868,7 @@ contract that pins the block; `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-d
 **Not in this task:** `choose_moe_batch_executor`'s early return, prompt rows (`ne12 > 1`), host-resident
 experts, a secondary card.
 
-**REVIEWED 2026-11-22 at `6cf95a1a8`, not merged yet (it merges after Task 7).** Task commits on `c1628c576`:
+**DONE 2026-11-22, merged as `bbdb6e4bc`** (reviewed at `6cf95a1a8`). Task commits on `c1628c576`:
 `2b2acecf0` (RED tests), `7038e6119` (the admission, the row-by-row copy, the regenerated inventory),
 `6cf95a1a8` (each passing device case prints its line). Spec review PASS WITH FINDINGS, quality review PASS WITH
 FINDINGS, no defect in the production code, no fix round: every finding taken sits on lines Task 8b rewrites and
@@ -3829,8 +3880,9 @@ moved there.
   33.277046`. The old single block copy reads the 1000.0 filler between strided rows into row 1.
 - `6cf95a1a8`, B70 and B50: the route oracle passes with 28 `PASS:` lines per card (6 through the production
   fixture, 4 strided), 0 context-bind WARN lines; the adapter device test passes on the B70.
-- Inkling gate, B70, `7038e6119`: both MoE matrices take the direct route on decode rows through `blk.19`, 0
-  refusals. The gate still fails, on the prompt (Task 8b).
+- Inkling gate, B70, `7038e6119`: both MoE matrices take the direct route through `blk.19` in the warm-up
+  decode, 0 refusals. The gate still fails, on the prompt (Task 8b). *Corrected 2026-11-22:* the warm-up is
+  the only decode that run reached; the first decode after a prompt is refused (Task 8b).
 - The gate command itself was wrong and had never run to its verdict: `llama-completion` enters conversation
   mode for a file with a chat template and throws on this one. Fixed on `feat/inkling2` (`66a4f0bd4`,
   `-no-cnv`, pinned in the stub test).
@@ -3844,7 +3896,7 @@ the previous case's identical bytes and the oracle passes); a contract tokenizer
 pins the loop); a `PASS:` line is printed before the fixture's teardown check.
 *For the profile stage:* a strided src1 costs one copy submit and one `std::vector<sycl::event>` per row. The
 usual graph gives a dense src1, which stays one copy.
-*Still owed at merge:* the Mistral and GPT-OSS gates and both sweeps on the merged tree.
+*Merged tree:* see Task 7's block; one build and one gate run cover both merges.
 
 **Also seen in the same run, recorded for the census (not fatal):** once per graph,
 `[UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight ... model=0 type=0
@@ -4954,6 +5006,23 @@ that no longer exists). Until someone files these, this list is the record. Each
 - The runtime KV-update path materializes the MMID pools (`unified_allocate`) under the inventory mutex when
   the geometry changes (the non-stable transaction branch).
 - `ExpertPrefetcher::mutex_` is not in the 12.5 table; on a load-bound thread it reaches the plan mutex.
+
+*Left by Task 7's reviews (2026-11-22):*
+- Move the into-empty republication (`ggml_sycl_republish_current_plan_into_empty`) to a graph boundary, like
+  the expert loan, so graph compute stops taking the inventory lock under the graph-compute locks at that
+  site. The other four sites are in section 12.5.
+- `ggml_sycl_materialize_published_mmid_workspaces` reads a backend context (`contexts.back()`) after
+  `g_backend_context_by_device_mutex` is released, then its queue and queue lifetime. A context freed on the
+  same device at that moment is a use after free, and `back()` is the newest context, not necessarily the
+  binding one. Older than Task 7. Fix: copy the queue and the lifetime under the mutex, or pass the binding
+  context in.
+- The runtime KV transaction runs the plan CAS and its retire under the inventory lock, so contexts it
+  displaces still die under L1 (listed in 12.5).
+- The rollback in `lifecycle_replace_placement_plan`'s CAS guards a `shared_ptr` assignment that cannot throw,
+  and would not restore the displaced context if it ran. Remove it or say so.
+- Nothing pins `stable_mmid` in the runtime transaction to the shared same-plan predicate; the host-zone
+  contract's check F does not catch an added inline comparison against the reservation; the comment at
+  `test-moe-mmid-workspace-plan.cpp:1901` still says "outside the plan lock".
 
 *Found by the Inkling runs:*
 - About 36 small host-resident F32 weights (`ne=[1,128,1,1]`, `model=0`) are not preloaded. `binbcast.cpp`'s
