@@ -14,6 +14,13 @@ source_reason=0`.  Two defects made that pair uninformative:
 
 Both are fixed at the source of the number rather than in the reader, so every
 future refusal arrives with reasons instead of archaeology.
+
+The same holds for the Q1_0/NVFP4 direct route in ggml_sycl_mul_mat_id. Those
+types run nowhere else, so a call the direct block declines falls through to the
+retained route core, whose refusal (reason=capability_unsupported) names that
+core's own refusal, not the step of the direct route that declined. Each exit
+that falls through the block therefore prints a line naming its step
+(direct_decline_violations below).
 """
 from pathlib import Path
 import re
@@ -64,6 +71,165 @@ def violations(batch: str, sycl: str) -> list[str]:
     return found
 
 
+DIRECT_DECLINE = "ggml_sycl_moe_direct_log_decline("
+DIRECT_GATE = "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&"
+DIRECT_END = "// MoE hybrid GPU+CPU dispatch gate"
+# The success path ends at the return right after the terminal host task is recorded.
+DIRECT_SUCCESS = "ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);"
+DIRECT_PRECONDITION = "if (all_primary &&"
+# Each step that can decline a call once it has a batch, in the order the route reaches them; "layout" is the gate's
+# own remaining conjunct.
+DIRECT_STEPS = ("layout", "precondition", "retained_table", "binding", "table_owner_retain", "private_table_owner",
+                "queue_capability", "invocation_snapshot", "submission_authority", "authority_issuer",
+                "workspace_admission", "workspace_slices")
+
+
+def blank_comments_and_literals(text: str) -> str:
+    """The same text, same length, with comments and string/char literals turned to spaces: a brace or parenthesis
+    inside them is not code."""
+    def blank(match: re.Match) -> str:
+        return re.sub(r"[^\n]", " ", match.group(0))
+
+    return re.sub(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])\'', blank, text, flags=re.DOTALL)
+
+
+def matching(code: str, open_at: int) -> int:
+    """Index of the bracket that closes the one at open_at."""
+    opener = code[open_at]
+    closer = {"{": "}", "(": ")"}[opener]
+    depth = 0
+    for i in range(open_at, len(code)):
+        if code[i] == opener:
+            depth += 1
+        elif code[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    raise ValueError(f"unbalanced {opener} at {open_at}")
+
+
+def enclosing_if_blocks(code: str, start: int, at: int) -> list[tuple[int, int]]:
+    """(open brace, close brace) of each `if` block, outermost first, between start and at whose body holds at."""
+    stack: list[int] = []
+    for i in range(start, at):
+        if code[i] == "{":
+            stack.append(i)
+        elif code[i] == "}" and stack:
+            stack.pop()
+    blocks = []
+    for brace in stack:
+        head = code[:brace].rstrip()
+        if not head.endswith(")"):
+            continue  # try, else, a struct or a lambda body
+        open_paren = len(head) - 1
+        depth = 0
+        while open_paren >= 0:
+            depth += {")": 1, "(": -1}.get(head[open_paren], 0)
+            if depth == 0:
+                break
+            open_paren -= 1
+        if re.search(r"\bif\s*$", head[:open_paren]):
+            blocks.append((brace, matching(code, brace)))
+    return blocks
+
+
+def else_body(code: str, close_brace: int) -> tuple[int, int] | None:
+    """(open, close) of the else (or else-if) body that follows an if block's closing brace, or None."""
+    head = re.match(r"\s*else\s*", code[close_brace + 1:])
+    if head is None:
+        return None
+    at = close_brace + 1 + head.end()
+    if re.match(r"if\s*\(", code[at:]):
+        at = matching(code, code.index("(", at)) + 1
+    brace = code.find("{", at)
+    if brace < 0 or code[at:brace].strip():
+        return None
+    return brace, matching(code, brace)
+
+
+def spaced(text: str) -> str:
+    """Whitespace runs as one space and none inside parentheses' edges, so a term survives re-wrapping."""
+    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"\s+\)", ")", re.sub(r"\(\s+", "(", text)).strip()
+
+
+def top_level_terms(condition: str) -> list[str]:
+    """The && operands of a parenthesized condition, each without its own outer parentheses."""
+    inner = condition[1:-1]
+    terms, depth, last = [], 0, 0
+    for i, ch in enumerate(inner):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0 and inner.startswith("&&", i):
+            terms.append(inner[last:i])
+            last = i + 2
+    terms.append(inner[last:])
+    out = []
+    for term in (spaced(t) for t in terms):
+        while term.startswith("(") and term.endswith(")") and matching(term, 0) == len(term) - 1:
+            term = spaced(term[1:-1])
+        out.append(term)
+    return out
+
+
+def direct_decline_violations(sycl: str) -> list[str]:
+    """Every exit that falls through the Q1_0/NVFP4 direct block prints one line naming the step that declined."""
+    found: list[str] = []
+    helper_at = sycl.find("static void " + DIRECT_DECLINE)
+    if helper_at < 0:
+        return ["the direct-route decline helper is missing"]
+    # The definition, not the declaration that carries the format attribute.
+    definition_at = sycl.find(") {", helper_at)
+    helper = sycl[definition_at:sycl.find("\n}\n", definition_at)]
+    if "route=direct step=%s" not in helper:
+        found.append("the decline line does not name its step")
+    if not ("MOE-DECODE-REFUSAL" in helper and "MOE-PROMPT-REFUSAL" in helper and "tensor=%s" in helper):
+        found.append("the decline line does not carry the phase label and the tensor")
+
+    gate_at = sycl.find(DIRECT_GATE)
+    end_at = sycl.find(DIRECT_END, gate_at)
+    if gate_at < 0 or end_at < 0:
+        return found + ["the direct block is missing"]
+    code = blank_comments_and_literals(sycl)
+    success = sycl.find(DIRECT_SUCCESS, gate_at, end_at)
+    if success < 0:
+        return found + ["the direct block's success path is missing"]
+    success_return = code.index("return;", success)
+
+    # Structural: each `if` the success path passes through has an else, and that else prints a decline line. An if
+    # without one is an exit that falls through unnamed, whatever its condition is.
+    blocks = enclosing_if_blocks(code, gate_at, success_return)
+    if len(blocks) < 5:
+        found.append(f"the success path passes {len(blocks)} if blocks; the gate, the precondition, the issuer, "
+                     "the admission and the slice check are expected")
+    for open_brace, close_brace in blocks:
+        line = sycl.count("\n", 0, open_brace) + 1
+        body = else_body(code, close_brace)
+        if body is None:
+            found.append(f"an exit falls through without a named line: the if block at line {line} has no else")
+        elif DIRECT_DECLINE not in sycl[body[0]:body[1]]:
+            found.append(f"an exit falls through without a named line: the else of the if block at line {line}")
+
+    direct = sycl[gate_at:end_at]
+    for step in DIRECT_STEPS:
+        if not re.search(re.escape(DIRECT_DECLINE) + r'\s*src0,\s*ne12,\s*"' + step + '"', direct):
+            found.append(f"no decline line names the step {step}")
+
+    # The precondition's line names every conjunct that failed: a conjunct the else does not spell is one it cannot
+    # name.
+    precondition_at = code.find(DIRECT_PRECONDITION, gate_at, end_at)
+    if precondition_at < 0:
+        return found + ["the direct block's precondition is missing"]
+    condition_open = code.index("(", precondition_at)
+    condition_close = matching(code, condition_open)
+    body = else_body(code, matching(code, code.index("{", condition_close)))
+    if body is not None:
+        named = spaced(sycl[body[0]:body[1]])
+        for term in top_level_terms(sycl[condition_open:condition_close + 1]):
+            if term not in named:
+                found.append(f"the precondition's decline line does not name the conjunct {term}")
+    return found
+
+
 def test_anchors_exist() -> None:
     # Methodology control, first: with the struct or the log lines renamed,
     # every check below is vacuous rather than failing.
@@ -105,6 +271,44 @@ def test_mutations_are_witnessed() -> None:
     for index, mutated in enumerate(sycl_mutations):
         assert mutated != sycl, f"log mutation {index} did not change the source"
         assert violations(batch, mutated), f"log mutation {index} was not witnessed"
+
+
+def test_direct_route_declines_are_named() -> None:
+    assert direct_decline_violations(SYCL.read_text()) == []
+
+
+def test_direct_route_decline_mutations_are_witnessed() -> None:
+    sycl = SYCL.read_text()
+    mutations = {
+        # The admission's exit falls through with no line: its status is never printed.
+        "admission-unnamed": re.sub(
+            r'\} else \{\n\s*ggml_sycl_moe_direct_log_decline\(src0, ne12, "workspace_admission".*?\);\n\s*\}', "}",
+            sycl, count=1, flags=re.DOTALL),
+        # A new exit on the success path, an if with no else around the submit.
+        "new-exit-unnamed": sycl.replace(
+            "completion->bundle.mark_possible_submit()) {",
+            "completion->bundle.mark_possible_submit()) {\nif (ne10 > 0) {", 1).replace(
+            "                    } else {\n                        // mark_possible_submit() is asked last",
+            "                    }\n                    } else {\n                        // mark_possible_submit() is asked last",
+            1),
+        # The else is there and prints nothing.
+        "else-silent": sycl.replace(
+            'ggml_sycl_moe_direct_log_decline(\n                            src0, ne12, "workspace_slices",',
+            '(void) (\n                            src0, ne12, "workspace_slices",', 1),
+        # One step of the issuer chain reported under another's name.
+        "step-renamed": sycl.replace('"binding", "occurrence=%zu', '"retained_table", "occurrence=%zu', 1),
+        # A precondition conjunct the decline line does not name.
+        "conjunct-unnamed": sycl.replace("if (all_primary && exec.context_id",
+                                         "if (all_primary && ne10 > 0 && exec.context_id", 1),
+        # The gate's layout conjunct falls through unnamed.
+        "layout-unnamed": re.sub(r'\} else if \(\(src0->type == GGML_TYPE_Q1_0.*?"layout".*?\);\n    \}', "}",
+                                 sycl, count=1, flags=re.DOTALL),
+        # The line no longer says which step declined.
+        "format-without-step": sycl.replace("route=direct step=%s %s\\n", "route=direct %s %s\\n", 1),
+    }
+    for name, mutated in mutations.items():
+        assert mutated != sycl, f"mutation {name} did not change the source"
+        assert direct_decline_violations(mutated), f"mutation {name} was not witnessed"
 
 
 if __name__ == "__main__":

@@ -83976,6 +83976,94 @@ static ggml_sycl::moe_mmid_queue_capability ggml_sycl_moe_direct_queue_capabilit
     return capability;
 }
 
+static const char * ggml_sycl_moe_batch_residency_name(ggml_sycl::moe_batch_residency residency) {
+    switch (residency) {
+        case ggml_sycl::moe_batch_residency::PRIMARY_DEVICE:
+            return "primary";
+        case ggml_sycl::moe_batch_residency::SECONDARY_DEVICE:
+            return "secondary";
+        case ggml_sycl::moe_batch_residency::HOST:
+            return "host";
+        case ggml_sycl::moe_batch_residency::UNAVAILABLE:
+            return "unavailable";
+    }
+    return "?";
+}
+
+static const char * ggml_sycl_moe_mmid_lease_status_name(ggml_sycl::moe_mmid_lease_status status) {
+    switch (status) {
+        case ggml_sycl::moe_mmid_lease_status::ACQUIRED:
+            return "acquired";
+        case ggml_sycl::moe_mmid_lease_status::BUSY:
+            return "busy";
+        case ggml_sycl::moe_mmid_lease_status::INVALID:
+            return "invalid";
+    }
+    return "?";
+}
+
+static const char * ggml_sycl_execution_error_name(ggml_sycl::execution::error error) {
+    switch (error) {
+        case ggml_sycl::execution::error::OK:
+            return "ok";
+        case ggml_sycl::execution::error::STALE:
+            return "stale";
+        case ggml_sycl::execution::error::MISMATCH:
+            return "mismatch";
+        case ggml_sycl::execution::error::OVERFLOW:
+            return "overflow";
+        case ggml_sycl::execution::error::DEVICE_BUSY:
+            return "device_busy";
+        case ggml_sycl::execution::error::BUSY:
+            return "busy";
+        case ggml_sycl::execution::error::NULL_OUTPUT:
+            return "null_output";
+        case ggml_sycl::execution::error::FOREIGN_BACKEND:
+            return "foreign_backend";
+        case ggml_sycl::execution::error::NOT_FOUND:
+            return "not_found";
+        case ggml_sycl::execution::error::ALLOCATION_FAILED:
+            return "allocation_failed";
+        case ggml_sycl::execution::error::LOCK_HELD_ALLOCATION:
+            return "lock_held_allocation";
+    }
+    return "?";
+}
+
+// A batch whose experts are all host-resident runs on the CPU (HOST_CPU recipes): the direct route was never its
+// route, so declining it there is not a refusal and prints nothing.
+static bool ggml_sycl_moe_direct_batch_all_host(const ggml_sycl::moe_resolved_batch & batch) {
+    if (batch.operands.empty()) {
+        return false;
+    }
+    for (const auto & operand : batch.operands) {
+        if (operand.residency() != ggml_sycl::moe_batch_residency::HOST) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Q1_0 and NVFP4 run only in the MMID direct block. A call the block declines falls through to the retained route
+// core, which refuses it with reason=capability_unsupported: that line names the core's refusal, not the step of the
+// direct route that declined. Each exit that falls through the block calls this once, on that exit only, so the log
+// names the step: the phase label (MOE-DECODE-REFUSAL for a token, MOE-PROMPT-REFUSAL for a prompt), the tensor, then
+// "route=direct step=<step> <detail>". A fixed buffer and no allocation: some of these exits hold an admitted
+// workspace bundle.
+static void ggml_sycl_moe_direct_log_decline(const ggml_tensor * src0,
+                                             int64_t             ne12,
+                                             const char *        step,
+                                             const char *        fmt,
+                                             ...) {
+    char    detail[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(detail, sizeof(detail), fmt, args);
+    va_end(args);
+    GGML_LOG_ERROR("[%s] tensor=%s route=direct step=%s %s\n", ne12 == 1 ? "MOE-DECODE-REFUSAL" : "MOE-PROMPT-REFUSAL",
+                   src0 && src0->name ? src0->name : "?", step, detail);
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
@@ -87426,6 +87514,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             bindings->reserve(direct_batch.operands.size());
             table_entries.reserve(direct_batch.operands.size() + 1);
             bool canonical = table_ptr != nullptr && retained_table.valid();
+            // The operand whose binding declined, for the decline line; the count means none did.
+            size_t binding_declined = direct_batch.operands.size();
             for (size_t i = 0; canonical && i < direct_batch.operands.size(); ++i) {
                 auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(
                     direct_batch.operands[i].lease(), static_cast<uint64_t>(GGML_LAYOUT_AOS) + 1,
@@ -87434,6 +87524,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (binding) {
                     table_entries.push_back(binding->owner);
                     bindings->push_back(std::move(*binding));
+                } else {
+                    binding_declined = i;
                 }
             }
             auto table_owner_binding = canonical ? ggml_sycl::moe::canonical_allocation_integration::retain(
@@ -87450,20 +87542,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
             auto          queue_cap   = direct_batch.operands.front().recipe_queue_capability();
-            for (const auto & operand : direct_batch.operands) {
+            // The operand whose capability is missing or differs, for the decline line.
+            size_t        queue_cap_declined = 0;
+            for (size_t i = 0; i < direct_batch.operands.size(); ++i) {
+                const auto & operand = direct_batch.operands[i];
                 if (!operand.recipe_queue_capability().valid() ||
                     operand.recipe_queue_capability().cookie() != queue_cap.cookie() ||
                     operand.recipe_queue_capability().owner_device() != queue_cap.owner_device()) {
-                    queue_cap = {};
+                    queue_cap          = {};
+                    queue_cap_declined = i;
                     break;
                 }
             }
             ggml_sycl::execution::AuthoritativeInvocationSnapshot invocation;
             auto & execution_registry = ggml_sycl::execution::global_registry();
-            const bool snapshot_ok = private_table && queue_cap.valid() &&
-                execution_registry.mint_authoritative_invocation_snapshot(
+            // Minted only once the table owner and the queue capability hold; a decline line reads its error.
+            ggml_sycl::execution::error snapshot_error     = ggml_sycl::execution::error::OK;
+            if (private_table && queue_cap.valid()) {
+                snapshot_error = execution_registry.mint_authoritative_invocation_snapshot(
                     { exec.context_id }, { exec.session_id }, { exec.reset_epoch }, { exec.graph_epoch },
-                    { exec.invocation_id }, root, &invocation) == ggml_sycl::execution::error::OK;
+                    { exec.invocation_id }, root, &invocation);
+            }
+            const bool snapshot_ok =
+                private_table && queue_cap.valid() && snapshot_error == ggml_sycl::execution::error::OK;
             // Every fallible owner needed after admission is prepared first. The
             // ids need none: the kernel reads the tensor in place, and the adapter
             // reads the batch's host snapshot only in its checks before it submits.
@@ -87479,11 +87580,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 submissions.push_back(ggml_sycl::moe_queue_submit_integration::terminal(
                     queue_cap, exec.graph_epoch, terminal));
             }
-            if (snapshot_ok && submissions.front().valid() &&
+            // Read before the issuer takes the submissions: a decline line after that cannot look at them.
+            const bool submission_ok = snapshot_ok && submissions.front().valid();
+            if (submission_ok &&
                 ggml_sycl::workspace_admission_authority_issuer::direct(
-                    execution_registry, std::move(invocation), plan_snapshot, model_token, ctx.device,
-                    bindings, private_table, std::move(owners), std::move(queues), std::move(submissions),
-                    &authority)) {
+                    execution_registry, std::move(invocation), plan_snapshot, model_token, ctx.device, bindings,
+                    private_table, std::move(owners), std::move(queues), std::move(submissions), &authority)) {
                 ggml_sycl_moe_mark_direct_authority_pre_admission(src0);
                 ggml_sycl::moe_mmid_authoritative_admission_request request;
                 request.authority = std::move(authority);
@@ -87656,10 +87758,107 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // treated as completion authority.
                             throw;
                         }
+                    } else {
+                        // mark_possible_submit() is asked last, so with every other part held it refused.
+                        const bool slices_held = activation && src1_device_base && dst_device_base &&
+                                                 slices.activation_f32.bytes == activation_bytes &&
+                                                 slices.output_f32.bytes == output_bytes;
+                        ggml_sycl_moe_direct_log_decline(
+                            src0, ne12, "workspace_slices",
+                            "activation=%d src1=%d dst=%d activation_bytes=%zu/%zu output_bytes=%zu/%zu "
+                            "mark_possible_submit=%s",
+                            activation ? 1 : 0, src1_device_base ? 1 : 0, dst_device_base ? 1 : 0,
+                            slices.activation_f32.bytes, activation_bytes, slices.output_f32.bytes, output_bytes,
+                            slices_held ? "refused" : "not_asked");
                     }
+                } else {
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "workspace_admission", "status=%s bundle=%d",
+                                                     ggml_sycl_moe_mmid_lease_status_name(admitted.status),
+                                                     admitted.bundle.valid() ? 1 : 0);
+                }
+            } else {
+                // The first part, in the order they are prepared, that does not hold. Each later part is built only
+                // from the earlier ones, so it is unset whenever an earlier one declined.
+                const auto decline_context = static_cast<unsigned long long>(exec.context_id);
+                const auto decline_epoch   = static_cast<unsigned long long>(exec.graph_epoch);
+                if (!table_ptr || !retained_table.valid()) {
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "retained_table", "table=%p valid=%d",
+                                                     static_cast<const void *>(table_ptr),
+                                                     retained_table.valid() ? 1 : 0);
+                } else if (binding_declined < direct_batch.operands.size()) {
+                    const auto & operand = direct_batch.operands[binding_declined];
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "binding", "occurrence=%zu expert=%d owner=%d",
+                                                     operand.occurrence, operand.expert_id, operand.owning_device());
+                } else if (!table_owner_binding) {
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "table_owner_retain", "table=%p",
+                                                     static_cast<const void *>(table_ptr));
+                } else if (!private_table) {
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "private_table_owner", "context=%llu graph_epoch=%llu",
+                                                     decline_context, decline_epoch);
+                } else if (!queue_cap.valid()) {
+                    const auto & operand = direct_batch.operands[queue_cap_declined];
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "queue_capability",
+                                                     "occurrence=%zu expert=%d owner=%d capability=%d",
+                                                     operand.occurrence, operand.expert_id, operand.owning_device(),
+                                                     operand.recipe_queue_capability().valid() ? 1 : 0);
+                } else if (!snapshot_ok) {
+                    ggml_sycl_moe_direct_log_decline(
+                        src0, ne12, "invocation_snapshot", "error=%s context=%llu graph_epoch=%llu",
+                        ggml_sycl_execution_error_name(snapshot_error), decline_context, decline_epoch);
+                } else if (!submission_ok) {
+                    ggml_sycl_moe_direct_log_decline(src0, ne12, "submission_authority", "graph_epoch=%llu",
+                                                     decline_epoch);
+                } else {
+                    ggml_sycl_moe_direct_log_decline(
+                        src0, ne12, "authority_issuer", "context=%llu graph_epoch=%llu invocation=%llu",
+                        decline_context, decline_epoch, static_cast<unsigned long long>(exec.invocation_id));
                 }
             }
+        } else if (!ggml_sycl_moe_direct_batch_all_host(direct_batch)) {
+            // Each conjunct of the condition above that does not hold, in its order.
+            char   failed[384] = "";
+            size_t used        = 0;
+            auto   note        = [&](bool holds, const char * name) {
+                if (!holds && used < sizeof(failed)) {
+                    const int n = snprintf(failed + used, sizeof(failed) - used, "%s%s", used ? "," : "", name);
+                    used += n > 0 ? static_cast<size_t>(n) : 0;
+                }
+            };
+            note(all_primary, "all_primary");
+            note(exec.context_id, "context_id");
+            note(exec.session_id, "session_id");
+            note(exec.reset_epoch, "reset_epoch");
+            note(exec.graph_epoch, "graph_epoch");
+            note(exec.invocation_id, "invocation_id");
+            note(ggml_sycl_execution_current_owner(&ctx, root), "current_owner");
+            note(plan_snapshot && plan_snapshot->plan, "placement_plan");
+            note(ids->ne[0] > 0, "ids_rows");
+            note(ne11 == 1 || ne11 == ids->ne[0], "src1_rows");
+            note(ids_device, "ids_device");
+            note(ids->nb[0] == sizeof(int32_t), "ids_stride");
+            note(src1->type == GGML_TYPE_F32, "src1_type");
+            note(nb10 == sizeof(float), "src1_element_stride");
+            note(nb2 == static_cast<size_t>(ne1) * nb1, "dst_token_stride");
+            note(nb1 == static_cast<size_t>(ne01) * sizeof(float), "dst_row_stride");
+            // all_primary names the first operand that is not primary on this card in AoS.
+            char first[192] = "";
+            for (const auto & operand : direct_batch.operands) {
+                if (operand.residency() != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ||
+                    operand.owning_device() != ctx.device || operand.actual_layout() != GGML_LAYOUT_AOS) {
+                    snprintf(first, sizeof(first), " occurrence=%zu expert=%d residency=%s owner=%d layout=%s",
+                             operand.occurrence, operand.expert_id,
+                             ggml_sycl_moe_batch_residency_name(operand.residency()), operand.owning_device(),
+                             ggml_sycl_layout_mode_name(operand.actual_layout()));
+                    break;
+                }
+            }
+            ggml_sycl_moe_direct_log_decline(src0, ne12, "precondition", "failed=%s%s operands=%zu", failed, first,
+                                             direct_batch.operands.size());
         }
+    } else if ((src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4) && direct_layout != GGML_LAYOUT_AOS &&
+               direct_admission && !ggml_sycl_moe_direct_batch_all_host(direct_admission.batch)) {
+        // A batch the gate declines for its layout alone: these types have no executor for any other layout.
+        ggml_sycl_moe_direct_log_decline(src0, ne12, "layout", "layout=%s", ggml_sycl_layout_mode_name(direct_layout));
     }
 
     // ---------------------------------------------------------------------------
