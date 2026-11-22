@@ -3756,7 +3756,10 @@ lifts it into `host_ledger_budget()`.
 
 **The host-fit gate** (the lead's point (b)) is not duplicated here.
 - The refusal is th32 T2's `host-budget-exceeded`: WARN-only in phase (a),
-  enforcing in phase (b).
+  enforcing in phase (b). One plan is refused in phase (a) already: a plan
+  charged the loader term whose commit total exceeds its budget is refused as
+  `loader-pool-over-budget` (§4.4, the loader's buffers as the pool holds
+  them), since its load would fail in `grow_zone`.
 - The number is 7v5c's dry-run.
 - 5efe supplies their inputs: `host_backing` per entry, the four terms of §4.4,
   the working-set figures, and the locked/unlocked policy. 7v5c's printout
