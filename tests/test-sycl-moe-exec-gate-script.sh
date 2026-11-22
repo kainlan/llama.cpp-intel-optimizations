@@ -45,9 +45,12 @@
 #   - a real run refuses without a <sha> or with a wrong one, prints verdicts_pass=0 GATE_DONE, exits 2 and never
 #     creates GPU.lock; the lock helper takes, refuses a second take, and releases;
 #   - GPU.lock through scripts/sycl-lock.sh (every case under $WORK): a lock directory that exists refuses the run
-#     even when the mkdir command reports success, a held lock refuses and quotes its holder, a holder replaced during
-#     the run stops it (STOPPED) and is left to its new owner, a TERM during the take's verify window releases the
-#     lock, a bad LLAMA_GPU_LOCK_VERIFY_SECONDS is a usage refusal, and a copy of the gate without the library stops;
+#     behind a mkdir shim that exits 0 for it (the system mkdir's check-then-create race), a held lock refuses and
+#     quotes its holder, a holder replaced during the run stops it (STOPPED, before the second of two arms) and is
+#     left to its new owner, a TERM during the take's verify window (in a run and in --lock-selftest) releases the
+#     lock, an unknown helper status after the holder is written leaves no holder behind, a device arm checks the
+#     holder between settle and its launch (source order), a bad or oversized LLAMA_GPU_LOCK_VERIFY_SECONDS is a usage
+#     refusal, and a copy of the gate without the library stops;
 #   - --make-prompt is deterministic and the committed prompt exists;
 #   - oneAPI's setvars.sh overwrites shell variables (the advisor and vtune vars.sh assign BIN_DIR=bin64), which made
 #     the first real run refuse with "no bin64/llama-bench": no bare BIN_DIR=, setvars sourced before the first use of

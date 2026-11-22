@@ -3,7 +3,7 @@
 # the multi-ubatch qwen35 perplexity runs are deterministic, and the shape of the arms it would run.
 # No GPU and no model: the scoring runs over fixture logs and the arms are read from --dry-run.
 # GPU.lock: --lock-selftest takes, checks and releases a lock under the test's temp dir through the run's wait loop
-# (an existing directory behind a mkdir that reports success, a busy lock waited for, an uncreatable lock not waited
+# (an existing directory behind a mkdir shim that exits 0 for it, a busy lock waited for, an uncreatable lock not waited
 # for, a TERM during the take, an unknown helper status after the holder is written, a TERM during the poll sleep,
 # bad and oversized LLAMA_GPU_LOCK_* values); no case names the real GPU.lock.
 set -euo pipefail
