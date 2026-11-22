@@ -6384,8 +6384,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     // This keeps cache DMA/fill work off the compute queue, preventing
     // >20s accumulated queue work that triggers L0 DirectSubmission timeouts.
     try {
-        dma_queue_ =
-            std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});
+        dma_queue_ = std::make_unique<sycl::queue>(
+            ggml_sycl_make_queue(queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+                                 sycl::property_list{ sycl::property::queue::in_order{} }));
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] Created separate DMA queue for cache operations\n");
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[UNIFIED-CACHE] Failed to create DMA queue, falling back to compute queue: %s\n", e.what());
@@ -6411,8 +6412,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     // window line times marker kernels on a queue of the ring's own instead (moe_stream_phase::timing_queue), which
     // wait on these copies from outside, so no copy is read for its device times or asked for its status.
     try {
-        bcs_queue_ =
-            std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});
+        bcs_queue_ = std::make_unique<sycl::queue>(
+            ggml_sycl_make_queue(queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+                                 sycl::property_list{ sycl::property::queue::in_order{} }));
         GGML_LOG_INFO("[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining\n");
         // Give the device pool a reference so it can drain BCS before chunk allocs.
         if (layout_pool_) {
@@ -12724,7 +12726,9 @@ sycl::queue * unified_cache::get_event_watch_queue() {
     // call it safely.
     std::call_once(event_watch_queue_once_, [this]() {
         try {
-            event_watch_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device());
+            event_watch_queue_ = std::make_unique<sycl::queue>(
+                ggml_sycl_make_queue(queue_.get_context(), queue_.get_device(),
+                                     ggml_sycl_get_device_id_from_queue(queue_), sycl::property_list{}));
         } catch (const sycl::exception & e) {
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] Failed to create event-watch queue, arming will fall back to a "
@@ -12746,8 +12750,9 @@ sycl::queue * unified_cache::get_moe_join_queue() {
     // std::call_once for the same reason as get_event_watch_queue(): this getter takes no lock of its own.
     std::call_once(moe_join_queue_once_, [this]() {
         try {
-            moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),
-                                                            sycl::property::queue::in_order{});
+            moe_join_queue_ = std::make_unique<sycl::queue>(ggml_sycl_make_queue(
+                queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+                sycl::property_list{ sycl::property::queue::in_order{} }));
         } catch (const sycl::exception & e) {
             GGML_LOG_WARN(
                 "[MOE-JOIN-QUEUE] Failed to create the CPU expert join queue; the joins stay on the compute "

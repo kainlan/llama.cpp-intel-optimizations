@@ -55,8 +55,9 @@ void ExpertPrefetcher::init(sycl::queue & compute_q) {
     }
 
     // Create an out-of-order queue on the same device/context for DMA.
-    dma_queue_ = std::make_shared<sycl::queue>(compute_q.get_context(), compute_q.get_device());
     device_id_ = ggml_sycl_get_device_id_from_queue(compute_q);
+    dma_queue_ = std::make_shared<sycl::queue>(
+        ggml_sycl_make_queue(compute_q.get_context(), compute_q.get_device(), device_id_, sycl::property_list{}));
     initialized_.store(true, std::memory_order_release);
     GGML_LOG_INFO("[SYCL] Expert prefetcher initialized (depth=%d, dynamic pool)\n", prefetch_depth_);
 }

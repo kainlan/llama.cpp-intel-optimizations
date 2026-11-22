@@ -6901,7 +6901,8 @@ set_tests_properties(sycl-host-weight-alias PROPERTIES
 # and compiled against gpu-arch.cpp directly instead of linking libggml-sycl:
 # the backend library would bring in dpct::dev_mgr, whose first use enumerates
 # every SYCL device on the machine. The test supplies its own definitions of
-# the two backend symbols dispatch.hpp's gate needs (see the link-seam comment
+# the two backend symbols dispatch.hpp's gate needs, and of the async-failure
+# handler dpct::device_ext's emitted code references (see the link-seam comment
 # in the test), so it stays host-only and needs no GPU.
 #
 # ggml-base is linked for one reason: dpct::dev_mgr's constructor references

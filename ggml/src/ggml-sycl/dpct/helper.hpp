@@ -14,6 +14,7 @@
 #define GGML_SYCL_DPCT_HELPER_HPP
 
 #include "../alloc-registry.hpp"
+#include "../async-failure.hpp"
 
 #include <map>
 #include <optional>
@@ -144,25 +145,6 @@ namespace dpct
     typedef char *device_ptr;
     typedef uint8_t byte_t;
     typedef sycl::buffer<byte_t> buffer_t;
-
-    /// SYCL default exception handler
-    inline auto exception_handler = [](sycl::exception_list exceptions)
-    {
-        for (std::exception_ptr const &e : exceptions)
-        {
-            try
-            {
-                std::rethrow_exception(e);
-            }
-            catch (sycl::exception const &e)
-            {
-                std::cerr << "Caught asynchronous SYCL exception:" << std::endl
-                          << e.what() << std::endl
-                          << "Exception caught at file:" << __FILE__
-                          << ", line:" << __LINE__ << std::endl;
-            }
-        }
-    };
 
     enum error_code
     {
@@ -879,10 +861,11 @@ namespace dpct
       template <class... Properties>
       sycl::queue create_queue_impl(bool enable_exception_handler,
                                     Properties... properties) {
-        sycl::async_handler eh = {};
-        if (enable_exception_handler) {
-          eh = exception_handler;
-        }
+        // Every dpct queue and its context carry the backend's recording handler, whatever the caller asked for:
+        // without one an asynchronous error terminates the process. device_ext does not know the backend's device
+        // index, so these queues latch the shared slot, which fails every device.
+        (void) enable_exception_handler;
+        const sycl::async_handler eh = ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED);
         sycl::context ctx(*this, eh);
         _queues.push_back(
             sycl::queue(ctx, *this, eh, sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
@@ -894,10 +877,11 @@ namespace dpct
       sycl::queue create_queue_impl(sycl::device device,
                                     bool enable_exception_handler,
                                     Properties... properties) {
-        sycl::async_handler eh = {};
-        if (enable_exception_handler) {
-          eh = exception_handler;
-        }
+        // Every dpct queue and its context carry the backend's recording handler, whatever the caller asked for:
+        // without one an asynchronous error terminates the process. device_ext does not know the backend's device
+        // index, so these queues latch the shared slot, which fails every device.
+        (void) enable_exception_handler;
+        const sycl::async_handler eh = ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED);
         sycl::context ctx(device, eh);
         _queues.push_back(sycl::queue(ctx, device, eh,
                                       sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));

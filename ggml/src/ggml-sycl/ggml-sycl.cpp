@@ -24891,7 +24891,8 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
     }
 
     // The prompt's ring reserves two slots on an in-order queue, as the first claimed layer's ring_ready() does.
-    sycl::queue      ccs(fx.queue->get_context(), fx.queue->get_device(), sycl::property::queue::in_order());
+    sycl::queue      ccs = ggml_sycl_make_queue(fx.queue->get_context(), fx.queue->get_device(), fx.device,
+                                                sycl::property_list{ sycl::property::queue::in_order() });
     moe_stream_phase phase;
     phase.begin_ubatch(4);
     moe_stream_ring_geometry geo;
@@ -24906,7 +24907,7 @@ std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_promp
     if (!phase.last_prompt_ring_engaged()) {
         return "the phase did not report the prompt's ring engaged";
     }
-    ccs.wait();
+    ccs.wait_and_throw();
     if (!fx.reclaim_until([&] { return fx.cache->zone_available(vram_zone_id::WEIGHT) >= 3 * fx.staged_bytes; })) {
         return "the ring's slots did not come back to the WEIGHT zone";
     }
@@ -31404,8 +31405,8 @@ static sycl::queue * get_pipeline_copy_queue(int device) {
     // Create an in-order copy queue on the primary device. Secondary queues use
     // isolated per-device contexts, so cross-device producer events are waited
     // by the background thread before this queue submits the H2D scatter.
-    g_pipeline_copy_queue[device] = new sycl::queue(dev0.default_queue().get_context(),
-                                                    dev.default_queue().get_device(), default_queue_properties());
+    g_pipeline_copy_queue[device] = new sycl::queue(ggml_sycl_make_queue(
+        dev0.default_queue().get_context(), dev.default_queue().get_device(), device, default_queue_properties()));
     static std::atomic<int> log_count{ 0 };
     if (log_count.fetch_add(1, std::memory_order_relaxed) < 2) {
         GGML_LOG_INFO("[PIPELINE-MOE] Created dedicated copy queue for device %d\n", device);
@@ -33627,7 +33628,8 @@ static ggml_sycl_device_info ggml_sycl_init() {
                 if (!cpu_dev.is_cpu()) {
                     throw std::runtime_error("selector resolved to non-CPU device");
                 }
-                return new sycl::queue{ cpu_dev };
+                return new sycl::queue(
+                    ggml_sycl_make_queue(cpu_dev, GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED, sycl::property_list{}));
             } catch (const std::exception & e) {
                 GGML_LOG_WARN("[SYCL-CPU] GGML_SYCL_CPU_DEVICE_SELECTOR='%s' failed: %s\n", override_selector,
                               e.what());
@@ -33637,7 +33639,8 @@ static ggml_sycl_device_info ggml_sycl_init() {
         for (const auto & platform : sycl::platform::get_platforms()) {
             for (const auto & dev : platform.get_devices()) {
                 if (dev.is_cpu()) {
-                    return new sycl::queue{ dev };
+                    return new sycl::queue(
+                        ggml_sycl_make_queue(dev, GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED, sycl::property_list{}));
                 }
             }
         }
@@ -34814,7 +34817,8 @@ static sycl::context ggml_sycl_control_host_context(const sycl::queue & fallback
                 devices.push_back(dev);
             }
             if (devices.size() >= 2) {
-                shared_ctx = std::make_unique<sycl::context>(devices);
+                shared_ctx = std::make_unique<sycl::context>(
+                    devices, ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED));
                 GGML_LOG_INFO("[SYCL-CONTROL] Created shared host-control context for %zu GPUs\n", devices.size());
             }
         } catch (const std::exception & e) {
@@ -34882,7 +34886,8 @@ static bool ggml_sycl_init_cross_device_control_tensor(ggml_backend_sycl_buffer_
     }
 
     sycl::context control_ctx = ggml_sycl_control_host_context(*ctx->stream);
-    sycl::queue   control_queue(control_ctx, ctx->stream->get_device(), default_queue_properties());
+    sycl::queue   control_queue =
+        ggml_sycl_make_queue(control_ctx, ctx->stream->get_device(), ctx->device, default_queue_properties());
 
     ggml_sycl::alloc_request control_req{};
     control_req.queue                                    = &control_queue;
@@ -46059,7 +46064,8 @@ static bool ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
     sycl::queue exec_q            = q;
     bool        using_fresh_queue = false;
     try {
-        exec_q            = sycl::queue(q.get_context(), q.get_device(), default_queue_properties());
+        exec_q            = ggml_sycl_make_queue(q.get_context(), q.get_device(), ggml_sycl_get_device_id_from_queue(q),
+                                                 default_queue_properties());
         using_fresh_queue = true;
     } catch (const sycl::exception & e) {
         if (s_shared_fallback_trace) {
@@ -46211,7 +46217,7 @@ static bool ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
                     }
                 }
             });
-            ev.wait();
+            ev.wait_and_throw();
             std::memcpy(dst + offset, host_stage, chunk);
             offset += chunk;
         }
@@ -58753,7 +58759,7 @@ static void tp_device1_worker_thread_func() {
     ggml_sycl_set_device(device);
     sycl::device dev = ggml_sycl_get_device(device);
     if (!g_tp_device1_worker_queue) {
-        g_tp_device1_worker_queue = new sycl::queue(dev, default_queue_properties());
+        g_tp_device1_worker_queue = new sycl::queue(ggml_sycl_make_queue(dev, device, default_queue_properties()));
     }
     queue_ptr stream = g_tp_device1_worker_queue;
 
@@ -73720,8 +73726,8 @@ static bool ensure_split_persistent_resources(sycl::queue & primary_queue,
     // needs an independent queue to poll progress and write merge_complete
     // concurrently with the running persistent kernel.
     if (!r.coord_queue) {
-        g_split_coord_queue_owner =
-            std::make_unique<sycl::queue>(primary_queue.get_context(), primary_queue.get_device());
+        g_split_coord_queue_owner = std::make_unique<sycl::queue>(ggml_sycl_make_queue(
+            primary_queue.get_context(), primary_queue.get_device(), primary_device, sycl::property_list{}));
         r.coord_queue = g_split_coord_queue_owner.get();
     }
 
@@ -73768,7 +73774,7 @@ static void split_merge_drain() {
         return;
     }
     for (auto & e : g_pending_merges) {
-        e.wait();
+        e.wait_and_throw();
     }
     g_pending_merges.clear();
     s_ring_idx = 0;
@@ -73919,8 +73925,9 @@ static void split_config_init(sycl::queue * primary_queue) {
             }
             if (have_primary && have_secondary) {
                 // Platform default context already contains both GPUs
-                g_split_secondary_queue_owner =
-                    std::make_unique<sycl::queue>(secondary_dev, sycl::property::queue::in_order{});
+                g_split_secondary_queue_owner = std::make_unique<sycl::queue>(
+                    ggml_sycl_make_queue(secondary_dev, ggml_sycl_get_device_id_from_device(secondary_dev),
+                                         sycl::property_list{ sycl::property::queue::in_order{} }));
                 sycl::queue & q1 = *g_split_secondary_queue_owner;
                 const int     secondary_device = ggml_sycl_get_device_id_from_queue(q1);
                 if (secondary_device < 0) {
@@ -73942,7 +73949,8 @@ static void split_config_init(sycl::queue * primary_queue) {
                 // OOQ so that depends_on(e_second_out) doesn't stall any
                 // other submission.
                 {
-                    g_split_merge_queue_owner = std::make_unique<sycl::queue>(primary_dev);
+                    g_split_merge_queue_owner = std::make_unique<sycl::queue>(ggml_sycl_make_queue(
+                        primary_dev, ggml_sycl_get_device_id_from_device(primary_dev), sycl::property_list{}));
                     g_split_merge_queue       = g_split_merge_queue_owner.get();
                 }
 
@@ -80737,9 +80745,11 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
         ggml_sycl::mem_handle      gate_dev_handle;
         managed_host_pinned_buffer out_reduce_alloc;
         managed_host_pinned_buffer out_reduce_target_alloc;
-        sycl::context              pri_ctx{};
-        sycl::context              sec_ctx{};
-        bool                       valid = false;
+        // Keep the contexts the ring's buffers live in. Optional: a default-constructed sycl::context is a real
+        // context, built with no handler.
+        std::optional<sycl::context> pri_ctx;
+        std::optional<sycl::context> sec_ctx;
+        bool                         valid = false;
 
         ~secondary_ring_buffers() {
             if (!valid || ggml_sycl::ggml_sycl_is_shutting_down()) {
@@ -96906,7 +96916,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
         for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
             if (g_pipeline_copy_queue[d]) {
                 try {
-                    g_pipeline_copy_queue[d]->wait();
+                    g_pipeline_copy_queue[d]->wait_and_throw();
                 } catch (...) {
                 }
                 delete g_pipeline_copy_queue[d];
@@ -100453,8 +100463,8 @@ static sycl::queue * ggml_sycl_block_exec_copy_queue_for_device(int device) {
     }
 
     try {
-        copy_queues[device] =
-            std::make_unique<sycl::queue>(base->get_context(), base->get_device(), default_queue_properties());
+        copy_queues[device] = std::make_unique<sycl::queue>(
+            ggml_sycl_make_queue(base->get_context(), base->get_device(), device, default_queue_properties()));
         ggml_sycl_block_exec_trace_queue_for_device(device, "copy-created", copy_queues[device].get());
         if (ggml_sycl_block_exec_queue_matches_device(*copy_queues[device], device, true)) {
             return copy_queues[device].get();
@@ -106358,9 +106368,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             // Create DMA queue on first use (in-order for L0 cross-queue deps)
             if (!pipe.dma_queue) {
                 auto & compute_q = *sycl_ctx->stream(sycl_ctx->device, 0);
-                pipe.dma_queue =
-                    std::make_unique<sycl::queue>(compute_q.get_context(), compute_q.get_device(),
-                                                  sycl::property_list{ sycl::property::queue::in_order{} });
+                pipe.dma_queue   = std::make_unique<sycl::queue>(
+                    ggml_sycl_make_queue(compute_q.get_context(), compute_q.get_device(), sycl_ctx->device,
+                                           sycl::property_list{ sycl::property::queue::in_order{} }));
             }
 
             // Determine max weight size across schedule for scratch allocation
