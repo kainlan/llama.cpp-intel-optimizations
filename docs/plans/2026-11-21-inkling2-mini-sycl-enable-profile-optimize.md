@@ -79,10 +79,10 @@ of `1dcdf49b1`): `git -C <wt> switch -c feat/inkling2 master`. Implementers work
 | A (`src/` load path) | 2, 3, 5, 4b | Requested context reaches the measures; unfundable term refused; expert names; zone-sizing refusal |
 | B (scripts) | 6, 6b, 10, 10b, 11 | `inkling` gate; GPT-OSS gate without `-ngl`; profile runner; atomic lock takers; scheduler-census parser |
 | C (planner rate, docs) | 13, 16 | Profile document; measured CPU expert rate row |
-| D (backend failure path) | 7a, 7b | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21) |
+| D (backend failure path) | 7a, 7b, 7c | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21) |
 
 **Amended 2026-11-21, after Task 1 ran and the two spikes concluded.** Task 1 ended red at an old defect
-(llama.cpp-kjoc), so Tasks 7a and 7b now precede the route's opening. Task 4's spike produced Task 4b. Task 6b was
+(llama.cpp-kjoc), so Tasks 7a and 7b now precede the route's opening, and Task 7c follows 7b. Task 4's spike produced Task 4b. Task 6b was
 found in review of Task 6. Their full specifications are separate files beside this plan:
 `2026-11-21-inkling2-task-4b-zone-sizing-refusal.md` and `2026-11-21-inkling2-task-7a-7b-async-failure.md`.
 Task 10b was found in review of Task 10: this host's `mkdir` is not atomic, so `GPU.lock` can be taken twice.
@@ -102,6 +102,7 @@ digraph dependencies {
     6b [label="T6b GPT-OSS gate without -ngl"];
     7a [label="T7a async error fails the boundary"];
     7b [label="T7b every queue has the handler"];
+    7c [label="T7c auxiliary drains deliver"];
     7  [label="T7 open NVFP4 direct route"];
     8  [label="T8 census + gap tasks (lead)"];
     9  [label="T9 Stage 1 gates (lead)"];
@@ -116,7 +117,7 @@ digraph dependencies {
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7b; 3 -> 7; 6 -> 7; 7 -> 8;
-    8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 9;
+    8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
     13 -> 17; 14 -> 17; 16 -> 17;
@@ -134,9 +135,10 @@ digraph dependencies {
 | `tests/test-sycl-load-measure-source.py`, `tests/test-sycl-kv-before-experts-source.py` | 2 | None |
 | `scripts/sycl-canonical-gates.sh`, `tests/test-sycl-canonical-gates-script.sh` | 6, 6b | Sequential (both merged) |
 | `docs/backend/gpt-oss-testing.md` | 6b | None |
-| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7a, then 7 and 7b, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
-| `ggml/src/ggml-sycl/unified-cache.cpp` | 7a, 7b, 4b | Sequential (lead orders them) |
-| `ggml/src/ggml-sycl/common.cpp`, `common.hpp`, `async-failure.hpp` | 7a, 7b | Sequential (Track D) |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7a, then 7 and 7b, then 7c, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
+| `ggml/src/ggml-sycl/unified-cache.cpp` | 7a, 7b, 7c, 4b | Sequential (lead orders them) |
+| `ggml/src/ggml-sycl/common.cpp`, `common.hpp`, `async-failure.hpp` | 7a, 7b, 7c (`common.cpp` only) | Sequential (Track D) |
+| `ggml/src/ggml-sycl/device-pool.hpp`, `layer-streaming.cpp`, `l2-prefetch.hpp`, `dense-scheduler.cpp`, `tests/test-sycl-async-drain-source.py` | 7c | None |
 | `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp` | 7a | None |
 | `ggml/src/ggml-sycl/zone-sizing.{hpp,cpp}`, `tests/test-zone-sizing.cpp` | 4b | None |
 | `ggml/src/ggml-sycl/moe-resolved-batch.hpp` | gap tasks from 8 | Sequential |
@@ -845,6 +847,39 @@ the llama.cpp-kjoc row of the no-crash census is updated.
 **Done when:** the source contract and its mutants pass, the full build succeeds, and the lead's Mistral B70 and
 GPT-OSS B50 gates pass once each.
 
+**Not in 7b (lead ruling 2026-11-21):** the spike that wrote Task 7c found two queue constructions that 7b's scanner
+does not see, because they are member initializers (`dense-scheduler.cpp:48`, `l2-prefetch.hpp:155`), and one more
+destruction drain (`ggml_backend_sycl_shutdown`, `ggml-sycl.cpp:125031`). They are in Task 7c, whose contract was
+validated with them (its claim M pins both constructions). "Every queue has the handler" is therefore true after 7c,
+not after 7b. Both merge before Task 9.
+
+---
+
+### Task 7c: A drain of a handled queue delivers its asynchronous errors
+
+**Track:** D
+**Depends on:** Task 7b merged. Blocks Task 9.
+**Full specification:** `docs/plans/2026-11-21-inkling2-task-7a-7b-async-failure.md` (the section after Task 7b).
+
+**Why:** a plain `wait()` neither throws nor calls the queue's handler (measured fact g), and a handled queue
+destroyed with an undelivered error drops it silently (fact f). After 7b every queue has the recording handler, but an
+error on a queue whose drains are all plain reaches the latch late or never.
+
+**What it does:** changes 50 existing drains of non-execution queues from `wait()` to `wait_and_throw()` (the cache's
+DMA and BCS queues, the prompt pipeline's DMA queue, the tensor-parallel worker queue, the pipeline copy queues, the
+replan's drains, the dpct default queues, L2 prefetch, the dense scheduler). It adds no wait and removes none. With
+the handler installed `wait_and_throw()` does not throw for an asynchronous error, so every `catch` block sees what it
+sees today. Of 384 SYCL waits in the backend, the other 334 stay plain under four stated rules: a context's own
+execution queue (synchronize already delivers it every graph), another device's execution queue (rule X, a known
+limit, below), generic helpers that wait on a queue their caller passes (not traced caller by caller), and
+`GGML_SYCL_PRIVATE_TESTING` fixtures.
+
+**Per-token cost:** on the default decode path only the two graph-entry drains change (`ggml-sycl.cpp:105217` and
+`:105233`). Task 9's interleaved A/B is where that is measured.
+
+**Done when:** `test-sycl-async-drain-source --self-test` passes and each of its eight mutants fails, the two earlier
+contracts still pass, the full build succeeds, and the lead's Mistral B70 and GPT-OSS B50 gates pass once each.
+
 ---
 
 ### Task 7: Open the NVFP4/Q1_0 direct decode route
@@ -967,7 +1002,7 @@ done
 ### Task 9: Stage 1 exit gates
 
 **Track:** L (lead; GPU)
-**Depends on:** Tasks 4b, 5, 6, 6b, 7b, 8 and every gap task Task 8 wrote
+**Depends on:** Tasks 4b, 5, 6, 6b, 7b, 7c, 8 and every gap task Task 8 wrote
 **File scope:**
 - Create: `docs/backend/data/inkling2/t9-gates.txt`, `docs/backend/data/inkling2/t9-bench-ab.txt`
 
@@ -1640,6 +1675,18 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
   terminates. After them the context that saw the error is failed for life and the caller gets an error from its next
   decode. Two limits are accepted and stated in Task 7a: one token can be sampled from the failed graph, and a failed
   bundle stays quarantined until the process exits.
+- **Two async-error gaps remain after Task 7c** (both recorded with file:line in the 7a/7b/7c specification, both
+  need a tracker task). First, a context reads only its own device's failure slot and the shared one: an error on
+  work it submitted to ANOTHER device's execution queue (`GGML_SYCL_MOE_MULTI_GPU`, tensor-parallel, split, the
+  secondary prestage) is recorded in that device's slot and this context's graph boundaries never see it. The fix is a
+  cursor on each device a context submits to. Second, five queues are destroyed with no drain at all (the
+  cross-device control queue, a test `ccs` queue on its early returns, the two split owner queues, the MoE stream
+  timing queue): an undelivered error on them is dropped. No wait is added for them, because the fork adds no host
+  waits; each needs its work chained to an event that a boundary already waits on.
+- **Three facts behind Task 7c are not measured:** whether `event::wait_and_throw` delivers errors from other
+  commands on the same queue (this decides synchronize's deferred-decode branch; the probe case is written in the
+  specification), whether every caller of the generic helpers passes an execution queue, and which lock
+  `throw_asynchronous` takes in the 2026.2 runtime.
 - **Task 2 moves every `llama-bench` load** (the measure follows the bench's own context). Throughput for every model
   can move; Task 9's A/B is where that is measured. No number taken before Task 2 is comparable to one taken after it
   without that A/B.
