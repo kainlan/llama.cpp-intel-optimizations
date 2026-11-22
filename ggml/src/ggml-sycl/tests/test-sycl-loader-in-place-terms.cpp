@@ -2,11 +2,13 @@
 // block of its own.
 //
 // On a load that does not map files, with evictable weights, the model loader binds the SYCL_Host buffer type for
-// every weight the plan places and keeps that buffer for the model's life. The zone charges it as the
-// loader_residency term: every entry's bytes, each rounded up to the loader's tensor alignment (exact for a dense
-// weight, a bound for an expert slice). On a single-device plan S1-PRELOAD serves each host-planned PINNED expert from
-// that buffer in place, under the buffer's owner, so the expert is counted once, inside loader_residency, as
-// loader_served, and holds no block. A dense host weight still holds a block: S1-PRELOAD copies it.
+// every weight the plan places and keeps that buffer for the model's life. A single-device plan's zone charges it as
+// the loader_residency term: every entry's bytes, each rounded up to the loader's tensor alignment (exact for a dense
+// weight, a bound for an expert slice). S1-PRELOAD then serves each host-planned PINNED expert from that buffer in
+// place, under the buffer's owner, so the expert is counted once, inside loader_residency, as loader_served, and holds
+// no block. A dense host weight still holds a block: S1-PRELOAD copies it. A multi-device plan charges no loader term:
+// every card's host zones are sized from that one whole-model plan, so the term would pin the whole loader buffer on
+// each card.
 //
 // Host-only: the fact rule is a constexpr function of the load's inputs, and the terms are a pure function of a
 // hand-built plan. No queue, no device, no allocation.
@@ -46,8 +48,9 @@ size_t align_up(size_t n, size_t a) {
 }
 
 // One dense weight on the device, one on the host, four host experts and one device expert, every backing PINNED as a
-// load that maps no file plans them.
-placement_plan make_plan(bool holds, bool serves) {
+// load that maps no file plans them. The weights are evictable exactly when the loader holds them, and the loader
+// facts are the ones the builder copies for that load.
+placement_plan make_plan(bool holds, bool multi) {
     placement_plan plan{};
     plan.entries.push_back({ "blk.0.attn_q.weight", kDense, kDense, 0, placement_priority::ATTENTION, 0, -1,
                              expert_tensor_role::UNKNOWN, true, 0 });
@@ -58,8 +61,10 @@ placement_plan make_plan(bool holds, bool serves) {
         plan.entries.push_back({ "blk.0.ffn_up_exps.weight", kExpert, kExpert, 0, placement_priority::MOE_UP, 0, e,
                                  expert_tensor_role::UP, !host, host ? -1 : 0 });
     }
-    plan.loader_holds_weights       = holds;
-    plan.loader_serves_host_experts = serves;
+    const placement_loader_fact fact = ggml_sycl::placement_loader_fact_for(false, holds, multi);
+    plan.multi_device                = multi;
+    plan.loader_holds_weights        = fact.holds_weights;
+    plan.loader_serves_host_experts  = fact.serves_host_experts;
     plan.build_index();
     return plan;
 }
@@ -97,7 +102,8 @@ size_t loader_bytes() {
 }
 
 void check_loader_serves_host_experts() {
-    const placement_plan         plan  = make_plan(true, true);
+    const placement_plan plan = make_plan(true, false);
+    CHECK(plan.loader_serves_host_experts);
     const host_weight_zone_terms terms = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
     // The dense host weight is copied, so it alone holds a block; the experts are served from the loader's buffer.
     CHECK(terms.host_weights == kDenseHost);
@@ -113,24 +119,31 @@ void check_loader_serves_host_experts() {
     CHECK(!terms.matches_charge(kDenseHost));
 }
 
-void check_loader_holds_but_copies() {
-    // A multi-device plan: the loader's buffer is charged, and every host weight is still copied into a block.
-    const placement_plan         plan  = make_plan(true, false);
+void check_multi_device_charges_no_loader_term() {
+    // A multi-device plan: the loader holds the weights, but every card's host zones are sized from this one plan, so a
+    // loader term would pin the whole buffer on each card. It charges none, and every host weight is copied into a
+    // block, the terms of a plan whose loader holds nothing.
+    const placement_plan plan = make_plan(true, true);
+    CHECK(plan.loader_holds_weights);
+    CHECK(!plan.loader_serves_host_experts);
     const host_weight_zone_terms terms = ggml_sycl::placement_plan_host_weight_zone_terms(plan);
     const size_t                 host  = kDenseHost + kHostExperts * kExpert;
     CHECK(terms.host_weights == host);
     CHECK(terms.blocks == 1 + kHostExperts);
     CHECK(terms.loader_served == 0);
-    CHECK(terms.loader_residency == loader_bytes());
-    CHECK(terms.total() == host + loader_bytes() + terms.host_compute_reserve + terms.tlsf_bound);
+    CHECK(terms.loader_residency == 0);
+    CHECK(terms.total() == host + terms.host_compute_reserve + terms.tlsf_bound);
     CHECK(terms.matches_charge(host));
+    // Positive control: the same entries on a single-device plan do charge the buffer.
+    CHECK(ggml_sycl::placement_plan_host_weight_zone_terms(make_plan(true, false)).loader_residency == loader_bytes());
 }
 
 void check_mapped_expert_is_neither() {
     // A FILE_MAPPED host expert is served from the file's mapping, not the loader's buffer: neither a block nor
     // loader_served, under either fact.
     for (const bool serves : { false, true }) {
-        placement_plan plan = make_plan(serves, serves);
+        placement_plan plan = make_plan(serves, false);
+        CHECK(plan.loader_serves_host_experts == serves);
         for (auto & e : plan.entries) {
             if (e.expert_id == 0) {
                 e.host_backing = placement_host_backing::FILE_MAPPED;
@@ -148,7 +161,7 @@ int main() {
     check_fact_rule();
     check_no_loader_buffer();
     check_loader_serves_host_experts();
-    check_loader_holds_but_copies();
+    check_multi_device_charges_no_loader_term();
     check_mapped_expert_is_neither();
     if (failures != 0) {
         std::printf("FAILED: %d check(s)\n", failures);
