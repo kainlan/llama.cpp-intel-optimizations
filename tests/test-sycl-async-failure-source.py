@@ -266,6 +266,11 @@ def main():
                 "return ggml_sycl_execution_release_graph(ctx);", 1), common),
             "context twin aborts without the retry": (cache, re.sub(
                 r"\s*&&\s*!ggml_sycl_execution_recover_and_release_graph\(backend_ctx\)", "", sycl, count=1), common),
+            "begin-path twin releases after a throwing wait": (cache, re.sub(
+                r"if \(!waited \|\|\s*(\(!ggml_sycl_execution_release_graph\(ctx\))", r"if (\1", sycl, count=1),
+                common),
+            "route arms its terminal with no event": (cache, sycl.replace(
+                "terminal->arm(final);", "terminal->arm(sycl::event{});", 1), common),
             "context twin releases after a throwing wait": (cache, re.sub(
                 r"if \(!waited \|\|\s*(\(!ggml_sycl_execution_release_graph\(backend_ctx\))", r"if (\1", sycl,
                 count=1), common),
