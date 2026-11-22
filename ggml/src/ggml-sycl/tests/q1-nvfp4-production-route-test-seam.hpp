@@ -32,6 +32,8 @@ enum ggml_sycl_q1_nvfp4_test_failure {
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL,
+    // The completion host task skips its release once, as one that has not run yet when the context is drained.
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE,
 };
 
 #if defined(__GNUC__) || defined(__clang__)

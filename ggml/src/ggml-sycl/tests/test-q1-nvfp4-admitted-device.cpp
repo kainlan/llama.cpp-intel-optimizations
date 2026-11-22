@@ -598,26 +598,17 @@ struct completion_hold {
     const bool armed;
 };
 
-// With hold_completion, a second holder of the route's completion object outlives the completion host task, as a copy
-// of the host-task functor inside the SYCL runtime would. The end state must not change: the host task empties the
-// shared bundle before it returns, so no holder of the completion object keeps the invocation pinned.
-void injected_async_terminal_failure_case(bool hold_completion) {
+void injected_async_terminal_failure_case() {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
 
-    const case_scope scope(hold_completion ? "injected_async_terminal_failure_case (completion held)" :
-                                             "injected_async_terminal_failure_case",
-                           before);
+    const case_scope scope("injected_async_terminal_failure_case", before);
 
     const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(life.backend_device);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
-    const completion_hold hold(hold_completion);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
                    "async terminal fixture failed before submission", before);
-    // If the seam held nothing, the held run would pass whatever the host task does with the bundle.
-    require_stages(!hold_completion || ggml_sycl_q1_nvfp4_test_completion_held(),
-                   "the route's completion object was not held past its host task", before);
     // ggml_backend_graph_compute ends with the synchronize that reports the failure. Its cleanup must release the
     // failed graph: a failed bundle whose workspace is never recovered keeps the invocation pinned, and the device
     // stays owned by a context that computes nothing more, so the next context's graph fails with DEVICE_BUSY.
@@ -635,8 +626,10 @@ void injected_async_terminal_failure_case(bool hold_completion) {
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
                    "async failpoint did not reach exactly one submitted terminal", before);
-    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
-                   "failed asynchronous terminal recycled its workspace", before);
+    // A terminal says when its work is finished, not whether it succeeded: the completion task releases the finished
+    // bundle of a failed graph too, and the failure is the boundary's to report.
+    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle + 1,
+                   "the completion task did not release the finished bundle of a failed terminal", before);
     // Fail closed: the device delivered an asynchronous failure, so this context refuses its next graph before
     // anything reaches the route (no new candidate, no new submit).
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
@@ -696,14 +689,22 @@ void refused_graph_then_synchronize_case() {
         before);
 }
 
+// Where a drained case started: its device, that device's delivered asynchronous errors, and the route counters.
+struct drained_case_start {
+    int                              device          = -1;
+    uint64_t                         device_failures = 0;
+    ggml_sycl_q1_nvfp4_test_counters counters{};
+};
+
 // A caller that stops at the first error tears its context down without another synchronize. llama_context's
 // teardown drains the terminal events first, and that drain must release a graph whose terminal failed: a slot left
 // quarantined keeps the invocation pinned and the device owned by a context nothing computes on.
-void failed_graph_then_drain_case() {
+drained_case_start failed_graph_then_drain_steps() {
     lifecycle_fixture                life;
     std::vector<float>               oracle;
     size_t                           count = 0;
     auto                             c     = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    const uint64_t                   device_failures = ggml_sycl_async_failure_count(life.backend_device);
     ggml_sycl_q1_nvfp4_test_counters before{};
     ggml_sycl_q1_nvfp4_test_counters_read(&before);
     const case_scope scope("failed_graph_then_drain_case", before);
@@ -734,8 +735,76 @@ void failed_graph_then_drain_case() {
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
                    "async failpoint did not reach exactly one submitted terminal", before);
-    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
-                   "failed asynchronous terminal recycled its workspace", before);
+    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle + 1,
+                   "the completion task did not release the finished bundle of a failed terminal", before);
+    return { life.backend_device, device_failures, before };
+}
+
+void failed_graph_then_drain_case() {
+    const drained_case_start start = failed_graph_then_drain_steps();
+
+    // The fixture is gone, so every queue is drained. Exactly one delivery tells "delivered on another thread" (the
+    // drain's wait can take the error before the completion task's own wait looks) from "never delivered".
+    const uint64_t delivered = ggml_sycl_async_failure_count(start.device) - start.device_failures;
+    require_stages(delivered == 1,
+                   "failed_graph_then_drain_case: the injected asynchronous failure was delivered " +
+                       std::to_string(delivered) + " times, not once",
+                   start.counters);
+}
+
+// A completion task that has not released its bundle when the context is drained: the drain's deferred-decode wait
+// covers the graph's last event, not necessarily the route's completion task. The drain must still release the graph.
+// No asynchronous error is injected, so the latch must not move. With hold_completion a second holder of the
+// completion object outlives its host task, as a copy of the host-task functor inside the SYCL runtime would; the host
+// task empties the shared bundle as its last statement, so that holder cannot keep the invocation pinned.
+void unreleased_graph_then_drain_case(bool hold_completion) {
+    lifecycle_fixture                life;
+    std::vector<float>               oracle;
+    size_t                           count = 0;
+    auto                             c     = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+
+    const case_scope scope(
+        hold_completion ? "unreleased_graph_then_drain_case (completion held)" : "unreleased_graph_then_drain_case",
+        before);
+
+    const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(life.backend_device);
+
+    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
+        return " (invocation=" + std::to_string(state.invocation_id.value) +
+               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+    };
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE);
+    const completion_hold hold(hold_completion);
+    require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "the graph was not submitted", before);
+    // If the seam held nothing, the held run would pass whatever the host task does with the bundle.
+    require_stages(!hold_completion || ggml_sycl_q1_nvfp4_test_completion_held(),
+                   "the route's completion object was not held past its host task", before);
+    ggml_sycl_execution_snapshot submitted{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &submitted) == GGML_SYCL_EXECUTION_OK,
+                   "context snapshot unavailable after the graph", before);
+    require_stages(submitted.invocation_id.value != 0 && submitted.busy_device_count != 0,
+                   "graph_compute released its own graph, so this case cannot observe the drain" + observed(submitted),
+                   before);
+    require_stages(ggml_backend_sycl_execution_context_drain_terminal_events(life.context) == GGML_SYCL_EXECUTION_OK,
+                   "the terminal drain was refused", before);
+    ggml_sycl_execution_snapshot drained{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &drained) == GGML_SYCL_EXECUTION_OK,
+                   "context snapshot unavailable after the drain", before);
+    require_stages(
+        drained.invocation_id.value == 0 && drained.busy_device_count == 0,
+        "the terminal drain did not release a graph its completion task had not released" + observed(drained), before);
+    ggml_sycl_q1_nvfp4_test_counters after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
+                   "the completion failpoint did not reach exactly one submitted graph", before);
+    require_stages(after.recycle == before.recycle && after.quarantine == before.quarantine,
+                   "the completion task released its bundle although the failpoint skipped the release", before);
+    require_stages(!ggml_sycl_async_failure_since(failure_cursor),
+                   "an asynchronous failure was recorded although none was injected", before);
 }
 } // namespace
 
@@ -754,9 +823,7 @@ int main() {
         require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         require_clean_teardown();
-        injected_async_terminal_failure_case(false);
-        require_clean_teardown();
-        injected_async_terminal_failure_case(true);
+        injected_async_terminal_failure_case();
         require_clean_teardown();
         refused_graph_then_synchronize_case();
         require_clean_teardown();
@@ -766,6 +833,16 @@ int main() {
         {
             lifecycle_fixture life;
             successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "after-failed-drain");
+        }
+        require_clean_teardown();
+        for (const bool hold_completion : { false, true }) {
+            unreleased_graph_then_drain_case(hold_completion);
+            require_clean_teardown();
+            // And after a context drained while its completion task had not released.
+            lifecycle_fixture life;
+            successful_reuse_case(
+                life, GGML_TYPE_Q1_0, 1,
+                hold_completion ? "after-unreleased-drain (completion held)" : "after-unreleased-drain");
         }
         require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;

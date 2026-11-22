@@ -17,17 +17,20 @@ With comments blanked:
      returned before the first ggml_backend_sycl_graph_compute_unchecked( call.
   R. (ggml-sycl.cpp ggml_sycl_async_failure_report) the [SYCL-ASYNC-FAILURE] line says the outputs of the context's
      last graph are not valid.
-  T. (ggml-sycl.cpp moe_direct_event_terminal) arm takes a ggml_sycl_async_failure_cursor; ready() tests the
-     command_execution_status, names neither ggml_sycl_async_failure_since nor wait_and_throw, and calls no wait at
-     all, because the slot-release sites read it as "finished" under the registry and pool mutexes and a failed bundle
-     must still be released; observe_success() tests ggml_sycl_async_failure_since( after event->wait_and_throw(), and
-     its catch records the throw with ggml_sycl_async_failure_record( so the next boundary fails the context and
-     recovers the slot; the route arms with a snapshot taken before its first submission.
+  T. (ggml-sycl.cpp moe_direct_event_terminal) the terminal says when its work is finished and nothing else: ready()
+     tests the command_execution_status, names neither ggml_sycl_async_failure_since nor wait_and_throw, and calls no
+     wait at all, because the slot-release sites read it as "finished" under the registry and pool mutexes; the class
+     has no observe_success and names no async-failure latch, arm takes the event alone, and the route arms it with
+     its final event. Whether the work succeeded is the latch's to say, read only by a boundary that drained on its own
+     thread: a wait on a host-task worker can return while another thread is still delivering the error.
+  F. (ggml-sycl.cpp, the completion host task) the task releases a finished bundle whatever the latch says: the body
+     computes recycled as !skip_release && completion->bundle.terminal_release(), and names no
+     ggml_sycl_async_failure, no observe_success and no wait.
   B. (ggml-sycl.cpp, the completion host task) the body's last statement assigns an empty bundle to
      completion->bundle, after the terminal_release() expression. The bundle holds the invocation pin until
-     terminal_release() runs, and a failed terminal never reaches it; the task's event completes only after the body
-     returns, so a boundary that waited on that event finds the pin released however long the runtime keeps the
-     functor or copies of it.
+     terminal_release() runs, and a release that was refused or skipped never resets it; the task's event completes
+     only after the body returns, so a boundary that waited on that event finds the pin released however long the
+     runtime keeps the functor or copies of it.
   D. (ggml-sycl.cpp) a release refused during a drain is retried after the workspace recovery:
      ggml_sycl_execution_recover_and_release_graph waits the stream, then calls
      ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
@@ -37,7 +40,10 @@ With comments blanked:
      outlives its host task, so the oracle can show that B, not the runtime's functor lifetime, releases the pin) is
      compiled only for route testing: every mention of ggml_sycl_q1_nvfp4_test_retain_completion,
      ggml_sycl_q1_nvfp4_test_hold_completion, ggml_sycl_q1_nvfp4_test_completion_held and the held pointer sits inside
-     an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the route hands its completion to the seam.
+     an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the route hands its completion to the seam. The same holds
+     for the completion failpoint GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE (a completion task that has
+     not released when the context is drained): the host task consumes it before its release, and the build without
+     route testing defines skip_release as constexpr false.
   H. (common.cpp ggml_sycl_async_handler) the handler body has no throw statement, no GGML_LOG, no lock or mutex, no
      std::string and no new.
 """
@@ -48,8 +54,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 BUNDLE_DROP = "completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};"
-HOLD_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_test_hold_completion",
-             "ggml_sycl_q1_nvfp4_test_completion_held", "g_q1_nvfp4_test_held_completion", "g_q1_nvfp4_test_hold_")
+TEST_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_test_hold_completion",
+             "ggml_sycl_q1_nvfp4_test_completion_held", "g_q1_nvfp4_test_held_completion", "g_q1_nvfp4_test_hold_",
+             "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE")
+NO_RELEASE = "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE"
+RELEASE = "const bool recycled = !skip_release && completion->bundle.terminal_release();"
 
 
 def blank_comments(text):
@@ -96,9 +105,9 @@ def route_testing_lines(text):
     return inside
 
 
-def hold_seam_guarded(sycl):
+def test_seam_guarded(sycl):
     inside = route_testing_lines(sycl)
-    mentions = [n for n, line in enumerate(sycl.split("\n")) if any(name in line for name in HOLD_SEAM)]
+    mentions = [n for n, line in enumerate(sycl.split("\n")) if any(name in line for name in TEST_SEAM)]
     return bool(mentions) and all(n in inside for n in mentions)
 
 
@@ -109,9 +118,8 @@ def claims(cache, sycl, common):
     r = body(sycl, "static void ggml_sycl_async_failure_report(ggml_backend_sycl_context * ctx, const char * stage)")
     t = body(sycl, "class moe_direct_event_terminal final")
     t_ready = body(t, "bool ready() const noexcept override")
-    t_success = body(t, "bool observe_success() noexcept")
     h = body(common, "sycl::async_handler ggml_sycl_async_handler(int slot)")
-    b = body(sycl, "h.host_task([completion, terminal]")[1:-1].rstrip()
+    b = body(sycl, "h.host_task([completion")[1:-1].rstrip()
     d = body(sycl, "static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept")
     d_own = body(sycl, "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {")
     d_ctx = body(sycl, "static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {")
@@ -138,13 +146,14 @@ def claims(cache, sycl, common):
             "async_failure_cleaned" not in g and "async_failure_cleaned" not in r,
         "G refusal before compute": 0 <= g_check < g_first and "GGML_STATUS_FAILED" in g[g_check:g_first],
         "R the report says the last outputs are invalid": "are not valid" in r,
-        "T arm takes a cursor": "void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor)" in t,
+        "T the terminal knows only that its work finished": t != "" and "observe_success" not in t and
+            "ggml_sycl_async_failure" not in t and "void arm(sycl::event event) noexcept" in t,
         "T ready tests completion only": "command_execution_status" in t_ready and
             "ggml_sycl_async_failure_since" not in t_ready and "wait_and_throw" not in t_ready and
             re.search(r"\bwait\w*\s*\(", t_ready) is None,
-        "T observe_success reads the latch after the wait": 0 <= t_success.find("event->wait_and_throw();") <
-            t_success.find("ggml_sycl_async_failure_since(cursor)"),
-        "T a throwing observation is latched": "ggml_sycl_async_failure_record(" in body(t_success, "catch (...)"),
+        "F the completion task releases a finished bundle": RELEASE in b,
+        "F the release asks neither the latch nor a wait": b != "" and "ggml_sycl_async_failure" not in b and
+            "observe_success" not in b and re.search(r"\bwait\w*\s*\(", b) is None,
         "B the completion task drops the bundle before it returns": b.endswith(BUNDLE_DROP) and
             0 <= b.find("completion->bundle.terminal_release()") < b.rfind(BUNDLE_DROP),
         "D the helper waits, recovers, then releases": 0 <= d_wait < d_recover < d_release,
@@ -157,10 +166,11 @@ def claims(cache, sycl, common):
         "D the destructor recovers before it releases": 0 <= d_dtor.find(
             "ggml_sycl_recover_exact_mmid_after_drain(this);") < d_dtor.find(
             "ggml_sycl_execution_abort_and_release_graph(this);"),
-        "K the completion-hold seam is compiled only for route testing": hold_seam_guarded(sycl),
+        "K the test seams are compiled only for route testing": test_seam_guarded(sycl),
+        "K the completion failpoint is consumed before the release": 0 <= b.find(NO_RELEASE) < b.find(RELEASE) and
+            "constexpr bool skip_release = false;" in b,
         "K the route hands its completion to the seam": "ggml_sycl_q1_nvfp4_test_retain_completion(completion);" in sycl,
-        "T route arms with its cursor": "terminal->arm(final, failure_cursor);" in sycl and
-            "const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);" in sycl,
+        "T route arms with its final event": "terminal->arm(final);" in sycl,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
                                                       r"std::string|\bnew\b", h.replace("rethrow_exception", "")),
     }
@@ -179,8 +189,6 @@ def main():
         print("async failure source contract failed: " + ", ".join(failed), file=sys.stderr)
         return 1
     if "--self-test" in sys.argv:
-        # check() passed, so this body is not empty and the replacements below cannot match at offset 0.
-        success = body(body(sycl, "class moe_direct_event_terminal final"), "bool observe_success() noexcept")
         mutants = {
             "execution queue without handler": (cache.replace("ggml_sycl_make_queue(ctx, dev, device,",
                                                               "sycl::queue(ctx, dev,", 1), sycl, common),
@@ -203,22 +211,26 @@ def main():
                 "ctx->async_failure_reported = true; ctx->async_failure_cleaned = true;", 1), common),
             "graph_compute does not refuse": (cache, sycl.replace("ggml_sycl_async_failure_since(failed_ctx->",
                                                                   "false && (failed_ctx->", 1), common),
-            "terminal ignores the latch": (cache, sycl.replace("terminal->arm(final, failure_cursor);",
-                                                               "terminal->arm(final, {});", 1), common),
+            "terminal judges success again": (cache, sycl.replace(
+                "void arm(sycl::event event) noexcept",
+                "bool observe_success() noexcept { return !ggml_sycl_async_failure_since({}); }\n"
+                "    void arm(sycl::event event) noexcept", 1), common),
             "ready reads the latch": (cache, re.sub(
                 r"(bool ready\(\) const noexcept override \{)",
                 r"\1 if (ggml_sycl_async_failure_since(cursor_)) return false;", sycl, count=1), common),
-            "observe_success is ready": (cache, sycl.replace(success, "{ return ready(); }", 1), common),
-            "observe_success skips the wait": (cache, sycl.replace(
-                success, success.replace("event->wait_and_throw();", "", 1), 1), common),
             "ready waits": (cache, re.sub(r"(bool ready\(\) const noexcept override \{)",
                                           r"\1 if (event_) event_->wait();", sycl, count=1), common),
-            "a throwing observation is not latched": (cache, sycl.replace(
-                success, re.sub(r"ggml_sycl_async_failure_record\([^;]*\);", "", success, count=1), 1), common),
+            "completion task asks the latch": (cache, sycl.replace(
+                RELEASE, RELEASE.replace("!skip_release && ", "!skip_release && !ggml_sycl_async_failure_since({}) && "),
+                1), common),
+            "completion task waits before it releases": (cache, sycl.replace(
+                RELEASE, "sycl::event{}.wait(); " + RELEASE, 1), common),
+            "completion failpoint outside the testing guard": (cache, sycl.replace(
+                "constexpr bool skip_release = false;",
+                "const bool skip_release = ggml_sycl_q1_nvfp4_test_consume_failure(" + NO_RELEASE + ");", 1), common),
             "completion task keeps the bundle": (cache, sycl.replace(BUNDLE_DROP, "", 1), common),
             "completion task drops the bundle first": (cache, sycl.replace(BUNDLE_DROP, "", 1).replace(
-                "const bool recycled = terminal->observe_success()",
-                BUNDLE_DROP + " const bool recycled = terminal->observe_success()", 1), common),
+                RELEASE, BUNDLE_DROP + " " + RELEASE, 1), common),
             "helper releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(ctx);\n    return ggml_sycl_execution_release_graph(ctx);",
                 "return ggml_sycl_execution_release_graph(ctx);", 1), common),
@@ -227,8 +239,8 @@ def main():
             "destructor releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
             "completion hold outside the testing guard": (cache, sycl.replace(
-                "terminal->arm(final, failure_cursor);",
-                "ggml_sycl_q1_nvfp4_test_retain_completion(completion); terminal->arm(final, failure_cursor);", 1),
+                "terminal->arm(final);",
+                "ggml_sycl_q1_nvfp4_test_retain_completion(completion); terminal->arm(final);", 1),
                 common),
             "completion hold under an else branch": (cache, sycl.replace(
                 "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n                            "
