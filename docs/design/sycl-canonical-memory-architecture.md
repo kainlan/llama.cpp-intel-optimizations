@@ -1565,21 +1565,23 @@ unload and the bind's own retire take it under no listed lock. Under it, each
 context's pool mutexes are taken in ascending owner-device order. No L1-L4 lock
 is taken under it.
 
-Two existing paths still break this section's prohibitions under the registry
-mutex. Both are known non-conformances, not exemptions.
+The pool mutexes (`registry_pool_state::mutex`, and the standalone
+`moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
+take no listed lock themselves.
+
+Three existing paths still break this section's prohibitions under these locks.
+All three are known non-conformances, not exemptions.
 
 - `replace_plan`'s prepared-replacement erase, and
   `recover_quarantined`'s retired-context sweep, can drop the last owner of a
   context's pools. The final `mem_handle` destructors then take the free path's
   L5 locks under the registry mutex.
+- A slot's quarantine release (`recover_quarantined`, and a registry lease's
+  terminal release) resets the slot's graph retention record and admission
+  authority under the pool mutex. When that reset drops the last owner, the
+  final destructors run under a listed lock.
 - `recover_quarantined(wait=true)` waits on a queue-quiescence proof under the
   registry and pool mutexes.
-
-The pool mutexes (`registry_pool_state::mutex`, and the standalone
-`moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
-take no listed lock themselves. A slot's quarantine release under them can drop
-a graph retention record or an admission authority, which is the same
-final-owner case.
 
 The zone-reset escape audit's `zone_audit_state::mutex` (`unified-cache.cpp`,
 `iiff` Phase 0) guards the per-site inventory the `GGML_SYCL_ZONE_RESET_AUDIT`
