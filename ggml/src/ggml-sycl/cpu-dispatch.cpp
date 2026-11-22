@@ -4479,8 +4479,15 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     // dnnl_sgemm GEMV with direct quantized vec_dot (e.g., Q4_0 × Q8_0).
     // Benefits: ~5x less memory bandwidth (quantized reads), no BLAS overhead,
     // L1-friendly access pattern (one 2KB weight row + 4KB activation per dot).
-    const auto * cpu_traits  = src0_quantized ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
-    const bool   use_vec_dot = (M <= 4 && cpu_traits && cpu_traits->vec_dot);
+    // The activation rows are of the weight's vec_dot_type: quantized blocks for a quantized weight, F32 for an F16
+    // weight. M rows of F32 outgrow src1_q at a much smaller K than quantized rows do, so the path asks whether they
+    // fit, and a K too large for the buffer takes the GEMM fallback below instead of the buffer assert.
+    const auto * cpu_traits = src0_quantized ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
+    const auto * vdt_cpu_traits =
+        cpu_traits && cpu_traits->vec_dot ? ggml_sycl_get_type_traits_cpu(cpu_traits->vec_dot_type) : nullptr;
+    const bool use_vec_dot =
+        M <= 4 && vdt_cpu_traits && vdt_cpu_traits->from_float &&
+        cpu_dispatch_src1_q_fits(static_cast<size_t>(M), ggml_row_size(cpu_traits->vec_dot_type, K));
 
     auto run_mul_mat = [=]() {
 #    if GGML_SYCL_A7L5W_INSTRUMENT
@@ -4519,15 +4526,11 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         static thread_local quant_cache_key src1_q_cache;
 
         if (use_vec_dot) {
-            const ggml_type vec_dot_type   = cpu_traits->vec_dot_type;
-            const auto *    vdt_cpu_traits = ggml_sycl_get_type_traits_cpu(vec_dot_type);
-            from_float_fn                  = vdt_cpu_traits ? vdt_cpu_traits->from_float : nullptr;
-            if (from_float_fn) {
-                q_row_size            = ggml_row_size(vec_dot_type, K);
-                const size_t buf_size = static_cast<size_t>(M) * q_row_size;
-                GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.src1_q.size());
-                src1_q_buf = g_cpu_dispatch_buffers.src1_q.data();
-            }
+            from_float_fn = vdt_cpu_traits->from_float;
+            q_row_size    = ggml_row_size(cpu_traits->vec_dot_type, K);
+            // use_vec_dot asked cpu_dispatch_src1_q_fits, and init() above sized src1_q to that bound
+            GGML_ASSERT(static_cast<size_t>(M) * q_row_size <= g_cpu_dispatch_buffers.src1_q.size());
+            src1_q_buf = g_cpu_dispatch_buffers.src1_q.data();
         }
 
         // Dequant/conversion buffer for non-F32 weights (only for GEMM fallback path)
