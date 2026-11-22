@@ -8971,6 +8971,7 @@ void UnifiedKernel::invalidate_plan_cache() {
     final_output_ggml_dst_handle_ = {};
     final_output_ggml_dst_offset_ = 0;
     plan_cache_valid_             = false;
+    plan_selection_hash_          = 0;
     cached_ops_.clear();
     cached_plan_template_ = {};
     // Clear original phase schedule data (rebuilt on next full build)

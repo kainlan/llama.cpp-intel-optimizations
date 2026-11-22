@@ -179,8 +179,9 @@ int main() {
     }
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
-        std::fprintf(stderr, "SKIP: ggml_backend_sycl_init(0) failed -- NO DEVICE WORK WAS PERFORMED.\n");
-        return LLAMA_TEST_EXIT_SKIP;
+        // A device was counted, so a failed init is a broken backend, not a missing device.
+        std::fprintf(stderr, "FAIL: a SYCL device was counted but ggml_backend_sycl_init(0) failed\n");
+        return 1;
     }
 
     int failures = 0;

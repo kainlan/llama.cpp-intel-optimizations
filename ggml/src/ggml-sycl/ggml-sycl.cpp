@@ -97471,15 +97471,24 @@ static bool ggml_sycl_fusion_chain_accessible_on_device(const ggml_cgraph * cgra
     return true;
 }
 
+// A node the graph asked for carries GGML_TENSOR_FLAG_COMPUTE. A node without it is an unselected branch of
+// ggml_build_forward_select: the scheduler does not upload its inputs (ggml-backend.cpp, hv_tensor_requires_copy), so
+// running it reads memory that nobody wrote. A walker that dispatches, fuses, records or plans work skips such a node
+// through ggml_sycl_is_noop. A walker that must keep views, for which ggml_sycl_is_noop is true, tests this helper.
+// tests/test-sycl-compute-flag-source.py holds the census of both.
+static inline bool ggml_sycl_node_is_computed(const ggml_tensor * node) {
+    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
+// Defined below, beside the node loop. The fusion detectors that follow test it on every node they absorb, so a
+// fusion never runs a node the graph did not ask for alongside one it did.
+static inline bool ggml_sycl_is_noop(const ggml_tensor * node);
+
 // =============================================================================
 // Per-projection fusion helper functions
 // Find all MUL_MAT nodes that consume the given tensor
 
 // =============================================================================
-// Defined below, beside the node loop. The fusion detectors that follow test it on every node they absorb, so a
-// fusion never runs a node the graph did not ask for alongside one it did.
-static inline bool ggml_sycl_is_noop(const ggml_tensor * node);
-
 static std::vector<std::pair<int, ggml_tensor *>> find_mulmat_consumers(const ggml_cgraph * cgraph,
                                                                         const ggml_tensor * tensor,
                                                                         int                 start_idx) {
@@ -99181,12 +99190,11 @@ static void ggml_sycl_trace_persistent_ops(ggml_backend_sycl_context & ctx) {
     }
 }
 
-// True for a node that generates no work in this backend. A node without GGML_TENSOR_FLAG_COMPUTE is one the graph
-// did not ask for (an unselected branch of ggml_build_forward_select). The scheduler does not upload such a node's
-// inputs (ggml-backend.cpp, hv_tensor_requires_copy), so running it reads memory that nobody wrote.
-// Used by graph_compute_impl, prefix detection, and suffix dispatch.
+// True for a node that generates no work in this backend: one the graph did not ask for (see
+// ggml_sycl_node_is_computed), an empty one, or a view. Every walker that dispatches, fuses, records or plans work
+// skips a node for which this is true. A walker that must keep views tests ggml_sycl_node_is_computed instead.
 static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {
-    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+    return !ggml_sycl_node_is_computed(node) || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
            node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
            node->op == GGML_OP_NONE;
 }
@@ -101247,8 +101255,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        if (!node || !ggml_sycl_node_is_computed(node) || ggml_sycl_block_exec_node_needs_local_output(node) ||
+            ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -101593,8 +101601,8 @@ static bool ggml_sycl_block_exec_publish_aliases(ggml_backend_sycl_context &    
     exec_ctx.alias_publications.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        if (!node || !ggml_sycl_node_is_computed(node) || ggml_sycl_block_exec_node_needs_local_output(node) ||
+            ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -104045,6 +104053,9 @@ class ggml_sycl_block_exec_dense_run {
             ggml_sycl::dense_exec_node & n    = g.nodes[static_cast<size_t>(i)];
             n.own_layer                       = extract_layer_index(node->name);
             n.is_noop                         = ggml_sycl_is_noop(node);
+            if (!ggml_sycl_node_is_computed(node)) {
+                continue;  // never runs, and no computed node reads it: it registers no root and marks none OUTPUT
+            }
             if (n.is_noop) {
                 (void) root_of(node);  // carries a view's OUTPUT flag to its root
                 continue;
@@ -113654,6 +113665,24 @@ static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph) {
     return h;
 }
 
+// Which nodes a graph computes: n_nodes and every node's GGML_TENSOR_FLAG_COMPUTE bit, folded. Two selections of one
+// ggml_build_forward_select graph hold the same nodes and differ only here. This is the persistent TG plan cache key
+// for the selection; it costs one load per node, where ggml_sycl_graph_signature mixes about a hundred fields per node
+// and would also change with every KV view the cached path refreshes in place.
+static uint64_t ggml_sycl_graph_selection_hash(const ggml_cgraph * cgraph) {
+    uint64_t h   = 1469598103934665603ULL;  // FNV-1a offset basis
+    auto     mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+    mix(static_cast<uint64_t>(cgraph->n_nodes));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        mix(node && ggml_sycl_node_is_computed(node) ? 1 : 0);
+    }
+    return h;
+}
+
 // llama.cpp-dkw0 (defect #4 closing fix, preventive fragmentation detector):
 // ggml_backend_sched rewires every cross-backend split input to a device copy
 // tensor named "%s#%s#%d" (backend name # source tensor name # copy index --
@@ -115139,6 +115168,16 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
 
     // Fast path: reuse cached plan and refresh mutable pointers only.
     if (kernel.has_cached_plan()) {
+        // The plan holds the nodes its graph computed. A graph that computes another set (a token decode after
+        // embedding decodes selects the token GET_ROWS) would leave a node outside the plan unrun: rebuild.
+        if (kernel.plan_selection_hash() != ggml_sycl_graph_selection_hash(cgraph)) {
+            GGML_SYCL_DEBUG("[PERSISTENT-TG] Graph selection changed, rebuilding the plan\n");
+            kernel.invalidate_update_recipe();
+            kernel.invalidate_plan_cache();
+            kernel.cancel_persistent();
+            goto full_build;
+        }
+
         const bool fast_path_debug_disabled = g_sycl_tg_trace_hash || profile_build || log_ops || (max_ops_limit > 0) ||
                                               g_persistent_set_rows_dbg.enabled || g_persistent_attn_dbg.enabled ||
                                               g_persistent_rms_dbg.enabled || g_persistent_matmul_dbg.enabled ||
@@ -115162,10 +115201,11 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                 if (!recipe_ok) {
                     break;
                 }
-                // The recipe holds only nodes the graph computed when it was built. A recipe node this graph does
-                // not compute means another selection: rebuild instead of running it.
+                // The selection hash checked above guarantees this graph computes the same nodes as the one the
+                // recipe was built from, so no node outside the recipe needs to run. This check is the direct
+                // guard for the other direction: a recipe node this graph does not compute is never run.
                 const ggml_tensor * recipe_node = cgraph->nodes[entry.graph_node_idx];
-                if (recipe_node && (recipe_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                if (recipe_node && !ggml_sycl_node_is_computed(recipe_node)) {
                     recipe_ok = false;
                     break;
                 }
@@ -115593,7 +115633,7 @@ recipe_failed:
 
             for (int i = 0; i < cgraph->n_nodes && fast_path_ok; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                if (!node || !ggml_sycl_node_is_computed(node)) {
                     continue;
                 }
 
@@ -116579,6 +116619,7 @@ full_build:
     // 2. Begin building the persistent plan
     kernel.begin_persistent(n_layers, 1 /* batch_size */, hidden_dim, intermediate_dim, n_heads, n_kv_heads, head_dim,
                             quant_type);
+    kernel.set_plan_selection_hash(ggml_sycl_graph_selection_hash(cgraph));
 
     // 3. Walk graph and add operations
     int                                          last_layer       = -1;
@@ -116626,9 +116667,9 @@ full_build:
             }
             break;
         }
-        // A node the graph did not ask for adds no plan op and is not pre-executed (see ggml_sycl_is_noop). Views
-        // stay in the walk: the plan resolves their pointers.
-        if (node && (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        // A node the graph did not ask for adds no plan op and is not pre-executed (see ggml_sycl_node_is_computed).
+        // Views stay in the walk: the plan resolves their pointers.
+        if (node && !ggml_sycl_node_is_computed(node)) {
             continue;
         }
         if (g_ggml_sycl_debug && node) {
