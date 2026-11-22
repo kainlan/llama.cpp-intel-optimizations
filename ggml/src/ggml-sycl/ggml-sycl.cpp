@@ -97476,6 +97476,10 @@ static bool ggml_sycl_fusion_chain_accessible_on_device(const ggml_cgraph * cgra
 // Find all MUL_MAT nodes that consume the given tensor
 
 // =============================================================================
+// Defined below, beside the node loop. The fusion detectors that follow test it on every node they absorb, so a
+// fusion never runs a node the graph did not ask for alongside one it did.
+static inline bool ggml_sycl_is_noop(const ggml_tensor * node);
+
 static std::vector<std::pair<int, ggml_tensor *>> find_mulmat_consumers(const ggml_cgraph * cgraph,
                                                                         const ggml_tensor * tensor,
                                                                         int                 start_idx) {
@@ -97484,7 +97488,7 @@ static std::vector<std::pair<int, ggml_tensor *>> find_mulmat_consumers(const gg
     for (int j = start_idx; j < cgraph->n_nodes; j++) {
         ggml_tensor * node = cgraph->nodes[j];
 
-        if (node->op == GGML_OP_MUL_MAT) {
+        if (node->op == GGML_OP_MUL_MAT && !ggml_sycl_is_noop(node)) {
             // MUL_MAT src[1] is the activation input
             if (node->src[1] == tensor) {
                 consumers.push_back({ j, node });
@@ -97981,7 +97985,7 @@ static int ggml_sycl_match_moe_down_sum_chain(const ggml_cgraph * cgraph, int no
     }
 
     const ggml_tensor * final = cgraph->nodes[final_idx];
-    if (!final || !final->name || !strstr(final->name, "ffn_moe_out")) {
+    if (!final || ggml_sycl_is_noop(final) || !final->name || !strstr(final->name, "ffn_moe_out")) {
         return -1;
     }
     return final_idx;
@@ -98156,8 +98160,7 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
         }
         for (int j = skip_start_idx; j <= replay_fused_to; ++j) {
             ggml_tensor * replay = cgraph->nodes[j];
-            if (!replay || ggml_is_empty(replay) || replay->op == GGML_OP_RESHAPE || replay->op == GGML_OP_TRANSPOSE ||
-                replay->op == GGML_OP_VIEW || replay->op == GGML_OP_PERMUTE || replay->op == GGML_OP_NONE) {
+            if (!replay || ggml_sycl_is_noop(replay)) {
                 continue;
             }
             g_preclassified_node_idx = j;
@@ -98207,9 +98210,7 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
                     (int) std::max<long>(skip_start_idx, std::min<long>(final_idx - 1, skip_start_idx + val));
                 for (int j = skip_start_idx; j <= target; ++j) {
                     ggml_tensor * replay = cgraph->nodes[j];
-                    if (!replay || ggml_is_empty(replay) || replay->op == GGML_OP_RESHAPE ||
-                        replay->op == GGML_OP_TRANSPOSE || replay->op == GGML_OP_VIEW ||
-                        replay->op == GGML_OP_PERMUTE || replay->op == GGML_OP_NONE) {
+                    if (!replay || ggml_sycl_is_noop(replay)) {
                         continue;
                     }
                     g_preclassified_node_idx = j;
@@ -98341,6 +98342,9 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
     }
     if (!mul || !add || !sort || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD || sort->op != GGML_OP_ARGSORT) {
         return reject("pattern");
+    }
+    if (ggml_sycl_is_noop(add) || ggml_sycl_is_noop(sort)) {
+        return reject("not-computed");
     }
     if (add->src[0] != mul && add->src[1] != mul) {
         return reject("add-not-consuming-mul");
@@ -98515,7 +98519,7 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     }
     ggml_tensor * mul = cgraph->nodes[node_idx];
     ggml_tensor * add = cgraph->nodes[node_idx + 1];
-    if (!mul || !add || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD) {
+    if (!mul || !add || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD || ggml_sycl_is_noop(add)) {
         return false;
     }
     if (add->src[0] != mul && add->src[1] != mul) {
@@ -98694,7 +98698,7 @@ struct glu_consumer_info {
 static glu_consumer_info find_glu_consumer(const ggml_cgraph * cgraph, const ggml_tensor * tensor, int start_idx) {
     for (int j = start_idx; j < cgraph->n_nodes; j++) {
         ggml_tensor * node = cgraph->nodes[j];
-        if (node->op == GGML_OP_GLU) {
+        if (node->op == GGML_OP_GLU && !ggml_sycl_is_noop(node)) {
             // For split GLU: src[0] = gate, src[1] = up
             if (node->src[0] == tensor) {
                 return { j, node, true };  // tensor is gate
@@ -99177,11 +99181,14 @@ static void ggml_sycl_trace_persistent_ops(ggml_backend_sycl_context & ctx) {
     }
 }
 
-// Check if a graph node is a no-op that doesn't generate GPU/CPU work.
+// True for a node that generates no work in this backend. A node without GGML_TENSOR_FLAG_COMPUTE is one the graph
+// did not ask for (an unselected branch of ggml_build_forward_select). The scheduler does not upload such a node's
+// inputs (ggml-backend.cpp, hv_tensor_requires_copy), so running it reads memory that nobody wrote.
 // Used by graph_compute_impl, prefix detection, and suffix dispatch.
 static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {
-    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+           node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE ||
+           node->op == GGML_OP_NONE;
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -101240,7 +101247,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -101585,7 +101593,8 @@ static bool ggml_sycl_block_exec_publish_aliases(ggml_backend_sycl_context &    
     exec_ctx.alias_publications.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -104823,7 +104832,8 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] ||
+            !node->src[2]) {
             continue;
         }
         const char * weight_name = node->src[0]->name ? node->src[0]->name : "";
@@ -104859,7 +104869,8 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] ||
+            !node->src[2]) {
             continue;
         }
         for (auto & kv : g_moe_gate_up_pairs) {
@@ -104884,7 +104895,7 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
             continue;
         }
         const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
@@ -104907,7 +104918,7 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL || !node->src[0] || !node->src[1]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_MUL || !node->src[0] || !node->src[1]) {
             continue;
         }
         for (auto & kv : g_moe_gate_up_pairs) {
@@ -106500,7 +106511,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 // 3. Reuses the quantized result for all projections (Q, K, V or gate, up)
                 // This bypasses the ggml_can_fuse_subgraph limitation where shared intermediates fail.
                 // Note: Only triggers for batch size >= 8 to avoid overhead during token generation
-                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+                    !ggml_sycl_is_noop(cgraph->nodes[i + 1])) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     // Check if MUL uses RMS_NORM output
                     if (mul_node->src[0] == node || mul_node->src[1] == node) {
@@ -106574,7 +106586,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
                     // Check: next op is RMS_NORM and it uses this ADD's output as input
-                    if (next->op == GGML_OP_RMS_NORM && next->src[0] == node &&
+                    if (next->op == GGML_OP_RMS_NORM && next->src[0] == node && !ggml_sycl_is_noop(next) &&
                         ggml_sycl_check_fusion_types(cgraph, i, 2) && ggml_is_contiguous(next) &&
                         ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
                         ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_ADD_RMS_NORM, cgraph, i,
@@ -106594,8 +106606,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     ggml_tensor * next = cgraph->nodes[i + 1];
                     // Check: next op is ADD and uses this MUL's output
                     if (next->op == GGML_OP_ADD && (next->src[0] == node || next->src[1] == node) &&
-                        node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
-                        ggml_is_contiguous(next)) {
+                        !ggml_sycl_is_noop(next) && node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(node) && ggml_is_contiguous(next)) {
                         ggml_tensor * x     = node->src[0];
                         ggml_tensor * scale = node->src[1];
                         ggml_tensor * bias  = (next->src[0] == node) ? next->src[1] : next->src[0];
@@ -108150,7 +108162,8 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] ||
+            !node->src[2]) {
             continue;
         }
         plan.total_moe_nodes++;
@@ -108188,7 +108201,8 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] ||
+            !node->src[2]) {
             continue;
         }
         for (auto & kv : pairs) {
@@ -108214,7 +108228,7 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
             continue;
         }
         const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
@@ -108248,7 +108262,7 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID) {
+        if (!node || ggml_sycl_is_noop(node) || node->op != GGML_OP_MUL_MAT_ID) {
             continue;
         }
         if (first_fused_indices.count(i) != 0) {
@@ -115148,6 +115162,13 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                 if (!recipe_ok) {
                     break;
                 }
+                // The recipe holds only nodes the graph computed when it was built. A recipe node this graph does
+                // not compute means another selection: rebuild instead of running it.
+                const ggml_tensor * recipe_node = cgraph->nodes[entry.graph_node_idx];
+                if (recipe_node && (recipe_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    recipe_ok = false;
+                    break;
+                }
                 // Skip CPY sentinel entries (handled separately after the loop)
                 if (entry.get_rows_idx == -2) {
                     continue;
@@ -115572,7 +115593,7 @@ recipe_failed:
 
             for (int i = 0; i < cgraph->n_nodes && fast_path_ok; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (!node) {
+                if (!node || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
                 }
 
@@ -116605,6 +116626,11 @@ full_build:
             }
             break;
         }
+        // A node the graph did not ask for adds no plan op and is not pre-executed (see ggml_sycl_is_noop). Views
+        // stay in the walk: the plan resolves their pointers.
+        if (node && (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
         if (g_ggml_sycl_debug && node) {
             graph_op_counts[node->op]++;
         }
@@ -116833,9 +116859,9 @@ full_build:
                         const ggml_tensor * next = cgraph->nodes[i + 1];
                         // Pattern: MUL(rms_norm_output, norm_weight) where norm_weight
                         // is a 1D weight tensor (same shape as hidden dim).
-                        if (next && next->op == GGML_OP_MUL && next->src[0] == node && next->src[1] &&
-                            ggml_are_same_shape(next->src[0], next->src[1]) && next->src[1]->type == GGML_TYPE_F32 &&
-                            ggml_is_contiguous(next)) {
+                        if (next && next->op == GGML_OP_MUL && next->src[0] == node && !ggml_sycl_is_noop(next) &&
+                            next->src[1] && ggml_are_same_shape(next->src[0], next->src[1]) &&
+                            next->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(next)) {
                             const void * wptr = resolve_input_ptr(next->src[1], layer);
                             if (wptr) {
                                 wptr = ensure_device_access_ptr(next->src[1], wptr, "RMS_NORM fused weight");
