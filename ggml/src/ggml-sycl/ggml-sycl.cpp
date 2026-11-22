@@ -11998,10 +11998,12 @@ bool ggml_sycl_q1_nvfp4_test_completion_held() {
 
 // The MoE MMID direct route (Q1_0/NVFP4 decode rows on the primary card, AoS) was fail-closed by owner ruling until
 // B70 validation. Opened 2026-11-22: sycl-q1-nvfp4-admitted-device passed on the B70 and the B50 on driver 26.44
-// (docs/backend/data/inkling2/t7a-oracle-b70.txt, t7a-oracle-b50.txt). Hoisted to file scope so the admission gate
-// (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind) read ONE constant and cannot drift
-// apart -- materializing a pool for a route that cannot execute reserves VRAM nothing will ever consume, and refusing
-// to materialize one the route CAN execute is a silent performance cliff.
+// (docs/backend/data/inkling2/t7a-oracle-b70.txt, t7a-oracle-b50.txt), with both input shapes a MoE decode gives
+// MUL_MAT_ID: one src1 row every selected expert shares (ne11 == 1, gate/up) and one row per selected expert
+// (ne11 == top_k, down). The admission takes both, since every decode layer runs one of each. Hoisted to file scope
+// so the admission gate (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind) read ONE
+// constant and cannot drift apart -- materializing a pool for a route that cannot execute reserves VRAM nothing will
+// ever consume, and refusing to materialize one the route CAN execute is a silent performance cliff.
 constexpr bool k_moe_mmid_direct_route_validated = true;
 
 // Compile-time reachability: the validated route, or a route-testing build. With the route validated it is true in
@@ -87469,6 +87471,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // residency, AoS). Prompt rows, host-resident experts and secondary residency
     // remain outside this route. All fall-throughs are pre-submit refusals; once
     // marked, the exact queue is drained/recovered.
+    // It takes both input shapes a MoE decode gives MUL_MAT_ID: one src1 row that
+    // every selected expert shares (ne11 == 1, the gate/up or fused gate_up
+    // projection) and one row per selected expert (ne11 == ids->ne[0], the down
+    // projection). The kernel reads row id % ne11 and the workspace is planned for
+    // top_k rows, so both are the kernel's own shapes, not a conversion. Rows are
+    // copied as one block when adjacent and one by one when a view strides them;
+    // elements that are not adjacent inside a row are not admitted.
     // One definition, shared with the materialization gate: see
     // k_moe_mmid_direct_route_validated. Do not re-spell this as a literal --
     // the two gates drifting is how a pool gets allocated for a route that
@@ -87496,9 +87505,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
         if (all_primary && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
             exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root) && plan_snapshot &&
-            plan_snapshot->plan && ids->ne[0] > 0 && ids->ne[1] == 1 &&
-            (ne11 == 1 || (q1_nvfp4_private_test_authorized && ne11 == ids->ne[0])) &&
-            nb1 == static_cast<size_t>(ne01) * sizeof(float)) {
+            plan_snapshot->plan && ids->ne[0] > 0 && ids->ne[1] == 1 && (ne11 == 1 || ne11 == ids->ne[0]) &&
+            nb10 == sizeof(float) && nb1 == static_cast<size_t>(ne01) * sizeof(float)) {
             auto retained_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
                 ctx, src0, decode, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
             const void * const * table_ptr = retained_table.resolve_abi(ctx.device);
@@ -87594,6 +87602,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     auto * ids_device = static_cast<int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
                     const size_t activation_bytes = static_cast<size_t>(ne00) * static_cast<size_t>(ne11) * sizeof(float);
                     const size_t output_bytes = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ne01) * sizeof(float);
+                    const size_t activation_row_bytes = static_cast<size_t>(ne00) * sizeof(float);
+                    // A view can place src1's rows a stride apart; one block of ne11 rows would then read the bytes
+                    // between them.
+                    const bool   src1_rows_adjacent   = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);
                     if (activation && ids_device && src1_device_base && dst_device_base &&
                         slices.activation_f32.bytes == activation_bytes && slices.output_f32.bytes == output_bytes &&
                         completion->bundle.mark_possible_submit()) {
@@ -87603,10 +87615,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 throw moe_direct_submit_failure{};
                             }
 #endif
+                            // Adjacent rows go as one block. Strided rows go one by one into the dense slice, each
+                            // copy depending on the one before, so the kernel's one dependency, the last copy, covers
+                            // every row.
                             sycl::event dependency = ggml_sycl::mem_copy_ptr_async(
-                                activation, src1_device_base, activation_bytes, *exact_queue,
+                                activation, src1_device_base,
+                                src1_rows_adjacent ? activation_bytes : activation_row_bytes, *exact_queue,
                                 retained_table.has_ready_event ? std::vector<sycl::event>{ retained_table.ready_event }
                                                                : std::vector<sycl::event>{});
+                            for (int64_t row = 1; !src1_rows_adjacent && row < ne11; ++row) {
+                                dependency = ggml_sycl::mem_copy_ptr_async(
+                                    activation + row * ne00, src1_device_base + row * nb11, activation_row_bytes,
+                                    *exact_queue, std::vector<sycl::event>{ dependency });
+                            }
                             mmvq_q1_nvfp4_admitted_buffers buffers{
                                 slices.activation_q8.ptr, slices.activation_q8.bytes,
                                 static_cast<float *>(slices.output_f32.ptr), slices.output_f32.bytes };
