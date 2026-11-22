@@ -132,7 +132,7 @@ digraph dependencies {
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
-    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5;
+    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5; 6f5 -> 6g;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -1085,7 +1085,7 @@ census cannot reach. Summary: `docs/backend/data/inkling2/bops-census-b50.tsv` (
 | A3 | `MUL_MAT(type_a=q6_K,type_b=f32,m=1000,n=21,k=4608,...,weights=1)` | abort through `SYCL_CHECK` at `ggml-sycl.cpp:58188` | the f16 dequant arm resolves the SoA plane, then asks for it a second time through a stricter lookup that refuses it | 6f-3 |
 | A4 | `CONV_1D_DW(ne_input=[64,16,1,1],ne_kernel=[3,1,16,1],type_kernel=bf16,stride=1,padding=0,dilation=1)` | abort, `ggml-sycl.cpp:57051` | `supports_op` never checks the type of MUL_MAT's src1; no route reads a bf16 src1 | 6f-2 |
 | A5 | `MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0)` | abort, `ggml-sycl.cpp:92331` | a 1 GiB activation staging allocation fails and the caller aborts instead of refusing | 6f-2 |
-| F1 | `MUL_MAT_ID(...,skip=1)`, 15 cases, and one q4_K case with `m_v=80` | FAIL (graph compute returns FAILED) | an expert id of -1 means "skip this slot, zero the row" upstream; the fork's resolver throws on it. The `m_v` case is an expert table inside a strided view | 6g; the `m_v` decline is in 6f-2 |
+| F1 | `MUL_MAT_ID(...,skip=1)`, 15 cases before the op aborted at A5 (185 exist, the backend admits 111), and one q4_K case with `m_v=80` | FAIL (graph compute returns FAILED) | an expert id of -1 means "skip this slot, zero the row" upstream; the fork's resolver throws on it. The `m_v` case is an expert table inside a strided view | 6g; the `m_v` decline is in 6f-2 |
 | F2 | `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,...)` | FAIL (graph refused before submission) | the f16 arm sizes one f16 copy of the whole src1; without a model plan the runtime zone cannot hold 128.5 MB | 6g |
 | F3 | `FLASH_ATTN_EXT` with `hsk=64,hsv=72` and with `hsk=128,hsv=96` | FAIL; the second case **writes past dst** (sentinel mismatch) | the support predicate checks only the key head size; the kernels index V with it | 6f-1 |
 | F4 | `PAD_REFLECT_1D(type=f32,ne_a=[2,16777217,1,1],pad_0=1,pad_1=1,view=0)` | FAIL, one row written | `dpct::dim3` multiplies in `unsigned`: 16777217 x 256 wraps to 256 work-items | 6f-1 |
@@ -1569,30 +1569,104 @@ its two sites.
 
 ### Task 6g: Skipped expert ids and a src1 larger than the f16 buffer (F1, F2)
 
-**Track:** F. **Depends on:** Task 6f-4. **Not a Stage 1 exit gate**, unless step 1 below says a real model reaches
-F1.
-**Status:** recorded 2026-11-22; written out to the Task Detail Standard before it starts.
-**F1, what is known:** upstream `701fd25b3` (#26631) gave `MUL_MAT_ID` a meaning for a negative id: skip the slot,
-and the output row is zero (`ggml.h:1385`, `ggml.c:3423`, CPU `ggml-cpu.c:1696-1700`). Upstream's SYCL backend
-implements it (`k_zero_dst_rows`, skipped rows in `mmid_counting_sort_rows`). The fork's
-`build_moe_resolved_batch` (`moe-resolved-batch.hpp:1013`) passes -1 to the resolver, which throws
-(`ggml-sycl.cpp:85192`), and the graph fails. The only producer of -1 ids found is
-`src/llama-moe-cache.cpp:940-958` (`cpu_ids`, upstream's MoE cache).
-**Step 1 (read-only, before anything else):** does this fork ever enable `llama_moe_cache`, and can a graph it
-builds reach the SYCL `MUL_MAT_ID` executor? If yes, F1 is reachable with a real model and this task moves ahead
-of Task 9.
-**F1, direction:** the batch builder records occurrences with a negative id in a skip list and never asks the
-resolver or the memo about them; the executor zeroes those destination rows with one kernel on the stream,
-event-chained; the token-generation id kernels are audited for the same rule (`mmvq.cpp:7963`, `:9056` skip a
-negative id; whether every route also zeroes the row is not verified).
-**F2, what is known:** the graph-entry walk sizes an f16 copy of the whole src1 (`ggml-sycl.cpp:112571-112575`)
-and refuses the graph when the runtime zone cannot hold it (`:112612-112632`). A decode never reaches this:
-`n_ubatch` bounds src1. An unplanned graph (a multimodal encoder) might.
-**F2, direction:** tile the f16 arm over src1 columns so each tile fits the planned f16 buffer or the zone's free
-space, and size the walk's demand by one tile. The same tiling answers A5 properly: Task 6f-2 only turns that
-abort into a refusal.
-**Not verified:** whether the fork enables `llama_moe_cache`; whether every token-generation id kernel zeroes a
-skipped row; whether any multimodal encoder graph reaches F2.
+**Track:** F. **Depends on:** Task 6f-4 (and Task 6f-5 for 6g-3). **Not a Stage 1 exit gate.**
+**Status:** groundwork done 2026-11-22 (read-only, at `146cfcfcc`; line numbers below are that tree's and move with
+Tasks 6f-2, 6f-3 and 6f-5, which edit the same file). It is three tasks. Each is written out to the Task Detail
+Standard, against the tree it will start from, before it starts.
+
+**Step 1, answered: no real model on this backend builds a negative expert id.**
+- The only producer is `cpu_ids` in upstream's MoE cache (`src/llama-moe-cache.cpp:942`, filled from a `cpu_map`
+  of -1). The cache is off unless `--moe-cache-mib` is passed, and `cpu_ids` also needs `--moe-cache-cpu-share`.
+- `llama_moe_cache::get_cpu_map` (`src/llama-moe-cache.cpp:707-724`) returns `nullptr` when any device answers
+  `ggml_backend_offload_op` for a `MUL_MAT_ID` probe, and the SYCL backend answers yes for every `MUL_MAT_ID`
+  (`ggml-sycl.cpp:124746`). So with this backend `cpu_ids` is never built, and `--moe-cache-cpu-share` does
+  nothing. That agrees with the placement ruling: the unified cache places the experts, not a second cache.
+- So F1 is a `test-backend-ops` failure only, and Task 6g stays behind Task 9.
+- Checked and never negative: the cache's `slots` (empty value is `n_slots`), granite-switch (clamps at 0), the
+  mtmd MoE ids (`ggml_top_k`), and the `ggml_add_id` calls (`selected_experts`).
+
+**How many cases.** `support -b SYCL0` on Task 6f-2's build lists 185 `MUL_MAT_ID` cases with `skip=1`; the
+backend admits 111 of them. The census saw 15 fail because the op aborted at A5 first. With Task 6f-2 merged, all
+111 run and fail; Task 6f-4 counts them as F1. The 36 `ADD_ID` cases with `skip=1` are admitted and pass
+(`add-id.cpp` skips an id outside `[0, ne11)`).
+
+#### Task 6g-1: `MUL_MAT_ID` skips a slot whose id is -1 and zeroes its row (F1)
+
+**The contract** (`ggml/include/ggml.h:1385`, upstream `701fd25b3`): an id of -1 skips the slot and zeroes the
+matching row of the result. Upstream's SYCL backend does it with a `k_zero_dst_rows` kernel over the skipped rows
+and a `stream->memset` in its single-expert loop.
+**What the fork does today (all from the code):**
+- `build_moe_resolved_batch` (`moe-resolved-batch.hpp:1062`, `:1090`) hands every id to the resolver, -1
+  included. The resolver finds no entry and the callers throw `ggml_sycl_fallback_error` (`ggml-sycl.cpp:85237`,
+  `:85242`, `:87061`); graph compute returns FAILED. That throw is the only thing that keeps a -1 out of the
+  kernels below.
+- No SYCL route zeroes the row of a skipped slot.
+- Kernels in `mmvq.cpp` that index `expert_ptrs[expert_id]` with no check: `:6218` (MXFP4), `:9661`, `:10062`,
+  `:11212` (gate/up), and `:9273` (bias at `expert_id * gate_bias_nb1`). Two weighted-down kernels (`:7963`,
+  `:9056`) already skip a negative id, which is right for them because they accumulate a sum.
+- The per-expert fallback asserts `i02 >= 0 && i02 < n_as` (`ggml-sycl.cpp:89957`): an abort if a -1 gets there.
+- With no plan and `allow_materialize`, the route resolver computes `src0->data + (size_t) expert_id *
+  expert_size` (`:6992`): out of bounds for -1.
+**Rulings (lead):**
+1. The host batch builder is where a -1 is recognised. It puts the (token, slot) pair on a skip list and asks
+   neither the resolver nor the memo about it. Any other id outside `[0, n_as)` stays the refusal it is today.
+2. The executor zeroes the skipped destination rows with one kernel on the stream, chained on the events of the
+   node. No host wait and no host write into a device buffer.
+3. A device kernel that reads ids itself cannot refuse, so it treats any negative id as "skip" and never indexes
+   with it. Every unchecked site above gets the check in this task.
+4. Order of commits: the kernel checks and the per-expert assert's replacement land **before** the builder stops
+   throwing. Otherwise one commit of the series lets a -1 reach an unchecked index.
+**Done when:** the 111 admitted `skip=1` cases print OK on the B50 and none prints FAIL on the B70; a source
+contract lists every `expert_ptrs[...]` index in `mmvq.cpp` and requires a guard above each; the GPT-OSS B50 gate
+and both Mistral gates pass.
+
+#### Task 6g-2: The f16 dequant arm tiles a src1 that does not fit its buffer (F2)
+
+**What the fork does today:**
+- The graph-entry walk `ggml_sycl_dequant_f16_ensure_for_graph` (`ggml-sycl.cpp:112626`) skips a node whose src1
+  has one row, asks the router, and takes `ggml_nrows(src1) * src1->ne[0]` as the demand (`:112687`), the whole
+  src1 across all batches. It keeps the largest per device and ensures `max(planned, demand)` (`:112729`). When
+  the RUNTIME zone cannot hold it the graph is refused before submission (`:112738`) and graph compute returns
+  `GGML_STATUS_ALLOC_FAILED`.
+- The legacy arm `ggml_sycl_op_mul_mat_sycl` takes `src1_ncols * ne10` halves (`:56013-56018`), converts with
+  `to_fp16_sycl` and calls `DnnlGemmWrapper::row_gemm`. Its caller already loops over src1 columns
+  (`ggml_sycl_op_mul_mat`, `:57746-57749`) with src1 and dst offset per step, but the stride is the whole `ne11`
+  unless the op is split over devices.
+- The unified route inside `ggml_sycl_mul_mat` sizes `M * K` for the whole src1 (`:76496`, `:76541`) and has no
+  column loop.
+- There is one f16 src1 buffer per context per device. A failed acquire during execution is
+  `ggml_sycl_dequant_f16_plan_breach`, which aborts; the walk exists so that this cannot happen.
+- oneDNN: `row_gemm` keys its primitive on `n` among others (`gemm.hpp:356-385`). A tile width is one more cached
+  primitive, at most two per shape (full tile and remainder).
+**Who can reach it.** A decode cannot: `n_ubatch` bounds src1 and the plan covers it. `test-backend-ops` has no
+plan, so the target is the raw demand (the F2 case needs 128.5 MB). The multimodal projector runs its graphs
+through the scheduler on this backend (`tools/mtmd/mtmd-subcontext.cpp`), and its src1 columns are patches, not
+`n_ubatch`; whether any projector graph exceeds the zone is **not verified**. If a Stage 1 Inkling run prints
+`[DEQUANT-F16] graph refused before submission`, this task moves ahead of Task 9.
+**Rulings (lead):**
+1. The walk decides a tile width per device and the consumers obey it. The width is the whole src1 whenever the
+   zone grants that buffer, so nothing that runs today changes shape or speed. Otherwise it is the largest column
+   count whose f16 copy the zone grants; the graph is refused only when one column does not fit.
+2. The demand is per (i03, i02) plane, which is what the consumer converts at a time, not the whole tensor.
+3. Tiles reuse the one buffer. The stream is in order, so tile i's GEMM runs before tile i+1's conversion
+   overwrites the buffer; no wait is added.
+4. The unified route gets the same column loop. Sending a tiled node to the legacy arm instead would be a
+   re-route for a layout the route already reads, which the layout ruling forbids.
+**To settle when it is written out:** how the walk learns the largest buffer the zone will grant without probing
+with failed allocations (the unified cache tracks `largest_free_block` for its residency plan; whether the
+RUNTIME zone exposes it is not checked).
+**Done when:** the F2 case prints OK on the B50; a decode graph's tile width is the whole src1 (asserted by a host
+test on the walk's arithmetic); the GPT-OSS B50 gate and both Mistral gates pass, with PP512 and TG128 on the B50
+inside the baseline's noise.
+
+#### Task 6g-3: `MUL_MAT_ID` prompt staging tiles over tokens (A5's proper fix)
+
+**Depends on:** Task 6f-5 (the same loop, and its retention of leases on an unwind).
+**What is known:** the staging buffer is `ids->ne[1] * n_ids` rows of `nb11` bytes (`ggml-sycl.cpp:90703-90704`),
+and the destination staging is the whole dst in float (`:92381`). Task 6f-2 turns the failed allocation into a
+refusal; the graph still does not run.
+**Direction:** tile over tokens (`ids->ne[1]`), `n_tok * n_ids` rows per tile, by the same rule as Task 6g-2.
+**Done when:** the A5 case prints OK on the B50, and the gates of Task 6g-2 pass.
 
 ---
 
