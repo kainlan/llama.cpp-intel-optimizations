@@ -86829,7 +86829,6 @@ template <size_t N>
 #    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) false
 #endif
 
-
 // The device-built MUL_MAT_ID schedule (upstream 18c5a95e2, fused-gemm.cpp), GGML_SYCL_MMID_SCHED, default 0. It takes
 // a prompt op whose experts are all planned on this device in the AOS layout, in upstream's f32/i32 layout. Its four
 // scratch tables must fit ceilings the planner names for them (mmid-sched-admission.hpp). The planner reserves no such
