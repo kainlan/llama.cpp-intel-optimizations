@@ -1549,7 +1549,7 @@ functions take that effect before their own cache locks. Under it,
 which takes the registry mutex and then the pool mutexes. A snapshot it drops
 holds a plain-data plan, so that destructor takes no lock. MUL_MAT_ID's
 republication into an empty snapshot also takes it under graph compute's L2 and
-L3 locks: see the into-empty bullet below.
+L3 locks: see the graph-compute bullet below.
 
 The MMID workspace registry's `moe_mmid_workspace_registry::state::mutex`
 (`moe-mmid-workspace.cpp`, one process registry) is **L4**. It cannot take L3 or a
@@ -1582,7 +1582,8 @@ take no listed lock themselves.
 Four existing paths still break this section's rules under these locks. All four
 are known non-conformances, not exemptions.
 
-- **Into-empty republication takes L1 under L2 and L3.**
+- **Graph compute takes L1 under L2 and L3.** The into-empty republication
+  is the site that carries further locks with it.
   `ggml_sycl_republish_current_plan_into_empty` takes `g_tensor_inventory_mutex`
   (L1) and then `g_lifecycle_plan_mutex`. Two sites call it while graph compute
   holds `g_sycl_graph_compute_mutex` (L2) and `sycl_ctx->graph_mutex` (L3): the
@@ -1593,9 +1594,29 @@ are known non-conformances, not exemptions.
   - The secondary-queue setup also reaches it under its function-local
     `static std::mutex init_mutex`. That lock is unranked, taken under L2 and
     L3, and itself takes L1.
+  - The layer map takes L1 under a second unranked lock. Both
+    `ggml_backend_sycl_graph_compute_impl` and `should_dispatch_to_cpu` take the
+    file-static `g_layer_map_mutex` and, under it, call `build_layer_device_map`,
+    which takes L1. Like `init_mutex`, that lock is taken under L3 and itself
+    takes L1. It is never taken under L1. Its other acquisitions are
+    `should_dispatch_to_cpu`'s per-layer classification and
+    `ggml_sycl_reset_layer_map_state`. The reset runs from
+    `ggml_sycl_reset_model_load_scratch_state` after that function's L1 block
+    has closed.
   - The data-pointer slow path (`ggml_sycl_get_data_ptr_slow` to
     `get_cached_tensor_ptr`) takes L1 from graph compute for an index lookup and
-    takes nothing under it.
+    takes nothing under it. Two other callers of `get_cached_tensor_ptr` run
+    under graph compute: `ggml_sycl_ensure_weight_on_device` (its tiered-cache
+    fallback) and `graph_prestage_leaf_tensors`.
+  - The budget log takes L1 for reads. After the first warmup,
+    `ggml_backend_sycl_graph_compute_unchecked` calls
+    `unified_cache_log_budget_summary`. That calls `ggml_sycl_get_model_size` and
+    `ggml_sycl_get_moe_info`, and each takes L1.
+  - On the `compute_impl_unlocked` path, graph compute releases
+    `g_sycl_graph_compute_mutex` (L2) before it computes. `sycl_ctx->graph_mutex`
+    (L3) stays held for the whole of
+    `ggml_backend_sycl_graph_compute_unchecked`. On that path every site in this
+    bullet takes L1 under L3 alone.
   - The ranks above (plan mutex L3, registry mutex L4, pool mutexes L5) hold on
     every other path.
   - No rank removes the inversion. At L3 the plan mutex is a global co-held with
@@ -1606,11 +1627,18 @@ are known non-conformances, not exemptions.
   - Moving the republication to a graph boundary, as the expert loan does, is
     owed work.
   - **No holder of L1 acquires L2 or L3, so the inversion cannot close a cycle
-    today.** Searched: all 35 acquisitions of `g_tensor_inventory_mutex`, each
-    walked five call levels deep, matching callees by name. The search looked
-    for an acquisition of `g_sycl_graph_compute_mutex` or
-    `sycl_ctx->graph_mutex`, a backend `graph_compute` entry, a read of the
-    graph in-flight counter, a synchronize call, and an event or condition wait.
+    today.** No holder of L1 acquires either unranked lock above. Searched on
+    2026-11-22: every `lock_guard`, `unique_lock` or `scoped_lock` on
+    `g_tensor_inventory_mutex` in `ggml/src/ggml-sycl`, each walked five call
+    levels deep, matching callees by name. The search looked for these:
+    - an acquisition of `g_sycl_graph_compute_mutex`, `sycl_ctx->graph_mutex`,
+      `g_layer_map_mutex` or `init_mutex`;
+    - a call to a function that takes `g_layer_map_mutex` or `init_mutex`;
+    - a call to the into-empty republication;
+    - a backend `graph_compute` entry;
+    - a read of the graph in-flight counter;
+    - a synchronize call;
+    - an event or condition wait.
     L2 and L3 are taken only in `ggml_backend_sycl_graph_compute_unchecked`, and
     none of those walks reaches it. The waits reached under L1 wait for one of
     three things: submitted device work, the retained-handle drain worker
