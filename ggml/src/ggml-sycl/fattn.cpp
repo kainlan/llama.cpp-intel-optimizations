@@ -2755,6 +2755,14 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // No flash-attention route in this backend is written for a value head size that differs from the key head size:
+    // the vec and tile kernels index V with D, which leaves part of each dst row unwritten (DV > D) or writes past
+    // dst (DV < D). The D=512 tile route checks DV itself, the D=512 oneDNN route does not, so the decline holds for
+    // every D.
+    if (V->ne[0] != D) {
+        return false;
+    }
+
     // MMA kernel handles high head counts (>32), vec kernel handles <=32
     // Both are now supported
 
