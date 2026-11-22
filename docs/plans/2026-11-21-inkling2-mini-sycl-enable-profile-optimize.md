@@ -80,7 +80,7 @@ of `1dcdf49b1`): `git -C <wt> switch -c feat/inkling2 master`. Implementers work
 | B (scripts) | 6, 6b, 10, 10b, 11 | `inkling` gate; GPT-OSS gate without `-ngl`; profile runner; atomic lock takers; scheduler-census parser |
 | C (planner rate, docs) | 13, 16 | Profile document; measured CPU expert rate row |
 | D (backend failure path) | 7a, 7d, 7b, 7c | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21); a failed context gives its device back |
-| E (inherited regression) | 6c, 6d | GPT-OSS 20B at the default context loses the B50: spike, then the COMPUTE-flag fix (found 2026-11-21). 6e, the exit path, is on Track D |
+| E (inherited regression) | 6c, 6d, 6h | GPT-OSS 20B at the default context loses the B50: spike, then the COMPUTE-flag fix (found 2026-11-21). 6e, the exit path, is on Track D |
 | F (`test-backend-ops`, inherited) | 6f-1, 6f-2, 6f-3, 6f-4, 6g | The suite aborts on the B50 and one case writes out of bounds (found 2026-11-22 by Task 6d's acceptance run). 6f-1 touches four kernel files only and runs beside Track D; 6f-2 and 6f-3 queue on `ggml-sycl.cpp` |
 
 **Amended 2026-11-21, after Task 1 ran and the two spikes concluded.** Task 1 ended red at an old defect
@@ -112,6 +112,7 @@ digraph dependencies {
     6f3 [label="T6f-3 q6_K f16 arm uses the plane it resolved"];
     6f4 [label="T6f-4 trustworthy census (lead)"];
     6g [label="T6g skipped expert ids; f16 src1 tiling"];
+    6h [label="T6h staging walks skip not-computed nodes"];
     7a [label="T7a async error fails the boundary"];
     7d [label="T7d failed context gives its device back"];
     7b [label="T7b every queue has the handler"];
@@ -130,7 +131,7 @@ digraph dependencies {
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
-    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g;
+    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -899,9 +900,9 @@ is caught at `ggml-sycl.cpp:93362`: a lost device must end in an error return or
 2026-09-27); no GPU kernel reads host memory; an op runs where its data is; a missing kernel for a layout is
 written, not routed around.
 
-**Until it is fixed:** every run of the GPT-OSS gate without `-c` on the B50 faults the card and resets the
-engine. Do not run it as a routine gate. Tasks 7a, 7d, 7b and 7c are accepted on the `-c 4096` arm plus the
-Mistral gate. Task 9's default-context arm stays red until this task's fix lands.
+**Fixed on this branch by Task 6d (merged 2026-11-22 as `8157bf677`):** the gate without `-c` passes on the
+B50 with zero kernel fault lines. From that merge on, Tasks 7d, 7b and 7c are accepted on the documented command.
+`master` (`313fa14e4`) still has the defect: there the command still faults the card.
 
 ---
 
@@ -986,6 +987,52 @@ card). It must show execution without faulting the card, so it uses no out-of-ra
 
 **Commit:** `sycl: a node without the COMPUTE flag is not executed (unselected select branches)`, paths: the
 five files above.
+
+**DONE 2026-11-22, merged as `8157bf677`** (task commits `083d09c1a` tests, `9013f01c2` fix, `3f1cb2f45` and
+`0838e9736` review rounds, `1f068bbc4` test registration). Spec review PASS; quality review PASS with findings;
+two fix rounds, each re-reviewed.
+
+*What the task became.* The predicate alone was not enough:
+- One helper, `ggml_sycl_node_is_computed(node)`, states the rule. The predicate calls it, and so do five walkers
+  that must keep views and therefore cannot call the predicate (the block-exec alias walk and publish, and the
+  persistent plan's recipe replay, fast path and full build).
+- The persistent token-generation plan (opt-in, `GGML_SYCL_PERSISTENT_TG`) is keyed to the graph's selection: a
+  hash over the node count and one computed bit per node, stored beside the plan and compared before any cached
+  path. A different selection rebuilds.
+- The persistent split plan (opt-in twice, `GGML_SYCL_PERSISTENT_SPLIT`) lists weights of computed MUL_MAT nodes
+  only, and rebuilds its secondary ops when the primary plan was rebuilt instead of updated.
+- The source contract (`tests/test-sycl-compute-flag-source.py`) counts every function that calls
+  `ggml_sycl_compute_forward(`: 9 functions, 7 guarded, 2 allowlisted with reasons. It fails closed on a
+  dispatch call outside a parsed function and on a census below its floor. 18 mutants and one control that
+  must still pass.
+- Accepted limits of that contract (it parses text, not C++): a string literal containing `//` or `/*` would
+  be read as a comment, and a block comment holding `//` before its `*/` would lose its end. The file has
+  neither; both would show as a failed claim or a census below the floor, not as a false pass. A guard that
+  sits in a function but off its dispatch path satisfies the census: the granularity is one function.
+- The rule is one sentence in `.claude/rules/sycl-backend.md`.
+
+*GPU, one run per arm at `1f068bbc4`:* the device test passes on the B50 and the B70 (it printed
+`FAIL: the unselected branch was executed` for both cases on the tree before the change); Mistral gates on both
+cards; **the GPT-OSS B50 gate without `-c`: rc 0, answer line 1, no device loss, zero kernel fault lines**, with a
+Mistral B50 health arm before and after it; the `-c 4096` control; the GPT-OSS B70 gate. Logs:
+`docs/backend/data/inkling2/t6d-*`.
+- The first run of these checks (at `9013f01c2`) lacked the Mistral health arm after the default-context gate,
+  which this task's acceptance asks for. It was added from the second run on.
+
+*Bench, B50 Mistral `-p 512 -n 128`, interleaved A B B A, parent against `9013f01c2`:* parent 1337.0 / 46.10 and
+1334.9 / 46.00; fix 1344.0 / 46.05 and 1342.4 / 45.99 (PP512 / TG128, t/s). Prompt processing is about 0.5%
+faster, token generation is unchanged. The host load was about 5 during the runs, far below its usual level:
+these are a paired comparison, not baselines.
+
+*`test-backend-ops` on the B50:* aborts, identically on the fix build and on its parent (per-op census of 130
+ops, same return code and counts for every op). Nothing in it comes from this task. It is Task 6f.
+
+*Not exercised by any vehicle:* the two persistent-plan changes. A Mistral B50 arm with
+`GGML_SYCL_PERSISTENT_TG=1` passed on both builds, but its policy line reads `eligible=0`: the persistent plan
+never engaged, so the arm says nothing about the selection key. The source contract is the only gate for it.
+
+*Left open, recorded as Task 6h below:* walks that stage or count the sources of a not-computed node, and two
+neighbours of the defect that this task was told not to touch.
 
 ---
 
@@ -1367,6 +1414,26 @@ skipped row; whether any multimodal encoder graph reaches F2.
 
 ---
 
+### Task 6h: Walks that stage or count a not-computed node's sources (recorded 2026-11-22)
+
+**Track:** E. **Depends on:** Task 6d. **Not a Stage 1 exit gate.**
+**Status:** recorded from Task 6d's audit and reviews; written out to the Task Detail Standard before it starts.
+**What is known:** Task 6d stops the backend from executing a node the graph did not select. Some walks still
+look at such a node's sources before execution: `graph_prestage_leaf_tensors`,
+`ggml_sycl_graph_stage_source_count`, the block-exec preblock staging, `missing_leaves` and
+`graph_prestage_or_decline`. They can stage, count or decline on behalf of work that will not run. The cost is
+wasted staging or a wrong decline, not a wrong result: nothing they stage is read by a skipped node.
+**Two neighbours, to be ruled on when this task is written:**
+- The MoE segment cache (near `ggml-sycl.cpp:121876`) is not keyed to the selection the way the persistent plan
+  now is. Its record and replay loops are protected by the guard in `moe_graph_dispatch_direct_node`; whether a
+  cached segment can describe another selection has not been checked.
+- `ggml_backend_sycl_device_supports_buft` accepts a `SYCL_Host` buffer, so in a graph with no CPU work the device
+  reads a host input in place (Task 6c, cause, sixth bullet). That is against "no GPU reads of host memory".
+**Done when:** each walk applies `ggml_sycl_node_is_computed`, the source contract's census covers them, and the
+two neighbours each have a ruling with its evidence.
+
+---
+
 ### Task 7a: An asynchronous error on the execution queue fails the next graph boundary instead of terminating
 
 **Track:** D (an implementer makes the host-side edits and host tests; the lead runs the GPU checks)
@@ -1431,6 +1498,10 @@ a handled queue destroyed with an undelivered error drops it silently.
 
 ### Task 7d: A failed context that is torn down without a synchronize gives its device back
 
+**Track:** D, after Task 7a and before Task 7b (same file). **Depends on:** Task 7a merged.
+**Written out:** 2026-11-22, against `095adc712`. Line numbers below are from that commit and move by a few lines
+after the Task 6d merge: find each function by name.
+
 **Step 0, added 2026-11-22 (Task 7a's commit 5 has no device test yet):** behind
 `GGML_SYCL_Q1_NVFP4_ROUTE_TESTING`, a test seam that keeps a second `shared_ptr` to the route's `completion`
 object alive past the host task (what a copied functor would do). The oracle runs case 7 once more with the seam
@@ -1438,10 +1509,6 @@ armed and asserts the same end state: `invocation_id == 0 && busy_device_count =
 synchronize. With commit 5 reverted in a scratch build the armed case must fail; the implementer shows that with
 the source-contract mutant, the lead with one B50 run of the scratch binary only if the implementer's build of
 it is at hand. The seam compiles out of a production build.
-
-**Track:** D, after Task 7a and before Task 7b (same file). **Depends on:** Task 7a merged.
-**Written out:** 2026-11-22, against `095adc712`. Line numbers below are from that commit and move by a few lines
-after the Task 6d merge: find each function by name.
 
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: one forward declaration, one new helper, and the three release paths
@@ -1878,9 +1945,8 @@ done
 
 **Added 2026-11-21 (each line is still one run; none is repeated):**
 - [ ] The `--gate all` run on the B50 above runs the GPT-OSS gate without `-c` and without `-ngl` (Task 6b). It was
-      first run on 2026-11-21, ahead of this task, and faults the card (Task 6c). Do not run it here until Task 6c's
-      fix has merged. Then record its `[LOAD-PLAN]` n_ctx line and its `[LOAD-PLAN] compute slot` line beside the
-      verdict.
+      first run on 2026-11-21, ahead of this task, and faulted the card (Task 6c). Task 6d fixed that and merged on
+      2026-11-22. Record its `[LOAD-PLAN]` n_ctx line and its `[LOAD-PLAN] compute slot` line beside the verdict.
 - [ ] Control arms, B50: the GPT-OSS gate command with `-c 4096` added, and the Mistral gate command with `-c 4096`
       added. Each must pass and print `[LOAD-PLAN]` with `n_ctx 4096` (Task 2: the measure follows the request).
 - [ ] Throughput A/B for the whole stage (Task 2 changes every bench's load; Task 7a changes how the execution queue
@@ -2901,9 +2967,10 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
   out-of-bounds device write. Two things stay open after them and are stated, not hidden: a MUL_MAT whose src1 is
   BF16 is declined to the CPU backend (no route reads one; a kernel to write when a model needs it), and Task 6g's
   two failing cases (negative expert ids, a src1 larger than the f16 buffer).
-- **The GPT-OSS gate without `-c` faults the B50 on this branch and on `master`** (Task 6c, found 2026-11-21). It is
-  a regression inherited from `master`, hidden there by a `-c 4096` pin. It blocks the Stage 1 exit (Task 9) and is
-  not yet diagnosed. The command in `CLAUDE.md` is that command: on the B50 it resets the engine each time.
+- **The GPT-OSS gate without `-c` faults the B50 on `master`** (Task 6c, found 2026-11-21). It is a regression from
+  the upstream sync, hidden there by a `-c 4096` pin: the backend ran graph nodes the graph had not selected.
+  Task 6d fixes it on this branch (merged 2026-11-22). `master` keeps the defect until this branch, or that fix
+  alone, is taken there: on `master` the command in `CLAUDE.md` still resets the B50's engine each time.
 - **Two async-error gaps remain after Task 7c** (both recorded with file:line in the 7a/7b/7c specification, both
   need a tracker task). First, a context reads only its own device's failure slot and the shared one: an error on
   work it submitted to ANOTHER device's execution queue (`GGML_SYCL_MOE_MULTI_GPU`, tensor-parallel, split, the
