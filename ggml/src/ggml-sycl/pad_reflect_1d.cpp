@@ -1,47 +1,61 @@
 #include "pad_reflect_1d.hpp"
 
-static void pad_reflect_1d_kernel_f32(
-    const void *__restrict__ src0, void *__restrict__ dst, const int64_t ne0,
-    const int64_t ne00, const sycl::uint3 ne01, const int64_t ne02,
-    const int64_t ne03, const int64_t nb00, const int64_t nb01,
-    const int64_t nb02, const int64_t nb03, const int64_t nb0,
-    const int64_t nb1, const int64_t nb2, const int64_t nb3, const int p0,
-    const int p1, sycl::nd_item<3> item_ct1) {
+#include <climits>
 
+static void pad_reflect_1d_kernel_f32(const void * __restrict__ src0,
+                                      void * __restrict__ dst,
+                                      const int64_t     ne0,
+                                      const int64_t     ne00,
+                                      const sycl::uint3 ne01,
+                                      const int64_t     ne02,
+                                      const int64_t     ne03,
+                                      const int64_t     nb00,
+                                      const int64_t     nb01,
+                                      const int64_t     nb02,
+                                      const int64_t     nb03,
+                                      const int64_t     nb0,
+                                      const int64_t     nb1,
+                                      const int64_t     nb2,
+                                      const int64_t     nb3,
+                                      const int         p0,
+                                      const int         p1,
+                                      const int64_t     n_groups0,
+                                      sycl::nd_item<3>  item_ct1) {
     const int64_t i3 = item_ct1.get_group(0);
     const int64_t i2 = item_ct1.get_group(1);
-
-    const sycl::uint2 div_mod_packed =
-        fast_div_modulo(item_ct1.get_group(2), ne01);
-    const int64_t tile1 = div_mod_packed.y();
-    const int64_t tile0 = div_mod_packed.x();
-    const int64_t i1 = tile1;
-    const int64_t i0 =
-        item_ct1.get_local_id(2) + tile0 * item_ct1.get_local_range(2);
-
-    if (i0 >= ne0 || i1 >= ne01.z() || i2 >= ne02 || i3 >= ne03) {
+    if (i2 >= ne02 || i3 >= ne03) {
         return;
     }
 
-    const char *src0_ptr =
-        (const char *)src0 + i3 * nb03 + i2 * nb02 + i1 * nb01;
-    char *dst_ptr = (char *)dst + i3 * nb3 + i2 * nb2 + i1 * nb1;
+    // The launcher caps dimension 2. A work-group serves every row tile congruent to its own index.
+    // fast_div_modulo takes a uint32_t: a tile count above 2^32 needs a tensor larger than either card.
+    for (int64_t g = item_ct1.get_group(2); g < n_groups0; g += (int64_t) item_ct1.get_group_range(2)) {
+        const sycl::uint2 div_mod_packed = fast_div_modulo((uint32_t) g, ne01);
+        const int64_t     i1             = div_mod_packed.y();
+        const int64_t     i0             = item_ct1.get_local_id(2) + div_mod_packed.x() * item_ct1.get_local_range(2);
+        if (i0 >= ne0 || i1 >= ne01.z()) {
+            continue;
+        }
 
-    const int64_t rel_i0 = i0 - p0; // relative i0 in src0
-    int64_t src_idx;
+        const char * src0_ptr = (const char *) src0 + i3 * nb03 + i2 * nb02 + i1 * nb01;
+        char *       dst_ptr  = (char *) dst + i3 * nb3 + i2 * nb2 + i1 * nb1;
 
-    if (rel_i0 < 0) {
-        // Left padding - reflect
-        src_idx = -rel_i0;
-    } else if (rel_i0 < ne00) {
-        // Middle - copy
-        src_idx = rel_i0;
-    } else {
-        // Right padding - reflect
-        src_idx = 2 * ne00 - 2 - rel_i0;
+        const int64_t rel_i0 = i0 - p0;  // relative i0 in src0
+        int64_t       src_idx;
+
+        if (rel_i0 < 0) {
+            // Left padding - reflect
+            src_idx = -rel_i0;
+        } else if (rel_i0 < ne00) {
+            // Middle - copy
+            src_idx = rel_i0;
+        } else {
+            // Right padding - reflect
+            src_idx = 2 * ne00 - 2 - rel_i0;
+        }
+        const float value               = *(const float *) (src0_ptr + src_idx * nb00);
+        *(float *) (dst_ptr + i0 * nb0) = value;
     }
-    const float value = *(const float *)(src0_ptr + src_idx * nb00);
-    *(float *)(dst_ptr + i0 * nb0) = value;
 
     GGML_UNUSED(p1);
 }
@@ -71,9 +85,15 @@ void ggml_sycl_op_pad_reflect_1d(ggml_backend_sycl_context & ctx, ggml_sycl::syc
 
     constexpr int64_t bx = SYCL_PAD_REFLECT_1D_BLOCK_SIZE;
     const int64_t tiles0 = (ne0 + bx - 1) / bx;
-    const dpct::dim3 grid_dims((unsigned)(ne01 * tiles0), (unsigned)ne02,
-                               (unsigned)ne03);
-    const dpct::dim3 block_dims((unsigned)bx, 1, 1);
+    const int64_t        n_groups0   = ne01 * tiles0;
+    // The runtime refuses a global range whose size, or any one dimension of it, exceeds INT_MAX (the default
+    // -fsycl-id-queries-range=int), and dpct::dim3 multiplies in unsigned: 16777217 rows times 256 wrapped to 256
+    // work-items and one row was written. Launch at most max_groups0 groups along dimension 2; the kernel strides over
+    // the rest.
+    const int64_t        max_groups0 = std::max<int64_t>(1, (int64_t) INT_MAX / (bx * ne02 * ne03));
+    const int64_t        launched0   = std::min(n_groups0, max_groups0);
+    const sycl::range<3> local_range(1, 1, (size_t) bx);
+    const sycl::range<3> global_range((size_t) ne03, (size_t) ne02, (size_t) (launched0 * bx));
 
     stream->submit([&](sycl::handler &cgh) {
         auto src0_data_ct0 = src0.resolve_ptr();
@@ -87,15 +107,11 @@ void ggml_sycl_op_pad_reflect_1d(ggml_backend_sycl_context & ctx, ggml_sycl::syc
         auto dst_nb_ct13   = dst.nb(2);
         auto dst_nb_ct14   = dst.nb(3);
 
-        cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) {
-                             pad_reflect_1d_kernel_f32(
-                                 src0_data_ct0, dst_data_ct1, ne0, ne00,
-                                 ne01_packed, ne02, ne03, src0_nb_ct7,
-                                 src0_nb_ct8, src0_nb_ct9, src0_nb_ct10,
-                                 dst_nb_ct11, dst_nb_ct12, dst_nb_ct13,
-                                 dst_nb_ct14, p0, p1, item_ct1);
-                         });
+        cgh.parallel_for(sycl::nd_range<3>(global_range, local_range), [=](sycl::nd_item<3> item_ct1) {
+            pad_reflect_1d_kernel_f32(src0_data_ct0, dst_data_ct1, ne0, ne00, ne01_packed, ne02, ne03, src0_nb_ct7,
+                                      src0_nb_ct8, src0_nb_ct9, src0_nb_ct10, dst_nb_ct11, dst_nb_ct12, dst_nb_ct13,
+                                      dst_nb_ct14, p0, p1, n_groups0, item_ct1);
+        });
     });
 
     GGML_UNUSED(dst_raw);
