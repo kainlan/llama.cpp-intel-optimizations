@@ -132,7 +132,7 @@ digraph dependencies {
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
-    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5; 6f5 -> 6g;
+    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5; 6f5 -> 6g; 6f3 -> 6f6;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -1549,6 +1549,36 @@ both Mistral gates pass.
 
 ---
 
+### Task 6f-6: `MUL_MAT` admits a one-plane non-F32 src1 for a reordered weight (recorded 2026-11-22)
+
+**Track:** F, after Task 6f-3 (same file). **Not a Stage 1 exit gate.** No `test-backend-ops` case and no llama
+graph reaches it: the `weights=1` cases all have an F32 src1, and no model feeds a non-F32 activation to a
+weight matmul.
+**Status:** recorded from Task 6f-2's quality review (traced from the code, not run); written out to the Task
+Detail Standard before it starts.
+**What is known (at Task 6f-2's branch):**
+- Outside the f16 attention chain and the unified-kernel arm, `ggml_sycl_mul_mat_src1_has_reader` admits a
+  non-F32 src1 with one plane. Only the arm that lands on the oneDNN AOS path
+  (`ggml_sycl_op_mul_mat_sycl`) converts such a src1 by its type.
+- DMMV, MMVQ and MMQ require an F32 src1 in their own eligibility checks, and the generic BLAS fallback does
+  too. For a weight in COALESCED or SOA layout the orchestrator prefers the oneDNN AOS arm, sees the layout
+  mismatch, picks a DMMV or MMVQ kernel, and that pick is rejected for the src1 type. The decision comes back
+  invalid and the dispatch ends in `GGML_ABORT("MUL_MAT dispatch failed")`.
+- The XMX GEMM arm (`use_xmx`, opt-in) has no src1 type check: a quantized weight with an F16 src1 could be
+  read as float there. Whether the default build compiles that arm in was not checked.
+- Also from the review, older than Task 6f-2: `is_unified_kernel_enabled_for_device` queries the device on
+  every call, and its one-time log is guarded by a plain `static bool` that scheduler threads can now reach
+  through `supports_op`.
+**Direction (lead):** the layout ruling decides it. A reordered weight is the loaded layout, so the answer is not
+to convert the weight for the oneDNN arm and not to widen what DMMV reads; `supports_op` declines the src1 type
+that no kernel for that layout reads, by asking the orchestrator's own decision for the node (as Task 6f-2 does
+for BF16: an activation type no kernel reads runs elsewhere, and the kernel is written when a model needs it).
+The XMX arm gets the same src1 check as the unified arm. The device query is cached per device at backend init.
+**Done when:** a source contract pins that every arm reachable from the default route either converts src1 by
+type or is declined for a non-F32 src1; the Mistral and GPT-OSS gates pass.
+
+---
+
 ### Task 6f-4: A census that reaches every case (lead)
 
 **Track:** F (lead, GPU). **Depends on:** Tasks 6f-1, 6f-2, 6f-3 merged. Task 6f-5 is not required: no case reaches
@@ -2089,6 +2119,11 @@ none blocking; quality re-review by a fresh reviewer PASS with four nits; all cl
 - `recover_quarantined` copies a vector inside a `noexcept` function: an allocation failure there terminates.
 - `wait_and_confirm()` with `wait=true` would run `terminal->wait()`, which is `event->wait_and_throw()`,
   under the workspace registry and pool mutexes. No caller passes `wait=true` today.
+
+*The merged tree (Tasks 6d, 6f-1, 7a and 7d), built with all targets and run once per arm at `4f8981184`
+(2026-11-22):* the unselected-branch device test and the lifecycle oracle on both cards, the Mistral gate on both
+cards, the GPT-OSS B50 gate without `-c` (rc 0, one answer line, no device loss) and the GPT-OSS B70 gate all
+pass, with zero kernel fault lines and `Shmem` at 9 GB.
 
 ---
 
