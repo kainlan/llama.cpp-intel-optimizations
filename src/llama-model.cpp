@@ -3649,9 +3649,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(
                         format("unable to map %s buffer for model file %u", ggml_backend_buft_name(buft), idx));
                 }
-                ml.sycl_mapped_base_offsets[buf] = base_file_offset;
+                ml.sycl_mapped_base_offsets[buf] = { idx, base_file_offset };
                 bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
             }
 #endif
         } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported &&

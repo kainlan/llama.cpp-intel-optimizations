@@ -535,8 +535,8 @@ def clause_l6_create_tensor_reads_no_use_mmap(t: dict) -> list:
 
 
 def buffer_creation_region(t: dict) -> str:
-    return between(t[LM], "std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;",
-                   "ctx_buf_maps.emplace_back(ctx, buf_map);")
+    return between(t[LM], "std::vector<std::pair<ggml_context *, std::vector<ggml_backend_buffer_t>>> ctx_bufs;",
+                   "ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));")
 
 
 def clause_l7_buffer_creation(t: dict) -> list:
@@ -555,9 +555,11 @@ def clause_l7_buffer_creation(t: dict) -> list:
             problems.append("the SYCL_Mapped branch does not pass the record's excluded_for_file(idx)")
         if "ggml_backend_alloc_ctx_tensors_from_buft" in mapped:
             problems.append("the SYCL_Mapped branch allocates its context")
-        if "sycl_mapped_base_offsets" not in mapped:
-            problems.append("the SYCL_Mapped branch does not record each buffer's base offset for load_all_data")
-    lock = re.search(r"if\s*\(\s*use_mlock\s*&&\s*ggml_backend_buffer_is_host\s*\(\s*buf\s*\)([^)]*)\)", region)
+        if not re.search(r"sycl_mapped_base_offsets\s*\[\s*buf\s*\]\s*=\s*\{\s*idx\s*,", mapped):
+            problems.append("the SYCL_Mapped branch does not record each buffer's file and base offset for "
+                            "load_all_data")
+    lock = re.search(r"if\s*\(\s*use_mlock\s*&&\s*(?:!\s*ml\s*\.\s*no_alloc\s*&&\s*)?ggml_backend_buffer_is_host"
+                     r"\s*\(\s*buf\s*\)([^)]*)\)", region)
     if not lock or "is_sycl_mapped" not in lock.group(1):
         problems.append("the mlock_bufs block does not skip SYCL_Mapped buffers")
     return problems
@@ -604,6 +606,9 @@ def clause_l10_load_all_data(t: dict) -> list:
         if not re.search(r"ggml_backend_tensor_alloc\s*\(\s*\w+\s*,\s*cur\s*,\s*\w+\s*\+\s*\(\s*weight\s*->\s*offs\s*-",
                          tail):
             problems.append("a SYCL_Mapped tensor is not addressed from its buffer base")
+        # the context's buffers are a list, one SYCL_Mapped buffer per file: the tensor's is the one of its file
+        if not re.search(r"\.\s*idx\s*==\s*weight\s*->\s*idx\b", tail.split("continue;")[0]):
+            problems.append("a SYCL_Mapped tensor's buffer is not the one recorded for its file")
         if "lock_range" in tail.split("continue;")[0] or "mmaps_used" in tail.split("continue;")[0]:
             problems.append("the SYCL_Mapped branch grows the loader's lock or mmaps_used")
     return problems
@@ -1028,8 +1033,13 @@ MUTANTS = [
     ("the override's select_weight_buft drops create_tensor's answer", "L3",
      lambda t: _mut(t, LML, r"(buft_list_cpu\s*,\s*false\s*,\s*)planned_file_mapped\s*\)", r"\1false)")),
     ("the mlock block locks SYCL_Mapped buffers", "L7",
-     lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*ggml_backend_buffer_is_host\s*\(\s*buf\s*\))[^)]*\)",
-                    r"\1)")),
+     lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*(?:!\s*ml\s*\.\s*no_alloc\s*&&\s*)?"
+                           r"ggml_backend_buffer_is_host\s*\(\s*buf\s*\))[^)]*\)", r"\1)")),
+    ("the SYCL_Mapped branch records a buffer's base offset without its file", "L7",
+     lambda t: _mut(t, LM, r"sycl_mapped_base_offsets\s*\[\s*buf\s*\]\s*=\s*\{\s*idx\s*,",
+                    "sycl_mapped_base_offsets[buf] = { 0,")),
+    ("load_all_data takes a SYCL_Mapped buffer of any file", "L10",
+     lambda t: _mut(t, LML, r"\.\s*idx\s*==\s*weight\s*->\s*idx\b", ".idx == mapped->second.idx")),
     ("create_tensor's demotion reads use_mmap", "L6",
      lambda t: _mut(t, LML, r"if\s*\(\s*weight_maps_files\s*\(\s*buft\s*,\s*planned_file_mapped\s*\)\s*&&\s*buft_dev",
                     "if (use_mmap && buft_dev")),

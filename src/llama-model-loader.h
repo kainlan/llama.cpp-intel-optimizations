@@ -95,8 +95,14 @@ struct llama_model_loader {
     // §4.3). false on a load with no SYCL transaction, or before the plan, which keeps today's use_mmap answers.
     bool sycl_load_plan_staged = false;
 
-    // Each SYCL_Mapped buffer's base file offset: a tensor at file offset offs lives at base + (offs - this).
-    std::unordered_map<ggml_backend_buffer_t, uint64_t> sycl_mapped_base_offsets;
+    // Each SYCL_Mapped buffer's file and base file offset: a tensor of file idx at file offset offs lives at
+    // base + (offs - offset). load_all_data gets a context's buffers as a list, so the file picks the buffer.
+    struct sycl_mapped_base {
+        uint32_t idx;
+        uint64_t offset;
+    };
+
+    std::unordered_map<ggml_backend_buffer_t, sycl_mapped_base> sycl_mapped_base_offsets;
 
     bool check_tensors;
     bool no_alloc;

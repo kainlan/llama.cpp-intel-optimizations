@@ -2479,14 +2479,22 @@ bool llama_model_loader::load_all_data(
 
         // A SYCL_Mapped tensor lives in its buffer's own mapping of the file (design 5efe §4.3): address it from that
         // buffer's base, never the loader's mapping. The tier locks what -lm mlock locks, so neither the loader's lock
-        // nor mmaps_used grows for it.
-        if (!sycl_mapped_base_offsets.empty() && cur->data == nullptr && bufs.count(weight->idx)) {
-            ggml_backend_buffer_t buf_mapped = bufs.at(weight->idx);
-            const auto            mapped     = sycl_mapped_base_offsets.find(buf_mapped);
-            if (mapped != sycl_mapped_base_offsets.end()) {
-                GGML_ASSERT(weight->offs >= mapped->second);
+        // nor mmaps_used grows for it. A SYCL_Mapped context holds one such buffer per file it has tensors in.
+        if (!sycl_mapped_base_offsets.empty() && cur->data == nullptr) {
+            ggml_backend_buffer_t buf_mapped  = nullptr;
+            uint64_t              base_offset = 0;
+            for (ggml_backend_buffer_t buf : bufs) {
+                const auto mapped = sycl_mapped_base_offsets.find(buf);
+                if (mapped != sycl_mapped_base_offsets.end() && mapped->second.idx == weight->idx) {
+                    buf_mapped  = buf;
+                    base_offset = mapped->second.offset;
+                    break;
+                }
+            }
+            if (buf_mapped != nullptr) {
+                GGML_ASSERT(weight->offs >= base_offset);
                 uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf_mapped);
-                ggml_backend_tensor_alloc(buf_mapped, cur, base + (weight->offs - mapped->second));
+                ggml_backend_tensor_alloc(buf_mapped, cur, base + (weight->offs - base_offset));
                 if (check_tensors) {
                     const uint8_t * data = (const uint8_t *) cur->data;
                     validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
