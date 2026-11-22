@@ -2397,6 +2397,52 @@ else()
         LABELS "sycl;attn;tkv13;hostonly;not-built")
 endif()
 
+# The asynchronous-failure latch (llama.cpp-kjoc). The latch test is host-only and enumerates no device. The delivery
+# probe runs host tasks (no kernel, no allocation) on a CPU SYCL device and skips (77) on a host that has none, so it is
+# host-only too; its GPU run is by hand, with --gpu. Both link ggml-sycl for common.cpp's latch.
+if (NOT GGML_BACKEND_DL)
+    foreach(_t test-sycl-async-failure-latch test-sycl-async-handler-delivery)
+        if (_t STREQUAL "test-sycl-async-failure-latch")
+            add_executable(${_t} tests/test-async-failure-latch.cpp)
+        else()
+            add_executable(${_t} tests/test-async-handler-delivery.cpp)
+        endif()
+        target_include_directories(${_t} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+            ${SYCL_INCLUDE_DIR}
+        )
+        target_compile_options(${_t} PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+        target_link_options(${_t} PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+        target_link_libraries(${_t} PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+        if (IntelSYCL_FOUND)
+            target_link_libraries(${_t} PRIVATE IntelSYCL::SYCL_CXX)
+        endif()
+        set_target_properties(${_t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    endforeach()
+    add_test(NAME sycl-async-failure-latch COMMAND test-sycl-async-failure-latch)
+    set_tests_properties(sycl-async-failure-latch PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;kjoc;hostonly"
+        TIMEOUT 30
+    )
+    # The selector is pinned to the CPU device: a host-only probe must not enumerate the GPUs through Level Zero, and
+    # a caller's pinned level_zero: selector would otherwise hide the CPU device and turn the probe into a skip.
+    add_test(NAME sycl-async-handler-delivery COMMAND test-sycl-async-handler-delivery)
+    set_tests_properties(sycl-async-handler-delivery PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+        LABELS "sycl;kjoc;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30
+    )
+else()
+    foreach(_n sycl-async-failure-latch sycl-async-handler-delivery)
+        add_test(NAME ${_n} COMMAND ${CMAKE_COMMAND} -E echo "not built: needs -DGGML_BACKEND_DL=OFF")
+        set_tests_properties(${_n} PROPERTIES DISABLED TRUE LABELS "sycl;kjoc;hostonly;not-built")
+    endforeach()
+endif()
+
 # The measured-tenant section: the tenant element's layout, the cohort table and
 # the visitor accumulator. context-tenant-measure.hpp names only ggml types, so
 # this needs neither -fsycl nor a device; it compiles the .cpp itself (the same
