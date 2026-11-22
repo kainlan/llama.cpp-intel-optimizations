@@ -52,18 +52,31 @@ def blank_comments(text):
     return re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
 
 
-def body(text, signature):
-    start = text.find(signature)
-    if start < 0:
+def body_span(text, signature):
+    # The definition, not a forward declaration: the signature followed by its opening brace with no ';' between.
+    # Taking the first textual match would scan from a declaration to whatever brace follows it.
+    m = re.search(re.escape(signature) + r"[^;{]*\{", text)
+    if m is None:
         return None
-    open_at = text.find("{", start)
+    open_at = m.end() - 1
     depth = 0
     for i in range(open_at, len(text)):
         depth += text[i] == "{"
         depth -= text[i] == "}"
         if depth == 0:
-            return text[open_at:i + 1]
+            return open_at, i + 1
     return None
+
+
+def body(text, signature):
+    span = body_span(text, signature)
+    return None if span is None else text[span[0]:span[1]]
+
+
+def names_alias(recv, alias):
+    # The wait's receiver ends in the alias, whole (not as the tail of a longer name or member), either bare or
+    # dereferenced as "(*alias)". A prefix such as "if (n > 0) " does not hide it.
+    return re.search(rf"(?<![\w.>])(?:(?:{alias})|\(\s*\*\s*(?:{alias})\s*\))$", recv) is not None
 
 
 def receiver(text, match):
@@ -99,7 +112,7 @@ def check(raw_files):
             bad[f"A {name} {signature}"] = f"A {name}: function not found: {signature}"
             continue
         for m, recv, line in plain_waits(scope):
-            if re.fullmatch(rf"(?:{alias})", recv):
+            if names_alias(recv, alias):
                 bad.setdefault(f"A {name} {signature} {line}", f"A {name} ({signature}): plain wait on {recv}")
     replan = body(texts.get("ggml-sycl.cpp", ""), REPLAN)
     if replan is None:
@@ -128,11 +141,10 @@ def mutate(files, name, old, new, signature=None):
     def apply(text):
         a, b = 0, len(text)
         if signature is not None:
-            scope = body(text, signature) or ""
-            a = text.find(scope) if scope else -1
-            if a < 0:
+            span = body_span(text, signature)
+            if span is None:
                 return text
-            b = a + len(scope)
+            a, b = span
         return text[:a] + text[a:b].replace(old, new, 1) + text[b:]
     out = [(n, apply(t) if n == name else t) for n, t in files]
     if out == files:
@@ -151,6 +163,8 @@ def main():
         tp_fn = "static void tp_device1_worker_thread_func()"
         tp_new = "stream->wait_and_throw();  // delivers this queue's asynchronous errors to the latch"
         shutdown = "void ggml_backend_sycl_shutdown(void)"
+        tp_decl = "static void tp_device1_worker_thread_func();"
+        shard_fn = "void ggml_sycl_tp_copy_weight_shard("
         mutants = {
             "direct auxiliary wait":
                 files + [("mutant.cpp", "void f(unified_cache * cache) { cache->get_bcs_queue().wait(); }")],
@@ -164,11 +178,31 @@ def main():
             "shutdown copy queue plain": mutate(files, sycl, " queue->wait_and_throw();", " queue->wait();", shutdown),
             "unhandled dense copy queue":
                 mutate(files, "dense-scheduler.cpp", "copy_queue_(ggml_sycl_make_queue(", "copy_queue_(sycl::queue("),
+            "unhandled L2 prefetch queue":
+                mutate(files, "l2-prefetch.hpp", "prefetch_queue_(ggml_sycl_make_queue(",
+                       "prefetch_queue_(sycl::queue("),
+            "braced declaration between the TP worker's declaration and definition":
+                mutate(mutate(files, sycl, tp_decl, tp_decl + "\nstatic int g_tp_probe{ 0 };"), sycl,
+                       "stream->wait_and_throw();", "stream->wait();", tp_fn),
+            "TP worker dereferenced plain":
+                mutate(files, sycl, "stream->wait_and_throw();", "(*stream).wait();", tp_fn),
+            "layer-streaming event plain behind a prefix":
+                mutate(files, "layer-streaming.cpp", "last_event.wait_and_throw();",
+                       "if (copied > 0) last_event.wait();"),
+            "layer-streaming event plain":
+                mutate(files, "layer-streaming.cpp", "last_event.wait_and_throw();", "last_event.wait();"),
+            "dense pending prefetch plain":
+                mutate(files, "dense-scheduler.cpp", "pending_prefetch_.wait_and_throw();",
+                       "pending_prefetch_.wait();"),
+            "TP shard upload plain":
+                mutate(files, "common.cpp", "stream->wait_and_throw();", "stream->wait();", shard_fn),
         }
         for name, mutant in mutants.items():
             if not check(mutant):
                 print(f"async drain source contract: mutant '{name}' was not caught", file=sys.stderr)
                 return 1
+            print(f"async drain source contract: mutant '{name}' caught")
+        print(f"async drain source contract: {len(mutants)} mutants, every one caught")
     print("async drain source contract: PASS")
     return 0
 
