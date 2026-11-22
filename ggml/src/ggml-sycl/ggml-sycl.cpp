@@ -52656,14 +52656,15 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
         // scheduler (its reserve is bare, with no plan scope or hold record around it); a scope opened there turns both
         // frees into paths on the list above, and each then needs a synchronize before it.
         //
-        // A FAILED DRAIN: "synchronize" is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a
-        // throwing drain goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call
-        // returns).  So after a failed drain (a lost device) the slot goes back with event 0 while the queue may
-        // still reference it, and the contract is void for that device from then on: nothing is submitted to a lost
-        // device's context, which is why that is tolerated, and the synchronize's own ERROR line is the only report.
-        // A caller that needs the drain to have worked must ask the backend, not infer it from this function having
-        // been reached.  A queue-wide wait here would be too much (it waited on, and rethrew, other contexts' work),
-        // and the contract already makes it unneeded.
+        // A FAILED DRAIN: "synchronize" is an attempt. A drain that throws, or an asynchronous error any wait delivered
+        // to the backend's handler, latches the device (async-failure.hpp): ggml_backend_sycl_synchronize logs, runs
+        // the boundary cleanup and returns, and every later graph_compute of a context that saw it returns
+        // GGML_STATUS_FAILED.  So after a failed drain (a lost device) the slot goes back with event 0 while the queue
+        // may still reference it, and the contract is void for that device from then on: nothing is submitted to a
+        // lost device's context, which is why that is tolerated, and the synchronize's ERROR lines are the only
+        // report.  A caller that needs the drain to have worked must ask the backend, not infer it from this function
+        // having been reached.  A queue-wide wait here would be too much (it waited on, and rethrew, other contexts'
+        // work), and the contract already makes it unneeded.
         (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
         ctx->claim.reset();
     }
@@ -79163,17 +79164,28 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
 class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
     bool ready() const noexcept override {
-        std::optional<sycl::event> event;
+        std::optional<sycl::event>     event;
+        ggml_sycl_async_failure_cursor cursor{};
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (quiescent_) return true;
             if (failed_ || !event_) return false;
-            event = event_;
+            event  = event_;
+            cursor = cursor_;
         }
         try {
             if (event->get_info<sycl::info::event::command_execution_status>() !=
                 sycl::info::event_command_status::complete) return false;
+            // Delivers a pending error to the queue's handler; it does not block, the event is complete.
             event->wait_and_throw();
+            // The backend's handler records instead of throwing, so a failure shows only in the latch. Any failure on
+            // this device since the route's first submission denies success: the terminal cannot tell whose it was,
+            // and a failed command does not stop the commands after it.
+            if (ggml_sycl_async_failure_since(cursor)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                failed_ = true;
+                return false;
+            }
             std::lock_guard<std::mutex> lock(mutex_);
             succeeded_ = true;
             return true;
@@ -79189,9 +79201,11 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
         { std::lock_guard<std::mutex> lock(mutex_); event = event_; }
         try { if (event) event->wait_and_throw(); } catch (...) {}
     }
-    void arm(sycl::event event) noexcept {
+
+    void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        event_ = std::move(event);
+        event_  = std::move(event);
+        cursor_ = cursor;
     }
     void confirm_quiescent() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -79200,6 +79214,7 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   private:
     mutable std::mutex mutex_;
     std::optional<sycl::event> event_;
+    ggml_sycl_async_failure_cursor cursor_{};
     bool quiescent_ = false;
     mutable bool succeeded_ = false;
     mutable bool failed_ = false;
@@ -87077,6 +87092,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const ggml_sycl::moe_mmid_model_token model_token{
                 root.model.value, root.load.value, root.owner.generation };
             sycl::queue * exact_queue = ctx.stream();
+            // Taken before the route's first submission: a failure delivered after it denies the terminal success.
+            const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);
             // The direct recipe and exact queue capability were proven together
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
@@ -87186,7 +87203,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 });
                             }
 #endif
-                            terminal->arm(final);
+                            terminal->arm(final, failure_cursor);
                             exact_queue->submit([completion, terminal, final](sycl::handler & h) {
                                 h.depends_on(final);
                                 h.host_task([completion, terminal] {
@@ -87209,18 +87226,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             g_q1_nvfp4_test_quarantine.fetch_add(1, std::memory_order_relaxed);
 #endif
-                            // wait_and_throw may report an asynchronous error after
-                            // it has drained. A non-throwing exact-queue wait is the
-                            // finalizer: only after it returns do we publish an
-                            // explicit quiescent terminal and recover the quarantine.
+                            // A throw here is synchronous: nothing reached the device, or a submit itself failed.
+                            // wait_and_throw drains the exact queue; an asynchronous error it delivers goes to the
+                            // backend's handler (the latch), not to this catch, so returning means drained, and the
+                            // latch fails this context at its next boundary. Only a drain that itself throws leaves
+                            // the bundle quarantined for the outer boundary.
                             bool quiescent = false;
                             try {
                                 exact_queue->wait_and_throw();
                                 quiescent = true;
                             } catch (...) {
-                                // An asynchronously failed event is not terminal
-                                // success. Outer graph/synchronize drain owns the
-                                // exact recovery attempt; keep this bundle quarantined.
+                                // The wait itself failed: quiescence is unproven, so the bundle stays quarantined.
                             }
                             if (quiescent) {
                                 terminal->confirm_quiescent();
@@ -97094,6 +97110,24 @@ static void ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context *
         { root.model.value, root.load.value, root.owner.generation }, plan->version, true);
 }
 
+// The boundary's report of a latched asynchronous failure, once per context (synchronize runs several times per
+// token). The handler itself never logs: it can run on a host-task worker or under backend mutexes.
+static void ggml_sycl_async_failure_report(ggml_backend_sycl_context * ctx, const char * stage) {
+    if (ctx->async_failure_reported) {
+        return;
+    }
+    ctx->async_failure_reported = true;
+    const char * device_msg     = ggml_sycl_async_failure_first_message(ctx->device);
+    const char * shared_msg     = ggml_sycl_async_failure_first_message(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED);
+    GGML_LOG_ERROR(
+        "[SYCL-ASYNC-FAILURE] device %d: %s: an asynchronous SYCL error was delivered after this context "
+        "was created (device errors=%llu, shared errors=%llu; first on device: %s; first shared: %s). "
+        "The outputs of this context's last graph are not valid, and this context computes nothing more.\n",
+        ctx->device, stage, (unsigned long long) ggml_sycl_async_failure_count(ctx->device),
+        (unsigned long long) ggml_sycl_async_failure_count(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED),
+        device_msg ? device_msg : "(none)", shared_msg ? shared_msg : "(none)");
+}
+
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
     try {
@@ -97113,40 +97147,67 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);
         const bool use_deferred_decode_event =
             sycl_ctx->last_graph_event.has_value() && sycl_ctx->last_graph_event_deferred_decode;
-        auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
-                                               CHECK_TRY_ERROR(stream->wait_and_throw());
+        std::string drain_error;
+        try {
+            if (use_deferred_decode_event) {
+                sycl_ctx->last_graph_event->wait_and_throw();
+            } else {
+                stream->wait_and_throw();
+            }
+        } catch (const std::exception & e) {
+            drain_error = e.what();
+        } catch (...) {
+            drain_error = "unknown exception";
+        }
         ggml_sycl_cpu_job_gates_clear(gate_sleep);
+        if (!drain_error.empty()) {
+            // An asynchronous error goes to the queue's handler, not to this catch: a throw here is the wait itself
+            // failing (a lost device, for one). Either way the queue's work cannot be trusted, so latch it like a
+            // delivered error instead of aborting.
+            ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());
+        }
+        if (ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)) {
+            // The first failed synchronize of a context cleans up its graph; later ones have nothing to clean, because
+            // graph_compute refuses this context from now on.
+            const bool first_report = !sycl_ctx->async_failure_reported;
+            if (first_report || !drain_error.empty()) {
+                const int dev          = sycl_ctx->device;
+                size_t    cache_used   = 0;
+                size_t    cache_budget = 0;
+                size_t    free_mem     = 0;
+                size_t    total_mem    = 0;
+                if (auto * cache = ggml_sycl::get_unified_cache_for_device(dev)) {
+                    cache_used   = cache->used();
+                    cache_budget = cache->budget();
+                }
+                try {
+                    ggml_backend_sycl_get_device_memory(dev, &free_mem, &total_mem);
+                } catch (...) {
+                }
+                // The drain's own error, not the latch's first message, which may be an older failure's.
+                GGML_LOG_ERROR(
+                    "[SYCL-SYNC-DIAG] failed drain on device %d: drain error: %s; cache_used=%.1f MB, "
+                    "cache_budget=%.1f MB, L0_free=%.1f MB, L0_total=%.1f MB\n",
+                    dev,
+                    drain_error.empty() ? "none (an asynchronous error was delivered to the handler)" :
+                                          drain_error.c_str(),
+                    cache_used / (1024.0 * 1024.0), cache_budget / (1024.0 * 1024.0), free_mem / (1024.0 * 1024.0),
+                    total_mem / (1024.0 * 1024.0));
+            }
+            ggml_sycl_async_failure_report(sycl_ctx, "synchronize");
+            if (first_report) {
+                // Quarantines the invocation and recovers only exact-MMID workspaces whose terminals report success
+                // or quiescence, so a bundle whose terminal failed stays quarantined with its handles.
+                ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, "synchronize",
+                                                                   "asynchronous SYCL failure latched");
+            }
+            return;
+        }
         // GGML_SYCL_MOE_EXEC_TRACE=2's per-window timing lines: read here, after the wait, so reading the windows'
         // device times never waits on the compute path. Nothing below trace level 2.
-        if (err == 0 && sycl_ctx->moe_stream) {
+        if (sycl_ctx->moe_stream) {
             sycl_ctx->moe_stream->flush_window_timing();
         }
-        if (err != 0) {
-            // The throwing drain is the outer async-failure boundary. Exact
-            // recovery observes terminal success/quiescence and leaves failed
-            // events quarantined rather than recycling them as completion.
-            ggml_sycl_recover_exact_mmid_after_drain(sycl_ctx);
-            const int dev          = sycl_ctx->device;
-            size_t    cache_used   = 0;
-            size_t    cache_budget = 0;
-            size_t    free_mem     = 0;
-            size_t    total_mem    = 0;
-            if (auto * cache = ggml_sycl::get_unified_cache_for_device(dev)) {
-                cache_used   = cache->used();
-                cache_budget = cache->budget();
-            }
-            try {
-                ggml_backend_sycl_get_device_memory(dev, &free_mem, &total_mem);
-            } catch (...) {
-            }
-            GGML_LOG_ERROR(
-                "[SYCL-SYNC-DIAG] DEVICE_LOST on device %d: "
-                "cache_used=%.1f MB, cache_budget=%.1f MB, "
-                "L0_free=%.1f MB, L0_total=%.1f MB\n",
-                dev, cache_used / (1024.0 * 1024.0), cache_budget / (1024.0 * 1024.0), free_mem / (1024.0 * 1024.0),
-                total_mem / (1024.0 * 1024.0));
-        }
-        SYCL_CHECK(err);
         (void) ggml_sycl_execution_release_graph(sycl_ctx);
         sycl_ctx->last_graph_event.reset();
         sycl_ctx->last_graph_event_deferred_decode = false;
@@ -122582,6 +122643,13 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // other thread's re-plan behind a decode. One load and one branch when the
     // witness is off.
     GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(), "[REPLAN-TOKEN] token held in graph compute");
+    // A context whose device delivered an asynchronous failure after the context was created computes nothing more,
+    // refused before any submission, so llama_decode returns -3 instead of building on failed outputs and KV rows.
+    if (auto * failed_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+        failed_ctx && ggml_sycl_async_failure_since(failed_ctx->async_failure_cursor)) {
+        ggml_sycl_async_failure_report(failed_ctx, "graph_compute");
+        return GGML_STATUS_FAILED;
+    }
     // The root that binds the dispatch owner for every ctx-less MoE route chain below.
     ggml_sycl_dispatch_owner_scope dispatch_owner(
         backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr);

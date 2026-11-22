@@ -6514,11 +6514,20 @@ struct ggml_backend_sycl_context {
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
+    // The asynchronous-failure counts when this context was created. Once either moves, this context's graph boundaries
+    // fail for the rest of its life: a failed command does not cancel its dependents, so its outputs and the KV rows it
+    // wrote may come from work that never ran, and the handler cannot tell whose command failed on a queue every
+    // context of the device shares. A context created later starts from the counts at its creation.
+    ggml_sycl_async_failure_cursor async_failure_cursor;
+    bool                           async_failure_reported = false;
+
     explicit ggml_backend_sycl_context(int device) :
         device(device),
         name(GGML_SYCL_NAME + std::to_string(device)),
         supports_soa_reorder(ggml_sycl_info().devices[device].supports_soa_reorder),
-        matmul_orchestrator(*this) {}
+        matmul_orchestrator(*this) {
+        async_failure_cursor = ggml_sycl_async_failure_snapshot(device);
+    }
 
     ~ggml_backend_sycl_context();
 

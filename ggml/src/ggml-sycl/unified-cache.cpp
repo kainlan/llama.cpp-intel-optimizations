@@ -17483,8 +17483,12 @@ static sycl::queue * ensure_single_device_context_queue(int device) {
     }
     try {
         auto &        dev = ggml_sycl_get_device(device);
-        sycl::context ctx(dev);
-        g_shared_ctx_queues[device] = new sycl::queue(ctx, dev, default_queue_properties());
+        // The execution queue and its context both carry the asynchronous-failure handler: both waits deliver to the
+        // queue's handler, a queue later built on this context without one falls back to the context's, and without
+        // either the runtime's default handler terminates the process.
+        sycl::context ctx = ggml_sycl_make_context(dev, device);
+        g_shared_ctx_queues[device] =
+            new sycl::queue(ggml_sycl_make_queue(ctx, dev, device, default_queue_properties()));
         GGML_LOG_INFO("[PER-DEV-QUEUE] Device %d cache queue created with a single-device context\n", device);
         return g_shared_ctx_queues[device];
     } catch (const std::exception & e) {
@@ -18619,8 +18623,8 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
     // Get queue for this device.  Always prefer the single-device context
-    // queue ensure_single_device_context_queue() builds directly via `new
-    // sycl::queue(ctx, dev, default_queue_properties())` over
+    // queue ensure_single_device_context_queue() builds directly via
+    // ggml_sycl_make_queue(ctx, dev, device, default_queue_properties()) over
     // ggml_sycl_get_device(device_id).default_queue() (dpct's raw,
     // header-cached default queue).
     //

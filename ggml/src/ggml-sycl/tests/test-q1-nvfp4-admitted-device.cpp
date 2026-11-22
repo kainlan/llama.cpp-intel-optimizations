@@ -93,10 +93,9 @@ struct case_scope {
     const case_marker * marker = nullptr;
 };
 
-// The seventh case, injected_async_terminal_failure_case, terminates instead of failing a check: its injected
-// host-task exception reaches the SYCL default async handler, which calls std::terminate, because the backend's
-// execution queues carry no async_handler (llama.cpp-kjoc). Name the running case, or the last one that ended when
-// none is running, and print its stage deltas first. Then hand over to the previous handler (ggml's, which prints a
+// If any case terminates, an asynchronous error reached a queue with no backend handler, and the runtime's default
+// handler called std::terminate (llama.cpp-kjoc). Name the running case, or the last one that ended when none is
+// running, and print its stage deltas first. Then hand over to the previous handler (ggml's, which prints a
 // backtrace), so the run still aborts red (rc 134).
 [[noreturn]] void report_terminate() {
     if (const case_marker * running = g_running_case.load(std::memory_order_acquire)) {
@@ -502,6 +501,14 @@ void injected_async_terminal_failure_case() {
                    "async failpoint did not reach exactly one submitted terminal", before);
     require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
                    "failed asynchronous terminal recycled its workspace", before);
+    // Fail closed: the device delivered an asynchronous failure, so this context refuses its next graph before
+    // anything reaches the route (no new candidate, no new submit).
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "a graph after an asynchronous failure was computed", before);
+    ggml_sycl_q1_nvfp4_test_counters refused{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&refused);
+    require_stages(refused.candidate == after.candidate && refused.submit == after.submit,
+                   "the refused graph reached the route", before);
 }
 } // namespace
 
