@@ -111,6 +111,7 @@ digraph dependencies {
     6f2 [label="T6f-2 supports_op tells the truth; staging refusal"];
     6f3 [label="T6f-3 q6_K f16 arm uses the plane it resolved"];
     6f4 [label="T6f-4 trustworthy census (lead)"];
+    6f5 [label="T6f-5 prompt loop unwind keeps its leases"];
     6g [label="T6g skipped expert ids; f16 src1 tiling"];
     6h [label="T6h staging walks skip not-computed nodes"];
     7a [label="T7a async error fails the boundary"];
@@ -131,7 +132,7 @@ digraph dependencies {
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
-    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h;
+    6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -1523,9 +1524,35 @@ The implementer verifies each name against the tree (`data_handle`, `kind()`, `d
 
 ---
 
+### Task 6f-5: An unwind out of the per-expert prompt loop keeps its leases until the submitted kernels finish (recorded 2026-11-22)
+
+**Track:** F, after Task 6f-3 (same file). **Depends on:** Tasks 6f-2, 6f-3. **Not a Stage 1 exit gate.**
+**Status:** recorded from Task 6f-2's step 5 and its spec review; written out to the Task Detail Standard before it
+starts.
+**What is known (at `8a1de2f51`, Task 6f-2's branch):**
+- Task 6f-2 turned the first prompt-staging failure in `ggml_sycl_mul_mat_id` into a refusal. That site runs
+  before any expert kernel is submitted.
+- Two more staging-failure sites sit inside the per-expert loop and still call `GGML_ABORT`. The spec review
+  placed them: they allocate only when the first site was skipped (the MXFP4 SOA f16 arm in a oneDNN build), and
+  no `test-backend-ops` case reaches them.
+- They cannot simply throw. Kernels for earlier experts are already in flight, and an unwind would destroy
+  `pp_gpu_leases` (a plain vector of `mem_handle`, retained on the normal path only at the end) and the oneDNN
+  scratch claim's weight, activation and output owners while those kernels still read them.
+- An existing throw in the same loop, `retained prompt secondary executor refused exact handle`, already has that
+  exposure today. That is a use-after-release, not an abort, and it is the reason this is a task and not a note.
+**Direction (lead):** every exit from the loop by exception hands the leases and the scratch owners to
+`retain_handles_until_event` on a barrier of the stream before it leaves; no host wait. With that in place the two
+abort sites become refusals, as the first one is.
+**Done when:** a source contract pins that no throw between the loop's first submission and its normal retention
+leaves the function without retaining; the two sites throw `ggml_sycl_fallback_error`; the GPT-OSS B50 gate and
+both Mistral gates pass.
+
+---
+
 ### Task 6f-4: A census that reaches every case (lead)
 
-**Track:** F (lead, GPU). **Depends on:** Tasks 6f-1, 6f-2, 6f-3 merged.
+**Track:** F (lead, GPU). **Depends on:** Tasks 6f-1, 6f-2, 6f-3 merged. Task 6f-5 is not required: no case reaches
+its two sites.
 **Steps:**
 1. `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-backend-ops support -b SYCL0 > cases.txt`, then the
    printed names: `sed -E 's/^  ([A-Z0-9_]+)\(.*/\1/' cases.txt | sort -u`. Drive the per-op loop from that list,
