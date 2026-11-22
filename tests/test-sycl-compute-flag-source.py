@@ -27,6 +27,13 @@ With `#if 0` regions, comments and string literals blanked, in ggml-sycl.cpp:
      ggml_sycl_node_is_computed, unless WALKER_ALLOW names it with its reason. A dispatch helper counts as much as
      a walker: its guard is the only protection for the loops in its callers.
   W0. The census fails closed: every ggml_sycl_compute_forward( call must lie inside a function it parsed.
+  W1. The census has a floor (CENSUS_MIN_FUNCTIONS, CENSUS_MIN_GUARDED): losing a dispatch function to a parser
+     miss or to blanking fails the contract instead of shrinking it.
+
+Disabled code: `#if 0` up to its matching #else, #elif or #endif (nesting counted) is blanked. Only the literal
+`#if 0` is recognised; `#elif 0`, `#if (0)`, `#if 0 || X` and the like are treated as live code, which errs towards a
+false FAIL (a claim met only by dead code still counts as met only if it is truly live), never a false PASS of the
+census.
 """
 import re
 import sys
@@ -58,6 +65,10 @@ SPLIT_REBUILT = re.compile(
     r"if\s*\(\s*!\s*primary\.has_cached_plan\(\)\s*\)\s*\{\s*(?:GGML_SYCL_DEBUG\([^;]*\);\s*)?"
     r"primary\.cancel_persistent\(\);\s*g_split_plan_cached\s*=\s*false;\s*g_cached_secondary_ops\.clear\(\);\s*"
     r"goto\s+normal_dispatch;\s*\}")
+
+# A floor, not an expected value: a new dispatch function raises these numbers, it must never lower them.
+CENSUS_MIN_FUNCTIONS = 9
+CENSUS_MIN_GUARDED = 7
 
 # Functions that call ggml_sycl_compute_forward yet need no guard of their own. Each entry says why.
 WALKER_ALLOW = {
@@ -96,8 +107,12 @@ def blank_disabled(text):
 
 
 def prepare(raw):
-    """Every blanking step is length-preserving, so offsets in the result are offsets in `raw`."""
-    return blank_literals(blank_comments(blank_disabled(raw)))
+    """Every blanking step is length-preserving, so offsets in the result are offsets in `raw`. The order matters:
+    comments go first, so a `#if 0` written inside a comment is not taken for a directive and cannot blank live code
+    up to an unrelated #endif; `#if 0` regions go next, so dead code meets no claim; literals go last. A `#if 0` inside
+    a string literal is harmless at any step: a directive must start its line, and the file has no raw or multi-line
+    string literals."""
+    return blank_literals(blank_disabled(blank_comments(raw)))
 
 
 def blank_comments(text):
@@ -256,13 +271,11 @@ def claims(sycl):
                       "invalidate_plan_cache()" in after, re.search(r"goto\s+full_build\s*;", after) is not None))
 
     split = function_span(sycl, "extract_persistent_plan_split")
-    split_call = SPLIT_CACHED_CALL.search(sycl)
-    split_after = sycl[split_call.end():split_call.end() + 1500] if split_call else ""
-    split_rebuilt = SPLIT_REBUILT.search(split_after)
-    scratch_at = split_after.find("build_scratch_pool()")
-    split_rebuilt_ok = split_rebuilt is not None and 0 <= split_rebuilt.start() < scratch_at
+    split_rebuilt_ok = split_rebuilt_span(sycl) is not None
 
-    unguarded = [name for name, b in walkers(sycl) if not WALKER_GUARD.search(b) and name not in WALKER_ALLOW]
+    found = walkers(sycl)
+    unguarded = [name for name, b in found if not WALKER_GUARD.search(b) and name not in WALKER_ALLOW]
+    n_guarded = sum(1 for _, b in found if WALKER_GUARD.search(b))
     stray = stray_dispatch_calls(sycl)
     return {
         "H ggml_sycl_node_is_computed tests GGML_TENSOR_FLAG_COMPUTE != 0": HELPER_TEST.search(helper) is not None,
@@ -283,6 +296,9 @@ def claims(sycl):
         "S ggml_sycl_graph_signature mixes node->flags": FLAG_MIX.search(sig) is not None,
         "W every dispatching function consults the rule (unguarded: " + ", ".join(unguarded) + ")": not unguarded,
         "W0 the census parsed every ggml_sycl_compute_forward call (stray at lines: %s)" % stray: not stray,
+        "W1 the census meets its floor (%d of >= %d functions, %d of >= %d guarded)" %
+        (len(found), CENSUS_MIN_FUNCTIONS, n_guarded, CENSUS_MIN_GUARDED):
+            len(found) >= CENSUS_MIN_FUNCTIONS and n_guarded >= CENSUS_MIN_GUARDED,
     }
 
 
@@ -323,11 +339,47 @@ def disable_selection_compare(sycl, raw):
     return prepare(raw[:line_start] + "#if 0\n" + raw[line_start:block[1]] + "\n#endif" + raw[block[1]:])
 
 
+def definition_line(sycl, name):
+    """Offset of the start of the line where function `name`'s definition begins, or -1."""
+    s = function_span(sycl, name)
+    m = None
+    for m in re.finditer(r"^[^\n]*\b" + re.escape(name) + r"\s*\(", sycl[:s[0]] if s else "", flags=re.M):
+        pass
+    return m.start() if m else -1
+
+
+def comment_with_if0_above(sycl, raw, name):
+    """`raw` with a block comment holding a `#if 0` line inserted above function `name`, prepared."""
+    at = definition_line(sycl, name)
+    if at < 0:
+        return sycl
+    return prepare(raw[:at] + "/* to disable, write\n#if 0\n around it */\n" + raw[at:])
+
+
+def function_disabled(sycl, raw, name):
+    """`raw` with the whole definition of function `name` between `#if 0` and `#endif`, prepared."""
+    at = definition_line(sycl, name)
+    s = function_span(sycl, name)
+    if at < 0 or not s:
+        return sycl
+    return prepare(raw[:at] + "#if 0\n" + raw[at:s[1]] + "\n#endif" + raw[s[1]:])
+
+
+def controls(sycl, raw):
+    """Edits that must leave every claim met: the contract must not FAIL on code that is still correct."""
+    return {
+        "a comment holding a #if 0 line above moe_graph_dispatch_direct_node":
+            comment_with_if0_above(sycl, raw, "moe_graph_dispatch_direct_node"),
+    }
+
+
 def split_rebuilt_span(sycl):
+    """The rebuilt-plan test between the cached split call and the scratch-pool rebuild that follows it, or None."""
     call = SPLIT_CACHED_CALL.search(sycl)
-    if not call:
+    scratch = sycl.find("build_scratch_pool()", call.end()) if call else -1
+    if scratch < 0:
         return None
-    m = SPLIT_REBUILT.search(sycl, call.end(), call.end() + 1500)
+    m = SPLIT_REBUILT.search(sycl, call.end(), scratch)
     return (m.start(), m.end()) if m else None
 
 
@@ -376,6 +428,8 @@ def mutants(sycl, raw):
             re.compile(r"ggml_sycl_node_is_computed\(\s*node\s*\)\s*&&"), ""),
         "rebuilt-plan test removed from the cached split path": mutate_span(
             sycl, split_rebuilt_span(sycl), re.compile(r"!\s*primary\.has_cached_plan\(\)"), "false"),
+        "guarded moe_graph_dispatch_direct_node wrapped whole in #if 0 (the census loses it)":
+            function_disabled(sycl, raw, "moe_graph_dispatch_direct_node"),
     }
 
 
@@ -398,6 +452,16 @@ def main():
                   file=sys.stderr)
             return 1
     if "--self-test" in sys.argv:
+        for name, text in controls(sycl, raw).items():
+            if text == sycl:
+                print(f"compute flag source contract: control '{name}' did not apply", file=sys.stderr)
+                return 1
+            broken = check(text)
+            if broken or len(walkers(text)) != len(found):
+                print(f"compute flag source contract: control '{name}' failed: census %d, %s" %
+                      (len(walkers(text)), "; ".join(broken)), file=sys.stderr)
+                return 1
+            print(f"compute flag source contract: control '{name}' still passes (census %d)" % len(walkers(text)))
         for name, text in mutants(sycl, raw).items():
             if text == sycl:
                 print(f"compute flag source contract: mutant '{name}' did not apply", file=sys.stderr)

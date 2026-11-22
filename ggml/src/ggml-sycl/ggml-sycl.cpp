@@ -120453,9 +120453,12 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
                     g_cached_secondary_ops.clear();
                     goto normal_dispatch;
                 }
-                // extract_persistent_plan rebuilt the plan instead of updating it (a failed recipe, a failed fast
-                // path, another graph selection): the plan cache stays invalid until the plan runs. Its op indices
-                // need not match g_cached_secondary_ops or the split config, so build the split plan anew next token.
+                // A rebuild that invalidated the plan cache (a failed recipe, a failed fast path, another graph
+                // selection) leaves has_cached_plan() false until the plan runs. Such a plan's op indices need not
+                // match g_cached_secondary_ops or the split config, so build the split plan anew next token. With the
+                // fast path disabled for debugging, extract_persistent_plan rebuilds every token without invalidating,
+                // and this test does not fire; it need not, because the selection compare passed, so the rebuilt plan
+                // has the same op layout.
                 if (!primary.has_cached_plan()) {
                     GGML_SYCL_DEBUG("[PERSISTENT-TG-SPLIT] Cached plan was rebuilt, rebuilding the split plan\n");
                     primary.cancel_persistent();
