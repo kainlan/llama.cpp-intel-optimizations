@@ -181,31 +181,46 @@ echo "someone else" >"$work/poll.lock/holder"
 LLAMA_GPU_LOCK="$work/poll.lock" LLAMA_GPU_LOCK_POLL_SECONDS=37 LLAMA_GPU_LOCK_WAIT_SECONDS=600 \
     "$GATE" --lock-selftest >"$work/poll.out" 2>&1 &
 gpid=$!
-sleep 2 # the first take is refused at once; after 2 s a live gate is in its poll sleep
-kill -0 "$gpid" 2>/dev/null || fail "the gate stopped before it was polling: $(cat "$work/poll.out")"
-[ "$(cat "$work/poll.lock/holder")" = "someone else" ] || fail "the gate touched a foreign holder while waiting"
-# the gate's own sleep child, found by parent pid: exactly one, or there is no poll sleep for the TERM to interrupt
-slp_pids="$(pgrep -P "$gpid" -x sleep || true)"
+slp_pid=""
+gate_reaped=0
+# Every failure of this case goes through poll_fail: fail exits at once, so the case stops what it started first
+# (the recorded sleep pid, then the gate, which is reaped).
+poll_fail() {
+    [ -z "$slp_pid" ] || kill "$slp_pid" 2>/dev/null || true
+    if [ "$gate_reaped" = 0 ]; then
+        kill -KILL "$gpid" 2>/dev/null || true
+        wait "$gpid" 2>/dev/null || true
+    fi
+    fail "$@"
+}
+# the gate's own sleep child, found by parent pid: poll up to 10 s (the host is loaded, so the take can be slow) until
+# there is exactly one, or there is no poll sleep for the TERM to interrupt
+slp_pids=""
+for _ in $(seq 100); do
+    kill -0 "$gpid" 2>/dev/null || break
+    slp_pids="$(pgrep -P "$gpid" -x sleep || true)"
+    if [ -n "$slp_pids" ] && [ "$(wc -w <<<"$slp_pids")" -eq 1 ]; then break; fi
+    sleep 0.1
+done
+kill -0 "$gpid" 2>/dev/null || poll_fail "the gate stopped before it was polling: $(cat "$work/poll.out")"
+[ "$(cat "$work/poll.lock/holder")" = "someone else" ] || poll_fail "the gate touched a foreign holder while waiting"
 if [ -z "$slp_pids" ] || [ "$(wc -w <<<"$slp_pids")" -ne 1 ]; then
-    kill -KILL "$gpid" 2>/dev/null || true
-    fail "the gate had no single sleep child to interrupt (found: '${slp_pids//$'\n'/ }')"
+    poll_fail "the gate had no single sleep child to interrupt after waiting up to 10 s (found: '${slp_pids//$'\n'/ }')"
 fi
 slp_pid="$slp_pids"
 kill -TERM "$gpid"
 for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
-if kill -0 "$gpid" 2>/dev/null; then
-    kill "$slp_pid" 2>/dev/null || true
-    kill -KILL "$gpid" 2>/dev/null || true
-    fail "a TERM during the poll sleep must end the gate within 5 s"
-fi
+if kill -0 "$gpid" 2>/dev/null; then poll_fail "a TERM during the poll sleep must end the gate within 5 s"; fi
 rc=0
 wait "$gpid" || rc=$?
-[ "$rc" -eq 143 ] || fail "a TERM during the poll sleep must end the gate with 143 (rc $rc): $(cat "$work/poll.out")"
-[ "$(cat "$work/poll.lock/holder")" = "someone else" ] || fail "a TERM during the poll sleep touched a foreign holder"
+gate_reaped=1
+[ "$rc" -eq 143 ] ||
+    poll_fail "a TERM during the poll sleep must end the gate with 143 (rc $rc): $(cat "$work/poll.out")"
+[ "$(cat "$work/poll.lock/holder")" = "someone else" ] ||
+    poll_fail "a TERM during the poll sleep touched a foreign holder"
 for _ in $(seq 10); do kill -0 "$slp_pid" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$slp_pid" 2>/dev/null; then
-    kill "$slp_pid" 2>/dev/null || true
-    fail "a TERM during the poll sleep left the gate's sleep running: the sleep pid $slp_pid is still alive"
+    poll_fail "a TERM during the poll sleep left the gate's sleep running: the sleep pid $slp_pid is still alive"
 fi
 for bad in LLAMA_GPU_LOCK_VERIFY_SECONDS=08 LLAMA_GPU_LOCK_WAIT_SECONDS=x LLAMA_GPU_LOCK_POLL_SECONDS=0 \
     LLAMA_GPU_LOCK_VERIFY_SECONDS=10000000000 LLAMA_GPU_LOCK_POLL_SECONDS=10000000000 \

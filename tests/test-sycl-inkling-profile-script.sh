@@ -222,7 +222,7 @@ fi
 
 # k2. two copies of one tag started together on a fresh lock, 20 times: the tool must run exactly once each time. This
 # catches a runner that does not recheck the rerun markers once the lock is held. It does not detect a non-atomic
-# take; the deterministic lying-mkdir, foreign-holder and lost-lock cases below cover that.
+# take; the deterministic mkdir-shim, foreign-holder and lost-lock cases below cover that.
 bad=""
 for i in $(seq 1 20); do
     : > "$STUB_LOG"; K="$T/kk$i"
