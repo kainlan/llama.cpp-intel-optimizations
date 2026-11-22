@@ -63,8 +63,10 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
 
 1. **Design.** A recording-only handler on every backend queue and context feeds a per-device latch. The graph
    boundaries read the latch. The handler never rethrows, logs, locks or allocates. It can run on a decode thread, on a
-   SYCL host-task worker, on a thread holding the workspace registry or pool mutexes (`recover_quarantined` ->
-   `terminal->ready()` -> `event->wait_and_throw()`), and during static destruction.
+   SYCL host-task worker, on a thread holding the workspace registry or pool mutexes, and during static destruction.
+   (Through commit 2 the registry path was `recover_quarantined` -> `terminal->ready()` ->
+   `event->wait_and_throw()`. Commit 4 takes the wait out of `ready()`; the handler rule stays, because nothing
+   stops another wait from being added under those mutexes.)
 2. **Granularity.** One slot per backend device index, plus one shared slot for queues bound to no single device (the
    dpct per-device queues, the CPU-offload queue, the multi-GPU control context). A failure on a device fails every
    context on it. A failure on the shared slot fails every device.
@@ -77,7 +79,10 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
    **synchronize** of such a context reports and runs the boundary cleanup on its first failed call, then returns. Both
    tasks add no host wait.
 6. **Terminals.** The direct route's terminal (7a) and the retained-graph terminal (7b) never report success once the
-   latch has moved past a cursor taken before their first submission.
+   latch has moved past a cursor taken before their first submission. *Amended 2026-11-21 (commit 4):* this is a
+   rule about success (`observe_success()`), not about `ready()`. `device_terminal::ready()` means "the terminal's
+   work is finished", and the two slot-release sites (`moe-mmid-workspace.cpp:947` and `:1617`) read it as "this
+   slot may be released". A terminal that folds success into `ready()` makes a failed slot unreleasable.
 7. **Last drain before a queue is destroyed.** Where a queue is destroyed before process exit and its last drain is a
    plain `wait()`, that wait becomes `wait_and_throw()` (7b). Where it has no drain at all, the site is listed under
    "Known limits" instead of getting a new wait. The other plain drains of every non-execution queue become
@@ -87,6 +92,19 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
    bench A/B inside these tasks: the Stage 1 exit (Task 9) runs an interleaved A/B of the stage tip against the commit
    before Task 2. The execution queue's context is already an explicit single-device context (`unified-cache.cpp:17486`), so
    7a adds a handler and changes no context identity.
+10. **The boundary cleanup runs once per failed context, whichever boundary reported first** (commit 3, ruled
+    2026-11-21). A refused `graph_compute` sets `async_failure_reported`, and commit 2's synchronize used that flag
+    to skip its cleanup. A context whose first failed boundary was a refusal then never cleaned up. The context
+    carries a second flag, `async_failure_cleaned`, set right before the cleanup call; synchronize cleans up
+    whenever it is false.
+11. **A failed context gives its device back** (commit 4 and Task 7d, ruled 2026-11-21). This replaces the limit
+    "failed-terminal bundles stay quarantined until process exit". The first GPU run showed what that limit cost:
+    the quarantined slot holds the invocation's authoritative-snapshot pin, `release_invocation` returns BUSY on a
+    pinned invocation (`execution-lifecycle.cpp:1365-1367`), so the dead context kept owning the device and every
+    later context on that card got `DEVICE_BUSY` on its first graph. A terminal whose event completed is finished
+    whether or not it succeeded; the cleanup's existing recovery (`ggml_sycl_recover_exact_mmid_after_drain`, called
+    after the cleanup's waits and before its release) then frees the slot and the release succeeds. Commit 4 covers
+    the synchronize path. Task 7d covers a context torn down with no synchronize after the failure.
 
 ### Known limits and follow-ups
 
@@ -99,9 +117,12 @@ here, in the plan's "Known limits".
   FAILED (`llama_decode` -3). The `[SYCL-ASYNC-FAILURE]` line and one paragraph in `docs/backend/SYCL.md` say so.
   Follow-up, two candidate designs: a status-returning synchronize, or the backend poisoning a failed context's pending
   readbacks.
-- **Failed-terminal bundles stay quarantined, with their handles, until process exit.** `retire` keeps a registry
-  context that has a quarantined slot (`moe-mmid-workspace.cpp:1656-1690`). Follow-up: release them at model unload
-  once the queue is drained.
+- **Withdrawn 2026-11-21: "failed-terminal bundles stay quarantined until process exit".** See decision 11. What is
+  left of it is Task 7d's scope: a failed context that is destroyed, or drained through
+  `ggml_sycl_execution_drain_context_terminal_events` or `ggml_sycl_execution_drain_own_terminal`, without a
+  synchronize in between. Those three paths wait and release without running the recovery first, so the pin
+  survives and the device stays owned (`ggml-sycl.cpp:54209`, `:16905`, `:16860` at `00487e5bb`). Task 7d is
+  written out after commit 4 passes on both cards, because its oracle case builds on commit 4's fixture.
 - **Granularity is coarse** (decision 2): one failing context fails its neighbours on the same device.
 - **A context does not read the slot of another device it submits to.** A context's cursor covers its own device's
   slot and the shared slot (decisions 2 and 3). Work it puts on another device's execution queue, which the two-card
@@ -158,7 +179,8 @@ runtime's default handler, which terminates the process, and the oracle's sevent
 - makes the route's terminal deny success after a failure;
 - extends the oracle's seventh case to assert fail-closed.
 
-Two ordered commits: commit 1 is the latch, the helper and their tests; commit 2 is the behaviour.
+Four ordered commits: commit 1 is the latch, the helper and their tests; commit 2 is the behaviour; commits 3 and 4
+are the two defects the first GPU run of commit 2 and of commit 3 found (decisions 10 and 11).
 
 **Acceptance Criteria:**
 - [ ] Commit 1: `sycl-async-failure-latch` passes (host-only).
@@ -171,7 +193,16 @@ Two ordered commits: commit 1 is the latch, the helper and their tests; commit 2
 - [ ] Lead, once per card. The oracle ends with `Q1/NVFP4 scoped production-route lifecycle: PASS` on the B70 (ctest)
       and rc 0 on the B50 (binary). Neither log contains `Default async_handler` or `terminate called`. The B70 log
       contains `[SYCL-ASYNC-FAILURE]`.
-- [ ] Lead, once each: the Mistral B70 completion gate and the GPT-OSS B50 chat gate (CLAUDE.md commands) pass.
+- [ ] Commit 3: the source contract's claim C (synchronize cleans up when `async_failure_cleaned` is false, and sets
+      it right before the cleanup call) passes with its mutants; oracle case 8 (`refused_graph_then_synchronize_case`)
+      passes on both cards.
+- [ ] Commit 4: the source contract's two terminal claims pass with their three mutants; oracle case 7 shows
+      `invocation_id == 0` and `busy_device_count == 0` after its first synchronize; no case's teardown reports a
+      `begin_drain` or `finish_drain` refusal.
+- [ ] Lead, once each: the Mistral B70 completion gate passes, and the GPT-OSS B50 chat gate passes **with
+      `-c 4096`**. Ruled 2026-11-21: the gate without `-c` faults the B50 on this branch with and without Task 7a
+      (plan, "GPT-OSS B50 default-context fault"), so it cannot accept or reject this task. The `-c 4096` arm is the
+      all-VRAM control CLAUDE.md names. The default-context arm stays a Stage 1 exit gate (Task 9).
 - [ ] No text in `ggml/src/ggml-sycl/` says the execution queue has no handler, or that synchronize swallows a throwing
       drain.
 
@@ -1078,6 +1109,52 @@ Subject: `sycl: an asynchronous error on the execution queue fails the next grap
 Body: the execution queue's handler, synchronize no longer aborting, the graph_compute refusal, the terminal check,
 the oracle's new assertion, and the accepted one-token window. End it with your own Co-Authored-By trailer.
 
+#### Commit 3: synchronize cleans up after a refusal (decision 10)
+
+Found by reading commit 2 before its GPU run. Landed as `00487e5bb`.
+- `common.hpp`: `bool async_failure_cleaned = false;` next to `async_failure_reported` in the backend context.
+- `ggml-sycl.cpp`, `ggml_backend_sycl_synchronize`: the failure branch runs
+  `ggml_backend_sycl_graph_boundary_exception_cleanup` under `if (!sycl_ctx->async_failure_cleaned)`, and sets the
+  flag on the line before the call. `async_failure_reported` still decides only whether the failure is logged.
+- `tests/test-sycl-async-failure-source.py`: claim C and five mutants.
+- Oracle case 8, `refused_graph_then_synchronize_case`: one graph computed; a failure recorded with
+  `ggml_sycl_async_failure_record`; the next graph submitted with `ggml_backend_graph_compute_async` (the
+  synchronous form synchronizes internally and would hide the order) and refused; then `ggml_backend_synchronize`;
+  then `ggml_backend_sycl_execution_context_extract` must show `invocation_id == 0` and `busy_device_count == 0`.
+
+#### Commit 4: a finished terminal is ready whether or not it succeeded (decision 11)
+
+Found by commit 3's GPU run (`inkling/t7a-run1/`, both cards): cases 1 to 7 ran, then case 8's first graph failed
+with `[SYCL] graph_compute: failed to begin tracked execution graph: error=DEVICE_BUSY device=0 context_id=5`.
+Case 7's context still owned the device:
+1. The direct route mints an authoritative-snapshot pin (`ggml-sycl.cpp:87112`) and `mark_possible_submit` copies
+   its authority into the workspace slot (`moe-mmid-workspace.cpp:888`).
+2. The slot is freed only when the terminal's `ready()` is true (`:947`, `:1617`).
+3. Commit 2's `moe_direct_event_terminal::ready()` set a sticky `failed_` once the latch had moved, so it stayed
+   false for the life of the process. Before Task 7a the same condition was a terminated process.
+4. `release_invocation` returns BUSY on the pinned invocation, so the cleanup's release, the backend destructor's
+   release and the next context's DEVICE_BUSY retry all fail.
+5. The fixture ignored `begin_drain`'s BUSY, so no earlier case could show it. Case 8 is the first case that runs
+   after a failed one. Commit 2 leaked the device the same way.
+
+The change:
+- `ggml-sycl.cpp`, `moe_direct_event_terminal`: `ready()` is true when `quiescent_` is set or the armed event's
+  `command_execution_status` is complete. It does not wait, does not read the latch and does not write `failed_`.
+  A status query that throws returns false. `observe_success()` is the success question: complete, then
+  `event->wait_and_throw()` returned, then the latch has not moved since the cursor; the sticky `failed_` lives
+  there. The completion host task still recycles the slot only on success, so case 7's counters (quarantine +1,
+  recycle +0) hold. This matches `moe_sycl_event_terminal::ready()`, which is "the event completed".
+- Nothing changes in `moe-mmid-workspace.cpp`, `execution-lifecycle.cpp` or the teardown functions.
+- `tests/test-sycl-async-failure-source.py`: the claim "T ready reads the latch after the wait" is replaced by two:
+  `ready()` tests the completion status and names neither `ggml_sycl_async_failure_since` nor `wait_and_throw`;
+  `observe_success()` names the latch after `event->wait_and_throw()`. Mutants: the latch check back in `ready()`;
+  `observe_success()` reduced to `return ready();`; the wait removed from `observe_success()`.
+- Oracle: case 7 asserts `invocation_id == 0` and `busy_device_count == 0` after its first synchronize. The
+  fixture's teardown fails the case that leaked when `begin_drain` or `finish_drain` refuses, and prints the case
+  name and the error.
+- Do not reorder cases 7 and 8. With case 8 first, its first graph's completion host task would usually run after
+  the recorded failure and pin the same way: pass or fail would follow host-task timing.
+
 **Gotchas:**
 - `ggml-sycl.cpp` is ~125k lines. Find each site with `cat ... | grep -n` and edit by exact string.
 - Keep the handler record-only (claim H). It runs on host-task workers, and under the workspace registry and pool
@@ -1092,8 +1169,8 @@ the oracle's new assertion, and the accepted one-token window. End it with your 
   `ggml_backend_synchronize` then returns quietly (`first_report` is false), and the new `graph_compute` is refused.
   That is the expected log shape: one `[SYCL-ASYNC-FAILURE] ... synchronize` line and one `[SYCL] synchronize failed`
   line.
-- The failed bundle stays quarantined until process exit (an accepted limit). If the oracle's teardown prints an
-  ownerless-lease warning, report it. Do not force-release it.
+- After commit 4 the failed bundle is recovered by the boundary cleanup (decision 11). If the oracle's teardown
+  prints an ownerless-lease warning or a drain refusal, report it. Do not force-release anything.
 
 ---
 

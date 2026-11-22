@@ -79,13 +79,15 @@ of `1dcdf49b1`): `git -C <wt> switch -c feat/inkling2 master`. Implementers work
 | A (`src/` load path) | 2, 3, 5, 4b | Requested context reaches the measures; unfundable term refused; expert names; zone-sizing refusal |
 | B (scripts) | 6, 6b, 10, 10b, 11 | `inkling` gate; GPT-OSS gate without `-ngl`; profile runner; atomic lock takers; scheduler-census parser |
 | C (planner rate, docs) | 13, 16 | Profile document; measured CPU expert rate row |
-| D (backend failure path) | 7a, 7b, 7c | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21) |
+| D (backend failure path) | 7a, 7d, 7b, 7c | Asynchronous SYCL errors fail the graph boundary instead of terminating (added 2026-11-21); a failed context gives its device back |
+| E (inherited regression) | 6c | GPT-OSS 20B at the default context loses the B50: spike, then fix tasks (found 2026-11-21) |
 
 **Amended 2026-11-21, after Task 1 ran and the two spikes concluded.** Task 1 ended red at an old defect
 (llama.cpp-kjoc), so Tasks 7a and 7b now precede the route's opening, and Task 7c follows 7b. Task 4's spike produced Task 4b. Task 6b was
 found in review of Task 6. Their full specifications are separate files beside this plan:
 `2026-11-21-inkling2-task-4b-zone-sizing-refusal.md` and `2026-11-21-inkling2-task-7a-7b-async-failure.md`.
 Task 10b was found in review of Task 10: this host's `mkdir` is not atomic, so `GPU.lock` can be taken twice.
+Task 7d was found by Task 7a's first oracle run, and Task 6c by the first real run of the GPT-OSS gate without `-c`.
 
 ### Dependency Graph
 
@@ -100,7 +102,9 @@ digraph dependencies {
     5  [label="T5 fused expert name"];
     6  [label="T6 inkling gate script"];
     6b [label="T6b GPT-OSS gate without -ngl"];
+    6c [label="T6c spike: GPT-OSS default context loses the B50"];
     7a [label="T7a async error fails the boundary"];
+    7d [label="T7d failed context gives its device back"];
     7b [label="T7b every queue has the handler"];
     7c [label="T7c auxiliary drains deliver"];
     7  [label="T7 open NVFP4 direct route"];
@@ -116,7 +120,7 @@ digraph dependencies {
     16 [label="T16 rate table row"];
     17 [label="T17 Stage 3 planning"];
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
-    1 -> 7a; 7a -> 7; 7a -> 7b; 3 -> 7; 6 -> 7; 7 -> 8;
+    1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 9;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -135,11 +139,11 @@ digraph dependencies {
 | `tests/test-sycl-load-measure-source.py`, `tests/test-sycl-kv-before-experts-source.py` | 2 | None |
 | `scripts/sycl-canonical-gates.sh`, `tests/test-sycl-canonical-gates-script.sh` | 6, 6b | Sequential (both merged) |
 | `docs/backend/gpt-oss-testing.md` | 6b | None |
-| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7a, then 7 and 7b, then 7c, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
+| `ggml/src/ggml-sycl/ggml-sycl.cpp` | 7a, then 7d, then 7 and 7b, then 7c, then 4b, then gap tasks from 8 | Lead orders the merges; 7 and 7b touch disjoint regions and may overlap in time, each merge is followed by a build |
 | `ggml/src/ggml-sycl/unified-cache.cpp` | 7a, 7b, 7c, 4b | Sequential (lead orders them) |
 | `ggml/src/ggml-sycl/common.cpp`, `common.hpp`, `async-failure.hpp` | 7a, 7b, 7c (`common.cpp` only) | Sequential (Track D) |
 | `ggml/src/ggml-sycl/device-pool.hpp`, `layer-streaming.cpp`, `l2-prefetch.hpp`, `dense-scheduler.cpp`, `tests/test-sycl-async-drain-source.py` | 7c | None |
-| `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp` | 7a | None |
+| `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp` | 7a, then 7d | Sequential (Track D) |
 | `ggml/src/ggml-sycl/zone-sizing.{hpp,cpp}`, `tests/test-zone-sizing.cpp` | 4b | None |
 | `ggml/src/ggml-sycl/moe-resolved-batch.hpp` | gap tasks from 8 | Sequential |
 | `scripts/sycl-inkling-profile.sh`, `tests/test-sycl-inkling-profile-script.sh` | 10 | None |
@@ -795,9 +799,72 @@ flag is a second source for that fact) and the rule that a gate never shrinks th
 the command in `CLAUDE.md`; a stub case pins its argv; `docs/backend/gpt-oss-testing.md` agrees (`-c 4096` only as the
 all-VRAM control arm of an A/B).
 
-**Not verified yet:** the real GPT-OSS B50 gate has not run since this change. Task 9 runs it once.
+**First real runs, 2026-11-21: the gate is red on the B50.** The documented command loses the device in its first
+decode. The fault is not from this task or any other task of this plan: Task 6c has the evidence and owns it. This
+task only removed the `-c 4096` pin that had kept the fault out of sight.
 **Left out on purpose:** the other fork scripts and documents that still mention `-ngl`, and the loader knob itself,
 belong to llama.cpp-guwc.
+
+---
+
+### Task 6c: Spike — GPT-OSS 20B at the default context loses the B50 (found 2026-11-21)
+
+**Track:** E (read-only investigation, then the lead's GPU runs). **Depends on:** nothing. **Blocks:** Task 9.
+**File scope:** none until the cause is known. The fix tasks are written from this spike's result, to the Task
+Detail Standard, before anyone starts them.
+
+**What was seen.** The gate command from `CLAUDE.md` (no `-c`, no `-ngl`, `ONEAPI_DEVICE_SELECTOR=level_zero:1`),
+each run on a card that had just passed the Mistral gate with zero kernel fault lines:
+
+| run | tree | flags | result |
+|---|---|---|---|
+| 22:43 | `00487e5bb` (Task 7a build) | gate | device lost, rc 139 |
+| C1 | `00487e5bb` (Task 7a build) | gate + `-c 4096` | **pass**, answer line 1, 0 kernel lines |
+| C2 | `1ce4cd442` (no Task 7a) | gate | device lost, rc 139, 6 CAT errors |
+| M | `7809ffac8` (product code = master `1dcdf49b1`) | gate + `-lv 4` | device lost, rc 139, 4 CAT errors |
+
+- stderr: `[MEM-HANDLE] event-bound lease wait failed (... UR_RESULT_ERROR_DEVICE_LOST)`, then `[MUL_MAT_ID-FAIL]
+  op=MUL_MAT_ID dst=ffn_moe_gate-0 src0=blk.0.ffn_gate_exps.weight ... src1_ne=[2880,1,2,1]` (the 2-token warmup
+  batch), then `Exception caught at ... ggml-sycl.cpp, line:93362`, then SIGSEGV with a core.
+- kernel: `xe ... Engine memory CAT error [18]: class=ccs ... guc_id=2`, `Timedout job ... in llama-cli`, engine
+  resets. A CAT error is a GPU page fault: a kernel touched an address with no mapping.
+- The Mistral gate on the same card passes right after each fault, with zero kernel lines.
+- Evidence: `inkling/t7a-run1/`, `inkling/t7a-control/`, `inkling/b50-noc/` under
+  `/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/`. The verbose log of run M is committed with the fix.
+
+**What is established.**
+- It is inherited from `master`. Run M is master's product code. `master` never ran this shape: its canonical gate
+  passed `-c 4096` until Task 6b.
+- It is a regression. On 2026-10-18, `master` `8b5946b53`, the same shape decoded at 23.5 t/s
+  (`docs/backend/sycl-perf-baselines.md` history; all experts on device, 12 layers' KV on the host tier).
+- It is not Task 7a, Task 2 or Task 3.
+- The shape at the fault (run M, `-lv 4`): weights 11536.5 MiB all on device; the 12 full-context layers' KV on the
+  host KV tier and the 12 sliding-window layers' KV on device; 49 scheduler splits; a 148.0 MiB
+  `SYCL_CpuActivation` compute buffer. At `-c 4096` all KV is on device.
+- The device is lost before layer 0's MoE gate, and the error is reported at the first wait. The faulting kernel
+  is something submitted before that wait, not necessarily `MUL_MAT_ID`.
+
+**What is not known:** which kernel faults and why its operand is unmapped in this shape; which commit between
+`8b5946b53` and `1dcdf49b1` introduced it (the range holds the upstream sync `3b3962534`).
+
+**Two defects, not one.** The device loss is the first. The second is the SIGSEGV after the device-lost exception
+is caught at `ggml-sycl.cpp:93362`: a lost device must end in an error return or a clean exit, not a core.
+
+**Steps.**
+1. Read-only investigation (running since 2026-11-21 23:10): rank the candidate kernels on the path before layer
+   0's MoE gate from the code and the verbose log; read the regression range; find why the catch at `:93362`
+   ends in a segfault; name at most one diagnostic GPU run.
+2. Lead: that one run, with a Mistral health arm before and after, under `GPU.lock`. A run that passes when the
+   hypothesis is right (a disable switch) is preferred over one that prints more and faults.
+3. Lead: write the fix tasks here.
+
+**Rules that bound the fix:** the context is not shrunk and the gate keeps no `-c` (rulings 2026-08-31 and
+2026-09-27); no GPU kernel reads host memory; an op runs where its data is; a missing kernel for a layout is
+written, not routed around.
+
+**Until it is fixed:** every run of the GPT-OSS gate without `-c` on the B50 faults the card and resets the
+engine. Do not run it as a routine gate. Tasks 7a, 7d, 7b and 7c are accepted on the `-c 4096` arm plus the
+Mistral gate. Task 9's default-context arm stays red until this task's fix lands.
 
 ---
 
@@ -815,9 +882,15 @@ route's terminal never reports success after a failure. The success path gains n
 
 **Done when:** the host tests and the source contract pass; and the lead's runs, once each, show the oracle ending
 `Q1/NVFP4 scoped production-route lifecycle: PASS` on the B70 and `rc=0` on the B50 with no `Default async_handler`
-and no `terminate called`, the delivery probe passing with `--gpu` on the B50, and the Mistral B70 and GPT-OSS B50
-gates passing. The oracle logs are committed as `docs/backend/data/inkling2/t7a-oracle-b70.txt` and
-`t7a-oracle-b50.txt`.
+and no `terminate called`, the delivery probe passing with `--gpu` on the B50, and the Mistral B70 gate and the
+GPT-OSS B50 gate with `-c 4096` passing (Task 6c explains the `-c 4096`). The oracle logs are committed as
+`docs/backend/data/inkling2/t7a-oracle-b70.txt` and `t7a-oracle-b50.txt`.
+
+**Two more commits than planned (2026-11-21, both in the specification):** commit 3 makes synchronize clean up
+when the first failed boundary was a refused `graph_compute` (`async_failure_cleaned`; oracle case 8). Commit 4
+fixes what case 8's first GPU run found: a failed terminal never reported `ready()`, its workspace slot kept the
+invocation's pin, and the dead context kept owning the device, so every later context on the card got
+`DEVICE_BUSY`. `ready()` now means finished; `observe_success()` means finished and succeeded.
 
 **Runtime facts this design rests on (measured 2026-11-21, B50, `docs/backend/data/inkling2/t7a-runtime-probe-b50.txt`):**
 `queue::wait_and_throw` and `event::wait_and_throw` both deliver to the queue's handler and return; the same holds for
@@ -829,7 +902,27 @@ a handled queue destroyed with an undelivered error drops it silently.
 - One token can be sampled from the failed graph: the failure is seen in a `void` synchronize, so
   `llama_get_logits_ith` returns that graph's logits before the next decode returns an error. Today the process
   terminates instead. Closing the window needs a status out of the synchronize or poisoned readbacks.
-- A bundle whose terminal failed stays quarantined, with its handles, until the process exits (existing behaviour).
+- Withdrawn 2026-11-21: "a bundle whose terminal failed stays quarantined until the process exits". That limit
+  left the device owned by the failed context. Commit 4 releases it at the failed synchronize; Task 7d covers a
+  context torn down without one.
+
+---
+
+### Task 7d: A failed context that is torn down without a synchronize gives its device back
+
+**Track:** D, after Task 7a and before Task 7b (same file). **Depends on:** Task 7a.
+**Status:** recorded 2026-11-21; written out to the Task Detail Standard after Task 7a's commit 4 passes on both
+cards, because its oracle case builds on commit 4's fixture.
+**What is known (at `00487e5bb`):** three paths wait and then release the invocation without first running
+`ggml_sycl_recover_exact_mmid_after_drain`: `~ggml_backend_sycl_context` (`ggml-sycl.cpp:54209`),
+`ggml_sycl_execution_drain_context_terminal_events` (`:16905`, used by the `DEVICE_BUSY` retry and the public
+drain) and `ggml_sycl_execution_drain_own_terminal` (`:16860`, on every begin that still holds an invocation). The
+last two are a documented twin sequence that must change together. After an asynchronous failure with no
+synchronize in between, the quarantined slot keeps the pin, the release returns BUSY, and the device stays owned.
+A caller that frees its context when `llama_decode` returns an error takes exactly this path.
+**Done when:** an oracle case that records a failure, frees the context without a synchronize and then computes a
+graph on a new context passes on both cards; a source contract pins the recovery before each of the three
+releases.
 
 ---
 
@@ -1019,8 +1112,10 @@ done
 - [ ] `grep -c 'MOE-DECODE-REFUSAL' build/gates/inkling.err` is `0` for each Inkling run.
 
 **Added 2026-11-21 (each line is still one run; none is repeated):**
-- [ ] The `--gate all` run on the B50 above is the first real run of the GPT-OSS gate without `-c` and without `-ngl`
-      (Task 6b). Record its `[LOAD-PLAN]` n_ctx line and its `[LOAD-PLAN] compute slot` line beside the verdict.
+- [ ] The `--gate all` run on the B50 above runs the GPT-OSS gate without `-c` and without `-ngl` (Task 6b). It was
+      first run on 2026-11-21, ahead of this task, and faults the card (Task 6c). Do not run it here until Task 6c's
+      fix has merged. Then record its `[LOAD-PLAN]` n_ctx line and its `[LOAD-PLAN] compute slot` line beside the
+      verdict.
 - [ ] Control arms, B50: the GPT-OSS gate command with `-c 4096` added, and the Mistral gate command with `-c 4096`
       added. Each must pass and print `[LOAD-PLAN]` with `n_ctx 4096` (Task 2: the measure follows the request).
 - [ ] Throughput A/B for the whole stage (Task 2 changes every bench's load; Task 7a changes how the execution queue
@@ -2033,8 +2128,12 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
   and only on the passing oracle runs that Task 7a records. Task 1's own run was red.
 - **Tasks 7a and 7b change how the whole backend meets an asynchronous error** (2026-11-21). Before them the process
   terminates. After them the context that saw the error is failed for life and the caller gets an error from its next
-  decode. Two limits are accepted and stated in Task 7a: one token can be sampled from the failed graph, and a failed
-  bundle stays quarantined until the process exits.
+  decode. One limit is accepted and stated in Task 7a: one token can be sampled from the failed graph. The second,
+  a failed bundle quarantined until process exit, was withdrawn on 2026-11-21 when the first GPU run showed it left
+  the card owned by the failed context (Task 7a commit 4, Task 7d).
+- **The GPT-OSS gate without `-c` faults the B50 on this branch and on `master`** (Task 6c, found 2026-11-21). It is
+  a regression inherited from `master`, hidden there by a `-c 4096` pin. It blocks the Stage 1 exit (Task 9) and is
+  not yet diagnosed. The command in `CLAUDE.md` is that command: on the B50 it resets the engine each time.
 - **Two async-error gaps remain after Task 7c** (both recorded with file:line in the 7a/7b/7c specification, both
   need a tracker task). First, a context reads only its own device's failure slot and the shared one: an error on
   work it submitted to ANOTHER device's execution queue (`GGML_SYCL_MOE_MULTI_GPU`, tensor-parallel, split, the
