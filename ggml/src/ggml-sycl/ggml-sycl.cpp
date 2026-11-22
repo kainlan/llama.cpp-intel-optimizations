@@ -114262,7 +114262,7 @@ static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
 // A slot's graph inputs, as positions in the split (leaf i as i, src j of node n as -(n*GGML_MAX_SRC+j)-1), never as
 // tensor pointers: a key fixes the split's structure, so the same positions name the same inputs on every replay.
 // Only a computed node's sources count, as in the pre-stage. The slot key is built on the graph signature, which mixes
-// each node's flags, so a slot's input list is never replayed for a graph that computes other nodes.
+// each node's flags; the prologue memo (default on) serves the signature it recorded while the graph's uid holds.
 static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vector<int32_t> & refs) {
     refs.clear();
     std::vector<const ggml_tensor *> seen;  // this call only
