@@ -114,7 +114,7 @@ digraph dependencies {
     15 [label="T15 CPU expert rate measure"];
     16 [label="T16 rate table row"];
     17 [label="T17 Stage 3 planning"];
-    2 -> 3; 3 -> 5; 4 -> 4b; 5 -> 4b; 7 -> 4b;
+    2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7b; 3 -> 7; 6 -> 7; 7 -> 8;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
@@ -568,7 +568,7 @@ Task 4b are in `docs/plans/2026-11-21-inkling2-task-4b-zone-sizing-refusal.md`. 
 ### Task 4b: A load whose arena zones cannot be sized is refused by name, not aborted (llama.cpp-ouur)
 
 **Track:** A
-**Depends on:** Task 4 (the decision); Tasks 2, 3 and 5 (same `src/llama-model.cpp`); Task 7 (same `ggml-sycl.cpp`)
+**Depends on:** Task 4 (the decision); Tasks 2 and 3 (same `src/llama-model.cpp`); Task 7 (same `ggml-sycl.cpp`)
 **Full specification:** `docs/plans/2026-11-21-inkling2-task-4b-zone-sizing-refusal.md` (files, RED, GREEN, commands,
 commit, gotchas). Its line numbers are at master `1dcdf49b1`; find each site by its text.
 
@@ -583,7 +583,7 @@ SYCL device 0 cannot size its arena zones`, names the device's capacity as the c
 ### Task 5: The loader's expert-name check knows the fused gate+up tensor
 
 **Track:** A
-**Depends on:** Task 3 (same test file)
+**Depends on:** Task 3 (same test file); Task 8 (HELD until the census, see below)
 **File scope:**
 - Create: `src/llama-sycl-expert-names.h`
 - Modify: `src/llama-model.cpp:248-254` and its include list
@@ -595,6 +595,36 @@ substrings, so the prompt-scratch sizing loop at `:476-485` never sees its dimen
 `ffn_down_exps` alone (N 1152). The backend's own classifiers already know the fused name
 (`ggml/src/ggml-sycl/ggml-sycl.cpp:7131`). This task makes the loader agree and puts the name test where a unit test
 can reach it.
+
+**HELD 2026-11-21 (lead ruling after quality review). Implemented on `task/inkling2-t5` (`98c3d4bc2`), reviewed, NOT
+merged.** The code does what this task says. The task's premise is not established, and two statements in it are
+wrong:
+- **What the loop sizes.** The maxima feed the prompt-processing MoE oneDNN scratch ring in the RUNTIME zone
+  (`src/llama-model.cpp:473-550`, published at `ggml-sycl.cpp:17291-17342`). For Inkling the ring is already planned
+  from `ffn_down_exps` alone: 892.1 MB (weight slot 172.1, activation 144.0, output 576.0;
+  `blockers-2026-11-21/b70-load.err`). `ffn_down_exps` is `{n_ff_exp, n_embd}`, so it gave K 1152 and N 2304, not
+  "N 1152" as the description says. With the fused tensor seen, K becomes 2304 and the weight slot doubles: the
+  activation slot and the weight slot each double, about +316 MB per card.
+- **Who consumes it.** The ring's executor (`try_pp_onednn_f16_batched`, `ggml-sycl.cpp:90653`) sizes from the tensor
+  it is dispatched, so the larger plan is exactly right IF that executor runs on a fused tensor. Whether it does is
+  not settled by the code: its claim predicate accepts only the gate, up and down roles (`moe_classify_tensor`
+  returns UNKNOWN for the fused name), and the one log line we have for Inkling's prompt path says
+  `[MOE-PROMPT-CANONICAL] tensor=blk.0.ffn_gate_up_exps.weight published=0 kind=-1`. If no executor consumes the ring
+  for a fused NVFP4 tensor, the growth reserves VRAM that nothing uses, on a card (the B50) where every MB displaces
+  an expert. The same question applies to the 892 MB planned today.
+- **"No other model's sizing changes" is false.** `create_tensor_gate_up_exps` (`src/llama-model.cpp:5236-5250`) tries
+  the fused tensor first for about fourteen architectures (gemma4, qwen3next, qwen35moe, deepseek2 and others). Any
+  GGUF that stores its experts fused gets the larger plan. Files with separate gate and up tensors are unchanged.
+
+**Decision rule, applied when Task 8's census exists:** the plan for the ring follows what its executor serves. If
+the census shows the executor meeting fused tensors (a `refusing unplanned PP MoE oneDNN batched scratch` WARN with
+`required=` above `planned_cap=`, or an executor line naming `ffn_gate_up_exps`), this branch is merged with a
+reason-comment at the sizing loop and a corrected commit message. If a gap task gives fused NVFP4 prompt rows an
+executor that uses the ring, this change lands with that task. If nothing uses the ring for Inkling, this branch is
+not merged, and the gap task is the opposite one: stop planning a ring that no executor of the loaded layout can use.
+The four Minor review findings (the header comment's claim about `.bias` dimensions, calling the helper directly
+instead of through a `static` wrapper, a negative test for `ffn_norm_exps`, and the grovemoe `*_chexps` names the
+backend's classifiers know and the loader does not) are fixed in whichever commit lands.
 
 **Acceptance Criteria:**
 - [ ] `blk.3.ffn_gate_up_exps.weight` is an expert weight; `blk.3.ffn_gate_inp.weight` is not; the three existing
@@ -900,6 +930,10 @@ each, and the lead writes one task per confirmed gap.
 **Acceptance Criteria:**
 - [ ] Three census files, each with the gate line, the count of `MOE-DECODE-REFUSAL` lines by `reason=`, `owner=` and
       `kernel=`, the `MOE-PROMPT-CANONICAL` / `MOE-EXEC` lines, and the first `E ` line of the run.
+- [ ] Each census file also answers Task 5's question: the `[SYCL-PLAN] PP MoE oneDNN scratch ring` line, the count
+      of `refusing unplanned PP MoE oneDNN batched scratch` lines with their `required=` and `planned_cap=` values,
+      and whether any executor line names `ffn_gate_up_exps`. The lead then applies Task 5's decision rule and
+      records the outcome in Task 5's section.
 - [ ] For every refusal class: a new task in this plan with files, RED, GREEN, commands and commit; or a sentence
       stating the class did not occur.
 - [ ] Each gap task closes the gap with a kernel or an executor for the loaded layout where the operand lives. None
