@@ -2945,8 +2945,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
         // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
         // its room. It is measured at the context the caller requested from the load (the n_ctx hint; the training
-        // context when none was named) and ubatch 512: the caller's -ub does not reach the load (fkpg (a)). A dense
-        // model's default auto ubatch climbs above 512 into whatever room is left; that part is not reserved.
+        // context when none was named) and ubatch 512: the caller's -ub does not reach the measures, which the load
+        // reads only as the n_ubatch hint, to place the PP MoE ring (fkpg (a)). A dense model's default auto ubatch
+        // climbs above 512 into whatever room is left; that part is not reserved.
         const uint32_t load_measure_n_ctx = llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);
         const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
 
@@ -2985,8 +2986,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const llama_admitted_term & t : admitted.terms) {
                 LLAMA_LOG_WARN(
                     "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
-                    "%zu recorded); measured at n_ctx %u ubatch %u, n_ctx is the load's requested context, the "
-                    "caller's -ub is not transported (fkpg); measure %lld ms probe, %lld ms admitted\n",
+                    "%zu recorded); measured at n_ctx %u ubatch %u, n_ctx is the load's requested context (the "
+                    "training context when none was requested), the caller's -ub is not transported to the measure "
+                    "(fkpg); measure %lld ms probe, %lld ms admitted\n",
                     __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
                     t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
                     t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,

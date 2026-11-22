@@ -216,8 +216,8 @@ inline uint32_t llama_load_measure_request_n_ctx(uint32_t n_ctx_hint, uint32_t n
 // trial reads), and the caller's n_ctx, the training context for 0; every other parameter is the default. The bottom
 // rung is the ubatch a MoE model's auto pick stays at (its cap is MOE_GPU_UBATCH_MAX) and the one a pinned -ub 512
 // runs at. A dense model's auto pick climbs above it, to 2048 at the default n_batch, into whatever room the zones
-// have left: that larger buffer is not reserved. The caller's -ub does not reach the load (fkpg); its -c does, as the
-// hint.
+// have left: that larger buffer is not reserved. The caller's -ub does not reach the measures (fkpg): the load reads it
+// only as the n_ubatch hint, to place the PP MoE ring. Its -c does, as the n_ctx hint.
 inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx                = llama_load_measure_n_ctx(n_ctx, n_ctx_train);

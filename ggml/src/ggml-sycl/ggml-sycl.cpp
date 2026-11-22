@@ -46810,10 +46810,10 @@ bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uin
 // `device`, from the probe measure's chunks.  The bytes are what those chunks occupy in the RUNTIME zone's TLSF at the
 // alignment this buffer type requests (ggml_sycl_load_compute_term_size): the allocator's grain, and no headroom.  It
 // writes the planner term only, never the ledger; c(P) is recorded at the admitted stage by
-// ggml_backend_sycl_load_record_compute_term.  The term is measured at the load's requested context (the caller's -c
-// via the hint, else the padded training context) and ubatch 512; the caller's -ub is not transported (fkpg).  False,
-// reserving nothing, when txn is not the open load, n_ctx is 0, the device is out of range or has no VRAM arena, or the
-// chunk list is unusable; the load then goes on with its compute buffer unplanned, as it did before this entry existed.
+// ggml_backend_sycl_load_record_compute_term.  It is measured at the load's requested context (-c via the hint, else
+// the padded n_ctx_train) and ubatch 512: -ub does not reach the measures (the load reads it only as the ring's hint;
+// fkpg).  False, reserving nothing, when txn is not the open load, n_ctx is 0, the device is out of range or has no
+// VRAM arena, or the chunk list is unusable; the load then goes on with its compute buffer unplanned, as before.
 // The term is stored as the load's own contribution, keyed by the model slot and slot generation the transaction was
 // given at its begin (llama.cpp-ihk6, canonical contract 12.4): the load effect admits only the exact open
 // transaction and names that owner, and it is held across the store, so the load's end, which waits load effects

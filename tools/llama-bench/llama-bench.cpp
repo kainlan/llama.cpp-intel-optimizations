@@ -1297,7 +1297,8 @@ struct cmd_params_instance {
     }
 
     // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
-    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p). n_ubatch_hint
+    // instance's room and the compute term its load measured (the load's measures follow the same hint), and a larger
+    // later context is re-placed at context creation (llama.cpp-ak0p). n_ubatch_hint
     // depends on -b and -ub alone, so it does not reload on a context change either, and it is compared: the routed
     // experts the load moved to the host tier for one micro-batch's PP MoE scratch ring stay there, so a reused model
     // would measure a smaller micro-batch with experts it did not need to move, and a larger one would find no room for

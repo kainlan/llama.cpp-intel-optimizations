@@ -440,7 +440,7 @@ def stage_order_ok(code: str) -> bool:
     )
     if c.count(request) != 2 or not (c.find(request) < probe < c.rfind(request) < late):
         return False
-    args = z("load_measure_n_ctx, sycl_model_loading_guard.txn,")
+    args = z("*this, load_measure_n_ctx, sycl_model_loading_guard.txn,")
     probe_seg = c[probe:late_inv]
     admit_seg = c[admit:sync]
     unsupported = block_after(probe_seg, "if (!probe.unsupported.empty())")
@@ -1071,8 +1071,8 @@ def test_stage_order_mutants():
 def test_mutant_measure_rides_the_envelope_again_fails():
     """A measure fed the envelope's n_ctx (0, the training context) instead of the load's requested context."""
     code = code_of(MODEL_CPP)
-    new = z("load_measure_n_ctx, sycl_model_loading_guard.txn,")
-    old = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    new = z("*this, load_measure_n_ctx, sycl_model_loading_guard.txn,")
+    old = z("*this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
     assert code.count(new) == 3, "the probe, admitted and late calls must each carry the requested n_ctx"
     at = -1
     for site in ("probe", "admitted", "late"):

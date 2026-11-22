@@ -3496,9 +3496,10 @@ void llama_context::tenant_plan_report(const sched_measure_plan & plan, uint32_t
 
 // llama.cpp-p6i0: the compute trace, one line per compute buffer type and graph, in one format for the load-time
 // measure (side=measure) and the allocating reserve (side=reserve), so the measured term and the real compute buffer
-// can be compared chunk by chunk. A difference in the shape line is the caller's -ub, which does not reach the load
-// (fkpg), or a context other than the one the load was asked for (its -c reaches the load as the n_ctx hint); a
-// difference at the same shape is the placement.
+// can be compared chunk by chunk. A difference in the shape line is the caller's -ub, which does not reach the
+// measures (they run at ubatch 512; the load reads -ub only as the n_ubatch hint, to place the PP MoE ring; fkpg), or
+// a context other than the one the load was asked for (its -c reaches the measures as the n_ctx hint); a difference
+// at the same shape is the placement.
 static const char * llama_compute_trace_kind_name(llama_measure_kind kind) {
     switch (kind) {
         case LLAMA_MEASURE_KIND_PP:
