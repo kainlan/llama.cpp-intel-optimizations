@@ -21,8 +21,8 @@ static void pad_reflect_1d_kernel_f32(const void * __restrict__ src0,
                                       const int         p1,
                                       const int64_t     n_groups0,
                                       sycl::nd_item<3>  item_ct1) {
-    // The launcher caps every dimension of the global range. A work-group serves every plane and row tile congruent
-    // to its own index in each dimension.
+    // The launcher launches at most cap work-groups in total, so a work-group may serve several planes or row tiles:
+    // every one congruent to its own index in each dimension.
     for (int64_t i3 = item_ct1.get_group(0); i3 < ne03; i3 += (int64_t) item_ct1.get_group_range(0)) {
         for (int64_t i2 = item_ct1.get_group(1); i2 < ne02; i2 += (int64_t) item_ct1.get_group_range(1)) {
             for (int64_t g = item_ct1.get_group(2); g < n_groups0; g += (int64_t) item_ct1.get_group_range(2)) {
@@ -100,14 +100,15 @@ void ggml_sycl_op_pad_reflect_1d(ggml_backend_sycl_context & ctx, ggml_sycl::syc
     const sycl::uint3 ne01_packed = init_fastdiv_values(ne01);
 
     // The runtime refuses a global range whose size, or any one dimension of it, exceeds INT_MAX (the default
-    // -fsycl-id-queries-range=int), and dpct::dim3 multiplies in unsigned: 16777217 rows times 256 wrapped to 256
-    // work-items and one row was written. Launch at most cap work-groups in total, filling dimensions 0, 1 and 2 in
-    // turn; each launched count is at most cap divided by the product of the ones before it, so the product of all
-    // three stays at most cap. The kernel strides over what the launch leaves out.
+    // -fsycl-id-queries-range=int). The range is built as sycl::range<3> in size_t; dpct::dim3 multiplies in unsigned
+    // and would wrap. Launch at most cap work-groups in total, filling the plane axes i3 and i2 first, then the row
+    // tiles. Each launched count is at most cap divided by the product of the ones before it, and that quotient is at
+    // least 1 because the product never exceeds cap, so the product of all three stays at most cap. The kernel
+    // strides over what the launch leaves out.
     const int64_t        cap       = (int64_t) INT_MAX / bx;
     const int64_t        launched3 = std::min(ne03, cap);
-    const int64_t        launched2 = std::min(ne02, std::max<int64_t>(1, cap / launched3));
-    const int64_t        launched0 = std::min(n_groups0, std::max<int64_t>(1, cap / (launched3 * launched2)));
+    const int64_t        launched2 = std::min(ne02, cap / launched3);
+    const int64_t        launched0 = std::min(n_groups0, cap / (launched3 * launched2));
     const sycl::range<3> local_range(1, 1, (size_t) bx);
     const sycl::range<3> global_range((size_t) launched3, (size_t) launched2, (size_t) (launched0 * bx));
 
