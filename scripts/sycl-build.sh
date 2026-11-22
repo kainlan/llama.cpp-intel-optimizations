@@ -269,6 +269,13 @@ if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
         echo "[sycl-build] refreshing cached oneCCL_DIR: ${cached_oneccl_dir:-<unset>} -> ${ONECCL_DIR}"
         needs_configure=1
     fi
+    # FindPython takes an absolute Python3_EXECUTABLE over its own cached _Python3_EXECUTABLE, so a configure with
+    # the hint below is enough; without one, an older build directory keeps running the contracts elsewhere.
+    cached_python3="$(sed -n 's/^Python3_EXECUTABLE:[A-Z]*=//p' "${BUILD_DIR}/CMakeCache.txt" | tail -n 1)"
+    if [[ "${cached_python3}" != "${PYTHON3}" ]]; then
+        echo "[sycl-build] refreshing cached Python3_EXECUTABLE: ${cached_python3:-<unset>} -> ${PYTHON3}"
+        needs_configure=1
+    fi
 fi
 
 if (( force_reconfigure )) || cmake_input_changed; then
