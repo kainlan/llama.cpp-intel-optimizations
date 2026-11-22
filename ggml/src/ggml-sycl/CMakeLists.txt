@@ -6984,6 +6984,28 @@ set_tests_properties(sycl-select-unselected-branch PROPERTIES
     RUN_SERIAL TRUE
     TIMEOUT 120)
 
+# test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set was given,
+# also for a weight the backend stores reordered (SOA). Set and get only: no graph, no model, at most 34 MB of
+# device memory per case, so it carries no model/cache/mem-handle label and the sweep runs it. It submits device
+# copies, so the registration pins the validation card (level_zero:1); run the binary under level_zero:0 for the
+# B70. Exits 77 when no device is visible.
+add_executable(test-sycl-weight-readback-layout
+    tests/test-weight-readback-layout.cpp
+)
+target_include_directories(test-sycl-weight-readback-layout PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_link_libraries(test-sycl-weight-readback-layout PRIVATE ggml-base ggml ggml-sycl)
+set_target_properties(test-sycl-weight-readback-layout PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-weight-readback-layout COMMAND test-sycl-weight-readback-layout)
+set_tests_properties(sycl-weight-readback-layout PROPERTIES
+    LABELS "sycl;graph;device"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 300)
+
 # Persistent-worker graph-boundary reset proof. Pure host C++: it creates two
 # std::threads but no SYCL queue, links no backend library, and takes no -fsycl
 # options. A repeated handoff/reset cycle stress-tests the fixture and TLS reuse.

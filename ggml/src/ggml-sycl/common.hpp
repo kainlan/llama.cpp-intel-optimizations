@@ -4694,6 +4694,12 @@ struct ggml_tensor_extra_gpu {
     tensor_layout_info layout;
     bool               layout_dirty = false;                // Weight data overwritten; layout must be re-materialized
 
+    // The order of the bytes in the tensor's own range (tensor->data). It is written only by code that writes those
+    // bytes (set_tensor, and the in-place reorders reorder_tensor_to_soa and convert_tensor_to_coalesced); a
+    // cache-side copy in another layout never changes it. optimized_feature and layout record what a kernel last
+    // resolved, which may be such a copy. ggml_backend_sycl_buffer_get_tensor decides from this field alone.
+    ggml_layout_mode own_data_layout = GGML_LAYOUT_AOS;
+
     tp_layer_type tp_type        = tp_layer_type::TP_NONE;  // Cached TP type (set once, avoids string compare)
     bool          tp_type_cached = false;                   // Whether tp_type has been computed
 

@@ -3873,6 +3873,11 @@ bool convert_tensor_to_coalesced(const ggml_tensor * tensor, dpct::queue_ptr str
 
     // SET THE FLAG - mark tensor as COALESCED (via private friend access)
     extra->optimized_feature.set_reorder_mode_(reorder_mode::COALESCED, tensor->name, caller);
+    // The conversion wrote in place at tensor_ptr, which is the tensor's own range only when it is tensor->data (the
+    // resolver may answer a cache copy).
+    if (tensor_ptr == tensor->data) {
+        extra->own_data_layout = GGML_LAYOUT_COALESCED;
+    }
 
     // Keep unified layout descriptor in sync
     extra->layout.mode        = GGML_LAYOUT_COALESCED;
