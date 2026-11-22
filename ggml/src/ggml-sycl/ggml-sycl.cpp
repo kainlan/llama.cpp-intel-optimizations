@@ -17448,10 +17448,11 @@ static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * p
 }
 
 // Refuses the load for a plan whose loader buffers the pinned pool cannot hold within the host budget
-// (placement_plan_loader_pool_refusal): logs one ERROR naming the reason and its figures and returns true, and the stage
-// then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. Such a load would fail in grow_zone partway through, so this refuses
-// nothing that could have run, and once the plan admits, no loader pool growth fails. The stage asks it before the
-// lazy-plan refusal, whose room the loader's zone took. Returns false, logging nothing, for any other plan.
+// (placement_plan_loader_pool_refusal): logs one ERROR naming the reason and its figures and returns true, and the
+// stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. Such a load would fail in grow_zone partway through, so this
+// refuses nothing that could have run. Once the plan admits, no loader pool growth fails, as long as the pool's own
+// budget, which it computes when its cache is created, is at least the plan's host budget. The stage asks it before
+// the lazy-plan refusal, whose room the loader's zone took. Returns false, logging nothing, for any other plan.
 static bool ggml_sycl_stage_refuse_loader_pool_plan(const ggml_sycl::placement_plan * plan, bool early) {
     if (plan == nullptr) {
         return false;
@@ -45039,8 +45040,8 @@ static void ggml_sycl_preload_model_weights() {
         std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_count{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_bytes{};
         std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_unowned_first{};
-        // Host experts the plan serves from the loader's SYCL_Host chunk whose chunk the gate refused: the plan sized no
-        // block for a copy, so the load refuses once the sweep has counted them, naming the gate's first reason.
+        // Host experts the plan serves from the loader's SYCL_Host chunk whose chunk the gate refused: the plan sized
+        // no block for a copy, so the load refuses once the sweep has counted them, naming the gate's first reason.
         std::array<size_t, GGML_SYCL_MAX_DEVICES>      host_expert_loader_refused_count{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES>      host_expert_loader_refused_bytes{};
         std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_loader_refused_first{};
@@ -55105,8 +55106,8 @@ struct sycl_host_buf_ctx {
     // the table that carried it.
     std::unique_ptr<ggml_sycl::tenant_claim> claim;
     // The buffer's owner serial and the lifetime its allocation was registered with (§4.4 "Lifetimes"): free_buffer
-    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns, and for
-    // a chunk a model owns.
+    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns, and
+    // for a chunk a model owns.
     uint64_t                                 owner_id = 0;
     ggml_sycl::alloc_lifetime                lifetime = ggml_sycl::alloc_lifetime::GRAPH;
     // The model whose load minted this chunk, which owns its allocation; 0 for any other buffer. free_buffer reports

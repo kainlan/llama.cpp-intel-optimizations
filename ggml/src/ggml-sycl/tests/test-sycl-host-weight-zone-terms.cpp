@@ -24,9 +24,10 @@
 //   tlsf_bound            the TLSF rounding of each block to its grain, so the block count times the grain
 //
 // One tenant of the zone is a term only when the load's fact says the loader holds it: loader_residency, the model
-// loader's SYCL_Host buffer, which holds every weight the loader reads (role WEIGHT, lifetime MODEL, category HOST_COMPUTE, from the buffer type the loader
-// adds to a SYCL device's list when weights are evictable; the buffer type asks role WEIGHT only under the model-load
-// flag, and a SYCL_Host buffer made after the load, the context's compute and output buffers, routes to SCRATCH).
+// loader's SYCL_Host buffer, which holds every weight the loader reads (role WEIGHT, lifetime MODEL, category
+// HOST_COMPUTE, from the buffer type the loader adds to a SYCL device's list when weights are evictable; the buffer
+// type asks role WEIGHT only under the model-load flag, and a SYCL_Host buffer made after the load, the context's
+// compute and output buffers, routes to SCRATCH).
 // A plan charges it once, host-wide, when the load maps no file, its weights are evictable and one device's pool holds
 // the buffer (placement_loader_fact_for: loader_device >= 0), and only that device's commit terms carry it. A plan made
 // for that device also has S1-PRELOAD serve each host expert from it in place: the expert is counted once, inside

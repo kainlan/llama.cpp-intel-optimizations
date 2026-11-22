@@ -1318,7 +1318,8 @@ struct placement_plan {
     // bytes only loader_device's pool commits (placement_plan_host_zone_commit_terms_on_device).
     size_t                                     host_zone_loader_bytes = 0;
     // Recorded with it, empty when it is 0: the loader's tensors in the order the loader allocates them, each padded to
-    // the loader's tensor alignment, which placement_loader_pool_footprint_for() splits into buffers as ggml-alloc does.
+    // the loader's tensor alignment, which placement_loader_pool_footprint_for() splits into buffers as ggml-alloc
+    // does.
     std::vector<size_t>                        loader_tensor_bytes;
     // th32 §3.3, §4.3 step 4: the lazy tables' residency and the block ring their STORAGE reads need. The ring is
     // sized after the residency pass over the tables that stayed STORAGE: block_ring_need = block_ring_qd x
@@ -2541,7 +2542,8 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     // configures a WEIGHT zone whose segments hold every loader buffer a chunk can hold, and the pool's only growth for
     // the others is loader_grown, which total() counts. A plan charged this term whose total exceeds its budget is
     // refused by name at plan time (placement_plan_loader_pool_refusal), so once the plan admits, no loader pool growth
-    // fails. A plan whose record carries no tensors charges the bytes.
+    // fails, as long as the pool's own budget, which it computes when its cache is created, is at least the plan's host
+    // budget. A plan whose record carries no tensors charges the bytes.
     terms.weight      = plan.host_zone_weight_bytes;
     terms.loader_zone = plan.host_zone_loader_bytes;
     if (plan.host_zone_loader_bytes > 0 && !plan.loader_tensor_bytes.empty()) {
@@ -2603,8 +2605,9 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
 // The refusal of a plan charged the loader term (the loader holds the weights in loader_device's pool) whose commit
 // total, loader_grown included, exceeds its host budget: "loader-pool-over-budget" followed by total=, host_budget=,
 // loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. The term is exact, so such a load
-// would fail in grow_zone partway through; the stage refuses it by that name at plan time instead, and once the plan
-// admits, no loader pool growth fails. A plan without the loader term keeps the ledger's WARN-only check.
+// would fail in grow_zone partway through; the stage refuses it by that name at plan time instead. Once the plan
+// admits, no loader pool growth fails, as long as the pool's own budget, which it computes when its cache is created,
+// is at least the plan's host budget. A plan without the loader term keeps the ledger's WARN-only check.
 inline std::string placement_plan_loader_pool_refusal(const placement_plan & plan) {
     const bool charged = plan.loader_holds_weights && plan.loader_device >= 0 && plan.host_zone_loader_bytes > 0;
     if (!charged || !(plan.host_zone_terms.total() > plan.host_budget)) {

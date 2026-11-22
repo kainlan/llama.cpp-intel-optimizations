@@ -60,7 +60,8 @@ The charge (ucc = unified-cache.cpp)
       copy copies the cap from info.load_loader_buffer_cap, which the kv_info fill takes from the buffer type's chunk
       cap; and ggml_sycl_host_buft_max_size answers through host_zone_buffer_max_size, so the plan and the buffer
       type share one rule.
-  C4. Once the plan admits, no loader pool growth fails. placement_plan_loader_pool_refusal (hpp) names
+  C4. Once the plan admits, no loader pool growth fails where the pool's own budget is at least the plan's host
+      budget. placement_plan_loader_pool_refusal (hpp) names
       "loader-pool-over-budget" for a plan charged the loader term (loader_holds_weights, loader_device >= 0,
       host_zone_loader_bytes > 0) whose commit total, loader_grown included (host_zone_terms.total()), exceeds
       host_budget; ggml_sycl_stage_refuse_loader_pool_plan logs it on one ERROR line, and the stage returns

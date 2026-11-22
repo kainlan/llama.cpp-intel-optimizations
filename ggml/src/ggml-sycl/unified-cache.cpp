@@ -36325,10 +36325,10 @@ static void placement_plan_hold_moe_swap_host_headroom(placement_plan & plan, co
 // load passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
 // line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
 // whole: phase (a) of th32 T2 refuses nothing here. The stage refuses one such plan, a plan charged the loader term
-// whose commit total exceeds the budget (placement_plan_loader_pool_refusal), and the WARN says so. The cache supplies the live oneDNN scratch and the chunk size, which
-// the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
-// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped. The lookup creates
-// no cache and holds the cache lock shared once, for the find alone.
+// whose commit total exceeds the budget (placement_plan_loader_pool_refusal), and the WARN says so. The cache supplies
+// the live oneDNN scratch and the chunk size, which the terms keep so a re-plan re-records from the same inputs; a plan
+// made before any cache exists counts the default chunk. A lookup before the device count is known would enumerate the
+// devices, so it is skipped. The lookup creates no cache and holds the cache lock shared once, for the find alone.
 static void record_host_ledger_plan(placement_plan &          plan,
                                     const placement_kv_info & kv_info,
                                     size_t                    host_budget,

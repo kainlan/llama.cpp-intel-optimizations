@@ -18,9 +18,10 @@
 // chunk segment of the WEIGHT zone, so a chunk holds one buffer of the loader's size and the rest of the chunk is lost
 // to it. The commit terms charge the zone bytes those buffers take (loader_zone) and the chunks the pool grows for a
 // buffer no segment holds (loader_grown): once the plan admits, the loader's WEIGHT zone allocations need no growth the
-// plan did not count. The oracle replays the pool's own rules (configure_host_zones' segments, zone_alloc's first fit,
-// grow_zone's one chunk sized to the request), and it is checked against the B70 Qwen load that admitted a plan
-// charging raw bytes: the zone held 34 of the 37 buffers, and the pool grew two chunks and was refused the third.
+// plan did not count, where the pool's own budget is at least the plan's host budget. The oracle replays the pool's own
+// rules (configure_host_zones' segments, zone_alloc's first fit, grow_zone's one chunk sized to the request), and it is
+// checked against the B70 Qwen load that admitted a plan charging raw bytes: the zone held 34 of the 37 buffers, and
+// the pool grew two chunks and was refused the third.
 //
 // Host-only: the fact rule is a constexpr function of the load's inputs, and the terms are a pure function of a
 // hand-built plan. No queue, no device, no allocation.
