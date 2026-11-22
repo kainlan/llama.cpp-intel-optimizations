@@ -35,6 +35,7 @@ case "${STUB_MODE:-ok}" in
     fail) exit 5 ;;
     hang) trap '' TERM; while :; do sleep 1; done ;;
     sleep) echo $$ > "$STUB_PIDFILE"; exec sleep 30 ;;
+    steal) echo 'foreign taker' > "$INKLING_GPU_LOCK/holder"; exit 0 ;;
     handshake)
         # On TERM: announce it, then refuse to exit until the test says so, so the test can look at the lock
         # while a TERM-stopped child is still alive.
@@ -45,6 +46,30 @@ esac
 STUB
 chmod +x "$BR/bin/stub"
 cp "$BR/bin/stub" "$BR/bin/llama-completion"; cp "$BR/bin/stub" "$BR/bin/llama-bench"
+
+# PATH shims for the lock: mkdir answers success for an existing directory (the system mkdir's behaviour here);
+# python3 runs the real one with a prefix wrapped around os.mkdir (foreign: a holder appears right after the mkdir,
+# sleep: the take stalls for 2 s after the mkdir).
+REAL_PY="$(command -v python3)"
+SHIM="$T/shim"; mkdir -p "$SHIM"
+cat > "$SHIM/mkdir" <<SH
+#!/usr/bin/env bash
+for a in "\$@"; do [ -d "\$a" ] && exit 0; done
+exec /usr/bin/mkdir "\$@"
+SH
+cat > "$SHIM/python3" <<SH
+#!/usr/bin/env bash
+prog="\$2"; shift 2
+exec "$REAL_PY" -c "import os as _o, time as _t
+_real = _o.mkdir
+def _mk(p, *a, **k):
+    _real(p, *a, **k)
+    if '\${SHIM_MODE:-}' == 'foreign': open(p + '/holder', 'w').write('foreign taker\\\\n')
+    if '\${SHIM_MODE:-}' == 'sleep': _t.sleep(2)
+_o.mkdir = _mk
+\$prog" "\$@"
+SH
+chmod +x "$SHIM/mkdir" "$SHIM/python3"
 
 check() { # LABEL EXPECTED_RC REGEX ARGS...
     local label="$1" want="$2" re="$3"; shift 3
@@ -109,7 +134,7 @@ rr() { # OUTDIR [ARGS...]: one real invocation with a hard ceiling so a hung run
 # a. success; the setvars file reads an unset variable, so a runner that sources it under set -u dies here.
 : > "$STUB_LOG"; XENV=(STUB_MODE=ok); A="$T/a"
 rr "$A"
-if [ "$RR_RC" -eq 0 ] && grep -q 'rc=0' "$A/$TAG.done" 2>/dev/null && grep -q 'timed_out=no' "$A/$TAG.done" \
+if [ "$RR_RC" -eq 0 ] && grep -q 'rc=0' "$A/$TAG.done" 2>/dev/null && grep -q 'timed_out=no' "$A/$TAG.done" && grep -q 'lock=held' "$A/$TAG.done" \
    && [ ! -e "$T/lock" ] && grep -q "TUNING=$A/tuning-$TAG" "$STUB_LOG"; then
     pass "(real: success writes .done rc=0 timed_out=no, lock released, tuning dir passed)"
 else
@@ -192,28 +217,27 @@ else
     fail "(real: overlapping runs) tool ran $runs times, rc=$rk1/$rk2; k1: $(cat "$T/k1.out") k2: $(cat "$T/k2.out") log: $(cat "$STUB_LOG")"
 fi
 
-# k2. the result must not depend on mkdir: 40 iterations of two runners started together on a fresh lock. The system
-# mkdir here is the racy one, so any use of it in the lock path shows up as a double run.
+# k2. two copies of one tag started together on a fresh lock, 20 times: the tool must run exactly once each time. This
+# catches a lock with no second check; the deterministic lying-mkdir, foreign-holder and lost-lock cases below catch
+# the specific lock bugs.
 bad=""
-for i in $(seq 1 40); do
+for i in $(seq 1 20); do
     : > "$STUB_LOG"; K="$T/kk$i"
-    env STUB_MODE=ok INKLING_LOCK_POLL_SECONDS=0.05 timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" \
-        --build-dir "$BR" >/dev/null 2>&1 &
+    env STUB_MODE=ok timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" --build-dir "$BR" >/dev/null 2>&1 &
     P1=$!
-    env STUB_MODE=ok INKLING_LOCK_POLL_SECONDS=0.05 timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" \
-        --build-dir "$BR" >/dev/null 2>&1 &
+    env STUB_MODE=ok timeout 60 bash "$S" --setup b70 --phase e2e-decode --out "$K" --build-dir "$BR" >/dev/null 2>&1 &
     P2=$!
     r1=0; wait "$P1" || r1=$?
     r2=0; wait "$P2" || r2=$?
     runs="$(wc -l < "$STUB_LOG")"
-    [ "$runs" -eq 1 ] && [ $((r1 + r2)) -eq 1 ] || bad="$bad [iter $i: runs=$runs rc=$r1/$r2]"
-    [ ! -e "$T/lock" ] || { bad="$bad [iter $i: lock left]"; rmdir "$T/lock" 2>/dev/null; }
+    if [ "$runs" -ne 1 ] || [ $((r1 + r2)) -ne 1 ]; then bad="$bad [iter $i: runs=$runs rc=$r1/$r2]"; fi
+    [ ! -e "$T/lock" ] || { bad="$bad [iter $i: lock left]"; rm -rf "${T:?}/lock"; }
 done
-if [ -z "$bad" ]; then pass "(real: 40 paired races, the tool ran exactly once each time)"; else fail "(real: lock race)$bad"; fi
+if [ -z "$bad" ]; then pass "(real: 20 paired starts, the tool ran exactly once each time)"; else fail "(real: lock race)$bad"; fi
 
 # n. a co-taker that overwrites holder inside our verify window owns the lock: no run, nothing removed.
 : > "$STUB_LOG"; Nn="$T/n"
-( while [ ! -e "$T/lock/holder" ]; do sleep 0.01; done; echo "foreign taker" > "$T/lock/holder" ) &
+( for _ in $(seq 1 1500); do [ -e "$T/lock/holder" ] && break; sleep 0.01; done; echo "foreign taker" > "$T/lock/holder" ) &
 WP=$!
 env STUB_MODE=ok INKLING_LOCK_VERIFY_SECONDS=2 INKLING_LOCK_WAIT_SECONDS=4 timeout 60 bash "$S" --setup b70 \
     --phase e2e-decode --out "$Nn" --build-dir "$BR" >/dev/null 2>&1
@@ -226,6 +250,92 @@ else
     fail "(real: co-taker) rc=$rn log: $(cat "$STUB_LOG") holder: $(cat "$T/lock/holder" 2>&1)"
 fi
 rm -f "$T/lock/holder"; rmdir "$T/lock" 2>/dev/null
+
+# D1. the system mkdir reports success for an existing directory: a lock directory with no holder must still be
+# busy, so the runner gives up with exit 3 and leaves it alone.
+: > "$STUB_LOG"; mkdir "$T/lock"; XENV=(PATH="$SHIM:$PATH" INKLING_LOCK_WAIT_SECONDS=2); D1="$T/d1"
+rr "$D1"
+if [ "$RR_RC" -eq 3 ] && [ ! -s "$STUB_LOG" ] && [ -d "$T/lock" ] && [ ! -e "$T/lock/holder" ]; then
+    pass "(real: an existing lock directory is busy even when mkdir lies; the runner gives up, tool not run)"
+else
+    fail "(real: lying mkdir) rc=$RR_RC out: $RR_OUT log: $(cat "$STUB_LOG")"
+fi
+rmdir "$T/lock" 2>/dev/null
+
+# D2. a foreign holder written right after our mkdir (O_EXCL): the runner must not take the lock, run, or remove it.
+: > "$STUB_LOG"; XENV=(PATH="$SHIM:$PATH" SHIM_MODE=foreign INKLING_LOCK_WAIT_SECONDS=2); D2="$T/d2"
+rr "$D2"
+if [ "$RR_RC" -eq 3 ] && [ ! -s "$STUB_LOG" ] && [ "$(cat "$T/lock/holder" 2>/dev/null)" = "foreign taker" ]; then
+    pass "(real: a holder written right after our mkdir is respected: no run, lock and holder untouched)"
+else
+    fail "(real: foreign holder after mkdir) rc=$RR_RC out: $RR_OUT log: $(cat "$STUB_LOG") holder: $(cat "$T/lock/holder" 2>&1)"
+fi
+rm -f "$T/lock/holder"; rmdir "$T/lock" 2>/dev/null
+
+# D4. the holder is replaced while the tool runs: the run is flagged lost, exits 4, and leaves the directory alone.
+: > "$STUB_LOG"; XENV=(STUB_MODE=steal); D4="$T/d4"
+rr "$D4"
+if [ "$RR_RC" -eq 4 ] && grep -q 'lock=lost' "$D4/$TAG.done" 2>/dev/null && grep -q 'rc=0' "$D4/$TAG.done" \
+   && printf '%s' "$RR_OUT" | grep -q 'numbers are not valid' && [ "$(cat "$T/lock/holder" 2>/dev/null)" = "foreign taker" ]; then
+    pass "(real: a lost lock is recorded lock=lost, exit 4, message printed, foreign holder and directory left)"
+else
+    fail "(real: lost lock) rc=$RR_RC out: $RR_OUT done: $(cat "$D4/$TAG.done" 2>&1)"
+fi
+rm -f "$T/lock/holder"; rmdir "$T/lock" 2>/dev/null
+
+# group signals: the runner runs in its own process group (setsid) and the whole group is signalled, which also
+# kills any sleep child. Bounded waits so a broken runner cannot hang the test.
+group_start() { # OUTDIR ENV... : starts the runner, sets GP to the group id
+    setsid env "${@:2}" bash "$S" --setup b70 --phase e2e-decode --out "$1" --build-dir "$BR" >"$1.log" 2>&1 &
+    GP=$!
+}
+await_gone() { # PID SECONDS: wait for a pid to exit, kill it after the bound
+    local n=$(($2 * 10))
+    while [ "$n" -gt 0 ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; n=$((n - 1)); done
+    if kill -0 "$1" 2>/dev/null; then kill -KILL -- "-$1" 2>/dev/null; return 1; fi
+    wait "$1" 2>/dev/null; GRC=$?
+}
+# settle: TERM to the process group during the settle must not cut it short.
+: > "$STUB_LOG"; Gs="$T/gs"
+group_start "$Gs" STUB_MODE=ok INKLING_SETTLE_SECONDS=4
+for _ in $(seq 1 3000); do [ -s "$STUB_LOG" ] && break; sleep 0.01; done
+t_ran=$(date +%s%N)
+kill -TERM -- "-$GP" 2>/dev/null
+for _ in $(seq 1 1500); do [ -e "$T/lock" ] || break; sleep 0.01; done
+t_gone=$(date +%s%N)
+await_gone "$GP" 20
+ms=$(( (t_gone - t_ran) / 1000000 ))
+if [ "$ms" -ge 2500 ] && [ ! -e "$T/lock" ] && grep -q 'signalled=yes' "$Gs/$TAG.done" 2>/dev/null; then
+    pass "(real: a group TERM during the settle does not cut it short (${ms} ms), signalled=yes)"
+else
+    fail "(real: group settle) lock held ${ms} ms; done: $(cat "$Gs/$TAG.done" 2>&1)"
+fi
+rm -rf "${T:?}/lock"
+
+# group TERM while the take is stalled right after its mkdir: never a directory with no holder and no owner.
+: > "$STUB_LOG"; Gt="$T/gt"
+group_start "$Gt" PATH="$SHIM:$PATH" SHIM_MODE=sleep STUB_MODE=ok
+for _ in $(seq 1 3000); do [ -d "$T/lock" ] && break; sleep 0.01; done
+kill -TERM -- "-$GP" 2>/dev/null
+await_gone "$GP" 30
+if [ ! -e "$T/lock" ] && [ ! -s "$STUB_LOG" ] && [ "$GRC" -eq 143 ] && [ -e "$Gt/$TAG.fail" ]; then
+    pass "(real: a group TERM during the take leaves no ownerless lock directory; run refused with 143)"
+else
+    fail "(real: group TERM during take) rc=${GRC:-?} lock: $(ls -A "$T/lock" 2>&1) log: $(cat "$STUB_LOG")"
+fi
+rm -rf "${T:?}/lock"
+
+# numeric overrides are validated before any marker, lock or tool.
+for bad_env in INKLING_LOCK_POLL_SECONDS=0 INKLING_SETTLE_SECONDS=abc INKLING_RUN_TIMEOUT=abc; do
+    : > "$STUB_LOG"; V="$T/v-${bad_env%%=*}"
+    RR_RC=0
+    out="$(env "$bad_env" timeout 20 bash "$S" --setup b70 --phase e2e-decode --out "$V" --build-dir "$BR" 2>&1)" || RR_RC=$?
+    if [ "$RR_RC" -eq 1 ] && ! ls "$V"/*.done >/dev/null 2>&1 && [ ! -s "$STUB_LOG" ] && printf '%s' "$out" | grep -q "${bad_env%%=*}"; then
+        pass "(a bad ${bad_env%%=*} exits 1 before any marker or run)"
+    else
+        fail "(bad ${bad_env%%=*}) rc=$RR_RC out: $out"
+    fi
+done
 
 # e. setvars fails.
 : > "$STUB_LOG"; printf 'return 3\n' > "$T/setvars-bad.sh"; XENV=(INKLING_SETVARS="$T/setvars-bad.sh"); E="$T/e"

@@ -1835,9 +1835,10 @@ if (NOT WIN32)
     )
 endif()
 
-# sycl-inkling-profile-script: --dry-run stub test of the Inkling profile runner
-# (selector map, per-run env, no -ngl, one instrument per run). Never locks the
-# GPU or loads a model.
+# sycl-inkling-profile-script: stub test of the Inkling profile runner. --dry-run covers the argument, command and
+# environment cases; the real-run path (lock, Shmem wait, setvars, child, signals, markers) runs against stub
+# binaries, a fake lock directory and a fake meminfo. It never locks the real GPU or loads a model. The race and
+# group-signal cases sleep for seconds, hence the longer timeout.
 if (NOT WIN32)
     llama_test_cmd(
         bash
@@ -1846,6 +1847,19 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-inkling-profile-script.sh
     )
     set_tests_properties(sycl-inkling-profile-script PROPERTIES
+        LABELS "sycl;policy"
+        TIMEOUT 300
+    )
+
+    # sycl-lock: the take/holder/release contract of scripts/sycl-lock.sh against a fake lock directory and PATH
+    # shims for a mkdir that succeeds on an existing directory and a foreign holder that appears mid-take.
+    llama_test_cmd(
+        bash
+        NAME sycl-lock
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lock.sh
+    )
+    set_tests_properties(sycl-lock PROPERTIES
         LABELS "sycl;policy"
         TIMEOUT 120
     )
