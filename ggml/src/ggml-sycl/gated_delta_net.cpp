@@ -328,7 +328,9 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT(neq1 == nek1);
     const int64_t neqk1 = neq1;
 
-    // q and k may repeat over the sequences at different ratios, as in the CPU reference.
+    // q and k may repeat over the sequences at different ratios, as in the CPU reference. The CPU reference assumes
+    // both divide v's sequence count without checking; the CUDA backend asserts it for q and requires nek3 == neq3.
+    GGML_ASSERT(neq3 > 0 && nek3 > 0 && nev3 % neq3 == 0 && nev3 % nek3 == 0);
     const int64_t rq3 = nev3 / neq3;
     const int64_t rk3 = nev3 / nek3;
 
