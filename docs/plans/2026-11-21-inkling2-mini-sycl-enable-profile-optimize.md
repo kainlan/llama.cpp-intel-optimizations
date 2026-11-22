@@ -1698,6 +1698,19 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
 - **`docs/backend/gpt-oss-testing.md` still quotes an old ctest exclusion list**, and the `sycl-canonical-gates`
   ctest label (`gpu;model-loading`) may not be excluded by the documented sweep. Both belong to the test-hygiene epic
   llama.cpp-97yn; neither is touched here.
+- **Five source contracts are red on `master` and were red before the upstream sync** (found 2026-11-21 by the
+  Task 7a implementer's sweep; confirmed by the lead on `1dcdf49b1` and on `a450d2c81`, the commit before the sync
+  merge, with the same messages): `test-sycl-counter-dump-gate` (two H13 claims), `test-sycl-dnnl-decline-consumers`
+  (a mutant survives), `sycl-mmq-src1-plan-source` (a mutant does not fire), `sycl-concat-no-host-wait-source` (the
+  `ggml_sycl_graph_safe_memcpy` anchor is gone and two mutants do not fire) and
+  `test-sycl-moe-cpu-activation-row-source` (exits 1). None is caused by this plan and none is repaired by it. Each
+  is either a stale pin or a lost property, and that is not yet known for any of them. Until they are repaired, a
+  `-L source-contract` sweep in this plan is read as "these five, and no others, fail". This needs its own tracker
+  task.
+- **The full build was broken on `master` since the upstream sync** by one test that called a removed function
+  (`tests/test-sycl-fattn-masked-nonfinite.cpp`). Fixed on this branch in `16a931347` and on `master` in `313fa14e4`.
+  The sync was verified with named-target builds only; whether other targets that were never built since the sync
+  compile is known only from Task 7a's `-k 0` build, where this was the single failure.
 - **Task 16's rate is a measurement** and appears in the plan as the value of a named file, not as a number.
 - **Tracker:** the codescout `task_*` tools were not reachable in the planning session (missing index root). The lead
   files one tracker task per plan task, with `task_dep` edges from the graph above, as the first step of execution.
