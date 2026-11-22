@@ -122,6 +122,7 @@ digraph dependencies {
     7d [label="T7d failed context gives its device back"];
     7b [label="T7b every queue has the handler"];
     7c [label="T7c auxiliary drains deliver"];
+    7f [label="T7f source contracts left red by 7a, 7b, 7d"];
     7  [label="T7 open NVFP4 direct route"];
     8  [label="T8 census + gap tasks (lead)"];
     9  [label="T9 Stage 1 gates (lead)"];
@@ -138,7 +139,7 @@ digraph dependencies {
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
     6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5; 6f5 -> 6g; 6f3 -> 6f6;
     6f3 -> 6f7; 6f7 -> 6f4; 6f7 -> 6f8; 6f7 -> 6f9;
-    8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
+    8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9; 7c -> 7f; 7f -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
     13 -> 17; 14 -> 17; 16 -> 17;
@@ -3179,6 +3180,198 @@ R's `q =` exemption.
   target. The class is dead in the product.
 - The handler's `std::rethrow_exception` can allocate when an error is delivered; decision 1's "never allocates"
   is true of the latch's `record` only.
+
+---
+
+### Task 7f: The source contracts Tasks 7a, 7b and 7d left red (written 2026-11-22)
+
+**Track:** D (worktree `inkling/wt-t7a`, branch `task/inkling2-t7f`). **Depends on:** Task 7c merged. **Blocks:** Task 9.
+**No C++ changes and no build:** contract data, two test scripts and one README.
+
+**Why this task exists.** On 2026-11-22 the lead ran, for the first time on this branch, the host-only source-contract
+sweep on the merged tree at `9ea787a34`:
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -L 'source' -LE 'model|cache|mem-handle|device|residency' -j 4 --timeout 300
+```
+
+Eight of 205 tests failed, and `scripts/check-sycl-alloc-zone-contract.py` (ctest `test-sycl-alloc-zone-contract`)
+failed too. Each script was then run on `master` (`313fa14e4`) and the outputs compared:
+
+| contract | master | branch | cause |
+|---|---|---|---|
+| `scripts/check-sycl-counter-dump.py` | red | red, same output | not this branch |
+| `scripts/check-sycl-dnnl-decline-consumers.py` | red | red, same output | not this branch |
+| `tests/test-sycl-mmq-src1-plan-source.py` | red | red, same output | not this branch |
+| `tests/test-sycl-concat-no-host-wait-source.py` | red | red, same output | not this branch |
+| `tests/test-sycl-moe-cpu-activation-row-source.py` | red | red, same output | not this branch |
+| `tests/test-sycl-moe-join-queue-source.py` | green | red | Task 7b: the join queue is built through `ggml_sycl_make_queue`; pin O still spells the direct construction |
+| `tests/test-sycl-gate-registration-audit.py` (`--self-test` and `--census`) | green | red | Task 7a: `tests/test-sycl-async-failure-source.py` has a helper named `test_seam_guarded`, so the audit reads the file as pytest-style (rules R2, R3) |
+| `scripts/check-sycl-alloc-zone-contract.py` | green | red, 8 new `G-CATCH` | Tasks 7a and 7d: new `catch` handlers around drains |
+
+The five that are red on `master` are outside this plan. Until `master` fixes them they are the **known-red baseline**
+of the sweep: a sweep passes when its failed set is exactly those five, or a subset.
+The census also printed `R7 test-sycl-async-drain-source.py is registered ... but is not in the configured build`:
+the merged tree's `build/` was configured before Task 7c merged. That line goes away with the next reconfigure and is
+not part of this task.
+
+**The process gap, closed from this task on.** No task review and no merged-tree gate ran the sweep. From now on:
+every implementer brief for a task that touches `ggml/src/ggml-sycl/` or a contract script says to run the sweep
+before reporting; every merged-tree gate of the lead runs it once and records the failed set.
+
+**File scope:**
+- Modify: `scripts/sycl-alloc-zone-contract/allowlist.json`, `scripts/sycl-alloc-zone-contract/debt.json`,
+  `scripts/sycl-alloc-zone-contract/README.md`
+- Modify: `tests/test-sycl-moe-join-queue-source.py`, `tests/test-sycl-async-failure-source.py`
+
+#### Part 1: the eight `G-CATCH` findings
+
+Clause (g) wants every `catch (...)` and `catch (const std::exception &)` preceded in its try by
+`catch (const ggml_sycl_fallback_error &) { throw; }`, so a planned refusal is never swallowed. An exemption is an
+allowlist entry with a reason (see `scripts/sycl-alloc-zone-contract/README.md`, clause (g), and the existing
+`G-CATCH` entries such as `E-SYNC-FOR-REPLAN`). All eight findings are handlers on a try whose body is a single SYCL
+wait, or the async handler's `std::rethrow_exception`. None of those bodies can raise a planned refusal, every handler
+records the error in the failure latch (which fails the next graph boundary, the opposite of swallowing), and a
+rethrow would be wrong: `std::terminate` through a `noexcept` boundary in three of the five functions, and in
+`ggml_backend_sycl_synchronize` it would skip the `ggml_sycl_cpu_job_gates_clear` that follows the try. So the
+handlers are exempted, not guarded. **Before writing each entry, read the function and confirm every clause of its
+reason against the code. If a clause is false, do not write the entry: stop and report to the lead.**
+
+Add these six entries at the end of `entries` in `allowlist.json`:
+
+1. `"id": "E-KJOC-ASYNC-HANDLER"`, `"code": "G-CATCH"`, `"file": "common.cpp"`,
+   `"function": "lambda in ggml_sycl_async_handler"`, `"count": 2`. Reason: *The lambda ggml_sycl_async_handler
+   returns is the SYCL asynchronous-error handler of every backend queue and context, and it is noexcept: the runtime
+   calls it from whichever wait_and_throw delivers, including ones in noexcept code, so a rethrow of any type would
+   std::terminate. Its try body is one std::rethrow_exception of an error the runtime delivered, and both handlers
+   record it in the per-device failure latch, which the graph boundaries read and turn into a failed graph. Nothing is
+   swallowed: an error of any type, a planned refusal thrown inside a host task included, fails the next boundary.
+   Permanent; llama.cpp-kjoc.*
+2. `"id": "E-KJOC-DRAIN-RETRY-WAIT"`, `"code": "G-CATCH"`, `"file": "ggml-sycl.cpp"`,
+   `"function": "ggml_sycl_execution_recover_and_release_graph"`, `"count": 2`. Reason: *ggml_sycl_execution_
+   recover_and_release_graph is noexcept and its try body is one wait_and_throw on the context's stream, which raises
+   no planned refusal: an asynchronous error goes to the queue's recording handler, and what the wait itself throws is
+   a SYCL runtime error. Both handlers record the failed wait in the failure latch and return false, which sends the
+   caller to its abort path with the workspace slot still quarantined; a rethrow would std::terminate through the
+   noexcept boundary. Permanent; llama.cpp-kjoc.*
+3. `"id": "E-KJOC-BEGIN-DRAIN-WAIT"`, `"code": "G-CATCH"`, `"file": "ggml-sycl.cpp"`,
+   `"function": "ggml_sycl_execution_drain_own_terminal"`, `"count": 2`. Reason: *ggml_sycl_execution_drain_own_
+   terminal is noexcept and its one try wraps the wait on the deferred decode event or the context's stream, which
+   raises no planned refusal. Both handlers record the failed wait in the failure latch and fall through to the
+   quarantine path, which retains every root and backing lease instead of releasing on an unproven terminal; a rethrow
+   would std::terminate through the noexcept boundary. The catch-all was shrink-only debt until the std::exception
+   handler joined it; the pair is exempt together because both sit on the same try. Permanent; llama.cpp-kjoc.*
+4. `"id": "E-KJOC-CONTEXT-DRAIN-WAIT"`, `"code": "G-CATCH"`, `"file": "ggml-sycl.cpp"`,
+   `"function": "lambda in ggml_sycl_execution_drain_context_terminal_events"`, `"count": 2`. Reason: *The lambda
+   runs once for each backend bound to an ending execution context. Its one try wraps the wait on the deferred decode
+   event or the backend's stream, which raises no planned refusal. Both handlers record the failed wait in the failure
+   latch and fall through to the quarantine path, which retains every root and backing lease instead of releasing on
+   an unproven terminal; a rethrow would leave the remaining bound backends undrained. The catch-all was shrink-only
+   debt until the std::exception handler joined it; the pair is exempt together because both sit on the same try.
+   Permanent; llama.cpp-kjoc.*
+5. `"id": "E-KJOC-SYNC-DRAIN-WAIT-EXC"`, `"code": "G-CATCH"`,
+   `"key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:exception#0"`, `"count": 1`. Reason: *The
+   first unguarded std::exception handler of ggml_backend_sycl_synchronize, which by source order is the one on the
+   drain's try. That try's body is one wait_and_throw on the deferred decode event or on stream 0, which raises no
+   planned refusal. The handler keeps the wait's error in drain_error, and the code after the try records it in the
+   failure latch, so the boundary reports a failed graph and cleans up. A rethrow would skip the CPU-job gate clear
+   that follows the try. Keyed to the handler and not to the function, because the function's other three unguarded
+   handlers (the diagnostic memory read and the outer boundary pair) stay shrink-only debt. Permanent;
+   llama.cpp-kjoc.*
+6. `"id": "E-KJOC-SYNC-DRAIN-WAIT-ALL"`, same as 5 with key
+   `"ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:all#0"` and "catch-all" for "std::exception" in the
+   first sentence.
+
+Copy the field order and JSON style of the neighbouring entries. A reason must not name a source line (`file:NNN`)
+or a ledger id; the script rejects both.
+
+`debt.json`, by hand (never `--write-debt`):
+- Delete `ggml-sycl.cpp::ggml_sycl_execution_drain_own_terminal::catch_clause:all#0`.
+- Delete `ggml-sycl.cpp::lambda in ggml_sycl_execution_drain_context_terminal_events::catch_clause:all#0`.
+- `ggml_backend_sycl_synchronize`: the ordinal counts unguarded handlers per kind in source order, and the drain's two
+  handlers now come first. The three debt handlers are the same three as before under new ordinals. Replace the keys
+  `...::catch_clause:all#0`, `...::catch_clause:all#1`, `...::catch_clause:exception#0` with
+  `...::catch_clause:all#1`, `...::catch_clause:all#2`, `...::catch_clause:exception#1`. Keep the file's sort order.
+- Result: debt has two entries fewer than before and no new handler in it. Show this with
+  `git diff --stat` and a count of `"code": "G-CATCH"` lines before and after.
+
+`README.md`, clause (g) paragraph: add that a `G-CATCH` exemption may be keyed to one handler with `key` (the debt
+key spelling) when the function's other unguarded handlers stay debt, that such an entry pins `count: 1`, and that an
+unguarded handler added before it in the same function shifts the ordinals and fails the gate as a new finding. Add
+one sentence listing the six `E-KJOC-*` entries and what they have in common (a try whose body is one SYCL wait or the
+async handler's rethrow; the handler records in the failure latch).
+
+Run and expect:
+```bash
+python3 scripts/check-sycl-alloc-zone-contract.py --root . ; echo "rc=$?"      # rc=0, no line starting FAIL
+ctest --test-dir build -R 'alloc-zone' -j 4 --timeout 600                       # every alloc-zone test passes
+```
+Then prove the keyed entries fail closed, on a scratch copy (see Gotchas), and report the two outputs: (a) insert
+`try { (void) 0; } catch (...) { }` as the first statement inside `ggml_backend_sycl_synchronize`'s outer try and
+run the script against the copy: it must print a `FAIL new G-CATCH` line; (b) delete the `catch (...)` block of the
+drain's try in the copy: it must print a `FAIL` (a stale debt entry or a new finding).
+
+#### Part 2: `tests/test-sycl-moe-join-queue-source.py`, pin O
+
+The construction in `unified_cache::get_moe_join_queue` (`ggml/src/ggml-sycl/unified-cache.cpp`) is now:
+```cpp
+moe_join_queue_ = std::make_unique<sycl::queue>(ggml_sycl_make_queue(
+    queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+    sycl::property_list{ sycl::property::queue::in_order{} }));
+```
+RED first: `python3 tests/test-sycl-moe-join-queue-source.py --self-test` prints `unmodified tree FAILS: FAIL [pin O]`.
+Replace the `make = re.search(...)` of pin O with:
+```python
+    make = re.search(r"moe_join_queue_\s*=\s*std::make_unique\s*<\s*sycl::queue\s*>\s*\(\s*ggml_sycl_make_queue\s*\(\s*"
+                     r"queue_\.get_context\s*\(\s*\)\s*,\s*queue_\.get_device\s*\(\s*\)\s*,\s*"
+                     r"ggml_sycl_get_device_id_from_queue\s*\(\s*queue_\s*\)\s*,\s*"
+                     r"sycl::property_list\s*\{\s*sycl::property::queue::in_order\s*\{\s*\}\s*\}\s*\)\s*\)\s*;", body)
+```
+and its message with `"get_moe_join_queue does not make one in-order queue, with the recording handler, on queue_'s
+context and device under call_once"`. Rewrite the two mutants that no longer apply so each edits the new text:
+- `join queue profiling-enabled`: turn `sycl::property_list{ sycl::property::queue::in_order{} }` in that statement
+  into `sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} }`.
+- `join queue out of order`: turn it into `sycl::property_list{}`.
+Add one mutant, pin O, `join queue without the recording handler`: the statement becomes the direct construction
+`moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),
+sycl::property::queue::in_order{});`. Update the docstring line that describes pin O if it spells the construction.
+GREEN: `python3 tests/test-sycl-moe-join-queue-source.py --self-test ; echo rc=$?` prints every mutant `caught` on
+its own pin and `rc=0`; without `--self-test` it also exits 0.
+
+#### Part 3: `tests/test-sycl-async-failure-source.py`
+
+Rename the helper `test_seam_guarded` to `seam_guarded` (the definition and its one call). It is a predicate the
+script calls, not a test; the name made the registration audit treat the file as pytest-style.
+```bash
+python3 tests/test-sycl-async-failure-source.py --self-test ; echo "rc=$?"       # PASS, rc=0
+python3 tests/test-sycl-gate-registration-audit.py --self-test ; echo "rc=$?"    # rc=0
+python3 tests/test-sycl-gate-registration-audit.py --census build ; echo "rc=$?" # rc=0 in this worktree
+```
+
+#### Acceptance
+- [ ] The three command groups above give the stated results.
+- [ ] The sweep (command at the top of this task, run in `inkling/wt-t7a`) fails exactly the five known-red tests
+      and nothing else. Paste the `The following tests FAILED` block in the report.
+- [ ] `git diff --stat` touches only the five files of the file scope.
+- [ ] Debt count for `G-CATCH` is two lower; no `--write-debt` was used.
+
+**Commits (two, path-scoped, never amended):**
+1. `scripts: exempt the async-failure drains' handlers from the catch clause, with reasons (kjoc)` — the three
+   files under `scripts/sycl-alloc-zone-contract/`.
+2. `tests: the join-queue pin and the async-failure contract follow Tasks 7a and 7b` — the two files under `tests/`.
+
+**Gotchas:**
+- A hook blocks `grep`/`rg` as the first word of a command on repo files: use `cat FILE | grep -n` or `git grep -n`.
+- codescout's index misses matches inside `ggml/src/ggml-sycl/ggml-sycl.cpp`; search it with `cat ... | grep -n`.
+- Scratch copies go under `inkling/t7f-tmp/` (next to the worktree, on the root disk), never under `/tmp`, and are
+  deleted before the report. For the fail-closed proof copy only what the script reads; if it needs the whole
+  `ggml/src/ggml-sycl/` and `scripts/` trees, copy those two directories and nothing else.
+- Do not build. `build/` in this worktree is from Task 7c and is only used by `ctest` to find the Python tests.
+- Do not run any test that loads a model or touches a GPU; the sweep's `-LE` list excludes them. Keep `-j 4`.
+- `debt.json` is shrink-only by rule. The synchronize re-key is a migration of the same three handlers; say so in the
+  commit message so the next reader does not take it for growth.
+- No C++ file changes. If you conclude one is needed, stop and report.
 
 ---
 
