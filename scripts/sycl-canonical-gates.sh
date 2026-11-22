@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # scripts/sycl-canonical-gates.sh (llama.cpp-rou3)
 #
-# One executable runner for the two canonical SYCL correctness gates
-# documented in CLAUDE.md ("Verification Commands & Correctness Gates"): the
-# Mistral completion gate and the GPT-OSS chat gate. See
+# One executable runner for the canonical SYCL correctness gates documented
+# in CLAUDE.md ("Verification Commands & Correctness Gates"): the Mistral
+# completion gate and the GPT-OSS chat gate, plus an opt-in Inkling gate that
+# is never part of `all`. See
 # docs/backend/gpt-oss-testing.md for the narrative rationale behind the
 # GPT-OSS command line.
 #
 # Usage:
-#   sycl-canonical-gates.sh [--build-dir DIR] [--gate mistral|gptoss|all] [--selector level_zero:N]
+#   sycl-canonical-gates.sh [--build-dir DIR] [--gate mistral|gptoss|inkling|all] [--selector level_zero:N]
 # Run with -h/--help for the full option list, defaults, and the
 # SYCL_GATES_* environment overrides.
 #
@@ -37,7 +38,7 @@
 #   opened -- verified by reading both functions. It does not count as
 #   "running a model-loading binary" under the never-loop rule.
 # - Every SYCL_GATES_* override below (SYCL_GATES_BIN_DIR, _CMAKE_CACHE,
-#   _LDD_CMD, _MISTRAL_MODEL, _GPTOSS_MODEL, _SETTLE_SECONDS,
+#   _LDD_CMD, _MISTRAL_MODEL, _GPTOSS_MODEL, _INKLING_MODEL, _SETTLE_SECONDS,
 #   _SKIP_ONEAPI_SOURCE, _SETVARS) exists so
 #   tests/test-sycl-canonical-gates-script.sh can drive this script
 #   deterministically without a GPU, real models, or a real SYCL build. They
@@ -64,17 +65,19 @@ SELECTOR="level_zero:1"
 
 usage() {
     cat <<'EOF'
-Usage: sycl-canonical-gates.sh [--build-dir DIR] [--gate mistral|gptoss|all] [--selector level_zero:N]
+Usage: sycl-canonical-gates.sh [--build-dir DIR] [--gate mistral|gptoss|inkling|all] [--selector level_zero:N]
 
 Runs the canonical SYCL correctness gates documented in CLAUDE.md
 ("Verification Commands & Correctness Gates"): the Mistral completion gate
 and/or the GPT-OSS chat gate, exactly once each, with the device selector
-pinned.
+pinned. The opt-in Inkling gate runs only with --gate inkling and is never
+part of all.
 
 Options and their defaults:
   --build-dir DIR   Build directory to read binaries/CMakeCache from and
                      write gate logs under. Default: build
-  --gate GATE        mistral, gptoss, or all. Default: all
+  --gate GATE        mistral, gptoss, inkling, or all. Default: all. inkling is
+                     opt-in and is not part of all.
   --selector SEL      ONEAPI_DEVICE_SELECTOR value pinned for the gates run
                      under this invocation. Default: level_zero:1 (the B50 --
                      never left unset; an unpinned selector enumerates the
@@ -85,7 +88,8 @@ tests/test-sycl-canonical-gates-script.sh to drive this script without a
 GPU, real models, or a real SYCL build -- a normal invocation needs none of
 them):
   SYCL_GATES_BIN_DIR, SYCL_GATES_CMAKE_CACHE, SYCL_GATES_LDD_CMD,
-  SYCL_GATES_MISTRAL_MODEL, SYCL_GATES_GPTOSS_MODEL, SYCL_GATES_SETTLE_SECONDS,
+  SYCL_GATES_MISTRAL_MODEL, SYCL_GATES_GPTOSS_MODEL, SYCL_GATES_INKLING_MODEL,
+  SYCL_GATES_SETTLE_SECONDS,
   SYCL_GATES_SKIP_ONEAPI_SOURCE, SYCL_GATES_SETVARS
 
 Exit codes: 0 = all requested gates PASS, 77 = all requested gates SKIP (no
@@ -105,9 +109,9 @@ while [ $# -gt 0 ]; do
 done
 
 case "$GATE" in
-    mistral|gptoss|all) ;;
+    mistral|gptoss|inkling|all) ;;
     *)
-        echo "sycl-canonical-gates: --gate must be mistral, gptoss, or all (got: $GATE)" >&2
+        echo "sycl-canonical-gates: --gate must be mistral, gptoss, inkling, or all (got: $GATE)" >&2
         exit 1
         ;;
 esac
@@ -202,6 +206,7 @@ CACHE_FILE="${SYCL_GATES_CMAKE_CACHE:-$BUILD_DIR/CMakeCache.txt}"
 LDD_CMD="${SYCL_GATES_LDD_CMD:-ldd}"
 MISTRAL_MODEL="${SYCL_GATES_MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 GPTOSS_MODEL="${SYCL_GATES_GPTOSS_MODEL:-/models/gpt-oss-20b-mxfp4.gguf}"
+INKLING_MODEL="${SYCL_GATES_INKLING_MODEL:-/models/Inkling-2-Mini-UD-Q8_K_XL.gguf}"
 GATES_OUT_DIR="$BUILD_DIR/gates"
 SETTLE_SECONDS="${SYCL_GATES_SETTLE_SECONDS:-5}"
 
@@ -241,7 +246,7 @@ need_bin() {
 # link the same libggml-sycl.so, per CLAUDE.md's own gate recipe).
 need_bin llama-completion
 case "$GATE" in
-    mistral) ;;
+    mistral|inkling) ;;
     gptoss|all) need_bin llama-cli ;;
 esac
 
@@ -399,9 +404,38 @@ run_gptoss() {
     gate_verdict gptoss "$out" "$err" "$rc" '^1, 2, 3, 4, 5[[:space:]]*$'
 }
 
+# Inkling-2-Mini (inkling2_loop, NVFP4 experts, BF16 dense). Scored against
+# the CPU reference of 2026-11-21 (--device none printed "1, 2, ... 13,");
+# the regex checks the first ten numbers only, as the Mistral gate does. The
+# gate names -c 8192: the model's default context is its 1,048,576-token
+# training context, which the load refuses by name on these cards.
+# GGML_SYCL_MOE_MULTI_GPU=0 is set for every selector, so a two-card run takes
+# the scheduler split and the script never reads the selector.
+run_inkling() {
+    if [ -n "$NO_DEVICE_REASON" ]; then
+        gate_skip inkling "$NO_DEVICE_REASON"
+        return
+    fi
+    if [ ! -f "$INKLING_MODEL" ]; then
+        gate_skip inkling "model not found at $INKLING_MODEL"
+        return
+    fi
+
+    local out="$GATES_OUT_DIR/inkling.out" err="$GATES_OUT_DIR/inkling.err"
+    sample_mem "inkling pre"
+    local rc=0
+    GGML_SYCL_MOE_MULTI_GPU=0 timeout 900 "$BIN_DIR/llama-completion" \
+        -m "$INKLING_MODEL" -c 8192 -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
+        >"$out" 2>"$err" || rc=$?
+    sleep "$SETTLE_SECONDS"
+    sample_mem "inkling post"
+    gate_verdict inkling "$out" "$err" "$rc" '^ ?1, 2, 3, 4, 5, 6, 7, 8, 9, 10'
+}
+
 case "$GATE" in
     mistral) run_mistral ;;
     gptoss) run_gptoss ;;
+    inkling) run_inkling ;;
     all) run_mistral; run_gptoss ;;
 esac
 
