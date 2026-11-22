@@ -3816,10 +3816,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.n_head_log2   = n_head_log2;
     params.logit_softcap = logit_softcap;
 
-    // Per-op precision hint. test-backend-ops sets PREC_F32 on every case via
-    // ggml_flash_attn_ext_set_prec; llama-graph.cpp:1726 pins PREC_F32
-    // unconditionally for the SYCL/CUDA paths. The XMX-v2 dispatcher reads
-    // this to force a float-accumulator specialization on PREC_F32.
+    // Per-op accumulator precision, set with ggml_prec_set_acc. llama-graph's
+    // attention builder pins PREC_F32 on every flash-attention op. The XMX-v2
+    // dispatcher reads this to force a float-accumulator specialization on
+    // PREC_F32.
     params.prec = ggml_flash_attn_ext_get_prec(dst);
 
     // Q dimensions: [batch, n_heads, n_queries, head_dim]
