@@ -20,8 +20,8 @@
 // Which cases are stored reordered is decided by the backend's layout policy and is not asserted here; each ok line
 // prints the own-range layout it observed. With the default policy on the Arc B50 and B70, q4_0, q8_0, q6_K, mxfp4
 // and q6_K-two-chunks print own=soa, and those five failed against a get_tensor that returned the stored bytes.
-// The *-set-async cases cover the upload path that never reorders: ggml_backend_tensor_set_async must record the own range as AOS, the own range must
-// still be AOS after the MUL_MAT, and the read must return the uploaded bytes.
+// The *-set-async cases cover the upload path that never reorders: ggml_backend_tensor_set_async must record the
+// own range as AOS, the own range must still be AOS after the MUL_MAT, and the read must return the uploaded bytes.
 // No case here reaches a reorder record that disagrees with the own range: that record is written only when the
 // unified cache materializes a weight it has registered, and a test tensor is not one. The reader's independence
 // from that record is pinned by the source contract tests/test-sycl-own-data-layout-source.py.
