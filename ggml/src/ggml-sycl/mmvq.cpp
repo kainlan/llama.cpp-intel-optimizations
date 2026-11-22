@@ -3336,7 +3336,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void * __restrict__ vx,
         const int iqs =
             vdr * (item_ct1.get_local_id(2) % (qi / vdr));  // x block quant index when casting the quants to int
 
-        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid, ksigns64);
+        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid);
     }
 
     // sum up partial sums and write back result
@@ -3424,7 +3424,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void * __restrict__ vx,
         const int iqs =
             vdr * (item_ct1.get_local_id(2) % (qi / vdr));  // x block quant index when casting the quants to int
 
-        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid, ksigns64);
+        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid);
     }
 
     // sum up partial sums and write back result
@@ -3489,7 +3489,7 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void * __restrict__ vx,
 static __dpct_inline__ float vec_dot_iq3_xxs_q8_1_id(const void * __restrict__ vbq,
                                                      const block_q8_1 * __restrict__ bq8_1,
                                                      const int & iqs) {
-    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid, ksigns64);
+    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid);
 }
 
 static __dpct_inline__ float vec_dot_iq3_s_q8_1_id(const void * __restrict__ vbq,
@@ -3509,7 +3509,7 @@ static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_id(const void * __restrict__ v
 static __dpct_inline__ float vec_dot_iq2_xs_q8_1_id(const void * __restrict__ vbq,
                                                     const block_q8_1 * __restrict__ bq8_1,
                                                     const int & iqs) {
-    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
+    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid);
 }
 
 template <int qk, int qi, typename block_q_t, int vdr>

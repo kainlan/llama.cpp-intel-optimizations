@@ -829,7 +829,7 @@ int main() {
     }
 
     // ---- Case 14e: the walk asks the unified route before it filters on precision (llama.cpp-8ony) -----------------
-    // The unified kernel's oneDNN f16 route has no precision check, the legacy f16 arm requires GGML_PREC_DEFAULT.
+    // The unified kernel's oneDNN f16 route has no precision check, the legacy f16 arm requires GGML_PREC_UNDEFINED.
     // A Q4_0 / MXFP4 node with GGML_PREC_F32 (a GLM4 attention output) that the scratch does not supply takes the
     // unified route and draws the planned buffers, so the walk must count it.
     {

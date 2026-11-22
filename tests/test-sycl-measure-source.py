@@ -170,7 +170,9 @@ def test_measure_is_pure():
 def test_measure_purity_mutants():
     body = measure_body(code_of(CONTEXT_CPP))
     mutants = [
-        ("a member scheduler write", "state.sched.reset(", "sched.reset("),
+        # the scheduler is built by sched_new on the state it is handed (since the 19bc41dbb merge); the reserve-state
+        # gate pins that sched_new writes only state.sched
+        ("a member scheduler write", "sched_new(state, {", "sched.reset(); sched_new(state, {"),
         ("a member cparams read", "const uint32_t n_seqs = state.cparams.n_seq_max;", "const uint32_t n_seqs = cparams.n_seq_max;"),
         ("the expected sizes written", "plan.graphs = graphs;", "backend_buf_exp_size[0] = 0; plan.graphs = graphs;"),
         ("the context synchronized", "const int64_t t_start_us = ggml_time_us();", "synchronize(); const int64_t t_start_us = ggml_time_us();"),
@@ -228,13 +230,18 @@ def scope_ctor(mode: str) -> str:
     return "llama_plan_scope plan_scope" + planned[len("llama_plan_scope"):] + ";"
 
 
+_SCHED_NEW = "void llama_context::sched_new(sched_reserve_state & state, const sched_params & params)"
+_SCHED_NEW_CALL = z("sched_new(state, {")
+
+
 def scopes_ok(code: str) -> bool:
     for body, mode in ((measure_body(code), "MEASURE"), (function_body(code, _IMPL), "ALLOC")):
         c = z(scope_ctor(mode))
         if body.count(c) != 1:
             return False
-        # the scheduler the scope covers is created after it
-        sched_new = body.find("ggml_backend_sched_new(")
+        # the scheduler the scope covers is created after it, by sched_new on this reserve's state (the one
+        # ggml_backend_sched_new call lives in sched_new; the reserve-state gate pins that)
+        sched_new = body.find(_SCHED_NEW_CALL)
         if sched_new == -1 or body.index(c) > sched_new:
             return False
         if z("const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);") not in body:
@@ -337,11 +344,24 @@ def test_scope_raii_mutants():
 def pipeline_ok(code: str) -> bool:
     m = measure_body(code)
     a = function_body(code, _IMPL)
+    n = function_body(code, _SCHED_NEW)
     retry = z("if (state.cparams.pipeline_parallel) { GGML_ASSERT(!plan_caps);")
+    # the retry rebuilds without pipelining, on the state
+    retry_new = z(
+        "state.cparams.pipeline_parallel = false; sched_new(state, { max_nodes, false, state.cparams.op_offload, });"
+    )
     return (
         z("GGML_ASSERT(!state.cparams.pipeline_parallel);") in m
-        and z("state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, state.cparams.op_offload));") in m
+        # the measure's one scheduler is never pipelined
+        and m.count(_SCHED_NEW_CALL) == 1
+        and z("sched_new(state, { max_nodes, false, state.cparams.op_offload, });") in m
+        # and sched_new builds exactly what it is asked for
+        and z(
+            "state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), "
+            "params.max_nodes, params.parallel, params.op_offload));"
+        ) in n
         and retry in a
+        and retry_new in a[a.index(retry) :]
     )
 
 
@@ -356,7 +376,10 @@ def test_pipeline_mutants():
     for name, body, old, new in [
         ("the measure no longer asserts", m, "GGML_ASSERT(!state.cparams.pipeline_parallel);", ""),
         ("the measure scheduler pipelined", m, "max_nodes, false, state.cparams.op_offload", "max_nodes, state.cparams.pipeline_parallel, state.cparams.op_offload"),
+        ("a second measure scheduler", m, "sched_new(state, {", "sched_new(state, { max_nodes, true, false, }); sched_new(state, {"),
         ("the retry may rebuild a planned scheduler", a, "if (state.cparams.pipeline_parallel) { GGML_ASSERT(!plan_caps);", "if (state.cparams.pipeline_parallel) {"),
+        ("the retry rebuilds pipelined", a, "state.cparams.pipeline_parallel = false; sched_new(state, { max_nodes, false,", "state.cparams.pipeline_parallel = false; sched_new(state, { max_nodes, true,"),
+        ("sched_new ignores the parallel flag", function_body(code, _SCHED_NEW), "params.max_nodes, params.parallel, params.op_offload", "params.max_nodes, true, params.op_offload"),
     ]:
         assert not pipeline_ok(code.replace(body, mutate(body, old, new), 1)), f"mutant {name!r} slipped through"
 
@@ -497,9 +520,12 @@ def test_recheck_mutants():
 # --- the reserve transaction ---------------------------------------------------
 
 _TXN = "sched_reserve_result llama_context::sched_reserve_transaction()"
+# every flag the measure resolves; the GDN and LID flags left with their probes in the 19bc41dbb merge, and the
+# K/V-rows and top-k-mask flags arrived with theirs
 _FLAGS = [
-    "flash_attn", "auto_fa", "fused_gdn_ar", "fused_gdn_ch", "auto_fgdn", "fused_lid", "auto_flid",
+    "flash_attn", "auto_fa", "fused_kv_rows", "auto_fkvr",
     "fused_dsv4_hc_pre", "fused_dsv4_hc_comb", "fused_dsv4_hc_post", "auto_fhc",
+    "fused_top_k_mask", "auto_ftkm",
 ]
 
 
@@ -546,7 +572,8 @@ def test_transaction_mutants():
         ("an unplanned context measures", "if (plan_caps) {", "if (true) {"),
         ("the measure runs on the context's own cparams", "sched_measure_storage storage(cparams);", "sched_measure_storage storage(llama_cparams{});"),
         ("the resolution never reported", "fused_resolution_report(storage.resolution);", ""),
-        ("a resolved flag dropped", "cparams.fused_lid = storage.cparams.fused_lid;", ""),
+        ("a resolved flag dropped", "cparams.fused_kv_rows = storage.cparams.fused_kv_rows;", ""),
+        ("the last resolved flag dropped", "cparams.auto_ftkm = storage.cparams.auto_ftkm;", ""),
         ("a resolved flag applied twice", "cparams.auto_fa = storage.cparams.auto_fa;", "cparams.auto_fa = storage.cparams.auto_fa; cparams.auto_fa = storage.cparams.auto_fa;"),
     ]
     for name, old, new in mutants:

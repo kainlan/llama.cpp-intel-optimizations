@@ -359,8 +359,12 @@ run_mistral() {
 
     # Anchored to the start of a line, matching the GPT-OSS check's own
     # anchoring: STDOUT contains the exact line/prefix, not the digits
-    # anywhere in the file (e.g. only inside an echoed prompt).
-    gate_verdict mistral "$out" "$err" "$rc" '^1, 2, 3, 4, 5, 6, 7, 8, 9, 10'
+    # anywhere in the file (e.g. only inside an echoed prompt). One optional
+    # leading space is allowed: Mistral's SPM tokenizer prepends the "\xe2\x96\x81" dummy
+    # prefix and llama-completion echoes the prompt token by token, so the
+    # real stdout is " 1, 2, 3, ..." (the same bytes in every recorded run
+    # before the 19bc41dbb sync; an exact '^1' anchor never matched it).
+    gate_verdict mistral "$out" "$err" "$rc" '^ ?1, 2, 3, 4, 5, 6, 7, 8, 9, 10'
 }
 
 run_gptoss() {

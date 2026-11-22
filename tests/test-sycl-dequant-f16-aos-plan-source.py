@@ -279,7 +279,7 @@ def check(srcs):
     # asks for F32 accumulation (ffn_down and attn_output of GLM4, GLM4_MOE and JAIS2; a quantized ffn_gate_inp
     # under SQRT_SOFTPLUS gating) takes the fp32 branch, whose weight copy is not planned (llama.cpp-4bu9).
     results["the router helper refuses an op that asks for F32 accumulation, and a call without the op"] = (
-        nows("if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {") in nows(serves))
+        nows("if (!dst || dst->op_params[0] != GGML_PREC_UNDEFINED) {") in nows(serves))
     # The f16 branch also needs every row of the weight: a row-split weight hands each device a slice, which takes the
     # same fp32 branch. A tensor-parallel weight is refused with it, as the BF16 route refuses both. The split
     # predicate dereferences the buffer, so the term asks for one first.
@@ -515,7 +515,7 @@ if args.self_test:
              "if (!ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(src0->type) || "
              "ggml_get_to_fp16_sycl_for_layout(src0->type, layout) == nullptr) {")], None),
         ("the router helper refuses an op that asks for F32 accumulation, and a call without the op", "backend",
-         "if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {", "if (!dst) {"),
+         "if (!dst || dst->op_params[0] != GGML_PREC_UNDEFINED) {", "if (!dst) {"),
         (SPLIT, "backend",
          "(ggml_backend_buffer_is_sycl_split(src0->buffer) || ggml_backend_buffer_is_sycl_tp(src0->buffer))",
          "ggml_backend_buffer_is_sycl_tp(src0->buffer)"),

@@ -82,25 +82,25 @@ static void case_1_empty() {
 static void case_2_partial() {
     marks_t          marks;
     fused_resolution rec;
-    set_header(rec, FUSED_RESOLUTION_ENTRY_GDN_HEADER, "resolving fused Gated Delta Net support:");
-    set_probe(rec, FUSED_RESOLUTION_ENTRY_GDN_AR, "fused Gated Delta Net (autoregressive)", true);
-    // the chunked probe threw before it completed: absent
+    set_header(rec, FUSED_RESOLUTION_ENTRY_HC_HEADER, "resolving fused DeepSeek V4 HC support:");
+    set_probe(rec, FUSED_RESOLUTION_ENTRY_HC_PRE, "fused DeepSeek V4 HC pre", true);
+    // the comb probe threw before it completed: absent
 
     g_sunk.clear();
     emit(rec, marks);
-    CHECK(g_sunk.size() == 2, "the partial record printed %zu lines, want 2 (header, ar enabled)", g_sunk.size());
-    CHECK(!marks[FUSED_RESOLUTION_ENTRY_GDN_HEADER].empty() && !marks[FUSED_RESOLUTION_ENTRY_GDN_AR].empty(),
+    CHECK(g_sunk.size() == 2, "the partial record printed %zu lines, want 2 (header, pre enabled)", g_sunk.size());
+    CHECK(!marks[FUSED_RESOLUTION_ENTRY_HC_HEADER].empty() && !marks[FUSED_RESOLUTION_ENTRY_HC_PRE].empty(),
           "the printed entries are not marked");
-    CHECK(marks[FUSED_RESOLUTION_ENTRY_GDN_CH].empty() && marks[FUSED_RESOLUTION_ENTRY_FA].empty(),
+    CHECK(marks[FUSED_RESOLUTION_ENTRY_HC_COMB].empty() && marks[FUSED_RESOLUTION_ENTRY_FA].empty(),
           "an absent entry was marked");
 
     // the retry resolves further: only the entry still unmarked prints
-    set_probe(rec, FUSED_RESOLUTION_ENTRY_GDN_CH, "fused Gated Delta Net (chunked)", true);
+    set_probe(rec, FUSED_RESOLUTION_ENTRY_HC_COMB, "fused DeepSeek V4 HC comb", true);
     g_sunk.clear();
     emit(rec, marks);
-    CHECK(g_sunk.size() == 1, "the fuller record printed %zu lines, want only the chunked probe's", g_sunk.size());
-    CHECK(g_sunk.size() == 1 && g_sunk[0].text == "resolve_fused_ops: fused Gated Delta Net (chunked) enabled",
-          "wrong line for the chunked probe");
+    CHECK(g_sunk.size() == 1, "the fuller record printed %zu lines, want only the comb probe's", g_sunk.size());
+    CHECK(g_sunk.size() == 1 && g_sunk[0].text == "resolve_fused_ops: fused DeepSeek V4 HC comb enabled",
+          "wrong line for the comb probe");
 }
 
 static void case_3_same_twice() {
@@ -147,9 +147,9 @@ static void case_4_changed() {
 static void case_5_a_b_b() {
     marks_t          marks;
     fused_resolution a;
-    set_probe(a, FUSED_RESOLUTION_ENTRY_LID, "Lightning Indexer", true);
+    set_probe(a, FUSED_RESOLUTION_ENTRY_KV_ROWS, "Flash Attention over K/V rows", true);
     fused_resolution b;
-    set_probe(b, FUSED_RESOLUTION_ENTRY_LID, "Lightning Indexer", false);
+    set_probe(b, FUSED_RESOLUTION_ENTRY_KV_ROWS, "Flash Attention over K/V rows", false);
 
     g_sunk.clear();
     emit(a, marks);
@@ -169,11 +169,11 @@ static void case_6_text() {
     rec.entry[FUSED_RESOLUTION_ENTRY_FA].mismatch_layer_dev = "SYCL0";
     rec.entry[FUSED_RESOLUTION_ENTRY_FA].mismatch_probe_dev = "SYCL1";
 
-    set_header(rec, FUSED_RESOLUTION_ENTRY_GDN_HEADER, "resolving fused Gated Delta Net support:");
-    set_probe(rec, FUSED_RESOLUTION_ENTRY_GDN_AR, "fused Gated Delta Net (autoregressive)", true);
-    rec.entry[FUSED_RESOLUTION_ENTRY_GDN_AR].n_cpu_landings    = 2;
-    rec.entry[FUSED_RESOLUTION_ENTRY_GDN_AR].cpu_landing_layer = 7;
-    rec.entry[FUSED_RESOLUTION_ENTRY_GDN_AR].cpu_landing_dev   = "CPU";
+    set_header(rec, FUSED_RESOLUTION_ENTRY_HC_HEADER, "resolving fused DeepSeek V4 HC support:");
+    set_probe(rec, FUSED_RESOLUTION_ENTRY_HC_PRE, "fused DeepSeek V4 HC pre", true);
+    rec.entry[FUSED_RESOLUTION_ENTRY_HC_PRE].n_cpu_landings    = 2;
+    rec.entry[FUSED_RESOLUTION_ENTRY_HC_PRE].cpu_landing_layer = 7;
+    rec.entry[FUSED_RESOLUTION_ENTRY_HC_PRE].cpu_landing_dev   = "CPU";
 
     g_sunk.clear();
     emit(rec, marks);
@@ -183,11 +183,11 @@ static void case_6_text() {
          "resolve_fused_ops: layer 3 is assigned to device SYCL0 but Flash Attention is assigned to device SYCL1 "
           "(usually due to missing support)"                                                               },
         { FUSED_RESOLUTION_LEVEL_WARN, "resolve_fused_ops: Flash Attention not supported, set to disabled" },
-        { FUSED_RESOLUTION_LEVEL_INFO, "resolve_fused_ops: resolving fused Gated Delta Net support:"       },
+        { FUSED_RESOLUTION_LEVEL_INFO, "resolve_fused_ops: resolving fused DeepSeek V4 HC support:"       },
         { FUSED_RESOLUTION_LEVEL_WARN,
-         "resolve_fused_ops: fused Gated Delta Net (autoregressive) executes on CPU for 2 layer(s) (e.g. layer 7) -- "
+         "resolve_fused_ops: fused DeepSeek V4 HC pre executes on CPU for 2 layer(s) (e.g. layer 7) -- "
           "the executor follows data placement, not a capability gap"                                      },
-        { FUSED_RESOLUTION_LEVEL_INFO, "resolve_fused_ops: fused Gated Delta Net (autoregressive) enabled" },
+        { FUSED_RESOLUTION_LEVEL_INFO, "resolve_fused_ops: fused DeepSeek V4 HC pre enabled" },
     };
     CHECK(g_sunk.size() == want.size(), "printed %zu lines, want %zu", g_sunk.size(), want.size());
     for (size_t i = 0; i < want.size() && i < g_sunk.size(); ++i) {

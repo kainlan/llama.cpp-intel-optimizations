@@ -115,7 +115,8 @@ static std::array<ggml_type_traits_cpu, GGML_TYPE_COUNT> make_baseline() {
     std::array<ggml_type_traits_cpu, GGML_TYPE_COUNT> table{};
 #define TRAIT(T, FROM, DOT, VDT) table[GGML_TYPE_##T] = { FROM, DOT, GGML_TYPE_##VDT, 1 }
     TRAIT(F32, from_float_f32, (vec_dot_ref<GGML_TYPE_F32, GGML_TYPE_F32>), F32);
-    TRAIT(F16, (from_float_ref<GGML_TYPE_F16>), (vec_dot_ref<GGML_TYPE_F16, GGML_TYPE_F16>), F16);
+    TRAIT(F16, (from_float_ref<GGML_TYPE_F16>), (vec_dot_ref<GGML_TYPE_F16, GGML_TYPE_F32>),
+          F32);  // upstream: ggml_vec_dot_f16_f32
     TRAIT(Q1_0, (from_float_ref<GGML_TYPE_Q1_0>), (vec_dot_ref<GGML_TYPE_Q1_0, GGML_TYPE_Q8_0>), Q8_0);
     TRAIT(Q2_0, (from_float_ref<GGML_TYPE_Q2_0>), (vec_dot_ref<GGML_TYPE_Q2_0, GGML_TYPE_Q8_0>), Q8_0);
     TRAIT(Q4_0, (from_float_ref<GGML_TYPE_Q4_0>), (vec_dot_ref<GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>), Q8_0);

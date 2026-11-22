@@ -4058,7 +4058,7 @@ and hanging at the first graph.
 libllama; each opens `ggml_backend_sycl_compute_alloc_scope` around the call. The KV cache's K-shift graph goes through
 `lctx->sched_alloc_graph` (the K-shift's compute buffer is a scheduler compute buffer like any other), and the
 multimodal projector's scheduler, which allocates on the same buffer type, opens the same exported scope through the
-registry (`clip_sycl_compute_scope`). `tests/test-sycl-hold-ledger-source.py` pins that no bare call remains anywhere in
+registry (`mtmd_sycl_compute_scope`). `tests/test-sycl-hold-ledger-source.py` pins that no bare call remains anywhere in
 `src/`, `tools/`, `common/` or `examples/`.
 
 *Only a fit verdict lowers `-ub`.* A reserve that threw is a loss of the rung, but it starts or continues the descent

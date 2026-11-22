@@ -194,15 +194,8 @@ static bool run(llama_context * ctx, const common_params & params) {
         return false;
     }
 
-    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
-    std::vector<int8_t> output;
-    if (params.save_logits) {
-        output.resize(tokens.size(), 0);
-        output.back() = 1;
-        batch.logits = output.data();
-    }
-
-    if (llama_decode(ctx, batch)) {
+    common_batch batch = common_batch_get_one(ctx, tokens);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         LOG_ERR("%s : failed to eval\n", __func__);
         return false;
     }

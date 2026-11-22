@@ -486,7 +486,8 @@ int main(int argc, char ** argv) {
     const int n_batch = (int) llama_n_batch(ctx);
     for (int i = 0; i < (int) tokens.size(); i += n_batch) {
         const int n = std::min(n_batch, (int) tokens.size() - i);
-        if (llama_decode(ctx, llama_batch_get_one(tokens.data() + i, n))) {
+        common_batch batch = common_batch_get_one(ctx, tokens.data() + i, n);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: prompt decode failed at token %d\n", __func__, i);
             fclose(st.file);
             return 1;
@@ -503,7 +504,8 @@ int main(int argc, char ** argv) {
         if (llama_vocab_is_eog(vocab, tok)) {
             break;
         }
-        if (llama_decode(ctx, llama_batch_get_one(&tok, 1))) {
+        common_batch batch = common_batch_get_one(ctx, &tok, 1);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             LOG_ERR("%s: decode failed at generated token %d\n", __func__, n_gen);
             llama_sampler_free(smpl);
             fclose(st.file);
