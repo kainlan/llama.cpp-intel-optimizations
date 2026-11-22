@@ -118682,10 +118682,11 @@ static bool extract_persistent_plan_split(ggml_sycl::UnifiedKernel &           p
     // Step 1b: Collect MUL_MAT weight tensors from the graph in node order.
     //          This lets us map plan matmul index -> graph weight tensor for
     //          resolve_split_weight_ptr (which needs the ggml_tensor* for cache lookup).
+    //          The plan skips a node the graph does not compute, so this list must too, or the indices drift.
     std::vector<const ggml_tensor *> matmul_weight_tensors;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0]) {
+        if (node && ggml_sycl_node_is_computed(node) && node->op == GGML_OP_MUL_MAT && node->src[0]) {
             matmul_weight_tensors.push_back(node->src[0]);
         }
     }
@@ -120447,6 +120448,16 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
                 // pointers while preserving the operation structure and weights.
                 if (!extract_persistent_plan(primary, *sycl_ctx, cgraph)) {
                     GGML_LOG_ERROR("[PERSISTENT-TG-SPLIT] Cached plan update failed, rebuilding\n");
+                    primary.cancel_persistent();
+                    g_split_plan_cached = false;
+                    g_cached_secondary_ops.clear();
+                    goto normal_dispatch;
+                }
+                // extract_persistent_plan rebuilt the plan instead of updating it (a failed recipe, a failed fast
+                // path, another graph selection): the plan cache stays invalid until the plan runs. Its op indices
+                // need not match g_cached_secondary_ops or the split config, so build the split plan anew next token.
+                if (!primary.has_cached_plan()) {
+                    GGML_SYCL_DEBUG("[PERSISTENT-TG-SPLIT] Cached plan was rebuilt, rebuilding the split plan\n");
                     primary.cancel_persistent();
                     g_split_plan_cached = false;
                     g_cached_secondary_ops.clear();
