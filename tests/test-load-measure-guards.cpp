@@ -1070,15 +1070,18 @@ static void test_state_excess() {
 // A compute term larger than its device's total memory is refused by name, before any reservation; a term that
 // fits, the host tier and a device of unknown capacity are not judged.
 static void test_probe_unfundable_text() {
-    const size_t                              mib = 1024 * 1024;
-    llama_load_measure_device                 big;
+    const size_t              mib = 1024 * 1024;
+    llama_load_measure_device big;
     big.device      = 0;
     big.chunk_bytes = { 1024 * mib, 2048 * mib, 49152 * mib, 49152 * mib, 49152 * mib };
     big.total       = 150528 * mib;
     llama_load_measure_device host;
     host.host  = true;
     host.total = 900000 * mib;
-    const std::vector<llama_load_device_capacity> caps = { { 0, 32656ull * mib }, { 1, 16304ull * mib } };
+
+    std::vector<llama_load_device_capacity> caps;
+    caps.push_back({ 0, 32656ull * mib });
+    caps.push_back({ 1, 16304ull * mib });
 
     const std::string refused = llama_load_probe_unfundable_text({ host, big }, caps, 1048576);
     CHECK(refused.find("load refused") != std::string::npos, "no refusal for a 150 GiB term on a 32 GiB device");
@@ -1095,7 +1098,9 @@ static void test_probe_unfundable_text() {
     llama_load_measure_device unknown = big;
     unknown.device                    = 7;
     CHECK(llama_load_probe_unfundable_text({ unknown }, caps, 1048576).empty(), "an unknown device was refused");
-    CHECK(llama_load_probe_unfundable_text({ big }, { { 0, 0 } }, 1048576).empty(), "a zero capacity was trusted");
+    std::vector<llama_load_device_capacity> zero_caps;
+    zero_caps.push_back({ 0, 0 });
+    CHECK(llama_load_probe_unfundable_text({ big }, zero_caps, 1048576).empty(), "a zero capacity was trusted");
 }
 
 int main() {
