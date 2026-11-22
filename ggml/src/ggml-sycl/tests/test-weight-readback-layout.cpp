@@ -1,5 +1,5 @@
 //
-// ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set was given.
+// ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set (or ggml_backend_tensor_set_async) was given.
 //
 // The SYCL backend may store a quantized weight in another order than ggml's block layout (SOA: one plane per
 // block field). That is the backend's own business: a reader of the tensor gets ggml's bytes. test-backend-ops
@@ -17,10 +17,13 @@
 // its own ok line with the two layout records of the weight (the reorder record, what a kernel last resolved, and
 // the order of the bytes in the weight's own range), and the final line counts them, so a run that skipped it
 // cannot print the same output.
-// The *-set-async cases upload with ggml_backend_tensor_set_async, which never reorders, so the own range holds
-// ggml order. Their MUL_MAT kernel takes SOA, so the backend resolves an SOA copy elsewhere and the reorder record
-// says SOA while the own range is still AOS: the case a reader that trusted the reorder record would scramble. They
-// require the own range to be AOS before and after the MUL_MAT and the reorder record to be SOA after it.
+// On the Arc B50 and B70 the q4_0, q8_0, q6_K, mxfp4 and q6_K-two-chunks weights are stored reordered (own=soa):
+// those five cases failed against a get_tensor that returned the stored bytes. The *-set-async cases cover the
+// upload path that never reorders: ggml_backend_tensor_set_async must record the own range as AOS, the own range must
+// still be AOS after the MUL_MAT, and the read must return the uploaded bytes.
+// No case here reaches a reorder record that disagrees with the own range: that record is written only when the
+// unified cache materializes a weight it has registered, and a test tensor is not one. The reader's independence
+// from that record is pinned by the source contract tests/test-sycl-own-data-layout-source.py.
 //
 // SYCL backend only, no scheduler, no model; one MUL_MAT graph per case. Exit 77 when no SYCL device is visible.
 //
@@ -34,7 +37,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -71,9 +73,9 @@ const type_case CASES[] = {
     { GGML_TYPE_Q6_K,  "q6_K-set-async",  1000, UPLOAD_SET_ASYNC },
 };
 
-// For a *-set-async case: true when the weight's own range is recorded as AOS and, after the MUL_MAT, the reorder
-// record says SOA. Prints a FAIL line naming what it found otherwise.
-bool records_match(const ggml_tensor * w, const type_case & tc, bool after_mul_mat) {
+// For a *-set-async case: true when the weight's own range is recorded as AOS. Prints a FAIL line naming what it
+// found otherwise.
+bool own_range_is_aos(const ggml_tensor * w, const type_case & tc, bool after_mul_mat) {
     const char * when = after_mul_mat ? "after the MUL_MAT" : "after the upload";
 
     const ggml_sycl::test_tensor_layout_records r = ggml_sycl::test_get_tensor_layout_records(w);
@@ -86,13 +88,6 @@ bool records_match(const ggml_tensor * w, const type_case & tc, bool after_mul_m
         std::fprintf(stderr,
                      "FAIL: %s, %s: the own range is recorded as %s, want aos (the async upload never reorders)\n",
                      tc.name, when, ggml_sycl::test_layout_name(r.own_range_layout));
-        return false;
-    }
-    if (after_mul_mat && std::strcmp(r.reorder_record, "soa") != 0) {
-        std::fprintf(stderr,
-                     "FAIL: %s, after the MUL_MAT: the reorder record is %s, want soa; the kernel did not resolve an "
-                     "SOA copy, so this case does not reach a record that disagrees with the own range\n",
-                     tc.name, r.reorder_record);
         return false;
     }
     return true;
@@ -159,8 +154,8 @@ bool read_after_mul_mat_matches(ggml_backend_t backend, ggml_tensor * w, const u
         if (status != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "FAIL: %s, after a MUL_MAT: graph compute returned %d\n", case_name, (int) status);
         } else {
-            const bool records_ok = tc.upload != UPLOAD_SET_ASYNC || records_match(w, tc, /*after_mul_mat=*/true);
-            ok = read_matches(w, 0, ggml_nbytes(w), want, case_name, "whole tensor after a MUL_MAT") && records_ok;
+            const bool own_range_ok = tc.upload != UPLOAD_SET_ASYNC || own_range_is_aos(w, tc, /*after_mul_mat=*/true);
+            ok = read_matches(w, 0, ggml_nbytes(w), want, case_name, "whole tensor after a MUL_MAT") && own_range_ok;
             if (ok) {
                 const ggml_sycl::test_tensor_layout_records r = ggml_sycl::test_get_tensor_layout_records(w);
                 ++g_reads_after_mul_mat;
@@ -217,7 +212,7 @@ int run_case(ggml_backend_t backend, const type_case & tc) {
     const size_t block_bytes = ggml_type_size(tc.type);
     const size_t win_offset  = row_bytes + 5;
     const size_t win_size    = 3 * block_bytes + 7;
-    bool         ok          = tc.upload != UPLOAD_SET_ASYNC || records_match(w, tc, /*after_mul_mat=*/false);
+    bool         ok          = tc.upload != UPLOAD_SET_ASYNC || own_range_is_aos(w, tc, /*after_mul_mat=*/false);
     ok                       = read_matches(w, 0, want.size(), want.data(), tc.name, "whole tensor") && ok;
     ok = read_matches(w, 3 * row_bytes, row_bytes, want.data() + 3 * row_bytes, tc.name, "row 3") && ok;
     ok = read_matches(w, win_offset, win_size, want.data() + win_offset, tc.name, "window inside blocks") && ok;

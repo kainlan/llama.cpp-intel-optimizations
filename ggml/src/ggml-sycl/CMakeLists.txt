@@ -6986,7 +6986,7 @@ set_tests_properties(sycl-select-unselected-branch PROPERTIES
 
 # test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set (or
 # ggml_backend_tensor_set_async) was given, also for a weight the backend stores reordered (SOA), and again after one
-# MUL_MAT that uses the weight, including a weight whose reorder record says SOA while its own range holds ggml order.
+# MUL_MAT that uses the weight; an upload through ggml_backend_tensor_set_async is recorded as ggml order.
 # Set, get and one small MUL_MAT graph per case: no scheduler, no model, at most 34 MB of device memory per case, so
 # it carries no model/cache/mem-handle label and the sweep runs it. It links the shipped ggml-sycl and reads the
 # layout records through the read-only seam ggml_sycl::test_get_tensor_layout_records (ggml-sycl-test.hpp, which
