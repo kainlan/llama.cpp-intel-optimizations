@@ -20648,6 +20648,16 @@ bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token
     return unified_cache_moe_mmid_registry().retire(token, plan_identity);
 }
 
+moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    bool                                                   live_followed) noexcept {
+    return moe_mmid_reconcile_live_plan(unified_cache_moe_mmid_registry(), published, live, live_identity,
+                                        stable_geometry, live_followed);
+}
+
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept {
     return unified_cache_moe_mmid_registry().published_contexts();
 }

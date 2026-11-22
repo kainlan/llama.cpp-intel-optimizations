@@ -85,6 +85,10 @@ const char * moe_mmid_materialize_refusal_name(moe_mmid_materialize_refusal refu
             return "publication-raced";
         case R::SAME_IDENTITY_OTHER_PLAN:
             return "same-identity-other-plan";
+        case R::PLAN_CHANGED_GEOMETRY_UNSTABLE:
+            return "plan-changed-geometry-unstable";
+        case R::PLAN_CHANGED_REBIND_REFUSED:
+            return "plan-changed-rebind-refused";
         case R::DEVICE_POOL_ALLOCATION_FAILED:
             return "device-pool-allocation-failed";
         case R::HOST_POOL_ALLOCATION_FAILED:
@@ -1076,10 +1080,37 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
     if (!allocator) {
         return invalid(R::NO_ALLOCATOR);
     }
+    // What an existing context of this token and submit device answers for `plan` (PUBLISHED: none answers, the
+    // attempt may publish). Called with state_->mutex held. `has_active` collects whether an exact-plan context is
+    // accepting, which makes a new exact-plan context a prepared replacement.
+    const auto existing_answer = [&](const lifecycle_plan_snapshot * plan, bool * has_active) {
+        for (const auto & existing : state_->contexts) {
+            if (!same_token(existing->token, token) || existing->submit_device != submit_device) {
+                continue;
+            }
+            if (plan && existing->exact_plan.get() == plan) {
+                return moe_mmid_materialize_status::ALREADY_PUBLISHED;
+            }
+            if (existing->plan_identity == plan_identity) {
+                return !plan && !existing->exact_plan ? moe_mmid_materialize_status::ALREADY_PUBLISHED :
+                                                        invalid(R::SAME_IDENTITY_OTHER_PLAN);
+            }
+            if (plan && has_active) {
+                *has_active |= existing->accepting && existing->exact_plan != nullptr;
+            }
+        }
+        return moe_mmid_materialize_status::PUBLISHED;
+    };
     try {
         uint64_t generation_ticket = 0;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
+            // An attempt an existing context already answers allocates nothing: a second context bind of a published
+            // plan costs no pool. The answer is asked again after the allocation, for a context published meanwhile.
+            const auto                  answer = existing_answer(exact_plan.get(), nullptr);
+            if (answer != moe_mmid_materialize_status::PUBLISHED) {
+                return answer;
+            }
             generation_ticket = model_publication_generation(*state_, token);
         }
         auto candidate           = std::make_shared<registry_context>();
@@ -1164,16 +1195,10 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (generation_ticket != model_publication_generation(*state_, token))
             return invalid(R::PUBLICATION_RACED);
-        bool has_active = false;
-        for (const auto & existing : state_->contexts) {
-            if (!same_token(existing->token, token) || existing->submit_device != submit_device) continue;
-            if (candidate->exact_plan && existing->exact_plan.get() == candidate->exact_plan.get())
-                return moe_mmid_materialize_status::ALREADY_PUBLISHED;
-            if (existing->plan_identity == plan_identity)
-                return !candidate->exact_plan && !existing->exact_plan ?
-                           moe_mmid_materialize_status::ALREADY_PUBLISHED :
-                           invalid(R::SAME_IDENTITY_OTHER_PLAN);
-            if (candidate->exact_plan) has_active |= existing->accepting && existing->exact_plan != nullptr;
+        bool       has_active = false;
+        const auto answer     = existing_answer(candidate->exact_plan.get(), &has_active);
+        if (answer != moe_mmid_materialize_status::PUBLISHED) {
+            return answer;
         }
         // A second authoritative exact plan is a prepared replacement. Legacy
         // host-test contexts remain independently addressable by plan id.
@@ -1754,6 +1779,55 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
                            return context_idle_locked(*context);
                        }), state_->retired_contexts.end());
     return released;
+}
+
+moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
+    moe_mmid_workspace_registry &                          registry,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    bool                                                   live_followed) noexcept {
+    if (!published || !live) {
+        return moe_mmid_reconcile_outcome::REBIND_REFUSED;
+    }
+    if (live.get() == published.get()) {
+        return moe_mmid_reconcile_outcome::CURRENT;
+    }
+    // Checked before replace_plan: after one replace published -> live, the replace's own CAS rebound the context and
+    // left previous_plan == published, and replace_plan(published, live) then refuses although nothing is wrong.
+    if (live_followed) {
+        return moe_mmid_reconcile_outcome::FOLLOWS_LIVE;
+    }
+    // Not reachable today: an expert loan or refill, the only replacement that can run while the bind is outside the
+    // plan lock, asserts the same MMID workspace plan before its swap, and every other replacement takes the re-plan
+    // token the bind holds. A replacement that changes the geometry would need pools the published ones cannot
+    // stand for.
+    if (!stable_geometry) {
+        return moe_mmid_reconcile_outcome::GEOMETRY_UNSTABLE;
+    }
+    return registry.replace_plan(published, live, live_identity, /*stable_geometry=*/true) ?
+               moe_mmid_reconcile_outcome::REBOUND :
+               moe_mmid_reconcile_outcome::REBIND_REFUSED;
+}
+
+bool moe_mmid_reconcile_retires(moe_mmid_reconcile_outcome outcome, moe_mmid_materialize_status published) noexcept {
+    return published == moe_mmid_materialize_status::PUBLISHED &&
+           moe_mmid_reconcile_refusal(outcome) != moe_mmid_materialize_refusal::NONE;
+}
+
+moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outcome outcome) noexcept {
+    switch (outcome) {
+        case moe_mmid_reconcile_outcome::CURRENT:
+        case moe_mmid_reconcile_outcome::FOLLOWS_LIVE:
+        case moe_mmid_reconcile_outcome::REBOUND:
+            return moe_mmid_materialize_refusal::NONE;
+        case moe_mmid_reconcile_outcome::GEOMETRY_UNSTABLE:
+            return moe_mmid_materialize_refusal::PLAN_CHANGED_GEOMETRY_UNSTABLE;
+        case moe_mmid_reconcile_outcome::REBIND_REFUSED:
+            return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
+    }
+    return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
 }
 
 bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uint64_t plan_identity) noexcept {

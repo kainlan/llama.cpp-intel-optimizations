@@ -1897,6 +1897,13 @@ size_t unified_cache_recover_moe_mmid_workspaces(const moe_mmid_model_token & to
                                                   uint64_t plan_identity, bool wait) noexcept;
 bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
                                                uint64_t plan_identity = 0) noexcept;
+// moe_mmid_reconcile_live_plan() on the cache's registry; the caller holds g_tensor_inventory_mutex.
+moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    bool                                                   live_followed) noexcept;
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept;
 
 // Immutable lifecycle-owned plan snapshots. A null plan with

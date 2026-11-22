@@ -985,9 +985,10 @@ static void common_direct_authority_plan_queue_and_lifetime() {
         while (!late_release.load(std::memory_order_acquire)) std::this_thread::yield();
         return allocator(host, device, bytes, alignment);
     };
-    std::thread late_materialize([&] {
-        late_status = registry.materialize(token, 1700, plan, 0, { owner }, late_allocator);
-    });
+    // Submit device 1: on submit device 0 the context published above answers the attempt before it allocates, and
+    // the race this pins is the one an attempt meets while it allocates.
+    std::thread late_materialize(
+        [&] { late_status = registry.materialize(token, 1700, plan, 1, { owner }, late_allocator); });
     while (!late_entered.load(std::memory_order_acquire)) std::this_thread::yield();
     check(registry.replace_plan(plan, replacement, 1703, true), "stable exact plan replacement failed");
     late_release.store(true, std::memory_order_release); late_materialize.join();
@@ -1400,6 +1401,8 @@ static void materialize_refusal_names() {
         R::OWNER_POOL_BYTES_MISMATCH,
         R::PUBLICATION_RACED,
         R::SAME_IDENTITY_OTHER_PLAN,
+        R::PLAN_CHANGED_GEOMETRY_UNSTABLE,
+        R::PLAN_CHANGED_REBIND_REFUSED,
         R::DEVICE_POOL_ALLOCATION_FAILED,
         R::HOST_POOL_ALLOCATION_FAILED,
         R::SLICE_FAILED,
@@ -1625,6 +1628,157 @@ static void registry_publish_after_stable_replace_follows_live() {
     }
 }
 
+// An attempt an existing context already answers allocates nothing: the same exact snapshot (a second context bind
+// of a published plan) and the same identity for another snapshot are both answered before any pool is allocated.
+static void registry_existing_answer_allocates_nothing() {
+    using S = moe_mmid_materialize_status;
+    const moe_mmid_model_token token{ 4401, 4402, 4403 };
+    std::atomic<int>           destroyed{ 0 };
+    int                        calls     = 0;
+    auto                       allocator = [&](bool host, int device, size_t bytes, size_t) {
+        ++calls;
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int  queue_object      = 0;
+    auto owner             = owner_plan(0, 4404);
+    owner.queue_capability = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 4404);
+    moe_mmid_workspace_registry registry;
+    const auto                  published = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, 44, published, 0, { owner }, allocator) == S::PUBLISHED,
+          "baseline publish failed");
+    check(calls > 0, "the baseline publish allocated nothing");
+    calls = 0;
+    check(registry.materialize(token, 44, published, 0, { owner }, allocator) == S::ALREADY_PUBLISHED,
+          "a second publish of the same snapshot was not ALREADY_PUBLISHED");
+    check(calls == 0, "a second publish of the same snapshot called the allocator");
+    moe_mmid_materialize_refusal detail = moe_mmid_materialize_refusal::NONE;
+    const auto                   other  = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, 44, other, 0, { owner }, allocator, &detail) == S::INVALID &&
+              detail == moe_mmid_materialize_refusal::SAME_IDENTITY_OTHER_PLAN,
+          "the same identity for another snapshot was not refused as same-identity-other-plan");
+    check(calls == 0, "a same-identity-other-plan attempt called the allocator");
+    check(registry.published_contexts() == 1, "an answered attempt changed the published contexts");
+}
+
+// The context bind's reconcile (moe_mmid_reconcile_live_plan) after it published for snapshot S outside the plan
+// lock and finds P live. `followed` is computed as the backend computes it: exact_queue on the live snapshot.
+static void registry_bind_reconcile_follows_live() {
+    using S = moe_mmid_materialize_status;
+    using O = moe_mmid_reconcile_outcome;
+    const moe_mmid_model_token token{ 4501, 4502, 4503 };
+    std::atomic<int>           destroyed{ 0 };
+    auto                       allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int  queue_object           = 0;
+    auto owner                  = owner_plan(0, 4504);
+    owner.queue_capability      = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 4504);
+    constexpr uint64_t identity = 45;
+    const auto         follows  = [&](moe_mmid_workspace_registry &                          registry,
+                             const std::shared_ptr<const lifecycle_plan_snapshot> & plan) {
+        return registry.exact_queue(token, plan, 0, 0, &queue_object).valid();
+    };
+    const auto reconcile = [&](moe_mmid_workspace_registry &                          registry,
+                               const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+                               const std::shared_ptr<const lifecycle_plan_snapshot> & live, bool stable) {
+        const bool followed = live.get() != published.get() && follows(registry, live);
+        return moe_mmid_reconcile_live_plan(registry, published, live, identity, stable, followed);
+    };
+    // The live snapshot is the published one.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "publish S failed");
+        const O outcome = reconcile(registry, s, s, true);
+        check(outcome == O::CURRENT && moe_mmid_reconcile_refusal(outcome) == moe_mmid_materialize_refusal::NONE,
+              "an unchanged live snapshot did not reconcile as CURRENT");
+        check(follows(registry, s), "the published live snapshot is not reachable");
+    }
+    // A loan swapped S -> P before the publish: its CAS found no context. The reconcile rebinds the context to P.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.replace_plan(s, p, identity, true), "the loan's replace with no context was refused");
+        check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "publish S failed");
+        const O outcome = reconcile(registry, s, p, true);
+        check(outcome == O::REBOUND && moe_mmid_reconcile_refusal(outcome) == moe_mmid_materialize_refusal::NONE,
+              "a publish behind a loan's swap was not rebound");
+        check(follows(registry, p), "after the rebind exact_queue on the live snapshot does not answer");
+        check(!follows(registry, s), "after the rebind exact_queue on the replaced snapshot still answers");
+    }
+    // One swap S -> P after the publish: the loan's own CAS rebound the context and left previous_plan == S, so
+    // replace_plan(S, P) would refuse. The reconcile sees the live snapshot followed and leaves the context alone.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "publish S failed");
+        check(registry.replace_plan(s, p, identity, true), "the loan's CAS rebind was refused");
+        const O outcome = reconcile(registry, s, p, true);
+        check(outcome == O::FOLLOWS_LIVE && moe_mmid_reconcile_refusal(outcome) == moe_mmid_materialize_refusal::NONE,
+              "a context the loan already rebound did not reconcile as FOLLOWS_LIVE");
+        check(!moe_mmid_reconcile_retires(outcome, S::PUBLISHED), "a followed live snapshot retires the context");
+        check(follows(registry, p) && registry.published_contexts() == 1, "the rebound context did not stay");
+        check(!registry.replace_plan(s, p, identity, true),
+              "replace_plan(S, P) after the CAS rebind no longer refuses: the FOLLOWS_LIVE check guards nothing");
+    }
+    // Two swaps S -> A -> P after the publish.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  a = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "publish S failed");
+        check(registry.replace_plan(s, a, identity, true) && registry.replace_plan(a, p, identity, true),
+              "the two CAS rebinds were refused");
+        const O outcome = reconcile(registry, s, p, true);
+        check(outcome == O::FOLLOWS_LIVE, "two swaps after the publish did not reconcile as FOLLOWS_LIVE");
+        check(follows(registry, p) && registry.published_contexts() == 1, "the twice-rebound context did not stay");
+    }
+    // The not-stable arm: this bind's own publication is retired and the refusal is named.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.replace_plan(s, p, identity, true), "the swap with no context was refused");
+        const S status = registry.materialize(token, identity, s, 0, { owner }, allocator);
+        check(status == S::PUBLISHED, "publish S failed");
+        const O outcome = reconcile(registry, s, p, /*stable=*/false);
+        check(outcome == O::GEOMETRY_UNSTABLE &&
+                  moe_mmid_reconcile_refusal(outcome) == moe_mmid_materialize_refusal::PLAN_CHANGED_GEOMETRY_UNSTABLE,
+              "an unstable geometry did not reconcile as GEOMETRY_UNSTABLE");
+        check(moe_mmid_reconcile_retires(outcome, status), "the bind's own publication is not retired");
+        check(registry.retire(token, identity), "the retire found nothing");
+        check(registry.published_contexts() == 0 && !follows(registry, s) && !follows(registry, p),
+              "the retired publication is still reachable");
+    }
+    // A second bind's ALREADY_PUBLISHED with a forced not-stable reconcile: the context an earlier bind published is
+    // not this bind's to retire.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p = std::make_shared<const lifecycle_plan_snapshot>();
+        check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "first bind failed");
+        const S status = registry.materialize(token, identity, s, 0, { owner }, allocator);
+        check(status == S::ALREADY_PUBLISHED, "the second bind was not ALREADY_PUBLISHED");
+        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, identity, /*stable_geometry=*/false,
+                                                       /*live_followed=*/false);
+        check(outcome == O::GEOMETRY_UNSTABLE, "the forced not-stable reconcile did not refuse");
+        check(!moe_mmid_reconcile_retires(outcome, status), "a second bind retires an earlier bind's context");
+        check(registry.published_contexts() == 1 && follows(registry, s), "the earlier context did not stay");
+    }
+    // No live snapshot (the model's plan is gone): refused, not taken for a rebind.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
+        check(moe_mmid_reconcile_live_plan(registry, s, nullptr, identity, true, false) == O::REBIND_REFUSED &&
+                  moe_mmid_reconcile_refusal(O::REBIND_REFUSED) ==
+                      moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED,
+              "a missing live snapshot did not refuse with plan-changed-rebind-refused");
+    }
+}
+
 // llama.cpp-n8da: a workspace is admitted only by a backend context on its owner device, and a backend context exists
 // only for a device the registry exposes. With two physical GPUs the backend exposes device 0 alone by default, so the
 // planner may place experts on device 1 but must not plan an MMID workspace there: nothing can bind or admit it, and
@@ -1657,6 +1811,8 @@ int main() {
         materialize_refusal_names();
         registry_refusal_detail_per_condition();
         registry_publish_after_stable_replace_follows_live();
+        registry_existing_answer_allocates_nothing();
+        registry_bind_reconcile_follows_live();
         owner_admissible_only_on_an_exposed_device();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();

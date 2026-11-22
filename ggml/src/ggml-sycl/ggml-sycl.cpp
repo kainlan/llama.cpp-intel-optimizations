@@ -13973,11 +13973,46 @@ static void ggml_sycl_moe_mmid_report_refusal(
         (unsigned long long) (snapshot ? snapshot->version : 0));
 }
 
+// The device a plan's MMID workspaces are published for: the plan's device, or a multi-device plan's first device.
+static int ggml_sycl_mmid_submit_device(const ggml_sycl::placement_plan & plan) {
+    return plan.device_id >= 0 ? plan.device_id : !plan.devices.empty() ? plan.devices.front() : -1;
+}
+
+// Whether the MMID registry holds a context accepting for exactly `snapshot`, for every workspace owner, asked with
+// the lookup decode admission uses (exact_queue) and the queue of the owner device's current backend context. True
+// for a plan with no workspace. Read-only: it takes no lease and moves no generation, and it allocates nothing, so a
+// caller may ask it under g_tensor_inventory_mutex.
+static bool ggml_sycl_mmid_workspaces_follow(
+    const ggml_sycl::lifecycle::ModelToken &                          token,
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
+        return true;
+    }
+    const int submit_device = ggml_sycl_mmid_submit_device(*snapshot->plan);
+    if (submit_device < 0) {
+        return false;
+    }
+    const ggml_sycl::moe_mmid_model_token owner{ token.model.value, token.load.value, token.owner.generation };
+    for (const auto & workspace : snapshot->plan->moe_mmid_workspaces) {
+        ggml_backend_sycl_context * backend = ggml_sycl_get_backend_context_for_device(workspace.owner_device);
+        if (!backend || !backend->stream() ||
+            !ggml_sycl::unified_cache_moe_mmid_exact_queue(owner, snapshot, submit_device, workspace.owner_device,
+                                                           backend->stream())
+                 .valid()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// `out_status`, when given, is the registry's own answer (PUBLISHED, ALREADY_PUBLISHED, ...); it stays INVALID when
+// the attempt never reached the registry.
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken &                          token,
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot,
     ggml_sycl::moe_mmid_materialize_reason *                          out_reason = nullptr,
-    ggml_sycl::moe_mmid_materialize_refusal *                         out_detail = nullptr) {
+    ggml_sycl::moe_mmid_materialize_refusal *                         out_detail = nullptr,
+    ggml_sycl::moe_mmid_materialize_status *                          out_status = nullptr) {
     const auto set_reason = [&](ggml_sycl::moe_mmid_materialize_reason reason) {
         if (out_reason) {
             *out_reason = reason;
@@ -13988,12 +14023,14 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     if (out_detail) {
         *out_detail = detail;
     }
+    if (out_status) {
+        *out_status = ggml_sycl::moe_mmid_materialize_status::INVALID;
+    }
     if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
         set_reason(ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE);
         return true;
     }
-    const int submit_device = snapshot->plan->device_id >= 0 ? snapshot->plan->device_id :
-                              !snapshot->plan->devices.empty() ? snapshot->plan->devices.front() : -1;
+    const int submit_device = ggml_sycl_mmid_submit_device(*snapshot->plan);
     if (submit_device < 0) {
         set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_SUBMIT_DEVICE);
         return false;
@@ -14042,6 +14079,9 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
         ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(owner, snapshot, submit_device, bindings, &detail);
     if (out_detail) {
         *out_detail = detail;
+    }
+    if (out_status) {
+        *out_status = result;
     }
     if (result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
         result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED) {
@@ -20850,10 +20890,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         ring_kv_zone.runtime_pending_bytes +=
             moe_host_scatter_planned > moe_host_scatter_held ? moe_host_scatter_planned - moe_host_scatter_held : 0;
     }
-    // The current plan's pools, still allocated, are already missing from the
-    // RUNTIME zone's free space, so they are counted twice here: conservative,
-    // and only in a build where the route is reachable.
-    if (mmid_route_reachable && !ggml_sycl_same_mmid_workspace_plan(*current->plan, next_plan)) {
+    // The next plan's pools are pending RUNTIME bytes when this transaction materializes them (a changed workspace
+    // plan: the current plan's pools, still allocated, are then already missing from the RUNTIME zone's free space,
+    // so they are counted twice, which is conservative), and when no context holds them yet (a load_end deferral the
+    // context bind materializes after this transaction returns). Only in a build where the route is reachable, and
+    // zero for a model without a Q1_0/NVFP4 expert, which plans no workspace.
+    if (mmid_route_reachable && (!ggml_sycl_same_mmid_workspace_plan(*current->plan, next_plan) ||
+                                 !ggml_sycl_mmid_workspaces_follow(current_token, current))) {
         for (const auto & workspace : next_plan.moe_mmid_workspaces) {
             if (workspace.owner_device == ctx->device) {
                 ring_kv_zone.runtime_pending_bytes += workspace.device_pool_bytes;
@@ -25232,6 +25275,68 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
     return ggml_sycl::MOE_GPU_UBATCH_MAX;
 }
 
+// The context bind's resolution of a load_end deferral, run under the bind's re-plan token after its runtime
+// transaction returned.
+//
+// The pools are allocated outside g_tensor_inventory_mutex (canonical 12.5: no allocation under a registry lock), so
+// the snapshot they are published for can be replaced meanwhile: an expert loan or refill swaps it at a micro-batch
+// boundary under that mutex without the re-plan token (ggml_sycl_expert_txn_run). Every plan replacement CASes under
+// that mutex, so the bind takes it again and makes the published context follow the live snapshot
+// (moe_mmid_reconcile_live_plan); once that returns, no snapshot can be live without the context following it. A
+// reconcile that cannot rebind retires what this bind published and leaves the deferral pending.
+//
+// Each refusal is a TRIPWIRE: the route is executable here and a planned pool is still unmaterialized where it
+// should have resolved. Admission then falls through to the retained route, which refuses Q1_0/NVFP4, and nothing
+// downstream names the cause, so the WARN names it.
+static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lifecycle::ModelToken & token) try {
+    const auto select_live = [&]() {
+        return ggml_sycl::lifecycle_select_placement_plan(token.model.value, token.load.value, token.owner.slot,
+                                                          token.owner.generation);
+    };
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> published;
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        published = select_live();
+    }
+    ggml_sycl::moe_mmid_materialize_reason  reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+    ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+    ggml_sycl::moe_mmid_materialize_status  status = ggml_sycl::moe_mmid_materialize_status::INVALID;
+    if (!ggml_sycl_materialize_published_mmid_workspaces(token, published, &reason, &detail, &status)) {
+        ggml_sycl_moe_mmid_report_refusal("context-bind", reason, detail, token, published);
+        return;
+    }
+    if (reason == ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE) {
+        return;
+    }
+    ggml_sycl::moe_mmid_reconcile_outcome outcome = ggml_sycl::moe_mmid_reconcile_outcome::REBIND_REFUSED;
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> live;
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+        live                = select_live();
+        const bool changed  = live && live.get() != published.get();
+        const bool followed = changed && ggml_sycl_mmid_workspaces_follow(token, live);
+        const bool stable =
+            live && live->plan && published->plan && ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan);
+        outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(published, live, live ? live->version : 0,
+                                                                         stable, followed);
+    }
+    const ggml_sycl::moe_mmid_materialize_refusal refusal = ggml_sycl::moe_mmid_reconcile_refusal(outcome);
+    if (refusal == ggml_sycl::moe_mmid_materialize_refusal::NONE) {
+        return;
+    }
+    if (ggml_sycl::moe_mmid_reconcile_retires(outcome, status)) {
+        (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+            { token.model.value, token.load.value, token.owner.generation }, published->version);
+    }
+    ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID, refusal,
+                                      token, live ? live : published);
+} catch (...) {
+    // A lock or a snapshot copy threw; nothing was published that the registry does not hold, and the deferral stays
+    // pending. The bind's own result is the transaction's, which already published.
+    ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
+                                      ggml_sycl::moe_mmid_materialize_refusal::EXCEPTION, token, nullptr);
+}
+
 // The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:
 // `desc` is then read once, here, under its gates (a refusal is deterministic, so PLAN_REJECTED, the
 // same answer the inner transaction gives), and the section it yields is stored in the context's
@@ -25357,11 +25462,6 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
         }
     }
 
-    // Retained past the locked scope below so a load_end deferral can be
-    // resolved OUTSIDE g_tensor_inventory_mutex. Copying the pointer under the
-    // lock is fine; materializing under it is not -- that allocates, and
-    // canonical §12 forbids allocation under the publication locks.
-    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> bound_snapshot;
     try {
         std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
         const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id, model.slot,
@@ -25369,7 +25469,6 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
         if (!snapshot) {
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
-        bound_snapshot = snapshot;
         if (backend_ctx) {
             std::vector<int> aggregate_devices;
             if (snapshot->plan) {
@@ -25465,26 +25564,16 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
             return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
         }
     }
-    // Resolve a load_end deferral now that a backend context exists. Idempotent:
-    // the MMID registry answers ALREADY_PUBLISHED when a pool is already live,
-    // so the registry itself is the deferred-state record and no parallel
-    // bookkeeping is kept (see the commit body).
+    // Resolve a load_end deferral now that a backend context exists, for the plan snapshot live after the
+    // transaction above (which replaced the snapshot the bind started from). Idempotent: the MMID registry answers
+    // ALREADY_PUBLISHED, allocating nothing, when a context already holds that snapshot, so the registry itself is
+    // the deferred-state record and no parallel bookkeeping is kept.
     //
     // Only when the inner bind SUCCEEDED. On inner failure the deferral stays
     // pending and stays silent: that failure has its own error surface, and a
     // tripwire on top of it would blame the wrong mechanism.
-    if (inner_ok && bound_snapshot && backend_ctx && ggml_sycl_moe_mmid_route_reachable(*backend_ctx)) {
-        ggml_sycl::moe_mmid_materialize_reason  mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-        ggml_sycl::moe_mmid_materialize_refusal mmid_detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
-        if (!ggml_sycl_materialize_published_mmid_workspaces(token, bound_snapshot, &mmid_reason, &mmid_detail)) {
-            // TRIPWIRE. The route IS executable here and a planned pool is
-            // still unmaterialized at the point it should have resolved.
-            // Consequence is a silent performance cliff rather than wrong
-            // results -- admission simply falls through to the generic MoE
-            // dispatch -- which is exactly why it has to be loud: nothing
-            // downstream would ever report it.
-            ggml_sycl_moe_mmid_report_refusal("context-bind", mmid_reason, mmid_detail, token, bound_snapshot);
-        }
+    if (inner_ok && backend_ctx && ggml_sycl_moe_mmid_route_reachable(*backend_ctx)) {
+        ggml_sycl_bind_materialize_live_mmid_workspaces(token);
     }
     // PLAN_REJECTED, not BUSY. The inner refusal is deterministic -- the same
     // n_ctx against the same budget refuses identically every time -- and a

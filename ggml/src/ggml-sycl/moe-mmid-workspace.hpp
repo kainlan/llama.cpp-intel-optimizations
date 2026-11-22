@@ -356,6 +356,11 @@ enum class moe_mmid_materialize_refusal : uint8_t {
     // exact plan snapshot.
     PUBLICATION_RACED,
     SAME_IDENTITY_OTHER_PLAN,
+    // The context bind's reconcile (moe_mmid_reconcile_live_plan): the plan was replaced while the bind's workspaces
+    // were allocated outside the plan lock, and the live plan plans another workspace geometry, or the registry
+    // refused to rebind the published context to it.
+    PLAN_CHANGED_GEOMETRY_UNSTABLE,
+    PLAN_CHANGED_REBIND_REFUSED,
     // Allocation: the device pool, the host pool, or a slot slice of either; or an exception.
     DEVICE_POOL_ALLOCATION_FAILED,
     HOST_POOL_ALLOCATION_FAILED,
@@ -647,6 +652,38 @@ class moe_mmid_workspace_registry {
     std::shared_ptr<state> state_;
     friend class moe_admitted_workspace_bundle;
 };
+
+// A context bind publishes the MMID workspaces of a deferred load for the plan snapshot live after its runtime
+// transaction, and allocates them outside the plan lock (canonical 12.5: no allocation under a registry lock). An
+// expert loan or refill can replace that snapshot meanwhile: it swaps the plan at a micro-batch boundary under the
+// plan lock without taking the re-plan token. The bind then takes the plan lock again, reads the live snapshot, and
+// asks this to make the published context follow it. Every plan replacement CASes under that lock, so once this
+// returns under it no snapshot can be live without the context following it. It allocates nothing.
+enum class moe_mmid_reconcile_outcome : uint8_t {
+    CURRENT,            // the live snapshot is the published one
+    FOLLOWS_LIVE,       // a context already accepts for the live snapshot: a replace's own CAS rebound it
+    REBOUND,            // replace_plan(published, live) rebound the published context
+    GEOMETRY_UNSTABLE,  // the live snapshot plans another workspace geometry: the published pools cannot serve it
+    REBIND_REFUSED,     // replace_plan(published, live) refused
+};
+
+// `live_followed`: whether a context accepts for exactly `live`, answered by the lookup decode admission uses
+// (exact_queue). `stable_geometry`: whether `published` and `live` plan the same workspace geometry.
+moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
+    moe_mmid_workspace_registry &                          registry,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    bool                                                   live_followed) noexcept;
+
+// Whether the bind retires what it published after a reconcile: only for a refused reconcile, and only when its own
+// attempt PUBLISHED. ALREADY_PUBLISHED names a context an earlier bind published, and the retire takes every context
+// of the token with the plan identity, so retiring then would take that one.
+bool moe_mmid_reconcile_retires(moe_mmid_reconcile_outcome outcome, moe_mmid_materialize_status published) noexcept;
+
+// The refusal detail a reconcile outcome names (NONE for the three that leave the live snapshot followed).
+moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outcome outcome) noexcept;
 
 #ifdef GGML_SYCL_RETENTION_TESTING
 class moe_mmid_queue_capability_test_factory final {
