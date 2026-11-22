@@ -4967,6 +4967,28 @@ that no longer exists). Until someone files these, this list is the record. Each
 - `hold_spills_kv_zone_full=1 hold_spills_kv_zone_full_bytes=1057724.1 KB` in the scratch statistics of the
   B70 run: one hold spilled about 1 GB because the KV zone was full. Find what it was.
 
+*Found by the scheduler print of the Inkling decode graph (B70, `GGML_SCHED_DEBUG=2 -v`, 2026-11-22, Task 8b's
+build `8ed0c3204`; evidence `inkling/t8b-ink-b70-diag/graph-40.txt`, not committed). One token's graph has
+8076 nodes in 282 splits, 141 of them CPU splits with 205 nodes. Each split boundary is a device-to-host or
+host-to-device copy with a wait. These are the first candidates for the profile in Stage 2:*
+- **KV of the loop's cache slots is on the CPU.** `inkling2_loop` has 24 physical layers and 48 cache slots
+  (`hparams.n_layer_all = n_slot`; layers 6 to 17 run three passes, slots 24 to 47 are passes 1 and 2).
+  `cache_k_l0..23` are on SYCL0, `cache_k_l24..47` on CPU, so 24 of 48 `FLASH_ATTN` nodes and 48 `SET_ROWS`
+  nodes run on the CPU. Probable cause, read not run: `llama-kv-cache.cpp` asks
+  `hooks.kv_layer_on_device(dev, il)` with the slot index, and the plan knows layers by tensor name
+  (`blk.0` to `blk.23`). The slot's physical layer is `layer_phys(il)`. Check that the plan's KV room counts
+  48 slots before moving them.
+- **The experts of `blk.20` to `blk.23` are BF16** (1296 MB and 648 MB per tensor; the 40 NVFP4 tensors are
+  `blk.0` to `blk.19`). Their 8 `MUL_MAT_ID` nodes run on the CPU. A missing kernel for a loaded layout: write
+  the BF16 `MUL_MAT_ID` kernel, or show the profile says it does not matter.
+- **`SCALE` of a view of the fused gate_up output runs on the CPU** in every layer pass (104 nodes, with 8
+  `TANH`, 8 `MUL` and 4 `SIGMOID` beside them in the CPU layers): the SiTU activation scales the gate half
+  and the up half, each a strided view of the `MUL_MAT_ID` output, and the SYCL `SCALE` does not take that
+  view. Two CPU round trips per layer pass between the two `MUL_MAT_ID` calls.
+- `GET_ROWS` of the token embedding runs on the CPU against a SYCL0 weight (one node).
+- The model has 24 layers and one graph holds 96 `MUL_MAT_ID` nodes, 88 of them NVFP4. Earlier notes in this
+  plan that say "20 layers" or "40 calls per token" count the NVFP4 tensors, not the calls.
+
 *Found by Task 8a and 8b:*
 - For a direct recipe, `recipe.workspace` (the 32-row chunk plan) is a size nothing allocates: a second figure
   for one thing.
