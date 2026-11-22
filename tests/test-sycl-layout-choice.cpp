@@ -2753,14 +2753,15 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
 // split mode) and is the control that the rule keys on exposure, not on "secondary".
 //
 // The experts are NVFP4, a type the direct route admits: no other type draws a pool, so no other type can name an
-// owner at all. The EXPERT split keeps every Q1_0/NVFP4 expert on device 0 (no secondary executor runs them), so the
-// fixture is a LAYER split instead: two layers whose dense weight fits device 1 (the faster one) only once, so layer 0
-// and its experts go to device 1 and layer 1 and its experts spill to device 0.
+// owner at all. No secondary executor runs them, so they never reach device 1 as a replica (the route the MXFP4 form
+// of this fixture took, an SOA alternate there). They reach it as a primary through the no-P2P cohesive placement:
+// two layers that together fit neither device, each layer (dense weight and experts) fitting either, so layer 0 goes
+// to the faster device 1 and layer 1 to device 0, each with its experts.
 static bool run_multi_device_mmid_owner_exposure_test() {
     constexpr size_t mib           = 1024u * 1024u;
     constexpr int    n_expert_used = 4;
     constexpr int    hidden_dim    = 4096;
-    constexpr int    dense_rows    = 32768;  // 256 MiB of F16 per layer
+    constexpr int    dense_rows    = 49152;  // 384 MiB of F16 per layer
 
     auto make_dense = [](const char * name) {
         ggml_sycl::placement_tensor_info tensor;
@@ -2790,8 +2791,8 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         make_expert("blk.1.ffn_up_exps.weight"), make_expert("blk.1.ffn_down_exps.weight"),
     };
     const std::vector<ggml_sycl::device_budget> devices = {
-        { 0, 1024u * mib, 1024u * mib, 1.0, true },
-        { 1, 400u * mib,  400u * mib,  4.0, true },
+        { 0, 700u * mib, 700u * mib, 1.0, true },
+        { 1, 700u * mib, 700u * mib, 4.0, true },
     };
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch      = 512;
@@ -2803,7 +2804,7 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         ggml_sycl_device_info info = make_mock_sycl_info(2);
         info.device_count          = exposed;  // total_gpu_count stays 2
         ggml_sycl::test_sycl_info_override_guard info_guard(info);
-        return ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::LAYER, kv_info,
+        return ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                     nullptr, moe_pp_n_experts);
     };
     // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
