@@ -3827,6 +3827,91 @@ candidates are the attention clip or relative-bias tensors). It costs a host wai
 
 ---
 
+### Task 8b: The direct route takes prompt rows (`ne12 > 1`) (found 2026-11-22)
+
+**Track:** L. **Depends on:** Task 8a; branch `task/inkling2-t8b` is cut from Task 8a's tip and merges after it.
+**Found by:** the lead's Inkling gate on the B70 from Task 8a's build (`7038e6119`), with the gate command fixed
+(`66a4f0bd4`, `-no-cnv`). The warm-up decode (one token) takes the direct route through `blk.19` with no
+refusal. The 11-token prompt is refused at the first MoE node and the graph fails:
+`[MOE-PROMPT-CANONICAL] tensor=blk.0.ffn_gate_up_exps.weight published=0 kind=-1 stable=0`, then
+`[MOE-DECODE-REFUSAL] tensor=blk.0.ffn_gate_up_exps.weight occurrence=0 expert=84 owner=0
+reason=capability_unsupported type=nvfp4 layout=aos kernel=mmvq-compat capability=local-mmvq queue_ready=1`.
+
+**Description (traced by an explorer on `feat/inkling2`; the lines marked *checked* were re-read by the lead in
+Task 8a's tree):**
+- The direct block in `ggml_sycl_mul_mat_id` admits `ne12 == 1` and `ids->ne[1] == 1` only, and reads its
+  operand from `retained_decode_batch_result`, which is built only when `ne12 == 1` and is the only build that
+  passes a queue capability. The capability function offers the direct recipe for
+  `phase == moe_route_phase::DECODE && rows == 1` only (*checked*).
+- A prompt batch therefore falls through to the retained hybrid route. Its capability answer is `MMVQ_COMPAT`
+  (`local-mmvq`), and `choose_moe_batch_executor` (`moe-resolved-batch.hpp`) refuses every Q1_0/NVFP4 device
+  recipe by design. The refusal is printed by a lambda shared by decode and prompt whose label is a fixed
+  string, which is why a prompt batch prints `MOE-DECODE-REFUSAL`.
+- The adapter `mmvq_submit_q1_nvfp4_aos_id_admitted` already takes `n_tokens` (*checked*): it sizes
+  `occurrences = top_k * n_tokens` and `activation_rows = ne11 * n_tokens`, uploads `occurrences` ids, and the
+  kernel reads expert `ids[token][slot]`, activation row `[slot % ne11][token]` and writes `[token][slot]`.
+  The direct block passes `n_tokens = 1`.
+- The MMID workspace is planned at load for `c = min(n_ctx, n_ubatch)` tokens (`moe_mmid_capacity`, *checked*)
+  with `ne11 = top_k = n_expert_used`, and admission derives the token count from the authority's bindings
+  (`bindings->size() / top_k`). So the pools already hold a whole ubatch.
+- The recipe's own workspace plan (`plan_moe_q1_nvfp4_device_workspace`) is given `max_prompt_chunk_rows = 32`
+  (*checked*). Whether `validate_moe_execution_recipe` would reject a direct-recipe prompt above 32 rows is
+  not traced.
+- No other prompt executor takes these types: the batched oneDNN table leaves them out because of the same
+  gate, the MXFP4 paths are type-gated, the prompt ring refuses them.
+
+**Ruling (lead, 2026-11-22):** the direct block admits a prompt batch and submits it once, through the same
+adapter, with `n_tokens = ne12`. This opens the kernel that exists for the operand where it lives; nothing is
+converted, re-routed or sent to the CPU, and `choose_moe_batch_executor` stays as it is.
+- One submission per `MUL_MAT_ID` node, one terminal event, every copy a dependency of the kernel on the exact
+  queue, no host wait added.
+- The ids are the immutable prompt snapshot, all `top_k * ne12` of them. A kernel that used token 0's ids for
+  every token must fail the device test.
+- The activation copy and the output copy cover `ne12` tokens. A src1 whose rows or tokens are strided is
+  copied piecewise on the exact queue, as Task 8a does for rows; a src1 whose elements are not contiguous
+  inside a row is not admitted.
+- One source for the size: the MMID workspace plan. If the recipe's 32-row chunk plan binds on this path, make
+  the recipe's plan agree with the workspace plan for the direct recipe; do not chunk the submission to 32.
+- `ne12` above the admitted capacity cannot come from a ubatch (`ne12 <= n_ubatch`). If it is seen, the block
+  refuses it with a reason that names the capacity; it is not chunked and not truncated.
+- The shared refusal line names the phase it refused (`MOE-PROMPT-REFUSAL` on a prompt batch). Every contract
+  and script that searches for the old string on a prompt batch moves with it.
+- Speed is not this task. The kernel is a row kernel; what it costs on 512 tokens is Stage 2's measurement.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Where the prompt operand for the direct block comes from: pass the queue capability to the prompt build, or
+   build the block's operand the same way for every `ne12`. Say which and why.
+2. Whether the pointer table the block uses (`ggml_sycl_upload_moe_retained_ptr_table_from_batch` or its
+   peer) is indexed by expert id for a multi-token batch.
+3. Whether `validate_moe_execution_recipe` or any other check binds the 32-row chunk on this path.
+4. What `[MOE-PROMPT-CANONICAL] published=0 kind=-1 stable=0` means for an AOS NVFP4 operand and whether the
+   direct block needs the publication.
+5. Every consumer after admission that assumes one token (byte counts, the output shape, counters, the
+   completion, the join queue).
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (the direct block, the capability function's direct-recipe
+arm, the shared refusal label, the comments that state what the route covers);
+`ggml/src/ggml-sycl/moe-resolved-batch.hpp` only if checkpoint item 3 requires it;
+`tests/test-sycl-moe-resolved-batch-source.py` and any other contract that pins the block or the label;
+`ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the source contract fails on the `ne12 == 1` admission and on the decode-only
+      capability arm; the device test has prompt cases the lead sees fail before the fix.
+- [ ] Device test cases, Q1_0 and NVFP4, `ne11 = 1` and `ne11 = top_k`, through the production fixture (no
+      private authorization): 2 tokens, 33 tokens (past the recipe's 32), the fixture's full capacity, and one
+      case with src1 strided across tokens. Every token selects different experts. The oracle has a token
+      axis. Each passing case prints its line.
+- [ ] One case above the capacity is refused by name and the graph fails cleanly (no abort).
+- [ ] Lead, one run each: the oracle on both cards passes with 0 context-bind WARN lines; the Inkling gate on
+      the B70 passes or names its next refusal; the Mistral and GPT-OSS gates pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** the speed of prompt rows, `choose_moe_batch_executor`'s early return, hybrid layers (host
+experts, the B50), a secondary card, the small F32 weights staged at run time.
+
+---
+
 ### Task 9: Stage 1 exit gates
 
 **Track:** L (lead; GPU)
