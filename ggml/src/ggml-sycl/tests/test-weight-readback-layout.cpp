@@ -13,9 +13,10 @@
 // the test does not ask; on a build where set_tensor reorders and get_tensor does not invert, those cases fail.
 // The last case is larger than one readback chunk (32 MiB), so the chunk walk is covered.
 // Every case then runs one MUL_MAT with the weight as src0 and reads the whole weight again: a layout the backend
-// resolves for a kernel (a reorder in place, a cache copy) does not change what a read returns.
+// resolves for a kernel (a reorder in place, a cache copy) does not change what a read returns. That step prints
+// its own ok line, and the final line counts them, so a run that skipped it cannot print the same output.
 //
-// SYCL backend only, no scheduler, no model, no compute. Exit 77 when no SYCL device is visible.
+// SYCL backend only, no scheduler, no model; one MUL_MAT graph per case. Exit 77 when no SYCL device is visible.
 //
 
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
@@ -30,6 +31,9 @@
 #include <vector>
 
 namespace {
+
+// Reads after a MUL_MAT that matched; main requires one per case.
+int g_reads_after_mul_mat = 0;
 
 constexpr int64_t N_COLS     = 4608;  // the weight shape of the test-backend-ops case that showed the defect
 constexpr size_t  GUARD      = 64;
@@ -111,6 +115,10 @@ bool read_after_mul_mat_matches(ggml_backend_t backend, ggml_tensor * w, const u
             std::fprintf(stderr, "FAIL: %s, after a MUL_MAT: graph compute returned %d\n", case_name, (int) status);
         } else {
             ok = read_matches(w, 0, ggml_nbytes(w), want, case_name, "whole tensor after a MUL_MAT");
+            if (ok) {
+                ++g_reads_after_mul_mat;
+                std::fprintf(stderr, "  ok: %s, read after MUL_MAT (%zu bytes)\n", case_name, ggml_nbytes(w));
+            }
         }
         ggml_backend_buffer_free(buf);
     }
@@ -196,10 +204,13 @@ int main() {
     }
     ggml_backend_free(backend);
 
-    if (failures > 0) {
-        std::fprintf(stderr, "test-sycl-weight-readback-layout: %d of %d cases failed\n", failures, n_cases);
+    if (failures > 0 || g_reads_after_mul_mat != n_cases) {
+        std::fprintf(stderr,
+                     "test-sycl-weight-readback-layout: %d of %d cases failed, %d of %d reads after MUL_MAT matched\n",
+                     failures, n_cases, g_reads_after_mul_mat, n_cases);
         return 1;
     }
-    std::fprintf(stderr, "test-sycl-weight-readback-layout: PASS\n");
+    std::fprintf(stderr, "test-sycl-weight-readback-layout: PASS (%d cases, %d reads after MUL_MAT)\n", n_cases,
+                 g_reads_after_mul_mat);
     return 0;
 }

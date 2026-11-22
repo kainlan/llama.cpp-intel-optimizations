@@ -6985,10 +6985,10 @@ set_tests_properties(sycl-select-unselected-branch PROPERTIES
     TIMEOUT 120)
 
 # test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set was given,
-# also for a weight the backend stores reordered (SOA). Set and get only: no graph, no model, at most 34 MB of
-# device memory per case, so it carries no model/cache/mem-handle label and the sweep runs it. It submits device
-# copies, so the registration pins the validation card (level_zero:1); run the binary under level_zero:0 for the
-# B70. Exits 77 when no device is visible.
+# also for a weight the backend stores reordered (SOA), and again after one MUL_MAT that uses the weight. Set, get
+# and one small MUL_MAT graph per case: no scheduler, no model, at most 34 MB of device memory per case, so it carries
+# no model/cache/mem-handle label and the sweep runs it. It submits device work, so the registration pins the
+# validation card (level_zero:1); run the binary under level_zero:0 for the B70. Exits 77 when no device is visible.
 add_executable(test-sycl-weight-readback-layout
     tests/test-weight-readback-layout.cpp
 )
