@@ -112,6 +112,10 @@ digraph dependencies {
     6f3 [label="T6f-3 q6_K f16 arm uses the plane it resolved"];
     6f4 [label="T6f-4 trustworthy census (lead)"];
     6f5 [label="T6f-5 prompt loop unwind keeps its leases"];
+    6f6 [label="T6f-6 non-F32 src1 for a reordered weight"];
+    6f7 [label="T6f-7 get_tensor returns ggml bytes for SOA"];
+    6f8 [label="T6f-8 readback of COALESCED and XMX tiled"];
+    6f9 [label="T6f-9 partial write into a reordered weight"];
     6g [label="T6g skipped expert ids; f16 src1 tiling"];
     6h [label="T6h staging walks skip not-computed nodes"];
     7a [label="T7a async error fails the boundary"];
@@ -133,6 +137,7 @@ digraph dependencies {
     2 -> 3; 3 -> 4b; 4 -> 4b; 7 -> 4b; 8 -> 5;
     1 -> 7a; 7a -> 7; 7a -> 7d; 7d -> 7b; 3 -> 7; 6 -> 7; 7 -> 8; 6c -> 6d; 6d -> 9; 7c -> 6e;
     6d -> 6f1; 6d -> 6f2; 6f2 -> 6f3; 6f1 -> 6f4; 6f3 -> 6f4; 6f4 -> 6g; 6d -> 6h; 6f3 -> 6f5; 6f5 -> 6g; 6f3 -> 6f6;
+    6f3 -> 6f7; 6f7 -> 6f4; 6f7 -> 6f8; 6f7 -> 6f9;
     8 -> 9; 6 -> 9; 6b -> 9; 4b -> 9; 5 -> 9; 7b -> 7c; 7c -> 9;
     9 -> 12; 10 -> 10b; 10b -> 12; 11 -> 12;
     12 -> 13; 12 -> 14; 9 -> 15; 15 -> 16;
@@ -1629,10 +1634,844 @@ type or is declined for a non-F32 src1; the Mistral and GPT-OSS gates pass.
 
 ---
 
+### Task 6f-7: `get_tensor` returns ggml's bytes for a weight stored as SOA (written 2026-11-22)
+
+**Track:** F, after Task 6f-3 (same file). **Depends on:** Task 6f-3 merged. **Blocks:** Task 6f-4.
+**Found by:** Task 6f-3's device run. The A3 case no longer aborts; it prints FAIL with
+`NaN at index 3 (SYCL0=-31.095451 CPU=nan)`. The SYCL value is finite and the CPU reference is NaN.
+
+**Description:** `ggml_backend_sycl_buffer_set_tensor` may reorder a whole quantized weight on the CPU before the
+upload: SOA (one plane per block field) for Q4_0, Q6_K, Q8_0 and MXFP4 where the layout policy says so, and it
+records that in `extra->optimized_feature` (`mark_soa_pretransformed`) and `extra->layout`. The lazy in-place
+reorder `reorder_tensor_to_soa` sets the same record. `ggml_backend_sycl_buffer_get_tensor` copies the stored
+bytes with no layout handling on any path, so a reader gets plane bytes where ggml's block bytes are expected. No
+inverse exists anywhere in the backend. Readers of weight bytes: `ggml_backend_graph_copy` (the CPU reference of
+`test-backend-ops`, which is why A3's reference is NaN), `llama_tensor_rows_to_f32` (`src/llama-model.cpp:5333`,
+token-embedding rows, used by the mtmd helpers), `gguf_write_to_file`, the scheduler's input copies and
+`common/debug.cpp:207`. The stored layout is the backend's own business; the buffer interface speaks ggml's
+layout. This task makes the read return it. The stored weight is not converted, moved or re-routed.
+
+**File scope:**
+- Create: `ggml/src/ggml-sycl/soa-readback.hpp` (pure C++ over `ggml.h`)
+- Create: `tests/test-sycl-soa-readback.cpp`; Modify: `tests/CMakeLists.txt` (register it after the
+  `test-sycl-ubatch-ring-plan` block, which ends near `:4425`)
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: `ggml_backend_sycl_buffer_get_tensor` (`:45879` on Task 6f-3's
+  branch; find it by name) and its forward declarations, if any
+- Create: `ggml/src/ggml-sycl/tests/test-weight-readback-layout.cpp`; Modify:
+  `ggml/src/ggml-sycl/CMakeLists.txt` (register it after `sycl-select-unselected-branch`, `:6969-6985`)
+
+**Acceptance criteria:**
+- [ ] `test-sycl-soa-readback` (host-only) passes: for the five types of `soa-reorder-types.hpp` the inverse
+      rebuilds every tested window of the AOS image from an SOA image the test built from the block structs.
+- [ ] The plane table and `ggml_sycl_soa_reorder_supported_type` name the same types (the same test, over the
+      whole `ggml_type` enum).
+- [ ] `sycl-weight-readback-layout` (device, run by the lead, once per card): all cases pass. On the tree
+      before the `get_tensor` edit the same binary fails for at least `q6_K` (the lead's RED run; it is the proof
+      that the cases exercise a reordered weight on this build).
+- [ ] Lead: the A3 case prints OK; `-o MUL_MAT` has one failing case, F2; the Mistral gates and the GPT-OSS B50
+      gate pass.
+- [ ] No wait is added to a path that had none; no allocation outside the unified cache apart from one
+      function-local `std::vector` (host scratch, see Gotchas); `scripts/check-sycl-alloc-zone-contract.py`
+      passes.
+
+**Implementation guide:**
+
+*Cycle 1: the plane table and its inverse (host only).*
+
+1. **Test.** Create `tests/test-sycl-soa-readback.cpp`:
+
+```cpp
+//
+// Host-only gate for the inverse of the AOS->SOA weight reorder (ggml/src/ggml-sycl/soa-readback.hpp).
+//
+// The SYCL backend may store a quantized weight as SOA: one plane per block field, each plane holding that field
+// of every block in block order. A reader of the tensor must get ggml's block bytes back, so get_tensor rebuilds
+// them with ggml_sycl_soa_to_aos_window. This test builds the SOA image from the block structs of ggml-common.h
+// (field by field, never from the header's numbers), asks the inverse for windows of the AOS image, and compares.
+// It also holds the header's plane table to the one list of SOA types (soa-reorder-types.hpp).
+//
+// No SYCL device, queue or backend library is touched.
+//
+
+#include "ggml-sycl/soa-readback.hpp"
+#include "ggml-sycl/soa-reorder-types.hpp"
+#include "ggml.h"
+
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+int g_failures = 0;
+
+void check(bool ok, const char * type_name, const char * what) {
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: %s: %s\n", type_name, what);
+        ++g_failures;
+    }
+}
+
+void append(std::vector<uint8_t> & out, const void * src, size_t n) {
+    const uint8_t * p = static_cast<const uint8_t *>(src);
+    out.insert(out.end(), p, p + n);
+}
+
+template <typename block_t> block_t block_at(const std::vector<uint8_t> & aos, size_t i) {
+    block_t blk;
+    std::memcpy(&blk, aos.data() + i * sizeof(block_t), sizeof(block_t));
+    return blk;
+}
+
+// The SOA images, stated from the structs. Plane order as the fills in ggml-sycl.cpp document it:
+// Q4_0 and Q8_0 [qs][d], Q4_K [qs][scales][dm], Q6_K [ql][qh][scales][d], MXFP4 [qs][e].
+std::vector<uint8_t> soa_q4_0(const std::vector<uint8_t> & aos) {
+    const size_t         n = aos.size() / sizeof(block_q4_0);
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < n; ++i) {
+        const block_q4_0 b = block_at<block_q4_0>(aos, i);
+        append(out, b.qs, sizeof(b.qs));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q4_0 b = block_at<block_q4_0>(aos, i);
+        append(out, &b.d, sizeof(b.d));
+    }
+    return out;
+}
+
+std::vector<uint8_t> soa_q8_0(const std::vector<uint8_t> & aos) {
+    const size_t         n = aos.size() / sizeof(block_q8_0);
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < n; ++i) {
+        const block_q8_0 b = block_at<block_q8_0>(aos, i);
+        append(out, b.qs, sizeof(b.qs));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q8_0 b = block_at<block_q8_0>(aos, i);
+        append(out, &b.d, sizeof(b.d));
+    }
+    return out;
+}
+
+std::vector<uint8_t> soa_q4_k(const std::vector<uint8_t> & aos) {
+    const size_t         n = aos.size() / sizeof(block_q4_K);
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < n; ++i) {
+        const block_q4_K b = block_at<block_q4_K>(aos, i);
+        append(out, b.qs, sizeof(b.qs));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q4_K b = block_at<block_q4_K>(aos, i);
+        append(out, b.scales, sizeof(b.scales));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q4_K b = block_at<block_q4_K>(aos, i);
+        append(out, &b.data.dm, sizeof(b.data.dm));
+    }
+    return out;
+}
+
+std::vector<uint8_t> soa_q6_k(const std::vector<uint8_t> & aos) {
+    const size_t         n = aos.size() / sizeof(block_q6_K);
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < n; ++i) {
+        const block_q6_K b = block_at<block_q6_K>(aos, i);
+        append(out, b.ql, sizeof(b.ql));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q6_K b = block_at<block_q6_K>(aos, i);
+        append(out, b.qh, sizeof(b.qh));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q6_K b = block_at<block_q6_K>(aos, i);
+        append(out, b.scales, sizeof(b.scales));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_q6_K b = block_at<block_q6_K>(aos, i);
+        append(out, &b.d, sizeof(b.d));
+    }
+    return out;
+}
+
+std::vector<uint8_t> soa_mxfp4(const std::vector<uint8_t> & aos) {
+    const size_t         n = aos.size() / sizeof(block_mxfp4);
+    std::vector<uint8_t> out;
+    for (size_t i = 0; i < n; ++i) {
+        const block_mxfp4 b = block_at<block_mxfp4>(aos, i);
+        append(out, b.qs, sizeof(b.qs));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const block_mxfp4 b = block_at<block_mxfp4>(aos, i);
+        append(out, &b.e, sizeof(b.e));
+    }
+    return out;
+}
+
+struct type_case {
+    ggml_type    type;
+    const char * name;
+    std::vector<uint8_t> (*to_soa)(const std::vector<uint8_t> &);
+};
+
+const type_case CASES[] = {
+    { GGML_TYPE_Q4_0,  "q4_0",  soa_q4_0  },
+    { GGML_TYPE_Q8_0,  "q8_0",  soa_q8_0  },
+    { GGML_TYPE_Q4_K,  "q4_K",  soa_q4_k  },
+    { GGML_TYPE_Q6_K,  "q6_K",  soa_q6_k  },
+    { GGML_TYPE_MXFP4, "mxfp4", soa_mxfp4 },
+};
+
+constexpr size_t  N_BLOCKS   = 7;
+constexpr size_t  GUARD      = 16;
+constexpr uint8_t GUARD_BYTE = 0xA5;
+
+void run_type(const type_case & tc) {
+    const size_t block_bytes = ggml_type_size(tc.type);
+
+    ggml_sycl_soa_plane_table table{};
+    check(ggml_sycl_soa_plane_table_for_type(tc.type, &table), tc.name, "the type has no plane table");
+    check(table.block_bytes == block_bytes, tc.name, "block_bytes is not ggml_type_size");
+    // The planes are a partition of the block: every byte of the block belongs to exactly one plane.
+    std::vector<int> owners(block_bytes, 0);
+    for (size_t p = 0; p < table.n_planes; ++p) {
+        for (size_t i = 0; i < table.planes[p].width; ++i) {
+            const size_t at = table.planes[p].aos_offset + i;
+            if (at < block_bytes) {
+                ++owners[at];
+            } else {
+                check(false, tc.name, "a plane leaves the block");
+            }
+        }
+    }
+    for (size_t i = 0; i < block_bytes; ++i) {
+        check(owners[i] == 1, tc.name, "the planes do not partition the block");
+    }
+
+    std::vector<uint8_t> aos(N_BLOCKS * block_bytes);
+    uint32_t             s = 0x9E3779B9u + (uint32_t) tc.type;
+    for (auto & b : aos) {
+        s = s * 1664525u + 1013904223u;
+        b = (uint8_t) (s >> 24);
+    }
+    const std::vector<uint8_t> soa = tc.to_soa(aos);
+    check(soa.size() == aos.size(), tc.name, "the SOA image is not as large as the AOS image");
+    if (soa.size() != aos.size()) {
+        return;
+    }
+
+    const size_t offsets[] = { 0, 1, block_bytes - 1, block_bytes, block_bytes + 5, 3 * block_bytes, aos.size() };
+    const size_t sizes[]   = { 0, 1, block_bytes - 1, block_bytes, block_bytes + 1, 2 * block_bytes + 3, aos.size() };
+    for (size_t offset : offsets) {
+        for (size_t size : sizes) {
+            if (offset + size > aos.size()) {
+                continue;
+            }
+            std::vector<uint8_t> got(size + 2 * GUARD, GUARD_BYTE);
+            uint8_t *            dst = got.data() + GUARD;
+            check(ggml_sycl_soa_to_aos_window(tc.type, soa.data(), N_BLOCKS, offset, size, dst), tc.name,
+                  "a window inside the image was refused");
+            check(std::memcmp(got.data() + GUARD, aos.data() + offset, size) == 0, tc.name,
+                  "the window does not hold the AOS bytes");
+            for (size_t i = 0; i < GUARD; ++i) {
+                check(got[i] == GUARD_BYTE && got[GUARD + size + i] == GUARD_BYTE, tc.name,
+                      "the inverse wrote outside the window");
+            }
+        }
+    }
+
+    uint8_t untouched = GUARD_BYTE;
+    check(!ggml_sycl_soa_to_aos_window(tc.type, soa.data(), N_BLOCKS, aos.size(), 1, &untouched), tc.name,
+          "a window past the image was accepted");
+    check(untouched == GUARD_BYTE, tc.name, "a refused window wrote to dst");
+}
+
+}  // namespace
+
+int main() {
+    for (const type_case & tc : CASES) {
+        run_type(tc);
+    }
+    // One list of SOA types: the plane table has exactly the types the reorder table has.
+    for (int t = 0; t < (int) GGML_TYPE_COUNT; ++t) {
+        ggml_sycl_soa_plane_table table{};
+        const bool                has_planes = ggml_sycl_soa_plane_table_for_type((ggml_type) t, &table);
+        if (has_planes != ggml_sycl_soa_reorder_supported_type((ggml_type) t)) {
+            std::fprintf(stderr, "FAIL: ggml_type %d: plane table %d, reorder table %d\n", t, (int) has_planes,
+                         (int) ggml_sycl_soa_reorder_supported_type((ggml_type) t));
+            ++g_failures;
+        }
+    }
+    uint8_t byte = 0;
+    if (ggml_sycl_soa_to_aos_window(GGML_TYPE_F32, &byte, 1, 0, 1, &byte)) {
+        std::fprintf(stderr, "FAIL: f32 has no SOA layout and was accepted\n");
+        ++g_failures;
+    }
+    if (g_failures > 0) {
+        std::fprintf(stderr, "test-sycl-soa-readback: %d checks failed\n", g_failures);
+        return 1;
+    }
+    std::fprintf(stderr, "test-sycl-soa-readback: PASS\n");
+    return 0;
+}
+```
+
+   Register it in `tests/CMakeLists.txt`, directly after the `test-sycl-ubatch-ring-plan` block and inside the
+   same kind of guard:
+
+```cmake
+# Inkling plan, Task 6f-7: host-only gate for the inverse of the AOS->SOA weight reorder
+# (ggml/src/ggml-sycl/soa-readback.hpp), which ggml_backend_sycl_buffer_get_tensor uses to return ggml's block
+# bytes for a weight stored as SOA. Pure C++ over ggml.h and the block structs: no device, no backend library.
+if (GGML_SYCL)
+    llama_build(test-sycl-soa-readback.cpp)
+    target_include_directories(test-sycl-soa-readback PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    llama_test(test-sycl-soa-readback)
+    set_tests_properties(test-sycl-soa-readback PROPERTIES
+        LABELS "sycl;host"
+        TIMEOUT 60)
+endif()
+```
+
+   RED: create `ggml/src/ggml-sycl/soa-readback.hpp` with the two structs and both functions declared as below
+   but with bodies `return false;`. Build only this target and run it:
+   `./scripts/sycl-build.sh test-sycl-soa-readback && ./build/bin/test-sycl-soa-readback; echo rc=$?`.
+   Expected: `rc=1`, with `FAIL: q4_0: the type has no plane table` among the lines. Keep the output for the
+   report. Do not commit the stub.
+
+2. **Implement.** `ggml/src/ggml-sycl/soa-readback.hpp`, complete:
+
+```cpp
+//
+// The inverse of the AOS->SOA weight reorder, for reading a weight back.
+//
+// set_tensor may store a quantized weight as SOA: every field of the block becomes one plane, and a plane holds
+// that field of all blocks in block order. The planes follow each other without padding, so the SOA image of n
+// blocks is exactly as large as their AOS image. ggml_backend_tensor_get returns ggml's block bytes, so a read
+// of an SOA weight rebuilds them from the planes.
+//
+// ggml_sycl_soa_plane_table_for_type lists, for each type of soa-reorder-types.hpp, the planes in SOA order with
+// the field's offset inside the AOS block. The fills in ggml-sycl.cpp (reorder_q4_0_cpu, reorder_q8_0_cpu,
+// reorder_q4_k_cpu, reorder_q6_k_cpu, reorder_mxfp4_cpu and their device forms) write this layout.
+// tests/test-sycl-soa-readback.cpp holds the numbers to the block structs and this table to that type list.
+//
+// Pure C++ over the ggml_type enum: usable from a host-only test.
+//
+#pragma once
+
+#include "ggml.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+struct ggml_sycl_soa_plane {
+    size_t aos_offset;  // offset of the field inside one AOS block
+    size_t width;       // bytes of the field per block
+};
+
+struct ggml_sycl_soa_plane_table {
+    const ggml_sycl_soa_plane * planes;       // in SOA order
+    size_t                      n_planes;
+    size_t                      block_bytes;  // size of one AOS block = sum of the widths
+};
+
+inline bool ggml_sycl_soa_plane_table_for_type(ggml_type type, ggml_sycl_soa_plane_table * table) {
+    // Each entry is { offset in the AOS block, width }. Plane order: Q4_0 and Q8_0 qs, d; Q4_K qs, scales, dm;
+    // Q6_K ql, qh, scales, d; MXFP4 qs, e.
+    static constexpr ggml_sycl_soa_plane q4_0[] = {
+        { 2, 16 },
+        { 0, 2  }
+    };
+    static constexpr ggml_sycl_soa_plane q8_0[] = {
+        { 2, 32 },
+        { 0, 2  }
+    };
+    static constexpr ggml_sycl_soa_plane q4_k[] = {
+        { 16, 128 },
+        { 4,  12  },
+        { 0,  4   }
+    };
+    static constexpr ggml_sycl_soa_plane q6_k[] = {
+        { 0,   128 },
+        { 128, 64  },
+        { 192, 16  },
+        { 208, 2   }
+    };
+    static constexpr ggml_sycl_soa_plane mxfp4[] = {
+        { 1, 16 },
+        { 0, 1  }
+    };
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            *table = { q4_0, 2, 18 };
+            return true;
+        case GGML_TYPE_Q8_0:
+            *table = { q8_0, 2, 34 };
+            return true;
+        case GGML_TYPE_Q4_K:
+            *table = { q4_k, 3, 144 };
+            return true;
+        case GGML_TYPE_Q6_K:
+            *table = { q6_k, 4, 210 };
+            return true;
+        case GGML_TYPE_MXFP4:
+            *table = { mxfp4, 2, 17 };
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Writes bytes [window_offset, window_offset + window_size) of the AOS image of n_blocks blocks to dst, reading
+// the SOA image of the same n_blocks blocks at soa. Returns false, and writes nothing, for a type without a
+// plane table or a window that leaves the image.
+inline bool ggml_sycl_soa_to_aos_window(ggml_type    type,
+                                        const void * soa,
+                                        size_t       n_blocks,
+                                        size_t       window_offset,
+                                        size_t       window_size,
+                                        void *       dst) {
+    ggml_sycl_soa_plane_table table{};
+    if (!ggml_sycl_soa_plane_table_for_type(type, &table)) {
+        return false;
+    }
+    const size_t image_bytes = n_blocks * table.block_bytes;
+    if (window_offset > image_bytes || window_size > image_bytes - window_offset) {
+        return false;
+    }
+    if (window_size == 0) {
+        return true;
+    }
+    const uint8_t * src         = static_cast<const uint8_t *>(soa);
+    uint8_t *       out         = static_cast<uint8_t *>(dst);
+    const size_t    window_end  = window_offset + window_size;
+    const size_t    block_first = window_offset / table.block_bytes;
+    const size_t    block_last  = (window_end - 1) / table.block_bytes;  // inclusive
+    size_t          plane_base  = 0;
+    for (size_t p = 0; p < table.n_planes; ++p) {
+        const ggml_sycl_soa_plane & plane = table.planes[p];
+        for (size_t b = block_first; b <= block_last; ++b) {
+            // The field of block b is AOS bytes [field_begin, field_end); copy its part inside the window.
+            const size_t field_begin = b * table.block_bytes + plane.aos_offset;
+            const size_t field_end   = field_begin + plane.width;
+            const size_t lo          = field_begin > window_offset ? field_begin : window_offset;
+            const size_t hi          = field_end < window_end ? field_end : window_end;
+            if (lo < hi) {
+                std::memcpy(out + (lo - window_offset), src + plane_base + b * plane.width + (lo - field_begin),
+                            hi - lo);
+            }
+        }
+        plane_base += n_blocks * plane.width;
+    }
+    return true;
+}
+```
+
+   Run: `./scripts/sycl-build.sh test-sycl-soa-readback && ./build/bin/test-sycl-soa-readback; echo rc=$?`.
+   Expected: `test-sycl-soa-readback: PASS`, `rc=0`.
+
+   **Commit 1:**
+   `sycl: the SOA plane table and its inverse, with a host test`, paths
+   `ggml/src/ggml-sycl/soa-readback.hpp tests/test-sycl-soa-readback.cpp tests/CMakeLists.txt`.
+
+*Cycle 2: `get_tensor` uses it.*
+
+3. **Test.** Create `ggml/src/ggml-sycl/tests/test-weight-readback-layout.cpp`:
+
+```cpp
+//
+// ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set was given.
+//
+// The SYCL backend may store a quantized weight in another order than ggml's block layout (SOA: one plane per
+// block field). That is the backend's own business: a reader of the tensor gets ggml's bytes. test-backend-ops
+// builds its CPU reference from such a read (ggml_backend_graph_copy), and llama reads token-embedding rows the
+// same way.
+//
+// Per case: a [N_COLS, n_rows] weight in a buffer marked GGML_BACKEND_BUFFER_USAGE_WEIGHTS, written whole, then
+// read back whole, as one row, as a window that starts and ends inside blocks, as its last three bytes, and
+// through a view of three rows. F32 has one layout, so its case is the positive control of the harness: it
+// passes on any build. Whether a quantized type is stored reordered is the backend's decision per device and
+// the test does not ask; on a build where set_tensor reorders and get_tensor does not invert, those cases fail.
+// The last case is larger than one readback chunk (32 MiB), so the chunk walk is covered.
+//
+// SYCL backend only, no scheduler, no model, no compute. Exit 77 when no SYCL device is visible.
+//
+
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-sycl.h"
+#include "ggml.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr int64_t N_COLS     = 4608;  // the weight shape of the test-backend-ops case that showed the defect
+constexpr size_t  GUARD      = 64;
+constexpr uint8_t GUARD_BYTE = 0xA5;
+
+struct type_case {
+    ggml_type    type;
+    const char * name;
+    int64_t      n_rows;
+};
+
+const type_case CASES[] = {
+    { GGML_TYPE_F32,   "f32",             1000 },
+    { GGML_TYPE_Q4_0,  "q4_0",            1000 },
+    { GGML_TYPE_Q8_0,  "q8_0",            1000 },
+    { GGML_TYPE_Q4_K,  "q4_K",            1000 },
+    { GGML_TYPE_Q6_K,  "q6_K",            1000 },
+    { GGML_TYPE_MXFP4, "mxfp4",           1000 },
+    { GGML_TYPE_Q6_K,  "q6_K-two-chunks", 9000 }, // 34.0 MB: more than one 32 MiB readback chunk
+};
+
+// Reads [offset, offset + size) of t and compares it with want. Returns true on a match.
+bool read_matches(const ggml_tensor * t,
+                  size_t              offset,
+                  size_t              size,
+                  const uint8_t *     want,
+                  const char *        case_name,
+                  const char *        what) {
+    std::vector<uint8_t> got(size + 2 * GUARD, GUARD_BYTE);
+    ggml_backend_tensor_get(t, got.data() + GUARD, offset, size);
+    for (size_t i = 0; i < GUARD; ++i) {
+        if (got[i] != GUARD_BYTE || got[GUARD + size + i] != GUARD_BYTE) {
+            std::fprintf(stderr, "FAIL: %s, %s: the read wrote outside its destination\n", case_name, what);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < size; ++i) {
+        if (got[GUARD + i] != want[i]) {
+            std::fprintf(stderr, "FAIL: %s, %s: byte %zu of %zu is 0x%02x, want 0x%02x\n", case_name, what, i, size,
+                         (unsigned) got[GUARD + i], (unsigned) want[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Returns 0 on pass, 1 on failure.
+int run_case(ggml_backend_t backend, const type_case & tc) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 4,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        std::fprintf(stderr, "FAIL: %s: ggml_init failed\n", tc.name);
+        return 1;
+    }
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, tc.type, N_COLS, tc.n_rows);
+    ggml_set_name(w, (std::string("w_") + tc.name).c_str());
+    const size_t  row_bytes = w->nb[1];
+    ggml_tensor * rows      = ggml_view_2d(ctx, w, N_COLS, 3, row_bytes, 2 * row_bytes);
+    ggml_set_name(rows, "rows_2_to_4");
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        std::fprintf(stderr, "FAIL: %s: ggml_backend_alloc_ctx_tensors failed\n", tc.name);
+        ggml_free(ctx);
+        return 1;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Deterministic bytes. The round trip is about bytes, so the blocks need not decode to sane values.
+    std::vector<uint8_t> want(ggml_nbytes(w));
+    uint32_t             s = 0x9E3779B9u + (uint32_t) tc.type;
+    for (auto & b : want) {
+        s = s * 1664525u + 1013904223u;
+        b = (uint8_t) (s >> 24);
+    }
+    ggml_backend_tensor_set(w, want.data(), 0, want.size());
+    ggml_backend_synchronize(backend);
+
+    const size_t block_bytes = ggml_type_size(tc.type);
+    const size_t win_offset  = row_bytes + 5;
+    const size_t win_size    = 3 * block_bytes + 7;
+    bool         ok          = true;
+    ok                       = read_matches(w, 0, want.size(), want.data(), tc.name, "whole tensor") && ok;
+    ok = read_matches(w, 3 * row_bytes, row_bytes, want.data() + 3 * row_bytes, tc.name, "row 3") && ok;
+    ok = read_matches(w, win_offset, win_size, want.data() + win_offset, tc.name, "window inside blocks") && ok;
+    ok = read_matches(w, want.size() - 3, 3, want.data() + want.size() - 3, tc.name, "last three bytes") && ok;
+    ok = read_matches(rows, 0, ggml_nbytes(rows), want.data() + 2 * row_bytes, tc.name, "view of rows 2 to 4") && ok;
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    if (ok) {
+        std::fprintf(stderr, "  ok: %s (%zu bytes)\n", tc.name, want.size());
+    }
+    return ok ? 0 : 1;
+}
+
+}  // namespace
+
+int main() {
+    if (ggml_backend_sycl_get_device_count() <= 0) {
+        std::fprintf(stderr,
+                     "SKIP: no SYCL device available -- NO DEVICE WORK WAS PERFORMED.\n"
+                     "      source /opt/intel/oneapi/setvars.sh --force and re-run.\n");
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    if (!backend) {
+        // A device was counted, so a failed init is a broken backend, not a missing device.
+        std::fprintf(stderr, "FAIL: a SYCL device was counted but ggml_backend_sycl_init(0) failed\n");
+        return 1;
+    }
+
+    const int n_cases  = (int) (sizeof(CASES) / sizeof(CASES[0]));
+    int       failures = 0;
+    for (const type_case & tc : CASES) {
+        failures += run_case(backend, tc);
+    }
+    ggml_backend_free(backend);
+
+    if (failures > 0) {
+        std::fprintf(stderr, "test-sycl-weight-readback-layout: %d of %d cases failed\n", failures, n_cases);
+        return 1;
+    }
+    std::fprintf(stderr, "test-sycl-weight-readback-layout: PASS\n");
+    return 0;
+}
+```
+
+   Register it in `ggml/src/ggml-sycl/CMakeLists.txt` directly after the `sycl-select-unselected-branch`
+   registration (before the comment `# Persistent-worker graph-boundary reset proof.`):
+
+```cmake
+# test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set was given,
+# also for a weight the backend stores reordered (SOA). Set and get only: no graph, no model, at most 34 MB of
+# device memory per case, so it carries no model/cache/mem-handle label and the sweep runs it. It submits device
+# copies, so the registration pins the validation card (level_zero:1); run the binary under level_zero:0 for the
+# B70. Exits 77 when no device is visible.
+add_executable(test-sycl-weight-readback-layout
+    tests/test-weight-readback-layout.cpp
+)
+target_include_directories(test-sycl-weight-readback-layout PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_link_libraries(test-sycl-weight-readback-layout PRIVATE ggml-base ggml ggml-sycl)
+set_target_properties(test-sycl-weight-readback-layout PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-weight-readback-layout COMMAND test-sycl-weight-readback-layout)
+set_tests_properties(sycl-weight-readback-layout PROPERTIES
+    LABELS "sycl;graph;device"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 300)
+```
+
+   RED is a device run, so the lead makes it. Build the whole tree with the test and the registration in place
+   and `get_tensor` untouched (`./scripts/sycl-build.sh`; `BUILD_RC=0`), do not commit, and message the lead
+   `RED build ready` with the build log path. Edit nothing until the lead answers. The lead runs
+   `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-weight-readback-layout` once.
+   Expected: `ok: f32`, a `FAIL:` line for `q6_K` at least, exit 1. The lead sends back the list of failing
+   cases; it goes into the commit message.
+
+4. **Implement.** In `ggml/src/ggml-sycl/ggml-sycl.cpp`:
+
+   a. Add `#include "soa-readback.hpp"` with the other local includes (alphabetical position, after
+      `"soa-reorder-types.hpp"` if that one is included there; otherwise next to the `common.hpp` include).
+
+   b. Rename the existing function. Its body stays byte for byte; only the name and the comment change:
+
+```cpp
+// Copies bytes [offset, offset + size) of the tensor's range in its buffer to host memory, as they are stored.
+// For a weight the backend stores reordered these are not ggml's block bytes: ggml_backend_sycl_buffer_get_tensor
+// is the reader that returns those.
+static void ggml_sycl_buffer_read_stored_bytes(ggml_backend_buffer_t buffer,
+                                               const ggml_tensor *   tensor,
+                                               void *                data,
+                                               size_t                offset,
+                                               size_t                size) try {
+    // ... the body of today's ggml_backend_sycl_buffer_get_tensor, unchanged, including its closing
+    //     `} catch (const sycl::exception & exc) { ... std::exit(1); }`
+```
+
+      The log strings inside keep saying `buffer_get_tensor`: they name the operation the user asked for.
+
+   c. Directly after it, the new reader:
+
+```cpp
+// The record of what the bytes at root->data hold. set_tensor (a CPU reorder before the upload) and
+// reorder_tensor_to_soa (in place, on first use) both set it. It is read from the root tensor: a view shares its
+// root's bytes, and the root's own record needs no owner lookup.
+static reorder_mode ggml_sycl_stored_reorder_mode(const ggml_tensor * root) {
+    const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+    return extra ? extra->optimized_feature.get_reorder() : reorder_mode::NONE;
+}
+
+// One read of an SOA weight stages at most this much on the host before it is rebuilt into the caller's memory.
+constexpr size_t k_soa_readback_chunk_bytes = 32ull * 1024 * 1024;
+
+// The buffer interface speaks ggml's layout: a read returns the tensor's block bytes whatever order the backend
+// stores them in. For an SOA weight the block range that covers the request is read plane by plane and rebuilt
+// (soa-readback.hpp). Every other tensor is read as stored.
+static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                const ggml_tensor *   tensor,
+                                                void *                data,
+                                                size_t                offset,
+                                                size_t                size) {
+    const ggml_tensor * root   = tensor->view_src ? tensor->view_src : tensor;
+    const reorder_mode  stored = ggml_sycl_stored_reorder_mode(root);
+    if (size == 0 || stored != reorder_mode::SOA) {
+        if (stored != reorder_mode::NONE && stored != reorder_mode::SOA) {
+            static std::atomic<bool> warned{ false };
+            if (!warned.exchange(true)) {
+                GGML_LOG_WARN("[SYCL] get_tensor: '%s' is stored in reorder mode %d, which has no inverse; the bytes "
+                              "returned are the stored bytes, not ggml's block layout (reported once)\n",
+                              root->name, (int) stored);
+            }
+        }
+        ggml_sycl_buffer_read_stored_bytes(buffer, tensor, data, offset, size);
+        return;
+    }
+
+    ggml_sycl_soa_plane_table table{};
+    const bool                has_table = ggml_sycl_soa_plane_table_for_type(root->type, &table);
+    GGML_ASSERT(has_table && "a tensor recorded as SOA has a plane table (soa-reorder-types.hpp)");
+    const size_t root_bytes = ggml_nbytes(root);
+    GGML_ASSERT(root_bytes % table.block_bytes == 0);
+    const size_t n_total   = root_bytes / table.block_bytes;
+    const size_t aos_begin = (tensor->view_src ? tensor->view_offs : 0) + offset;
+    GGML_ASSERT(aos_begin <= root_bytes && size <= root_bytes - aos_begin);
+    const size_t aos_end      = aos_begin + size;
+    const size_t block_first  = aos_begin / table.block_bytes;
+    const size_t block_end    = (aos_end - 1) / table.block_bytes + 1;
+    const size_t chunk_blocks = std::max<size_t>(1, k_soa_readback_chunk_bytes / table.block_bytes);
+
+    // Host scratch for the SOA image of one chunk of blocks. It is filled and consumed inside this call.
+    std::vector<uint8_t> image;
+    for (size_t c0 = block_first; c0 < block_end; c0 += chunk_blocks) {
+        const size_t n = std::min(chunk_blocks, block_end - c0);
+        image.resize(n * table.block_bytes);
+        size_t plane_base = 0;  // of the plane inside the stored tensor
+        size_t image_pos  = 0;  // of the plane inside the chunk's image
+        for (size_t p = 0; p < table.n_planes; ++p) {
+            const size_t width = table.planes[p].width;
+            ggml_sycl_buffer_read_stored_bytes(buffer, root, image.data() + image_pos, plane_base + c0 * width,
+                                               n * width);
+            plane_base += n_total * width;
+            image_pos  += n * width;
+        }
+        const size_t chunk_begin = c0 * table.block_bytes;
+        const size_t lo          = std::max(aos_begin, chunk_begin);
+        const size_t hi          = std::min(aos_end, chunk_begin + n * table.block_bytes);
+        const bool   rebuilt     = ggml_sycl_soa_to_aos_window(root->type, image.data(), n, lo - chunk_begin, hi - lo,
+                                                               static_cast<uint8_t *>(data) + (lo - aos_begin));
+        GGML_ASSERT(rebuilt && "the window lies inside the chunk it was cut from");
+    }
+}
+```
+
+   d. If a forward declaration of `ggml_backend_sycl_buffer_get_tensor` exists, it still fits (same signature).
+      The interface table (`.get_tensor = ggml_backend_sycl_buffer_get_tensor`, near `:46703`) is unchanged.
+
+   Build: `./scripts/sycl-build.sh`, `BUILD_RC=0`. Run the host gates:
+   `./build/bin/test-sycl-soa-readback`, `python3 scripts/check-sycl-alloc-zone-contract.py`, and
+   `ctest --test-dir build -R 'test-sycl-.*-source' --output-on-failure` (source contracts; no device).
+   Report the head sha and the build log; the lead runs the device arms.
+
+   **Commit 2:**
+   `sycl: get_tensor returns ggml's bytes for a weight stored as SOA`, paths
+   `ggml/src/ggml-sycl/ggml-sycl.cpp ggml/src/ggml-sycl/tests/test-weight-readback-layout.cpp
+   ggml/src/ggml-sycl/CMakeLists.txt`. The message names the cases the lead's RED run saw fail.
+
+**Lead arms (once each, under `GPU.lock`, selector pinned):** the device test on the B50 and on the B70; the A3
+case alone; the whole `-o MUL_MAT` sweep; the Mistral gate on both cards; the GPT-OSS B50 gate without `-c`.
+
+**Gotchas:**
+- The three rules of the memory design that this edit touches: the stored weight keeps its layout (nothing is
+  converted back on the device, nothing is re-uploaded); no allocation is taken from the device or from USM (the
+  `std::vector` is plain host scratch, like the caller's own destination, which the existing path already reads
+  into directly); no handle outlives the call. Do not add a cache of rebuilt bytes.
+- The renamed function waits on the stream before each copy (`stream.wait_and_throw()`), as it did. The new
+  reader calls it once per plane per chunk, so a read of an SOA weight repeats that wait on a queue that is
+  already drained. That is not a new wait on a path that had none. Do not add any other wait.
+- `get_tensor` runs for every logits read. The new prelude for a tensor that is not SOA is two loads and a
+  compare; keep it that way. Do not call `get_effective_layout_mode` there: it answers for cache layouts whose
+  `layout.data_ptr` is not `tensor->data` (XMX tiled), which is a different question.
+- `ggml_nbytes` of a quantized tensor counts all blocks of all matrices, and `set_tensor` reorders the whole
+  tensor as one image (`nrows = ggml_nrows(tensor)`), so one plane table walk covers a 3D expert tensor.
+- COALESCED and the XMX tiled forms have no inverse here. The reader keeps today's behaviour for them and says
+  so once at WARN (`GGML_LOG_INFO` is dropped at default verbosity). Task 6f-8 owns them.
+- `ggml-common.h` needs `GGML_COMMON_DECL_CPP` defined before the include to declare the block structs
+  (`tests/test-onednn-woq.cpp:13` does the same). In that mode the unions of the K blocks are named `data`, so
+  the Q4_K scale pair is `b.data.dm`, not `b.dm`.
+- The lead compiled the host test against the header above with `g++ -std=c++17 -Wall -Wextra` on 2026-11-22: it
+  passes, and it fails for each of six mutants of the header (two planes swapped, a wrong field offset, a type
+  list that differs from `soa-reorder-types.hpp`, a plane base that does not advance, a lost window clamp, a
+  lost refusal). Both files are `clang-format-19` clean as written here.
+- Never `clang-format-19 -i`; check with `clang-format-19 --dry-run -Werror` on the three new files only.
+  `ggml-sycl.cpp` carries drift: format your own hunk by hand.
+- Build with `TMPDIR` on the root disk and only when fewer than three `ninja` processes run. Scratch copies of
+  the tree go under the task's temp folder and are deleted before the report.
+- Line numbers above are from Task 6f-3's branch and move with its merge: find every site by name.
+
+---
+
+### Task 6f-8: Readback of a weight stored COALESCED or XMX tiled (recorded 2026-11-22)
+
+**Track:** F, after Task 6f-7 (same function). **Not a Stage 1 exit gate** unless the census of Task 6f-4 shows a
+case that reaches it.
+**Status:** recorded from the lead's reading of `set_tensor` for Task 6f-7; not run. Written out to the Task
+Detail Standard before it starts.
+**What is known (at Task 6f-3's branch):**
+- When the layout policy answers COALESCED, `set_tensor` reorders Q4_0, Q8_0, Q6_K and MXFP4 on the CPU into
+  word-major tiles (`reorder_*_coalesced_cpu`) and records `reorder_mode::COALESCED`. The Q8_0 form can be larger
+  than the AOS bytes (`ggml_sycl_layout_bytes_for_tensor`), and the Q6_K form uses power-of-two tiles of at most
+  32 blocks. `get_tensor` returns those bytes as they are. No inverse exists
+  (`moe_loan_soa_inverse_exists` answers false).
+- When a pre-converted XMX tiled layout exists for an MXFP4 tensor (`extra->xmx_tiled_ptr(device)`), `set_tensor`
+  skips the upload into the tensor's own range (`Skipping SoA upload ... using pre-converted tiled layout`). A
+  read of that tensor returns whatever the range held.
+- After Task 6f-7 the reader warns once at WARN for a stored mode other than NONE and SOA. The XMX tiled skip
+  leaves the mode at NONE, so it does not warn.
+**Open, to settle first:** which default policies answer COALESCED for a weight buffer on the two cards, and
+whether any reader in the plan's models reaches such a tensor (the token embedding, a `gguf` write, a
+`test-backend-ops` case).
+**Direction (lead):** the same shape as Task 6f-7: the read returns ggml's bytes and the stored layout stays. For
+COALESCED that is an inverse per type, stated from the tile geometry and host-tested against the forward fill.
+For the XMX tiled skip, either the tensor's own range is written as well (the layout ruling allows one layout
+per weight, so this needs a decision) or the read is served from the tiled form by an inverse.
+**Done when:** the device round-trip test of Task 6f-7 has a case per stored form and passes on both cards.
+
+---
+
+### Task 6f-9: A partial write into a reordered weight, and copies between SYCL buffers (recorded 2026-11-22)
+
+**Track:** F, after Task 6f-7. **Not a Stage 1 exit gate.**
+**Status:** recorded from the lead's reading of `set_tensor`; not run.
+**What is known:**
+- `set_tensor` reorders only a whole-tensor write (`offset == 0 && size == ggml_nbytes(tensor)`). Every write
+  first resets the layout record to AOS (`reset_reorder`, `ggml_sycl_init_layout_info`). A partial write into a
+  tensor stored as SOA therefore copies AOS bytes into plane positions and marks the whole tensor AOS: the
+  untouched part is still SOA and is now read as AOS.
+- `ggml_backend_sycl_buffer_cpy_tensor` and `ggml_backend_sycl_cpy_tensor_async` copy bytes between SYCL buffers.
+  Whether they carry the source's layout record to the destination was not checked.
+**Direction (lead):** a partial write into a reordered tensor writes each block field into its plane (the forward
+of Task 6f-7's table, by block range) and leaves the record alone; a copy between buffers carries the record with
+the bytes.
+**Done when:** the device round-trip test has a partial-write case and a buffer-copy case, and both pass.
+
+---
+
 ### Task 6f-4: A census that reaches every case (lead)
 
-**Track:** F (lead, GPU). **Depends on:** Tasks 6f-1, 6f-2, 6f-3 merged. Task 6f-5 is not required: no case reaches
-its two sites.
+**Track:** F (lead, GPU). **Depends on:** Tasks 6f-1, 6f-2, 6f-3, 6f-7 merged. Task 6f-5 is not required: no case
+reaches its two sites. Task 6f-7 is required: until a weight read returns ggml's bytes, the CPU reference of a
+`weights=1` case with a reordered weight is built from plane bytes and the case fails whatever the kernel does.
 **Steps:**
 1. `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-backend-ops support -b SYCL0 > cases.txt`, then the
    printed names: `sed -E 's/^  ([A-Z0-9_]+)\(.*/\1/' cases.txt | sort -u`. Drive the per-op loop from that list,
@@ -2179,6 +3018,11 @@ pass, with zero kernel fault lines and `Shmem` at 9 GB.
 (2026-11-22):* the same eight arms all pass (device test and lifecycle oracle on both cards, the Mistral gate
 on both cards, the GPT-OSS B50 gate without `-c` with rc 0, one answer line and no device loss, the GPT-OSS B70
 gate), with zero kernel fault lines and `Shmem` at 8 GB.
+
+*The merged tree with Task 7b added, built with all targets and run once per arm at `822f181f3`
+(2026-11-22):* the same eight arms all pass (device test and lifecycle oracle on both cards, the Mistral gate
+on both cards, the GPT-OSS B50 gate without `-c` with rc 0, one answer line and no device loss, the GPT-OSS B70
+gate with rc 0 and one answer line), with zero kernel fault lines and `Shmem` at 8 GB.
 
 ---
 
