@@ -40,8 +40,8 @@ set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
 list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ui-version.cmake")
 
 # Priority 1 in scripts/ui-assets.cmake is pre-built assets dropped into
-# tools/ui/dist -- the documented recovery path for disconnected builds, and
-# NOT covered by sources.cmake's globs (src/*, static/*). Without this the
+# ui/apps/chat/dist -- the documented recovery path for disconnected builds,
+# and NOT covered by sources.cmake's globs (src/*, static/*). Without this the
 # stamp is never invalidated by them and manually supplied assets are silently
 # ignored for as long as the stamp stays fresh.
 #
@@ -49,8 +49,9 @@ list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ui-version.cmake")
 # keys on CMakeLists.txt rather than on the guarded path: a declaration left
 # behind by a deleted dist/ is a hard build failure, not merely a stale one.
 # Hence CMAKE_CONFIGURE_DEPENDS on the directory, at TWO levels -- POSIX moves a
-# directory's mtime only for entries changing in THAT directory, so tools/ui
-# catches dist/ appearing and vanishing, and dist/ catches entries within it.
+# directory's mtime only for entries changing in THAT directory, so
+# ui/apps/chat catches dist/ appearing and vanishing, and dist/ catches entries
+# within it.
 #
 # Deliberately a directory dependency, NOT file(GLOB ... CONFIGURE_DEPENDS):
 # CMake implements the latter with a glob re-verification step in the
@@ -121,7 +122,7 @@ endif()
 # "reasoned about it" is not CLOSED and does not belong in that half.
 #
 #   CLOSED  direction     create vs delete of dist/
-#           mechanism     CONFIGURE_DEPENDS on tools/ui
+#           mechanism     CONFIGURE_DEPENDS on ui/apps/chat
 #           test          create dist/ -> "Re-running CMake"; rm -rf dist/ -> same
 #
 #   CLOSED  granularity   dist/ itself vs a file inside it
@@ -178,9 +179,10 @@ endif()
 #                         was replaced; emit_files() uses the same glob
 #
 #   OPEN    npm cold start   a first-ever `node_modules` install could create a
-#                            top-level entry under tools/ui and fire one extra
-#                            reconfigure. Correct behaviour, bounded to once,
-#                            never observed here (this tree is always warm).
+#                            top-level entry under ui/apps/chat and fire one
+#                            extra reconfigure. Correct behaviour, bounded to
+#                            once, never observed here (this tree is always
+#                            warm).
 #   OPEN    sources.cmake    UI_SOURCE_GLOBS is stale in both directions -- it
 #                            names a file that no longer exists and omits real
 #                            inputs (the vite plugins). Inherited by everything
@@ -209,10 +211,11 @@ endif()
 # which CMake emits with an output file it never creates -- so Ninja found it
 # dirty on every build and the tree had no no-op build at all (llama.cpp-9ubg).
 # Driving it from a real OUTPUT stamp keeps the same behaviour where it matters
-# (a changed tools/ui/ source still re-provisions, via UI_ASSET_DEPENDS) while
-# letting an untouched tree settle. ui.cpp/ui.h are declared outputs rather than
-# BYPRODUCTS; the script writes them with copy_if_different and CMake marks the
-# rule `restat`, so the library still only recompiles when contents change.
+# (a changed ui/apps/chat/ source still re-provisions, via UI_ASSET_DEPENDS)
+# while letting an untouched tree settle. ui.cpp/ui.h are declared outputs
+# rather than BYPRODUCTS; the script writes them with copy_if_different and
+# CMake marks the rule `restat`, so the library still only recompiles when
+# contents change.
 #
 # The glob above is evaluated at configure time, like the file(GLOB) in
 # ggml/src/ggml-sycl/CMakeLists.txt: editing an existing UI source is picked up

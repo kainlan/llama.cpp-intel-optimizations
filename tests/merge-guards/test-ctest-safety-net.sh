@@ -299,16 +299,17 @@ echo "RED-17 ok (dropped lookalike label named, not allowed as fast-exit)"
 
 # RED-real-unanchored: against the real build/, an unanchored `model` in the
 # label exclusion (ctest -LE is a regex search per label) also drops the
-# `cross-model` tests and test-layout-cache (`model-load`), none of which loads
-# a model. The guard must name them. The override keeps the fast-exit device
-# label, so the run isolates the `model` change.
+# `cross-model` tests, none of which loads a model. The guard must name them.
+# test-layout-cache (`model-load`) is no witness: its `cache` label already
+# excludes it. The override keeps the fast-exit device label, so the run
+# isolates the `model` change.
 rc=0; out=$(bash "$G" --build-dir build --sweep-label-exclude 'residency|mem-handle|cache|model|^fatal-exit-device$' 2>&1) || rc=$?
 [ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with label model unanchored, want 1: $out"; exit 1; }
-for t in test-layout-cache cross-model-weight-usage; do
+for t in cross-model-weight-usage canonical-checksum-owner-scope; do
     grep -qF "SWEEP DROPS NON-LOADER: $t " <<<"$out" \
         || { echo "FAIL: RED-real-unanchored did not name $t: $out"; exit 1; }
 done
-echo "RED-real-unanchored ok (unanchored model drops test-layout-cache and the cross-model tests)"
+echo "RED-real-unanchored ok (unanchored model drops the cross-model tests)"
 
 # RED-real-label: against the real build/, drop `model` from the label
 # exclusion. The guard must name the environment-model tests and the G1
@@ -322,14 +323,15 @@ for t in test-model-load-cancel test-autorelease test-backend-sampler sycl-lifec
 done
 echo "RED-real-label ok (label model dropped: env-model and G1 tests named against build/)"
 
-# RED-real: against the real build/, drop test-save-load-state from the
-# exclusion. The guard must fail and name exactly that test. Read-only -N
-# listings only -- no test execution, no GPU.
-dropped=${sweep_e/|test-save-load-state/}
-[ "$dropped" != "$sweep_e" ] || { echo "FAIL: test-save-load-state is not in the default exclusion"; exit 1; }
+# RED-real: against the real build/, drop test-eval-callback from the
+# exclusion. The guard must fail and name exactly that test: it loads a model
+# through a fixture and carries no label, so only the name exclusion keeps it
+# out of the sweep. Read-only -N listings only -- no test execution, no GPU.
+dropped=${sweep_e/|test-eval-callback/}
+[ "$dropped" != "$sweep_e" ] || { echo "FAIL: test-eval-callback is not in the default exclusion"; exit 1; }
 rc=0; out=$(bash "$G" --build-dir build --sweep-exclude "$dropped" 2>&1) || rc=$?
-[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with test-save-load-state dropped, want 1: $out"; exit 1; }
-grep -qF "SWEEP RUNS MODEL LOADER: test-save-load-state" <<<"$out" || { echo "FAIL: RED-real did not name the test: $out"; exit 1; }
+[ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc with test-eval-callback dropped, want 1: $out"; exit 1; }
+grep -qF "SWEEP RUNS MODEL LOADER: test-eval-callback" <<<"$out" || { echo "FAIL: RED-real did not name the test: $out"; exit 1; }
 [ "$(grep -c 'SWEEP RUNS MODEL LOADER' <<<"$out")" -eq 1 ] || { echo "FAIL: RED-real named more than the dropped test: $out"; exit 1; }
 echo "RED-real ok (dropped exclusion named against build/)"
 
