@@ -87273,8 +87273,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     });
                                 });
                             }
-#endif
-#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             ggml_sycl_q1_nvfp4_test_retain_completion(completion);
 #endif
                             terminal->arm(final);

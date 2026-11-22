@@ -70,7 +70,8 @@ TEST_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_te
 NO_RELEASE = "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE"
 RELEASE = "const bool recycled = !skip_release && completion->bundle.terminal_release();"
 RETAIN = "ggml_sycl_q1_nvfp4_test_retain_completion(completion);"
-RETAIN_BLOCK = "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n                            " + RETAIN + "\n#endif\n"
+RETAIN_LINE = "                            " + RETAIN + "\n"
+RETAIN_BLOCK = "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n" + RETAIN_LINE + "#endif\n"
 # Both drain twins: a wait that threw goes straight to the abort, else release, else recover and release.
 TWIN_CONDITION = (r"if \(!waited \|\|\s*\(!ggml_sycl_execution_release_graph\({ctx}\) &&\s*"
                   r"!ggml_sycl_execution_recover_and_release_graph\({ctx}\)\)\) \{{")
@@ -320,12 +321,9 @@ def main():
                 "terminal->arm(final);",
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion); terminal->arm(final);", 1),
                 common),
-            "completion hold under an else branch": (cache, sycl.replace(
-                "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n                            "
-                "ggml_sycl_q1_nvfp4_test_retain_completion(completion);",
-                "#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n#else\n                            "
-                "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", 1), common),
-            "route hands over its completion after the submit": (cache, sycl.replace(RETAIN_BLOCK, "", 1).replace(
+            "completion hold under an else branch": (cache, sycl.replace(RETAIN_LINE, "#else\n" + RETAIN_LINE, 1),
+                                                     common),
+            "route hands over its completion after the submit": (cache, sycl.replace(RETAIN_LINE, "", 1).replace(
                 BUNDLE_DROP + "\n                                });\n                            });\n",
                 BUNDLE_DROP + "\n                                });\n                            });\n" + RETAIN_BLOCK, 1), common),
             "route does not hand over its completion": (cache, sycl.replace(
