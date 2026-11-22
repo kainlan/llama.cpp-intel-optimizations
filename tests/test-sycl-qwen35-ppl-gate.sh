@@ -184,10 +184,17 @@ gpid=$!
 sleep 2 # the first take is refused at once; after 2 s a live gate is in its poll sleep
 kill -0 "$gpid" 2>/dev/null || fail "the gate stopped before it was polling: $(cat "$work/poll.out")"
 [ "$(cat "$work/poll.lock/holder")" = "someone else" ] || fail "the gate touched a foreign holder while waiting"
+# the gate's own sleep child, found by parent pid: exactly one, or there is no poll sleep for the TERM to interrupt
+slp_pids="$(pgrep -P "$gpid" -x sleep || true)"
+if [ -z "$slp_pids" ] || [ "$(wc -w <<<"$slp_pids")" -ne 1 ]; then
+    kill -KILL "$gpid" 2>/dev/null || true
+    fail "the gate had no single sleep child to interrupt (found: '${slp_pids//$'\n'/ }')"
+fi
+slp_pid="$slp_pids"
 kill -TERM "$gpid"
 for _ in $(seq 50); do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$gpid" 2>/dev/null; then
-    pkill -P "$gpid" 2>/dev/null || true
+    kill "$slp_pid" 2>/dev/null || true
     kill -KILL "$gpid" 2>/dev/null || true
     fail "a TERM during the poll sleep must end the gate within 5 s"
 fi
@@ -195,8 +202,11 @@ rc=0
 wait "$gpid" || rc=$?
 [ "$rc" -eq 143 ] || fail "a TERM during the poll sleep must end the gate with 143 (rc $rc): $(cat "$work/poll.out")"
 [ "$(cat "$work/poll.lock/holder")" = "someone else" ] || fail "a TERM during the poll sleep touched a foreign holder"
-for _ in $(seq 10); do pgrep -fx 'sleep 37' >/dev/null || break; sleep 0.1; done
-if pgrep -fx 'sleep 37' >/dev/null; then fail "a TERM during the poll sleep left its sleep running"; fi
+for _ in $(seq 10); do kill -0 "$slp_pid" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$slp_pid" 2>/dev/null; then
+    kill "$slp_pid" 2>/dev/null || true
+    fail "a TERM during the poll sleep left the gate's sleep running: the sleep pid $slp_pid is still alive"
+fi
 for bad in LLAMA_GPU_LOCK_VERIFY_SECONDS=08 LLAMA_GPU_LOCK_WAIT_SECONDS=x LLAMA_GPU_LOCK_POLL_SECONDS=0 \
     LLAMA_GPU_LOCK_VERIFY_SECONDS=10000000000 LLAMA_GPU_LOCK_POLL_SECONDS=10000000000 \
     LLAMA_GPU_LOCK_WAIT_SECONDS=10000000000; do
