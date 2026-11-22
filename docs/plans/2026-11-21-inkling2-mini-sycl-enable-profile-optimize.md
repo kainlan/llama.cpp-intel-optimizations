@@ -1020,6 +1020,13 @@ fixes what case 8's first GPU run found: a failed terminal never reported `ready
 invocation's pin, and the dead context kept owning the device, so every later context on the card got
 `DEVICE_BUSY`. `ready()` now means finished; `observe_success()` means finished and succeeded.
 
+**A fifth commit (2026-11-22, `095adc712`):** the admitted bundle holds a second reference to the invocation's
+pin, and after a failure only the completion host task's functor kept the bundle alive. Whether the cleanup's
+release succeeded then depended on when the SYCL runtime destroyed that functor. The task now assigns an empty
+bundle as its last statement. Verified at `095adc712`, once per arm: oracle on both cards, Mistral B70 gate,
+GPT-OSS B50 gate with `-c 4096`, zero kernel fault lines. Logs: `docs/backend/data/inkling2/t7a-oracle-b70.txt`
+and `t7a-oracle-b50.txt`.
+
 **Runtime facts this design rests on (measured 2026-11-21, B50, `docs/backend/data/inkling2/t7a-runtime-probe-b50.txt`):**
 `queue::wait_and_throw` and `event::wait_and_throw` both deliver to the queue's handler and return; the same holds for
 a queue on the platform default context; a queue without a handler falls back to its context's; a host task that
@@ -1038,19 +1045,255 @@ a handled queue destroyed with an undelivered error drops it silently.
 
 ### Task 7d: A failed context that is torn down without a synchronize gives its device back
 
-**Track:** D, after Task 7a and before Task 7b (same file). **Depends on:** Task 7a.
-**Status:** recorded 2026-11-21; written out to the Task Detail Standard after Task 7a's commit 4 passes on both
-cards, because its oracle case builds on commit 4's fixture.
-**What is known (at `00487e5bb`):** three paths wait and then release the invocation without first running
-`ggml_sycl_recover_exact_mmid_after_drain`: `~ggml_backend_sycl_context` (`ggml-sycl.cpp:54209`),
-`ggml_sycl_execution_drain_context_terminal_events` (`:16905`, used by the `DEVICE_BUSY` retry and the public
-drain) and `ggml_sycl_execution_drain_own_terminal` (`:16860`, on every begin that still holds an invocation). The
-last two are a documented twin sequence that must change together. After an asynchronous failure with no
-synchronize in between, the quarantined slot keeps the pin, the release returns BUSY, and the device stays owned.
-A caller that frees its context when `llama_decode` returns an error takes exactly this path.
-**Done when:** an oracle case that records a failure, frees the context without a synchronize and then computes a
-graph on a new context passes on both cards; a source contract pins the recovery before each of the three
-releases.
+**Track:** D, after Task 7a and before Task 7b (same file). **Depends on:** Task 7a merged.
+**Written out:** 2026-11-22, against `095adc712`. Line numbers below are from that commit and move by a few lines
+after the Task 6d merge: find each function by name.
+
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: one forward declaration, one new helper, and the three release paths
+  named below. Nothing else in the file.
+- Modify: `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`: oracle case 9.
+- Modify: `tests/test-sycl-async-failure-source.py`: claim D and three mutants.
+
+**Description.** After Task 7a a failed context releases its device when the failure is reported at a synchronize.
+A caller that stops at the first error never synchronizes again: it tears the context down. Three paths wait and
+then release the invocation, and none of them recovers the quarantined workspace slot first. The slot keeps the
+invocation's pin, `release_invocation` returns BUSY (`execution-lifecycle.cpp:1365-1367`), and the device stays
+owned by a context that no longer exists. Every later context on that card gets `DEVICE_BUSY`. This task makes
+the three paths recover the slot and release.
+
+**What the code does now.**
+- `ggml_sycl_execution_drain_own_terminal` (`ggml-sycl.cpp:16844`): wait, clear the event fields, then
+  `if (!waited || !ggml_sycl_execution_release_graph(ctx)) ggml_sycl_execution_abort_and_release_graph(ctx);`,
+  then retire. Called from the begin path.
+- `ggml_sycl_execution_drain_context_terminal_events` (`:16910`): the same sequence in a lambda, once per backend
+  bound to the context. Called by the public `ggml_backend_sycl_execution_context_drain_terminal_events`
+  (`:16095`, which `llama_context` teardown calls before `begin_drain`, `src/llama-context.cpp:275` and `:295`)
+  and by the `DEVICE_BUSY` retry in graph_compute (`:105428`).
+- Those two are a documented twin (the comment block "DUPLICATED SEQUENCE -- KEEP BOTH IN STEP" above each). A
+  change to one is made to the other in the same commit.
+- `ggml_backend_sycl_context::~ggml_backend_sycl_context` (`:54189`): waits every queue, then calls
+  `ggml_sycl_execution_abort_and_release_graph(this)`.
+- `ggml_sycl_recover_exact_mmid_after_drain` (`:97139`) is the recovery. It is `static` and defined after all three
+  paths. `ggml_backend_sycl_graph_boundary_exception_cleanup` (`:122645`) is the model to follow: waits, then the
+  recovery, then the release.
+- The recovery is safe to call at any time: `recover_quarantined` (`moe-mmid-workspace.cpp:1576`) frees a slot only
+  when its terminal reports `ready()`, which since Task 7a means "the event completed". It takes the workspace
+  registry mutex and the pool mutexes, so it is not called on a path that runs per token.
+- The direct route submits on `ctx.stream()` (`:87122`), the queue the three paths wait on. One exception: when
+  `last_graph_event_deferred_decode` is set, the twins wait only on `last_graph_event`, which need not cover the
+  route's completion task.
+
+**Acceptance criteria:**
+- [ ] `python3 tests/test-sycl-async-failure-source.py --self-test` prints PASS with claim D and its three mutants.
+- [ ] Oracle case 9 fails before the change with its own message (the lead runs it once on the B50) and passes
+      after it on both cards; the oracle ends with `Q1/NVFP4 scoped production-route lifecycle: PASS`.
+- [ ] No case's teardown reports a drain refusal; zero kernel fault lines.
+- [ ] Lead, once each: Mistral B70 completion gate, GPT-OSS B50 chat gate (the documented command; `-c 4096` only if
+      Task 6d has not merged yet).
+- [ ] No wait is added to a path that succeeds: the new wait and the registry walk run only after a refused release.
+
+**Implementation guide.**
+
+1. **RED 1, source contract.** In `tests/test-sycl-async-failure-source.py` add to the docstring, after entry B:
+
+```
+  D. (ggml-sycl.cpp) a release refused during a drain is retried after the workspace recovery:
+     ggml_sycl_execution_recover_and_release_graph waits the stream, then calls
+     ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
+     call it before ggml_sycl_execution_abort_and_release_graph; the backend destructor calls the recovery before
+     its abort-and-release.
+```
+
+   In `claims()` add these locals after `b = ...`:
+
+```python
+    d = body(sycl, "static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept")
+    d_own = body(sycl, "static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {")
+    d_ctx = body(sycl, "static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {")
+    d_dtor = body(sycl, "ggml_backend_sycl_context::~ggml_backend_sycl_context() {")
+    d_wait = d.find("stream->wait_and_throw();")
+    d_recover = d.find("ggml_sycl_recover_exact_mmid_after_drain(ctx);")
+    d_release = d.find("return ggml_sycl_execution_release_graph(ctx);")
+```
+
+   and these entries to the returned dict:
+
+```python
+        "D the helper waits, recovers, then releases": 0 <= d_wait < d_recover < d_release,
+        "D the begin-path twin retries before it aborts": 0 <= d_own.find(
+            "ggml_sycl_execution_recover_and_release_graph(ctx)") < d_own.find(
+            "ggml_sycl_execution_abort_and_release_graph(ctx);"),
+        "D the context twin retries before it aborts": 0 <= d_ctx.find(
+            "ggml_sycl_execution_recover_and_release_graph(backend_ctx)") < d_ctx.find(
+            "ggml_sycl_execution_abort_and_release_graph(backend_ctx);"),
+        "D the destructor recovers before it releases": 0 <= d_dtor.find(
+            "ggml_sycl_recover_exact_mmid_after_drain(this);") < d_dtor.find(
+            "ggml_sycl_execution_abort_and_release_graph(this);"),
+```
+
+   The signature strings for `d_own` and `d_ctx` end in ` {` on purpose: without it `body()` would find the forward
+   declaration first (`:12280`, `:16598`) and return the body of whatever function follows it.
+
+   Mutants, in the `mutants` dict:
+
+```python
+            "helper releases without recovering": (cache, sycl.replace(
+                "ggml_sycl_recover_exact_mmid_after_drain(ctx);\n    return ggml_sycl_execution_release_graph(ctx);",
+                "return ggml_sycl_execution_release_graph(ctx);", 1), common),
+            "context twin aborts without the retry": (cache, sycl.replace(
+                " && !ggml_sycl_execution_recover_and_release_graph(backend_ctx)", "", 1), common),
+            "destructor releases without recovering": (cache, sycl.replace(
+                "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
+```
+
+   Run: `python3 tests/test-sycl-async-failure-source.py`
+   Expected before the C++ change: rc 1, `async failure source contract failed:` followed by the four D claims.
+
+2. **RED 2, oracle case 9.** In `test-q1-nvfp4-admitted-device.cpp`, after `refused_graph_then_synchronize_case`:
+
+```cpp
+// A caller that stops at the first error tears its context down without another synchronize. llama_context's
+// teardown drains the terminal events first, and that drain must release a graph whose terminal failed: a slot left
+// quarantined keeps the invocation pinned and the device owned by a context nothing computes on.
+void failed_graph_then_drain_case() {
+    lifecycle_fixture                life;
+    std::vector<float>               oracle;
+    size_t                           count = 0;
+    auto                             c     = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
+    ggml_sycl_q1_nvfp4_test_counters before{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope("failed_graph_then_drain_case", before);
+
+    const auto observed = [](const ggml_sycl_execution_snapshot & state) {
+        return " (invocation=" + std::to_string(state.invocation_id.value) +
+               " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+               " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+    };
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
+    // The asynchronous form: ggml_backend_graph_compute would synchronize, and the synchronize would clean up.
+    require_stages(ggml_backend_graph_compute_async(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "async terminal fixture failed before submission", before);
+    ggml_sycl_execution_snapshot submitted{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &submitted) == GGML_SYCL_EXECUTION_OK,
+                   "context snapshot unavailable after the failed graph", before);
+    require_stages(submitted.invocation_id.value != 0 && submitted.busy_device_count != 0,
+                   "graph_compute released its own graph, so this case cannot observe the drain" + observed(submitted),
+                   before);
+    require_stages(ggml_backend_sycl_execution_context_drain_terminal_events(life.context) == GGML_SYCL_EXECUTION_OK,
+                   "the terminal drain was refused", before);
+    ggml_sycl_execution_snapshot drained{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &drained) == GGML_SYCL_EXECUTION_OK,
+                   "context snapshot unavailable after the drain", before);
+    require_stages(drained.invocation_id.value == 0 && drained.busy_device_count == 0,
+                   "the terminal drain did not release the failed graph" + observed(drained), before);
+    ggml_sycl_q1_nvfp4_test_counters after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
+                   "async failpoint did not reach exactly one submitted terminal", before);
+    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
+                   "failed asynchronous terminal recycled its workspace", before);
+}
+```
+
+   In `main()`, after the `refused_graph_then_synchronize_case(); require_clean_teardown();` pair:
+
+```cpp
+        failed_graph_then_drain_case();
+        require_clean_teardown();
+        // The card must be usable by a new context after a context that failed and was only drained.
+        { lifecycle_fixture life; successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "after-failed-drain"); }
+        require_clean_teardown();
+```
+
+   `successful_reuse_case`'s last parameter (`:484`) is only a label for its failure messages.
+
+   Build: `TMPDIR=<a directory on the root disk> ./scripts/sycl-build.sh test-sycl-q1-nvfp4-admitted-device`
+   (start unless `pgrep -c -x ninja` is 2 or more). Do not run the binary: the lead runs it once on the B50.
+   Expected RED on the GPU: `FAIL: ... the terminal drain did not release the failed graph (invocation=N ...)`
+   with N not zero. If the lead's run fails at a different line, stop and report: the case does not show the defect.
+
+3. **GREEN.** In `ggml-sycl.cpp`:
+   - Next to the forward declarations at `:12280` add
+     `static void ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context * ctx) noexcept;`
+   - Directly above the comment block of `ggml_sycl_execution_drain_own_terminal` add:
+
+```cpp
+// The second attempt of a drain whose release was refused. A refusal with the invocation still live usually means a
+// quarantined MoE workspace slot pins it: the slot's terminal finished without success, so nothing recycled the slot.
+// The recovery frees a slot only once its terminal's event is complete, and the caller's wait may have covered only
+// the deferred decode event, so the stream is drained first. Only a refused release pays for this wait and for the
+// registry walk; a drain that releases at once does neither. Returns true when the graph was released.
+static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx || ggml_sycl_take_execution_state_snapshot(ctx).invocation_id == 0) {
+        return false;
+    }
+    try {
+        if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
+            stream->wait_and_throw();
+        }
+    } catch (...) {
+        // Enqueue status is unproven: the slot stays quarantined and the caller takes the abort path.
+        return false;
+    }
+    ggml_sycl_recover_exact_mmid_after_drain(ctx);
+    return ggml_sycl_execution_release_graph(ctx);
+}
+```
+
+   - In `ggml_sycl_execution_drain_own_terminal` replace the condition
+     `if (!waited || !ggml_sycl_execution_release_graph(ctx)) {` with
+
+```cpp
+    if (!waited ||
+        (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {
+```
+
+   - In the lambda of `ggml_sycl_execution_drain_context_terminal_events` replace
+     `if (!ggml_sycl_execution_release_graph(backend_ctx)) {` with
+
+```cpp
+            if (!ggml_sycl_execution_release_graph(backend_ctx) &&
+                !ggml_sycl_execution_recover_and_release_graph(backend_ctx)) {
+```
+
+   - In both "DUPLICATED SEQUENCE" comment blocks change the sequence they name from "wait -> clear the event
+     fields -> release-or-abort -> retire" to "wait -> clear the event fields -> release, else recover and release,
+     else abort -> retire".
+   - In `~ggml_backend_sycl_context`, on the line before `ggml_sycl_execution_abort_and_release_graph(this);` add:
+
+```cpp
+    // Every queue is drained, so a workspace slot whose terminal failed is finished and can be recovered. Without
+    // this its pin outlives the context and the device stays owned.
+    ggml_sycl_recover_exact_mmid_after_drain(this);
+```
+
+   Run: `python3 tests/test-sycl-async-failure-source.py --self-test` — expected `async failure source contract:
+   PASS`. Then build `llama-cli llama-completion test-sycl-q1-nvfp4-admitted-device` and report; the lead runs the
+   oracle once per card and the gates.
+
+**Commit:** two commits, each path-scoped with `git commit -F <msgfile> -- <paths>`.
+1. `tests: a failed graph that is only drained must give its device back (oracle case 9, source contract, RED)`
+   paths: the two test files.
+2. `sycl: a drain whose release is refused recovers the workspace slot and releases again (kjoc)`
+   path: `ggml/src/ggml-sycl/ggml-sycl.cpp`.
+
+**Gotchas:**
+- Do not call the recovery before the first release in the twins. `drain_own_terminal` runs on the begin path; a
+  registry mutex and a plan snapshot there on every successful drain is a cost this task must not add.
+- Do not release, reset or free a quarantined slot by any other route. If the retry still fails, the abort path
+  stays as it is: an unproven terminal keeps its leases.
+- `ggml_sycl_execution_release_graph` returns false when there is nothing to release (`invocation_id == 0`). The
+  context twin calls it for every bound backend, so the helper's first line must keep the early return; without
+  it every idle backend would wait and walk the registry at teardown.
+- The async handler from Task 7a is installed on the stream, so `wait_and_throw()` latches an asynchronous error and
+  returns. It throws only for a synchronous failure such as a lost device, and then the slot must stay quarantined.
+- The begin-path twin cannot be reached by a context with a latched failure: graph_compute refuses first. Its edit is
+  covered by the source contract only, and is made because the twin rule requires it.
+- The destructor path has no oracle case: the fixture always drains its context before it frees a backend. The
+  source contract covers it. Say so in the commit message.
+- `/tmp` is a small quota-limited tmpfs: build with `TMPDIR` on the root disk.
+- Never `clang-format-19 -i` on `ggml-sycl.cpp`; check your lines with `clang-format-19 --dry-run --lines=A:B`.
 
 ---
 

@@ -105,6 +105,10 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
     whether or not it succeeded; the cleanup's existing recovery (`ggml_sycl_recover_exact_mmid_after_drain`, called
     after the cleanup's waits and before its release) then frees the slot and the release succeeds. Commit 4 covers
     the synchronize path. Task 7d covers a context torn down with no synchronize after the failure.
+    *Second holder (commit 5, ruled 2026-11-22):* the pin has two holders once the route returns, the slot's
+    `quarantine_authority` and the admitted bundle's `common_authority_`. The bundle lives in the completion
+    object, and after a failure only the completion host task's functor referenced it. The rule: the pin must not
+    depend on when the SYCL runtime destroys a host-task functor; the task releases it before its body returns.
 
 ### Known limits and follow-ups
 
@@ -179,8 +183,9 @@ runtime's default handler, which terminates the process, and the oracle's sevent
 - makes the route's terminal deny success after a failure;
 - extends the oracle's seventh case to assert fail-closed.
 
-Four ordered commits: commit 1 is the latch, the helper and their tests; commit 2 is the behaviour; commits 3 and 4
-are the two defects the first GPU run of commit 2 and of commit 3 found (decisions 10 and 11).
+Five ordered commits: commit 1 is the latch, the helper and their tests; commit 2 is the behaviour; commits 3 and 4
+are the two defects the first GPU run of commit 2 and of commit 3 found (decisions 10 and 11); commit 5 removes a
+dependency on SYCL runtime timing that commit 4 left (decision 11, second holder).
 
 **Acceptance Criteria:**
 - [ ] Commit 1: `sycl-async-failure-latch` passes (host-only).
@@ -199,6 +204,7 @@ are the two defects the first GPU run of commit 2 and of commit 3 found (decisio
 - [ ] Commit 4: the source contract's two terminal claims pass with their three mutants; oracle case 7 shows
       `invocation_id == 0` and `busy_device_count == 0` after its first synchronize; no case's teardown reports a
       `begin_drain` or `finish_drain` refusal.
+- [ ] Commit 5: the source contract's claim B passes with its two mutants.
 - [ ] Lead, once each: the Mistral B70 completion gate passes, and the GPT-OSS B50 chat gate passes **with
       `-c 4096`**. Ruled 2026-11-21: the gate without `-c` faults the B50 on this branch with and without Task 7a
       (plan, "GPT-OSS B50 default-context fault"), so it cannot accept or reject this task. The `-c 4096` arm is the
@@ -1154,6 +1160,29 @@ The change:
   name and the error.
 - Do not reorder cases 7 and 8. With case 8 first, its first graph's completion host task would usually run after
   the recorded failure and pin the same way: pass or fail would follow host-task timing.
+
+#### Commit 5: the completion task empties its bundle before it returns (decision 11, second holder)
+
+Found by reading after commit 4 passed on both cards. Landed as `095adc712`.
+- On success `terminal_release()` empties the bundle. A failed terminal never reaches it, so the bundle kept its
+  reference to the admission authority, and with it the pin, until the runtime destroyed the functor that held
+  the completion object. Commit 4's pass therefore rested on the runtime destroying that functor before the
+  cleanup's release ran, which this tree cannot see or control.
+- The change (`ggml-sycl.cpp`, the completion host task only): the body's last statement is
+  `completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};`, on every path, after the `recycled`
+  expression and the test counters.
+- It empties the shared completion object, not the functor's own reference. The runtime stores the functor in a
+  `std::function` and may copy it; a copy cannot keep the pin when the shared bundle is empty.
+- Why it is deterministic: a host task's event cannot complete before its body returns. A boundary that waited on
+  that event finds the bundle empty.
+- The bundle's move-assignment swaps. The temporary that receives the old state has `possible_submit_` set, so its
+  destructor does not release the slot (`moe-mmid-workspace.cpp:764-768`); it only drops references. The
+  quarantined slot keeps its own `quarantine_authority` for the recovery.
+- `tests/test-sycl-async-failure-source.py`: claim B (the host task body ends with the assignment, after the
+  `terminal_release()` expression) and two mutants: the assignment removed; the assignment moved before
+  `observe_success()`.
+- There is no device assertion that separates commit 5 from commit 4: the difference is a runtime timing that the
+  oracle cannot force. The source contract is the gate.
 
 **Gotchas:**
 - `ggml-sycl.cpp` is ~125k lines. Find each site with `cat ... | grep -n` and edit by exact string.
