@@ -7,6 +7,9 @@ With comments blanked, in ggml-sycl.cpp:
      cache placed.
   2. The branch whose condition names mem_handle_kind::CHUNK_LEASE compares the handle's device() with ctx.device
      and loaded.layout with GGML_LAYOUT_SOA in that condition, and takes the plane from loaded.ptr only in its body.
+     The same condition tests loaded.retention == nullptr: a resolution that carries its own retention (the
+     resolver's fallback to a cache pointer) did not come from the tensor's handle, so a copy of that handle does
+     not own loaded.ptr, and the case falls to the named refusal below.
   3. That branch calls ggml_sycl_chain_ready_event_if_needed(*stream, loaded), and the branch precedes the SOA
      converter call to_fp16(plane, ...).
   4. Both owner branches assign owner, and after the SOA converter call the function passes std::move(owner) to
@@ -15,8 +18,9 @@ With comments blanked, in ggml-sycl.cpp:
   5. The function body has no .wait(, ->wait( and no wait_and_throw(.
   6. (ggml_sycl_op_mul_mat) both op(ctx, src0, src1, dst, ...) calls sit in a try block whose first catch is
      catch (const ggml_sycl_fallback_error &) with a body of throw; alone (the form check-sycl-alloc-zone-contract
-     accepts as a guard), followed by a general catch; neither call is wrapped in CHECK_TRY_ERROR, whose catch-all
-     would turn the refusal into SYCL_CHECK's abort.
+     accepts as a guard), followed by a general catch whose body still reaches ggml_sycl_error( (the abort every other
+     exception took through SYCL_CHECK); neither call is wrapped in CHECK_TRY_ERROR, whose catch-all would turn the
+     refusal into SYCL_CHECK's abort.
 """
 import re
 import sys
@@ -85,6 +89,16 @@ def op_call_sites(m):
     return sites
 
 
+def general_catch(after, guard):
+    """The body of the catch clause that follows the fallback guard matched in `after`, or ''."""
+    if guard is None:
+        return ""
+    rest = after[guard.end():]
+    open_at = rest.find("{")
+    end = block_end(rest, open_at) if open_at >= 0 else -1
+    return rest[open_at:end] if end >= 0 else ""
+
+
 def claims(sycl):
     f = body(sycl, F16_SIG)
     w_cond, w_body = branch(f, "mem_handle_kind::WEIGHT")
@@ -95,6 +109,7 @@ def claims(sycl):
     m = body(sycl, MUL_MAT_SIG)
     sites = op_call_sites(m)
     catches = [FALLBACK_CATCH.match(after) for after in sites]
+    generals = [general_catch(after, c) for after, c in zip(sites, catches)]
     return {
         "1 the cache lease is asked only on the WEIGHT branch": w_body != "" and
             f.count("ggml_sycl_acquire_weight_layout(") >= 1 and
@@ -103,6 +118,8 @@ def claims(sycl):
             r"\bdevice\(\)\s*==\s*ctx\.device\b", c_cond) is not None,
         "2 the CHUNK_LEASE branch checks the loaded layout": "loaded.layout == GGML_LAYOUT_SOA" in c_cond and
             re.search(r"\bplane\s*=\s*loaded\.ptr;", c_body) is not None and "loaded.ptr" not in c_cond,
+        "2 the CHUNK_LEASE branch refuses a resolution that carries its own retention": re.search(
+            r"\bloaded\.retention\s*==\s*nullptr\b", c_cond) is not None,
         "3 the CHUNK_LEASE branch chains the ready event before the converter": re.search(
             r"ggml_sycl_chain_ready_event_if_needed\(\*stream,\s*loaded\)", c_body) is not None and
             0 <= c_at < converter_at,
@@ -116,6 +133,8 @@ def claims(sycl):
         "5 no host wait in the arm": f != "" and re.search(r"(\.|->)wait\(|wait_and_throw\(", f) is None,
         "6 both op calls rethrow a refusal ahead of the general catch": len(sites) == 2 and
             all(c is not None and re.fullmatch(r"\s*throw;\s*", c.group("body")) for c in catches),
+        "6 the general catch after each rethrow still aborts through ggml_sycl_error": len(generals) == 2 and
+            all("ggml_sycl_error(" in g for g in generals),
         "6 no op call is wrapped in CHECK_TRY_ERROR": m != "" and re.search(r"CHECK_TRY_ERROR\(\s*op\(", m) is None,
     }
 
@@ -152,6 +171,7 @@ def main():
                 "ggml_sycl::mem_handle owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);"),
             "2 device compare dropped": mutate(sycl, F16_SIG, r"own->device\(\)\s*==\s*ctx\.device\s*&&", ""),
             "2 layout compare dropped": mutate(sycl, F16_SIG, r"&&\s*loaded\.layout == GGML_LAYOUT_SOA", ""),
+            "2 retention test dropped": mutate(sycl, F16_SIG, r"\s*&&\s*loaded\.retention\s*==\s*nullptr", ""),
             "3 ready event not chained": mutate(sycl, F16_SIG, r"ggml_sycl_chain_ready_event_if_needed\([^;]*;", ""),
             "4 CHUNK_LEASE branch holds no owner": mutate(sycl, F16_SIG, r"\bowner\s*=\s*\*own;", "(void) own;"),
             "4 owner not retained": mutate(sycl, F16_SIG, r"\{\s*std::move\(owner\)\s*\}", "{}"),
@@ -164,6 +184,12 @@ def main():
             "6 first rethrow does more than rethrow": mutate(
                 sycl, MUL_MAT_SIG, r"catch \(const ggml_sycl_fallback_error &\) \{\s*throw;",
                 "catch (const ggml_sycl_fallback_error &) { GGML_LOG_ERROR(\"refused\\n\"); throw;", 0),
+            "6 second general catch emptied": mutate(
+                sycl, MUL_MAT_SIG,
+                r"catch \(const ggml_sycl_fallback_error &\) \{\s*throw;\s*\}\s*catch \(const std::exception & e\) "
+                r"\{[^{}]*\}",
+                "catch (const ggml_sycl_fallback_error &) { throw; } "
+                "catch (const std::exception & e) { (void) e; }", 1),
         }
         for name, text in mutants.items():
             if text == sycl:

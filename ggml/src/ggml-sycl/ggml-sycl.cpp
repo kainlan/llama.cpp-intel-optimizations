@@ -56015,7 +56015,8 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
     // through a cache lease, which is what stops an eviction under the read. A weight in a plain backend buffer
     // (CHUNK_LEASE: test-backend-ops, or any graph whose weights were never registered with the cache) is owned by
     // the tensor's own handle, and a copy of it shares the chunk lease. No other kind carries a lifetime a reader
-    // that outlives this call can hold.
+    // that outlives this call can hold. A resolution that carries its own retention (the resolver's fallback to a
+    // cache pointer) did not come from the tensor's handle, so a copy of that handle does not own its pointer.
     const auto *                  extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const ggml_sycl::mem_handle * own =
         (extra != nullptr && ggml_sycl_valid_device_index(ctx.device)) ? &extra->data_handle[ctx.device] : nullptr;
@@ -56028,7 +56029,7 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
             refuse("f16 dequant arm: the SOA plane is not staged on this device");
         }
     } else if (own->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE && own->device() == ctx.device &&
-               loaded.layout == GGML_LAYOUT_SOA) {
+               loaded.layout == GGML_LAYOUT_SOA && loaded.retention == nullptr) {
         owner = *own;
         plane = loaded.ptr;
         ggml_sycl_chain_ready_event_if_needed(*stream, loaded);
