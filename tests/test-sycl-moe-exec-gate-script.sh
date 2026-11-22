@@ -1177,8 +1177,10 @@ expect "the dry-run names the source tree the build's head is read from" "$out" 
 # lk <lock dir> <out dir>: a real run of the journal arm that takes the lock (no device, no model)
 lk() { PATH="${LK_PATH:-$WORK/stubbin}:$PATH" bash "$GATE" --lock-dir "$1" --arm resets \
     --build-dir "$WORK/srcrepo/build" --out-dir "$2" "$SRC_SHA" 2>&1; }
-# a mkdir that reports success for an existing directory, as the system mkdir on the lead's host does
+# a mkdir that gives, every time, the outcome the system mkdir on the lead's host gives when the directory appears
+# between its check and its mkdir(2): exit 0 for a directory that exists
 mkdir -p "$WORK/shim"
+# shellcheck disable=SC2016  # literal shim text
 printf '#!/usr/bin/env bash\nfor a in "$@"; do [ -d "$a" ] && exit 0; done\nexec /usr/bin/mkdir "$@"\n' \
     > "$WORK/shim/mkdir"
 chmod +x "$WORK/shim/mkdir"
@@ -1210,20 +1212,65 @@ if [ "$(cat "$WORK/lost.lock/holder" 2>/dev/null)" = intruder ]; then
 else
     fail "the gate removed a lock it no longer held"
 fi
+# the same co-taker with two arms: the check at the top of the arm loop stops the run before the second arm
+mkstub "[ -d \"$WORK/lost2.lock\" ] && echo intruder > \"$WORK/lost2.lock/holder\"; exit 0"
+out="$(PATH="$WORK/stubbin:$PATH" bash "$GATE" --lock-dir "$WORK/lost2.lock" --arm resets --arm resets \
+    --build-dir "$WORK/srcrepo/build" --out-dir "$WORK/lk-lost2" "$SRC_SHA" 2>&1)"; rc=$?
+mkstub 'exit 0'
+expect_rc "a lock lost during the first of two arms stops the gate" "$rc" 2
+expect "the stop comes before the second arm" "$out" "(1 of 2 arms scored)"
 # a TERM while the take is still verifying must release the lock the take wins
 LLAMA_GPU_LOCK_VERIFY_SECONDS=3 bash "$GATE" --signal-selftest --lock-dir "$WORK/tk.lock" > "$WORK/tk.out" 2>&1 &
 tpid=$!
 for _ in $(seq 50); do [ -f "$WORK/tk.lock/holder" ] && break; sleep 0.1; done
+if [ -f "$WORK/tk.lock/holder" ]; then
+    pass "the take reached its verify window before the TERM"
+else
+    fail "the take never wrote its holder: the TERM case below proves nothing"
+fi
 kill -TERM "$tpid" 2>/dev/null
 wait "$tpid"; rc=$?
 out="$(cat "$WORK/tk.out")"
 expect_rc "a TERM during the take ends the gate with rc 143" "$rc" 143
 expect_not "the TERM landed before the selftest child started" "$out" "signal-selftest: child="
 if [ -e "$WORK/tk.lock" ]; then fail "a TERM during the take left GPU.lock behind"; else pass "a TERM during the take releases GPU.lock"; fi
-for bad in 08 x -1; do
-    out="$(LLAMA_GPU_LOCK_VERIFY_SECONDS="$bad" bash "$GATE" --lock-dir "$WORK/bad.lock" --lock-selftest 2>&1)"; rc=$?
+# the same for --lock-selftest, which takes before the run's traps exist
+LLAMA_GPU_LOCK_VERIFY_SECONDS=3 bash "$GATE" --lock-selftest --lock-dir "$WORK/stk.lock" > "$WORK/stk.out" 2>&1 &
+spid=$!
+for _ in $(seq 50); do [ -f "$WORK/stk.lock/holder" ] && break; sleep 0.1; done
+if [ -f "$WORK/stk.lock/holder" ]; then
+    pass "the selftest take reached its verify window before the TERM"
+else
+    fail "the selftest take never wrote its holder: the TERM case below proves nothing"
+fi
+kill -TERM "$spid" 2>/dev/null
+wait "$spid"; rc=$?
+expect_rc "a TERM during the selftest take ends it with rc 143" "$rc" 143
+if [ -e "$WORK/stk.lock" ]; then
+    fail "a TERM during the selftest take left the lock behind"
+else
+    pass "a TERM during the selftest take releases the lock"
+fi
+# a take whose helper ends with an unknown status (5) after writing our holder must not leave that holder behind:
+# the shim runs the real python3 (the take succeeds) and then reports a status the library does not know
+mkdir -p "$WORK/py1"
+# shellcheck disable=SC2016  # literal shim text
+printf '#!/bin/sh\n"%s" "$@"\nexit 1\n' "$(command -v python3)" > "$WORK/py1/python3"
+chmod +x "$WORK/py1/python3"
+out="$(PATH="$WORK/py1:$PATH" bash "$GATE" --lock-dir "$WORK/py1.lock" --lock-selftest 2>&1)"; rc=$?
+expect_rc "a take with an unknown helper status fails the selftest" "$rc" 1
+expect "the selftest says the take failed" "$out" "lock-selftest: first take failed"
+if [ -e "$WORK/py1.lock" ]; then
+    fail "a take with an unknown helper status left our holder behind"
+else
+    pass "a take with an unknown helper status removes our own holder"
+fi
+for bad in 08 x -1 10000000000; do
+    out="$(LLAMA_GPU_LOCK_VERIFY_SECONDS="$bad" timeout 20 bash "$GATE" --lock-dir "$WORK/bad.lock" --lock-selftest 2>&1)"
+    rc=$?
     expect_rc "LLAMA_GPU_LOCK_VERIFY_SECONDS=$bad is a usage refusal" "$rc" 2
     expect "the refusal names the variable ($bad)" "$out" "LLAMA_GPU_LOCK_VERIFY_SECONDS"
+    expect_not "the refusal is the gate's, not bash's ($bad)" "$out" "integer expected"
 done
 if [ -e "$WORK/bad.lock" ]; then fail "a usage refusal created the lock"; else pass "a usage refusal never creates the lock"; fi
 mkdir -p "$WORK/nolib/scripts"
@@ -1393,6 +1440,18 @@ if [ -n "$wb_line" ] && [ -n "$lk_line" ] && [ -n "$st_line" ] \
     pass "the start waits for builders before the settle check and before the lock"
 else
     fail "wait_builders start ($wb_line) must precede host_settled ($st_line) and lock_take ($lk_line)"
+fi
+# a device arm checks the holder after its waits (builders and settle can take 25 minutes) and before its launch;
+# no stub reaches a device arm, so the order is read from the source
+ra_settle="$(cat "$GATE" | grep -n -x '    settle' | cut -d: -f1 | head -1)"
+# shellcheck disable=SC2016  # literal source text
+ra_launch="$(cat "$GATE" | grep -n -F 'timeout -k 15 "$A_TMO" env ONEAPI_DEVICE_SELECTOR=' | cut -d: -f1 | head -1)"
+ra_check="$(awk -v a="${ra_settle:-0}" -v b="${ra_launch:-0}" 'NR > a && NR < b && /^ *lock_check( |$)/ { print NR; exit }' \
+    "$GATE")"
+if [ -n "$ra_settle" ] && [ -n "$ra_launch" ] && [ -n "$ra_check" ]; then
+    pass "a device arm checks the lock holder after settle ($ra_settle) and before its launch ($ra_launch)"
+else
+    fail "run_arm needs lock_check between settle (${ra_settle:-none}) and the launch (${ra_launch:-none})"
 fi
 
 # every arm scores a non-zero rc as a FAIL; a GO run that prints the answer and aborts in teardown must FAIL

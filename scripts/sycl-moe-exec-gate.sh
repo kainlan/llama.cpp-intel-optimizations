@@ -126,9 +126,11 @@
 # Once the lock is held, every stop (a refusal such as an expired wait, or a signal) prints STOPPED: <reason>, the
 # summary over the verdicts scored so far, and the final line; exit 2 for a refusal, 143 for a signal.
 # GPU.lock is taken, checked and released through scripts/sycl-lock.sh (mkdir(2) through python3, a `holder` line
-# unique to this run): the system mkdir command reports success on an existing directory. A holder that is no longer
-# ours stops the run before each arm and after the last. The gate does not wait for the lock: a failed take is a
-# refusal that names why (held, a co-taker's holder, a directory it cannot create, or a helper that cannot run).
+# unique to this run): the system mkdir command checks, then creates, and exits 0 when the directory appears in
+# between, so two takers that arrive together can both win. A holder that is no longer ours stops the run before each
+# arm, before each device arm's launch and after the last arm. The gate does not wait for the lock: a failed take is a
+# refusal that names why (held, a co-taker's holder, a directory created without a holder that must be removed by
+# hand, a directory it cannot create, or a helper that cannot run).
 #
 # Exit codes: 0 every requested verdict PASS; 1 at least one FAIL; 2 refused or usage; 3 none failed but at least
 # one arm was NOT_EXERCISED or NOT_SCORED, or a ring-scoring arm ran and no arm engaged the ring (the summary line
@@ -181,7 +183,7 @@
 #   --out-dir DIR  --clobber (accept a non-empty --out-dir)  --lock-dir DIR  --no-lock  --no-head-check
 #   environment: LLAMA_GPU_LOCK (the lock directory when --lock-dir is not given; default /Apps/llama.cpp/GPU.lock),
 #   LLAMA_GPU_LOCK_VERIFY_SECONDS (how long the take waits before it reads its holder back; default 1, a whole number
-#   without a leading zero, anything else is a usage refusal)
+#   from 0 to 999999 without a leading zero, anything else is a usage refusal)
 #   --since 'YYYY-MM-DD HH:MM:SS'
 #   --qwen F --gptoss F --mistral F   model files
 #   --tuning-dir DIR   export GGML_SYCL_TUNING_CACHE_DIR (default: the real cache, so acceptance runs write it)
@@ -416,9 +418,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "${#ARMS[@]}" -gt 0 ] || ARMS=("${ALL_ARMS[@]}")
-# A leading zero would be an octal error in arithmetic, and the verify window is passed on as seconds.
-[[ "$LOCK_VERIFY" =~ ^(0|[1-9][0-9]*)$ ]] ||
-    die_usage "LLAMA_GPU_LOCK_VERIFY_SECONDS must be a whole number of seconds without a leading zero: '$LOCK_VERIFY'"
+# The verify window goes to the lock helper's sleep: a bounded unsigned integer keeps a typo from becoming a hang or an
+# overflow inside the take.
+[[ "$LOCK_VERIFY" =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+    die_usage "LLAMA_GPU_LOCK_VERIFY_SECONDS must be a whole number of seconds from 0 to 999999 without a leading zero:" \
+        "'$LOCK_VERIFY'"
 
 # A real run sources oneAPI here, after the options are parsed and before any variable is derived from them, because
 # setvars.sh overwrites shell variables (see the caveat in the header). The modes that run nothing on a device do not
@@ -1250,14 +1254,20 @@ print_arm_plan() {
 
 # ---------------------------------------------------------------- GPU.lock
 
-# Taken, checked and released only through scripts/sycl-lock.sh: the system mkdir command reports success on an
-# existing directory, so two takers could both win with it.
+# Taken, checked and released only through scripts/sycl-lock.sh: the system mkdir command checks, then creates, and
+# exits 0 when the directory appears in between, so two takers that arrive together can both win with it.
 lock_take() { # 0 held | the sycl_lock_take status; LOCK_RC keeps it for the refusal text
-    [ "$LOCK_HELD" = 0 ] || return 5 # never take twice: the second text would replace the first
+    if [ "$LOCK_HELD" != 0 ]; then # never take twice: the second text would replace the first
+        LOCK_RC=5
+        echo "sycl-moe-exec-gate: lock_take called while the lock is held" >&2
+        return 5
+    fi
     LOCK_TEXT="sycl-moe-exec-gate pid=$$ sha=${EXPECT_SHA:-none} start=$(date +%FT%T)"
     LOCK_HELD=1 # before the take: a signal during it is handled right after it returns, and must release
     sycl_lock_take "$LOCK_DIR" "$LOCK_TEXT" "$LOCK_VERIFY"
     LOCK_RC=$?
+    # An unknown status can follow a holder the helper already wrote; after 1 to 4 no holder of ours exists.
+    [ "$LOCK_RC" != 5 ] || sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" 2>/dev/null || true
     [ "$LOCK_RC" = 0 ] || LOCK_HELD=0
     return "$LOCK_RC"
 }
@@ -1461,11 +1471,19 @@ fi
 
 if [ "$LOCK_SELFTEST" = 1 ]; then
     lock_selftest_fail() { say "lock-selftest: $*"; lock_release; exit 1; } # the release removes only our holder
+    # The run's traps are installed later; a signal during this take must still release the lock it wins.
+    trap lock_release EXIT
+    trap 'exit 143' TERM INT HUP
     lock_take || lock_selftest_fail "first take failed ($(lock_why))"
     sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" || lock_selftest_fail "the holder is not ours after the take"
     # A second taker with its own text: calling lock_take again would replace LOCK_TEXT.
-    sycl_lock_take "$LOCK_DIR" "lock-selftest second taker" 0
+    second_text="lock-selftest second taker pid=$$"
+    sycl_lock_take "$LOCK_DIR" "$second_text" 0
     second_rc=$?
+    if [ "$second_rc" = 0 ]; then
+        sycl_lock_release "$LOCK_DIR" "$second_text" || true
+        lock_selftest_fail "a second take succeeded"
+    fi
     [ "$second_rc" = 1 ] || lock_selftest_fail "a second take returned $second_rc, not 1 (busy)"
     ( lock_release )
     sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" || lock_selftest_fail "a release in a subshell removed our holder"
@@ -1642,6 +1660,7 @@ run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
     fi
     wait_builders "$arm"
     settle
+    lock_check # the waits above can take 25 minutes: a lock lost during them must stop the run before the load
     pre="$(builders)"
     echo "$pre" > "$OUT_DIR/$arm.builders_pre"
     echo 0 > "$OUT_DIR/$arm.builders_max"
