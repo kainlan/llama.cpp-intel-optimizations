@@ -18,10 +18,11 @@ With comments blanked:
   R. (ggml-sycl.cpp ggml_sycl_async_failure_report) the [SYCL-ASYNC-FAILURE] line says the outputs of the context's
      last graph are not valid.
   T. (ggml-sycl.cpp moe_direct_event_terminal) arm takes a ggml_sycl_async_failure_cursor; ready() tests the
-     command_execution_status and names neither ggml_sycl_async_failure_since nor wait_and_throw, because the
-     slot-release sites read it as "finished" and a failed bundle must still be released; observe_success() tests
-     ggml_sycl_async_failure_since( after event->wait_and_throw(); the route arms with a snapshot taken before its
-     first submission.
+     command_execution_status, names neither ggml_sycl_async_failure_since nor wait_and_throw, and calls no wait at
+     all, because the slot-release sites read it as "finished" under the registry and pool mutexes and a failed bundle
+     must still be released; observe_success() tests ggml_sycl_async_failure_since( after event->wait_and_throw(), and
+     its catch records the throw with ggml_sycl_async_failure_record( so the next boundary fails the context and
+     recovers the slot; the route arms with a snapshot taken before its first submission.
   B. (ggml-sycl.cpp, the completion host task) the body's last statement assigns an empty bundle to
      completion->bundle, after the terminal_release() expression. The bundle holds the invocation pin until
      terminal_release() runs, and a failed terminal never reaches it; the task's event completes only after the body
@@ -92,9 +93,11 @@ def claims(cache, sycl, common):
         "R the report says the last outputs are invalid": "are not valid" in r,
         "T arm takes a cursor": "void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor)" in t,
         "T ready tests completion only": "command_execution_status" in t_ready and
-            "ggml_sycl_async_failure_since" not in t_ready and "wait_and_throw" not in t_ready,
+            "ggml_sycl_async_failure_since" not in t_ready and "wait_and_throw" not in t_ready and
+            re.search(r"\bwait\w*\s*\(", t_ready) is None,
         "T observe_success reads the latch after the wait": 0 <= t_success.find("event->wait_and_throw();") <
             t_success.find("ggml_sycl_async_failure_since(cursor)"),
+        "T a throwing observation is latched": "ggml_sycl_async_failure_record(" in body(t_success, "catch (...)"),
         "B the completion task drops the bundle before it returns": b.endswith(BUNDLE_DROP) and
             0 <= b.find("completion->bundle.terminal_release()") < b.rfind(BUNDLE_DROP),
         "T route arms with its cursor": "terminal->arm(final, failure_cursor);" in sycl and
@@ -149,6 +152,10 @@ def main():
             "observe_success is ready": (cache, sycl.replace(success, "{ return ready(); }", 1), common),
             "observe_success skips the wait": (cache, sycl.replace(
                 success, success.replace("event->wait_and_throw();", "", 1), 1), common),
+            "ready waits": (cache, re.sub(r"(bool ready\(\) const noexcept override \{)",
+                                          r"\1 if (event_) event_->wait();", sycl, count=1), common),
+            "a throwing observation is not latched": (cache, sycl.replace(
+                success, re.sub(r"ggml_sycl_async_failure_record\([^;]*\);", "", success, count=1), 1), common),
             "completion task keeps the bundle": (cache, sycl.replace(BUNDLE_DROP, "", 1), common),
             "completion task drops the bundle first": (cache, sycl.replace(BUNDLE_DROP, "", 1).replace(
                 "const bool recycled = terminal->observe_success()",

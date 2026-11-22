@@ -6519,8 +6519,10 @@ struct ggml_backend_sycl_context {
     // wrote may come from work that never ran, and the handler cannot tell whose command failed on a queue every
     // context of the device shares. A context created later starts from the counts at its creation. The two flags are
     // separate facts: `reported` means the [SYCL-ASYNC-FAILURE] line was logged, by whichever boundary saw the failure
-    // first; `cleaned` means synchronize ran the boundary cleanup for what the context submitted before the failure was
-    // seen. graph_compute never cleans, because it refuses before any submission.
+    // first; `cleaned` means synchronize's failure branch ran the boundary cleanup for what the context submitted before
+    // the failure was seen. graph_compute's refusal never cleans up, because it refuses before any submission. A cleanup
+    // run by an exception catch (graph_compute's or synchronize's own) does not set the flag, so the next synchronize may
+    // run the cleanup a second time, which finds nothing to release.
     ggml_sycl_async_failure_cursor async_failure_cursor;
     bool                           async_failure_reported = false;
     bool                           async_failure_cleaned  = false;

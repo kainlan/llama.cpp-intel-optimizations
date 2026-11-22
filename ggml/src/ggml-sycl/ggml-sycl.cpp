@@ -79215,10 +79215,13 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
                 failed_ = true;
                 return false;
             }
-            std::lock_guard<std::mutex> lock(mutex_);
-            succeeded_ = true;
             return true;
         } catch (...) {
+            // A throw here bypasses the handler, so the latch has not moved: the boundaries would take their normal
+            // path, and the release would be refused by the pin of a slot nobody recovers. Record it, as synchronize
+            // records a drain that throws. The record is lock-free and allocation-free, so a host-task worker may call
+            // it; mutex_ is not held.
+            ggml_sycl_async_failure_record(cursor.device, "direct-route terminal wait threw");
             std::lock_guard<std::mutex> lock(mutex_);
             failed_ = true;
             return false;
@@ -79244,7 +79247,6 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
     std::optional<sycl::event> event_;
     ggml_sycl_async_failure_cursor cursor_{};
     bool quiescent_ = false;
-    bool succeeded_ = false;
     bool failed_ = false;
 };
 
