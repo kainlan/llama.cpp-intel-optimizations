@@ -83,6 +83,8 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
    rule about success (`observe_success()`), not about `ready()`. `device_terminal::ready()` means "the terminal's
    work is finished", and the two slot-release sites (`moe-mmid-workspace.cpp:947` and `:1617`) read it as "this
    slot may be released". A terminal that folds success into `ready()` makes a failed slot unreleasable.
+   *Withdrawn for the direct route 2026-11-22 (decision 12):* its terminal no longer reports success at all.
+   Task 7b's retained-graph terminal follows decision 12, not this rule.
 7. **Last drain before a queue is destroyed.** Where a queue is destroyed before process exit and its last drain is a
    plain `wait()`, that wait becomes `wait_and_throw()` (7b). Where it has no drain at all, the site is listed under
    "Known limits" instead of getting a new wait. The other plain drains of every non-execution queue become
@@ -109,6 +111,16 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
     `quarantine_authority` and the admitted bundle's `common_authority_`. The bundle lives in the completion
     object, and after a failure only the completion host task's functor referenced it. The rule: the pin must not
     depend on when the SYCL runtime destroys a host-task functor; the task releases it before its body returns.
+12. **A terminal reports "finished"; only a boundary reads "succeeded"** (ruled 2026-11-22, Task 7d fix
+    round 1). `observe_success()` waited on the terminal's event and then read the latch, on a host-task
+    worker. Delivery is not atomic across threads: `throw_asynchronous` takes the pending list under the
+    queue's mutex and calls the handler after unlocking, so while one thread is between the two, another
+    thread's `wait_and_throw` on the same queue delivers nothing and finds the latch unmoved. The B70 oracle
+    run at `ff51e943c` showed a failed terminal read as a success that way (fact (i), pinned by the delivery
+    probe). A thread can trust the latch for its own queue only after its own `wait_and_throw` has returned
+    AND every task that could deliver has finished, which is what a boundary's queue-wide drain gives and a
+    host task cannot have. So the completion host task releases a finished bundle unconditionally
+    (`terminal_release()` already requires `ready()`), and the context's failure is the latch's alone.
 
 ### Known limits and follow-ups
 

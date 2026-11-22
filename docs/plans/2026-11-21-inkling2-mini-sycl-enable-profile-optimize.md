@@ -1034,6 +1034,11 @@ never engaged, so the arm says nothing about the selection key. The source contr
 *Left open, recorded as Task 6h below:* walks that stage or count the sources of a not-computed node, and two
 neighbours of the defect that this task was told not to touch.
 
+*The merged tree, built and run once per arm at `dffdfbedb` (2026-11-22):* the device test on both cards, the
+Mistral gate on both cards, the GPT-OSS B50 gate without `-c` (rc 0, answer line 1, no device loss) with a
+Mistral health arm after it, the `-c 4096` control and the GPT-OSS B70 gate all pass, with zero kernel fault
+lines. The first attempt lost the `GPU.lock` race to another session and ran nothing; this is the retry.
+
 ---
 
 ### Task 6e: A lost device ends the process without running static destructors under live workers
@@ -1216,6 +1221,38 @@ Commit: `sycl: pad_reflect_1d launches a range that fits in an int and strides o
   `checkValueRange` in `sycl/handler.hpp`, and it covers the product of the dimensions, not each one alone.
 - `gated_delta_net.cpp` reads `src->data` directly. Do not change how it resolves pointers in this task.
 - Four commits, each path-scoped (`git commit -F msgfile -- <one file>`), never amended.
+
+**Rulings after this text was written (lead, 2026-11-22). They supersede the GREEN blocks above.**
+1. *Flash attention declines `V->ne[0] != D` for every D.* The D=512 exception in GREEN 2 was wrong:
+   `ggml_sycl_fattn_d512_onednn_admissible` does not check the value head size; only the tile route does.
+   Nothing that runs today is dropped: both Gemma 4 files in `/models/` have key and value lengths 512/512,
+   and 256/256 for the sliding-window layers.
+2. *Gated delta net indexes k's sequence with k's own repeat ratio,* `rk3 = nev3 / nek3`, as the CPU reference
+   does (`ops.cpp`, gated delta net). `ggml_gated_delta_net` has no assert that ties `k->ne[3]` to `q->ne[3]`.
+3. *The launch-range rule, measured on DPC++ 2026.2:* there is no `checkValueRange` in the headers. The check is
+   inlined in `libsycl.so.9` (`enqueueImpKernel`). In the default `-fsycl-id-queries-range=int` mode it refuses
+   a global range in which any dimension, or the running product of the dimensions, exceeds `INT_MAX`.
+4. *`PAD_REFLECT_1D` caps all three launch dimensions* (fix round, from the spec review). Capping only the
+   row dimension left a tensor with more than 8,388,607 planes (`ne02 * ne03`, times the block size 256)
+   unable to launch, as it was before this task. The launch takes at most `INT_MAX / 256` work-groups in
+   total and the kernel strides over the rest in each dimension. Above `INT_MAX` row tiles the kernel splits
+   the tile index with 64-bit division, because `fastdiv` adds in `uint32_t` and overflows from 2^31: a row
+   of one float with no padding reaches that at 16 GiB of src plus dst, which the B70 holds. A new
+   `test-backend-ops` case, `ne_a=[2,1,8388608,1]`, is the RED.
+
+**Device results so far (B50, one run per arm; not yet merged, quality review open):**
+- At `9d6b9a4d9`: `-o TIMESTEP_EMBEDDING`, `-o PAD_REFLECT_1D`, `-o GATED_DELTA_NET` and `-o FLASH_ATTN_EXT`
+  all end rc 0 with no FAIL line (the census had rc 1, 1, 134 and 1). The `dim=1` and 16,777,217-row cases
+  print OK, both gated-delta-net `padded_q=1,permuted_k=0` cases print OK, the two mismatched head-size
+  flash-attention cases print `not supported`, and no case with `hsk != hsv` runs. Mistral B70 gate passes.
+  No gated-delta-net model is staged, so no model exercised that kernel.
+- Fix round: on the binary built at the tests-only commit `14ae8586a` the many-plane case ends rc 1 with
+  `Error OP PAD_REFLECT_1D` and no result line (the runtime's range exception; the 16,777,217-row case on
+  the same binary prints OK, as the positive control). At `5d5bbe417` `-o PAD_REFLECT_1D` ends rc 0 and all
+  eight cases print OK. Zero kernel fault lines throughout.
+- Found in passing: an exception thrown by a kernel launch that is not a resource-exhaustion error ends the
+  process with `std::exit(1)` from the dispatch catch (`Error OP ...`). That is not an abort, but it is the
+  same class of ending as Task 6f-2's staging aborts; it is noted there for Task 6f-4's census.
 
 ---
 
@@ -1510,6 +1547,36 @@ synchronize. With commit 5 reverted in a scratch build the armed case must fail;
 the source-contract mutant, the lead with one B50 run of the scratch binary only if the implementer's build of
 it is at hand. The seam compiles out of a production build.
 
+**Fix round 1 (2026-11-22): the oracle failed on the B70, and the completion task stops deciding success.**
+- *What ran, once per arm, at `ff51e943c`:* oracle on the B50 PASS; Mistral B70 gate and GPT-OSS B50 gate
+  (`-c 4096`, the branch predates the Task 6d merge) pass; zero kernel fault lines. **Oracle on the B70: FAIL**
+  in case 9, `failed asynchronous terminal recycled its workspace` (`recycled=+1 quarantined=+1`). The drain
+  assertions before it passed. Spec review of the same commit: PASS.
+- *Cause, from the code; the probe that pins it is commit 1 of this round:* the completion host task called
+  `terminal->observe_success()`, which does `event->wait_and_throw()` and then reads the latch. The runtime's
+  `throw_asynchronous` takes the pending exception list under its mutex and calls the handler after
+  unlocking. When another thread (here the drain on the main thread) has taken the list and not yet run the
+  handler, the completion task's wait delivers nothing and the latch has not moved: a failed terminal reads
+  as a success. Runtime fact (d) was measured with one thread.
+- *What it costs in the product:* nothing unsafe. `terminal_release()` itself requires `terminal->ready()`, so a
+  slot is released only when its work is finished, and the boundary reads the latch after its own drain.
+  But the terminal claimed to know something it cannot know, and the oracle asserted on it.
+- *Ruling (decision 12 in the async-failure spec):* a terminal says when its work is **finished**; the latch
+  says whether it **succeeded**, and only a boundary that has drained on its own thread reads that. The
+  completion host task releases a finished bundle whether or not it succeeded. `observe_success()`, the
+  terminal's `failed_` flag and its cursor go.
+- *Tests:* cases 7 and 9 expect the release (`recycle == before + 1`); case 9 also asserts, after its fixture
+  is destroyed, that the device's failure count moved by exactly one. A new failpoint,
+  `GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE`, makes the completion task skip its release once:
+  it stands for a completion task that has not released when the context is drained, which the
+  deferred-decode wait allows. `unreleased_graph_then_drain_case` uses it, without and with the second
+  holder of Step 0. That case is now the device vehicle for this task's drain retry and for Task 7a's
+  commit 5; the held run of case 7 is dropped, because with the release unconditional it shows nothing.
+- *From the spec review, in the same round:* a drain wait that throws synchronously (a lost device) is recorded
+  in the device latch in the helper and in both twins' first wait; the context twin gets the begin-path
+  twin's `waited` flag, so a wait that threw is not followed by a second wait on the same queue; contract
+  claim K checks where the seam call sits, not only that it exists.
+
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp`: one forward declaration, one new helper, and the three release paths
   named below. Nothing else in the file.
@@ -1552,7 +1619,9 @@ the three paths recover the slot and release.
 - [ ] No case's teardown reports a drain refusal; zero kernel fault lines.
 - [ ] Lead, once each: Mistral B70 completion gate, GPT-OSS B50 chat gate (the documented command; `-c 4096` only if
       Task 6d has not merged yet).
-- [ ] No wait is added to a path that succeeds: the new wait and the registry walk run only after a refused release.
+- [ ] No wait is added to a path that succeeds: in the two drain twins the new wait and the registry walk run
+      only after a refused release. The destructor runs the registry walk on every teardown (once per backend
+      context, after its queues are drained; corrected 2026-11-22, the code block always said so).
 
 **Implementation guide.**
 
