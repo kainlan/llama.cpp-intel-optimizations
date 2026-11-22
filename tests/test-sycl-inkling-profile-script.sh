@@ -28,8 +28,25 @@ check "ctx flag"       0 'llama-completion .* -c 32768 '     --setup b70  --phas
 check "bench no ctx"   0 'llama-bench -m [^ ]+ -p 512 -n 128 -r 3$' --setup b70 --phase bench "${D[@]}"
 check "bad setup"      1 'unknown setup'                     --setup b580 --phase bench "${D[@]}"
 check "bad phase"      1 'unknown phase'                     --setup b70  --phase warp "${D[@]}"
+# Every phase: no -ngl (token-anchored), and a positive control that the line names the model.
+for ph in bench kprof-prompt kprof-decode e2e-decode census; do
+    out="$(bash "$S" --setup b70 --phase "$ph" "${D[@]}" 2>&1)"
+    if printf '%s\n' "$out" | grep -qE -- '(^| )-ngl( |$)'; then
+        echo "FAIL: (no ngl, $ph) $out"; n_fail=$((n_fail + 1))
+    elif ! printf '%s\n' "$out" | grep -q -- 'Inkling-2-Mini'; then
+        echo "FAIL: (no ngl control, $ph: model path missing) $out"; n_fail=$((n_fail + 1))
+    else
+        echo "PASS: (no ngl, $ph)"
+    fi
+done
+# Both kernel-profile phases ask for JSON and CSV; no other phase carries any kernel-profile variable.
+check "kprof format prompt" 0 'GGML_SYCL_KERNEL_PROFILE_FORMAT=both' --setup b70 --phase kprof-prompt "${D[@]}"
+check "kprof format decode" 0 'GGML_SYCL_KERNEL_PROFILE_FORMAT=both' --setup b70 --phase kprof-decode "${D[@]}"
 out="$(bash "$S" --setup b70 --phase bench "${D[@]}" 2>&1)"
-case "$out" in *-ngl*) echo "FAIL: (no ngl) $out"; n_fail=$((n_fail + 1));; *) echo "PASS: (no ngl)";; esac
+case "$out" in *GGML_SYCL_KERNEL_PROFILE*) echo "FAIL: (bench has no kprof env) $out"; n_fail=$((n_fail + 1));;
+               *) echo "PASS: (bench has no kprof env)";; esac
+# The printed command is the one that runs, kill escalation included.
+check "timeout kill" 0 'timeout -k 30 900 ' --setup b70 --phase bench "${D[@]}"
 out="$(bash "$S" --setup b70 --phase kprof-prompt "${D[@]}" 2>&1)"
 case "$out" in *E2E_TG_PROFILE*|*GGML_SCHED_DEBUG*) echo "FAIL: (one instrument) $out"; n_fail=$((n_fail + 1));;
                *) echo "PASS: (one instrument)";; esac

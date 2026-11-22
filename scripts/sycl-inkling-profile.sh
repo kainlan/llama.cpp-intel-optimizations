@@ -40,6 +40,8 @@ TAG="$SETUP-$PHASE-c$CTX"
 ENVV=("ONEAPI_DEVICE_SELECTOR=$SELECTOR" "GGML_SYCL_MOE_MULTI_GPU=0" "GGML_SYCL_TUNING_CACHE_DIR=$OUT/tuning-$TAG")
 COMPLETION=(llama-completion -m "$MODEL" -c "$CTX" --seed 42 --temp 0)
 TIMEOUT=900
+# -k escalates to SIGKILL: a child that ignores SIGTERM must not hold GPU.lock forever.
+TIMEOUT_CMD=(timeout -k 30 "$TIMEOUT")
 # One instrument per run: an instrument's cost must not land in another instrument's numbers.
 case "$PHASE" in
     bench)
@@ -48,10 +50,12 @@ case "$PHASE" in
         ENVV[2]="GGML_SYCL_TUNING_CACHE_DIR=$OUT/tuning-$TAG"
         CMD=(llama-bench -m "$MODEL" -p 512 -n 128 -r 3) ;;
     kprof-prompt)
-        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof")
+        # The profile needs both the JSON and the CSV, and a run is never repeated; the default format is CSV only.
+        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof" "GGML_SYCL_KERNEL_PROFILE_FORMAT=both")
         CMD=("${COMPLETION[@]}" -f "$PROMPT_FILE" -n 1) ;;
     kprof-decode)
-        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof")
+        # The profile needs both the JSON and the CSV, and a run is never repeated; the default format is CSV only.
+        ENVV+=("GGML_SYCL_KERNEL_PROFILE=1" "GGML_SYCL_KERNEL_PROFILE_OUTPUT=$OUT/$TAG.kprof" "GGML_SYCL_KERNEL_PROFILE_FORMAT=both")
         CMD=("${COMPLETION[@]}" -p '1, 2, 3, 4, 5,' -n 128 --ignore-eos) ;;
     e2e-decode)
         ENVV+=("GGML_SYCL_E2E_TG_PROFILE=1")
@@ -63,7 +67,7 @@ case "$PHASE" in
 esac
 
 if [ "$DRY" -eq 1 ]; then
-    echo "RUN tag=$TAG selector=$SELECTOR timeout=$TIMEOUT env=${ENVV[*]} cmd=${CMD[*]}"
+    echo "RUN tag=$TAG selector=$SELECTOR timeout=$TIMEOUT run=${TIMEOUT_CMD[*]} env=${ENVV[*]} cmd=${CMD[*]}"
     exit 0
 fi
 
@@ -93,7 +97,7 @@ SHMEM_BEFORE="$(shmem_gb)"; T0="$(date +%s)"
 LOAD="$(cut -d' ' -f1 /proc/loadavg)"; BUILDERS="$(pgrep -c -f 'ninja|icpx' || true)"
 rc=0
 BIN="${CMD[0]}"
-timeout "$TIMEOUT" env "${ENVV[@]}" "$BUILD_DIR/bin/$BIN" "${CMD[@]:1}" >"$OUT/$TAG.out" 2>"$OUT/$TAG.err" || rc=$?
+"${TIMEOUT_CMD[@]}" env "${ENVV[@]}" "$BUILD_DIR/bin/$BIN" "${CMD[@]:1}" >"$OUT/$TAG.out" 2>"$OUT/$TAG.err" || rc=$?
 # Settle before the lock is released: a process started right after a fast exit can hang the GT.
 sleep 12
 KLOG="$(journalctl -k --since "@$T0" --no-pager 2>/dev/null | grep -ciE 'GT reset|guc_id|GPU hang|CAT error' || true)"
