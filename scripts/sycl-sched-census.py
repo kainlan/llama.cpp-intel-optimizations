@@ -4,12 +4,18 @@
 A graph starts at its "SPLIT #0" line. "largest" is by op-node count, which excludes view ops because the scheduler
 does not print them. Node lines carry no backend, so each node counts for the backend of the split it sits in. A split
 index that neither restarts at 0 nor follows the previous one is reported as an anomaly (a torn line).
+That detector sees a tear only when a later split of the same graph exposes it. It misses a torn last split of a graph
+(undercounted), a torn "#0" right after a single-split graph (the next "#1" looks consecutive, so two graphs merge) and
+a log that starts mid-graph. Zero anomalies means "no tear seen", not "no tear".
 """
 import argparse
 import collections
+import contextlib
+import io
 import json
 import re
 import sys
+import tempfile
 
 # ggml-backend.cpp prints "## SPLIT #<i>: <backend> # <n> inputs" and "node #%3d (%10.10s): ...": the op name is
 # right-aligned and cut to 10 characters, so FLASH_ATTN_EXT appears as FLASH_ATTN. Threads interleave and tear lines
@@ -76,15 +82,24 @@ def self_test():
     torn_graphs, torn_anomalies = parse(torn)
     assert torn_anomalies == 1 and len(torn_graphs) == 1, (torn_anomalies, torn_graphs)
     assert parse("node #  4 (\n   MUL_MAT): x\n") == ([], 0)
+    with tempfile.NamedTemporaryFile("w", suffix=".log") as log:
+        log.write("## SPLIT #0: A # 1 inputs\n## SPLIT #3: B # 1 inputs\n")
+        log.flush()
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = main(["--json", log.name])
+    assert rc == 0, rc
+    assert err.getvalue().startswith("WARNING: 1 split-index"), err.getvalue()
+    assert '"anomalies": 1' in out.getvalue(), out.getvalue()
     print("self-test: PASS")
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("log", nargs="?")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test and args.json:
         ap.error("--self-test cannot be combined with --json")
     if args.self_test:
