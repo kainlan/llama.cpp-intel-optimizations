@@ -1234,6 +1234,12 @@ Found by reading after commit 4 passed on both cards. Landed as `095adc712`.
 
 **Track:** L-ordered. One implementer makes the host-side edits; the lead runs the gates.
 **Depends on:** Task 7a merged (it adds the helper and the latch). Runs after 7a, since both edit `ggml-sycl.cpp`.
+**Amended 2026-11-22, after Task 7d (decision 12).** The terminal edit is withdrawn: `moe_sycl_event_terminal`
+already reports only that its event is complete, which is what decision 12 asks of a terminal. A terminal that
+denied success after a failure would never become ready, and the retained graphs' leases would keep the device
+owned, the defect Task 7d fixed for the direct route. Claim E now pins that the class reads no latch.
+**Line numbers in this task are from `7809ffac8`** and are stale by several merges. Find each site by its text.
+The scanner's RED output is the current list of constructions.
 **File scope:**
 - Modify: `ggml/src/ggml-sycl/dpct/helper.hpp`: top includes `:1-30`; `exception_handler` `:148-164`;
   `create_queue_impl` `:878-905`
@@ -1242,7 +1248,7 @@ Found by reading after commit 4 passed on both cards. Landed as `095adc712`.
   - queue and context constructions: `:24803`, `:31316-31317`, `:33539`, `:33549`, `:34726`, `:34794`, `:45971`,
     `:58660`, `:73599-73600`, `:73797-73798`, `:73820`, `:80611-80612`, `:100241-100242`, `:106138-106140`
   - drains: `:24818`, `:46123`, `:73646`, `:96756`
-  - `moe_sycl_event_terminal` and its construction: `:109442-109478`, `:109592`
+  - `moe_sycl_event_terminal`: **not changed** (decision 12). The contract's claim E reads it.
 - Modify: `ggml/src/ggml-sycl/unified-cache.cpp:6388-6389`, `:6415-6416`, `:12727`, `:12749-12750`
 - Modify: `ggml/src/ggml-sycl/expert-prefetch.cpp:57-59`, `ggml/src/ggml-sycl/moe-stream-plan.cpp:285`
 - Modify: `docs/plans/data/2026-11-16-no-crash-census.md:50` (the kjoc row)
@@ -1254,7 +1260,7 @@ process on an asynchronous error: those with no handler, and those built with `q
 - routes every construction through `ggml_sycl_make_queue` / `ggml_sycl_make_context` / `ggml_sycl_async_handler`;
 - makes the last drain before each early-destroyed queue a `wait_and_throw`, so its errors reach the handler instead of
   being dropped (fact f);
-- makes the retained-graph terminal deny success after a failure;
+- pins that the retained-graph terminal reports only "finished" (decision 12; it already does);
 - pins all of it with a source contract.
 
 **Acceptance Criteria:**
@@ -1283,9 +1289,9 @@ ggml_sycl_async_handler.
      ggml_sycl_make_context( or ggml_sycl_async_handler(. dpct/helper.hpp's create_queue_impl may pass `eh` (claim D).
   D. dpct/helper.hpp defines no exception_handler, never assigns `eh = exception_handler`, and installs
      ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED) in both create_queue_impl overloads.
-  E. moe_sycl_event_terminal takes its cursor at construction, the retained graphs' publication snapshots it per
-     device before any replay is submitted, and ready() denies success once the latch moved, after a wait_and_throw
-     on the complete event.
+  E. moe_sycl_event_terminal reports only that its event is complete: the class reads no failure latch, and its
+     ready() makes no wait. Whether the work succeeded is the latch's to say, at a boundary that drained on its own
+     thread (decision 12 of the async-failure spec).
   F. The last drain of each queue destroyed before process exit is a wait_and_throw: the test's ccs queue, the shared
      readback's kernel copy, the split merge events, and the pipeline copy queues freed in ggml_backend_sycl_free.
 """
@@ -1363,8 +1369,7 @@ def semantic(files):
     helper = texts.get("dpct/helper.hpp", "")
     sycl = texts.get("ggml-sycl.cpp", "")
     term = body(sycl, "class moe_sycl_event_terminal final")
-    t_wait = term.find("event->wait_and_throw();")
-    t_since = term.find("return !ggml_sycl_async_failure_since(cursor_);")
+    term_ready = body(term, "bool ready() const noexcept override")
     merge = body(sycl, "static void split_merge_drain()")
     free_fn = body(sycl, "static void ggml_backend_sycl_free(ggml_backend_t backend)")
     return {
@@ -1372,11 +1377,8 @@ def semantic(files):
             not re.search(r"\beh\s*=\s*exception_handler\b", helper),
         "D both overloads install the shared handler":
             helper.count("ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED)") >= 2,
-        "E terminal cursor at construction":
-            "explicit moe_sycl_event_terminal(ggml_sycl_async_failure_cursor cursor)" in term,
-        "E ready denies after the latch moved": 0 <= t_wait < t_since,
-        "E publication snapshots before replay":
-            "std::make_shared<moe_sycl_event_terminal>(ggml_sycl_async_failure_snapshot(device))" in sycl,
+        "E terminal reports finished only": bool(term_ready) and "ggml_sycl_async_failure" not in term and
+            "wait" not in term_ready,
         "F ccs drains with wait_and_throw": "ccs.wait_and_throw();" in sycl and not re.search(r"\bccs\.wait\(\);", sycl),
         "F readback kernel copy drains with wait_and_throw": not re.search(
             r"\bev\.wait\(\);\s*std::memcpy\(dst \+ offset, host_stage, chunk\);", sycl),
@@ -1410,11 +1412,14 @@ def main():
             "unhandled new queue": files + [("mutant.cpp", "void f(sycl::device dev) { auto * q = new sycl::queue(dev, props); }")],
             "dpct handler back": mutate(files, "dpct/helper.hpp",
                                         "ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED)", "exception_handler"),
-            "terminal ignores the latch": mutate(files, "ggml-sycl.cpp",
-                                                 "return !ggml_sycl_async_failure_since(cursor_);", "return true;"),
-            "terminal cursor after replay": mutate(
-                files, "ggml-sycl.cpp", "std::make_shared<moe_sycl_event_terminal>(ggml_sycl_async_failure_snapshot(device))",
-                "std::make_shared<moe_sycl_event_terminal>(ggml_sycl_async_failure_cursor{})"),
+            "terminal reads the latch": mutate(
+                files, "ggml-sycl.cpp", "return event_->get_info<sycl::info::event::command_execution_status>() ==",
+                "return !ggml_sycl_async_failure_since({}) && "
+                "event_->get_info<sycl::info::event::command_execution_status>() =="),
+            "terminal waits in ready": mutate(
+                files, "ggml-sycl.cpp", "return event_->get_info<sycl::info::event::command_execution_status>() ==",
+                "event_->wait_and_throw();\n"
+                "            return event_->get_info<sycl::info::event::command_execution_status>() =="),
             "plain wait before destruction": mutate(files, "ggml-sycl.cpp", "ccs.wait_and_throw();", "ccs.wait();"),
         }
         for name, mutant in mutants.items():
@@ -1433,8 +1438,8 @@ Register it in `tests/CMakeLists.txt` directly after 7a's `test-sycl-async-failu
 timeout.
 
 Run: `python3 tests/test-sycl-async-handler-source.py --self-test; echo "rc=$?"`. Expected RED: 22 claim-C lines, one
-per construction site in the table below; the dpct overloads are covered by claim D, not C. Then the nine D, E and F
-claim names, and `rc=1`. This was checked before 7a, against the tree at `7809ffac8`, plus the two execution-queue lines
+per construction site in the table below; the dpct overloads are covered by claim D, not C. Then the six D and F
+claim names, and `rc=1` (claim E holds already: the terminal is not changed; its two mutants are what test it). This was checked before 7a, against the tree at `7809ffac8`, plus the two execution-queue lines
 that 7a removes. After the table's edits, the dpct edit, the terminal edit and the four drain edits were applied to a
 scratch copy, both this contract and 7a's passed with `--self-test`. Read the list against the table. A hit that is
 not a construction is a scanner bug: fix the scanner and add a mutant for the fix. A construction the table lacks is a
@@ -1514,64 +1519,12 @@ None of these edits adds a wait. Each changes an existing wait so that it delive
 its current result: `ggml_sycl_readback_via_shared_kernel` still returns true after a delivered error. The latch fails
 the device at its next boundary, which is the same accepted one-graph window.
 
-**`moe_sycl_event_terminal`** (`:109442-109478`). One terminal per device is created when the retained graphs are
-published, in `moe_graph_retention_publish` (`:109590-109597`). It is re-armed after each replay's submission, in
-`moe_graph_retention_finish_replay` (`:109640-109642`). All four replay sites (`:107197-107208`, `:109992-110007`,
-`:111210-111220`, `:111467-111528`) follow begin -> `graph_exec_submit` -> finish, and `arm` runs after the
-submission. A cursor taken at `arm` would therefore come after the submission it guards. A cursor taken at each
-replay's begin would let a failure of replay k, delivered after replay k+1 begins, be absorbed into k+1's cursor. The
-point before the first submission is construction: `publish` runs after recording and before any replay of the
-published graphs. Recorded sequence graphs are explicitly not submitted in their recording token (`:109981-109984`).
-So the cursor is taken per device at construction:
-
-```cpp
-class moe_sycl_event_terminal final : public ggml_sycl::moe::device_terminal {
-  public:
-    // Taken when the retained graphs are published, before any replay of them is submitted. Once this device latches
-    // a failure, a replay may have run on inputs that were never produced (a failed command does not cancel its
-    // dependents), so the terminal never reports success again.
-    explicit moe_sycl_event_terminal(ggml_sycl_async_failure_cursor cursor) : cursor_(cursor) {}
-
-    bool ready() const noexcept override {
-        std::optional<sycl::event> event;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!event_.has_value()) {
-                return true;  // nothing was submitted under this terminal
-            }
-            event = event_;
-        }
-        try {
-            if (event->get_info<sycl::info::event::command_execution_status>() !=
-                sycl::info::event_command_status::complete) {
-                return false;
-            }
-            // "complete" says the command ended, not that it succeeded; a status query never delivers an error.
-            // This wait does not block (the event is complete) and delivers a pending error to the queue's handler.
-            event->wait_and_throw();
-        } catch (...) {
-            return false;
-        }
-        return !ggml_sycl_async_failure_since(cursor_);
-    }
-
-    void wait() noexcept override {
-        // unchanged
-    }
-
-    void arm(sycl::event event) {
-        // unchanged
-    }
-
-  private:
-    mutable std::mutex                   mutex_;
-    std::optional<sycl::event>           event_;
-    const ggml_sycl_async_failure_cursor cursor_;
-};
-```
-
-At `:109592`, replace `auto terminal = std::make_shared<moe_sycl_event_terminal>();` with
-`auto terminal = std::make_shared<moe_sycl_event_terminal>(ggml_sycl_async_failure_snapshot(device));`.
+**`moe_sycl_event_terminal`: no edit (amended 2026-11-22, decision 12).** This section first gave the class a
+cursor taken at publication and a `ready()` that waited on the complete event and then read the latch. Task 7d
+measured why a terminal cannot do that (fact (i)): a wait on one thread can return while another thread is still
+delivering the queue's errors, so the latch read after it can miss the failure. The class stays as it is, "the
+event is complete", and a replay's failure is reported by the context's next boundary, which drains the
+execution queue the replays are submitted on.
 
 **Census row**, `docs/plans/data/2026-11-16-no-crash-census.md:50`. Replace the `kjoc` row with:
 

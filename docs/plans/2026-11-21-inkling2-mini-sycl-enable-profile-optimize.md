@@ -2099,8 +2099,9 @@ none blocking; quality re-review by a fresh reviewer PASS with four nits; all cl
 **Full specification:** `docs/plans/2026-11-21-inkling2-task-7a-7b-async-failure.md`.
 
 **What it does:** every other queue and context the backend builds goes through the same two constructors; dpct's
-print-and-drop handler is removed; the second terminal class (`moe_sycl_event_terminal`) stops treating "complete" as
-success after a latched failure; a source contract with a mutant fails on any new queue built without the handler;
+print-and-drop handler is removed; the second terminal class (`moe_sycl_event_terminal`) is left as it is and the
+contract pins that it reports only "finished" (amended 2026-11-22: decision 12 withdrew the edit that made it
+deny success); a source contract with a mutant fails on any new queue built without the handler;
 the llama.cpp-kjoc row of the no-crash census is updated.
 
 **Done when:** the source contract and its mutants pass, the full build succeeds, and the lead's Mistral B70 and
