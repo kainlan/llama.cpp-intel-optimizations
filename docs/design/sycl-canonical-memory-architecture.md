@@ -1466,9 +1466,9 @@ The target lock inventory and mandatory order is concrete:
 |---|---|---|
 | L1 | planned `lifecycle_registry_mutex`; current `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
-| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
-| L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex`, the placement-plan publication lock `g_lifecycle_plan_mutex` (`unified-cache.cpp`) | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
+| L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, the MoE MMID workspace registry's `moe_mmid_workspace_registry::state::mutex` (`moe-mmid-workspace.cpp`) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the MMID workspace pools' `registry_pool_state::mutex` and `moe_mmid_workspace_pool::state::mutex` (`moe-mmid-workspace.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1536,6 +1536,50 @@ mutex while waiting; their callers hold no other listed lock.
 records whether its thread holds the store mutex (`retained_store_mutex_held()`,
 a `GGML_SYCL_PRIVATE_TESTING` witness kept by the mutex's one lock type,
 `retained_store_lock`), and the run fails if any did.
+
+`g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the staged, probe and
+published placement-plan snapshots. It is **L3**. The runtime context
+transaction, the expert loan and refill transactions, plan activation,
+republication and owner teardown take it under the L1 `g_tensor_inventory_mutex`.
+Load begin and end, the load-time measure and unload take it under no listed
+lock. The bound-load-candidate reads behind `global_placement_plan_owner()` and
+`acquire_bound_load_effect()` take it only on a thread bound to a load. The cache
+functions take that effect before their own cache locks. Under it,
+`lifecycle_replace_placement_plan` calls the MMID registry's `replace_plan`,
+which takes the registry mutex and then the pool mutexes. Nothing else is taken
+under it. A snapshot it drops holds a plain-data plan, so that destructor takes
+no lock. It is never taken under `g_sycl_graph_compute_mutex` or an L3 lock,
+which leaves it room at L3 as a global.
+
+The MMID workspace registry's `moe_mmid_workspace_registry::state::mutex`
+(`moe-mmid-workspace.cpp`, one process registry) is **L4**. It cannot take L3 or a
+lower-numbered rank, because two kinds of site take it while holding an L3 lock.
+
+- `ggml_sycl_mul_mat_id`'s exact-queue lookup, admission and quarantine recovery
+  run under `g_sycl_graph_compute_mutex` and `sycl_ctx->graph_mutex`.
+- The plan replacement above holds `g_lifecycle_plan_mutex`.
+
+It is also taken under L1 alone, by the context bind's follows question and
+reconcile and by the runtime transaction's materialization and retire. Load end,
+unload and the bind's own retire take it under no listed lock. Under it, each
+context's pool mutexes are taken in ascending owner-device order. No L1-L4 lock
+is taken under it.
+
+Two existing paths still break this section's prohibitions under the registry
+mutex. Both are known non-conformances, not exemptions.
+
+- `replace_plan`'s prepared-replacement erase, and
+  `recover_quarantined`'s retired-context sweep, can drop the last owner of a
+  context's pools. The final `mem_handle` destructors then take the free path's
+  L5 locks under the registry mutex.
+- `recover_quarantined(wait=true)` waits on a queue-quiescence proof under the
+  registry and pool mutexes.
+
+The pool mutexes (`registry_pool_state::mutex`, and the standalone
+`moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
+take no listed lock themselves. A slot's quarantine release under them can drop
+a graph retention record or an admission authority, which is the same
+final-owner case.
 
 The zone-reset escape audit's `zone_audit_state::mutex` (`unified-cache.cpp`,
 `iiff` Phase 0) guards the per-site inventory the `GGML_SYCL_ZONE_RESET_AUDIT`
