@@ -1404,6 +1404,56 @@ removed; the first abort restored. The claims fail before the change.
 `sycl: MUL_MAT and MUL_MAT_ID decline what no route reads; prompt staging refuses instead of aborting`
 (`ggml-sycl.cpp`, the contract).
 
+**DONE 2026-11-22, merged as `0c698019b`** (task commits `dffdfbedb..4cb961040`, logs `90c3643dd`). Spec review
+PASS with one should-fix; quality review PASS with five findings; two fix rounds, the last re-reviewed by a
+fresh reviewer. The spec review ruled the implementer's seven deviations from the GREEN text within the task's
+intent.
+
+*What landed, beyond the text above:*
+- `supports_op` asks the dispatch's own answers instead of restating them:
+  `ggml_sycl_bin_bcast_types_supported` for the seven type triples the kernel chain has, and
+  `ggml_sycl_mul_mat_src1_has_reader`, which asks the route classifier with the dispatch's environment.
+- *Fix round 1, from the spec review:* the orchestrator's unified-kernel arm (on by default for Q4_0 and MXFP4)
+  reads src1 as float with no type check, so a one-plane F16 or BF16 src1 was admitted and read as float. The
+  CPU backend declines the same shape, so `test-backend-ops` compared nothing. The arm's condition is now
+  `ggml_sycl_mul_mat_takes_unified_arm`, called by `UnifiedMatmulOrchestrator::select` and by `supports_op`.
+  The batched f16 routes admit a src1 type only if the strided converter has it (F32 and BF16; a quantized
+  or integer src1 reached `GGML_ASSERT(to_fp16_nc_sycl != nullptr)`).
+- *Fix round 2, from the quality review:* the contract requires the two per-expert staging sites to be
+  `GGML_ABORT` calls, not only to carry the message (Task 6f-5 turns them into refusals once an unwind keeps
+  its leases); the predicate asks the weight type before the uncached device query; the reader's comment says
+  what each arm reads.
+
+*How regressions were looked for.* The census could not show them: on the parent the ops aborted part-way, so
+its OK counts are lower bounds. `test-backend-ops support -b SYCL0` calls only `supports_op` on unallocated
+graphs, so it lists a verdict for all 24,649 cases on any build without running a kernel. Parent against
+task, same case list:
+
+| newly declined | cases | on the parent build |
+|---|---|---|
+| `ADD`, `f8_e4m3` with an F32 src1 | 6 lines, 3 distinct | aborts, `binbcast.cpp:989` (run once) |
+| `MUL_MAT`, F16 src1 with several planes | 116 | aborts at the F32-or-one-plane assert (first case run once) |
+| `MUL_MAT`, Q4_0 or MXFP4 with a one-plane F16 src1 | 4 | read as float; the CPU declines them too |
+| `MUL_MAT_HADAMARD` | 1 | aborts at the same assert (run once) |
+| `MUL_MAT_ID`, `m_v=80` (expert table in a strided view) | 1 | FAIL |
+
+Two `REPEAT` cases are newly admitted and pass. Three one-plane F16 `MUL_MAT` cases that pass on the parent
+are still admitted. Nothing that passed is declined.
+
+*Device results, B50 unless said, one run per arm per build, zero kernel fault lines, `Shmem` 9 GB:*
+- At `232ebf50d`: `-o ADD`, `SUB`, `MUL`, `DIV` rc 0 with 129, 106, 107 and 106 OK (the census aborted at 78,
+  68, 68, 68); the BF16 `[1,1,8,1]` case prints OK in all four. `-o REPEAT` rc 0, 18 OK. `CONV_1D_DW` rc 0:
+  F32 and F16 kernels OK, BF16 `not supported`. A5 prints FAIL, rc 1, with `[MoE] prompt F32 activation
+  staging refused` and no abort, `Shmem` 9 GB before and after. `m_v=80` prints `not supported`. Mistral gates
+  pass on both cards; the GPT-OSS B50 gate without `-c` rc 0, one answer line, no device loss.
+- At `804055691` and again at `4cb961040`: the `support` list (above; identical on the two builds), `-o MUL_MAT -p
+  '^(?!.*weights=1$)'` with 1,993 OK and one FAIL, the F2 case of Task 6g, no abort; the Mistral gate passes.
+
+*Left open, each recorded as its own task:* the two staging sites inside the per-expert loop and the existing
+throw beside them (Task 6f-5); a one-plane non-F32 src1 for a reordered weight (Task 6f-6). *Accepted:* three
+commits of this task left a source contract red until a later commit of the same task; a contract update
+belongs in the commit that breaks it.
+
 ---
 
 ### Task 6f-3: The f16 dequant arm takes an SOA plane from the owner the resolver names (A3)
