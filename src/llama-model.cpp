@@ -3689,8 +3689,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
             // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
-            // a SYCL_Mapped buffer is the file's pages, which the tier locks itself under -lm mmap+mlock
-            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf) && !is_sycl_mapped) {
+            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
                 std::vector<ggml_backend_buffer_t> lock_bufs;
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     if (t->buffer != nullptr && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {

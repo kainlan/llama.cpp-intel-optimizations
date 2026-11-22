@@ -63,7 +63,8 @@ The §4.3 loader sites (lml = src/llama-model-loader.cpp, lm = src/llama-model.c
       only, so SYCL_Mapped is never demoted;
   L7. buffer creation: a SYCL_Mapped context's buffers come from mapped_buffer_from_file per file, with the record's
       excluded_for_file(idx) as its lazy ranges, never from ggml_backend_alloc_ctx_tensors_from_buft; the mlock_bufs
-      block skips SYCL_Mapped buffers, which lock through the tier;
+      block, which a SYCL_Mapped buffer (locked through the tier) must not reach, sits in a later arm of the chain the
+      SYCL_Mapped branch opens and asks !ml.no_alloc;
   L8. lm's use_mmap clear is narrowed to a SYCL load whose fact is false (!ml.sycl_load_maps_files(): a build without
       the tier);
   L9. init_mappings: prefetch 0 on a SYCL load (landed before this change; kept here as the §4.3 row);
@@ -558,11 +559,43 @@ def clause_l7_buffer_creation(t: dict) -> list:
         if not re.search(r"sycl_mapped_base_offsets\s*\[\s*buf\s*\]\s*=\s*\{\s*idx\s*,", mapped):
             problems.append("the SYCL_Mapped branch does not record each buffer's file and base offset for "
                             "load_all_data")
-    lock = re.search(r"if\s*\(\s*use_mlock\s*&&\s*(?:!\s*ml\s*\.\s*no_alloc\s*&&\s*)?ggml_backend_buffer_is_host"
-                     r"\s*\(\s*buf\s*\)([^)]*)\)", region)
-    if not lock or "is_sycl_mapped" not in lock.group(1):
-        problems.append("the mlock_bufs block does not skip SYCL_Mapped buffers")
+    # A SYCL_Mapped buffer locks through the tier. The mlock_bufs block keeps it out by where it sits, not by a test of
+    # its own: it is a later arm of the chain the SYCL_Mapped branch opens, so a mapped buffer outside no_alloc never
+    # reaches it, and it asks !ml.no_alloc, so a no_alloc one never does either.
+    lock = re.search(r"if\s*\(\s*use_mlock\s*&&\s*!\s*ml\s*\.\s*no_alloc\s*&&\s*ggml_backend_buffer_is_host"
+                     r"\s*\(\s*buf\s*\)", region)
+    if not lock:
+        problems.append("the mlock_bufs block does not ask !ml.no_alloc, so a no_alloc SYCL_Mapped buffer reaches it")
+    elif branch and not in_later_chain_arm(region, region.index("{", branch.start()), lock.start()):
+        problems.append("the mlock_bufs block is not in a later arm of the SYCL_Mapped branch's if-chain, so a "
+                        "SYCL_Mapped buffer reaches it")
     return problems
+
+
+def in_later_chain_arm(text: str, open_idx: int, pos: int) -> bool:
+    """True when `pos` lies inside an `else` or `else if` block of the if-chain whose first block opens at
+    text[open_idx] == '{'."""
+    close = open_idx + 1 + len(balanced(text, open_idx))
+    while True:
+        step = re.match(r"\s*else\b\s*", text[close + 1:])
+        if not step:
+            return False
+        i = close + 1 + step.end()
+        if re.match(r"if\b", text[i:]):
+            depth, j = 0, text.find("(", i)
+            while 0 <= j < len(text):
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                if depth == 0:
+                    break
+                j += 1
+            i = j + 1
+        brace = re.match(r"\s*\{", text[i:])
+        if not brace:
+            return False
+        arm = i + brace.end() - 1
+        close = arm + 1 + len(balanced(text, arm))
+        if arm < pos < close:
+            return True
 
 
 def clause_l8_narrowed_use_mmap_clear(t: dict) -> list:
@@ -1032,9 +1065,12 @@ MUTANTS = [
                     "GGML_SYCL_HOST_BACKING_FILE_MAPPED)")),
     ("the override's select_weight_buft drops create_tensor's answer", "L3",
      lambda t: _mut(t, LML, r"(buft_list_cpu\s*,\s*false\s*,\s*)planned_file_mapped\s*\)", r"\1false)")),
-    ("the mlock block locks SYCL_Mapped buffers", "L7",
-     lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*(?:!\s*ml\s*\.\s*no_alloc\s*&&\s*)?"
-                           r"ggml_backend_buffer_is_host\s*\(\s*buf\s*\))[^)]*\)", r"\1)")),
+    ("the mlock block locks a no_alloc SYCL_Mapped buffer", "L7",
+     lambda t: _mut(t, LM, r"(if\s*\(\s*use_mlock\s*&&\s*)!\s*ml\s*\.\s*no_alloc\s*&&\s*"
+                           r"(ggml_backend_buffer_is_host\s*\(\s*buf\s*\))", r"\1\2")),
+    ("the mlock block leaves the SYCL_Mapped branch's if-chain", "L7",
+     lambda t: _mut(t, LM, r"\}\s*else\s+if\s*\(\s*\(\s*ml\s*\.\s*use_mmap\s*\|\|\s*is_lazy_mapped\s*\)",
+                    "} if ((ml.use_mmap || is_lazy_mapped)")),
     ("the SYCL_Mapped branch records a buffer's base offset without its file", "L7",
      lambda t: _mut(t, LM, r"sycl_mapped_base_offsets\s*\[\s*buf\s*\]\s*=\s*\{\s*idx\s*,",
                     "sycl_mapped_base_offsets[buf] = { 0,")),
