@@ -5,17 +5,22 @@ Without a handler an asynchronous error reaches the runtime's default handler, w
 handler printed and dropped it. ggml_sycl_make_queue / ggml_sycl_make_context (common.cpp) install
 ggml_sycl_async_handler.
 
-  C. Every construction in the backend's non-test sources -- `new sycl::queue|context`, `make_unique|make_shared<
-     sycl::queue|context>`, a `sycl::queue|context(...)` or `{...}` temporary, a named `sycl::queue|context x(...)` or
-     `x{...}`, and an `emplace(` on an optional queue -- has, in its statement, ggml_sycl_make_queue(,
-     ggml_sycl_make_context( or ggml_sycl_async_handler(. dpct/helper.hpp's create_queue_impl may pass `eh` (claim D).
+  C. Every construction in the backend's non-test sources -- `new sycl::queue|context`, `make_unique|make_shared|
+     make_optional|allocate_shared<sycl::queue|context>`, a `sycl::queue|context(...)` or `{...}` temporary, a named
+     `sycl::queue|context x(...)`, `x{...}` or `x = {...}`, and an `emplace(` on an optional queue -- has, in its
+     statement, ggml_sycl_make_queue(, ggml_sycl_make_context( or ggml_sycl_async_handler(. dpct/helper.hpp's
+     create_queue_impl may pass `eh` (claim D).
+     Outside the scanner: member initializers, `emplace_back` on a container, constructions spelled without `sycl::`
+     (`using namespace sycl`), and an unhandled construction in a statement that also makes a handled call.
   D. dpct/helper.hpp defines no exception_handler, never assigns `eh = exception_handler`, and installs
      ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED) in both create_queue_impl overloads.
   E. moe_sycl_event_terminal reports only that its event is complete: the class reads no failure latch, and its
      ready() makes no wait. Whether the work succeeded is the latch's to say, at a boundary that drained on its own
      thread (decision 12 of the async-failure spec).
-  F. The last drain of each queue destroyed before process exit is a wait_and_throw: the test's ccs queue, the shared
-     readback's kernel copy, the split merge events, and the pipeline copy queues freed in ggml_backend_sycl_free.
+  F. Four drains are a wait_and_throw, each scoped to the function it is in, with no plain wait() left beside it: the
+     last drain of the test's ccs queue and of the shared readback's fresh queue (its kernel copy), both destroyed at
+     the end of their scope; the split merge events, which are on the execution queue and are drained before the merge
+     ring is freed; and the pipeline copy queues, drained before ggml_backend_sycl_free deletes them.
 """
 import re
 import sys
@@ -26,9 +31,10 @@ SYCL = ROOT / "ggml/src/ggml-sycl"
 
 CONSTRUCTIONS = [
     re.compile(r"\bnew\s+sycl::(queue|context)\b"),
-    re.compile(r"\bmake_(unique|shared)\s*<\s*sycl::(queue|context)\s*>\s*\("),
+    re.compile(r"\b(make_(unique|shared|optional)|allocate_shared)\s*<\s*sycl::(queue|context)\s*>\s*\("),
     re.compile(r"\bsycl::(queue|context)\s*[({]"),
     re.compile(r"\bsycl::(queue|context)\s+[A-Za-z_]\w*\s*[({]"),
+    re.compile(r"\bsycl::(queue|context)\s+[A-Za-z_]\w*\s*=\s*\{"),  # copy-list initialization: sycl::queue q = { dev }
     re.compile(r"\b\w*queue_?\s*\.\s*emplace\s*\("),  # an optional queue member: timing_queue_.emplace(
 ]
 # A function declared or defined to return a queue or context by value, not a construction.
@@ -49,18 +55,44 @@ def statement(text, pos):
     return text[pos:end if end >= 0 else len(text)]
 
 
-def body(text, signature):
+def body_span(text, signature):
+    # The (start, end) of the body of the first definition matching `signature`; a declaration (a ";" before the
+    # next "{") is skipped. (-1, -1) when there is none, so a claim on a renamed function fails instead of passing.
     start = text.find(signature)
-    if start < 0:
-        return ""
-    open_at = text.find("{", start)
-    depth = 0
-    for i in range(open_at, len(text)):
-        depth += text[i] == "{"
-        depth -= text[i] == "}"
-        if depth == 0:
-            return text[open_at:i + 1]
-    return ""
+    while start >= 0:
+        open_at = text.find("{", start)
+        semi = text.find(";", start)
+        if open_at >= 0 and (semi < 0 or open_at < semi):
+            depth = 0
+            for i in range(open_at, len(text)):
+                depth += text[i] == "{"
+                depth -= text[i] == "}"
+                if depth == 0:
+                    return open_at, i + 1
+            return -1, -1
+        start = text.find(signature, start + 1)
+    return -1, -1
+
+
+def body(text, signature):
+    begin, end = body_span(text, signature)
+    return text[begin:end] if begin >= 0 else ""
+
+
+# The functions each claim-F drain lives in, and the drain's wait as a whitespace-tolerant pattern over its receiver.
+CCS_FN = "std::string test_expert_refill_keeps_the_per_graph_refill_after_an_engaged_prompt()"
+READBACK_FN = "static bool ggml_sycl_readback_via_shared_kernel("
+MERGE_FN = "static void split_merge_drain()"
+FREE_FN = "static void ggml_backend_sycl_free(ggml_backend_t backend)"
+
+
+def wait_call(receiver, throwing):
+    return re.compile(receiver + r"\s*(\.|->)\s*" + ("wait_and_throw" if throwing else "wait") + r"\s*\(\s*\)")
+
+
+def drains_with_throw(fn_body, receiver):
+    # The drain is a wait_and_throw, and no plain wait() on the same receiver is left in the function.
+    return bool(wait_call(receiver, True).search(fn_body)) and not wait_call(receiver, False).search(fn_body)
 
 
 def violations(name, text):
@@ -92,8 +124,6 @@ def semantic(files):
     sycl = texts.get("ggml-sycl.cpp", "")
     term = body(sycl, "class moe_sycl_event_terminal final")
     term_ready = body(term, "bool ready() const noexcept override")
-    merge = body(sycl, "static void split_merge_drain()")
-    free_fn = body(sycl, "static void ggml_backend_sycl_free(ggml_backend_t backend)")
     return {
         "D no dpct exception_handler": not re.search(r"\binline\s+auto\s+exception_handler\b", helper) and
             not re.search(r"\beh\s*=\s*exception_handler\b", helper),
@@ -101,12 +131,11 @@ def semantic(files):
             helper.count("ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED)") >= 2,
         "E terminal reports finished only": bool(term_ready) and "ggml_sycl_async_failure" not in term and
             "wait" not in term_ready,
-        "F ccs drains with wait_and_throw": "ccs.wait_and_throw();" in sycl and not re.search(r"\bccs\.wait\(\);", sycl),
-        "F readback kernel copy drains with wait_and_throw": not re.search(
-            r"\bev\.wait\(\);\s*std::memcpy\(dst \+ offset, host_stage, chunk\);", sycl),
-        "F split merge events drain with wait_and_throw": "e.wait_and_throw();" in merge and "e.wait();" not in merge,
+        "F ccs drains with wait_and_throw": drains_with_throw(body(sycl, CCS_FN), r"\bccs"),
+        "F readback kernel copy drains with wait_and_throw": drains_with_throw(body(sycl, READBACK_FN), r"\bev"),
+        "F split merge events drain with wait_and_throw": drains_with_throw(body(sycl, MERGE_FN), r"\be"),
         "F freed pipeline copy queues drain with wait_and_throw":
-            "g_pipeline_copy_queue[d]->wait_and_throw();" in free_fn and "g_pipeline_copy_queue[d]->wait();" not in free_fn,
+            drains_with_throw(body(sycl, FREE_FN), r"\bg_pipeline_copy_queue\s*\[[^\]]*\]"),
     }
 
 
@@ -121,6 +150,26 @@ def mutate(files, name, old, new):
     if out == files:
         raise SystemExit(f"self-test: mutant text not found in {name}: {old!r}")
     return out
+
+
+def mutate_in(files, name, signature, old, new):
+    # As mutate, but only inside the body of `signature`, so the edit lands on the drain the claim is about.
+    out = []
+    for n, t in files:
+        if n == name:
+            begin, end = body_span(t, signature)
+            if begin < 0 or old not in t[begin:end]:
+                raise SystemExit(f"self-test: mutant text not found in {name} {signature}: {old!r}")
+            t = t[:begin] + t[begin:end].replace(old, new, 1) + t[end:]
+        out.append((n, t))
+    return out
+
+
+def append(files, name, code):
+    # A construction added to one of the scanned files.
+    if name not in dict(files):
+        raise SystemExit(f"self-test: no scanned file {name}")
+    return [(n, t + "\n" + code + "\n" if n == name else t) for n, t in files]
 
 
 def main():
@@ -142,12 +191,36 @@ def main():
                 files, "ggml-sycl.cpp", "return event_->get_info<sycl::info::event::command_execution_status>() ==",
                 "event_->wait_and_throw();\n"
                 "            return event_->get_info<sycl::info::event::command_execution_status>() =="),
-            "plain wait before destruction": mutate(files, "ggml-sycl.cpp", "ccs.wait_and_throw();", "ccs.wait();"),
+            "make_optional queue": append(
+                files, "common.cpp",
+                "void mutant_f(sycl::device dev) { auto q = std::make_optional<sycl::queue>(dev); }"),
+            "allocate_shared context": append(
+                files, "common.cpp", "void mutant_f(sycl::device dev) {\n"
+                "    auto c = std::allocate_shared<sycl::context>(std::allocator<sycl::context>(), dev);\n}"),
+            "copy-list queue": append(
+                files, "common.cpp", "void mutant_f(sycl::device dev) { sycl::queue q = { dev }; }"),
+            "copy-list context": append(
+                files, "common.cpp", "void mutant_f(sycl::device dev) { sycl::context c = { dev }; }"),
+            "ccs drain reverted": mutate_in(files, "ggml-sycl.cpp", CCS_FN, "ccs.wait_and_throw();", "ccs.wait();"),
+            "ccs drain reverted with spaces": mutate_in(
+                files, "ggml-sycl.cpp", CCS_FN, "ccs.wait_and_throw();", "ccs . wait ( );"),
+            "readback drain reverted": mutate_in(
+                files, "ggml-sycl.cpp", READBACK_FN, "ev.wait_and_throw();", "ev.wait();"),
+            "readback drain reverted behind a statement": mutate_in(
+                files, "ggml-sycl.cpp", READBACK_FN, "ev.wait_and_throw();",
+                "ev.wait();\n            const size_t mutant_bytes = chunk;\n            (void) mutant_bytes;"),
+            "split merge drain reverted": mutate_in(
+                files, "ggml-sycl.cpp", MERGE_FN, "e.wait_and_throw();", "e.wait();"),
+            "pipeline copy drain reverted": mutate_in(
+                files, "ggml-sycl.cpp", FREE_FN, "g_pipeline_copy_queue[d]->wait_and_throw();",
+                "g_pipeline_copy_queue[d]->wait();"),
         }
         for name, mutant in mutants.items():
             if not check(mutant):
                 print(f"async handler source contract: mutant '{name}' was not caught", file=sys.stderr)
                 return 1
+            print(f"async handler source contract: mutant '{name}' caught")
+        print(f"async handler source contract: {len(mutants)} mutants, every one caught")
     print("async handler source contract: PASS")
     return 0
 
