@@ -3776,6 +3776,57 @@ done
 
 ---
 
+### Task 8a: The direct route admits one input row per selected expert (found 2026-11-22)
+
+**Track:** L. **Depends on:** Task 7's bind fix (`c1628c576`); branch `task/inkling2-t8a` is cut from it and
+merges after Task 7. **Found by:** the lead's Inkling gate on the B70 at `c1628c576`, the first run in which
+the workspace is bound. `blk.0.ffn_gate_up_exps` is admitted (`[MOE-DIRECT-AUTHORITY-CANDIDATE]`); the next
+node is refused and the graph fails:
+`[MOE-DECODE-REFUSAL] tensor=blk.0.ffn_down_exps.weight ... reason=capability_unsupported type=nvfp4 layout=aos
+kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate`.
+
+**Description:** `build_moe_ffn` (`src/llama-graph.cpp`) gives the fused gate+up `MUL_MAT_ID` a src1 of
+`[n_embd, 1, n_tokens]` and the down `MUL_MAT_ID` a src1 of `[n_ff, n_expert_used, n_tokens]`. The direct
+block in `ggml_sycl_mul_mat_id` admits `ne11 == 1` in a production build and `ne11 == ids->ne[0]` only under
+the private test authorization. Traced from the code (2026-11-22): the workspace planner already sizes for
+`ne11 == top_k` (`plan_moe_mmid_workspaces`, `moe_mmid_plan_workspace`), the adapter
+`mmvq_submit_q1_nvfp4_aos_id_admitted` accepts both shapes, the kernel indexes `id % ne11`, and no commit
+message or document gives a reason for the restriction (it predates `06daafe61`, which added only the
+test-only arm). The route oracle runs `ne11 = 1` and `ne11 = 3` for both types and passes on both cards.
+
+**Ruling (lead, 2026-11-22):** production admits both shapes. This opens the kernel that exists for the
+operand where it lives; nothing is re-routed or converted. The activation copy in the block is one flat copy of
+`ne00 * ne11` floats with no contiguity check, which cannot go wrong for one row and can for several: a src1
+whose rows are strided is copied row by row on the exact queue, every copy a dependency of the kernel, no host
+wait added; a src1 whose elements are not contiguous inside a row is not admitted.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (the direct block's admission and its activation copy, the
+two comments that state what the route covers); `tests/test-sycl-moe-resolved-batch-source.py` and any other
+contract that pins the block; `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the source contract fails on the current admission line; the device test has a
+      strided-input case for `ne11 = 3` (Q1_0 and NVFP4) that the lead sees fail before the fix.
+- [ ] The string `q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]` is gone; the outer condition is
+      unchanged.
+- [ ] Lead, one run each: the oracle on both cards passes with 0 context-bind WARN lines; the Inkling gate on
+      the B70 admits `ffn_down_exps` (an `AUTHORITY-CANDIDATE` line for it) and either passes or names its next
+      refusal; the Mistral and GPT-OSS gates pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** `choose_moe_batch_executor`'s early return, prompt rows (`ne12 > 1`), host-resident
+experts, a secondary card.
+
+**Also seen in the same run, recorded for the census (not fatal):** once per graph,
+`[UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight ... model=0 type=0
+ne=[1,128,1,1]`. Traced: `stage_raw_host_source` in `binbcast.cpp` stages a small host-resident F32 weight that
+the load never preloaded; the cache refuses it in planned mode and the op then copies it into a STAGING buffer
+with a synchronous wait. The tensor is not identified yet (a weight with `model_id` 0 and 128 elements; the
+candidates are the attention clip or relative-bias tensors). It costs a host wait per op and is a placement gap
+(a weight the plan does not know); Task 8's census names the tensor and writes its task.
+
+---
+
 ### Task 9: Stage 1 exit gates
 
 **Track:** L (lead; GPU)
