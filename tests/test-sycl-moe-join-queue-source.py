@@ -58,7 +58,8 @@ THE CONTRACT.  With comments blanked:
      the token went on the join queue: each join is counted by where it went, under the
      trace only, and the counts are reset with the token's.
   O. (unified-cache) the cache owns the join queue: a unique_ptr member made once under
-     std::call_once, in_order, without enable_profiling, on queue_'s context and device,
+     std::call_once through ggml_sycl_make_queue (so it carries the recording async
+     handler), in_order, without enable_profiling, on queue_'s context and device,
      and drained by drain_all_queues_noexcept.
   D. (ggml-sycl.cpp flush_pending_cpu_scatter_slot) the scatter still depends on the
      join events (compact, per-run copies, flagged), the job buffers are still retained
@@ -394,10 +395,13 @@ def check_owner(cache_hpp: str, cache_cpp: str) -> None:
     code = blank_comments(cache_cpp)
     body, _ = body_of(code, GET_QUEUE_SIG, "O")
     once = re.search(r"std::call_once\s*\(\s*moe_join_queue_once_", body)
-    make = re.search(r"moe_join_queue_\s*=\s*std::make_unique\s*<\s*sycl::queue\s*>\s*\(\s*queue_\.get_context\s*\(\s*\)"
-                     r"\s*,\s*queue_\.get_device\s*\(\s*\)\s*,\s*sycl::property::queue::in_order\s*\{\s*\}\s*\)\s*;", body)
+    make = re.search(r"moe_join_queue_\s*=\s*std::make_unique\s*<\s*sycl::queue\s*>\s*\(\s*ggml_sycl_make_queue\s*\(\s*"
+                     r"queue_\.get_context\s*\(\s*\)\s*,\s*queue_\.get_device\s*\(\s*\)\s*,\s*"
+                     r"ggml_sycl_get_device_id_from_queue\s*\(\s*queue_\s*\)\s*,\s*"
+                     r"sycl::property_list\s*\{\s*sycl::property::queue::in_order\s*\{\s*\}\s*\}\s*\)\s*\)\s*;", body)
     if not once or not make or make.start() < once.end():
-        fail("O", "get_moe_join_queue does not make one in-order queue on queue_'s context and device under call_once")
+        fail("O", "get_moe_join_queue does not make one in-order queue, with the recording handler, on queue_'s context and "
+                  "device under call_once")
     if "enable_profiling" in body:
         fail("O", "the join queue is profiling-enabled, which makes any status query on it a busy-wait")
     if not re.search(r"return\s+moe_join_queue_\.get\s*\(\s*\)\s*;", body):
@@ -600,12 +604,21 @@ def self_test(s: dict) -> int:
          sub(r"if \(q\.ext_oneapi_get_state\(\) == sycl::ext::oneapi::experimental::queue_state::recording\) \{",
              "if (false) {")),
         ("O", "cache_cpp", "join queue profiling-enabled",
-         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(queue_\.get_context\(\), queue_\.get_device\(\),\s*)"
-             r"sycl::property::queue::in_order\{\}\);",
-             r"\1sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} });")),
+         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(ggml_sycl_make_queue\("
+             r"[^;]*?ggml_sycl_get_device_id_from_queue\(queue_\),\s*)"
+             r"sycl::property_list\{ sycl::property::queue::in_order\{\} \}\)\);",
+             r"\1sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} }));")),
         ("O", "cache_cpp", "join queue out of order",
-         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(queue_\.get_context\(\), queue_\.get_device\(\)),\s*"
-             r"sycl::property::queue::in_order\{\}\);", r"\1);")),
+         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(ggml_sycl_make_queue\("
+             r"[^;]*?ggml_sycl_get_device_id_from_queue\(queue_\),\s*)"
+             r"sycl::property_list\{ sycl::property::queue::in_order\{\} \}\)\);",
+             r"\1sycl::property_list{}));")),
+        ("O", "cache_cpp", "join queue without the recording handler",
+         sub(r"moe_join_queue_ = std::make_unique<sycl::queue>\(ggml_sycl_make_queue\(\s*queue_\.get_context\(\), "
+             r"queue_\.get_device\(\), ggml_sycl_get_device_id_from_queue\(queue_\),\s*"
+             r"sycl::property_list\{ sycl::property::queue::in_order\{\} \}\)\);",
+             "moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),\n"
+             "                sycl::property::queue::in_order{});")),
         ("O", "cache_cpp", "join queue not drained", sub(r",\s*moe_join_queue_\.get\(\)", "")),
         ("O", "cache_hpp", "join queue not owned",
          sub(r"std::unique_ptr<sycl::queue>(\s+)moe_join_queue_;", r"sycl::queue *\1moe_join_queue_;")),
