@@ -2,10 +2,12 @@
 #include "moe-mmid-workspace.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -739,6 +741,135 @@ static void registry_retirement_retains_outstanding_lease() {
     check(destroyed.load() == 2, "device/host blobs were not destroyed after final lease");
 }
 
+// A pool blob whose destruction asks whether the registry mutex is free (canonical 12.5: no final release under a
+// registry lock). A second thread reads the registry and the destructor waits for it: under the mutex the read cannot
+// finish, and the probe counts the release as held. The probe threads are joined after the call under test returns.
+struct registry_lock_probe {
+    moe_mmid_workspace_registry * registry = nullptr;
+    std::atomic<bool>             armed{ true };  // cleared before the registry itself is destroyed
+    std::atomic<int>              released{ 0 };
+    std::atomic<int>              held{ 0 };
+    std::vector<std::thread>      readers;
+    std::mutex                    readers_mutex;
+
+    struct allocation {
+        allocation(size_t bytes, registry_lock_probe * probe) : storage(bytes + 255), probe(probe) {}
+
+        ~allocation() {
+            if (!probe->armed.load()) {
+                return;
+            }
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            {
+                std::lock_guard<std::mutex> lock(probe->readers_mutex);
+                probe->readers.emplace_back([registry = probe->registry, done] {
+                    (void) registry->published_contexts();
+                    done->store(true);
+                });
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!done->load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            if (!done->load()) {
+                probe->held.fetch_add(1);
+            }
+            probe->released.fetch_add(1);
+        }
+
+        std::vector<unsigned char> storage;
+        registry_lock_probe *      probe;
+    };
+
+    moe_mmid_blob blob(bool host, int device, size_t bytes) {
+        auto          owner = std::make_shared<allocation>(bytes, this);
+        moe_mmid_blob out;
+        out.owner           = owner;
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(owner->storage.data());
+        out.ptr             = reinterpret_cast<void *>((raw + 255) & ~uintptr_t{ 255 });
+        out.bytes           = bytes;
+        out.device          = device;
+        out.host_pinned     = host;
+        return out;
+    }
+
+    void join() {
+        std::lock_guard<std::mutex> lock(readers_mutex);
+        for (auto & reader : readers) {
+            reader.join();
+        }
+        readers.clear();
+    }
+
+    ~registry_lock_probe() { join(); }
+
+    // Declared after the registry, so it disarms the probe before the registry's own destruction releases what the
+    // registry still holds, on a failed check as well.
+    struct disarm_on_exit {
+        registry_lock_probe & probe;
+
+        ~disarm_on_exit() { probe.armed.store(false); }
+    };
+};
+
+static void registry_releases_pools_after_its_mutex() {
+    const moe_mmid_model_token token{ 47, 48, 49 };
+    {
+        // retire: the erased context held the pools' last owners.
+        registry_lock_probe         probe;
+        moe_mmid_workspace_registry registry;
+        probe.registry = &registry;
+        registry_lock_probe::disarm_on_exit disarm{ probe };
+        auto                                allocator = [&](bool host, int device, size_t bytes, size_t) {
+            return probe.blob(host, device, bytes);
+        };
+        check(registry.materialize(token, 51, 0, { owner_plan(0, 61) }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED,
+              "retire probe publish failed");
+        check(registry.retire(token, 51), "retire probe retirement failed");
+        probe.join();
+        check(probe.released.load() == 2, "retire did not release the retired context's pools");
+        check(probe.held.load() == 0, "retire released pools under the registry mutex");
+    }
+    for (const bool hand_out : { false, true }) {
+        // replace_plan's prepared replacement: the context it displaced held the pools' last owners.
+        registry_lock_probe         probe;
+        moe_mmid_workspace_registry registry;
+        probe.registry = &registry;
+        registry_lock_probe::disarm_on_exit disarm{ probe };
+        auto                                allocator = [&](bool host, int device, size_t bytes, size_t) {
+            return probe.blob(host, device, bytes);
+        };
+        auto old_plan          = std::make_shared<const lifecycle_plan_snapshot>();
+        auto new_plan          = std::make_shared<const lifecycle_plan_snapshot>();
+        int  queue_object      = 0;
+        auto owner             = owner_plan(0, 62);
+        owner.queue_capability = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 62);
+        auto changed           = owner;
+        check(registry.materialize(token, 52, old_plan, 0, { owner }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED,
+              "replace probe publish failed");
+        check(moe_mmid_plan_workspace({ 128, 96, 2, 2, 3 }, false, &changed.geometry) &&
+                  moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH, &changed.device_pool_bytes,
+                                              &changed.host_pool_bytes) &&
+                  registry.materialize(token, 53, new_plan, 0, { changed }, allocator) ==
+                      moe_mmid_materialize_status::PUBLISHED,
+              "replace probe preparation failed");
+        std::shared_ptr<void> displaced;
+        check(registry.replace_plan(old_plan, new_plan, 53, false, hand_out ? &displaced : nullptr),
+              "replace probe replacement failed");
+        probe.join();
+        if (hand_out) {
+            check(displaced != nullptr && probe.released.load() == 0,
+                  "replace_plan released the displaced context it handed out");
+            displaced.reset();
+            probe.join();
+        }
+        check(probe.released.load() == 2, "replace_plan did not release the displaced context's pools");
+        check(probe.held.load() == 0, "replace_plan released the displaced context's pools under the registry mutex");
+    }
+}
+
 struct ready_terminal final : moe::device_terminal {
     explicit ready_terminal(std::shared_ptr<std::atomic<bool>> ready) : ready_(std::move(ready)) {}
     bool ready() const noexcept override { return ready_->load(); }
@@ -1115,6 +1246,55 @@ static void model_scoped_replacement_and_retired_recovery() {
           "model A replacement invalidated model B generation ticket");
 }
 
+// recover_quarantined drops the retired contexts it recovered to idle; one can hold its pools' last owners.
+static void recovered_retired_context_releases_pools_after_the_registry_mutex() {
+    registry_lock_probe         probe;
+    moe_mmid_workspace_registry registry;
+    probe.registry = &registry;
+    registry_lock_probe::disarm_on_exit disarm{ probe };
+    auto                                allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return probe.blob(host, device, bytes);
+    };
+    int  queue_object      = 0;
+    auto queue             = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 2401);
+    auto owner             = owner_plan(0, 2401);
+    owner.queue_capability = queue;
+    const moe_mmid_model_token token{ 241, 242, 243 };
+    auto                       plan = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, 2400, plan, 0, { owner }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+          "recovery probe publish failed");
+    const std::vector<moe_mmid_admission_owner> admission_owners(1, moe_mmid_admission_owner{ 0, 2401 });
+    auto graph    = admission_request(token, 2400, admission_owners, 2402, std::make_shared<std::atomic<bool>>(false));
+    auto terminal = graph.graph_snapshot->terminals.at(0);
+    auto submission = workspace_admission_authority_test_factory::terminal(queue, 2402, terminal);
+    auto authority  = workspace_admission_authority_test_factory::direct(
+        token, 2400, 2402, 0, plan, graph.retained_occurrences, graph.table_owner, admission_owners,
+        std::vector<moe_mmid_queue_capability>(1, queue), {}, std::vector<queue_submission_authority>(1, submission));
+    const workspace_admission_shape shape{ 2, 2, 64, 96, 1 };
+    auto admitted = registry.admit(moe_mmid_authoritative_admission_request{ std::move(authority), shape });
+    check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
+          "recovery probe submitted setup failed");
+    auto replacement = std::make_shared<const lifecycle_plan_snapshot>();
+    auto changed     = owner;
+    check(moe_mmid_plan_workspace({ 128, 96, 2, 2, 3 }, false, &changed.geometry) &&
+              moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH, &changed.device_pool_bytes,
+                                          &changed.host_pool_bytes) &&
+              registry.materialize(token, 2403, replacement, 0, { changed }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED &&
+              registry.replace_plan(plan, replacement, 2403, false),
+          "recovery probe replacement did not retire the submitted context");
+    terminal->wait();
+    admitted = {};  // the submitted bundle quarantines its slots; the retired context holds the pools from here
+    graph    = {};
+    probe.join();
+    const int before = probe.released.load();
+    check(registry.recover_quarantined(token, 2400, false) == 1, "recovery probe did not recover the bundle");
+    probe.join();
+    check(registry.retired_contexts_for_test() == 0, "recovered retired context stayed in the registry");
+    check(probe.released.load() == before + 2, "recovery did not release the retired context's pools");
+    check(probe.held.load() == 0, "recovery released the retired context's pools under the registry mutex");
+}
+
 static void changed_replacement_terminal_release_gc() {
     std::atomic<int> destroyed{ 0 };
     moe_mmid_workspace_registry registry;
@@ -1343,6 +1523,8 @@ static void materialize_reason_contract() {
         moe_mmid_materialize_reason::NO_QUEUE_LIFETIME,
         moe_mmid_materialize_reason::REGISTRY_INVALID,
         moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED,
+        moe_mmid_materialize_reason::RECONCILE_REFUSED,
+        moe_mmid_materialize_reason::BIND_EXCEPTION,
     };
     constexpr size_t count = sizeof(all) / sizeof(all[0]);
 
@@ -1373,10 +1555,17 @@ static void materialize_reason_contract() {
     check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::NO_BACKEND_CONTEXT),
                       "no-backend-context") == 0,
           "NO_BACKEND_CONTEXT name changed -- the gate grep for it would fail open");
+    // The context bind's own refusals: the registry accepted, and the reconcile or the bind itself refused.
+    check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::RECONCILE_REFUSED),
+                      "reconcile-refused") == 0,
+          "RECONCILE_REFUSED name changed -- the gate grep for it would fail open");
+    check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::BIND_EXCEPTION),
+                      "bind-exception") == 0,
+          "BIND_EXCEPTION name changed -- the gate grep for it would fail open");
 }
 
-// The registry's refusal detail is what the WARN line prints after reason=registry-invalid or
-// registry-allocation-failed: every condition names itself, distinctly, and NONE is the only value a success leaves.
+// The refusal detail is what the WARN line prints after reason=registry-invalid, registry-allocation-failed,
+// reconcile-refused or bind-exception: every condition names itself, distinctly, and NONE is the only value a success leaves.
 static void materialize_refusal_names() {
     using R       = moe_mmid_materialize_refusal;
     const R all[] = {
@@ -1403,8 +1592,12 @@ static void materialize_refusal_names() {
         R::SAME_IDENTITY_OTHER_PLAN,
         R::PLAN_CHANGED_GEOMETRY_UNSTABLE,
         R::PLAN_CHANGED_REBIND_REFUSED,
+        R::PLAN_CHANGED_REBIND_NOT_FOLLOWED,
         R::DEVICE_POOL_ALLOCATION_FAILED,
         R::HOST_POOL_ALLOCATION_FAILED,
+        R::HOST_POOL_ZONES_NOT_CONFIGURED,
+        R::HOST_POOL_OVER_NO_GROWTH_BOUND,
+        R::HOST_POOL_NO_CONTIGUOUS_BLOCK,
         R::SLICE_FAILED,
         R::EXCEPTION,
     };
@@ -1660,6 +1853,51 @@ static void registry_existing_answer_allocates_nothing() {
     check(registry.published_contexts() == 1, "an answered attempt changed the published contexts");
 }
 
+// The context bind's refused materialization. An expert loan rebinds the published context in place (S1 -> S2, the
+// same identity) while the bind holds S1; the bind's attempt for S1 then meets that context as
+// same-identity-other-plan. Nothing is unresolved: the context follows the live snapshot, so the refusal is not a
+// tripwire. `follows` is computed as the backend computes it: exact_queue on the live snapshot.
+static void registry_bind_refusal_answered_by_live() {
+    using S = moe_mmid_materialize_status;
+    using R = moe_mmid_materialize_refusal;
+    const moe_mmid_model_token token{ 4601, 4602, 4603 };
+    std::atomic<int>           destroyed{ 0 };
+    auto                       allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return fake_blob(host, device, bytes, &destroyed);
+    };
+    int  queue_object           = 0;
+    auto owner                  = owner_plan(0, 4604);
+    owner.queue_capability      = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 4604);
+    constexpr uint64_t identity = 46;
+
+    moe_mmid_workspace_registry registry;
+    const moe_mmid_follows_fn   follows = [&](const std::shared_ptr<const lifecycle_plan_snapshot> & plan) {
+        return registry.exact_queue(token, plan, 0, 0, &queue_object).valid();
+    };
+    const auto first  = std::make_shared<const lifecycle_plan_snapshot>();
+    const auto second = std::make_shared<const lifecycle_plan_snapshot>();
+    const auto other  = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, identity, first, 0, { owner }, allocator) == S::PUBLISHED,
+          "the bind's publication failed");
+    check(registry.replace_plan(first, second, identity, /*stable_geometry=*/true), "the loan's rebind was refused");
+    R detail = R::NONE;
+    check(registry.materialize(token, identity, first, 0, { owner }, allocator, &detail) == S::INVALID &&
+              detail == R::SAME_IDENTITY_OTHER_PLAN,
+          "the late attempt after the rebind was not refused as same-identity-other-plan");
+    check(!moe_mmid_materialize_refusal_reported(detail, second, follows),
+          "a same-identity-other-plan refusal whose context follows the live snapshot was reported");
+    check(moe_mmid_materialize_refusal_reported(detail, other, follows),
+          "a same-identity-other-plan refusal whose context does not follow the live snapshot was not reported");
+    check(moe_mmid_materialize_refusal_reported(detail, nullptr, follows),
+          "a same-identity-other-plan refusal with no live snapshot was not reported");
+    const moe_mmid_follows_fn throws = [](const std::shared_ptr<const lifecycle_plan_snapshot> &) -> bool {
+        throw std::runtime_error("follows threw");
+    };
+    check(moe_mmid_materialize_refusal_reported(detail, second, throws), "a follows that threw answered yes");
+    check(moe_mmid_materialize_refusal_reported(R::PUBLICATION_RACED, second, follows),
+          "a refusal other than same-identity-other-plan was not reported");
+}
+
 // The context bind's reconcile (moe_mmid_reconcile_live_plan) after it published for snapshot S outside the plan
 // lock and finds P live. `followed` is computed as the backend computes it: exact_queue on the live snapshot.
 static void registry_bind_reconcile_follows_live() {
@@ -1681,8 +1919,12 @@ static void registry_bind_reconcile_follows_live() {
     const auto reconcile = [&](moe_mmid_workspace_registry &                          registry,
                                const std::shared_ptr<const lifecycle_plan_snapshot> & published,
                                const std::shared_ptr<const lifecycle_plan_snapshot> & live, bool stable) {
-        const bool followed = live.get() != published.get() && follows(registry, live);
-        return moe_mmid_reconcile_live_plan(registry, published, live, identity, stable, followed);
+        return moe_mmid_reconcile_live_plan(
+            registry, published, live, identity, stable,
+            [&](const std::shared_ptr<const lifecycle_plan_snapshot> & plan) { return follows(registry, plan); });
+    };
+    const moe_mmid_follows_fn never = [](const std::shared_ptr<const lifecycle_plan_snapshot> &) {
+        return false;
     };
     // The live snapshot is the published one.
     {
@@ -1762,8 +2004,7 @@ static void registry_bind_reconcile_follows_live() {
         check(registry.materialize(token, identity, s, 0, { owner }, allocator) == S::PUBLISHED, "first bind failed");
         const S status = registry.materialize(token, identity, s, 0, { owner }, allocator);
         check(status == S::ALREADY_PUBLISHED, "the second bind was not ALREADY_PUBLISHED");
-        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, identity, /*stable_geometry=*/false,
-                                                       /*live_followed=*/false);
+        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, identity, /*stable_geometry=*/false, never);
         check(outcome == O::GEOMETRY_UNSTABLE, "the forced not-stable reconcile did not refuse");
         check(!moe_mmid_reconcile_retires(outcome, status), "a second bind retires an earlier bind's context");
         check(registry.published_contexts() == 1 && follows(registry, s), "the earlier context did not stay");
@@ -1772,10 +2013,60 @@ static void registry_bind_reconcile_follows_live() {
     {
         moe_mmid_workspace_registry registry;
         const auto                  s = std::make_shared<const lifecycle_plan_snapshot>();
-        check(moe_mmid_reconcile_live_plan(registry, s, nullptr, identity, true, false) == O::REBIND_REFUSED &&
+        check(moe_mmid_reconcile_live_plan(registry, s, nullptr, identity, true, never) == O::REBIND_REFUSED &&
                   moe_mmid_reconcile_refusal(O::REBIND_REFUSED) ==
                       moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED,
               "a missing live snapshot did not refuse with plan-changed-rebind-refused");
+    }
+    // The published context is gone (retired between the publish and the reconcile) and no context last held S:
+    // replace_plan(S, P) accepts as a swap with nothing to rebind, and nothing follows P. The reconcile must not
+    // call that REBOUND.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s      = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p      = std::make_shared<const lifecycle_plan_snapshot>();
+        const S                     status = registry.materialize(token, identity, s, 0, { owner }, allocator);
+        check(status == S::PUBLISHED, "publish S failed");
+        check(registry.retire(token, identity) && registry.published_contexts() == 0, "the retire found nothing");
+        const O outcome = reconcile(registry, s, p, true);
+        check(outcome == O::REBIND_NOT_FOLLOWED &&
+                  moe_mmid_reconcile_refusal(outcome) == moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_NOT_FOLLOWED,
+              "an accepted rebind nothing follows reconciled as REBOUND");
+        check(moe_mmid_reconcile_retires(outcome, status), "a rebind nothing follows does not retire the publication");
+        check(!follows(registry, p), "the live snapshot is reachable with no context");
+    }
+    // An in-place rebind re-keys the published context to the live identity. When the live snapshot is then not
+    // followed (here the follows answer is no), the refused bind withdraws its publication, so its retire must name
+    // the identity the registry now holds, or the context stays accepting for the live plan.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s             = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p             = std::make_shared<const lifecycle_plan_snapshot>();
+        constexpr uint64_t          live_identity = identity + 1;
+        const S                     status        = registry.materialize(token, identity, s, 0, { owner }, allocator);
+        check(status == S::PUBLISHED, "publish S failed");
+        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, live_identity, true, never);
+        check(outcome == O::REBIND_NOT_FOLLOWED, "an in-place rebind nothing follows did not reconcile as such");
+        check(follows(registry, p), "the in-place rebind did not move the context to the live snapshot");
+        check(moe_mmid_reconcile_retires(outcome, status), "a refused in-place rebind does not retire");
+        (void) registry.retire(token, moe_mmid_reconcile_retire_identity(outcome, identity, live_identity));
+        check(!follows(registry, p) && registry.published_contexts() == 0,
+              "a refused in-place rebind left a context accepting for the live plan");
+    }
+    // Every other refusal leaves the publication under the identity it was published with.
+    check(moe_mmid_reconcile_retire_identity(O::GEOMETRY_UNSTABLE, 7, 8) == 7 &&
+              moe_mmid_reconcile_retire_identity(O::REBIND_REFUSED, 7, 8) == 7,
+          "a refusal before any rebind names the live identity");
+    // A follows answer that throws answers no.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s      = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p      = std::make_shared<const lifecycle_plan_snapshot>();
+        const moe_mmid_follows_fn   throws = [](const std::shared_ptr<const lifecycle_plan_snapshot> &) -> bool {
+            throw std::runtime_error("follows");
+        };
+        check(moe_mmid_reconcile_live_plan(registry, s, p, identity, true, throws) == O::REBIND_NOT_FOLLOWED,
+              "a throwing follows answer was not taken for no");
     }
 }
 
@@ -1813,6 +2104,7 @@ int main() {
         registry_publish_after_stable_replace_follows_live();
         registry_existing_answer_allocates_nothing();
         registry_bind_reconcile_follows_live();
+        registry_bind_refusal_answered_by_live();
         owner_admissible_only_on_an_exposed_device();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();
@@ -1831,10 +2123,12 @@ int main() {
         registry_replacement_and_queue_reset();
         registry_concurrent_depth_busy();
         registry_retirement_retains_outstanding_lease();
+        registry_releases_pools_after_its_mutex();
         registry_component_max_constituent_coverage();
         registry_atomic_bundle_authority();
         common_direct_authority_plan_queue_and_lifetime();
         model_scoped_replacement_and_retired_recovery();
+        recovered_retired_context_releases_pools_after_the_registry_mutex();
         changed_replacement_terminal_release_gc();
         registry_bundle_rollback_move_oom_and_quarantine();
         registry_destroyed_quarantine_recovery();

@@ -1903,7 +1903,7 @@ moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
     const std::shared_ptr<const lifecycle_plan_snapshot> & live,
     uint64_t                                               live_identity,
     bool                                                   stable_geometry,
-    bool                                                   live_followed) noexcept;
+    const moe_mmid_follows_fn &                            follows) noexcept;
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept;
 
 // Immutable lifecycle-owned plan snapshots. A null plan with
@@ -2008,6 +2008,11 @@ void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) n
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
+// Whether two plans plan the same MMID workspaces: the one answer to "can the pools materialized for `a` serve `b`".
+// It compares the plan-level validity, and per owner the device, depth, validity, secondary role, pool bytes and
+// the whole slot geometry (moe_mmid_same_workspace_geometry). The runtime transaction's stable_mmid, the plan CAS's
+// in-place rebind, the context bind's reconcile and the expert loan's assert all ask it.
+bool   moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
 #endif
@@ -6893,15 +6898,42 @@ struct alloc_intent {
     int               site_line = __builtin_LINE();
 };
 
+// Why unified_alloc()'s host-pinned pool path handed out no pointer.
+enum class host_zone_alloc_miss : uint8_t {
+    NONE,                  // no miss on the pinned pool path (or the request never took it)
+    ZONES_NOT_CONFIGURED,  // no zones yet, and the unzoned pinned pool had no room
+    OVER_NO_GROWTH_BOUND,  // a request that may not grow the zone would fill it past host_zone_no_growth_bound()
+    NO_CONTIGUOUS_BLOCK,   // within that bound, but no chunk of the zone has the room, and the request may not grow it
+    GROWTH_FAILED,         // no chunk had the room, and growing the zone for it failed
+};
+
+// Stable, distinct, never-null name for logs.
+const char * host_zone_alloc_miss_name(host_zone_alloc_miss miss) noexcept;
+
+// How full a request that may not grow its host zone (alloc_constraints::forbid_host_zone_growth) may bring the zone,
+// given the zone's planned reservation and its current capacity; 0 means no bound. The reservation is the planner's
+// room for the tenants it sized. That holds for STAGING, SCRATCH and KV, so their bound is the reservation even after
+// a growth-allowed request grew them. WEIGHT also holds tenants no plan sizes, the host weights the model load places
+// through the SYCL host buffer type, and the load grows the zone for them by design; its used bytes then exceed the
+// reservation while the zone has room, so its bound is its capacity, and the request still never grows it.
+size_t host_zone_no_growth_bound(host_zone_id zone, size_t reserved, size_t capacity) noexcept;
+
+// The MMID workspace refusal that names the host-zone condition the host pool's allocation missed on;
+// HOST_POOL_ALLOCATION_FAILED for a miss with no condition.
+moe_mmid_materialize_refusal moe_mmid_host_pool_refusal(host_zone_alloc_miss miss) noexcept;
+
 struct alloc_request {
-    sycl::queue * queue                = nullptr;
-    int           device               = -1;
-    size_t        size                 = 0;
-    size_t        alignment            = 0;  // 0 = allocator default; otherwise power-of-two
-    bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
-    alloc_intent  intent;
-    const char *  site_file            = __builtin_FILE();
-    int           site_line            = __builtin_LINE();
+    sycl::queue *          queue                = nullptr;
+    int                    device               = -1;
+    size_t                 size                 = 0;
+    size_t                 alignment            = 0;      // 0 = allocator default; otherwise power-of-two
+    bool                   suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
+    alloc_intent           intent;
+    // Optional: where unified_alloc() writes why its host-pinned pool path handed out no pointer (NONE otherwise),
+    // for a caller that names the condition in its own refusal.
+    host_zone_alloc_miss * host_zone_miss = nullptr;
+    const char *           site_file      = __builtin_FILE();
+    int                    site_line      = __builtin_LINE();
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,
