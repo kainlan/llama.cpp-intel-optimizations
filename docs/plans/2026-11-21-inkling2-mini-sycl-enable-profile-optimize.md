@@ -3133,6 +3133,53 @@ limit, below), generic helpers that wait on a queue their caller passes (not tra
 **Done when:** `test-sycl-async-drain-source --self-test` passes and each of its eight mutants fails, the two earlier
 contracts still pass, the full build succeeds, and the lead's Mistral B70 and GPT-OSS B50 gates pass once each.
 
+**DONE 2026-11-22, merged as `49f22d624`** (task commits `822f181f3..58fc74833`, logs `d201bd8aa`). Spec review
+PASS with no finding against the code and three against the spec's text; quality review PASS with one should-fix
+and four nits on the contract script and one gap in the spec's known limits; one fix round. The fix round was re-reviewed by a fresh reviewer: PASS, no findings.
+
+*What landed:*
+- 50 waits changed from `wait()` to `wait_and_throw()`, each in the function the spec's table names, and nothing
+  else: 34 in `ggml-sycl.cpp`, 5 each in `dense-scheduler.cpp` and `layer-streaming.cpp`, 2 each in
+  `unified-cache.cpp` and `device-pool.hpp`, 1 each in `common.cpp` and `l2-prefetch.hpp`. Both reviewers measured
+  the same number of wait calls per file before and after (411, 24, 4, 1, 5, 1, 5). The execution-queue waits
+  beside the converted ones stay plain. No `catch` block changed.
+- The dense scheduler's copy queue and the L2 prefetch queue are built through `ggml_sycl_make_queue` with the
+  same device, the same explicit context and an empty property list. With that the `kjoc` census row says `fixed:
+  every backend queue and context has the recording handler` again.
+- The spec reviewer reverted each of the 52 edits alone; the contract failed on every one. The quality reviewer
+  traced, per group of sites, which thread now runs the handler: the handler takes no backend lock and never
+  rethrows, so no site can deadlock on a mutex it holds and nothing new escapes a destructor.
+- *Fix round 1, from the quality review (contract script only, no source edit, no rebuild):* the script took a
+  function's body from the first textual match of its signature, which for the TP worker is a forward
+  declaration; a braced declaration inserted before the definition made a reverted TP wait pass. It now finds the
+  definition. Claim A matched the whole receiver, so `(*stream).wait()` escaped; it now matches the alias at the
+  end of the receiver. The self-test gained mutants for both, for claim M's L2 half and for the file-wide aliases.
+  The merged script is therefore stronger than the block in the spec, which is kept as the RED text.
+
+*Device results, one run per arm at `fa6dc37a7`, zero kernel fault lines, `Shmem` 8 GB:* the Mistral B70 gate
+passes; the GPT-OSS B50 gate without `-c` rc 0, one answer line, no device loss, no async-failure line. The fix
+round changes one Python script, so the build stands.
+
+*Not taken:* a list of drains that must be present (the script checks that no plain wait remains at a pinned
+site, not that the drain still exists; the wait counts were measured in review instead), and the scope of claim
+R's `q =` exemption.
+
+*Recorded from the quality review, older than this task:*
+- The graph-entry drains of the cache's BCS and DMA queues now deliver, but they sit behind the entry check: see
+  the spec's known limit "The begin-path drain is behind the entry check", which now names them.
+- The pipeline copy queue for device D latches slot D, although its copy lands on the primary device. A failed
+  scatter fails device D's contexts, not the primary context whose output it corrupted (a Task 7b slot choice).
+  Task 7e decides slots; this goes with it.
+- The L2 prefetch queue (opt-in `GGML_SYCL_L2_PREFETCH`) is drained only in its destructor, so its errors reach the
+  latch when the owning context is destroyed and then fail the other contexts on that device.
+- `prefetch_next_layer` (layer streaming, opt-in) sets `prefetch_pending_` even when no weight has a host pointer,
+  so the later wait can be on a default-constructed event. The open DPC++ source makes `wait_and_throw()` on such
+  an event a no-op; the shipped 2026.2 runtime is a binary and was not checked.
+- `dense_layer_scheduler` is constructed by no product code, and `tests/test-dense-scheduler.cpp` is built by no
+  target. The class is dead in the product.
+- The handler's `std::rethrow_exception` can allocate when an error is delivered; decision 1's "never allocates"
+  is true of the latch's `record` only.
+
 ---
 
 ### Task 7: Open the NVFP4/Q1_0 direct decode route

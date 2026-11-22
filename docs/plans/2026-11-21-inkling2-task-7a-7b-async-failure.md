@@ -139,6 +139,10 @@ here, in the plan's "Known limits".
   `graph_compute_impl`, which returns void. An error that drain delivers, or a wait of it that throws, moves the latch
   after the check: the graph that is beginning still runs, and the failure is reported at the next boundary. The same
   follow-up as the one-token window would close it, or the drain hoisted above the entry check.
+  Since Task 7c the same holds for the two graph-entry drains of the cache's BCS and DMA queues in
+  `ggml_backend_sycl_graph_compute_impl` (recorded 2026-11-22, Task 7c's quality review): before 7c they never
+  delivered; now a failed expert fill is delivered at the next graph's entry, behind the check, so that graph
+  still runs on the failed fill and the failure is reported at the next synchronize.
 - **Withdrawn 2026-11-21: "failed-terminal bundles stay quarantined until process exit".** See decision 11. What is
   left of it is Task 7d's scope: a failed context that is destroyed, or drained through
   `ggml_sycl_execution_drain_context_terminal_events` or `ggml_sycl_execution_drain_own_terminal`, without a
@@ -1573,6 +1577,10 @@ Co-Authored-By trailer.
 
 ### Task 7c: A drain of a handled queue delivers its asynchronous errors
 
+**Line numbers in this task are from `7809ffac8`**, before Tasks 7a and 7b merged. At Task 7c's base
+(`822f181f3`) the `ggml-sycl.cpp` sites sit up to 301 lines later and the `unified-cache.cpp` sites 5 lines
+later. Find each site by its "today" text.
+
 **Track:** L-ordered, the same track as 7a and 7b. One implementer makes the host-side edits; the lead runs the gates.
 **Depends on:** Task 7b merged (every queue below gets its handler there, except the two member queues this task
 builds).
@@ -1957,7 +1965,7 @@ The replan's execution-queue waits stay plain under rule E or X. These are `ctx-
 | `:51647` | `ggml_backend_sycl_verify_speculative_with_tokens` | `default_q.wait();` | `default_q.wait_and_throw();` | per verification, same API |
 | `layer-streaming.cpp:58` | `drain_and_invalidate_buffers` | `prefetch_event_.wait();` | `prefetch_event_.wait_and_throw();` | L |
 | `layer-streaming.cpp:353` | `load_layer_sync` | `last_event.wait();` | `last_event.wait_and_throw();` | O, only while layer streaming is active |
-| `layer-streaming.cpp:379`, `:410`, `:464` | `ensure_layer`, `prefetch_next_layer` | `prefetch_event_.wait();` | `prefetch_event_.wait_and_throw();` | O, same |
+| `layer-streaming.cpp:379`, `:410`, `:464` | `ensure_layer`, `prefetch_next_layer`, `await_prefetch` | `prefetch_event_.wait();` | `prefetch_event_.wait_and_throw();` | O, same |
 
 The layer-streaming events come from `mem_copy_async` on the queue the caller passes. Both product callers pass
 `ggml_sycl_get_device(d).default_queue()` (`ggml-sycl.cpp:58428`, `:75884`, `:75893`).
@@ -2013,8 +2021,9 @@ per decode token.
 - [ ] No plain wait remains on the queues in the table, outside the execution-queue waits that rules E and X keep
       (claims W, A and R).
 - [ ] `:58792` no longer says "Add wait to catch any async errors" (claim T).
-- [ ] Full build succeeds (`./scripts/sycl-build.sh`, all targets; `tests/test-dense-scheduler.cpp` compiles against
-      the new member initializer).
+- [ ] Full build succeeds (`./scripts/sycl-build.sh`, all targets; `ggml/src/ggml-sycl/dense-scheduler.cpp` compiles
+      with the new member initializer). Corrected 2026-11-22: this line named `tests/test-dense-scheduler.cpp`,
+      which no build target compiles.
 - [ ] Lead: the Mistral B70 completion gate and the GPT-OSS B50 chat gate pass once each.
 
 Run:
