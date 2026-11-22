@@ -37,8 +37,9 @@
 # GPU.lock is taken and released through scripts/sycl-lock.sh (mkdir(2) through python3, a `holder` line unique to
 # this run): the system mkdir command reports success on an existing directory. The gate waits for a busy lock (up to
 # LLAMA_GPU_LOCK_WAIT_SECONDS, polling every LLAMA_GPU_LOCK_POLL_SECONDS) and stops at once when waiting cannot clear
-# the failure. It does not read its holder again during the run: a co-taker that still uses plain mkdir and writes
-# its holder after the verify window goes unseen here. The run path cannot be exercised by a stub test on this host
+# the failure. Each take reads its holder back after LLAMA_GPU_LOCK_VERIFY_SECONDS (default 1). It does not read
+# its holder again during the run: a co-taker that still uses plain mkdir and writes its holder after the verify
+# window goes unseen here. The run path cannot be exercised by a stub test on this host
 # (its settle waits for MemAvailable > 150 GB), so that check waits until it can be tested.
 
 set -euo pipefail
