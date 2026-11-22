@@ -9794,6 +9794,16 @@ static bool ggml_sycl_unified_kernel_requires_aos(ggml_type type) {
     return true;
 }
 
+// The unified-kernel arm of UnifiedMatmulOrchestrator::select: a weight type the unified kernel serves, on a device
+// whose unified kernel is enabled, with a dense src1. Every kernel under that arm (the ESIMD kernel, its oneDNN prompt
+// path, the COALESCED fall-through to MMVQ) reads src1 as F32. select and supports_op both ask this one function.
+static bool ggml_sycl_mul_mat_takes_unified_arm(const ggml_tensor * src0, const ggml_tensor * src1, int device) {
+    // The weight type is a pure switch and rules out most calls; the device query is not cached, so it comes last.
+    return ggml_sycl::should_use_unified(src0->type) && ggml_sycl_unified_dispatch_enabled() &&
+           ggml_sycl::is_unified_kernel_enabled_for_device(device) && ggml_is_contiguous(src1) &&
+           !ggml_is_transposed(src1) && !ggml_is_permuted(src1);
+}
+
 static bool ggml_sycl_reorder_guard_enabled() {
     const char * env = std::getenv("GGML_SYCL_REORDER_GUARD");
     return env && std::atoi(env) != 0;
@@ -61375,6 +61385,41 @@ bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sy
 }
 }  // namespace ggml_sycl
 
+// Whether a route of ggml_sycl_mul_mat reads `src1` in its type and shape. Every route reads F32. Beyond that:
+// - the f16 chain's p021 and nc kernels read F32 only;
+// - its batched routes (batched oneDNN/oneMath and the scalar fallback) read F16 as it is and convert any other type
+//   with the strided f16 converter, which has F32 and BF16 only;
+// - outside the chain, the orchestrator's unified-kernel arm reads F32 only; DMMV, MMVQ, MMQ and the generic BLAS
+//   fallback read F32 only, by their own eligibility checks; the oneDNN AoS arm (ggml_sycl_op_mul_mat with
+//   ggml_sycl_op_mul_mat_sycl) reads a src1 that is not F32 as one 2-D plane and converts that plane by its type.
+//   The NONE answer below (not the unified arm, and one plane) is exact for a src0 that is not a weight or is in the
+//   AoS layout; for a weight reordered to COALESCED or SOA it admits more than the kernels read, and such a src1 can
+//   end in "MUL_MAT dispatch failed" (no llama graph builds that shape).
+// The route is the one the dispatch takes, from the same classifier, environment and unified-arm predicate. The
+// environment reads whether src0 is a weight from its buffer's usage, so a caller that asks before the weight buffer
+// is allocated and marked (test-backend-ops does) can see a different route than the dispatch; llama places weights
+// before it schedules a graph.
+static bool ggml_sycl_mul_mat_src1_has_reader(const ggml_tensor * src0,
+                                              const ggml_tensor * src1,
+                                              const ggml_tensor * dst,
+                                              int                 device) {
+    if (src1->type == GGML_TYPE_F32) {
+        return true;
+    }
+    switch (ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, ggml_sycl_mul_mat_route_env_of(src0, src1))) {
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED:
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED:
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR:
+            return src1->type == GGML_TYPE_F16 || ggml_get_to_fp16_nc_sycl(src1->type) != nullptr;
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021:
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC:
+            return false;
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_NONE:
+            return !ggml_sycl_mul_mat_takes_unified_arm(src0, src1, device) && src1->ne[2] == 1 && src1->ne[3] == 1;
+    }
+    return false;
+}
+
 // Returns false when the oneDNN scratchpad request was declined before anything was written to dst: both callers then
 // run ggml_sycl_mul_mat_batched_f16_fallback (llama.cpp-23mk S3-4). A decline is not resource exhaustion, so it never
 // reaches the resource-exhaustion ladder; errors still throw as before.
@@ -73198,30 +73243,24 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
         has_override    = true;
     }
 
-    const bool unified_enabled = allow_unified && ggml_sycl_unified_dispatch_enabled() &&
-                                 ggml_sycl::is_unified_kernel_enabled_for_device(ctx_.device) &&
-                                 ggml_sycl::should_use_unified(src0->type);
-    if (unified_enabled) {
-        const bool src1_contiguous = ggml_is_contiguous(src1) && !ggml_is_transposed(src1) && !ggml_is_permuted(src1);
-        if (src1_contiguous) {
-            // Prefer COALESCED for quantized types that support it (best TG performance).
-            // Dequant handles COALESCED→FP16 / SOA→FP16 for oneDNN PP path.
-            // Non-quantized types (FP16/FP32) keep AOS.
-            const bool use_reordered = ggml_sycl_unified_soa_enabled() && ggml_is_quantized(src0->type) &&
-                                       ggml_sycl_supports_reorder_mmvq(src0->type);
-            decision.valid   = true;
-            decision.backend = MatmulBackend::UnifiedKernel;
-            if (has_override && ggml_sycl_can_use_layout_for_kernel(src0, override_layout, ctx_.device)) {
-                decision.layout = override_layout;
-            } else if (use_reordered && is_coalesced_supported(src0->type)) {
-                decision.layout = GGML_LAYOUT_COALESCED;
-            } else if (use_reordered) {
-                decision.layout = GGML_LAYOUT_SOA;
-            } else {
-                decision.layout = GGML_LAYOUT_AOS;
-            }
-            return decision;
+    if (allow_unified && ggml_sycl_mul_mat_takes_unified_arm(src0, src1, ctx_.device)) {
+        // Prefer COALESCED for quantized types that support it (best TG performance).
+        // Dequant handles COALESCED→FP16 / SOA→FP16 for oneDNN PP path.
+        // Non-quantized types (FP16/FP32) keep AOS.
+        const bool use_reordered = ggml_sycl_unified_soa_enabled() && ggml_is_quantized(src0->type) &&
+                                   ggml_sycl_supports_reorder_mmvq(src0->type);
+        decision.valid   = true;
+        decision.backend = MatmulBackend::UnifiedKernel;
+        if (has_override && ggml_sycl_can_use_layout_for_kernel(src0, override_layout, ctx_.device)) {
+            decision.layout = override_layout;
+        } else if (use_reordered && is_coalesced_supported(src0->type)) {
+            decision.layout = GGML_LAYOUT_COALESCED;
+        } else if (use_reordered) {
+            decision.layout = GGML_LAYOUT_SOA;
+        } else {
+            decision.layout = GGML_LAYOUT_AOS;
         }
+        return decision;
     }
 
     // Use resolve().layout to determine the materialized layout — no finalization gate needed.
@@ -92439,8 +92478,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             dst_contiguous_ptr = dst_contiguous.get();
         }
         if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {
-            GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%zu row_bytes=%zu",
-                       src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
+            // No expert kernel has been submitted yet, so the graph can still be refused whole: the
+            // scoped staging temps already taken release through queue markers on unwind.
+            GGML_LOG_ERROR("[MoE] prompt F32 activation staging refused for %s rows=%zu row_bytes=%zu\n",
+                           src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
+            throw ggml_sycl_fallback_error("MUL_MAT_ID prompt activation staging does not fit");
         }
         if (pp_oor_trace) {
             fprintf(stderr,
@@ -123674,6 +123716,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         // which is not a refusal.
         const ggml_type indexed_a_type = op->src[0]->type;
         if (op->op == GGML_OP_MUL_MAT_ID) {
+            // Expert routes are resolved per contiguous expert table; a strided view of one has no route.
+            if (!ggml_is_contiguous(op->src[0])) {
+                return false;
+            }
             // MUL_MAT_ID admission keys on MMID coverage, NOT on the dense
             // MUL_MAT allowlist the two branches used to share (llama.cpp-yitq).
             // ggml_sycl_mul_mat_type_supported() is true for F32/F16 and the
@@ -123804,6 +123850,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (a->ne[3] != b->ne[3]) {
+                    return false;
+                }
+                // A src1 type and shape no route reads (a BF16 src1 with several planes, as a BF16 depthwise-conv
+                // kernel builds, reaches ggml_sycl_op_mul_mat's F32-or-one-plane assert) runs elsewhere.
+                if (b->type != GGML_TYPE_F32 && !ggml_sycl_mul_mat_src1_has_reader(a, b, op, device)) {
                     return false;
                 }
                 ggml_type a_type = a->type;
@@ -124045,22 +124096,14 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 return src0_type == GGML_TYPE_F32;
             }
         case GGML_OP_REPEAT:
-            {
-                // REPEAT routes through ggml_sycl_op_bin_bcast, whose type chain
-                // implements f32/f16/i32/i16 and ends in GGML_ABORT -- there is no
-                // fallback -- so admitting anything else (bf16) crashes at runtime
-                // rather than deferring to another backend. Keep this list in step
-                // with binbcast.cpp. CUDA declines the same way, and more narrowly
-                // (f32/f16 only), because its bin_bcast omits the integer branches.
-                ggml_type src0_type = op->src[0]->type;
-                if (src0_type != GGML_TYPE_F32 && src0_type != GGML_TYPE_F16 && src0_type != GGML_TYPE_I32 &&
-                    src0_type != GGML_TYPE_I16) {
-                    return false;
-                }
-                // REPEAT hands (dst, src, dst) to bin_bcast, so the stride
-                // preconditions land on dst and on op->src[0].
-                return ggml_sycl_binbcast_layout_supported(op, op->src[0], op);
-            }
+            // REPEAT routes through ggml_sycl_op_bin_bcast, whose type chain ends
+            // in GGML_ABORT -- there is no fallback -- so a type triple outside it
+            // crashes at runtime rather than deferring to another backend. The list
+            // lives beside that chain, in binbcast.cpp. REPEAT hands (dst, src, dst)
+            // to bin_bcast, so the type triple and the stride preconditions land on
+            // dst and on op->src[0].
+            return ggml_sycl_bin_bcast_types_supported(op->type, op->src[0]->type, op->type) &&
+                   ggml_sycl_binbcast_layout_supported(op, op->src[0], op);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -124069,7 +124112,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // ggml_sycl_binbcast_layout_supported and the REPEAT case above.
             // ADD_ID and COUNT_EQUAL have their own kernels and stay in the
             // unconditional group below.
-            return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
+            return ggml_sycl_bin_bcast_types_supported(op->src[0]->type, op->src[1]->type, op->type) &&
+                   ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
             // Layout is genuinely handled: concat.cpp:119-153 has a fully
             // stride-aware kernel for the non-contiguous case.  TYPE is not --

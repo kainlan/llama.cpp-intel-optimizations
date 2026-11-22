@@ -1,0 +1,106 @@
+[SYCL] Device 0 alloc caps: raw=15977.9 MB, safe=15128.7 MB, host_unified=no
+[XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+[SYCL] Device 0 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+[SYCL] Host malloc per-allocation limit: 15.6 GB (min max_mem_alloc_size across 1 active devices)
+Running with Environment Variables:
+  GGML_SYCL_DEBUG: 0
+  GGML_SYCL_DEBUG_SYNC: 0
+  GGML_SYCL_TP_DEBUG: 0
+  GGML_SYCL_KQV_FORCE_SIMPLE: 0
+  GGML_SYCL_KQV_DISABLE_FP16: 0
+  GGML_SYCL_DISABLE_GRAPH: 0
+  GGML_SYCL_ASYNC_MEM: 0
+  GGML_SYCL_DISABLE_DNN: 0
+  GGML_SYCL_PRIORITIZE_DMMV: 0
+Build with Macros:
+  GGML_SYCL_FORCE_MMQ: no
+  GGML_SYCL_F16: yes
+Found 1 SYCL devices:
+|  |                   |                                       |       |Max    |        |Max  |Global |                     |
+|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|         1.18.40734+8|
+SYCL Optimization Feature:
+|ID|        Device Type|Reorder|
+|--|-------------------|-------|
+| 0| [level_zero:gpu:0]|      Y|
+[PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+[UNIFIED-CACHE] Device 0 budget authority: base=16304.0 MB free=15923.1 MB pct=100% external_headroom=1630.4 MB budget=14292.7 MB
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15923.1 MB budget=14292.7 MB (100%)
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13012.0 MB)
+[VRAM-ARENA] Active on device 0: 1 chunk(s), 14292.0 MB total
+[VRAM-ARENA] Scratch zone: 0xffffe39279a00000 + 512.0 MB (offset 13780.0 MB from base)
+[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+[UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+[SYCL] Pinned chunk pool created with 102.6 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+[HOST-ARENA] Created with 102.6 GB budget, committed=0.0 GB (system total=246.9 GB available=110.6 GB reserve=8.0 GB pct=90)
+[SYCL] buffer-scoped provenance: minted first buffer owner id=0x8000000000000002 slot=4294967294
+[SYCL] buffer-scoped provenance: minted first buffer owner id=0x8000000000000002 slot=4294967294
+[SYCL] buffer-scoped provenance: registered first tensor name=sent_0 owner=0x8000000000000002 offset=0 nbytes=4096 device=0
+[SYCL] buffer-scoped provenance: registered first tensor name=sent_0 owner=0x8000000000000002 offset=0 nbytes=4096 device=0
+[SYCL] tensor usage UNKNOWN: name=sent_0 type=f32 ne=[1024,1,1,1]
+[SYCL] tensor usage UNKNOWN: name=as type=q8_0 ne=[256,32,16,1]
+[SYCL] tensor usage UNKNOWN: name=sent_1 type=f32 ne=[1024,1,1,1]
+[SYCL] tensor usage UNKNOWN: name=ids type=i32 ne=[16,65536,1,1]
+[SYCL] tensor usage UNKNOWN: name=sent_2 type=f32 ne=[1024,1,1,1]
+[SYCL] tensor usage UNKNOWN: name=b type=f32 ne=[256,16,65536,1]
+[SYCL] tensor usage UNKNOWN: name=sent_3 type=f32 ne=[1024,1,1,1]
+[SYCL] tensor usage UNKNOWN: name=out type=f32 ne=[32,16,65536,1]
+[SYCL] tensor usage UNKNOWN: name=sent_4 type=f32 ne=[1024,1,1,1]
+[SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=2.0 GB)
+[HOST-ARENA] runtime pinned chunk 1: +2048.0 MB, 2.0 of 102.6 GB committed before host zones exist
+[SYCL] low-free-memory staged readback guard enabled on device 0: free=468 MB threshold=6144 MB size=128 MB tensor=out
+[SYCL] buffer_get_tensor force-shared readback succeeded (134217728 bytes)
+[SYCL] buffer_get_tensor force-shared readback succeeded (1073741824 bytes)
+[SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+[MOE-HYBRID] Detected MoE: 1 layers, 16 experts/layer, top-16, 8.5 KB/expert, 0/16 host-resident
+[UNIFIED-CACHE] Reserved GPU reorder temp buffer (unified): 0.0 MB
+[MOE-WARMUP] Zero-warmup mode: 1 layers x 16 experts, using gate weight norms for initial placement
+[MOE-HYBRID] Expert registry: 16 entries, 0 with host_src_ptr, 16 device-only
+[MOE-HYBRID] Expert metadata stored: 0 entries for post-warmup pre-staging
+[MOE-HYBRID] Expert group registry: 0 groups (0 complete with gate+up+down), 0 entries registered
+[MOE-MULTI-GPU] Disabled: single GPU detected (use ONEAPI_DEVICE_SELECTOR="level_zero:0,1" for dual GPU)
+[MOE-HYBRID] Phase 1: GPU0 cache budget=14292.7 MB, expert total=0.1 MB -> all on GPU0 (fits)
+[MOE-HYBRID] Phase 2 verify: GPU0=0 GPU1=0 CPU=16 (legacy-cache)
+[MOE-HYBRID] First tensor L1579491469: GPU0 experts=[] (0), GPU1 experts=0
+[MOE-HYBRID] Expert distribution: GPU0=16(cache) (16 total, 8.5 KB/expert)
+[SYCL] Expert prefetcher initialized (depth=2, dynamic pool)
+[MOE-HYBRID] Phase 3: skipped; unified cache owns planned expert residency/layout
+[SYCL] Expert predictor initialized (layers=1, experts=16, top_k=8, depth=3)
+[MOE-HYBRID] Predictor initialized: 1 layers, 16 experts, top-8
+[MOE-POOL] Pinned buffer pool: act=1048576 KB, out=131072 KB, ids=4194304 B, max_experts=1048576
+[CPU-EXPERT-POOL] Initialized: 1 threads, row loop on 22 threads, spin 2000 us
+[MOE-GATE-NORM] No ffn_gate_inp tensors found in graph, cannot compute gate norms. Falling back to uniform placement.
+[HOST-POOL] chunk allocation during pp phase site=pre_allocate — planner should pre-size (2147483648 bytes)
+[SYCL] Allocated pinned base chunk 1 (size=2048.0 MB, total=4.0 GB)
+[SYCL] Pinned pool pre_allocate: grew 1 chunks for 2048.0 MB working set (total=4.0 GB)
+[MOE-HYBRID] Pre-allocated 1 pinned chunks for 2048.0 MB working set
+[MOE-PREALLOC] device 0: n_tables=1 table_bytes=128 total_table=0.1 KB ids_staging=16.0 KB compact=32.0 KB
+[MOE-PREALLOC] device 0: tables=VRAM (1 x 128 B) ids=VRAM (16.0 KB) compact=VRAM (32.0 KB)
+[MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers (device=0, tables=1, experts=16)
+check_graph_compatibility: disabling whole-graph SYCL capture for MUL_MAT_ID (type=q8_0, ne12=65536); segmented replay can still run it as a direct boundary
+[MOE-LAYOUT] tensor=as device=0 residency=device-resident type=q8_0 shape=[256,32,16] layout=aos reason=default-policy executor=xmx-mmvq xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=1
+[MOE-PROMPT-CANONICAL] tensor=as published=1 kind=1 stable=1 seq=1
+[MMVQ-MoE] PP batch threshold = 16 (n_experts=16 top_k=16 adaptive)
+[MoE] prompt F32 activation staging refused for as rows=1048576 row_bytes=1024
+[SYCL] recoverable runtime fallback failed: MUL_MAT_ID prompt activation staging does not fit
+ggml_backend_compare_graph_backend: graph compute failed at node 0 (MUL_MAT_ID), not comparing (SYCL0 status=-1, CPU status=0)
+Testing 2 devices
+
+Backend 1/2: SYCL0
+  Device description: Intel(R) Arc(TM) Pro B50 Graphics
+  Device memory: 16304 MB (14292 MB free)
+
+  MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+[SYCL] Expert prefetcher shut down (prefetched=0)
+[CPU-EXPERT-POOL] Shut down
+  0/1 tests passed
+
+Failing tests:
+  MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0)
+  Backend SYCL0: FAIL
+Backend 2/2: CPU
+  Skipping CPU backend
+1/2 backends passed
+FAIL

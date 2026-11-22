@@ -1,0 +1,10 @@
+arm	rc	ok	fail	unsupported	seconds	census_rc	census_ok	census_fail	census_unsupported
+ADD	0	129	0	50	7	134	78	0	31
+SUB	0	106	0	36	6	134	68	0	24
+MUL	0	107	0	36	5	134	68	0	24
+DIV	0	106	0	36	6	134	68	0	24
+REPEAT	0	18	0	0	1	0	18	0	2
+CONV_1D_DW	0	6	0	3	2	
+MUL_MAT-no-weights	1	1993	1	1337	52	134	1461	1	246
+A5	1	0	1	0	6	
+m_v80	0	0	0	1	0	
