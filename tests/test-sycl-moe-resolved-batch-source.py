@@ -11,7 +11,9 @@ MEM_HANDLE_SOURCE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 CPU_DISPATCH_SOURCE = ROOT / "ggml/src/ggml-sycl/cpu-dispatch.cpp"
 UNIFIED_CACHE_SOURCE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 
-TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|::|&&|\|\||!=|==|<=|>=|->|[{}()[\].,;:%=*<>!&+-]")
+# Identifiers, numeric literals and operators. A literal is a token like any other: dropped, `for (row = 2;` would read
+# as `for (row = 1;`, and a count passed as `1` as one passed as `ne11`.
+TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9A-Za-z_.]*|::|&&|\|\||!=|==|<=|>=|->|[{}()[\].,;:%=*<>!&+?/|^~-]")
 
 
 def tokens(text: str) -> list[str]:
@@ -744,6 +746,10 @@ def direct_route_input_shape_violations(direct: str) -> list[str]:
             has_tokens(pre_mark, "const size_t activation_piece_bytes = static_cast<size_t>(activation_piece_rows) "
                                  "* activation_row_bytes;")):
         failures.append("pieces: the copy is not cut into whole-input, per-token or per-row pieces")
+    # A dense src1, the usual graph, stays one copy for the whole [ne11][ne12] span: one piece, so the loop that copies
+    # the pieces after the first never runs.
+    if not has_tokens(pre_mark, "src1_tokens_adjacent ? ne11 * ne12 : ne11;"):
+        failures.append("dense-one-copy: a src1 whose rows and tokens are adjacent is not copied as one block")
     # Every byte count covers the batch's tokens: the admitted slices are sized for ne12 tokens.
     if not has_tokens(pre_mark, "const size_t activation_bytes = activation_row_bytes * static_cast<size_t>(ne11) * "
                                 "static_cast<size_t>(ne12);"):
@@ -802,6 +808,12 @@ def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
          "const bool src1_tokens_adjacent = ne12 == 1 || nb12 == static_cast<size_t>(ne11) * nb11;",
          "const bool src1_tokens_adjacent = true;", "tokens-adjacent"),
         ("pieces-ignore-tokens", "src1_tokens_adjacent ? ne11 * ne12 : ne11;", "ne11 * ne12;", "pieces"),
+        ("dense-split-per-token", "src1_tokens_adjacent ? ne11 * ne12 : ne11;", "src1_tokens_adjacent ? ne11 : ne11;",
+         "dense-one-copy"),
+        ("piece-loop-starts-late", "for (int64_t piece = 1;", "for (int64_t piece = 2;", "piece-copies"),
+        ("piece-loop-stops-short", "piece < activation_pieces;", "piece < activation_pieces - 1;", "piece-copies"),
+        ("slot-count-wrong-index", "(ne11 == 1 || ne11 == ids->ne[0])", "(ne11 == 1 || ne11 == ids->ne[1])",
+         "per-slot-shape"),
         ("activation-one-token", "activation_row_bytes * static_cast<size_t>(ne11) * static_cast<size_t>(ne12);",
          "activation_row_bytes * static_cast<size_t>(ne11);", "token-bytes"),
         ("output-one-token", "static_cast<size_t>(ne01) * static_cast<size_t>(ne12) * sizeof(float);",
@@ -821,6 +833,10 @@ def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
         ("kernel-skips-copies", "buffers, &dependency, &kernel)", "buffers, nullptr, &kernel)", "kernel-dependency"),
         ("kernel-one-token", "static_cast<int>(ids->ne[0]), static_cast<int>(ne12), static_cast<int>(ne11),",
          "static_cast<int>(ids->ne[0]), 1, static_cast<int>(ne11),", "token-count"),
+        ("kernel-one-row", "static_cast<int>(ids->ne[0]), static_cast<int>(ne12), static_cast<int>(ne11),",
+         "static_cast<int>(ids->ne[0]), static_cast<int>(ne12), 1,", "token-count"),
+        ("kernel-top-k-wrong-index", "static_cast<int>(ids->ne[0]), static_cast<int>(ne12), static_cast<int>(ne11),",
+         "static_cast<int>(ids->ne[1]), static_cast<int>(ne12), static_cast<int>(ne11),", "token-count"),
         ("host-wait", DIRECT_ROUTE_PIECE_LOOP, "dependency.wait(); " + DIRECT_ROUTE_PIECE_LOOP, "no-host-wait"),
     ]
     for name, old, new, claim in mutants:

@@ -92,6 +92,9 @@ def violations(source: str) -> list[str]:
     logical_resolver = function(common, "bool resolve_moe_storage_record")
     owner = function(source, "void set_managed_owner")
     capability = function(source, "static moe_route_capability ggml_sycl_moe_query_route_capability")
+    # The direct recipe's candidate expression: a decode token and a prompt's rows alike since 2026-11-22.
+    candidate_at = capability.find("static_candidate =")
+    candidate = capability[candidate_at:capability.find(";", candidate_at)] if candidate_at >= 0 else ""
     # set_managed_owner takes the legacy alloc_handle, so it mints through the
     # allocator-private adapter rather than the public from_owned_alloc. Score
     # the adapter's body too: scoring only the call site would let it be
@@ -141,7 +144,7 @@ def violations(source: str) -> list[str]:
         # re-spelling it as a literal is how the two gates drift apart.
         "Q1/NVFP4 executor gate is open and read by name": "k_moe_mmid_direct_route_validated = true" in source
             and "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated" in source,
-        "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
+        "Q1/NVFP4 recipe is phase-blind": bool(candidate) and not {"phase", "rows"} & set(re.findall(r"\w+", candidate)),
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
         # The recipe asks the binder for an exact allocation identity, the test bind() applies; a handle-kind
         # test refused every arena-slice lease (llama.cpp-1sxq).

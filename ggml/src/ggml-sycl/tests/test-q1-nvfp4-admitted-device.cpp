@@ -546,6 +546,19 @@ constexpr int ids_view_lead = 1;  // sentinel columns before the view's first sl
 
 const char * ids_layout_name(ids_layout ids_at) { return ids_at == ids_layout::VIEW ? "view" : "packed"; }
 
+// The route reuses its workspace slot from case to case, so a row or token its copy never wrote still holds the
+// previous case's activation there. Each case therefore draws different activation values, and inside a case every
+// row and every token differ: a copy that skipped a piece, or stopped one short, leaves stale values that fail the
+// oracle instead of matching it.
+uint32_t g_activation_case = 0;
+
+float activation_value(uint32_t seed, size_t token, size_t row, size_t k) {
+    uint32_t h = seed * 0x9e3779b9u ^ static_cast<uint32_t>(token) * 0x85ebca6bu ^
+                 static_cast<uint32_t>(row) * 0xc2b2ae35u ^ static_cast<uint32_t>(k) * 0x27d4eb2fu;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return (h & 1u ? -1.0f : 1.0f) * (0.2f + float((h >> 1) % 19u) / 31.0f);
+}
+
 graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vector<float> & oracle,
                       size_t & output_count, input_rows rows = input_rows::DENSE, int tokens = 1,
                       ids_layout ids_at = ids_layout::PACKED) {
@@ -622,11 +635,13 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vec
         else { quantize_row_nvfp4_ref(src, static_cast<block_nvfp4 *>(dst), K);
                dequantize_row_nvfp4(static_cast<block_nvfp4 *>(dst), dq, K); }
     }
-    // [token][row][K]. Every token's rows differ, so a route that copied one token's input for another fails too.
+    // [token][row][K], drawn fresh for this case (activation_value). Every token's rows differ, so a route that copied
+    // one token's input for another fails too.
     std::vector<float> activation(static_cast<size_t>(tokens) * ne11 * K);
+    const uint32_t     seed = ++g_activation_case;
     for (size_t i = 0; i < activation.size(); ++i) {
         const size_t k = i % K, row = (i / K) % ne11, token = i / (static_cast<size_t>(K) * ne11);
-        activation[i] = ((k + row + token) % 5 == 0 ? -1.0f : 1.0f) * (0.2f + float((i * 5) % 19) / 31.0f);
+        activation[i] = activation_value(seed, token, row, k);
     }
     // The storage holds each row where its layout puts it, poison before the first and between them (none when
     // DENSE).
