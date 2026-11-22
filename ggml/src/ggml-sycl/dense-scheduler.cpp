@@ -45,7 +45,10 @@ static void * dense_scheduler_alloc_slot(size_t size, sycl::queue & queue, int d
 
 dense_layer_scheduler::dense_layer_scheduler(sycl::queue & compute_queue, size_t max_layer_size) :
     compute_queue_(compute_queue),
-    copy_queue_(compute_queue.get_context(), compute_queue.get_device()),
+    copy_queue_(ggml_sycl_make_queue(compute_queue.get_context(),
+                                     compute_queue.get_device(),
+                                     ggml_sycl_get_device_id_from_queue(compute_queue),
+                                     sycl::property_list{})),
     device_id_(ggml_sycl_get_device_id_from_queue(compute_queue)),
     slot_size_(max_layer_size) {
     // Allocate two VRAM slots for double buffering
@@ -68,7 +71,7 @@ dense_layer_scheduler::~dense_layer_scheduler() {
     // Wait for any pending prefetch
     if (has_pending_prefetch_) {
         try {
-            pending_prefetch_.wait();
+            pending_prefetch_.wait_and_throw();
         } catch (...) {
             // Ignore exceptions during destruction
         }
@@ -110,7 +113,7 @@ void * dense_layer_scheduler::get_dense_layer(int layer_id, size_t size) {
 
     // Wait for any pending prefetch to this slot
     if (has_pending_prefetch_) {
-        pending_prefetch_.wait();
+        pending_prefetch_.wait_and_throw();
         has_pending_prefetch_ = false;
     }
 
@@ -174,7 +177,7 @@ void dense_layer_scheduler::prefetch_next(int next_layer_id, size_t size) {
 
     // Wait for any previous prefetch to complete
     if (has_pending_prefetch_) {
-        pending_prefetch_.wait();
+        pending_prefetch_.wait_and_throw();
         has_pending_prefetch_ = false;
     }
 
@@ -199,7 +202,7 @@ void dense_layer_scheduler::prefetch_next(int next_layer_id, size_t size) {
 void dense_layer_scheduler::wait_prefetch() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (has_pending_prefetch_) {
-        pending_prefetch_.wait();
+        pending_prefetch_.wait_and_throw();
         has_pending_prefetch_ = false;
     }
 }
@@ -209,7 +212,7 @@ void dense_layer_scheduler::advance_slot() {
 
     // Wait for prefetch before advancing
     if (has_pending_prefetch_) {
-        pending_prefetch_.wait();
+        pending_prefetch_.wait_and_throw();
         has_pending_prefetch_ = false;
     }
 

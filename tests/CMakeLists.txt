@@ -1027,6 +1027,13 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-async-handler-source.py --self-test)
     set_tests_properties(test-sycl-async-handler-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every drain of an auxiliary backend queue delivers that queue's asynchronous errors to the latch
+    # (llama.cpp-kjoc). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-async-drain-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-async-drain-source.py --self-test)
+    set_tests_properties(test-sycl-async-drain-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Every synchronous wait mem_copy_submit makes is counted by kind and by the copy's caller under the MoE trace,
     # and the [MOE-HOSTPATH-WAITS] line prints the census (llama.cpp-qwn5). Run WITH --self-test so each pin is
     # proven to catch its mutant.

@@ -55,7 +55,7 @@ void layer_stream_manager::drain_and_invalidate_buffers() {
         // the caller does next — free the buffers, or fill them for a different
         // model — must not race it.
         try {
-            prefetch_event_.wait();
+            prefetch_event_.wait_and_throw();
         } catch (...) {
         }
     }
@@ -350,7 +350,7 @@ bool layer_stream_manager::load_layer_sync(int layer_id, int buffer_idx, sycl::q
 
     // Wait for last copy event (in-order queue guarantees all prior copies complete)
     if (copied > 0) {
-        last_event.wait();
+        last_event.wait_and_throw();
     }
 
     loaded_layers_[buffer_idx] = layer_id;
@@ -376,7 +376,7 @@ bool layer_stream_manager::ensure_layer(int layer_id, sycl::queue & queue) {
         if (prefetch_pending_ && prefetch_target_layer_ == layer_id) {
             // Wait for the prefetch to complete
             try {
-                prefetch_event_.wait();
+                prefetch_event_.wait_and_throw();
             } catch (const sycl::exception & e) {
                 GGML_LOG_ERROR("[LAYER-STREAM] Prefetch wait failed: %s\n", e.what());
             }
@@ -407,7 +407,7 @@ void layer_stream_manager::prefetch_next_layer(int layer_id, sycl::queue & queue
     // Cancel any existing prefetch that hasn't been consumed
     if (prefetch_pending_ && prefetch_target_layer_ != layer_id) {
         try {
-            prefetch_event_.wait();
+            prefetch_event_.wait_and_throw();
         } catch (...) {
         }
         prefetch_pending_ = false;
@@ -461,7 +461,7 @@ void layer_stream_manager::await_prefetch() {
     }
 
     try {
-        prefetch_event_.wait();
+        prefetch_event_.wait_and_throw();
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[LAYER-STREAM] Prefetch await failed: %s\n", e.what());
     }
