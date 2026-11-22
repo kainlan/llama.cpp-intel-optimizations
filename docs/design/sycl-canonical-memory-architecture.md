@@ -1546,10 +1546,10 @@ lock. The bound-load-candidate reads behind `global_placement_plan_owner()` and
 `acquire_bound_load_effect()` take it only on a thread bound to a load. The cache
 functions take that effect before their own cache locks. Under it,
 `lifecycle_replace_placement_plan` calls the MMID registry's `replace_plan`,
-which takes the registry mutex and then the pool mutexes. Nothing else is taken
-under it. A snapshot it drops holds a plain-data plan, so that destructor takes
-no lock. It is never taken under `g_sycl_graph_compute_mutex` or an L3 lock,
-which leaves it room at L3 as a global.
+which takes the registry mutex and then the pool mutexes. A snapshot it drops
+holds a plain-data plan, so that destructor takes no lock. MUL_MAT_ID's
+republication into an empty snapshot also takes it under graph compute's L2 and
+L3 locks: see the into-empty bullet below.
 
 The MMID workspace registry's `moe_mmid_workspace_registry::state::mutex`
 (`moe-mmid-workspace.cpp`, one process registry) is **L4**. It cannot take L3 or a
@@ -1579,8 +1579,46 @@ The pool mutexes (`registry_pool_state::mutex`, and the standalone
 `moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
 take no listed lock themselves.
 
-Three existing paths still break this section's prohibitions under these locks.
-All three are known non-conformances, not exemptions.
+Four existing paths still break this section's rules under these locks. All four
+are known non-conformances, not exemptions.
+
+- **Into-empty republication takes L1 under L2 and L3.**
+  `ggml_sycl_republish_current_plan_into_empty` takes `g_tensor_inventory_mutex`
+  (L1) and then `g_lifecycle_plan_mutex`. Two sites call it while graph compute
+  holds `g_sycl_graph_compute_mutex` (L2) and `sycl_ctx->graph_mutex` (L3): the
+  route-cache block of `ggml_sycl_mul_mat_id`, and
+  `ggml_sycl_ensure_moe_secondary_queues_for_plan`. That is a lower rank taken
+  under a higher one. The plan mutex, the registry mutex and the pool mutexes
+  taken under it inherit the inversion on this path.
+  - The secondary-queue setup also reaches it under its function-local
+    `static std::mutex init_mutex`. That lock is unranked, taken under L2 and
+    L3, and itself takes L1.
+  - The data-pointer slow path (`ggml_sycl_get_data_ptr_slow` to
+    `get_cached_tensor_ptr`) takes L1 from graph compute for an index lookup and
+    takes nothing under it.
+  - The ranks above (plan mutex L3, registry mutex L4, pool mutexes L5) hold on
+    every other path.
+  - No rank removes the inversion. At L3 the plan mutex is a global co-held with
+    the keyed L3 `sycl_ctx->graph_mutex`. At L4 the registry mutex it holds
+    would move to L5, co-held with the pool mutexes and the free path's L5
+    locks. At L5 the registry mutex has no rank left. The cause is L1 taken
+    under L2 and L3, which no rank below L1 can repair.
+  - Moving the republication to a graph boundary, as the expert loan does, is
+    owed work.
+  - **No holder of L1 acquires L2 or L3, so the inversion cannot close a cycle
+    today.** Searched: all 35 acquisitions of `g_tensor_inventory_mutex`, each
+    walked five call levels deep, matching callees by name. The search looked
+    for an acquisition of `g_sycl_graph_compute_mutex` or
+    `sycl_ctx->graph_mutex`, a backend `graph_compute` entry, a read of the
+    graph in-flight counter, a synchronize call, and an event or condition wait.
+    L2 and L3 are taken only in `ggml_backend_sycl_graph_compute_unchecked`, and
+    none of those walks reaches it. The waits reached under L1 wait for one of
+    three things: submitted device work, the retained-handle drain worker
+    (which takes only the store mutex), or CPU expert-pool job gates. No
+    `host_task` body (25 sites) and no CPU-job or host-attention source
+    (`cpu-*`, `attn-host-*`) reaches a function that takes L1. The one path
+    from `cpu-dispatch.cpp` into L1 is the retained flush, and it runs on the
+    graph thread.
 
 - The runtime context transaction (`ggml_sycl_run_runtime_context_transaction`)
   runs the plan replacement and its MMID retire under L1
