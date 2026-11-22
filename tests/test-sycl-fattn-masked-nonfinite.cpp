@@ -376,9 +376,14 @@ static bool build_graph(const fa_case & c, fa_graph & g) {
         ggml_set_name(g.sinks, "masked_nonfinite_sinks");
         ggml_flash_attn_ext_add_sinks(g.out, g.sinks);
     }
-    // llama-graph pins every FA op to F32 precision; the dispatcher picks the
-    // accumulator variant from it, so match production.
-    ggml_flash_attn_ext_set_prec(g.out, GGML_PREC_F32);
+    // llama-graph pins every FA op to an F32 accumulator; the dispatcher picks the
+    // accumulator variant from it, so match production. A refused precision would
+    // run a different variant than the one under test.
+    if (!ggml_prec_set_acc(g.out, GGML_PREC_F32)) {
+        ggml_free(g.ctx);
+        g.ctx = nullptr;
+        return false;
+    }
     ggml_set_name(g.out, "masked_nonfinite_out");
     g.graph = ggml_new_graph(g.ctx);
     ggml_build_forward_expand(g.graph, g.out);
