@@ -27,6 +27,7 @@
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -11829,6 +11830,12 @@ std::atomic<uint64_t> g_q1_nvfp4_test_quarantine{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_failure_consumed{ 0 };
 std::atomic<uint32_t> g_q1_nvfp4_test_workspace_slot{ UINT32_MAX };
 std::atomic<uint64_t> g_q1_nvfp4_test_workspace_generation{ 0 };
+// A second holder of the direct route's completion object that outlives the completion host task, as a copy of the
+// host-task functor kept by the SYCL runtime would. Typed void because the completion type is defined further down;
+// the shared pointer still destroys it as what it is.
+std::mutex            g_q1_nvfp4_test_hold_mutex;
+bool                  g_q1_nvfp4_test_hold_armed = false;
+std::shared_ptr<void> g_q1_nvfp4_test_held_completion;
 
 bool ggml_sycl_q1_nvfp4_test_model_matches(ggml_sycl_model_token a, ggml_sycl_model_token b) {
     return a.model_id == b.model_id && a.load_txn_id == b.load_txn_id &&
@@ -11865,6 +11872,14 @@ bool ggml_sycl_q1_nvfp4_test_consume_failure(ggml_sycl_q1_nvfp4_test_failure fai
         expected, GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE, std::memory_order_acq_rel);
     if (consumed) g_q1_nvfp4_test_failure_consumed.fetch_add(1, std::memory_order_relaxed);
     return consumed;
+}
+
+// Keeps the first completion submitted while armed; later ones are not held.
+void ggml_sycl_q1_nvfp4_test_retain_completion(std::shared_ptr<void> completion) {
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
+    if (g_q1_nvfp4_test_hold_armed && !g_q1_nvfp4_test_held_completion) {
+        g_q1_nvfp4_test_held_completion = std::move(completion);
+    }
 }
 } // namespace
 
@@ -11922,6 +11937,23 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
 
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
     g_q1_nvfp4_test_failure.store(static_cast<uint32_t>(failure), std::memory_order_release);
+}
+
+void ggml_sycl_q1_nvfp4_test_hold_completion(bool hold) {
+    std::shared_ptr<void> released;
+    {
+        std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
+        g_q1_nvfp4_test_hold_armed = hold;
+        if (!hold) {
+            released = std::move(g_q1_nvfp4_test_held_completion);
+        }
+    }
+    // The completion is destroyed here, outside the hold mutex: a bundle it still owns takes the workspace locks.
+}
+
+bool ggml_sycl_q1_nvfp4_test_completion_held() {
+    std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
+    return g_q1_nvfp4_test_held_completion != nullptr;
 }
 #endif
 
@@ -12275,6 +12307,7 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 #endif
 }
 
+static void                        ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context * ctx) noexcept;
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
@@ -16808,6 +16841,44 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
     ggml_sycl_execution_clear_graph_tracking(ctx);
 }
 
+// The record of a drain wait that threw, as "<stage>: <what>". A throw out of a wait bypasses the queue's handler, so
+// the latch has not moved; this records it, as synchronize records a drain that throws, so the context's next boundary
+// fails. The text is formatted into a buffer on the stack and the record copies it, so neither allocates or locks, and
+// this is safe under any lock a caller holds.
+static void ggml_sycl_async_failure_record_stage(int device, const char * stage, const char * what) noexcept {
+    char message[256];
+    std::snprintf(message, sizeof(message), "%s: %s", stage, what ? what : "(no message)");
+    ggml_sycl_async_failure_record(device, message);
+}
+
+// The second attempt of a drain whose release was refused. A refusal with the invocation still live usually means a
+// quarantined MoE workspace slot pins it: nothing recycled the slot, because its completion task's terminal_release()
+// was refused or skipped, or because a route catch whose own wait threw left it quarantined. The recovery frees only
+// the slots whose terminal reports ready() (its event complete, or its quiescence confirmed). Whether a completion task
+// can still be pending after the caller's deferred-decode wait is unmeasured, so the stream is drained first. Only a
+// refused release pays for this wait and for the registry walk; a drain that releases at once does neither. Returns
+// true when the graph was released.
+static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx || ggml_sycl_take_execution_state_snapshot(ctx).invocation_id == 0) {
+        return false;
+    }
+    try {
+        if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
+            stream->wait_and_throw();
+        }
+    } catch (const std::exception & e) {
+        ggml_sycl_async_failure_record_stage(ctx->device, "drain retry wait threw", e.what());
+        // Enqueue status is unproven: the slot stays quarantined and the caller takes the abort path.
+        return false;
+    } catch (...) {
+        // Nothing to say beyond the stage. The record is lock-free and allocation-free.
+        ggml_sycl_async_failure_record(ctx->device, "drain retry wait threw");
+        return false;
+    }
+    ggml_sycl_recover_exact_mmid_after_drain(ctx);
+    return ggml_sycl_execution_release_graph(ctx);
+}
+
 // The owner's own next begin as a drain point (llama.cpp-2dgc, RCA c-5ozb).
 //
 // ggml_backend_sycl_graph_compute_unchecked()'s execution_tail_guard submits the
@@ -16833,14 +16904,12 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
 // begin is per-backend, and a sibling backend bound to the same context has not
 // asked to start a graph here.
 //
-// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The wait -> clear the event fields ->
-// release-or-abort -> retire body below is a near-verbatim twin of the lambda in
-// ggml_sycl_execution_drain_context_terminal_events(). The duplication is
-// deliberate (the call sites genuinely differ: one context vs one backend, begin
-// vs teardown, and only teardown clears the executable graph), but the ORDERING
-// is a correctness invariant shared by both. Any change to that ordering, to the
-// unproven-wait fallback, or to which event is waited on must be applied to the
-// other function in the same commit.
+// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The body below -- wait (a wait that throws is recorded in the latch and
+// goes straight to the abort) -> clear the event fields -> release, else recover and release, else abort -> retire --
+// is a near-verbatim twin of the lambda in ggml_sycl_execution_drain_context_terminal_events(). The duplication is
+// deliberate (the call sites genuinely differ: one context vs one backend, begin vs teardown, and only teardown clears
+// the executable graph), but the ORDERING is a correctness invariant shared by both. Any change to that ordering, to
+// the unproven-wait fallback, or to which event is waited on must be applied to the other function in the same commit.
 static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {
     if (!ctx) {
         return;
@@ -16872,15 +16941,20 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
         } else if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
             stream->wait_and_throw();
         }
-    } catch (...) {
+    } catch (const std::exception & e) {
+        ggml_sycl_async_failure_record_stage(ctx->device, "begin-path drain wait threw", e.what());
         // Enqueue status is now uncertain for this device. Fall through to the
         // quarantine path, which retains every root/backing lease instead of
         // releasing on an unproven terminal.
         waited = false;
+    } catch (...) {
+        // Nothing to say beyond the stage. The record is lock-free and allocation-free.
+        ggml_sycl_async_failure_record(ctx->device, "begin-path drain wait threw");
+        waited = false;
     }
     ctx->last_graph_event.reset();
     ctx->last_graph_event_deferred_decode = false;
-    if (!waited || !ggml_sycl_execution_release_graph(ctx)) {
+    if (!waited || (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {
         ggml_sycl_execution_abort_and_release_graph(ctx);
     }
     ggml_sycl_execution_try_retire_terminal(ctx);
@@ -16900,33 +16974,40 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
 // binding lock and releases the lock before the callback, so every queue wait
 // and every final handle destruction below happens outside all ranked locks.
 //
-// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The lambda's wait -> clear the event
-// fields -> release-or-abort -> retire body is a near-verbatim twin of
-// ggml_sycl_execution_drain_own_terminal(), which drains one backend's own
-// terminal invocation from the begin path (llama.cpp-2dgc). The duplication is
-// deliberate, but the ORDERING is a correctness invariant shared by both. Any
-// change to that ordering, to the unproven-wait fallback, or to which event is
-// waited on must be applied to the other function in the same commit.
+// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The lambda's body -- wait (a wait that throws is recorded in the latch
+// and goes straight to the abort) -> clear the event fields -> release, else recover and release, else abort ->
+// retire -- is a near-verbatim twin of ggml_sycl_execution_drain_own_terminal(), which drains one backend's own
+// terminal invocation from the begin path (llama.cpp-2dgc). The duplication is deliberate, but the ORDERING is a
+// correctness invariant shared by both. Any change to that ordering, to the unproven-wait fallback, or to which event
+// is waited on must be applied to the other function in the same commit.
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {
     if (context_id == 0) {
         return;
     }
     ggml_sycl_execution_for_each_bound_backend(
         context_id, [](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
+            bool waited = true;
             try {
                 if (backend_ctx->last_graph_event.has_value() && backend_ctx->last_graph_event_deferred_decode) {
                     backend_ctx->last_graph_event->wait_and_throw();
                 } else if (const queue_ptr stream = backend_ctx->stream(backend_ctx->device, 0)) {
                     stream->wait_and_throw();
                 }
-            } catch (...) {
+            } catch (const std::exception & e) {
+                ggml_sycl_async_failure_record_stage(backend_ctx->device, "context drain wait threw", e.what());
                 // Enqueue status is now uncertain for this device. Fall through
                 // to the quarantine path, which retains every root/backing lease
                 // instead of releasing on an unproven terminal.
+                waited = false;
+            } catch (...) {
+                // Nothing to say beyond the stage. The record is lock-free and allocation-free.
+                ggml_sycl_async_failure_record(backend_ctx->device, "context drain wait threw");
+                waited = false;
             }
             backend_ctx->last_graph_event.reset();
             backend_ctx->last_graph_event_deferred_decode = false;
-            if (!ggml_sycl_execution_release_graph(backend_ctx)) {
+            if (!waited || (!ggml_sycl_execution_release_graph(backend_ctx) &&
+                            !ggml_sycl_execution_recover_and_release_graph(backend_ctx))) {
                 ggml_sycl_execution_abort_and_release_graph(backend_ctx);
             }
             ggml_sycl_execution_try_retire_terminal(backend_ctx);
@@ -54206,6 +54287,10 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     moe_stream.reset();
     ggml_sycl_moe_stream_release_payload(*this);
     pp_moe_onednn_drain_scratch_slots(device);
+    // The queues were waited on above, and a wait that threw was swallowed there. The recovery frees only the slots
+    // whose terminal reports ready() (its event complete, or its quiescence confirmed); a slot still in flight stays
+    // quarantined. Without this a finished slot's pin outlives the context and the device stays owned.
+    ggml_sycl_recover_exact_mmid_after_drain(this);
     ggml_sycl_execution_abort_and_release_graph(this);
     // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
     // entries by the ended id already.
@@ -79161,6 +79246,10 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
                                                           allow_cpu_fallback, ptr);
 }
 
+// The direct route's terminal says when the route's work is finished, and nothing else. Whether that work succeeded is
+// the asynchronous-failure latch's to say, and only a boundary that drained on its own thread may read it: a wait on
+// another thread, such as one a completion host task would make, can return while a boundary's wait is still
+// delivering the error to the handler, so a latch read after it can miss the failure.
 class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
     // The work is finished, whatever its outcome. The slot-release sites read this as "may be released", so success
@@ -79186,68 +79275,24 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
         }
     }
 
-    // The work finished and succeeded; the completion host task recycles the slot only on true. A terminal confirmed
-    // quiescent is not a success: the route's catch confirms it when its commands never ran or a submission failed,
-    // and that catch has already recovered the slot.
-    bool observe_success() noexcept {
-        std::optional<sycl::event>     event;
-        ggml_sycl_async_failure_cursor cursor{};
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (failed_ || quiescent_ || !event_) {
-                return false;
-            }
-            event  = event_;
-            cursor = cursor_;
-        }
-        try {
-            if (event->get_info<sycl::info::event::command_execution_status>() !=
-                sycl::info::event_command_status::complete) {
-                return false;
-            }
-            // Delivers a pending error to the queue's handler; it does not block, the event is complete.
-            event->wait_and_throw();
-            // The backend's handler records instead of throwing, so a failure shows only in the latch. Any failure on
-            // this device since the route's first submission denies success: the terminal cannot tell whose it was,
-            // and a failed command does not stop the commands after it.
-            if (ggml_sycl_async_failure_since(cursor)) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                failed_ = true;
-                return false;
-            }
-            return true;
-        } catch (...) {
-            // A throw here bypasses the handler, so the latch has not moved: the boundaries would take their normal
-            // path, and the release would be refused by the pin of a slot nobody recovers. Record it, as synchronize
-            // records a drain that throws. The record is lock-free and allocation-free, so a host-task worker may call
-            // it; mutex_ is not held.
-            ggml_sycl_async_failure_record(cursor.device, "direct-route terminal wait threw");
-            std::lock_guard<std::mutex> lock(mutex_);
-            failed_ = true;
-            return false;
-        }
-    }
     void wait() noexcept override {
         std::optional<sycl::event> event;
         { std::lock_guard<std::mutex> lock(mutex_); event = event_; }
         try { if (event) event->wait_and_throw(); } catch (...) {}
     }
 
-    void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor) noexcept {
+    void arm(sycl::event event) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        event_  = std::move(event);
-        cursor_ = cursor;
+        event_ = std::move(event);
     }
     void confirm_quiescent() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         quiescent_ = true;
     }
   private:
-    mutable std::mutex mutex_;
+    mutable std::mutex         mutex_;
     std::optional<sycl::event> event_;
-    ggml_sycl_async_failure_cursor cursor_{};
-    bool quiescent_ = false;
-    bool failed_ = false;
+    bool                       quiescent_ = false;
 };
 
 struct moe_direct_bundle_completion {
@@ -87122,8 +87167,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const ggml_sycl::moe_mmid_model_token model_token{
                 root.model.value, root.load.value, root.owner.generation };
             sycl::queue * exact_queue = ctx.stream();
-            // Taken before the route's first submission: a failure delivered after it denies the terminal success.
-            const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);
             // The direct recipe and exact queue capability were proven together
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
@@ -87232,26 +87275,40 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     });
                                 });
                             }
+                            ggml_sycl_q1_nvfp4_test_retain_completion(completion);
 #endif
-                            terminal->arm(final, failure_cursor);
-                            exact_queue->submit([completion, terminal, final](sycl::handler & h) {
+                            terminal->arm(final);
+                            exact_queue->submit([completion, final](sycl::handler & h) {
                                 h.depends_on(final);
-                                h.host_task([completion, terminal] {
+                                // Runs once the route's commands have finished, whatever their outcome, and releases
+                                // the finished bundle. It does not ask whether the work succeeded: a wait of its own
+                                // would return while a boundary's wait may still be delivering the error, and the
+                                // failure is the boundary's to report. terminal_release() fails closed when a recovery
+                                // already freed the slot.
+                                h.host_task([completion] {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                                     g_q1_nvfp4_test_terminal.fetch_add(1, std::memory_order_relaxed);
+                                    // Stands for a completion task that did not release: its release refused or
+                                    // skipped.
+                                    const bool skip_release = ggml_sycl_q1_nvfp4_test_consume_failure(
+                                        GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE);
+#else
+                                    constexpr bool skip_release = false;
 #endif
-                                    const bool recycled = terminal->observe_success() &&
-                                                          completion->bundle.terminal_release();
+                                    const bool recycled = !skip_release && completion->bundle.terminal_release();
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
-                                    if (recycled) g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
+                                    if (recycled) {
+                                        g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
+                                    }
 #endif
                                     // The bundle holds the admission authority, and with it the invocation pin, until
-                                    // terminal_release() resets it, which a failed terminal never reaches. Empty it as
-                                    // the body's last statement, through the shared completion object rather than this
-                                    // functor's reference to it, so no copy of the functor keeps the pin. The event of a
-                                    // host task cannot complete before its body returns, so a boundary that waited on
-                                    // that event finds the bundle gone whatever the runtime does with the functor
-                                    // afterwards. A quarantined slot keeps its own reference, for recovery.
+                                    // terminal_release() resets it, which a refused or skipped release never does.
+                                    // Empty it as the body's last statement, through the shared completion object
+                                    // rather than this functor's reference to it, so no copy of the functor keeps the
+                                    // pin. The event of a host task cannot complete before its body returns, so a
+                                    // boundary that waited on that event finds the bundle gone whatever the runtime
+                                    // does with the functor afterwards. A quarantined slot keeps its own reference,
+                                    // for recovery.
                                     completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};
                                 });
                             });
