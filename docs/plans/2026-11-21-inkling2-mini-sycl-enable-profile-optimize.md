@@ -1254,6 +1254,36 @@ Commit: `sycl: pad_reflect_1d launches a range that fits in an int and strides o
   process with `std::exit(1)` from the dispatch catch (`Error OP ...`). That is not an abort, but it is the
   same class of ending as Task 6f-2's staging aborts; it is noted there for Task 6f-4's census.
 
+**DONE 2026-11-22, merged as `48632a819`** (task commits `619915c6e` .. `1be861bc0`, logs `c930d7762`). Spec review
+PASS; quality review PASS with five findings; two fix rounds, each re-reviewed (the last by a fresh reviewer: PASS).
+
+*Fix round 2, from the quality review:*
+- Two `test-backend-ops` cases for gated delta net with k broadcast over sequences (`k_seq_bcast=1`, one with a
+  scalar gate, one KDA), and `GGML_ASSERT(neq3 > 0 && nek3 > 0 && nev3 % neq3 == 0 && nev3 % nek3 == 0)` beside the
+  ratios. CUDA asserts `nek3 == neq3` (`gated_delta_net.cu:308`), so a CUDA run aborts on the two cases unless its
+  `supports_op` declines them. CUDA is not built in this fork; this is a known consequence for upstream CI.
+- A flash-attention case with head sizes 512/256 (F16 K and V), which the D=512 exception would admit.
+- Both many-plane `PAD_REFLECT_1D` cases have 2^24 planes, `[2,1,16777216,1]` and `[2,1,1,16777216]` (ruling 4
+  above names the first as `8388608`; it was enlarged). The smallest count above the launch bound leaves one plane
+  to the stride loop, and dropping that loop then moves the error to 1.2e-7 against a threshold of 1e-7. At 2^24
+  half the planes depend on the loop.
+- The two dead `std::max` clamps in the launch arithmetic are gone, and the kernel's comments describe the code.
+
+*Mutation run, B50, once per arm* (the build at `1be861bc0` with three deliberate mutations: k's divisor built from
+q's ratio, the D=512 exception restored, the last-axis stride loop removed): both `k_seq_bcast` cases FAIL (error
+0.99 and 1.05); `[2,1,1,16777216]` FAILs (error 1.00) while `[2,1,16777216,1]` prints OK as the positive control;
+the 512/256 flash-attention case reads SUPPORTED. That last arm ran in `support` mode, which calls `supports_op` on
+an unallocated graph and runs no kernel: executing the mutant would write about 128 KiB past the end of dst on a
+shared card, and the lead does not run that.
+
+*GREEN, B50, once per arm at `1be861bc0`:* `-o GATED_DELTA_NET` rc 0 (74 OK), `-o FLASH_ATTN_EXT` rc 0 (1352 OK
+lines, the 512/256 case `not supported`, no case with `hsk != hsv` ran), `-o PAD_REFLECT_1D` rc 0 (11 OK). Mistral
+B70 gate passes. Zero kernel fault lines. `-o TIMESTEP_EMBEDDING` passed at `9d6b9a4d9` and its kernel has not
+changed since. Logs: `docs/backend/data/inkling2/t6f1-*`.
+
+*Not exercised by any model:* no gated-delta-net model is staged, and no staged model has differing key and value
+head sizes. The four kernels are covered by `test-backend-ops` only.
+
 ---
 
 ### Task 6f-2: `supports_op` says what the kernels can do, and a staging failure is a refusal (A1, A4, A5, F1's view case)
