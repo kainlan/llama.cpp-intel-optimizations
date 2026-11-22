@@ -55953,10 +55953,11 @@ static void * ggml_sycl_dequant_f16_scratch(ggml_backend_sycl_context::dequant_f
 // llama.cpp-h9c8: the f16 copy of a weight of an MMQ type the f16 dequant arm serves
 // (dense_pp_route_prefers_f16_dequant_arm), converted from the layout the weight is loaded in. The loaded layout is
 // the answer: the resolver says what the bytes are, and this function never asks a policy. An AOS weight is converted
-// from the op's row slice, as every other type is. An SOA weight is converted from its leased plane. A layout no f16
-// converter decodes is refused by name, never read as AOS: the AOS converter on SOA bytes decodes garbage
-// (llama.cpp-pzu9). The router (ggml_sycl_dense_f16_arm_serves_pp) sends here only layouts a converter exists for, so
-// a refusal means the router and this arm disagree, and the op fails by name instead of computing a wrong answer.
+// from the op's row slice, as every other type is. An SOA weight is converted from its plane, held through the owner
+// the resolver's handle names. A layout no f16 converter decodes is refused by name, never read as AOS: the AOS
+// converter on SOA bytes decodes garbage (llama.cpp-pzu9). The router (ggml_sycl_dense_f16_arm_serves_pp) sends here
+// only layouts a converter exists for, so a refusal means the router and this arm disagree, and the op fails by name
+// instead of computing a wrong answer.
 static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context & ctx,
                                                      const ggml_tensor *         src0,
                                                      const char *                src0_dd_i,
@@ -56010,12 +56011,29 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
     if (to_fp16 == nullptr) {
         refuse("f16 dequant arm: no SOA f16 converter for this type");
     }
-    // The plane is read through a leased handle, held until the conversion's reads complete. Recording lands the
-    // lease in the graph's sink for the graph's life; the event is unused there.
-    ggml_sycl::mem_handle owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);
-    void *                plane = owner.resolve(ctx.device).ptr;
-    if (plane == nullptr) {
-        refuse("f16 dequant arm: the SOA plane is not staged on this device");
+    // The plane's owner is whoever the resolver's handle says it is. A weight the cache placed (WEIGHT) is read
+    // through a cache lease, which is what stops an eviction under the read. A weight in a plain backend buffer
+    // (CHUNK_LEASE: test-backend-ops, or any graph whose weights were never registered with the cache) is owned by
+    // the tensor's own handle, and a copy of it shares the chunk lease. No other kind carries a lifetime a reader
+    // that outlives this call can hold.
+    const auto *                  extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const ggml_sycl::mem_handle * own =
+        (extra != nullptr && ggml_sycl_valid_device_index(ctx.device)) ? &extra->data_handle[ctx.device] : nullptr;
+    ggml_sycl::mem_handle owner;
+    void *                plane = nullptr;
+    if (own == nullptr || !own->valid() || own->kind() == ggml_sycl::mem_handle_kind::WEIGHT) {
+        owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);
+        plane = owner.resolve(ctx.device).ptr;
+        if (plane == nullptr) {
+            refuse("f16 dequant arm: the SOA plane is not staged on this device");
+        }
+    } else if (own->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE && own->device() == ctx.device &&
+               loaded.layout == GGML_LAYOUT_SOA) {
+        owner = *own;
+        plane = loaded.ptr;
+        ggml_sycl_chain_ready_event_if_needed(*stream, loaded);
+    } else {
+        refuse("f16 dequant arm: the SOA plane has no owner the arm can hold");
     }
     const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(plane);
     if (ptr_type != sycl::usm::alloc::device && ptr_type != sycl::usm::alloc::shared) {
@@ -56023,6 +56041,8 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
     }
     to_fp16(plane, dst_f16, ne, stream);
     sycl::event read_done = g_ggml_sycl_graph_recording ? sycl::event{} : stream->ext_oneapi_submit_barrier();
+    // The owner is held until the conversion's reads complete. Recording lands it in the graph's sink for the
+    // graph's life; the event is unused there.
     ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));
     witness();
 }
