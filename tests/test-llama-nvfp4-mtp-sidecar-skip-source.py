@@ -21,7 +21,8 @@ The rule the fix pins:
   it twice and fail with "too many tensors created");
 - every weight kind that has a ".scale" or an ".input_scale" site in the existing pass has its skipped counterpart,
   with the same dims (create_tensor checks the dims before the skip path returns), so a sidecar site added later
-  cannot leave a hole;
+  cannot leave a hole, and every skipped kind has both sites, except a kind listed as having a ".scale" site only
+  (ffn_gate_up_exps); every site in the pass is one the check can read, so a site of another shape cannot hide;
 - all of it sits after load_arch_tensors(ml) and before ml.done_getting_tensors().
 """
 
@@ -74,14 +75,21 @@ _SKIP_INPUT_SCALE = 'create_tensor(tn(tensor, "input_scale", il), {n}, skip);'
 
 
 def _site_re(suffix: str) -> re.Pattern:
-    # `if (!layer.wq_s && layer.wq) { layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q, "scale", i), {1}, ...); }`
+    # `if (!layer.wq_s && layer.wq) { layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q, "scale", i), {1}, ...); }`,
+    # optionally followed inside the block by one `if (...) { throw ...; }` (ffn_up_exps refuses a .scale beside
+    # ffn_gate_up_exps.weight)
     return re.compile(
         r"if \(!layer\.[\w.]+ && layer\.([\w.]+)\) \{ layer\.[\w.]+ = create_tensor\(tn\((LLM_TENSOR_\w+), "
-        rf'"{suffix}", i\), \{{([^}}]*)\}}, TENSOR_NOT_REQUIRED\); \}}'
+        rf'"{suffix}", i\), \{{([^}}]*)\}}, TENSOR_NOT_REQUIRED\);(?: if \([^{{}}]*\) \{{ throw [^;]*; \}})? \}}'
     )
 
 
 _SITE_RES = {"scale": _site_re("scale"), "input_scale": _site_re("input_scale")}
+# every sidecar ask of the loop over all layers, whatever its shape
+_ASK_RES = {suffix: re.compile(rf'create_tensor\(tn\(LLM_TENSOR_\w+, "{suffix}", i\)') for suffix in _SITE_RES}
+# Kinds with a ".scale" site and no ".input_scale" site: the pass maps ffn_gate_up_exps.scale onto ffn_up_exps_s and
+# asks for no input scale of the fused tensor. Their skip asks for both, and one that is not in the file counts nothing.
+_SCALE_ONLY = {"LLM_TENSOR_FFN_GATE_UP_EXPS"}
 _CALL_RE = re.compile(r"skip_scales\(i, (LLM_TENSOR_\w+), layer\.([\w.]+), ([^)]*)\);")
 
 
@@ -175,16 +183,24 @@ def skip_pairs_violations(code: str) -> list:
         return ["the loop over the MTP range is not found in the generic pass"]
     # the helper takes the bare dims figure; the existing sites write `{1}` and `{n_expert}`
     have = {(m.group(1), m.group(2), m.group(3)) for m in _CALL_RE.finditer(loop)}
+    rest = body.replace(loop, "", 1)
     violations = []
     for suffix in _SITE_RES:
-        wanted = site_pairs(body.replace(loop, "", 1), suffix)
+        wanted = site_pairs(rest, suffix)
+        asks = len(_ASK_RES[suffix].findall(rest))
+        if asks != len(list(_SITE_RES[suffix].finditer(rest))):
+            violations.append(f"{asks} .{suffix} asks in the generic pass, {len(wanted)} in a shape the check reads")
         if not wanted:
             violations.append(f"no .{suffix} site is found in the generic pass")
             continue
+        exempt = _SCALE_ONLY if suffix == "input_scale" else set()
         for tensor, weight, dims in sorted(wanted - have):
             violations.append(f".{suffix} of {tensor} (layer.{weight}, dims {{{dims}}}) has a site, no skipped counterpart")
         for tensor, weight, dims in sorted(have - wanted):
-            violations.append(f"{tensor} (layer.{weight}, dims {{{dims}}}) is skipped but has no .{suffix} site")
+            if tensor not in exempt:
+                violations.append(f"{tensor} (layer.{weight}, dims {{{dims}}}) is skipped but has no .{suffix} site")
+        for tensor in sorted(exempt & {t for t, _, _ in wanted}):
+            violations.append(f"{tensor} has an .input_scale site now: drop it from the .scale-only kinds")
     return violations
 
 
@@ -296,6 +312,29 @@ def test_skip_pairs_check_has_mutation_witnesses():
     in_dims = CODE.replace(in_exps, in_exps.replace("{n_expert}", "{1}"), 1)
     assert in_dims != CODE
     assert skip_pairs_violations(in_dims) != [], "the check must catch an .input_scale site with other dims"
+    # a skipped kind with neither site
+    last = list(_CALL_RE.finditer(CODE))[-1].group(0)
+    assert CODE.count(last) == 1
+    orphan = CODE.replace(last, last + " skip_scales(i, LLM_TENSOR_FFN_GATE_INP, layer.ffn_gate_inp, 1);", 1)
+    assert skip_pairs_violations(orphan) != [], "the check must catch a skipped kind with no sidecar site"
+    # a site of a new kind added in a shape the check cannot read, with no counterpart: only the ask count sees it
+    unread_site = extra.replace("LLM_TENSOR_ATTN_Q", "LLM_TENSOR_ATTN_Q_B").replace(
+        "TENSOR_NOT_REQUIRED)", "TENSOR_NOT_REQUIRED | 0)"
+    )
+    unread = CODE.replace(site, site + " " + unread_site, 1)
+    assert unread != CODE
+    assert skip_pairs_violations(unread) != [], "the check must catch a .scale site it cannot read"
+    # the nested refusal is read, so ffn_up_exps.scale counts as a site of its kind
+    up_site = 'create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED); if ('
+    assert CODE.count(up_site) == 1
+    assert ("LLM_TENSOR_FFN_UP_EXPS", "ffn_up_exps", "n_expert") in site_pairs(sidecar_pass(CODE), "scale")
+    # a .scale-only kind that gains an .input_scale site is reported, so the exemption cannot outlive its reason
+    gu_in = (
+        "if (!layer.ffn_gate_up_in_s && layer.ffn_gate_up_exps) { layer.ffn_gate_up_in_s = create_tensor(tn("
+        'LLM_TENSOR_FFN_GATE_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED); } '
+    )
+    gained = CODE.replace(in_site, in_site + " " + gu_in, 1)
+    assert any("drop it from the .scale-only kinds" in v for v in skip_pairs_violations(gained))
 
 
 def test_skipped_sidecars_sit_between_the_arch_loader_and_the_tensor_count():

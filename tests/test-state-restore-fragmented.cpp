@@ -65,20 +65,16 @@ static bool find_slot_head(const std::vector<std::string> & lines, int strm, int
 }
 
 // Decodes n_tokens copies of token 1 on seq_id at positions pos0 .. pos0 + n_tokens - 1,
-// requesting logits for the last token only. Returns the llama_decode() result.
+// requesting logits for the last token only. Returns the llama_process() result, which has the
+// same meaning as the llama_decode() result.
 static int decode_seq(llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, int n_tokens) {
-    llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    common_batch batch(ctx);
 
     for (int i = 0; i < n_tokens; ++i) {
-        common_batch_add(batch, 1, pos0 + i, { seq_id }, false);
+        batch.add(1, pos0 + i, seq_id, i == n_tokens - 1);
     }
-    batch.logits[batch.n_tokens - 1] = true;
 
-    const int ret = llama_decode(ctx, batch);
-
-    llama_batch_free(batch);
-
-    return ret;
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
 }
 
 // Regression for the llama_kv_cache::prepare() rollback: prepare() saves a copy of the whole
@@ -90,7 +86,7 @@ static int decode_seq(llama_context * ctx, llama_seq_id seq_id, llama_pos pos0, 
 //   - prime seq 0, 1, 2 with 38 tokens and seq 3 with 42 tokens -> heads = [38, 38, 38, 42]
 //   - a 240-token batch on seq 3 alone (positions 42..281) splits into ubatches of 128 + 112:
 //     the first is placed (head 42 -> 170), the second needs 112 cells but only 86 remain,
-//     so prepare() fails after one placed ubatch and rolls it back; llama_decode() returns > 0
+//     so prepare() fails after one placed ubatch and rolls it back; llama_process() returns > 0
 //   - buggy rollback:   v_heads[3] = v_heads_old[0] = 38
 //     correct rollback: v_heads[3] = v_heads_old[3] = 42
 //   - the head is observed through the find_slot debug line of the next decode on seq 3
@@ -249,15 +245,15 @@ int main(int argc, char ** argv) {
 
     // interleave the 3 sequences:
     // 01201230123...
-    llama_batch batch = llama_batch_init(params.n_parallel*tokens.size(), 0, 1);
+    common_batch batch(ctx);
     for (size_t i = 0; i < tokens.size(); i++) {
         for (int s = 0; s < params.n_parallel; ++s) {
-            common_batch_add(batch, tokens[i], i, {s}, false);
+            const bool last = i + 1 == tokens.size() && s + 1 == params.n_parallel;
+            batch.add(tokens[i], (llama_pos) i, s, last);
         }
     }
-    batch.logits[batch.n_tokens - 1] = true;
 
-    if (llama_decode(ctx, batch)) {
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         fprintf(stderr, "%s : failed to decode seq 0\n", __func__);
         return 1;
     }
@@ -291,7 +287,6 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : FAILED to restore seq state into fragmented cache (got %zu, expected %zu)\n",
                 __func__, nset, seq_state.size());
         fprintf(stderr, "%s : This is the bug - state restore fails with fragmented KV cache\n", __func__);
-        llama_batch_free(batch);
         return 1;
     }
     fprintf(stderr, "%s : restored state into seq 1, %zu bytes\n", __func__, nset);
@@ -305,13 +300,12 @@ int main(int argc, char ** argv) {
     auto next_token = llama_sampler_sample(smpl, ctx, -1);
     auto next_token_str = common_token_to_piece(ctx, next_token);
 
-    common_batch_clear(batch);
-    common_batch_add(batch, next_token, (int)tokens.size(), {1}, true);
+    batch.clear();
+    batch.add(next_token, (int)tokens.size(), 1, true);
 
-    if (llama_decode(ctx, batch)) {
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         fprintf(stderr, "%s : failed to decode with restored state\n", __func__);
         llama_sampler_free(smpl);
-        llama_batch_free(batch);
         return 1;
     }
 
@@ -319,7 +313,6 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s : SUCCESS - state restore works with fragmented KV cache\n", __func__);
 
     llama_sampler_free(smpl);
-    llama_batch_free(batch);
 
     // release this scenario's model and context before the next scenario loads its own
     llama_init.reset();

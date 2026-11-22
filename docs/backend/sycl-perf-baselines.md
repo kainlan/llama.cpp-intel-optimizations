@@ -1532,3 +1532,175 @@ bands are stale-low — both binaries EXCEED the pp bands by ~20% and miss the
 tg band identically — refresh is owner-review task llama.cpp-kzug; these rows
 are history, not new floors; (3) absolute values under ambient load are not
 baselines (standing rule).
+
+## Orientation figures and guardrail history moved from `CLAUDE.md` (2026-11-16)
+
+This section holds the text that `CLAUDE.md` carried under "Performance Expectations" and
+"Regression Baselines (hard guardrails)" until 2026-11-16. `CLAUDE.md` now keeps the guardrail rule
+and the gate figures in a few lines, and points here. The moved text is unchanged. In it, "this
+file" means `CLAUDE.md` as it stood before that date. It overlaps "Guardrail status" above. Where
+the two differ, the tables in this document are the gate.
+
+Note, checked 2026-11-16: the loaded driver is 26.44 since 2026-11-14 (see
+`docs/backend/compute-runtime.md`). The figures below were measured on the driver named beside
+them and have not been re-validated on 26.44.
+
+### Performance Expectations (as it stood)
+
+Full tables, run counts and spreads live in `docs/backend/sycl-perf-baselines.md`.
+**Gate against that document, not this one.** Orientation figures, `-p 512 -n 128`,
+driver 26.27:
+
+| card | model | PP512 | TG128 |
+|------|-------|------:|------:|
+| Arc Pro B70 (`level_zero:0`) | GPT-OSS 20B MXFP4 | ~1415 | ~44 on 26.27 — **~39-40 on 26.31, see Regression Baselines** |
+| Arc Pro B70 (`level_zero:0`) | Mistral 7B Q4_0 | ~2495 | ~108 |
+| Arc Pro B50 (`level_zero:1`) | GPT-OSS 20B MXFP4 | ~894 | ~32 |
+| Arc Pro B50 (`level_zero:1`) | Mistral 7B Q4_0 | ~1188 | ~47 |
+
+Re-measured 2026-07-25 at `79ae63559` (machine under load): B70 1397.55/47.79 and
+2513.76/108.94; B50 902.26/36.55 and 1200.21/46.94. Seven of eight at or above
+baseline, so the table above is current.
+
+**B70 tg128 is the noisy axis** — cv 3.3% over 21 runs, range 40.18–46.27. Ignore
+B70 tg differences below ~10% between single runs. The B50 is steady (cv 0.7% tg,
+0.3% pp), so a B50 move of a few percent is real.
+
+Any **B580** figure in older notes is history — that card was replaced by the B70.
+Measuring a B70 against a B580 target makes a healthy run look catastrophic.
+
+⚠️ **`GGML_SYCL_FA_ONEDNN_ALLOW` does not exist, and the warning that used to
+stand here was wrong in both directions.** It read: *"Do not use
+`GGML_SYCL_FA_ONEDNN_ALLOW=1` to restore Mistral PP numbers — it can raise PP
+throughput, but the deterministic completion gate produces incorrect output with
+the current nc!=D contiguity fast-path."* Corrected 2026-07-30. Every clause of
+that is now false:
+
+1. **No such variable.** Commit `3c8f296fd` (2026-05-15) *removed* the
+   `getenv("GGML_SYCL_FA_ONEDNN_ALLOW")` bypass **and added that warning in the
+   same commit** — it documented a footgun it had just deleted. Setting it today
+   is a no-op; verified, the Mistral gate emits the identical correct
+   `1, 2, 3, 4, 5, 6, 7, 8, 9, 10` with and without it. The name survives only in
+   a stale comment at `fattn.cpp` and here.
+2. **oneDNN SDPA is not retired for Mistral — it is ON by default and Mistral
+   uses it.** `16a241dd1` (2026-05-30) added the `MATERIALIZE_REQUIRED` path, so
+   nc≠D GQA is no longer rejected: the planner
+   (`fattn-onednn.cpp:140`) asks a unified-cache-backed materializer for dense
+   f16 K/V, and `fattn.cpp:2618` accepts that plan alongside `DIRECT`. Confirmed
+   live with `GGML_SYCL_FA_DISPATCH_DEBUG=1` — 32 dispatches per generation:
+   `oneDNN MATERIALIZED D=128 ne01=16 ne11=256 H_q=32 H_kv=8` (H_q≠H_kv **is**
+   the GQA shape the old note claimed corrupts).
+3. **There is no correctness penalty, and disabling it is expensive.**
+   Interleaved paired A/B, Mistral Q4_0 pp512 on the B50:
+
+   | pair | default (oneDNN on) | `GGML_SYCL_FA_ONEDNN=0` |
+   |------|--------------------:|------------------------:|
+   | 1 | 1142.76 | 695.31 |
+   | 2 | 1145.14 | 697.12 |
+   | 3 | 1113.92 | 697.23 |
+
+   **Turning oneDNN FA off costs ~39% of PP512** (1.63x slower). Taken under
+   load 38 — absolute values are depressed and are not baselines, but the
+   interleaved pairing makes the *ratio* sound, and the spreads are tight
+   (off: cv 0.15%).
+
+The real variable is **`GGML_SYCL_FA_ONEDNN`** (default ON; `=0` disables).
+Leave it alone unless you are deliberately bisecting the attention path.
+
+### Regression Baselines (as it stood)
+
+Do not accept lower post-merge/post-debug numbers as new baselines (codescout
+tasks `llama.cpp-aqzz3.1`, `llama.cpp-po3nd.2.45/.46`, `llama.cpp-ix58x`):
+
+**Gate against the rows in `docs/backend/sycl-perf-baselines.md`** (reproduced in
+Performance Expectations above), never against a number remembered from an older
+card or an older driver. Allow the stated spread: B70 tg is noisy (±10% between
+single runs means nothing), the B50 is steady.
+
+- **B50 GPT-OSS 20B MXFP4 FA-on:** ~894 PP512 / ~32 TG128, count gate passing.
+- **B70 GPT-OSS 20B MXFP4 FA-on:** ~1415 PP512 / **~39-40** TG128, count gate
+  passing.
+  ⚠️ **This line carried `~44 TG128` until 2026-09-17 and it was stale in exactly
+  the way the `≥1100` story below describes.** `docs/backend/sycl-perf-baselines.md`
+  — the document this section defers to — states in the notes under its pp512
+  table: *"The documented ~44 B70 GPT-OSS tg floor predates driver 26.31; ~39-40
+  is what this tree does."* Every measurement since 2026-08-18 ran on 26.31 (see
+  the stale-pin correction under Patched compute-runtime). Scored against ~44, a
+  healthy B70 reads as a ~10% regression — and B70 tg is the noisy axis, so a
+  single run cannot tell you which it is. If you find ~44 quoted as a gate
+  anywhere else, it is wrong there too.
+- **B50 / B70 Mistral 7B Q4_0:** ~1188 / ~2495 PP512, ~47 / ~108 TG128.
+
+⚠️ **A `≥1100 PP512, ~50+ TG128` B50 GPT-OSS guardrail appeared here until
+2026-07-25 and was wrong** — it predates the 26.27 driver. Against it a healthy
+B50 (~894–902 PP512) reads as an ~18% catastrophe. That stale figure triggered
+three separate false-regression scares in one session. If you find it quoted
+anywhere else, it is wrong there too.
+
+- ~~**B580 Mistral 7B Q4_0 FA-on:** >2000 PP512, >85 TG128~~ — **SUPERSEDED, not
+  a gate.** The B580 was replaced by the Arc Pro B70 and is no longer installed.
+  The figure `docs/backend/SYCL.md` records (`5b206c499-dirty`, 2173.92 PP512 /
+  88.42 TG128) remains valid history *for that card only*. **Do not gate on it.**
+
+Keep these opt-in until same-build B50 GPT-OSS + B70 Mistral gates pass on a
+clean boot: `GGML_SYCL_MOE_BLOCK_GRAPHLETS`, `GGML_SYCL_XMX_MOE_PP` /
+`GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP`, `GGML_SYCL_PP_PIPELINE` (the last has shown
+GPT-OSS chat correctness failures).
+
+⚠️ **The stale guardrail above is also baked into the tracker**, where the doc
+pass could not reach it. `llama.cpp-po3nd.2` (epic, 42 dependents) carries both
+dead figures in its **acceptance criteria**, and a June "gate audit" propagated
+them into every open child (`.2.13`, `.2.21`, `.2.27`, `.2.30`, `.2.38`, `.2.45`,
+`.2.46`) plus `llama.cpp-ix58x` and `llama.cpp-aqzz3`. Both conditions are now
+unreachable — B50 ≥1100 PP512 exceeds a healthy card, and the B580 gate names
+hardware that is no longer installed — so those tasks cannot be closed as
+written. See the 2026-07-25 comment on `llama.cpp-po3nd.2`. Re-read the gate from
+`docs/backend/sycl-perf-baselines.md`, never from a task's acceptance criteria.
+
+Active regression-hunt state (commit deltas, suspect changes) lives in the
+codescout task tracker. Find it with `task_search` (pass `semantic=false` — the
+semantic path times out on this store); there is no single standing task id.
+
+## 2026-11-21 upstream sync (19bc41dbb): first measurements and one resolved regression
+
+Tree `278a6e4a3` (merge of ggml-org/master `19bc41dbb` into `a450d2c81`), driver 26.44, `llama-bench -fa 1 -v`, one
+model load per command, pinned selector, under `GPU.lock`. Another session ran about 32 compiler processes during the
+runs, so absolute figures carry the "builders" invalid bit; the B70 and B50 Mistral prompt-processing figures still sit
+at or above the table above. Mistral gate and GPT-OSS gate pass on both cards (`scripts/sycl-canonical-gates.sh`).
+
+| model | card | pp512 | pp2048 (ub 2048) | tg128 |
+|---|---|---:|---:|---:|
+| Mistral 7B Q4_0 | B70 | 3228.8 ± 26.8 | 4228.8 ± 8.5 | 109.2 ± 0.9 (`-p 0 -r 8`); 92.3 ± 7.7 in the mixed run |
+| Mistral 7B Q4_0 | B50 | 1329.0 ± 3.5 | 1636.7 ± 2.3 | 44.1 ± 1.7 |
+| GPT-OSS 20B MXFP4 | B70 | 1628.9 ± 36.8 | 1180.9 ± 146.2 | 36.4 ± 3.8 (mixed run); 51.2 ± 1.2 (`-p 0`, tiny context, not comparable) |
+| GPT-OSS 20B MXFP4 | B50 | 550.3 ± 5.4 at ub 256 (after the fix below) | not measured | 34.69 ± 0.19 (after the fix below) |
+
+**B50 GPT-OSS (resolved).** Paired ABBA against `a450d2c81` (pre-merge, own worktree, `-p 512 -n 128 -r 3`):
+
+| arm | n_ubatch chosen | pp512 | tg128 | worst case at ub 512 | compute probe at n_ctx 131072 |
+|---|---:|---:|---:|---:|---:|
+| pre-merge, run 1 / 2 | 256 | 455.7 ± 110.7 / 423.0 ± 208.2 | 34.8 ± 0.4 / 34.6 ± 0.3 | 1445.1 MB | 404.0 MiB |
+| merged, run 1 / 2 | 256 | 552.0 ± 5.2 / 424.9 ± 219.5 | none (refused) | 1522.8 MB | 543.3 MiB |
+
+- The drop from `n_ubatch` 512 to 256 on this card is **not** from the merge: the pre-merge fork does it too (the card
+  has about 1.6 GB free for compute after the planned zones). The B50 GPT-OSS figures near 870 pp512 above were measured
+  at ub 512 on an earlier tree and no longer describe HEAD.
+- What the merge added: the load-time compute probe (`stage=probe`, n_ctx 131072, ub 512, 93 splits) measured 543.3 MiB
+  on SYCL0 instead of 404.0 MiB (+139.3 MiB). The RUNTIME zone rose 1919 -> 2059 MB, the weight zone shrank, 8 MoE
+  expert layers (100.9 MB) moved to the host, and at ub 128 the context needed 1198.9 MB with 167.7 MB free, under the
+  256 MB driver headroom, so creation failed.
+- Cause: upstream 0bb496dbd (mixed token and embedding batches) makes the input select 3-way. The unselected branch
+  ends in a node with no consumer that is never computed (`DUP` then `SET_ROWS` of `[2880, 512]`). `ggml-alloc` frees a
+  node only when a consumer finishes, so that block stayed allocated to the end of the graph, next to the 128 MiB
+  attention-mask copy. When the mask was freed the hole was too small for the 392 MiB logits tensor, which went above
+  it: +128 MiB mask hole plus two 5.62 MiB blocks. Found by diffing the node lists of both trees (they differ only in the
+  mixed path) and by disabling the mixed path (probe back to 404.0 MiB).
+- Fix: `ggml_gallocr_alloc_graph_impl` frees a node that is not computed, not an output and has no consumers or views as
+  soon as it is allocated. With the mixed path on, the probe is 404.0 MiB, the tg128 context is created again and tg128
+  is 34.69 ± 0.19 (pre-merge 34.7). B70 tg128 after the fix: Mistral 109.5 ± 1.0 (`-p 0 -r 8`), GPT-OSS 53.3 ± 1.8
+  (`-p 0`, tiny context, not comparable). Regression test: `test_unselected_branch_is_not_pinned` in
+  `tests/test-alloc.cpp` (80 bytes with the fix, 88 without).
+- Also fixed in the merge: CPU flash attention aborted on the F16 Q that the SYCL graph casts (`GGML_SYCL_FATTN_Q_TYPE`)
+  once upstream gave F16 an F32 `vec_dot_type`; `ggml_compute_forward_flash_attn_ext_f16_one_chunk` widens an F16 Q row,
+  and the SYCL baseline trait table in `cpu-traits-support.cpp` follows upstream's F16 entry.
+- Gates after the fix: Mistral and GPT-OSS completion gates pass on both cards (`scripts/sycl-canonical-gates.sh`).

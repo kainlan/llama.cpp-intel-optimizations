@@ -110,6 +110,7 @@
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/exit-settle.hpp"
 #include "ggml-sycl/fattn.hpp"
+#include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -151,6 +152,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/tenant-claim-scope.hpp"
+#include "ggml-sycl/top-k-mask.hpp"
 #include "ggml-sycl/topk.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
@@ -35075,6 +35077,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_probe_buffer_interface = {
 
     /* .clear           = */ NULL,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 static ggml_backend_buffer_t ggml_backend_sycl_probe_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -35107,9 +35112,11 @@ static bool ggml_backend_sycl_probe_buffer_type_is_host(ggml_backend_buffer_type
 static const ggml_backend_buffer_type_i ggml_backend_sycl_probe_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_sycl_probe_buffer_type_get_name,
     /* .alloc_buffer   = */ ggml_backend_sycl_probe_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n = */ NULL,
     /* .get_alignment  = */ ggml_backend_sycl_probe_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_sycl_probe_buffer_type_get_max_size,
     /* .get_alloc_size = */ NULL,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host        = */ ggml_backend_sycl_probe_buffer_type_is_host,
 
 };
@@ -36755,6 +36762,9 @@ static void ggml_check_sycl() try {
             { "GGML_SYCL_PRIORITIZE_DMMV",  &g_ggml_sycl_prioritize_dmmv,  0  },
             { "GGML_SYCL_KQV_FORCE_SIMPLE", &g_ggml_sycl_kqv_force_simple, 0  },
             { "GGML_SYCL_KQV_DISABLE_FP16", &g_ggml_sycl_kqv_disable_fp16, 0  },
+            // Upstream's device-built MUL_MAT_ID schedule (18c5a95e2). Upstream defaults it to 1, this fork to 0
+            // (owner decision 2026-11-21); the bits are masked after the loop, as upstream does.
+            { "GGML_SYCL_MMID_SCHED",       &g_ggml_sycl_mmid_sched,       0  },
 #ifdef GGML_SYCL_XMX_GEMM
             { "GGML_SYCL_USE_XMX_GEMM",     &g_ggml_sycl_use_xmx_gemm,     0  },
             // 64 is the ONLY statement of the XMX batch threshold's default;
@@ -36800,6 +36810,7 @@ static void ggml_check_sycl() try {
         for (const sycl_env_setting & setting : sycl_env_settings) {
             *setting.dest = get_sycl_env(setting.name, setting.default_value);
         }
+        g_ggml_sycl_mmid_sched &= GGML_SYCL_MMID_SCHED_DEVICE | GGML_SYCL_MMID_SCHED_UNBOUNDED;
         g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
         g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
 
@@ -38002,8 +38013,14 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                                 extra->data_device_ptr(dev_id));
             }
         }
-    } else if (ggml_sycl_soa_reorder_supported_type(tensor->type) &&
+    } else if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+               ggml_sycl_soa_reorder_supported_type(tensor->type) &&
                (ggml_sycl_reorder_enabled() || ggml_sycl_unified_kernel_requires_aos(tensor->type))) {
+        // A compute-buffer copy of a host weight (the scheduler's upload of an op it gave this device) is
+        // refilled in the plain layout before every run, so it takes no reorder record: it falls through to
+        // the plain extra below and is read as the AOS bytes it holds (upstream 18c5a95e2, "stop
+        // erroneously reordering host-offloaded tensors").
+        //
         // Reuse an existing extra if present.  Do NOT overwrite it or we lose the
         // model_id for unified cache lookups.
         //
@@ -38778,7 +38795,7 @@ static bool ggml_sycl_dense_f16_arm_serves_pp(const ggml_tensor * src0,
         !ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)) {
         return false;
     }
-    if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {
+    if (!dst || dst->op_params[0] != GGML_PREC_UNDEFINED) {
         return false;
     }
     if (src0->buffer &&
@@ -48775,6 +48792,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
 
     /* .reset           = */ ggml_backend_sycl_buffer_reset,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_buffer_get_caps,
 
 };
@@ -50177,10 +50197,12 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface 
 
     /* .get_name         = */ ggml_backend_sycl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
 
     /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
 };
 
@@ -51081,6 +51103,9 @@ static const ggml_backend_buffer_i tiered_kv_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ tiered_kv_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 // Buffer type: allocates tiered buffer with hot (device) + cold (host pinned) regions
@@ -51876,9 +51901,11 @@ static size_t tiered_kv_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 static const ggml_backend_buffer_type_i tiered_kv_buft_interface = {
     /* .get_name         = */ tiered_kv_buft_get_name,
     /* .alloc_buffer     = */ tiered_kv_buft_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ tiered_kv_buft_get_alignment,
     /* .get_max_size     = */ tiered_kv_buft_get_max_size,
     /* .get_alloc_size   = */ NULL,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
 };
 
@@ -52298,6 +52325,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_split_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_split_buffer_clear,
 
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_split_buffer_get_caps,
 };
 
@@ -52409,10 +52439,12 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
 
     /* .get_name         = */ ggml_backend_sycl_split_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_split_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_split_buffer_type_get_alignment,
     /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
 
     /* .get_alloc_size   = */ ggml_backend_sycl_split_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ ggml_backend_sycl_split_buffer_type_is_host,
     /* .get_caps         = */ ggml_backend_sycl_split_buffer_type_get_caps,
 };
@@ -53065,6 +53097,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_tp_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_sycl_tp_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_tp_buffer_get_caps,
 };
 
@@ -53169,9 +53204,11 @@ static uint32_t ggml_backend_sycl_tp_buffer_type_get_caps(ggml_backend_buffer_ty
 static const ggml_backend_buffer_type_i ggml_backend_sycl_tp_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_sycl_tp_buffer_type_name,
     /* .alloc_buffer   = */ ggml_backend_sycl_tp_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n = */ NULL,
     /* .get_alignment  = */ ggml_backend_sycl_tp_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_sycl_tp_buffer_type_get_max_size,
     /* .get_alloc_size = */ ggml_backend_sycl_tp_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host        = */ ggml_backend_sycl_tp_buffer_type_is_host,
     /* .get_caps       = */ ggml_backend_sycl_tp_buffer_type_get_caps,
 };
@@ -55124,10 +55161,12 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
         /* .iface    = */ {
                            /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
                            /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n   = */ NULL,
 
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                            /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
                            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n = */ NULL,
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
@@ -55145,9 +55184,11 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing()
         /* .iface    = */ {
                            /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
                            /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n   = */ NULL,
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                            /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
                            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n = */ NULL,
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
@@ -55810,6 +55851,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_lazy_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_sycl_lazy_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_lazy_buffer_clear,
     /* .reset           = */ nullptr,
+    /* .set_tensor_n    = */ nullptr,  // ggml falls back to the single-tensor entries above
+    /* .get_tensor_n    = */ nullptr,
+    /* .cpy_tensor_n    = */ nullptr,
     /* .get_caps        = */ nullptr,  // the type's: STABLE_BASE, and no host access since is_host is false
 };
 
@@ -56025,9 +56069,11 @@ static size_t ggml_backend_sycl_host_compute_buffer_type_get_max_size(ggml_backe
 static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_host_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_host_compute_buffer_alloc,  // Per-device buffer for TP
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_sycl_host_compute_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,  // Not a CPU host buffer - it's SYCL host memory
 };
 
@@ -56156,9 +56202,11 @@ static size_t ggml_backend_sycl_cpu_offload_compute_get_max_size(ggml_backend_bu
 static const ggml_backend_buffer_type_i ggml_backend_sycl_cpu_offload_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_cpu_offload_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_sycl_cpu_offload_compute_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ ggml_backend_sycl_cpu_offload_compute_is_host,
 };
 
@@ -58061,23 +58109,6 @@ __dpct_inline__ static void k_argsort_f32_i32(const float * x,
     }
 }
 
-static void diag_mask_inf_f32(const float *            x,
-                              float *                  dst,
-                              const int                ncols,
-                              const int                rows_per_channel,
-                              const int                n_past,
-                              const sycl::nd_item<3> & item_ct1) {
-    const int col = item_ct1.get_local_range(1) * item_ct1.get_group(1) + item_ct1.get_local_id(1);
-    const int row = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
-    if (col >= ncols) {
-        return;
-    }
-    const int i = row * ncols + col;
-    //dst[i] = col > (n_past + row % rows_per_channel) ? -INFINITY : x[i];
-    //dst[i] = x[i] - (col > n_past + row % rows_per_channel) * INT_MAX; // equivalent within rounding error but slightly faster on GPU
-    dst[i]      = x[i] - (col > n_past + row % rows_per_channel) * FLT_MAX;
-}
-
 static void scale_f32(const float *            x,
                       float *                  dst,
                       const float              scale,
@@ -58471,22 +58502,6 @@ static void topk_f32_i32_sycl(const float * x,
                 }
             });
         });
-    });
-}
-
-static void diag_mask_inf_f32_sycl(const float * x,
-                                   float *       dst,
-                                   const int     ncols_x,
-                                   const int     nrows_x,
-                                   const int     rows_per_channel,
-                                   const int     n_past,
-
-                                   queue_ptr stream) {
-    const sycl::range<3> block_dims(1, SYCL_DIAG_MASK_INF_BLOCK_SIZE, 1);
-    const int            block_num_x = (ncols_x + SYCL_DIAG_MASK_INF_BLOCK_SIZE - 1) / SYCL_DIAG_MASK_INF_BLOCK_SIZE;
-    const sycl::range<3> block_nums(1, block_num_x, nrows_x);
-    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-        diag_mask_inf_f32(x, dst, ncols_x, rows_per_channel, n_past, item_ct1);
     });
 }
 
@@ -58945,7 +58960,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
     // for why and what it does not (yet) cover.
     const layout_mode q8_0_dense_planned_layout = ggml_sycl_q8_0_dense_planned_layout(src0, ctx.device);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+        row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_UNDEFINED) {
         sycl::half * src0_pp_scratch = nullptr;
         sycl::half * src1_pp_scratch = nullptr;
 #if GGML_SYCL_DNNL
@@ -59720,24 +59735,6 @@ inline void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
             GGML_ABORT("[TOP_K] no SYCL path for ncols=%lld k=%lld; supports_op should have declined it",
                        (long long) ncols, (long long) k);
     }
-}
-
-inline void ggml_sycl_op_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    auto src0 = dst.src(0);
-    GGML_ASSERT(src0.type() == GGML_TYPE_F32);
-    GGML_ASSERT(dst.type() == GGML_TYPE_F32);
-    dpct::queue_ptr main_stream = ctx.stream();
-    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-
-    const float * src0_dd = src0.resolve_as<const float>();
-    float *       dst_dd  = dst.resolve_as<float>();
-    const int64_t ne00    = src0.ne(0);
-    const int64_t ne01    = src0.ne(1);
-
-    const int    nrows0 = ggml_nrows(src0.raw());
-    const auto * params = static_cast<const int32_t *>(dst.op_params());
-    const int    n_past = params ? params[0] : 0;
-    diag_mask_inf_f32_sycl(src0_dd, dst_dd, ne00, nrows0, ne01, n_past, main_stream);
 }
 
 inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -65515,7 +65512,7 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *            
 }
 
 static bool ggml_sycl_simple_consumer_op(enum ggml_op op) {
-    return op == GGML_OP_ADD || op == GGML_OP_ADD1 || op == GGML_OP_MUL || op == GGML_OP_CONT || op == GGML_OP_DUP ||
+    return op == GGML_OP_ADD || op == GGML_OP_MUL || op == GGML_OP_CONT || op == GGML_OP_DUP ||
            op == GGML_OP_CPY || op == GGML_OP_SOFT_MAX || op == GGML_OP_ROPE || op == GGML_OP_NORM ||
            op == GGML_OP_RMS_NORM || op == GGML_OP_ARGSORT || op == GGML_OP_TOP_K || op == GGML_OP_GET_ROWS ||
            op == GGML_OP_GLU;
@@ -66386,7 +66383,7 @@ static bool ggml_sycl_try_route_simple_consumer(ggml_backend_sycl_context & ctx,
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -66763,7 +66760,7 @@ static bool ggml_sycl_try_cross_device_f16_attention(ggml_backend_sycl_context &
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -66968,7 +66965,7 @@ static bool ggml_sycl_try_route_flash_attn_ext(ggml_backend_sycl_context & ctx, 
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -67194,7 +67191,7 @@ static bool ggml_sycl_try_route_mul_mat_weight_owner(ggml_backend_sycl_context &
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -67427,7 +67424,7 @@ static bool ggml_sycl_try_route_mul_mat_activation(ggml_backend_sycl_context & c
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -80403,11 +80400,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     }
 }
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
 struct fused_moe_route_validation {
     bool                               ok     = false;
     const char *                       reason = "not-validated";
@@ -86838,6 +86830,41 @@ template <size_t N>
 #    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) false
 #endif
 
+// The device-built MUL_MAT_ID schedule (upstream 18c5a95e2, fused-gemm.cpp), GGML_SYCL_MMID_SCHED, default 0. It takes
+// a prompt op whose experts are all planned on this device in the AOS layout, in upstream's f32/i32 layout. Its four
+// scratch tables must fit ceilings the planner names for them (mmid-sched-admission.hpp). The planner reserves no such
+// tables yet, so every eligible call is refused MISSING_PLAN, reported once, and the op takes its planned MoE route.
+// Admission refusing before anything is allocated or queued is the contract that later wiring keeps.
+static bool ggml_sycl_mul_mat_id_device_sched(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (!src0 || !src1 || !ids || src1->ne[2] == 1 || !ggml_is_contiguous(src0) || ids->type != GGML_TYPE_I32 ||
+        ids->nb[0] != sizeof(int32_t) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->nb[1] != sizeof(float) * src1->ne[0] || dst->nb[1] != sizeof(float) * dst->ne[0] ||
+        ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    // Layout follows residency: the schedule reads AOS expert slices from this device, so it is asked only when the plan
+    // put every expert here in that layout. Upstream's kernel reads the experts at base + e * nb02; the fork keeps each
+    // expert in its own cache entry, so a launch also needs the kernel to read a per-expert pointer table.
+    layout_mode planned_layout = GGML_LAYOUT_AOS;
+    if (!ggml_sycl_moe_tensor_plan_primary_layout(src0, ctx.device, &planned_layout) ||
+        planned_layout != GGML_LAYOUT_AOS) {
+        return false;
+    }
+    ggml_sycl::mmid_sched_scratch_shape required;
+    if (!ggml_sycl_grouped_dequant_gemm_device_scratch(src0->type, /*reordered=*/false, ggml_sycl_src1_prec(dst),
+                                                       src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0],
+                                                       ctx.stream(), &required)) {
+        return false;
+    }
+    const ggml_sycl::mmid_sched_scratch_admission admission =
+        ggml_sycl::mmid_sched_preflight_scratch(/*planned=*/nullptr, required);
+    ggml_sycl::mmid_sched_warn_refusal_once(admission);
+    return false;
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
@@ -87096,6 +87123,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    /* use_tensor_data_ptr = */ false);
         std::lock_guard<std::mutex> lock(s_mul_mat_id_extras_mutex);
         s_mul_mat_id_extras.push_back(std::move(new_extra));
+    }
+
+    // GGML_SYCL_MMID_SCHED (default 0): the device-built prompt schedule. A refusal falls through to the planned routes.
+    if ((g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_DEVICE) && ggml_sycl_mul_mat_id_device_sched(ctx, dst)) {
+        return;
     }
 
     // llama.cpp-yx28: batch-1 decode with every expert resident on this
@@ -96605,11 +96637,6 @@ static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_ten
     ggml_sycl_op_scale(ctx, dst);
 }
 
-static void ggml_sycl_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
-    ggml_sycl_op_diag_mask_inf(ctx, dst);
-}
-
 static void ggml_sycl_pool2d(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
     ggml_sycl_op_pool2d(ctx, dst);
@@ -96660,12 +96687,13 @@ static void ggml_sycl_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_ten
 }
 
 static void ggml_sycl_set_main_device(const int main_device) try {
-    if (dpct::get_current_device_id() == static_cast<unsigned int>(main_device)) {
+    // The thread's cached device id (upstream f3d7725a7): this runs at the start of every graph compute.
+    if (get_current_device_id() == main_device) {
         return;
     }
     check_allow_gpu_index(main_device);
 
-    dpct::select_device(main_device);
+    ggml_sycl_select_dpct_device(main_device);
     if (g_ggml_sycl_debug) {
         dpct::device_info prop;
 
@@ -99497,6 +99525,9 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_sycl_op_lightning_indexer(ctx, safe_dst);
             break;
+        case GGML_OP_TOP_K_MASK:
+            ggml_sycl_op_top_k_mask(ctx, safe_dst);
+            break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
             break;
@@ -99507,14 +99538,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
                 ggml_sycl_debug_dump_tensor_meta("ADD src1", dst->src[1]);
             }
             ggml_sycl_add(ctx, safe_dst);
-            break;
-        case GGML_OP_ADD1:
-            if (g_ggml_sycl_debug) {
-                ggml_sycl_debug_dump_tensor_meta("ADD1 dst", dst);
-                ggml_sycl_debug_dump_tensor_meta("ADD1 src0", dst->src[0]);
-                ggml_sycl_debug_dump_tensor_meta("ADD1 src1", dst->src[1]);
-            }
-            ggml_sycl_add1(ctx, safe_dst);
             break;
         case GGML_OP_ADD_ID:
             // Skip residual MoE ADD_ID bias nodes only when a fused/direct producer
@@ -99762,9 +99785,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_TRANSPOSE:
             GGML_SYCL_DEBUG("%s: Tensor NO-OP\n", __func__);
 
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_sycl_diag_mask_inf(ctx, safe_dst);
             break;
 
         case GGML_OP_SOFT_MAX:
@@ -101029,6 +101049,10 @@ static std::vector<std::pair<int, ggml_tensor *>> find_mulmat_consumers(const gg
 
     for (int j = start_idx; j < cgraph->n_nodes; j++) {
         ggml_tensor * node = cgraph->nodes[j];
+        // the fusion runs every consumer it returns, so an uncomputed MUL_MAT is not one
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
 
         if (node->op == GGML_OP_MUL_MAT) {
             // MUL_MAT src[1] is the activation input
@@ -101498,7 +101522,9 @@ static int ggml_sycl_match_moe_down_sum_chain(const ggml_cgraph * cgraph, int no
         if (add->op == GGML_OP_VIEW || add->op == GGML_OP_RESHAPE || add->op == GGML_OP_PERMUTE) {
             continue;
         }
-        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || add->ne[0] != weighted->ne[0]) {
+        // the fused sum stands in for every ADD of the chain, so an uncomputed one would run through it
+        if (!ggml_sycl_graph_node_is_computed(add) || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+            add->ne[0] != weighted->ne[0]) {
             return -1;
         }
         int  weighted_views = 0;
@@ -101593,8 +101619,10 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
     if (!cgraph || node_idx < 0 || node_idx >= cgraph->n_nodes) {
         return false;
     }
+    // the bias entry hands in a MUL it found by looking ahead, which may be a node the graph does not compute
     ggml_tensor * mul = cgraph->nodes[node_idx];
-    if (!mul || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || mul->ne[3] != 1) {
+    if (!mul || !ggml_sycl_graph_node_is_computed(mul) || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 ||
+        mul->ne[3] != 1) {
         return false;
     }
 
@@ -101888,6 +101916,10 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
     if (!mul || !add || !sort || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD || sort->op != GGML_OP_ARGSORT) {
         return reject("pattern");
     }
+    // the fused kernel runs the look-ahead nodes too, so each must be one the graph computes
+    if (!ggml_sycl_graph_node_is_computed(add) || !ggml_sycl_graph_node_is_computed(sort)) {
+        return reject("uncomputed");
+    }
     if (add->src[0] != mul && add->src[1] != mul) {
         return reject("add-not-consuming-mul");
     }
@@ -102061,7 +102093,9 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     }
     ggml_tensor * mul = cgraph->nodes[node_idx];
     ggml_tensor * add = cgraph->nodes[node_idx + 1];
-    if (!mul || !add || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD) {
+    // the fused kernel runs the ADD too, so it must be a node the graph computes
+    if (!mul || !add || !ggml_sycl_graph_node_is_computed(add) || mul->op != GGML_OP_MUL_MAT ||
+        add->op != GGML_OP_ADD) {
         return false;
     }
     if (add->src[0] != mul && add->src[1] != mul) {
@@ -102725,9 +102759,12 @@ static void ggml_sycl_trace_persistent_ops(ggml_backend_sycl_context & ctx) {
 
 // Check if a graph node is a no-op that doesn't generate GPU/CPU work.
 // Used by graph_compute_impl, prefix detection, and suffix dispatch.
+// A node the graph does not compute (an unselected ggml_build_forward_select branch) is one: its inputs were never
+// written or uploaded, and its output may already belong to another tensor (ggml_sycl_graph_node_is_computed).
 static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+           !ggml_sycl_graph_node_is_computed(node);
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -104792,7 +104829,11 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        // as in ggml_sycl_block_exec_publish_aliases: an uncomputed node has no output to alias
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -104852,7 +104893,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
     preblock_seen.reserve(8);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // as in the pre-block copy: an uncomputed node's sources are not its block's inputs
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -104909,7 +104951,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // as in the plan's source scan: an input only an uncomputed node reads is not missing
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -105137,7 +105180,11 @@ static bool ggml_sycl_block_exec_publish_aliases(ggml_backend_sycl_context &    
     exec_ctx.alias_publications.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        // an uncomputed node has no output to alias: nothing writes it, and nothing computed reads it
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -105247,7 +105294,8 @@ static bool ggml_sycl_block_exec_prepare_context(ggml_backend_sycl_context &    
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * dst = cgraph->nodes[i];
-        if (!dst) {
+        // the block dispatch does not run an uncomputed node, so its sources plan no copy and no edge
+        if (!dst || !ggml_sycl_graph_node_is_computed(dst)) {
             continue;
         }
         const int dst_block = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -105596,7 +105644,8 @@ static bool ggml_sycl_block_exec_stage_preblock_inputs(ggml_backend_sycl_context
     std::unordered_set<block_exec_planned_tensor_key, block_exec_planned_tensor_key_hash> seen;
     for (int i = exec_ctx.block_first[block_idx]; i <= exec_ctx.block_last[block_idx]; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // the block dispatch does not run an uncomputed node, so its sources need no copy on the block's device
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
@@ -105709,7 +105758,7 @@ struct ggml_sycl_block_exec_device_scope {
     ~ggml_sycl_block_exec_device_scope() {
         if (prev_dpct_device >= 0) {
             try {
-                dpct::select_device(static_cast<unsigned int>(prev_dpct_device));
+                ggml_sycl_select_dpct_device(prev_dpct_device);
             } catch (...) {
             }
         }
@@ -108360,6 +108409,8 @@ static void moe_prefetch_scan(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph 
 
 static thread_local bool g_moe_descriptor_prescanned_for_dispatch = false;
 
+// Every loop leaves a node the graph does not compute. g_moe_gate_up_pairs feeds the fused dispatch, the down-sum
+// take and the persistent descriptors, and an uncomputed MUL_MAT_ID of the same layer would take a slot of the pair.
 static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
                                           ggml_cgraph *               cgraph,
                                           bool                        reset_precomputed,
@@ -108377,7 +108428,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         const char * weight_name = node->src[0]->name ? node->src[0]->name : "";
@@ -108413,7 +108467,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         for (auto & kv : g_moe_gate_up_pairs) {
@@ -108438,7 +108495,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
             continue;
         }
         const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
@@ -108461,7 +108521,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL || !node->src[0] || !node->src[1]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL || !node->src[0] || !node->src[1]) {
             continue;
         }
         for (auto & kv : g_moe_gate_up_pairs) {
@@ -110054,7 +110117,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 // 3. Reuses the quantized result for all projections (Q, K, V or gate, up)
                 // This bypasses the ggml_can_fuse_subgraph limitation where shared intermediates fail.
                 // Note: Only triggers for batch size >= 8 to avoid overhead during token generation
-                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes &&
+                    ggml_sycl_graph_node_is_computed(cgraph->nodes[i + 1]) && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     // Check if MUL uses RMS_NORM output
                     if (mul_node->src[0] == node || mul_node->src[1] == node) {
@@ -110127,9 +110191,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (fusion_site_on(5) && node->op == GGML_OP_ADD) {
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
-                    // Check: next op is RMS_NORM and it uses this ADD's output as input
-                    if (next->op == GGML_OP_RMS_NORM && next->src[0] == node &&
-                        ggml_sycl_check_fusion_types(cgraph, i, 2) && ggml_is_contiguous(next) &&
+                    // Check: next op is RMS_NORM, the graph computes it, and it uses this ADD's output as input
+                    if (ggml_sycl_graph_node_is_computed(next) && next->op == GGML_OP_RMS_NORM &&
+                        next->src[0] == node && ggml_sycl_check_fusion_types(cgraph, i, 2) &&
+                        ggml_is_contiguous(next) &&
                         ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
                         ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_ADD_RMS_NORM, cgraph, i,
                                                            sycl_ctx->device)) {
@@ -110146,10 +110211,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (fusion_site_on(6) && node->op == GGML_OP_MUL) {
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
-                    // Check: next op is ADD and uses this MUL's output
-                    if (next->op == GGML_OP_ADD && (next->src[0] == node || next->src[1] == node) &&
-                        node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
-                        ggml_is_contiguous(next)) {
+                    // Check: next op is ADD, the graph computes it, and it uses this MUL's output
+                    if (ggml_sycl_graph_node_is_computed(next) && next->op == GGML_OP_ADD &&
+                        (next->src[0] == node || next->src[1] == node) && node->type == GGML_TYPE_F32 &&
+                        next->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && ggml_is_contiguous(next)) {
                         ggml_tensor * x     = node->src[0];
                         ggml_tensor * scale = node->src[1];
                         ggml_tensor * bias  = (next->src[0] == node) ? next->src[1] : next->src[0];
@@ -110258,7 +110323,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     fprintf(stderr, "[FFN TRACE] MUL_MAT node %d (%s): glu_info.glu=%p\n", i, node->name,
                             (void *) glu_info.glu);
                 }
-                if (glu_info.glu != nullptr) {
+                // The fused kernel runs the GLU and its paired MUL_MAT. A computed GLU's sources are computed too, so
+                // asking of the GLU covers both.
+                if (glu_info.glu != nullptr && ggml_sycl_graph_node_is_computed(glu_info.glu)) {
                     // Found GLU consumer, now find the paired MUL_MAT
                     ggml_tensor *       glu       = glu_info.glu;
                     const ggml_tensor * other_src = glu_info.is_gate ? glu->src[1] : glu->src[0];
@@ -111694,6 +111761,9 @@ static bool moe_graph_pair_can_fuse_segment(const moe_gate_up_pair & pair) {
     return pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI;
 }
 
+// Every loop leaves a node the graph does not compute, so dispatch_indices names only nodes that run. The descriptor
+// candidate count, the segment recorder, the block graphs, the graphlets and the decode analysis take their MoE
+// dispatch points from that list, and an uncomputed MUL_MAT_ID of the same layer cannot take a slot of a fused pair.
 static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgraph * cgraph) {
     moe_graph_dispatch_plan plan;
     if (!cgraph) {
@@ -111706,7 +111776,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         plan.total_moe_nodes++;
@@ -111744,7 +111817,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         for (auto & kv : pairs) {
@@ -111770,7 +111846,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
             continue;
         }
         const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
@@ -111804,7 +111883,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID) {
             continue;
         }
         if (first_fused_indices.count(i) != 0) {
@@ -114183,6 +114265,8 @@ static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
 
 // A slot's graph inputs, as positions in the split (leaf i as i, src j of node n as -(n*GGML_MAX_SRC+j)-1), never as
 // tensor pointers: a key fixes the split's structure, so the same positions name the same inputs on every replay.
+// Only a computed node's sources count, as in the pre-stage. The slot key is built on the graph signature, which mixes
+// each node's flags; the prologue memo (default on) serves the signature it recorded while the graph's uid holds.
 static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vector<int32_t> & refs) {
     refs.clear();
     std::vector<const ggml_tensor *> seen;  // this call only
@@ -114201,7 +114285,10 @@ static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vec
     }
     for (int n = 0; n < cgraph->n_nodes; ++n) {
         const ggml_tensor * node = cgraph->nodes[n];
-        for (int j = 0; node && j < GGML_MAX_SRC; ++j) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
             consider(node->src[j], -(n * GGML_MAX_SRC + j) - 1);
         }
     }
@@ -116447,7 +116534,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         }
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
-        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_DEFAULT, the unified kernel's
+        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_UNDEFINED, the unified kernel's
         // oneDNN f16 route has none, so each arm's own condition is applied below.
         if (!src0 || !src1 || !(src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) ||
             !ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1) {
@@ -116475,7 +116562,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         // The unified kernel's own oneDNN f16 route (Route A) draws them too for an op the scratch does not supply,
         // whatever its precision. The router is asked once per node and its answer shared by both arms.
         const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);
-        const bool                      prec_default = node->op_params[0] == GGML_PREC_DEFAULT;
+        const bool                      prec_default = node->op_params[0] == GGML_PREC_UNDEFINED;
         const bool legacy_draws = prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
         const bool unified_draws =
             ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied);
@@ -116922,7 +117009,7 @@ uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phas
 }
 
 // The sources a prestage of `cgraph` copies to `device`, in the prestage's own
-// walk: leafs, then every node's sources. Sources are deduplicated by tensor
+// walk: leafs, then every computed node's sources. Sources are deduplicated by tensor
 // object, not by the prestage's (cache id, device, view offset) key, so two
 // tensors that share a key count twice; the value is a diagnostic cohort size.
 static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int device) {
@@ -116941,7 +117028,10 @@ static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        for (int j = 0; node && j < GGML_MAX_SRC; j++) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
             visit(node->src[j]);
         }
     }
@@ -117239,9 +117329,10 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
     // The cgraph->leafs array may be empty even when nodes reference non-device tensors.
     // This is the ROOT CAUSE of the DEVICE_LOST error - leaf tensors like "leaf_5" are
     // referenced by nodes but not in cgraph->leafs, so they weren't being pre-staged.
+    // A node the graph does not compute never runs, so nothing reads its sources.
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
 
@@ -117596,12 +117687,14 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     for (int i = 0; i < cgraph->n_leafs; ++i) {
         discover_input(cgraph->leafs[i]);
     }
+    // As in the pre-stage: only a computed node's sources, so this never lists an input the pre-stage skipped.
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (!cgraph->nodes[i]) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            discover_input(cgraph->nodes[i]->src[j]);
+            discover_input(node->src[j]);
         }
     }
 
@@ -119156,6 +119249,16 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         }
         return false;
     };
+    // An update recipe names graph nodes by their index in the graph its plan was built from. The caller drops the plan
+    // when the graph signature, which carries every node's flags, changes, so each index names a computed node of this
+    // graph. One that does not fails the replay into a full rebuild instead of running a node the graph does not compute.
+    auto recipe_node = [cgraph](const auto & entry) -> ggml_tensor * {
+        if (entry.graph_node_idx < 0 || entry.graph_node_idx >= cgraph->n_nodes) {
+            return nullptr;
+        }
+        ggml_tensor * node = cgraph->nodes[entry.graph_node_idx];
+        return node && ggml_sycl_graph_node_is_computed(node) ? node : nullptr;
+    };
 
     // Fast path: reuse cached plan and refresh mutable pointers only.
     if (kernel.has_cached_plan()) {
@@ -119187,7 +119290,11 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                     continue;
                 }
                 const int     oi   = entry.plan_op_idx;
-                ggml_tensor * node = cgraph->nodes[entry.graph_node_idx];
+                ggml_tensor * node = recipe_node(entry);
+                if (!node) {
+                    recipe_ok = false;
+                    break;
+                }
 
                 // GET_ROWS has no plan op (plan_op_idx == -1); others use direct mutable access
                 OperationDescriptor * op = (oi >= 0) ? kernel.get_op_descriptor_mut(oi) : nullptr;
@@ -119520,8 +119627,12 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                 for (const auto & entry : recipe) {
                     if (entry.op_type == OperationType::GET_ROWS && entry.get_rows_idx == -2) {
                         // Sentinel: this is a CPY entry stored in the recipe
-                        ggml_tensor * cpy_node = cgraph->nodes[entry.graph_node_idx];
-                        if (cpy_node && cpy_node->src[0] && cpy_node->src[1]) {
+                        ggml_tensor * cpy_node = recipe_node(entry);
+                        if (!cpy_node) {
+                            recipe_ok = false;
+                            break;
+                        }
+                        if (cpy_node->src[0] && cpy_node->src[1]) {
                             int                              source_op_idx = entry.plan_op_idx;
                             ggml_sycl_deferred_copy_endpoint src_endpoint{};
                             ggml_sycl_deferred_copy_endpoint dst_endpoint{};
@@ -119606,7 +119717,8 @@ recipe_failed:
 
             for (int i = 0; i < cgraph->n_nodes && fast_path_ok; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (!node) {
+                // the full walk below adds no op for an uncomputed node; both walks leave the same nodes
+                if (!node || !ggml_sycl_graph_node_is_computed(node)) {
                     continue;
                 }
 
@@ -120639,7 +120751,12 @@ full_build:
             }
             break;
         }
-        if (g_ggml_sycl_debug && node) {
+        // An uncomputed node adds no op. The unselected input-embedding branch carries a DUP, which the switch below
+        // does not support, so walking it would decline the whole plan for a node that never runs.
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (g_ggml_sycl_debug) {
             graph_op_counts[node->op]++;
         }
         int layer = -1;
@@ -120867,9 +120984,10 @@ full_build:
                         const ggml_tensor * next = cgraph->nodes[i + 1];
                         // Pattern: MUL(rms_norm_output, norm_weight) where norm_weight
                         // is a 1D weight tensor (same shape as hidden dim).
-                        if (next && next->op == GGML_OP_MUL && next->src[0] == node && next->src[1] &&
-                            ggml_are_same_shape(next->src[0], next->src[1]) && next->src[1]->type == GGML_TYPE_F32 &&
-                            ggml_is_contiguous(next)) {
+                        // An uncomputed node can read a computed one; fusing it would run it.
+                        if (next && ggml_sycl_graph_node_is_computed(next) && next->op == GGML_OP_MUL &&
+                            next->src[0] == node && next->src[1] && ggml_are_same_shape(next->src[0], next->src[1]) &&
+                            next->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(next)) {
                             const void * wptr = resolve_input_ptr(next->src[1], layer);
                             if (wptr) {
                                 wptr = ensure_device_access_ptr(next->src[1], wptr, "RMS_NORM fused weight");
@@ -122652,7 +122770,11 @@ static bool extract_persistent_plan_split(ggml_sycl::UnifiedKernel &           p
     std::vector<const ggml_tensor *> matmul_weight_tensors;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0]) {
+        // the plan holds no op for an uncomputed node, so the list skips the same nodes to stay index-aligned
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
             matmul_weight_tensors.push_back(node->src[0]);
         }
     }
@@ -123027,6 +123149,9 @@ static bool is_decode_phase_graph(ggml_cgraph * cgraph) {
     bool found_mul_mat = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             found_mul_mat = true;
             // src[1] is the activation tensor, ne[1] is the M dimension (batch size)
@@ -123362,6 +123487,9 @@ static bool has_supported_architecture(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         if (node->op == GGML_OP_RMS_NORM) {
             has_rms_norm = true;
         }
@@ -123445,7 +123573,7 @@ static persistent_moe_graph_probe persistent_tg_probe_moe_graph(const ggml_cgrap
     std::unordered_map<int, persistent_moe_layer_probe> layers;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         if (persistent_tg_is_moe_router_argsort(node)) {
@@ -123553,7 +123681,8 @@ static persistent_tg_policy_summary persistent_tg_summarize_policy(ggml_cgraph *
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // the plan skips an uncomputed node, so its op is no blocker
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         switch (node->op) {
@@ -123679,7 +123808,10 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
             static bool logged_f16_matmul_once = false;
             if (!logged_f16_matmul_once) {
                 GGML_LOG_INFO(
@@ -123693,6 +123825,10 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
+        // the plan skips an uncomputed node: the unselected input-embedding branch's DUP declines nothing
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         switch (node->op) {
             case GGML_OP_GET_ROWS:
             case GGML_OP_RMS_NORM:
@@ -123718,6 +123854,23 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
     }
 
     return true;
+}
+
+// Drop the decode plans the persistent TG path cached for one graph: the primary kernel's plan and its update
+// recipe, the split secondary kernel's plan, and the secondary ops the split plan reuses. Both the graphs that leave the
+// persistent path and a graph that changes its eligibility key call it, so no plan outlives the graph it was built
+// from. No plan update is in progress at either call, so dropping the cache is all it takes.
+static void persistent_tg_drop_cached_plans(ggml_backend_sycl_context & ctx) {
+    if (ctx.unified_kernel && ctx.unified_kernel->has_cached_plan()) {
+        ctx.unified_kernel->invalidate_plan_cache();
+    }
+    if (g_split_secondary_kernel && g_split_secondary_kernel->has_cached_plan()) {
+        g_split_secondary_kernel->invalidate_plan_cache();
+    }
+    if (g_split_plan_cached) {
+        g_split_plan_cached = false;
+        g_cached_secondary_ops.clear();
+    }
 }
 
 /**
@@ -124292,14 +124445,23 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // re-scanning the graph on every call.
     // Cache key includes both n_nodes AND phase (decode vs PP) because PP and TG
     // can have the same n_nodes when GPU prefix mode truncates the graph.
-    bool       persistent_eligible;
-    const int  persistent_cache_key = cgraph->n_nodes + (cached_is_decode ? 1000000 : 0);
-    const bool persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key;
+    // The answer, the plan built from it and the plan's update recipe hold for one graph, and n_nodes does not name
+    // one: the same nodes with a different input branch selected differ only in their COMPUTE flags. The key carries
+    // the graph signature too, which mixes each node's op, shape and flags, and a new key drops the cached plans before
+    // the graph is judged. The signature costs a walk of the graph, so only a process with persistent TG on pays it.
+    bool           persistent_eligible;
+    const int      persistent_cache_key = cgraph->n_nodes + (cached_is_decode ? 1000000 : 0);
+    const uint64_t persistent_cache_sig =
+        ggml_sycl::env_persistent_tg_enabled() ? ggml_sycl_graph_signature(cgraph) : 0;
+    const bool persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key &&
+                                      sycl_ctx->cached_persistent_sig == persistent_cache_sig;
     if (persistent_cache_hit) {
         persistent_eligible = sycl_ctx->cached_persistent_result;
     } else {
+        persistent_tg_drop_cached_plans(*sycl_ctx);
         persistent_eligible                 = should_use_persistent_tg(*sycl_ctx, cgraph);
         sycl_ctx->cached_persistent_n_nodes = persistent_cache_key;
+        sycl_ctx->cached_persistent_sig     = persistent_cache_sig;
         sycl_ctx->cached_persistent_result  = persistent_eligible;
     }
     if (persistent_tg_log_policy_enabled()) {
@@ -124714,16 +124876,7 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     }
 normal_dispatch:
     // Leaving persistent TG path (e.g. PP phase): drop cached decode plans.
-    if (sycl_ctx->unified_kernel && sycl_ctx->unified_kernel->has_cached_plan()) {
-        sycl_ctx->unified_kernel->invalidate_plan_cache();
-    }
-    if (g_split_secondary_kernel && g_split_secondary_kernel->has_cached_plan()) {
-        g_split_secondary_kernel->invalidate_plan_cache();
-    }
-    if (g_split_plan_cached) {
-        g_split_plan_cached = false;
-        g_cached_secondary_ops.clear();
-    }
+    persistent_tg_drop_cached_plans(*sycl_ctx);
 
 #ifdef GGML_SYCL_GRAPH
     // Optional layout copies were retired since this context last looked: drop
@@ -127414,6 +127567,25 @@ static bool ggml_sycl_norm_rows_supported(const ggml_tensor * t) {
     return t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
 }
 
+// Upstream ggml widened these ops past what the SYCL kernels compute; a node that uses the wider form runs
+// elsewhere. supports_op and the capability query ask it before the shared impl. It stays out of the impl's prologue
+// and per-op cases, and ahead of the MUL_MAT type helper, because those are pinned by source contracts
+// (tests/test-sycl-op-support-predicates.py, tests/test-sycl-supports-op-indexed-moe-source.py).
+//   ROPE    the kernels are instantiated for f32/f16 sources (ggml_rope accepts BF16 since upstream 7fce5439f).
+//           rope.cpp passes the node's truncate flag (upstream 1fa7f1c48) to the YaRN correction dims itself.
+//   MUL_MAT [TAG_GGML_PREC] every route converts src1 below f32 (q8_1 for MMVQ/MMQ, f16 for the oneDNN and
+//           dequant routes), so a node whose src1 precision forbids that is declined (upstream 494d0f47b).
+static bool ggml_sycl_op_core_semantics_supported(const ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_ROPE:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
+        case GGML_OP_MUL_MAT:
+            return ggml_prec_get_src(op, 1) != GGML_PREC_BF16 && ggml_prec_get_src(op, 1) != GGML_PREC_F32;
+        default:
+            return true;
+    }
+}
+
 static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
     // The one list lives in unified-types.hpp: the zone planner asks it too.
     return ggml_sycl::dense_mul_mat_type_supported(type);
@@ -127440,10 +127612,14 @@ static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
 // supports_op is "is there a kernel for this op, type and shape" AND "is the data placed where this device runs it".
 // The second half is the placement declines below (host-demoted KV, planner-on-host); `placement_declines` switches
 // exactly those off, which is what ggml_backend_sycl_supports_op_capability() does, so the capability answer is
-// this same body and cannot drift from supports_op.
+// this same body and cannot drift from supports_op. Both entries also ask ggml_sycl_op_core_semantics_supported()
+// first: the impl's prologue and cases are pinned by source contracts, and that check is a kernel question too.
 static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines);
 
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (!ggml_sycl_op_core_semantics_supported(op)) {
+        return false;
+    }
     return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/true);
 }
 
@@ -127958,8 +128134,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         case GGML_OP_DIV:
             // The other four bin_bcast consumers; see
             // ggml_sycl_binbcast_layout_supported and the REPEAT case above.
-            // ADD1 (k_add1), ADD_ID and COUNT_EQUAL have their own kernels and
-            // stay in the unconditional group below.
+            // ADD_ID and COUNT_EQUAL have their own kernels and stay in the
+            // unconditional group below.
             return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
             // Layout is genuinely handled: concat.cpp:119-153 has a fully
@@ -127978,7 +128154,6 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD1:
         case GGML_OP_ADD_ID:
         case GGML_OP_COUNT_EQUAL:
             return true;
@@ -128055,12 +128230,12 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                    ggml_sycl_norm_rows_supported(op);
 
         case GGML_OP_SCALE:
-            return true;
+            // ggml_sycl_op_scale asserts f32 on both sides and reads src0 flat; ggml_scale now accepts
+            // non-contiguous views, which that flat read would mis-address
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
 
         case GGML_OP_CONT:
             return op->src[0]->type != GGML_TYPE_BF16;
-        case GGML_OP_DIAG_MASK_INF:
-            return true;
         case GGML_OP_SOFT_MAX:
             return true;
         case GGML_OP_SOFT_MAX_BACK:
@@ -128155,6 +128330,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             return ggml_sycl_dsv4_hc_post_supported(op);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_sycl_lightning_indexer_supported(op);
+        case GGML_OP_TOP_K_MASK:
+            return ggml_sycl_top_k_mask_supported(op);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN:
@@ -128179,9 +128356,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 return false;
             }
         case GGML_OP_FILL:
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_CUMSUM:
         case GGML_OP_DIAG:
-            return true;
+            // the kernels are f32 only; the ops accept BF16 now
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_ROLL:
@@ -128208,10 +128387,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
 // ggml_backend_sycl_reg_get_proc_address for callers that must tell a missing kernel from a placement decline
 // (llama_context::resolve_fused_ops): supports_op's "false" covers both, this is false only when there is no
 // kernel. Exact for the fused ops that caller probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER,
-// DSV4_HC_*); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks of their
-// own that this does not neutralise.
+// DSV4_HC_*, TOP_K_MASK); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks
+// of their own that this does not neutralise.
 bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (dev == nullptr || op == nullptr) {
+    if (dev == nullptr || op == nullptr || !ggml_sycl_op_core_semantics_supported(op)) {
         return false;
     }
 

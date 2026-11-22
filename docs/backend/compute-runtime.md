@@ -257,3 +257,135 @@ A one-way PPA upgrade on 2026-08-18 moved the loaded driver to **26.31**
 (hung-i915 discovery, cross-device in-order deps, PR 930 USM compression) is
 unverified; the 26.22-vs-26.27 GPT-OSS TG regression measured 2026-07-24 has
 not been re-measured on 26.31.
+
+## Driver version and P2P short form moved from `CLAUDE.md` (2026-11-16)
+
+This section holds the text that `CLAUDE.md` carried under "Patched compute-runtime & P2P topology"
+until 2026-11-16. `CLAUDE.md` now keeps only the rules: read the driver version live, and keep
+direct peer-to-peer (P2P) paths between the two discrete cards disabled. The moved text follows the
+correction below and is otherwise unchanged. In it, "this file" means `CLAUDE.md` as it stood
+before that date. It overlaps the sections above in places. Where they differ, the newer dated
+statement wins.
+
+### Correction: the loaded driver is 26.44 since 2026-11-14
+
+Checked 2026-11-16. The moved text says the loaded driver is 26.40. One more one-way PPA upgrade
+has happened since:
+
+| date | `libze-intel-gpu1` |
+|------|--------------------|
+| 2026-11-14 12:05 | 26.40 to 26.44.40734.6 |
+
+`libze_intel_gpu.so.1` points at `libze_intel_gpu.so.1.18.40734`. The source is
+`/var/log/dpkg.log`: `2026-11-14 12:05:36 upgrade libze-intel-gpu1:amd64 26.40.40196.8-1~26.04~ppa1
+26.44.40734.6-1~26.04~ppa1`. A measurement is on 26.40 only if it was taken between 2026-11-01 and
+2026-11-14 12:05, and on 26.44 after that. No figure in this repository has been re-validated on
+26.44 as far as this check could tell.
+
+The directory `/usr/lib/x86_64-linux-gnu/` holds `libze_intel_gpu.so.1.14.36300.orig`,
+`libze_intel_gpu.so.1.14.37435`, `libze_intel_gpu.so.1.14.37435.pre-single-device-default-ctx` and
+`libze_intel_gpu.so.1.18.40734` today. The moved text names the preserved stock build as
+`1.14.37020` in one paragraph and `1.14.36300.orig` in another. Only the second name is on disk.
+
+The rule that lasts is the one in the moved text: read the version live before you attribute a
+throughput change to the tree.
+
+### The moved text
+
+⚠️ **THE LOADED DRIVER IS 26.40, NOT 26.31 (verified 2026-11-13).**
+`libze_intel_gpu.so.1` points at `libze_intel_gpu.so.1.18.40196`, package
+`libze-intel-gpu1 26.40.40196.8`. `/var/log/dpkg.log` records two further one-way
+PPA upgrades after the 26.31 one described below:
+
+| date | `libze-intel-gpu1` |
+|------|--------------------|
+| 2026-08-20 | 26.27 → 26.31.39395.13 |
+| 2026-10-10 | 26.31 → 26.35.39758.11 |
+| 2026-11-01 | 26.35 → 26.40.40196.8 |
+
+So a measurement is on 26.31 only if it was taken before 2026-10-10, on 26.35
+from then until 2026-11-01, and on 26.40 since. Every "26.31" figure in this file
+and in `docs/backend/sycl-perf-baselines.md` was measured on 26.31 and has not
+been re-validated on 26.40. Read the version live before attributing a
+throughput delta to the tree:
+
+```bash
+readlink /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
+dpkg -l libze-intel-gpu1 | tail -1
+```
+
+⚠️ **STALE-PIN CORRECTION (verified 2026-08-30, llama.cpp-09um):** the paragraph
+below described the loader state until 2026-08-18, when a PPA upgrade (one-way)
+moved `libze_intel_gpu.so.1` to **26.31** (`libze_intel_gpu.so.1.17.39395`,
+package `libze-intel-gpu1 26.31.39395.13`). The patched 26.22 build
+(`1.14.37435`) and stock `1.14.36300.orig` remain on disk in
+`/usr/lib/x86_64-linux-gnu/` but are NOT loaded. Every measurement since
+2026-08-18 — including the dkw0 campaign — ran on 26.31. The perf-baseline
+tables were validated under 26.27; treat driver-version deltas accordingly, and
+note the patched build's fixes (below) may have landed upstream in 26.31 —
+unverified. Historical record follows:
+
+The system `libze_intel_gpu.so.1` *was* a patched 26.22/BMG-only build (from
+`/Apps/compute-runtime-26.22-llama`, branch `llama/26.22-cross-device`) carrying
+the hung-i915 discovery fix, cross-device in-order dependency fixes, and the
+PR 930 USM compression fix. Stock `1.14.37020` is preserved alongside for
+rollback. Reverting to stock without restoring the old allocation check can
+reintroduce silent oversized-allocation hangs (the m09zb `event.wait()` hang).
+
+**Durable rule — there is NO direct P2P between the two discrete cards.
+Re-verified on the B70 on 2026-07-31; the earlier "not re-tested" hedge is retired.**
+
+Keep direct peer-copy / shared-context paths disabled. Host-bounce
+(`level_zero:0,1`) validation may continue.
+
+The restriction is **PCI topology, not a property of either card**, which is why
+swapping the B580 for the B70 in the same slot changed nothing:
+
+```
+$ lspci -tv
++-06.0-[01-04]--...--[03]----00.0  Battlemage G31  <- B70, 0000:03:00.0
++-06.3-[05-08]--...--[07]----00.0  Battlemage G21  <- B50, 0000:07:00.0
+```
+
+Different CPU root ports (`00:06.0` vs `00:06.3`), no shared PCIe switch — they meet
+only at the root complex. The kernel says so outright:
+
+```
+xe 0000:07:00.0: cannot be used for peer-to-peer DMA as the client and provider
+(0000:03:00.0) do not share an upstream bridge or whitelisted host bridge
+```
+
+(Same refusal, same root ports, on the 2026-09-05 boot where the cards enumerate at
+`0000:04:00.0` / `0000:09:00.0`: `xe 0000:09:00.0: cannot be used for peer-to-peer DMA
+as the client and provider (0000:04:00.0) ...`. The addresses moved; the topology did not.)
+
+Measured behaviour, identical on B580 (historical) and B70 (2026-07-31): a 256 KiB
+direct device-to-device USM copy fails **both directions** with
+`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (error 39), on a card with 31.89 GiB free.
+`can_access_peer` returns **false** both directions for both `access_supported` and
+`atomics_supported`.
+
+⚠️ **`ext_oneapi_enable_peer_access()` returns OK on hardware that has no P2P.** No
+throw, no warning, both directions. Code that treats a successful `enable_peer_access`
+as proof P2P is available will conclude the exact opposite of the truth, then fail at
+the first copy with a *memory* error that sends you hunting for a VRAM budget bug.
+**`can_access_peer` is the honest query; `enable_peer_access` is not a capability
+check.** This is why `OUT_OF_DEVICE_MEMORY` above is so misleading — it is a P2P
+refusal wearing a memory error's name.
+
+Probe and log: `p2p-probe.cpp` / `nguy-p2p-run1.log` (session scratchpad; not a
+committed artifact — lift anything load-bearing into a ticket). Caveat stated by the
+measurer: separate per-device contexts were used, mirroring the backend's isolated
+per-device queues and the historical B580 test. The single-context variant was
+deliberately **not** run, because that is the multi-GPU Level Zero context this file
+records as triggering DEVICE_LOST on compute-runtime 26.x. The verdict does not rest
+on context scoping — `can_access_peer` is a device-level query and the kernel refusal
+is a fact about the two BDFs.
+
+**Consequence for multi-GPU work:** `GGML_SYCL_MOE_MULTI_GPU` must stay opt-in. The
+MoE multi-device path would be moving expert data between two cards that cannot DMA to
+each other, so any traffic host-bounces — which is also why an earlier two-GPU run
+halving throughput (32.11 → 15.81 tok/s) reads as expected rather than anomalous.
+
+Install history, rollback commands, and loader-path notes:
+`docs/backend/compute-runtime.md`.

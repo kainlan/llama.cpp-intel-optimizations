@@ -63,7 +63,7 @@ set -euo pipefail
 MODEL_LABEL_RE='^model$'
 FAST_EXIT_LABEL_RE='^fatal-exit-device$'
 SWEEP_LE_DEFAULT="residency|mem-handle|cache|$MODEL_LABEL_RE|$FAST_EXIT_LABEL_RE"
-SWEEP_E_DEFAULT='^(test-backend-ops|test-generate-models|test-recurrent-state-rollback.*|test-save-load-state|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
+SWEEP_E_DEFAULT='^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 BUILD="build" CTEST="ctest" SWEEP_LE="$SWEEP_LE_DEFAULT" SWEEP_E="$SWEEP_E_DEFAULT"
 CLAUDE_MD="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/CLAUDE.md"
 while [ $# -gt 0 ]; do case "$1" in

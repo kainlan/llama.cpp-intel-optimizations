@@ -585,7 +585,8 @@ inline void ggml_sycl_op_rope(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     }
 
     rope_corr_dims corr_dims;
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst),
+                             corr_dims.v);
 
     ggml_sycl_profile_label rope_profile_label{};
     rope_profile_label.name       = "sycl.rope";

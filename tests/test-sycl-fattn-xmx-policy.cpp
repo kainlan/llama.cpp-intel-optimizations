@@ -62,7 +62,7 @@ static fattn_params decode_params_dim(int h_q, int h_kv, int D) {
     params.K_type    = GGML_TYPE_F16;
     params.V_type    = GGML_TYPE_F16;
     params.mask_type = GGML_TYPE_F16;
-    params.prec      = GGML_PREC_DEFAULT;
+    params.prec      = GGML_PREC_UNDEFINED;
     params.ne00      = D;
     params.ne01      = 1;
     params.ne02      = h_q;

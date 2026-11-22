@@ -109,16 +109,6 @@ static void test_shapes() {
     expect(!g[0].embeddings && !g[1].embeddings && !g[2].embeddings && g[3].embeddings && g[4].embeddings &&
                g[5].embeddings,
            "embeddings off first, then on");
-
-    // Warmup marks every graph while it is on.
-    p        = params(512, 1, 2048, true);
-    p.warmup = true;
-    g        = llama_measure_graph_set(p);
-    bool all = true;
-    for (const auto & x : g) {
-        all = all && x.warmup;
-    }
-    expect(all && g.size() == 6, "warmup on: every graph is a warmup graph, none added");
 }
 
 static void test_streams() {

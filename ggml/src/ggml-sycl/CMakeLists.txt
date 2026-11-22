@@ -1049,6 +1049,11 @@ if (BUILD_TESTING)
     # llama.cpp-pmzl: DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER have a SYCL arm in both the executor switch and
     # supports_op, supports_op asks the one predicate each executor asserts, and the op sources allocate nothing
     # and never block the host. Numbers: test-sycl-dsv4-hc-kernels (host) and test-backend-ops (device).
+    # TOP_K_MASK joins them on the same terms, plus: the capability query llama's fused-op resolver asks is
+    # supports_op's body with only the placement declines off; while recording, the op reads a graph input through
+    # the pre-stage's device copy (the lookup bin-broadcast shares, graph-input-staged.hpp) and throws before any
+    # submit on a source that is neither staged nor device memory, so the segment runs directly; and its kernel has a
+    # barrier between the -inf fill and the kept cells.
     # --self-test: the allocation and host-wait checks are absence-based and pass on a tree that never had them.
     add_test(NAME sycl-dsv4-ops-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dsv4-ops-source.py
@@ -1069,6 +1074,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
             --self-test)
     set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
+    # An unselected ggml_build_forward_select branch carries no GGML_TENSOR_FLAG_COMPUTE: the executors the test names
+    # skip it through ggml_sycl_is_noop; the source readers, the MoE dispatch walkers, the persistent TG checks and
+    # plan, and the fusions that run a look-ahead node ask the rule directly. --self-test: the single-rule check is
+    # absence-based.
+    add_test(NAME sycl-graph-compute-flag-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-compute-flag-source.py
+            --self-test)
+    set_tests_properties(sycl-graph-compute-flag-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
     # llama.cpp-qhfp: GET_ROWS runs Q4_K on the device through one shared support predicate, so qwen35's q4_K
     # token_embd.weight no longer forces a CPU split whose host-memory output cannot be recorded. --self-test:
     # the private-type-list and missing-arm checks are absence-based.
@@ -1518,6 +1531,10 @@ if (GGML_SYCL_F16)
     # scope serves llama code. They are not redundant.
     add_compile_definitions(GGML_SYCL_F16)
     target_compile_definitions(ggml PUBLIC GGML_SYCL_F16)
+endif()
+
+if (GGML_SYCL_SUPPORT_XMX)
+    add_compile_definitions(GGML_SYCL_SUPPORT_XMX)
 endif()
 
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
@@ -2487,12 +2504,13 @@ set_tests_properties(sycl-bf16-mul-mat PROPERTIES
     TIMEOUT 300
 )
 
-# DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER kernels against an independent double-precision oracle
-# (llama.cpp-pmzl). Host-only: the kernels run on the opencl:cpu device, so no GPU, no model and no unified
-# cache is touched. The kernels are header-only (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp) and the test
-# compiles the SAME headers dsv4-hc.cpp / lightning-indexer.cpp launch; it links ggml-base only, for the
-# reference quantizers that build the indexer's K. -fsycl without an AOT target list: the device image is JIT
-# compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
+# DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER kernels against an independent double-precision oracle, and TOP_K_MASK
+# against a bit-exact one, so a kernel that diverges from its op fails before it reaches a model. Host-only: the kernels
+# run on the opencl:cpu device, so no GPU, no model and no unified cache is touched. The kernels are header-only
+# (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp, top-k-mask-kernel.hpp) and the test compiles the SAME headers
+# dsv4-hc.cpp / lightning-indexer.cpp / top-k-mask.cpp launch; it links ggml-base only, for the reference quantizers
+# that build the indexer's K and the f16 conversion of the top-k mask's cells. -fsycl without an AOT target list: the
+# device image is JIT compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
 add_executable(test-sycl-dsv4-hc-kernels
     tests/test-dsv4-hc-kernels.cpp
 )

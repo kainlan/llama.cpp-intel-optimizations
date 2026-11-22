@@ -30,20 +30,24 @@ Duplicated numbers rot silently, because two documents cannot disagree loudly.
 | Hard-won rules (safety, workflow, architecture) | `CLAUDE.md` → *Hard-Won Rules* |
 | Live debugging state, bisects, regression hunts | the codescout task tracker (`task_list`, `task_show`) — **not a document** |
 
-## Upstream policy carried forward (b10630 merge)
+## Upstream policy carried forward (19bc41dbb merge)
 
-Three upstream policy facts live here rather than in `CLAUDE.md` because they
-are maintainer/contribution policy, not build or architecture content:
+Upstream's own `AGENTS.md` (revamped upstream in bf79dbbcd) says it applies to
+ggml-org/llama.cpp and not to forks, so this fork does not carry its text. The
+policy facts below matter only when work is prepared for upstream:
 
-- **Only `ggml-gh-bot` may post PR comments or replies.** This is a hard,
-  non-overridable upstream rule: agents and automation must never post to
-  upstream PRs from any other account.
-- Do NOT add a new file in `tests/*` without maintainers' approval — AI tends
-  to add excessive test cases for small features; reuse existing
-  infrastructure.
+- Do not write PR descriptions, commit messages or reviewer responses for an
+  upstream submission, and never `git push` or `gh pr create` to upstream on
+  the user's behalf: upstream treats automated submissions as grounds for a
+  contributor ban.
+- A commit made for upstream on the user's behalf carries
+  `Assisted-by: <assistant name>`, not `Co-authored-by:`.
+- Reuse upstream's existing test infrastructure rather than adding new files
+  under `tests/`.
 - Upstream ships reusable task recipes under `skills/` (e.g.
-  `skills/add-new-model/SKILL.md`, `skills/code-review/SKILL.md`) — check
-  there before hand-deriving a workflow they already cover.
+  `skills/add-new-model/SKILL.md`, `skills/code-review/SKILL.md`,
+  `skills/slice-model/SKILL.md`) — check there before hand-deriving a
+  workflow they already cover.
 
 ## Intel Arc GPU Memory Architecture (Critical for Multi-GPU)
 

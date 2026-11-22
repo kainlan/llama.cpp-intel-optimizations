@@ -106,7 +106,9 @@ def test_llama_context_has_no_busy_retry_loop():
 
 
 def test_no_wait_mutants():
-    anchor = "static const llm_fused_op_probe llm_fused_op_lid_probe = {"
+    # a file-scope plant point; the Lightning Indexer probe that held it left with the 19bc41dbb merge, and the
+    # HC pre probe took its place in the probe list
+    anchor = "static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {"
     assert CONTEXT_CPP.count(anchor) == 1
     mutants = {
         "the shared constant left behind": "static constexpr int llama_context_sycl_max_busy_waits = 7;\n",

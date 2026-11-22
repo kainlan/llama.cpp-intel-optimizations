@@ -2,8 +2,8 @@
 
 #include "dnnl-ops.hpp"
 #include "ggml.h"
+#include "graph-input-staged.hpp"
 #include "mem-ops.hpp"
-#include "prestage-class.hpp"
 #include "sycl-kernel-profiler.hpp"
 
 #include <cmath>
@@ -418,50 +418,12 @@ bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, 
     return ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device);
 }
 
-// The device copy of a graph input that the graph pre-stage made this token (graph_prestage_leaf_tensors, INPUT arm,
-// keyed by tensor identity in graph_input_staging), or nullptr. A kernel being recorded reads that copy instead of the
-// input's host bytes: raw host staging cannot be recorded, and running the segment directly instead pays a stream
-// drain for the staging copy.
-//
-// The handle comes back in out_handle so the caller can keep it alive for as long as the recorded kernel can read it.
-static void * ggml_sycl_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
-                                                        const ggml_tensor *         tensor,
-                                                        size_t                      span_bytes,
-                                                        int                         device,
-                                                        ggml_sycl::mem_handle *     out_handle) {
-    // Only while this thread records. The staged copy is current only when the pre-stage ran for this token; a direct
-    // run has no such guarantee, and its raw host staging is correct there.
-    if (!ggml_sycl_graph_recording_this_thread() || tensor == nullptr || tensor->name[0] == '\0' || span_bytes == 0) {
-        return nullptr;
-    }
-    // Only a flagged graph input or a view of one, by the pre-stage's own INPUT rule, so this never accepts a tensor
-    // the pre-stage does not stage and refresh. A host op output from another split is staged as an input too, but
-    // this op cannot tell it from an output this graph produces, whose staging entry would predate its producer, so
-    // that case keeps failing closed.
-    if (!ggml_sycl_prestage_is_input(tensor)) {
-        return nullptr;
-    }
-    // The pre-stage stages a source under the tensor pointer it meets, copying ggml_nbytes(tensor) from that tensor's
-    // own data, so the copy starts where this kernel's addressing starts. It stages a storage range once per pass,
-    // keyed by (cache id, device, view offset), so a second tensor over the same range gets no entry of its own: the
-    // lookup then misses and this op fails closed, which costs speed, not correctness. The entry's capacity may exceed
-    // what was copied this token (a reused, larger buffer), so the span must also fit the copied bytes.
-    if (span_bytes > ggml_nbytes(tensor)) {
-        return nullptr;
-    }
-    void * staged_ptr = nullptr;
-    if (!ctx.graph_input_stage_lookup(tensor, span_bytes, device, out_handle, &staged_ptr)) {
-        return nullptr;
-    }
-    return staged_ptr;
-}
-
 void * ggml_sycl_test_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
                                                       const ggml_tensor *         tensor,
                                                       size_t                      span_bytes,
                                                       int                         device) {
     ggml_sycl::mem_handle handle;
-    return ggml_sycl_binbcast_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &handle);
+    return ggml_sycl_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &handle);
 }
 
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
@@ -472,7 +434,7 @@ static void k_bin_bcast(const src0_t *           src0,
                         int                      ne1,
                         int                      ne2,
                         int                      ne3,
-                        int                      ne10,
+                        const sycl::uint3        ne10_fd,
                         int                      ne11,
                         int                      ne12,
                         int                      ne13,
@@ -508,7 +470,7 @@ static void k_bin_bcast(const src0_t *           src0,
     dst_t *        dst_row  = dst + i_dst;
 
     for (int i0 = i0s; i0 < ne0; i0 += item_ct1.get_local_range(2) * item_ct1.get_group_range(2)) {
-        const int i10 = i0 % ne10;
+        const int i10 = (int) fast_div_modulo((uint32_t) i0, ne10_fd).y();
         dst_row[i0]   = (dst_t) bin_op(src0 ? (float) src0_row[i0] : 0.0f, (float) src1_row[i10]);
     }
 }
@@ -521,7 +483,7 @@ static void k_bin_bcast_unravel(const src0_t *           src0,
                                 int                      ne1,
                                 int                      ne2,
                                 int                      ne3,
-                                int                      ne10,
+                                const sycl::uint3        ne10_fd,
                                 int                      ne11,
                                 int                      ne12,
                                 int                      ne13,
@@ -558,7 +520,7 @@ static void k_bin_bcast_unravel(const src0_t *           src0,
     const src1_t * src1_row = src1 + i_src1;
     dst_t *        dst_row  = dst + i_dst;
 
-    const int i10 = i0 % ne10;
+    const int i10 = (int) fast_div_modulo((uint32_t) i0, ne10_fd).y();
     dst_row[i0]   = (dst_t) bin_op(src0 ? (float) src0_row[i0] : 0.0f, (float) src1_row[i10]);
 }
 
@@ -653,7 +615,9 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
             int64_t ne2 = cne[2];
             int64_t ne3 = cne[3];
 
-            int64_t ne10 = cne1[0];
+            // fast division for the per-element i0 % ne10; init_fastdiv_values rejects a divisor past 32 bits
+            const sycl::uint3 ne10_fd = init_fastdiv_values((uint64_t) cne1[0]);
+
             int64_t ne11 = cne1[1];
             int64_t ne12 = cne1[2];
             int64_t ne13 = cne1[3];
@@ -737,7 +701,7 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                                 sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
                                                   sycl::range<3>(1, 1, block_size)),
                                 [=](sycl::nd_item<3> item_ct1) {
-                                    k_bin_bcast_unravel<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10,
+                                    k_bin_bcast_unravel<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10_fd,
                                                                 ne11, ne12, ne13, s1, s2, s3, s01, s02, s03, s11, s12,
                                                                 s13, item_ct1);
                                 });
@@ -759,7 +723,7 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
                     [&](sycl::queue & profiled_queue) {
                         return profiled_queue.parallel_for(
                             sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                                k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11, ne12,
+                                k_bin_bcast<bin_op>(src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3, ne10_fd, ne11, ne12,
                                                     ne13, s1, s2, s3, s01, s02, s03, s11, s12, s13, item_ct1);
                             });
                     },
@@ -864,8 +828,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         // baked the old pointer (graph_input_staging_swapped in common.hpp). No wait follows: the pre-stage's copy is
         // ordered ahead on the same stream.
         ggml_sycl::mem_handle graph_input_handle;
-        if (void * staged =
-                ggml_sycl_binbcast_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &graph_input_handle)) {
+        if (void * staged = ggml_sycl_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &graph_input_handle)) {
             ggml_sycl_binbcast_tracef("graph-input-staged tensor=%s bytes=%zu device=%d src=%p dst=%p", tensor->name,
                                       span_bytes, device, source_ptr, staged);
             stage = std::move(graph_input_handle);

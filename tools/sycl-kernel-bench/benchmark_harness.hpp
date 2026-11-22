@@ -2214,7 +2214,7 @@ inline bool BenchmarkHarness::run(const BenchmarkConfig & config, BenchmarkOutpu
         return false;
     }
 
-    dpct::select_device(static_cast<unsigned int>(device_id));
+    ggml_sycl_select_dpct_device(static_cast<unsigned int>(device_id));
     auto &              device     = dpct::get_device(device_id);
     auto &              base_queue = device.default_queue();
     sycl::async_handler handler    = [](sycl::exception_list exceptions) {

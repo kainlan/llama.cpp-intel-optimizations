@@ -525,8 +525,14 @@ class Model:
                     elif is_define(item):
                         self.function_publishes.add(args[0])
             if fname in ("llama_build", "llama_build_and_test"):
-                links, skip = [], None
+                # The body links `${<prefix>_LINK}`: the caller's LINK values, or the default the body sets when the
+                # caller passed none (`if (NOT <prefix>_LINK) set(<prefix>_LINK llama-common)`).
+                links, skip, prefix, multis, sets = [], None, None, (), {}
                 for name, args, _ in body:
+                    if name == "cmake_parse_arguments" and args:
+                        prefix = args[0]
+                    if name == "set" and args:
+                        sets[args[0]] = list(args[1:])
                     if name == "target_link_libraries" and args and args[0] == "${TEST_TARGET}":
                         links.extend(item for _, item in scoped(args[1:]))
                     if name == "set_tests_properties" and "PROPERTIES" in args:
@@ -534,7 +540,23 @@ class Model:
                         for k, v in zip(kv[::2], kv[1::2]):
                             if k == "SKIP_RETURN_CODE":
                                 skip = v
-                self.helpers[fname] = {"links": links, "skip": skip}
+                multis = tuple(sets.get("multiValueArgs", ()))
+                keyed = {f"{prefix}_{kw}": kw for kw in multis} if prefix else {}
+                self.helpers[fname] = {"links": links, "skip": skip, "multis": multis, "keyed": keyed,
+                                       "defaults": {var: sets[var] for var in keyed if var in sets}}
+
+    def _helper_links(self, helper: dict, values: dict) -> list:
+        """The libraries a helper call links: each `${<prefix>_<KW>}` item is the call's KW values, else the body's
+        default for it; any other item as written."""
+        out = []
+        for item in helper["links"]:
+            m = _VAR_REF.fullmatch(item)
+            var = m.group(1) if m else None
+            if var in helper.get("keyed", {}):
+                out.extend(values.get(helper["keyed"][var]) or helper["defaults"].get(var, []))
+            else:
+                out.append(item)
+        return out
 
     def _add_source(self, target, token, path, line, origins):
         self.executables.setdefault(target, []).append((token, path, line, origins))
@@ -553,14 +575,16 @@ class Model:
         elif name in ("llama_build", "llama_build_and_test") and args:
             # llama_build(<source> [<source>...]) takes NAME only from the caller's LLAMA_TEST_NAME (added by expand);
             # llama_build_and_test(<source> [NAME n] [LABEL l] [WORKING_DIRECTORY d] [ARGS ...] [<source>...]).
+            # Both also take LINK <lib>... (the helper body's multiValueArgs).
             and_test = name == "llama_build_and_test"
+            helper = self.helpers.get(name, {"links": [], "skip": None})
+            multis = tuple(dict.fromkeys((("ARGS",) if and_test else ()) + helper.get("multis", ())))
             values, extra = parse_arguments(args[1:], (), ("NAME", "LABEL", "WORKING_DIRECTORY") if and_test else
-                                            ("NAME",), ("ARGS",) if and_test else ())
+                                            ("NAME",), multis)
             target = values.get("NAME", [re.sub(r"\.[^.]*$", "", os.path.basename(args[0]))])[0]
             for token in [args[0]] + extra:
                 self._add_source(target, token, path, line, origins)
-            helper = self.helpers.get(name, {"links": [], "skip": None})
-            self.links.setdefault(target, []).extend(("PRIVATE", lib) for lib in helper["links"])
+            self.links.setdefault(target, []).extend(("PRIVATE", lib) for lib in self._helper_links(helper, values))
             if and_test:
                 self.tests[(d, target)] = ((f"$<TARGET_FILE:{target}>", *values.get("ARGS", [])), path, line,
                                            helper["skip"], origins)
@@ -1114,6 +1138,15 @@ MUTANTS = {
     "unresolved-source-path": (
         _add(SYCL_CMAKE, "\nadd_executable(test-ucb-unknown ${SOME_UNSET_DIR}/test-unified-cache-bugs.cpp)\n"),
         "cannot tell whether `${SOME_UNSET_DIR}/test-unified-cache-bugs.cpp` compiles tests/test-unified-cache-bugs.cpp"),
+    # llama_build()'s default link set loses the define: a stub target that passes no LINK links only the default.
+    "llama-build-default-link-without-define": (
+        _edit(TESTS_CMAKE, "        set(LLAMA_BUILD_LINK llama-common)", "        set(LLAMA_BUILD_LINK ggml-base)"),
+        "target test-sycl-compute-buffer-kv-zone compiles tests/test-sycl-compute-buffer-kv-zone.cpp"),
+    # A caller's LINK replaces the default: a stub target linking only ggml-base loses the define.
+    "llama-build-caller-link-without-define": (
+        _edit(TESTS_CMAKE, "llama_build(test-sycl-compute-buffer-kv-zone.cpp)",
+              "llama_build(test-sycl-compute-buffer-kv-zone.cpp LINK ggml-base)"),
+        "target test-sycl-compute-buffer-kv-zone compiles tests/test-sycl-compute-buffer-kv-zone.cpp"),
     # The stub exits 0 again.
     "stub-returns-0": (
         _edit(UCB, f"return {SKIP_MACRO};", "return 0;"),

@@ -58,7 +58,7 @@ def read(rel: str) -> str:
 CTX = read("src/llama-context.cpp")
 CTX_H = read("src/llama-context.h")
 KV = read("src/llama-kv-cache.cpp")
-CLIP = read("tools/mtmd/clip.cpp")
+MTMD = read("tools/mtmd/mtmd-subcontext.cpp")
 UBATCH_H = read("src/llama-auto-ubatch.h")
 SYCL_CPP = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 CACHE_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
@@ -275,12 +275,15 @@ def claim_every_scheduler_allocation_goes_through_the_helpers(ctx: str, kv: str,
     return "bool sched_alloc_graph(ggml_cgraph * gf);" in h and "bool sched_reserve_graph(ggml_cgraph * gf);" in h
 
 
-def claim_clip_opens_the_exported_scope(clip: str) -> bool:
-    c = norm(clip)
+def claim_mtmd_opens_the_exported_scope(mtmd: str) -> bool:
+    """The projector's scheduler calls (tools/mtmd/mtmd-subcontext.cpp since the 19bc41dbb merge split clip.cpp) each
+    run inside mtmd_sycl_compute_scope, which opens the backend's exported compute scope."""
+    c = norm(mtmd)
     return (
         '"ggml_backend_sycl_compute_alloc_scope"' in c
-        and "{ clip_sycl_compute_scope sycl_scope(ctx_clip.backend); ggml_backend_sched_reserve(ctx_clip.sched.get(), gf); }" in c
-        and "{ clip_sycl_compute_scope sycl_scope(ctx->backend); alloc_ok = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf); }" in c
+        and "{ mtmd_sycl_compute_scope sycl_scope(backends.backend); ggml_backend_sched_reserve(backends.sched.get(), gf); }" in c
+        and "{ mtmd_sycl_compute_scope sycl_scope(backends.backend); alloc_ok = ggml_backend_sched_alloc_graph(backends.sched.get(), gf); }" in c
+        and "{ mtmd_sycl_compute_scope sycl_scope(ggml_backend_sched_get_backend(sched, 0)); alloc_ok = ggml_backend_sched_alloc_graph(sched, gf); }" in c
     )
 
 
@@ -353,7 +356,7 @@ def claim_record_cap_is_one_constant_and_one_raw_filter_remains(sycl_cpp: str, c
 def claim_no_bare_scheduler_allocation_elsewhere() -> bool:
     """Every other source that includes the ggml-backend scheduler API: no bare alloc/reserve outside the two helpers
     and the projector's scoped blocks."""
-    allowed = {"src/llama-context.cpp", "tools/mtmd/clip.cpp"}
+    allowed = {"src/llama-context.cpp", "tools/mtmd/mtmd-subcontext.cpp"}
     for base in ("src", "tools", "common", "examples"):
         for p in sorted((ROOT / base).rglob("*.cpp")):
             rel = str(p.relative_to(ROOT))
@@ -403,7 +406,7 @@ def test_truncating_the_rung_records_is_loud():
 
 def test_every_scheduler_allocation_goes_through_the_scoped_helpers():
     assert claim_every_scheduler_allocation_goes_through_the_helpers(CTX, KV, CTX_H)
-    assert claim_clip_opens_the_exported_scope(CLIP)
+    assert claim_mtmd_opens_the_exported_scope(MTMD)
     assert claim_no_bare_scheduler_allocation_elsewhere()
 
 
@@ -623,22 +626,31 @@ def test_mutant_k_shift_back_to_a_bare_call_fails_the_claim():
     assert not claim_every_scheduler_allocation_goes_through_the_helpers(CTX, mutated, CTX_H)
 
 
-def test_mutant_clip_alloc_outside_the_scope_fails_the_claim():
+def test_mutant_mtmd_alloc_outside_the_scope_fails_the_claim():
     mutated = _once(
-        CLIP,
-        "        clip_sycl_compute_scope sycl_scope(ctx->backend);\n        alloc_ok = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);",
-        "        alloc_ok = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);",
+        MTMD,
+        "        mtmd_sycl_compute_scope sycl_scope(backends.backend);\n        alloc_ok = ggml_backend_sched_alloc_graph(backends.sched.get(), gf);",
+        "        alloc_ok = ggml_backend_sched_alloc_graph(backends.sched.get(), gf);",
     )
-    assert not claim_clip_opens_the_exported_scope(mutated)
+    assert not claim_mtmd_opens_the_exported_scope(mutated)
 
 
-def test_mutant_clip_reserve_outside_the_scope_fails_the_claim():
+def test_mutant_mtmd_reserve_outside_the_scope_fails_the_claim():
     mutated = _once(
-        CLIP,
-        "            clip_sycl_compute_scope sycl_scope(ctx_clip.backend);\n            ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);",
-        "            ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);",
+        MTMD,
+        "        mtmd_sycl_compute_scope sycl_scope(backends.backend);\n        ggml_backend_sched_reserve(backends.sched.get(), gf);",
+        "        ggml_backend_sched_reserve(backends.sched.get(), gf);",
     )
-    assert not claim_clip_opens_the_exported_scope(mutated)
+    assert not claim_mtmd_opens_the_exported_scope(mutated)
+
+
+def test_mutant_mtmd_sched_alloc_outside_the_scope_fails_the_claim():
+    mutated = _once(
+        MTMD,
+        "            mtmd_sycl_compute_scope sycl_scope(ggml_backend_sched_get_backend(sched, 0));\n            alloc_ok = ggml_backend_sched_alloc_graph(sched, gf);",
+        "            alloc_ok = ggml_backend_sched_alloc_graph(sched, gf);",
+    )
+    assert not claim_mtmd_opens_the_exported_scope(mutated)
 
 
 def test_mutant_fit_always_uses_the_live_kv_room_fails_the_claim():

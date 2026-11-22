@@ -163,6 +163,20 @@ void ggml_sycl_cpu_dispatch_buffers_init() {
     g_cpu_dispatch_buffers.init();
 }
 
+// A row kernel quantizes `rows` activation rows of `row_bytes` each into this thread's src1_q. The bound is the one
+// init() sizes it to (cpu_dispatch_src1_q_fits), and the buffer must have been sized on this thread. A void kernel
+// has no fallback that leaves its output written, so either miss aborts with the sizes instead of overrunning.
+static void cpu_dispatch_src1_q_require(size_t rows, size_t row_bytes, int64_t K, const char * caller) {
+    if (!cpu_dispatch_src1_q_fits(rows, row_bytes)) {
+        GGML_ABORT("%s: %zu activation row(s) of %zu bytes (K=%lld) exceed the %zu-byte src1_q buffer", caller, rows,
+                   row_bytes, (long long) K, CPU_DISPATCH_SRC1_Q_BYTES);
+    }
+    if (g_cpu_dispatch_buffers.src1_q.size() < CPU_DISPATCH_SRC1_Q_BYTES) {
+        GGML_ABORT("%s: src1_q holds %zu bytes on this thread; ggml_sycl_cpu_dispatch_buffers_init() did not run",
+                   caller, g_cpu_dispatch_buffers.src1_q.size());
+    }
+}
+
 void ggml_sycl_cpu_quant_cache_new_graph() {
     g_quant_cache_generation.fetch_add(1, std::memory_order_relaxed);
 }
@@ -519,7 +533,7 @@ void ggml_sycl_cpu_vec_dot_rows(ggml_type     type,
     // Quantize src1 (activation) from float32 to Q8 format
     const size_t q_row_size = ggml_row_size(vec_dot_type, ne00);
     // Pre-allocated buffer via g_cpu_dispatch_buffers.src1_q
-    GGML_ASSERT(q_row_size <= g_cpu_dispatch_buffers.src1_q.size());
+    cpu_dispatch_src1_q_require(1, q_row_size, ne00, __func__);
     uint8_t * src1_q_buf = g_cpu_dispatch_buffers.src1_q.data();
     from_float_fn(src1_host, src1_q_buf, ne00);
 
@@ -842,7 +856,7 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
     const size_t q_size     = ggml_row_size(vdt, task.K);
     const size_t row_stride = ggml_row_size(task.type, task.K);
     // Pre-allocated buffer via g_cpu_dispatch_buffers.src1_q
-    GGML_ASSERT(q_size <= g_cpu_dispatch_buffers.src1_q.size());
+    cpu_dispatch_src1_q_require(1, q_size, task.K, __func__);
     uint8_t * q_buf = g_cpu_dispatch_buffers.src1_q.data();
     from_float(task.act_host, q_buf, task.K);
 
@@ -1630,7 +1644,7 @@ static void cpu_expert_mul_mat_int4(const cpu_expert_task & task) {
 
     const size_t q_size = ggml_row_size(vdt, K);
     // Pre-allocated buffer via g_cpu_dispatch_buffers.src1_q
-    GGML_ASSERT(q_size <= g_cpu_dispatch_buffers.src1_q.size());
+    cpu_dispatch_src1_q_require(1, q_size, K, __func__);
     uint8_t * q8_buf = g_cpu_dispatch_buffers.src1_q.data();
     vdt_traits->from_float(task.act_host, q8_buf, K);
 
@@ -1782,7 +1796,7 @@ void ggml_sycl_cpu_expert_fused_gate_up_silu(const cpu_expert_fused_task & task)
     // Quantize activation once (shared between gate and up)
     const size_t q_row_size = ggml_row_size(vec_dot_type, task.K);
     // Pre-allocated buffer via g_cpu_dispatch_buffers.src1_q
-    GGML_ASSERT(q_row_size <= g_cpu_dispatch_buffers.src1_q.size());
+    cpu_dispatch_src1_q_require(1, q_row_size, task.K, __func__);
     uint8_t * act_q_buf = g_cpu_dispatch_buffers.src1_q.data();
     from_float_fn(task.act_host, act_q_buf, task.K);
 
@@ -4479,8 +4493,15 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     // dnnl_sgemm GEMV with direct quantized vec_dot (e.g., Q4_0 × Q8_0).
     // Benefits: ~5x less memory bandwidth (quantized reads), no BLAS overhead,
     // L1-friendly access pattern (one 2KB weight row + 4KB activation per dot).
-    const auto * cpu_traits  = src0_quantized ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
-    const bool   use_vec_dot = (M <= 4 && cpu_traits && cpu_traits->vec_dot);
+    // The activation rows are of the weight's vec_dot_type: quantized blocks for a quantized weight, F32 for an F16
+    // weight. M rows of F32 outgrow src1_q at a much smaller K than quantized rows do, so the path asks whether they
+    // fit, and a K too large for the buffer takes the GEMM fallback below instead of the buffer assert.
+    const auto * cpu_traits = src0_quantized ? ggml_sycl_get_type_traits_cpu(src0->type) : nullptr;
+    const auto * vdt_cpu_traits =
+        cpu_traits && cpu_traits->vec_dot ? ggml_sycl_get_type_traits_cpu(cpu_traits->vec_dot_type) : nullptr;
+    const bool use_vec_dot =
+        M <= 4 && vdt_cpu_traits && vdt_cpu_traits->from_float &&
+        cpu_dispatch_src1_q_fits(static_cast<size_t>(M), ggml_row_size(cpu_traits->vec_dot_type, K));
 
     auto run_mul_mat = [=]() {
 #    if GGML_SYCL_A7L5W_INSTRUMENT
@@ -4519,15 +4540,12 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         static thread_local quant_cache_key src1_q_cache;
 
         if (use_vec_dot) {
-            const ggml_type vec_dot_type   = cpu_traits->vec_dot_type;
-            const auto *    vdt_cpu_traits = ggml_sycl_get_type_traits_cpu(vec_dot_type);
-            from_float_fn                  = vdt_cpu_traits ? vdt_cpu_traits->from_float : nullptr;
-            if (from_float_fn) {
-                q_row_size            = ggml_row_size(vec_dot_type, K);
-                const size_t buf_size = static_cast<size_t>(M) * q_row_size;
-                GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.src1_q.size());
-                src1_q_buf = g_cpu_dispatch_buffers.src1_q.data();
-            }
+            from_float_fn = vdt_cpu_traits->from_float;
+            q_row_size    = ggml_row_size(cpu_traits->vec_dot_type, K);
+            // use_vec_dot asked cpu_dispatch_src1_q_fits, and init() above sized src1_q to that bound. The caller is
+            // named by hand: __func__ here names the lambda.
+            cpu_dispatch_src1_q_require(static_cast<size_t>(M), q_row_size, K, "cpu_mul_mat");
+            src1_q_buf = g_cpu_dispatch_buffers.src1_q.data();
         }
 
         // Dequant/conversion buffer for non-F32 weights (only for GEMM fallback path)
@@ -4547,7 +4565,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                     reinterpret_cast<const float *>(static_cast<const char *>(src1_data) + i12 * nb12 + i13 * nb13);
                 float * dst_batch = reinterpret_cast<float *>(static_cast<char *>(dst_data) + i12 * nb2 + i13 * nb3);
 
-                if (use_vec_dot && from_float_fn) {
+                if (use_vec_dot) {
                     // Quantized dot product path: quantize activations, then vec_dot
                     // per output element.  No weight dequantization needed.
                     // Cache only for single-batch (ne12*ne13==1): multi-batch
@@ -6088,7 +6106,7 @@ static bool cpu_rope(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t d03 = dst->nb[3] / sizeof(float);
 
     float corr_dims[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst), corr_dims);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
