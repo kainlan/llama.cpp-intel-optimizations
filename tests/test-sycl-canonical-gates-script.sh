@@ -31,6 +31,8 @@
 #        SELECTOR/ROOT_DIR
 #   (stderr-only-mistral) correct digits on STDERR only -> FAIL
 #   (stderr-only-gptoss)  same, GPT-OSS side            -> FAIL
+#   (gptoss argv) the GPT-OSS gate's llama-cli argv has no -ngl and no -c
+#        (--reasoning-budget 0 is the positive control)
 #   (inkling-pass/-wrong/-no-model) opt-in inkling gate: PASS, wrong tokens
 #        -> FAIL, model file absent -> rc 77; argv has -c 8192, no -ngl and
 #        GGML_SYCL_MOE_MULTI_GPU=0 in the child environment;
@@ -211,6 +213,9 @@ esac
 # appear only inside an echoed prompt line, never alone on their own line.
 # shellcheck disable=SC2016
 LLAMA_CLI_STUB='#!/usr/bin/env bash
+if [ -n "${STUB_ARGV_FILE:-}" ]; then
+    printf "%s\n" "$*" > "$STUB_ARGV_FILE"
+fi
 case "${STUB_GPTOSS_MODE:-pass}" in
     pass)
         printf "1, 2, 3, 4, 5\n"
@@ -557,6 +562,23 @@ touch_fake_models "$case_serr_g_dir"
 out="$(STUB_GPTOSS_MODE=stderr-only run_gates "$case_serr_g_dir" gptoss)"
 rc=$?
 expect_gate "stderr-only-gptoss" 1 "$out" "$rc" '^GATE gptoss FAIL rc=0 '
+
+# --- (gptoss argv) the GPT-OSS gate carries no -ngl and no -c ---------------
+# The unified cache places every weight and the KV, so neither flag may appear.
+# --reasoning-budget 0 is the positive control: an empty argv file cannot pass.
+case_ga_dir="$TMP/gptoss-argv"
+setup_case_dir "$case_ga_dir"
+touch_fake_models "$case_ga_dir"
+out="$(STUB_ARGV_FILE="$case_ga_dir/argv" run_gates "$case_ga_dir" gptoss)"
+rc=$?
+expect_gate "gptoss argv run" 0 "$out" "$rc" '^GATE gptoss PASS rc=0 '
+if grep -qE -- '(^| )--reasoning-budget 0( |$)' "$case_ga_dir/argv" 2>/dev/null \
+    && ! grep -qE -- '(^| )-ngl( |$)' "$case_ga_dir/argv" \
+    && ! grep -qE -- '(^| )-c( |$)' "$case_ga_dir/argv"; then
+    echo "PASS: (gptoss argv) no -ngl, no -c, --reasoning-budget 0 present"
+else
+    fail "(gptoss argv) expected no -ngl, no -c and --reasoning-budget 0; got: $(cat "$case_ga_dir/argv" 2>/dev/null)"
+fi
 
 # --- (inkling) the opt-in Inkling gate --------------------------------------
 # The same llama-completion stub serves it (STUB_MISTRAL_MODE shapes the

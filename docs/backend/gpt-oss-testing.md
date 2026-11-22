@@ -23,8 +23,8 @@ invocation. Its own logic (preconditions, the no-device probe, the
 digit-regex pass/fail checks) is covered without a GPU by
 `tests/test-sycl-canonical-gates-script.sh`, registered as
 `sycl-canonical-gates-script`. Command line construction for the GPT-OSS
-gate inside the script follows the post-b10630 form (no `-cnv`, `-c 4096`
-pinned, digit-line-only expected output) shown in the "Canonical B50
+gate inside the script follows the post-b10630 form (no `-cnv`, no `-c`,
+no `-ngl`, digit-line-only expected output) shown in the "Canonical B50
 GPT-OSS correctness gate" section immediately below, which this task
 brought in line with CLAUDE.md's own post-b10630 update -- it previously
 still showed the pre-b10630 `-cnv` form and a colon-prefixed expected
@@ -54,16 +54,18 @@ model-format requirement.
 ## Canonical B50 GPT-OSS correctness gate
 
 Post-b10630 form (verified in CLAUDE.md and matching what
-`scripts/sycl-canonical-gates.sh` runs): no `-cnv`, `-c 4096` pinned
-(llama.cpp-uize -- the model's `n_ctx_train` default does not fit the B50).
-An earlier revision of this section showed the pre-b10630 `-cnv` form with
-no `-c` pin and a colon-prefixed expected output; that form is retired --
-do not use it for new comparisons.
+`scripts/sycl-canonical-gates.sh` runs): no `-cnv`, no `-c` and no `-ngl`.
+The unified cache places the KV and every weight, so a context is never
+shrunk to make the model fit and no layer count is passed (`-ngl`: ruling
+2026-10-17). A `-c 4096` run is kept only as the all-VRAM control arm of an
+A/B, never as the gate. An earlier revision of this section showed the
+pre-b10630 `-cnv` form and a colon-prefixed expected output; that form is
+retired -- do not use it for new comparisons.
 
 ```bash
 source /opt/intel/oneapi/setvars.sh --force
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -c 4096 \
+  -m /models/gpt-oss-20b-mxfp4.gguf \
   -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \
