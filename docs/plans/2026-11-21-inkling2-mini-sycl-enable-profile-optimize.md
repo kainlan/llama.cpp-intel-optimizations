@@ -1487,13 +1487,19 @@ on that device, and the arm never asks it.
 the resolver's handle says it is.
 - Handle kind `WEIGHT`: the cache lease, exactly as today. A miss there is still refused by name. Nothing changes
   for a model weight, so no Q4_K_M path moves.
-- Handle kind `CHUNK_LEASE` on this device, resolving to SOA: the owner is a copy of that handle (a copy shares the
-  chunk lease, `mem_handle::mem_handle(const mem_handle &)` in `mem-handle.cpp`), and the plane is the pointer the
-  resolver returned. The conversion is chained on the resolution's ready event with
+- Handle kind `CHUNK_LEASE` on this device, resolving to SOA: the owner is a copy of that handle, and the plane is
+  the pointer the resolver returned. Corrected 2026-11-22 (quality review): the copy does not share the lease, it
+  takes its own lease on the same chunk (`bump_chunk_lease_for_copy` in `mem-handle.cpp`). That keeps the arena
+  chunk alive; it does not stop the tensor's own sub-allocation from being freed and dealt again, which is the
+  same strength as the tensor's own handle (ggml synchronizes before it frees a buffer). Since fix round 2 the arm
+  also checks that the copied handle resolves to the pointer it reads, and refuses by name when it does not. The conversion is chained on the resolution's ready event with
   `ggml_sycl_chain_ready_event_if_needed` (`common.hpp`), and the copy is retained until the read's event, as the
   cache lease is today. No host wait.
-- Any other kind (`DIRECT` and the arena kinds carry no lifetime for a reader that outlives the call): refused by
-  name, `f16 dequant arm: the SOA plane has no owner the arm can hold`.
+- Any other kind: refused by name, `f16 dequant arm: the SOA plane has no owner the arm can hold`. Corrected
+  2026-11-22 (quality review): this line said `DIRECT` and the arena kinds carry no lifetime a reader can hold.
+  That is false for an owning `DIRECT` handle (`from_owned_alloc`) and for an arena handle with an authority; a
+  copy of either holds the allocation. They are refused because nothing installs an SOA plane in one today, not
+  because they could not be held. The first path that does install one gets its own arm here.
 - The earlier direction said the arm should never call `ggml_sycl_acquire_weight_layout`. Withdrawn: for a
   cache-managed weight the lease is what stops an eviction under the read, and a plain copy of a `WEIGHT` handle is
   not known to do that.
