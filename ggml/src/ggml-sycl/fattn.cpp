@@ -2755,6 +2755,13 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // The vec and tile kernels are templated on one head size and index V with it. A value head size that differs
+    // from the key head size leaves part of each dst row unwritten (DV > D) or writes past dst (DV < D). D=512 is
+    // screened by its own admissibility functions above.
+    if (D != 512 && V->ne[0] != D) {
+        return false;
+    }
+
     // MMA kernel handles high head counts (>32), vec kernel handles <=32
     // Both are now supported
 
