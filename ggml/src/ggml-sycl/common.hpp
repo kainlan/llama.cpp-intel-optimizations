@@ -14,6 +14,7 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include "alloc-registry.hpp"
+#include "async-failure.hpp"
 #include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"

@@ -3036,3 +3036,91 @@ GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts(const char * site, u
     return true;
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Asynchronous SYCL failure latch (async-failure.hpp)
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int    k_async_failure_slots       = GGML_SYCL_MAX_DEVICES + 1;
+constexpr size_t k_async_failure_message_len = 256;
+
+struct async_failure_slot {
+    std::atomic<uint64_t> count{ 0 };
+    std::atomic<int>      message_state{ 0 };  // 0 empty, 1 being written, 2 readable
+    char                  message[k_async_failure_message_len] = {};
+};
+
+// Namespace scope, constant-initialized and trivially destructible: a queue drained during static destruction can still
+// deliver an error here.
+async_failure_slot g_async_failure[k_async_failure_slots];
+
+int async_failure_clamp(int slot) noexcept {
+    return slot >= 0 && slot < GGML_SYCL_MAX_DEVICES ? slot : GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED;
+}
+}  // namespace
+
+void ggml_sycl_async_failure_record(int slot, const char * what) noexcept {
+    async_failure_slot & s        = g_async_failure[async_failure_clamp(slot)];
+    int                  expected = 0;
+    if (s.message_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        const char * text = what ? what : "(no message)";
+        size_t       n    = 0;
+        for (; n + 1 < k_async_failure_message_len && text[n] != '\0'; ++n) {
+            s.message[n] = text[n];
+        }
+        s.message[n] = '\0';
+        s.message_state.store(2, std::memory_order_release);
+    }
+    s.count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+uint64_t ggml_sycl_async_failure_count(int slot) noexcept {
+    return g_async_failure[async_failure_clamp(slot)].count.load(std::memory_order_acquire);
+}
+
+const char * ggml_sycl_async_failure_first_message(int slot) noexcept {
+    const async_failure_slot & s = g_async_failure[async_failure_clamp(slot)];
+    return s.message_state.load(std::memory_order_acquire) == 2 ? s.message : nullptr;
+}
+
+ggml_sycl_async_failure_cursor ggml_sycl_async_failure_snapshot(int device) noexcept {
+    return { device, ggml_sycl_async_failure_count(device),
+             ggml_sycl_async_failure_count(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED) };
+}
+
+bool ggml_sycl_async_failure_since(const ggml_sycl_async_failure_cursor & cursor) noexcept {
+    return ggml_sycl_async_failure_count(cursor.device) != cursor.device_count ||
+           ggml_sycl_async_failure_count(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED) != cursor.shared_count;
+}
+
+sycl::async_handler ggml_sycl_async_handler(int slot) {
+    const int bound = async_failure_clamp(slot);
+    // Record only. Rethrowing would surface the error from whichever wait_and_throw delivers it, including ones in
+    // noexcept code and in host tasks; the graph boundaries read the latch instead.
+    return [bound](sycl::exception_list errors) noexcept {
+        for (const std::exception_ptr & error : errors) {
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception & e) {
+                ggml_sycl_async_failure_record(bound, e.what());
+            } catch (...) {
+                ggml_sycl_async_failure_record(bound, "non-standard exception");
+            }
+        }
+    };
+}
+
+sycl::context ggml_sycl_make_context(const sycl::device & dev, int slot) {
+    return sycl::context(dev, ggml_sycl_async_handler(slot));
+}
+
+sycl::queue ggml_sycl_make_queue(const sycl::context &       ctx,
+                                 const sycl::device &        dev,
+                                 int                         slot,
+                                 const sycl::property_list & props) {
+    return sycl::queue(ctx, dev, ggml_sycl_async_handler(slot), props);
+}
+
+sycl::queue ggml_sycl_make_queue(const sycl::device & dev, int slot, const sycl::property_list & props) {
+    return sycl::queue(dev, ggml_sycl_async_handler(slot), props);
+}
