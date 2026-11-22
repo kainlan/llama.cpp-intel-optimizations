@@ -333,7 +333,8 @@ means its owner has the entry's base and the entry's size, so retiring the entry
 gives back exactly its bytes; an owner wider than its entry may hold another
 expert. A copy served in place from a file mapping, or one whose owner is wider
 than its entry, is refused "host copy not pinned", REFUSED, and stays on the
-host.
+host. A host expert served in place from the loader's `SYCL_Host` chunk under
+`-lm none` is the second kind: its owner is the whole chunk.
 
 An evict is the loan's move under the named move's rules. The preparation mints
 pinned host storage for the tensor's bytes per expert, and the loan's cache body

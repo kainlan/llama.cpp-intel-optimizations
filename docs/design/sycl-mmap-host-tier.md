@@ -1186,6 +1186,7 @@ copied into a cache allocation at load.
 |---|---|---|---|---|
 | device-planned dense or expert | GPU | per-device (SOA, XMX, WOQ...) | `FILE_MAPPED` (its staging source) | `DEVICE_VRAM`, staged once from the mapping (§5.3); the mapped pages are dropped after staging (§4.6) |
 | host MoE expert, AOS | CPU (`CpuExpertPool`) | AOS = file | `FILE_MAPPED`; `PINNED`, copied from the mapping by the preload, when the plan holds window-ring room, the host plan fits and no lazy table refuses | **`FILE_MAPPED`, served in place**; when `PINNED`, the pinned copy, which the window ring streams to the device for prompts |
+| host MoE expert, AOS, under `-lm none` (a load that maps no file) with evictable weights | CPU (`CpuExpertPool`) | AOS = file | `PINNED` | **`SYCL_Host`, served in place** from the loader's buffer with that buffer's owner (lifetime `MODEL`, owned by the model), ring-streamable; single-device plans only, a multi-device plan copies it into a pinned block ("The loader's `SYCL_Host` buffer" below) |
 | host MoE expert needing a CPU reorder (`register_host_aos_expert`'s SOA/XMX branch) | CPU | reordered | `FILE_MAPPED` source | copied: into `HOST_CPU` once th32 T1 lands, pinned until then |
 | planner-host dense, `GGML_SYCL_HOST_WEIGHT_LAYOUT=cpu` (default) | ggml-cpu | `CPU_REPACK` | `CPU_OWNED` | copied by ggml-cpu, outside the cache (ticket below) |
 | planner-host dense, `=plain` | ggml-cpu | file | `FILE_MAPPED` | `FILE_MAPPED` (`is_host`, so the CPU backend runs it) |
@@ -1201,6 +1202,50 @@ no lazy table refuses it (`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` keeps them
 mapped). That pin is measured at 47.6 GiB of pinned memory on the Qwen3.8
 exps-IQ4_NL pack. Otherwise `PINNED` host backing survives only when
 `load_maps_files` is false.
+
+**The loader's `SYCL_Host` buffer** (llama.cpp-cg69). On a load that maps no
+file, with evictable weights, the loader binds `SYCL_Host` for every weight the
+plan places and keeps that buffer for the model's life. The plan states it as
+two facts with one source, `placement_loader_fact_for(load_maps_files,
+load_weights_evictable, multi_device)` in `placement_plan_copy_host_backing_fact`
+(`kv_info.load_weights_evictable` comes from
+`ggml_backend_sycl_weights_evictable()`):
+- `loader_holds_weights` (no mapping, evictable weights). The WEIGHT zone
+  charges the buffer as the term `loader_residency`: every entry's `src_size`
+  rounded up to the loader's tensor alignment, exact for a dense weight and a
+  bound for an expert slice. The term reaches `host_planned_bytes` through the
+  zone. It covers the device-planned weights' host bytes too, which the loader
+  keeps after staging (22.9 GB on the Qwen3.8 B70 `-lm none` load); releasing
+  them after staging is a separate ticket.
+- `loader_serves_host_experts` (the same, on a single-device plan). S1-PRELOAD
+  registers each host expert backed `PINNED` in place: its lease is the
+  expert's bytes inside the loader's chunk, its owner a copy of that chunk's
+  owner, which `moe_stream_owner_streamable` accepts, so the window ring
+  streams it as it streams a pinned copy. The expert counts once, as
+  `loader_served` inside `loader_residency`, and holds no block, so
+  `host_weights + loader_served == weight_host_bytes` is the
+  `[HOST-PLAN-BUG]` comparison. A host dense weight is still copied into a
+  block.
+
+The gate (`ggml_sycl_loader_buffer_owner`) accepts a `SYCL_Host` buffer that is
+not a claimed tenant slot, has lifetime `MODEL`, holds the expert's bytes, and
+whose owner the ring copies from on that device. A refusal logs one
+`[MOE-LAYOUT]` WARN per tensor and copies the expert into a block the plan did
+not size. The limits:
+- Single-device, evictable, non-mapping plans only. A multi-device plan charges
+  the buffer and still copies every host expert, so it holds them twice, and
+  says so in the charge.
+- An in-place expert's owner is wider than its entry, so the named move's admit
+  refuses it ("host copy not pinned", REFUSED) and a swap cannot move it to the
+  device: it stays on the host for the model's life (`sycl-memory-design.md`,
+  the named move).
+- No silent degrade: a host-planned expert with no owner (no room for a copy
+  and no buffer to serve it from) is never registered. The load counts them,
+  logs one `[S1-PRELOAD] ... host-planned experts (... MB) have no owner` ERROR
+  line and refuses, as a dense weight that cannot be registered does.
+- The preload compares what the model still holds in `SYCL_Host` chunks on the
+  plan's device with `loader_residency`, and logs a `[HOST-PLAN-BUG]` WARN
+  when it holds more.
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),
@@ -1219,6 +1264,7 @@ CPU_OWNED }` for every entry. The planner derives it once from
 | `host_cpu_owned_bytes` | `CPU_OWNED` entries | yes (anonymous memory, P3 counts it) | nothing: not in the zone (today they inflate it) |
 | `host_mapped_bytes` | host-executed `FILE_MAPPED` entries | only when locked (§4.5) | nothing |
 | `host_mapped_source_bytes` | device-planned `FILE_MAPPED` sources | no | nothing (transient page cache during staging) |
+| `loader_residency` (a WEIGHT zone term, not a plan field) | every entry at the loader's alignment, when `loader_holds_weights` | through the WEIGHT zone | the WEIGHT zone; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
 
 Every accumulation site of `weight_host_bytes` in the planner
 (`uc:25928`, `:25933`, `:28136`, `:28196`, `:28230`, `:28322`, `:29554`,
@@ -1613,7 +1659,21 @@ created") describes a path that does not run.
     - **`MODEL`**. The record carries the model's `ModelId`
       (`model-lifecycle.hpp`), whose release is the model-free point. The
       `in_model_load` branch of `gs:42652`, a model's `SYCL_Host` weights
-      with role `WEIGHT`, is `MODEL` (r3 m8).
+      with role `WEIGHT`, is `MODEL` (r3 m8), and its owner is the model:
+      `ggml_sycl_host_buft_alloc` mints the row `{MODEL, ModelId}` from the
+      load effect the host-weight registration takes, and the buffer keeps no
+      `BUFFER` owner. The check runs in
+      `ggml_sycl_release_model_slot_resources` after
+      `unified_cache_release_model_slot`, not before: a host expert served in
+      place from such a chunk holds a copy of the chunk's owner in its cache
+      entry until the reclaim drops it, so only a row that outlives the
+      reclaim is a leak. A load that rolls back runs the same check once both
+      its rollback (`ggml_sycl_abort_owner_effects_noexcept`, after its slot
+      release) and the free of its last `SYCL_Host` chunk (the model's
+      destructor) have happened, whichever is last. The loader's temporaries,
+      the pinned upload buffers a load frees before it ends, are `MODEL` rows
+      too: they lose a check at their own free, and a leaked one outlives the
+      reclaim, so the model's check reports it.
     - **`DEVICE`** (addendum 10 (b), §M62 (D)). It is allowed only for a
       holder whose contents are device-scoped and shared by every context
       on the device. It is not the refused `PROCESS`: it has a named owner
