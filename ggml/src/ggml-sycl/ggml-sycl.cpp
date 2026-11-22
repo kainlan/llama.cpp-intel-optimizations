@@ -87243,6 +87243,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                                     if (recycled) g_q1_nvfp4_test_recycle.fetch_add(1, std::memory_order_relaxed);
 #endif
+                                    // The bundle holds the admission authority, and with it the invocation pin, until
+                                    // terminal_release() resets it, which a failed terminal never reaches. Empty it as
+                                    // the body's last statement, through the shared completion object rather than this
+                                    // functor's reference to it, so no copy of the functor keeps the pin. The event of a
+                                    // host task cannot complete before its body returns, so a boundary that waited on
+                                    // that event finds the bundle gone whatever the runtime does with the functor
+                                    // afterwards. A quarantined slot keeps its own reference, for recovery.
+                                    completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};
                                 });
                             });
                             // No diagnostics or ownership construction is allowed

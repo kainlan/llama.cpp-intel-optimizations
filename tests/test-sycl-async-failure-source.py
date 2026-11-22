@@ -22,6 +22,11 @@ With comments blanked:
      slot-release sites read it as "finished" and a failed bundle must still be released; observe_success() tests
      ggml_sycl_async_failure_since( after event->wait_and_throw(); the route arms with a snapshot taken before its
      first submission.
+  B. (ggml-sycl.cpp, the completion host task) the body's last statement assigns an empty bundle to
+     completion->bundle, after the terminal_release() expression. The bundle holds the invocation pin until
+     terminal_release() runs, and a failed terminal never reaches it; the task's event completes only after the body
+     returns, so a boundary that waited on that event finds the pin released however long the runtime keeps the
+     functor or copies of it.
   H. (common.cpp ggml_sycl_async_handler) the handler body has no throw statement, no GGML_LOG, no lock or mutex, no
      std::string and no new.
 """
@@ -31,6 +36,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
+BUNDLE_DROP = "completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};"
 
 
 def blank_comments(text):
@@ -64,6 +70,7 @@ def claims(cache, sycl, common):
     t_ready = body(t, "bool ready() const noexcept override")
     t_success = body(t, "bool observe_success() noexcept")
     h = body(common, "sycl::async_handler ggml_sycl_async_handler(int slot)")
+    b = body(sycl, "h.host_task([completion, terminal]")[1:-1].rstrip()
     g_check = g.find("ggml_sycl_async_failure_since(")
     g_first = g.find("ggml_backend_sycl_graph_compute_unchecked(")
     s_since = s.find("ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)")
@@ -88,6 +95,8 @@ def claims(cache, sycl, common):
             "ggml_sycl_async_failure_since" not in t_ready and "wait_and_throw" not in t_ready,
         "T observe_success reads the latch after the wait": 0 <= t_success.find("event->wait_and_throw();") <
             t_success.find("ggml_sycl_async_failure_since(cursor)"),
+        "B the completion task drops the bundle before it returns": b.endswith(BUNDLE_DROP) and
+            0 <= b.find("completion->bundle.terminal_release()") < b.rfind(BUNDLE_DROP),
         "T route arms with its cursor": "terminal->arm(final, failure_cursor);" in sycl and
             "const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);" in sycl,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
@@ -140,6 +149,10 @@ def main():
             "observe_success is ready": (cache, sycl.replace(success, "{ return ready(); }", 1), common),
             "observe_success skips the wait": (cache, sycl.replace(
                 success, success.replace("event->wait_and_throw();", "", 1), 1), common),
+            "completion task keeps the bundle": (cache, sycl.replace(BUNDLE_DROP, "", 1), common),
+            "completion task drops the bundle first": (cache, sycl.replace(BUNDLE_DROP, "", 1).replace(
+                "const bool recycled = terminal->observe_success()",
+                BUNDLE_DROP + " const bool recycled = terminal->observe_success()", 1), common),
             "handler logs": (cache, sycl, common.replace("ggml_sycl_async_failure_record(bound, e.what());",
                                                          "GGML_LOG_ERROR(\"%s\", e.what());", 1)),
         }
