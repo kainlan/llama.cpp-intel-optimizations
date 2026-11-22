@@ -1515,6 +1515,14 @@ copy of these inlines, which matches the interposition rule at `:853-878`.
 | the cache's six queues (`unified-cache.cpp:6388`, `:6415`, `:12727`, `:12749`, plus `queue_` and `compute_queue_`) | cache member destruction | `drain_all_queues_noexcept` runs `q->wait_and_throw()` on each (`unified-cache.cpp:6954-6990`) before members go | none |
 | expert-prefetch `dma_queue_` | `shutdown()` `expert-prefetch.cpp:74` | `cancel_all()`: `queue->wait_and_throw()` `:401` | none |
 
+*The split merge row, corrected 2026-11-22 (Task 7b's spec review):* the pending merge events are not submitted
+on the split merge queue. They are the events of `mem_copy_async(..., *stream, ...)` in the split dispatch, and
+`stream` is the context's execution queue. `g_split_merge_queue` receives no submission: it is created, reset, and
+waited on in the replan. So `split_merge_drain`'s `e.wait_and_throw()` delivers the execution queue's pending
+errors into that device's own slot. The edit and claim F stand as written. Two callers of the drain have no catch
+above them, `ggml_backend_sycl_free` and `ggml_backend_sycl_shutdown`: a synchronous exception from the wait
+escapes them today exactly as it did from `e.wait()`.
+
 None of these edits adds a wait. Each changes an existing wait so that it delivers. The kernel path in `exec_q` keeps
 its current result: `ggml_sycl_readback_via_shared_kernel` still returns true after a delivered error. The latch fails
 the device at its next boundary, which is the same accepted one-graph window.
@@ -1529,8 +1537,11 @@ execution queue the replays are submitted on.
 **Census row**, `docs/plans/data/2026-11-16-no-crash-census.md:50`. Replace the `kjoc` row with:
 
 ```markdown
-| kjoc | Backend queues had no async_handler: async errors hit the SYCL default handler and terminated | P1 | Q1/NVFP4 route terminal failure injection | unclear | 2026-10-10 | n/a | fixed: every backend queue and context has the recording handler (async-failure.hpp); a delivered error fails its device's contexts at the next graph boundary (`llama_decode` -3), one graph late | |
+| kjoc | Backend queues had no async_handler: async errors hit the SYCL default handler and terminated | P1 | Q1/NVFP4 route terminal failure injection | unclear | 2026-10-10 | n/a | partly fixed: every backend queue and context built by a construction expression, and every dpct queue, has the recording handler (async-failure.hpp); the dense scheduler's copy queue and the L2 prefetch queue, built in member initializers, do not yet; a delivered error fails its device's contexts at the next graph boundary (`llama_decode` -3), one graph late | |
 ```
+(Reworded 2026-11-22 after the spec review. The row first said every backend queue and context; the dense
+scheduler's `copy_queue_` and the L2 prefetch `prefetch_queue_` are built in member initializers, which the
+contract's scanner does not see, and Task 7c converts them and restores the full statement.)
 
 Run:
 ```bash
@@ -1581,10 +1592,13 @@ builds).
 - Modify: `ggml/src/ggml-sycl/layer-streaming.cpp:58`, `:353`, `:379`, `:410`, `:464`
 - Modify: `ggml/src/ggml-sycl/l2-prefetch.hpp:155`, `:164`
 - Modify: `ggml/src/ggml-sycl/dense-scheduler.cpp:48`, `:71`, `:113`, `:177`, `:202`, `:212`
+- Modify: `docs/plans/data/2026-11-16-no-crash-census.md`, the `kjoc` row: once `:48` and `l2-prefetch.hpp:155` are
+  converted, its status cell becomes `fixed: every backend queue and context has the recording handler (async-failure.hpp); a delivered error fails its device's contexts at the next graph boundary (`llama_decode` -3), one graph late`.
 - Create: `tests/test-sycl-async-drain-source.py`; Modify: `tests/CMakeLists.txt`
 
 **Description:** A plain `wait()` neither throws nor delivers (fact g). After 7b every backend queue has the recording
-handler, but an error on a queue whose drains are all plain still reaches the latch late or never. A process-lifetime
+handler except the two built in member initializers, which this task converts (`dense-scheduler.cpp:48`,
+`l2-prefetch.hpp:155`), but an error on a queue whose drains are all plain still reaches the latch late or never. A process-lifetime
 queue's error is held until the queue is destroyed at exit, and fact (f) says it is dropped then. This task changes
 the existing drains of every non-execution queue from `wait()` to `wait_and_throw()`, so each delivers what has
 accumulated so far. With the handler installed, `wait_and_throw()` does not throw for an asynchronous error: the
@@ -2017,7 +2031,7 @@ ctest --test-dir build -L source-contract -j 4 --output-on-failure
 git commit -F <msgfile> -- ggml/src/ggml-sycl/ggml-sycl.cpp ggml/src/ggml-sycl/unified-cache.cpp \
   ggml/src/ggml-sycl/device-pool.hpp ggml/src/ggml-sycl/common.cpp ggml/src/ggml-sycl/layer-streaming.cpp \
   ggml/src/ggml-sycl/l2-prefetch.hpp ggml/src/ggml-sycl/dense-scheduler.cpp \
-  tests/test-sycl-async-drain-source.py tests/CMakeLists.txt
+  docs/plans/data/2026-11-16-no-crash-census.md tests/test-sycl-async-drain-source.py tests/CMakeLists.txt
 ```
 Subject: `sycl: drains of auxiliary queues deliver their asynchronous errors (kjoc)`. End it with your own
 Co-Authored-By trailer.

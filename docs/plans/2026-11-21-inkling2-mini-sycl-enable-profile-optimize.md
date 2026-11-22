@@ -2175,6 +2175,11 @@ none blocking; quality re-review by a fresh reviewer PASS with four nits; all cl
 cards, the GPT-OSS B50 gate without `-c` (rc 0, one answer line, no device loss) and the GPT-OSS B70 gate all
 pass, with zero kernel fault lines and `Shmem` at 9 GB.
 
+*The merged tree with Task 6f-2 added, built with all targets and run once per arm at `64a6a1f7e`
+(2026-11-22):* the same eight arms all pass (device test and lifecycle oracle on both cards, the Mistral gate
+on both cards, the GPT-OSS B50 gate without `-c` with rc 0, one answer line and no device loss, the GPT-OSS B70
+gate), with zero kernel fault lines and `Shmem` at 8 GB.
+
 ---
 
 ### Task 7b: Every backend queue and context carries the async-failure handler
@@ -2197,6 +2202,63 @@ does not see, because they are member initializers (`dense-scheduler.cpp:48`, `l
 destruction drain (`ggml_backend_sycl_shutdown`, `ggml-sycl.cpp:125031`). They are in Task 7c, whose contract was
 validated with them (its claim M pins both constructions). "Every queue has the handler" is therefore true after 7c,
 not after 7b. Both merge before Task 9.
+
+**DONE 2026-11-22, merged as `ee6017e88`** (task commits `4f8981184..5592ae7a6`, logs `0a48fb5d5`). Spec review
+PASS with four nits; quality review PASS with one should-fix and four nits; two fix rounds. A fresh reviewer re-reviewed fix round 2 and ran 24 reverts of its own against the four drain claims: PASS, three nits about older scanner behaviour that fails closed, not changed.
+
+*What landed:*
+- The 22 constructions of the spec's table carry the recording handler with the slot the table names. Every
+  queue kept its properties and its context: a queue built from a device alone still lands on the platform
+  default context. `dpct/helper.hpp` installs the shared-slot handler on every dpct queue and context, and its
+  printing handler is gone. Four existing drains became `wait_and_throw`; no wait was added (509 wait calls in
+  `ggml-sycl.cpp` before and after). `moe_sycl_event_terminal` is untouched.
+- *Outside the spec's file scope:* `test-esimd-dpas-gate` compiles against `gpu-arch.cpp` without linking the
+  backend library, so the header's new reference failed its link. The test defines the handler factory itself,
+  as it already does for the two symbols the gate needs, and that definition aborts if it is ever reached. The
+  reviewers checked that no other target needs one.
+- *Fix round 1, from the spec review:* the census row says `partly fixed` and names the two queues that still
+  have no handler (member initializers; Task 7c converts them and restores the full statement). The spec's
+  drain table said the split merge events are on the split merge queue; they are on the context's execution
+  queue, and `g_split_merge_queue` receives no submission. The spec is corrected; the code was right.
+- *Fix round 2, from the quality review:* three of the four drain claims of the new contract passed on a
+  broken tree (a reverted readback drain with one statement inserted before the copy) and had no mutant. Each
+  claim is now scoped to the body of its function, requires the `wait_and_throw` there and rejects a plain wait
+  on the same receiver; the self-test runs 14 mutants. The scanner also reports `make_optional`,
+  `allocate_shared` and copy-list constructions. The merged script is therefore stronger than the block in the
+  spec, which is kept as the RED text.
+
+*Device results, one run per arm at `34620abe7`, zero kernel fault lines, `Shmem` 11 GB:* Mistral B70 gate
+passes; GPT-OSS B50 gate without `-c` rc 0, one answer line, no device loss. `244ece1b5` and `5592ae7a6` change
+the contract script and rewrap one comment (verified by diff, words equal) and were not built on the task
+branch; the post-merge build covers them.
+
+*Not taken, recorded as Task 7e:* the duplicate device lookups at two converted sites.
+
+---
+
+### Task 7e: The device-id lookups cannot say "unmapped" (recorded 2026-11-22)
+
+**Track:** D, after Task 7c (same files). **Not a Stage 1 exit gate.**
+**Status:** recorded from Task 7b's quality review and confirmed in the code by the lead; written out to the Task
+Detail Standard before it starts.
+**What is known (at Task 7b's branch):**
+- `ggml_sycl_get_device_id_from_device` and `ggml_sycl_get_device_id_from_queue` (`common.cpp`) never return a
+  negative value. For a device the backend does not map, and on any exception, they return
+  `dpct::dev_mgr::instance().current_device_id()`: the calling thread's current dpct device, which is another
+  device's id and not necessarily a backend index at all.
+- So a queue built on an unmapped device takes another device's async-failure slot instead of the shared slot,
+  and an error on it fails the wrong device's contexts.
+- `split_config_init` checks `secondary_device < 0` after the lookup and logs `secondary GPU queue did not map to
+  a ggml SYCL device id`. The check is dead: a GPU outside the backend's device list would be adopted as the
+  split secondary under the current device's id.
+- Two converted sites look the same device up twice (`split_config_init`: from the device, then from the queue
+  built on it; the readback: `q`, then `exec_q`).
+**Direction (lead):** one lookup that can answer "unmapped" (a negative value, no fallback to the current device),
+used by the callers that choose a slot or adopt a device; an unmapped answer takes the shared slot for a handler
+and refuses the adoption. Callers that rely on the fallback today are found and decided one by one before the
+fallback is removed. The duplicate lookups go in the same edit.
+**Done when:** a host-only test shows the lookup's answer for an unmapped device; a source contract pins that no
+handler slot comes from a lookup that falls back to the current device; the Mistral and GPT-OSS gates pass.
 
 ---
 
