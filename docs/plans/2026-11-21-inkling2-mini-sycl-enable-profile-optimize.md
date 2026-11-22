@@ -4938,6 +4938,50 @@ rewritten Stage 3 before any of it starts.
 
 ---
 
+## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
+
+The codescout `task_*` tools fail in the lead's session (2026-11-22: the session's index root is a directory
+that no longer exists). Until someone files these, this list is the record. Each line is one task.
+
+*Found by Task 7's lock analysis (section 12.5 non-conformances, all older than this branch):*
+- `replace_plan`'s prepared-replacement erase and `recover_quarantined`'s sweep of retired contexts can drop the
+  last owner of a context's pools under the MMID registry mutex, which runs final `mem_handle` destructors and
+  their free-path locks under a ranked lock.
+- The quarantine resets under the MMID pool mutexes can do the same with a graph retention record or an
+  admission authority.
+- `recover_quarantined(wait=true)` calls `wait_and_confirm` under the registry and pool mutexes; on the
+  `MUL_MAT_ID` path the graph-compute lock and the context's graph mutex are held too. A host wait under locks.
+- The runtime KV-update path materializes the MMID pools (`unified_allocate`) under the inventory mutex when
+  the geometry changes (the non-stable transaction branch).
+- `ExpertPrefetcher::mutex_` is not in the 12.5 table; on a load-bound thread it reaches the plan mutex.
+
+*Found by the Inkling runs:*
+- About 36 small host-resident F32 weights (`ne=[1,128,1,1]`, `model=0`) are not preloaded. `binbcast.cpp`'s
+  `stage_raw_host_source` asks the cache to stage them, planned mode refuses
+  (`planned-mode runtime materialization rejected op=direct_stage_weight`), and the op copies them into a
+  STAGING buffer with a synchronous wait, once per op. A placement gap and a host wait per op. Name the
+  tensors first.
+- With every weight in VRAM on the B70, the load keeps 21.3 to 21.8 GB in the host pinned pool
+  (`[HOSTMEM] ... WEIGHT=21.75/24.06`). Find the owner and whether it is the load path's staging copy that
+  nobody releases.
+- `hold_spills_kv_zone_full=1 hold_spills_kv_zone_full_bytes=1057724.1 KB` in the scratch statistics of the
+  B70 run: one hold spilled about 1 GB because the KV zone was full. Find what it was.
+
+*Found by Task 8a and 8b:*
+- For a direct recipe, `recipe.workspace` (the 32-row chunk plan) is a size nothing allocates: a second figure
+  for one thing.
+- `choose_moe_batch_executor` refuses every Q1_0/NVFP4 device recipe "until all four B70 oracle cases pass";
+  no document lists the four cases. Either state them and close the gate properly, or remove the generic arm
+  for these types.
+- The batched oneDNN prompt table leaves Q1_0 and NVFP4 out because of that same gate, although converters
+  exist. A candidate for prompt speed once the profile says where the time goes.
+
+*Decisions that are the user's (asked, not answered):* the eight contracts that are red on `master`; the
+interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkling2`; replacing the system
+`mkdir`.
+
+---
+
 ## End-to-End Validation (on the user's machine) — MANDATORY
 
 > Run after all task tests pass and before the work is declared done. Owned by the lead. Stage 1 is done when this
