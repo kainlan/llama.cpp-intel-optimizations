@@ -2487,6 +2487,56 @@ case alone; the whole `-o MUL_MAT` sweep; the Mistral gate on both cards; the GP
   the tree go under the task's temp folder and are deleted before the report.
 - Line numbers above are from Task 6f-3's branch and move with its merge: find every site by name.
 
+**DONE 2026-11-22, merged as `d558d0a14`** (task commits `9363848c1..651dd0844`, fourteen commits and one
+merge of Task 7f). Spec review, then three quality reviews with a fix round after each; the last is PASS WITH
+FINDINGS, all minor.
+
+*The design changed during the task (lead ruling 2026-11-22).* The guide above decides the read from the
+reorder record (`extra->optimized_feature`). That record answers another question: which layout a kernel last
+resolved for the weight, and for a cache layout the bytes it describes are not in the tensor's own range at
+all. A read needs to know the order of the bytes in the tensor's own range and nothing else. So:
+- `ggml_tensor_extra_gpu::own_data_layout` (`common.hpp`) records the order of the bytes in the tensor's own
+  range. Every path that writes that range sets it; the field's comment names every writer and the writers it
+  does not cover (see Task 6f-9).
+- `ggml_backend_sycl_buffer_get_tensor` decides from the ROOT extra's `own_data_layout` alone. It does not read
+  the reorder record. A view reads through its root.
+- `set_tensor_async` records ggml order only when it wrote the tensor's own range (`dst_is_own_range`: the
+  storage-handle branch, or `dst_ptr == tensor->data`). A write that landed elsewhere leaves the record alone.
+- A stored order with no inverse (COALESCED) is read as stored and reported once per tensor at WARN. The helper
+  decides under its mutex and logs after releasing it, names the layout, and keys an unnamed tensor by type
+  and size.
+- `tests/test-sycl-own-data-layout-source.py` pins the reader's source of truth, counts every write of the
+  field and pins where the async own-range flag is set, with a mutation self-test. Accepted as a limit of a
+  text contract: an assignment wrapped in `if (true) { ... }` passes.
+- A read-only test seam, `ggml_sycl::test_get_tensor_layout_records` (`ggml-sycl-test.hpp`), lets the device
+  test print both records. Accepted: it reads two fields and changes nothing.
+
+*Device results, one run per arm, zero kernel fault lines, `Shmem` 8 to 9 GB.*
+- RED, B50, the tree before the `get_tensor` edit: `f32` and `q4_K` pass; `q4_0`, `q8_0`, `q6_K`, `mxfp4` and
+  `q6_K` in two chunks fail every read (whole tensor, one row, a window inside blocks, the last three bytes, a
+  view).
+- At `d379ed84d`, B50 and B70: `PASS (9 cases, 9 reads after MUL_MAT)`. The five reordered cases print
+  `record=soa own=soa`; `f32`, `q4_K` and the two `set_tensor_async` cases print `record=none own=aos`.
+- Lead arms from the task build (the code before the review rounds, `9d7f6da30`), B50 unless said: the A3 case
+  prints OK (this closes the criterion moved here from Task 6f-3); `-o MUL_MAT` 1995 of 1996, the one failure
+  the large f16 case (`n=2105344`, Task 6g-2); Mistral gate on both cards and the GPT-OSS gate without `-c`
+  pass.
+*Merged tree at `d558d0a14`, one run per arm, zero kernel fault lines, `Shmem` 9 GB:* the readback test passes on both
+cards with the same nine lines; the A3 case prints OK; the unselected-branch device test, the route oracle on both
+cards, the Mistral gate on both cards and the GPT-OSS gate on both cards (B50 without `-c`) pass. Sweep: first
+selection 200 of 208, the failed set exactly the eight of the baseline; second selection 22 of 22; none skipped.
+
+*What the device test does not reach:* a tensor whose reorder record says SOA while its own range holds ggml
+order. The cache-side record (`ggml_sycl_update_layout_from_cache`, `mark_soa_pretransformed`) is written only
+when the unified cache materializes a weight it has registered, and a test tensor is not one. Two cases
+written for it failed by design (`reorder record is none, want soa`) and were restated to what the async path
+reaches: own range is ggml order before and after the MUL_MAT, and the read is byte-equal to the upload. The
+reader's independence from the reorder record is held by the source contract only. A device vehicle needs a
+test control that can set the record; Task 6f-9 owns it.
+
+*Declined (lead):* a `Claude-Session:` trailer (not a convention here); a stricter default than ggml order for
+a tensor no writer has recorded (every writer records, and the contract counts them).
+
 ---
 
 ### Task 6f-8: Readback of a weight stored COALESCED or XMX tiled (recorded 2026-11-22)
@@ -2528,10 +2578,29 @@ per weight, so this needs a decision) or the read is served from the tiled form 
   untouched part is still SOA and is now read as AOS.
 - `ggml_backend_sycl_buffer_cpy_tensor` and `ggml_backend_sycl_cpy_tensor_async` copy bytes between SYCL buffers.
   Whether they carry the source's layout record to the destination was not checked.
+**Also in scope (recorded 2026-11-22 from Task 6f-7's reviews; traced from the code, not run; verify each
+before writing the task out):**
+- Writers of a tensor's own range that `own_data_layout` does not follow: the destination of
+  `ggml_backend_sycl_buffer_cpy_tensor`; a partial `memset_tensor`; a partial `set_tensor` or
+  `set_tensor_async`, which records ggml order for the whole range after writing part of it.
+- `get_tensor_async` returns the stored bytes with no layout handling.
+- Tied aliases share one extra, and a write through a view records on the view's extra while the reader asks
+  the root's.
+- `set_tensor_async` skips what `set_tensor` does before a write: `reset_reorder`,
+  `ggml_sycl_init_layout_info`, the `layout_dirty` mark and the weight-mutation invalidation. Its catch block
+  calls `std::exit(1)`.
+- `ggml_backend_sycl_cpy_tensor_async` is not wired into the backend interface. `reorder_tensor_to_soa` and
+  `convert_tensor_layout` look dead; if `reorder_tensor_to_soa` is live, its ordering against asynchronous
+  memory operations on the same range is open.
+- The `has_preconverted_tiled` branch of `set_tensor` skips the upload into the own range (Task 6f-8 has the
+  read side).
+- A mutable test control that sets the reorder record apart from the own range, so the device test can reach
+  `record=soa own=aos` (Task 6f-7 could not).
 **Direction (lead):** a partial write into a reordered tensor writes each block field into its plane (the forward
 of Task 6f-7's table, by block range) and leaves the record alone; a copy between buffers carries the record with
 the bytes.
-**Done when:** the device round-trip test has a partial-write case and a buffer-copy case, and both pass.
+**Done when:** the device round-trip test has a partial-write case, a buffer-copy case and a case whose
+reorder record disagrees with its own range, and all pass.
 
 ---
 
