@@ -23,17 +23,15 @@ invocation. Its own logic (preconditions, the no-device probe, the
 digit-regex pass/fail checks) is covered without a GPU by
 `tests/test-sycl-canonical-gates-script.sh`, registered as
 `sycl-canonical-gates-script`. Command line construction for the GPT-OSS
-gate inside the script follows the post-b10630 form (no `-cnv`, no `-c`,
-no `-ngl`, digit-line-only expected output) shown in the "Canonical B50
-GPT-OSS correctness gate" section immediately below, which this task
-brought in line with CLAUDE.md's own post-b10630 update -- it previously
-still showed the pre-b10630 `-cnv` form and a colon-prefixed expected
-output the script's anchored regex does not accept.
+gate inside the script is the gate command shown in the "Canonical B50
+GPT-OSS correctness gate" section immediately below: no `-cnv`, no `-c`, no
+`-ngl`, and the answer alone on its own line.
 
 ## The rule
 
-Use `llama-cli -cnv` so the CLI applies the model's embedded GGUF/Jinja chat
-template to the prompt as a user message. Do not hand-render a raw Harmony
+Use `llama-cli` so the CLI applies the model's embedded GGUF/Jinja chat
+template to the prompt as a user message. Do not pass `-cnv`, which is invalid
+on `llama-cli`. Do not hand-render a raw Harmony
 prompt, and do not pass `--chat-template gpt-oss` or a custom template unless the
 test is explicitly about that formatter. `llama-cli --help` reports Jinja enabled
 by default and `--chat-template` as a custom override whose default is the
