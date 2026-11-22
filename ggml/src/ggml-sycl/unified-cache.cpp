@@ -19762,15 +19762,15 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     // refusal there is a planning fault. A STAGING miss is back-pressure its caller retries.
                     if (zone == host_zone_id::WEIGHT) {
                         host_zone_no_growth_refusal_warn(miss, zone, req, alloc_size,
-                                                         ucache->host_zone_reserved_capacity(zone),
-                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
-                                                         ucache->host_zone_largest_free_block(zone));
+                                                                         ucache->host_zone_reserved_capacity(zone),
+                                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
+                                                                         ucache->host_zone_largest_free_block(zone));
                     }
                     return nullptr;
                 };
                 if (req.intent.constraints.forbid_host_zone_growth) {
                     const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),
-                                                                   ucache->host_zone_capacity(zone));
+                                                                                   ucache->host_zone_capacity(zone));
                     if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {
                         return refuse_no_growth(host_zone_alloc_miss::OVER_NO_GROWTH_BOUND);
                     }
