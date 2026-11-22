@@ -12370,11 +12370,45 @@ static ggml_sycl_execution_state_snapshot ggml_sycl_take_execution_state_snapsho
     return ggml_sycl_execution_snapshot_locked(ctx);
 }
 
-static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_context * ctx) {
+// A dispatch scope holds the backend's tracked graph open while graph_compute dispatches nodes: an op in it reads the
+// invocation's identity (the Q1_0/NVFP4 direct route takes its authority from it), and every kernel it enqueues belongs
+// to that invocation. Submitting, releasing, quarantining or clearing the graph before the scope closes breaks both,
+// so the lifecycle verbs report it: one ERROR line per invocation, naming the caller that did it (the verb's own
+// caller, passed down through the defaulted site/line arguments). Nothing else changes, so a run that trips it fails
+// or passes exactly as it would without the line. Caller holds ctx->execution_state_mutex.
+static void ggml_sycl_execution_tripwire_locked(ggml_backend_sycl_context * ctx,
+                                                const char *                action,
+                                                const char *                site,
+                                                int                         line) noexcept {
+    if (ctx->execution_dispatch_depth == 0 || ctx->execution_invocation_id == 0 ||
+        ctx->execution_tripwire_invocation == ctx->execution_invocation_id) {
+        return;
+    }
+    ctx->execution_tripwire_invocation = ctx->execution_invocation_id;
+    GGML_LOG_ERROR(
+        "[EXECUTION-TRIPWIRE] %s the tracked graph of device %d while a dispatch scope holds it open: site=%s:%d "
+        "context=%llu graph=%llu invocation=%llu depth=%d\n",
+        action, ctx->device, site ? site : "?", line, (unsigned long long) ctx->execution_context_id,
+        (unsigned long long) ctx->execution_graph_epoch, (unsigned long long) ctx->execution_invocation_id,
+        ctx->execution_dispatch_depth);
+}
+
+static void ggml_sycl_execution_tripwire(ggml_backend_sycl_context * ctx,
+                                         const char *                action,
+                                         const char *                site,
+                                         int                         line) noexcept {
+    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+    ggml_sycl_execution_tripwire_locked(ctx, action, site, line);
+}
+
+static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_context * ctx,
+                                                            const char *                site = __builtin_FUNCTION(),
+                                                            int                         line = __builtin_LINE()) {
     if (!ctx) {
         return;
     }
     std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+    ggml_sycl_execution_tripwire_locked(ctx, "unbinding", site, line);
     ctx->execution_context_id = 0;
     ctx->execution_participant_id = -1;
     ctx->execution_session_id = 0;
@@ -16662,17 +16696,22 @@ static std::vector<int> ggml_sycl_execution_aggregate_devices(const ggml_backend
     return devices;
 }
 
-static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context * ctx) {
+static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context * ctx,
+                                                     const char *                site = __builtin_FUNCTION(),
+                                                     int                         line = __builtin_LINE()) {
     if (!ctx) {
         return;
     }
     std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+    ggml_sycl_execution_tripwire_locked(ctx, "clearing", site, line);
     ctx->execution_graph_epoch = 0;
     ctx->execution_invocation_id = 0;
     ctx->execution_graph_sealed = false;
 }
 
-static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * ctx) noexcept {
+static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * ctx,
+                                                    const char *                site = __builtin_FUNCTION(),
+                                                    int                         line = __builtin_LINE()) noexcept {
     if (!ctx) {
         return;
     }
@@ -16697,7 +16736,7 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
     if (rc == ggml_sycl::execution::error::OK || rc == ggml_sycl::execution::error::STALE) {
         ggml_sycl_execution_for_each_bound_backend(state.context_id,
             [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
-                ggml_sycl_execution_clear_graph_tracking(backend_ctx);
+                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);
             });
     }
 }
@@ -16840,7 +16879,9 @@ static void ggml_sycl_execution_seal_graph(ggml_backend_sycl_context * ctx) noex
     }
 }
 
-static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx) noexcept {
+static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx,
+                                                 const char *                site = __builtin_FUNCTION(),
+                                                 int                         line = __builtin_LINE()) noexcept {
     if (!ctx) {
         return;
     }
@@ -16852,13 +16893,16 @@ static void ggml_sycl_execution_quarantine_graph(ggml_backend_sycl_context * ctx
     if (!ggml_sycl_execution_current_owner(ctx, owner)) {
         return;
     }
+    ggml_sycl_execution_tripwire(ctx, "quarantining", site, line);
     auto & registry = ggml_sycl::execution::global_registry();
     (void) registry.abort_invocation({ state.context_id }, { state.session_id },
                                      { state.reset_epoch }, { state.graph_epoch },
                                      { state.invocation_id }, owner);
 }
 
-static bool ggml_sycl_execution_submit_graph(ggml_backend_sycl_context * ctx) noexcept {
+static bool ggml_sycl_execution_submit_graph(ggml_backend_sycl_context * ctx,
+                                             const char *                site = __builtin_FUNCTION(),
+                                             int                         line = __builtin_LINE()) noexcept {
     if (!ctx) {
         return false;
     }
@@ -16870,6 +16914,7 @@ static bool ggml_sycl_execution_submit_graph(ggml_backend_sycl_context * ctx) no
     if (!ggml_sycl_execution_current_owner(ctx, owner)) {
         return false;
     }
+    ggml_sycl_execution_tripwire(ctx, "submitting", site, line);
     auto & registry = ggml_sycl::execution::global_registry();
     ggml_sycl_execution_seal_graph(ctx);
     const auto rc = registry.submit_invocation({ state.context_id }, { state.session_id },
@@ -16878,7 +16923,9 @@ static bool ggml_sycl_execution_submit_graph(ggml_backend_sycl_context * ctx) no
     return rc == ggml_sycl::execution::error::OK || rc == ggml_sycl::execution::error::STALE;
 }
 
-static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx,
+                                              const char *                site = __builtin_FUNCTION(),
+                                              int                         line = __builtin_LINE()) noexcept {
     if (!ctx) {
         return false;
     }
@@ -16890,6 +16937,7 @@ static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx) n
     if (!ggml_sycl_execution_current_owner(ctx, owner)) {
         return false;
     }
+    ggml_sycl_execution_tripwire(ctx, "releasing", site, line);
     auto & registry = ggml_sycl::execution::global_registry();
     const auto rc   = registry.release_invocation({ state.context_id }, { state.session_id },
                                                 { state.reset_epoch }, { state.graph_epoch },
@@ -16902,20 +16950,22 @@ static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx) n
         snapshot.invocation.value == 0) {
         ggml_sycl_execution_for_each_bound_backend(state.context_id,
             [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
-                ggml_sycl_execution_clear_graph_tracking(backend_ctx);
+                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);
             });
-        ggml_sycl_execution_try_retire_terminal(ctx);
+        ggml_sycl_execution_try_retire_terminal(ctx, site, line);
     }
     return true;
 }
 
-static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_context * ctx,
+                                                        const char *                site = __builtin_FUNCTION(),
+                                                        int                         line = __builtin_LINE()) noexcept {
     if (!ctx) {
         return;
     }
-    ggml_sycl_execution_quarantine_graph(ctx);
-    (void) ggml_sycl_execution_release_graph(ctx);
-    ggml_sycl_execution_clear_graph_tracking(ctx);
+    ggml_sycl_execution_quarantine_graph(ctx, site, line);
+    (void) ggml_sycl_execution_release_graph(ctx, site, line);
+    ggml_sycl_execution_clear_graph_tracking(ctx, site, line);
 }
 
 // The record of a drain wait that threw, as "<stage>: <what>". A throw out of a wait bypasses the queue's handler, so
@@ -83962,16 +84012,18 @@ static bool ggml_sycl_mul_mat_id_device_sched(ggml_backend_sycl_context & ctx, c
 // proved against the live plan snapshot and the context's current owner. Invalid when any of those is missing, and the
 // build then mints none. One answer for both admissions, a decode token's and a prompt's.
 static ggml_sycl::moe_mmid_queue_capability ggml_sycl_moe_direct_queue_capability(ggml_backend_sycl_context & ctx) {
-    ggml_sycl::moe_mmid_queue_capability capability;
-    sycl::queue *                        queue = ctx.stream();
-    auto *                               cache = queue ? ggml_sycl::get_unified_cache(*queue) : nullptr;
-    const auto                           plan  = cache ? cache->get_placement_plan_snapshot() : nullptr;
-    const auto                           exec  = ggml_sycl_take_execution_state_snapshot(&ctx);
+    sycl::queue * queue = ctx.stream();
+    auto *        cache = queue ? ggml_sycl::get_unified_cache(*queue) : nullptr;
+
+    const auto recipe_plan = cache ? cache->get_placement_plan_snapshot() : nullptr;
+
+    const auto                           exec = ggml_sycl_take_execution_state_snapshot(&ctx);
     ggml_sycl::lifecycle::ModelToken     root{};
-    if (queue && plan && plan->plan && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
-        exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root)) {
+    ggml_sycl::moe_mmid_queue_capability capability;
+    if (queue && recipe_plan && recipe_plan->plan && exec.context_id && exec.session_id && exec.reset_epoch &&
+        exec.graph_epoch && exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root)) {
         capability = ggml_sycl::unified_cache_moe_mmid_exact_queue(
-            { root.model.value, root.load.value, root.owner.generation }, plan, ctx.device, ctx.device, queue);
+            { root.model.value, root.load.value, root.owner.generation }, recipe_plan, ctx.device, ctx.device, queue);
     }
     return capability;
 }
@@ -105801,6 +105853,151 @@ static std::string ggml_sycl_timeline_node_metadata(const ggml_tensor * node,
     return metadata;
 }
 
+// Begins the tracked graph for one dispatch scope, or joins the one this backend already holds open, and returns
+// whether it did. A refusal on a context armed for tracked execution throws (it is not a state any dispatch may run
+// in); an unarmed context returns false and runs untracked, as it always has.
+static bool ggml_sycl_execution_begin_dispatch_graph(ggml_backend_sycl_context * sycl_ctx) {
+    ggml_sycl::execution::error execution_graph_error = ggml_sycl::execution::error::OK;
+    bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
+    if (!execution_graph_active && execution_graph_error == ggml_sycl::execution::error::DEVICE_BUSY) {
+        // llama.cpp-8q35 (TKV-15): a SIBLING context's TERMINAL invocation
+        // (COMPLETE/QUARANTINED -- already submitted, just not yet released)
+        // can still occupy device_owners_ for one of this ctx's contended
+        // devices. ggml_sycl_execution_drain_own_terminal() (inside
+        // begin_graph, called before begin_graph's own locks -- see its
+        // comment) only ever drains THIS ctx's own root; nothing before this
+        // point looks at a DIFFERENT context's terminal.
+        //
+        // Drain that other context's terminal via the exact primitive
+        // teardown already uses, then retry begin_graph ONCE. This runs here,
+        // in the CALLER, deliberately -- not inside begin_graph's own locked
+        // body. begin_graph has already returned by the time we get here, so
+        // its two lock_guards (g_execution_backend_binding_mutex,
+        // ctx->execution_state_mutex) are already released; retrying from
+        // inside that locked body would re-enter g_execution_backend_binding_
+        // mutex, which ggml_sycl_execution_drain_context_terminal_events()
+        // also takes, and perform a blocking queue wait under it -- exactly
+        // the stall/deadlock hazard begin_graph's own comment above
+        // ggml_sycl_execution_drain_own_terminal() already warns against.
+        //
+        // Never touch a device whose current owner is still OPEN/SEALED --
+        // that is genuine concurrent use and must keep refusing hard, per
+        // canonical contract §12.3 ("unsupported today; no optimistic
+        // overlap").
+        auto &                                       registry      = ggml_sycl::execution::global_registry();
+        std::vector<int>                             busy_devices  = ggml_sycl_execution_aggregate_devices(sycl_ctx);
+        bool                                         all_drainable = true;
+        std::vector<ggml_sycl::execution::ContextId> drainable_owners;
+        // PASS 1: validate every contended device's current owner before
+        // touching anything (llama.cpp-8q35 review finding). Draining
+        // device N's owner and only THEN discovering device N+1's owner is
+        // OPEN would mutate registry state on the path this function's
+        // caller is told is "today's unmodified DEVICE_BUSY failure" -- so
+        // nothing may be drained until every device has been confirmed
+        // drainable.
+        for (int device : busy_devices) {
+            ggml_sycl::execution::ContextId owner_ctx{};
+            const auto                      owner_rc = registry.device_owner_context(device, &owner_ctx);
+            if (owner_rc == ggml_sycl::execution::error::NOT_FOUND) {
+                continue;  // freed itself between the failed claim and here -- nothing to drain
+            }
+            if (owner_rc != ggml_sycl::execution::error::OK) {
+                // Any other registry error (e.g. MISMATCH) is an unexpected
+                // state, not "device is free" -- do not guess, do not drain.
+                all_drainable = false;
+                break;
+            }
+            ggml_sycl::execution::snapshot owner_snap{};
+            if (registry.extract(owner_ctx, &owner_snap) != ggml_sycl::execution::error::OK ||
+                (owner_snap.graph_state != ggml_sycl::execution::graph_phase::COMPLETE &&
+                 owner_snap.graph_state != ggml_sycl::execution::graph_phase::QUARANTINED)) {
+                all_drainable = false;
+                break;
+            }
+            // llama.cpp-8q35 (c-pfp8): aggregate_devices dedups DEVICES, not
+            // OWNERS -- a context holding two contended devices would appear
+            // here twice and get drained twice in PASS 2. The primitive
+            // tolerates a duplicate drain (the second release fails harmlessly
+            // -> abort_and_release), so this is an efficiency fix, not a
+            // correctness one; folding it in since this touch is already here.
+            if (std::find(drainable_owners.begin(), drainable_owners.end(), owner_ctx) == drainable_owners.end()) {
+                drainable_owners.push_back(owner_ctx);
+            }
+        }
+        // PASS 2: only now, with every contended device proven drainable,
+        // actually drain them and retry once.
+        if (all_drainable) {
+            for (const auto & owner_ctx : drainable_owners) {
+                ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value);
+            }
+            execution_graph_error  = ggml_sycl::execution::error::OK;
+            execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> state_lock(sycl_ctx->execution_state_mutex);
+        if (sycl_ctx->execution_context_id != 0 && sycl_ctx->execution_root_model_id != 0 && !execution_graph_active) {
+            // llama.cpp-cnre: WARN (not INFO -- dropped at default verbosity,
+            // see CLAUDE.md) so a refusal is attributable without
+            // instrumentation. DEVICE_BUSY here is the contract-compliant
+            // "another context already owns this device" rejection
+            // (docs/design/sycl-canonical-memory-architecture.md §12.3);
+            // MISMATCH/STALE/OVERFLOW indicate an actual registry defect.
+            GGML_LOG_WARN(
+                "[SYCL] graph_compute: failed to begin tracked execution graph: error=%s device=%d "
+                "context_id=%llu\n",
+                ggml_sycl_execution_error_name(execution_graph_error), sycl_ctx->device,
+                (unsigned long long) sycl_ctx->execution_context_id);
+            throw std::runtime_error(std::string("failed to begin tracked SYCL execution graph: error=") +
+                                     ggml_sycl_execution_error_name(execution_graph_error));
+        }
+    }
+    return execution_graph_active;
+}
+
+// The tracked invocation of one stretch of graph_compute's node dispatch, open from construction to destruction:
+// sealed when the stretch returns, quarantined when an exception leaves it. compute_impl opens one, and so does every
+// path that dispatches nodes without compute_impl -- the keyed and whole-split segment record and replay and the block
+// graphlets -- so an op that takes the invocation's authority (the Q1_0/NVFP4 direct route) finds it open whichever
+// path ran it. Without it, such an op sees no graph (a synchronize at the previous split boundary released it) and
+// the direct route declines with failed=graph_epoch,invocation_id. A scope opened while the backend's graph is still
+// open joins that invocation, so a path that opens one and then falls back to compute_impl runs in one invocation.
+// Submit and release stay where they were: graph_compute's exit and synchronize.
+struct ggml_sycl_execution_dispatch_scope {
+    ggml_backend_sycl_context * ctx;
+    bool                        active;
+    int                         uncaught = std::uncaught_exceptions();
+
+    explicit ggml_sycl_execution_dispatch_scope(ggml_backend_sycl_context * ctx) :
+        ctx(ctx),
+        active(ggml_sycl_execution_begin_dispatch_graph(ctx)) {
+        if (active) {
+            std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+            ++ctx->execution_dispatch_depth;
+        }
+    }
+
+    ~ggml_sycl_execution_dispatch_scope() {
+        if (!active) {
+            return;
+        }
+        // The depth drops first: the seal or quarantine below is this scope closing its own stretch, not something
+        // ending the graph under it, so it must not trip the wire.
+        {
+            std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+            --ctx->execution_dispatch_depth;
+        }
+        if (std::uncaught_exceptions() > uncaught) {
+            ggml_sycl_execution_quarantine_graph(ctx);
+        } else {
+            ggml_sycl_execution_seal_graph(ctx);
+        }
+    }
+
+    ggml_sycl_execution_dispatch_scope(const ggml_sycl_execution_dispatch_scope &)             = delete;
+    ggml_sycl_execution_dispatch_scope & operator=(const ggml_sycl_execution_dispatch_scope &) = delete;
+};
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     // Re-entrancy guard: Prevent nested calls to compute_impl
     static thread_local bool g_in_compute_impl = false;
@@ -105922,116 +106119,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     const auto t_impl_entry = std::chrono::high_resolution_clock::now();
 
     compute_impl_guard _reentry_guard(sycl_ctx->device);
-    ggml_sycl::execution::error execution_graph_error = ggml_sycl::execution::error::OK;
-    bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
-    if (!execution_graph_active && execution_graph_error == ggml_sycl::execution::error::DEVICE_BUSY) {
-        // llama.cpp-8q35 (TKV-15): a SIBLING context's TERMINAL invocation
-        // (COMPLETE/QUARANTINED -- already submitted, just not yet released)
-        // can still occupy device_owners_ for one of this ctx's contended
-        // devices. ggml_sycl_execution_drain_own_terminal() (inside
-        // begin_graph, called before begin_graph's own locks -- see its
-        // comment) only ever drains THIS ctx's own root; nothing before this
-        // point looks at a DIFFERENT context's terminal.
-        //
-        // Drain that other context's terminal via the exact primitive
-        // teardown already uses, then retry begin_graph ONCE. This runs here,
-        // in the CALLER, deliberately -- not inside begin_graph's own locked
-        // body. begin_graph has already returned by the time we get here, so
-        // its two lock_guards (g_execution_backend_binding_mutex,
-        // ctx->execution_state_mutex) are already released; retrying from
-        // inside that locked body would re-enter g_execution_backend_binding_
-        // mutex, which ggml_sycl_execution_drain_context_terminal_events()
-        // also takes, and perform a blocking queue wait under it -- exactly
-        // the stall/deadlock hazard begin_graph's own comment above
-        // ggml_sycl_execution_drain_own_terminal() already warns against.
-        //
-        // Never touch a device whose current owner is still OPEN/SEALED --
-        // that is genuine concurrent use and must keep refusing hard, per
-        // canonical contract §12.3 ("unsupported today; no optimistic
-        // overlap").
-        auto &                                       registry      = ggml_sycl::execution::global_registry();
-        std::vector<int>                             busy_devices  = ggml_sycl_execution_aggregate_devices(sycl_ctx);
-        bool                                         all_drainable = true;
-        std::vector<ggml_sycl::execution::ContextId> drainable_owners;
-        // PASS 1: validate every contended device's current owner before
-        // touching anything (llama.cpp-8q35 review finding). Draining
-        // device N's owner and only THEN discovering device N+1's owner is
-        // OPEN would mutate registry state on the path this function's
-        // caller is told is "today's unmodified DEVICE_BUSY failure" -- so
-        // nothing may be drained until every device has been confirmed
-        // drainable.
-        for (int device : busy_devices) {
-            ggml_sycl::execution::ContextId owner_ctx{};
-            const auto                      owner_rc = registry.device_owner_context(device, &owner_ctx);
-            if (owner_rc == ggml_sycl::execution::error::NOT_FOUND) {
-                continue;  // freed itself between the failed claim and here -- nothing to drain
-            }
-            if (owner_rc != ggml_sycl::execution::error::OK) {
-                // Any other registry error (e.g. MISMATCH) is an unexpected
-                // state, not "device is free" -- do not guess, do not drain.
-                all_drainable = false;
-                break;
-            }
-            ggml_sycl::execution::snapshot owner_snap{};
-            if (registry.extract(owner_ctx, &owner_snap) != ggml_sycl::execution::error::OK ||
-                (owner_snap.graph_state != ggml_sycl::execution::graph_phase::COMPLETE &&
-                 owner_snap.graph_state != ggml_sycl::execution::graph_phase::QUARANTINED)) {
-                all_drainable = false;
-                break;
-            }
-            // llama.cpp-8q35 (c-pfp8): aggregate_devices dedups DEVICES, not
-            // OWNERS -- a context holding two contended devices would appear
-            // here twice and get drained twice in PASS 2. The primitive
-            // tolerates a duplicate drain (the second release fails harmlessly
-            // -> abort_and_release), so this is an efficiency fix, not a
-            // correctness one; folding it in since this touch is already here.
-            if (std::find(drainable_owners.begin(), drainable_owners.end(), owner_ctx) == drainable_owners.end()) {
-                drainable_owners.push_back(owner_ctx);
-            }
-        }
-        // PASS 2: only now, with every contended device proven drainable,
-        // actually drain them and retry once.
-        if (all_drainable) {
-            for (const auto & owner_ctx : drainable_owners) {
-                ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value);
-            }
-            execution_graph_error  = ggml_sycl::execution::error::OK;
-            execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
-        }
-    }
-    {
-        std::lock_guard<std::mutex> state_lock(sycl_ctx->execution_state_mutex);
-        if (sycl_ctx->execution_context_id != 0 && sycl_ctx->execution_root_model_id != 0 && !execution_graph_active) {
-            // llama.cpp-cnre: WARN (not INFO -- dropped at default verbosity,
-            // see CLAUDE.md) so a refusal is attributable without
-            // instrumentation. DEVICE_BUSY here is the contract-compliant
-            // "another context already owns this device" rejection
-            // (docs/design/sycl-canonical-memory-architecture.md §12.3);
-            // MISMATCH/STALE/OVERFLOW indicate an actual registry defect.
-            GGML_LOG_WARN(
-                "[SYCL] graph_compute: failed to begin tracked execution graph: error=%s device=%d "
-                "context_id=%llu\n",
-                ggml_sycl_execution_error_name(execution_graph_error), sycl_ctx->device,
-                (unsigned long long) sycl_ctx->execution_context_id);
-            throw std::runtime_error(std::string("failed to begin tracked SYCL execution graph: error=") +
-                                     ggml_sycl_execution_error_name(execution_graph_error));
-        }
-    }
-    struct execution_graph_scope {
-        ggml_backend_sycl_context * ctx;
-        bool                        active;
-        int                         uncaught = std::uncaught_exceptions();
-        ~execution_graph_scope() {
-            if (!active) {
-                return;
-            }
-            if (std::uncaught_exceptions() > uncaught) {
-                ggml_sycl_execution_quarantine_graph(ctx);
-            } else {
-                ggml_sycl_execution_seal_graph(ctx);
-            }
-        }
-    } execution_graph_scope_{ sycl_ctx, execution_graph_active };
+    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);
 
     std::string  graph_timeline_metadata;
     const char * graph_timeline_metadata_cstr = "";
@@ -111201,6 +111289,7 @@ static bool moe_graph_dispatch_direct_node(ggml_backend_sycl_context * sycl_ctx,
 static void moe_graph_record_segment_slot(ggml_backend_sycl_context *                   sycl_ctx,
                                           ggml_cgraph *                                 cgraph,
                                           ggml_backend_sycl_context::moe_segment_slot & slot) {
+    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);
     g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);
     moe_graph_segmented_call_begin(sycl_ctx, cgraph);
     ggml_sycl_moe_precomputed_skip_new_graph();
@@ -111354,6 +111443,7 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
 static void moe_graph_replay_segment_slot(ggml_backend_sycl_context *                         sycl_ctx,
                                           ggml_cgraph *                                       cgraph,
                                           const ggml_backend_sycl_context::moe_segment_slot & slot) {
+    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);
     g_graph_diag_counters.seg_replay.fetch_add(1, std::memory_order_relaxed);
     moe_graph_segmented_call_begin(sycl_ctx, cgraph);
     ggml_sycl_moe_precomputed_skip_new_graph();
@@ -111396,6 +111486,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
                                       ggml_cgraph *               cgraph,
                                       bool                        is_decode_phase,
                                       bool                        direct_fa_segments_once) {
+    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);
     g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);
     GGML_LOG_INFO("[SYCL-SEG] Recording segmented graphs (%d nodes, %s phase)...\n", cgraph->n_nodes,
                   is_decode_phase ? "decode" : "prompt");
@@ -111774,6 +111865,7 @@ static bool moe_decode_segmented_graph_profitable(const ggml_cgraph * cgraph) {
 // Replay segmented graphs for a MoE compute graph.
 // Interleaves segment graph replay with individual MoE op dispatch.
 static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);
     g_graph_diag_counters.seg_replay.fetch_add(1, std::memory_order_relaxed);
     GGML_SYCL_DEBUG("[SYCL-SEG] Replaying %zu segments + %zu MoE ops\n", sycl_ctx->moe_segments.size(),
                     sycl_ctx->moe_node_indices.size());
@@ -112615,6 +112707,8 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
         return false;
     }
     graph_refresh_input_tensors(sycl_ctx, cgraph);
+    // Replay and record both run nodes here, outside compute_impl.
+    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);
 
     try {
         if (moe_graph_block_graphs_match(sycl_ctx, cgraph, graph_hash, is_decode_phase, block_size, mode_hash,

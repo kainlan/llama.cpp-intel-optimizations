@@ -276,6 +276,229 @@ checks = {
         and "next_id(" not in device_owner_context_body
         and re.search(r"device_owners_\[[^\]]*\]\s*=", device_owner_context_body) is None,
 }
+
+
+# --- Every node dispatch of graph_compute runs inside an open tracked invocation ---
+#
+# compute_impl begins the context's tracked graph. The keyed and whole-split segment record and replay and the block
+# graphlets dispatch nodes without compute_impl, so before they opened the same scope an op there found the graph a
+# synchronize had already released: the Q1_0/NVFP4 direct route declined with failed=graph_epoch,invocation_id on
+# the first decode split that took a keyed slot. The census below starts from graph_compute_unchecked's body, follows
+# every top-level function it calls down to a node dispatch, and requires that function to open the dispatch scope
+# before its first dispatch.
+DISPATCH_CALL = re.compile(r"\b(?:ggml_sycl_compute_forward|moe_graph_dispatch_direct_node)\s*\(")
+DISPATCH_SCOPE_OPEN = re.compile(r"\bggml_sycl_execution_dispatch_scope\s+\w+\s*\(\s*\w+\s*\)\s*;")
+DISPATCH_ROOT = "ggml_backend_sycl_graph_compute_unchecked"
+DISPATCH_DEPTH = 3
+COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.S)
+
+
+def blank_comments_and_literals(source):
+    """The source with comments and literals turned to spaces (newlines kept), so a name in prose or in a format
+    string is not a call and every offset still points at the same place."""
+    return COMMENT_OR_LITERAL.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), source)
+
+
+def matching_close(text, open_at, opening="{", closing="}"):
+    depth = 0
+    for at in range(open_at, len(text)):
+        if text[at] == opening:
+            depth += 1
+        elif text[at] == closing:
+            depth -= 1
+            if depth == 0:
+                return at
+    return -1
+
+
+def function_bodies(blank):
+    """name -> body of every column-0 `static` function definition in the blanked source."""
+    bodies = {}
+    for m in re.finditer(r"^static\b[^;{}()]*?\b(\w+)\s*\(", blank, re.M):
+        params_close = matching_close(blank, m.end() - 1, "(", ")")
+        if params_close < 0:
+            continue
+        tail = re.match(r"\s*(?:const\s*)?(?:noexcept\s*)?\{", blank[params_close + 1:])
+        if not tail:
+            continue
+        open_at = params_close + 1 + tail.end() - 1
+        close_at = matching_close(blank, open_at)
+        if close_at > open_at:
+            bodies.setdefault(m.group(1), blank[open_at:close_at + 1])
+    return bodies
+
+
+def dispatch_scope_violations(source):
+    """Functions graph_compute_unchecked calls that reach a node dispatch with no dispatch scope opened before it."""
+    bodies = function_bodies(blank_comments_and_literals(source))
+    root = bodies.get(DISPATCH_ROOT)
+    if not root:
+        return [DISPATCH_ROOT + " not found"]
+    memo = {}
+
+    def first_dispatch(name, depth):
+        """Offset in `name`'s body of the first call that reaches a node dispatch within `depth` levels, or None."""
+        key = (name, depth)
+        if key in memo:
+            return memo[key]
+        memo[key] = None  # a recursive cycle reaches nothing new
+        body = bodies[name]
+        found = None
+        for call in re.finditer(r"\b(\w+)\s*\(", body):
+            if DISPATCH_CALL.match(body, call.start()):
+                found = call.start()
+                break
+            callee = call.group(1)
+            if depth > 0 and callee != name and callee in bodies and first_dispatch(callee, depth - 1) is not None:
+                found = call.start()
+                break
+        memo[key] = found
+        return found
+
+    violations = set()
+    callees = {call.group(1) for call in re.finditer(r"\b(\w+)\s*\(", root)}
+    for callee in sorted(callees):
+        if callee == DISPATCH_ROOT or callee not in bodies:
+            continue
+        at = first_dispatch(callee, DISPATCH_DEPTH)
+        if at is None:
+            continue
+        scope = DISPATCH_SCOPE_OPEN.search(bodies[callee])
+        if not scope or scope.start() > at:
+            violations.add(callee)
+    return sorted(violations)
+
+
+def dispatchers_found(source):
+    """The functions the census reaches, so a census that reaches nothing cannot pass vacuously."""
+    bodies = function_bodies(blank_comments_and_literals(source))
+    return {name for name in bodies if DISPATCH_SCOPE_OPEN.search(bodies[name])}
+
+
+# The paths that dispatch without compute_impl, each of which must open the scope itself.
+DISPATCH_SCOPE_OWNERS = {
+    "ggml_backend_sycl_graph_compute_impl",
+    "moe_graph_record_segment_slot",
+    "moe_graph_replay_segment_slot",
+    "moe_graph_record_segments",
+    "moe_graph_replay_segments",
+    "moe_graph_try_block_graphlets",
+}
+
+dispatch_violations = dispatch_scope_violations(backend)
+dispatch_mutants = {
+    # A bypass path that does not open the scope.
+    "replay-slot-unscoped": backend.replace(
+        "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n    g_graph_diag_counters.seg_replay", "    g_graph_diag_counters.seg_replay", 1),
+    # The block graphlets reach a dispatch two calls down; their scope is gone.
+    "block-graphlets-unscoped": backend.replace(
+        "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n\n    try {\n        if (moe_graph_block_graphs_match",
+        "\n    try {\n        if (moe_graph_block_graphs_match", 1),
+    # The scope opens after the first node already ran.
+    "record-slot-scoped-late": backend.replace(
+        "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);",
+        "    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);", 1).replace(
+        "    for (const moe_graph_keyed_item & item : plan) {\n        if (item.boundary) {",
+        "    for (const moe_graph_keyed_item & item : plan) {\n        ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n        if (item.boundary) {", 1),
+    # A new dispatcher graph_compute calls, with no scope.
+    "new-unscoped-dispatcher": backend.replace(
+        "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {",
+        "static void moe_graph_unscoped_probe(ggml_backend_sycl_context * c, ggml_tensor * t) { ggml_sycl_compute_forward(*c, t); }\n"
+        "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {\n"
+        "    moe_graph_unscoped_probe(nullptr, nullptr);", 1),
+}
+
+checks.update({
+    "every graph_compute path that dispatches nodes opens the tracked invocation first": not dispatch_violations,
+    "the dispatch scope is opened by compute_impl and by each path that bypasses it":
+        DISPATCH_SCOPE_OWNERS <= dispatchers_found(backend),
+    **{
+        f"dispatch-scope census witnesses mutation {name}": mutated != backend
+        and bool(dispatch_scope_violations(mutated))
+        for name, mutated in dispatch_mutants.items()
+    },
+})
+if dispatch_violations:
+    print("dispatch without an open tracked invocation in: " + ", ".join(dispatch_violations), file=sys.stderr)
+
+
+# --- The tripwire: ending or clearing a graph a dispatch scope holds open is reported, by site ---
+#
+# Each lifecycle verb that ends the invocation (submit, release, quarantine) or zeroes the backend's copy of it (the
+# clear, the binding reset) asks the tripwire first, with its caller's site; the scope counts itself out before its
+# own seal or quarantine.
+def tripwire_violations(source):
+    found = []
+
+    def body(name):
+        return function_body(source, r"static \w+ " + name + r"\s*\(")
+
+    tripwire = body("ggml_sycl_execution_tripwire_locked")
+    if not (re.search(r"execution_dispatch_depth == 0 \|\|", tripwire) and "site=%s:%d" in tripwire
+            and "execution_tripwire_invocation = ctx->execution_invocation_id;" in tripwire):
+        found.append("tripwire reports once per invocation, only while a scope is open, with the site")
+    for name, action, before in (
+        ("ggml_sycl_execution_clear_graph_tracking", '"clearing"', "ctx->execution_graph_epoch = 0;"),
+        ("ggml_sycl_execution_reset_backend_binding_state", '"unbinding"', "ctx->execution_context_id = 0;"),
+    ):
+        if not ordered(body(name), "ggml_sycl_execution_tripwire_locked(ctx, " + action + ", site, line);", before):
+            found.append(name + " asks the tripwire before it zeroes")
+    for name, action, before in (
+        ("ggml_sycl_execution_submit_graph", '"submitting"', "registry.submit_invocation("),
+        ("ggml_sycl_execution_release_graph", '"releasing"', "registry.release_invocation("),
+        ("ggml_sycl_execution_quarantine_graph", '"quarantining"', "registry.abort_invocation("),
+    ):
+        if not ordered(body(name), "ggml_sycl_execution_tripwire(ctx, " + action + ", site, line);", before):
+            found.append(name + " asks the tripwire before it ends the invocation")
+    if not ordered(body("ggml_sycl_execution_abort_and_release_graph"),
+                   "ggml_sycl_execution_quarantine_graph(ctx, site, line);",
+                   "ggml_sycl_execution_release_graph(ctx, site, line);",
+                   "ggml_sycl_execution_clear_graph_tracking(ctx, site, line);"):
+        found.append("abort_and_release passes its caller's site on")
+    if not ordered(body("ggml_sycl_execution_release_graph"),
+                   "ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);",
+                   "ggml_sycl_execution_try_retire_terminal(ctx, site, line);"):
+        found.append("release passes its caller's site to the clear and the retire")
+    scope = slice_between(source, "struct ggml_sycl_execution_dispatch_scope {", "\n};\n")
+    if not ordered(scope, "if (active) {", "++ctx->execution_dispatch_depth;", "~ggml_sycl_execution_dispatch_scope()",
+                   "--ctx->execution_dispatch_depth;", "ggml_sycl_execution_quarantine_graph(ctx);",
+                   "ggml_sycl_execution_seal_graph(ctx);"):
+        found.append("the scope counts itself in after a begin and out before its own seal or quarantine")
+    return found
+
+
+tripwire_found = tripwire_violations(backend)
+tripwire_mutants = {
+    "clear-unwired": backend.replace(
+        '    ggml_sycl_execution_tripwire_locked(ctx, "clearing", site, line);\n', "", 1),
+    "release-unwired": backend.replace('    ggml_sycl_execution_tripwire(ctx, "releasing", site, line);\n', "", 1),
+    "release-site-dropped": backend.replace(
+        "                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);\n            });\n"
+        "        ggml_sycl_execution_try_retire_terminal(ctx, site, line);",
+        "                ggml_sycl_execution_clear_graph_tracking(backend_ctx);\n            });\n"
+        "        ggml_sycl_execution_try_retire_terminal(ctx, site, line);", 1),
+    "scope-counts-out-late": backend.replace(
+        "            --ctx->execution_dispatch_depth;\n        }\n        if (std::uncaught_exceptions() > uncaught) {\n"
+        "            ggml_sycl_execution_quarantine_graph(ctx);\n        } else {\n"
+        "            ggml_sycl_execution_seal_graph(ctx);\n        }\n",
+        "        }\n        if (std::uncaught_exceptions() > uncaught) {\n"
+        "            ggml_sycl_execution_quarantine_graph(ctx);\n        } else {\n"
+        "            ggml_sycl_execution_seal_graph(ctx);\n        }\n"
+        "        {\n            std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);\n"
+        "            --ctx->execution_dispatch_depth;\n        }\n", 1),
+    "tripwire-without-site": backend.replace("while a dispatch scope holds it open: site=%s:%d ",
+                                             "while a dispatch scope holds it open: ", 1),
+}
+checks.update({
+    "the tripwire guards every verb that ends or clears an open graph": not tripwire_found,
+    **{
+        f"tripwire contract witnesses mutation {name}": mutated != backend and bool(tripwire_violations(mutated))
+        for name, mutated in tripwire_mutants.items()
+    },
+})
+if tripwire_found:
+    print("tripwire contract: " + "; ".join(tripwire_found), file=sys.stderr)
+
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
     print("execution abort source contract failed: " + ", ".join(failed), file=sys.stderr)
