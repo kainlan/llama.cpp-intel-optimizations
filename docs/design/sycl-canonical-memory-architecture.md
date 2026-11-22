@@ -1563,7 +1563,17 @@ It is also taken under L1 alone, by the context bind's follows question and
 reconcile and by the runtime transaction's materialization and retire. Load end,
 unload and the bind's own retire take it under no listed lock. Under it, each
 context's pool mutexes are taken in ascending owner-device order. No L1-L4 lock
-is taken under it.
+is taken under it. A context the registry removes can hold its pools' last
+owners. `retire` and `recover_quarantined` move the removed contexts into a
+holder declared before the mutex, and `replace_plan`'s prepared replacement
+does the same with the context it displaces. So the decision is made under the
+mutex and the release runs after it. `replace_plan` hands the displaced context
+to its caller, and `lifecycle_replace_placement_plan` holds it from before
+`g_lifecycle_plan_mutex`, so it is released after that lock too.
+`test-moe-mmid-workspace-plan`'s registry lock probe gates the registry half:
+a pool blob's destructor asks a second thread to read the registry and fails the
+run if that read cannot finish. `sycl-mmid-deferral-contract` pins the plan
+replacement's holder.
 
 The pool mutexes (`registry_pool_state::mutex`, and the standalone
 `moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
@@ -1572,10 +1582,16 @@ take no listed lock themselves.
 Three existing paths still break this section's prohibitions under these locks.
 All three are known non-conformances, not exemptions.
 
-- `replace_plan`'s prepared-replacement erase, and
-  `recover_quarantined`'s retired-context sweep, can drop the last owner of a
-  context's pools. The final `mem_handle` destructors then take the free path's
-  L5 locks under the registry mutex.
+- The runtime context transaction (`ggml_sycl_run_runtime_context_transaction`)
+  runs the plan replacement and its MMID retire under L1
+  `g_tensor_inventory_mutex`. A displaced or retired context that holds its
+  pools' last owners is released when those calls return, after the registry
+  and plan mutexes but still under L1. The final `mem_handle` destructors then
+  take the free path's L5 locks under L1. Moving the release past L1 would put
+  it after the plan claims that the transaction makes under the same hold
+  (`ggml_sycl_mmq_src1_claim_plan`, `ggml_sycl_moe_host_scatter_claim_plan`).
+  Those claims allocate, and they now run after the old pools are freed. The
+  order is therefore kept.
 - A slot's quarantine release (`recover_quarantined`, and a registry lease's
   terminal release) resets the slot's graph retention record and admission
   authority under the pool mutex. When that reset drops the last owner, the
