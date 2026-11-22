@@ -540,7 +540,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     return failures
 
 
-def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
+def test_direct_decode_review_contract_is_open_and_lifetime_safe() -> None:
     source = SOURCE.read_text()
     mmid = function_definition(source, "static void ggml_sycl_mul_mat_id(")
     # The gate is one file-scope definition shared with the materialization gate;
@@ -548,7 +548,8 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     start = mmid.index("constexpr bool q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated")
     end = mmid.index("// MoE hybrid GPU+CPU dispatch gate", start)
     direct = mmid[start:end]
-    assert "constexpr bool k_moe_mmid_direct_route_validated = false;" in source
+    # Open since the B70 and B50 oracle runs of 2026-11-22; the admission still reads the shared constant (above).
+    assert "constexpr bool k_moe_mmid_direct_route_validated = true;" in source
     assert "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1" in direct
     validator = function_definition(HEADER.read_text(), "inline moe_batch_reject_reason validate_moe_batch_route(")
     assert "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()" in validator
@@ -610,7 +611,7 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
         "sycl::queue * queue = backend->stream();")
     assert ".default_queue()" not in materialize
     assert "const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot" in materialize
-    assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot, submit_device" in materialize
+    assert "unified_cache_materialize_moe_mmid_workspaces(owner, snapshot, submit_device" in materialize
     assert "snapshot.version, *snapshot.plan" not in materialize
     pre_admit = mmid[:start]
     assert "ggml_sycl_moe_log_canonical_publish_pre_admission" in pre_admit

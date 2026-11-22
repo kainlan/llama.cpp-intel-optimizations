@@ -116,12 +116,12 @@ struct lifecycle_fixture {
         require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
                     GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle inventory staging failed");
-        // This binary links the ordinary backend, where the MMID direct route is closed, so the planner must plan
-        // and charge no MMID workspace for it (llama.cpp-84ck). wrapper_exact_plan_identity() covers materialization
-        // with a hand-built plan.
+        // This binary links the ordinary backend, where the MMID direct route is open, so the planner plans and
+        // charges a workspace pool for the Q1_0 experts it puts on the device, and the committed plan carries that
+        // same pool. wrapper_exact_plan_identity() covers materialization with a hand-built plan.
         const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
         require(candidate && candidate->plan, "synthetic lifecycle produced no candidate plan");
-        // Precondition: the plan put experts on the device, so the empty pool below means "experts present, no pool"
+        // Precondition: the plan put experts on the device, so a missing pool below means "experts present, no pool"
         // and not "no experts planned at all".
         size_t device_experts = 0;
         for (const auto & entry : candidate->plan->entries) {
@@ -130,13 +130,15 @@ struct lifecycle_fixture {
             }
         }
         require(device_experts > 0, "synthetic inventory placed no expert on the device");
-        require(candidate->plan->moe_mmid_workspaces.empty() && candidate->plan->moe_mmid_device_pool_bytes == 0,
-                "closed MMID route still planned an MMID workspace pool");
+        require(!candidate->plan->moe_mmid_workspaces.empty() && candidate->plan->moe_mmid_device_pool_bytes > 0,
+                "open MMID route planned no MMID workspace pool for device Q1_0 experts");
+        const size_t candidate_pool_bytes = candidate->plan->moe_mmid_device_pool_bytes;
         require(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle load commit failed");
         const auto exact = ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id);
-        require(exact && exact->plan && exact->plan->moe_mmid_workspaces.empty(),
-                "committed lifecycle plan gained an MMID workspace pool");
+        require(exact && exact->plan && !exact->plan->moe_mmid_workspaces.empty() &&
+                    exact->plan->moe_mmid_device_pool_bytes == candidate_pool_bytes,
+                "committed lifecycle plan lost or resized the candidate's MMID workspace pool");
         require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
                 "execution context create failed");
         require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,

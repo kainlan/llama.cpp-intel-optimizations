@@ -1,6 +1,6 @@
 #pragma once
 
-// Private BUILD_TESTING-only seam for exercising the closed Q1/NVFP4 direct
+// Private BUILD_TESTING-only seam for exercising the Q1/NVFP4 direct
 // production route. This header is deliberately kept beside its sole test and
 // is not installed with ggml-sycl.h.
 #include "ggml-backend.h"

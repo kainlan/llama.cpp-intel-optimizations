@@ -11996,17 +11996,17 @@ bool ggml_sycl_q1_nvfp4_test_completion_held() {
 }
 #endif
 
-// The MoE MMID direct route is fail-closed by owner ruling: this stays false
-// until B70 validation opens it.  Hoisted to file scope so the admission gate
-// (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind)
-// read ONE constant and cannot drift apart -- materializing a pool for a route
-// that cannot execute reserves VRAM nothing will ever consume, and refusing to
-// materialize one the route CAN execute is a silent performance cliff.
-constexpr bool k_moe_mmid_direct_route_validated = false;
+// The MoE MMID direct route (Q1_0/NVFP4 decode rows on the primary card, AoS) was fail-closed by owner ruling until
+// B70 validation. Opened 2026-11-22: sycl-q1-nvfp4-admitted-device passed on the B70 and the B50 on driver 26.44
+// (docs/backend/data/inkling2/t7a-oracle-b70.txt, t7a-oracle-b50.txt). Hoisted to file scope so the admission gate
+// (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind) read ONE constant and cannot drift
+// apart -- materializing a pool for a route that cannot execute reserves VRAM nothing will ever consume, and refusing
+// to materialize one the route CAN execute is a silent performance cliff.
+constexpr bool k_moe_mmid_direct_route_validated = true;
 
-// Compile-time reachability. In an ordinary build both operands are false, the
-// admission block folds away entirely, and nothing can consume a materialized
-// workspace -- so nothing is materialized either.
+// Compile-time reachability: the validated route, or a route-testing build. With the route validated it is true in
+// every build; the pools are then scoped by the plan, which holds one only for a model with Q1_0/NVFP4 experts
+// (plan_moe_mmid_workspaces), so a model without them materializes nothing.
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
 constexpr bool k_moe_mmid_route_compiled = true;
 #else
@@ -12022,13 +12022,14 @@ static std::atomic<int> g_test_moe_mmid_route_reachable_override{ -1 };
 
 // The build-level half of MMID route reachability: can ANY context of this build execute the route? The planner has no
 // context, so the workspace pools' planning charge and the runtime re-plan of their demand ask this (declared in
-// common.hpp, llama.cpp-84ck), as do load_end's materialization and the per-context predicate below. In an ordinary
-// build it is false, so no pool is planned, charged or materialized. The PRIVATE_TESTING override governs every one of
-// those sites: forced open, the planner plans and charges the pool, load_end materializes it, and the per-context
-// predicate lets the context-bind hook and the runtime transaction materialize it. Admission still needs the route
-// validated (its own gate reads k_moe_mmid_direct_route_validated) or, in a route-testing build, a test-authorized
-// context, so forcing the override open cannot execute anything. The layout-choice test sets it around planning and
-// the runtime re-plan, with no context.
+// common.hpp, llama.cpp-84ck), as do load_end's materialization and the per-context predicate below. It is true since
+// the route was validated; even so the planner plans a pool only for an expert of a type the route admits
+// (moe_type_needs_direct_kernel), so a model without one plans, charges and materializes none. The PRIVATE_TESTING
+// override governs every one of those sites: forced closed, nothing is planned, charged or materialized; forced open,
+// the planner plans and charges the pool, load_end materializes it, and the per-context predicate lets the
+// context-bind hook and the runtime transaction materialize it. Forcing it open never admits anything by itself:
+// admission reads k_moe_mmid_direct_route_validated (or, in a route-testing build, a test-authorized context). The
+// layout-choice test sets it around planning and the runtime re-plan, with no context.
 bool ggml_sycl_moe_mmid_route_reachable_in_build() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const int forced = g_test_moe_mmid_route_reachable_override.load(std::memory_order_acquire);
@@ -13940,32 +13941,6 @@ class ggml_sycl_load_candidate_end_scope {
     bool                             enabled_;
 };
 
-static bool ggml_sycl_same_mmid_workspace_plan(const ggml_sycl::placement_plan & a,
-                                               const ggml_sycl::placement_plan & b) {
-    if (a.moe_mmid_workspace_valid != b.moe_mmid_workspace_valid ||
-        a.moe_mmid_workspaces.size() != b.moe_mmid_workspaces.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.moe_mmid_workspaces.size(); ++i) {
-        const auto & x = a.moe_mmid_workspaces[i];
-        const auto & y = b.moe_mmid_workspaces[i];
-        const auto & gx = x.slot;
-        const auto & gy = y.slot;
-        if (x.owner_device != y.owner_device || x.depth != y.depth || x.valid != y.valid ||
-            x.device_pool_bytes != y.device_pool_bytes || x.host_pool_bytes != y.host_pool_bytes ||
-            gx.valid != gy.valid || gx.activation_rows != gy.activation_rows || gx.occurrences != gy.occurrences ||
-            gx.activation_f32_offset != gy.activation_f32_offset || gx.activation_f32_bytes != gy.activation_f32_bytes ||
-            gx.activation_q8_offset != gy.activation_q8_offset || gx.activation_q8_bytes != gy.activation_q8_bytes ||
-            gx.output_f32_offset != gy.output_f32_offset || gx.output_f32_bytes != gy.output_f32_bytes ||
-            gx.output_q8_offset != gy.output_q8_offset || gx.output_q8_bytes != gy.output_q8_bytes ||
-            gx.device_slot_bytes != gy.device_slot_bytes || gx.descriptor_host_bytes != gy.descriptor_host_bytes ||
-            gx.secondary_bounce_bytes != gy.secondary_bounce_bytes || gx.host_slot_bytes != gy.host_slot_bytes) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static uint64_t ggml_sycl_next_mmid_queue_cookie() {
     static std::atomic<uint64_t> last_issued{ 0 };
     return ggml_sycl::moe_mmid_mint_monotonic_cookie(last_issued);
@@ -13976,37 +13951,93 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
 // Report a materialization refusal.  WARN and never INFO: common_get_verbosity()
 // maps GGML_LOG_INFO below the default threshold, so an INFO diagnostic here
 // would never reach a log -- which is how this failure stayed invisible.
-static void ggml_sycl_moe_mmid_report_refusal(const char *                           site,
-                                              ggml_sycl::moe_mmid_materialize_reason reason,
-                                              int                                    device,
-                                              size_t                                 device_pool_bytes,
-                                              size_t                                 host_pool_bytes) {
+// `detail` names the condition behind REGISTRY_INVALID / REGISTRY_ALLOCATION_FAILED (the registry's),
+// RECONCILE_REFUSED (the reconcile outcome) or BIND_EXCEPTION ("exception"), and is "none" for the backend's own
+// reasons. The token's and the snapshot's model and load ids, and the snapshot's version, are printed
+// because two of those conditions are identity mismatches and one is a plan identity held for another snapshot.
+static void ggml_sycl_moe_mmid_report_refusal(
+    const char *                                                      site,
+    ggml_sycl::moe_mmid_materialize_reason                            reason,
+    ggml_sycl::moe_mmid_materialize_refusal                           detail,
+    const ggml_sycl::lifecycle::ModelToken &                          token,
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
     if (!ggml_sycl::moe_mmid_materialize_reason_is_refusal(reason)) {
         return;
     }
+    const ggml_sycl::placement_plan * plan = snapshot ? snapshot->plan.get() : nullptr;
     GGML_LOG_WARN(
-        "[SYCL] MoE MMID workspace materialization refused at %s: reason=%s device=%d "
-        "device_pool=%.1f MB host_pool=%.1f MB\n",
-        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), device, device_pool_bytes / (1024.0 * 1024.0),
-        host_pool_bytes / (1024.0 * 1024.0));
+        "[SYCL] MoE MMID workspace materialization refused at %s: reason=%s detail=%s device=%d "
+        "device_pool=%.1f MB host_pool=%.1f MB token=%llu/%llu/%llu snapshot=%llu/%llu version=%llu\n",
+        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), ggml_sycl::moe_mmid_materialize_refusal_name(detail),
+        plan ? plan->device_id : -1, (plan ? plan->moe_mmid_device_pool_bytes : 0) / (1024.0 * 1024.0),
+        (plan ? plan->moe_mmid_host_pool_bytes : 0) / (1024.0 * 1024.0), (unsigned long long) token.model.value,
+        (unsigned long long) token.load.value, (unsigned long long) token.owner.generation,
+        (unsigned long long) (snapshot ? snapshot->model_id : 0),
+        (unsigned long long) (snapshot ? snapshot->load_txn_id : 0),
+        (unsigned long long) (snapshot ? snapshot->version : 0));
 }
 
+// The device a plan's MMID workspaces are published for: the plan's device, or a multi-device plan's first device.
+static int ggml_sycl_mmid_submit_device(const ggml_sycl::placement_plan & plan) {
+    return plan.device_id >= 0 ? plan.device_id : !plan.devices.empty() ? plan.devices.front() : -1;
+}
+
+// Whether the MMID registry holds a context accepting for exactly `snapshot`, for every workspace owner, asked with
+// the lookup decode admission uses (exact_queue) and the owner device's execution queue. That queue is device-global
+// (ggml_sycl_execution_queue_for_device), the one a backend context's stream() answers once the unified cache exists,
+// so no backend context is read and a context freed meanwhile cannot be dereferenced. True for a plan with no
+// workspace. Read-only: it takes no lease and moves no generation, and it allocates nothing, so a caller may ask it
+// under g_tensor_inventory_mutex.
+static bool ggml_sycl_mmid_workspaces_follow(
+    const ggml_sycl::lifecycle::ModelToken &                          token,
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
+        return true;
+    }
+    const int submit_device = ggml_sycl_mmid_submit_device(*snapshot->plan);
+    if (submit_device < 0) {
+        return false;
+    }
+    const ggml_sycl::moe_mmid_model_token owner{ token.model.value, token.load.value, token.owner.generation };
+    for (const auto & workspace : snapshot->plan->moe_mmid_workspaces) {
+        sycl::queue * queue = ggml_sycl_valid_device_index(workspace.owner_device) ?
+                                  ggml_sycl_execution_queue_for_device(workspace.owner_device) :
+                                  nullptr;
+        if (!queue || !ggml_sycl::unified_cache_moe_mmid_exact_queue(owner, snapshot, submit_device,
+                                                                     workspace.owner_device, queue)
+                           .valid()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// `out_status`, when given, is the registry's own answer (PUBLISHED, ALREADY_PUBLISHED, ...); it stays INVALID when
+// the attempt never reached the registry.
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken &                          token,
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot,
-    ggml_sycl::moe_mmid_materialize_reason *                          out_reason = nullptr) {
+    ggml_sycl::moe_mmid_materialize_reason *                          out_reason = nullptr,
+    ggml_sycl::moe_mmid_materialize_refusal *                         out_detail = nullptr,
+    ggml_sycl::moe_mmid_materialize_status *                          out_status = nullptr) {
     const auto set_reason = [&](ggml_sycl::moe_mmid_materialize_reason reason) {
         if (out_reason) {
             *out_reason = reason;
         }
     };
     set_reason(ggml_sycl::moe_mmid_materialize_reason::OK);
+    ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+    if (out_detail) {
+        *out_detail = detail;
+    }
+    if (out_status) {
+        *out_status = ggml_sycl::moe_mmid_materialize_status::INVALID;
+    }
     if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
         set_reason(ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE);
         return true;
     }
-    const int submit_device = snapshot->plan->device_id >= 0 ? snapshot->plan->device_id :
-                              !snapshot->plan->devices.empty() ? snapshot->plan->devices.front() : -1;
+    const int submit_device = ggml_sycl_mmid_submit_device(*snapshot->plan);
     if (submit_device < 0) {
         set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_SUBMIT_DEVICE);
         return false;
@@ -14051,8 +14082,14 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     }
     const ggml_sycl::moe_mmid_model_token owner{
         token.model.value, token.load.value, token.owner.generation };
-    const auto result = ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(
-        owner, snapshot, submit_device, bindings);
+    const auto result =
+        ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(owner, snapshot, submit_device, bindings, &detail);
+    if (out_detail) {
+        *out_detail = detail;
+    }
+    if (out_status) {
+        *out_status = result;
+    }
     if (result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
         result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED) {
         return true;
@@ -14162,22 +14199,26 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         // it. A later load that runs while a context IS live still materializes
         // here, which is why the attempt is kept rather than removed.
         //
-        // Only a reachable route is materialized at all: in an ordinary build
-        // the admission block folds away, so allocating the pools would reserve
-        // VRAM for a route that cannot execute. No backend context exists here
+        // Only a reachable route is materialized at all, and only the pools
+        // the plan holds (none for a model without Q1_0/NVFP4 experts):
+        // allocating a pool the route cannot draw on would reserve VRAM
+        // nothing consumes. No backend context exists here
         // to answer the per-context half of ggml_sycl_moe_mmid_route_reachable(),
         // so only a Q1_NVFP4 route-testing build can materialize here for a
         // context the bind hook and the runtime transaction would not. The
         // build-level half is the predicate the planner charges the pools on.
         if (ggml_sycl_moe_mmid_route_reachable_in_build()) {
-            ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-            if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason)) {
+            ggml_sycl::moe_mmid_materialize_reason  mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+            ggml_sycl::moe_mmid_materialize_refusal mmid_detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+            if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason,
+                                                                 &mmid_detail)) {
                 // Deferred, not failed. Silent at INFO-and-below on purpose: the
                 // expected reason here is NO_BACKEND_CONTEXT on every first load,
                 // and a WARN on every load is noise. The bind hook reports if it
                 // is STILL unresolved once a context exists.
-                GGML_SYCL_DEBUG("[SYCL] MoE MMID workspaces deferred at load_end: reason=%s\n",
-                                ggml_sycl::moe_mmid_materialize_reason_name(mmid_reason));
+                GGML_SYCL_DEBUG("[SYCL] MoE MMID workspaces deferred at load_end: reason=%s detail=%s\n",
+                                ggml_sycl::moe_mmid_materialize_reason_name(mmid_reason),
+                                ggml_sycl::moe_mmid_materialize_refusal_name(mmid_detail));
             }
         }
         ggml_sycl_prepared_plan_publication prepared_publication;
@@ -20856,10 +20897,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         ring_kv_zone.runtime_pending_bytes +=
             moe_host_scatter_planned > moe_host_scatter_held ? moe_host_scatter_planned - moe_host_scatter_held : 0;
     }
-    // The current plan's pools, still allocated, are already missing from the
-    // RUNTIME zone's free space, so they are counted twice here: conservative,
-    // and only in a build where the route is reachable.
-    if (mmid_route_reachable && !ggml_sycl_same_mmid_workspace_plan(*current->plan, next_plan)) {
+    // The next plan's pools are pending RUNTIME bytes when this transaction materializes them (a changed workspace
+    // plan: the current plan's pools, still allocated, are then already missing from the RUNTIME zone's free space,
+    // so they are counted twice, which is conservative), and when no context holds them yet (a load_end deferral the
+    // context bind materializes after this transaction returns). Only in a build where the route is reachable, and
+    // zero for a model without a Q1_0/NVFP4 expert, which plans no workspace.
+    if (mmid_route_reachable && (!ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, next_plan) ||
+                                 !ggml_sycl_mmid_workspaces_follow(current_token, current))) {
         for (const auto & workspace : next_plan.moe_mmid_workspaces) {
             if (workspace.owner_device == ctx->device) {
                 ring_kv_zone.runtime_pending_bytes += workspace.device_pool_bytes;
@@ -20996,7 +21040,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
     next->kv_info       = next_kv_info;
     next->model_n_layer = current->model_n_layer;
-    const bool stable_mmid = ggml_sycl_same_mmid_workspace_plan(*current->plan, *next->plan);
+    const bool stable_mmid = ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next->plan);
     next->version = stable_mmid ? current->version : ggml_sycl::lifecycle_next_plan_publication_id();
     if (next->version == 0) {
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
@@ -21013,11 +21057,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
         return refuse("publication ID exhausted");
     }
-    ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+    ggml_sycl::moe_mmid_materialize_reason  mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+    ggml_sycl::moe_mmid_materialize_refusal mmid_detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
     if (!stable_mmid && mmid_route_reachable &&
-        !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
-        ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, next->plan->device_id,
-                                          next->plan->moe_mmid_device_pool_bytes, next->plan->moe_mmid_host_pool_bytes);
+        !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason, &mmid_detail)) {
+        ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, mmid_detail, current_token, next);
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         // Same rollback as the publication-ID-exhaustion path above.
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
@@ -21880,8 +21924,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direct
     }
 
     // update_expert_placement() touches no MMID workspace, so the publication keeps the current version, as the
-    // runtime context transaction does when ggml_sycl_same_mmid_workspace_plan() holds.
-    GGML_ASSERT(ggml_sycl_same_mmid_workspace_plan(*current->plan, *next_plan));
+    // runtime context transaction does when ggml_sycl::moe_mmid_same_workspace_plan() holds.
+    GGML_ASSERT(ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next_plan));
     next->plan    = std::move(next_plan);
     next->version = current->version;
 
@@ -25238,6 +25282,96 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
     return ggml_sycl::MOE_GPU_UBATCH_MAX;
 }
 
+// The context bind's resolution of a load_end deferral, run under the bind's re-plan token after its runtime
+// transaction returned.
+//
+// The pools are allocated outside g_tensor_inventory_mutex (canonical 12.5: no allocation under a registry lock), so
+// the snapshot they are published for can be replaced meanwhile: an expert loan or refill swaps it at a graph
+// boundary under that mutex without the re-plan token (ggml_sycl_expert_txn_run). Every plan replacement CASes under
+// that mutex, so the bind takes it again and makes the published context follow the live snapshot
+// (moe_mmid_reconcile_live_plan); once that returns, no snapshot can be live without the context following it. A
+// reconcile that cannot rebind retires what this bind published and leaves the deferral pending.
+//
+// Each refusal is a TRIPWIRE: the route is executable here and a planned pool is still unmaterialized where it
+// should have resolved. Admission then falls through to the retained route, which refuses Q1_0/NVFP4, and nothing
+// downstream names the cause, so the WARN names it.
+static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lifecycle::ModelToken & token) {
+    // Outside the try, so a throw after this bind's own publication can still retire it.
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> published;
+    ggml_sycl::moe_mmid_materialize_status                    status = ggml_sycl::moe_mmid_materialize_status::INVALID;
+
+    // `identity` is the plan identity the registry keys this bind's publication by when it retires. Zero would retire
+    // every identity of the token, so it retires nothing.
+    const auto retire_own_publication = [&](uint64_t identity) noexcept {
+        if (published && status == ggml_sycl::moe_mmid_materialize_status::PUBLISHED && identity != 0) {
+            (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
+                { token.model.value, token.load.value, token.owner.generation }, identity);
+        }
+    };
+    try {
+        const auto select_live = [&]() {
+            return ggml_sycl::lifecycle_select_placement_plan(token.model.value, token.load.value, token.owner.slot,
+                                                              token.owner.generation);
+        };
+        const ggml_sycl::moe_mmid_follows_fn follows =
+            [&](const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+                return ggml_sycl_mmid_workspaces_follow(token, snapshot);
+            };
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            published = select_live();
+        }
+        ggml_sycl::moe_mmid_materialize_reason  reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+        ggml_sycl::moe_mmid_materialize_refusal detail = ggml_sycl::moe_mmid_materialize_refusal::NONE;
+        if (!ggml_sycl_materialize_published_mmid_workspaces(token, published, &reason, &detail, &status)) {
+            // A loan or refill may have rebound the published context in place to a newer snapshot of the same
+            // identity: the refusal then names a context that follows the live snapshot, which is asked under the
+            // mutex every plan replacement CASes under.
+            bool reported = true;
+            {
+                std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+                reported = ggml_sycl::moe_mmid_materialize_refusal_reported(detail, select_live(), follows);
+            }
+            if (reported) {
+                ggml_sycl_moe_mmid_report_refusal("context-bind", reason, detail, token, published);
+            }
+            return;
+        }
+        if (reason == ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE) {
+            return;
+        }
+        ggml_sycl::moe_mmid_reconcile_outcome outcome = ggml_sycl::moe_mmid_reconcile_outcome::REBIND_REFUSED;
+        std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> live;
+        {
+            std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+            live              = select_live();
+            const bool stable = live && live->plan && published->plan &&
+                                ggml_sycl::moe_mmid_same_workspace_plan(*published->plan, *live->plan);
+            outcome = ggml_sycl::unified_cache_reconcile_moe_mmid_workspaces(published, live, live ? live->version : 0,
+                                                                             stable, follows);
+        }
+        const ggml_sycl::moe_mmid_materialize_refusal refusal = ggml_sycl::moe_mmid_reconcile_refusal(outcome);
+        if (refusal == ggml_sycl::moe_mmid_materialize_refusal::NONE) {
+            return;
+        }
+        if (ggml_sycl::moe_mmid_reconcile_retires(outcome, status)) {
+            // An in-place rebind re-keyed the publication to the live identity: retire what the registry holds now.
+            retire_own_publication(
+                ggml_sycl::moe_mmid_reconcile_retire_identity(outcome, published->version, live ? live->version : 0));
+        }
+        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::RECONCILE_REFUSED,
+                                          refusal, token, live ? live : published);
+    } catch (...) {
+        // A lock or a snapshot copy threw. A context this bind's own attempt PUBLISHED may then be for a snapshot no
+        // reconcile made it follow, and left alone it answers the next bind's attempt as same-identity-other-plan:
+        // retire it, as the refused reconcile does, and leave the deferral pending. The bind's own result is the
+        // transaction's, which already published.
+        retire_own_publication(published ? published->version : 0);
+        ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::BIND_EXCEPTION,
+                                          ggml_sycl::moe_mmid_materialize_refusal::EXCEPTION, token, nullptr);
+    }
+}
+
 // The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:
 // `desc` is then read once, here, under its gates (a refusal is deterministic, so PLAN_REJECTED, the
 // same answer the inner transaction gives), and the section it yields is stored in the context's
@@ -25363,11 +25497,6 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
         }
     }
 
-    // Retained past the locked scope below so a load_end deferral can be
-    // resolved OUTSIDE g_tensor_inventory_mutex. Copying the pointer under the
-    // lock is fine; materializing under it is not -- that allocates, and
-    // canonical §12 forbids allocation under the publication locks.
-    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> bound_snapshot;
     try {
         std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
         const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id, model.slot,
@@ -25375,7 +25504,6 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
         if (!snapshot) {
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
-        bound_snapshot = snapshot;
         if (backend_ctx) {
             std::vector<int> aggregate_devices;
             if (snapshot->plan) {
@@ -25471,28 +25599,16 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
             return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
         }
     }
-    // Resolve a load_end deferral now that a backend context exists. Idempotent:
-    // the MMID registry answers ALREADY_PUBLISHED when a pool is already live,
-    // so the registry itself is the deferred-state record and no parallel
-    // bookkeeping is kept (see the commit body).
+    // Resolve a load_end deferral now that a backend context exists, for the plan snapshot live after the
+    // transaction above (which replaced the snapshot the bind started from). Idempotent: the MMID registry answers
+    // ALREADY_PUBLISHED, allocating nothing, when a context already holds that snapshot, so the registry itself is
+    // the deferred-state record and no parallel bookkeeping is kept.
     //
     // Only when the inner bind SUCCEEDED. On inner failure the deferral stays
     // pending and stays silent: that failure has its own error surface, and a
     // tripwire on top of it would blame the wrong mechanism.
-    if (inner_ok && bound_snapshot && backend_ctx && ggml_sycl_moe_mmid_route_reachable(*backend_ctx)) {
-        ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-        if (!ggml_sycl_materialize_published_mmid_workspaces(token, bound_snapshot, &mmid_reason)) {
-            // TRIPWIRE. The route IS executable here and a planned pool is
-            // still unmaterialized at the point it should have resolved.
-            // Consequence is a silent performance cliff rather than wrong
-            // results -- admission simply falls through to the generic MoE
-            // dispatch -- which is exactly why it has to be loud: nothing
-            // downstream would ever report it.
-            ggml_sycl_moe_mmid_report_refusal(
-                "context-bind", mmid_reason, bound_snapshot->plan ? bound_snapshot->plan->device_id : -1,
-                bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_device_pool_bytes : 0,
-                bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_host_pool_bytes : 0);
-        }
+    if (inner_ok && backend_ctx && ggml_sycl_moe_mmid_route_reachable(*backend_ctx)) {
+        ggml_sycl_bind_materialize_live_mmid_workspaces(token);
     }
     // PLAN_REJECTED, not BUSY. The inner refusal is deterministic -- the same
     // n_ctx against the same budget refuses identically every time -- and a
@@ -36659,11 +36775,16 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // than refusing here. Secondary residency keeps the old refusal -- the
         // fall-through is validated for the local executor only.
         //
-        // Admitting here does NOT mean Q1_0/NVFP4 execute. choose_moe_batch_executor()
-        // in moe-resolved-batch.hpp rejects them unconditionally while the B70 oracle
-        // gate is closed, so they still refuse one layer down (census 10: 85 such
-        // refusals, reason=capability_unsupported, carrying capability=local-mmvq from
-        // right here). That is deliberate, not a bug in either layer.
+        // Admitting here does NOT mean the generic executor runs Q1_0/NVFP4.
+        // choose_moe_batch_executor() in moe-resolved-batch.hpp rejects a device
+        // recipe for them unconditionally; they execute only through the direct
+        // block in ggml_sycl_mul_mat_id (decode rows, primary card, AoS). The gate
+        // has two askers: the hybrid decode record build, before the direct block,
+        // for a layer with host experts (its refusal hands the tensor back to the
+        // retained route), and the retained route core, after the direct block, for
+        // an operand that fell through it, which refuses with
+        // reason=capability_unsupported and capability=local-mmvq from right here.
+        // That is deliberate, not a bug in either layer.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
                                              K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         if (!local_executor_shape_ok) {
@@ -87344,9 +87465,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
 
-    // Closed production DIRECT authority for decode Q1/NVFP4. Prompt and
-    // secondary residency remain outside this route. All fall-throughs are
-    // pre-submit refusals; once marked, the exact queue is drained/recovered.
+    // The production DIRECT authority for decode Q1/NVFP4 (decode rows, primary
+    // residency, AoS). Prompt rows, host-resident experts and secondary residency
+    // remain outside this route. All fall-throughs are pre-submit refusals; once
+    // marked, the exact queue is drained/recovered.
     // One definition, shared with the materialization gate: see
     // k_moe_mmid_direct_route_validated. Do not re-spell this as a literal --
     // the two gates drifting is how a pool gets allocated for a route that
@@ -87511,11 +87633,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                         throw std::runtime_error("injected Q1/NVFP4 asynchronous terminal failure");
                                     });
                                 });
+                                // A host task on the stream like the terminal below, recorded for the same reason.
+                                ggml_sycl::unified_cache_note_host_task(*exact_queue, final);
                             }
                             ggml_sycl_q1_nvfp4_test_retain_completion(completion);
 #endif
                             terminal->arm(final);
-                            exact_queue->submit([completion, final](sycl::handler & h) {
+                            sycl::event terminal_task = exact_queue->submit([completion, final](sycl::handler & h) {
                                 h.depends_on(final);
                                 // Runs once the route's commands have finished, whatever their outcome, and releases
                                 // the finished bundle. It does not ask whether the work succeeded: a wait of its own
@@ -87549,10 +87673,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};
                                 });
                             });
+                            // Recorded on the submitting thread, right after the submit returns. A CPU expert job's
+                            // join on the join-only queue waits only for the latest RECORDED host task of this
+                            // stream; an unrecorded one could be posted behind a join that holds the runtime's one
+                            // host-task thread while its job's inputs wait, on this in-order stream, for it.
+                            ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);
                             // No diagnostics or ownership construction is allowed
-                            // after admission. The B70 validation gate remains shut,
-                            // so a future enabling commit must place its marker before
-                            // this boundary or use preallocated counters.
+                            // after admission: a marker added for this route goes
+                            // before this boundary or uses preallocated counters.
                             return;
                         } catch (...) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
@@ -123913,8 +124041,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         //
         // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
         // the MMID coverage tables below. Q1_0 and NVFP4 are in them and stay
-        // admitted by design: they carry fp16 converters and are refused by the
-        // runtime route oracle (the sanctioned fail-closed class of c-wps7).
+        // admitted by design: they carry fp16 converters, their decode rows on the
+        // primary card run through the MMID direct route, host-resident experts run
+        // on the CPU, and the remaining device rows are refused by the runtime route
+        // oracle (the sanctioned fail-closed class of c-wps7).
         // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
         // the dense allowlist plus Q1_0/NVFP4, so every other type without a
         // kernel -- upstream b10630's tq2_0 and anything future -- is refused

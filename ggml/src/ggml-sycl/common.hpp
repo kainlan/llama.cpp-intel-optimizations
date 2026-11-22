@@ -2782,7 +2782,8 @@ bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
 // (GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the admission above). Defined beside it; the router's helper reads the same knob.
 bool   ggml_sycl_onednn_pp_mmq_types_admitted(ggml_type type);
 // llama.cpp-84ck: whether this build can execute the MoE MMID direct route at all. Defined in ggml-sycl.cpp from the
-// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds.
+// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds,
+// and then only for the Q1_0/NVFP4 experts the route admits.
 bool   ggml_sycl_moe_mmid_route_reachable_in_build();
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.

@@ -342,6 +342,23 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
     }
 }
 
+bool moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept {
+    if (a.moe_mmid_workspace_valid != b.moe_mmid_workspace_valid ||
+        a.moe_mmid_workspaces.size() != b.moe_mmid_workspaces.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.moe_mmid_workspaces.size(); ++i) {
+        const auto & x = a.moe_mmid_workspaces[i];
+        const auto & y = b.moe_mmid_workspaces[i];
+        if (x.owner_device != y.owner_device || x.depth != y.depth || x.valid != y.valid ||
+            x.secondary_owner != y.secondary_owner || x.device_pool_bytes != y.device_pool_bytes ||
+            x.host_pool_bytes != y.host_pool_bytes || !moe_mmid_same_workspace_geometry(x.slot, y.slot)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                       const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
     if (!expected || !replacement || expected.get() == replacement.get() || expected->model_id == 0 ||
@@ -350,6 +367,10 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         replacement->slot_generation != expected->slot_generation || replacement->version == 0) {
         return false;
     }
+    // The MMID context a prepared replacement displaces can hold its pools' last owners: declared before the plan
+    // lock, so the swap is decided under it and the release runs after it (canonical 12.5: no final release under a
+    // listed lock).
+    std::shared_ptr<void> displaced_mmid, rollback_displaced_mmid;
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(expected->model_id);
@@ -360,26 +381,17 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         if (current == model->second.end() || current->second.get() != expected.get()) {
             return false;
         }
-        const auto stable_workspace = [&] {
-            if (!expected->plan || !replacement->plan) return false;
-            const auto & a = expected->plan->moe_mmid_workspaces;
-            const auto & b = replacement->plan->moe_mmid_workspaces;
-            if (a.size() != b.size()) return false;
-            for (size_t i = 0; i < a.size(); ++i) {
-                if (a[i].owner_device != b[i].owner_device || a[i].depth != b[i].depth ||
-                    a[i].valid != b[i].valid || a[i].secondary_owner != b[i].secondary_owner ||
-                    a[i].device_pool_bytes != b[i].device_pool_bytes || a[i].host_pool_bytes != b[i].host_pool_bytes ||
-                    !moe_mmid_same_workspace_geometry(a[i].slot, b[i].slot)) return false;
-            }
-            return true;
-        }();
-        if (!unified_cache_moe_mmid_registry().replace_plan(
-                expected, replacement, replacement->version, stable_workspace)) return false;
+        const bool stable_workspace =
+            expected->plan && replacement->plan && moe_mmid_same_workspace_plan(*expected->plan, *replacement->plan);
+        if (!unified_cache_moe_mmid_registry().replace_plan(expected, replacement, replacement->version,
+                                                            stable_workspace, &displaced_mmid)) {
+            return false;
+        }
         try {
             current->second = replacement;
         } catch (...) {
-            (void) unified_cache_moe_mmid_registry().replace_plan(
-                replacement, expected, expected->version, stable_workspace);
+            (void) unified_cache_moe_mmid_registry().replace_plan(replacement, expected, expected->version,
+                                                                  stable_workspace, &rollback_displaced_mmid);
             throw;
         }
         return true;
@@ -6285,6 +6297,25 @@ static void host_zone_alloc_trace_print(const char * where, host_zone_id zone, v
             static_cast<int>(req.intent.role), static_cast<int>(req.intent.category),
             req.intent.cohort_id ? req.intent.cohort_id : "?", (unsigned long long) alloc_id, used_after,
             largest_free_after);
+}
+
+// A no-growth request refused in a configured host zone. WARN, not INFO, so it reaches a default-verbosity log: the
+// refusal surfaces to its caller only as a miss name, and the zone's configured reservation, its capacity and its use
+// at the refusal are what say whether the planner under-sized the zone or something else filled it.
+static void host_zone_no_growth_refusal_warn(host_zone_alloc_miss  miss,
+                                             host_zone_id          zone,
+                                             const alloc_request & req,
+                                             size_t                size,
+                                             size_t                reserved,
+                                             size_t                capacity,
+                                             size_t                used,
+                                             size_t                largest_free) {
+    GGML_LOG_WARN(
+        "[SYCL] host zone refused a no-growth request: miss=%s zone=%s dev=%d request=%zu reserved=%zu capacity=%zu "
+        "bound=%zu used=%zu largest_free=%zu role=%d category=%d\n",
+        host_zone_alloc_miss_name(miss), host_zone_name(zone), req.device, size, reserved, capacity,
+        host_zone_no_growth_bound(zone, reserved, capacity), used, largest_free, static_cast<int>(req.intent.role),
+        static_cast<int>(req.intent.category));
 }
 
 static bool copy_to_device_sync_enabled() {
@@ -19261,6 +19292,43 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
 // EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
 // released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
 // host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+const char * host_zone_alloc_miss_name(host_zone_alloc_miss miss) noexcept {
+    switch (miss) {
+        case host_zone_alloc_miss::NONE:
+            return "none";
+        case host_zone_alloc_miss::ZONES_NOT_CONFIGURED:
+            return "zones-not-configured";
+        case host_zone_alloc_miss::OVER_NO_GROWTH_BOUND:
+            return "over-no-growth-bound";
+        case host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK:
+            return "no-contiguous-block";
+        case host_zone_alloc_miss::GROWTH_FAILED:
+            return "growth-failed";
+    }
+    return "unknown";
+}
+
+moe_mmid_materialize_refusal moe_mmid_host_pool_refusal(host_zone_alloc_miss miss) noexcept {
+    switch (miss) {
+        case host_zone_alloc_miss::ZONES_NOT_CONFIGURED:
+            return moe_mmid_materialize_refusal::HOST_POOL_ZONES_NOT_CONFIGURED;
+        case host_zone_alloc_miss::OVER_NO_GROWTH_BOUND:
+            return moe_mmid_materialize_refusal::HOST_POOL_OVER_NO_GROWTH_BOUND;
+        case host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK:
+            return moe_mmid_materialize_refusal::HOST_POOL_NO_CONTIGUOUS_BLOCK;
+        case host_zone_alloc_miss::NONE:
+        case host_zone_alloc_miss::GROWTH_FAILED:  // the host pool's request never grows its zone
+            break;
+    }
+    return moe_mmid_materialize_refusal::HOST_POOL_ALLOCATION_FAILED;
+}
+
+size_t host_zone_no_growth_bound(host_zone_id zone, size_t reserved, size_t capacity) noexcept {
+    // The model load grows WEIGHT for host weights no plan sized (see the declaration), so only its capacity says
+    // whether a request fits without growing it. Every other zone's tenants are planned: their reservation stands.
+    return zone == host_zone_id::WEIGHT ? std::max(reserved, capacity) : reserved;
+}
+
 static host_zone_id unified_alloc_host_zone(const alloc_request & req,
                                             runtime_category      cat,
                                             bool                  kv_spill_to_host) noexcept {
@@ -19296,6 +19364,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     }
 
     alloc_request req = req_in;
+    if (req.host_zone_miss != nullptr) {
+        *req.host_zone_miss = host_zone_alloc_miss::NONE;
+    }
     if (req.queue == nullptr && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
         req.queue = &ggml_sycl_get_device(req.device).default_queue();
     }
@@ -19690,16 +19761,30 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // blocked (phase gate or budget exhausted), return a miss. The
             // host-buffer WEIGHT path fails cleanly without a raw malloc_host
             // escape; the separate KV-only pool retry below is not its fallback.
-            auto try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
+            host_zone_alloc_miss host_miss                 = host_zone_alloc_miss::NONE;
+            auto                 try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
                 if (!ucache->host_zones_configured() && req.intent.constraints.use_pinned_pool) {
                     // Zones not yet configured (pre-configure model-load path):
                     // fall through to host_pool_alloc below.
                     return nullptr;
                 }
+                const auto refuse_no_growth = [&](host_zone_alloc_miss miss) -> void * {
+                    host_miss = miss;
+                    // Only WEIGHT: its no-growth requests are persistent owners the planner sized the zone for, so a
+                    // refusal there is a planning fault. A STAGING miss is back-pressure its caller retries.
+                    if (zone == host_zone_id::WEIGHT) {
+                        host_zone_no_growth_refusal_warn(miss, zone, req, alloc_size,
+                                                                         ucache->host_zone_reserved_capacity(zone),
+                                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
+                                                                         ucache->host_zone_largest_free_block(zone));
+                    }
+                    return nullptr;
+                };
                 if (req.intent.constraints.forbid_host_zone_growth) {
-                    const size_t reserved = ucache->host_zone_reserved_capacity(zone);
-                    if (reserved > 0 && ucache->host_zone_used(zone) + alloc_size > reserved) {
-                        return nullptr;
+                    const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),
+                                                                                   ucache->host_zone_capacity(zone));
+                    if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {
+                        return refuse_no_growth(host_zone_alloc_miss::OVER_NO_GROWTH_BOUND);
                     }
                 }
                 const size_t alignment = req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT;
@@ -19708,7 +19793,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     return p;
                 }
                 if (req.intent.constraints.forbid_host_zone_growth) {
-                    return nullptr;
+                    return refuse_no_growth(host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK);
                 }
                 // Fragmentation path: the zone has enough aggregate free bytes
                 // somewhere (possibly across multiple chunks) but no single
@@ -19729,10 +19814,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // max(chunk_size_, align_up(need)); the alignment slack keeps
                 // the aligned request inside the arena.
                 const size_t need = alloc_size + std::max(alignment, pinned_chunk_pool::DEFAULT_ALIGNMENT);
-                if (!ucache->host_zone_grow(zone, need)) {
-                    return nullptr;
+                void *       grown =
+                    ucache->host_zone_grow(zone, need) ? ucache->host_zone_alloc(zone, alloc_size, alignment) : nullptr;
+                if (!grown) {
+                    host_miss = host_zone_alloc_miss::GROWTH_FAILED;
                 }
-                return ucache->host_zone_alloc(zone, alloc_size, alignment);
+                return grown;
             };
             if (req.intent.constraints.use_pinned_pool) {
                 if (!ucache->host_zones_configured()) {
@@ -19796,6 +19883,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
             }
             uses_pinned_pool = (ptr != nullptr);
+            if (!ptr && host_miss == host_zone_alloc_miss::NONE && !ucache->host_zones_configured()) {
+                host_miss = host_zone_alloc_miss::ZONES_NOT_CONFIGURED;
+            }
+            if (req.host_zone_miss != nullptr) {
+                *req.host_zone_miss = ptr ? host_zone_alloc_miss::NONE : host_miss;
+            }
         }
         if (!ptr) {
             // When host zones are configured, a WEIGHT zone miss means the zone is
@@ -20474,15 +20567,34 @@ static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry() {
 }
 
 static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
-    const moe_mmid_model_token & token,
-    uint64_t plan_identity,
+    const moe_mmid_model_token &                   token,
+    uint64_t                                       plan_identity,
     std::shared_ptr<const lifecycle_plan_snapshot> exact_plan,
-    const placement_plan & plan,
-    int submit_device,
-    const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    if (!plan.moe_mmid_workspace_valid || plan_identity == 0 || submit_device < 0 ||
-        plan.moe_mmid_workspaces.empty()) {
+    const placement_plan &                         plan,
+    int                                            submit_device,
+    const std::vector<moe_mmid_queue_binding> &    bindings,
+    moe_mmid_materialize_refusal *                 refusal) noexcept {
+    using R            = moe_mmid_materialize_refusal;
+    const auto invalid = [refusal](R why) {
+        if (refusal) {
+            *refusal = why;
+        }
         return moe_mmid_materialize_status::INVALID;
+    };
+    if (refusal) {
+        *refusal = R::NONE;
+    }
+    if (!plan.moe_mmid_workspace_valid) {
+        return invalid(R::PLAN_POOL_REJECTED);
+    }
+    if (plan_identity == 0) {
+        return invalid(R::PLAN_NO_IDENTITY);
+    }
+    if (submit_device < 0) {
+        return invalid(R::PLAN_NO_SUBMIT_DEVICE);
+    }
+    if (plan.moe_mmid_workspaces.empty()) {
+        return invalid(R::PLAN_NO_WORKSPACES);
     }
     try {
         std::vector<moe_mmid_materialized_owner_plan> owners;
@@ -20491,8 +20603,11 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == workspace.owner_device;
         });
-        if (!workspace.valid || binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
-            return moe_mmid_materialize_status::INVALID;
+        if (!workspace.valid) {
+            return invalid(R::WORKSPACE_INVALID);
+        }
+        if (binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
+            return invalid(R::WORKSPACE_NO_BINDING);
         }
         moe_mmid_materialized_owner_plan owner;
         owner.owner_device      = workspace.owner_device;
@@ -20506,6 +20621,8 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         owners.push_back(owner);
     }
 
+    // The host-zone condition the host pool's allocation missed on, if it missed on one.
+    host_zone_alloc_miss host_pool_miss = host_zone_alloc_miss::NONE;
     auto allocator = [&](bool host_pinned, int device, size_t bytes, size_t alignment) -> moe_mmid_blob {
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == device;
@@ -20519,13 +20636,19 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         request.size                 = bytes;
         request.alignment            = alignment;
         request.suppress_failure_log = true;
-        request.intent.role          = host_pinned ? alloc_role::STAGING : alloc_role::COMPUTE;
-        request.intent.category      = host_pinned ? runtime_category::STAGING : runtime_category::COMPUTE;
+        request.host_zone_miss       = host_pinned ? &host_pool_miss : nullptr;
+        // The host pool holds the route's CPU-written, GPU-read slot descriptors (and a secondary owner's bounce
+        // slices): control data. Its owner is the registry context, which holds it for the model's plan, past every
+        // graph, so it is a persistent owner and lands in the WEIGHT host zone, where the planner sized it. In the
+        // STAGING zone every graph boundary found it live and refused. It never grows the zone.
+        request.intent.role          = host_pinned ? alloc_role::CONTROL : alloc_role::COMPUTE;
+        request.intent.category      = host_pinned ? runtime_category::CONTROL : runtime_category::COMPUTE;
         request.intent.cohort_id     = "moe_mmid_workspace";
         request.intent.constraints.must_device             = !host_pinned;
         request.intent.constraints.must_host_pinned        = host_pinned;
         request.intent.constraints.use_pinned_pool         = host_pinned;
         request.intent.constraints.forbid_host_zone_growth = host_pinned;
+        request.intent.constraints.persistent_owner        = host_pinned;
         request.intent.constraints.prefer_vram_zone        = host_pinned ? vram_zone_id::COUNT : vram_zone_id::RUNTIME;
         auto handle = std::make_shared<mem_handle>(unified_allocate(request));
         const resolved_ptr resolved = handle->resolve();
@@ -20545,27 +20668,60 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         blob.host_pinned = host_pinned;
         return blob;
     };
-        return exact_plan ? unified_cache_moe_mmid_registry().materialize(
-                                token, plan_identity, std::move(exact_plan), submit_device, owners, allocator) :
-                            unified_cache_moe_mmid_registry().materialize(
-                                token, plan_identity, submit_device, owners, allocator);
+    const moe_mmid_materialize_status status =
+        exact_plan ? unified_cache_moe_mmid_registry().materialize(token, plan_identity, std::move(exact_plan),
+                                                                   submit_device, owners, allocator, refusal) :
+                     unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners,
+                                                                   allocator, refusal);
+    if (refusal && *refusal == moe_mmid_materialize_refusal::HOST_POOL_ALLOCATION_FAILED) {
+        *refusal = moe_mmid_host_pool_refusal(host_pool_miss);
+    }
+    return status;
     } catch (...) {
+        if (refusal) {
+            *refusal = R::EXCEPTION;
+        }
         return moe_mmid_materialize_status::ALLOCATION_FAILED;
     }
 }
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token, uint64_t plan_identity, const placement_plan & plan,
-    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings);
+    const moe_mmid_model_token &                token,
+    uint64_t                                    plan_identity,
+    const placement_plan &                      plan,
+    int                                         submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings,
+    moe_mmid_materialize_refusal *              refusal) noexcept {
+    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings, refusal);
 }
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token, const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
-    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    if (!plan || !plan->plan || plan->version == 0 || plan->model_id != token.model_id ||
-        plan->load_txn_id != token.load_txn_id) return moe_mmid_materialize_status::INVALID;
-    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings);
+    const moe_mmid_model_token &                           token,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+    int                                                    submit_device,
+    const std::vector<moe_mmid_queue_binding> &            bindings,
+    moe_mmid_materialize_refusal *                         refusal) noexcept {
+    using R            = moe_mmid_materialize_refusal;
+    const auto invalid = [refusal](R why) {
+        if (refusal) {
+            *refusal = why;
+        }
+        return moe_mmid_materialize_status::INVALID;
+    };
+    if (!plan || !plan->plan) {
+        return invalid(R::SNAPSHOT_MISSING);
+    }
+    if (plan->version == 0) {
+        return invalid(R::SNAPSHOT_NO_VERSION);
+    }
+    if (plan->model_id != token.model_id) {
+        return invalid(R::SNAPSHOT_MODEL_MISMATCH);
+    }
+    if (plan->load_txn_id != token.load_txn_id) {
+        return invalid(R::SNAPSHOT_LOAD_MISMATCH);
+    }
+    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings,
+                                                refusal);
 }
 
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
@@ -20596,6 +20752,16 @@ size_t unified_cache_recover_moe_mmid_workspaces(const moe_mmid_model_token & to
 bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
                                                uint64_t plan_identity) noexcept {
     return unified_cache_moe_mmid_registry().retire(token, plan_identity);
+}
+
+moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    const moe_mmid_follows_fn &                            follows) noexcept {
+    return moe_mmid_reconcile_live_plan(unified_cache_moe_mmid_registry(), published, live, live_identity,
+                                        stable_geometry, follows);
 }
 
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept {
@@ -31985,6 +32151,12 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             item.ne[0] <= 0 || item.ne[1] <= 0) {
             continue;
         }
+        // The pool's only consumer is the direct route, and it admits only the types that need their direct kernel
+        // (Q1_0, NVFP4). An expert of any other type (MXFP4, Q4_0, ...) never draws on a pool, so it neither sizes
+        // one nor names an owner: a model without such an expert plans, charges and materializes nothing.
+        if (!moe_type_needs_direct_kernel(item.type)) {
+            continue;
+        }
         // Only the expert weight matrices are MUL_MAT_ID operands. Per-expert
         // auxiliary tensors (".scale"/".input_scale" fp8 metadata) share the
         // "ffn_*_exps" stem — and legitimately get per-expert placement — but
@@ -32204,9 +32376,11 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         }
         if (demand.moe_mmid_host_pool_bytes > plan.moe_mmid_host_pool_bytes) {
             const size_t growth = demand.moe_mmid_host_pool_bytes - plan.moe_mmid_host_pool_bytes;
-            if (plan.host_zone_scratch_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth)
+            // The zone the load planner sizes the pool into (the WEIGHT host zone, see the host zone sizing).
+            if (plan.host_zone_weight_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth) {
                 return refuse(moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW);
-            plan.host_zone_scratch_bytes += growth;
+            }
+            plan.host_zone_weight_bytes += growth;
             plan.host_bytes += growth;
         }
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
@@ -32248,7 +32422,9 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
     // plan_moe_mmid_workspaces() planned none there (same bound).
     const int exposed_devices = moe_mmid_exposed_owner_count();
     for (const placement_entry & entry : plan.entries) {
-        if (entry.expert_id < 0) {
+        // Only an expert of a type the direct route admits needs an owner: plan_moe_mmid_workspaces() plans none for
+        // any other type, so requiring one would reject the pool of a model that mixes the two.
+        if (entry.expert_id < 0 || !moe_type_needs_direct_kernel(entry.type)) {
             continue;
         }
         if (entry.on_device && moe_mmid_owner_admissible(entry.target_device, exposed_devices) &&
@@ -32935,7 +33111,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     if (host_sizing_valid) {
         host_staging_total = s1_preload_staging_bytes;
         for (size_t bytes : { k_tp_staging_headroom, plan.expert_bias_bytes, plan.moe_routing_ids_bytes,
-                              plan.tp_staging_buffer_bytes, plan.moe_mmid_host_pool_bytes }) {
+                              plan.tp_staging_buffer_bytes }) {
             size_t next = 0;
             if (!moe_mmid_checked_zone_total(host_staging_total, bytes, &next)) {
                 host_sizing_valid = false;
@@ -32943,6 +33119,16 @@ static void populate_host_zone_sizing(placement_plan &                          
             }
             host_staging_total = next;
         }
+    }
+    // The MMID workspace host pool is held by its registry context for the model's plan, past every graph, so it is
+    // allocated from the WEIGHT host zone, which no graph boundary checks, and sized into that zone here. In STAGING
+    // every graph boundary found it live and refused.
+    size_t host_weight_total = 0;
+    if (host_sizing_valid &&
+        moe_mmid_checked_zone_total(plan.host_zone_weight_bytes, plan.moe_mmid_host_pool_bytes, &host_weight_total)) {
+        plan.host_zone_weight_bytes = host_weight_total;
+    } else {
+        host_sizing_valid = false;
     }
     if (!host_sizing_valid) {
         plan.moe_mmid_workspace_valid = false;

@@ -1,8 +1,8 @@
-// BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+// BUILD_TESTING-only live regression for the Q1/NVFP4 production MMID route.
 //
 // Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
 // there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
-// off the primary card (to the host or another card), which the closed route cannot reach; SKIP[no-backend] means no
+// off the primary card (to the host or another card), which the route cannot reach; SKIP[no-backend] means no
 // backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
 // the no-GPU skip.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
@@ -188,10 +188,15 @@ struct synthetic_inventory {
     }
 };
 
+// When the fixture creates the backends it binds: before load_end (load_end materializes the MMID workspaces itself),
+// or after it, as a real model load does (load_end defers them to the context bind).
+enum class backend_order { BEFORE_LOAD_END, AFTER_LOAD_END };
+
 struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     int backend_device = -1;  // the registry device `backend` was created for
     std::vector<ggml_backend_t> retained_backends;
+    ggml_backend_buffer_t       unplanned_host_weights = nullptr;  // the deferred order's host weights no plan sized
     ggml_sycl_load_txn load{};
     bool load_open = false;
     ggml_sycl_model_token model{};
@@ -201,7 +206,7 @@ struct lifecycle_fixture {
     // Every case marker from this index on was published while this fixture was alive: the cases its teardown names.
     size_t first_case = g_case_markers.size();
 
-    lifecycle_fixture() {
+    explicit lifecycle_fixture(backend_order order = backend_order::BEFORE_LOAD_END) {
         try {
             const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
             if (begin_result != GGML_SYCL_LIFECYCLE_OK) {
@@ -242,7 +247,7 @@ struct lifecycle_fixture {
                 }
                 owner_devices.insert(workspace.owner_device);
             }
-            // The closed route admits primary residency only; a selected expert the plan put elsewhere (a secondary
+            // The route admits primary residency only; a selected expert the plan put elsewhere (a secondary
             // card or the host) cannot reach it, so this environment cannot exercise the route.
             for (int expert : route_selected_experts) {
                 bool found = false;
@@ -257,7 +262,7 @@ struct lifecycle_fixture {
                                             (entry.on_device ? "device " + std::to_string(entry.target_device) :
                                                                std::string("the host")) +
                                             ", not primary device " + std::to_string(primary_device) +
-                                            "; the closed route covers primary residency only "
+                                            "; the route covers primary residency only "
                                             "(pin ONEAPI_DEVICE_SELECTOR to one card)");
                     }
                 }
@@ -267,28 +272,34 @@ struct lifecycle_fixture {
             // Inventory staging uses temporary backends. Create fresh retained
             // backends afterwards, one per unique owner device, so load_end's
             // exact-queue lookup cannot observe a transient context that was cleared.
-            retained_backends.reserve(owner_devices.size());
-            for (int device : owner_devices) {
-                using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
-                backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
-                if (retained == nullptr) {
-                    throw test_skip("no-backend", "no backend for candidate owner device " + std::to_string(device) +
-                                                      " (ggml_backend_sycl_init returned null)");
+            const auto create_retained_backends = [&]() {
+                retained_backends.reserve(owner_devices.size());
+                for (int device : owner_devices) {
+                    using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
+                    backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
+                    if (retained == nullptr) {
+                        throw test_skip("no-backend", "no backend for candidate owner device " +
+                                                          std::to_string(device) +
+                                                          " (ggml_backend_sycl_init returned null)");
+                    }
+                    retained_backends.push_back(retained.get());
+                    if (!backend || device == primary_device) {
+                        backend        = retained.get();
+                        backend_device = device;
+                    }
+                    retained.release();
                 }
-                retained_backends.push_back(retained.get());
-                if (!backend || device == primary_device) {
-                    backend        = retained.get();
-                    backend_device = device;
-                }
-                retained.release();
-            }
-            require(backend != nullptr, "no primary candidate owner backend");
+                require(backend != nullptr, "no primary candidate owner backend");
 
-            // Same-device registry is a stack: a short-lived newer backend B
-            // must not erase the retained backend A selected above.
-            ggml_backend_t shadow = ggml_backend_sycl_init(primary_device);
-            require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
-            ggml_backend_free(shadow);
+                // Same-device registry is a stack: a short-lived newer backend B
+                // must not erase the retained backend A selected above.
+                ggml_backend_t shadow = ggml_backend_sycl_init(primary_device);
+                require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
+                ggml_backend_free(shadow);
+            };
+            if (order == backend_order::BEFORE_LOAD_END) {
+                create_retained_backends();
+            }
 
             const auto commit_result = ggml_backend_sycl_model_load_end(load, true, &model);
             if (commit_result != GGML_SYCL_LIFECYCLE_BUSY) load_open = false;
@@ -296,6 +307,12 @@ struct lifecycle_fixture {
             if (commit_result != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error("synthetic lifecycle load commit result=" +
                                          std::to_string(static_cast<int>(commit_result)));
+            }
+            // A real model load ends before llama_context creates any backend: load_end finds no backend context
+            // for the owner device and defers the MMID workspaces to the context bind.
+            if (order == backend_order::AFTER_LOAD_END) {
+                place_unplanned_host_weights(plan, primary_device);
+                create_retained_backends();
             }
             require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
                     "plan activation failed");
@@ -314,6 +331,16 @@ struct lifecycle_fixture {
                                                                 /*swa_full=*/false,
                                                                 /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
                 "model root bind failed");
+            // The deferred order binds twice, as a real load does: each bind runs a runtime transaction that
+            // replaces the plan snapshot (a stable replace keeps the version), and the route must then admit on the
+            // snapshot that is live after the second.
+            if (order == backend_order::AFTER_LOAD_END) {
+                require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
+                                                                        /*swa_full=*/false,
+                                                                        /*flash_attn_enabled=*/true) ==
+                            GGML_SYCL_LIFECYCLE_OK,
+                        "second model root bind failed");
+            }
             require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
                     "private scope mint failed");
             scope_minted = true;
@@ -326,6 +353,29 @@ struct lifecycle_fixture {
             cleanup();
             throw;
         }
+    }
+
+    // A real load also places host weights the plan never sized, through the SYCL host buffer type, and grows the
+    // WEIGHT host zone for them (Inkling: the plan places no host weight; the load grows WEIGHT from 64 MiB by twelve
+    // 2 GiB chunks). The MMID workspace host pool is a request that may not grow its zone, allocated from WEIGHT at
+    // the context bind, so the deferred order fills WEIGHT past its reservation first, the way such a load leaves it.
+    void place_unplanned_host_weights(const ggml_sycl::placement_plan & plan, int device) {
+        require(plan.moe_mmid_host_pool_bytes > 0, "the candidate plan has no MMID host pool to place");
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        require(cache && cache->host_zones_configured(), "the primary device's host zones are not configured");
+        const size_t reserved = cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT);
+        const size_t used     = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
+        require(reserved > used, "the WEIGHT host zone is already past its reservation");
+        constexpr size_t past_reservation = 1024ull * 1024ull;
+        unplanned_host_weights =
+            ggml_backend_buft_alloc_buffer(ggml_backend_sycl_host_buffer_type(), reserved - used + past_reservation);
+        require(unplanned_host_weights != nullptr, "the unplanned host weight buffer was not allocated");
+        const size_t now_used = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
+        const size_t capacity = cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
+        require(now_used > reserved && capacity > reserved,
+                "the unplanned host weights did not grow the WEIGHT host zone past its reservation");
+        std::cerr << "unplanned host weights: WEIGHT used " << now_used << " of capacity " << capacity
+                  << ", reservation " << reserved << "; MMID host pool " << plan.moe_mmid_host_pool_bytes << " bytes\n";
     }
 
     void cleanup() noexcept {
@@ -349,6 +399,10 @@ struct lifecycle_fixture {
             ggml_backend_free(*it);
         }
         retained_backends.clear();
+        if (unplanned_host_weights) {
+            ggml_backend_buffer_free(unplanned_host_weights);
+            unplanned_host_weights = nullptr;
+        }
         backend        = nullptr;
         backend_device = -1;
     }
@@ -811,6 +865,14 @@ int main() {
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 3); }
+        require_clean_teardown();
+        // The order a real model load runs in: no backend at load_end, then the context binds twice. The route must
+        // admit on the plan snapshot that is live after the second bind.
+        {
+            lifecycle_fixture life(backend_order::AFTER_LOAD_END);
+            successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "deferred-bind");
+            successful_reuse_case(life, GGML_TYPE_NVFP4, 1, "deferred-bind");
+        }
         require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
         require_clean_teardown();

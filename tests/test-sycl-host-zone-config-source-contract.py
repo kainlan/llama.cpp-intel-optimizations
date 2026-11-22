@@ -126,6 +126,8 @@ texts = {
     # the default window ended inside it.
     "host_arena_ctor_window": statement_window(
         cache_cpp, "size_t host_mem_budget = g_unified_cache_host_budget;", window=3200),
+    "unified_alloc_fn": function_window(
+        cache_cpp, "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {", window=120000),
     "cache_cpp": cache_cpp,
     "pool_cpp": pool_cpp,
     "env_doc": env_doc,
@@ -408,6 +410,51 @@ def witness_e_docs(t):
     return t
 
 
+# --- F: unified_alloc's no-growth pre-check bounds a request by
+# host_zone_no_growth_bound(), not by the zone's configured reservation. The
+# load grows the WEIGHT zone past its reservation for host-buffer weights, so
+# a reservation bound refused the MMID host pool at every context bind while
+# the zone had room. The host test calls the bound helper directly and passes
+# whatever the pre-check compares against; only this check pins the use site.
+NO_GROWTH_PRECHECK = "if (req.intent.constraints.forbid_host_zone_growth) {"
+NO_GROWTH_BOUND_DECL = "const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),"
+NO_GROWTH_BOUND_CMP = "if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {"
+
+
+def no_growth_precheck_block(fn: str) -> str:
+    """The first forbid_host_zone_growth block in unified_alloc (the pre-check
+    ahead of host_zone_alloc), brace-matched, or "" when absent."""
+    idx = fn.find(NO_GROWTH_PRECHECK)
+    if idx < 0:
+        return ""
+    return function_window(fn[idx:], NO_GROWTH_PRECHECK, window=2000)
+
+
+def check_f_no_growth_bound_use_site(t):
+    block = no_growth_precheck_block(t["unified_alloc_fn"])
+    return (
+        bool(block)
+        and NO_GROWTH_BOUND_DECL in block
+        and NO_GROWTH_BOUND_CMP in block
+        and "> reserved" not in block
+        and "host_zone_reserved_capacity(zone);" not in block
+    )
+
+
+def witness_f_no_growth_bound_use_site(t):
+    # Restore the pre-fix comparison: the request bounded by the reservation alone.
+    block = no_growth_precheck_block(t["unified_alloc_fn"])
+    head = block.find(NO_GROWTH_BOUND_DECL)
+    tail = block.find(NO_GROWTH_BOUND_CMP)
+    if not block or head < 0 or tail < 0:
+        return t
+    old = (block[:head] + "const size_t reserved = ucache->host_zone_reserved_capacity(zone);\n"
+           "                    if (reserved > 0 && ucache->host_zone_used(zone) + alloc_size > reserved) {"
+           + block[tail + len(NO_GROWTH_BOUND_CMP):])
+    t["unified_alloc_fn"] = t["unified_alloc_fn"].replace(block, old, 1)
+    return t
+
+
 # (name, check, witness): the witness reproduces the defect textually in a
 # copy of `texts`; the check must then fail against that copy.
 checks = [
@@ -437,6 +484,8 @@ checks = [
      check_e2_rejection_warns_and_falls_through, witness_e2_rejection_warns_and_falls_through),
     ("E: env-var catalog documents the wiring and the staging-buffer distinction",
      check_e_docs, witness_e_docs),
+    ("F: unified_alloc's no-growth pre-check compares against host_zone_no_growth_bound(), not the reservation",
+     check_f_no_growth_bound_use_site, witness_f_no_growth_bound_use_site),
 ]
 
 failed = [name for name, check, _witness in checks if not check(texts)]
