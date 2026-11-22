@@ -743,8 +743,8 @@ drained_case_start failed_graph_then_drain_steps() {
 void failed_graph_then_drain_case() {
     const drained_case_start start = failed_graph_then_drain_steps();
 
-    // The fixture is gone, so every queue is drained. Exactly one delivery tells "delivered on another thread" (the
-    // drain's wait can take the error before the completion task's own wait looks) from "never delivered".
+    // The fixture is gone, so every queue is drained. The count proves the error was delivered exactly once, by the
+    // drain: the completion task has no wait of its own, and a second delivery or none would change it.
     const uint64_t delivered = ggml_sycl_async_failure_count(start.device) - start.device_failures;
     require_stages(delivered == 1,
                    "failed_graph_then_drain_case: the injected asynchronous failure was delivered " +
@@ -752,8 +752,8 @@ void failed_graph_then_drain_case() {
                    start.counters);
 }
 
-// A completion task that has not released its bundle when the context is drained: the drain's deferred-decode wait
-// covers the graph's last event, not necessarily the route's completion task. The drain must still release the graph.
+// A completion task that did not release its bundle, its release refused or skipped; whether one can still be pending
+// after the drain's deferred-decode wait is unmeasured. The drain must still release the graph.
 // No asynchronous error is injected, so the latch must not move. With hold_completion a second holder of the
 // completion object outlives its host task, as a copy of the host-task functor inside the SYCL runtime would; the host
 // task empties the shared bundle as its last statement, so that holder cannot keep the invocation pinned.

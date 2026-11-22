@@ -47,9 +47,10 @@ With comments blanked:
      an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the direct route in ggml_sycl_mul_mat_id hands its
      completion to the seam after mark_possible_submit() and before terminal->arm(final) and the completion host
      task, so the seam holds the completion of the graph it was armed for. The same holds
-     for the completion failpoint GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE (a completion task that has
-     not released when the context is drained): the host task consumes it before its release, and the build without
-     route testing defines skip_release as constexpr false.
+     for the completion failpoint GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE (a completion task that did
+     not release, its release refused or skipped; whether one can still be pending after the drain's deferred-decode
+     wait is unmeasured): the host task consumes it before its release, and the build without route testing defines
+     skip_release as constexpr false.
   H. (common.cpp ggml_sycl_async_handler) the handler body has no throw statement, no GGML_LOG, no lock or mutex, no
      std::string and no new.
 """

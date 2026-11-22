@@ -32,7 +32,8 @@ enum ggml_sycl_q1_nvfp4_test_failure {
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL,
-    // The completion host task skips its release once, as one that has not run yet when the context is drained.
+    // The completion host task skips its release once. It stands for a completion task that did not release, its
+    // release refused or skipped; whether one can still be pending after the drain's deferred-decode wait is unmeasured.
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE,
 };
 

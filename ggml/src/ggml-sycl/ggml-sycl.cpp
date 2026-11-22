@@ -16841,10 +16841,11 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
 }
 
 // The second attempt of a drain whose release was refused. A refusal with the invocation still live usually means a
-// quarantined MoE workspace slot pins it: the slot's terminal finished without success, so nothing recycled the slot.
-// The recovery frees a slot only once its terminal's event is complete, and the caller's wait may have covered only
-// the deferred decode event, so the stream is drained first. Only a refused release pays for this wait and for the
-// registry walk; a drain that releases at once does neither. Returns true when the graph was released.
+// quarantined MoE workspace slot pins it: nothing recycled the slot, because its completion task's terminal_release()
+// was refused or skipped, or because a route catch whose own wait threw left it quarantined. The recovery frees a slot
+// only once its terminal's event is complete. Whether a completion task can still be pending after the caller's
+// deferred-decode wait is unmeasured, so the stream is drained first. Only a refused release pays for this wait and
+// for the registry walk; a drain that releases at once does neither. Returns true when the graph was released.
 static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
     if (!ctx || ggml_sycl_take_execution_state_snapshot(ctx).invocation_id == 0) {
         return false;
@@ -54271,8 +54272,9 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     moe_stream.reset();
     ggml_sycl_moe_stream_release_payload(*this);
     pp_moe_onednn_drain_scratch_slots(device);
-    // Every queue is drained, so a workspace slot whose terminal failed is finished and can be recovered. Without
-    // this its pin outlives the context and the device stays owned.
+    // The queues were waited on above, and a wait that threw was swallowed there. The recovery frees only the slots
+    // whose terminal reports ready() (its event complete, or its quiescence confirmed); a slot still in flight stays
+    // quarantined. Without this a finished slot's pin outlives the context and the device stays owned.
     ggml_sycl_recover_exact_mmid_after_drain(this);
     ggml_sycl_execution_abort_and_release_graph(this);
     // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
@@ -79231,8 +79233,8 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
 
 // The direct route's terminal says when the route's work is finished, and nothing else. Whether that work succeeded is
 // the asynchronous-failure latch's to say, and only a boundary that drained on its own thread may read it: a wait on
-// another thread, such as the completion host task's, can return while a boundary's wait is still delivering the error
-// to the handler, so a latch read after it can miss the failure.
+// another thread, such as one a completion host task would make, can return while a boundary's wait is still
+// delivering the error to the handler, so a latch read after it can miss the failure.
 class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
     // The work is finished, whatever its outcome. The slot-release sites read this as "may be released", so success
@@ -87266,15 +87268,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             exact_queue->submit([completion, final](sycl::handler & h) {
                                 h.depends_on(final);
                                 // Runs once the route's commands have finished, whatever their outcome, and releases
-                                // the finished bundle. It does not ask whether the work succeeded: its own wait could
-                                // return while a boundary's wait is still delivering the error, and the failure is the
-                                // boundary's to report. terminal_release() fails closed when a recovery already freed
-                                // the slot.
+                                // the finished bundle. It does not ask whether the work succeeded: a wait of its own
+                                // would return while a boundary's wait may still be delivering the error, and the
+                                // failure is the boundary's to report. terminal_release() fails closed when a recovery
+                                // already freed the slot.
                                 h.host_task([completion] {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                                     g_q1_nvfp4_test_terminal.fetch_add(1, std::memory_order_relaxed);
-                                    // Stands for a completion task that has not released yet when the context is
-                                    // drained.
+                                    // Stands for a completion task that did not release: its release refused or
+                                    // skipped.
                                     const bool skip_release = ggml_sycl_q1_nvfp4_test_consume_failure(
                                         GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE);
 #else
