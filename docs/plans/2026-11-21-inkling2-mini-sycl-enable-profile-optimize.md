@@ -4016,6 +4016,121 @@ experts, the B50), a secondary card, the small F32 weights staged at run time.
 
 ---
 
+### Task 8c: A `MUL_MAT_ID` node that selects card experts and host experts runs both (found 2026-11-22)
+
+**Track:** L. **Depends on:** Task 8b (merged).
+**Found by:** the lead's Inkling gate on the B50 from Task 8b's build (`6ee2a4058`). The load places 21.3 GiB
+on a 16 GB card by pinning about 10 GB of experts in host memory. The warm-up decode is refused at the first
+node that selects one of them, and the graph fails:
+`[MOE-DECODE-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight route=direct step=precondition failed=all_primary
+occurrence=0 expert=23 residency=host owner=-1 layout=aos operands=8`, then the retained route's
+`reason=capability_unsupported ... kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate`, then
+`[SYCL] recoverable runtime fallback failed: MUL_MAT_ID retained hybrid executor refused route`. The prompt
+prints the same pair with `MOE-PROMPT-REFUSAL` and `operands=112`. The B70 holds every expert and passes.
+
+**Description (traced by an explorer in Task 8b's tree at `6ee2a4058`, read not run; line numbers are that
+tree's and move with every merge, so find each site by name):**
+- The host half exists. ggml-cpu has `ggml_vec_dot_nvfp4_q8_0` and `ggml_vec_dot_q1_0_q8_0`. The backend's
+  executor for a host-resident Q1_0/NVFP4 expert is `ggml_sycl_cpu_moe_host_aos_execute` (`cpu-dispatch.cpp`):
+  one task at a time, single-threaded, staged through a host-pinned `moe_q1_nvfp4_recipe_workspace` that the
+  plan reserves (`moe_host_recipe_workspace_bytes`, `unified-cache.cpp`), run from a `std::async` thread in the
+  retained core, its rows written into `dst` by the same pending scatter MXFP4 uses.
+- A batch whose selected experts are ALL host-resident already runs: `ggml_sycl_moe_direct_batch_all_host`
+  lets the direct block pass it on silently and the retained core runs the HOST_CPU recipes.
+- A tensor with NO expert on a card already runs: `supports_op` declines it and the CPU backend takes the node
+  (`ggml_sycl_moe_tensor_all_experts_on_host`).
+- The mix does not run. `choose_moe_batch_executor` (`moe-resolved-batch.hpp`) returns
+  `CAPABILITY_UNSUPPORTED` for every Q1_0/NVFP4 recipe that is not HOST_CPU, by design: its comment says these
+  types run only through the direct block. The direct block requires every operand PRIMARY on the context's
+  device. So in a mixed batch the host operands pass, the card operands are refused, and
+  `append_retained_operand` throws. The hybrid decode record build (`ggml_sycl_moe_hybrid_decode_record_build`)
+  asks the same chooser per expert and declines for the same reason.
+- `mmvq_submit_q1_nvfp4_aos_id_admitted` computes all `top_k * n_tokens` occurrences from the ids tensor on
+  the device; the host ids are only range-checked. It cannot take a subset.
+- How MXFP4 does the mix (`ggml_sycl_moe_hybrid_decode_event_chained`): the pointer table is indexed by
+  expert id, a host expert's slot names a card expert as a stand-in, the device kernel computes every slot,
+  and the CPU job's rows replace the host slots through a flagged scatter chained on the in-order queue.
+- The CPU expert pool (`ggml_sycl_cpu_expert_mul_mat`, `cpu_expert_mul_mat_batched_run`) asserts these types
+  out ("must use its admitted host recipe").
+- The CPU expert rate table (`placement_cpu_expert_rate_measured`, `kv-room-cost.hpp`) has no Q1_0 or NVFP4
+  row; both read the 40 GB/s default, flagged unmeasured. Tasks 15 and 16 own the row.
+
+**Ruling (lead, 2026-11-22):** placement decides the executor, per occurrence. A card-resident expert runs in
+the admitted device kernel, a host-pinned expert runs on the CPU through the host recipe that already exists,
+and one node may do both. Nothing is converted, staged to the card for the purpose, or read from host memory
+by a GPU kernel.
+- The direct block is the one place a Q1_0/NVFP4 node is executed. It admits a batch whose operands are each
+  PRIMARY on its device or HOST; `choose_moe_batch_executor`'s refusal stays, because no generic executor
+  runs these types.
+- The device kernel must not compute a host occurrence from a stand-in expert and must not read a host
+  pointer. It skips an occurrence whose expert is not on the card (the table slot says so) and leaves that
+  output row alone. This differs from the MXFP4 stand-in on purpose: on the B50 about half the experts are
+  host-pinned, so a stand-in would spend about half the device kernel on rows that are thrown away. If the
+  checkpoint shows a skip cannot be had without a second kernel image, say so before writing one.
+- The host rows are computed by `ggml_sycl_cpu_moe_host_aos_execute` and reach `dst` through the existing
+  scatter, ordered after the device kernel's output copy on the in-order queue. One terminal event per node
+  that covers both legs; the bundle's leases are released by it, not before the host leg is done.
+- No host wait on the submitting thread. The host leg waits for its activation and ids on its worker, as the
+  MXFP4 job prologue does.
+- A secondary-card operand (`residency=secondary`) is still refused by name. It is Task 8d's.
+- Speed is not this task. One task at a time on one thread is what exists; its cost is Stage 2's measurement,
+  and the pool or a threaded recipe is a Stage 3 candidate.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. How the pointer table the direct block uploads represents a host expert today (null, absent, or a
+   stand-in), and what the kernel needs to skip one without a second image.
+2. Where the host leg gets its activation rows and its ids for the direct block, which stages neither to the
+   host today, and what that costs per node (one D2H of `ne11 * ne12` rows at most).
+3. How the host rows' scatter and the block's terminal event combine into one terminal, given that the pending
+   scatter is flushed at the first consumer and not at a terminal.
+4. Whether the host recipe workspace the plan reserves covers a prompt batch (`n_expert_used * ubatch` rows)
+   when only some occurrences are host occurrences, and what refuses if it does not.
+5. Whether the hybrid decode record build must change too, or is not reached once the direct block takes the
+   mix.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (the direct block, its precondition and decline lines),
+`ggml/src/ggml-sycl/mmvq.cpp` and `mmvq.hpp` (the admitted adapter and its kernel),
+`ggml/src/ggml-sycl/cpu-dispatch.cpp` only if checkpoint item 2 requires it,
+`ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`, `tests/test-sycl-moe-resolved-batch-source.py`,
+`tests/test-sycl-moe-refusal-reason-source.py`.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the source contract fails on the all-PRIMARY precondition; the device test has mixed
+      cases the lead sees fail before the fix.
+- [ ] Device test cases through the production fixture, Q1_0 and NVFP4, decode and a prompt batch: one host
+      occurrence among card occurrences, all but one host, and a prompt in which different tokens mix
+      differently. The oracle is the CPU result for every row. A kernel that computed a host row from another
+      expert must fail; so must one that left a card row unwritten.
+- [ ] A secondary-card operand is refused by name and the graph fails cleanly.
+- [ ] Lead, one run each: the oracle on both cards with 0 context-bind lines; the Inkling gate on the B50
+      passes or names its next refusal; the Inkling gate on the B70, the Mistral gate and the GPT-OSS gate on
+      the B50 pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** a secondary card (Task 8d), the CPU expert pool for these types, the rate-table row, the
+speed of the host leg.
+
+---
+
+### Task 8d: Experts on the second card (recorded 2026-11-22)
+
+**Found by:** the lead's Inkling gate on `level_zero:0,1` from Task 8b's build. With
+`GGML_SYCL_MOE_MULTI_GPU=0`, which every gate sets, the load puts all 21.3 GiB on the B70 and the B50 holds
+nothing: the run prints `1, 2, ... 10` with 0 refusals and is the B70 setup with an idle second card. No
+secondary cache arena is registered when the variable is 0, so overflow would go to host, not to the B50
+(read, not run). With the variable on, an NVFP4 expert owned by device 1 resolves as SECONDARY, MXFP4's
+secondary executor is SOA-only, and the direct block would print `failed=all_primary ... residency=secondary
+owner=1`. The variable defaults ON when unset (`ggml_sycl_moe_multi_gpu_requested`), which CLAUDE.md states as
+opt-in.
+**Direction (lead):** a secondary-owned expert runs on the card that holds it, through the same admitted
+kernel on that card's queue, with its activation and result crossing by host bounce (there is no peer-to-peer
+path). Not written out: it depends on Task 8c's per-occurrence split and on what Stage 2 says a second card is
+worth for a model the B70 holds whole.
+**Done when:** written to the Task Detail Standard after Task 8c merges, or dropped by the profile with the
+reason recorded.
+
+---
+
 ### Task 9: Stage 1 exit gates
 
 **Track:** L (lead; GPU)
