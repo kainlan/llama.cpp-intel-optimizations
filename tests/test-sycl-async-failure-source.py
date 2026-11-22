@@ -34,8 +34,9 @@ With comments blanked:
   D. (ggml-sycl.cpp) a release refused during a drain is retried after the workspace recovery:
      ggml_sycl_execution_recover_and_release_graph waits the stream, then calls
      ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
-     call it before ggml_sycl_execution_abort_and_release_graph; the backend destructor calls the recovery before
-     its abort-and-release.
+     call it before ggml_sycl_execution_abort_and_release_graph, with the same condition: a wait that threw
+     (waited false) goes straight to the abort, else release, else recover and release; the backend destructor
+     calls the recovery before its abort-and-release.
   W. (ggml-sycl.cpp) a drain wait that throws is recorded in the device latch, as synchronize records one: a
      synchronous throw (a lost device) bypasses the queue's handler. The catch of the drain retry's wait, and of the
      first wait of each drain twin, calls ggml_sycl_async_failure_record with that context's device.
@@ -62,6 +63,9 @@ TEST_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_te
              "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE")
 NO_RELEASE = "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE"
 RELEASE = "const bool recycled = !skip_release && completion->bundle.terminal_release();"
+# Both drain twins: a wait that threw goes straight to the abort, else release, else recover and release.
+TWIN_CONDITION = (r"if \(!waited \|\|\s*\(!ggml_sycl_execution_release_graph\({ctx}\) &&\s*"
+                  r"!ggml_sycl_execution_recover_and_release_graph\({ctx}\)\)\) \{{")
 # (claim name, function body local, the record call its catch must make)
 DRAIN_RECORDS = (
     ("W the drain retry records a throwing wait", "d",
@@ -174,6 +178,11 @@ def claims(cache, sycl, common):
         "D the begin-path twin retries before it aborts": 0 <= d_own.find(
             "ggml_sycl_execution_recover_and_release_graph(ctx)") < d_own.find(
             "ggml_sycl_execution_abort_and_release_graph(ctx);"),
+        "D the begin-path twin skips the release after a throwing wait": re.search(
+            TWIN_CONDITION.format(ctx="ctx"), d_own) is not None,
+        "D the context twin skips the release after a throwing wait": re.search(
+            TWIN_CONDITION.format(ctx="backend_ctx"), d_ctx) is not None and "waited = false;" in body(
+            d_ctx, "catch (...)"),
         "D the context twin retries before it aborts": 0 <= d_ctx.find(
             "ggml_sycl_execution_recover_and_release_graph(backend_ctx)") < d_ctx.find(
             "ggml_sycl_execution_abort_and_release_graph(backend_ctx);"),
@@ -250,6 +259,12 @@ def main():
                 "return ggml_sycl_execution_release_graph(ctx);", 1), common),
             "context twin aborts without the retry": (cache, re.sub(
                 r"\s*&&\s*!ggml_sycl_execution_recover_and_release_graph\(backend_ctx\)", "", sycl, count=1), common),
+            "context twin releases after a throwing wait": (cache, re.sub(
+                r"if \(!waited \|\|\s*(\(!ggml_sycl_execution_release_graph\(backend_ctx\))", r"if (\1", sycl,
+                count=1), common),
+            "context twin forgets the throwing wait": (cache, sycl.replace(
+                'context drain wait threw");', 'context drain wait threw"); waited = true;', 1).replace(
+                "                waited = false;\n            }", "            }", 1), common),
             "destructor releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
             "completion hold outside the testing guard": (cache, sycl.replace(

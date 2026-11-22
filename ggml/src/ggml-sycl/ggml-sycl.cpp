@@ -16890,14 +16890,12 @@ static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_cont
 // begin is per-backend, and a sibling backend bound to the same context has not
 // asked to start a graph here.
 //
-// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The wait -> clear the event fields ->
-// release, else recover and release, else abort -> retire body below is a near-verbatim twin of the lambda in
-// ggml_sycl_execution_drain_context_terminal_events(). The duplication is
-// deliberate (the call sites genuinely differ: one context vs one backend, begin
-// vs teardown, and only teardown clears the executable graph), but the ORDERING
-// is a correctness invariant shared by both. Any change to that ordering, to the
-// unproven-wait fallback, or to which event is waited on must be applied to the
-// other function in the same commit.
+// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The body below -- wait (a wait that throws is recorded in the latch and
+// goes straight to the abort) -> clear the event fields -> release, else recover and release, else abort -> retire --
+// is a near-verbatim twin of the lambda in ggml_sycl_execution_drain_context_terminal_events(). The duplication is
+// deliberate (the call sites genuinely differ: one context vs one backend, begin vs teardown, and only teardown clears
+// the executable graph), but the ORDERING is a correctness invariant shared by both. Any change to that ordering, to
+// the unproven-wait fallback, or to which event is waited on must be applied to the other function in the same commit.
 static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * ctx) noexcept {
     if (!ctx) {
         return;
@@ -16961,19 +16959,19 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
 // binding lock and releases the lock before the callback, so every queue wait
 // and every final handle destruction below happens outside all ranked locks.
 //
-// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The lambda's wait -> clear the event
-// fields -> release, else recover and release, else abort -> retire body is a near-verbatim twin of
-// ggml_sycl_execution_drain_own_terminal(), which drains one backend's own
-// terminal invocation from the begin path (llama.cpp-2dgc). The duplication is
-// deliberate, but the ORDERING is a correctness invariant shared by both. Any
-// change to that ordering, to the unproven-wait fallback, or to which event is
-// waited on must be applied to the other function in the same commit.
+// DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The lambda's body -- wait (a wait that throws is recorded in the latch
+// and goes straight to the abort) -> clear the event fields -> release, else recover and release, else abort ->
+// retire -- is a near-verbatim twin of ggml_sycl_execution_drain_own_terminal(), which drains one backend's own
+// terminal invocation from the begin path (llama.cpp-2dgc). The duplication is deliberate, but the ORDERING is a
+// correctness invariant shared by both. Any change to that ordering, to the unproven-wait fallback, or to which event
+// is waited on must be applied to the other function in the same commit.
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id) {
     if (context_id == 0) {
         return;
     }
     ggml_sycl_execution_for_each_bound_backend(
         context_id, [](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
+            bool waited = true;
             try {
                 if (backend_ctx->last_graph_event.has_value() && backend_ctx->last_graph_event_deferred_decode) {
                     backend_ctx->last_graph_event->wait_and_throw();
@@ -16988,11 +16986,12 @@ static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_i
                 // Enqueue status is now uncertain for this device. Fall through
                 // to the quarantine path, which retains every root/backing lease
                 // instead of releasing on an unproven terminal.
+                waited = false;
             }
             backend_ctx->last_graph_event.reset();
             backend_ctx->last_graph_event_deferred_decode = false;
-            if (!ggml_sycl_execution_release_graph(backend_ctx) &&
-                !ggml_sycl_execution_recover_and_release_graph(backend_ctx)) {
+            if (!waited || (!ggml_sycl_execution_release_graph(backend_ctx) &&
+                            !ggml_sycl_execution_recover_and_release_graph(backend_ctx))) {
                 ggml_sycl_execution_abort_and_release_graph(backend_ctx);
             }
             ggml_sycl_execution_try_retire_terminal(backend_ctx);
