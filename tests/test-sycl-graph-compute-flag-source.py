@@ -24,6 +24,10 @@ Checks:
     layer-block plan's source scan and its alias publication; the persistent TG plan's fast path and full walk, the
     split plan's weight list, and the eligibility checks before them (decode, architecture, op support, MoE probe,
     policy summary), so an unselected branch's DUP no longer declines persistent TG;
+  * the persistent TG answer, its plan and the plan's update recipe are keyed on the graph signature, which mixes each
+    node's flags, as well as on n_nodes and the phase: a new key drops the cached plans (the drop a graph leaving the
+    persistent path takes) before the graph is judged. A recipe replay takes each node through one lookup that
+    refuses an index outside the graph or an uncomputed node, and such a node fails the replay into a full rebuild;
   * a fusion that also runs a node it looked ahead to asks the rule of that node: the TG router and MUL_MAT+ADD
     fusions, ADD+RMS_NORM, MUL+ADD, the FFN fusion, the MoE down-sum chain and its weighted MUL, and the persistent
     plan's RMS_NORM+MUL. The two CPU-path fusions ask ggml_sycl_is_noop of the next node. The RMS_NORM fusions that
@@ -253,6 +257,48 @@ LOOKAHEADS = {
          "next->op == GGML_OP_MUL", 1),
 }
 
+GRAPH_COMPUTE_UNCHECKED = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
+DROP_PLANS = r"static void persistent_tg_drop_cached_plans\([^)]*\)\s*\{"
+
+# name -> (signature, the statement that must be in its body, the same text without it for the self-test)
+PERSISTENT_KEY = {
+    "the persistent eligibility key carries the graph signature":
+        (GRAPH_COMPUTE_UNCHECKED,
+         r"persistent_cache_sig\s*=\s*ggml_sycl::env_persistent_tg_enabled\(\)\s*\?\s*"
+         r"ggml_sycl_graph_signature\(cgraph\)\s*:\s*0\s*;", "persistent_cache_sig = 0;"),
+    "a persistent eligibility hit needs the same graph signature":
+        (GRAPH_COMPUTE_UNCHECKED,
+         r"persistent_cache_hit\s*=\s*sycl_ctx->cached_persistent_n_nodes\s*==\s*persistent_cache_key\s*&&\s*"
+         r"sycl_ctx->cached_persistent_sig\s*==\s*persistent_cache_sig\s*;",
+         "persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key;"),
+    "a persistent eligibility miss drops the cached plans before it judges the graph":
+        (GRAPH_COMPUTE_UNCHECKED,
+         r"\}\s*else\s*\{\s*persistent_tg_drop_cached_plans\(\*sycl_ctx\)\s*;\s*"
+         r"persistent_eligible\s*=\s*should_use_persistent_tg\(",
+         "} else {\n        persistent_eligible = should_use_persistent_tg("),
+    "a persistent eligibility miss stores the graph signature":
+        (GRAPH_COMPUTE_UNCHECKED, r"sycl_ctx->cached_persistent_sig\s*=\s*persistent_cache_sig\s*;", ""),
+    "leaving the persistent path drops the cached plans":
+        (GRAPH_COMPUTE_UNCHECKED, r"normal_dispatch:\s*persistent_tg_drop_cached_plans\(\*sycl_ctx\)\s*;",
+         "normal_dispatch:\n"),
+    "the plan drop drops the primary kernel's plan":
+        (DROP_PLANS, r"ctx\.unified_kernel->invalidate_plan_cache\(\)\s*;", ""),
+    "the plan drop drops the split secondary kernel's plan":
+        (DROP_PLANS, r"g_split_secondary_kernel->invalidate_plan_cache\(\)\s*;", ""),
+    "the plan drop drops the split plan's secondary ops":
+        (DROP_PLANS, r"g_split_plan_cached\s*=\s*false\s*;\s*g_cached_secondary_ops\.clear\(\)\s*;", ""),
+}
+
+RECIPE_LOOKUP = r"auto\s+recipe_node\s*=\s*\[cgraph\]\(\s*const\s+auto\s*&\s*entry\s*\)\s*->\s*ggml_tensor\s*\*\s*\{"
+RECIPE_BOUNDS = r"entry\.graph_node_idx\s*<\s*0\s*\|\|\s*entry\.graph_node_idx\s*>=\s*cgraph->n_nodes"
+RECIPE_COMPUTED = r"return\s+node\s*&&\s*ggml_sycl_graph_node_is_computed\(node\)\s*\?\s*node\s*:\s*nullptr\s*;"
+
+
+def recipe_take(var):
+    """A recipe loop that takes `var` through the lookup and fails the replay when it names no computed node."""
+    return (r"ggml_tensor\s*\*\s*" + var + r"\s*=\s*recipe_node\(entry\)\s*;\s*"
+            r"if\s*\(\s*!" + var + r"\s*\)\s*\{\s*recipe_ok\s*=\s*false\s*;\s*break\s*;\s*\}")
+
 
 def evaluate(backend, class_hdr):
     results = {}
@@ -291,6 +337,24 @@ def evaluate(backend, class_hdr):
         body = function_body(backend, sig)
         results[f"{name} asks the rule of the node it looks ahead to"] = \
             body is not None and len(re.findall(pattern, body)) >= least
+
+    for name, (sig, pattern, _) in PERSISTENT_KEY.items():
+        body = function_body(backend, sig)
+        results[name] = body is not None and re.search(pattern, body) is not None
+
+    plan = function_body(backend, PERSISTENT_PLAN) or ""
+    lookup = re.search(RECIPE_LOOKUP, plan)
+    lookup_body = balanced(plan, lookup.end() - 1) if lookup else None
+    results["the recipe's node lookup refuses an index outside the graph"] = \
+        lookup_body is not None and re.search(RECIPE_BOUNDS, lookup_body) is not None
+    results["the recipe's node lookup refuses an uncomputed node"] = \
+        lookup_body is not None and re.search(RECIPE_COMPUTED, lookup_body) is not None
+    results["the recipe replay takes each node through the lookup and fails on none"] = \
+        re.search(recipe_take("node"), plan) is not None
+    results["the recipe's CPY entries take each node through the lookup and fail on none"] = \
+        re.search(recipe_take("cpy_node"), plan) is not None
+    results["the recipe reads a graph node only inside the lookup"] = \
+        len(re.findall(r"cgraph->nodes\[entry\.graph_node_idx\]", plan)) == 1
 
     return results
 
@@ -387,6 +451,31 @@ if args.self_test:
         mutants.append((f"{name} fuses an uncomputed look-ahead node",
                         f"{name} asks the rule of the node it looks ahead to",
                         (mutate_in_func(backend, sig, pattern, without), class_hdr)))
+    for name, (sig, pattern, without) in PERSISTENT_KEY.items():
+        mutants.append((f"not: {name}", name, (mutate_in_func(backend, sig, pattern, without), class_hdr)))
+    direct_node = "ggml_tensor * {0} = cgraph->nodes[entry.graph_node_idx];"
+    mutants += [
+        ("the recipe's lookup takes any index", "the recipe's node lookup refuses an index outside the graph",
+         (mutate_in_func(backend, RECIPE_LOOKUP, RECIPE_BOUNDS, "false"), class_hdr)),
+        ("the recipe's lookup takes an uncomputed node", "the recipe's node lookup refuses an uncomputed node",
+         (mutate_in_func(backend, RECIPE_LOOKUP, RECIPE_COMPUTED, "return node;"), class_hdr)),
+        ("the recipe replay reads its node directly",
+         "the recipe replay takes each node through the lookup and fails on none",
+         (mutate_in_func(backend, PERSISTENT_PLAN, r"ggml_tensor\s*\*\s*node\s*=\s*recipe_node\(entry\)\s*;",
+                         direct_node.format("node")), class_hdr)),
+        ("the recipe replay runs on when the lookup names no node",
+         "the recipe replay takes each node through the lookup and fails on none",
+         (mutate_in_func(backend, PERSISTENT_PLAN, recipe_take("node"),
+                         "ggml_tensor * node = recipe_node(entry);"), class_hdr)),
+        ("the recipe's CPY entries read their node directly",
+         "the recipe's CPY entries take each node through the lookup and fail on none",
+         (mutate_in_func(backend, PERSISTENT_PLAN, r"ggml_tensor\s*\*\s*cpy_node\s*=\s*recipe_node\(entry\)\s*;",
+                         direct_node.format("cpy_node")), class_hdr)),
+        ("the recipe's CPY entries skip a node the lookup refuses",
+         "the recipe's CPY entries take each node through the lookup and fail on none",
+         (mutate_in_func(backend, PERSISTENT_PLAN, recipe_take("cpy_node"),
+                         "ggml_tensor * cpy_node = recipe_node(entry);\n if (!cpy_node) { continue; }"), class_hdr)),
+    ]
 
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)

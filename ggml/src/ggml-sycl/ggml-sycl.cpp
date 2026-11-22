@@ -114251,7 +114251,8 @@ static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
 
 // A slot's graph inputs, as positions in the split (leaf i as i, src j of node n as -(n*GGML_MAX_SRC+j)-1), never as
 // tensor pointers: a key fixes the split's structure, so the same positions name the same inputs on every replay.
-// Only a computed node's sources count, as in the pre-stage; the key's signature carries each node's flags.
+// Only a computed node's sources count, as in the pre-stage. The slot key is built on the graph signature, which mixes
+// each node's flags, so a slot's input list is never replayed for a graph that computes other nodes.
 static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vector<int32_t> & refs) {
     refs.clear();
     std::vector<const ggml_tensor *> seen;  // this call only
@@ -119234,6 +119235,16 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         }
         return false;
     };
+    // An update recipe names graph nodes by their index in the graph its plan was built from. The caller drops the plan
+    // when the graph signature, which carries every node's flags, changes, so each index names a computed node of this
+    // graph. One that does not fails the replay into a full rebuild instead of running a node the graph does not compute.
+    auto recipe_node = [cgraph](const auto & entry) -> ggml_tensor * {
+        if (entry.graph_node_idx < 0 || entry.graph_node_idx >= cgraph->n_nodes) {
+            return nullptr;
+        }
+        ggml_tensor * node = cgraph->nodes[entry.graph_node_idx];
+        return node && ggml_sycl_graph_node_is_computed(node) ? node : nullptr;
+    };
 
     // Fast path: reuse cached plan and refresh mutable pointers only.
     if (kernel.has_cached_plan()) {
@@ -119265,7 +119276,11 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                     continue;
                 }
                 const int     oi   = entry.plan_op_idx;
-                ggml_tensor * node = cgraph->nodes[entry.graph_node_idx];
+                ggml_tensor * node = recipe_node(entry);
+                if (!node) {
+                    recipe_ok = false;
+                    break;
+                }
 
                 // GET_ROWS has no plan op (plan_op_idx == -1); others use direct mutable access
                 OperationDescriptor * op = (oi >= 0) ? kernel.get_op_descriptor_mut(oi) : nullptr;
@@ -119598,8 +119613,12 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                 for (const auto & entry : recipe) {
                     if (entry.op_type == OperationType::GET_ROWS && entry.get_rows_idx == -2) {
                         // Sentinel: this is a CPY entry stored in the recipe
-                        ggml_tensor * cpy_node = cgraph->nodes[entry.graph_node_idx];
-                        if (cpy_node && cpy_node->src[0] && cpy_node->src[1]) {
+                        ggml_tensor * cpy_node = recipe_node(entry);
+                        if (!cpy_node) {
+                            recipe_ok = false;
+                            break;
+                        }
+                        if (cpy_node->src[0] && cpy_node->src[1]) {
                             int                              source_op_idx = entry.plan_op_idx;
                             ggml_sycl_deferred_copy_endpoint src_endpoint{};
                             ggml_sycl_deferred_copy_endpoint dst_endpoint{};
@@ -123823,6 +123842,23 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
     return true;
 }
 
+// Drop the decode plans the persistent TG path cached for one graph: the primary kernel's plan and its update
+// recipe, the split secondary kernel's plan, and the secondary ops the split plan reuses. Both the graphs that leave the
+// persistent path and a graph that changes its eligibility key call it, so no plan outlives the graph it was built
+// from. No plan update is in progress at either call, so dropping the cache is all it takes.
+static void persistent_tg_drop_cached_plans(ggml_backend_sycl_context & ctx) {
+    if (ctx.unified_kernel && ctx.unified_kernel->has_cached_plan()) {
+        ctx.unified_kernel->invalidate_plan_cache();
+    }
+    if (g_split_secondary_kernel && g_split_secondary_kernel->has_cached_plan()) {
+        g_split_secondary_kernel->invalidate_plan_cache();
+    }
+    if (g_split_plan_cached) {
+        g_split_plan_cached = false;
+        g_cached_secondary_ops.clear();
+    }
+}
+
 /**
  * Check if persistent TG kernel should be used for this graph.
  *
@@ -124395,14 +124431,23 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // re-scanning the graph on every call.
     // Cache key includes both n_nodes AND phase (decode vs PP) because PP and TG
     // can have the same n_nodes when GPU prefix mode truncates the graph.
-    bool       persistent_eligible;
-    const int  persistent_cache_key = cgraph->n_nodes + (cached_is_decode ? 1000000 : 0);
-    const bool persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key;
+    // The answer, the plan built from it and the plan's update recipe hold for one graph, and n_nodes does not name
+    // one: the same nodes with a different input branch selected differ only in their COMPUTE flags. The key carries
+    // the graph signature too, which mixes each node's op, shape and flags, and a new key drops the cached plans before
+    // the graph is judged. The signature costs a walk of the graph, so only a process with persistent TG on pays it.
+    bool           persistent_eligible;
+    const int      persistent_cache_key = cgraph->n_nodes + (cached_is_decode ? 1000000 : 0);
+    const uint64_t persistent_cache_sig =
+        ggml_sycl::env_persistent_tg_enabled() ? ggml_sycl_graph_signature(cgraph) : 0;
+    const bool persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key &&
+                                      sycl_ctx->cached_persistent_sig == persistent_cache_sig;
     if (persistent_cache_hit) {
         persistent_eligible = sycl_ctx->cached_persistent_result;
     } else {
+        persistent_tg_drop_cached_plans(*sycl_ctx);
         persistent_eligible                 = should_use_persistent_tg(*sycl_ctx, cgraph);
         sycl_ctx->cached_persistent_n_nodes = persistent_cache_key;
+        sycl_ctx->cached_persistent_sig     = persistent_cache_sig;
         sycl_ctx->cached_persistent_result  = persistent_eligible;
     }
     if (persistent_tg_log_policy_enabled()) {
@@ -124817,16 +124862,7 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     }
 normal_dispatch:
     // Leaving persistent TG path (e.g. PP phase): drop cached decode plans.
-    if (sycl_ctx->unified_kernel && sycl_ctx->unified_kernel->has_cached_plan()) {
-        sycl_ctx->unified_kernel->invalidate_plan_cache();
-    }
-    if (g_split_secondary_kernel && g_split_secondary_kernel->has_cached_plan()) {
-        g_split_secondary_kernel->invalidate_plan_cache();
-    }
-    if (g_split_plan_cached) {
-        g_split_plan_cached = false;
-        g_cached_secondary_ops.clear();
-    }
+    persistent_tg_drop_cached_plans(*sycl_ctx);
 
 #ifdef GGML_SYCL_GRAPH
     // Optional layout copies were retired since this context last looked: drop

@@ -7170,9 +7170,10 @@ struct ggml_backend_sycl_context {
     }
 
     // === Cached per-graph computations (reset when n_nodes changes) ===
-    int  cached_persistent_n_nodes = -1;     // n_nodes when persistent check was cached
-    bool cached_persistent_result  = false;  // cached should_use_persistent_tg result
-    bool cached_is_decode_phase    = false;  // cached phase detection result
+    int      cached_persistent_n_nodes = -1;     // n_nodes when persistent check was cached
+    uint64_t cached_persistent_sig     = 0;      // graph signature when persistent check was cached
+    bool     cached_persistent_result  = false;  // cached should_use_persistent_tg result
+    bool     cached_is_decode_phase    = false;  // cached phase detection result
 
     // MoE phase layouts are persistent unified-cache allocations. Once a graph
     // phase has verified/materialized the planner-selected expert layouts,
