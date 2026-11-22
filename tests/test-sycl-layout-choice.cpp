@@ -2591,6 +2591,113 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         ok = arm_ok && ok;
     }
 
+    // The pool's host bytes are sized into the WEIGHT host zone, which no graph boundary checks: its registry context
+    // holds it for the model's plan, past every graph. In STAGING every graph boundary found it live and refused. The
+    // same NVFP4 layer is planned with the route open (a pool) and closed (none): the open plan's WEIGHT host zone is
+    // larger by exactly the pool, and its STAGING and SCRATCH host zones are the closed plan's.
+    const auto host_zones = [](const ggml_sycl::placement_plan & p) {
+        char text[160];
+        snprintf(text, sizeof(text), "weight=%zu staging=%zu scratch=%zu", p.host_zone_weight_bytes,
+                 p.host_zone_staging_bytes, p.host_zone_scratch_bytes);
+        return std::string(text);
+    };
+    ggml_sycl::placement_plan closed_nvfp4;
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+        closed_nvfp4 = plan_on(1024u * mib);
+    }
+    {
+        ggml_sycl::placement_plan open_nvfp4;
+        {
+            ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+            open_nvfp4 = plan_on(1024u * mib);
+        }
+        const size_t pool   = open_nvfp4.moe_mmid_host_pool_bytes;
+        bool         arm_ok = true;
+        if (pool == 0 || closed_nvfp4.moe_mmid_host_pool_bytes != 0 ||
+            open_nvfp4.weight_host_bytes != closed_nvfp4.weight_host_bytes) {
+            printf(
+                "FAIL: MMID host pool zone: precondition, want a host pool only with the route open and the same host "
+                "weights, got pool open=%zu closed=%zu weight_host open=%zu closed=%zu\n",
+                pool, closed_nvfp4.moe_mmid_host_pool_bytes, open_nvfp4.weight_host_bytes,
+                closed_nvfp4.weight_host_bytes);
+            arm_ok = false;
+        } else if (open_nvfp4.host_zone_weight_bytes != closed_nvfp4.host_zone_weight_bytes + pool ||
+                   open_nvfp4.host_zone_staging_bytes != closed_nvfp4.host_zone_staging_bytes ||
+                   open_nvfp4.host_zone_scratch_bytes != closed_nvfp4.host_zone_scratch_bytes) {
+            printf(
+                "FAIL: MMID host pool zone: the %zu-byte host pool must be in the WEIGHT host zone and in neither "
+                "STAGING nor SCRATCH, got open %s, closed %s\n",
+                pool, host_zones(open_nvfp4).c_str(), host_zones(closed_nvfp4).c_str());
+            arm_ok = false;
+        }
+        if (arm_ok) {
+            printf(
+                "PASS: MMID host pool zone: the %zu-byte host pool is in the WEIGHT host zone only (open %s, "
+                "closed %s)\n",
+                pool, host_zones(open_nvfp4).c_str(), host_zones(closed_nvfp4).c_str());
+        }
+        ok = arm_ok && ok;
+    }
+    // The runtime re-plan's growth goes to the same zone: the closed plan re-planned with the route open grows by the
+    // pool in WEIGHT, and STAGING and SCRATCH stay as they were.
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+        ggml_sycl::placement_plan                               grown  = closed_nvfp4;
+        ggml_sycl::moe_mmid_runtime_reason                      reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+        const bool                                              replanned =
+            ggml_sycl::replan_moe_mmid_workspaces_for_runtime(grown, inventory, n_expert_used, &reason);
+        const size_t pool   = grown.moe_mmid_host_pool_bytes;
+        bool         arm_ok = true;
+        if (!replanned || reason != ggml_sycl::moe_mmid_runtime_reason::OK || pool == 0) {
+            printf(
+                "FAIL: MMID host pool zone, runtime growth: precondition, want an accepted re-plan that grows a host "
+                "pool, got ok=%d reason=%s pool=%zu\n",
+                replanned ? 1 : 0, ggml_sycl::moe_mmid_runtime_reason_name(reason), pool);
+            arm_ok = false;
+        } else if (grown.host_zone_weight_bytes != closed_nvfp4.host_zone_weight_bytes + pool ||
+                   grown.host_zone_staging_bytes != closed_nvfp4.host_zone_staging_bytes ||
+                   grown.host_zone_scratch_bytes != closed_nvfp4.host_zone_scratch_bytes) {
+            printf(
+                "FAIL: MMID host pool zone, runtime growth: the %zu-byte growth must go to the WEIGHT host zone only, "
+                "got %s from %s\n",
+                pool, host_zones(grown).c_str(), host_zones(closed_nvfp4).c_str());
+            arm_ok = false;
+        }
+        if (arm_ok) {
+            printf(
+                "PASS: MMID host pool zone, runtime growth: the %zu-byte host pool grows the WEIGHT host zone only "
+                "(%s from %s)\n",
+                pool, host_zones(grown).c_str(), host_zones(closed_nvfp4).c_str());
+        }
+        ok = arm_ok && ok;
+    }
+    // A model without a Q1_0/NVFP4 expert plans no pool, so its host zones are the same with the route open or closed.
+    {
+        ggml_sycl::placement_plan open_mxfp4, closed_mxfp4;
+        {
+            ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+            open_mxfp4 = plan_inventory_on(mxfp4_inventory, 1024u * mib);
+        }
+        {
+            ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+            closed_mxfp4 = plan_inventory_on(mxfp4_inventory, 1024u * mib);
+        }
+        if (open_mxfp4.moe_mmid_host_pool_bytes != 0 ||
+            open_mxfp4.host_zone_weight_bytes != closed_mxfp4.host_zone_weight_bytes ||
+            open_mxfp4.host_zone_staging_bytes != closed_mxfp4.host_zone_staging_bytes ||
+            open_mxfp4.host_zone_scratch_bytes != closed_mxfp4.host_zone_scratch_bytes) {
+            printf(
+                "FAIL: MMID host pool zone, MXFP4 experts: want no pool and the same host zones, got pool=%zu open "
+                "%s closed %s\n",
+                open_mxfp4.moe_mmid_host_pool_bytes, host_zones(open_mxfp4).c_str(), host_zones(closed_mxfp4).c_str());
+            ok = false;
+        } else {
+            printf("PASS: MMID host pool zone, MXFP4 experts: no pool, host zones unchanged (%s)\n",
+                   host_zones(open_mxfp4).c_str());
+        }
+    }
+
     if (ok) {
         printf(
             "PASS: MoE MMID workspace pool is charged only for a reachable route and an expert type it admits, and a "

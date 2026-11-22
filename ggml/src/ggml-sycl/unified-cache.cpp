@@ -20541,13 +20541,18 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         request.size                 = bytes;
         request.alignment            = alignment;
         request.suppress_failure_log = true;
-        request.intent.role          = host_pinned ? alloc_role::STAGING : alloc_role::COMPUTE;
-        request.intent.category      = host_pinned ? runtime_category::STAGING : runtime_category::COMPUTE;
+        // The host pool holds the route's CPU-written, GPU-read slot descriptors (and a secondary owner's bounce
+        // slices): control data. Its owner is the registry context, which holds it for the model's plan, past every
+        // graph, so it is a persistent owner and lands in the WEIGHT host zone, where the planner sized it. In the
+        // STAGING zone every graph boundary found it live and refused. It never grows the zone.
+        request.intent.role          = host_pinned ? alloc_role::CONTROL : alloc_role::COMPUTE;
+        request.intent.category      = host_pinned ? runtime_category::CONTROL : runtime_category::COMPUTE;
         request.intent.cohort_id     = "moe_mmid_workspace";
         request.intent.constraints.must_device             = !host_pinned;
         request.intent.constraints.must_host_pinned        = host_pinned;
         request.intent.constraints.use_pinned_pool         = host_pinned;
         request.intent.constraints.forbid_host_zone_growth = host_pinned;
+        request.intent.constraints.persistent_owner        = host_pinned;
         request.intent.constraints.prefer_vram_zone        = host_pinned ? vram_zone_id::COUNT : vram_zone_id::RUNTIME;
         auto handle = std::make_shared<mem_handle>(unified_allocate(request));
         const resolved_ptr resolved = handle->resolve();
@@ -32270,9 +32275,11 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         }
         if (demand.moe_mmid_host_pool_bytes > plan.moe_mmid_host_pool_bytes) {
             const size_t growth = demand.moe_mmid_host_pool_bytes - plan.moe_mmid_host_pool_bytes;
-            if (plan.host_zone_scratch_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth)
+            // The zone the load planner sizes the pool into (the WEIGHT host zone, see the host zone sizing).
+            if (plan.host_zone_weight_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth) {
                 return refuse(moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW);
-            plan.host_zone_scratch_bytes += growth;
+            }
+            plan.host_zone_weight_bytes += growth;
             plan.host_bytes += growth;
         }
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
@@ -33003,7 +33010,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     if (host_sizing_valid) {
         host_staging_total = s1_preload_staging_bytes;
         for (size_t bytes : { k_tp_staging_headroom, plan.expert_bias_bytes, plan.moe_routing_ids_bytes,
-                              plan.tp_staging_buffer_bytes, plan.moe_mmid_host_pool_bytes }) {
+                              plan.tp_staging_buffer_bytes }) {
             size_t next = 0;
             if (!moe_mmid_checked_zone_total(host_staging_total, bytes, &next)) {
                 host_sizing_valid = false;
@@ -33011,6 +33018,16 @@ static void populate_host_zone_sizing(placement_plan &                          
             }
             host_staging_total = next;
         }
+    }
+    // The MMID workspace host pool is held by its registry context for the model's plan, past every graph, so it is
+    // allocated from the WEIGHT host zone, which no graph boundary checks, and sized into that zone here. In STAGING
+    // every graph boundary found it live and refused.
+    size_t host_weight_total = 0;
+    if (host_sizing_valid &&
+        moe_mmid_checked_zone_total(plan.host_zone_weight_bytes, plan.moe_mmid_host_pool_bytes, &host_weight_total)) {
+        plan.host_zone_weight_bytes = host_weight_total;
+    } else {
+        host_sizing_valid = false;
     }
     if (!host_sizing_valid) {
         plan.moe_mmid_workspace_valid = false;
