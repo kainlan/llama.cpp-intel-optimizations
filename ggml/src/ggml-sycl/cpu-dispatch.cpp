@@ -4550,7 +4550,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
                     reinterpret_cast<const float *>(static_cast<const char *>(src1_data) + i12 * nb12 + i13 * nb13);
                 float * dst_batch = reinterpret_cast<float *>(static_cast<char *>(dst_data) + i12 * nb2 + i13 * nb3);
 
-                if (use_vec_dot && from_float_fn) {
+                if (use_vec_dot) {
                     // Quantized dot product path: quantize activations, then vec_dot
                     // per output element.  No weight dequantization needed.
                     // Cache only for single-batch (ne12*ne13==1): multi-batch
