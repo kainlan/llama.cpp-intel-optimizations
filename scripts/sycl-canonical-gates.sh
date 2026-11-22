@@ -385,10 +385,11 @@ run_gptoss() {
     local out="$GATES_OUT_DIR/gptoss.out" err="$GATES_OUT_DIR/gptoss.err"
     sample_mem "gptoss pre"
     local rc=0
-    # NO -cnv (post-b10630 form verified in CLAUDE.md); -c 4096 is pinned
-    # (llama.cpp-uize -- the model's n_ctx_train default does not fit the B50).
+    # No -cnv (invalid on llama-cli). No -c: the unified cache places the KV,
+    # and a context is never shrunk to make a model fit. No -ngl: the unified
+    # cache places every weight, so a layer count would be a second source.
     timeout 900 "$BIN_DIR/llama-cli" \
-        -m "$GPTOSS_MODEL" -ngl 99 -c 4096 -st --simple-io --no-display-prompt \
+        -m "$GPTOSS_MODEL" -st --simple-io --no-display-prompt \
         --chat-template-kwargs '{"reasoning_effort":"medium"}' \
         --reasoning-format none --reasoning-budget 0 \
         -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
