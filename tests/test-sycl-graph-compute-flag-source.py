@@ -15,9 +15,11 @@ that runs it reads indices nobody wrote and writes through them.
 Checks:
   * one rule: ggml_sycl_graph_node_is_computed (prestage-class.hpp) tests the flag, and ggml-sycl.cpp tests it
     nowhere else;
-  * ggml_sycl_is_noop is true for a node the graph does not compute. The executors pinned here ask it: the node
-    loop of graph_compute_impl, the segment dispatch (moe_graph_dispatch_direct_node), the MoE block graphs, the
-    layer-block dispatch, and the Q8_1 src1 planner that sizes what those dispatches draw;
+  * ggml_sycl_is_noop is true for a node the graph does not compute. The executors pinned here ask it, each guard
+    counted, so dropping one of a function's guards fails: the node loop of graph_compute_impl and its first-CPU-node
+    scan, the segment dispatch (moe_graph_dispatch_direct_node), the segment recorder's direct and recorded loops,
+    the segment replay's direct loop, the segment boundary flush, the MoE block graphs (both of the recorder's loops),
+    the layer-block dispatch, and the Q8_1 src1 and F16 dequant planners that size what those dispatches draw;
   * the walkers that choose, stage or plan what runs leave an uncomputed node before they read it: every node loop
     of the MoE topology scan (g_moe_gate_up_pairs) and of the MoE dispatch list (whose dispatch_indices the segment
     recorder, the block graphs, the graphlets and the decode analysis take); the layer-block pre-block copy, the
@@ -166,26 +168,42 @@ WALKERS = {
     "the segment slot's input list": r"static void moe_segment_slot_collect_inputs\([^)]*\)\s*\{",
 }
 
-# name -> (signature, the guard that asks ggml_sycl_is_noop, the same guard without it for the self-test)
+SKIP_NOOP = r"if\s*\(\s*ggml_sycl_is_noop\(node\)\s*\)\s*\{\s*continue;\s*\}"
+RUN_UNLESS_NOOP = r"if\s*\(\s*node\s*&&\s*!ggml_sycl_is_noop\(node\)\s*\)"
+LEAVE_NOOP = r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\)"
+LEAVE_NOOP_OR = r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\|\|"
+MUL_MAT_UNLESS_NOOP = r"node->op\s*!=\s*GGML_OP_MUL_MAT\s*\|\|\s*ggml_sycl_is_noop\(node\)"
+RECORD_SEGMENTS = r"static bool moe_graph_record_segments\([^)]*\)\s*\{"
+
+# name -> (signature, the guard that asks ggml_sycl_is_noop, the same guard without it for the self-test, the least
+# number of such guards in the function: one per node loop that runs or plans a node)
 EXECUTORS = {
     "the node loop of graph_compute_impl":
-        (r"static void ggml_backend_sycl_graph_compute_impl\([^)]*\)\s*\{",
-         r"if\s*\(\s*ggml_sycl_is_noop\(node\)\s*\)\s*\{\s*continue;\s*\}", ""),
+        (r"static void ggml_backend_sycl_graph_compute_impl\([^)]*\)\s*\{", SKIP_NOOP, "", 1),
     "the segment dispatch":
-        (r"static bool moe_graph_dispatch_direct_node\([^)]*\)\s*\{",
-         r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\|\|", "if (!node ||"),
+        (r"static bool moe_graph_dispatch_direct_node\([^)]*\)\s*\{", LEAVE_NOOP_OR, "if (!node ||", 1),
     "the MoE block-graph replay":
-        (r"static void moe_graph_replay_block_graphs\([^)]*\)\s*\{",
-         r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\|\|", "if (!node ||"),
+        (r"static void moe_graph_replay_block_graphs\([^)]*\)\s*\{", LEAVE_NOOP_OR, "if (!node ||", 1),
     "the MoE block-graph record":
-        (r"static bool moe_graph_record_block_graphs\([^)]*\)\s*\{",
-         r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\|\|", "if (!node ||"),
+        (r"static bool moe_graph_record_block_graphs\([^)]*\)\s*\{", LEAVE_NOOP_OR, "if (!node ||", 2),
     "the layer-block dispatch":
-        (r"static bool ggml_sycl_block_exec_dispatch_node_on_device\([^)]*\)\s*\{",
-         r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\)", "if (!node)"),
+        (r"static bool ggml_sycl_block_exec_dispatch_node_on_device\([^)]*\)\s*\{", LEAVE_NOOP, "if (!node)", 1),
     "the Q8_1 src1 planner":
-        (r"static bool ggml_sycl_mmq_src1_ensure_for_graph\([^)]*\)\s*\{",
-         r"node->op\s*!=\s*GGML_OP_MUL_MAT\s*\|\|\s*ggml_sycl_is_noop\(node\)", "node->op != GGML_OP_MUL_MAT"),
+        (r"static bool ggml_sycl_mmq_src1_ensure_for_graph\([^)]*\)\s*\{", MUL_MAT_UNLESS_NOOP,
+         "node->op != GGML_OP_MUL_MAT", 1),
+    "the F16 dequant planner":
+        (r"static bool ggml_sycl_dequant_f16_ensure_for_graph\([^)]*\)\s*\{", MUL_MAT_UNLESS_NOOP,
+         "node->op != GGML_OP_MUL_MAT", 1),
+    "the segment recorder's direct segments":
+        (RECORD_SEGMENTS, RUN_UNLESS_NOOP, "if (node)", 1),
+    "the segment recorder's recorded segments":
+        (RECORD_SEGMENTS, LEAVE_NOOP, "if (!node)", 1),
+    "the segment replay's direct segments":
+        (r"static void moe_graph_replay_segments\([^)]*\)\s*\{", RUN_UNLESS_NOOP, "if (node)", 1),
+    "the segment boundary flush":
+        (r"static void moe_graph_segment_boundary_flush\([^)]*\)\s*\{", LEAVE_NOOP, "if (!node)", 1),
+    "the first-CPU-node scan of graph_compute":
+        (r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{", SKIP_NOOP, "", 1),
 }
 
 ZERO_TO_N_NODES = r"for\s*\(\s*int\s+(\w+)\s*=\s*0\s*;\s*\1\s*<\s*cgraph->n_nodes\s*;[^)]*\)\s*\{"
@@ -323,9 +341,9 @@ def evaluate(backend, class_hdr):
         re.search(r"\|\|\s*!ggml_sycl_graph_node_is_computed\(node\)", ret) is not None or \
         re.search(r"return\s*!ggml_sycl_graph_node_is_computed\(node\)\s*\|\|", ret) is not None
 
-    for name, (sig, pattern, _) in EXECUTORS.items():
+    for name, (sig, pattern, _, least) in EXECUTORS.items():
         body = function_body(backend, sig)
-        results[f"{name} asks ggml_sycl_is_noop"] = body is not None and re.search(pattern, body) is not None
+        results[f"{name} asks ggml_sycl_is_noop"] = body is not None and len(re.findall(pattern, body)) >= least
 
     for name, sig in WALKERS.items():
         body = function_body(backend, sig)
@@ -394,17 +412,6 @@ if args.self_test:
             return src
         return src[:pm.start()] + repl + src[pm.end():]
 
-    def mutate_all_in_func(src, sig_regex, pattern, repl):
-        """Replace every match of `pattern` inside the body of the first function matching `sig_regex`."""
-        m = re.search(sig_regex, src)
-        start = src.find("{", m.end() - 1) if m else -1
-        body = balanced(src, start) if start >= 0 else None
-        if body is None or not re.search(pattern, body):
-            print(f"FAIL: self-test anchor missing: {sig_regex!r} .. {pattern!r}")
-            failed.append("self-test anchor " + pattern)
-            return src
-        return src[:start] + re.sub(pattern, repl, body) + src[start + len(body):]
-
     noop_sig = r"static inline bool ggml_sycl_is_noop\(const ggml_tensor \* node\)\s*\{"
     helper_sig = r"static inline bool ggml_sycl_graph_node_is_computed\(const ggml_tensor \* node\)\s*\{"
     mutants = [
@@ -421,9 +428,23 @@ if args.self_test:
          (mutate_in_func(backend, noop_sig, r"\s*\|\|\s*!ggml_sycl_graph_node_is_computed\(node\)\s*;",
                          ";\n    (void) ggml_sycl_graph_node_is_computed(node);"), class_hdr)),
     ]
-    for name, (sig, pattern, without) in EXECUTORS.items():
-        mutants.append((f"{name} forgets ggml_sycl_is_noop", f"{name} asks ggml_sycl_is_noop",
-                        (mutate_all_in_func(backend, sig, pattern, without), class_hdr)))
+    def mutate_nth_in_func(src, sig_regex, pattern, repl, k):
+        """Replace the k-th match of `pattern` inside the body of the first function matching `sig_regex`."""
+        m = re.search(sig_regex, src)
+        start = src.find("{", m.end() - 1) if m else -1
+        body = balanced(src, start) if start >= 0 else None
+        hits = list(re.finditer(pattern, body)) if body is not None else []
+        if k >= len(hits):
+            print(f"FAIL: self-test anchor missing: {sig_regex!r} .. {pattern!r} #{k + 1}")
+            failed.append(f"self-test anchor {pattern} #{k + 1}")
+            return src
+        a, b = start + hits[k].start(), start + hits[k].end()
+        return src[:a] + repl + src[b:]
+
+    for name, (sig, pattern, without, least) in EXECUTORS.items():
+        for k in range(least):
+            mutants.append((f"{name} forgets ggml_sycl_is_noop (guard {k + 1})", f"{name} asks ggml_sycl_is_noop",
+                            (mutate_nth_in_func(backend, sig, pattern, without, k), class_hdr)))
     for name, sig in WALKERS.items():
         mutants.append((f"{name} reads an uncomputed node's sources", f"{name} reads only a computed node's sources",
                         (mutate_in_func(backend, sig, SKIP_UNCOMPUTED.pattern, ""), class_hdr)))
