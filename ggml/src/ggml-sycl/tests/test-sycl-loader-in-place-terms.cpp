@@ -490,12 +490,32 @@ void check_admitted_plan_grows_nothing_unplanned() {
     constexpr size_t kReserve = 64 * kMiB;  // the WEIGHT zone's host_compute_reserve, its only other term here
 
     // The B70 Qwen load: the plan admits only what its 37 chunks need.
-    const placement_plan qwen = make_loader_plan(qwen_b70_buffers(), kPoolChunk, kQwenWeight - kQwenLoader);
+    placement_plan qwen = make_loader_plan(qwen_b70_buffers(), kPoolChunk, kQwenWeight - kQwenLoader);
     check_admitted_plan(qwen, kPoolChunk);
+    // With the other terms its [HOST-LEDGER] line logged, the plan that charged raw bytes reproduces the logged commit
+    // total (zones=79456897344 on its [HOST-PLAN] lazy line), and the footprint's total is what the lazy-table decision
+    // then weighs against the logged budget, less the logged reserve.
+    qwen.host_zone_kv_bytes      = 67108864;
+    qwen.host_zone_staging_bytes = 1370882048;
+    qwen.host_zone_scratch_bytes = 1180844032;
+    qwen.onednn_scratchpad_bytes = 1048576000;
+    placement_plan raw           = qwen;
+    raw.loader_tensor_bytes.clear();
+    const host_zone_commit_terms was   = ggml_sycl::placement_plan_host_zone_commit_terms(raw, 0, kPoolChunk);
     const host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(qwen, 0, kPoolChunk);
+    CHECK(was.weight == kQwenWeight && was.total() == 79456897344);
+    constexpr long long kQwenBudget  = 85755396096;  // host_budget
+    constexpr long long kQwenReserve = 2147483648;   // the room rule's reserve
+    constexpr long long kQwenFloor   = 2149580800;   // the lazy table's floor and ring
     std::printf(
-        "Qwen B70 WEIGHT zone: %zu bytes (%.1f MB) for the loader's 37 buffers; raw bytes charged %zu (%.1f MB)\n",
-        terms.weight, terms.weight / double(kMiB), kQwenWeight, kQwenWeight / double(kMiB));
+        "Qwen B70 WEIGHT zone: %zu bytes (%.1f MB) for the loader's 37 buffers, loader_zone=%zu loader_grown=%zu; "
+        "raw bytes charged %zu (%.1f MB)\n",
+        terms.weight, terms.weight / double(kMiB), terms.loader_zone, terms.loader_grown, kQwenWeight,
+        kQwenWeight / double(kMiB));
+    std::printf(
+        "Qwen B70 commit total: %zu bytes (raw %zu); lazy fit room %lld bytes (raw %lld) for a %lld-byte floor\n",
+        terms.total(), was.total(), kQwenBudget - (long long) terms.total() - kQwenReserve,
+        kQwenBudget - (long long) was.total() - kQwenReserve, kQwenFloor);
     for (const std::vector<size_t> & order : orders_of(moe_tensors())) {
         check_admitted_plan(make_loader_plan(order, kPoolChunk, kReserve), kPoolChunk);
         check_admitted_plan(make_loader_plan(order, 0, kReserve), 1024 * kMiB);

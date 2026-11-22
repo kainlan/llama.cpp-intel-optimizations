@@ -36344,9 +36344,9 @@ static void record_host_ledger_plan(placement_plan &          plan,
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
         "[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu "
-        "scratch=%zu runtime=%zu rounding=%zu\n",
+        "scratch=%zu runtime=%zu loader_zone=%zu loader_grown=%zu rounding=%zu\n",
         plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-        t.rounding);
+        t.loader_zone, t.loader_grown, t.rounding);
     if (plan.host_planned_bytes > plan.host_budget) {
         // The headroom refusal names itself here as on every refused charge (design 5efe §4.5), from the sample this
         // plan's budget came from: the planner input, which a dry run fills from its own sample and never stores.
@@ -36355,10 +36355,10 @@ static void record_host_ledger_plan(placement_plan &          plan,
                                          kv_info.host_mem_total, kv_info.host_headroom);
         GGML_LOG_WARN(
             "[HOST-LEDGER] device=%d would refuse: host-budget-exceeded host_budget=%zu "
-            "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu rounding=%zu (the "
-            "plan is kept: the ledger is WARN-only)%s\n",
+            "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu loader_zone=%zu "
+            "loader_grown=%zu rounding=%zu (the plan is kept: the ledger is WARN-only)%s\n",
             plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-            t.rounding, reason.c_str());
+            t.loader_zone, t.loader_grown, t.rounding, reason.c_str());
     }
 }
 
@@ -36398,6 +36398,7 @@ static void placement_plan_copy_host_backing_fact(placement_plan &          plan
     plan.loader_holds_weights          = loader.holds_weights;
     plan.loader_device                 = loader.device;
     plan.loader_serves_host_experts    = loader.serves_host_experts;
+    plan.loader_buffer_cap             = info.load_loader_buffer_cap;
 }
 
 // A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
@@ -37229,6 +37230,24 @@ static void populate_host_zone_sizing(placement_plan &                          
     }
     plan.host_zone_weight_bytes = weight_terms.total();
     plan.host_zone_loader_bytes = weight_terms.loader_residency;
+    // The loader's tensors with the term, for the commit terms' replay of its buffers in the pool: the tensors the plan
+    // places, the ones the term counts, each at the loader's alignment as ggml-alloc pads it, in the inventory's order.
+    // That is the order the loader creates them in for the late plan's inventory. The early plan's is weights_map's, by
+    // layer and then name, so its replay can take a little more or less of the last chunk, and its lazy-table decision
+    // can refuse the load on that figure; the late plan configures the zones.
+    plan.loader_tensor_bytes.clear();
+    if (plan.host_zone_loader_bytes > 0) {
+        std::unordered_set<std::string> placed;
+        for (const placement_entry & entry : plan.entries) {
+            placed.insert(entry.name);
+        }
+        for (const auto & item : tensor_inventory) {
+            if (placed.count(item.name) > 0) {
+                plan.loader_tensor_bytes.push_back((item.size + TENSOR_ALIGNMENT - 1) / TENSOR_ALIGNMENT *
+                                                   TENSOR_ALIGNMENT);
+            }
+        }
+    }
 
     const char * loader_role = "the loader binds no SYCL_Host buffer for weights";
     if (plan.loader_holds_weights && plan.loader_device < 0) {

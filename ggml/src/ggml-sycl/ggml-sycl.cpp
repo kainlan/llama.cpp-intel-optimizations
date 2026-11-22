@@ -4637,8 +4637,10 @@ static void ggml_sycl_configure_host_zones_for_plan(
         if (plan.loader_device >= 0) {
             GGML_LOG_WARN(
                 "[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer is in device "
-                "%d's pool, which commits its %zu B; this card's zones leave it out\n",
-                device, plan.loader_device, plan.host_zone_loader_bytes);
+                "%d's pool, which commits its %zu B of tensors as loader_zone=%zu loader_grown=%zu; this card's zones "
+                "leave it out\n",
+                device, plan.loader_device, plan.host_zone_loader_bytes, plan.host_zone_terms.loader_zone,
+                plan.host_zone_terms.loader_grown);
         } else {
             GGML_LOG_WARN(
                 "[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer is split across "
@@ -15859,6 +15861,9 @@ static bool ggml_sycl_inventory_malformed(const ggml_sycl_tensor_inventory * inv
            (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr);
 }
 
+// The SYCL_Host buffer type's chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB), defined with that buffer type.
+static size_t ggml_backend_sycl_host_buffer_type_chunk_cap();
+
 // The planner's KV and cost inputs from an inventory, written over `kv`, which keeps every field the inventory does not
 // carry (n_seq_max is a runtime-context input). The stage fills g_placement_kv_info; the plan dry run fills a copy.
 static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     kv,
@@ -15925,6 +15930,9 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     // buffer's chunks come from that device's cache. With one device visible to the scheduler (one GPU selected, or
     // several collapsed to device 0) that is device 0 for every layer; with more, the buffer is split across them.
     kv.load_loader_device       = ggml_backend_sycl_get_device_count() == 1 ? 0 : -1;
+    // The largest buffer that buffer type lets ggml-alloc request, before a zone bounds it: the plan splits the
+    // loader's tensors into buffers with it, as ggml-alloc does, to charge them as the pinned pool will hold them.
+    kv.load_loader_buffer_cap   = ggml_backend_sycl_host_buffer_type_chunk_cap();
     kv.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
     // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
     // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
@@ -17902,10 +17910,14 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                              
     line("WEIGHT", "tlsf_bound", out.weight_tlsf_bound);
     line("WEIGHT", "swap_headroom", weight.swap_headroom);
     line("ZONE", "weight", out.zone_weight);
+    // The loader's buffers as the pool holds them: the WEIGHT zone bytes they take, and the chunks the pool grows for
+    // a buffer larger than a chunk. Printed and not exported, as above.
+    line("ZONE", "loader_zone", terms.loader_zone);
     line("ZONE", "kv", out.zone_kv);
     line("ZONE", "staging", out.zone_staging);
     line("ZONE", "scratch", out.zone_scratch);
     line("COMMIT", "runtime", out.runtime);
+    line("COMMIT", "loader_grown", terms.loader_grown);
     line("COMMIT", "rounding", out.rounding);
     line("HOST", "expected_host", out.expected_host);
     line("HOST", "host_budget", out.host_budget);
@@ -49784,8 +49796,6 @@ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_ty
 // reached through one wrapper, ggml_sycl_arena_chunk_cap, which is the only function
 // on this path that names the arena backing kind.
 
-static size_t ggml_backend_sycl_host_buffer_type_chunk_cap();
-
 enum class ggml_sycl_chunk_cap_set {
     LEDGER_CURRENT,  // the capacities the ledger holds now: the unscoped device function reads these
     COMMITTED,       // the committed planned capacities: only the freeze reads these
@@ -54991,17 +55001,14 @@ static size_t ggml_sycl_host_buft_max_size(ggml_backend_buffer_type_t buft, int 
 
     auto * cache = device >= 0 ? ggml_sycl::get_unified_cache_for_device(device) : nullptr;
     if (cache && cache->host_zones_configured()) {
-        size_t largest = cache->host_zone_largest_free_block(zone);
         // Optimistic chunk capability, not a reservation or a guarantee of
         // currently available contiguous bytes. unified_alloc may try zone
         // growth, but budget, phase, or alignment constraints can still make
         // allocation fail. This host buffer path then returns nullptr; it
-        // does not escape the pool through raw sycl::malloc_host.
-        if (largest < chunk_cap) {
-            largest =
-                std::min(chunk_cap, std::max(largest, static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE)));
-        }
-        return std::min(largest, chunk_cap);
+        // does not escape the pool through raw sycl::malloc_host. The plan
+        // replays the loader's split at the same rule
+        // (placement_loader_pool_footprint_for).
+        return ggml_sycl::host_zone_buffer_max_size(chunk_cap, cache->host_zone_largest_free_block(zone));
     }
 
     // Use host_max_alloc_size based on the minimum maxMemAllocSize across active

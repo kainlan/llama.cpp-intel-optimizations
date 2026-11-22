@@ -1239,6 +1239,55 @@ the multi-device builder):
   `[HOST-PLAN-BUG]` comparison. A host dense weight is still copied into a
   block.
 
+**The loader's buffers as the pool holds them.** ggml-alloc splits the
+loader's tensors into buffers next-fit, in the order the loader creates them,
+each at most the buffer type's maximum size (`host_zone_buffer_max_size`: the
+chunk cap `GGML_SYCL_HOST_BUFFER_CHUNK_MB`, 2 GiB by default, bounded by the
+zone's largest free block but never below one pool chunk). The pinned pool
+carves the WEIGHT zone into chunk-sized segments and serves each buffer from
+the first segment with room; a request never spans two. So a buffer larger
+than half a chunk takes a segment of its own, and the rest of that segment is
+lost to it. The Qwen3.8 B70 `-lm none` load at `-ub 2048` splits into 37
+buffers that take 37 segments, 36 whole chunks and the last buffer, where its
+raw bytes are 34.2 chunks; the plan that charged the raw bytes admitted, and
+the loader's third grow past the zone was refused (`grow_zone: budget
+exhausted`). The plan therefore charges the footprint:
+`populate_host_zone_sizing` records the loader's tensors
+(`loader_tensor_bytes`, from its inventory, in the inventory's order, each at
+the loader's alignment), and `placement_plan_host_zone_commit_terms` replays
+the split and the placement (`placement_loader_pool_footprint_for`) at the
+buffer type's maximum size and the pool's chunk. The WEIGHT zone holds the
+footprint's zone bytes (`loader_zone`) in place of `host_zone_loader_bytes`,
+and a buffer larger than a chunk, for which the pool grows a chunk of its own,
+is `loader_grown`, counted by `total()` outside the zones. What this
+guarantees: a plan within its budget configures a WEIGHT zone whose segments
+hold every loader buffer a chunk can hold, and the pool's only growth for the
+others is `loader_grown`, so once the plan admits, no pool growth for the
+loader's buffers is one the plan did not count. It refuses nothing by itself.
+The host ledger only warns until it enforces (th32 T2 phase (b)), so a plan
+over its budget is refused at plan time only where the lazy-table decision
+refuses it: the larger zone takes its tables' room. The Qwen3.8 load above has
+a lazy table, and its honest plan (commit total 83751864768 B against
+79456897344 B) leaves the table's 2149580800 B floor a fit room of
+-143952320 B at its logged budget, so it is refused as
+`lazy-table-cache-below-floor` with `fit_room=0`. A model with no lazy table
+over its budget proceeds on the would-refuse WARN and can still meet
+`grow_zone`'s refusal. Its limits:
+- The replay assumes the WEIGHT zone is empty when the loader allocates, which
+  it is (the copies S1-PRELOAD makes come after), and that the zone's largest
+  free block then is one chunk, true for a zone of at least one chunk, since
+  the WEIGHT zone is carved first.
+- The host weights copied after the loader are charged at their bytes plus the
+  TLSF grain, not at the segments they take: their fragmentation is not
+  replayed.
+- The late plan's inventory is in the loader's creation order. The early plan
+  builds its inventory in `weights_map` order (by layer, then name), so its
+  footprint can differ: on the Qwen3.8 load the same 37 buffers take 22.6 MB
+  more of the last chunk (78752837632 B against 78730221568 B). The early
+  plan's lazy-table decision can refuse the load on its own figure
+  (`ggml_sycl_stage_refuse_lazy_plan`), so near the budget the two plans can
+  decide differently; the late plan configures the zones.
+
 The gate (`ggml_sycl_loader_buffer_owner`) accepts a `SYCL_Host` buffer that is
 not a claimed tenant slot, has lifetime `MODEL`, holds the expert's bytes, and
 whose owner the ring copies from on that device. A refusal logs one
@@ -1253,9 +1302,9 @@ not size. The limits:
   are sized and pre-allocated from its snapshot of the one plan
   (`ggml_sycl_configure_host_zones_for_plan`). That step takes each card's
   share through `placement_plan_host_zone_commit_terms_on_device(plan, terms,
-  cache->device())`: every card but `loader_device` leaves
-  `host_zone_loader_bytes` out of its WEIGHT zone, and its chunk rounding
-  follows. The zone check compares the card's growth with its share of the
+  device)`, the card its caller names: every card but `loader_device` leaves
+  the loader's `loader_zone` out of its WEIGHT zone and carries no
+  `loader_grown`, and its chunk rounding follows. The zone check compares the card's growth with its share of the
   plan's record. A card that leaves the term out logs one
   `[HOST-PLAN] device=N WEIGHT zone: loader_residency=0` WARN naming the pool
   that holds the buffer.
@@ -1297,7 +1346,7 @@ CPU_OWNED }` for every entry. The planner derives it once from
 | `host_cpu_owned_bytes` | `CPU_OWNED` entries | yes (anonymous memory, P3 counts it) | nothing: not in the zone (today they inflate it) |
 | `host_mapped_bytes` | host-executed `FILE_MAPPED` entries | only when locked (§4.5) | nothing |
 | `host_mapped_source_bytes` | device-planned `FILE_MAPPED` sources | no | nothing (transient page cache during staging) |
-| `loader_residency` (a WEIGHT zone term, recorded as `host_zone_loader_bytes`) | every entry at the loader's alignment, when `loader_holds_weights` and `loader_device >= 0`, once host-wide | through the WEIGHT zone | `loader_device`'s WEIGHT zone only; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
+| `loader_residency` (a WEIGHT zone term, recorded as `host_zone_loader_bytes`) | every entry at the loader's alignment, when `loader_holds_weights` and `loader_device >= 0`, once host-wide | through the WEIGHT zone, as the pool holds the loader's buffers (`loader_zone`, and `loader_grown` outside the zones) | `loader_device`'s WEIGHT zone only; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
 
 Every accumulation site of `weight_host_bytes` in the planner
 (`uc:25928`, `:25933`, `:28136`, `:28196`, `:28230`, `:28322`, `:29554`,

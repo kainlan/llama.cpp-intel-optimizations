@@ -746,7 +746,7 @@ struct placement_kv_info {
     // the buffer is split across their pools by layer. Unstaged it is -1: no pool is known to hold it.
     int                   load_loader_device       = -1;
     // The SYCL_Host buffer type's chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB): the largest buffer it lets ggml-alloc
-    // request before the WEIGHT zone bounds it (host_weight_buffer_max_size). The plan replays the loader's split of
+    // request before the WEIGHT zone bounds it (host_zone_buffer_max_size). The plan replays the loader's split of
     // its tensors into buffers with it. Unstaged it is 0: no cap beyond the zone's.
     size_t                load_loader_buffer_cap   = 0;
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
@@ -1115,7 +1115,7 @@ struct host_zone_commit_terms {
 
     size_t zones() const { return weight + kv + staging + scratch; }
 
-    size_t total() const { return zones() + runtime + rounding; }
+    size_t total() const { return zones() + runtime + rounding + loader_grown; }
 };
 
 // Defined below the plan, with the commit terms it recomputes: the KV refresh inside placement_plan calls it.
@@ -2444,10 +2444,58 @@ struct placement_loader_pool_footprint {
 inline placement_loader_pool_footprint placement_loader_pool_footprint_for(const std::vector<size_t> & tensor_bytes,
                                                                            size_t                      max_size,
                                                                            size_t                      chunk) {
-    (void) tensor_bytes;
-    (void) max_size;
-    (void) chunk;
-    return {};
+    placement_loader_pool_footprint footprint;
+    if (chunk == 0) {
+        return footprint;
+    }
+    // The pool's TLSF grain, to which zone_alloc rounds each request, and the alignment of a chunk and its header.
+    constexpr size_t    grain = 256;
+    constexpr size_t    align = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    std::vector<size_t> filled;  // the bytes each chunk segment holds, in segment order
+    const auto          place = [&](size_t buffer) {
+        ++footprint.buffers;
+        const size_t bytes = (buffer + grain - 1) / grain * grain;
+        if (bytes > chunk) {
+            // no segment holds it: grow_zone grows one chunk sized to the request
+            footprint.grown += std::max(chunk, (bytes + align - 1) / align * align) + align;
+            return;
+        }
+        for (size_t & used : filled) {
+            if (chunk - used >= bytes) {
+                used += bytes;
+                return;
+            }
+        }
+        filled.push_back(bytes);
+    };
+    // ggml_backend_buft_alloc_buffer_n_plan: a buffer is flushed when the next tensor would take it past max_size, so a
+    // tensor larger than max_size is a buffer of its own
+    size_t buffer = 0;
+    for (const size_t bytes : tensor_bytes) {
+        if (buffer > 0 && buffer + bytes > max_size) {
+            place(buffer);
+            buffer = 0;
+        }
+        buffer += bytes;
+    }
+    if (buffer > 0) {
+        place(buffer);
+    }
+    footprint.chunks = filled.size();
+    // A zone of that size has every segment but the last whole and the last as large as it is filled, so first fit
+    // places each buffer where the replay did.
+    footprint.zone   = filled.empty() ? 0 : (filled.size() - 1) * chunk + filled.back();
+    return footprint;
+}
+
+// The largest buffer a SYCL host buffer type lets ggml-alloc request from a configured zone: its chunk cap, bounded by
+// the zone's largest free block `largest_free` but never below the pool's default chunk, since the pool grows a chunk
+// for a request no block holds. A cap of 0 is no cap. The host buffer types answer get_max_size with it
+// (ggml_sycl_host_buft_max_size), and the commit terms replay the loader's split at it with an empty WEIGHT zone's
+// largest block, one chunk.
+inline size_t host_zone_buffer_max_size(size_t chunk_cap, size_t largest_free) {
+    const size_t bound = std::max(largest_free, static_cast<size_t>(pinned_chunk_pool::CHUNK_SIZE));
+    return chunk_cap == 0 ? bound : std::min(chunk_cap, bound);
 }
 
 // Sets `terms.rounding`:the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
@@ -2489,9 +2537,22 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
     const auto sat_add = [](size_t a, size_t b) {
         return a > SIZE_MAX - b ? SIZE_MAX : a + b;
     };
+    // The loader's buffers are charged as the pool will hold them, not at their bytes. A plan within its budget then
+    // configures a WEIGHT zone whose segments hold every loader buffer a chunk can hold, and the pool's only growth for
+    // the others is loader_grown, which total() counts: once the plan admits, no pool growth for the loader's buffers
+    // is one the plan did not count. Refusing a plan over its budget is not done here: the host ledger only warns
+    // until it enforces, and the lazy-table decision refuses a plan whose zones leave its tables no room. A plan whose
+    // record carries no tensors charges the bytes.
     terms.weight      = plan.host_zone_weight_bytes;
     terms.loader_zone = plan.host_zone_loader_bytes;
-    terms.kv          = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
+    if (plan.host_zone_loader_bytes > 0 && !plan.loader_tensor_bytes.empty()) {
+        const placement_loader_pool_footprint footprint = placement_loader_pool_footprint_for(
+            plan.loader_tensor_bytes, host_zone_buffer_max_size(plan.loader_buffer_cap, chunk_bytes), chunk_bytes);
+        terms.loader_zone  = footprint.zone;
+        terms.loader_grown = footprint.grown;
+        terms.weight       = plan.host_zone_weight_bytes - plan.host_zone_loader_bytes + terms.loader_zone;
+    }
+    terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
     terms.staging = plan.host_zone_staging_bytes;
     terms.scratch =
         std::max(plan.host_zone_scratch_bytes,
@@ -2505,18 +2566,21 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
 
 // `plan`'s commit terms `terms` (placement_plan_host_zone_commit_terms(), or the plan's record of them) on `device`'s
 // pinned pool. Every card's zones are configured from the one plan, and every card has its own pool, but the loader's
-// SYCL_Host buffer is in one of them, plan.loader_device's. So on every other device the WEIGHT zone leaves out the
-// host_zone_loader_bytes the plan charged for it, and the rounding is recomputed for the smaller zone. On the loader's
-// device, and for a plan that charged no loader term, they are `terms`. The other terms stay whole-model on every
-// device, the host weights among them, though each pool materializes only its own share.
+// SYCL_Host buffers are in one of them, plan.loader_device's. So on every other device the WEIGHT zone leaves out the
+// loader_zone the plan charged for them, no chunk is grown for them (loader_grown), and the rounding is recomputed for
+// the smaller zone. On the loader's device, and for a plan that charged no loader term, they are `terms`. The other
+// terms stay whole-model on every device, the host weights among them, though each pool materializes only its own
+// share.
 inline host_zone_commit_terms placement_plan_host_zone_commit_terms_on_device(const placement_plan &         plan,
                                                                               const host_zone_commit_terms & terms,
                                                                               int                            device) {
-    if (device == plan.loader_device || plan.host_zone_loader_bytes == 0 || terms.chunk == 0) {
+    if (device == plan.loader_device || (terms.loader_zone == 0 && terms.loader_grown == 0) || terms.chunk == 0) {
         return terms;
     }
     host_zone_commit_terms on_device = terms;
-    on_device.weight -= std::min(on_device.weight, plan.host_zone_loader_bytes);
+    on_device.weight -= std::min(on_device.weight, terms.loader_zone);
+    on_device.loader_zone  = 0;
+    on_device.loader_grown = 0;
     host_zone_commit_terms_round(on_device);
     return on_device;
 }
