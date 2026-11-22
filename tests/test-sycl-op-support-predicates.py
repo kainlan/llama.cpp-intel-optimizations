@@ -639,19 +639,36 @@ def test_bin_bcast_mutations_are_detected() -> None:
 
 ROUTE_SOURCE = ROOT / "ggml/src/ggml-sycl/nonfa-stage.hpp"
 _SRC1_READER_SIGNATURE = re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_src1_has_reader\s*\([^)]*\)\s*\{")
-_SRC1_READER_GUARD = "if(b->type!=GGML_TYPE_F32&&!ggml_sycl_mul_mat_src1_has_reader(a,b,op)){returnfalse;}"
+_SRC1_READER_GUARD = "if(b->type!=GGML_TYPE_F32&&!ggml_sycl_mul_mat_src1_has_reader(a,b,op,device)){returnfalse;}"
+_UNIFIED_ARM_SIGNATURE = re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_takes_unified_arm\s*\([^)]*\)\s*\{")
+_UNIFIED_ARM_BODY = (
+    "returnggml_sycl_unified_dispatch_enabled()&&ggml_sycl::is_unified_kernel_enabled_for_device(device)&&"
+    "ggml_sycl::should_use_unified(src0->type)&&ggml_is_contiguous(src1)&&!ggml_is_transposed(src1)&&"
+    "!ggml_is_permuted(src1);"
+)
+_SELECT_SIGNATURE = re.compile(r"MatmulDecision\s+UnifiedMatmulOrchestrator::select\s*\([^)]*\)\s*const\s*\{")
+_SELECT_UNIFIED_ARM = "if(allow_unified&&ggml_sycl_mul_mat_takes_unified_arm(src0,src1,ctx_.device)){"
+_BATCHED_SIGNATURES = (
+    re.compile(r"\[\[nodiscard\]\]\s+static\s+bool\s+ggml_sycl_mul_mat_batched_sycl\s*\([^)]*\)\s*try\s*\{"),
+    re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_batched_f16_fallback\s*\([^)]*\)\s*(?:try\s*)?\{"),
+)
+_BATCHED_NC_CONVERT = "const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);"
 _INDEXED_CONTIGUITY_GUARD = "if(op->op==GGML_OP_MUL_MAT_ID){if(!ggml_is_contiguous(op->src[0])){returnfalse;}"
 _PROMPT_STAGING_SITE = "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {"
 _PROMPT_STAGING_ABORT = "Failed to allocate PP F32 activation staging"
-# What each kernel family reads, from its own source: the p021 and nc kernels assert an F32 src1, and
-# ggml_sycl_op_mul_mat (every route outside the f16 chain ends there) reads another type as one 2-D plane only.
+# What each kernel family reads, from its own source. The p021 and nc kernels assert an F32 src1. The batched
+# routes read F16 as it is and convert any other type through the strided f16 converter (their oneMath and
+# scalar-fallback arms), so a type that converter lacks has no reader. Outside the f16 chain, the orchestrator's
+# unified-kernel arm reads src1 as F32 with no type check, and every other arm ends in ggml_sycl_op_mul_mat, which
+# reads another type as one 2-D plane only.
+_BATCHED_ANSWER = "src1->type==GGML_TYPE_F16||ggml_get_to_fp16_nc_sycl(src1->type)!=nullptr"
 _SRC1_READER_ANSWERS = {
-    "NONE": "src1->ne[2]==1&&src1->ne[3]==1",
+    "NONE": "!ggml_sycl_mul_mat_takes_unified_arm(src0,src1,device)&&src1->ne[2]==1&&src1->ne[3]==1",
     "KQ_P021": "false",
-    "KQ_BATCHED": "true",
+    "KQ_BATCHED": _BATCHED_ANSWER,
     "VEC_NC": "false",
-    "KQKV_BATCHED": "true",
-    "KQKV_SCALAR": "true",
+    "KQKV_BATCHED": _BATCHED_ANSWER,
+    "KQKV_SCALAR": _BATCHED_ANSWER,
 }
 
 
@@ -707,6 +724,16 @@ def _assert_mul_mat_src1_contract(full_source: str, route_header: str) -> None:
     op_mul_mat_signature = re.compile(r"static\s+bool\s+ggml_sycl_op_mul_mat\s*\([^)]*\)\s*(?:try\s*)?\{")
     op_mul_mat = _function_body(full_source, op_mul_mat_signature)
     assert "GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));" in op_mul_mat
+    # The unified-kernel arm is one function: the orchestrator's select takes its arm from it and supports_op asks
+    # it, so the two cannot disagree. Its kernels read src1 through a float pointer.
+    assert _compact(_function_body(full_source, _UNIFIED_ARM_SIGNATURE)) == _UNIFIED_ARM_BODY
+    select = _compact(_function_body(full_source, _SELECT_SIGNATURE))
+    assert select.count(_SELECT_UNIFIED_ARM) == 1 and "should_use_unified(" not in select, "select's unified arm"
+    assert "static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device))" in full_source
+    # Both batched executors convert a non-F16 src1 through the strided converter the helper asks about.
+    for signature in _BATCHED_SIGNATURES:
+        batched = _function_body(full_source, signature)
+        assert "if (src1->type != GGML_TYPE_F16) {" in batched and _BATCHED_NC_CONVERT in batched, signature.pattern
 
     support = _compact(_supports_source(full_source))
     mul_mat = support[support.index("caseGGML_OP_MUL_MAT:") : support.index("caseGGML_OP_OUT_PROD:")]
@@ -747,7 +774,7 @@ def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
         return source.replace(old, new, 1)
 
     # The src1 question removed from MUL_MAT.
-    guard = "                if (b->type != GGML_TYPE_F32 && !ggml_sycl_mul_mat_src1_has_reader(a, b, op)) {\n"
+    guard = "                if (b->type != GGML_TYPE_F32 && !ggml_sycl_mul_mat_src1_has_reader(a, b, op, device)) {\n"
     assert rejects_src1(mutate(full_source, guard, "                if (false) {\n"))
     # A route that asserts an F32 src1 answered as a reader.
     assert rejects_src1(mutate(
@@ -758,9 +785,23 @@ def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
         "        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED:\n",
         "        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED:\n        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021:\n", 1,
     ))
+    none_answer = (
+        "            return !ggml_sycl_mul_mat_takes_unified_arm(src0, src1, device) && src1->ne[2] == 1 && "
+        "src1->ne[3] == 1;\n"
+    )
     # The orchestrator answered as reading any src1 shape.
-    assert rejects_src1(mutate(full_source, "            return src1->ne[2] == 1 && src1->ne[3] == 1;\n",
-                               "            return true;\n"))
+    assert rejects_src1(mutate(full_source, none_answer, "            return true;\n"))
+    # The unified-kernel arm, which reads src1 as F32, answered as reading a one-plane src1 of any type.
+    assert rejects_src1(mutate(full_source, none_answer, "            return src1->ne[2] == 1 && src1->ne[3] == 1;\n"))
+    # select deciding its unified arm inline again, a second copy supports_op does not ask.
+    select_arm = "    if (allow_unified && ggml_sycl_mul_mat_takes_unified_arm(src0, src1, ctx_.device)) {\n"
+    assert rejects_src1(mutate(
+        full_source, select_arm,
+        "    if (allow_unified && ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(src0->type)) {\n",
+    ))
+    # The batched routes answered as reading every type, including those the strided converter lacks.
+    batched_answer = "            return src1->type == GGML_TYPE_F16 || ggml_get_to_fp16_nc_sycl(src1->type) != nullptr;\n"
+    assert rejects_src1(mutate(full_source, batched_answer, "            return true;\n"))
     # A route added to the classifier that the helper does not answer.
     assert rejects_src1(full_source, mutate(
         route_header,
