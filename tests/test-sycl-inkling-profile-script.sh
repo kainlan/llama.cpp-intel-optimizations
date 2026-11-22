@@ -48,7 +48,8 @@ STUB
 chmod +x "$BR/bin/stub"
 cp "$BR/bin/stub" "$BR/bin/llama-completion"; cp "$BR/bin/stub" "$BR/bin/llama-bench"
 
-# PATH shims for the lock: mkdir answers success for an existing directory (the system mkdir's behaviour here);
+# PATH shims for the lock: mkdir exits 0 for an existing directory, every time (the outcome the system mkdir gives
+# only when the directory appears between its check and its mkdir(2));
 # python3 runs the real one with a prefix wrapped around os.mkdir (foreign: a holder appears right after the mkdir,
 # sleep: the take stalls for 2 s after the mkdir).
 REAL_PY="$(command -v python3)"
@@ -253,14 +254,15 @@ else
 fi
 rm -f "$T/lock/holder"; rmdir "$T/lock" 2>/dev/null
 
-# D1. the system mkdir reports success for an existing directory: a lock directory with no holder must still be
+# D1. the mkdir shim exits 0 for an existing directory (the losing side of the system mkdir's check-then-create
+# race): a lock directory with no holder must still be
 # busy, so the runner gives up with exit 3 and leaves it alone.
 : > "$STUB_LOG"; mkdir "$T/lock"; XENV=(PATH="$SHIM:$PATH" INKLING_LOCK_WAIT_SECONDS=2); D1="$T/d1"
 rr "$D1"
 if [ "$RR_RC" -eq 3 ] && [ ! -s "$STUB_LOG" ] && [ -d "$T/lock" ] && [ ! -e "$T/lock/holder" ]; then
-    pass "(real: an existing lock directory is busy even when mkdir lies; the runner gives up, tool not run)"
+    pass "(real: an existing lock directory is busy even when the mkdir shim exits 0 for it; the runner gives up, tool not run)"
 else
-    fail "(real: lying mkdir) rc=$RR_RC out: $RR_OUT log: $(cat "$STUB_LOG")"
+    fail "(real: mkdir shim exiting 0 on an existing directory) rc=$RR_RC out: $RR_OUT log: $(cat "$STUB_LOG")"
 fi
 rmdir "$T/lock" 2>/dev/null
 
