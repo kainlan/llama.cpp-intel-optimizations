@@ -1801,6 +1801,28 @@ static void registry_bind_reconcile_follows_live() {
         check(moe_mmid_reconcile_retires(outcome, status), "a rebind nothing follows does not retire the publication");
         check(!follows(registry, p), "the live snapshot is reachable with no context");
     }
+    // An in-place rebind re-keys the published context to the live identity. When the live snapshot is then not
+    // followed (here the follows answer is no), the refused bind withdraws its publication, so its retire must name
+    // the identity the registry now holds, or the context stays accepting for the live plan.
+    {
+        moe_mmid_workspace_registry registry;
+        const auto                  s             = std::make_shared<const lifecycle_plan_snapshot>();
+        const auto                  p             = std::make_shared<const lifecycle_plan_snapshot>();
+        constexpr uint64_t          live_identity = identity + 1;
+        const S                     status        = registry.materialize(token, identity, s, 0, { owner }, allocator);
+        check(status == S::PUBLISHED, "publish S failed");
+        const O outcome = moe_mmid_reconcile_live_plan(registry, s, p, live_identity, true, never);
+        check(outcome == O::REBIND_NOT_FOLLOWED, "an in-place rebind nothing follows did not reconcile as such");
+        check(follows(registry, p), "the in-place rebind did not move the context to the live snapshot");
+        check(moe_mmid_reconcile_retires(outcome, status), "a refused in-place rebind does not retire");
+        (void) registry.retire(token, moe_mmid_reconcile_retire_identity(outcome, identity, live_identity));
+        check(!follows(registry, p) && registry.published_contexts() == 0,
+              "a refused in-place rebind left a context accepting for the live plan");
+    }
+    // Every other refusal leaves the publication under the identity it was published with.
+    check(moe_mmid_reconcile_retire_identity(O::GEOMETRY_UNSTABLE, 7, 8) == 7 &&
+              moe_mmid_reconcile_retire_identity(O::REBIND_REFUSED, 7, 8) == 7,
+          "a refusal before any rebind names the live identity");
     // A follows answer that throws answers no.
     {
         moe_mmid_workspace_registry registry;

@@ -25293,10 +25293,12 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> published;
     ggml_sycl::moe_mmid_materialize_status                    status = ggml_sycl::moe_mmid_materialize_status::INVALID;
 
-    const auto retire_own_publication = [&]() noexcept {
-        if (published && status == ggml_sycl::moe_mmid_materialize_status::PUBLISHED) {
+    // `identity` is the plan identity the registry keys this bind's publication by when it retires. Zero would retire
+    // every identity of the token, so it retires nothing.
+    const auto retire_own_publication = [&](uint64_t identity) noexcept {
+        if (published && status == ggml_sycl::moe_mmid_materialize_status::PUBLISHED && identity != 0) {
             (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
-                { token.model.value, token.load.value, token.owner.generation }, published->version);
+                { token.model.value, token.load.value, token.owner.generation }, identity);
         }
     };
     try {
@@ -25335,7 +25337,9 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
             return;
         }
         if (ggml_sycl::moe_mmid_reconcile_retires(outcome, status)) {
-            retire_own_publication();
+            // An in-place rebind re-keyed the publication to the live identity: retire what the registry holds now.
+            retire_own_publication(ggml_sycl::moe_mmid_reconcile_retire_identity(outcome, published->version,
+                                                                                 live ? live->version : 0));
         }
         ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
                                           refusal, token, live ? live : published);
@@ -25344,7 +25348,7 @@ static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lif
         // reconcile made it follow, and left alone it answers the next bind's attempt as same-identity-other-plan:
         // retire it, as the refused reconcile does, and leave the deferral pending. The bind's own result is the
         // transaction's, which already published.
-        retire_own_publication();
+        retire_own_publication(published ? published->version : 0);
         ggml_sycl_moe_mmid_report_refusal("context-bind", ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID,
                                           ggml_sycl::moe_mmid_materialize_refusal::EXCEPTION, token, nullptr);
     }

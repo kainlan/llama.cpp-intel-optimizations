@@ -698,6 +698,13 @@ moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
 // of the token with the plan identity, so retiring then would take that one.
 bool moe_mmid_reconcile_retires(moe_mmid_reconcile_outcome outcome, moe_mmid_materialize_status published) noexcept;
 
+// The plan identity that retire names: the identity the registry keys the bind's publication by after the reconcile.
+// REBIND_NOT_FOLLOWED comes after an accepted replace_plan, which re-keyed a context it rebound in place to
+// `live_identity`; every other refusal left the publication under `published_identity`.
+uint64_t moe_mmid_reconcile_retire_identity(moe_mmid_reconcile_outcome outcome,
+                                            uint64_t                   published_identity,
+                                            uint64_t                   live_identity) noexcept;
+
 // The refusal detail a reconcile outcome names (NONE for the three that leave the live snapshot followed).
 moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outcome outcome) noexcept;
 

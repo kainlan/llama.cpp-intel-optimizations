@@ -1834,6 +1834,12 @@ bool moe_mmid_reconcile_retires(moe_mmid_reconcile_outcome outcome, moe_mmid_mat
            moe_mmid_reconcile_refusal(outcome) != moe_mmid_materialize_refusal::NONE;
 }
 
+uint64_t moe_mmid_reconcile_retire_identity(moe_mmid_reconcile_outcome outcome,
+                                            uint64_t                   published_identity,
+                                            uint64_t                   live_identity) noexcept {
+    return outcome == moe_mmid_reconcile_outcome::REBIND_NOT_FOLLOWED ? live_identity : published_identity;
+}
+
 moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outcome outcome) noexcept {
     switch (outcome) {
         case moe_mmid_reconcile_outcome::CURRENT:
