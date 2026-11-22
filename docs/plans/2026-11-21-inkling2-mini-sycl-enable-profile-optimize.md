@@ -1628,6 +1628,12 @@ recorded under Task 6f-5 below.
 
 *Not taken:* a new query-site enum member for the arm; the call site's line in the helper's error text.
 
+*Merged-tree gate at `5c6f9d379` (2026-11-22, full rebuild rc 0, one run per arm, zero kernel fault lines, `Shmem`
+8 GB after each model run):* `test-sycl-select-unselected-branch` PASS on both cards; the Q1/NVFP4 lifecycle oracle
+PASS on both cards; the Mistral gate passes on both cards; the GPT-OSS gate rc 0 with one answer line and no device
+loss on the B50 without `-c` and on the B70. The source-contract sweep of the merged tree waits for Task 7f's
+interpreter fix (see there: under the old interpreter 128 of its tests report Skipped).
+
 ---
 
 ### Task 6f-5: An unwind out of the per-expert prompt loop keeps its leases until the submitted kernels finish (recorded 2026-11-22)
