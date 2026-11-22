@@ -247,10 +247,12 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
 }
 
 // Q1_0 and NVFP4 run on a device only through their direct kernel (DEVICE_MMVQ_Q1_NVFP4_AOS) and its admitted
-// workspace bundle, which validate_moe_execution_recipe checks and choose_moe_batch_executor keeps closed; any other
-// device recipe for them is refused. One answer for the validator, the executor choice and the staged route's
-// capability refusal (ggml_sycl_moe_staged_capability_refusal). The stream ring does not ask it: it stages windows
-// only for layers the library executor claims whole (W2 of docs/plans/2026-10-24-prefill-window-ring.md).
+// workspace bundle -- the MMID direct route in ggml_sycl_mul_mat_id, which validate_moe_execution_recipe checks and
+// choose_moe_batch_executor keeps closed to every other executor; any other device recipe for them is refused. One
+// answer for the validator, the executor choice, the staged route's capability refusal
+// (ggml_sycl_moe_staged_capability_refusal) and the planner's MMID workspace pools (plan_moe_mmid_workspaces). The
+// stream ring does not ask it: it stages windows only for layers the library executor claims whole (W2 of
+// docs/plans/2026-10-24-prefill-window-ring.md).
 inline bool moe_type_needs_direct_kernel(ggml_type type) {
     return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
 }
@@ -828,10 +830,16 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     const bool                direct_q1_nvfp4 = operand.recipe().kind != moe_batch_executor::HOST_CPU &&
                                  moe_type_needs_direct_kernel(operand.recipe().request.type);
     if (direct_q1_nvfp4) {
-        // Production capability remains closed until all four B70 oracle cases
-        // pass. A matching bundle is necessary but not sufficient to advertise.
+        // Q1_0/NVFP4 run on a device only through the MMID direct route in
+        // ggml_sycl_mul_mat_id (decode rows on the primary card, AoS, with an
+        // admitted workspace bundle), which executes before this choice is asked;
+        // that route is open since the B70 and B50 oracle runs of 2026-11-22. A
+        // device recipe that reaches this gate fell through it -- prompt rows, a
+        // secondary card, a layout other than AoS, an authority or bundle the
+        // route could not obtain -- and no generic executor runs these types, so it
+        // is refused here. A host-resident expert carries a HOST_CPU recipe, runs on
+        // the CPU, and is not refused by this gate.
         //
-        // This gate, not the capability query, is why Q1_0/NVFP4 do not execute.
         // ggml_sycl_moe_query_route_capability() (ggml-sycl.cpp, the Q1_0/NVFP4
         // fall-through) deliberately ADMITS them as MMVQ_COMPAT, so a reader
         // tracing "capability says local-mmvq but nothing runs" lands here. The

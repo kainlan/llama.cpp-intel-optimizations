@@ -2598,18 +2598,24 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
 - The RUNTIME zone is counted without what the transaction still places there
   after the ring: the MoE MMID workspace pools, when this update materializes
   them. It materializes them only for a route that can run them, the predicate
-  `load_end` and the context-bind hook already use. In an ordinary build that
-  route is closed, so this is 0.
+  `load_end` and the context-bind hook already use, and only the pools the plan
+  holds. The route is open in an ordinary build since 2026-11-22 (the
+  `sycl-q1-nvfp4-admitted-device` oracle passed on the B70 and the B50), but
+  the plan holds pools only for a model with Q1_0 or NVFP4 experts, so for any
+  other model this is 0.
 - The plan charges the MMID pools on the same fact. `plan_moe_mmid_workspaces()`
   plans them, and `vram_bytes` carries their device bytes, only when
-  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`). So
-  in an ordinary build no pool bytes are charged. A pool rejected by the load
+  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`), and
+  only from the experts whose type the route admits (`moe_type_needs_direct_kernel`:
+  Q1_0, NVFP4). So a model without such an expert (GPT-OSS's MXFP4, any dense
+  model) is charged no pool bytes. A pool rejected by the load
   plan (budget, geometry or owner) stays rejected: the runtime re-plan neither
   re-plans its demand nor asks the growth admission for it, so it cannot demote
   KV or refuse a context.
-  A closed route is not a rejection. Its plan is valid and empty
-  (`moe_mmid_workspace_valid` stays true, and no owner check runs), because a
-  closed route is a fact about the build. A rejection is an outcome of one load
+  A closed route (a test override) is not a rejection, and neither is a model
+  without a Q1_0/NVFP4 expert. Its plan is valid and empty
+  (`moe_mmid_workspace_valid` stays true, and no owner check runs or none is
+  required), because each is a fact about the build or the model. A rejection is an outcome of one load
   plan for a route that could run, and the runtime keeps it rejected.
   `reject_moe_mmid_workspaces()` clears its workspaces, so the materialization
   wrapper returns `NOT_APPLICABLE` before the implementation's `INVALID` check

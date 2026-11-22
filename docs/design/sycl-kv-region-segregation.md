@@ -1883,7 +1883,8 @@ The request `r`:
   at `-ub 1024`'s PAD (design-zhcn-r4). **The context's other head slots, H (r16 m-3), on GA's
   shape:** `moe_control`, 4 × 1024 × 8 + 256 = 33024 B; 23mk's A, 1024 × 4096 × 2 = 8388608 B
   (`max_K` 4096, `attn_output`); `set_rows_stage`, 0 on one device; the oneDNN scratchpad, 0
-  (rulings §M31a); the MMID pool, 0, its route unreachable in an ordinary build; the recurrent
+  (rulings §M31a); the MMID pool, 0, since GPT-OSS has no Q1_0/NVFP4 expert (and until
+  2026-11-22 the route was unreachable in an ordinary build); the recurrent
   state, 0, since GPT-OSS has no recurrent layer; jzvq's MXFP4 MoE TG caches, 223560 B on
   master's `-c 4096` baseline (3240 + 184320 + 23040 + 12960 B, llama.cpp-jzvq comment c-jv0r),
   which jzvq's function re-sizes at GA's shape; and jzvq's fattn workspaces, from jzvq's
@@ -5274,9 +5275,13 @@ prompt-processing performance, never correctness, and the yield WARN names them.
    - **only a reachable route is planned (rulings §M9 I-2; P4).** The fit takes master's
      predicate, `ggml_sycl_moe_mmid_route_reachable(ctx)` (`:11541`; its compile-time half is
      `k_moe_mmid_route_reachable_compiled`, `:11537`, and `k_moe_mmid_direct_route_validated`
-     is false, `:11526`), the one master uses at `:18485-18504`, `:18613` and `:18978`. In an
-     ordinary build it is false, so no pool slot is planned and no VRAM is carved for a route
-     that cannot execute. Where it is true, the fit plans this context's device pool whenever
+     was false on that master, `:11526`), the one master uses at `:18485-18504`, `:18613` and
+     `:18978`. While the route was closed it was false in an ordinary build, so no pool slot was
+     planned and no VRAM carved for a route that could not execute. Since 2026-11-22 the
+     constant is true (the Q1_0/NVFP4 oracle passed on the B70 and the B50), and the planner
+     plans a pool only from experts whose type the route admits (`moe_type_needs_direct_kernel`),
+     so a model without a Q1_0/NVFP4 expert still plans no slot. Where a pool is planned, the
+     fit plans this context's device pool whenever
      the context has none on that device or has a smaller one than the candidate's workspace,
      as a head slot in the context's `REGION` headroom, the shared zone like every head slot
      (§2.3.3; rulings §M32 I-2; 7.14e placed it on the RUNTIME TLSF), and step 6 carves it with
@@ -6397,8 +6402,9 @@ not a list any code reads: the reservation sums the function's output.
   `attn_output` Q8_0 4096 × 2880; on Qwen a 4096-wide plane-W tensor), by 23mk's `gguf_w2.py`
   rule over each gate's model file.
 - **The zeros:** `set_rows_stage` is 0 on one device, `onednn_scratchpad` is 0 by §M31a's probe,
-  and `mmid_workspace` is 0 because the MMID route is unreachable in an ordinary build
-  (§2.4.2 (b) step 7).
+  and `mmid_workspace` is 0 because neither model has a Q1_0/NVFP4 expert, the only type whose
+  pool the planner plans (§2.4.2 (b) step 7; until 2026-11-22 the MMID route was also
+  unreachable in an ordinary build).
 - **jzvq's two rows** come from jzvq's exact demand functions. The TG caches are 0 on Qwen,
   which has no MXFP4 experts. For scale, master's baseline on GPT-OSS 20B at `-c 4096` draws
   3240, 184320, 23040 and 12960 B (llama.cpp-jzvq comment c-jv0r). The gates' values come from
@@ -8452,8 +8458,8 @@ means that.
     transaction, only checks that the registry answers `ALREADY_PUBLISHED` for this context;
     and the fit plans a pool slot only under `ggml_sycl_moe_mmid_route_reachable(ctx)`. GREEN
     arms:
-    - an ordinary build, where the route is unreachable, plans no MMID slot and carves nothing
-      for it;
+    - a model without a Q1_0/NVFP4 expert (and, while the route was closed, any model of an
+      ordinary build) plans no MMID slot and carves nothing for it;
     - in a route-testing build, two contexts of one model (one plan identity) each hold their
       own accepting registry entry, keyed by (token, context, device), with pools bound to
       their own queues, and each admits at its top rung with no cookie mismatch;

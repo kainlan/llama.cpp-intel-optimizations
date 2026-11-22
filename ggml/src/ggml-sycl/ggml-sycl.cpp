@@ -11967,17 +11967,17 @@ bool ggml_sycl_q1_nvfp4_test_completion_held() {
 }
 #endif
 
-// The MoE MMID direct route is fail-closed by owner ruling: this stays false
-// until B70 validation opens it.  Hoisted to file scope so the admission gate
-// (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind)
-// read ONE constant and cannot drift apart -- materializing a pool for a route
-// that cannot execute reserves VRAM nothing will ever consume, and refusing to
-// materialize one the route CAN execute is a silent performance cliff.
-constexpr bool k_moe_mmid_direct_route_validated = false;
+// The MoE MMID direct route (Q1_0/NVFP4 decode rows on the primary card, AoS) was fail-closed by owner ruling until
+// B70 validation. Opened 2026-11-22: sycl-q1-nvfp4-admitted-device passed on the B70 and the B50 on driver 26.44
+// (docs/backend/data/inkling2/t7a-oracle-b70.txt, t7a-oracle-b50.txt). Hoisted to file scope so the admission gate
+// (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind) read ONE constant and cannot drift
+// apart -- materializing a pool for a route that cannot execute reserves VRAM nothing will ever consume, and refusing
+// to materialize one the route CAN execute is a silent performance cliff.
+constexpr bool k_moe_mmid_direct_route_validated = true;
 
-// Compile-time reachability. In an ordinary build both operands are false, the
-// admission block folds away entirely, and nothing can consume a materialized
-// workspace -- so nothing is materialized either.
+// Compile-time reachability: the validated route, or a route-testing build. With the route validated it is true in
+// every build; the pools are then scoped by the plan, which holds one only for a model with Q1_0/NVFP4 experts
+// (plan_moe_mmid_workspaces), so a model without them materializes nothing.
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
 constexpr bool k_moe_mmid_route_compiled = true;
 #else
@@ -11993,13 +11993,14 @@ static std::atomic<int> g_test_moe_mmid_route_reachable_override{ -1 };
 
 // The build-level half of MMID route reachability: can ANY context of this build execute the route? The planner has no
 // context, so the workspace pools' planning charge and the runtime re-plan of their demand ask this (declared in
-// common.hpp, llama.cpp-84ck), as do load_end's materialization and the per-context predicate below. In an ordinary
-// build it is false, so no pool is planned, charged or materialized. The PRIVATE_TESTING override governs every one of
-// those sites: forced open, the planner plans and charges the pool, load_end materializes it, and the per-context
-// predicate lets the context-bind hook and the runtime transaction materialize it. Admission still needs the route
-// validated (its own gate reads k_moe_mmid_direct_route_validated) or, in a route-testing build, a test-authorized
-// context, so forcing the override open cannot execute anything. The layout-choice test sets it around planning and
-// the runtime re-plan, with no context.
+// common.hpp, llama.cpp-84ck), as do load_end's materialization and the per-context predicate below. It is true since
+// the route was validated; even so the planner plans a pool only for an expert of a type the route admits
+// (moe_type_needs_direct_kernel), so a model without one plans, charges and materializes none. The PRIVATE_TESTING
+// override governs every one of those sites: forced closed, nothing is planned, charged or materialized; forced open,
+// the planner plans and charges the pool, load_end materializes it, and the per-context predicate lets the
+// context-bind hook and the runtime transaction materialize it. Forcing it open never admits anything by itself:
+// admission reads k_moe_mmid_direct_route_validated (or, in a route-testing build, a test-authorized context). The
+// layout-choice test sets it around planning and the runtime re-plan, with no context.
 bool ggml_sycl_moe_mmid_route_reachable_in_build() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const int forced = g_test_moe_mmid_route_reachable_override.load(std::memory_order_acquire);
@@ -14133,9 +14134,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         // it. A later load that runs while a context IS live still materializes
         // here, which is why the attempt is kept rather than removed.
         //
-        // Only a reachable route is materialized at all: in an ordinary build
-        // the admission block folds away, so allocating the pools would reserve
-        // VRAM for a route that cannot execute. No backend context exists here
+        // Only a reachable route is materialized at all, and only the pools
+        // the plan holds (none for a model without Q1_0/NVFP4 experts):
+        // allocating a pool the route cannot draw on would reserve VRAM
+        // nothing consumes. No backend context exists here
         // to answer the per-context half of ggml_sycl_moe_mmid_route_reachable(),
         // so only a Q1_NVFP4 route-testing build can materialize here for a
         // context the bind hook and the runtime transaction would not. The
@@ -36630,11 +36632,13 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // than refusing here. Secondary residency keeps the old refusal -- the
         // fall-through is validated for the local executor only.
         //
-        // Admitting here does NOT mean Q1_0/NVFP4 execute. choose_moe_batch_executor()
-        // in moe-resolved-batch.hpp rejects them unconditionally while the B70 oracle
-        // gate is closed, so they still refuse one layer down (census 10: 85 such
-        // refusals, reason=capability_unsupported, carrying capability=local-mmvq from
-        // right here). That is deliberate, not a bug in either layer.
+        // Admitting here does NOT mean the generic executor runs Q1_0/NVFP4.
+        // choose_moe_batch_executor() in moe-resolved-batch.hpp rejects them
+        // unconditionally; they execute only through the direct block in
+        // ggml_sycl_mul_mat_id (decode rows, primary card, AoS), which runs before
+        // it. An operand that falls through that block still refuses one layer down
+        // (reason=capability_unsupported, carrying capability=local-mmvq from right
+        // here). That is deliberate, not a bug in either layer.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
                                              K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         if (!local_executor_shape_ok) {
@@ -87206,9 +87210,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
 
-    // Closed production DIRECT authority for decode Q1/NVFP4. Prompt and
-    // secondary residency remain outside this route. All fall-throughs are
-    // pre-submit refusals; once marked, the exact queue is drained/recovered.
+    // The production DIRECT authority for decode Q1/NVFP4 (decode rows, primary
+    // residency, AoS). Prompt rows, host-resident experts and secondary residency
+    // remain outside this route. All fall-throughs are pre-submit refusals; once
+    // marked, the exact queue is drained/recovered.
     // One definition, shared with the materialization gate: see
     // k_moe_mmid_direct_route_validated. Do not re-spell this as a literal --
     // the two gates drifting is how a pool gets allocated for a route that
@@ -87419,9 +87424,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // host-task thread while its job's inputs wait, on this in-order stream, for it.
                             ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);
                             // No diagnostics or ownership construction is allowed
-                            // after admission. The B70 validation gate remains shut,
-                            // so a future enabling commit must place its marker before
-                            // this boundary or use preallocated counters.
+                            // after admission: a marker added for this route goes
+                            // before this boundary or uses preallocated counters.
                             return;
                         } catch (...) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
@@ -123773,8 +123777,9 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         //
         // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
         // the MMID coverage tables below. Q1_0 and NVFP4 are in them and stay
-        // admitted by design: they carry fp16 converters and are refused by the
-        // runtime route oracle (the sanctioned fail-closed class of c-wps7).
+        // admitted by design: they carry fp16 converters, their decode rows on the
+        // primary card run through the MMID direct route, and the rest are refused
+        // by the runtime route oracle (the sanctioned fail-closed class of c-wps7).
         // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
         // the dense allowlist plus Q1_0/NVFP4, so every other type without a
         // kernel -- upstream b10630's tq2_0 and anything future -- is refused
