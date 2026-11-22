@@ -58291,9 +58291,21 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                                 const int64_t src0_row_offset = row - src0_row_base;
                                 src0_slice = src0_dd_i + src0_row_offset * static_cast<int64_t>(src0_row_bytes);
                             }
-                            SYCL_CHECK(
-                                CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_slice, src1_ddf_i, src1_ddq_i, dst_slice,
-                                                   row, row_high, src1_ncols, src1_padded_row_size, stream)));
+                            // A refusal (ggml_sycl_fallback_error) leaves the op and fails the graph: the handler in
+                            // ggml_backend_sycl_graph_compute quarantines it and returns a failed status. Any other
+                            // exception aborts here, as SYCL_CHECK(CHECK_TRY_ERROR(...)) does; that macro's catch-all
+                            // would turn the refusal into the same abort.
+                            try {
+                                op(ctx, src0, src1, dst, src0_slice, src1_ddf_i, src1_ddq_i, dst_slice, row, row_high,
+                                   src1_ncols, src1_padded_row_size, stream);
+                            } catch (const ggml_sycl_fallback_error &) {
+                                throw;
+                            } catch (const std::exception & e) {
+                                std::cerr << e.what() << "\nException caught at file:" << __FILE__
+                                          << ", line:" << __LINE__ << ", func:" << __func__ << std::endl;
+                                ggml_sycl_error("op(...)", __func__, __FILE__, __LINE__,
+                                                "Exception caught in this line of code.");
+                            }
                         }
                     } else {
                         std::chrono::steady_clock::time_point stage_t0;
@@ -58301,9 +58313,18 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                             stream->wait();
                             stage_t0 = std::chrono::steady_clock::now();
                         }
-                        SYCL_CHECK(CHECK_TRY_ERROR(op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
-                                                      dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_row_size,
-                                                      stream)));
+                        // A refusal fails the graph and any other exception aborts, as in the sliced loop above.
+                        try {
+                            op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, dev[i].row_low,
+                               dev[i].row_high, src1_ncols, src1_padded_row_size, stream);
+                        } catch (const ggml_sycl_fallback_error &) {
+                            throw;
+                        } catch (const std::exception & e) {
+                            std::cerr << e.what() << "\nException caught at file:" << __FILE__ << ", line:" << __LINE__
+                                      << ", func:" << __func__ << std::endl;
+                            ggml_sycl_error("op(...)", __func__, __FILE__, __LINE__,
+                                            "Exception caught in this line of code.");
+                        }
                         if (mmvq_stage_timing) {
                             stream->wait();
                             const auto   stage_t1 = std::chrono::steady_clock::now();

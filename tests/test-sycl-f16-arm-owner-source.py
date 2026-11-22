@@ -14,10 +14,9 @@ With comments blanked, in ggml-sycl.cpp:
   O. The else after the CHUNK_LEASE branch refuses by name: "the SOA plane has no owner the arm can hold".
   5. The function body has no .wait(, ->wait( and no wait_and_throw(.
   6. (ggml_sycl_op_mul_mat) both op(ctx, src0, src1, dst, ...) calls sit in a try block whose first catch is
-     catch (const ggml_sycl_fallback_error &) and rethrows with throw;, followed by a general catch; neither call is
-     wrapped in CHECK_TRY_ERROR, whose catch-all would turn the refusal into SYCL_CHECK's abort.
-  P. Each of those fallback catches calls release_pin() before throw;, so the weight pin the op took is released on
-     the refusal path as on the success path.
+     catch (const ggml_sycl_fallback_error &) with a body of throw; alone (the form check-sycl-alloc-zone-contract
+     accepts as a guard), followed by a general catch; neither call is wrapped in CHECK_TRY_ERROR, whose catch-all
+     would turn the refusal into SYCL_CHECK's abort.
 """
 import re
 import sys
@@ -116,11 +115,8 @@ def claims(sycl):
             r"\s*else\s*\{\s*" + re.escape(NO_OWNER) + r"\s*\}", f[c_at + len(c_body):]) is not None,
         "5 no host wait in the arm": f != "" and re.search(r"(\.|->)wait\(|wait_and_throw\(", f) is None,
         "6 both op calls rethrow a refusal ahead of the general catch": len(sites) == 2 and
-            all(c is not None and re.fullmatch(r"(?:\s*release_pin\(\);)?\s*throw;\s*", c.group("body"))
-                for c in catches),
+            all(c is not None and re.fullmatch(r"\s*throw;\s*", c.group("body")) for c in catches),
         "6 no op call is wrapped in CHECK_TRY_ERROR": m != "" and re.search(r"CHECK_TRY_ERROR\(\s*op\(", m) is None,
-        "P the refusal releases the op's pin before it rethrows": len(catches) == 2 and all(
-            c is not None and re.fullmatch(r"\s*release_pin\(\);\s*throw;\s*", c.group("body")) for c in catches),
     }
 
 
@@ -165,7 +161,9 @@ def main():
             "6 second op call loses its rethrow": mutate(sycl, MUL_MAT_SIG, catch_re, "", 1),
             "6 op call back under CHECK_TRY_ERROR": mutate(sycl, MUL_MAT_SIG, OP_CALL.pattern,
                                                            "SYCL_CHECK(CHECK_TRY_ERROR(op(ctx, src0, src1, dst,", 1),
-            "P refusal keeps the pin": mutate(sycl, MUL_MAT_SIG, r"release_pin\(\);(\s*throw;)", "throw;", 0),
+            "6 first rethrow does more than rethrow": mutate(
+                sycl, MUL_MAT_SIG, r"catch \(const ggml_sycl_fallback_error &\) \{\s*throw;",
+                "catch (const ggml_sycl_fallback_error &) { GGML_LOG_ERROR(\"refused\\n\"); throw;", 0),
         }
         for name, text in mutants.items():
             if text == sycl:
