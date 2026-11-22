@@ -54,6 +54,7 @@ upgrade.
 | (f) | A handled queue destroyed with an undelivered error (only a plain `wait()` before the destructor). The error is dropped silently: no delivery, no terminate. |
 | (g) | A plain `event.wait()` on a failed event neither throws nor delivers. The error stays pending until a `wait_and_throw`/`throw_asynchronous` on that queue. |
 | (h) | `event::wait_and_throw` on ANY event of a queue delivers every pending asynchronous error of that queue to its handler, not only the event's own. Measured 2026-11-21 on the B50 and on the OpenCL CPU device, both ways round: a good command submitted after the failure, and a good command that completed before it. A following `queue::throw_asynchronous` delivers nothing more. Log: `docs/backend/data/inkling2/t7c-runtime-probe.txt`; source beside it. |
+| (i) | Delivery is not atomic across threads. While one thread's `wait_and_throw` is delivering a queue's errors (its handler has not returned), another thread's `wait_and_throw` on an event of the same queue returns and delivers nothing; each error is delivered exactly once. Measured 2026-11-22 by case (i) of `test-async-handler-delivery.cpp` on the OpenCL CPU device and, with `--gpu`, on the B50. Log: `docs/backend/data/inkling2/t7d-probe-b50.txt`. Decision 12 rests on this. |
 | CPU | This host HAS a CPU SYCL device: `Intel(R) OpenCL`, registered by `/etc/OpenCL/vendors/intel64.icd` (`libintelocl.so`). Corrected 2026-11-21: this row first said there was none, inferred from the absence of a `libur_adapter_opencl*.so` file in `/opt/intel/oneapi/compiler/2026.2/lib/`. The Task 7a implementer's host-only run of the delivery probe selected that device (`SYCL_UR_TRACE=1`: `platform: Intel(R) OpenCL`) and printed `async handler delivery: PASS`. Facts (a) to (e) therefore hold on the OpenCL CPU device as well as on the B50. |
 
 The header comment at `sycl/event.hpp:101-106` says `event::wait_and_throw` calls the context's handler. That is wrong
@@ -133,6 +134,11 @@ here, in the plan's "Known limits".
   FAILED (`llama_decode` -3). The `[SYCL-ASYNC-FAILURE]` line and one paragraph in `docs/backend/SYCL.md` say so.
   Follow-up, two candidate designs: a status-returning synchronize, or the backend poisoning a failed context's pending
   readbacks.
+- **The begin-path drain is behind the entry check** (recorded 2026-11-22, Task 7d). `ggml_backend_sycl_graph_compute`
+  reads the latch on entry; the owner's begin-path drain (`ggml_sycl_execution_drain_own_terminal`) runs later, inside
+  `graph_compute_impl`, which returns void. An error that drain delivers, or a wait of it that throws, moves the latch
+  after the check: the graph that is beginning still runs, and the failure is reported at the next boundary. The same
+  follow-up as the one-token window would close it, or the drain hoisted above the entry check.
 - **Withdrawn 2026-11-21: "failed-terminal bundles stay quarantined until process exit".** See decision 11. What is
   left of it is Task 7d's scope: a failed context that is destroyed, or drained through
   `ggml_sycl_execution_drain_context_terminal_events` or `ggml_sycl_execution_drain_own_terminal`, without a
@@ -1205,6 +1211,10 @@ Found by reading after commit 4 passed on both cards. Landed as `095adc712`.
 - `ggml-sycl.cpp` is ~125k lines. Find each site with `cat ... | grep -n` and edit by exact string.
 - Keep the handler record-only (claim H). It runs on host-task workers, and under the workspace registry and pool
   mutexes (`recover_quarantined` -> `terminal->ready()` -> `event->wait_and_throw()`).
+  *After Task 7d (2026-11-22):* `ready()` reads the event's status and no longer waits, and the completion host
+  task makes no wait of its own. The handler now runs on a boundary's or a drain's thread, and under those
+  mutexes only through `terminal->wait()` (`wait_and_confirm` with `wait=true`, which no caller passes today).
+  The claim stays: a drain wait can run under any lock its caller holds.
 - Keep the latch out of line in `common.cpp`. An `inline` variable in the header could become one copy per shared
   object wherever visibility hides it. `dpct/helper.hpp:853-878` explains the same interposition hazard.
 - `ggml_backend_graph_compute` still returns SUCCESS for the graph that failed asynchronously

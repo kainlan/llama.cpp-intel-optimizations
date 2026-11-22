@@ -1795,10 +1795,12 @@ it is at hand. The seam compiles out of a production build.
   `the completion task did not release the finished bundle of a failed terminal` (`recycled=+0
   quarantined=+1`). The delivery probe with `--gpu` on the B50 prints PASS, as it does on the OpenCL CPU device:
   fact (i) holds on both. Zero kernel fault lines.
-- *The implementer's refinement of the cause:* the racing wait in case 9 was the deferred-decode branch's
-  `last_graph_event->wait_and_throw()`. `queue::wait_and_throw` waits for every command, the completion task
-  included, before it takes the error list, so it cannot race that task; `event::wait_and_throw` on an event
-  that does not cover the task can, and it takes the whole queue's list.
+- *Which wait raced in case 9 is not determined (corrected 2026-11-22).* This bullet first named the
+  deferred-decode branch's `last_graph_event->wait_and_throw()`. The quality review showed that cannot be:
+  that event is a barrier submitted on the same in-order stream after the completion task
+  (`can_defer_exit_wait` requires an in-order queue), so its wait cannot return before the task has run.
+  The code does not show which other wait on that queue was delivering. Fact (i) is measured by the probe
+  and decision 12 rests on it, not on the identity of the racer.
 - *From the spec review, in the same round:* a drain wait that throws synchronously (a lost device) is recorded
   in the device latch in the helper and in both twins' first wait; the context twin gets the begin-path
   twin's `waited` flag, so a wait that threw is not followed by a second wait on the same queue; contract
@@ -2024,6 +2026,9 @@ static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_cont
     // this its pin outlives the context and the device stays owned.
     ggml_sycl_recover_exact_mmid_after_drain(this);
 ```
+   (As merged the comment says more exactly: the queues were waited on and a wait that threw was swallowed;
+   the recovery frees only the slots whose terminal reports `ready()`; a slot still in flight stays
+   quarantined.)
 
    Run: `python3 tests/test-sycl-async-failure-source.py --self-test` — expected `async failure source contract:
    PASS`. Then build `llama-cli llama-completion test-sycl-q1-nvfp4-admitted-device` and report; the lead runs the
@@ -2051,6 +2056,39 @@ static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_cont
   source contract covers it. Say so in the commit message.
 - `/tmp` is a small quota-limited tmpfs: build with `TMPDIR` on the root disk.
 - Never `clang-format-19 -i` on `ggml-sycl.cpp`; check your lines with `clang-format-19 --dry-run --lines=A:B`.
+
+**DONE 2026-11-22, merged as `2c472b280`** (task commits `4e055f90c..afac98001`, logs `572064142`). Spec
+review PASS at `ff51e943c`, spec re-review PASS after fix round 1; quality review PASS with twelve findings,
+none blocking; quality re-review by a fresh reviewer PASS with four nits; all closed in fix rounds 2 and 3.
+
+*Fix rounds 2 and 3, from the quality reviews:*
+- A drain wait that throws records `<stage>: <what>`, formatted into a stack buffer by
+  `ggml_sycl_async_failure_record_stage` (the record copies the text and neither allocates nor locks). Each
+  of the three sites catches `const std::exception &` and then `catch (...)`; the contract checks both
+  catches at each site, and that both catches of the retry helper return before the recovery.
+- Comments that said a completion task can still be pending after the deferred-decode wait now say that is
+  unmeasured. The failpoint stands for a completion task that did not release.
+- The oracle checks each reuse fixture's teardown inside its loop (the single check after the loop never
+  saw the first iteration's). The delivery probe prints `handler_calls` on its blocked path.
+- *Not changed, by ruling:* the begin-path drain runs inside `graph_compute_impl`, after graph_compute's
+  entry check of the latch. A failure it records or delivers does not fail the graph that is beginning; it
+  is reported at the context's next boundary, like every asynchronous failure. Failing that graph would
+  mean hoisting the drain above the entry check, which changes Task 7a's boundary model; it is listed in
+  the spec's known limits beside the one-token window.
+
+*Device results, one run per arm, zero kernel fault lines, `Shmem` 9 GB:*
+- RED at `df7da66df` (B50): rc 1, `the completion task did not release the finished bundle of a failed
+  terminal`. Delivery probe `--gpu` on the B50: PASS.
+- At `b6acf0455`: oracle on the B70 (ctest) and on the B50 PASS; Mistral B70 gate passes; GPT-OSS B50 gate
+  with `-c 4096` rc 0, one answer line.
+- At `060c5a330` (an include, a comment, a renamed lambda and the contract since `b6acf0455`): oracle on the
+  B70 and on the B50 PASS. The two model gates were not repeated. `afac98001` reflows one comment and was
+  not built on the task branch; the post-merge build covers it.
+
+*Recorded, not fixed here (older code, not live today; tracker items once the tracker is back):*
+- `recover_quarantined` copies a vector inside a `noexcept` function: an allocation failure there terminates.
+- `wait_and_confirm()` with `wait=true` would run `terminal->wait()`, which is `event->wait_and_throw()`,
+  under the workspace registry and pool mutexes. No caller passes `wait=true` today.
 
 ---
 
