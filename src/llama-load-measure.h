@@ -6,6 +6,7 @@
 #include "llama-auto-ubatch.h"
 #include "llama-context-tenant.h"
 #include "llama-kv-cache.h"
+#include "llama-n-ctx-hint.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -204,11 +205,19 @@ inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train) {
     return n_ctx != 0 ? n_ctx : n_ctx_train;
 }
 
+// The n_ctx the load's three measures are asked for: the context the caller requested from the load (the hint,
+// resolved and padded once by llama_n_ctx_hint_resolve, so the measure and the KV room read one value), or 0 when the
+// caller requested none, which llama_load_measure_n_ctx turns into the training context.
+inline uint32_t llama_load_measure_request_n_ctx(uint32_t n_ctx_hint, uint32_t n_ctx_train) {
+    return llama_n_ctx_hint_resolve(n_ctx_hint, n_ctx_train).n_ctx_context;
+}
+
 // The shape a load-time measure uses: n_ubatch is the auto ladder's bottom rung (from the helper the real context's
 // trial reads), and the caller's n_ctx, the training context for 0; every other parameter is the default. The bottom
 // rung is the ubatch a MoE model's auto pick stays at (its cap is MOE_GPU_UBATCH_MAX) and the one a pinned -ub 512
 // runs at. A dense model's auto pick climbs above it, to 2048 at the default n_batch, into whatever room the zones
-// have left: that larger buffer is not reserved. The caller's -c and -ub do not reach the load (fkpg).
+// have left: that larger buffer is not reserved. The caller's -ub does not reach the measures (fkpg): the load reads it
+// only as the n_ubatch hint, to place the PP MoE ring. Its -c does, as the n_ctx hint.
 inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx                = llama_load_measure_n_ctx(n_ctx, n_ctx_train);

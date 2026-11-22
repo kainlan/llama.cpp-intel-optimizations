@@ -321,6 +321,22 @@ static void test_measure_n_ctx() {
           "the measure's n_ctx and the recorded n_ctx disagree");
 }
 
+static void test_measure_request_n_ctx() {
+    CHECK(llama_load_measure_request_n_ctx(8192, 1048576) == 8192, "a named context was not kept");
+    CHECK(llama_load_measure_request_n_ctx(8000, 1048576) == 8192, "the request is not padded like the context");
+    CHECK(llama_load_measure_request_n_ctx(LLAMA_N_CTX_HINT_DEFAULT, 1048576) == 1048576,
+          "no -c did not resolve to the training context");
+    CHECK(llama_load_measure_request_n_ctx(0, 1048576) == 0, "hint 0 (no request) did not stay 0");
+    CHECK(llama_load_measure_n_ctx(llama_load_measure_request_n_ctx(0, 262144), 262144) == 262144,
+          "hint 0 does not measure at the training context");
+    // the helper is the resolver's answer, not a copy of it: the default pads a training context that is not a
+    // multiple of 256, and a hint above the training context (a rope-extended -c) is not clamped
+    CHECK(llama_load_measure_request_n_ctx(LLAMA_N_CTX_HINT_DEFAULT, 40000) == 40192,
+          "no -c did not pad the training context like the context");
+    CHECK(llama_load_measure_request_n_ctx(2097152, 1048576) == 2097152,
+          "a context above the training context was clamped");
+}
+
 // The test's stand-in for the reservation's units: each nonzero chunk rounded up to 256 B, summed. The fold must
 // compare what this answers, not the raw totals; the backend's own rule is pinned by test-zone-sizing.
 static bool fake_term_bytes(const uint64_t * chunks, uint32_t n, uint64_t * out) {
@@ -1062,6 +1078,7 @@ int main() {
     test_measure_params_tie_to_the_ladder();
     test_measure_kv_shape();
     test_measure_n_ctx();
+    test_measure_request_n_ctx();
     test_admitted_fold();
     test_admitted_record();
     test_probe_reserve();

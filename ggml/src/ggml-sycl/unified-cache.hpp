@@ -2140,10 +2140,10 @@ bool     unified_cache_planned_dense_scratch_owner_rejected(int                 
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
 // llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
 // zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
-// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
-// It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
-// -c and -ub), so it is the planned term for that shape, not for every context. moua L6 retires it into the
-// FIRST_CONTEXT head slot.
+// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack. It
+// is measured at the load's requested context (-c via the n_ctx hint, else the padded training context) and ubatch 512;
+// -ub does not reach the measures (the load reads it only as the ring's n_ubatch hint; fkpg). So it is the planned term
+// for that shape, not for every context. moua L6 retires it into the FIRST_CONTEXT head slot.
 // Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
 // that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
 // term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model

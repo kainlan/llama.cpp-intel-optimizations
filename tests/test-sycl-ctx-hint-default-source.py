@@ -275,7 +275,9 @@ PICK_DEFAULT = "inventory.n_ctx_context_is_default = ctx_room.is_default;"
 
 def claim_loader_resolves_once(model: str) -> bool:
     """llama-model.cpp resolves the hint in exactly one place, where it fills the inventory, and copies both the
-    context and its provenance; it neither resolves the hint itself nor calls the resolver anywhere else."""
+    context and its provenance; it neither resolves the hint itself nor calls the resolver anywhere else. The load
+    measures reach the same resolver through llama_load_measure_request_n_ctx (src/llama-load-measure.h), not through
+    a second call in this file."""
     m = norm(model)
     pop = body(m, POPULATE_SIG)
     return (RESOLVER_INCLUDE in m and bool(pop) and m.count("llama_n_ctx_hint_resolve(") == 1
