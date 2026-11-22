@@ -13,6 +13,9 @@
 #   (b)  digits only in the prompt echo (GPT-OSS)     -> FAIL
 #   (b2) digits mid-line, not at line start (Mistral) -> FAIL
 #   (c)  digits correct but an abort line on stderr   -> FAIL
+#   (two-gpu-advisory) digits correct, and stderr holds only the backend's
+#        two-GPU startup advisory, which names DEVICE_LOST  -> PASS
+#   (device-lost) digits correct, the advisory AND a real loss line -> FAIL
 #   (d)  --list-devices: the CURRENTLY LIVE dev_mgr abort shape
 #        (rc!=0, empty stdout, "SYCL" text only on stderr)   -> rc 77 (SKIP)
 #   (d2) --list-devices: the FUTURE llama.cpp-1lrh graceful shape
@@ -185,6 +188,20 @@ case "${STUB_MISTRAL_MODE:-pass}" in
     abort)
         printf "1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
         printf "/build/ggml/src/ggml-sycl/ggml-sycl.cpp:12345: GGML_ASSERT(x) failed\n" >&2
+        exit 0
+        ;;
+    two-gpu-advisory)
+        # What the backend prints at startup under a two-card selector. It
+        # names the error it warns about; nothing was lost.
+        printf " 1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
+        printf "0.00.123.438 W [SYCL] WARNING: 2 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.\n" >&2
+        exit 0
+        ;;
+    device-lost)
+        # The same startup advisory, then a real loss as the runtime reports it.
+        printf " 1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
+        printf "0.00.123.438 W [SYCL] WARNING: 2 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.\n" >&2
+        printf "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)\n" >&2
         exit 0
         ;;
     mid-line)
@@ -399,6 +416,22 @@ touch_fake_models "$case_c_dir"
 out="$(STUB_MISTRAL_MODE=abort run_gates "$case_c_dir" mistral)"
 rc=$?
 expect_gate "c" 1 "$out" "$rc" '^GATE mistral FAIL rc=0 '
+
+# --- (two-gpu-advisory) the startup advisory alone is not a loss -> PASS -----
+# Under a two-card selector the backend prints one WARN line that names
+# DEVICE_LOST. A verdict that searched for the bare word failed every gate on
+# level_zero:0,1 whatever the model did (seen on the Inkling gate, 2026-11-22).
+case_adv_dir="$TMP/advisory"
+setup_case_dir "$case_adv_dir"
+touch_fake_models "$case_adv_dir"
+out="$(STUB_MISTRAL_MODE=two-gpu-advisory run_gates "$case_adv_dir" mistral)"
+rc=$?
+expect_gate "two-gpu-advisory" 0 "$out" "$rc" '^GATE mistral PASS rc=0 '
+
+# --- (device-lost) the advisory does not hide a real loss -> FAIL ------------
+out="$(STUB_MISTRAL_MODE=device-lost run_gates "$case_adv_dir" mistral)"
+rc=$?
+expect_gate "device-lost" 1 "$out" "$rc" '^GATE mistral FAIL rc=0 '
 
 # --- (d) --list-devices: the LIVE dev_mgr abort shape -> rc 77 (SKIP) ------
 # The no-device probe must read stdout only: this exact shape (abort text
