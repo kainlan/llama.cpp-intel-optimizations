@@ -500,9 +500,9 @@ inline std::string llama_load_probe_unfundable_text(const std::vector<llama_load
             }
             char text[512];
             snprintf(text, sizeof(text),
-                     "load refused: the compute buffer measured at n_ctx %u needs %.1f MiB on SYCL device %d, and "
-                     "that device has %.1f MiB in total; request a context that fits with -c (with no -c the context "
-                     "is the model's training context)",
+                     "[LOAD-PLAN] load refused: the compute buffer measured at n_ctx %u needs %.1f MiB on SYCL device "
+                     "%d, and that device has %.1f MiB in total; request a context that fits with -c (with no -c the "
+                     "context is the model's training context)",
                      n_ctx, d.total / mib, (int) d.device, c.total_bytes / mib);
             return text;
         }
