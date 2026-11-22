@@ -19,7 +19,10 @@ reaching them needs a GPU and a loaded MoE model:
   5. one predicate answers "same MMID workspace plan": the context bind's
      reconcile, the expert loan's assert and the plan CAS all call
      moe_mmid_same_workspace_plan (unified-cache.cpp), so no site can drift
-     back to a subset of its fields.
+     back to a subset of its fields;
+  6. the follows question (ggml_sycl_mmid_workspaces_follow) asks the owner
+     device's execution queue, not a backend context: a context pointer read
+     after the lookup mutex is released can be freed under it.
 
 EVERY assertion here is checked against a POISONED copy of the source under
 --self-test, and the gate fails if a poisoned variant still passes. A source
@@ -161,6 +164,22 @@ def check_same_plan_cas(cache):
     return True, "plan CAS asks the shared same-plan predicate"
 
 
+FOLLOWS_FN = "static bool ggml_sycl_mmid_workspaces_follow("
+FOLLOWS_QUEUE = "ggml_sycl_execution_queue_for_device(workspace.owner_device)"
+BACKEND_LOOKUP = "ggml_sycl_get_backend_context_for_device("
+
+
+def check_follows_device_queue(text):
+    fn = strip_comments(body(text, FOLLOWS_FN))
+    if not fn:
+        return False, "follows question not found (renamed?)"
+    if BACKEND_LOOKUP in fn:
+        return False, "follows question reads a backend context: freed under it once the lookup mutex is released"
+    if FOLLOWS_QUEUE not in fn:
+        return False, "follows question no longer asks the owner device's execution queue"
+    return True, "follows question asks the device-global execution queue"
+
+
 # (name, source the check reads, check)
 CHECKS = [
     ("shared-predicate", "sycl", check_shared_predicate),
@@ -169,6 +188,7 @@ CHECKS = [
     ("cas-release-order", "cache", check_cas_releases_after_plan_lock),
     ("same-plan:sycl", "sycl", check_same_plan_sycl),
     ("same-plan:cas", "cache", check_same_plan_cas),
+    ("follows-queue", "sycl", check_follows_device_queue),
 ]
 
 def poison_load_end(text):
@@ -212,6 +232,9 @@ POISONS = {
     # The regression: a site going back to a local predicate of its own.
     "same-plan:sycl": lambda t: t.replace(SAME_PLAN_SYCL_SITES[0][1],
                                           "ggml_sycl_same_mmid_workspace_plan(*published->plan, *live->plan)", 1),
+    "follows-queue": lambda t: t.replace(
+        "ggml_sycl_execution_queue_for_device(workspace.owner_device) :",
+        "ggml_sycl_get_backend_context_for_device(workspace.owner_device)->stream() :", 1),
     "same-plan:cas": lambda t: t.replace(SAME_PLAN_CAS_SITE, "same_workspace_locally(*expected->plan, *replacement->plan)", 1),
 }
 

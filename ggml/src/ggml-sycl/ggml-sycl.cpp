@@ -13953,9 +13953,11 @@ static int ggml_sycl_mmid_submit_device(const ggml_sycl::placement_plan & plan) 
 }
 
 // Whether the MMID registry holds a context accepting for exactly `snapshot`, for every workspace owner, asked with
-// the lookup decode admission uses (exact_queue) and the queue of the owner device's current backend context. True
-// for a plan with no workspace. Read-only: it takes no lease and moves no generation, and it allocates nothing, so a
-// caller may ask it under g_tensor_inventory_mutex.
+// the lookup decode admission uses (exact_queue) and the owner device's execution queue. That queue is device-global
+// (ggml_sycl_execution_queue_for_device), the one a backend context's stream() answers once the unified cache exists,
+// so no backend context is read and a context freed meanwhile cannot be dereferenced. True for a plan with no
+// workspace. Read-only: it takes no lease and moves no generation, and it allocates nothing, so a caller may ask it
+// under g_tensor_inventory_mutex.
 static bool ggml_sycl_mmid_workspaces_follow(
     const ggml_sycl::lifecycle::ModelToken &                          token,
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
@@ -13968,11 +13970,12 @@ static bool ggml_sycl_mmid_workspaces_follow(
     }
     const ggml_sycl::moe_mmid_model_token owner{ token.model.value, token.load.value, token.owner.generation };
     for (const auto & workspace : snapshot->plan->moe_mmid_workspaces) {
-        ggml_backend_sycl_context * backend = ggml_sycl_get_backend_context_for_device(workspace.owner_device);
-        if (!backend || !backend->stream() ||
-            !ggml_sycl::unified_cache_moe_mmid_exact_queue(owner, snapshot, submit_device, workspace.owner_device,
-                                                           backend->stream())
-                 .valid()) {
+        sycl::queue * queue = ggml_sycl_valid_device_index(workspace.owner_device) ?
+                                  ggml_sycl_execution_queue_for_device(workspace.owner_device) :
+                                  nullptr;
+        if (!queue || !ggml_sycl::unified_cache_moe_mmid_exact_queue(owner, snapshot, submit_device,
+                                                                     workspace.owner_device, queue)
+                           .valid()) {
             return false;
         }
     }
