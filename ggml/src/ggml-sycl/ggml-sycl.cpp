@@ -80706,8 +80706,8 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
         ggml_sycl::mem_handle      gate_dev_handle;
         managed_host_pinned_buffer out_reduce_alloc;
         managed_host_pinned_buffer out_reduce_target_alloc;
-        // Keep the contexts the ring's buffers live in. Optional: a default-constructed sycl::context is a real context,
-        // built with no handler.
+        // Keep the contexts the ring's buffers live in. Optional: a default-constructed sycl::context is a real
+        // context, built with no handler.
         std::optional<sycl::context> pri_ctx;
         std::optional<sycl::context> sec_ctx;
         bool                         valid = false;
