@@ -35,6 +35,7 @@ case "${STUB_MODE:-ok}" in
     fail) exit 5 ;;
     hang) trap '' TERM; while :; do sleep 1; done ;;
     sleep) echo $$ > "$STUB_PIDFILE"; exec sleep 30 ;;
+    jitter) sleep "0.$((RANDOM % 10))"; touch "$STUB_ENDFILE"; exit 0 ;;
     steal) echo 'foreign taker' > "$INKLING_GPU_LOCK/holder"; exit 0 ;;
     handshake)
         # On TERM: announce it, then refuse to exit until the test says so, so the test can look at the lock
@@ -66,6 +67,7 @@ def _mk(p, *a, **k):
     _real(p, *a, **k)
     if '\${SHIM_MODE:-}' == 'foreign': open(p + '/holder', 'w').write('foreign taker\\\\n')
     if '\${SHIM_MODE:-}' == 'sleep': _t.sleep(2)
+    if '\${SHIM_MODE:-}' == 'chmod': _o.chmod(p, 0o500)
 _o.mkdir = _mk
 \$prog" "\$@"
 SH
@@ -218,8 +220,8 @@ else
 fi
 
 # k2. two copies of one tag started together on a fresh lock, 20 times: the tool must run exactly once each time. This
-# catches a lock with no second check; the deterministic lying-mkdir, foreign-holder and lost-lock cases below catch
-# the specific lock bugs.
+# catches a runner that does not recheck the rerun markers once the lock is held. It does not detect a non-atomic
+# take; the deterministic lying-mkdir, foreign-holder and lost-lock cases below cover that.
 bad=""
 for i in $(seq 1 20); do
     : > "$STUB_LOG"; K="$T/kk$i"
@@ -295,22 +297,29 @@ await_gone() { # PID SECONDS: wait for a pid to exit, kill it after the bound
     if kill -0 "$1" 2>/dev/null; then kill -KILL -- "-$1" 2>/dev/null; return 1; fi
     wait "$1" 2>/dev/null; GRC=$?
 }
-# settle: TERM to the process group during the settle must not cut it short.
-: > "$STUB_LOG"; Gs="$T/gs"
-group_start "$Gs" STUB_MODE=ok INKLING_SETTLE_SECONDS=4
-for _ in $(seq 1 3000); do [ -s "$STUB_LOG" ] && break; sleep 0.01; done
-t_ran=$(date +%s%N)
-kill -TERM -- "-$GP" 2>/dev/null
-for _ in $(seq 1 1500); do [ -e "$T/lock" ] || break; sleep 0.01; done
-t_gone=$(date +%s%N)
-await_gone "$GP" 20
-ms=$(( (t_gone - t_ran) / 1000000 ))
-if [ "$ms" -ge 2500 ] && [ ! -e "$T/lock" ] && grep -q 'signalled=yes' "$Gs/$TAG.done" 2>/dev/null; then
-    pass "(real: a group TERM during the settle does not cut it short (${ms} ms), signalled=yes)"
-else
-    fail "(real: group settle) lock held ${ms} ms; done: $(cat "$Gs/$TAG.done" 2>&1)"
-fi
-rm -rf "${T:?}/lock"
+# settle: TERM to the process group during the settle must not cut it short. The jitter stub randomises where in the
+# second the settle starts, because the early end a killed sleep causes depends on that; 4 attempts.
+# A journalctl shim keeps the time after the settle small, so the measured hold time is the settle itself.
+JSH="$T/jshim"; mkdir -p "$JSH"; printf '#!/bin/sh\nexit 0\n' > "$JSH/journalctl"; chmod +x "$JSH/journalctl"
+bad=""
+for i in 1 2 3 4; do
+    : > "$STUB_LOG"; Gs="$T/gs$i"; rm -f "$T/stub.end"
+    group_start "$Gs" PATH="$JSH:$PATH" STUB_MODE=jitter STUB_ENDFILE="$T/stub.end" INKLING_SETTLE_SECONDS=4
+    for _ in $(seq 1 3000); do [ -e "$T/stub.end" ] && break; sleep 0.005; done
+    t_ran=$(date +%s%N)
+    sleep 0.3    # a TERM sent before the settle starts would kill no sleep at all
+    kill -TERM -- "-$GP" 2>/dev/null
+    for _ in $(seq 1 1500); do [ -e "$T/lock" ] || break; sleep 0.01; done
+    t_gone=$(date +%s%N)
+    await_gone "$GP" 20
+    ms=$(( (t_gone - t_ran) / 1000000 ))
+    if [ "$ms" -lt 4000 ] || [ -e "$T/lock" ] || ! grep -q 'signalled=yes' "$Gs/$TAG.done" 2>/dev/null; then
+        bad="$bad [try $i: lock held ${ms} ms; done: $(cat "$Gs/$TAG.done" 2>&1)]"
+    fi
+    rm -rf "${T:?}/lock"
+done
+if [ -z "$bad" ]; then pass "(real: a group TERM during the settle does not cut it short, signalled=yes, 4 tries)"
+else fail "(real: group settle)$bad"; fi
 
 # group TERM while the take is stalled right after its mkdir: never a directory with no holder and no owner.
 : > "$STUB_LOG"; Gt="$T/gt"
@@ -325,17 +334,63 @@ else
 fi
 rm -rf "${T:?}/lock"
 
-# numeric overrides are validated before any marker, lock or tool.
-for bad_env in INKLING_LOCK_POLL_SECONDS=0 INKLING_SETTLE_SECONDS=abc INKLING_RUN_TIMEOUT=abc; do
-    : > "$STUB_LOG"; V="$T/v-${bad_env%%=*}"
-    RR_RC=0
+# numeric overrides are validated before any marker, lock or tool; a leading zero is read as bad octal by $(( )).
+vi=0
+for bad_env in INKLING_LOCK_POLL_SECONDS=0 INKLING_SETTLE_SECONDS=abc INKLING_RUN_TIMEOUT=abc INKLING_SETTLE_SECONDS=08 \
+               INKLING_LOCK_POLL_SECONDS=08 INKLING_KILL_SECONDS=0 INKLING_RUN_TIMEOUT=0; do
+    vi=$((vi + 1)); : > "$STUB_LOG"; V="$T/v$vi"; RR_RC=0
     out="$(env "$bad_env" timeout 20 bash "$S" --setup b70 --phase e2e-decode --out "$V" --build-dir "$BR" 2>&1)" || RR_RC=$?
     if [ "$RR_RC" -eq 1 ] && ! ls "$V"/*.done >/dev/null 2>&1 && [ ! -s "$STUB_LOG" ] && printf '%s' "$out" | grep -q "${bad_env%%=*}"; then
-        pass "(a bad ${bad_env%%=*} exits 1 before any marker or run)"
+        pass "(a bad $bad_env exits 1 before any marker or run)"
     else
-        fail "(bad ${bad_env%%=*}) rc=$RR_RC out: $out"
+        fail "(bad $bad_env) rc=$RR_RC out: $out"
     fi
 done
+
+# a lock take that cannot succeed ends the run at once instead of waiting out the lock timeout.
+: > "$STUB_LOG"; XENV=(PATH="$SHIM:$PATH" SHIM_MODE=chmod INKLING_LOCK_WAIT_SECONDS=20); R3="$T/r3"; t0=$SECONDS
+rr "$R3"
+if [ "$RR_RC" -eq 3 ] && [ $((SECONDS - t0)) -lt 8 ] && [ ! -s "$STUB_LOG" ] && [ -d "$T/lock" ] \
+   && printf '%s' "$RR_OUT" | grep -q 'remove that directory by hand'; then
+    pass "(real: a holder that cannot be written stops the run at once with the by-hand message)"
+else
+    fail "(real: take rc 3) rc=$RR_RC after $((SECONDS - t0)) s out: $RR_OUT"
+fi
+chmod -R u+rwx "$T/lock" 2>/dev/null; rm -rf "${T:?}/lock"
+: > "$STUB_LOG"; XENV=(INKLING_GPU_LOCK="$T/nodir/lock" INKLING_LOCK_WAIT_SECONDS=20); R4="$T/r4"; t0=$SECONDS
+rr "$R4"
+if [ "$RR_RC" -eq 3 ] && [ $((SECONDS - t0)) -lt 8 ] && [ ! -s "$STUB_LOG" ] && [ ! -e "$T/nodir" ] \
+   && printf '%s' "$RR_OUT" | grep -q 'cannot create the lock directory'; then
+    pass "(real: an uncreatable lock directory stops the run at once)"
+else
+    fail "(real: take rc 4) rc=$RR_RC after $((SECONDS - t0)) s out: $RR_OUT"
+fi
+
+# group TERM while the done line is being built (a git that takes 3 s): .done is complete and the lock is released by
+# the main shell only.
+GSH="$T/gshim"; mkdir -p "$GSH"
+printf '#!/usr/bin/env bash\ntouch "%s/git.started"; sleep 3; exec /usr/bin/git "$@"\n' "$T" > "$GSH/git"; chmod +x "$GSH/git"
+: > "$STUB_LOG"; rm -f "$T/git.started"; Gd="$T/gd"
+group_start "$Gd" PATH="$GSH:$PATH" STUB_MODE=ok
+for _ in $(seq 1 3000); do [ -e "$T/git.started" ] && break; sleep 0.01; done
+kill -TERM -- "-$GP" 2>/dev/null
+await_gone "$GP" 30
+if [ -e "$T/git.started" ] && grep -q 'signalled=yes' "$Gd/$TAG.done" 2>/dev/null && grep -q 'sha=' "$Gd/$TAG.done" \
+   && [ ! -e "$T/lock" ] && [ "$(wc -l < "$Gd/$TAG.done")" -eq 1 ]; then
+    pass "(real: a group TERM while the done line is built leaves a complete .done and no lock)"
+else
+    fail "(real: group TERM at the done line) done: $(cat "$Gd/$TAG.done" 2>&1) lock: $(ls -A "$T/lock" 2>&1)"
+fi
+rm -rf "${T:?}/lock"
+
+# a runner that cannot load its lock library stops before any marker or lock.
+mkdir -p "$T/solo/scripts"; cp "$S" "$T/solo/scripts/"
+out="$(bash "$T/solo/scripts/sycl-inkling-profile.sh" --setup b70 --phase bench --dry-run --out "$T/solo/o" --build-dir "$BR" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'cannot load scripts/sycl-lock.sh' && [ ! -e "$T/solo/o" ]; then
+    pass "(a missing lock library stops the runner with exit 1)"
+else
+    fail "(missing library) rc=$rc out: $out"
+fi
 
 # e. setvars fails.
 : > "$STUB_LOG"; printf 'return 3\n' > "$T/setvars-bad.sh"; XENV=(INKLING_SETVARS="$T/setvars-bad.sh"); E="$T/e"

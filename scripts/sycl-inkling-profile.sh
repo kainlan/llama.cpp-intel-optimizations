@@ -14,27 +14,28 @@
 # rerun refusal (the first run's evidence stays untouched), a failed mkdir of DIR, and a signal before the traps are
 # installed. Stop a run with TERM: a script started with & from a non-interactive shell has INT ignored and a trap
 # cannot override that.
-# Exit codes: 1 usage, preflight, setvars failure or rerun refusal; 3 lock or Shmem give-up; 4 the lock was lost
+# Exit codes: 1 usage, preflight, setvars failure, unloadable library or rerun refusal; 3 lock or Shmem give-up, or a
+# lock take that failed for a reason waiting cannot clear; 4 the lock was lost
 # during the run (.done says lock=lost, the numbers are not valid); 143 signalled before the run; otherwise the
 # tool's rc (124/137 = timeout, unless signalled=yes).
 # What the lock cannot close: a co-taker that takes the directory with a non-atomic mkdir and writes its holder after
 # our verify window is found only at the end of the run (lock=lost); one that writes no holder is not found at all.
 # A SIGKILL of the take process between the mkdir and the holder write, and a take that cannot write the holder,
 # leave a directory that must be removed by hand once no holder is alive.
-# Environment overrides, all non-negative integers (the test drives the real path through them; defaults are the
-# production values): INKLING_MODEL INKLING_PROMPT_FILE INKLING_GPU_LOCK INKLING_SETVARS INKLING_MEMINFO
-#   INKLING_SETTLE_SECONDS (12) INKLING_RUN_TIMEOUT (900, >0) INKLING_KILL_SECONDS (30, >0)
-#   INKLING_LOCK_WAIT_SECONDS (2400) INKLING_SHMEM_WAIT_SECONDS (600) INKLING_LOCK_POLL_SECONDS (1, >0)
-#   INKLING_LOCK_VERIFY_SECONDS (1)
+# Environment overrides (the test drives the real path through them; defaults are the production values).
+#   Paths: INKLING_MODEL INKLING_PROMPT_FILE INKLING_GPU_LOCK INKLING_SETVARS INKLING_MEMINFO
+#   Integers, written without a leading zero: INKLING_SETTLE_SECONDS (12) INKLING_RUN_TIMEOUT (900, >0)
+#   INKLING_KILL_SECONDS (30, >0) INKLING_LOCK_WAIT_SECONDS (2400) INKLING_SHMEM_WAIT_SECONDS (600)
+#   INKLING_LOCK_POLL_SECONDS (1, >0) INKLING_LOCK_VERIFY_SECONDS (1)
 set -u
 
 usage() {
-    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck disable=SC1091  # sourced by a path computed from this file
-source "$(dirname "${BASH_SOURCE[0]}")/sycl-lock.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/sycl-lock.sh" || { echo "sycl-inkling-profile: cannot load scripts/sycl-lock.sh" >&2; exit 1; }
 SETUP="" PHASE="" CTX=8192 OUT="" BUILD_DIR="$REPO/build" DRY=0
 MODEL="${INKLING_MODEL:-/models/Inkling-2-Mini-UD-Q8_K_XL.gguf}"
 PROMPT_FILE="${INKLING_PROMPT_FILE:-$REPO/docs/backend/data/inkling2/prompt-1208.txt}"
@@ -51,8 +52,11 @@ LOCK_VERIFY="${INKLING_LOCK_VERIFY_SECONDS:-1}"
 
 # Numeric overrides are validated like --ctx: a bad value exits before any marker, lock or tool.
 need_uint() { # NAME VALUE MIN
+    # No leading zero: $(( )) would read 08 as a bad octal number.
     case "$2" in
-        ''|*[!0-9]*) echo "sycl-inkling-profile: $1 must be a non-negative integer, got '$2'" >&2; exit 1 ;;
+        0) ;;
+        [1-9]*) case "${2#?}" in *[!0-9]*) echo "sycl-inkling-profile: $1 must be a non-negative integer, got '$2'" >&2; exit 1 ;; esac ;;
+        *) echo "sycl-inkling-profile: $1 must be a non-negative integer without a leading zero, got '$2'" >&2; exit 1 ;;
     esac
     [ "$2" -ge "$3" ] || { echo "sycl-inkling-profile: $1 must be at least $3, got '$2'" >&2; exit 1; }
 }
@@ -144,7 +148,7 @@ refuse_rerun() {
 }
 refuse_rerun
 
-LOCK_HELD=0 CHILD="" SIGNALLED=0 MINE=
+LOCK_HELD=0 CHILD="" SIGNALLED=0 MINE="" MAIN_PID=$BASHPID
 die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this process holds
     printf 'tag=%s rc=%s reason=%s\n' "$TAG" "$1" "$2" > "$OUT/$TAG.fail"
     echo "sycl-inkling-profile: $2" >&2
@@ -153,6 +157,8 @@ die() { # RC REASON: marker, then exit; the EXIT trap releases a lock this proce
 # shellcheck disable=SC2329  # installed through trap
 lock_release() {
     [ "$LOCK_HELD" = 1 ] || return 0
+    # A subshell inherits LOCK_HELD and may run this trap; only the main shell may release the lock.
+    [ "$BASHPID" = "$MAIN_PID" ] || return 0
     LOCK_HELD=0
     # Removes only a holder that is still ours; a foreign or missing holder is reported and left alone.
     sycl_lock_release "$LOCK" "$MINE"
@@ -184,8 +190,8 @@ meminfo_shmem_gb() { awk '/^Shmem:/ { printf "%d", $2 / 1048576 }' "$MEMINFO"; }
 MINE="sycl-inkling-profile pid=$$ tag=$TAG start=$(date +%FT%T)"
 # Sleeping to a deadline instead of one long sleep: a signal sent to the whole process group kills a sleep child, and
 # a wait that trusted it would end early.
-wait_seconds() {
-    local end=$((SECONDS + $1))
+wait_seconds() { # SECONDS [EXTRA]: EXTRA=1 makes it a lower bound, since $SECONDS counts whole seconds
+    local end=$((SECONDS + $1 + ${2:-0}))
     while [ "$SECONDS" -lt "$end" ]; do sleep 1; done
 }
 # Failing to get the lock in time exits without running. Busy (1) and a co-taker's holder (2) both keep waiting.
@@ -193,8 +199,13 @@ lock_start=$SECONDS
 check_signal
 while :; do
     sycl_lock_take "$LOCK" "$MINE" "$LOCK_VERIFY"; take_rc=$?
-    [ "$take_rc" -ne 0 ] || break
-    [ "$take_rc" -ne 3 ] || die 3 "$LOCK was created but its holder could not be written; remove that directory by hand"
+    case "$take_rc" in
+        0) break ;;
+        1|2) ;;
+        3) die 3 "$LOCK was created but its holder could not be written; remove that directory by hand" ;;
+        4) die 3 "cannot create the lock directory $LOCK (see the message above); waiting will not clear it" ;;
+        *) die 3 "the lock take failed unexpectedly (rc=$take_rc, see the message above)" ;;
+    esac
     wait_seconds "$LOCK_POLL"
     check_signal
     [ $((SECONDS - lock_start)) -lt "$LOCK_WAIT" ] || die 3 "GPU.lock not acquired in ${LOCK_WAIT}s"
@@ -240,21 +251,25 @@ CHILD=""
 TIMED_OUT=no
 { [ "$SIGNALLED" = 0 ] && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; }; } && TIMED_OUT=yes
 # Settle before the lock is released: a process started right after a fast exit can hang the GT.
-wait_seconds "$SETTLE"
-SIGNALLED_STR=no
-[ "$SIGNALLED" = 0 ] || SIGNALLED_STR=yes
+if [ "$SETTLE" -gt 0 ]; then wait_seconds "$SETTLE" 1; fi
 # A co-taker that replaced the holder means this run shared the GPU: its numbers are not valid.
 LOCK_STATE=held
 sycl_lock_holder_is "$LOCK" "$MINE" || LOCK_STATE=lost
 KLOG_RAW="$(journalctl -k --since "@$T0" --no-pager 2>/dev/null)"; jrc=$?
 if [ "$jrc" -eq 0 ]; then
-    KLOG="$(printf '%s\n' "$KLOG_RAW" | grep -ciE 'GT reset|guc_id|GPU hang|CAT error')"
+    KLOG="$(grep -ciE 'GT reset|guc_id|GPU hang|CAT error' <<<"$KLOG_RAW")"
 else
     KLOG=unreadable
 fi
-echo "tag=$TAG rc=$rc timed_out=$TIMED_OUT signalled=$SIGNALLED_STR lock=$LOCK_STATE secs=$SECS shmem_before=${SHMEM_BEFORE}G" \
-     "shmem_after=$(meminfo_shmem_gb)G kernel_lines=$KLOG load=$LOAD builders=$BUILDERS" \
-     "sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)" | tee "$OUT/$TAG.done"
+# Plain assignments and two printf calls, no pipeline: a pipeline runs its left side in a subshell, and under a group
+# signal that subshell ran this shell's EXIT trap and left an empty .done.
+SHMEM_AFTER="$(meminfo_shmem_gb)"
+SHA="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+SIGNALLED_STR=no
+[ "$SIGNALLED" = 0 ] || SIGNALLED_STR=yes
+DONE_LINE="tag=$TAG rc=$rc timed_out=$TIMED_OUT signalled=$SIGNALLED_STR lock=$LOCK_STATE secs=$SECS shmem_before=${SHMEM_BEFORE}G shmem_after=${SHMEM_AFTER}G kernel_lines=$KLOG load=$LOAD builders=$BUILDERS sha=$SHA"
+printf '%s\n' "$DONE_LINE" > "$OUT/$TAG.done"
+printf '%s\n' "$DONE_LINE"
 if [ "$LOCK_STATE" = lost ]; then
     echo "sycl-inkling-profile: the run shared GPU.lock with another taker; its numbers are not valid" >&2
     exit 4

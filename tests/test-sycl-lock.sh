@@ -30,6 +30,8 @@ def _mk(p, *a, **k):
     if '\${SHIM_MODE:-}' == 'foreign': open(p + '/holder', 'w').write('foreign taker\\\\n')
     if '\${SHIM_MODE:-}' == 'chmod': _o.chmod(p, 0o500)
 _o.mkdir = _mk
+if '\${SHIM_MODE:-}' == 'enospc': _o.write = lambda *a: (_ for _ in ()).throw(OSError(28, 'No space left on device'))
+if '\${SHIM_MODE:-}' == 'boom': _o.open = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom'))
 \$prog" "\$@"
 SH
 chmod +x "$SHIM/mkdir" "$SHIM/python3"
@@ -82,6 +84,25 @@ if [ "$TAKE_RC" -eq 3 ] && [ -d "$L" ] && printf '%s' "$TAKE_ERR" | grep -q 'hol
 else fail "(take rc 3) rc=$TAKE_RC err=$TAKE_ERR"; fi
 chmod u+rwx "$L" 2>/dev/null
 
+# rc 4: the directory cannot be created (missing parent): nothing is created and the errno text is on stderr.
+L0="$L"; L="$T/nodir/lock"
+take 0
+if [ "$TAKE_RC" -eq 4 ] && [ ! -e "$T/nodir" ] && printf '%s' "$TAKE_ERR" | grep -q 'cannot create'; then pass "(take: a missing parent is rc 4, nothing created)"
+else fail "(take rc 4) rc=$TAKE_RC err=$TAKE_ERR"; fi
+L="$L0"
+
+# rc 3 on a write failure after the directory exists (a full disk): directory left in place.
+reset
+take 0 "PATH=$SHIM:$PATH" SHIM_MODE=enospc
+if [ "$TAKE_RC" -eq 3 ] && [ -d "$L" ] && printf '%s' "$TAKE_ERR" | grep -q 'could not be written'; then pass "(take: a failed holder write is rc 3, directory left)"
+else fail "(take write failure) rc=$TAKE_RC err=$TAKE_ERR"; fi
+
+# rc 5: an unexpected failure is neither busy nor a co-taker.
+reset
+take 0 "PATH=$SHIM:$PATH" SHIM_MODE=boom
+if [ "$TAKE_RC" -eq 5 ] && printf '%s' "$TAKE_ERR" | grep -q 'unexpected failure'; then pass "(take: an unexpected exception is rc 5)"
+else fail "(take rc 5) rc=$TAKE_RC err=$TAKE_ERR"; fi
+
 # release with a foreign holder and with no holder: nothing removed, one line on stderr
 reset; mkdir "$L"; echo "foreign taker" > "$L/holder"
 err="$(bash -c 'source "$1"; sycl_lock_release "$2" me' _ "$LIB" "$L" 2>&1)"; rc=$?
@@ -92,5 +113,21 @@ rm "$L/holder"
 err="$(bash -c 'source "$1"; sycl_lock_release "$2" me' _ "$LIB" "$L" 2>&1)"; rc=$?
 if [ "$rc" -eq 1 ] && [ -d "$L" ] && printf '%s' "$err" | grep -q 'missing'; then pass "(release: a missing holder is reported, directory left)"
 else fail "(release missing) rc=$rc err=$err"; fi
+
+# release under a group TERM sent 3-42 ms after it starts (python3 start-up is the dangerous window), 80 times: the directory must be gone every time.
+left=0
+for i in $(seq 1 80); do
+    reset; mkdir "$L"; echo me > "$L/holder"
+    # shellcheck disable=SC2016  # the bash -c program expands its own parameters
+    setsid bash -c 'source "$1"; sycl_lock_release "$2" me' _ "$LIB" "$L" >/dev/null 2>&1 &
+    GP=$!
+    sleep "0.$(printf '%03d' $((3 + (i * 7) % 40)))"
+    kill -TERM -- "-$GP" 2>/dev/null
+    for _ in $(seq 1 100); do [ -e "$L" ] || break; sleep 0.03; done
+    [ ! -e "$L" ] || left=$((left + 1))
+    wait "$GP" 2>/dev/null
+done
+if [ "$left" -eq 0 ]; then pass "(release: a group TERM during start-up never strands our holder, 80 tries)"
+else fail "(release under group TERM) $left of 80 left the directory"; fi
 
 [ "$n_fail" -eq 0 ] || exit 1
