@@ -17,7 +17,9 @@ With comments blanked:
      returned before the first ggml_backend_sycl_graph_compute_unchecked( call.
   R. (ggml-sycl.cpp ggml_sycl_async_failure_report) the [SYCL-ASYNC-FAILURE] line says the outputs of the context's
      last graph are not valid.
-  T. (ggml-sycl.cpp moe_direct_event_terminal) arm takes a ggml_sycl_async_failure_cursor; ready() tests
+  T. (ggml-sycl.cpp moe_direct_event_terminal) arm takes a ggml_sycl_async_failure_cursor; ready() tests the
+     command_execution_status and names neither ggml_sycl_async_failure_since nor wait_and_throw, because the
+     slot-release sites read it as "finished" and a failed bundle must still be released; observe_success() tests
      ggml_sycl_async_failure_since( after event->wait_and_throw(); the route arms with a snapshot taken before its
      first submission.
   H. (common.cpp ggml_sycl_async_handler) the handler body has no throw statement, no GGML_LOG, no lock or mutex, no
@@ -59,6 +61,8 @@ def claims(cache, sycl, common):
     g = body(sycl, "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph)")
     r = body(sycl, "static void ggml_sycl_async_failure_report(ggml_backend_sycl_context * ctx, const char * stage)")
     t = body(sycl, "class moe_direct_event_terminal final")
+    t_ready = body(t, "bool ready() const noexcept override")
+    t_success = body(t, "bool observe_success() noexcept")
     h = body(common, "sycl::async_handler ggml_sycl_async_handler(int slot)")
     g_check = g.find("ggml_sycl_async_failure_since(")
     g_first = g.find("ggml_backend_sycl_graph_compute_unchecked(")
@@ -80,8 +84,10 @@ def claims(cache, sycl, common):
         "G refusal before compute": 0 <= g_check < g_first and "GGML_STATUS_FAILED" in g[g_check:g_first],
         "R the report says the last outputs are invalid": "are not valid" in r,
         "T arm takes a cursor": "void arm(sycl::event event, ggml_sycl_async_failure_cursor cursor)" in t,
-        "T ready reads the latch after the wait": 0 <= t.find("event->wait_and_throw();") <
-            t.find("ggml_sycl_async_failure_since(cursor)"),
+        "T ready tests completion only": "command_execution_status" in t_ready and
+            "ggml_sycl_async_failure_since" not in t_ready and "wait_and_throw" not in t_ready,
+        "T observe_success reads the latch after the wait": 0 <= t_success.find("event->wait_and_throw();") <
+            t_success.find("ggml_sycl_async_failure_since(cursor)"),
         "T route arms with its cursor": "terminal->arm(final, failure_cursor);" in sycl and
             "const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(ctx.device);" in sycl,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
@@ -102,6 +108,8 @@ def main():
         print("async failure source contract failed: " + ", ".join(failed), file=sys.stderr)
         return 1
     if "--self-test" in sys.argv:
+        # check() passed, so this body is not empty and the replacements below cannot match at offset 0.
+        success = body(body(sycl, "class moe_direct_event_terminal final"), "bool observe_success() noexcept")
         mutants = {
             "execution queue without handler": (cache.replace("ggml_sycl_make_queue(ctx, dev, device,",
                                                               "sycl::queue(ctx, dev,", 1), sycl, common),
@@ -126,6 +134,12 @@ def main():
                                                                   "false && (failed_ctx->", 1), common),
             "terminal ignores the latch": (cache, sycl.replace("terminal->arm(final, failure_cursor);",
                                                                "terminal->arm(final, {});", 1), common),
+            "ready reads the latch": (cache, re.sub(
+                r"(bool ready\(\) const noexcept override \{)",
+                r"\1 if (ggml_sycl_async_failure_since(cursor_)) return false;", sycl, count=1), common),
+            "observe_success is ready": (cache, sycl.replace(success, "{ return ready(); }", 1), common),
+            "observe_success skips the wait": (cache, sycl.replace(
+                success, success.replace("event->wait_and_throw();", "", 1), 1), common),
             "handler logs": (cache, sycl, common.replace("ggml_sycl_async_failure_record(bound, e.what());",
                                                          "GGML_LOG_ERROR(\"%s\", e.what());", 1)),
         }

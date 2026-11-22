@@ -94,6 +94,46 @@ struct case_scope {
     const case_marker * marker = nullptr;
 };
 
+// A fixture whose context cannot be drained leaves the device owned by a context nothing computes on, and the next
+// case's graph fails with DEVICE_BUSY, far from the case that leaked. The fixture's destructor cannot throw, so its
+// teardown records the first refusal here and main() fails the run on it after the case.
+bool        g_teardown_failed = false;
+std::string g_teardown_failure;
+
+void require_clean_teardown() {
+    if (g_teardown_failed) {
+        throw std::runtime_error(g_teardown_failure.empty() ? "a fixture teardown was refused" : g_teardown_failure);
+    }
+}
+
+const char * execution_result_name(ggml_sycl_execution_result result) {
+    switch (result) {
+        case GGML_SYCL_EXECUTION_OK:
+            return "OK";
+        case GGML_SYCL_EXECUTION_STALE:
+            return "STALE";
+        case GGML_SYCL_EXECUTION_MISMATCH:
+            return "MISMATCH";
+        case GGML_SYCL_EXECUTION_OVERFLOW:
+            return "OVERFLOW";
+        case GGML_SYCL_EXECUTION_DEVICE_BUSY:
+            return "DEVICE_BUSY";
+        case GGML_SYCL_EXECUTION_BUSY:
+            return "BUSY";
+        case GGML_SYCL_EXECUTION_NULL_OUTPUT:
+            return "NULL_OUTPUT";
+        case GGML_SYCL_EXECUTION_FOREIGN_BACKEND:
+            return "FOREIGN_BACKEND";
+        case GGML_SYCL_EXECUTION_NOT_FOUND:
+            return "NOT_FOUND";
+        case GGML_SYCL_EXECUTION_ALLOCATION_FAILURE:
+            return "ALLOCATION_FAILURE";
+        case GGML_SYCL_EXECUTION_INTERNAL_ERROR:
+            return "INTERNAL_ERROR";
+    }
+    return "unknown";
+}
+
 // If any case terminates, an asynchronous error reached a queue with no backend handler, and the runtime's default
 // handler called std::terminate (llama.cpp-kjoc). Name the running case, or the last one that ended when none is
 // running, and print its stage deltas first. Then hand over to the previous handler (ggml's, which prints a
@@ -158,6 +198,8 @@ struct lifecycle_fixture {
     ggml_sycl_exec_context_id context{};
     ggml_sycl_q1_nvfp4_test_scope_token scope{};
     bool scope_minted = false;
+    // Every case marker from this index on was published while this fixture was alive: the cases its teardown names.
+    size_t first_case = g_case_markers.size();
 
     lifecycle_fixture() {
         try {
@@ -291,14 +333,8 @@ struct lifecycle_fixture {
             ggml_sycl_q1_nvfp4_test_scope_leave(backend, &scope);
             scope_minted = false;
         }
-        ggml_sycl_exec_drain_ticket ticket{};
-        ggml_sycl_exec_control_host_alloc_batch batch{};
-        if (context.value &&
-            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
-            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
-                GGML_SYCL_EXECUTION_OK) {
-            (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
-            (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
+        if (context.value) {
+            drain_context();
         }
         context = {};
         if (model.model_id) {
@@ -318,6 +354,56 @@ struct lifecycle_fixture {
     }
 
     ~lifecycle_fixture() { cleanup(); }
+
+    // A refusal means a case left work or a device owned by the context; it fails the run, and the rest of the
+    // teardown still runs.
+    void drain_context() noexcept {
+        ggml_sycl_exec_drain_ticket             ticket{};
+        ggml_sycl_exec_control_host_alloc_batch batch{};
+        auto result = ggml_backend_sycl_execution_context_begin_drain(context, &ticket);
+        if (result != GGML_SYCL_EXECUTION_OK) {
+            report_drain_refusal("begin_drain", result);
+            return;
+        }
+        result = ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch);
+        if (result != GGML_SYCL_EXECUTION_OK) {
+            report_drain_refusal("extract_control_host_allocs", result);
+            return;
+        }
+        result = ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
+        if (result != GGML_SYCL_EXECUTION_OK) {
+            report_drain_refusal("release_control_host_allocs", result);
+        }
+        result = ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
+        if (result != GGML_SYCL_EXECUTION_OK) {
+            report_drain_refusal("finish_drain", result);
+        }
+    }
+
+    void report_drain_refusal(const char * step, ggml_sycl_execution_result result) const noexcept {
+        g_teardown_failed = true;
+        try {
+            std::string cases;
+            for (size_t i = first_case; i < g_case_markers.size(); ++i) {
+                cases += (cases.empty() ? "" : ", ") + g_case_markers[i].name;
+            }
+            std::string message = (cases.empty() ? std::string("teardown of a fixture no case started on") :
+                                                   "teardown of the fixture for " + cases) +
+                                  ": " + step + " returned " + execution_result_name(result);
+            ggml_sycl_execution_snapshot state{};
+            if (ggml_backend_sycl_execution_context_extract(context, &state) == GGML_SYCL_EXECUTION_OK) {
+                message += " (invocation=" + std::to_string(state.invocation_id.value) +
+                           " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+                           " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+            }
+            std::cerr << "FAIL: " << message << std::endl;
+            if (g_teardown_failure.empty()) {
+                g_teardown_failure = message;
+            }
+        } catch (...) {
+            // The flag alone still fails the run when the message cannot be built.
+        }
+    }
 };
 
 ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * tensor,
@@ -496,9 +582,23 @@ void injected_async_terminal_failure_case() {
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     const case_scope scope("injected_async_terminal_failure_case", before);
+    const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(life.backend_device);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
                    "async terminal fixture failed before submission", before);
+    // ggml_backend_graph_compute ends with the synchronize that reports the failure. Its cleanup must release the
+    // failed graph: a failed bundle whose workspace is never recovered keeps the invocation pinned, and the device
+    // stays owned by a context that computes nothing more, so the next context's graph fails with DEVICE_BUSY.
+    require_stages(ggml_sycl_async_failure_since(failure_cursor),
+                   "the synchronize inside graph_compute did not see the asynchronous failure", before);
+    ggml_sycl_execution_snapshot failed{};
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &failed) == GGML_SYCL_EXECUTION_OK,
+                   "failure context snapshot unavailable", before);
+    require_stages(failed.invocation_id.value == 0 && failed.busy_device_count == 0,
+                   "the failed graph still owns the device (invocation=" + std::to_string(failed.invocation_id.value) +
+                       " graph_state=" + std::to_string(static_cast<int>(failed.graph_state)) +
+                       " busy_devices=" + std::to_string(failed.busy_device_count) + ")",
+                   before);
     ggml_backend_synchronize(life.backend);
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
@@ -575,10 +675,15 @@ int main() {
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 3); }
+        require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);
+        require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
+        require_clean_teardown();
         injected_async_terminal_failure_case();
+        require_clean_teardown();
         refused_graph_then_synchronize_case();
+        require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
         std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';

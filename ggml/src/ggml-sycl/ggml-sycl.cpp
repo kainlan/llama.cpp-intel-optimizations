@@ -79163,19 +79163,48 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
 
 class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
   public:
+    // The work is finished, whatever its outcome. The slot-release sites read this as "may be released", so success
+    // must not be folded in: a failed bundle's slot would never be released, and the invocation pin it holds would
+    // keep the device owned by a context that computes nothing more.
     bool ready() const noexcept override {
+        std::optional<sycl::event> event;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (quiescent_) {
+                return true;
+            }
+            if (!event_) {
+                return false;
+            }
+            event = event_;
+        }
+        try {
+            return event->get_info<sycl::info::event::command_execution_status>() ==
+                   sycl::info::event_command_status::complete;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // The work finished and succeeded; the completion host task recycles the slot only on true. A terminal confirmed
+    // quiescent is not a success: the route's catch confirms it when its commands never ran or a submission failed,
+    // and that catch has already recovered the slot.
+    bool observe_success() noexcept {
         std::optional<sycl::event>     event;
         ggml_sycl_async_failure_cursor cursor{};
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (quiescent_) return true;
-            if (failed_ || !event_) return false;
+            if (failed_ || quiescent_ || !event_) {
+                return false;
+            }
             event  = event_;
             cursor = cursor_;
         }
         try {
             if (event->get_info<sycl::info::event::command_execution_status>() !=
-                sycl::info::event_command_status::complete) return false;
+                sycl::info::event_command_status::complete) {
+                return false;
+            }
             // Delivers a pending error to the queue's handler; it does not block, the event is complete.
             event->wait_and_throw();
             // The backend's handler records instead of throwing, so a failure shows only in the latch. Any failure on
@@ -79195,7 +79224,6 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
             return false;
         }
     }
-    bool observe_success() noexcept { return ready(); }
     void wait() noexcept override {
         std::optional<sycl::event> event;
         { std::lock_guard<std::mutex> lock(mutex_); event = event_; }
@@ -79216,8 +79244,8 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
     std::optional<sycl::event> event_;
     ggml_sycl_async_failure_cursor cursor_{};
     bool quiescent_ = false;
-    mutable bool succeeded_ = false;
-    mutable bool failed_ = false;
+    bool succeeded_ = false;
+    bool failed_ = false;
 };
 
 struct moe_direct_bundle_completion {
@@ -97199,8 +97227,8 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
             if (!sycl_ctx->async_failure_cleaned) {
                 // Set before the call, so no later synchronize of this context can start the cleanup a second time.
                 sycl_ctx->async_failure_cleaned = true;
-                // Quarantines the invocation and recovers only exact-MMID workspaces whose terminals report success
-                // or quiescence, so a bundle whose terminal failed stays quarantined with its handles.
+                // Quarantines the invocation, recovers the exact-MMID workspaces whose work has finished, failed or not,
+                // so their slots stop pinning the invocation, and then releases the graph.
                 ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, "synchronize",
                                                                    "asynchronous SYCL failure latched");
             }
