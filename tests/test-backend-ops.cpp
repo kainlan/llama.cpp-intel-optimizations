@@ -5386,33 +5386,39 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted_k;
     // lower bound of the log-gate; a mild gate keeps the state alive over the whole sequence
     const float   g_min;
+    // k holds one sequence that every sequence of v reads, so k repeats over sequences at a different ratio than q
+    const bool    k_seq_bcast;
 
     std::string vars() override {
         std::string s = VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, correlated, padded_v, padded_q, permuted_k);
         if (g_min != -20.0f) {
             s += "," + VAR_TO_STR(g_min);
         }
+        if (k_seq_bcast) {
+            s += "," + VAR_TO_STR(k_seq_bcast);
+        }
         return s;
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool correlated = false, bool padded_v = false, bool padded_q = false, bool permuted_k = false, float g_min = -20.0f)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool correlated = false, bool padded_v = false, bool padded_q = false, bool permuted_k = false, float g_min = -20.0f, bool k_seq_bcast = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), correlated(correlated), padded_v(padded_v), padded_q(padded_q), permuted_k(permuted_k), g_min(g_min) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), correlated(correlated), padded_v(padded_v), padded_q(padded_q), permuted_k(permuted_k), g_min(g_min), k_seq_bcast(k_seq_bcast) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
         ggml_tensor * k;
         ggml_tensor * v;
+        const int64_t k_seqs = k_seq_bcast ? 1 : n_seqs;
         if (permuted) {
             // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
             q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
-            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, k_seqs), 0, 2, 1, 3);
             v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size + padded_v, n_seq_tokens, head_count * v_repeat, n_seqs), 0, 2, 1, 3);
         } else {
             q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
-            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, k_seqs);
             v = ggml_new_tensor_4d(ctx, type, head_size + padded_v, head_count * v_repeat, n_seq_tokens, n_seqs);
         }
         if (padded_v) {
@@ -5439,7 +5445,7 @@ struct test_gated_delta_net : public test_case {
             q = ggml_cpy(ctx, q, q_padded);
         }
         if (permuted_k) {
-            ggml_tensor * k_permuted = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs);
+            ggml_tensor * k_permuted = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, k_seqs);
             k_permuted = ggml_permute(ctx, k_permuted, 0, 2, 1, 3);
             k = ggml_cpy(ctx, k, k_permuted);
         }
@@ -13673,6 +13679,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {257, 7, 1, 1}, 0, 256));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 16777217, 1, 1}, 1, 1));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 8388608, 1}, 1, 1));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 1, 8388608}, 1, 1));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
@@ -13879,6 +13886,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // hsk=512 is a separate route family; the head-size loop only pairs it with hsv=512
+    test_cases.emplace_back(new test_flash_attn_ext(512, 256, 4, {1, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -14291,6 +14300,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // k broadcast over sequences: q and k repeat over v's sequences at different ratios
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, false, 1, false, false, false, false, -20.0f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  1, false, false, false, false, -20.0f, true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));
