@@ -2,10 +2,12 @@
 #include "moe-mmid-workspace.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -739,6 +741,135 @@ static void registry_retirement_retains_outstanding_lease() {
     check(destroyed.load() == 2, "device/host blobs were not destroyed after final lease");
 }
 
+// A pool blob whose destruction asks whether the registry mutex is free (canonical 12.5: no final release under a
+// registry lock). A second thread reads the registry and the destructor waits for it: under the mutex the read cannot
+// finish, and the probe counts the release as held. The probe threads are joined after the call under test returns.
+struct registry_lock_probe {
+    moe_mmid_workspace_registry * registry = nullptr;
+    std::atomic<bool>             armed{ true };  // cleared before the registry itself is destroyed
+    std::atomic<int>              released{ 0 };
+    std::atomic<int>              held{ 0 };
+    std::vector<std::thread>      readers;
+    std::mutex                    readers_mutex;
+
+    struct allocation {
+        allocation(size_t bytes, registry_lock_probe * probe) : storage(bytes + 255), probe(probe) {}
+
+        ~allocation() {
+            if (!probe->armed.load()) {
+                return;
+            }
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            {
+                std::lock_guard<std::mutex> lock(probe->readers_mutex);
+                probe->readers.emplace_back([registry = probe->registry, done] {
+                    (void) registry->published_contexts();
+                    done->store(true);
+                });
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!done->load() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            if (!done->load()) {
+                probe->held.fetch_add(1);
+            }
+            probe->released.fetch_add(1);
+        }
+
+        std::vector<unsigned char> storage;
+        registry_lock_probe *      probe;
+    };
+
+    moe_mmid_blob blob(bool host, int device, size_t bytes) {
+        auto          owner = std::make_shared<allocation>(bytes, this);
+        moe_mmid_blob out;
+        out.owner           = owner;
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(owner->storage.data());
+        out.ptr             = reinterpret_cast<void *>((raw + 255) & ~uintptr_t{ 255 });
+        out.bytes           = bytes;
+        out.device          = device;
+        out.host_pinned     = host;
+        return out;
+    }
+
+    void join() {
+        std::lock_guard<std::mutex> lock(readers_mutex);
+        for (auto & reader : readers) {
+            reader.join();
+        }
+        readers.clear();
+    }
+
+    ~registry_lock_probe() { join(); }
+
+    // Declared after the registry, so it disarms the probe before the registry's own destruction releases what the
+    // registry still holds, on a failed check as well.
+    struct disarm_on_exit {
+        registry_lock_probe & probe;
+
+        ~disarm_on_exit() { probe.armed.store(false); }
+    };
+};
+
+static void registry_releases_pools_after_its_mutex() {
+    const moe_mmid_model_token token{ 47, 48, 49 };
+    {
+        // retire: the erased context held the pools' last owners.
+        registry_lock_probe         probe;
+        moe_mmid_workspace_registry registry;
+        probe.registry = &registry;
+        registry_lock_probe::disarm_on_exit disarm{ probe };
+        auto                                allocator = [&](bool host, int device, size_t bytes, size_t) {
+            return probe.blob(host, device, bytes);
+        };
+        check(registry.materialize(token, 51, 0, { owner_plan(0, 61) }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED,
+              "retire probe publish failed");
+        check(registry.retire(token, 51), "retire probe retirement failed");
+        probe.join();
+        check(probe.released.load() == 2, "retire did not release the retired context's pools");
+        check(probe.held.load() == 0, "retire released pools under the registry mutex");
+    }
+    for (const bool hand_out : { false, true }) {
+        // replace_plan's prepared replacement: the context it displaced held the pools' last owners.
+        registry_lock_probe         probe;
+        moe_mmid_workspace_registry registry;
+        probe.registry = &registry;
+        registry_lock_probe::disarm_on_exit disarm{ probe };
+        auto                                allocator = [&](bool host, int device, size_t bytes, size_t) {
+            return probe.blob(host, device, bytes);
+        };
+        auto old_plan          = std::make_shared<const lifecycle_plan_snapshot>();
+        auto new_plan          = std::make_shared<const lifecycle_plan_snapshot>();
+        int  queue_object      = 0;
+        auto owner             = owner_plan(0, 62);
+        owner.queue_capability = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 62);
+        auto changed           = owner;
+        check(registry.materialize(token, 52, old_plan, 0, { owner }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED,
+              "replace probe publish failed");
+        check(moe_mmid_plan_workspace({ 128, 96, 2, 2, 3 }, false, &changed.geometry) &&
+                  moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH, &changed.device_pool_bytes,
+                                              &changed.host_pool_bytes) &&
+                  registry.materialize(token, 53, new_plan, 0, { changed }, allocator) ==
+                      moe_mmid_materialize_status::PUBLISHED,
+              "replace probe preparation failed");
+        std::shared_ptr<void> displaced;
+        check(registry.replace_plan(old_plan, new_plan, 53, false, hand_out ? &displaced : nullptr),
+              "replace probe replacement failed");
+        probe.join();
+        if (hand_out) {
+            check(displaced != nullptr && probe.released.load() == 0,
+                  "replace_plan released the displaced context it handed out");
+            displaced.reset();
+            probe.join();
+        }
+        check(probe.released.load() == 2, "replace_plan did not release the displaced context's pools");
+        check(probe.held.load() == 0, "replace_plan released the displaced context's pools under the registry mutex");
+    }
+}
+
 struct ready_terminal final : moe::device_terminal {
     explicit ready_terminal(std::shared_ptr<std::atomic<bool>> ready) : ready_(std::move(ready)) {}
     bool ready() const noexcept override { return ready_->load(); }
@@ -1113,6 +1244,55 @@ static void model_scoped_replacement_and_retired_recovery() {
     release.store(true, std::memory_order_release); late_thread.join();
     check(late == moe_mmid_materialize_status::PUBLISHED,
           "model A replacement invalidated model B generation ticket");
+}
+
+// recover_quarantined drops the retired contexts it recovered to idle; one can hold its pools' last owners.
+static void recovered_retired_context_releases_pools_after_the_registry_mutex() {
+    registry_lock_probe         probe;
+    moe_mmid_workspace_registry registry;
+    probe.registry = &registry;
+    registry_lock_probe::disarm_on_exit disarm{ probe };
+    auto                                allocator = [&](bool host, int device, size_t bytes, size_t) {
+        return probe.blob(host, device, bytes);
+    };
+    int  queue_object      = 0;
+    auto queue             = moe_mmid_queue_capability_test_factory::mint(0, &queue_object, 2401);
+    auto owner             = owner_plan(0, 2401);
+    owner.queue_capability = queue;
+    const moe_mmid_model_token token{ 241, 242, 243 };
+    auto                       plan = std::make_shared<const lifecycle_plan_snapshot>();
+    check(registry.materialize(token, 2400, plan, 0, { owner }, allocator) == moe_mmid_materialize_status::PUBLISHED,
+          "recovery probe publish failed");
+    const std::vector<moe_mmid_admission_owner> admission_owners(1, moe_mmid_admission_owner{ 0, 2401 });
+    auto graph    = admission_request(token, 2400, admission_owners, 2402, std::make_shared<std::atomic<bool>>(false));
+    auto terminal = graph.graph_snapshot->terminals.at(0);
+    auto submission = workspace_admission_authority_test_factory::terminal(queue, 2402, terminal);
+    auto authority  = workspace_admission_authority_test_factory::direct(
+        token, 2400, 2402, 0, plan, graph.retained_occurrences, graph.table_owner, admission_owners,
+        std::vector<moe_mmid_queue_capability>(1, queue), {}, std::vector<queue_submission_authority>(1, submission));
+    const workspace_admission_shape shape{ 2, 2, 64, 96, 1 };
+    auto admitted = registry.admit(moe_mmid_authoritative_admission_request{ std::move(authority), shape });
+    check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
+          "recovery probe submitted setup failed");
+    auto replacement = std::make_shared<const lifecycle_plan_snapshot>();
+    auto changed     = owner;
+    check(moe_mmid_plan_workspace({ 128, 96, 2, 2, 3 }, false, &changed.geometry) &&
+              moe_mmid_checked_pool_bytes(changed.geometry, MOE_MMID_WORKSPACE_DEPTH, &changed.device_pool_bytes,
+                                          &changed.host_pool_bytes) &&
+              registry.materialize(token, 2403, replacement, 0, { changed }, allocator) ==
+                  moe_mmid_materialize_status::PUBLISHED &&
+              registry.replace_plan(plan, replacement, 2403, false),
+          "recovery probe replacement did not retire the submitted context");
+    terminal->wait();
+    admitted = {};  // the submitted bundle quarantines its slots; the retired context holds the pools from here
+    graph    = {};
+    probe.join();
+    const int before = probe.released.load();
+    check(registry.recover_quarantined(token, 2400, false) == 1, "recovery probe did not recover the bundle");
+    probe.join();
+    check(registry.retired_contexts_for_test() == 0, "recovered retired context stayed in the registry");
+    check(probe.released.load() == before + 2, "recovery did not release the retired context's pools");
+    check(probe.held.load() == 0, "recovery released the retired context's pools under the registry mutex");
 }
 
 static void changed_replacement_terminal_release_gc() {
@@ -1888,10 +2068,12 @@ int main() {
         registry_replacement_and_queue_reset();
         registry_concurrent_depth_busy();
         registry_retirement_retains_outstanding_lease();
+        registry_releases_pools_after_its_mutex();
         registry_component_max_constituent_coverage();
         registry_atomic_bundle_authority();
         common_direct_authority_plan_queue_and_lifetime();
         model_scoped_replacement_and_retired_recovery();
+        recovered_retired_context_releases_pools_after_the_registry_mutex();
         changed_replacement_terminal_release_gc();
         registry_bundle_rollback_move_oom_and_quarantine();
         registry_destroyed_quarantine_recovery();

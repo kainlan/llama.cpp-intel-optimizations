@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <vector>
@@ -722,6 +723,20 @@ void gc_retired_context_locked(moe_mmid_workspace_registry::state & state,
     for (size_t i = 0; i < owning_context->pools.size(); ++i)
         locks[i] = std::unique_lock<std::mutex>(owning_context->pools[order[i]]->mutex);
     if (context_idle_locked(*owning_context)) state.retired_contexts.erase(retired);
+}
+
+// Moves every context `doomed` names out of `from` into `released`, keeping the rest in order. A removed context can
+// hold its pools' last owners: the caller declares `released` before the registry lock, so the decision is made under
+// the lock and the release runs after it (canonical 12.5: no final release under a listed lock). `released` must have
+// room for every context of `from`, so the move cannot throw.
+template <typename doomed_fn>
+void take_contexts_locked(std::vector<std::shared_ptr<registry_context>> & from,
+                          std::vector<std::shared_ptr<registry_context>> & released,
+                          const doomed_fn &                                doomed) {
+    const auto first =
+        std::stable_partition(from.begin(), from.end(), [&](const auto & context) { return !doomed(context); });
+    released.insert(released.end(), std::make_move_iterator(first), std::make_move_iterator(from.end()));
+    from.erase(first, from.end());
 }
 
 moe_mmid_blob retained_subrange(const moe_mmid_blob & blob, size_t offset, size_t bytes) noexcept {
@@ -1637,13 +1652,15 @@ moe_mmid_queue_capability moe_mmid_workspace_registry::exact_queue(
     return {};
 }
 
-bool moe_mmid_workspace_registry::replace_plan(
-    const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
-    const std::shared_ptr<const lifecycle_plan_snapshot> & replacement,
-    uint64_t replacement_identity, bool stable_geometry) noexcept {
+bool moe_mmid_workspace_registry::replace_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
+                                               const std::shared_ptr<const lifecycle_plan_snapshot> & replacement,
+                                               uint64_t                replacement_identity,
+                                               bool                    stable_geometry,
+                                               std::shared_ptr<void> * displaced) noexcept {
     if (!expected || !replacement || !replacement_identity) return false;
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    // Declared before the lock: a displaced context not handed out is released after the registry mutex.
     std::shared_ptr<registry_context> old_context, prepared_context;
+    std::lock_guard<std::mutex>       lock(state_->mutex);
     for (const auto & context : state_->contexts) {
         if (context->exact_plan.get() == expected.get() && context->accepting) old_context = context;
         if (context->exact_plan.get() == replacement.get() && !context->accepting) prepared_context = context;
@@ -1679,6 +1696,9 @@ bool moe_mmid_workspace_registry::replace_plan(
         }
         state_->contexts.erase(std::remove(state_->contexts.begin(), state_->contexts.end(), old_context),
                                state_->contexts.end());
+        if (displaced) {
+            *displaced = std::move(old_context);
+        }
     } else {
         old_context->previous_plan = expected;
         old_context->exact_plan = replacement;
@@ -1713,7 +1733,9 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
                                                          bool wait) noexcept {
     if (!token.valid() || plan_identity == 0) return 0;
     size_t released = 0;
+    std::vector<std::shared_ptr<registry_context>> collected;  // before the lock: see take_contexts_locked
     std::lock_guard<std::mutex> registry_lock(state_->mutex);
+    collected.reserve(state_->retired_contexts.size());
     std::vector<std::shared_ptr<registry_context>> searchable = state_->contexts;
     searchable.insert(searchable.end(), state_->retired_contexts.begin(), state_->retired_contexts.end());
     for (const auto & context : searchable) {
@@ -1772,20 +1794,23 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
             }
         }
     }
-    state_->retired_contexts.erase(
-        std::remove_if(state_->retired_contexts.begin(), state_->retired_contexts.end(),
-                       [&](const std::shared_ptr<registry_context> & context) {
-                           if (!same_token(context->token, token)) return false;
-                           std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
-                           std::array<size_t, execution::max_devices> order{};
-                           for (size_t i = 0; i < context->pools.size(); ++i) order[i] = i;
-                           std::sort(order.begin(), order.begin() + context->pools.size(), [&](size_t a, size_t b) {
-                               return context->pools[a]->owner_device < context->pools[b]->owner_device;
-                           });
-                           for (size_t i = 0; i < context->pools.size(); ++i)
-                               locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
-                           return context_idle_locked(*context);
-                       }), state_->retired_contexts.end());
+    take_contexts_locked(state_->retired_contexts, collected, [&](const std::shared_ptr<registry_context> & context) {
+        if (!same_token(context->token, token)) {
+            return false;
+        }
+        std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+        std::array<size_t, execution::max_devices>                       order{};
+        for (size_t i = 0; i < context->pools.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.begin() + context->pools.size(), [&](size_t a, size_t b) {
+            return context->pools[a]->owner_device < context->pools[b]->owner_device;
+        });
+        for (size_t i = 0; i < context->pools.size(); ++i) {
+            locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
+        }
+        return context_idle_locked(*context);
+    });
     return released;
 }
 
@@ -1860,9 +1885,10 @@ bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uin
     if (!token.valid()) {
         return false;
     }
+    std::vector<std::shared_ptr<registry_context>> released;  // before the lock: see take_contexts_locked
     try {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        const size_t before = state_->contexts.size() + state_->retired_contexts.size();
+        released.reserve(state_->contexts.size() + state_->retired_contexts.size());
         auto matches = [&](const std::shared_ptr<registry_context> & context) {
             return same_token(context->token, token) &&
                    (plan_identity == 0 || context->plan_identity == plan_identity);
@@ -1877,20 +1903,30 @@ bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uin
             for (size_t i = 0; i < context->pools.size(); ++i)
                 locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
         };
-        state_->contexts.erase(std::remove_if(state_->contexts.begin(), state_->contexts.end(), [&](const auto & context) {
-            if (!matches(context)) return false;
-            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{}; lock_pools(context, locks);
-            for (const auto & pool : context->pools) for (const auto & slot : pool->slots)
-                if (slot.quarantined) return false;
+        take_contexts_locked(state_->contexts, released, [&](const auto & context) {
+            if (!matches(context)) {
+                return false;
+            }
+            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+            lock_pools(context, locks);
+            for (const auto & pool : context->pools) {
+                for (const auto & slot : pool->slots) {
+                    if (slot.quarantined) {
+                        return false;
+                    }
+                }
+            }
             return true; // ordinary outstanding leases retain their pools independently
-        }), state_->contexts.end());
-        state_->retired_contexts.erase(std::remove_if(state_->retired_contexts.begin(), state_->retired_contexts.end(),
-            [&](const auto & context) {
-                if (!matches(context)) return false;
-                std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{}; lock_pools(context, locks);
-                return context_idle_locked(*context);
-            }), state_->retired_contexts.end());
-        return before != state_->contexts.size() + state_->retired_contexts.size();
+        });
+        take_contexts_locked(state_->retired_contexts, released, [&](const auto & context) {
+            if (!matches(context)) {
+                return false;
+            }
+            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+            lock_pools(context, locks);
+            return context_idle_locked(*context);
+        });
+        return !released.empty();
     } catch (...) {
         return false;
     }

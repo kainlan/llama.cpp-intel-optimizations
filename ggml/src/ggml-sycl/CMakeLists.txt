@@ -7488,7 +7488,7 @@ else()
 endif()
 
 # MoE MMID workspace deferral contract (llama.cpp-7lvk). The behavioural arms
-# need a GPU and a loaded MoE model; these three properties do not, and they are
+# need a GPU and a loaded MoE model; the properties it pins do not, and they are
 # the ones a future edit is most likely to undo silently. --self-test poisons
 # each assertion and requires it to go red, so the gate cannot pass vacuously on
 # a tree that already carries the fix.

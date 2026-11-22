@@ -350,6 +350,10 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         replacement->slot_generation != expected->slot_generation || replacement->version == 0) {
         return false;
     }
+    // The MMID context a prepared replacement displaces can hold its pools' last owners: declared before the plan
+    // lock, so the swap is decided under it and the release runs after it (canonical 12.5: no final release under a
+    // listed lock).
+    std::shared_ptr<void> displaced_mmid, rollback_displaced_mmid;
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(expected->model_id);
@@ -373,13 +377,15 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
             }
             return true;
         }();
-        if (!unified_cache_moe_mmid_registry().replace_plan(
-                expected, replacement, replacement->version, stable_workspace)) return false;
+        if (!unified_cache_moe_mmid_registry().replace_plan(expected, replacement, replacement->version,
+                                                            stable_workspace, &displaced_mmid)) {
+            return false;
+        }
         try {
             current->second = replacement;
         } catch (...) {
-            (void) unified_cache_moe_mmid_registry().replace_plan(
-                replacement, expected, expected->version, stable_workspace);
+            (void) unified_cache_moe_mmid_registry().replace_plan(replacement, expected, expected->version,
+                                                                  stable_workspace, &rollback_displaced_mmid);
             throw;
         }
         return true;

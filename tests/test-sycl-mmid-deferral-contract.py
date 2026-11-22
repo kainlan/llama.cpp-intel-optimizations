@@ -10,7 +10,12 @@ reaching them needs a GPU and a loaded MoE model:
   2. load_end DEFERS instead of throwing -- the regression that made GPT-OSS
      unloadable was a bare `throw std::bad_alloc()` on this exact path;
   3. the context-bind hook carries the tripwire, so a deferral that never
-     resolves cannot pass silently.
+     resolves cannot pass silently;
+  4. the plan CAS (lifecycle_replace_placement_plan) takes the MMID context a
+     prepared replacement displaces into a holder declared before the plan
+     lock, so the pools' last owners are released after that lock (canonical
+     12.5: no final release under a listed lock). The registry side is pinned
+     by the host test's registry lock probe; this pins the caller.
 
 EVERY assertion here is checked against a POISONED copy of the source under
 --self-test, and the gate fails if a poisoned variant still passes. A source
@@ -22,9 +27,10 @@ import argparse
 import pathlib
 import sys
 
-from sycl_gate import run_without_source
+from sycl_gate import body, run_without_source, strip_comments
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / "ggml" / "src" / "ggml-sycl" / "ggml-sycl.cpp"
+CACHE_SOURCE = SOURCE.parent / "unified-cache.cpp"
 
 ADMISSION_INIT = "constexpr bool q1_nvfp4_direct_b70_validated ="
 SHARED_CONST = "k_moe_mmid_direct_route_validated"
@@ -108,10 +114,32 @@ def poison_one_site(text, marker):
     return text
 
 
+CAS_FN = "bool lifecycle_replace_placement_plan("
+CAS_HOLDER = "std::shared_ptr<void> displaced_mmid"
+CAS_LOCK = "std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);"
+CAS_HAND_OUT = "stable_workspace, &displaced_mmid)"
+
+
+def check_cas_releases_after_plan_lock(cache):
+    fn = strip_comments(body(cache, CAS_FN))
+    if not fn:
+        return False, "plan CAS not found (renamed?)"
+    holder, lock, hand_out = fn.find(CAS_HOLDER), fn.find(CAS_LOCK), fn.find(CAS_HAND_OUT)
+    if lock < 0:
+        return False, "plan CAS no longer takes the plan lock with a lock_guard named lock (renamed?)"
+    if hand_out < 0:
+        return False, "plan CAS no longer hands replace_plan a holder: the displaced context dies in the registry"
+    if holder < 0 or holder > lock:
+        return False, "plan CAS declares its displaced-context holder after the plan lock: released under it"
+    return True, "plan CAS releases the displaced MMID context after the plan lock"
+
+
+# (name, source the check reads, check)
 CHECKS = [
-    ("shared-predicate", check_shared_predicate),
-    ("load-end-defers", check_load_end_defers),
-    ("tripwire-present", check_tripwire_present),
+    ("shared-predicate", "sycl", check_shared_predicate),
+    ("load-end-defers", "sycl", check_load_end_defers),
+    ("tripwire-present", "sycl", check_tripwire_present),
+    ("cas-release-order", "cache", check_cas_releases_after_plan_lock),
 ]
 
 def poison_load_end(text):
@@ -131,6 +159,18 @@ def poison_load_end(text):
     return text[:brace + 1] + " throw std::bad_alloc();" + text[brace + 1:]
 
 
+def poison_cas_holder_under_lock(cache):
+    """The regression itself: the holder declared after the plan lock, so it is destroyed while the lock is held."""
+    fn = body(cache, CAS_FN)
+    at = fn.find(CAS_HOLDER)
+    if at < 0:
+        return cache
+    line_end = fn.find("\n", at)
+    holder_line = fn[at:line_end + 1]
+    moved = fn.replace(holder_line, "", 1).replace(CAS_LOCK, CAS_LOCK + "\n        " + holder_line.strip(), 1)
+    return cache.replace(fn, moved, 1)
+
+
 # Each poison must make its own check go red. If it does not, that check cannot
 # observe the property it claims to enforce.
 POISONS = {
@@ -139,7 +179,11 @@ POISONS = {
     "load-end-defers": poison_load_end,
     "tripwire-present":
         lambda t: t.replace(TRIPWIRE_SITE, '"context-bind-REMOVED"'),
+    "cas-release-order": poison_cas_holder_under_lock,
 }
+
+# A second control for the CAS: the holder kept but not handed to replace_plan.
+CAS_DROP_HAND_OUT = ("cas:hand-out-dropped", lambda t: t.replace(CAS_HAND_OUT, "stable_workspace)", 1))
 
 
 def main():
@@ -148,24 +192,30 @@ def main():
                         help="prove each check can go red against a poisoned source")
     args = parser.parse_args()
 
-    if not SOURCE.exists():
-        # Not 77: ctest reports that as a skip, which reads as green, and a moved source is what this gate is for.
-        print("FAIL: %s not found" % SOURCE)
-        return 1
-    text = SOURCE.read_text(encoding="utf-8", errors="replace")
+    for source in (SOURCE, CACHE_SOURCE):
+        if not source.exists():
+            # Not 77: ctest reports that as a skip, which reads as green, and a moved source is what this gate is for.
+            print("FAIL: %s not found" % source)
+            return 1
+    sources = {
+        "sycl": SOURCE.read_text(encoding="utf-8", errors="replace"),
+        "cache": CACHE_SOURCE.read_text(encoding="utf-8", errors="replace"),
+    }
+    text = sources["sycl"]
 
     failures = 0
-    for name, check in CHECKS:
-        ok, detail = check(text)
+    for name, key, check in CHECKS:
+        ok, detail = check(sources[key])
         print("%-20s %s  %s" % (name, "PASS" if ok else "FAIL", detail))
         if not ok:
             failures += 1
 
     if args.self_test:
         print("--- poisoned controls (each MUST go red) ---")
-        for name, check in CHECKS:
-            poisoned = POISONS[name](text)
-            if poisoned == text:
+        for name, key, check in CHECKS + [(CAS_DROP_HAND_OUT[0], "cache", check_cas_releases_after_plan_lock)]:
+            poison = CAS_DROP_HAND_OUT[1] if name == CAS_DROP_HAND_OUT[0] else POISONS[name]
+            poisoned = poison(sources[key])
+            if poisoned == sources[key]:
                 print("%-20s VOID  poison did not modify the source" % name)
                 failures += 1
                 continue

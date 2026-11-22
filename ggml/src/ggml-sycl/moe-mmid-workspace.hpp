@@ -642,10 +642,15 @@ class moe_mmid_workspace_registry {
                                                 const void * queue_object) const noexcept;
     // Invalidates only future admissions using this exact shared plan object.
     // Already committed bundles retain their pools and finish normally.
+    // A prepared replacement displaces the context that accepted for `expected`, and that context can hold its pools'
+    // last owners. `displaced`, when given, receives it, so the release runs where the caller drops it, after the
+    // caller's own locks (canonical 12.5: no final release under a listed lock). Without it the context is dropped
+    // after the registry mutex is released.
     bool                           replace_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                                 const std::shared_ptr<const lifecycle_plan_snapshot> & replacement,
-                                                uint64_t replacement_identity,
-                                                bool stable_geometry) noexcept;
+                                                uint64_t                                               replacement_identity,
+                                                bool                                                   stable_geometry,
+                                                std::shared_ptr<void> *                                displaced = nullptr) noexcept;
     size_t                         invalidate_plan(const lifecycle_plan_snapshot * exact_plan) noexcept;
     size_t                         recover_quarantined(const moe_mmid_model_token & token, uint64_t plan_identity,
                                                        bool wait) noexcept;
