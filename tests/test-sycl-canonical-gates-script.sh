@@ -31,6 +31,9 @@
 #        SELECTOR/ROOT_DIR
 #   (stderr-only-mistral) correct digits on STDERR only -> FAIL
 #   (stderr-only-gptoss)  same, GPT-OSS side            -> FAIL
+#   (inkling-pass/-wrong/-no-model) opt-in inkling gate: PASS, wrong tokens
+#        -> FAIL, model file absent -> rc 77; argv has -c 8192 and no -ngl;
+#        --gate all never runs it
 #
 # Run directly: bash tests/test-sycl-canonical-gates-script.sh; echo rc=$?
 #
@@ -164,6 +167,9 @@ if [ "${1:-}" = "--list-devices" ]; then
             ;;
     esac
 fi
+if [ -n "${STUB_ARGV_FILE:-}" ]; then
+    printf "%s\n" "$*" > "$STUB_ARGV_FILE"
+fi
 case "${STUB_MISTRAL_MODE:-pass}" in
     pass)
         # the real shape: the SPM dummy prefix is echoed as a leading space
@@ -258,6 +264,7 @@ run_gates() {
     SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt" \
     SYCL_GATES_LDD_CMD="$dir/ldd" \
     SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf" \
+    SYCL_GATES_INKLING_MODEL="$dir/fake-inkling.gguf" \
     SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf" \
     SYCL_GATES_SKIP_ONEAPI_SOURCE=1 \
     SYCL_GATES_SETTLE_SECONDS=0 \
@@ -280,6 +287,7 @@ run_gates_real_oneapi() {
         SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt" \
         SYCL_GATES_LDD_CMD="$dir/ldd" \
         SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf" \
+        SYCL_GATES_INKLING_MODEL="$dir/fake-inkling.gguf" \
         SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf" \
         SYCL_GATES_SETTLE_SECONDS=0 \
         "$GATES_SCRIPT" --build-dir "$dir/build" --gate "$gate" --selector level_zero:1 "$@"
@@ -289,6 +297,7 @@ touch_fake_models() {
     local dir="$1"
     : > "$dir/fake-mistral.gguf"
     : > "$dir/fake-gptoss.gguf"
+    : > "$dir/fake-inkling.gguf"
 }
 
 # Creates a tiny, throwaway git repo -- deliberately NOT this checkout --
@@ -337,6 +346,7 @@ run_gates_fake_setvars() {
         SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt" \
         SYCL_GATES_LDD_CMD="$dir/ldd" \
         SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf" \
+        SYCL_GATES_INKLING_MODEL="$dir/fake-inkling.gguf" \
         SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf" \
         SYCL_GATES_SETTLE_SECONDS=0 \
         SYCL_GATES_SETVARS="$dir/hostile-setvars.sh" \
@@ -543,6 +553,39 @@ touch_fake_models "$case_serr_g_dir"
 out="$(STUB_GPTOSS_MODE=stderr-only run_gates "$case_serr_g_dir" gptoss)"
 rc=$?
 expect_gate "stderr-only-gptoss" 1 "$out" "$rc" '^GATE gptoss FAIL rc=0 '
+
+# --- (inkling) the opt-in Inkling gate --------------------------------------
+# The same llama-completion stub serves it (STUB_MISTRAL_MODE shapes the
+# output); STUB_ARGV_FILE records the arguments the gate passed.
+case_ink_dir="$TMP/inkling"
+setup_case_dir "$case_ink_dir"
+touch_fake_models "$case_ink_dir"
+out="$(STUB_ARGV_FILE="$case_ink_dir/argv" STUB_MISTRAL_MODE=pass run_gates "$case_ink_dir" inkling)"
+rc=$?
+expect_gate "inkling pass" 0 "$out" "$rc" '^GATE inkling PASS rc=0 '
+if grep -q -- '-c 8192' "$case_ink_dir/argv" && ! grep -q -- '-ngl' "$case_ink_dir/argv"; then
+    echo "PASS: (inkling argv) -c 8192 present, no -ngl"
+else
+    fail "(inkling argv) expected -c 8192 and no -ngl; got: $(cat "$case_ink_dir/argv" 2>/dev/null)"
+fi
+
+out="$(STUB_MISTRAL_MODE=wrong run_gates "$case_ink_dir" inkling)"
+rc=$?
+expect_gate "inkling wrong tokens" 1 "$out" "$rc" '^GATE inkling FAIL rc=0 '
+
+rm -f "$case_ink_dir/fake-inkling.gguf"
+out="$(run_gates "$case_ink_dir" inkling 2>"$TMP/inkling.err")"
+rc=$?
+expect_gate "inkling no model" 77 "$out" "$rc" '^GATE inkling SKIP rc=77 ' "$TMP/inkling.err" 'model not found'
+
+# --gate all must not run inkling (a 22.9 GB model stays out of every default run).
+: > "$case_ink_dir/fake-inkling.gguf"
+out="$(run_gates "$case_ink_dir" all 2>"$TMP/inkling-all.err")"
+if printf '%s\n' "$out" | grep -q '^GATE inkling'; then
+    fail "(inkling all) --gate all ran the inkling gate"
+else
+    echo "PASS: (inkling all) --gate all does not run inkling"
+fi
 
 echo "---"
 if [ "$FAILURES" -eq 0 ]; then
