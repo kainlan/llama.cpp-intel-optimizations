@@ -2136,7 +2136,7 @@ if (NOT WIN32)
     set_property(TEST test-skip-policy PROPERTY
         ENVIRONMENT "LLAMA_TEST_SKIP_BINARY=$<TARGET_FILE:test-autorelease>")
 
-    # Gate for the single _gzip exclusion predicate in tools/ui/CMakeLists.txt,
+    # Gate for the single _gzip exclusion predicate in ui/apps/chat/CMakeLists.txt,
     # which is consumed by both list(FILTER ... REGEX) and if(... MATCHES). It
     # was two hand-written patterns and they drifted, so a real directory merely
     # beginning "_gzip" was silently dropped from the watch while its files
@@ -2152,7 +2152,7 @@ if (NOT WIN32)
         ${CMAKE_COMMAND}
         NAME test-ui-gzip-exclude
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+        ARGS -DUI_CMAKE=${PROJECT_SOURCE_DIR}/ui/apps/chat/CMakeLists.txt
              -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-gzip-exclude.cmake
     )
     set_tests_properties(test-ui-gzip-exclude PROPERTIES
@@ -2160,7 +2160,7 @@ if (NOT WIN32)
         TIMEOUT 60
     )
 
-    # Gate for the UI bundle version order in tools/ui/ui-version.cmake: env
+    # Gate for the UI bundle version order in ui/apps/chat/ui-version.cmake: env
     # overrides, then the committed pin, then the build-number derivation. Without
     # the pin the build embeds the floating bundle, which can stop matching this
     # tree's server code at any time.
@@ -2168,8 +2168,8 @@ if (NOT WIN32)
         ${CMAKE_COMMAND}
         NAME test-ui-version-pin
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/ui-version.cmake
-             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/ui/apps/chat/ui-version.cmake
+             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/ui/apps/chat/CMakeLists.txt
              -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-version-pin.cmake
     )
     set_tests_properties(test-ui-version-pin PROPERTIES
