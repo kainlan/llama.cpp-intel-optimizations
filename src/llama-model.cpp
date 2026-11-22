@@ -3175,6 +3175,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             skip_scales(i, LLM_TENSOR_FFN_GATE_EXPS,          layer.ffn_gate_exps,          n_expert);
             skip_scales(i, LLM_TENSOR_FFN_DOWN_EXPS,          layer.ffn_down_exps,          n_expert);
             skip_scales(i, LLM_TENSOR_FFN_UP_EXPS,            layer.ffn_up_exps,            n_expert);
+            skip_scales(i, LLM_TENSOR_FFN_GATE_UP_EXPS,       layer.ffn_gate_up_exps,       n_expert);
             skip_scales(i, LLM_TENSOR_SSM_IN,                 layer.ssm_in,                 1);
             skip_scales(i, LLM_TENSOR_SSM_OUT,                layer.ssm_out,                1);
             skip_scales(i, LLM_TENSOR_SSM_ALPHA,              layer.ssm_alpha,              1);
