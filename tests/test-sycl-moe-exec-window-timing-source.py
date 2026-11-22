@@ -715,6 +715,7 @@ WAIT = "stream->wait_and_throw();"
 # A failed drain is recorded in the failure latch just before this test, so its early return keeps the flush to a
 # wait that succeeded.
 FAILED_RETURN = "if (ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)) {"
+DRAIN_RECORD = "ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());"
 RUNNER = "const bool loan_accepted = ggml_sycl_run_pending_expert_loan(backend);"
 SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {"
 FLUSH_FN_SIG = "void moe_stream_phase::flush_window_timing() {"
@@ -732,7 +733,8 @@ def claim_flush_site(sycl: str, plan_cpp: str) -> bool:
     ahead = sync[:at]
     failed = sync.find(FAILED_RETURN)
     flush_fn = body(norm(plan_cpp), FLUSH_FN_SIG)
-    return (sync.count(FLUSH_CALL) == 1 and 0 <= sync.find(WAIT) < failed < at < sync.find(RUNNER)
+    return (sync.count(FLUSH_CALL) == 1 and sync.count(DRAIN_RECORD) == 1
+            and 0 <= sync.find(WAIT) < sync.find(DRAIN_RECORD) < failed < at < sync.find(RUNNER)
             and sync.count(FAILED_RETURN) == 1 and body(sync[failed:], FAILED_RETURN).endswith(" return; }")
             and n.count("flush_window_timing()") == 1
             and not any(k in ahead for k in LOCKS) and flush_fn != "" and not any(k in flush_fn for k in LOCKS))
@@ -758,6 +760,10 @@ def test_flush_site_mutants():
     assert sync.count(FAILED_RETURN) == 1, "mutant precondition: one failed-drain return"
     unguarded = sync.replace(" " + FLUSH_CALL, "").replace(FAILED_RETURN, FLUSH_CALL + " " + FAILED_RETURN)
     assert not claim_flush_site(n.replace(sync, unguarded), PLAN_CPP)
+    # the drain's error recorded only after the failure test, which then lets a failed drain reach the flush
+    assert sync.count(" " + DRAIN_RECORD) == 1, "mutant precondition: one drain record"
+    late_record = sync.replace(" " + DRAIN_RECORD, "").replace(" " + FLUSH_CALL, " " + DRAIN_RECORD + " " + FLUSH_CALL)
+    assert not claim_flush_site(n.replace(sync, late_record), PLAN_CPP)
     # a lock taken in synchronize ahead of the flush
     locked = sync.replace(head, head + " std::lock_guard<std::mutex> guard(g_sycl_graph_compute_mutex);")
     assert not claim_flush_site(n.replace(sync, locked), PLAN_CPP)

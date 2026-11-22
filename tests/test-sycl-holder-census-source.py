@@ -388,7 +388,8 @@ def violations(files):
             out.append("%s: only %d returns in graph_compute; the gate would pass vacuously" % (MAIN, len(returns)))
         # The entry refusal of a context whose device delivered an asynchronous failure returns before the graph opens
         # anything the exit hooks close, and a flush there would wait on the failed device's queue. It is admitted
-        # only before the dispatch-owner scope, after the failure test, right behind the report, and only once.
+        # only before the dispatch-owner scope, after the failure test, right behind the report, and only once; the
+        # block is the report and the return alone (a wait ahead of the report would wait on the failed device).
         owner_at = body.find("ggml_sycl_dispatch_owner_scope dispatch_owner(")
         entry_refusals = 0
         for m in returns:
@@ -400,7 +401,8 @@ def violations(files):
                 prev_end = body.rfind(";", 0, m.start())
                 prev_start = max(body.rfind(c, 0, prev_end) for c in ";{}") + 1
                 if prev_end >= 0 and not re.search(r"[{}]", body[prev_end:m.start()]) and \
-                        body[prev_start:prev_end].strip().startswith("ggml_sycl_async_failure_report("):
+                        body[prev_start:prev_end].strip().startswith("ggml_sycl_async_failure_report(") and \
+                        prev_start > 0 and body[prev_start - 1] == "{":
                     entry_refusals += 1
                     if entry_refusals == 1:
                         continue
@@ -632,6 +634,9 @@ def mutants(files):
            "skips the exit hooks")
     yield ("a second bare return ahead of the entry refusal",
            edit(files, M, refusal, "return GGML_STATUS_FAILED;\n    " + refusal, "k18b"), "skips the exit hooks")
+    report = "ggml_sycl_async_failure_report(failed_ctx, \"graph_compute\");"
+    yield ("a wait ahead of the entry refusal's report",
+           edit(files, M, report, "failed_ctx->stream()->wait();\n        " + report, "k18c"), "skips the exit hooks")
     yield ("an exit without the eager flush",
            edit(files, M, "            ggml_sycl_cpu_tg_flush_pending();\n        }\n        ggml_sycl_moe_ids_cache_new_graph();",
                 "        }\n        ggml_sycl_moe_ids_cache_new_graph();", "k19"), "does not call ggml_sycl_cpu_tg_flush_pending(")
