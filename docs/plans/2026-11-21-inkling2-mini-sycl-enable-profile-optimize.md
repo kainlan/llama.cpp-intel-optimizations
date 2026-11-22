@@ -2204,7 +2204,9 @@ validated with them (its claim M pins both constructions). "Every queue has the 
 not after 7b. Both merge before Task 9.
 
 **DONE 2026-11-22, merged as `ee6017e88`** (task commits `4f8981184..5592ae7a6`, logs `0a48fb5d5`). Spec review
-PASS with four nits; quality review PASS with one should-fix and four nits; two fix rounds. A fresh reviewer re-reviewed fix round 2 and ran 24 reverts of its own against the four drain claims: PASS, three nits about older scanner behaviour that fails closed, not changed.
+PASS with four nits; quality review PASS with one should-fix and four nits; two fix rounds. A fresh reviewer
+re-reviewed fix round 2 and ran 24 reverts of its own against the four drain claims: PASS, with three nits about
+older scanner behaviour that fails closed, not changed.
 
 *What landed:*
 - The 22 constructions of the spec's table carry the recording handler with the slot the table names. Every

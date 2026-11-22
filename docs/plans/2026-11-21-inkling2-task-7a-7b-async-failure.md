@@ -1598,7 +1598,8 @@ builds).
 
 **Description:** A plain `wait()` neither throws nor delivers (fact g). After 7b every backend queue has the recording
 handler except the two built in member initializers, which this task converts (`dense-scheduler.cpp:48`,
-`l2-prefetch.hpp:155`), but an error on a queue whose drains are all plain still reaches the latch late or never. A process-lifetime
+`l2-prefetch.hpp:155`), but an error on a queue whose drains are all plain still reaches the latch late or
+never. A process-lifetime
 queue's error is held until the queue is destroyed at exit, and fact (f) says it is dropped then. This task changes
 the existing drains of every non-execution queue from `wait()` to `wait_and_throw()`, so each delivers what has
 accumulated so far. With the handler installed, `wait_and_throw()` does not throw for an asynchronous error: the
