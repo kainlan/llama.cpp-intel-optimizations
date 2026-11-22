@@ -1683,10 +1683,10 @@ lead records each observed line in `docs/backend/data/inkling2/e2e-<sha>.txt` an
   cross-device control queue, a test `ccs` queue on its early returns, the two split owner queues, the MoE stream
   timing queue): an undelivered error on them is dropped. No wait is added for them, because the fork adds no host
   waits; each needs its work chained to an event that a boundary already waits on.
-- **Three facts behind Task 7c are not measured:** whether `event::wait_and_throw` delivers errors from other
-  commands on the same queue (this decides synchronize's deferred-decode branch; the probe case is written in the
-  specification), whether every caller of the generic helpers passes an execution queue, and which lock
-  `throw_asynchronous` takes in the 2026.2 runtime.
+- **Two facts behind Task 7c are not measured:** whether every caller of the generic helpers passes an execution
+  queue, and which lock `throw_asynchronous` takes in the 2026.2 runtime. A third was measured on 2026-11-21 (fact h
+  in the specification): `event::wait_and_throw` delivers every pending error of the event's queue, so synchronize's
+  deferred-decode branch already delivers and needs no extra call per token.
 - **Task 2 moves every `llama-bench` load** (the measure follows the bench's own context). Throughput for every model
   can move; Task 9's A/B is where that is measured. No number taken before Task 2 is comparable to one taken after it
   without that A/B.

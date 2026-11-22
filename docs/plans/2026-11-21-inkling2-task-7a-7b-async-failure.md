@@ -53,6 +53,7 @@ upgrade.
 | (e) | A queue **without** its own handler, in a context that has one. Both waits deliver to the **context's** handler, so the context handler is the fallback for any queue later built on it. |
 | (f) | A handled queue destroyed with an undelivered error (only a plain `wait()` before the destructor). The error is dropped silently: no delivery, no terminate. |
 | (g) | A plain `event.wait()` on a failed event neither throws nor delivers. The error stays pending until a `wait_and_throw`/`throw_asynchronous` on that queue. |
+| (h) | `event::wait_and_throw` on ANY event of a queue delivers every pending asynchronous error of that queue to its handler, not only the event's own. Measured 2026-11-21 on the B50 and on the OpenCL CPU device, both ways round: a good command submitted after the failure, and a good command that completed before it. A following `queue::throw_asynchronous` delivers nothing more. Log: `docs/backend/data/inkling2/t7c-runtime-probe.txt`; source beside it. |
 | CPU | This host HAS a CPU SYCL device: `Intel(R) OpenCL`, registered by `/etc/OpenCL/vendors/intel64.icd` (`libintelocl.so`). Corrected 2026-11-21: this row first said there was none, inferred from the absence of a `libur_adapter_opencl*.so` file in `/opt/intel/oneapi/compiler/2026.2/lib/`. The Task 7a implementer's host-only run of the delivery probe selected that device (`SYCL_UR_TRACE=1`: `platform: Intel(R) OpenCL`) and printed `async handler delivery: PASS`. Facts (a) to (e) therefore hold on the OpenCL CPU device as well as on the B50. |
 
 The header comment at `sycl/event.hpp:101-106` says `event::wait_and_throw` calls the context's handler. That is wrong
@@ -1893,16 +1894,14 @@ Only with a feature on, or off the decode thread:
 - `layer-streaming.cpp:353`, `:379`, `:410`, `:464`: per layer transition while layer streaming is active.
 - `:76593`, `:76610`, `:76662`, `:108039`: prompt graphs only (`GGML_SYCL_PP_PIPELINE`).
 
-Not changed, listed for Task 9: synchronize's deferred-decode branch runs `last_graph_event->wait_and_throw()` and does
-not drain the queue (`ggml-sycl.cpp:97097`ff). If that call does not deliver errors from other commands on the same
-queue (see "Not verified"), the fix would be `stream->throw_asynchronous()` (`queue.hpp:527-531`) in that branch. It
-would be a new call per decode token, taking one queue-mutex lock. 7c does not add it.
+Not changed, and settled by fact (h): synchronize's deferred-decode branch runs `last_graph_event->wait_and_throw()`
+and does not drain the queue (`ggml-sycl.cpp:97097`ff). That call delivers every pending asynchronous error of the
+execution queue, whichever command raised it, so the branch needs no `stream->throw_asynchronous()` and no new call
+per decode token.
 
 **Not verified** (host-only design; the lead decides which, if any, to measure):
-- Whether `event::wait_and_throw()` delivers asynchronous errors of other commands on the event's queue, or only its
-  own. Facts (a) and (b) measured one failing command waited by its own event. A probe case would be: one failing
-  command, then a second command on the same queue, then `wait_and_throw` on the second command's event; count the
-  handler calls. This decides the deferred-decode branch above. It changes no site in this task.
+- (Measured since, by the lead: fact (h). `event::wait_and_throw()` delivers the asynchronous errors of other
+  commands on the event's queue.)
 - Rule P: that every caller of the listed helpers passes an execution queue. If one passes an auxiliary queue, its
   wait belongs in the table.
 - Which lock `throw_asynchronous` takes in the 2026.2 runtime.
