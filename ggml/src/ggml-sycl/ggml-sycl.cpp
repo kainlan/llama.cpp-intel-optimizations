@@ -12278,6 +12278,7 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
+static void ggml_sycl_recover_exact_mmid_after_drain(ggml_backend_sycl_context * ctx) noexcept;
 static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
                                                                                      const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept;
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
@@ -16808,6 +16809,27 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
     ggml_sycl_execution_clear_graph_tracking(ctx);
 }
 
+// The second attempt of a drain whose release was refused. A refusal with the invocation still live usually means a
+// quarantined MoE workspace slot pins it: the slot's terminal finished without success, so nothing recycled the slot.
+// The recovery frees a slot only once its terminal's event is complete, and the caller's wait may have covered only
+// the deferred decode event, so the stream is drained first. Only a refused release pays for this wait and for the
+// registry walk; a drain that releases at once does neither. Returns true when the graph was released.
+static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_context * ctx) noexcept {
+    if (!ctx || ggml_sycl_take_execution_state_snapshot(ctx).invocation_id == 0) {
+        return false;
+    }
+    try {
+        if (const queue_ptr stream = ctx->stream(ctx->device, 0)) {
+            stream->wait_and_throw();
+        }
+    } catch (...) {
+        // Enqueue status is unproven: the slot stays quarantined and the caller takes the abort path.
+        return false;
+    }
+    ggml_sycl_recover_exact_mmid_after_drain(ctx);
+    return ggml_sycl_execution_release_graph(ctx);
+}
+
 // The owner's own next begin as a drain point (llama.cpp-2dgc, RCA c-5ozb).
 //
 // ggml_backend_sycl_graph_compute_unchecked()'s execution_tail_guard submits the
@@ -16834,7 +16856,7 @@ static void ggml_sycl_execution_abort_and_release_graph(ggml_backend_sycl_contex
 // asked to start a graph here.
 //
 // DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The wait -> clear the event fields ->
-// release-or-abort -> retire body below is a near-verbatim twin of the lambda in
+// release, else recover and release, else abort -> retire body below is a near-verbatim twin of the lambda in
 // ggml_sycl_execution_drain_context_terminal_events(). The duplication is
 // deliberate (the call sites genuinely differ: one context vs one backend, begin
 // vs teardown, and only teardown clears the executable graph), but the ORDERING
@@ -16880,7 +16902,8 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
     }
     ctx->last_graph_event.reset();
     ctx->last_graph_event_deferred_decode = false;
-    if (!waited || !ggml_sycl_execution_release_graph(ctx)) {
+    if (!waited ||
+        (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {
         ggml_sycl_execution_abort_and_release_graph(ctx);
     }
     ggml_sycl_execution_try_retire_terminal(ctx);
@@ -16901,7 +16924,7 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
 // and every final handle destruction below happens outside all ranked locks.
 //
 // DUPLICATED SEQUENCE -- KEEP BOTH IN STEP. The lambda's wait -> clear the event
-// fields -> release-or-abort -> retire body is a near-verbatim twin of
+// fields -> release, else recover and release, else abort -> retire body is a near-verbatim twin of
 // ggml_sycl_execution_drain_own_terminal(), which drains one backend's own
 // terminal invocation from the begin path (llama.cpp-2dgc). The duplication is
 // deliberate, but the ORDERING is a correctness invariant shared by both. Any
@@ -16926,7 +16949,8 @@ static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_i
             }
             backend_ctx->last_graph_event.reset();
             backend_ctx->last_graph_event_deferred_decode = false;
-            if (!ggml_sycl_execution_release_graph(backend_ctx)) {
+            if (!ggml_sycl_execution_release_graph(backend_ctx) &&
+                !ggml_sycl_execution_recover_and_release_graph(backend_ctx)) {
                 ggml_sycl_execution_abort_and_release_graph(backend_ctx);
             }
             ggml_sycl_execution_try_retire_terminal(backend_ctx);
@@ -54206,6 +54230,9 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     moe_stream.reset();
     ggml_sycl_moe_stream_release_payload(*this);
     pp_moe_onednn_drain_scratch_slots(device);
+    // Every queue is drained, so a workspace slot whose terminal failed is finished and can be recovered. Without
+    // this its pin outlives the context and the device stays owned.
+    ggml_sycl_recover_exact_mmid_after_drain(this);
     ggml_sycl_execution_abort_and_release_graph(this);
     // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
     // entries by the ended id already.
