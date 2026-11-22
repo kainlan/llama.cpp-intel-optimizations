@@ -36,6 +36,9 @@ With comments blanked:
      ggml_sycl_recover_exact_mmid_after_drain(ctx), then ggml_sycl_execution_release_graph(ctx); both drain twins
      call it before ggml_sycl_execution_abort_and_release_graph; the backend destructor calls the recovery before
      its abort-and-release.
+  W. (ggml-sycl.cpp) a drain wait that throws is recorded in the device latch, as synchronize records one: a
+     synchronous throw (a lost device) bypasses the queue's handler. The catch of the drain retry's wait, and of the
+     first wait of each drain twin, calls ggml_sycl_async_failure_record with that context's device.
   K. (ggml-sycl.cpp) the completion-hold test seam (a second holder of the direct route's completion object that
      outlives its host task, so the oracle can show that B, not the runtime's functor lifetime, releases the pin) is
      compiled only for route testing: every mention of ggml_sycl_q1_nvfp4_test_retain_completion,
@@ -59,6 +62,15 @@ TEST_SEAM = ("ggml_sycl_q1_nvfp4_test_retain_completion", "ggml_sycl_q1_nvfp4_te
              "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE")
 NO_RELEASE = "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE"
 RELEASE = "const bool recycled = !skip_release && completion->bundle.terminal_release();"
+# (claim name, function body local, the record call its catch must make)
+DRAIN_RECORDS = (
+    ("W the drain retry records a throwing wait", "d",
+     'ggml_sycl_async_failure_record(ctx->device, "drain retry wait threw");'),
+    ("W the begin-path twin records a throwing wait", "d_own",
+     'ggml_sycl_async_failure_record(ctx->device, "begin-path drain wait threw");'),
+    ("W the context twin records a throwing wait", "d_ctx",
+     'ggml_sycl_async_failure_record(backend_ctx->device, "context drain wait threw");'),
+)
 
 
 def blank_comments(text):
@@ -132,7 +144,9 @@ def claims(cache, sycl, common):
     s_since = s.find("ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)")
     s_clean = s.find('ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, "synchronize"')
     s_release = s.find("(void) ggml_sycl_execution_release_graph(sycl_ctx);")
-    return {
+    bodies = {"d": d, "d_own": d_own, "d_ctx": d_ctx}
+    records = {name: record in body(bodies[local], "catch (...)") for name, local, record in DRAIN_RECORDS}
+    return records | {
         "Q execution context has the handler": "ggml_sycl_make_context(dev, device)" in q,
         "Q execution queue has the handler": "ggml_sycl_make_queue(ctx, dev, device," in q,
         "S no abort on a throwing drain": s != "" and "SYCL_CHECK(err)" not in s and "CHECK_TRY_ERROR" not in s,
@@ -249,6 +263,8 @@ def main():
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", 1), common),
             "route does not hand over its completion": (cache, sycl.replace(
                 "ggml_sycl_q1_nvfp4_test_retain_completion(completion);", "", 1), common),
+            **{f"{name}: record removed": (cache, sycl.replace(record, "", 1), common)
+               for name, _, record in DRAIN_RECORDS},
             "handler logs": (cache, sycl, common.replace("ggml_sycl_async_failure_record(bound, e.what());",
                                                          "GGML_LOG_ERROR(\"%s\", e.what());", 1)),
         }

@@ -16854,6 +16854,10 @@ static bool ggml_sycl_execution_recover_and_release_graph(ggml_backend_sycl_cont
             stream->wait_and_throw();
         }
     } catch (...) {
+        // A throw out of the wait bypasses the queue's handler, so the latch has not moved: record it, as synchronize
+        // records a drain that throws, so the context's next boundary fails. The record is lock-free and
+        // allocation-free, so it is safe under any lock a caller holds.
+        ggml_sycl_async_failure_record(ctx->device, "drain retry wait threw");
         // Enqueue status is unproven: the slot stays quarantined and the caller takes the abort path.
         return false;
     }
@@ -16926,6 +16930,10 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
             stream->wait_and_throw();
         }
     } catch (...) {
+        // A throw out of the wait bypasses the queue's handler, so the latch has not moved: record it, as synchronize
+        // records a drain that throws, so the context's next boundary fails. The record is lock-free and
+        // allocation-free, so it is safe under any lock a caller holds.
+        ggml_sycl_async_failure_record(ctx->device, "begin-path drain wait threw");
         // Enqueue status is now uncertain for this device. Fall through to the
         // quarantine path, which retains every root/backing lease instead of
         // releasing on an unproven terminal.
@@ -16973,6 +16981,10 @@ static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_i
                     stream->wait_and_throw();
                 }
             } catch (...) {
+                // A throw out of the wait bypasses the queue's handler, so the latch has not moved: record it, as
+                // synchronize records a drain that throws, so the context's next boundary fails. The record is
+                // lock-free and allocation-free, so it is safe under any lock a caller holds.
+                ggml_sycl_async_failure_record(backend_ctx->device, "context drain wait threw");
                 // Enqueue status is now uncertain for this device. Fall through
                 // to the quarantine path, which retains every root/backing lease
                 // instead of releasing on an unproven terminal.
