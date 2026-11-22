@@ -4439,6 +4439,18 @@ if (GGML_SYCL)
     )
 endif()
 
+# Inkling plan, Task 6f-7: host-only gate for the inverse of the AOS->SOA weight reorder
+# (ggml/src/ggml-sycl/soa-readback.hpp), which ggml_backend_sycl_buffer_get_tensor uses to return ggml's block
+# bytes for a weight stored as SOA. Pure C++ over ggml.h and the block structs: no device, no backend library.
+if (GGML_SYCL)
+    llama_build(test-sycl-soa-readback.cpp)
+    target_include_directories(test-sycl-soa-readback PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    llama_test(test-sycl-soa-readback)
+    set_tests_properties(test-sycl-soa-readback PROPERTIES
+        LABELS "sycl;host"
+        TIMEOUT 60)
+endif()
+
 # llama.cpp-ibj0: source gate -- ggml_backend_sycl_set_runtime_context() must
 # re-plan the PP MoE oneDNN scratch ring for the runtime n_ubatch (after the
 # non-FA attention scratch check, before the plan is published), refuse with
