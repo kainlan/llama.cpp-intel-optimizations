@@ -9,6 +9,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT_SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 CONCAT_SOURCE = ROOT / "ggml/src/ggml-sycl/concat.cpp"
+BINBCAST_SOURCE = ROOT / "ggml/src/ggml-sycl/binbcast.cpp"
 BACKEND_OPS_SOURCE = ROOT / "tests/test-backend-ops.cpp"
 
 
@@ -516,6 +517,123 @@ def test_concat_support_helper_and_dispatch_case_sets_are_identical() -> None:
     assert helper_cases == expected
     assert dispatch_cases == expected
     assert helper_cases == dispatch_cases
+
+
+_BIN_BCAST_ARM = re.compile(
+    r"src0->type\s*==\s*GGML_TYPE_(\w+)\s*&&\s*src1->type\s*==\s*GGML_TYPE_(\w+)\s*&&\s*"
+    r"dst->type\s*==\s*GGML_TYPE_(\w+)"
+)
+_BIN_BCAST_TRIPLE = re.compile(r"\{\s*GGML_TYPE_(\w+)\s*,\s*GGML_TYPE_(\w+)\s*,\s*GGML_TYPE_(\w+)\s*\}")
+_BF16_GUARD = "#ifdef GGML_SYCL_HAS_BF16"
+
+
+def _guarded_matches(region: str, pattern: "re.Pattern[str]") -> List[Tuple[str, str, str, bool]]:
+    """Every (src0, src1, dst) the pattern finds, and whether it sits under the bf16 guard. Any other
+    preprocessor conditional in the region fails the parse: the guard state would no longer be known."""
+    found: List[Tuple[str, str, str, bool]] = []
+    guarded = False
+    for line in region.splitlines():
+        stripped = line.strip()
+        if stripped == _BF16_GUARD:
+            assert not guarded, "nested bf16 guard"
+            guarded = True
+            continue
+        if stripped.startswith("#endif") and guarded:
+            guarded = False
+            continue
+        assert not re.match(r"#\s*(if|ifdef|ifndef|else|elif|endif)\b", stripped), f"unmodelled conditional: {stripped}"
+        found += [(*match.groups(), guarded) for match in pattern.finditer(line)]
+    assert not guarded, "unterminated bf16 guard"
+    return found
+
+
+def _bin_bcast_chain_arms(text: str) -> List[Tuple[str, str, str, bool]]:
+    start = text.index("inline void ggml_sycl_op_bin_bcast(")
+    end = text.index("kernel_event_valid = true;", start)
+    chain = text[start:end]
+    arms = _guarded_matches(chain, _BIN_BCAST_ARM)
+    # One kernel launch per arm, so an arm the parse misses (or a launch outside an arm) shows here.
+    assert chain.count("kernel_event = op()(") == len(arms), "chain arms and kernel launches disagree"
+    return arms
+
+
+def _bin_bcast_predicate_triples(text: str) -> List[Tuple[str, str, str, bool]]:
+    start = text.index("bool ggml_sycl_bin_bcast_types_supported(ggml_type src0, ggml_type src1, ggml_type dst) {")
+    end = text.index("\n}\n", start)
+    return _guarded_matches(text[start:end], _BIN_BCAST_TRIPLE)
+
+
+def _assert_bin_bcast_type_contract(binbcast: str) -> None:
+    arms = _bin_bcast_chain_arms(binbcast)
+    triples = _bin_bcast_predicate_triples(binbcast)
+    assert len(set(arms)) == len(arms) and len(set(triples)) == len(triples), "duplicate type triple"
+    assert set(triples) == set(arms), (sorted(set(arms) - set(triples)), sorted(set(triples) - set(arms)))
+    # The upstream bf16 arms are the chain's, under the guard, and nothing else is guarded.
+    assert {arm for arm in arms if arm[3]} == {("BF16", "BF16", "BF16", True), ("BF16", "F32", "BF16", True)}
+
+
+def _assert_bin_bcast_support_contract(full_source: str) -> None:
+    source = _supports_source(full_source)
+    binary = _case(source, "ADD", "CONCAT")
+    labels = re.sub(r"//[^\n]*", "", binary[: binary.index("return")])
+    assert re.sub(r"\s+", "", labels) == "caseGGML_OP_ADD:caseGGML_OP_SUB:caseGGML_OP_MUL:caseGGML_OP_DIV:"
+    _assert_expression(
+        binary,
+        """
+            ggml_sycl_bin_bcast_types_supported(op->src[0]->type, op->src[1]->type, op->type) &&
+            ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op)
+        """,
+    )
+    # REPEAT hands (dst, src, dst) to the kernel, so the triple it asks about is (op, src0, op).
+    _assert_expression(
+        _case(source, "REPEAT", "ADD"),
+        """
+            ggml_sycl_bin_bcast_types_supported(op->type, op->src[0]->type, op->type) &&
+            ggml_sycl_binbcast_layout_supported(op, op->src[0], op)
+        """,
+    )
+
+
+def test_bin_bcast_admits_exactly_the_type_triples_its_chain_has() -> None:
+    _assert_bin_bcast_type_contract(BINBCAST_SOURCE.read_text(encoding="utf-8"))
+    _assert_bin_bcast_support_contract(SUPPORT_SOURCE.read_text(encoding="utf-8"))
+
+
+def test_bin_bcast_mutations_are_detected() -> None:
+    binbcast = BINBCAST_SOURCE.read_text(encoding="utf-8")
+    # A chain arm added without a predicate triple.
+    last_arm = binbcast.index("    } else {\n        fprintf(stderr, \"%s: unsupported types")
+    added_arm = (
+        "    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {\n"
+        "        kernel_event = op()((const float *) src0_d, (const sycl::half *) src1_d, (float *) dst_d);\n"
+    )
+    assert _contract_rejects(_assert_bin_bcast_type_contract, binbcast[:last_arm] + added_arm + binbcast[last_arm:])
+    # A predicate triple without a chain arm.
+    triple = "        { GGML_TYPE_I16,  GGML_TYPE_I16, GGML_TYPE_I16  },\n"
+    assert binbcast.count(triple) == 1
+    widened = binbcast.replace(triple, triple + "        { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F32 },\n", 1)
+    assert _contract_rejects(_assert_bin_bcast_type_contract, widened)
+    # A bf16 triple moved out from under the guard.
+    bf16_triple = "        { GGML_TYPE_BF16, GGML_TYPE_F32,  GGML_TYPE_BF16 },\n"
+    assert binbcast.count(bf16_triple) == 1
+    unguarded = binbcast.replace(bf16_triple, "", 1).replace(triple, triple + bf16_triple, 1)
+    assert _contract_rejects(_assert_bin_bcast_type_contract, unguarded)
+
+    full_support = SUPPORT_SOURCE.read_text(encoding="utf-8")
+    support_start = _supports_impl_start(full_support)
+    # The predicate call removed from the ADD/SUB/MUL/DIV case, and from REPEAT.
+    for start_label, end_label, call in (
+        ("case GGML_OP_ADD:", "case GGML_OP_CONCAT:",
+         "ggml_sycl_bin_bcast_types_supported(op->src[0]->type, op->src[1]->type, op->type) &&"),
+        ("case GGML_OP_REPEAT:", "case GGML_OP_ADD:",
+         "ggml_sycl_bin_bcast_types_supported(op->type, op->src[0]->type, op->type) &&"),
+    ):
+        case_start = full_support.index(start_label, support_start)
+        case_end = full_support.index(end_label, case_start)
+        case = full_support[case_start:case_end]
+        assert case.count(call) == 1, call
+        mutated = full_support[:case_start] + case.replace(call, "", 1) + full_support[case_end:]
+        assert _contract_rejects(_assert_bin_bcast_support_contract, mutated), start_label
 
 
 def test_review_mutations_are_detected() -> None:

@@ -123988,22 +123988,14 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 return src0_type == GGML_TYPE_F32;
             }
         case GGML_OP_REPEAT:
-            {
-                // REPEAT routes through ggml_sycl_op_bin_bcast, whose type chain
-                // implements f32/f16/i32/i16 and ends in GGML_ABORT -- there is no
-                // fallback -- so admitting anything else (bf16) crashes at runtime
-                // rather than deferring to another backend. Keep this list in step
-                // with binbcast.cpp. CUDA declines the same way, and more narrowly
-                // (f32/f16 only), because its bin_bcast omits the integer branches.
-                ggml_type src0_type = op->src[0]->type;
-                if (src0_type != GGML_TYPE_F32 && src0_type != GGML_TYPE_F16 && src0_type != GGML_TYPE_I32 &&
-                    src0_type != GGML_TYPE_I16) {
-                    return false;
-                }
-                // REPEAT hands (dst, src, dst) to bin_bcast, so the stride
-                // preconditions land on dst and on op->src[0].
-                return ggml_sycl_binbcast_layout_supported(op, op->src[0], op);
-            }
+            // REPEAT routes through ggml_sycl_op_bin_bcast, whose type chain ends
+            // in GGML_ABORT -- there is no fallback -- so a type triple outside it
+            // crashes at runtime rather than deferring to another backend. The list
+            // lives beside that chain, in binbcast.cpp. REPEAT hands (dst, src, dst)
+            // to bin_bcast, so the type triple and the stride preconditions land on
+            // dst and on op->src[0].
+            return ggml_sycl_bin_bcast_types_supported(op->type, op->src[0]->type, op->type) &&
+                   ggml_sycl_binbcast_layout_supported(op, op->src[0], op);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -124012,7 +124004,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // ggml_sycl_binbcast_layout_supported and the REPEAT case above.
             // ADD_ID and COUNT_EQUAL have their own kernels and stay in the
             // unconditional group below.
-            return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
+            return ggml_sycl_bin_bcast_types_supported(op->src[0]->type, op->src[1]->type, op->type) &&
+                   ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
             // Layout is genuinely handled: concat.cpp:119-153 has a fully
             // stride-aware kernel for the non-contiguous case.  TYPE is not --
