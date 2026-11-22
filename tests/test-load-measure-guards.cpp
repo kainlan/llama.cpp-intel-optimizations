@@ -1067,6 +1067,37 @@ static void test_state_excess() {
     CHECK(llama_context_state_excess_text(0, 4, 0, 0).empty(), "no state and no term warned");
 }
 
+// A compute term larger than its device's total memory is refused by name, before any reservation; a term that
+// fits, the host tier and a device of unknown capacity are not judged.
+static void test_probe_unfundable_text() {
+    const size_t                              mib = 1024 * 1024;
+    llama_load_measure_device                 big;
+    big.device      = 0;
+    big.chunk_bytes = { 1024 * mib, 2048 * mib, 49152 * mib, 49152 * mib, 49152 * mib };
+    big.total       = 150528 * mib;
+    llama_load_measure_device host;
+    host.host  = true;
+    host.total = 900000 * mib;
+    const std::vector<llama_load_device_capacity> caps = { { 0, 32656ull * mib }, { 1, 16304ull * mib } };
+
+    const std::string refused = llama_load_probe_unfundable_text({ host, big }, caps, 1048576);
+    CHECK(refused.find("load refused") != std::string::npos, "no refusal for a 150 GiB term on a 32 GiB device");
+    CHECK(refused.find("n_ctx 1048576") != std::string::npos, "the refusal does not name the context");
+    CHECK(refused.find("device 0") != std::string::npos, "the refusal does not name the device");
+    CHECK(refused.find("150528.0 MiB") != std::string::npos, "the refusal does not name the term");
+    CHECK(refused.find("32656.0 MiB") != std::string::npos, "the refusal does not name the device total");
+    CHECK(refused.find("-c") != std::string::npos, "the refusal does not name the remedy");
+
+    llama_load_measure_device fits = big;
+    fits.total                     = 1052 * mib;
+    CHECK(llama_load_probe_unfundable_text({ fits }, caps, 8192).empty(), "a term that fits was refused");
+    CHECK(llama_load_probe_unfundable_text({ host }, caps, 1048576).empty(), "the host tier was judged");
+    llama_load_measure_device unknown = big;
+    unknown.device                    = 7;
+    CHECK(llama_load_probe_unfundable_text({ unknown }, caps, 1048576).empty(), "an unknown device was refused");
+    CHECK(llama_load_probe_unfundable_text({ big }, { { 0, 0 } }, 1048576).empty(), "a zero capacity was trusted");
+}
+
 int main() {
     test_guard();
     test_dummies();
@@ -1084,6 +1115,7 @@ int main() {
     test_probe_reserve();
     test_state_terms();
     test_state_excess();
+    test_probe_unfundable_text();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

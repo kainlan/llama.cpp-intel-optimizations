@@ -4351,11 +4351,28 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
         llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
+    const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
+    // a term no placement can fund is the load's refusal, by name, before anything is reserved
+    std::vector<llama_load_device_capacity> capacities;
+    int                                     sycl_ordinal = 0;
+    for (const auto & d : model.devices) {
+        if (!llama_context_dev_is_sycl(d.dev)) {
+            continue;
+        }
+        size_t free_bytes  = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(d.dev, &free_bytes, &total_bytes);
+        capacities.push_back(
+            { (int32_t) llama_context_sycl_device_index(d.dev, sycl_ordinal++), (uint64_t) total_bytes });
+    }
+    out.refusal = llama_load_probe_unfundable_text(measured.devices, capacities, measured_n_ctx);
+    if (!out.refusal.empty()) {
+        return out;
+    }
     out.devices  = measured.devices;
     out.kv       = measured.kv;
     out.measured = true;
 
-    const uint32_t                measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
     llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
     out.compute_declined                   = std::move(reserved.compute_declined);
