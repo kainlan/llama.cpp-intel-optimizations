@@ -271,13 +271,13 @@ def evaluate(backend, common, memo_hdr, class_hdr=None):
 
     prestage = function_body(backend, r"static bool graph_prestage_leaf_tensors\([^)]*\)\s*\{")
     refresh = function_body(backend, r"static void graph_refresh_input_tensors\([^)]*\)\s*\{")
-    is_input = function_body(backend, r"static bool graph_tensor_is_input\([^)]*\)\s*\{")
+    is_input = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_is_input\([^)]*\)\s*\{")
     decline = function_body(backend, r"static bool graph_prestage_or_decline\([^)]*\)\s*\{")
     declined = function_body(backend, r"static bool graph_prestage_skip_declined\([^)]*\)\s*\{")
     compute = function_body(backend, r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{")
     results["anchor: prestage returns bool"] = prestage is not None
     results["anchor: graph_refresh_input_tensors exists"] = refresh is not None
-    results["anchor: graph_tensor_is_input exists"] = is_input is not None
+    results["anchor: ggml_sycl_prestage_is_input exists"] = is_input is not None
     results["anchor: graph_prestage_or_decline exists"] = decline is not None
     results["anchor: graph_prestage_skip_declined exists"] = declined is not None
     results["anchor: graph_compute_unchecked exists"] = compute is not None
@@ -291,7 +291,7 @@ def evaluate(backend, common, memo_hdr, class_hdr=None):
     classify = function_body(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{") or ""
     facts_fn = function_body(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{") or ""
     results["pre-stage asks the view-aware INPUT test"] = \
-        "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in facts_fn
+        "ggml_sycl_prestage_classify(" in prestage and "ggml_sycl_prestage_is_input(tensor)" in facts_fn
     results["pre-stage has no flag-only INPUT test left"] = \
         "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify and \
         "flags & GGML_TENSOR_FLAG_INPUT" not in facts_fn
@@ -339,10 +339,10 @@ def evaluate(backend, common, memo_hdr, class_hdr=None):
         re.search(r"while\s*\(\s*tensor->view_src\s*\)\s*\{\s*tensor\s*=\s*tensor->view_src;\s*\}\s*return tensor;", view_root) is not None \
         and re.search(r"const ggml_tensor \*\s*root\s*=\s*ggml_sycl_prestage_view_root\(tensor\);\s*"
                       r"return\s+root\s*&&\s*root->op\s*!=\s*GGML_OP_NONE;", root_walk) is not None
-    results["refresh discovery asks the view-aware INPUT test"] = "graph_tensor_is_input(" in refresh
+    results["refresh discovery asks the view-aware INPUT test"] = "ggml_sycl_prestage_is_input(" in refresh
     results["refresh discovery also takes the host op outputs the pre-stage stages as INPUT"] = \
         re.search(r"ggml_sycl_graph_node_set\s+graph_nodes\(cgraph\);", refresh) is not None and \
-        re.search(r"graph_tensor_is_input\(tensor\)\s*\|\|\s*"
+        re.search(r"ggml_sycl_prestage_is_input\(tensor\)\s*\|\|\s*"
                   r"ggml_sycl_prestage_classify\(tensor,\s*ggml_sycl_prestage_source_buft\(tensor\),\s*&graph_nodes\)\s*==\s*"
                   r"ggml_sycl_prestage_class::INPUT", refresh) is not None
     results["refresh discovery has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in refresh
@@ -911,7 +911,7 @@ if args.self_test:
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
-         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "ggml_sycl_prestage_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("classify returns a class of its own", "classify asks the shared class rule, with the view root's op as a fact",
          (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{",
@@ -956,14 +956,14 @@ if args.self_test:
         ("the op-output fact reads the view's own op", "the op-output fact reads the view root's op, not the view's",
          (backend, common, mem_, mutate(CLASS_HDR, "tensor = tensor->view_src;", "break;"))),
         ("refresh discovery skips host op outputs", "refresh discovery also takes the host op outputs the pre-stage stages as INPUT",
-         (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor) ||", "graph_tensor_is_input(tensor) || false &&"),
+         (mutate_in_func(backend, ref_sig, "ggml_sycl_prestage_is_input(tensor) ||", "ggml_sycl_prestage_is_input(tensor) || false &&"),
           common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
-         (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, ref_sig, "ggml_sycl_prestage_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("view walk dropped", "the INPUT test walks view_src",
-         (mutate_in_func(backend, r"static bool graph_tensor_is_input\([^)]*\)\s*\{", "view_src", "view_XXXX"),
-          common, mem_)),
+         (backend, common, mem_,
+          mutate_in_func(CLASS_HDR, r"bool\s+ggml_sycl_prestage_is_input\([^)]*\)\s*\{", "view_src", "view_XXXX"))),
         ("zero-byte failure restored", "a zero-byte tensor is a no-op, not a staging failure",
          (mutate_in_func(backend, pre_sig, "ggml_nbytes(tensor) == 0", "ggml_nbytes(tensor) == 12345"), common, mem_)),
         ("failure swallowed", "a staging failure is reported to the caller",

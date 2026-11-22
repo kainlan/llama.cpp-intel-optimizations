@@ -113844,8 +113844,6 @@ static void moe_graph_segmented_call_end() {
 // storage it touches. The single moe_segments slot keyed on (n_nodes, is_decode) let two same-sized splits from
 // different layers replay each other's graphs, and thrashed across the splits of one token.
 
-static bool graph_tensor_is_input(const ggml_tensor * tensor);
-
 // GGML_SYCL_GRAPH_RERECORD or GGML_SYCL_NO_SEG_GRAPH turns segmented replay off.
 static bool ggml_sycl_segmented_graph_env_allows() {
     static const bool allows =
@@ -114189,7 +114187,7 @@ static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vec
     refs.clear();
     std::vector<const ggml_tensor *> seen;  // this call only
     auto                             consider = [&](const ggml_tensor * t, int32_t ref) {
-        if (!t || !t->data || ggml_sycl_tensor_is_weight(t) || ggml_nbytes(t) == 0 || !graph_tensor_is_input(t)) {
+        if (!t || !t->data || ggml_sycl_tensor_is_weight(t) || ggml_nbytes(t) == 0 || !ggml_sycl_prestage_is_input(t)) {
             return;
         }
         if (std::find(seen.begin(), seen.end(), t) != seen.end()) {
@@ -116802,18 +116800,6 @@ static void ggml_sycl_xmx_moe_pre_allocate_buffers(ggml_backend_sycl_context & c
 
 #endif
 
-// A view of an INPUT tensor is that input. ggml_view_tensor() does not copy flags, so the INPUT flag lives on
-// the root (llama's recurrent-state copy indices are `ggml_view_1d(s_copy, ...)`), and a flag-only test would
-// treat the view as an ordinary host tensor: not staged to a stable device buffer, and never refreshed on replay.
-static bool graph_tensor_is_input(const ggml_tensor * tensor) {
-    for (; tensor; tensor = tensor->view_src) {
-        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // The buffer type `tensor`'s bytes live in. A view lives in its source's buffer.
 static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tensor * tensor) {
     if (!tensor) {
@@ -116856,7 +116842,7 @@ static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of(const ggml_tensor * 
     facts.is_control        = ggml_sycl_tensor_uses_cross_device_control_storage(tensor);
     facts.is_weight         = ggml_sycl_tensor_is_weight(tensor);
     facts.is_device         = ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device;
-    facts.is_input          = graph_tensor_is_input(tensor);
+    facts.is_input          = ggml_sycl_prestage_is_input(tensor);
     facts.is_kv_host        = src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
     facts.root_is_op_output = ggml_sycl_prestage_root_is_op_output(tensor);
     // The rule reads the graph-node fact only for a host op output no earlier class claims; asking for any other
@@ -117572,7 +117558,7 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         }
         // A host-resident op output the pre-stage stages as an INPUT is refreshed like one: a replay that does not run
         // the pre-stage first would otherwise read the bytes of the token that recorded it.
-        if (!(graph_tensor_is_input(tensor) ||
+        if (!(ggml_sycl_prestage_is_input(tensor) ||
               ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor), &graph_nodes) ==
                   ggml_sycl_prestage_class::INPUT)) {
             if (dkw0_input_list_on && dkw0_skipped_seen.insert(tensor).second) {

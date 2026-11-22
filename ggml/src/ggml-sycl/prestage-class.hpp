@@ -47,6 +47,22 @@ static inline const ggml_tensor * ggml_sycl_prestage_view_root(const ggml_tensor
     return tensor;
 }
 
+// A view of an INPUT tensor is that input. ggml_view_tensor() does not copy flags, so the INPUT flag lives on the root
+// (llama's recurrent-state copy indices are `ggml_view_1d(s_copy, ...)`), and a flag-only test would treat the view as
+// an ordinary host tensor: not staged to a stable device buffer, and never refreshed on replay.
+//
+// One rule for every reader: the prestage's INPUT fact, the replay refresh, the segment slot's input list, and a
+// recorded kernel that reads a staged copy (bin-broadcast). A reader that accepted a tensor the prestage no longer
+// stages or refreshes would read a staging entry left from an earlier token.
+static inline bool ggml_sycl_prestage_is_input(const ggml_tensor * tensor) {
+    for (; tensor; tensor = tensor->view_src) {
+        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // True when an op wrote the tensor's bytes: its view root is not a leaf. The root decides, because a view's own op is
 // GGML_OP_VIEW whether it views a leaf or an op output.
 static inline bool ggml_sycl_prestage_root_is_op_output(const ggml_tensor * tensor) {

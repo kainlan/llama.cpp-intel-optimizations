@@ -2866,6 +2866,18 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # A recorded bin-broadcast reads a staged graph input instead of raw-staging host memory. A main()-only script:
+    # llama_test_pytest would collect no tests and fail with pytest's exit 5.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-binbcast-graph-input-staging-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-binbcast-graph-input-staging-source.py
+    )
+    set_tests_properties(test-sycl-binbcast-graph-input-staging-source PROPERTIES
+        LABELS "sycl;python;source-assert"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kernel-profiler-source-copy.py
