@@ -985,6 +985,12 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-row-workers-source.py --self-test)
     set_tests_properties(test-sycl-cpu-row-workers-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # The CPU row kernels and cpu_mul_mat's vec_dot path ask cpu_dispatch_src1_q_fits, the one
+    # src1_q bound, before they quantize activations into it. WITH --self-test.
+    add_test(NAME test-sycl-cpu-dispatch-src1-q-bound-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-dispatch-src1-q-bound-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-dispatch-src1-q-bound-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 30)
     # Every CPU expert pool job stamp is taken inside a trace guard, the trace line
     # carries the six per-token sums, and =2 is the only per-job printer
     # (llama.cpp-j6jf). Run WITH --self-test so each pin is proven to catch its mutant.
