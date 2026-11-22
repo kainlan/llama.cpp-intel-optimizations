@@ -26,6 +26,9 @@ could scramble correct bytes. With comments and string literals blanked:
      vector's resize/data), so no helper can carry the decision out of sight.
   D. set_tensor's reset block (the if (extra) block that calls optimized_feature.reset_reorder) assigns
      own_data_layout = GGML_LAYOUT_AOS.
+  G. ggml_backend_sycl_set_tensor_async assigns it only under if (extra != nullptr && dst_is_own_range), and
+     dst_is_own_range is declared false and set only to true (where the tensor's own storage handle took the write)
+     and to dst_ptr == tensor->data (where it did not): the resolved destination need not be the own range.
 
 --self-test applies at least one mutant per claim and requires each to fail the claim it targets; a mutant whose
 target text is not found fails the self-test.
@@ -57,6 +60,9 @@ SET_AOS = "extra->own_data_layout = GGML_LAYOUT_AOS;"
 MARK_COAL = "extra->optimized_feature.mark_coalesced_pretransformed(tensor->name);"
 MARK_SOA = "extra->optimized_feature.mark_soa_pretransformed(tensor->name);"
 COAL_GUARD = "if (tensor_ptr == tensor->data)"
+ASYNC_GUARD = "if (extra != nullptr && dst_is_own_range)"
+ASYNC_FLAG = re.compile(r"\bdst_is_own_range\s*=(?!=)\s*([^;]*?)\s*;")
+ASYNC_FLAG_VALUES = ["dst_ptr == tensor->data", "false", "true"]
 MEMSET_SIG = "static void ggml_backend_sycl_buffer_memset_tensor("
 ROOT_EXTRA = "static_cast<const ggml_tensor_extra_gpu *>(root->extra)"
 # The forms the token may appear in (R): the declaration, a write through extra->, and the reader's one read.
@@ -87,6 +93,7 @@ CK = "K the coalesced conversion assigns only when it wrote tensor->data"
 CB = "B update_layout_from_cache does not name own_data_layout"
 CC = "C get_tensor decides from own_data_layout and from no other record"
 CD = "D set_tensor's reset block assigns AOS"
+CG = "G the async write records only when it wrote the tensor's own range"
 
 
 def blank_strings(text):
@@ -189,6 +196,13 @@ def reader_calls_ok(get_body):
         all(name in READER_MEMBER_CALLS for name in member)
 
 
+def async_guard_ok(async_body):
+    writes = list(re.finditer(r"\bown_data_layout\s*=(?!=)", async_body))
+    flags = sorted(" ".join(m.group(1).split()) for m in ASYNC_FLAG.finditer(async_body))
+    return len(writes) >= 1 and all(guarded_by(async_body, m.start(), ASYNC_GUARD) for m in writes) and \
+        flags == ASYNC_FLAG_VALUES and re.search(r"\bbool\s+dst_is_own_range\s*=\s*false\s*;", async_body) is not None
+
+
 def claims(files):
     sycl = files.get(SYCL, "")
     set_body = body(sycl, SET_SIG)
@@ -211,6 +225,7 @@ def claims(files):
             READ_FORM.search(get_body) is not None and
             re.search(r"get_reorder\(|layout\.mode|layout\.data_ptr", get_body) is None and reader_calls_ok(get_body),
         CD: SET_AOS in reset_block and RESET in reset_block,
+        CG: async_guard_ok(body(sycl, ASYNC_SIG)),
     }
 
 
@@ -268,6 +283,10 @@ def mutants(files):
         ("the reader takes the view's extra", CC, s(GET_SIG, r"\(root->extra\)", "(tensor->extra)")),
         ("the reader's decision moved into a helper", CC,
          s(GET_SIG, READ_FORM.pattern, "ggml_sycl_stored_layout_of(root);")),
+        ("the async record no longer guarded by the own range", CG,
+         s(ASYNC_SIG, re.escape(ASYNC_GUARD), "if (extra != nullptr)")),
+        ("the async own-range flag set without the pointer check", CG,
+         s(ASYNC_SIG, r"\bdst_is_own_range\s*=\s*dst_ptr == tensor->data\s*;", "dst_is_own_range = true;")),
         ("the reset block records SOA", CD,
          s(SET_SIG, re.escape(SET_AOS), "extra->own_data_layout = GGML_LAYOUT_SOA;")),
         ("the reset assignment moved out of the reset block", CD,

@@ -97264,18 +97264,23 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     ggml_sycl_tensor_storage_handle dst_storage{};
     ggml_sycl::mem_handle           dst_handle{};
-    size_t                          dst_base_offset = 0;
+    size_t                          dst_base_offset  = 0;
+    bool                            dst_is_own_range = false;
     if (ggml_sycl_find_tensor_storage_handle(tensor, owner, &dst_storage) && dst_storage.handle.valid()) {
-        dst_handle      = dst_storage.handle;
-        dst_base_offset = dst_storage.view_offset;
+        dst_handle       = dst_storage.handle;
+        dst_base_offset  = dst_storage.view_offset;
+        dst_is_own_range = true;
     } else {
-        dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst_ptr, GGML_LAYOUT_AOS, owner);
+        dst_handle       = ggml_sycl_copy_handle_for_raw_ptr(dst_ptr, GGML_LAYOUT_AOS, owner);
+        dst_is_own_range = dst_ptr == tensor->data;
     }
     auto src_handle = ggml_sycl::mem_handle::from_direct(const_cast<void *>(data), GGML_LAYOUT_AOS, /*on_device=*/false,
                                                          ggml_sycl::mem_handle::HOST_DEVICE, size);
     (void) ggml_sycl::mem_copy_async(dst_handle, dst_base_offset + offset, src_handle, 0, size, *stream);
-    // The tensor's range now holds ggml-order bytes: record it on the extra set_tensor records it on.
-    if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+    // The write put ggml-order bytes in the tensor's own range only when this tensor's storage handle took it or the
+    // resolved destination is tensor->data; only then is AOS recorded, on the extra set_tensor records it on.
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+    if (extra != nullptr && dst_is_own_range) {
         extra->own_data_layout = GGML_LAYOUT_AOS;
     }
 } catch (const sycl::exception & exc) {
