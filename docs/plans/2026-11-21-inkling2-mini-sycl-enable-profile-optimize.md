@@ -3817,6 +3817,35 @@ contract that pins the block; `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-d
 **Not in this task:** `choose_moe_batch_executor`'s early return, prompt rows (`ne12 > 1`), host-resident
 experts, a secondary card.
 
+**REVIEWED 2026-11-22 at `6cf95a1a8`, not merged yet (it merges after Task 7).** Task commits on `c1628c576`:
+`2b2acecf0` (RED tests), `7038e6119` (the admission, the row-by-row copy, the regenerated inventory),
+`6cf95a1a8` (each passing device case prints its line). Spec review PASS WITH FINDINGS, quality review PASS WITH
+FINDINGS, no defect in the production code, no fix round: every finding taken sits on lines Task 8b rewrites and
+moved there.
+
+*Device results, one run each, zero kernel fault lines, `Shmem` 9 GB:*
+- RED, B70, `2b2acecf0`, predicted by the implementer to the index before the run:
+  `FAIL: CPU oracle mismatch (type=q1_0 ne11=3 graph=strided pass=0) at 96: got 33989.679688, expected
+  33.277046`. The old single block copy reads the 1000.0 filler between strided rows into row 1.
+- `6cf95a1a8`, B70 and B50: the route oracle passes with 28 `PASS:` lines per card (6 through the production
+  fixture, 4 strided), 0 context-bind WARN lines; the adapter device test passes on the B70.
+- Inkling gate, B70, `7038e6119`: both MoE matrices take the direct route on decode rows through `blk.19`, 0
+  refusals. The gate still fails, on the prompt (Task 8b).
+- The gate command itself was wrong and had never run to its verdict: `llama-completion` enters conversation
+  mode for a file with a chat template and throws on this one. Fixed on `feat/inkling2` (`66a4f0bd4`,
+  `-no-cnv`, pinned in the stub test).
+
+*Moved to Task 8b:* a strided test view that starts at a non-zero offset (a root-based copy would pass today);
+one spelling for `ne00`/`ne10` in the block; an explicit `src1->type == GGML_TYPE_F32` conjunct; activation data
+that differs per case, row and token (the workspace slot is reused, so a piece the copy loop skips still holds
+the previous case's identical bytes and the oracle passes); a contract tokenizer that keeps numeric literals
+(`for (int64_t row = 2;` is not caught today).
+*Not taken:* an older contract test accepts the dependency-vector spelling anywhere after the mark (the new test
+pins the loop); a `PASS:` line is printed before the fixture's teardown check.
+*For the profile stage:* a strided src1 costs one copy submit and one `std::vector<sycl::event>` per row. The
+usual graph gives a dense src1, which stays one copy.
+*Still owed at merge:* the Mistral and GPT-OSS gates and both sweeps on the merged tree.
+
 **Also seen in the same run, recorded for the census (not fatal):** once per graph,
 `[UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight ... model=0 type=0
 ne=[1,128,1,1]`. Traced: `stage_raw_host_source` in `binbcast.cpp` stages a small host-resident F32 weight that
