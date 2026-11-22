@@ -1,0 +1,94 @@
+Backend 1/2: SYCL0
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=128,n_seq_tokens=1,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=16,n_seq_tokens=1,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=16,n_seq_tokens=1,n_seqs=1,v_repeat=1,permuted=1,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=16,n_seq_tokens=1,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=64,n_seq_tokens=1,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=8,head_size=32,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=1,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=1,v_repeat=1,permuted=1,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=1,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=1,n_seqs=2,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=16,n_seq_tokens=1,n_seqs=2,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=32,n_seq_tokens=4,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=8,head_size=32,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=1,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=16,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=1,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,k_seq_bcast=1): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,k_seq_bcast=1): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=64,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=127,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=256,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=65,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=100,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=200,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=127,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=64,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=33,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=100,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=128,n_seq_tokens=1,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=64,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=65,n_seqs=2,v_repeat=2,permuted=1,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=257,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=65,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=1,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=257,n_seqs=1,v_repeat=1,permuted=1,kda=1,K=1,correlated=1,padded_v=1,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=1,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=65,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=65,n_seqs=3,v_repeat=4,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=64,n_seqs=1,v_repeat=4,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=257,n_seqs=1,v_repeat=3,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=512,n_seqs=1,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=513,n_seqs=1,v_repeat=3,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=513,n_seqs=2,v_repeat=2,permuted=1,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=2048,n_seqs=1,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=2047,n_seqs=2,v_repeat=3,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=4097,n_seqs=1,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=127,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=256,n_seqs=1,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=256,n_seqs=1,v_repeat=3,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=513,n_seqs=1,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=512,n_seqs=2,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=257,n_seqs=2,v_repeat=2,permuted=1,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=3,head_size=128,n_seq_tokens=129,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=1,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=4095,n_seqs=1,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=64,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=1,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=65,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=1,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=257,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=1,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=3,head_size=128,n_seq_tokens=65,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=1,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=2,head_size=128,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=1,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=2,head_size=128,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=1): OK
+  GATED_DELTA_NET(type=f32,head_count=2,head_size=128,n_seq_tokens=65,n_seqs=2,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=1,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=2,head_size=128,n_seq_tokens=65,n_seqs=2,v_repeat=2,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=1): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=5,n_seqs=1,v_repeat=3,permuted=0,kda=0,K=5,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=300,n_seqs=1,v_repeat=3,permuted=0,kda=0,K=5,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=128,n_seq_tokens=2048,n_seqs=1,v_repeat=3,permuted=0,kda=0,K=5,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=300,n_seqs=2,v_repeat=2,permuted=1,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=200,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=5,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=16,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=32,head_size=16,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=512,head_size=16,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=512,head_size=16,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=32,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=16,head_size=32,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=256,head_size=32,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=256,head_size=32,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=8,head_size=64,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=8,head_size=64,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=128,head_size=64,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=128,head_size=64,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=128,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=64,head_size=128,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=64,head_size=128,n_seq_tokens=37,n_seqs=1,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,g_min=-0.050000): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=16,n_seq_tokens=2,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=2,correlated=0,padded_v=0,padded_q=0,permuted_k=0): not supported [SYCL0, SYCL0] 
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=32,n_seq_tokens=4,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=8,head_size=128,n_seq_tokens=4,n_seqs=1,v_repeat=1,permuted=0,kda=0,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=1,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  GATED_DELTA_NET(type=f32,head_count=8,head_size=32,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=1,K=4,correlated=0,padded_v=0,padded_q=0,permuted_k=0): OK
+  72/72 tests passed
+  Backend SYCL0: OK
+Backend 2/2: CPU
