@@ -554,7 +554,7 @@ typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
 //
 // compute_room_n_ubatch and compute_room_bytes name the one rung whose compute buffers the plan sized the RUNTIME zone
 // to hold beside the hold, and that room: the explicit micro-batch the load placed, whose zone holds the planned
-// compute term (the compute buffers the load measured at its planning shape) beside that micro-batch's ring and dense
+// compute term (measured at the load's requested context and ubatch 512) beside that micro-batch's ring and dense
 // scratch. 0 for none, the case of every load that names no micro-batch.
 struct zone_hold_fit_inputs {
     size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself

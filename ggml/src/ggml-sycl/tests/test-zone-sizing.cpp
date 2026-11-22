@@ -1692,7 +1692,8 @@ int main() {
     // compute term beside that micro-batch's ring and dense scratch, so at that rung a compute buffer no larger than
     // the term is served by the zone and the hold cannot keep it out. The B70 / Qwen3.8 IQ3_XXS context at -ub 2048:
     // plan 98 MiB, one 1960 MiB compute buffer, 64 MiB of KV-zone room, 1946 MiB free outside the arena, and the
-    // 2055 MiB compute term the load measured at its planning shape (n_ctx_train, ubatch 512). Without the room the
+    // 2055 MiB compute term, as measured when the load measures still ran at n_ctx_train and ubatch 512 (before they
+    // followed the requested context; the figure is that measurement, not the current rule). Without the room the
     // bound charges the whole buffer as a spill and refuses the context, although no request was held out. ------------
     {
         const size_t MiB  = 1024 * 1024;

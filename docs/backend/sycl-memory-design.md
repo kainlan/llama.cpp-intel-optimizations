@@ -3355,7 +3355,9 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 - The term is measured at the context the caller requested from the load (the `n_ctx` hint, padded like the context;
   `n_ctx_train` when none was named) and ubatch 512: the caller's `-ub` does not reach the load (`llama.cpp-fkpg`). A
   context created smaller than the hint (a llama-bench model reused for a smaller test) and `-ub 256` both
-  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
+  over-reserve. A context created larger than the hint the model was loaded with is measured below what it needs at
+  load; the runtime transaction at context creation handles it (llama-bench reuses a model for a later instance with a
+  larger `n_prompt + n_gen`, because `equal_mparams` does not compare `n_ctx_hint`). Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
   `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
   climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
   `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
