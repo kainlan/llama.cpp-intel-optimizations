@@ -3355,17 +3355,101 @@ python3 tests/test-sycl-gate-registration-audit.py --self-test ; echo "rc=$?"   
 python3 tests/test-sycl-gate-registration-audit.py --census build ; echo "rc=$?" # rc=0 in this worktree
 ```
 
+#### Part 4: three more contracts, found by the second selection (added 2026-11-22)
+
+The first sweep selected by the label `source`. Twenty-two Python contracts carry no such label (the ten
+`alloc-zone` tests among them), so the sweep is now two selections (see "The sweep" below). The second one showed
+three more contracts that are green on `master` and red on the branch:
+
+1. `tests/test-sycl-replan-census-source.py`, mutant `g30b` ("a censused queue no longer waited"): its anchor is
+   `g_tp_device1_worker_queue->wait();`. Task 7c made that drain `wait_and_throw()`. Change the anchor text to the
+   current statement. Then read the claim the mutant is meant to trip ("does not wait g_tp_device1_worker_queue")
+   and confirm it accepts `wait_and_throw` because it requires a wait, not because it stopped looking.
+2. `tests/test-sycl-execution-abort-source.py`, pin "own-terminal drain quarantines on an unproven wait": it spells
+   `if (!waited || !ggml_sycl_execution_release_graph(ctx)) {`. Task 7d put a recovery between the refused release
+   and the abort; the statement in `ggml_sycl_execution_drain_own_terminal` is now
+   `if (!waited || (!ggml_sycl_execution_release_graph(ctx) && !ggml_sycl_execution_recover_and_release_graph(ctx))) {`.
+   Pin the new statement whole (an unproven wait still goes straight to the abort: `!waited ||` comes first, so
+   neither release nor recovery runs on it; say that in the comment above the pin). If the script pins the twin
+   statement in `ggml_sycl_execution_drain_context_terminal_events`, check it the same way. If the script has no
+   mutation self-test for this pin, do not add a framework; report it.
+3. `tests/test-sycl-holder-census-source.py`, gate (H) "every return path of graph_compute runs the exit hooks":
+   it flags the entry refusal Task 7a added at the top of `ggml_backend_sycl_graph_compute`:
+   ```cpp
+   if (auto * failed_ctx = ...; failed_ctx && ggml_sycl_async_failure_since(failed_ctx->async_failure_cursor)) {
+       ggml_sycl_async_failure_report(failed_ctx, "graph_compute");
+       return GGML_STATUS_FAILED;
+   }
+   ```
+   **Ruling (lead):** the code is right and the gate learns the exception. The refusal returns before the graph
+   begins anything: before the dispatch-owner scope, before any recording, staging or submission. The exit hooks
+   close what a graph opened (they flush pending scatter state with a wait, advance the per-graph caches, publish
+   staged owners, release tenant staging); here nothing was opened, and a flush would wait on a queue whose device
+   has failed. What the failed context submitted earlier is cleaned by the first failed `synchronize`
+   (`ggml_backend_sycl_graph_boundary_exception_cleanup`, which runs the exceptional exit).
+   Change gate (H) so that a `return GGML_STATUS_FAILED;` is admitted when, and only when, all three hold: it lies
+   before the first occurrence of `ggml_sycl_dispatch_owner_scope dispatch_owner(` in the function body; the text
+   between the function's start and the return contains `ggml_sycl_async_failure_since(`; and the statement just
+   before it is the `ggml_sycl_async_failure_report(` call. Exactly one return may use the exception (a second
+   one fails). Add two mutants: (i) the same three-line refusal block moved to just after the dispatch-owner
+   scope's construction is reported as skipping the exit hooks; (ii) a second bare `return GGML_STATUS_FAILED;`
+   inserted before the refusal block is reported. Keep mutant `k18`.
+
+Run each script as its ctest does (find the arguments with
+`ctest --test-dir build -N -V -R '^<test name>$' | cat | grep -a 'Test command'`) and with plain `python3`; all
+three exit 0, and the holder-census and replan-census self-tests report every mutant caught.
+
+#### Part 5: `ctest` runs the contracts with the interpreter the shell uses
+
+`find_package(Python3)` picks `/home/kainlan/.local/bin/python3.13` on this host, an interpreter without
+`tree_sitter_language_pack`; the shell's `python3` (miniconda) has it. So every `alloc-zone` test, and the other
+`ast` contracts, fail under `ctest` in every build directory with `tree_sitter_language_pack with the C++ grammar
+is required`, while the same command passes by hand. That is how the allocation-zone contract stayed out of every
+gate.
+- Modify `scripts/sycl-build.sh`: add `"-DPython3_EXECUTABLE=$(command -v python3)"` to `configure_args`, next to
+  the compiler lines, with a two-line comment giving the reason (ctest must run the Python contracts with the
+  interpreter the developer's shell runs them with; CMake's own search prefers a versioned name that can be a
+  different installation). If `command -v python3` is empty the script must stop with a clear error before
+  configuring.
+- An existing build directory keeps its cached interpreter until the script configures again: run
+  `export TMPDIR=<dir under inkling/>; ./scripts/sycl-build.sh -r` once in `inkling/wt-t7a` (only while
+  `pgrep -c -x ninja` prints less than 3; nothing in C++ changed, so it should compile little), then
+  `cat build/CMakeCache.txt | grep -a Python3_EXECUTABLE` and `ctest --test-dir build -R 'alloc-zone' -j 4
+  --timeout 600` must pass all ten.
+- Add one line to `docs/development/sycl-fork-guide.md`, in the build section: after pulling this change, run the
+  build script with `-r` once per build directory.
+
+#### The sweep (two selections; both in every implementer brief and every merged-tree gate)
+
+```bash
+source /opt/intel/oneapi/setvars.sh --force
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -L 'source' -LE 'model|cache|mem-handle|device|residency' -j 4 --timeout 300
+ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R 'alloc-zone|-source$|source-contract$|-audit$' -LE 'source|model|cache|mem-handle|device|residency' -j 4 --timeout 600
+```
+The second selects 22 tests, all Python (checked against `ctest --show-only=json-v1` on 2026-11-22). **Never widen
+either selection by label.** On 2026-11-22 the lead tried `-L '^ast$|audit|policy|tdd'`: `tdd` and `policy` also
+label compiled device tests, 163 tests ran four at a time on both cards without `GPU.lock`, and
+`test-moe-mul-mat-id` timed out on the B50 with a GT reset (`06:01:05`, `xe 0000:09:00.0 ... reset done`). No
+process or VRAM was left behind and `Shmem` stayed at 9 GB. Before a selection is changed, list it with
+`--show-only=json-v1` and confirm every command is the Python interpreter.
+
 #### Acceptance
-- [ ] The three command groups above give the stated results.
-- [ ] The sweep (command at the top of this task, run in `inkling/wt-t7a`) fails exactly the five known-red tests
-      and nothing else. Paste the `The following tests FAILED` block in the report.
-- [ ] `git diff --stat` touches only the five files of the file scope.
+- [ ] The three command groups above give the stated results, and Parts 4 and 5 theirs.
+- [ ] The sweep (both selections, run in `inkling/wt-t7a` after Part 5's reconfigure) fails exactly the five
+      known-red tests in the first selection and nothing in the second. Paste both `tests passed` lines and
+      any `The following tests FAILED` block in the report.
+- [ ] `git diff --stat` touches only the files of the file scope (Parts 4 and 5 add
+      `tests/test-sycl-replan-census-source.py`, `tests/test-sycl-execution-abort-source.py`,
+      `tests/test-sycl-holder-census-source.py`, `scripts/sycl-build.sh`,
+      `docs/development/sycl-fork-guide.md`).
 - [ ] Debt count for `G-CATCH` is two lower; no `--write-debt` was used.
 
 **Commits (two, path-scoped, never amended):**
 1. `scripts: exempt the async-failure drains' handlers from the catch clause, with reasons (kjoc)` — the three
    files under `scripts/sycl-alloc-zone-contract/`.
 2. `tests: the join-queue pin and the async-failure contract follow Tasks 7a and 7b` — the two files under `tests/`.
+3. `tests: three contracts follow the async-failure drains and the entry refusal (kjoc)` — Part 4's three files.
+4. `scripts: ctest runs the Python contracts with the shell's interpreter` — Part 5's two files.
 
 **Gotchas:**
 - A hook blocks `grep`/`rg` as the first word of a command on repo files: use `cat FILE | grep -n` or `git grep -n`.
