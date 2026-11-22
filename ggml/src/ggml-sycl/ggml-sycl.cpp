@@ -56013,26 +56013,37 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
     }
     // The plane's owner is whoever the resolver's handle says it is. A weight the cache placed (WEIGHT) is read
     // through a cache lease, which is what stops an eviction under the read. A weight in a plain backend buffer
-    // (CHUNK_LEASE: test-backend-ops, or any graph whose weights were never registered with the cache) is owned by
-    // the tensor's own handle, and a copy of it shares the chunk lease. No other kind carries a lifetime a reader
-    // that outlives this call can hold. A resolution that carries its own retention (the resolver's fallback to a
-    // cache pointer) did not come from the tensor's handle, so a copy of that handle does not own its pointer.
+    // (CHUNK_LEASE: test-backend-ops, or any graph whose weights were never registered with the cache) is held by a
+    // copy of the tensor's handle. The copy takes its own lease on the same arena chunk: that keeps the chunk alive,
+    // not the tensor's sub-allocation, which is the strength of the tensor's own handle (ggml synchronizes before it
+    // frees a buffer). An owning DIRECT handle or an arena handle with an authority could be held the same way, but
+    // nothing installs an SOA plane in one, so those kinds are refused by name. A resolution that carries its own
+    // retention (the resolver's fallback to a cache pointer) did not come from the tensor's handle.
     const auto *                  extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-    const ggml_sycl::mem_handle * own =
+    const ggml_sycl::mem_handle * tensor_handle =
         (extra != nullptr && ggml_sycl_valid_device_index(ctx.device)) ? &extra->data_handle[ctx.device] : nullptr;
     ggml_sycl::mem_handle owner;
     void *                plane = nullptr;
-    if (own == nullptr || !own->valid() || own->kind() == ggml_sycl::mem_handle_kind::WEIGHT) {
+    if (tensor_handle == nullptr || !tensor_handle->valid() ||
+        tensor_handle->kind() == ggml_sycl::mem_handle_kind::WEIGHT) {
         owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);
         plane = owner.resolve(ctx.device).ptr;
         if (plane == nullptr) {
             refuse("f16 dequant arm: the SOA plane is not staged on this device");
         }
-    } else if (own->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE && own->device() == ctx.device &&
-               loaded.layout == GGML_LAYOUT_SOA && loaded.retention == nullptr) {
-        owner = *own;
-        plane = loaded.ptr;
-        ggml_sycl_chain_ready_event_if_needed(*stream, loaded);
+    } else if (tensor_handle->kind() == ggml_sycl::mem_handle_kind::CHUNK_LEASE &&
+               tensor_handle->device() == ctx.device && loaded.layout == GGML_LAYOUT_SOA &&
+               loaded.retention == nullptr) {
+        owner = *tensor_handle;
+        // The retention test says the answer did not come from the cache; this says it came from this handle.
+        if (owner.resolve(ctx.device).ptr != loaded.ptr) {
+            refuse("f16 dequant arm: the SOA plane has no owner the arm can hold");
+        }
+        plane                  = loaded.ptr;
+        size_t stream_identity = 0;
+        ggml_sycl_chain_ready_event_if_needed(*stream, loaded,
+                                              ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                              GGML_SYCL_READY_QUERY_SITE_MUL_MAT_WEIGHT);
     } else {
         refuse("f16 dequant arm: the SOA plane has no owner the arm can hold");
     }
@@ -57144,6 +57155,22 @@ static sycl::event ggml_sycl_mul_mat_stream_slice(sycl::queue & queue,
         device, src0 && src0->name[0] ? src0->name : "?", ggml_sycl_scratch_caller(), required_bytes, (long long) nrows,
         (long long) ne10, why, ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(device) / (1024.0 * 1024.0),
         zone_avail / (1024.0 * 1024.0));
+}
+
+// Runs one op(...) call of ggml_sycl_op_mul_mat. A refusal (ggml_sycl_fallback_error) leaves the op and fails the
+// graph: the handler in ggml_backend_sycl_graph_compute quarantines it and returns a failed status. Any other
+// exception aborts here, as SYCL_CHECK(CHECK_TRY_ERROR(...)) does; that macro's catch-all would turn the refusal into
+// the same abort.
+template <typename call_t> static void ggml_sycl_op_mul_mat_call(call_t && call) {
+    try {
+        call();
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        std::cerr << e.what() << "\nException caught at file:" << __FILE__ << ", line:" << __LINE__
+                  << ", func:" << __func__ << std::endl;
+        ggml_sycl_error("op(...)", __func__, __FILE__, __LINE__, "Exception caught in this line of code.");
+    }
 }
 
 template <template <int> typename quantize_f>
@@ -58292,21 +58319,10 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                                 const int64_t src0_row_offset = row - src0_row_base;
                                 src0_slice = src0_dd_i + src0_row_offset * static_cast<int64_t>(src0_row_bytes);
                             }
-                            // A refusal (ggml_sycl_fallback_error) leaves the op and fails the graph: the handler in
-                            // ggml_backend_sycl_graph_compute quarantines it and returns a failed status. Any other
-                            // exception aborts here, as SYCL_CHECK(CHECK_TRY_ERROR(...)) does; that macro's catch-all
-                            // would turn the refusal into the same abort.
-                            try {
+                            ggml_sycl_op_mul_mat_call([&] {
                                 op(ctx, src0, src1, dst, src0_slice, src1_ddf_i, src1_ddq_i, dst_slice, row, row_high,
                                    src1_ncols, src1_padded_row_size, stream);
-                            } catch (const ggml_sycl_fallback_error &) {
-                                throw;
-                            } catch (const std::exception & e) {
-                                std::cerr << e.what() << "\nException caught at file:" << __FILE__
-                                          << ", line:" << __LINE__ << ", func:" << __func__ << std::endl;
-                                ggml_sycl_error("op(...)", __func__, __FILE__, __LINE__,
-                                                "Exception caught in this line of code.");
-                            }
+                            });
                         }
                     } else {
                         std::chrono::steady_clock::time_point stage_t0;
@@ -58314,18 +58330,10 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                             stream->wait();
                             stage_t0 = std::chrono::steady_clock::now();
                         }
-                        // A refusal fails the graph and any other exception aborts, as in the sliced loop above.
-                        try {
+                        ggml_sycl_op_mul_mat_call([&] {
                             op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, dev[i].row_low,
                                dev[i].row_high, src1_ncols, src1_padded_row_size, stream);
-                        } catch (const ggml_sycl_fallback_error &) {
-                            throw;
-                        } catch (const std::exception & e) {
-                            std::cerr << e.what() << "\nException caught at file:" << __FILE__ << ", line:" << __LINE__
-                                      << ", func:" << __func__ << std::endl;
-                            ggml_sycl_error("op(...)", __func__, __FILE__, __LINE__,
-                                            "Exception caught in this line of code.");
-                        }
+                        });
                         if (mmvq_stage_timing) {
                             stream->wait();
                             const auto   stage_t1 = std::chrono::steady_clock::now();
