@@ -61290,6 +61290,31 @@ bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sy
 }
 }  // namespace ggml_sycl
 
+// Whether a route of ggml_sycl_mul_mat reads `src1` in its type and shape. Every route outside the f16 attention
+// chain (the orchestrator's kernels and the generic BLAS fallback) ends in ggml_sycl_op_mul_mat, which reads a src1
+// that is not F32 only as one 2-D plane and converts that plane by its type; the chain's batched routes convert a
+// src1 of any type and batch to f16; its p021 and nc kernels read F32 only. The route is the one the dispatch takes,
+// from the same classifier and environment, so supports_op and the dispatch cannot disagree about it.
+static bool ggml_sycl_mul_mat_src1_has_reader(const ggml_tensor * src0,
+                                              const ggml_tensor * src1,
+                                              const ggml_tensor * dst) {
+    if (src1->type == GGML_TYPE_F32) {
+        return true;
+    }
+    switch (ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, ggml_sycl_mul_mat_route_env_of(src0, src1))) {
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED:
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED:
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR:
+            return true;
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021:
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC:
+            return false;
+        case GGML_SYCL_MUL_MAT_F16_ROUTE_NONE:
+            return src1->ne[2] == 1 && src1->ne[3] == 1;
+    }
+    return false;
+}
+
 // Returns false when the oneDNN scratchpad request was declined before anything was written to dst: both callers then
 // run ggml_sycl_mul_mat_batched_f16_fallback (llama.cpp-23mk S3-4). A decline is not resource exhaustion, so it never
 // reaches the resource-exhaustion ladder; errors still throw as before.
@@ -92382,8 +92407,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             dst_contiguous_ptr = dst_contiguous.get();
         }
         if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {
-            GGML_ABORT("[MoE] Failed to allocate PP F32 activation staging for %s rows=%zu row_bytes=%zu",
-                       src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
+            // No expert kernel has been submitted yet, so the graph can still be refused whole: the
+            // scoped staging temps already taken release through queue markers on unwind.
+            GGML_LOG_ERROR("[MoE] prompt F32 activation staging refused for %s rows=%zu row_bytes=%zu\n",
+                           src0->name ? src0->name : "?", src1_contiguous_rows, src1_contiguous_f32_row_bytes);
+            throw ggml_sycl_fallback_error("MUL_MAT_ID prompt activation staging does not fit");
         }
         if (pp_oor_trace) {
             fprintf(stderr,
@@ -123617,6 +123645,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         // which is not a refusal.
         const ggml_type indexed_a_type = op->src[0]->type;
         if (op->op == GGML_OP_MUL_MAT_ID) {
+            // Expert routes are resolved per contiguous expert table; a strided view of one has no route.
+            if (!ggml_is_contiguous(op->src[0])) {
+                return false;
+            }
             // MUL_MAT_ID admission keys on MMID coverage, NOT on the dense
             // MUL_MAT allowlist the two branches used to share (llama.cpp-yitq).
             // ggml_sycl_mul_mat_type_supported() is true for F32/F16 and the
@@ -123747,6 +123779,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (a->ne[3] != b->ne[3]) {
+                    return false;
+                }
+                // A src1 type and shape no route reads (a BF16 src1 with several planes, as a BF16 depthwise-conv
+                // kernel builds, reaches ggml_sycl_op_mul_mat's F32-or-one-plane assert) runs elsewhere.
+                if (b->type != GGML_TYPE_F32 && !ggml_sycl_mul_mat_src1_has_reader(a, b, op)) {
                     return false;
                 }
                 ggml_type a_type = a->type;

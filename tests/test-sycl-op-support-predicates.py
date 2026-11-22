@@ -637,6 +637,152 @@ def test_bin_bcast_mutations_are_detected() -> None:
         assert _contract_rejects(_assert_bin_bcast_support_contract, mutated), start_label
 
 
+ROUTE_SOURCE = ROOT / "ggml/src/ggml-sycl/nonfa-stage.hpp"
+_SRC1_READER_SIGNATURE = re.compile(r"static\s+bool\s+ggml_sycl_mul_mat_src1_has_reader\s*\([^)]*\)\s*\{")
+_SRC1_READER_GUARD = "if(b->type!=GGML_TYPE_F32&&!ggml_sycl_mul_mat_src1_has_reader(a,b,op)){returnfalse;}"
+_INDEXED_CONTIGUITY_GUARD = "if(op->op==GGML_OP_MUL_MAT_ID){if(!ggml_is_contiguous(op->src[0])){returnfalse;}"
+_PROMPT_STAGING_SITE = "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {"
+_PROMPT_STAGING_ABORT = "Failed to allocate PP F32 activation staging"
+# What each kernel family reads, from its own source: the p021 and nc kernels assert an F32 src1, and
+# ggml_sycl_op_mul_mat (every route outside the f16 chain ends there) reads another type as one 2-D plane only.
+_SRC1_READER_ANSWERS = {
+    "NONE": "src1->ne[2]==1&&src1->ne[3]==1",
+    "KQ_P021": "false",
+    "KQ_BATCHED": "true",
+    "VEC_NC": "false",
+    "KQKV_BATCHED": "true",
+    "KQKV_SCALAR": "true",
+}
+
+
+def _strip_comments(text: str) -> str:
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"\s+", "", _strip_comments(text))
+
+
+def _function_body(text: str, signature: "re.Pattern[str]") -> str:
+    match = signature.search(text)
+    assert match is not None, signature.pattern
+    close = _matching_close(text, match.end() - 1)
+    return text[match.end() : close]
+
+
+def _route_enumerators(route_header: str) -> List[str]:
+    match = re.search(r"enum\s+\w+\s*\{([^}]*GGML_SYCL_MUL_MAT_F16_ROUTE_NONE[^}]*)\}", route_header)
+    assert match is not None, "f16 route enum"
+    return re.findall(r"GGML_SYCL_MUL_MAT_F16_ROUTE_(\w+)\s*,", _strip_comments(match.group(1)))
+
+
+def _src1_reader_answers(full_source: str) -> Dict[str, str]:
+    body = _compact(_function_body(full_source, _SRC1_READER_SIGNATURE))
+    prefix = (
+        "if(src1->type==GGML_TYPE_F32){returntrue;}"
+        "switch(ggml_sycl_mul_mat_f16_route_of(src0,src1,dst,ggml_sycl_mul_mat_route_env_of(src0,src1))){"
+    )
+    suffix = "}returnfalse;"
+    assert body.startswith(prefix) and body.endswith(suffix), body
+    switch = body[len(prefix) : -len(suffix)]
+    groups = re.findall(r"((?:caseGGML_SYCL_MUL_MAT_F16_ROUTE_\w+:)+)return([^;]+);", switch)
+    assert "".join(f"{labels}return{answer};" for labels, answer in groups) == switch, switch
+    answers: Dict[str, str] = {}
+    for labels, answer in groups:
+        for route in re.findall(r"caseGGML_SYCL_MUL_MAT_F16_ROUTE_(\w+):", labels):
+            assert route not in answers, route
+            answers[route] = answer
+    return answers
+
+
+def _assert_mul_mat_src1_contract(full_source: str, route_header: str) -> None:
+    routes = _route_enumerators(route_header)
+    answers = _src1_reader_answers(full_source)
+    # Every route the dispatch's classifier can return has an answer, and the answer is its kernel's.
+    assert sorted(answers) == sorted(routes) == sorted(_SRC1_READER_ANSWERS), (routes, answers)
+    assert answers == _SRC1_READER_ANSWERS, answers
+    for kernel in ("ggml_sycl_mul_mat_vec_p021", "ggml_sycl_mul_mat_vec_nc"):
+        body = _function_body(full_source, re.compile(r"static\s+void\s+" + kernel + r"\s*\([^)]*\)\s*try\s*\{"))
+        assert "GGML_ASSERT(src1->type == GGML_TYPE_F32);" in body, kernel
+    op_mul_mat_signature = re.compile(r"static\s+bool\s+ggml_sycl_op_mul_mat\s*\([^)]*\)\s*(?:try\s*)?\{")
+    op_mul_mat = _function_body(full_source, op_mul_mat_signature)
+    assert "GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));" in op_mul_mat
+
+    support = _compact(_supports_source(full_source))
+    mul_mat = support[support.index("caseGGML_OP_MUL_MAT:") : support.index("caseGGML_OP_OUT_PROD:")]
+    assert mul_mat.count(_SRC1_READER_GUARD) == 1, "MUL_MAT asks whether a route reads its src1"
+    # A strided view of an expert table has no MUL_MAT_ID route; the indexed prologue declines it first.
+    assert support.count(_INDEXED_CONTIGUITY_GUARD) == 1, "MUL_MAT_ID declines a non-contiguous src0"
+
+
+def _assert_prompt_staging_contract(full_source: str) -> None:
+    site = full_source.find(_PROMPT_STAGING_SITE)
+    assert site >= 0 and full_source.count(_PROMPT_STAGING_SITE) == 1, "prompt activation staging site"
+    open_brace = site + len(_PROMPT_STAGING_SITE) - 1
+    body = _compact(full_source[open_brace + 1 : _matching_close(full_source, open_brace)])
+    # Before any expert kernel is submitted, a staging failure refuses the graph through the recoverable path.
+    assert "GGML_ABORT" not in body, body
+    assert re.search(r"throwggml_sycl_fallback_error\(\"[^\"]+\"\);$", body), body
+    # The two per-expert sites stay aborts: an unwind there would release expert-weight leases and scratch
+    # owners that kernels already submitted still read.
+    later = [m.start() for m in re.finditer(re.escape(_PROMPT_STAGING_ABORT), full_source)]
+    assert len(later) == 2 and all(position > site for position in later), later
+
+
+def test_mul_mat_and_mul_mat_id_decline_what_no_route_reads() -> None:
+    full_source = SUPPORT_SOURCE.read_text(encoding="utf-8")
+    _assert_mul_mat_src1_contract(full_source, ROUTE_SOURCE.read_text(encoding="utf-8"))
+    _assert_prompt_staging_contract(full_source)
+
+
+def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
+    full_source = SUPPORT_SOURCE.read_text(encoding="utf-8")
+    route_header = ROUTE_SOURCE.read_text(encoding="utf-8")
+
+    def rejects_src1(source: str, header: str = route_header) -> bool:
+        return _contract_rejects(lambda text: _assert_mul_mat_src1_contract(text, header), source)
+
+    def mutate(source: str, old: str, new: str) -> str:
+        assert source.count(old) == 1, old
+        return source.replace(old, new, 1)
+
+    # The src1 question removed from MUL_MAT.
+    guard = "                if (b->type != GGML_TYPE_F32 && !ggml_sycl_mul_mat_src1_has_reader(a, b, op)) {\n"
+    assert rejects_src1(mutate(full_source, guard, "                if (false) {\n"))
+    # A route that asserts an F32 src1 answered as a reader.
+    assert rejects_src1(mutate(
+        full_source,
+        "        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021:\n        case GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC:\n",
+        "        case GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC:\n",
+    ).replace(
+        "        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED:\n",
+        "        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED:\n        case GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021:\n", 1,
+    ))
+    # The orchestrator answered as reading any src1 shape.
+    assert rejects_src1(mutate(full_source, "            return src1->ne[2] == 1 && src1->ne[3] == 1;\n",
+                               "            return true;\n"))
+    # A route added to the classifier that the helper does not answer.
+    assert rejects_src1(full_source, mutate(
+        route_header,
+        "    GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR,",
+        "    GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR,\n    GGML_SYCL_MUL_MAT_F16_ROUTE_EXTRA,",
+    ))
+    # The contiguity decline removed from MUL_MAT_ID.
+    contiguity = "            if (!ggml_is_contiguous(op->src[0])) {\n                return false;\n            }\n"
+    assert rejects_src1(mutate(full_source, contiguity, ""))
+
+    # The first staging site aborting again.
+    site = full_source.index(_PROMPT_STAGING_SITE)
+    throw = full_source.index("throw ggml_sycl_fallback_error(", site)
+    end = full_source.index(";", throw) + 1
+    aborting = full_source[:throw] + 'GGML_ABORT("staging");' + full_source[end:]
+    assert _contract_rejects(_assert_prompt_staging_contract, aborting)
+    # A per-expert site turned into a throw (its unwind would release live leases): the census moves.
+    loop_abort = full_source.index(_PROMPT_STAGING_ABORT, site)
+    renamed = full_source[:loop_abort] + "staging refused" + full_source[loop_abort + len(_PROMPT_STAGING_ABORT) :]
+    assert _contract_rejects(_assert_prompt_staging_contract, renamed)
+
+
 def test_review_mutations_are_detected() -> None:
     full_support = SUPPORT_SOURCE.read_text(encoding="utf-8")
     odd_stride_guard = _odd_stride_guard(full_support)
