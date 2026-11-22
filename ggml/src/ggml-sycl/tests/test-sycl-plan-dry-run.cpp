@@ -538,10 +538,14 @@ void residency_from_the_plan_fields(arm_result & r) {
 // budget the plan recorded on its [HOST-LEDGER] plan line. The dry run prints each on a line of its own, under the
 // term's name, and each must equal the planner's. The WEIGHT term swap_headroom is printed and not exported: it is
 // held after the [HOST-PLAN] line, so its planner figure is the bytes on the spread plan's headroom line, and 0 for a
-// plan that prints none. The dry run logs no [PLAN-DRY-RUN-BUG] line for these plans. The
+// plan that prints none. The WEIGHT terms loader_residency and loader_served are printed and not exported, so their
+// printed figures alone are scored. The dry run logs no [PLAN-DRY-RUN-BUG] line for these plans. The
 // PINNED and HOST_CPU residency is scored against the plan: those are the entries the WEIGHT walk counts, so their
-// count is its blocks, and their bytes are the plan's own charge for them, weight_host_bytes, which the result
-// carries. The shaped inventory maps no file (use_mmap_resolved is false), so its plan keeps every host entry PINNED,
+// count is its blocks plus the host experts the loader serves in place (more than the blocks exactly when
+// loader_served is not 0), their bytes are host_weights plus loader_served, and they are the plan's own charge for
+// them, weight_host_bytes, which the result carries. The shaped inventory maps no file (use_mmap_resolved is false), so
+// with evictable weights a single-device plan serves its host experts from the loader's buffer, and its plan keeps
+// every host entry PINNED,
 // and a second leg scores the residency on a plan built by hand, through the record's private seam: its FILE_MAPPED
 // and CPU_OWNED figures are the plan's host_mapped_bytes and host_cpu_owned_bytes, which the fixture charges apart from
 // either per-entry sum, its weight_host_bytes is the plan's, and a plan whose weight_host_bytes is charged on the DST
@@ -580,6 +584,8 @@ arm_result arm_b_every_term_printed_from_the_plan() {
 
     using dry_plan = ggml_sycl_plan_dry_run_plan;
 
+    // A term with no field is printed and not exported (the result struct's layout stays): its printed figure alone
+    // is scored against the planner's.
     struct term {
         const char * printed_name;
         const char * planner_name;
@@ -590,6 +596,8 @@ arm_result arm_b_every_term_printed_from_the_plan() {
     const term terms[] = {
         { "host_weights",         "host_weights",         false, &dry_plan::weight_host_weights         },
         { "blocks",               "blocks",               false, &dry_plan::weight_blocks               },
+        { "loader_residency",     "loader_residency",     false, nullptr                                },
+        { "loader_served",        "loader_served",        false, nullptr                                },
         { "host_compute_reserve", "host_compute_reserve", false, &dry_plan::weight_host_compute_reserve },
         { "layout_copies",        "layout_copies",        false, &dry_plan::weight_layout_copies        },
         { "tlsf_bound",           "tlsf_bound",           false, &dry_plan::weight_tlsf_bound           },
@@ -617,9 +625,11 @@ arm_result arm_b_every_term_printed_from_the_plan() {
             expect(r, shown == planner,
                    "plan " + num(i) + ": printed " + t.printed_name + "=" + num(shown) + ", the plan's " +
                        t.planner_name + "=" + num(planner));
-            expect(r, p.*(t.field) == planner,
-                   "plan " + num(i) + ": the result's " + t.printed_name + " is " + num(p.*(t.field)) +
-                       ", the plan's " + num(planner));
+            if (t.field != nullptr) {
+                expect(r, p.*(t.field) == planner,
+                       "plan " + num(i) + ": the result's " + t.printed_name + " is " + num(p.*(t.field)) +
+                           ", the plan's " + num(planner));
+            }
         }
         const size_t swap_planned = i < headroom.size() ? printed(headroom[i], "bytes") : 0;
         const size_t swap_shown   = dry_run_figure(r, i, "swap_headroom");
@@ -630,12 +640,18 @@ arm_result arm_b_every_term_printed_from_the_plan() {
                                     p.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU];
         const uint64_t zone_bytes = p.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED] +
                                     p.residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU];
-        expect(r, zone_count == p.weight_blocks,
+        // The host experts the loader serves in place are PINNED entries that hold no block, so the walk's blocks are
+        // the other entries, and the two byte terms split the entries' bytes between them.
+        const size_t served = printed(weight[i], "loader_served");
+        expect(r, served == 0 ? zone_count == p.weight_blocks : zone_count > p.weight_blocks,
                "plan " + num(i) + ": PINNED + HOST_CPU residency counts " + num(zone_count) + " entries, the WEIGHT " +
-                   "walk " + num(p.weight_blocks) + " blocks");
+                   "walk " + num(p.weight_blocks) + " blocks, with " + num(served) + " bytes served in place");
         expect(r, zone_bytes == p.weight_host_bytes,
                "plan " + num(i) + ": PINNED + HOST_CPU residency holds " + num(zone_bytes) + " bytes, the plan's " +
                    "weight_host_bytes " + num(p.weight_host_bytes));
+        expect(r, served != SIZE_MAX && p.weight_host_weights + served == zone_bytes,
+               "plan " + num(i) + ": host_weights " + num(p.weight_host_weights) + " + loader_served " + num(served) +
+                   " is not the PINNED + HOST_CPU residency's " + num(zone_bytes) + " bytes");
         const char * const backings[] = { "PINNED", "FILE_MAPPED", "HOST_CPU", "CPU_OWNED" };
         for (int b = 0; b < GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT; ++b) {
             const std::string              tag   = " plan=" + num(i) + " ";

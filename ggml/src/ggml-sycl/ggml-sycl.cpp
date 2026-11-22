@@ -17867,6 +17867,10 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                              
     line("WEIGHT", "host_weights", out.weight_host_weights);
     GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d WEIGHT blocks=%" PRIu64 "\n", index, plan.device_id,
                   out.weight_blocks);
+    // The loader's SYCL_Host buffer and the host experts it serves in place, which hold no block. Printed and not
+    // exported: the result struct crosses the backend's dlopen boundary, so its layout stays.
+    line("WEIGHT", "loader_residency", weight.loader_residency);
+    line("WEIGHT", "loader_served", weight.loader_served);
     line("WEIGHT", "host_compute_reserve", out.weight_host_compute_reserve);
     line("WEIGHT", "layout_copies", out.weight_layout_copies);
     line("WEIGHT", "tlsf_bound", out.weight_tlsf_bound);
@@ -46997,9 +47001,12 @@ static void ggml_sycl_preload_model_weights() {
                              std::to_string(host_expert_unowned_count[d]) + " from " + host_expert_unowned_first[d];
         }
         if (unowned_count > 0) {
+            // The count covers the first unowned expert on a device and every host expert the sweep met after it,
+            // for which it asked no room.
             GGML_LOG_ERROR(
-                "[S1-PRELOAD] %zu host-planned experts (%.1f MB) have no owner: no pinned room for a copy and no "
-                "buffer to serve them from in place (%s); the load refuses rather than register them unowned\n",
+                "[S1-PRELOAD] %zu host-planned experts (%.1f MB) have no owner: the first on a device found no pinned "
+                "room for a copy and no buffer to serve it from in place, and no room was asked for those after it "
+                "(%s); the load refuses rather than register them unowned\n",
                 unowned_count, unowned_bytes / (1024.0 * 1024.0), unowned_where.c_str());
             throw std::runtime_error("S1 preload planned host experts have no owner");
         }

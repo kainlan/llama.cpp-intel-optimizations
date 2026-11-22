@@ -1240,9 +1240,11 @@ not size. The limits:
   device: it stays on the host for the model's life (`sycl-memory-design.md`,
   the named move).
 - No silent degrade: a host-planned expert with no owner (no room for a copy
-  and no buffer to serve it from) is never registered. The load counts them,
-  logs one `[S1-PRELOAD] ... host-planned experts (... MB) have no owner` ERROR
-  line and refuses, as a dense weight that cannot be registered does.
+  and no buffer to serve it from) is never registered. Once one on a device has
+  none, the sweep asks no room for the host experts after it there and counts
+  them too. The load logs one
+  `[S1-PRELOAD] ... host-planned experts (... MB) have no owner` ERROR line
+  and refuses, as a dense weight that cannot be registered does.
 - The preload compares what the model still holds in `SYCL_Host` chunks on the
   plan's device with `loader_residency`, and logs a `[HOST-PLAN-BUG]` WARN
   when it holds more.
