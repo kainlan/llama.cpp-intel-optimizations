@@ -1069,6 +1069,13 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
             --self-test)
     set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
+    # An unselected ggml_build_forward_select branch carries no GGML_TENSOR_FLAG_COMPUTE: every executor skips it
+    # through ggml_sycl_is_noop, and the pre-stage, its refresh and the segment input list skip its sources.
+    # --self-test: the single-rule check is absence-based.
+    add_test(NAME sycl-graph-compute-flag-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-compute-flag-source.py
+            --self-test)
+    set_tests_properties(sycl-graph-compute-flag-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
     # llama.cpp-qhfp: GET_ROWS runs Q4_K on the device through one shared support predicate, so qwen35's q4_K
     # token_embd.weight no longer forces a CPU split whose host-memory output cannot be recorded. --self-test:
     # the private-type-list and missing-arm checks are absence-based.

@@ -63,6 +63,19 @@ static inline bool ggml_sycl_prestage_is_input(const ggml_tensor * tensor) {
     return false;
 }
 
+// True when the graph computes this node. ggml_build_forward_select adds every branch to the graph and flags only the
+// selected one, so llama's unselected input-embedding branches (a GET_ROWS on inp_mixed_tokens, a SET_ROWS through
+// inp_mixed_slots) are nodes too. The scheduler does not upload an input that only such a node reads, and ggml-alloc
+// frees such a node's output at once when nothing consumes it, so running it reads indices nobody wrote and writes
+// through them into memory another tensor owns. A leaf never carries the flag: ask this of nodes only.
+//
+// One rule for the executors (through ggml_sycl_is_noop) and for every reader of a node's sources: the pre-stage, its
+// refresh and the segment slot's input list. An input that only an uncomputed node reads is not staged, and no kernel
+// asks for its staged copy, because only a computed node runs.
+static inline bool ggml_sycl_graph_node_is_computed(const ggml_tensor * node) {
+    return (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
 // True when an op wrote the tensor's bytes: its view root is not a leaf. The root decides, because a view's own op is
 // GGML_OP_VIEW whether it views a leaf or an op output.
 static inline bool ggml_sycl_prestage_root_is_op_output(const ggml_tensor * tensor) {

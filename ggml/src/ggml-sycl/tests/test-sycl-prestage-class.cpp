@@ -125,6 +125,16 @@ static void test_input_flag_reaches_views() {
     check(!ggml_sycl_prestage_is_input(&leaf), "input-flag: a flag on a view does not reach its root");
 }
 
+static void test_computed_flag_decides() {
+    // ggml_build_forward_select flags only the selected branch. An unselected node keeps its op and its other flags.
+    ggml_tensor get_rows = tensor_with_op(GGML_OP_GET_ROWS);
+    check(!ggml_sycl_graph_node_is_computed(&get_rows), "computed-flag: an unflagged node is not computed");
+    get_rows.flags = GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT;
+    check(!ggml_sycl_graph_node_is_computed(&get_rows), "computed-flag: OUTPUT and INPUT do not make a node computed");
+    get_rows.flags |= GGML_TENSOR_FLAG_COMPUTE;
+    check(ggml_sycl_graph_node_is_computed(&get_rows), "computed-flag: the COMPUTE flag makes it computed");
+}
+
 static void test_kv_write_is_not_an_activation() {
     // A KV write's result is an op that views the cache, a leaf. The root decides, so it never takes the op-output
     // rule, in the KV-host buft or anywhere else.
@@ -245,6 +255,7 @@ int main() {
         { "graph-own-op-output-stays-copy", test_graph_own_op_output_stays_copy },
         { "view-chain-reaches-the-root",    test_view_chain_reaches_the_root    },
         { "input-flag-reaches-views",       test_input_flag_reaches_views       },
+        { "computed-flag-decides",          test_computed_flag_decides          },
         { "kv-write-is-not-an-activation",  test_kv_write_is_not_an_activation  },
         { "reported-bytes",                 test_reported_bytes                 },
         { "leaf-without-flag-stays-copy",   test_leaf_without_flag_stays_copy   },

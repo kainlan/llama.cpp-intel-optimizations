@@ -102742,9 +102742,12 @@ static void ggml_sycl_trace_persistent_ops(ggml_backend_sycl_context & ctx) {
 
 // Check if a graph node is a no-op that doesn't generate GPU/CPU work.
 // Used by graph_compute_impl, prefix detection, and suffix dispatch.
+// A node the graph does not compute (an unselected ggml_build_forward_select branch) is one: its inputs were never
+// written or uploaded, and its output may already belong to another tensor (ggml_sycl_graph_node_is_computed).
 static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+           !ggml_sycl_graph_node_is_computed(node);
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -114200,6 +114203,7 @@ static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
 
 // A slot's graph inputs, as positions in the split (leaf i as i, src j of node n as -(n*GGML_MAX_SRC+j)-1), never as
 // tensor pointers: a key fixes the split's structure, so the same positions name the same inputs on every replay.
+// Only a computed node's sources count, as in the pre-stage; the key's signature carries each node's flags.
 static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vector<int32_t> & refs) {
     refs.clear();
     std::vector<const ggml_tensor *> seen;  // this call only
@@ -114218,7 +114222,10 @@ static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vec
     }
     for (int n = 0; n < cgraph->n_nodes; ++n) {
         const ggml_tensor * node = cgraph->nodes[n];
-        for (int j = 0; node && j < GGML_MAX_SRC; ++j) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
             consider(node->src[j], -(n * GGML_MAX_SRC + j) - 1);
         }
     }
@@ -116939,7 +116946,7 @@ uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phas
 }
 
 // The sources a prestage of `cgraph` copies to `device`, in the prestage's own
-// walk: leafs, then every node's sources. Sources are deduplicated by tensor
+// walk: leafs, then every computed node's sources. Sources are deduplicated by tensor
 // object, not by the prestage's (cache id, device, view offset) key, so two
 // tensors that share a key count twice; the value is a diagnostic cohort size.
 static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int device) {
@@ -116958,7 +116965,10 @@ static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        for (int j = 0; node && j < GGML_MAX_SRC; j++) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
             visit(node->src[j]);
         }
     }
@@ -117256,9 +117266,10 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
     // The cgraph->leafs array may be empty even when nodes reference non-device tensors.
     // This is the ROOT CAUSE of the DEVICE_LOST error - leaf tensors like "leaf_5" are
     // referenced by nodes but not in cgraph->leafs, so they weren't being pre-staged.
+    // A node the graph does not compute never runs, so nothing reads its sources.
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
 
@@ -117613,12 +117624,14 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     for (int i = 0; i < cgraph->n_leafs; ++i) {
         discover_input(cgraph->leafs[i]);
     }
+    // As in the pre-stage: only a computed node's sources, so this never lists an input the pre-stage skipped.
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (!cgraph->nodes[i]) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            discover_input(cgraph->nodes[i]->src[j]);
+            discover_input(node->src[j]);
         }
     }
 
