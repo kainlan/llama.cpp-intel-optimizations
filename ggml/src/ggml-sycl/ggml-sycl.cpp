@@ -46051,29 +46051,45 @@ static void ggml_sycl_buffer_read_stored_bytes(ggml_backend_buffer_t buffer,
     std::exit(1);
 }
 
-// Reports, once per tensor name, a read of a tensor whose own range holds a layout this reader has no inverse for.
-// At most k_stored_order_warn_names names are remembered, so a long-lived process does not grow the set without
-// bound; one last line says that further reads are not reported.
+// Reports, once per tensor, a read of a tensor whose own range holds a layout this reader has no inverse for. A
+// tensor is keyed by its name; an unnamed one by its type and byte size, so distinct unnamed tensors are each
+// reported. At most k_stored_order_warn_names keys are remembered, so a long-lived process does not grow the set
+// without bound; one last line says that further reads are not reported. The decision is taken under the mutex and
+// the line is logged after it is released: the log callback may be the user's and must not run under a backend lock.
 constexpr size_t k_stored_order_warn_names = 64;
 
 static void ggml_sycl_warn_stored_order_read(const ggml_tensor * root, ggml_layout_mode stored) {
     static std::mutex                      warned_mutex;
-    static std::unordered_set<std::string> warned_names;
+    static std::unordered_set<std::string> warned_keys;
     static bool                            warned_full = false;
-    std::lock_guard<std::mutex>            lock(warned_mutex);
-    if (warned_full || warned_names.count(root->name) != 0) {
-        return;
+
+    std::string key = root->name;
+    if (key.empty()) {
+        key = std::string("<unnamed ") + ggml_type_name(root->type) + ", " + std::to_string(ggml_nbytes(root)) +
+              " bytes>";
     }
-    if (warned_names.size() == k_stored_order_warn_names) {
-        warned_full = true;
+    bool report_tensor = false;
+    bool report_full   = false;
+    {
+        std::lock_guard<std::mutex> lock(warned_mutex);
+        if (!warned_full && warned_keys.count(key) == 0) {
+            if (warned_keys.size() == k_stored_order_warn_names) {
+                warned_full = true;
+                report_full = true;
+            } else {
+                warned_keys.insert(key);
+                report_tensor = true;
+            }
+        }
+    }
+    if (report_full) {
         GGML_LOG_WARN("[SYCL] get_tensor: further stored-order reads are not reported\n");
-        return;
+    } else if (report_tensor) {
+        GGML_LOG_WARN(
+            "[SYCL] get_tensor: '%s' is stored in layout %s, which has no inverse here; the read returns the "
+            "stored bytes, not ggml's block layout (reported once per tensor)\n",
+            key.c_str(), ggml_sycl_layout_mode_name(stored));
     }
-    warned_names.insert(root->name);
-    GGML_LOG_WARN(
-        "[SYCL] get_tensor: '%s' is stored in layout %d, which has no inverse here; the read returns the "
-        "stored bytes, not ggml's block layout (reported once per tensor)\n",
-        root->name, (int) stored);
 }
 
 // One read of an SOA weight stages at most this much on the host before it is rebuilt into the caller's memory.
