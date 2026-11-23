@@ -185,29 +185,50 @@ head -1 "$T/run3.log" | grep -q "SUSPECT.*backing-grew:40000000kB" || { echo "FA
 head -1 "$T/run3.log" | grep -qE 'pre_remainder=0kB pre_backing=3000000kB post_remainder=40000000kB post_backing=43000000kB' \
     || { echo "FAIL: header must stamp remainder and backing (got: $(head -1 "$T/run3.log"))"; fail=1; }
 
-cases=$((cases+1))
-# The post-run sample is re-taken when the first is over the growth threshold, because the host backing of the
-# exiting process is released a moment later. The fake df-cmd counts its calls (one per sample: preflight, pre,
-# post, post again) and switches the meminfo the remainder is read from. First post high, second low: VALID.
-# Both high: SUSPECT. The wait is set to 0 through the environment.
-mk_recheck_df() { # $1 = remainder kB on the 4th sample
-    printf '%s\n' '#!/usr/bin/env bash' \
-        "n=\$(cat '$T/df.n' 2>/dev/null || echo 0); n=\$((n+1)); echo \$n > '$T/df.n'" \
-        "if [ \$n -eq 3 ]; then printf 'MemTotal: 296000000 kB\\nMemFree: 256000000 kB\\nShmem: 3000000 kB\\n' > '$T/meminfo'; fi" \
-        "if [ \$n -eq 4 ]; then printf 'MemTotal: %s kB\\nMemFree: 256000000 kB\\nShmem: 3000000 kB\\n' \$((256000000 + $1)) > '$T/meminfo'; fi" \
-        "echo 'Filesystem 1K-blocks Used Available Use% Mounted on'" > "$T/recheck-df.sh"
-    chmod +x "$T/recheck-df.sh"; rm -f "$T/df.n"
+# The post-run re-check. The host backing of an exiting process is released a moment after exit, so a first
+# post sample over the growth threshold is re-taken after BENCH_GUARD_POST_RECHECK_S seconds and only the second
+# counts. The wrapped command writes the high meminfo (a 40 GB remainder) and, when asked, starts a background
+# writer that restores the low one one second later; the guard waits two seconds before it samples again.
+HIGH_MI='MemTotal: 296000000 kB\nMemFree: 256000000 kB\nShmem: 3000000 kB\n'
+LOW_MI='MemTotal: 256000000 kB\nMemFree: 256000000 kB\nShmem: 3000000 kB\n'
+recheck_run() { # $1 = log, $2 = wait seconds, $3 = wrapped sh -c body
+    BENCH_GUARD_POST_RECHECK_S="$2" "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true \
+        --max-wait 1 --journalctl-cmd true --log "$1" -- sh -c "$3"
 }
-mk_tree 0 0; mk_meminfo 3000000; mk_recheck_df 0
-BENCH_GUARD_POST_RECHECK_S=0 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "$T/recheck-df.sh" --max-wait 1 --journalctl-cmd true \
-    --log "$T/run4.log" -- true || fail=1
-head -1 "$T/run4.log" | grep -q "VALID" || { echo "FAIL: a post sample that drops on the re-check must stay VALID (got: $(head -1 "$T/run4.log"))"; fail=1; }
-head -1 "$T/run4.log" | grep -q "post_remainder=0kB post_backing=3000000kB" || { echo "FAIL: header must record the deciding (second) sample (got: $(head -1 "$T/run4.log"))"; fail=1; }
 cases=$((cases+1))
-mk_tree 0 0; mk_meminfo 3000000; mk_recheck_df 40000000
-BENCH_GUARD_POST_RECHECK_S=0 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "$T/recheck-df.sh" --max-wait 1 --journalctl-cmd true \
-    --log "$T/run5.log" -- true || fail=1
-head -1 "$T/run5.log" | grep -q "SUSPECT.*backing-grew:40000000kB" || { echo "FAIL: a post sample high on both reads must stamp SUSPECT (got: $(head -1 "$T/run5.log"))"; fail=1; }
+mk_tree 0 0; mk_meminfo 3000000
+recheck_run "$T/run4.log" 2 "printf '$HIGH_MI' > '$T/meminfo'; (sleep 1; printf '$LOW_MI' > '$T/meminfo') >/dev/null 2>&1 &" || fail=1
+head -1 "$T/run4.log" | grep -q "VALID" || { echo "FAIL: a post sample that drops before the re-check must stay VALID (got: $(head -1 "$T/run4.log"))"; fail=1; }
+head -1 "$T/run4.log" | grep -q "post_remainder=0kB post_backing=3000000kB post_recheck=1 post_first_backing=43000000kB" \
+    || { echo "FAIL: header must record the deciding sample and the first one (got: $(head -1 "$T/run4.log"))"; fail=1; }
+cases=$((cases+1))
+mk_tree 0 0; mk_meminfo 3000000
+recheck_run "$T/run5.log" 1 "printf '$HIGH_MI' > '$T/meminfo'" || fail=1
+head -1 "$T/run5.log" | grep -q "SUSPECT.*backing-grew:40000000kB" || { echo "FAIL: a post sample still high at the re-check must stamp SUSPECT (got: $(head -1 "$T/run5.log"))"; fail=1; }
+head -1 "$T/run5.log" | grep -q "post_recheck=1 post_first_backing=43000000kB" || { echo "FAIL: header must stamp post_recheck=1 (got: $(head -1 "$T/run5.log"))"; fail=1; }
+cases=$((cases+1))
+# No wait when the first post sample is under the threshold: a 30 s wait that were taken would show in the elapsed time.
+mk_tree 0 0; mk_meminfo 3000000
+t0=$SECONDS
+recheck_run "$T/run6.log" 30 "true" || fail=1
+[ $((SECONDS - t0)) -lt 15 ] || { echo "FAIL: a first post sample under the threshold must not wait ($((SECONDS - t0)) s)"; fail=1; }
+head -1 "$T/run6.log" | grep -q "post_recheck" && { echo "FAIL: no re-check stamp when none ran"; fail=1; }
+cases=$((cases+1))
+# A BENCH_GUARD_POST_RECHECK_S that is not a whole number refuses before the command runs.
+mk_tree 0 0; mk_meminfo 3000000; rm -f "$T/ran"
+out="$(BENCH_GUARD_POST_RECHECK_S=1.5 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- touch "$T/ran" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: a non-integer recheck wait must refuse with exit 3, got $rc"; fail=1; }
+echo "$out" | grep -q "BENCH_GUARD_POST_RECHECK_S" || { echo "FAIL: the refusal must name the variable (got: $out)"; fail=1; }
+[ ! -e "$T/ran" ] || { echo "FAIL: the command ran despite the refusal"; fail=1; }
+cases=$((cases+1))
+# A post-run sample that cannot be read: the command has already run, so no refusal. SUSPECT backing-unreadable,
+# the log is written and the exit code mirrors the command's (7 here).
+mk_tree 0 0; mk_meminfo 3000000
+rc=0; recheck_run "$T/run7.log" 0 "rm -f '$T/meminfo'; exit 7" || rc=$?
+[ "$rc" -eq 7 ] || { echo "FAIL: an unreadable post sample must still mirror the command's exit code 7, got $rc"; fail=1; }
+head -1 "$T/run7.log" | grep -q "SUSPECT.*backing-unreadable" || { echo "FAIL: an unreadable post sample must stamp SUSPECT backing-unreadable (got: $(head -1 "$T/run7.log"))"; fail=1; }
+head -1 "$T/run7.log" | grep -q "REFUSED" && { echo "FAIL: an unreadable post sample must not say REFUSED"; fail=1; }
+head -1 "$T/run7.log" | grep -q "post_backing=unreadable" || { echo "FAIL: header must say post_backing=unreadable (got: $(head -1 "$T/run7.log"))"; fail=1; }
 
 cases=$((cases+1))
 # A meminfo without MemTotal gives no remainder: refuse, never read it as 0.
@@ -850,7 +871,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 51 ] || { echo "FAIL: expected 51 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 54 ] || { echo "FAIL: expected 54 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then

@@ -34,9 +34,12 @@
 # the wrapped command's, never the verdict.
 #
 # Postflight SUSPECT triggers, each with its own reason token in the verdict
-# line and archived header: GPU host backing grew more than 5 GB across the run
+# line and archived header: GPU host backing grew more than 5 GiB across the run
 # (`backing-grew:<N>kB`, net Shmem plus the remainder; a first post sample over the threshold is
-# re-taken after BENCH_GUARD_POST_RECHECK_S seconds, default 5, and only the second sample counts); the run was killed by the timeout
+# re-taken after BENCH_GUARD_POST_RECHECK_S seconds, a whole number, default 5, and only the second sample
+# counts; the header then stamps `post_recheck=1 post_first_backing=<N>kB`); a post-run sample that cannot be
+# read (`backing-unreadable`: the command has already run, so this stamps SUSPECT and never refuses); the run
+# was killed by the timeout
 # (`timeout-killed:rc=<N>`, rc 124/137); `timeout` itself could not execute
 # the wrapped command -- bad `timeout` invocation, command not executable, or
 # command not found (`not-executed:rc=<N>`, rc 125/126/127); the wrapped
@@ -108,6 +111,8 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # mode this file guards against everywhere else (llama.cpp-imns review
 # round 5, finding F9).
 [ -r "$MEMINFO" ] || refuse "no meminfo at $MEMINFO"
+# A wait that is not a whole number would make `sleep` fail after the command has run.
+case "$POST_RECHECK_S" in ''|*[!0-9]*) refuse "BENCH_GUARD_POST_RECHECK_S must be a whole number of seconds (got '$POST_RECHECK_S')";; esac
 
 # is_top_level_card, derive_card_for_selector, and find_card_by_pci (used
 # just below) now live in a small shared helper -- scripts/sycl-gpu-sysfs.sh
@@ -120,11 +125,12 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # not a behaviour change: this script's own test suite (tests/test-bench-guard.sh)
 # must stay green across it.
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-gpu-sysfs.sh"
-[ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-host-backing.sh" ] || refuse "sycl-host-backing.sh is missing next to this script"
+source "$SCRIPT_DIR/sycl-gpu-sysfs.sh"
+[ -r "$SCRIPT_DIR/sycl-host-backing.sh" ] || refuse "$SCRIPT_DIR/sycl-host-backing.sh is missing"
 # shellcheck disable=SC1091
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-host-backing.sh"
+source "$SCRIPT_DIR/sycl-host-backing.sh"
 
 if [ -z "$SYSFS_CARD" ]; then
     if [ -z "$PCI" ]; then
@@ -162,7 +168,6 @@ tenants() {
 t="$(tenants | grep -E 'llama' || true)"
 [ -z "$t" ] || refuse "stale GPU tenant(s): $t"
 
-shmem_kb() { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
 # tmpfs_kb sits to the LEFT of a pipe (piped into awk): each pipeline stage
 # runs in its own subshell, so a refuse()/exit called from inside DF_CMD (or
 # a future rewrite of this helper) would only exit that subshell -- it would
@@ -173,14 +178,18 @@ tmpfs_kb() { { if [ -n "$DF_CMD" ]; then $DF_CMD 2>/dev/null; else df -k -t tmpf
 # Sample raw Shmem + tmpfs usage + the meminfo remainder ONCE and derive the
 # effective figures, into the SAMPLE_* globals -- never re-derive individually.
 # SAMPLE_EFF is Shmem net of tmpfs; SAMPLE_BACKING is SAMPLE_EFF plus the
-# remainder. An unreadable meminfo refuses: no figure is not a low figure. Callers: the
-# preflight ceiling check, and pre/post around the wrapped command. The clamp
+# remainder. Shmem and the remainder come from ONE read of the meminfo (the library's parts function), taken
+# before `df` runs. sample_shmem returns 1 when the meminfo cannot be read and leaves the SAMPLE_* globals
+# untouched: no figure is not a low figure, and the caller decides (a refusal before the command, a SUSPECT
+# stamp after it). Callers: the preflight ceiling check, and pre/post around the wrapped command. The clamp
 # note (below) is printed only at the FIRST call (preflight), not at every
 # sample point -- one run should print it at most once, not up to three
 # times for the same underlying host condition.
 SAMPLE_RAW=0 SAMPLE_TMPFS=0 SAMPLE_EFF=0 SAMPLE_REM=0 SAMPLE_BACKING=0
 sample_shmem() {
-    SAMPLE_RAW="$(shmem_kb)"
+    local parts
+    parts="$(sycl_gpu_host_parts_kb "$MEMINFO")" || return 1
+    SAMPLE_RAW="${parts% *}" SAMPLE_REM="${parts#* }"
     # `|| true`: tmpfs_kb's internal pipe can return non-zero under pipefail
     # when DF_CMD itself fails (e.g. a fake `false` in tests) even though the
     # trailing awk still emits a valid "0" -- this is a *plain* assignment
@@ -193,11 +202,10 @@ sample_shmem() {
     else
         SAMPLE_EFF=0
     fi
-    SAMPLE_REM="$(sycl_gpu_host_remainder_kb "$MEMINFO")" || refuse "cannot compute the meminfo remainder from $MEMINFO"
     SAMPLE_BACKING=$((SAMPLE_EFF + SAMPLE_REM))
 }
 
-sample_shmem
+sample_shmem || refuse "cannot compute GPU host backing from $MEMINFO"
 raw_shmem="$SAMPLE_RAW" tmpfs_used="$SAMPLE_TMPFS" eff_shmem="$SAMPLE_EFF" remainder="$SAMPLE_REM" backing="$SAMPLE_BACKING"
 if [ "$tmpfs_used" -ge "$raw_shmem" ]; then
     echo "bench-guard: note: tmpfs used (${tmpfs_used} kB) meets or exceeds Shmem (${raw_shmem} kB); effective Shmem clamped to 0" >&2
@@ -219,7 +227,7 @@ while :; do
     waited=$((waited + interval))
 done
 
-sample_shmem
+sample_shmem || refuse "cannot compute GPU host backing from $MEMINFO"
 pre_shmem_raw="$SAMPLE_RAW" pre_tmpfs="$SAMPLE_TMPFS" pre_shmem_eff="$SAMPLE_EFF" pre_remainder="$SAMPLE_REM" pre_backing="$SAMPLE_BACKING"
 pre_thr="$st"
 
@@ -244,22 +252,37 @@ else
     timeout -k 15 "$BUDGET" "$@" || rc=$?
 fi
 
-sample_shmem
+# The command has already run: an unreadable post sample never refuses. It stamps SUSPECT `backing-unreadable`
+# and the exit code still mirrors the command's.
 # A sample taken as the wrapped process exits can still see its host backing (the xe driver releases it a moment
 # later). When the first post sample is over the growth threshold, wait and sample once more; the second sample is
-# the one that decides and is the one the header records. No wait when the first sample is under.
-if [ $((SAMPLE_BACKING - pre_backing)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
-    sleep "$POST_RECHECK_S"
-    sample_shmem
+# the one that decides and is the one the header records, together with the first. No wait when the first sample is
+# under.
+post_unreadable=0 post_recheck=0 post_first_backing=""
+if sample_shmem; then
+    if [ $((SAMPLE_BACKING - pre_backing)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
+        post_recheck=1 post_first_backing="$SAMPLE_BACKING"
+        sleep "$POST_RECHECK_S"
+        sample_shmem || post_unreadable=1
+    fi
+else
+    post_unreadable=1
 fi
-post_shmem_raw="$SAMPLE_RAW" post_tmpfs="$SAMPLE_TMPFS" post_shmem_eff="$SAMPLE_EFF" post_remainder="$SAMPLE_REM" post_backing="$SAMPLE_BACKING"
+if [ "$post_unreadable" = 1 ]; then
+    post_shmem_raw=unreadable post_tmpfs=unreadable post_shmem_eff=unreadable post_remainder=unreadable post_backing=unreadable
+else
+    post_shmem_raw="$SAMPLE_RAW" post_tmpfs="$SAMPLE_TMPFS" post_shmem_eff="$SAMPLE_EFF" post_remainder="$SAMPLE_REM" post_backing="$SAMPLE_BACKING"
+fi
 post_thr="$(cat "$FREQ/throttle/status")"
 
 verdict="VALID"
 reasons=""
 # Plain `if` blocks, not `&&` chains -- a trailing false `&&` under `set -e`
 # would exit the script instead of just skipping the reason.
-if [ $((post_backing - pre_backing)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
+if [ "$post_unreadable" = 1 ]; then
+    verdict="SUSPECT"
+    reasons="$reasons backing-unreadable"
+elif [ $((post_backing - pre_backing)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
     verdict="SUSPECT"
     reasons="$reasons backing-grew:$((post_backing - pre_backing))kB"
 fi
@@ -303,9 +326,13 @@ verdict_line="$verdict${reasons:+:$reasons}"
 # directly (bypassing derivation) and no --pci accompanied it, $PCI is
 # still empty here -- stamp the literal "override" rather than a blank.
 pci_for_log="${PCI:-override}"
+# A post figure that could not be read stays the word "unreadable"; a number gets its kB suffix.
+kbv() { case "$1" in unreadable) echo unreadable;; *) echo "${1}kB";; esac; }
+recheck_stamp=""
+[ "$post_recheck" = 1 ] && recheck_stamp=" post_recheck=1 post_first_backing=${post_first_backing}kB"
 if [ -n "$LOG" ]; then
     {
-        echo "# bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB pre_remainder=${pre_remainder}kB pre_backing=${pre_backing}kB post_remainder=${post_remainder}kB post_backing=${post_backing}kB cmd: $*"
+        echo "# bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=$(kbv "$post_shmem_raw") post_tmpfs=$(kbv "$post_tmpfs") post_shmem_eff=$(kbv "$post_shmem_eff") pre_remainder=${pre_remainder}kB pre_backing=${pre_backing}kB post_remainder=$(kbv "$post_remainder") post_backing=$(kbv "$post_backing")${recheck_stamp} cmd: $*"
         cat "$tmp_out"
     } > "$LOG"
 else
