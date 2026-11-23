@@ -330,7 +330,7 @@ void check_loader_holds_what_it_places() {
             replayed += b;
         }
         CHECK(replayed == want);
-        // The host dense weight is still planned on the host and charged a block: the plan copies it into one.
+        // The plan still charges the host dense weight a pinned block, whichever buffer the loader then gives it.
         CHECK(ggml_sycl::placement_plan_host_weight_zone_terms(plan).host_weights == kDenseHost);
     }
     // A device-planned dense weight and every expert stay in the buffer under every layout and pass.

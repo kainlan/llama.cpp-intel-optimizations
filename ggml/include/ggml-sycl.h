@@ -467,7 +467,7 @@ struct ggml_sycl_tensor_inventory {
     // files (§4.4). cpu and plain both put a planner-host dense weight of a load that maps no files in a CPU-owned
     // buffer, not the loader's SYCL_Host buffer, which the loader term counts; off leaves it in SYCL_Host. A zeroed
     // inventory carries off, and a reader compares the byte with a named value, never tests it as a bool.
-    // The three sit in the padding after n_ctx_context_is_default (offsets 185-187), so the struct stays 192 bytes. A
+    // The three sit in the padding after n_ctx_context_is_default (offsets 185-187), so they add no bytes to it. A
     // libllama built before them leaves those bytes unspecified, which is safe only because the staging proc that reads
     // them is exported under a new name (ggml_backend_sycl_stage_load_inventory_plan): such a libllama resolves the old
     // name, whose stub refuses the load, and never reaches a reader of these bytes. libllama and libggml-sycl must be
@@ -480,8 +480,8 @@ struct ggml_sycl_tensor_inventory {
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
     // host tier for the room, as it re-places KV that does not fit. The oneDNN Graph scratch floor is sized for it and
     // n_ctx_context; when it is 0, for the planning micro-batch (the placement envelope's n_ubatch when the envelope
-    // names one, else n_ubatch). It sits in the padding after the bools, so the
-    // struct stays 192 bytes (pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
+    // names one, else n_ubatch). It sits in the padding after the bools, so it adds
+    // no bytes (the size is pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
     // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
     // still be rebuilt together for the planner to see it.
     uint32_t                       n_ubatch_context;

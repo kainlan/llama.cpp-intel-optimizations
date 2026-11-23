@@ -2372,10 +2372,10 @@ arm_result arm_k_load_start_runs_the_deferred_release() {
 // uncommitted. With no model live a refused load's abort releases every arena nothing holds, as arm (k)'s last end
 // leaves them, so the arm runs after (k) and before (g).
 // Engagement: the load began, and its stage logged a plan line carrying every term.
-// Mutants: the refusal dropped (a charged plan over its budget stages OK); the refusal judged on another figure than
-// the commit total, host_planned_bytes or a total without loader_grown (its printed total is not the line's sum, or the
-// outcome is not the one the line gives); the refusal taken for a plan not charged the term or within its budget
-// (PLAN_REJECTED where the line admits); the ERROR printed without its figures, or from the other pass.
+// Mutants: the refusal dropped (a charged plan over its budget stages OK); the refusal taken for a plan not charged the
+// term or within its budget (PLAN_REJECTED where the line admits); the ERROR printed without its figures, or from the
+// other pass; the refusal judged on a figure that differs here from the commit total. Not killed here: one judged on
+// host_planned_bytes or on a total without loader_grown, which equal it (no lazy table, no buffer above a chunk).
 // Not seen: an early stage creates no tensor, so the admitted leg cannot show the loader's buffers then fitting the
 // pool without a WEIGHT-zone grow; that is sycl-loader-in-place-terms' replay, and a full load's.
 arm_result arm_l_loader_pool_over_budget_refuses_the_load() {

@@ -2664,10 +2664,10 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
 
 // The refusal of a plan charged the loader term (the loader holds the weights in loader_device's pool) whose commit
 // total, loader_grown included, exceeds its host budget: "loader-pool-over-budget" followed by total=, host_budget=,
-// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. The term is exact, so such a load
-// would fail in grow_zone partway through; the stage refuses it by that name at plan time instead. Once the plan
-// admits, no loader pool growth fails, as long as the pool's own budget, which it computes when its cache is created,
-// is at least the plan's host budget. A plan without the loader term keeps the ledger's WARN-only check.
+// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. A late plan's term is exact, so such a
+// load would fail in grow_zone partway through. An early candidate's total can exceed what the pool receives (it also
+// counts tensors the loader skips or puts in a CPU-owned buffer), so it can refuse a load that fits. Once a late plan
+// admits, no loader pool growth fails where the pool's own budget is at least the plan's. Others keep the WARN check.
 inline std::string placement_plan_loader_pool_refusal(const placement_plan & plan) {
     const bool charged = plan.loader_holds_weights && plan.loader_device >= 0 && plan.host_zone_loader_bytes > 0;
     if (!charged || !(plan.host_zone_terms.total() > plan.host_budget)) {

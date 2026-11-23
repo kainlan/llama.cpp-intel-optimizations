@@ -1283,9 +1283,9 @@ host budget is refused at plan time as `loader-pool-over-budget`:
 `ggml_sycl_stage_refuse_loader_pool_plan` logs it on one `[HOST-PLAN] load
 refused:` ERROR line, and the stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED`
 for each late decision and for the early candidate, before the lazy-table
-refusal. The term is exact, so such a load would otherwise fail in
-`grow_zone` partway through; the refusal refuses nothing that could have run,
-and once the plan admits, no loader pool growth fails. A plan without the term
+refusal. A late plan's term is exact, so such a load would otherwise fail in
+`grow_zone` partway through, and once a late plan admits, no loader pool
+growth fails. A plan without the term
 keeps the host ledger's WARN-only check (th32 T2 phase (a)), whose would-refuse
 WARN names the loader refusal when it applies. A plan within its budget can
 still be refused where the lazy-table decision refuses it: the larger zone
@@ -1300,6 +1300,14 @@ on a sample about 0.57 GB higher. Its limits:
   the load's transaction stored. `grow_zone` enforces the pool's own budget,
   set when the pool was created; the invariant holds where the pool's budget is
   at least the plan's.
+- The early candidate's total can exceed what the pool receives, so the early
+  refusal can refuse a load whose pool growth would have fit. Its inventory is
+  built before any tensor is created: it counts tensors the loader then skips,
+  and under the `cpu` and `plain` layouts the early plan still charges a
+  host-planned dense weight as a pinned block although the loader puts it in a
+  CPU-owned buffer. The error is one-sided. The late plan counts only the
+  tensors bound to the loader's buffers and decides again before the zones are
+  sized, so no load is admitted that then fails.
 - The replay assumes the WEIGHT zone is empty when the loader allocates, which
   it is (the copies S1-PRELOAD makes come after), and that the zone's largest
   free block then is one chunk, true for a zone of at least one chunk, since

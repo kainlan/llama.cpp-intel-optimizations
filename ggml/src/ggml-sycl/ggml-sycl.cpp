@@ -17454,10 +17454,10 @@ static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * p
 
 // Refuses the load for a plan whose loader buffers the pinned pool cannot hold within the host budget
 // (placement_plan_loader_pool_refusal): logs one ERROR naming the reason and its figures and returns true, and the
-// stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. Such a load would fail in grow_zone partway through, so this
-// refuses nothing that could have run. Once the plan admits, no loader pool growth fails, as long as the pool's own
-// budget, which it computes when its cache is created, is at least the plan's host budget. The stage asks it before
-// the lazy-plan refusal, whose room the loader's zone took. Returns false, logging nothing, for any other plan.
+// stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. A late plan over its budget would fail in grow_zone partway
+// through; an early candidate can also be refused although its pool growth would fit (see the refusal's comment). Once
+// a late plan admits, no loader pool growth fails where the pool's own budget is at least the plan's. The stage asks it
+// before the lazy-plan refusal, whose room the loader's zone took. Returns false, logging nothing, for any other plan.
 static bool ggml_sycl_stage_refuse_loader_pool_plan(const ggml_sycl::placement_plan * plan, bool early) {
     if (plan == nullptr) {
         return false;
