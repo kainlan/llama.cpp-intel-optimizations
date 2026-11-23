@@ -217,6 +217,7 @@ export ONEAPI_DEVICE_SELECTOR="$SELECTOR"
 
 # Log only. Shmem stays in the line as the iGPU signature; HostBacking (Shmem + the meminfo remainder)
 # is the figure that sees a discrete card's host-USM memory.
+[ -r "$SCRIPT_DIR/sycl-host-backing.sh" ] || { echo "sycl-canonical-gates: $SCRIPT_DIR/sycl-host-backing.sh is missing" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/sycl-host-backing.sh"
 sample_mem() {
