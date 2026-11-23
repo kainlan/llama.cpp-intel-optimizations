@@ -1632,6 +1632,78 @@ def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
                         REGISTER_INSERT, REGISTER_MIRROR_TXN))
 
 
+# --- the evict hands the id over before it retires ------------------------------------------------------------------
+
+# Direct staging maps the id to the device entry, so a retire that found the mapping still there walked every entry of
+# the cache under both locks looking for another to hand it to (13.6 ms a triplet at 75k entries). The loan names the
+# host copy's key first, as an admit names the device entry before it retires the host copy, so its retire finds the id
+# handed over and walks nothing, and the deferred-free pass that erases the entry later finds the same. A rollback hands
+# the id back to the device entry before it withdraws any host copy, so neither walk runs there either, unless the host
+# key is another registrant's live entry, which keeps it. A registration that fails after it named its copy under the
+# id hands the id back to the entry it was to replace, which its mover puts back, so the rollback finds the id to hand
+# back without building a mapping. The remap counts each walk, which the device test reads across an evict.
+LOAN_HOST_KEY = "const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };"
+LOAN_REPOINT = "if (mapped != id_to_key_.end() && mapped->second == device_key) { mapped->second = host_key; }"
+LOAN_HAND_BACK = ("if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) "
+                  "{ mapped->second = device_key; }")
+LOAN_HELD_BY_ANOTHER = ("const bool held_by_another = host != entries_.end() && !host->second.retired && "
+                        "host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();")
+REGISTER_HAND_BACK = ("if (id != id_to_key_.end() && id->second == cache_key) { if (moved_from && "
+                      "detail::cache_id_equal(moved_from->id, key)) { id->second = *moved_from; } "
+                      "else { id_to_key_.erase(id); } }")
+REMAP_EARLY = "if (mapped == id_to_key_.end() || !(mapped->second == removed_key)) { return; }"
+REMAP_WALK_COUNT = "id_remap_walks_.fetch_add(1, std::memory_order_relaxed);"
+REMAP_WALK = "for (const auto & pair : entries_) {"
+
+
+def claim_the_evict_hands_the_id_over_before_it_retires(cache: str) -> bool:
+    c = norm(cache)
+    loan = body(c, LOAN_SIG)
+    reg = body(c, REGISTER_BODY_SIG)
+    remap = body(c, REMAP_SIG)
+    return (loan.count(LOAN_REPOINT) == 1 and loan.count(LOAN_HAND_BACK) == 1 and loan.count(LOAN_HELD_BY_ANOTHER) == 1
+            and ordered(loan, STAMP_FLAG, LOAN_HOST_KEY, LOAN_REPOINT, DEVICE_RETIRE, REGISTER)
+            and ordered(loan, REGISTER_CATCH, LOAN_HELD_BY_ANOTHER, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
+            and reg.count(REGISTER_HAND_BACK) == 1
+            and remap.count(REMAP_WALK_COUNT) == 1 and ordered(remap, REMAP_EARLY, REMAP_WALK_COUNT, REMAP_WALK))
+
+
+def test_the_evict_hands_the_id_over_before_it_retires():
+    assert claim_the_evict_hands_the_id_over_before_it_retires(CACHE)
+
+
+def test_mutant_evict_retires_with_the_id_still_on_the_device_entry_fails():
+    """Without the hand-over the retire finds the id on its entry and walks the whole cache for a replacement."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, LOAN_SIG, LOAN_REPOINT, ""))
+
+
+def test_mutant_evict_hands_the_id_over_after_the_retire_fails():
+    moved = _once_in(CACHE, LOAN_SIG, LOAN_REPOINT, "")
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(moved, LOAN_SIG, DEVICE_RETIRE, DEVICE_RETIRE + " " + LOAN_REPOINT))
+
+
+def test_mutant_rollback_leaves_the_id_on_the_host_key_fails():
+    """The rollback puts the device entry back with the id still naming the host key its withdrawn copy held."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, ""))
+
+
+def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, LOAN_HAND_BACK.replace(" && !held_by_another", "")))
+
+
+def test_mutant_failed_registration_drops_the_moved_id_fails():
+    """A registration whose mirror fails erases the id its copy took, and the rollback has no mapping to hand back."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_HAND_BACK,
+                 "if (id != id_to_key_.end() && id->second == cache_key) { id_to_key_.erase(id); }"))
+
+
+def test_mutant_remap_walks_uncounted_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, REMAP_SIG, REMAP_WALK_COUNT, ""))
+
+
 def test_loan_never_waits():
     assert claim_loan_never_waits(CACHE, SYCL)
 

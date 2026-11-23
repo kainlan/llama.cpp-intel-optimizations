@@ -4910,9 +4910,10 @@ class unified_cache {
     // ("device entry size" otherwise) and its owner must hold them too ("host storage too small"). Otherwise the
     // three D2H copies go on the DMA queue, each moving the member's logical_bytes from offset 0 of its device entry,
     // so a padded entry's tail stays behind, and each retaining its two owners until it completes; each device
-    // entry's last write becomes its copy, so its storage is freed behind the copy; each device entry is retired
-    // exactly; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy as
-    // the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
+    // entry's last write becomes its copy, so its storage is freed behind the copy; each member's id is handed to its
+    // host copy's key and then its device entry is retired exactly, so no retire walks the cache for an entry to hand
+    // the id to; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy
+    // as the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
     // entries' whole size, which the deferred-free pass gives back once each entry is reaped. Nothing here waits and
     // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the device
     // lease, and flips the plan.
@@ -5658,6 +5659,10 @@ class unified_cache {
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
     bool     test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_layout_mode layout, sycl::event event);
+    // The walks of entries_ the id remap has made over the cache's life (id_remap_walks_).
+    uint64_t test_id_remap_walks() const noexcept;
+    // The key `id` maps to, in *out; false when the id maps to nothing.
+    bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
     size_t   retired_pending_count_for_test() const noexcept {
         return retired_pending_count_.load(std::memory_order_acquire);
     }
@@ -6734,6 +6739,10 @@ class unified_cache {
     // Cache storage: (identity, type, layer/expert) -> entry
     entry_map entries_;
     id_map    id_to_key_;
+    // How often remap_or_extract_id_mapping_locked() walked entries_ for an entry to hand an id to: a retire whose
+    // id still named it. Each walk visits every entry under both locks, so a move hands its ids over before it
+    // retires and makes none; the device tests read the count across one.
+    std::atomic<uint64_t> id_remap_walks_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness

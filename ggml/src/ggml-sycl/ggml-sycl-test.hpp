@@ -712,6 +712,10 @@ std::string test_expert_evict_takes_a_block_off_the_direct_route();
 // A named evict's host copies never grow the pinned host zone: into a full host WEIGHT zone it is BUSY "host pinned
 // pool exhausted" and the zone's capacity is unchanged; once the room is back the same evict moves.
 std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone();
+// A move hands each member's id to the copy it publishes before it retires the entry the id named, so no retire and
+// no reaping walks the cache's entries for an entry to hand the id to, and a loan's rollback hands it back.
+std::string test_expert_evict_walks_no_entry_to_hand_over_its_id();
+std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry();
 // Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
 // it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
 // no model ever owned stays through the release. A copy made while its source's load is still pending takes that

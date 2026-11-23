@@ -232,6 +232,15 @@
 //                           The control: fillers that never grow the host WEIGHT zone fill it. The evict of expert 0 is
 //                           then BUSY "host pinned pool exhausted", moves nothing and leaves the zone's capacity as it
 //                           was; once the fillers go, the same evict moves, still without growing the zone.
+//   evict_walks_no_entry_to_hand_over_its_id
+//                           The control: before the evict each of expert 0's ids names its device entry. The evict and
+//                           the reaping of its device entries leave the id remap's walk count where it was, and each
+//                           id then names its host copy.
+//   loan_rollback_hands_the_id_back_to_the_device_entry
+//                           The control: expert 0 resolves on the device through its id. A loan of it whose first host
+//                           registration fails is refused "host registration failed" and leaves no host copy; each id
+//                           names its device entry again, each member resolves on the device, and the walk count is
+//                           where it was.
 //
 // Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
 // releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
@@ -365,6 +374,10 @@ int main() {
                    ggml_sycl::test_expert_evict_takes_a_block_off_the_direct_route);
     ok &= run_case("evict_without_host_room_is_busy_and_keeps_the_zone",
                    ggml_sycl::test_expert_evict_without_host_room_is_busy_and_keeps_the_zone);
+    ok &= run_case("evict_walks_no_entry_to_hand_over_its_id",
+                   ggml_sycl::test_expert_evict_walks_no_entry_to_hand_over_its_id);
+    ok &= run_case("loan_rollback_hands_the_id_back_to_the_device_entry",
+                   ggml_sycl::test_expert_loan_rollback_hands_the_id_back_to_the_device_entry);
     // Last: each releases a model slot, a teardown scan of the whole device cache.
     ok &=
         run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);

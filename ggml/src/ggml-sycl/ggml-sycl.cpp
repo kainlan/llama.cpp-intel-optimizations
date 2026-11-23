@@ -28274,6 +28274,134 @@ std::string test_expert_evict_host_copy_takes_the_sources_pending_load() {
     return {};
 }
 
+// Whether (layer, slot, expert)'s id maps to its AOS device entry (`device`) or to its host copy. The cache files a
+// direct-staged device entry under expert_id -1000 - layout and a host copy under -1 (make_direct_stage_key and
+// register_host_expert).
+bool test_id_names(const test_loan_fixture & fx, int layer, int slot, int expert, bool device) {
+    const ggml_sycl_cache_id id = fx.keys[fx.index(layer, slot, expert)];
+    unified_cache_key        key{};
+    return fx.cache->test_id_mapping(id, &key) && key.type == cache_entry_type::MOE_EXPERT &&
+           detail::cache_id_equal(key.id, id) &&
+           key.expert_id == (device ? -1000 - static_cast<int>(GGML_LAYOUT_AOS) : -1);
+}
+
+std::string test_expert_evict_walks_no_entry_to_hand_over_its_id() {
+    // Direct staging maps each expert's id to its device entry. An evict hands the id to its host copy's key before it
+    // retires the device entry, so neither the retire nor the deferred-free pass that erases the entry walks the
+    // cache's entries looking for another entry to hand the id to: the remap's walk count is the same after the evict
+    // and the reaping as before them, and each id ends on its host copy. The control: before the evict each id names
+    // its device entry, the mapping a retire would otherwise have walked from.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637410ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    for (int s = 0; s < 3; ++s) {
+        if (!test_id_names(fx, 0, s, 0, /*device=*/true)) {
+            return test_loan_fail("before the evict slot %d expert 0's id does not name its device entry", s);
+        }
+    }
+    const uint64_t walks = fx.cache->test_id_remap_walks();
+
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, test_no_triplet, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_evicted != 1 ||
+        !test_admit_outcome_is(result.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict answered " + test_admit_answer(code, result);
+    }
+    if (!fx.reclaim_until([&] { return test_evict_device_entries(fx, 0, 0) == 0; })) {
+        return "the evicted triplet's device entries were not reaped within 2 s";
+    }
+    if (fx.cache->test_id_remap_walks() != walks) {
+        return test_loan_fail("the evict and the reaping walked the cache's entries %llu times to remap an id, not 0",
+                              (unsigned long long) (fx.cache->test_id_remap_walks() - walks));
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (!test_id_names(fx, 0, s, 0, /*device=*/false)) {
+            return test_loan_fail("after the evict slot %d expert 0's id does not name its host copy", s);
+        }
+    }
+    return {};
+}
+
+std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry() {
+    // A loan whose host registration fails after its device entries were retired puts each back as it was, its id
+    // included: the loan handed the id to the host copy's key before the retire, and the rollback hands it back, so
+    // the restored member resolves through its id on the device again and no walk of the cache's entries ran. The
+    // registration is made to fail at its first insert, after all three retires. The control: before the loan each id
+    // names its device entry and each member resolves there.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637411ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    for (int s = 0; s < 3; ++s) {
+        const expert_resolve_result resolved = fx.resolve(0, s, 0);
+        if (!resolved || resolved.location != cache_location::DEVICE || !test_id_names(fx, 0, s, 0, true)) {
+            return test_loan_fail("before the loan slot %d expert 0 does not resolve on the device through its id", s);
+        }
+    }
+    const uint64_t walks = fx.cache->test_id_remap_walks();
+    {
+        expert_move_member members[3];
+        for (int s = 0; s < 3; ++s) {
+            members[s].placement     = { 0, 0, test_loan_fixture::role(s) };
+            members[s].key           = fx.keys[fx.index(0, s, 0)];
+            members[s].host_keys     = { members[s].key };
+            members[s].owner         = ::ggml_sycl_host_expert_alloc(fx.device, bytes);
+            members[s].type          = fx.resolved_type;
+            members[s].ncols         = fx.resolved_ncols;
+            members[s].logical_bytes = bytes;
+            if (!members[s].owner.valid()) {
+                return test_loan_fail("no pinned host storage of %zu bytes for slot %d", bytes, s);
+            }
+        }
+        expert_move_record refused;
+        bool               accepted = false;
+        fx.cache->test_fail_next_host_registration_insert();
+        {
+            std::lock_guard lock(g_tensor_inventory_mutex);
+            accepted = fx.cache->loan_expert_triplet(members, refused);
+        }
+        if (accepted || std::strcmp(refused.reason, "host registration failed") != 0) {
+            return test_loan_fail(
+                "the loan with a failing registration was %s (%s), not refused \"host registration failed\"",
+                accepted ? "accepted" : "refused", refused.reason);
+        }
+    }
+    for (int s = 0; s < 3; ++s) {
+        if (fx.host_entry_present(0, s, 0)) {
+            return test_loan_fail("the refused loan left slot %d expert 0's host copy", s);
+        }
+        if (!test_id_names(fx, 0, s, 0, /*device=*/true)) {
+            return test_loan_fail("after the refused loan slot %d expert 0's id does not name its device entry", s);
+        }
+        const expert_resolve_result resolved = fx.resolve(0, s, 0);
+        if (!resolved || resolved.location != cache_location::DEVICE) {
+            return test_loan_fail("after the refused loan slot %d expert 0 does not resolve on the device", s);
+        }
+    }
+    if (fx.cache->test_id_remap_walks() != walks) {
+        return test_loan_fail("the loan and its rollback walked the cache's entries %llu times to remap an id, not 0",
+                              (unsigned long long) (fx.cache->test_id_remap_walks() - walks));
+    }
+    return {};
+}
+
 std::string test_expert_refill_belongs_to_the_lending_model() {
     // A loan and its refill move a triplet to the host and back, and each copy belongs to the model that owned the
     // one it replaced: the re-admitted device entries are still that model's, and its release reclaims them. A model

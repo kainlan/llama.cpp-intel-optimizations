@@ -9677,6 +9677,7 @@ void unified_cache::remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id 
         return score;
     };
     int best_score = std::numeric_limits<int>::min();
+    id_remap_walks_.fetch_add(1, std::memory_order_relaxed);
     for (const auto & pair : entries_) {
         const unified_cache_key &   candidate_key = pair.first;
         const unified_cache_entry & candidate     = pair.second;
@@ -11609,10 +11610,15 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     // the fill, so its storage is freed behind the copy, and it is withdrawn exactly, leaving any other entry under its
     // id alone. DEFERRED is the expected status: that lease alone defers the free. The leases are minted in the check
     // loop, before any entry changes: minting allocates, so a throw leaves every entry as it was, and the leases
-    // already minted go with the unwinding. What changes the entries after it allocates nothing: each retire moves its
-    // entry's mirror and id mapping out as nodes, into device_nodes, for a rollback to put back. The rollback after
-    // step 4 collects the host copies a failed registration left published into `host_nodes`, sized here, before any
-    // entry changes, so collecting them cannot throw.
+    // already minted go with the unwinding. What changes the entries after it allocates nothing. Each member's id is
+    // handed to its host copy's key before its device entry is retired, as an admit hands it to the device entry before
+    // it retires the host copy: direct staging maps the id to the device entry, and a retire that finds the id still
+    // on its entry walks every entry of the cache for another to hand it to. Handed over first, the retire walks
+    // nothing, nor does the deferred-free pass that erases the entry, and a reader that resolves the id before the
+    // registration below finds no entry under the host key, a miss, never the retiring device entry. Each retire moves
+    // its entry's mirror out as a node, into device_nodes, for a rollback to put back; the rollback hands the id back.
+    // The rollback after step 4 collects the host copies a failed registration left published into `host_nodes`, sized
+    // here, before any entry changes, so collecting them cannot throw.
     std::shared_ptr<mem_handle>      held[3];
     expert_retire_nodes              device_nodes[3];
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
@@ -11639,8 +11645,13 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
                 make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
             device_entry[i]->last_write_event = out.copy_events[i];
             device_entry[i]->has_write_event  = true;
-            out.retire_status[i]              = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
-            out.device_keys[i]                = device_key;
+            const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };
+            const auto              mapped = id_to_key_.find(members[i].key);
+            if (mapped != id_to_key_.end() && mapped->second == device_key) {
+                mapped->second = host_key;
+            }
+            out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
+            out.device_keys[i]   = device_key;
         }
     }
     if (refusal) {
@@ -11689,10 +11700,27 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         // until they complete. Every host copy is withdrawn before any device entry goes back, so at each restore no
         // lookup map holds more entries than it did before step 3 took the nodes out, and the restores, which re-insert
         // those nodes, allocate nothing unless other registrations filled a map while the locks were released.
+        // First each id goes back to its device entry, where step 3 took it from, so withdrawing a host copy walks no
+        // entry looking for one to hand it to. A registration that failed after naming its copy under the id handed it
+        // back itself (register_host_expert's moved_from). A host key that holds another registrant's live entry keeps
+        // the id: that entry appeared after step 1 and is not this loan's to undo.
         {
             std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
             std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
             std::lock(direct_lock, cache_lock);
+            for (int i = 0; i < 3; ++i) {
+                const unified_cache_key device_key =
+                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };
+                const auto              mapped = id_to_key_.find(members[i].key);
+                const auto              host   = entries_.find(host_key);
+                const bool              held_by_another =
+                    host != entries_.end() && !host->second.retired &&
+                    host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();
+                if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) {
+                    mapped->second = device_key;
+                }
+            }
             size_t r = 0;
             for (int i = 0; i < 3; ++i) {
                 const uint64_t host_control = members[i].owner.owner_control_id();
@@ -12744,9 +12772,16 @@ publish_host_expert_direct:
         if (it != entries_.end() && it->second.device_ptr == ptr) {
             erase_entry_locked(it);
         }
+        // A moved copy hands its id back to the entry it was to replace, which its mover puts back (the loan's
+        // rollback): the mover handed the id over before it retired that entry, and a rollback that found the id gone
+        // would have to build a mapping. Any other id the copy took goes with it.
         auto id = id_to_key_.find(key);
         if (id != id_to_key_.end() && id->second == cache_key) {
-            id_to_key_.erase(id);
+            if (moved_from && detail::cache_id_equal(moved_from->id, key)) {
+                id->second = *moved_from;
+            } else {
+                id_to_key_.erase(id);
+            }
         }
         return false;
     }
@@ -17418,6 +17453,22 @@ bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
     if (owner) {
         *owner = alloc_metadata{};
         (void) it->second.direct_alloc_owner.owner_metadata(owner);
+    }
+    return true;
+}
+
+uint64_t unified_cache::test_id_remap_walks() const noexcept {
+    return id_remap_walks_.load(std::memory_order_relaxed);
+}
+
+bool unified_cache::test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const auto                          mapped = id_to_key_.find(id);
+    if (mapped == id_to_key_.end()) {
+        return false;
+    }
+    if (out) {
+        *out = mapped->second;
     }
     return true;
 }
