@@ -157,7 +157,7 @@ settled() {
 waited=0
 until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
-        stamp "refused: not settled after ${waited}s"
+        echo "$(date +%T) refused: not settled after ${waited}s $(mem_fmt "$SETTLE_STATE")" | tee -a "$OUT/mem.log"
         echo "host did not settle to GPU host backing < 30 GiB in ${waited}s ($(mem_fmt "$SETTLE_STATE")); release GPU.lock and escalate" >&2
         exit 3
     fi
@@ -240,7 +240,7 @@ while kill -0 "$RUN_PID" 2>/dev/null; do
     if st=$(sycl_gpu_host_state_kb 2>/dev/null); then
         read -r sh rem av <<< "$st"; bk=$((sh + rem))
     else
-        st= sh=-1 bk=-1
+        st='' sh=-1 bk=-1
     fi
     echo "$(date +%T) $(mem_fmt "$st")" >> "$OUT/mem.log"
     why=

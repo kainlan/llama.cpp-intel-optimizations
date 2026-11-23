@@ -87,6 +87,11 @@ check_eq "state, idle" "11597780 1765960 $(awk '/^MemAvailable:/{print $2}' "$ID
 # A caller that decides on one read and prints the figure it decided on keeps the state string.
 st="$(sycl_gpu_host_state_kb "$LOADED")"
 check_eq "state backing" 68554068 "$(sycl_gpu_host_state_backing_kb "$st")"
+for bad in "" "11970836" "11970836 56583232" "11970836 x 52242988" "1 2 3 4"; do
+    out="$(sycl_gpu_host_state_backing_kb "$bad" 2>/dev/null)" && rc=0 || rc=$?
+    check_true "state backing refuses '$bad'" [ "$rc" -ne 0 ]
+    check_eq "state backing prints nothing for '$bad'" "" "$out"
+done
 check_eq "state format" "Shmem: 11970836 kB HostBacking: 68554068 kB MemAvailable: 52242988 kB" "$(sycl_gpu_host_format_state "$st")"
 
 # Default file is /proc/meminfo: a number on any Linux host.

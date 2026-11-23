@@ -92,10 +92,14 @@ sycl_gpu_host_backing_log_line() {
 # sycl_gpu_host_state_backing_kb "<state>": Shmem + remainder in kB, from a string that
 # sycl_gpu_host_state_kb printed. A caller that decides on a read and then prints the figure it
 # decided on keeps the state string and passes it to both this and the format function.
+# A string that is not three whole numbers returns non-zero and prints nothing: an empty
+# state must never read as a backing of 0, which a caller would take for a settled host.
 sycl_gpu_host_state_backing_kb() {
-    local shm rem av
-    read -r shm rem av <<< "$1"
-    echo $((shm + rem))
+    local shm rem av extra
+    read -r shm rem av extra <<< "$1"
+    case "$shm$rem$av" in ''|*[!0-9]*) return 1;; esac
+    [ -n "$shm" ] && [ -n "$rem" ] && [ -n "$av" ] && [ -z "$extra" ] || return 1
+    echo $((10#$shm + 10#$rem))
 }
 
 # sycl_gpu_host_format_state "<state>": the log line for a state string.

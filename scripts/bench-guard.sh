@@ -111,8 +111,8 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # mode this file guards against everywhere else (llama.cpp-imns review
 # round 5, finding F9).
 [ -r "$MEMINFO" ] || refuse "no meminfo at $MEMINFO"
-# A wait that is not a whole number from 0 to 999 with no leading zero would make the post-run arithmetic or
-# `sleep` fail after the command has run (08 is invalid octal in `$(( ))`, and a long value overflows).
+# The wait reaches `sleep` after the command has run. A value `sleep` rejects would fail there and lose the
+# verdict, and a huge one would hold the run long after it finished, so only 0 to 999 is taken.
 case "$POST_RECHECK_S" in
     0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
     *) refuse "BENCH_GUARD_POST_RECHECK_S must be a whole number of seconds from 0 to 999 with no leading zero (got '$POST_RECHECK_S')";;

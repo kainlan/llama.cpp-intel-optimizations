@@ -39,6 +39,10 @@ expect_accepted() { # $1 = value: validation passes and the script goes on to it
     run_script WATCHDOG_HOST_BACKING_GIB="$1"
     case "$out" in *WATCHDOG_HOST_BACKING_GIB*) echo "FAIL: '$1' must be accepted (got: $out)"; fail=1;; esac
     [ "$rc" -eq 3 ] || { echo "FAIL: '$1' should stop at the binary or build check with exit 3, got $rc ($out)"; fail=1; }
+    case "$out" in
+        *"GGML_SYCL is not ON"*|*"does not link a resolvable SYCL backend"*) ;;
+        *) echo "FAIL: '$1' should stop at the build or binary check (got: $out)"; fail=1;;
+    esac
 }
 
 for v in 150.5 abc "" 0 00 08 09 018 0100 -5 " 5" 1000 123456789012345; do
