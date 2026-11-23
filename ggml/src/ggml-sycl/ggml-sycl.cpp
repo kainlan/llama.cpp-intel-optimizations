@@ -84142,8 +84142,9 @@ static bool ggml_sycl_moe_direct_batch_all_host(const ggml_sycl::moe_resolved_ba
 
 // Q1_0 and NVFP4 run only in the MMID direct block. A call the block declines falls through to the retained route
 // core, which refuses it with reason=capability_unsupported: that line names the core's refusal, not the step of the
-// direct route that declined. Each exit that falls through the block calls this once, on that exit only, so the log
-// names the step: the phase label (MOE-DECODE-REFUSAL for a token, MOE-PROMPT-REFUSAL for a prompt), the tensor, then
+// direct route that declined. Each exit that falls through the block calls this once, on that exit only, and so does
+// the adapter's refusal after the mark, before its throw, so the log names the step: the phase label
+// (MOE-DECODE-REFUSAL for a token, MOE-PROMPT-REFUSAL for a prompt), the tensor, then
 // "route=direct step=<step> <detail>". A fixed buffer and no allocation: some of these exits hold an admitted
 // workspace bundle.
 static void ggml_sycl_moe_direct_log_decline(const ggml_tensor * src0,
@@ -87562,22 +87563,43 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         g_q1_nvfp4_test_candidate.fetch_add(1, std::memory_order_relaxed);
 #endif
         const auto & direct_batch = direct_admission.batch;
-        bool all_primary = !direct_batch.operands.empty();
-        for (const auto & operand : direct_batch.operands) {
-            all_primary = all_primary && operand.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE &&
-                          operand.owning_device() == ctx.device && operand.actual_layout() == GGML_LAYOUT_AOS;
-        }
+
         const auto exec = ggml_sycl_take_execution_state_snapshot(&ctx);
         ggml_sycl::lifecycle::ModelToken root{};
         const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
 
         // The kernel reads the ids where they are: this device's own storage of the tensor, view offset included.
-        const int32_t * ids_device = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);
-        if (all_primary && exec.context_id && exec.session_id && exec.reset_epoch && exec.graph_epoch &&
-            exec.invocation_id && ggml_sycl_execution_current_owner(&ctx, root) && plan_snapshot &&
-            plan_snapshot->plan && ids->ne[0] > 0 && (ne11 == 1 || ne11 == ids->ne[0]) && ids_device &&
-            ids->nb[0] == sizeof(int32_t) && src1->type == GGML_TYPE_F32 && nb10 == sizeof(float) &&
-            nb2 == static_cast<size_t>(ne1) * nb1 && nb1 == static_cast<size_t>(ne01) * sizeof(float)) {
+        const int32_t * ids_device_ptr = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);
+
+        // The route's precondition, one named bool per conjunct, in the order the condition tests them. The condition
+        // and the decline's failed= list read these same bools under these names, so neither can test or name a
+        // conjunct the other does not. Each bool is computed whatever the others hold, as the decline list always
+        // evaluated them; the one guard against a dereference stays inside its own bool (placement_plan tests the
+        // snapshot before it reads the plan), and no bool dereferences what another one tests.
+        const bool all_primary =
+            !direct_batch.operands.empty() &&
+            std::all_of(direct_batch.operands.begin(), direct_batch.operands.end(), [&](const auto & operand) {
+                return operand.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE &&
+                       operand.owning_device() == ctx.device && operand.actual_layout() == GGML_LAYOUT_AOS;
+            });
+        const bool context_id          = exec.context_id != 0;
+        const bool session_id          = exec.session_id != 0;
+        const bool reset_epoch         = exec.reset_epoch != 0;
+        const bool graph_epoch         = exec.graph_epoch != 0;
+        const bool invocation_id       = exec.invocation_id != 0;
+        const bool current_owner       = ggml_sycl_execution_current_owner(&ctx, root);
+        const bool placement_plan      = plan_snapshot && plan_snapshot->plan;
+        const bool ids_rows            = ids->ne[0] > 0;
+        const bool src1_rows           = ne11 == 1 || ne11 == ids->ne[0];
+        const bool ids_device          = ids_device_ptr != nullptr;
+        const bool ids_stride          = ids->nb[0] == sizeof(int32_t);
+        const bool src1_type           = src1->type == GGML_TYPE_F32;
+        const bool src1_element_stride = nb10 == sizeof(float);
+        const bool dst_token_stride    = nb2 == static_cast<size_t>(ne1) * nb1;
+        const bool dst_row_stride      = nb1 == static_cast<size_t>(ne01) * sizeof(float);
+        if (all_primary && context_id && session_id && reset_epoch && graph_epoch && invocation_id && current_owner &&
+            placement_plan && ids_rows && src1_rows && ids_device && ids_stride && src1_type && src1_element_stride &&
+            dst_token_stride && dst_row_stride) {
             // A batch above the workspace the plan holds for this device is refused by name here, before admission:
             // the plan's own sizing function asked for this batch's ne12 tokens, held against that slot by the
             // comparison admission makes. With no slot for this device there is nothing to admit into, and
@@ -87757,10 +87779,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // storage before the kernel runs; the snapshot stays the authority for which experts the
                             // batch resolved and leased, and the adapter range-checks it before it submits.
                             if (!mmvq_submit_q1_nvfp4_aos_id_admitted(
-                                    *exact_queue, src0->type, GGML_LAYOUT_AOS, table_ptr, activation, ids_device,
+                                    *exact_queue, src0->type, GGML_LAYOUT_AOS, table_ptr, activation, ids_device_ptr,
                                     direct_batch.expert_ids.data(), static_cast<int>(n_experts), static_cast<int>(ne10),
                                     static_cast<int>(ne01), static_cast<int>(ids->ne[0]), static_cast<int>(ne12),
                                     static_cast<int>(ne11), ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)) {
+                                // The adapter declined: one of its checks of the shape, the strides, the alignment
+                                // or the ids snapshot's range, or its kernel's submit. The catch below drains the
+                                // queue; this line names the step the throw does not.
+                                ggml_sycl_moe_direct_log_decline(
+                                    src0, ne12, "adapter",
+                                    "type=%s ncols=%lld rows=%lld top_k=%lld ne11=%lld experts=%lld ids_nb0=%zu "
+                                    "ids_nb1=%zu",
+                                    ggml_type_name(src0->type), static_cast<long long>(ne10),
+                                    static_cast<long long>(ne01), static_cast<long long>(ids->ne[0]),
+                                    static_cast<long long>(ne11), static_cast<long long>(n_experts), ids->nb[0],
+                                    ids->nb[1]);
                                 throw moe_direct_submit_failure{};
                             }
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
@@ -87911,7 +87944,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
         } else if (!ggml_sycl_moe_direct_batch_all_host(direct_batch)) {
-            // Each conjunct of the condition above that does not hold, in its order.
+            // Each conjunct of the condition above that does not hold, in its order, named as its bool is.
             char   failed[384] = "";
             size_t used        = 0;
             auto   note        = [&](bool holds, const char * name) {
@@ -87921,21 +87954,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             };
             note(all_primary, "all_primary");
-            note(exec.context_id, "context_id");
-            note(exec.session_id, "session_id");
-            note(exec.reset_epoch, "reset_epoch");
-            note(exec.graph_epoch, "graph_epoch");
-            note(exec.invocation_id, "invocation_id");
-            note(ggml_sycl_execution_current_owner(&ctx, root), "current_owner");
-            note(plan_snapshot && plan_snapshot->plan, "placement_plan");
-            note(ids->ne[0] > 0, "ids_rows");
-            note(ne11 == 1 || ne11 == ids->ne[0], "src1_rows");
+            note(context_id, "context_id");
+            note(session_id, "session_id");
+            note(reset_epoch, "reset_epoch");
+            note(graph_epoch, "graph_epoch");
+            note(invocation_id, "invocation_id");
+            note(current_owner, "current_owner");
+            note(placement_plan, "placement_plan");
+            note(ids_rows, "ids_rows");
+            note(src1_rows, "src1_rows");
             note(ids_device, "ids_device");
-            note(ids->nb[0] == sizeof(int32_t), "ids_stride");
-            note(src1->type == GGML_TYPE_F32, "src1_type");
-            note(nb10 == sizeof(float), "src1_element_stride");
-            note(nb2 == static_cast<size_t>(ne1) * nb1, "dst_token_stride");
-            note(nb1 == static_cast<size_t>(ne01) * sizeof(float), "dst_row_stride");
+            note(ids_stride, "ids_stride");
+            note(src1_type, "src1_type");
+            note(src1_element_stride, "src1_element_stride");
+            note(dst_token_stride, "dst_token_stride");
+            note(dst_row_stride, "dst_row_stride");
             // all_primary names the first operand that is not primary on this card in AoS.
             char first[192] = "";
             for (const auto & operand : direct_batch.operands) {

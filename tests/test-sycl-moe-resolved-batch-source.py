@@ -684,6 +684,23 @@ def parenthesized_after(text: str, anchor: str) -> str:
     raise ValueError(f"unbalanced condition after: {anchor}")
 
 
+def direct_precondition(code: str) -> str:
+    """The direct route's precondition with each named bool it tests replaced by that bool's expression, in
+    parentheses. The condition tests one const bool per conjunct (test-sycl-moe-refusal-reason-source.py holds that
+    shape); the claims here are about what each conjunct tests, which the expansion puts back in the condition."""
+    anchor = code.index("if (all_primary &&")
+    condition = parenthesized_after(code, "if (all_primary &&")
+    declared = {}
+    for m in re.finditer(r"\bconst bool (\w+) = ", code[:anchor]):
+        depth, end = 0, m.end()
+        while end < anchor and not (depth == 0 and code[end] == ";"):
+            depth += {"(": 1, "[": 1, "{": 1, ")": -1, "]": -1, "}": -1}.get(code[end], 0)
+            end += 1
+        declared[m.group(1)] = code[m.end():end]
+    return re.sub(r"\b\w+\b", lambda m: f"({declared[m.group(0)]})" if m.group(0) in declared else m.group(0),
+                  condition)
+
+
 # Claims about which inputs the direct route admits and how it copies them (owner rulings 2026-11-22). The route takes
 # both shapes build_moe_ffn gives it: one row every selected expert shares (the fused gate_up, src1
 # [n_embd, 1, n_tokens]) and one row per selected expert (down, src1 [n_ff, n_expert_used, n_tokens]); the kernel
@@ -700,7 +717,7 @@ def direct_route_input_shape_violations(direct: str) -> list[str]:
     code = normalized_code(direct)
     failures: list[str] = []
     try:
-        admission = parenthesized_after(code, "if (all_primary &&")
+        admission = direct_precondition(code)
     except ValueError:
         return ["admission: the direct route's inner admission condition was not found"]
     if not has_tokens(admission, "(ne11 == 1 || ne11 == ids->ne[0])"):
@@ -794,15 +811,16 @@ def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
     direct = normalized_code(direct_route_block(SOURCE.read_text()))
     assert direct_route_input_shape_violations(direct) == []
     mutants = [
-        ("per-slot-test-only", "(ne11 == 1 || ne11 == ids->ne[0])",
-         "(ne11 == 1 || (q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]))", "test-flag"),
-        ("per-slot-closed", "(ne11 == 1 || ne11 == ids->ne[0])", "ne11 == 1", "per-slot-shape"),
-        ("drop-element-contiguity", "nb10 == sizeof(float) &&", "", "element-contiguity"),
-        ("type-by-side-effect", "src1->type == GGML_TYPE_F32 &&", "", "f32-input"),
+        ("per-slot-test-only", "src1_rows = ne11 == 1 || ne11 == ids->ne[0];",
+         "src1_rows = ne11 == 1 || (q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]);", "test-flag"),
+        ("per-slot-closed", "src1_rows = ne11 == 1 || ne11 == ids->ne[0];", "src1_rows = ne11 == 1;",
+         "per-slot-shape"),
+        ("drop-element-contiguity", "src1_element_stride && ", "", "element-contiguity"),
+        ("type-by-side-effect", "src1_type && ", "", "f32-input"),
         ("two-names", "const size_t activation_row_bytes = static_cast<size_t>(ne10) * sizeof(float);",
          "const size_t activation_row_bytes = static_cast<size_t>(ne00) * sizeof(float);", "one-name"),
-        ("drop-dense-dst", "nb2 == static_cast<size_t>(ne1) * nb1 &&", "", "dense-dst"),
-        ("one-token-only", "nb10 == sizeof(float) &&", "ids->ne[1] == 1 && nb10 == sizeof(float) &&", "token-rows"),
+        ("drop-dense-dst", "dst_token_stride && ", "", "dense-dst"),
+        ("one-token-only", "src1_element_stride && ", "ids->ne[1] == 1 && src1_element_stride && ", "token-rows"),
         ("rows-always-adjacent",
          "const bool src1_rows_adjacent = ne11 == 1 || nb11 == static_cast<size_t>(ne10) * sizeof(float);",
          "const bool src1_rows_adjacent = true;", "rows-adjacent"),
@@ -816,8 +834,8 @@ def test_direct_route_input_shape_mutants_each_fail_their_claim() -> None:
          "dense-one-copy"),
         ("piece-loop-starts-late", "for (int64_t piece = 1;", "for (int64_t piece = 2;", "piece-copies"),
         ("piece-loop-stops-short", "piece < activation_pieces;", "piece < activation_pieces - 1;", "piece-copies"),
-        ("slot-count-wrong-index", "(ne11 == 1 || ne11 == ids->ne[0])", "(ne11 == 1 || ne11 == ids->ne[1])",
-         "per-slot-shape"),
+        ("slot-count-wrong-index", "src1_rows = ne11 == 1 || ne11 == ids->ne[0];",
+         "src1_rows = ne11 == 1 || ne11 == ids->ne[1];", "per-slot-shape"),
         ("activation-one-token", "activation_row_bytes * static_cast<size_t>(ne11) * static_cast<size_t>(ne12);",
          "activation_row_bytes * static_cast<size_t>(ne11);", "token-bytes"),
         ("output-one-token", "static_cast<size_t>(ne01) * static_cast<size_t>(ne12) * sizeof(float);",
@@ -902,7 +920,7 @@ def direct_prompt_violations(parts: dict[str, str]) -> list[str]:
     mmid, direct = parts["mmid"], parts["direct"]
     try:
         gate = parenthesized_after(direct, "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized)")
-        admission = parenthesized_after(direct, "if (all_primary &&")
+        admission = direct_precondition(direct)
     except ValueError:
         return ["prompt-gate: the direct route's gate or admission condition was not found"]
     if "ne12" in tokens(gate):
@@ -968,10 +986,11 @@ def direct_prompt_violations(parts: dict[str, str]) -> list[str]:
             has_tokens(append, "(void) phase;") or '"[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu' in append:
         failures.append("phase-label: the shared refusal line does not name its phase")
     # The ids: this device's own storage, adjacent inside a token, read with the tensor's strides.
-    if not has_tokens(direct, "const int32_t * ids_device = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);") or \
+    if not has_tokens(direct, "const int32_t * ids_device_ptr = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);") or \
             has_tokens(direct, "ggml_sycl_resolve_tensor_ptr(ids"):
         failures.append("ids-resident: the route does not take the ids tensor's own storage on this device")
-    if not has_tokens(admission, "ids_device &&") or not has_tokens(admission, "ids->nb[0] == sizeof(int32_t)"):
+    if not has_tokens(admission, "ids_device_ptr != nullptr") or \
+            not has_tokens(admission, "ids->nb[0] == sizeof(int32_t)"):
         failures.append("ids-admission: ids that are not resident here, or not adjacent inside a token, are admitted")
     if not has_tokens(direct, "direct_batch.expert_ids.data(),") or \
             not has_tokens(direct, "ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)"):
@@ -1038,7 +1057,7 @@ def test_direct_prompt_mutants_each_fail_their_claim() -> None:
          "phase-label"),
         ("ids-unchecked-residency", "direct", "ggml_sycl_moe_ids_device_resident_ptr(ctx, ids);",
          "static_cast<const int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));", "ids-resident"),
-        ("ids-any-element-stride", "direct", "ids->nb[0] == sizeof(int32_t) &&", "", "ids-admission"),
+        ("ids-any-element-stride", "direct", "ids_stride && ", "", "ids-admission"),
         ("ids-packed-strides", "direct", "ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)",
          "sizeof(int32_t), ids->ne[0] * sizeof(int32_t), buffers, &dependency, &kernel)", "ids-strides"),
         ("ids-writable", "declared", "const int32_t * ids_device,", "int32_t * ids_device,", "ids-read-only"),
