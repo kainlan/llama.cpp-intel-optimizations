@@ -20,12 +20,13 @@
 #   outdir  receives run.err (the sched dump), run.out, mem.log, census.md
 #
 # One single-invocation llama-completion per call, wrapped by bench-guard
-# (net-of-tmpfs Shmem ceiling, GPU-fault journal check, timeout -k, and a
+# (net-of-tmpfs GPU host backing ceiling, GPU-fault journal check, timeout -k, and a
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
 # /proc/meminfo every 2 s and kills the run's whole session if MemAvailable
 # drops under WATCHDOG_FLOOR_GB (default 20) or, in the control and vehicle
-# modes, if Shmem climbs past WATCHDOG_SHMEM_GB (default 100): the controls
-# measured ~1-2 GB, so 100 GB means a runaway, not a large load.
+# modes, if GPU host backing (Shmem + the meminfo remainder, scripts/sycl-host-backing.sh)
+# climbs past WATCHDOG_SHMEM_GB (default 100): idle reads 12.7 to 15 GiB and the
+# largest planned load about 90 GiB, so 100 GB means a runaway, not a large load.
 #
 # Every memory figure here is decimal GB (10^9 bytes), the unit of CLAUDE.md's
 # settle rule; /proc/meminfo's kB are KiB and are converted, never relabelled.
@@ -73,8 +74,12 @@ grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL 
 # so a refusal at the floor and a pass just above it never print the same figure.
 # /proc/meminfo's "kB" is KiB
 meminfo_b() { echo $(( $(awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo) * 1024 )); }
+# GPU host backing in bytes. An unreadable meminfo returns 1: callers fail closed.
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-host-backing.sh"
+backing_b() { local kb; kb=$(sycl_gpu_host_backing_kb) || return 1; echo $((kb * 1024)); }
 gb() { awk -v b="$1" 'BEGIN { printf "%.2f", b / 1e9 }'; }
-mem_line() { echo "Shmem=$(gb "$(meminfo_b Shmem)")GB MemAvailable=$(gb "$(meminfo_b MemAvailable)")GB"; }
+mem_line() { echo "Shmem=$(gb "$(meminfo_b Shmem)")GB HostBacking=$(gb "$(backing_b || echo 0)")GB MemAvailable=$(gb "$(meminfo_b MemAvailable)")GB"; }
 stamp() { echo "$(date +%T) $1 $(mem_line)" | tee -a "$OUT/mem.log"; }
 
 REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
@@ -121,22 +126,23 @@ case "$MODE" in
         ;;
 esac
 
-# CLAUDE.md's post-lock settle: TTM shmem release lags the previous run, so
-# wait for Shmem < 30 GB and MemAvailable > 150 GB (and the mode's own need)
+# CLAUDE.md's post-lock settle: the release of GPU host backing lags the previous run, so
+# wait for GPU host backing < 30 GB and MemAvailable > 150 GB (and the mode's own need)
 # before touching the device; give up after SETTLE_TIMEOUT_S and escalate.
 # Compared in bytes against the rule's decimal GB, so the floor is exactly the
 # rule's 150e9, neither the 161 GB a GiB floor would be nor anything lower.
 [ "$NEED_GB" -gt 150 ] || NEED_GB=150
 settled() {
-    [ "$(meminfo_b Shmem)" -lt $((30 * 1000000000)) ] &&
+    local bk; bk=$(backing_b) || return 1
+    [ "$bk" -lt $((30 * 1000000000)) ] &&
         [ "$(meminfo_b MemAvailable)" -gt $((NEED_GB * 1000000000)) ]
 }
 waited=0
 until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
         stamp "refused: not settled after ${waited}s"
-        echo "host did not settle to Shmem < 30 GB and MemAvailable > ${NEED_GB} GB in ${waited}s" \
-             "(Shmem $(meminfo_b Shmem) B, MemAvailable $(meminfo_b MemAvailable) B); release GPU.lock and escalate" >&2
+        echo "host did not settle to GPU host backing < 30 GB and MemAvailable > ${NEED_GB} GB in ${waited}s" \
+             "(host backing $(backing_b || echo unreadable) B, Shmem $(meminfo_b Shmem) B, MemAvailable $(meminfo_b MemAvailable) B); release GPU.lock and escalate" >&2
         exit 3
     fi
     sleep 10; waited=$((waited + 10))
@@ -215,12 +221,15 @@ fi
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
     a=$(meminfo_b MemAvailable) sh=$(meminfo_b Shmem)
-    echo "$(date +%T) Shmem=$(gb "$sh")GB MemAvailable=$(gb "$a")GB" >> "$OUT/mem.log"
+    bk=$(backing_b) || bk=-1
+    echo "$(date +%T) Shmem=$(gb "$sh")GB HostBacking=$(gb "$bk")GB MemAvailable=$(gb "$a")GB" >> "$OUT/mem.log"
     why=
     if [ "$a" -lt $((FLOOR_GB * 1000000000)) ]; then
         why="MemAvailable $(gb "$a") GB ($a B) < ${FLOOR_GB} GB"
-    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$sh" -gt $((SHMEM_ABORT_GB * 1000000000)) ]; then
-        why="Shmem $(gb "$sh") GB ($sh B) > ${SHMEM_ABORT_GB} GB"
+    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -lt 0 ]; then
+        why="meminfo unreadable, host backing unknown"
+    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -gt $((SHMEM_ABORT_GB * 1000000000)) ]; then
+        why="GPU host backing $(gb "$bk") GB ($bk B, Shmem $(gb "$sh") GB) > ${SHMEM_ABORT_GB} GB"
     fi
     if [ -n "$why" ]; then
         echo "watchdog: $why, killing session $SID" | tee -a "$OUT/mem.log" >&2
