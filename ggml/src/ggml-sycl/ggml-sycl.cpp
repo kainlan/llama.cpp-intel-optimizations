@@ -138,6 +138,7 @@
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set_rows_paged.hpp"
 #include "ggml-sycl/simple-consumer-route-policy.hpp"
+#include "ggml-sycl/soa-readback.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/tenant-claim-scope.hpp"
@@ -10804,6 +10805,34 @@ size_t test_layout_bytes(const ggml_tensor * tensor, ggml_layout_mode layout, in
 
 const char * test_layout_name(ggml_layout_mode layout) {
     return ggml_sycl_layout_mode_name(layout);
+}
+
+test_tensor_layout_records test_get_tensor_layout_records(const ggml_tensor * tensor) {
+    test_tensor_layout_records records;
+    const auto *               extra = tensor ? static_cast<const ggml_tensor_extra_gpu *>(tensor->extra) : nullptr;
+    if (extra == nullptr) {
+        return records;
+    }
+    records.has_extra = true;
+    switch (extra->optimized_feature.get_reorder()) {
+        case reorder_mode::NONE:
+            records.reorder_record = "none";
+            break;
+        case reorder_mode::SOA:
+            records.reorder_record = "soa";
+            break;
+        case reorder_mode::COALESCED:
+            records.reorder_record = "coalesced";
+            break;
+        case reorder_mode::XMX_COALESCED:
+            records.reorder_record = "xmx_coalesced";
+            break;
+        case reorder_mode::XMX_GEMM_TILED:
+            records.reorder_record = "xmx_gemm_tiled";
+            break;
+    }
+    records.own_range_layout = extra->own_data_layout;
+    return records;
 }
 }  // namespace ggml_sycl
 
@@ -45568,6 +45597,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) tensor->extra;
     if (extra) {
         extra->optimized_feature.reset_reorder(tensor->name);
+        extra->own_data_layout = GGML_LAYOUT_AOS;
         ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
         if (is_weight_buffer) {
             extra->layout_dirty = true;
@@ -45956,10 +45986,12 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     if (do_cpu_reorder && extra && !has_preconverted_tiled) {
         if (cpu_reorder_mode == reorder_mode::COALESCED) {
             extra->optimized_feature.mark_coalesced_pretransformed(tensor->name);
-            extra->layout.mode = GGML_LAYOUT_COALESCED;
+            extra->layout.mode     = GGML_LAYOUT_COALESCED;
+            extra->own_data_layout = GGML_LAYOUT_COALESCED;
         } else {
             extra->optimized_feature.mark_soa_pretransformed(tensor->name);
-            extra->layout.mode = GGML_LAYOUT_SOA;
+            extra->layout.mode     = GGML_LAYOUT_SOA;
+            extra->own_data_layout = GGML_LAYOUT_SOA;
         }
         extra->layout.data_ptr    = tensor->data;
         extra->layout.size        = reorder_size;
@@ -46125,12 +46157,14 @@ static inline void ggml_sycl_enable_device_kernel_readback(int          device,
     }
 }
 
-static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
-                                                const ggml_tensor *   tensor,
-                                                void *                data,
-                                                size_t                offset,
-
-                                                size_t size) try {
+// Copies bytes [offset, offset + size) of the tensor's range in its buffer to host memory, as they are stored.
+// For a weight the backend stores reordered these are not ggml's block bytes: ggml_backend_sycl_buffer_get_tensor
+// is the reader that returns those.
+static void ggml_sycl_buffer_read_stored_bytes(ggml_backend_buffer_t buffer,
+                                               const ggml_tensor *   tensor,
+                                               void *                data,
+                                               size_t                offset,
+                                               size_t                size) try {
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
@@ -46287,6 +46321,107 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
+}
+
+// Reports, once per tensor, a read of a tensor whose own range holds a layout this reader has no inverse for. A
+// tensor is keyed by its name; an unnamed one by its type and byte size, so distinct unnamed tensors are each
+// reported. At most k_stored_order_warn_names keys are remembered, so a long-lived process does not grow the set
+// without bound; one last line says that further reads are not reported. The decision is taken under the mutex and
+// the line is logged after it is released: the log callback may be the user's and must not run under a backend lock.
+constexpr size_t k_stored_order_warn_names = 64;
+
+static void ggml_sycl_warn_stored_order_read(const ggml_tensor * root, ggml_layout_mode stored) {
+    static std::mutex                      warned_mutex;
+    static std::unordered_set<std::string> warned_keys;
+    static bool                            warned_full = false;
+
+    std::string key = root->name;
+    if (key.empty()) {
+        key = std::string("<unnamed ") + ggml_type_name(root->type) + ", " + std::to_string(ggml_nbytes(root)) +
+              " bytes>";
+    }
+    bool report_tensor = false;
+    bool report_full   = false;
+    {
+        std::lock_guard<std::mutex> lock(warned_mutex);
+        if (!warned_full && warned_keys.count(key) == 0) {
+            if (warned_keys.size() == k_stored_order_warn_names) {
+                warned_full = true;
+                report_full = true;
+            } else {
+                warned_keys.insert(key);
+                report_tensor = true;
+            }
+        }
+    }
+    if (report_full) {
+        GGML_LOG_WARN("[SYCL] get_tensor: further stored-order reads are not reported\n");
+    } else if (report_tensor) {
+        GGML_LOG_WARN(
+            "[SYCL] get_tensor: '%s' is stored in layout %s, which has no inverse here; the read returns the "
+            "stored bytes, not ggml's block layout (reported once per tensor)\n",
+            key.c_str(), ggml_sycl_layout_mode_name(stored));
+    }
+}
+
+// One read of an SOA weight stages at most this much on the host before it is rebuilt into the caller's memory.
+constexpr size_t k_soa_readback_chunk_bytes = 32ull * 1024 * 1024;
+
+// The buffer interface speaks ggml's layout: a read returns the tensor's block bytes whatever order the backend
+// stores them in. The order of the bytes in the tensor's own range is own_data_layout of the root tensor's extra (a
+// view shares its root's bytes). The reorder record and extra->layout say what a kernel last resolved, which may be
+// a cache copy elsewhere, so they are not consulted here. For an SOA weight the block range that covers the request
+// is read plane by plane and rebuilt (soa-readback.hpp); every other tensor is read as stored.
+static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                const ggml_tensor *   tensor,
+                                                void *                data,
+                                                size_t                offset,
+                                                size_t                size) {
+    const ggml_tensor *           root   = tensor->view_src ? tensor->view_src : tensor;
+    const ggml_tensor_extra_gpu * extra  = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+    const ggml_layout_mode        stored = extra ? extra->own_data_layout : GGML_LAYOUT_AOS;
+    if (size == 0 || stored != GGML_LAYOUT_SOA) {
+        if (size > 0 && stored != GGML_LAYOUT_AOS) {
+            ggml_sycl_warn_stored_order_read(root, stored);
+        }
+        ggml_sycl_buffer_read_stored_bytes(buffer, tensor, data, offset, size);
+        return;
+    }
+
+    ggml_sycl_soa_plane_table table{};
+    const bool                has_table = ggml_sycl_soa_plane_table_for_type(root->type, &table);
+    GGML_ASSERT(has_table && "a tensor recorded as SOA has a plane table (soa-reorder-types.hpp)");
+    const size_t root_bytes = ggml_nbytes(root);
+    GGML_ASSERT(root_bytes % table.block_bytes == 0);
+    const size_t n_total   = root_bytes / table.block_bytes;
+    const size_t aos_begin = (tensor->view_src ? tensor->view_offs : 0) + offset;
+    GGML_ASSERT(aos_begin <= root_bytes && size <= root_bytes - aos_begin);
+    const size_t aos_end      = aos_begin + size;
+    const size_t block_first  = aos_begin / table.block_bytes;
+    const size_t block_end    = (aos_end - 1) / table.block_bytes + 1;
+    const size_t chunk_blocks = std::max<size_t>(1, k_soa_readback_chunk_bytes / table.block_bytes);
+
+    // Host scratch for the SOA image of one chunk of blocks. It is filled and consumed inside this call.
+    std::vector<uint8_t> image;
+    for (size_t c0 = block_first; c0 < block_end; c0 += chunk_blocks) {
+        const size_t n = std::min(chunk_blocks, block_end - c0);
+        image.resize(n * table.block_bytes);
+        size_t plane_base = 0;  // of the plane inside the stored tensor
+        size_t image_pos  = 0;  // of the plane inside the chunk's image
+        for (size_t p = 0; p < table.n_planes; ++p) {
+            const size_t width = table.planes[p].width;
+            ggml_sycl_buffer_read_stored_bytes(buffer, root, image.data() + image_pos, plane_base + c0 * width,
+                                               n * width);
+            plane_base += n_total * width;
+            image_pos += n * width;
+        }
+        const size_t chunk_begin = c0 * table.block_bytes;
+        const size_t lo          = std::max(aos_begin, chunk_begin);
+        const size_t hi          = std::min(aos_end, chunk_begin + n * table.block_bytes);
+        const bool   rebuilt     = ggml_sycl_soa_to_aos_window(root->type, image.data(), n, lo - chunk_begin, hi - lo,
+                                                               static_cast<uint8_t *>(data) + (lo - aos_begin));
+        GGML_ASSERT(rebuilt && "the window lies inside the chunk it was cut from");
+    }
 }
 
 static bool ggml_sycl_readback_via_shared_kernel(sycl::queue &               q,
@@ -55480,6 +55615,41 @@ static void scale_f32(const float *            x,
     dst[i] = scale * x[i] + bias;
 }
 
+// The source and dst each walked with their own byte strides, as unary_op_generic_kernel (element_wise.cpp)
+// walks a strided unary operand: one work-item per element of the logical shape, decomposed into (i0..i3).
+// Each work-item reads its element before it writes it, so in place (dst a view of src0 with src0's
+// strides) is safe.
+static void scale_f32_strided(const float *            x,
+                              float *                  dst,
+                              const float              scale,
+                              const float              bias,
+                              const int64_t            k,
+                              const int64_t            ne0,
+                              const int64_t            ne1,
+                              const int64_t            ne2,
+                              const size_t             nb00,
+                              const size_t             nb01,
+                              const size_t             nb02,
+                              const size_t             nb03,
+                              const size_t             nb0,
+                              const size_t             nb1,
+                              const size_t             nb2,
+                              const size_t             nb3,
+                              const sycl::nd_item<3> & item_ct1) {
+    const int64_t i = (int64_t) item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
+    if (i >= k) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / (ne0 * ne1)) % ne2;
+    const int64_t i3 = i / (ne0 * ne1 * ne2);
+
+    const float * src = (const float *) ((const char *) x + i0 * nb00 + i1 * nb01 + i2 * nb02 + i3 * nb03);
+    float *       out = (float *) ((char *) dst + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+    *out              = scale * *src + bias;
+}
+
 template <typename Ti, typename To>
 static void pool2d_nchw_kernel(const int ih,
                                const int iw,
@@ -55620,6 +55790,36 @@ static void scale_f32_sycl(const float * x,
                           sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE)),
 
         [=](sycl::nd_item<3> item_ct1) { scale_f32(x, dst, scale, bias, k, item_ct1); });
+}
+
+static void scale_f32_strided_sycl(const float *   x,
+                                   float *         dst,
+                                   const float     scale,
+                                   const float     bias,
+                                   const int64_t * ne,
+                                   const size_t *  nb_src,
+                                   const size_t *  nb_dst,
+                                   queue_ptr       stream) {
+    const int64_t k          = ne[0] * ne[1] * ne[2] * ne[3];
+    const int64_t num_blocks = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
+    const int64_t ne0        = ne[0];
+    const int64_t ne1        = ne[1];
+    const int64_t ne2        = ne[2];
+    const size_t  nb00       = nb_src[0];
+    const size_t  nb01       = nb_src[1];
+    const size_t  nb02       = nb_src[2];
+    const size_t  nb03       = nb_src[3];
+    const size_t  nb0        = nb_dst[0];
+    const size_t  nb1        = nb_dst[1];
+    const size_t  nb2        = nb_dst[2];
+    const size_t  nb3        = nb_dst[3];
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE),
+                          sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) {
+            scale_f32_strided(x, dst, scale, bias, k, ne0, ne1, ne2, nb00, nb01, nb02, nb03, nb0, nb1, nb2, nb3,
+                              item_ct1);
+        });
 }
 
 static void sum_rows_f32_sycl(const float * x, float * dst, const int ncols, const int nrows, queue_ptr stream) {
@@ -57143,7 +57343,15 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
     const auto * params = static_cast<const float *>(dst.op_params());
     memcpy(&scale, params + 0, sizeof(float));
     memcpy(&bias, params + 1, sizeof(float));
-    scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0.raw()), main_stream);
+    GGML_ASSERT(ggml_are_same_shape(src0.raw(), dst.raw()));
+    if (src0.is_contiguous() && dst.is_contiguous()) {
+        // both flat: index by element, no per-element index decomposition
+        scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0.raw()), main_stream);
+    } else {
+        // a view (e.g. one half of a fused gate_up row) and/or a dst that is a view of it (in place):
+        // read and write each in the layout it is in, no contiguous copy first
+        scale_f32_strided_sycl(src0_dd, dst_dd, scale, bias, src0.ne_arr(), src0.nb_arr(), dst.nb_arr(), main_stream);
+    }
     /*
 
     DPCT1010:87: SYCL uses exceptions to report errors and does not use the
@@ -66007,6 +66215,9 @@ bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, c
     }
     // SET THE FLAG - mark tensor as SoA (using private method via friend access)
     extra->optimized_feature.set_reorder_mode_(reorder_mode::SOA, tensor->name, caller);
+    // The bytes at tensor->data are SOA now. A read of a view goes through its root's record, so an in-place reorder
+    // of a view would not be seen by get_tensor.
+    extra->own_data_layout    = GGML_LAYOUT_SOA;
     extra->layout.mode        = GGML_LAYOUT_SOA;
     extra->layout.data_ptr    = tensor->data;
     extra->layout.size        = ggml_nbytes(tensor);
@@ -97715,16 +97926,25 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     ggml_sycl_tensor_storage_handle dst_storage{};
     ggml_sycl::mem_handle           dst_handle{};
-    size_t                          dst_base_offset = 0;
+    size_t                          dst_base_offset  = 0;
+    bool                            dst_is_own_range = false;
     if (ggml_sycl_find_tensor_storage_handle(tensor, owner, &dst_storage) && dst_storage.handle.valid()) {
-        dst_handle      = dst_storage.handle;
-        dst_base_offset = dst_storage.view_offset;
+        dst_handle       = dst_storage.handle;
+        dst_base_offset  = dst_storage.view_offset;
+        dst_is_own_range = true;
     } else {
-        dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst_ptr, GGML_LAYOUT_AOS, owner);
+        dst_handle       = ggml_sycl_copy_handle_for_raw_ptr(dst_ptr, GGML_LAYOUT_AOS, owner);
+        dst_is_own_range = (dst_ptr == tensor->data);
     }
     auto src_handle = ggml_sycl::mem_handle::from_direct(const_cast<void *>(data), GGML_LAYOUT_AOS, /*on_device=*/false,
                                                          ggml_sycl::mem_handle::HOST_DEVICE, size);
     (void) ggml_sycl::mem_copy_async(dst_handle, dst_base_offset + offset, src_handle, 0, size, *stream);
+    // The write put ggml-order bytes in the tensor's own range only when this tensor's storage handle took it or the
+    // resolved destination is tensor->data; only then is AOS recorded, on the extra set_tensor records it on.
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+    if (extra != nullptr && dst_is_own_range) {
+        extra->own_data_layout = GGML_LAYOUT_AOS;
+    }
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
 
@@ -124877,9 +125097,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                    ggml_sycl_norm_rows_supported(op);
 
         case GGML_OP_SCALE:
-            // ggml_sycl_op_scale asserts f32 on both sides and reads src0 flat; ggml_scale now accepts
-            // non-contiguous views, which that flat read would mis-address
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+            // F32 only (ggml_sycl_op_scale asserts f32 on both sides; F16 and BF16 are declined). Any layout:
+            // a flat src0 and dst take scale_f32, anything else (a strided or offset view of src0, and in place
+            // a dst that is a view of src0 with its strides) takes scale_f32_strided, which walks src0 and dst
+            // each with its own byte strides.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
 
         case GGML_OP_CONT:
             return op->src[0]->type != GGML_TYPE_BF16;

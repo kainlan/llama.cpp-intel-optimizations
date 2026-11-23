@@ -1,0 +1,14 @@
+host: load average: 5.61, 6.58, 7.90  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+arm ink: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 lib-newer-than-source=yes
+lock wait: 0s
+== arm ink  2026-11-22T18:25:25-05:00  shmem=11GB  load=5.61
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 32187  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT ink pp512 avg=39.47 t/s stddev=0.00 samples=[39.47]
+  RESULT ink tg128 avg=4.36 t/s stddev=0.00 samples=[4.36]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:27:17-05:00
+lock released
+BENCH_DONE

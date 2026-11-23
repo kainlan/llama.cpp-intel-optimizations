@@ -111,6 +111,7 @@ int main() {
     CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_Q4_0), "Q4_0 stays admitted");
     CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_Q6_K), "Q6_K stays admitted");
     CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_F16), "F16 stays admitted");
+    CHECK(ggml_sycl_get_rows_type_supported(GGML_TYPE_BF16), "BF16 is admitted (get_rows_sycl_float has the arm)");
     // (type, layout): the Q4_K kernel reads AoS blocks only, so the pair for any other layout is declined.
     CHECK(ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, GGML_LAYOUT_AOS), "Q4_K AoS is a supported pair");
     CHECK(!ggml_sycl_get_rows_layout_supported(GGML_TYPE_Q4_K, GGML_LAYOUT_SOA), "Q4_K SoA is declined");

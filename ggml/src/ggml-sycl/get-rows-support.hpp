@@ -25,6 +25,7 @@
 inline bool ggml_sycl_get_rows_type_supported(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
         case GGML_TYPE_F32:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:

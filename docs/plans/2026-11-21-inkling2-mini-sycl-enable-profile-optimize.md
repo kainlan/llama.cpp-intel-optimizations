@@ -2487,6 +2487,56 @@ case alone; the whole `-o MUL_MAT` sweep; the Mistral gate on both cards; the GP
   the tree go under the task's temp folder and are deleted before the report.
 - Line numbers above are from Task 6f-3's branch and move with its merge: find every site by name.
 
+**DONE 2026-11-22, merged as `d558d0a14`** (task commits `9363848c1..651dd0844`, fourteen commits and one
+merge of Task 7f). Spec review, then three quality reviews with a fix round after each; the last is PASS WITH
+FINDINGS, all minor.
+
+*The design changed during the task (lead ruling 2026-11-22).* The guide above decides the read from the
+reorder record (`extra->optimized_feature`). That record answers another question: which layout a kernel last
+resolved for the weight, and for a cache layout the bytes it describes are not in the tensor's own range at
+all. A read needs to know the order of the bytes in the tensor's own range and nothing else. So:
+- `ggml_tensor_extra_gpu::own_data_layout` (`common.hpp`) records the order of the bytes in the tensor's own
+  range. Every path that writes that range sets it; the field's comment names every writer and the writers it
+  does not cover (see Task 6f-9).
+- `ggml_backend_sycl_buffer_get_tensor` decides from the ROOT extra's `own_data_layout` alone. It does not read
+  the reorder record. A view reads through its root.
+- `set_tensor_async` records ggml order only when it wrote the tensor's own range (`dst_is_own_range`: the
+  storage-handle branch, or `dst_ptr == tensor->data`). A write that landed elsewhere leaves the record alone.
+- A stored order with no inverse (COALESCED) is read as stored and reported once per tensor at WARN. The helper
+  decides under its mutex and logs after releasing it, names the layout, and keys an unnamed tensor by type
+  and size.
+- `tests/test-sycl-own-data-layout-source.py` pins the reader's source of truth, counts every write of the
+  field and pins where the async own-range flag is set, with a mutation self-test. Accepted as a limit of a
+  text contract: an assignment wrapped in `if (true) { ... }` passes.
+- A read-only test seam, `ggml_sycl::test_get_tensor_layout_records` (`ggml-sycl-test.hpp`), lets the device
+  test print both records. Accepted: it reads two fields and changes nothing.
+
+*Device results, one run per arm, zero kernel fault lines, `Shmem` 8 to 9 GB.*
+- RED, B50, the tree before the `get_tensor` edit: `f32` and `q4_K` pass; `q4_0`, `q8_0`, `q6_K`, `mxfp4` and
+  `q6_K` in two chunks fail every read (whole tensor, one row, a window inside blocks, the last three bytes, a
+  view).
+- At `d379ed84d`, B50 and B70: `PASS (9 cases, 9 reads after MUL_MAT)`. The five reordered cases print
+  `record=soa own=soa`; `f32`, `q4_K` and the two `set_tensor_async` cases print `record=none own=aos`.
+- Lead arms from the task build (the code before the review rounds, `9d7f6da30`), B50 unless said: the A3 case
+  prints OK (this closes the criterion moved here from Task 6f-3); `-o MUL_MAT` 1995 of 1996, the one failure
+  the large f16 case (`n=2105344`, Task 6g-2); Mistral gate on both cards and the GPT-OSS gate without `-c`
+  pass.
+*Merged tree at `d558d0a14`, one run per arm, zero kernel fault lines, `Shmem` 9 GB:* the readback test passes on both
+cards with the same nine lines; the A3 case prints OK; the unselected-branch device test, the route oracle on both
+cards, the Mistral gate on both cards and the GPT-OSS gate on both cards (B50 without `-c`) pass. Sweep: first
+selection 200 of 208, the failed set exactly the eight of the baseline; second selection 22 of 22; none skipped.
+
+*What the device test does not reach:* a tensor whose reorder record says SOA while its own range holds ggml
+order. The cache-side record (`ggml_sycl_update_layout_from_cache`, `mark_soa_pretransformed`) is written only
+when the unified cache materializes a weight it has registered, and a test tensor is not one. Two cases
+written for it failed by design (`reorder record is none, want soa`) and were restated to what the async path
+reaches: own range is ggml order before and after the MUL_MAT, and the read is byte-equal to the upload. The
+reader's independence from the reorder record is held by the source contract only. A device vehicle needs a
+test control that can set the record; Task 6f-9 owns it.
+
+*Declined (lead):* a `Claude-Session:` trailer (not a convention here); a stricter default than ggml order for
+a tensor no writer has recorded (every writer records, and the contract counts them).
+
 ---
 
 ### Task 6f-8: Readback of a weight stored COALESCED or XMX tiled (recorded 2026-11-22)
@@ -2528,10 +2578,29 @@ per weight, so this needs a decision) or the read is served from the tiled form 
   untouched part is still SOA and is now read as AOS.
 - `ggml_backend_sycl_buffer_cpy_tensor` and `ggml_backend_sycl_cpy_tensor_async` copy bytes between SYCL buffers.
   Whether they carry the source's layout record to the destination was not checked.
+**Also in scope (recorded 2026-11-22 from Task 6f-7's reviews; traced from the code, not run; verify each
+before writing the task out):**
+- Writers of a tensor's own range that `own_data_layout` does not follow: the destination of
+  `ggml_backend_sycl_buffer_cpy_tensor`; a partial `memset_tensor`; a partial `set_tensor` or
+  `set_tensor_async`, which records ggml order for the whole range after writing part of it.
+- `get_tensor_async` returns the stored bytes with no layout handling.
+- Tied aliases share one extra, and a write through a view records on the view's extra while the reader asks
+  the root's.
+- `set_tensor_async` skips what `set_tensor` does before a write: `reset_reorder`,
+  `ggml_sycl_init_layout_info`, the `layout_dirty` mark and the weight-mutation invalidation. Its catch block
+  calls `std::exit(1)`.
+- `ggml_backend_sycl_cpy_tensor_async` is not wired into the backend interface. `reorder_tensor_to_soa` and
+  `convert_tensor_layout` look dead; if `reorder_tensor_to_soa` is live, its ordering against asynchronous
+  memory operations on the same range is open.
+- The `has_preconverted_tiled` branch of `set_tensor` skips the upload into the own range (Task 6f-8 has the
+  read side).
+- A mutable test control that sets the reorder record apart from the own range, so the device test can reach
+  `record=soa own=aos` (Task 6f-7 could not).
 **Direction (lead):** a partial write into a reordered tensor writes each block field into its plane (the forward
 of Task 6f-7's table, by block range) and leaves the record alone; a copy between buffers carries the record with
 the bytes.
-**Done when:** the device round-trip test has a partial-write case and a buffer-copy case, and both pass.
+**Done when:** the device round-trip test has a partial-write case, a buffer-copy case and a case whose
+reorder record disagrees with its own range, and all pass.
 
 ---
 
@@ -3655,6 +3724,57 @@ Gotchas below.
 - `GGML_SYCL_Q1_NVFP4_ROUTE_TESTING` builds keep working: `q1_nvfp4_private_test_authorized` is an `||` operand.
 - Edit `ggml-sycl.cpp` by exact-string replacement; it is 97k lines and other sessions' branches touch it.
 
+**DONE 2026-11-22, merged as `ce8a3f27f`** (code freeze `0cbe9b572`; the section 12.5 completion `d72c0bf97`
+merged as `d2ac34ce1`). The task grew from one constant to twenty-six commits, because opening the route
+showed four defects the closed route had hidden. Reviews: spec, spec re-review, a whole-range quality review,
+and a fresh re-review of both fix rounds; the last is PASS WITH FINDINGS, nothing must-fix.
+
+*What landed, in order:*
+- `5b51abc41` the planner charges an MMID pool only for a model that holds Q1_0 or NVFP4 experts;
+  `3f2548276` the join-queue host task; `79d54a811` the fixture; `fe7e2ee5c` the flip;
+  `cfab28c94` named refusals; `c67c34928` comments; `47bf6b5cf` tests for the deferred bind order.
+- **The context bind** (`c1628c576`, hardened in `7ce1b01b7`, `b794ea4df`, `35e0fd7cc`). At `fe7e2ee5c` a real
+  load printed eleven false context-bind WARN lines and no pool existed when decode asked for one: the load
+  defers materialization to the bind, and the bind published against a plan snapshot that a later swap had
+  replaced. `ggml_sycl_bind_materialize_live_mmid_workspaces` now publishes for the live snapshot and
+  reconciles (`CURRENT`, `FOLLOWS_LIVE`, `REBOUND`, `REBIND_NOT_FOLLOWED`, `GEOMETRY_UNSTABLE`,
+  `REBIND_REFUSED`, `EXCEPTION`); a refused in-place rebind retires the context under the identity the
+  registry holds; a `SAME_IDENTITY_OTHER_PLAN` answer is reported only when the context does not follow the
+  live snapshot. The bar for a device run is 0 context-bind lines, not a passing oracle: a passing oracle hid
+  the eleven.
+  `cfefd737e` and `dbf37608e` are the deferral contract: every report site named and controlled alone.
+- **The host pool** (`defec841d`, `72889ec99`, `d09fe07a8`). `unified_alloc`'s no-growth pre-check
+  compared `used + size` with the zone's reservation (about 64 MiB for Inkling) although llama's host compute
+  buffers had grown the WEIGHT zone to 24 GB, so the 192-byte MMID host pool was refused.
+  `host_zone_no_growth_bound(zone, reserved, capacity)` is `max(reserved, capacity)` for WEIGHT and the
+  reservation for STAGING, SCRATCH and KV; the refusal names which of three causes applied.
+- **Lock ranks** (`3802933d4`, `5e97a3f5c`, `786057358`, `7a00eb08a`, `d72c0bf97`). Section 12.5 of
+  `docs/design/sycl-canonical-memory-architecture.md` ranks `g_lifecycle_plan_mutex` L3, the MMID registry
+  mutex L4 and the pool mutexes L5, and lists what does not conform. Lead ruling 2026-11-22: graph compute
+  takes the tensor-inventory lock (L1) under the graph-compute locks (L2, L3) at the into-empty republication
+  and at four other sites; no rank removes that, so the ranks stand for every other path and the inversion is
+  a recorded non-conformance. Two independent searches (implementer, reviewer) found no holder of L1 that takes
+  L2 or L3, so it cannot close a cycle today. Both searches are by name, not a proof.
+- **Release after the lock** (`7cd8aeaf4`). `retire`, `recover_quarantined` and `replace_plan` decide under the
+  registry mutex and drop the erased contexts, and so the last pool owners, after it; `replace_plan` hands the
+  displaced context out so it dies after the plan mutex too.
+- **One predicate** (`f0976d787`): `ggml_sycl::moe_mmid_same_workspace_plan` answers "same MMID workspace plan"
+  for the bind, the loan assert and the plan CAS. `30a653c94`: the follows question asks the device-global
+  execution queue and reads no backend context. `0cbe9b572`: reconcile refusals print `reconcile-refused`, the
+  bind's catch-all `bind-exception`.
+
+*Device results at `0cbe9b572`, one run per arm, zero kernel fault lines, `Shmem` 10 to 11 GB:* route oracle
+B70 and B50 pass, adapter test B70 passes, 0 context-bind lines; Mistral B70 gate prints `1, 2, ... 10`;
+GPT-OSS B50 gate one answer line, no device loss; the `[LOAD-PLAN]` and `[PLACEMENT]` lines of both differ
+from the run before the task only in a 2 MB free-VRAM reading; Inkling loads on the B70, the B50 and both
+cards with 0 context-bind lines and 0 host-pool refusals. The Inkling token gate fails at this commit on the
+down projection (Task 8a) and the prompt (Task 8b).
+*Merged tree, `d2ac34ce1` (Task 7, Task 8a and the 12.5 completion), one build (`[713/713]`), one run per arm:* route oracle B70 and B50 pass (28 `PASS:` lines each, 0 context-bind lines), adapter test B70 passes, Mistral B70 gate passes, GPT-OSS B50 gate one answer line and no device loss, zero kernel fault lines. Sweep: first selection fails exactly the eight of the known-red baseline, second selection passes entirely, none skipped.
+
+*Not taken (lead):* `unified_cache_note_host_task` is not `noexcept` inside the direct block's try; the bind's
+catch-all retires conservatively; several intermediate commits fail the allocation-zone contract that the tip
+passes (a bisect across this range must skip them); 136-column lines left by `8f1cabe52`.
+
 ---
 
 ### Task 8: Census — what still refuses with the route open, and the gap tasks
@@ -3704,6 +3824,495 @@ done
   it sticks".
 - The B50 holds 16 GB and the model is 22.9 GB: host-resident experts there are placement working as designed. The
   gap, if any, is the CPU executor for NVFP4, not the placement.
+
+---
+
+### Task 8a: The direct route admits one input row per selected expert (found 2026-11-22)
+
+**Track:** L. **Depends on:** Task 7's bind fix (`c1628c576`); branch `task/inkling2-t8a` is cut from it and
+merges after Task 7. **Found by:** the lead's Inkling gate on the B70 at `c1628c576`, the first run in which
+the workspace is bound. `blk.0.ffn_gate_up_exps` is admitted (`[MOE-DIRECT-AUTHORITY-CANDIDATE]`); the next
+node is refused and the graph fails:
+`[MOE-DECODE-REFUSAL] tensor=blk.0.ffn_down_exps.weight ... reason=capability_unsupported type=nvfp4 layout=aos
+kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate`.
+
+**Description:** `build_moe_ffn` (`src/llama-graph.cpp`) gives the fused gate+up `MUL_MAT_ID` a src1 of
+`[n_embd, 1, n_tokens]` and the down `MUL_MAT_ID` a src1 of `[n_ff, n_expert_used, n_tokens]`. The direct
+block in `ggml_sycl_mul_mat_id` admits `ne11 == 1` in a production build and `ne11 == ids->ne[0]` only under
+the private test authorization. Traced from the code (2026-11-22): the workspace planner already sizes for
+`ne11 == top_k` (`plan_moe_mmid_workspaces`, `moe_mmid_plan_workspace`), the adapter
+`mmvq_submit_q1_nvfp4_aos_id_admitted` accepts both shapes, the kernel indexes `id % ne11`, and no commit
+message or document gives a reason for the restriction (it predates `06daafe61`, which added only the
+test-only arm). The route oracle runs `ne11 = 1` and `ne11 = 3` for both types and passes on both cards.
+
+**Ruling (lead, 2026-11-22):** production admits both shapes. This opens the kernel that exists for the
+operand where it lives; nothing is re-routed or converted. The activation copy in the block is one flat copy of
+`ne00 * ne11` floats with no contiguity check, which cannot go wrong for one row and can for several: a src1
+whose rows are strided is copied row by row on the exact queue, every copy a dependency of the kernel, no host
+wait added; a src1 whose elements are not contiguous inside a row is not admitted.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (the direct block's admission and its activation copy, the
+two comments that state what the route covers); `tests/test-sycl-moe-resolved-batch-source.py` and any other
+contract that pins the block; `ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the source contract fails on the current admission line; the device test has a
+      strided-input case for `ne11 = 3` (Q1_0 and NVFP4) that the lead sees fail before the fix.
+- [ ] The string `q1_nvfp4_private_test_authorized && ne11 == ids->ne[0]` is gone; the outer condition is
+      unchanged.
+- [ ] Lead, one run each: the oracle on both cards passes with 0 context-bind WARN lines; the Inkling gate on
+      the B70 admits `ffn_down_exps` (an `AUTHORITY-CANDIDATE` line for it) and either passes or names its next
+      refusal; the Mistral and GPT-OSS gates pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** `choose_moe_batch_executor`'s early return, prompt rows (`ne12 > 1`), host-resident
+experts, a secondary card.
+
+**DONE 2026-11-22, merged as `bbdb6e4bc`** (reviewed at `6cf95a1a8`). Task commits on `c1628c576`:
+`2b2acecf0` (RED tests), `7038e6119` (the admission, the row-by-row copy, the regenerated inventory),
+`6cf95a1a8` (each passing device case prints its line). Spec review PASS WITH FINDINGS, quality review PASS WITH
+FINDINGS, no defect in the production code, no fix round: every finding taken sits on lines Task 8b rewrites and
+moved there.
+
+*Device results, one run each, zero kernel fault lines, `Shmem` 9 GB:*
+- RED, B70, `2b2acecf0`, predicted by the implementer to the index before the run:
+  `FAIL: CPU oracle mismatch (type=q1_0 ne11=3 graph=strided pass=0) at 96: got 33989.679688, expected
+  33.277046`. The old single block copy reads the 1000.0 filler between strided rows into row 1.
+- `6cf95a1a8`, B70 and B50: the route oracle passes with 28 `PASS:` lines per card (6 through the production
+  fixture, 4 strided), 0 context-bind WARN lines; the adapter device test passes on the B70.
+- Inkling gate, B70, `7038e6119`: both MoE matrices take the direct route through `blk.19` in the warm-up
+  decode, 0 refusals. The gate still fails, on the prompt (Task 8b). *Corrected 2026-11-22:* the warm-up is
+  the only decode that run reached; the first decode after a prompt is refused (Task 8b).
+- The gate command itself was wrong and had never run to its verdict: `llama-completion` enters conversation
+  mode for a file with a chat template and throws on this one. Fixed on `feat/inkling2` (`66a4f0bd4`,
+  `-no-cnv`, pinned in the stub test).
+
+*Moved to Task 8b:* a strided test view that starts at a non-zero offset (a root-based copy would pass today);
+one spelling for `ne00`/`ne10` in the block; an explicit `src1->type == GGML_TYPE_F32` conjunct; activation data
+that differs per case, row and token (the workspace slot is reused, so a piece the copy loop skips still holds
+the previous case's identical bytes and the oracle passes); a contract tokenizer that keeps numeric literals
+(`for (int64_t row = 2;` is not caught today).
+*Not taken:* an older contract test accepts the dependency-vector spelling anywhere after the mark (the new test
+pins the loop); a `PASS:` line is printed before the fixture's teardown check.
+*For the profile stage:* a strided src1 costs one copy submit and one `std::vector<sycl::event>` per row. The
+usual graph gives a dense src1, which stays one copy.
+*Merged tree:* see Task 7's block; one build and one gate run cover both merges.
+
+**Also seen in the same run, recorded for the census (not fatal):** once per graph,
+`[UNIFIED-CACHE] planned-mode runtime materialization rejected op=direct_stage_weight ... model=0 type=0
+ne=[1,128,1,1]`. Traced: `stage_raw_host_source` in `binbcast.cpp` stages a small host-resident F32 weight that
+the load never preloaded; the cache refuses it in planned mode and the op then copies it into a STAGING buffer
+with a synchronous wait. The tensor is not identified yet (a weight with `model_id` 0 and 128 elements; the
+candidates are the attention clip or relative-bias tensors). It costs a host wait per op and is a placement gap
+(a weight the plan does not know); Task 8's census names the tensor and writes its task.
+
+---
+
+### Task 8b: The direct route takes prompt rows (`ne12 > 1`) (found 2026-11-22)
+
+**Track:** L. **Depends on:** Task 8a; branch `task/inkling2-t8b` is cut from Task 8a's tip and merges after it.
+**Found by:** the lead's Inkling gate on the B70 from Task 8a's build (`7038e6119`), with the gate command fixed
+(`66a4f0bd4`, `-no-cnv`). The warm-up decode (one token) takes the direct route through `blk.19` with no
+refusal. The 11-token prompt is refused at the first MoE node and the graph fails:
+`[MOE-PROMPT-CANONICAL] tensor=blk.0.ffn_gate_up_exps.weight published=0 kind=-1 stable=0`, then
+`[MOE-DECODE-REFUSAL] tensor=blk.0.ffn_gate_up_exps.weight occurrence=0 expert=84 owner=0
+reason=capability_unsupported type=nvfp4 layout=aos kernel=mmvq-compat capability=local-mmvq queue_ready=1`.
+
+**Description (traced by an explorer on `feat/inkling2`; the lines marked *checked* were re-read by the lead in
+Task 8a's tree):**
+- The direct block in `ggml_sycl_mul_mat_id` admits `ne12 == 1` and `ids->ne[1] == 1` only, and reads its
+  operand from `retained_decode_batch_result`, which is built only when `ne12 == 1` and is the only build that
+  passes a queue capability. The capability function offers the direct recipe for
+  `phase == moe_route_phase::DECODE && rows == 1` only (*checked*).
+- A prompt batch therefore falls through to the retained hybrid route. Its capability answer is `MMVQ_COMPAT`
+  (`local-mmvq`), and `choose_moe_batch_executor` (`moe-resolved-batch.hpp`) refuses every Q1_0/NVFP4 device
+  recipe by design. The refusal is printed by a lambda shared by decode and prompt whose label is a fixed
+  string, which is why a prompt batch prints `MOE-DECODE-REFUSAL`.
+- The adapter `mmvq_submit_q1_nvfp4_aos_id_admitted` already takes `n_tokens` (*checked*): it sizes
+  `occurrences = top_k * n_tokens` and `activation_rows = ne11 * n_tokens`, uploads `occurrences` ids, and the
+  kernel reads expert `ids[token][slot]`, activation row `[slot % ne11][token]` and writes `[token][slot]`.
+  The direct block passes `n_tokens = 1`.
+- The MMID workspace is planned at load for `c = min(n_ctx, n_ubatch)` tokens (`moe_mmid_capacity`, *checked*)
+  with `ne11 = top_k = n_expert_used`, and admission derives the token count from the authority's bindings
+  (`bindings->size() / top_k`). So the pools already hold a whole ubatch.
+- The recipe's own workspace plan (`plan_moe_q1_nvfp4_device_workspace`) is given `max_prompt_chunk_rows = 32`
+  (*checked*). Whether `validate_moe_execution_recipe` would reject a direct-recipe prompt above 32 rows is
+  not traced.
+- No other prompt executor takes these types: the batched oneDNN table leaves them out because of the same
+  gate, the MXFP4 paths are type-gated, the prompt ring refuses them.
+
+**Ruling (lead, 2026-11-22):** the direct block admits a prompt batch and submits it once, through the same
+adapter, with `n_tokens = ne12`. This opens the kernel that exists for the operand where it lives; nothing is
+converted, re-routed or sent to the CPU, and `choose_moe_batch_executor` stays as it is.
+- One submission per `MUL_MAT_ID` node, one terminal event, every copy a dependency of the kernel on the exact
+  queue, no host wait added.
+- The ids are the immutable prompt snapshot, all `top_k * ne12` of them. A kernel that used token 0's ids for
+  every token must fail the device test.
+- The activation copy and the output copy cover `ne12` tokens. A src1 whose rows or tokens are strided is
+  copied piecewise on the exact queue, as Task 8a does for rows; a src1 whose elements are not contiguous
+  inside a row is not admitted.
+- One source for the size: the MMID workspace plan. If the recipe's 32-row chunk plan binds on this path, make
+  the recipe's plan agree with the workspace plan for the direct recipe; do not chunk the submission to 32.
+- `ne12` above the admitted capacity cannot come from a ubatch (`ne12 <= n_ubatch`). If it is seen, the block
+  refuses it with a reason that names the capacity; it is not chunked and not truncated.
+- The shared refusal line names the phase it refused (`MOE-PROMPT-REFUSAL` on a prompt batch). Every contract
+  and script that searches for the old string on a prompt batch moves with it.
+- Speed is not this task. The kernel is a row kernel; what it costs on 512 tokens is Stage 2's measurement.
+
+**Added at the checkpoint (2026-11-22), a defect the implementer found and its ruling:** the block passes the
+ids tensor's own storage as the adapter's upload target, and the adapter writes the packed `[token][top_k]`
+snapshot there. In a model, ids is the `ggml_argsort_top_k` view with `nb1 = n_expert * 4`. For one token the
+write puts the same values in the same places. For a prompt, token `t` lands at `t * top_k` instead of
+`t * n_expert`, and from `top_k * ne12 > n_expert` on (Inkling: 17 tokens) it overwrites later tokens' ids,
+which the down `MUL_MAT_ID` and the routing-weight `get_rows` read afterwards. The test fixture builds ids
+contiguous, so no fixture run could show it.
+- *Ruling:* an op does not write its input. The kernel reads the ids tensor in place with its own strides, as
+  every other device MoE path here does (`ggml_sycl_get_moe_ids_device_ptr_exact`), and the upload is removed.
+  The host snapshot stays the authority for which experts are resolved and leased; the adapter keeps its range
+  check over it. What replaces "the kernel reads the snapshot": the snapshot was read from that storage, its
+  producer has completed, and nothing writes it before the kernel.
+- *Not taken:* a planned ids pool in the MMID workspace (a second copy of bytes already on the device, in a
+  geometry Task 7 is editing); admitting only contiguous ids (refuses the real model).
+- File scope gains `ggml/src/ggml-sycl/mmvq.cpp`, `mmvq.hpp` and
+  `ggml/src/ggml-sycl/tests/test-q1-nvfp4-adapter-device.cpp`. Both device tests get a strided-ids case that
+  asserts the ids bytes are unchanged after the compute.
+- Expected side effect, not measured: one host-to-device copy less per `MUL_MAT_ID` in decode.
+- Also ruled: the capability arm's widening must not steer a prompt operand with a host-resident or
+  secondary-card expert into an abort; both end in a named refusal. Recorded as debt, not fixed here: for a
+  direct recipe `recipe.workspace` (the 32-row chunk plan) is a size nothing allocates, a second figure for one
+  thing.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Where the prompt operand for the direct block comes from: pass the queue capability to the prompt build, or
+   build the block's operand the same way for every `ne12`. Say which and why.
+2. Whether the pointer table the block uses (`ggml_sycl_upload_moe_retained_ptr_table_from_batch` or its
+   peer) is indexed by expert id for a multi-token batch.
+3. Whether `validate_moe_execution_recipe` or any other check binds the 32-row chunk on this path.
+4. What `[MOE-PROMPT-CANONICAL] published=0 kind=-1 stable=0` means for an AOS NVFP4 operand and whether the
+   direct block needs the publication.
+5. Every consumer after admission that assumes one token (byte counts, the output shape, counters, the
+   completion, the join queue).
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (the direct block, the capability function's direct-recipe
+arm, the shared refusal label, the comments that state what the route covers);
+`ggml/src/ggml-sycl/moe-resolved-batch.hpp` only if checkpoint item 3 requires it;
+`tests/test-sycl-moe-resolved-batch-source.py` and any other contract that pins the block or the label;
+`ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the source contract fails on the `ne12 == 1` admission and on the decode-only
+      capability arm; the device test has prompt cases the lead sees fail before the fix.
+- [ ] Device test cases, Q1_0 and NVFP4, `ne11 = 1` and `ne11 = top_k`, through the production fixture (no
+      private authorization): 2 tokens, 33 tokens (past the recipe's 32), the fixture's full capacity, and one
+      case with src1 strided across tokens. Every token selects different experts. The oracle has a token
+      axis. Each passing case prints its line.
+- [ ] One case above the capacity is refused by name and the graph fails cleanly (no abort).
+- [ ] Lead, one run each: the oracle on both cards passes with 0 context-bind WARN lines; the Inkling gate on
+      the B70 passes or names its next refusal; the Mistral and GPT-OSS gates pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** the speed of prompt rows, `choose_moe_batch_executor`'s early return, hybrid layers (host
+experts, the B50), a secondary card, the small F32 weights staged at run time.
+
+---
+
+### Task 8c: A `MUL_MAT_ID` node that selects card experts and host experts runs both (found 2026-11-22)
+
+**Track:** L. **Depends on:** Task 8b (merged).
+**Found by:** the lead's Inkling gate on the B50 from Task 8b's build (`6ee2a4058`). The load places 21.3 GiB
+on a 16 GB card by pinning about 10 GB of experts in host memory. The warm-up decode is refused at the first
+node that selects one of them, and the graph fails:
+`[MOE-DECODE-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight route=direct step=precondition failed=all_primary
+occurrence=0 expert=23 residency=host owner=-1 layout=aos operands=8`, then the retained route's
+`reason=capability_unsupported ... kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate`, then
+`[SYCL] recoverable runtime fallback failed: MUL_MAT_ID retained hybrid executor refused route`. The prompt
+prints the same pair with `MOE-PROMPT-REFUSAL` and `operands=112`. The B70 holds every expert and passes.
+
+**Description (traced by an explorer in Task 8b's tree at `6ee2a4058`, read not run; line numbers are that
+tree's and move with every merge, so find each site by name):**
+- The host half exists. ggml-cpu has `ggml_vec_dot_nvfp4_q8_0` and `ggml_vec_dot_q1_0_q8_0`. The backend's
+  executor for a host-resident Q1_0/NVFP4 expert is `ggml_sycl_cpu_moe_host_aos_execute` (`cpu-dispatch.cpp`):
+  one task at a time, single-threaded, staged through a host-pinned `moe_q1_nvfp4_recipe_workspace` that the
+  plan reserves (`moe_host_recipe_workspace_bytes`, `unified-cache.cpp`), run from a `std::async` thread in the
+  retained core, its rows written into `dst` by the same pending scatter MXFP4 uses.
+- A batch whose selected experts are ALL host-resident already runs: `ggml_sycl_moe_direct_batch_all_host`
+  lets the direct block pass it on silently and the retained core runs the HOST_CPU recipes.
+- A tensor with NO expert on a card already runs: `supports_op` declines it and the CPU backend takes the node
+  (`ggml_sycl_moe_tensor_all_experts_on_host`).
+- The mix does not run. `choose_moe_batch_executor` (`moe-resolved-batch.hpp`) returns
+  `CAPABILITY_UNSUPPORTED` for every Q1_0/NVFP4 recipe that is not HOST_CPU, by design: its comment says these
+  types run only through the direct block. The direct block requires every operand PRIMARY on the context's
+  device. So in a mixed batch the host operands pass, the card operands are refused, and
+  `append_retained_operand` throws. The hybrid decode record build (`ggml_sycl_moe_hybrid_decode_record_build`)
+  asks the same chooser per expert and declines for the same reason.
+- `mmvq_submit_q1_nvfp4_aos_id_admitted` computes all `top_k * n_tokens` occurrences from the ids tensor on
+  the device; the host ids are only range-checked. It cannot take a subset.
+- How MXFP4 does the mix (`ggml_sycl_moe_hybrid_decode_event_chained`): the pointer table is indexed by
+  expert id, a host expert's slot names a card expert as a stand-in, the device kernel computes every slot,
+  and the CPU job's rows replace the host slots through a flagged scatter chained on the in-order queue.
+- The CPU expert pool (`ggml_sycl_cpu_expert_mul_mat`, `cpu_expert_mul_mat_batched_run`) asserts these types
+  out ("must use its admitted host recipe").
+- The CPU expert rate table (`placement_cpu_expert_rate_measured`, `kv-room-cost.hpp`) has no Q1_0 or NVFP4
+  row; both read the 40 GB/s default, flagged unmeasured. Tasks 15 and 16 own the row.
+
+**Ruling (lead, 2026-11-22):** placement decides the executor, per occurrence. A card-resident expert runs in
+the admitted device kernel, a host-pinned expert runs on the CPU through the host recipe that already exists,
+and one node may do both. Nothing is converted, staged to the card for the purpose, or read from host memory
+by a GPU kernel.
+- The direct block is the one place a Q1_0/NVFP4 node is executed. It admits a batch whose operands are each
+  PRIMARY on its device or HOST; `choose_moe_batch_executor`'s refusal stays, because no generic executor
+  runs these types.
+- The device kernel must not compute a host occurrence from a stand-in expert and must not read a host
+  pointer. It skips an occurrence whose expert is not on the card (the table slot says so) and leaves that
+  output row alone. This differs from the MXFP4 stand-in on purpose: on the B50 about half the experts are
+  host-pinned, so a stand-in would spend about half the device kernel on rows that are thrown away. If the
+  checkpoint shows a skip cannot be had without a second kernel image, say so before writing one.
+- The host rows are computed by `ggml_sycl_cpu_moe_host_aos_execute` and reach `dst` through the existing
+  scatter, ordered after the device kernel's output copy on the in-order queue. One terminal event per node
+  that covers both legs; the bundle's leases are released by it, not before the host leg is done.
+- No host wait on the submitting thread. The host leg waits for its activation and ids on its worker, as the
+  MXFP4 job prologue does.
+- A secondary-card operand (`residency=secondary`) is still refused by name. It is Task 8d's.
+- Speed is not this task. One task at a time on one thread is what exists; its cost is Stage 2's measurement,
+  and the pool or a threaded recipe is a Stage 3 candidate.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. How the pointer table the direct block uploads represents a host expert today (null, absent, or a
+   stand-in), and what the kernel needs to skip one without a second image.
+2. Where the host leg gets its activation rows and its ids for the direct block, which stages neither to the
+   host today, and what that costs per node (one D2H of `ne11 * ne12` rows at most).
+3. How the host rows' scatter and the block's terminal event combine into one terminal, given that the pending
+   scatter is flushed at the first consumer and not at a terminal.
+4. Whether the host recipe workspace the plan reserves covers a prompt batch (`n_expert_used * ubatch` rows)
+   when only some occurrences are host occurrences, and what refuses if it does not.
+5. Whether the hybrid decode record build must change too, or is not reached once the direct block takes the
+   mix.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (the direct block, its precondition and decline lines),
+`ggml/src/ggml-sycl/mmvq.cpp` and `mmvq.hpp` (the admitted adapter and its kernel),
+`ggml/src/ggml-sycl/cpu-dispatch.cpp` only if checkpoint item 2 requires it,
+`ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp`, `tests/test-sycl-moe-resolved-batch-source.py`,
+`tests/test-sycl-moe-refusal-reason-source.py`.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the source contract fails on the all-PRIMARY precondition; the device test has mixed
+      cases the lead sees fail before the fix.
+- [ ] Device test cases through the production fixture, Q1_0 and NVFP4, decode and a prompt batch: one host
+      occurrence among card occurrences, all but one host, and a prompt in which different tokens mix
+      differently. The oracle is the CPU result for every row. A kernel that computed a host row from another
+      expert must fail; so must one that left a card row unwritten.
+- [ ] A secondary-card operand is refused by name and the graph fails cleanly.
+- [ ] Lead, one run each: the oracle on both cards with 0 context-bind lines; the Inkling gate on the B50
+      passes or names its next refusal; the Inkling gate on the B70, the Mistral gate and the GPT-OSS gate on
+      the B50 pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** a secondary card (Task 8d), the CPU expert pool for these types, the rate-table row, the
+speed of the host leg.
+
+---
+
+### Task 8d: Experts on the second card (recorded 2026-11-22)
+
+**Found by:** the lead's Inkling gate on `level_zero:0,1` from Task 8b's build. With
+`GGML_SYCL_MOE_MULTI_GPU=0`, which every gate sets, the load puts all 21.3 GiB on the B70 and the B50 holds
+nothing: the run prints `1, 2, ... 10` with 0 refusals and is the B70 setup with an idle second card. No
+secondary cache arena is registered when the variable is 0, so overflow would go to host, not to the B50
+(read, not run). With the variable on, an NVFP4 expert owned by device 1 resolves as SECONDARY, MXFP4's
+secondary executor is SOA-only, and the direct block would print `failed=all_primary ... residency=secondary
+owner=1`. The variable defaults ON when unset (`ggml_sycl_moe_multi_gpu_requested`), which CLAUDE.md states as
+opt-in.
+**Direction (lead):** a secondary-owned expert runs on the card that holds it, through the same admitted
+kernel on that card's queue, with its activation and result crossing by host bounce (there is no peer-to-peer
+path). Not written out: it depends on Task 8c's per-occurrence split and on what Stage 2 says a second card is
+worth for a model the B70 holds whole.
+**Done when:** written to the Task Detail Standard after Task 8c merges, or dropped by the profile with the
+reason recorded.
+
+---
+
+### The CPU splits of an all-on-card decode (census, 2026-11-22)
+
+With every weight on the B70, one decode token's graph is 282 scheduler splits, 141 of them on the CPU; each
+CPU split forces a re-entry split on the card. An explorer parsed all 282 splits of the scheduler print
+(`GGML_SCHED_DEBUG=2 -v`, Task 8b's tree) and read the declining clause for each class. The table is in
+`docs/backend/data/inkling2/t8-census-b70.txt`. Four causes, one task each:
+
+| CPU splits | Nodes | Cause | Task |
+|---|---|---|---|
+| 88 | 88 SCALE | `SCALE` declines a strided source | 8f |
+| 24 + 24 | 48 SET_ROWS, 24 FLASH_ATTN_EXT | KV of cache slots 24..47 is planned on the host | 8e |
+| 4 | 8 MUL_MAT_ID, 16 SCALE, 8 TANH, 8 MUL, 4 SIGMOID | BF16 experts have no device kernel | 8g |
+| 1 | 1 GET_ROWS | BF16 is missing from the GET_ROWS type list | 8h |
+
+The first decode figure (B70, one sample, 4 threads, `docs/backend/data/inkling2/t8b-bench-inkling-b70-6ee2a4058.jsonl`)
+is pp512 39.5 t/s and tg128 4.36 t/s, below the CPU reference's decode. Tasks 8e, 8f and 8h leave 4 CPU splits.
+
+---
+
+### Task 8e: A KV cache slot lives where the layer that executes it lives (found 2026-11-22)
+
+**Track:** K (planner). **Depends on:** none; branch from `feat/inkling2`.
+**Found by:** the scheduler print. `cache_k_l0..23` are on SYCL0, `cache_k_l24..47` in `SYCL_KV_Host`, and the 24
+FLASH_ATTN_EXT and 48 SET_ROWS nodes that touch slots 24..47 run on the CPU (48 CPU splits per token).
+
+**Description (read by the lead and an explorer in Task 8b's tree; line numbers move, find each site by name):**
+- `inkling2_loop` has 24 physical layers and 48 KV slots: layers 6..17 run three passes, and
+  `layer_phys(il)` maps a slot to the layer that executes it (`src/models/inkling2-loop.cpp`).
+- `src/llama-kv-cache.cpp` asks `hooks.kv_layer_on_device(dev, il)` with the slot index.
+  `ggml_backend_sycl_kv_layer_on_device_from_dev` returns `plan->get_kv_device(il) >= 0`.
+- `plan.kv_device` is filled per layer id that has weights, and ids come from tensor names (`blk.N`), so 0..23.
+  The fallback loop in `compute_multi_device_plan` sets every missing id below `n_layers` to -1: slots 24..47
+  are host by default, on a card with room.
+- The planner is told the slot count and nothing else: `inventory.n_layer = hparams.n_layer()` is 48, and
+  `llama_model_sycl_build_kv_layer_arrays` (`src/llama-model.cpp`) builds `kind`, `k_width`, `v_width`,
+  `idx_k_width` and `swa_layer_mask` for 48 slots. The slot-to-layer map is not transported.
+- KV is charged per weight layer id, 24 times: the charge loop iterates `dense_layer_indices`, the KV phase
+  and the `[PLACEMENT] layer N` lines stop at 23, and `kv_context_room` held "4 full-attention + 20 SWA"
+  layers. The host zone is sized over all 48 slots. So making 48 slots resident without charging them would
+  under-plan the device KV room by half.
+- `model.dev_layer(il)` is SYCL0 for every slot (`pimpl->dev_layer` is sized to `n_layer_all`); the host
+  decision comes from the plan alone.
+- `supports_op` declines SET_ROWS and FLASH_ATTN_EXT whose KV tensor is in the host KV buffer type
+  (`ggml_sycl_tensor_is_in_kv_host_buft`), which is the rule working as written.
+
+**Ruling (lead, 2026-11-22):** placement decides the executor, per slot. A slot's attention runs in the layer
+that executes it, so the slot's KV lives where that layer's weights live, and the layer pays for every slot it
+executes.
+- The model transports the map: one physical layer id per slot, beside the per-slot arrays it already builds.
+  For every other architecture the map is the identity and nothing changes.
+- The planner keys KV by slot: `kv_device` has an entry for every slot, the charge for a layer is the sum of
+  `kv_bytes_for_layer(slot)` over its slots, and the KV phase, the context room, the block KV owner and the
+  log lines iterate slots. A layer whose slots do not all fit keeps the ones that do only if the existing
+  per-layer rule already allows a split; otherwise the layer's slots move together. Say which the code does.
+- The hook answers by slot from the plan. It does not compute the map itself and llama does not pass a
+  physical id in place of a slot.
+- The struct that carries the map crosses the dlopen boundary and is allocated by libllama and indexed by
+  libggml-sycl. Do not change an array stride: add the map as a new pointer-plus-count pair where the per-slot
+  arrays already travel, or in existing padding; print `sizeof` and `offsetof` before and after from a
+  standalone compile, and say in the commit message that both libraries rebuild together.
+- No behaviour change for a model whose slots are its layers: the `[LOAD-PLAN]`, `[PLACEMENT]` and
+  `[SYCL-PLAN]` lines of the Mistral B70 and GPT-OSS B50 gates are byte-equal before and after (timestamps
+  and the free-VRAM reading aside). The lead runs that comparison.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Every reader of `kv_device`, `get_kv_device`, `layer_range_kv_device`, `kv_bytes_for_layer` and the per-layer
+   KV charge, with what each assumes about "layer id" (a table).
+2. Where the map travels (the struct, its producer, its consumers) and the measured `sizeof`/`offsetof`.
+3. Which existing host-only planner test can hold a 48-slot, 24-layer inventory, or what the smallest new one
+   is.
+4. What `GGML_SYCL_ATTN_HOST_DISPATCH` does and whether it is on by default; it must not become the fix.
+
+**File scope:** `ggml/src/ggml-sycl/unified-cache.cpp`, `unified-cache.hpp`, `ggml/include/ggml-sycl.h` (the
+transported struct), `ggml/src/ggml-sycl/ggml-sycl.cpp` (the inventory intake, the hook),
+`src/llama-model.cpp` (`llama_model_sycl_build_kv_layer_arrays` and its caller), the planner's host-only test,
+one source contract.
+
+**Acceptance criteria:**
+- [ ] RED first: a host-only planner test with 24 weight layers and 48 slots (layers 6..17 three times) on a
+      device with room fails because slots 24..47 are host; it also has a device too small for all 48, where
+      the plan must charge 48 slots and not 24.
+- [ ] An identity-map case proves the plan is unchanged for a model whose slots are its layers.
+- [ ] Lead, one run each: Inkling gate on the B70 passes; the scheduler print shows `cache_k_l24..47` on
+      SYCL0, no FLASH_ATTN_EXT and no SET_ROWS on the CPU; Mistral B70 and GPT-OSS B50 gates pass with
+      byte-equal plan lines; one `llama-bench -p 512 -n 128` on the B70 for the before/after figure.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** the speed of attention on the card, a card too small for the model (the B50's hybrid
+layers), the BF16 experts.
+
+---
+
+### Task 8f: `SCALE` reads a strided source (found 2026-11-22)
+
+**Track:** M (kernels). **Depends on:** none; branch from `feat/inkling2`.
+**Found by:** the scheduler print: 88 CPU splits per token hold one SCALE each (and 16 more SCALE nodes sit in
+the BF16 layers' splits). Each costs a 67K copy to the CPU and a 36K copy back.
+
+**Description (read by an explorer in Task 8b's tree):**
+- `build_moe_ffn` (`src/llama-graph.cpp`) splits the fused `ffn_moe_gate_up` output into two `ggml_view_3d`
+  halves, `ffn_moe_gate-N` and `ffn_moe_up-N`, with `nb1 = 2 * n_ff * 4`: each half is not contiguous. The
+  SiTU activation starts with `ggml_scale(cur, 1 / beta)` and `ggml_scale(up, 1 / lb)` on those views.
+- The `GGML_OP_SCALE` case of the SYCL `supports_op` admits `type F32 && src0 F32 && ggml_is_contiguous(src0)`;
+  its comment says `scale_f32` (called from `ggml_sycl_op_scale`) reads src0 flat over `ggml_nelements`.
+- In the same graph SIGMOID and MUL read the same strided views on SYCL0, and 525 SCALE nodes with contiguous
+  sources run on SYCL0.
+
+**Ruling (lead, 2026-11-22):** the layout the operand is in is the answer; the kernel reads it. `scale_f32`
+walks src0 with the tensor's own strides and writes dst with dst's own strides, and `supports_op` admits what
+the kernel can read. No contiguous copy is made first, and the graph builder is not changed to avoid the view.
+- The contiguous case keeps its flat loop (same kernel image or a second arm; say which, and why, from what
+  the other strided element-wise kernels in this backend do).
+- The in-place case (`ggml_scale_inplace` on a view: dst is a view of src with the same strides) must be
+  right or be declined by name in `supports_op`; it must not be admitted untested.
+- F16 and BF16 SCALE keep whatever they do today.
+- The view's storage is read through its root with its offset, as the other device kernels here read a view;
+  a raw pointer is a transient view of the operand and is not stored.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (`scale_f32`, `ggml_sycl_op_scale`, the `GGML_OP_SCALE` case
+of `supports_op`), `tests/test-backend-ops.cpp` (`test_scale`), one source contract if a pin of the SCALE case
+exists.
+
+**Acceptance criteria:**
+- [ ] RED first: `test_scale` gains strided-source cases (a `ggml_view_3d` half of a wider tensor with
+      `nb1` twice the row size, the upper half so the offset is not zero; one with a bias; one in place).
+      Before the fix the SYCL backend reports them not supported.
+- [ ] Lead, by hand, one run per card: `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops -o SCALE`
+      prints every SCALE case OK and none "not supported".
+- [ ] Lead, one run each: Inkling gate on the B70 passes and the scheduler print has no SCALE-only CPU split;
+      Mistral B70 and GPT-OSS B50 gates pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** fusing the SiTU chain into one kernel (a Stage 3 candidate), other ops that decline a
+strided source.
+
+---
+
+### Task 8g: BF16 experts have a device kernel (recorded 2026-11-22)
+
+**Found by:** the scheduler print: the 8 `MUL_MAT_ID` nodes of `blk.20..23` (`ffn_gate_up_exps` 1296 MB,
+`ffn_down_exps` 648 MB, BF16) run on the CPU, and their SiTU chain (16 SCALE, 8 TANH, 8 MUL, 4 SIGMOID) is
+dragged there with them: 4 CPU splits per token.
+**Read (explorer):** the indexed-ops block of `supports_op` declines on
+`!moe_mmvq_admission_supports_type(BF16) && !ggml_sycl_moe_pp_batched_admits_op`. The device expert tables
+(`moe-mmvq-tables.hpp`) list the quantized types and MXFP4; F32, F16 and BF16 are absent, and the "f16 arm"
+dequantizes quantized experts into F16, it is not an F16 weight route. A dense BF16 `MUL_MAT` weight does run
+on the card. Not resolved: the CPU `MUL_MAT_ID` reads weights the print shows as `[SYCL0]` with no copy in the
+split's inputs.
+**Direction (lead):** a kernel for the layout the weight is in: BF16 experts through an indexed matvec on the
+card (decode) and an indexed matmul for a prompt batch, taking the expert slices where they are. Not written
+out: it is the one cause that needs a new kernel, it removes 4 of 141 CPU splits, and Stage 2's profile says
+what those four cost. The unresolved read above is settled first.
+**Done when:** written to the Task Detail Standard after the profile, or dropped by it with the reason recorded.
+
+---
+
+### Task 8h: `GET_ROWS` admits the BF16 arm its kernel has (found 2026-11-22)
+
+**Track:** M (kernels), after Task 8f on the same branch line or in its own worktree (the two edits are in
+different cases of `supports_op`). **Depends on:** none.
+**Found by:** the scheduler print: split #0 of every token is a CPU `GET_ROWS` of `token_embd.weight` (BF16,
+2304 x 201024, 883 MB, resident on SYCL0), so the first thing every token does is leave the card.
+**Read (explorer):** `ggml_sycl_get_rows_type_supported` (`ggml/src/ggml-sycl/get-rows-support.hpp`) admits F16,
+F32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K and Q6_K. The kernel has a BF16 arm (`getrows.cpp`,
+`get_rows_sycl_float` with `bfloat16`). `tests/test-sycl-get-rows-q4-k-source.py` checks that every admitted type
+has an arm. The ids being a CPU tensor is not the cause: 233 other GET_ROWS nodes run on SYCL0 from copied ids.
+Whether the BF16 arm has ever run is not known.
+
+**Ruling (lead, 2026-11-22):** the predicate says what the kernel can do. BF16 joins the list if and only if
+the arm is right, and the device test decides that.
+
+**File scope:** `ggml/src/ggml-sycl/get-rows-support.hpp`, `ggml/src/ggml-sycl/getrows.cpp` only if the arm is
+wrong, `tests/test-backend-ops.cpp` (`test_get_rows` cases), `tests/test-sycl-get-rows-q4-k-source.py`.
+
+**Acceptance criteria:**
+- [ ] RED first: `test_get_rows` BF16 cases (the small shape, a view case, and one with more rows than a
+      16-bit index holds, as the existing wide cases do for other types). Before the fix the SYCL backend
+      reports them not supported. The source contract lists BF16.
+- [ ] Lead, by hand, one run per card: `./build/bin/test-backend-ops -o GET_ROWS` prints every case OK.
+- [ ] Lead: the Inkling scheduler print has no CPU GET_ROWS; the Inkling B70, Mistral B70 and GPT-OSS B50 gates
+      pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
 
 ---
 
@@ -4678,6 +5287,89 @@ rewritten Stage 3 before any of it starts.
 - [ ] No task changes placement policy to make a kernel's layout fit; no task adds a second source for a fact the
       loaded operand already carries.
 - [ ] The user has approved the rewritten Stage 3.
+
+---
+
+## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
+
+The codescout `task_*` tools fail in the lead's session (2026-11-22: the session's index root is a directory
+that no longer exists). Until someone files these, this list is the record. Each line is one task.
+
+*Found by Task 7's lock analysis (section 12.5 non-conformances, all older than this branch):*
+- `replace_plan`'s prepared-replacement erase and `recover_quarantined`'s sweep of retired contexts can drop the
+  last owner of a context's pools under the MMID registry mutex, which runs final `mem_handle` destructors and
+  their free-path locks under a ranked lock.
+- The quarantine resets under the MMID pool mutexes can do the same with a graph retention record or an
+  admission authority.
+- `recover_quarantined(wait=true)` calls `wait_and_confirm` under the registry and pool mutexes; on the
+  `MUL_MAT_ID` path the graph-compute lock and the context's graph mutex are held too. A host wait under locks.
+- The runtime KV-update path materializes the MMID pools (`unified_allocate`) under the inventory mutex when
+  the geometry changes (the non-stable transaction branch).
+- `ExpertPrefetcher::mutex_` is not in the 12.5 table; on a load-bound thread it reaches the plan mutex.
+
+*Left by Task 7's reviews (2026-11-22):*
+- Move the into-empty republication (`ggml_sycl_republish_current_plan_into_empty`) to a graph boundary, like
+  the expert loan, so graph compute stops taking the inventory lock under the graph-compute locks at that
+  site. The other four sites are in section 12.5.
+- `ggml_sycl_materialize_published_mmid_workspaces` reads a backend context (`contexts.back()`) after
+  `g_backend_context_by_device_mutex` is released, then its queue and queue lifetime. A context freed on the
+  same device at that moment is a use after free, and `back()` is the newest context, not necessarily the
+  binding one. Older than Task 7. Fix: copy the queue and the lifetime under the mutex, or pass the binding
+  context in.
+- The runtime KV transaction runs the plan CAS and its retire under the inventory lock, so contexts it
+  displaces still die under L1 (listed in 12.5).
+- The rollback in `lifecycle_replace_placement_plan`'s CAS guards a `shared_ptr` assignment that cannot throw,
+  and would not restore the displaced context if it ran. Remove it or say so.
+- Nothing pins `stable_mmid` in the runtime transaction to the shared same-plan predicate; the host-zone
+  contract's check F does not catch an added inline comparison against the reservation; the comment at
+  `test-moe-mmid-workspace-plan.cpp:1901` still says "outside the plan lock".
+
+*Found by the Inkling runs:*
+- About 36 small host-resident F32 weights (`ne=[1,128,1,1]`, `model=0`) are not preloaded. `binbcast.cpp`'s
+  `stage_raw_host_source` asks the cache to stage them, planned mode refuses
+  (`planned-mode runtime materialization rejected op=direct_stage_weight`), and the op copies them into a
+  STAGING buffer with a synchronous wait, once per op. A placement gap and a host wait per op. Name the
+  tensors first.
+- With every weight in VRAM on the B70, the load keeps 21.3 to 21.8 GB in the host pinned pool
+  (`[HOSTMEM] ... WEIGHT=21.75/24.06`). Find the owner and whether it is the load path's staging copy that
+  nobody releases.
+- `hold_spills_kv_zone_full=1 hold_spills_kv_zone_full_bytes=1057724.1 KB` in the scratch statistics of the
+  B70 run: one hold spilled about 1 GB because the KV zone was full. Find what it was.
+
+*Found by the scheduler print of the Inkling decode graph (B70, `GGML_SCHED_DEBUG=2 -v`, 2026-11-22, Task 8b's
+build `8ed0c3204`; evidence `inkling/t8b-ink-b70-diag/graph-40.txt`, not committed). One token's graph has
+8076 nodes in 282 splits, 141 of them CPU splits with 205 nodes. Each split boundary is a device-to-host or
+host-to-device copy with a wait. These are the first candidates for the profile in Stage 2:*
+- **KV of the loop's cache slots is on the CPU.** `inkling2_loop` has 24 physical layers and 48 cache slots
+  (`hparams.n_layer_all = n_slot`; layers 6 to 17 run three passes, slots 24 to 47 are passes 1 and 2).
+  `cache_k_l0..23` are on SYCL0, `cache_k_l24..47` on CPU, so 24 of 48 `FLASH_ATTN` nodes and 48 `SET_ROWS`
+  nodes run on the CPU. Probable cause, read not run: `llama-kv-cache.cpp` asks
+  `hooks.kv_layer_on_device(dev, il)` with the slot index, and the plan knows layers by tensor name
+  (`blk.0` to `blk.23`). The slot's physical layer is `layer_phys(il)`. Check that the plan's KV room counts
+  48 slots before moving them.
+- **The experts of `blk.20` to `blk.23` are BF16** (1296 MB and 648 MB per tensor; the 40 NVFP4 tensors are
+  `blk.0` to `blk.19`). Their 8 `MUL_MAT_ID` nodes run on the CPU. A missing kernel for a loaded layout: write
+  the BF16 `MUL_MAT_ID` kernel, or show the profile says it does not matter.
+- **`SCALE` of a view of the fused gate_up output runs on the CPU** in every layer pass (104 nodes, with 8
+  `TANH`, 8 `MUL` and 4 `SIGMOID` beside them in the CPU layers): the SiTU activation scales the gate half
+  and the up half, each a strided view of the `MUL_MAT_ID` output, and the SYCL `SCALE` does not take that
+  view. Two CPU round trips per layer pass between the two `MUL_MAT_ID` calls.
+- `GET_ROWS` of the token embedding runs on the CPU against a SYCL0 weight (one node).
+- The model has 24 layers and one graph holds 96 `MUL_MAT_ID` nodes, 88 of them NVFP4. Earlier notes in this
+  plan that say "20 layers" or "40 calls per token" count the NVFP4 tensors, not the calls.
+
+*Found by Task 8a and 8b:*
+- For a direct recipe, `recipe.workspace` (the 32-row chunk plan) is a size nothing allocates: a second figure
+  for one thing.
+- `choose_moe_batch_executor` refuses every Q1_0/NVFP4 device recipe "until all four B70 oracle cases pass";
+  no document lists the four cases. Either state them and close the gate properly, or remove the generic arm
+  for these types.
+- The batched oneDNN prompt table leaves Q1_0 and NVFP4 out because of that same gate, although converters
+  exist. A candidate for prompt speed once the profile says where the time goes.
+
+*Decisions that are the user's (asked, not answered):* the eight contracts that are red on `master`; the
+interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkling2`; replacing the system
+`mkdir`.
 
 ---
 

@@ -331,12 +331,28 @@ gate_skip() {
 # Prints the GATE line and records the result. This -- not per-gate
 # duplication -- is where the "STDOUT only, and no abort line" rule lives,
 # so it applies identically to both gates by construction.
+#
+# One line is taken out of ERR before the search. When the backend sees more
+# than one GPU it prints a startup advisory that names the error it warns
+# about ("... Multi-GPU Level Zero contexts trigger DEVICE_LOST on
+# compute-runtime 26.x ..."). Nothing was lost when it prints, and counting it
+# failed every gate under a two-card selector. It is matched on its fixed
+# text, so any other line that mentions DEVICE_LOST still fails the gate. An
+# unreadable ERR is a FAIL: it cannot show that no abort line was printed.
+# The abort lines are counted, not searched with `grep -q`: under `pipefail` a
+# `grep -q` that stops at its first match can kill the filter in front of it
+# with SIGPIPE, and the pipeline would then read as "no match".
+GATE_TWO_GPU_ADVISORY='\[SYCL\] WARNING: [0-9]+ GPUs visible\. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime'
 gate_verdict() {
     local name="$1" out="$2" err="$3" rc="$4" pass_regex="$5"
-    local verdict="FAIL"
+    local verdict="FAIL" abort_lines=""
+    if [ -r "$err" ]; then
+        abort_lines="$(grep -vE "$GATE_TWO_GPU_ADVISORY" "$err" \
+            | grep -cE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' || true)"
+    fi
     if [ "$rc" -eq 0 ] \
         && grep -qE "$pass_regex" "$out" \
-        && ! grep -qE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' "$err"; then
+        && [ "$abort_lines" = "0" ]; then
         verdict="PASS"
     fi
     echo "GATE $name $verdict rc=$rc selector=$SELECTOR sha=$SHA"
@@ -410,6 +426,11 @@ run_gptoss() {
 # the regex checks the first ten numbers only, as the Mistral gate does. The
 # gate names -c 8192: the model's default context is its 1,048,576-token
 # training context, which the load refuses by name on these cards.
+# The gate names -no-cnv: the file carries a chat template, so llama-completion
+# would enter conversation mode by itself, and this template is not one of its
+# built-in formats ("this custom template is not supported, try using --jinja",
+# an uncaught throw, rc 134). The gate scores a raw continuation, as the CPU
+# reference did, so a chat turn would be the wrong vehicle either way.
 # GGML_SYCL_MOE_MULTI_GPU=0 is set for every selector, so a two-card run takes
 # the scheduler split and the script never reads the selector.
 run_inkling() {
@@ -426,7 +447,7 @@ run_inkling() {
     sample_mem "inkling pre"
     local rc=0
     GGML_SYCL_MOE_MULTI_GPU=0 timeout 900 "$BIN_DIR/llama-completion" \
-        -m "$INKLING_MODEL" -c 8192 -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
+        -m "$INKLING_MODEL" -c 8192 -no-cnv -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
         >"$out" 2>"$err" || rc=$?
     sleep "$SETTLE_SECONDS"
     sample_mem "inkling post"
