@@ -1816,8 +1816,8 @@ static bool run_dense_weights_before_kv_test() {
 }
 
 // A KV cache slot lives where the weight layer that executes it lives, and the layer pays for every slot it executes.
-// The synthetic model has Inkling 2 Mini's shape: 24 weight layers, each with one dense attention weight, and 48 FULL KV
-// slots, the core layers 6..17 running three passes (slots 24..35 and 36..47 run layers 6..17 again).
+// The synthetic model has Inkling 2 Mini's shape: 24 weight layers, each with one dense attention weight, and 48 FULL
+// KV slots, the core layers 6..17 running three passes (slots 24..35 and 36..47 run layers 6..17 again).
 // placement_kv_info::layer_phys maps a slot to its layer.
 namespace kv_slot_case {
 constexpr int    n_phys      = 24;
@@ -2030,19 +2030,40 @@ static bool run_kv_slot_identity_map_test() {
 }
 
 // The multi-device planner moves a layer's slots with the layer: every slot's KV is on its layer's device, the layer
-// is charged for each of its slots, and the block that holds a layer counts the KV of every slot it executes and is
-// owned by its execution device.
+// is charged for each of its slots, and each block counts the KV of every slot its layers execute and is owned by its
+// execution device. Device 1 ranks first and has room for layers 0..8 and two more short layers with their slots
+// (a short layer is 64 KiB of weights and one 256 KiB slot, a looped one three slots), so the layers split across
+// both cards with looped layers on each: a plan that put every layer on one card could not tell a slot that follows
+// its layer from a slot that lands on the only card there is.
 static bool run_multi_device_kv_slot_block_test() {
     using namespace kv_slot_case;
     constexpr size_t                            mib     = 1024u * 1024u;
     const std::vector<ggml_sycl::device_budget> devices = {
         { 0, 64u * mib, 64u * mib, 1.0, true },
-        { 1, 64u * mib, 64u * mib, 4.0, true },
+        { 1, 5u * mib,  64u * mib, 4.0, true },
     };
     const auto kv   = kv_info(n_slot, loop_map());
     const auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory(n_phys), n_slot,
                                                            ggml_sycl::multi_gpu_mode::LAYER, kv, nullptr, 0);
-    bool       ok   = true;
+
+    int layers_on[2] = { 0, 0 };
+    int looped_on[2] = { 0, 0 };
+    for (int l = 0; l < n_phys; ++l) {
+        const int device = plan.get_layer_device(l);
+        if (device == 0 || device == 1) {
+            layers_on[device]++;
+            looped_on[device] += l >= core_start && l < core_end ? 1 : 0;
+        }
+    }
+    if (looped_on[0] == 0 || looped_on[1] == 0 || layers_on[0] + layers_on[1] != n_phys) {
+        printf(
+            "FAIL: precondition: the plan must split the layers across both cards with looped layers on each: "
+            "layers on 0/1 %d/%d, looped layers on 0/1 %d/%d\n",
+            layers_on[0], layers_on[1], looped_on[0], looped_on[1]);
+        return false;
+    }
+
+    bool ok = true;
     for (int s = 0; s < n_slot; ++s) {
         const int layer_device = plan.get_layer_device(loop_layer_of(s));
         if (layer_device < 0 || plan.get_kv_device(s) != layer_device) {
@@ -2052,22 +2073,33 @@ static bool run_multi_device_kv_slot_block_test() {
             break;
         }
     }
-    const ggml_sycl::placement_plan::layer_block * core = nullptr;
+    // Every block that holds a looped layer, on either card, counts the KV of all the slots its layers execute.
+    int looped_blocks_on[2] = { 0, 0 };
     for (const auto & block : plan.layer_blocks) {
-        if (block.start_layer <= core_start && core_start <= block.end_layer) {
-            core = &block;
+        size_t block_kv = 0;
+        bool   looped   = false;
+        for (int s = 0; s < n_slot; ++s) {
+            const int l = loop_layer_of(s);
+            block_kv += l >= block.start_layer && l <= block.end_layer ? kv_slot : 0;
+            looped = looped || (s >= n_phys && l >= block.start_layer && l <= block.end_layer);
+        }
+        if (!looped) {
+            continue;
+        }
+        if (block.kv_bytes != block_kv || block.kv_device != block.execution_device) {
+            printf(
+                "FAIL: the block of layers %d..%d counts its layers' %zu slot bytes and its KV owner is its "
+                "executor: kv=%zu owner=%d exec=%d\n",
+                block.start_layer, block.end_layer, block_kv, block.kv_bytes, block.kv_device, block.execution_device);
+            ok = false;
+        }
+        if (block.execution_device == 0 || block.execution_device == 1) {
+            looped_blocks_on[block.execution_device]++;
         }
     }
-    size_t core_kv = 0;
-    for (int s = 0; core != nullptr && s < n_slot; ++s) {
-        const int l = loop_layer_of(s);
-        core_kv += l >= core->start_layer && l <= core->end_layer ? kv_slot : 0;
-    }
-    if (core == nullptr || core->kv_bytes != core_kv || core->kv_device != core->execution_device) {
-        printf(
-            "FAIL: the block of layer 6 counts its layers' %zu slot bytes and its KV owner is its executor: "
-            "kv=%zu owner=%d exec=%d\n",
-            core_kv, core ? core->kv_bytes : 0, core ? core->kv_device : -3, core ? core->execution_device : -3);
+    if (looped_blocks_on[0] == 0 || looped_blocks_on[1] == 0) {
+        printf("FAIL: a block that holds looped layers on each card: %d on device 0, %d on device 1\n",
+               looped_blocks_on[0], looped_blocks_on[1]);
         ok = false;
     }
     if (plan.kv_vram_bytes != n_slot * kv_slot) {
@@ -2154,8 +2186,10 @@ static bool run_kv_slot_map_intake_test() {
         ok = false;
     }
 
-    // The late inventory without layer 6, whose weights went to a CPU buffer type: the map stands, and slots 6, 30
-    // and 42 are the host's while every other slot is on the card with room.
+    // The late inventory without layer 6, whose weights went to a CPU buffer type. The intake never reads `tensors`,
+    // so this half checks that it ignores tensor names: the map stands with layer 6 missing from the names. The
+    // planner half is kept because it is the reason the intake must not read them: planned from what the intake
+    // returned, slots 6, 30 and 42 are the host's while every other slot is on the card with room.
     tensors.erase(tensors.begin() + 6);
     const auto late           = intake(&loop, n_slot);
     auto       late_inventory = inventory(n_phys);
