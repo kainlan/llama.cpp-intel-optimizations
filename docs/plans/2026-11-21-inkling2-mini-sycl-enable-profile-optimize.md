@@ -4131,6 +4131,191 @@ reason recorded.
 
 ---
 
+### The CPU splits of an all-on-card decode (census, 2026-11-22)
+
+With every weight on the B70, one decode token's graph is 282 scheduler splits, 141 of them on the CPU; each
+CPU split forces a re-entry split on the card. An explorer parsed all 282 splits of the scheduler print
+(`GGML_SCHED_DEBUG=2 -v`, Task 8b's tree) and read the declining clause for each class. The table is in
+`docs/backend/data/inkling2/t8-census-b70.txt`. Four causes, one task each:
+
+| CPU splits | Nodes | Cause | Task |
+|---|---|---|---|
+| 88 | 88 SCALE | `SCALE` declines a strided source | 8f |
+| 24 + 24 | 48 SET_ROWS, 24 FLASH_ATTN_EXT | KV of cache slots 24..47 is planned on the host | 8e |
+| 4 | 8 MUL_MAT_ID, 16 SCALE, 8 TANH, 8 MUL, 4 SIGMOID | BF16 experts have no device kernel | 8g |
+| 1 | 1 GET_ROWS | BF16 is missing from the GET_ROWS type list | 8h |
+
+The first decode figure (B70, one sample, 4 threads, `docs/backend/data/inkling2/t8b-bench-inkling-b70-6ee2a4058.jsonl`)
+is pp512 39.5 t/s and tg128 4.36 t/s, below the CPU reference's decode. Tasks 8e, 8f and 8h leave 4 CPU splits.
+
+---
+
+### Task 8e: A KV cache slot lives where the layer that executes it lives (found 2026-11-22)
+
+**Track:** K (planner). **Depends on:** none; branch from `feat/inkling2`.
+**Found by:** the scheduler print. `cache_k_l0..23` are on SYCL0, `cache_k_l24..47` in `SYCL_KV_Host`, and the 24
+FLASH_ATTN_EXT and 48 SET_ROWS nodes that touch slots 24..47 run on the CPU (48 CPU splits per token).
+
+**Description (read by the lead and an explorer in Task 8b's tree; line numbers move, find each site by name):**
+- `inkling2_loop` has 24 physical layers and 48 KV slots: layers 6..17 run three passes, and
+  `layer_phys(il)` maps a slot to the layer that executes it (`src/models/inkling2-loop.cpp`).
+- `src/llama-kv-cache.cpp` asks `hooks.kv_layer_on_device(dev, il)` with the slot index.
+  `ggml_backend_sycl_kv_layer_on_device_from_dev` returns `plan->get_kv_device(il) >= 0`.
+- `plan.kv_device` is filled per layer id that has weights, and ids come from tensor names (`blk.N`), so 0..23.
+  The fallback loop in `compute_multi_device_plan` sets every missing id below `n_layers` to -1: slots 24..47
+  are host by default, on a card with room.
+- The planner is told the slot count and nothing else: `inventory.n_layer = hparams.n_layer()` is 48, and
+  `llama_model_sycl_build_kv_layer_arrays` (`src/llama-model.cpp`) builds `kind`, `k_width`, `v_width`,
+  `idx_k_width` and `swa_layer_mask` for 48 slots. The slot-to-layer map is not transported.
+- KV is charged per weight layer id, 24 times: the charge loop iterates `dense_layer_indices`, the KV phase
+  and the `[PLACEMENT] layer N` lines stop at 23, and `kv_context_room` held "4 full-attention + 20 SWA"
+  layers. The host zone is sized over all 48 slots. So making 48 slots resident without charging them would
+  under-plan the device KV room by half.
+- `model.dev_layer(il)` is SYCL0 for every slot (`pimpl->dev_layer` is sized to `n_layer_all`); the host
+  decision comes from the plan alone.
+- `supports_op` declines SET_ROWS and FLASH_ATTN_EXT whose KV tensor is in the host KV buffer type
+  (`ggml_sycl_tensor_is_in_kv_host_buft`), which is the rule working as written.
+
+**Ruling (lead, 2026-11-22):** placement decides the executor, per slot. A slot's attention runs in the layer
+that executes it, so the slot's KV lives where that layer's weights live, and the layer pays for every slot it
+executes.
+- The model transports the map: one physical layer id per slot, beside the per-slot arrays it already builds.
+  For every other architecture the map is the identity and nothing changes.
+- The planner keys KV by slot: `kv_device` has an entry for every slot, the charge for a layer is the sum of
+  `kv_bytes_for_layer(slot)` over its slots, and the KV phase, the context room, the block KV owner and the
+  log lines iterate slots. A layer whose slots do not all fit keeps the ones that do only if the existing
+  per-layer rule already allows a split; otherwise the layer's slots move together. Say which the code does.
+- The hook answers by slot from the plan. It does not compute the map itself and llama does not pass a
+  physical id in place of a slot.
+- The struct that carries the map crosses the dlopen boundary and is allocated by libllama and indexed by
+  libggml-sycl. Do not change an array stride: add the map as a new pointer-plus-count pair where the per-slot
+  arrays already travel, or in existing padding; print `sizeof` and `offsetof` before and after from a
+  standalone compile, and say in the commit message that both libraries rebuild together.
+- No behaviour change for a model whose slots are its layers: the `[LOAD-PLAN]`, `[PLACEMENT]` and
+  `[SYCL-PLAN]` lines of the Mistral B70 and GPT-OSS B50 gates are byte-equal before and after (timestamps
+  and the free-VRAM reading aside). The lead runs that comparison.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Every reader of `kv_device`, `get_kv_device`, `layer_range_kv_device`, `kv_bytes_for_layer` and the per-layer
+   KV charge, with what each assumes about "layer id" (a table).
+2. Where the map travels (the struct, its producer, its consumers) and the measured `sizeof`/`offsetof`.
+3. Which existing host-only planner test can hold a 48-slot, 24-layer inventory, or what the smallest new one
+   is.
+4. What `GGML_SYCL_ATTN_HOST_DISPATCH` does and whether it is on by default; it must not become the fix.
+
+**File scope:** `ggml/src/ggml-sycl/unified-cache.cpp`, `unified-cache.hpp`, `ggml/include/ggml-sycl.h` (the
+transported struct), `ggml/src/ggml-sycl/ggml-sycl.cpp` (the inventory intake, the hook),
+`src/llama-model.cpp` (`llama_model_sycl_build_kv_layer_arrays` and its caller), the planner's host-only test,
+one source contract.
+
+**Acceptance criteria:**
+- [ ] RED first: a host-only planner test with 24 weight layers and 48 slots (layers 6..17 three times) on a
+      device with room fails because slots 24..47 are host; it also has a device too small for all 48, where
+      the plan must charge 48 slots and not 24.
+- [ ] An identity-map case proves the plan is unchanged for a model whose slots are its layers.
+- [ ] Lead, one run each: Inkling gate on the B70 passes; the scheduler print shows `cache_k_l24..47` on
+      SYCL0, no FLASH_ATTN_EXT and no SET_ROWS on the CPU; Mistral B70 and GPT-OSS B50 gates pass with
+      byte-equal plan lines; one `llama-bench -p 512 -n 128` on the B70 for the before/after figure.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** the speed of attention on the card, a card too small for the model (the B50's hybrid
+layers), the BF16 experts.
+
+---
+
+### Task 8f: `SCALE` reads a strided source (found 2026-11-22)
+
+**Track:** M (kernels). **Depends on:** none; branch from `feat/inkling2`.
+**Found by:** the scheduler print: 88 CPU splits per token hold one SCALE each (and 16 more SCALE nodes sit in
+the BF16 layers' splits). Each costs a 67K copy to the CPU and a 36K copy back.
+
+**Description (read by an explorer in Task 8b's tree):**
+- `build_moe_ffn` (`src/llama-graph.cpp`) splits the fused `ffn_moe_gate_up` output into two `ggml_view_3d`
+  halves, `ffn_moe_gate-N` and `ffn_moe_up-N`, with `nb1 = 2 * n_ff * 4`: each half is not contiguous. The
+  SiTU activation starts with `ggml_scale(cur, 1 / beta)` and `ggml_scale(up, 1 / lb)` on those views.
+- The `GGML_OP_SCALE` case of the SYCL `supports_op` admits `type F32 && src0 F32 && ggml_is_contiguous(src0)`;
+  its comment says `scale_f32` (called from `ggml_sycl_op_scale`) reads src0 flat over `ggml_nelements`.
+- In the same graph SIGMOID and MUL read the same strided views on SYCL0, and 525 SCALE nodes with contiguous
+  sources run on SYCL0.
+
+**Ruling (lead, 2026-11-22):** the layout the operand is in is the answer; the kernel reads it. `scale_f32`
+walks src0 with the tensor's own strides and writes dst with dst's own strides, and `supports_op` admits what
+the kernel can read. No contiguous copy is made first, and the graph builder is not changed to avoid the view.
+- The contiguous case keeps its flat loop (same kernel image or a second arm; say which, and why, from what
+  the other strided element-wise kernels in this backend do).
+- The in-place case (`ggml_scale_inplace` on a view: dst is a view of src with the same strides) must be
+  right or be declined by name in `supports_op`; it must not be admitted untested.
+- F16 and BF16 SCALE keep whatever they do today.
+- The view's storage is read through its root with its offset, as the other device kernels here read a view;
+  a raw pointer is a transient view of the operand and is not stored.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (`scale_f32`, `ggml_sycl_op_scale`, the `GGML_OP_SCALE` case
+of `supports_op`), `tests/test-backend-ops.cpp` (`test_scale`), one source contract if a pin of the SCALE case
+exists.
+
+**Acceptance criteria:**
+- [ ] RED first: `test_scale` gains strided-source cases (a `ggml_view_3d` half of a wider tensor with
+      `nb1` twice the row size, the upper half so the offset is not zero; one with a bias; one in place).
+      Before the fix the SYCL backend reports them not supported.
+- [ ] Lead, by hand, one run per card: `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops -o SCALE`
+      prints every SCALE case OK and none "not supported".
+- [ ] Lead, one run each: Inkling gate on the B70 passes and the scheduler print has no SCALE-only CPU split;
+      Mistral B70 and GPT-OSS B50 gates pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** fusing the SiTU chain into one kernel (a Stage 3 candidate), other ops that decline a
+strided source.
+
+---
+
+### Task 8g: BF16 experts have a device kernel (recorded 2026-11-22)
+
+**Found by:** the scheduler print: the 8 `MUL_MAT_ID` nodes of `blk.20..23` (`ffn_gate_up_exps` 1296 MB,
+`ffn_down_exps` 648 MB, BF16) run on the CPU, and their SiTU chain (16 SCALE, 8 TANH, 8 MUL, 4 SIGMOID) is
+dragged there with them: 4 CPU splits per token.
+**Read (explorer):** the indexed-ops block of `supports_op` declines on
+`!moe_mmvq_admission_supports_type(BF16) && !ggml_sycl_moe_pp_batched_admits_op`. The device expert tables
+(`moe-mmvq-tables.hpp`) list the quantized types and MXFP4; F32, F16 and BF16 are absent, and the "f16 arm"
+dequantizes quantized experts into F16, it is not an F16 weight route. A dense BF16 `MUL_MAT` weight does run
+on the card. Not resolved: the CPU `MUL_MAT_ID` reads weights the print shows as `[SYCL0]` with no copy in the
+split's inputs.
+**Direction (lead):** a kernel for the layout the weight is in: BF16 experts through an indexed matvec on the
+card (decode) and an indexed matmul for a prompt batch, taking the expert slices where they are. Not written
+out: it is the one cause that needs a new kernel, it removes 4 of 141 CPU splits, and Stage 2's profile says
+what those four cost. The unresolved read above is settled first.
+**Done when:** written to the Task Detail Standard after the profile, or dropped by it with the reason recorded.
+
+---
+
+### Task 8h: `GET_ROWS` admits the BF16 arm its kernel has (found 2026-11-22)
+
+**Track:** M (kernels), after Task 8f on the same branch line or in its own worktree (the two edits are in
+different cases of `supports_op`). **Depends on:** none.
+**Found by:** the scheduler print: split #0 of every token is a CPU `GET_ROWS` of `token_embd.weight` (BF16,
+2304 x 201024, 883 MB, resident on SYCL0), so the first thing every token does is leave the card.
+**Read (explorer):** `ggml_sycl_get_rows_type_supported` (`ggml/src/ggml-sycl/get-rows-support.hpp`) admits F16,
+F32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q4_K and Q6_K. The kernel has a BF16 arm (`getrows.cpp`,
+`get_rows_sycl_float` with `bfloat16`). `tests/test-sycl-get-rows-q4-k-source.py` checks that every admitted type
+has an arm. The ids being a CPU tensor is not the cause: 233 other GET_ROWS nodes run on SYCL0 from copied ids.
+Whether the BF16 arm has ever run is not known.
+
+**Ruling (lead, 2026-11-22):** the predicate says what the kernel can do. BF16 joins the list if and only if
+the arm is right, and the device test decides that.
+
+**File scope:** `ggml/src/ggml-sycl/get-rows-support.hpp`, `ggml/src/ggml-sycl/getrows.cpp` only if the arm is
+wrong, `tests/test-backend-ops.cpp` (`test_get_rows` cases), `tests/test-sycl-get-rows-q4-k-source.py`.
+
+**Acceptance criteria:**
+- [ ] RED first: `test_get_rows` BF16 cases (the small shape, a view case, and one with more rows than a
+      16-bit index holds, as the existing wide cases do for other types). Before the fix the SYCL backend
+      reports them not supported. The source contract lists BF16.
+- [ ] Lead, by hand, one run per card: `./build/bin/test-backend-ops -o GET_ROWS` prints every case OK.
+- [ ] Lead: the Inkling scheduler print has no CPU GET_ROWS; the Inkling B70, Mistral B70 and GPT-OSS B50 gates
+      pass.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+---
+
 ### Task 9: Stage 1 exit gates
 
 **Track:** L (lead; GPU)
