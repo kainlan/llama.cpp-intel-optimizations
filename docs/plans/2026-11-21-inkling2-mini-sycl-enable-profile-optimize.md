@@ -6034,8 +6034,10 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
   exit, an expert moving from card to host between nodes. A marker failure on the no-throw path can leave the
   job waiting (the MXFP4 marker jobs have the same exposure). The join holds a SYCL host-task thread for the
   job's whole run.
-- Task 8c, second card: a `residency=secondary` operand is still refused by name
-  (`[MOE-DECODE-REFUSAL] ... failed=card_or_host`); no witness run exists. Task 8d's.
+- Task 8c, second card: the direct route does not take a `residency=secondary` operand and says so by name. Since
+  the storage-tier merge of 2026-11-23 that line is a decline (`[MOE-DIRECT-DECLINE] ... failed=card_or_host`), and
+  the op goes on to the retained core. No run exists of either the decline or what the retained core then does with
+  such an operand. Task 8d's.
 - The lead's gate scoring counted the two-GPU startup warning as a lost device (`device_lost: 1`). The
   scratch runner ignores that line now; `scripts/sycl-canonical-gates.sh` should own the check.
 - A lead mistake to keep out of the next round: a throughput pair was read while implementer builds started

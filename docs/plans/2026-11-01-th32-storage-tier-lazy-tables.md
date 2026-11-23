@@ -61,6 +61,10 @@ look for, never where it is.
   and th32 T2-T8 with T9q acceptance (Qwen, §8.2-8.3). T9d waits for 9g22, yl3v, s4ip.
 - **Merge unit** (th32 c-0elm, 5efe c-q50c): 5efe C1-C4 and th32 T6 and T7 reach master in **one merge**. Nothing in this
   plan lands on master before Task 30. The integration branch merges master in at every wave boundary instead.
+  **Lifted by the owner on 2026-11-23:** the plan is paused after Task 16, and the owner asked for `integ/th32` to land
+  on master as it stood (75e6b5861, Tasks 1 to 16 and their follow-ups), provided master stays stable and no slower.
+  It was merged with master's Inkling 2 line (b3e761180) on the branch `merge/th32-into-master`. Tasks 17 to 30 start
+  from master.
 - **Owner's loader edit, COMMITTED on master as 5eb8407fc on 2026-11-01 after the lead's B50 gate at the default and 40 % budgets (ir18 ticket); the paragraph below is the state at plan-writing time, kept for the record. integ/th32 merges master at the Task 1 review boundary to carry it.** (`src/llama-model-loader.cpp`, +24/-3: `selected_layer_dev`, hooks resolved from the
   layer device, OUTPUT-duplicated to TOKEN_EMBD op mapping, `register_host_weight` guarded on the final device's hooks;
   the ir18 SIGBUS fix). It is one of the nine owner-dirty paths nobody but the owner touches. The lane changes the same

@@ -79,6 +79,10 @@ for this runtime: (b) shows it uses the queue's handler, falling back to the con
 5. **graph_compute** refuses, before any submission, every graph of a context that has seen a failure.
    **synchronize** of such a context reports and runs the boundary cleanup on its first failed call, then returns. Both
    tasks add no host wait.
+   **Amended 2026-11-23, when the storage-tier line was merged in:** decisions 4 and 5 hold for every drain failure
+   except a device loss. When the device-lost latch is set, synchronize prints the `[SYCL-SYNC-DIAG]` line and ends the
+   process at once with exit 69, before the report and the cleanup: the driver's teardown can hang on a lost card, and
+   a hang holds the card (`docs/backend/SYCL.md`). `test-sycl-fatal-exit-sync` is the device test of that case.
 6. **Terminals.** The direct route's terminal (7a) and the retained-graph terminal (7b) never report success once the
    latch has moved past a cursor taken before their first submission. *Amended 2026-11-21 (commit 4):* this is a
    rule about success (`observe_success()`), not about `ready()`. `device_terminal::ready()` means "the terminal's
