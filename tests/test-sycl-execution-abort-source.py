@@ -284,9 +284,16 @@ checks = {
 # graphlets dispatch nodes without compute_impl, so before they opened the same scope an op there found the graph a
 # synchronize had already released: the Q1_0/NVFP4 direct route declined with failed=graph_epoch,invocation_id on
 # the first decode split that took a keyed slot. The census below starts from graph_compute_unchecked's body, follows
-# every top-level function it calls down to a node dispatch, and requires that function to open the dispatch scope
-# before its first dispatch.
-DISPATCH_CALL = re.compile(r"\b(?:ggml_sycl_compute_forward|moe_graph_dispatch_direct_node)\s*\(")
+# every top-level function it calls down to a node dispatch, and requires that function to declare the dispatch scope
+# in its outermost block, so the scope lives to the function's end, with every dispatch after it and only the
+# statements listed for that function in PRE_SCOPE_CALLS before it.
+#
+# A node dispatch is a call of compute_forward, compute_forward_impl or the direct-node helper, or of an op entry point
+# compute_forward_impl's op switch hands the context to, so a path that calls an op directly is counted too.
+DISPATCH_ANCHORS = ("ggml_sycl_compute_forward", "ggml_sycl_compute_forward_impl", "moe_graph_dispatch_direct_node")
+DISPATCH_OP_SWITCH = re.compile(r"\bswitch\s*\(\s*dst->op\s*\)\s*\{")
+DISPATCH_OP_CALL = re.compile(r"\b(ggml_sycl_\w+)\s*\(\s*ctx\b")
+CALL = re.compile(r"\b(\w+)\s*\(")
 DISPATCH_SCOPE_OPEN = re.compile(r"\bggml_sycl_execution_dispatch_scope\s+\w+\s*\(\s*\w+\s*\)\s*;")
 DISPATCH_ROOT = "ggml_backend_sycl_graph_compute_unchecked"
 DISPATCH_DEPTH = 3
@@ -312,13 +319,14 @@ def matching_close(text, open_at, opening="{", closing="}"):
 
 
 def function_bodies(blank):
-    """name -> body of every column-0 `static` function definition in the blanked source."""
+    """name -> body of every column-0 `static` function definition in the blanked source, function-try-blocks
+    included (compute_forward_impl is one)."""
     bodies = {}
     for m in re.finditer(r"^static\b[^;{}()]*?\b(\w+)\s*\(", blank, re.M):
         params_close = matching_close(blank, m.end() - 1, "(", ")")
         if params_close < 0:
             continue
-        tail = re.match(r"\s*(?:const\s*)?(?:noexcept\s*)?\{", blank[params_close + 1:])
+        tail = re.match(r"\s*(?:const\s*)?(?:noexcept\s*)?(?:try\s*)?\{", blank[params_close + 1:])
         if not tail:
             continue
         open_at = params_close + 1 + tail.end() - 1
@@ -328,44 +336,69 @@ def function_bodies(blank):
     return bodies
 
 
+def dispatch_names(bodies):
+    """The calls that dispatch a node: the anchors and every op entry point the op switch of compute_forward_impl
+    hands the context to. None when the switch is gone, so the census cannot shrink to the anchors unnoticed."""
+    impl = bodies.get("ggml_sycl_compute_forward_impl", "")
+    switch = DISPATCH_OP_SWITCH.search(impl)
+    if not switch:
+        return None
+    cases = impl[switch.end() - 1:matching_close(impl, switch.end() - 1) + 1]
+    return set(DISPATCH_ANCHORS) | {call.group(1) for call in DISPATCH_OP_CALL.finditer(cases)}
+
+
 def dispatch_scope_violations(source):
-    """Functions graph_compute_unchecked calls that reach a node dispatch with no dispatch scope opened before it."""
+    """The functions graph_compute_unchecked calls that reach a node dispatch outside a dispatch scope, each with the
+    reason: no scope, a scope in a nested block, a dispatch before the scope, or an unlisted call before it."""
     bodies = function_bodies(blank_comments_and_literals(source))
     root = bodies.get(DISPATCH_ROOT)
     if not root:
         return [DISPATCH_ROOT + " not found"]
+    dispatch = dispatch_names(bodies)
+    if dispatch is None or not {"ggml_sycl_mul_mat", "ggml_sycl_mul_mat_id"} <= dispatch:
+        return ["the op switch of ggml_sycl_compute_forward_impl yields no matmul entry point"]
     memo = {}
 
-    def first_dispatch(name, depth):
-        """Offset in `name`'s body of the first call that reaches a node dispatch within `depth` levels, or None."""
+    def reaches(name, depth):
+        """Whether `name`'s body calls a node dispatch within `depth` further levels."""
         key = (name, depth)
-        if key in memo:
-            return memo[key]
-        memo[key] = None  # a recursive cycle reaches nothing new
-        body = bodies[name]
-        found = None
-        for call in re.finditer(r"\b(\w+)\s*\(", body):
-            if DISPATCH_CALL.match(body, call.start()):
-                found = call.start()
-                break
-            callee = call.group(1)
-            if depth > 0 and callee != name and callee in bodies and first_dispatch(callee, depth - 1) is not None:
-                found = call.start()
-                break
-        memo[key] = found
-        return found
+        if key not in memo:
+            memo[key] = False  # a recursive cycle reaches nothing new
+            memo[key] = any(call.group(1) in dispatch or (depth > 0 and call.group(1) != name
+                                                          and call.group(1) in bodies
+                                                          and reaches(call.group(1), depth - 1))
+                            for call in CALL.finditer(bodies[name]))
+        return memo[key]
 
     violations = set()
-    callees = {call.group(1) for call in re.finditer(r"\b(\w+)\s*\(", root)}
+    callees = {call.group(1) for call in CALL.finditer(root)}
     for callee in sorted(callees):
         if callee == DISPATCH_ROOT or callee not in bodies:
             continue
-        at = first_dispatch(callee, DISPATCH_DEPTH)
-        if at is None:
+        if callee in DISPATCH_EXEMPT:
+            if not reaches(callee, DISPATCH_DEPTH):
+                violations.add(callee + ": exempt but reaches no node dispatch")
             continue
-        scope = DISPATCH_SCOPE_OPEN.search(bodies[callee])
-        if not scope or scope.start() > at:
-            violations.add(callee)
+        body = bodies[callee]
+        sites = [call for call in CALL.finditer(body)
+                 if call.group(1) in dispatch or (call.group(1) != callee and call.group(1) in bodies
+                                                  and reaches(call.group(1), DISPATCH_DEPTH - 1))]
+        if not sites:
+            continue
+        scope = DISPATCH_SCOPE_OPEN.search(body)
+        if not scope:
+            violations.add(callee + ": no dispatch scope")
+            continue
+        if body.count("{", 0, scope.start()) - body.count("}", 0, scope.start()) != 1:
+            violations.add(callee + ": the dispatch scope is declared in a nested block")
+        if sites[0].start() < scope.start():
+            violations.add(callee + ": " + sites[0].group(1) + " dispatches before the scope")
+        listed = PRE_SCOPE_CALLS.get(callee, frozenset())
+        before = {call.group(1) for call in CALL.finditer(body, 0, scope.start()) if call.group(1) in bodies}
+        for name in sorted(before - listed):
+            violations.add(callee + ": " + name + " runs before the scope and is not listed")
+        for name in sorted(listed - before):
+            violations.add(callee + ": listed pre-scope call " + name + " no longer precedes the scope")
     return sorted(violations)
 
 
@@ -383,6 +416,41 @@ DISPATCH_SCOPE_OWNERS = {
     "moe_graph_record_segments",
     "moe_graph_replay_segments",
     "moe_graph_try_block_graphlets",
+}
+
+# The calls into this file's functions that may run before a path's scope. None of them reaches a node; a new one
+# must be added here on purpose. A path not named here may run none.
+PRE_SCOPE_CALLS = {
+    # The per-graph precomputed-skip reset, before the compute guard is taken.
+    "ggml_backend_sycl_graph_compute_impl": frozenset({"ggml_sycl_moe_precomputed_skip_new_graph"}),
+    "moe_graph_try_block_graphlets": frozenset({
+        # The aggregation decision and its diagnostics, which may still decline the graphlets.
+        "ggml_sycl_graph_diag_enabled",
+        "ggml_sycl_moe_aggregation_diag",
+        "moe_aggregation_selected_decision",
+        "moe_block_graphlet_requested_size",
+        "moe_default_fast_path_policy_for_decode",
+        # The dispatch identities the recorded graphlets are matched against.
+        "moe_graph_collect_dispatch_indices",
+        "moe_graph_descriptor_moe_dispatch_candidate_count",
+        "moe_graph_sequence_dispatch_identity_signature",
+        "moe_sequence_graphlet_mode_hash",
+        # The per-graph cache resets compute_impl's flush would do.
+        "ggml_sycl_moe_ids_cache_new_graph",
+        "moe_shared_act_new_graph",
+        # The input prestage, which may decline the graph, and the input refresh.
+        "graph_prestage_or_decline",
+        "graph_refresh_input_tensors",
+    }),
+}
+
+# graph_compute_unchecked's callees that call an op entry point and open no scope, with the reason.
+DISPATCH_EXEMPT = {
+    name: "the opt-in persistent TG executor (GGML_SYCL_PERSISTENT_TG) runs a graph as one fused kernel; its plan "
+          "builder and SET_ROWS validator call an op entry point only as a debug reference under "
+          "GGML_SYCL_PERSISTENT_TG_USE_BASE_* or the validator, and wait on the queue after it. "
+          "should_use_persistent_tg declines every MoE graph, so the MoE direct route never runs there."
+    for name in ("extract_persistent_plan", "extract_persistent_plan_split", "debug_validate_persistent_set_rows")
 }
 
 dispatch_violations = dispatch_scope_violations(backend)
@@ -424,11 +492,15 @@ GRAPHLETS_REFRESH = (
     "    // Replay and record both run nodes here, outside compute_impl.\n")
 UNCHECKED_OPEN = (
     "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {")
+REPLAY_SEGMENTS_OPEN = (
+    "static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {\n"
+    + SCOPE_DECL)
 dispatch_mutants.update({
     # The scope closes with the block it was declared in, before the slot's first node.
     "scope-in-dead-block": backend.replace(
         REPLAY_SLOT_SCOPE,
-        REPLAY_SLOT_SCOPE.replace(SCOPE_DECL, "    { ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx); }\n"),
+        REPLAY_SLOT_SCOPE.replace(SCOPE_DECL,
+                                  "    { ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx); }\n"),
         1),
     # A temporary scope ends at its own semicolon.
     "scope-temporary": backend.replace(
@@ -455,6 +527,20 @@ dispatch_mutants.update({
         "    graph_refresh_input_tensors(sycl_ctx, cgraph);\n"
         "    ggml_sycl_moe_precomputed_skip_new_graph();\n"
         "    // Replay and record both run nodes here, outside compute_impl.\n", 1),
+    # A node runs before a top-level scope.
+    "dispatch-before-scope": backend.replace(
+        REPLAY_SEGMENTS_OPEN,
+        REPLAY_SEGMENTS_OPEN.replace(SCOPE_DECL,
+                                     "    ggml_sycl_compute_forward(*sycl_ctx, cgraph->nodes[0]);\n" + SCOPE_DECL),
+        1),
+    # A listed pre-scope call that moved after the scope leaves the list wider than the code.
+    "listed-call-moved-after-scope": backend.replace(
+        GRAPHLETS_REFRESH + SCOPE_DECL,
+        "    // Replay and record both run nodes here, outside compute_impl.\n" + SCOPE_DECL
+        + "    graph_refresh_input_tensors(sycl_ctx, cgraph);\n", 1),
+    # An exempt function that no longer calls an op entry point keeps an exemption it does not need.
+    "exemption-outlives-its-op-call": backend.replace(
+        "    ggml_sycl_op_set_rows(ctx, ggml_sycl::sycl_tensor(&dst, ctx.device));\n", "", 1),
 })
 
 checks.update({
