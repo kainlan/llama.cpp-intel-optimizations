@@ -83466,8 +83466,9 @@ static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int devic
 // op the route runs, decode and prompt alike. Placement decides the executor: with a placement plan for `device`, only
 // the plan answers, and it must put every expert of the weight on `device` at AOS, the layout a BF16 expert is loaded
 // in; a weight with an expert on the host or on another card is left to the backend that holds it. Without a plan
-// (test-backend-ops' graphs, ordinary backend allocations), a weight in this device's own SYCL device buffer counts:
-// the route publishes its expert slices from that buffer.
+// (test-backend-ops' graphs, ordinary backend allocations), a weight that nothing has placed yet counts, because the
+// caller allocates it on the backend it asked (test-backend-ops asks supports_op before it allocates), and a placed
+// weight counts only in this device's own SYCL device buffer: the route publishes its expert slices from that buffer.
 static bool ggml_sycl_moe_bf16_direct_route_available(const ggml_tensor * op, int device) {
     if (op == nullptr || op->op != GGML_OP_MUL_MAT_ID || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return false;
@@ -83480,7 +83481,10 @@ static bool ggml_sycl_moe_bf16_direct_route_available(const ggml_tensor * op, in
         return false;
     }
     // The kernel reads each expert as one contiguous matrix and each activation and output row as contiguous floats.
-    if (!ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) || op->nb[0] != sizeof(float)) {
+    // The expert records live on the weight's own extra and the AOS publisher publishes only a root tensor, so a view
+    // of the weight has no table the route could build.
+    if (src0->view_src != nullptr || !ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) ||
+        op->nb[0] != sizeof(float)) {
         return false;
     }
     const auto plan = ggml_sycl_moe_plan_owner_for_device(device);
@@ -83488,8 +83492,11 @@ static bool ggml_sycl_moe_bf16_direct_route_available(const ggml_tensor * op, in
         layout_mode layout = GGML_LAYOUT_AOS;
         return ggml_sycl_moe_tensor_plan_primary_layout(*plan, src0, device, &layout) && layout == GGML_LAYOUT_AOS;
     }
-    const bool sycl_buffer = src0->buffer != nullptr && ggml_backend_buffer_is_sycl(src0->buffer) &&
-                             !ggml_backend_buffer_is_sycl_split(src0->buffer);
+    if (src0->buffer == nullptr) {
+        return true;
+    }
+    const bool sycl_buffer =
+        ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer);
     if (!sycl_buffer) {
         return false;
     }
