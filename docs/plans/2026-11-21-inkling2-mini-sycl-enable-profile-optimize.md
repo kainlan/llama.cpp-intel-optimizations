@@ -4333,6 +4333,52 @@ one source contract.
 **Not in this task:** the speed of attention on the card, a card too small for the model (the B50's hybrid
 layers), the BF16 experts.
 
+**DONE 2026-11-22, merged as `70292d66e`.** Task commits: `b4c687446`..`d6822101d` (first round), `131f17266`,
+`10a0db1ee` (RED), `8050f81b3`, `60adba46f`, `b04a25680`, `ada7ce225` (RED), `4ddfb9137` (hrm_text),
+`6b73fda3c` (docs), `d96e480cb` (the unowned-alias mutant, a docstring, the scan's limits). Review PASS WITH
+FINDINGS, one fix round, re-review PASS WITH FINDINGS with all nine items fixed.
+
+*What was built:* `ggml_sycl_tensor_inventory` carries `kv_layer_phys` and its count; `llama_model` has
+`virtual int layer_phys(int il) const` with overrides in inkling2_loop, nanbeige, metis16 and hrm_text (the
+last three written from their graph builders, not run on a model). The intake copies the map (empty means
+identity; a null map with a count, a count mismatch or an out-of-range entry gives one WARN and identity).
+The planner places KV per cache slot on the device of the layer that executes it. The contract is
+`tests/test-sycl-kv-slot-layer-source.py` (37 tests).
+
+*Device results on the merged tree (`baf7cf05a`, the docs commit on `70292d66e`), each run once, zero kernel
+fault lines* (`docs/backend/data/inkling2/t8e-merged-chain-baf7cf05a.txt`):
+- `sycl-q1-nvfp4-admitted-device` on the B70 and on the B50: pass, 56 PASS lines each, 0 context-bind lines.
+  `sycl-q1-nvfp4-adapter-device` on the B70: pass.
+- Inkling gate, B70: `1, 2, ... 10`, 0 refusals. Inkling gate, both cards: the same.
+- Mistral B70 and GPT-OSS B50 gates pass; their plan lines differ from `integ-plan-d2ac34ce1` only in
+  measured milliseconds and one RSS figure.
+- The Inkling plan prints `kv_layers device=48 host=0`.
+- Split census, B70: 9 splits per token, 4 on the CPU, and the 4 are the BF16 expert nodes (Task 8g). The
+  tree before this task had 105 and 52.
+- Both sweeps: sweep 1 fails the known-red eight of 209, sweep 2 passes 22 of 22, none skipped.
+- Not run: `test-llama-archs`; Inkling on the B50 alone (Task 8c); nanbeige, metis16 and hrm_text on a model.
+
+*Speed: no change.* Interleaved ABBA on the B70, one load per arm, previous tree (`0f4060d0f`) against the
+merged tree (`docs/backend/data/inkling2/t8e-ab-b70-baf7cf05a.txt`): merged pp512 43.17 and 42.98, tg128 4.33
+and 4.27 t/s; previous pp512 41.12, tg128 4.54 t/s in its clean arm (its other arm, 34.18 and 4.27, overlapped
+the lead's contract sweep and is not used). The differences are inside the B70's run-to-run noise. A first
+single sample of the merged tree, 38.15 and 3.91, was taken beside the same sweep and is not a result.
+
+*Why decode did not move (profile and trace, one run each, B70):*
+- The run is 163802 SYCL dispatches over 24 graph passes (the prompt and 23 decoded tokens), about 6800 per
+  pass, and their host time is 5929 ms of about 6940 ms of prompt and decode wall time
+  (`docs/backend/data/inkling2/t8-profile-stage-totals-2026-11-22.txt`). Decode is host dispatch.
+- The "replay futility" refusal is gone: segmented recording now runs. 88 segments then fail at a
+  `REPEAT` node with `bin-broadcast raw host staging is not graph-recordable` (no other failure is
+  printed), each split's key is marked failed, and no segment replays for the rest of the context.
+- The `REPEAT` sources that stage are the per-expert `.scale` tensors of the NVFP4 layers
+  (`blk.N.ffn_gate_up_exps.scale`, `blk.N.ffn_down_exps.scale`, 512 bytes): 88 per decoded token. Each one
+  is a plain host pointer, the cache's direct stage declines it (`ok=0`, `model=0`), and the op then makes a
+  blocking host-to-device copy and waits on the whole queue
+  (`docs/backend/data/inkling2/t8i-binbcast-stage-census-baf7cf05a.txt`). This is Task 8i.
+- The outputs of the 4 BF16 CPU splits (`ffn_moe_weighted-2X`, `ffn_moe_down-2X`) stage the same way; they
+  go away with Task 8g.
+
 ---
 
 ### Task 8f: `SCALE` reads a strided source (found 2026-11-22)
@@ -4458,29 +4504,46 @@ only the segments between them replay.
   `tests/test-sycl-canonical-aos-expert-handles-source.py`, `tests/test-sycl-moe-resolved-batch-source.py`,
   `ggml/src/ggml-sycl/tests/test-q1-nvfp4-direct-mmvq.cpp`.
 
-**Ruling (lead, 2026-11-22): a BF16 arm of the admitted direct route.** The weight is loaded BF16, AOS, on the
-card; the kernel reads it there.
-- A new submitter beside `mmvq_submit_q1_nvfp4_aos_id_admitted`, in its own file. It reads the expert pointer
-  from the retained table by the id it reads on the device from the ids tensor, reads the activation row from
-  `activation_f32` where it is, converts each weight with `bf16_to_f32`, accumulates in F32 and writes the
-  output row. Decode (`ne12 == 1`) and a prompt batch (`ne12 > 1`) are one kernel.
-- No Q8_1 activation, no dequantized or F16 copy of the weights, no staging copy, no per-expert host loop, no
-  host read of the ids for the device leg, no host wait. The submitter returns its event the way the
-  Q1_0/NVFP4 submitter does, and a failure reaches the graph boundary through the same path.
-- The MMVQ tables do not change: a float type is not an MMVQ type. `supports_op` gets a named predicate for
-  the float direct route beside the MMVQ term.
-- `supports_op` admits a BF16 `MUL_MAT_ID` only where this route can run it: the shapes the kernel takes, and
-  every expert of the tensor on this context's device. A BF16 expert tensor with any expert on the host or on
-  the other card stays where it runs today (the CPU). That mix is owed after Task 8c, which builds the mixed
-  executor for the direct route; it is recorded, not done here.
-- A slot the kernel cannot read (null, or an id out of range) gives a NaN row, as Task 8c rules for the
-  Q1_0/NVFP4 kernel. Nothing reads through a null slot.
-- The kernel does not inherit the 32-multiple shape rule unless it needs it. If the route's workspace
-  machinery demands a workspace this kernel does not use, the checkpoint says so and proposes the smallest
-  change; a shape the route cannot take is declined in `supports_op`, never refused inside the op.
-- Rejected: an arm in `mmvq_moe_batched_dispatch` (it contradicts the tables' invariant and has the widest
-  surface); one dense BF16 kernel launch per (token, slot) through `src0_row` (it needs the ids on the host,
-  which is a wait, and it is one launch per occurrence).
+**Ruling (lead, 2026-11-22, amended the same day after the checkpoint): a BF16 route of its own, ahead of the
+admission.** The weight is loaded BF16, AOS, on the card; the kernel reads it there.
+- *What changed and why.* The first ruling put the BF16 arm inside the admitted direct block. The checkpoint
+  showed that block cannot meet the ruling's own constraints: it runs only after an admission that copies the
+  ids to the host and waits for them (`ggml_sycl_copy_ids_to_host` under `MOE_WAIT_B1` for decode,
+  `ggml_sycl_refresh_moe_ids_cache` for a prompt), and its workspace admission demands the Q8_1 slices, the
+  32-multiple geometry and a planner pool that a float kernel does not use. The constraints were the point;
+  the location was the means. The location moves.
+- A new submitter in `ggml/src/ggml-sycl/moe-bf16-direct.{hpp,cpp}` and one route block in
+  `ggml_sycl_mul_mat_id`, ahead of the MMID_SCHED check and the decode direct MMVQ block. The pointer table is
+  the tensor's full-coverage table (`moe_fusion_ensure_full_local_ptr_table`, AOS). The ids are read where
+  they are (`ggml_sycl_moe_ids_device_resident_ptr`). `src1` is read in place with its own strides and `dst`
+  is written in place. Decode (`ne12 == 1`) and a prompt batch are one kernel: one sub-group of 16 lanes per
+  output row of one occurrence, F32 accumulation, `bf16_to_f32` per weight.
+- No admission, no MMID workspace, no Q8_1 activation, no dequantized or F16 copy of the weights, no staging
+  copy, no host read of the ids, no host wait. The kernel's event keeps the table's leases
+  (`ggml_sycl_retain_moe_ptr_table_leases_until_event`).
+- One predicate, `ggml_sycl_moe_bf16_direct_route_available(op, device)`, asked by `supports_op` and by the
+  route, so the two cannot drift. It has no 32-multiple rule. With a placement plan known, the plan answers:
+  every expert of the tensor on this device, AOS (`ggml_sycl_moe_tensor_plan_primary_layout`). With no plan
+  known (test-backend-ops), a weight in this device's SYCL device buffer counts, on the condition that the
+  lead's `test-backend-ops -o MUL_MAT_ID` run shows no FAIL and no abort for BF16; otherwise it is plan-only.
+- The MMVQ tables do not change: a float type is not an MMVQ type. The direct block, `moe-resolved-batch.hpp`,
+  `unified-cache.cpp`, `mmvq.cpp` and `moe-mmid-workspace.*` do not change, so there is no overlap with
+  Task 8c.
+- A BF16 expert tensor with any expert on the host or on the other card stays where it runs today (the CPU).
+  That mix is owed after Task 8c; it is recorded, not done here.
+- An id of -1 gives a zero row (ggml's skip contract, which the CPU follows). Any other out-of-range id and a
+  null slot give a quiet NaN row. Nothing reads through a slot it has not checked.
+- If the plan says the experts are on this device and the table cannot be built at run time, the route uses
+  the cache's existing materialization call if there is one, and otherwise prints one named WARN line and
+  throws `ggml_sycl_fallback_error` so the graph fails at its boundary. No abort, no re-route inside the op.
+- Under command-graph recording a BF16 node does what the NVFP4 nodes of the same model do and disables
+  nothing more than they do.
+- Read before GREEN, not inferred: the preload materializes the BF16 experts at AOS on the card; the AOS
+  expert address rule holds for BF16; nothing at graph level claims the node first; the reason for the decode
+  direct block's single-device restriction; the route sits after the op-entry flush of a pending host scatter.
+- Rejected: the admitted direct block (above); an arm in `mmvq_moe_batched_dispatch` (it contradicts the
+  tables' invariant); one dense BF16 launch per (token, slot) through `src0_row` (host ids, a wait, one launch
+  per occurrence).
 
 **Checkpoint before any code (report to the lead, then wait):**
 1. How the CPU backend reads these experts today, given that the scheduler print shows them as `[SYCL0]` with
@@ -4496,22 +4559,25 @@ card; the kernel reads it there.
    `mul_mat_bf16_f32` and `mul_mat_vec_q_id` do, and its cost for the two Inkling shapes.
 6. Every contract that must change, with the claim each one keeps.
 
-**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (`supports_op` MoE block, the direct block's route
-condition and decline lines), a new `ggml/src/ggml-sycl/moe-bf16-direct.{hpp,cpp}`,
-`ggml/src/ggml-sycl/moe-resolved-batch.hpp` and `ggml/src/ggml-sycl/unified-cache.cpp` only as far as
-checkpoint item 4 requires, `ggml/src/ggml-sycl/tests/` (a device test through the production fixture, with
-its CMake registration and label), `tests/test-backend-ops.cpp` only if a case is missing, and the contracts
-listed above.
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (`supports_op` MoE block, the predicate, the one route
+block), a new `ggml/src/ggml-sycl/moe-bf16-direct.{hpp,cpp}`, a new device test
+`ggml/src/ggml-sycl/tests/test-moe-bf16-direct-device.cpp` with its CMake registration and `device` label,
+a new contract `tests/test-sycl-moe-bf16-direct-source.py`, and the two contracts that pin the gate line
+(`tests/test-sycl-supports-op-indexed-moe-source.py`, `tests/test-sycl-moe-pp-batched-types-source.py`).
+The other contracts in the list above do not move under the amended ruling, and
+`tests/test-sycl-moe-mmvq-tables.cpp` never did.
 
 **Acceptance criteria:**
 - [ ] RED commit first: the contracts fail on the admitted set, and the device test has BF16 cases the lead
       sees fail before the fix.
 - [ ] Device test through the production fixture, both Inkling shapes (one input row, and one input row per
-      selected expert), decode and a prompt batch, one shape whose dimensions are not multiples of 32 if the
-      kernel admits it. The oracle is the CPU result for every row. A null slot's row and an out-of-range
-      id's row are NaN.
-- [ ] Lead, by hand, one run per card: `test-backend-ops -o MUL_MAT_ID` has no FAIL; every BF16 case is OK or
-      "not supported"; no other case changes against the integ tree's run of the same command.
+      selected expert) with 8 experts, and one shape whose dimensions are not multiples of 32, each for
+      decode and a prompt batch. The oracle is the CPU result for every row. A tensor the plan does not
+      contain and a strided expert view are declined by `supports_op`. At the submitter level: a null
+      slot's row and an out-of-range id's row are NaN, and an id of -1 gives a zero row.
+- [ ] Lead, by hand, one run per card: in `test-backend-ops -o MUL_MAT_ID` every BF16 case is OK or
+      "not supported", and no other case changes against the integ tree's run of the same command
+      (`integ-tbo-mmid-baf7cf05a`).
 - [ ] Lead, one run each: the Inkling gate on the B70 passes; the scheduler print has no CPU split that holds
       a `MUL_MAT_ID`, and the split census is recorded; the Inkling gate on both cards passes; the Mistral
       gate on the B70 and the GPT-OSS gate on the B50 pass with unchanged plan lines.
@@ -4525,8 +4591,12 @@ graph, fusing the SiTU chain, the speed of the prompt batch beyond being correct
 
 **Gotchas:**
 - Task 8c is editing the direct block, `mmvq.cpp`, `moe-resolved-batch.hpp` and `moe-mmid-workspace.*` at the
-  same time. Add beside, do not rename or re-sign what the Q1_0/NVFP4 arm uses, and list every shared helper
-  you touch. Whichever task merges second merges `feat/inkling2` first.
+  same time. Under the amended ruling this task edits none of them. Whichever task merges second merges
+  `feat/inkling2` first.
+- The baseline `test-backend-ops -o MUL_MAT_ID` run on the merged tree is not clean: 150 FAIL on the B70 and
+  151 on the B50 before this task (111 are the `skip=1` cases of every admitted type, 37 are the MXFP4,
+  NVFP4 and Q1_0 cases whose routes need a placement plan). The criterion is "no BF16 FAIL and no other
+  case changes", not a clean run. The baseline failures are recorded as owed.
 - `GGML_ABORT` is not an error path. A refusal is a named decline or a thrown error that fails the graph.
 - A raw expert pointer is a transient view. The table owner's lease is what keeps the weight alive until the
   kernel's event is done.
@@ -4582,6 +4652,72 @@ path. The slice arm ships read, not run: no fixture drives `get_rows_stream_slic
 *Recorded as owed:* `supports_op`'s `GET_ROWS` arm checks type and planned layout, not placement. A table the
 plan tiered to the host reaches the stream slice, which copies a host weight to the card per call. That is
 weight streaming, which the placement ruling of 2026-08-16 forbids outside the prompt staging exception.
+
+---
+
+### Task 8i: A device layer's per-expert `.scale` tensors are on the card (found 2026-11-22)
+
+**Track:** P (placement). **Depends on:** none; branch from `feat/inkling2`. Runs beside Tasks 8c and 8g.
+
+**Found by:** the merged-tree profile and one `GGML_SYCL_BINBCAST_TRACE=1` run (B70, 4 tokens, `baf7cf05a`).
+
+**Description (trace and an explorer's read; the cause is not read yet, see the checkpoint):**
+- The model loads optional per-expert scale tensors beside the expert weights (`src/llama-model.cpp`, the
+  "generic pass" that creates `tn(LLM_TENSOR_FFN_*_EXPS, "scale", i)` with `{n_expert}` elements). Inkling's
+  NVFP4 layers have two each: `blk.N.ffn_gate_up_exps.scale` and `blk.N.ffn_down_exps.scale`, 512 bytes.
+- Each `MUL_MAT_ID` of those layers is followed by a `REPEAT` whose source is that tensor. In the trace the
+  source pointer is a plain host address while every other operand is a device address:
+  `cache-stage-try ... key_valid=1 model=0`, then `cache-stage-result ... ok=0 ptr=(nil)`, then `stage` and
+  `stage-copied` to one STAGING address. 88 times per decoded token (16 from the layers that run once, 72
+  from `blk.6..17`, which run three times).
+- That path is `stage_raw_host_source` in `ggml_sycl_op_bin_bcast` (`binbcast.cpp`): the predicate is
+  `ggml_sycl_binbcast_needs_raw_host_staging`; the copy is a synchronous
+  `ggml_sycl_graph_safe_memcpy(...).wait()`; after the kernel the op calls `main_stream->wait_and_throw()`
+  because `staged_raw_host` is set. Under graph recording it throws
+  "bin-broadcast raw host staging is not graph-recordable", which is the first failure of every decode
+  segment.
+- `moe-control-plan.cpp` lists the `.scale` names of expert tensors as `moe_expert_candidate::IGNORED`.
+- A comparable small weight, `blk.N.attn_q_clip.weight`, resolves to a device pointer with no staging.
+
+**Ruling (lead, 2026-11-22):** the tensor lives where its consumer runs. A `.scale` tensor of a layer that
+executes on a card is device-resident on that card through the unified cache, as the layer's other small
+weights are, and the op reads it there.
+- Not by teaching `REPEAT` to record a host staging, not by a per-token copy that is merely cheaper, and not
+  by changing the model's graph builder.
+- A layer that executes on the host keeps its `.scale` on the host.
+- The raw-host staging path of the bin-broadcast op is not removed in this task. Its blocking copy and its
+  queue-wide wait are a host wait on a hot path and are recorded as owed, with the census of who still
+  reaches it after this task and Task 8g.
+
+**Checkpoint before any code (report to the lead, then wait):**
+1. Where a `.scale` tensor's storage lives today (which buffer type, who allocates it) and why the cache
+   does not materialize it on the card: the intake's classification, `ggml_sycl_tensor_is_weight`, the
+   weight plan, the `IGNORED` candidate class.
+2. Why `unified_cache_direct_stage_weight` declines it (`ok=0`, `model=0`).
+3. How `blk.N.attn_q_clip.weight` becomes device-resident: the path a `.scale` tensor should take.
+4. Every tensor of this model in the same class (loaded, consumed by a device op, not planned on the card):
+   read the loader and the plan, do not load the model. Say whether GPT-OSS or Mistral has any.
+5. The consumers of `.scale` in the graph (`build_moe_ffn`), for decode and for a prompt batch.
+6. The change you propose, its RED test, and what the lead's trace run will print after it.
+
+**File scope:** set after the checkpoint. Expected: the intake and the weight plan in
+`ggml/src/ggml-sycl/unified-cache.cpp` and `ggml/src/ggml-sycl/ggml-sycl.cpp`, possibly
+`ggml/src/ggml-sycl/moe-control-plan.cpp`, and their contracts.
+
+**Acceptance criteria:**
+- [ ] RED commit first.
+- [ ] Lead, one run, B70, `GGML_SYCL_BINBCAST_TRACE=1`, 4 tokens: no `[BINBCAST] stage` line names a `.scale`
+      tensor. The `[SYCL-SEG-SLOT]` lines no longer name these `REPEAT` nodes; what they name next, or that
+      they are gone, is recorded.
+- [ ] Lead, one run each: the Inkling gate on the B70 and on both cards passes; the Mistral gate on the B70
+      and the GPT-OSS gate on the B50 pass, and every changed plan line is explained.
+- [ ] One Inkling bench load on the B70 is recorded; an interleaved A/B against the merged tree follows if
+      the sample differs by more than the B70's noise.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** removing the raw-host staging path, the bin-broadcast event mode
+(`GGML_SYCL_BINBCAST_EVENT_MODE`), removing the identity `REPEAT` of the residual query weights in the graph
+builder, the recording failures that appear after this one.
 
 ---
 
@@ -5561,6 +5697,29 @@ rewritten Stage 3 before any of it starts.
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
+
+*Left by the merged-tree runs of 2026-11-22 (`baf7cf05a`):*
+- `test-backend-ops -o MUL_MAT_ID` is not clean on the merged tree: 150 FAIL on the B70, 151 on the B50
+  (`docs/backend/data/inkling2/t8g-tbo-mmid-baseline-baf7cf05a-b70.txt`). 111 are the `skip=1` cases (expert
+  id -1) of every admitted type: no device route gives ggml's zero row for a skipped id. 37 are MXFP4, NVFP4
+  and Q1_0 cases with `skip=0`, whose routes need a placement plan the test does not have: the graph fails
+  ("graph compute failed ... not comparing"). Production top-k never emits -1, and a model load has a plan,
+  so no gate sees either.
+- The Q1_0/NVFP4 direct route copies the ids to the host and waits for them on every expert node
+  (`ggml_sycl_copy_ids_to_host` under `MOE_WAIT_B1`): 88 waits per decoded Inkling token. Task 8g's BF16
+  route reads the ids on the card from the tensor's full-coverage table. Candidate for Stage 3: the same for
+  Q1_0/NVFP4 when every expert is on the card.
+- The bin-broadcast op submits a marker per op in its default event mode and waits on the whole queue after
+  any op with a staged host source (`binbcast.cpp`). Candidates for Stage 3; the census after Tasks 8g and 8i
+  says who still stages.
+- The residual query weights (`attn_res_query`, `ffn_res_query`, `output_res_query`, `msg_query`) go through
+  a `REPEAT` that is an identity copy at one token (`src/models/inkling2.cpp`, `graph::mix`): 208 dispatches
+  per decoded token.
+- A lead mistake to keep out of the next round: the contract sweep (`-j 4`) ran beside the device chain and
+  overlapped the bench step. A bench step runs with nothing else of the lead's on the CPU.
+- From Task 8e's re-review: the commit message of `8050f81b3` words its change loosely (not amended, by
+  rule); `ALIAS_RE` in `tests/test-sycl-kv-slot-layer-source.py` scans for the aliasing forms known today and
+  its comment says so.
 
 The codescout `task_*` tools fail in the lead's session (2026-11-22: the session's index root is a directory
 that no longer exists). Until someone files these, this list is the record. Each line is one task.

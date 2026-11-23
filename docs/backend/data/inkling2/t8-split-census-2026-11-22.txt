@@ -33,3 +33,6 @@ Task 8b+8h+8f 0f4060d0f: graphs printed 40; largest graph: 105 splits, 52 CPU sp
      24 x CPU split of 1 FLASH_ATTN
       4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
     ops in CPU splits: FLASH_ATTN 24, MUL 8, MUL_MAT_ID 8, SCALE 16, SET_ROWS 48, SIGMOID 4, TANH 8
+Task 8b+8e+8f+8h baf7cf05a: graphs printed 40; largest graph: 9 splits, 4 CPU splits, 44 nodes in CPU splits
+      4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+    ops in CPU splits: MUL 8, MUL_MAT_ID 8, SCALE 16, SIGMOID 4, TANH 8
