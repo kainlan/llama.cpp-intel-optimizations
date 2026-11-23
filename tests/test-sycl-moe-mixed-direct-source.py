@@ -21,10 +21,11 @@ The claims, each failure message starting with its name:
 - host-*: the host leg refuses by name before admission (no input marker in play, a task the host recipe would refuse,
   no host workspace), never aborts, and lets a failure in its job reach the graph boundary through the join's host task.
   The host recipe's executor runs on its check's findings. A leg whose catch could not drain the queue joins the
-  bundle's quarantine through the terminal (host-quarantine). A leg lets its job go before its future goes and as it is
-  parked, and a job let go stops waiting for its input marker and runs no further task (host-let-go): the registry
-  lets a quarantined slot go at process exit before the cache abandons the marker word, std::async's future waits its
-  job, and a parked leg's marker may never be written.
+  bundle's quarantine through the terminal, unless the terminal task was submitted, which then owns its release
+  (host-quarantine). A leg lets its job go before its future goes and as it is parked, and a job let go stops waiting
+  for its input marker and runs no further task (host-let-go): the registry lets a quarantined slot go at process exit
+  before the cache abandons the marker word, std::async's future waits its job, and a parked leg's marker may never be
+  written.
 - terminal-*: the node's terminal is armed on the last host row copy, after the device output copy.
 - funnel-order: the per-op funnel flushes a pending CPU scatter on every op's path before MUL_MAT_ID is dispatched,
   which the direct block relies on to read src1 rows a deferred scatter may still owe.
@@ -429,9 +430,12 @@ def direct_violations(src: dict[str, str]) -> list[str]:
         if "mem_copy_ptr_async(" not in helpers.get(name, ""):
             found.append(f"host-copies: {name} does not copy the host rows")
 
-    try_at = find(direct, "completion->bundle.mark_possible_submit()) { try {")
+    gate_head = spaced("completion->bundle.mark_possible_submit()) {")
+    gate = find(direct, gate_head)
+    try_at = find(direct, "try {", gate) if gate >= 0 else -1
     if try_at < 0:
         return found + ["terminal-order: the submit try body was not found"]
+    before_try = direct[gate + len(gate_head):try_at].strip()
     body = direct[try_at:]
     order = [find(body, needle) for needle in (
         "ggml_sycl_moe_direct_host_gather(", "mmvq_submit_q1_nvfp4_aos_id_admitted(",
@@ -447,15 +451,25 @@ def direct_violations(src: dict[str, str]) -> list[str]:
     # buffers are not freed under a queued copy and the submitting thread does not wait its job.
     # The branch parks the leg and does nothing else to it, but let its job go (host-let-go).
     drain = find(body, "exact_queue->wait_and_throw();")
-    branch_head = spaced("} else if (completion->host_leg) {")
-    park = find(body, branch_head)
-    branch = body[park + len(branch_head) - 1:matching(body, park + len(branch_head) - 1) + 1] if park >= 0 else ""
+    head = re.search(r"\} else if \((!terminal_submitted && )?completion->host_leg\) \{", body)
+    park = head.start() if head else -1
+    branch = body[head.end() - 1:matching(body, head.end() - 1) + 1] if head else ""
     parked = branch.replace(spaced("completion->host_leg->let_go_job();") + " ", "", 1)
     if drain < 0 or park < drain or find(body, "if (quiescent) {", drain) > park or \
             find(body, "if (quiescent) {", drain) < 0 or \
             parked != "{" + spaced("terminal->quarantine_host_leg(std::move(completion->host_leg));") + "}":
         found.append("host-quarantine: a host leg whose drain failed does not join the bundle's quarantine through "
                      "the terminal")
+    # Once the terminal task is submitted it owns the leg's release: its body resets the leg on the host-task thread.
+    # A flag cleared before the try is set as that submit returns, and the catch parks the leg only while it is clear;
+    # otherwise a throw after the submit would move the leg here as that thread resets it.
+    submit = find(body, "sycl::event terminal_task = exact_queue->submit(")
+    submit_end = matching(body, submit + len(spaced("sycl::event terminal_task = exact_queue->submit(")) - 1) \
+        if submit >= 0 else -1
+    if before_try != "bool terminal_submitted = false;" or submit_end < 0 or \
+            not body.startswith("; terminal_submitted = true;", submit_end + 1) or not head or not head.group(1):
+        found.append("host-quarantine: the catch can park a host leg that the submitted terminal task releases on "
+                     "the host-task thread")
     if not has(direct, "g_q1_nvfp4_test_host_submit.fetch_add(") or \
             not has(direct, "g_q1_nvfp4_test_host_occurrences.fetch_add("):
         found.append("host-counters: the route-testing build does not count the host leg's submits")
@@ -540,8 +554,9 @@ def let_go_violations(src: dict[str, str]) -> list[str]:
         found.append("host-let-go: a job let go between its tasks runs the tasks left")
     # A parked leg's rows are never read (the graph has failed), and its marker may never be written: its job is let go
     # as it is parked, so it neither spins a core until exit nor runs tasks whose rows nothing reads.
-    if not re.search(r"\}\s*else\s+if\s*\(\s*completion\s*->\s*host_leg\s*\)\s*\{\s*completion\s*->\s*host_leg\s*->\s*"
-                     r"let_go_job\s*\(\s*\)\s*;\s*terminal\s*->\s*quarantine_host_leg\s*\(", code):
+    if not re.search(r"\}\s*else\s+if\s*\(\s*(?:!\s*terminal_submitted\s*&&\s*)?completion\s*->\s*host_leg\s*\)\s*\{"
+                     r"\s*completion\s*->\s*host_leg\s*->\s*let_go_job\s*\(\s*\)\s*;\s*terminal\s*->\s*"
+                     r"quarantine_host_leg\s*\(", code):
         found.append("host-let-go: a leg parked in the terminal keeps its job waiting for a marker that may never "
                      "come")
     header = code_of(src["signal"])
@@ -645,6 +660,11 @@ def test_mutations_are_witnessed() -> None:
         # A failed drain frees the host leg with the unwinding completion instead of parking it.
         ("sycl", r"terminal->quarantine_host_leg\(std::move\(completion->host_leg\)\);", "completion->host_leg.reset();",
          "host-quarantine"),
+        # The catch parks the leg after the terminal task was submitted, as that task resets it on its own thread.
+        ("sycl", r"\} else if \(!terminal_submitted && completion->host_leg\) \{", "} else if (completion->host_leg) {",
+         "host-quarantine"),
+        # The flag is never set, so the catch parks a leg the submitted terminal task owns.
+        ("sycl", r"(\}\);\s*)terminal_submitted = true;", r"\1", "host-quarantine"),
         # The executor resolves the weight again instead of using what the check found.
         ("cpu", r"const resolved_ptr &\s*weight\s*=\s*checked\.weight;",
          "const resolved_ptr weight = task.weight_lease.resolve(mem_handle::HOST_DEVICE);", "host-validate"),
