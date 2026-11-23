@@ -690,6 +690,10 @@ struct placement_kv_info {
     // llama.cpp-8ecj: ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, the key width of each layer's indexer
     // key cache (a second buffer over the layer's cells, K only); empty or 0 where a layer has none.
     std::vector<uint32_t> layer_idx_k_width;
+    // The weight layer (`blk.N`) that executes each KV cache slot, from ggml_sycl_tensor_inventory::kv_layer_phys. A
+    // looped model runs one weight layer for several slots (inkling2_loop, nanbeige, metis16). Empty means every slot is
+    // its own layer, which is every other architecture. Every array above is indexed by slot.
+    std::vector<int32_t>  layer_phys;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
     // above stays the load's planning shape.

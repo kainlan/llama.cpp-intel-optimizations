@@ -1815,6 +1815,272 @@ static bool run_dense_weights_before_kv_test() {
     return true;
 }
 
+// A KV cache slot lives where the weight layer that executes it lives, and the layer pays for every slot it executes.
+// The synthetic model has Inkling 2 Mini's shape: 24 weight layers, each with one dense attention weight, and 48 FULL KV
+// slots, the core layers 6..17 running three passes (slots 24..35 and 36..47 run layers 6..17 again).
+// placement_kv_info::layer_phys maps a slot to its layer.
+namespace kv_slot_case {
+constexpr int    n_phys      = 24;
+constexpr int    n_slot      = 48;
+constexpr int    core_start  = 6;
+constexpr int    core_end    = 18;
+constexpr size_t dense_bytes = kv_order_case::dense_bytes;
+constexpr size_t kv_slot     = kv_order_case::kv_at_512;       // one FULL slot at the planning n_ctx 512
+constexpr size_t kv_extra    = kv_order_case::kv_extra_layer;  // what the opening n_ctx 4096 adds to one slot
+
+static int loop_layer_of(int slot) {
+    return slot < n_phys ? slot : core_start + (slot - n_phys) % (core_end - core_start);
+}
+
+static std::vector<int32_t> loop_map() {
+    std::vector<int32_t> map;
+    for (int s = 0; s < n_slot; ++s) {
+        map.push_back(loop_layer_of(s));
+    }
+    return map;
+}
+
+// One dense attention weight per layer; `big_layer`, when given, carries `big_bytes` instead.
+static std::vector<std::pair<std::string, size_t>> inventory(int n_layers, int big_layer = -1, size_t big_bytes = 0) {
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < n_layers; ++l) {
+        inv.push_back({ "blk." + std::to_string(l) + ".attn_q.weight", l == big_layer ? big_bytes : dense_bytes });
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_kv_info kv_info(uint32_t             n_slots,
+                                            std::vector<int32_t> layer_phys,
+                                            uint32_t             n_ctx_context = 0) {
+    ggml_sycl::placement_kv_info kv{};
+    kv.n_layer       = n_slots;
+    kv.n_embd_k_gqa  = kv_order_case::kv_width;
+    kv.n_embd_v_gqa  = kv_order_case::kv_width;
+    kv.n_ctx         = 512;
+    kv.n_ubatch      = 512;
+    kv.n_ctx_context = n_ctx_context;
+    kv.layer_kind.assign(n_slots, GGML_SYCL_KV_LAYER_FULL);
+    kv.layer_k_width.assign(n_slots, kv_order_case::kv_width);
+    kv.layer_v_width.assign(n_slots, kv_order_case::kv_width);
+    kv.layer_phys = std::move(layer_phys);
+    return kv;
+}
+
+// The slots in [0, n_slots) whose KV the plan puts on `device` (-1: the host tier).
+static int count_slots_on(const ggml_sycl::placement_plan & plan, int n_slots, int device) {
+    int n = 0;
+    for (int s = 0; s < n_slots; ++s) {
+        n += plan.get_kv_device(s) == device;
+    }
+    return n;
+}
+}  // namespace kv_slot_case
+
+// The Inkling shape on one device: with room, every slot's KV is on the device and charged; with room for the dense
+// weights and 30 slots, the slots are decided one by one in slot order, so slots 30..47 are the host's; and the room of
+// the opening context is held for all 48 slots.
+static bool run_kv_slot_lives_with_its_layer_test() {
+    using namespace kv_slot_case;
+    bool ok = true;
+
+    const size_t roomy = n_phys * dense_bytes + n_slot * kv_slot + kv_slot;
+    const auto   roomy_plan =
+        ggml_sycl::compute_placement_plan(inventory(n_phys), roomy, 0, kv_info(n_slot, loop_map()), nullptr, 0);
+    for (int s = 0; s < n_slot; ++s) {
+        if (roomy_plan.get_kv_device(s) != 0) {
+            printf("FAIL: with room, slot %d (layer %d) must have its KV on device 0 with its layer, got %d\n", s,
+                   loop_layer_of(s), roomy_plan.get_kv_device(s));
+            ok = false;
+            break;
+        }
+    }
+    if (roomy_plan.kv_vram_bytes != n_slot * kv_slot || roomy_plan.kv_host_bytes != 0) {
+        printf("FAIL: with room the plan charges 48 slots on the device: kv vram=%zu host=%zu, want %zu and 0\n",
+               roomy_plan.kv_vram_bytes, roomy_plan.kv_host_bytes, n_slot * kv_slot);
+        ok = false;
+    }
+
+    const size_t tight = n_phys * dense_bytes + 30 * kv_slot;
+    const auto   tight_plan =
+        ggml_sycl::compute_placement_plan(inventory(n_phys), tight, 0, kv_info(n_slot, loop_map()), nullptr, 0);
+    bool order_ok = true;
+    for (int s = 0; s < n_slot; ++s) {
+        order_ok = order_ok && tight_plan.get_kv_device(s) == (s < 30 ? 0 : -1);
+    }
+    if (!order_ok || tight_plan.kv_vram_bytes != 30 * kv_slot || tight_plan.kv_host_bytes != 18 * kv_slot) {
+        printf(
+            "FAIL: room for 30 slots puts slots 0..29 on the device and charges 48 slots: %d slots on device, "
+            "slot 29 on %d, slot 30 on %d, kv vram=%zu host=%zu, want 30, 0, -1, %zu and %zu\n",
+            count_slots_on(tight_plan, n_slot, 0), tight_plan.get_kv_device(29), tight_plan.get_kv_device(30),
+            tight_plan.kv_vram_bytes, tight_plan.kv_host_bytes, 30 * kv_slot, 18 * kv_slot);
+        ok = false;
+    }
+
+    const size_t with_room = n_phys * dense_bytes + n_slot * (kv_slot + kv_extra);
+    const auto   room_plan = ggml_sycl::compute_placement_plan(inventory(n_phys), with_room, 0,
+                                                               kv_info(n_slot, loop_map(), 4096), nullptr, 0);
+    if (room_plan.kv_context_reserve_bytes != n_slot * kv_extra || count_slots_on(room_plan, n_slot, 0) != n_slot) {
+        printf("FAIL: the opening context's room covers 48 slots: held %zu bytes with %d slots on device, want %zu\n",
+               room_plan.kv_context_reserve_bytes, count_slots_on(room_plan, n_slot, 0), n_slot * kv_extra);
+        ok = false;
+    }
+
+    if (ok) {
+        printf("PASS: every KV slot lives on the device of the layer that executes it and is charged there\n");
+    }
+    return ok;
+}
+
+// A slot is eligible for device KV only while the layer that executes it has its weights on that device. Layer 6
+// does not fit the device here, so its three slots (6, 30 and 42) are the host's, though the card has room for them.
+static bool run_kv_slot_of_host_layer_test() {
+    using namespace kv_slot_case;
+    const size_t big    = 64u * 1024u * 1024u;
+    const size_t budget = (n_phys - 1) * dense_bytes + n_slot * kv_slot + kv_slot;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inventory(n_phys, 6, big), budget, 0,
+                                                            kv_info(n_slot, loop_map()), nullptr, 0);
+    bool         ok = plan.get_layer_device(6) == -1 && plan.get_layer_device(5) == 0 && plan.get_layer_device(7) == 0;
+    for (int s = 0; s < n_slot; ++s) {
+        ok = ok && plan.get_kv_device(s) == (loop_layer_of(s) == 6 ? -1 : 0);
+    }
+    ok = ok && plan.kv_vram_bytes == (n_slot - 3) * kv_slot && plan.kv_host_bytes == 3 * kv_slot;
+    if (!ok) {
+        printf(
+            "FAIL: a host layer's slots are host slots: layer 6 on %d, slots 6/30/42 on %d/%d/%d, slot 18 on %d, "
+            "kv vram=%zu host=%zu, want -1, -1/-1/-1, 0, %zu and %zu\n",
+            plan.get_layer_device(6), plan.get_kv_device(6), plan.get_kv_device(30), plan.get_kv_device(42),
+            plan.get_kv_device(18), plan.kv_vram_bytes, plan.kv_host_bytes, (n_slot - 3) * kv_slot, 3 * kv_slot);
+        return false;
+    }
+    printf("PASS: the slots of a host layer are host slots whatever room the card has\n");
+    return true;
+}
+
+// The modulo loop of nanbeige and metis16: 4 weight layers run twice, so slot s runs layer s % 4. With room for the
+// dense weights and 6 slots, slots 0..5 are on the device and the plan charges all 8.
+static bool run_kv_slot_modulo_map_test() {
+    using namespace kv_slot_case;
+    const std::vector<int32_t> map   = { 0, 1, 2, 3, 0, 1, 2, 3 };
+    const size_t               roomy = 4 * dense_bytes + 8 * kv_slot;
+    const size_t               tight = 4 * dense_bytes + 6 * kv_slot;
+    const auto room_plan  = ggml_sycl::compute_placement_plan(inventory(4), roomy, 0, kv_info(8, map), nullptr, 0);
+    const auto tight_plan = ggml_sycl::compute_placement_plan(inventory(4), tight, 0, kv_info(8, map), nullptr, 0);
+    bool       ok         = count_slots_on(room_plan, 8, 0) == 8 && room_plan.kv_vram_bytes == 8 * kv_slot;
+    for (int s = 0; s < 8; ++s) {
+        ok = ok && tight_plan.get_kv_device(s) == (s < 6 ? 0 : -1);
+    }
+    ok = ok && tight_plan.kv_vram_bytes == 6 * kv_slot && tight_plan.kv_host_bytes == 2 * kv_slot;
+    if (!ok) {
+        printf(
+            "FAIL: the modulo map charges 8 slots: with room %d on device (kv vram=%zu); tight slots 5/6 on %d/%d, "
+            "kv vram=%zu host=%zu, want 8 (%zu), 0/-1, %zu and %zu\n",
+            count_slots_on(room_plan, 8, 0), room_plan.kv_vram_bytes, tight_plan.get_kv_device(5),
+            tight_plan.get_kv_device(6), tight_plan.kv_vram_bytes, tight_plan.kv_host_bytes, 8 * kv_slot, 6 * kv_slot,
+            2 * kv_slot);
+        return false;
+    }
+    printf("PASS: a modulo slot map puts each slot with its layer and charges every slot\n");
+    return true;
+}
+
+// A model whose slots are its layers plans the same with no map and with the identity map, at a roomy, a tight and a
+// room-holding budget.
+static bool run_kv_slot_identity_map_test() {
+    using namespace kv_slot_case;
+    std::vector<int32_t> identity;
+    for (int l = 0; l < n_phys; ++l) {
+        identity.push_back(l);
+    }
+
+    struct budget_case {
+        size_t   budget;
+        uint32_t n_ctx_context;
+    };
+
+    const budget_case cases[] = {
+        { n_phys * dense_bytes + n_phys * kv_slot + kv_slot,    0    },
+        { n_phys * dense_bytes + 10 * kv_slot,                  0    },
+        { n_phys * dense_bytes + n_phys * (kv_slot + kv_extra), 4096 },
+    };
+    bool ok = true;
+    for (const budget_case & c : cases) {
+        const auto none  = ggml_sycl::compute_placement_plan(inventory(n_phys), c.budget, 0,
+                                                             kv_info(n_phys, {}, c.n_ctx_context), nullptr, 0);
+        const auto same  = ggml_sycl::compute_placement_plan(inventory(n_phys), c.budget, 0,
+                                                             kv_info(n_phys, identity, c.n_ctx_context), nullptr, 0);
+        const bool equal = none.kv_device == same.kv_device && none.layer_device == same.layer_device &&
+                           none.kv_vram_bytes == same.kv_vram_bytes && none.kv_host_bytes == same.kv_host_bytes &&
+                           none.kv_context_reserve_bytes == same.kv_context_reserve_bytes &&
+                           none.vram_bytes == same.vram_bytes && none.host_bytes == same.host_bytes &&
+                           none.kv_layer_count() == same.kv_layer_count();
+        if (!equal) {
+            printf(
+                "FAIL: the identity map must plan as no map (budget %zu, n_ctx_context %u): kv vram %zu/%zu host "
+                "%zu/%zu room %zu/%zu slots %zu/%zu\n",
+                c.budget, c.n_ctx_context, none.kv_vram_bytes, same.kv_vram_bytes, none.kv_host_bytes,
+                same.kv_host_bytes, none.kv_context_reserve_bytes, same.kv_context_reserve_bytes, none.kv_layer_count(),
+                same.kv_layer_count());
+            ok = false;
+        }
+    }
+    if (ok) {
+        printf("PASS: the identity slot map plans exactly as no map\n");
+    }
+    return ok;
+}
+
+// The multi-device planner moves a layer's slots with the layer: every slot's KV is on its layer's device, the layer
+// is charged for each of its slots, and the block that holds a layer counts the KV of every slot it executes and is
+// owned by its execution device.
+static bool run_multi_device_kv_slot_block_test() {
+    using namespace kv_slot_case;
+    constexpr size_t                            mib     = 1024u * 1024u;
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 64u * mib, 64u * mib, 1.0, true },
+        { 1, 64u * mib, 64u * mib, 4.0, true },
+    };
+    const auto kv   = kv_info(n_slot, loop_map());
+    const auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory(n_phys), n_slot,
+                                                           ggml_sycl::multi_gpu_mode::LAYER, kv, nullptr, 0);
+    bool       ok   = true;
+    for (int s = 0; s < n_slot; ++s) {
+        const int layer_device = plan.get_layer_device(loop_layer_of(s));
+        if (layer_device < 0 || plan.get_kv_device(s) != layer_device) {
+            printf("FAIL: slot %d must be on its layer %d's device %d, got %d\n", s, loop_layer_of(s), layer_device,
+                   plan.get_kv_device(s));
+            ok = false;
+            break;
+        }
+    }
+    const ggml_sycl::placement_plan::layer_block * core = nullptr;
+    for (const auto & block : plan.layer_blocks) {
+        if (block.start_layer <= core_start && core_start <= block.end_layer) {
+            core = &block;
+        }
+    }
+    size_t core_kv = 0;
+    for (int s = 0; core != nullptr && s < n_slot; ++s) {
+        const int l = loop_layer_of(s);
+        core_kv += l >= core->start_layer && l <= core->end_layer ? kv_slot : 0;
+    }
+    if (core == nullptr || core->kv_bytes != core_kv || core->kv_device != core->execution_device) {
+        printf(
+            "FAIL: the block of layer 6 counts its layers' %zu slot bytes and its KV owner is its executor: "
+            "kv=%zu owner=%d exec=%d\n",
+            core_kv, core ? core->kv_bytes : 0, core ? core->kv_device : -3, core ? core->execution_device : -3);
+        ok = false;
+    }
+    if (plan.kv_vram_bytes != n_slot * kv_slot) {
+        printf("FAIL: the multi-device plan charges 48 slots: kv vram=%zu, want %zu\n", plan.kv_vram_bytes,
+               n_slot * kv_slot);
+        ok = false;
+    }
+    if (ok) {
+        printf("PASS: the multi-device planner moves a layer's slots with the layer and counts them in its block\n");
+    }
+    return ok;
+}
+
 static bool run_multi_device_layer_block_plan_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -4335,6 +4601,11 @@ int main() {
         mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
+        mock_ok = run_kv_slot_lives_with_its_layer_test() && mock_ok;
+        mock_ok = run_kv_slot_of_host_layer_test() && mock_ok;
+        mock_ok = run_kv_slot_modulo_map_test() && mock_ok;
+        mock_ok = run_kv_slot_identity_map_test() && mock_ok;
+        mock_ok = run_multi_device_kv_slot_block_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
         mock_ok = run_multi_device_moe_i8_executor_support_test() && mock_ok;
