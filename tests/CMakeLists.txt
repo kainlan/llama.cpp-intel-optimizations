@@ -4420,6 +4420,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mapped-loader-source.py --self-test)
     set_tests_properties(test-sycl-mapped-loader-source PROPERTIES
         LABELS "sycl;host;source-contract;python" TIMEOUT 120)
+    # On a load that does not map files the loader's SYCL_Host buffer is a charged host term, owned by the model, and
+    # S1-PRELOAD serves host experts from it in place; a host expert with no owner refuses the load. A plain script:
+    # --self-test requires each witness mutant to be caught.
+    add_test(NAME test-sycl-loader-in-place-source
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-loader-in-place-source.py --self-test)
+    set_tests_properties(test-sycl-loader-in-place-source PROPERTIES
+        LABELS "sycl;host;source-contract;python;hostonly" TIMEOUT 120)
     # docs/design/sycl-mmap-host-tier.md §7 C4: every test the C4 section names is registered exactly once, read from
     # the design's own list; with --load-log, the mapped load's DMA staging pool reads 0.0 MB. A plain script whose
     # planted controls (one registration removed, one doubled, the section gone) run on every invocation.

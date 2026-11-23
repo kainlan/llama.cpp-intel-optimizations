@@ -1392,12 +1392,20 @@ static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hpara
 }
 #endif
 
-bool llama_model_loader::host_weight_layout_cpu() {
+uint8_t llama_model_loader::host_weight_layout_sycl() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    return host_weight_layout() == LLAMA_HOST_WEIGHT_LAYOUT_CPU;
+    switch (host_weight_layout()) {
+        case LLAMA_HOST_WEIGHT_LAYOUT_CPU:
+            return GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU;
+        case LLAMA_HOST_WEIGHT_LAYOUT_PLAIN:
+            return GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN;
+        case LLAMA_HOST_WEIGHT_LAYOUT_OFF:
+            return GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF;
+    }
+    return GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF;
 #else
-    // No SYCL planner reads the layout in this build; false is the value a zeroed inventory carries.
-    return false;
+    // No SYCL planner reads the layout in this build; 0 (off) is the value a zeroed inventory carries.
+    return 0;
 #endif
 }
 

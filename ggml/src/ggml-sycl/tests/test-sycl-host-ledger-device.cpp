@@ -1210,7 +1210,7 @@ arm_result fixture_plan_against_committed() {
         }
         const uint64_t before = cache->pinned_pool_committed();
         log_clear();
-        configure_host_zones_for_plan_for_testing(cache, plan);
+        configure_host_zones_for_plan_for_testing(cache, device, plan);
         const uint64_t delta = cache->pinned_pool_committed() - before;
         if (!cache->host_zones_configured()) {
             void_arm(r, name + ": the zones were not configured, so nothing was measured");

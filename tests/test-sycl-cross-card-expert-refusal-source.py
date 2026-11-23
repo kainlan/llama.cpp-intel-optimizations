@@ -127,12 +127,15 @@ REJECTED = "return GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }"
 LATE_AFTER = 'throw std::runtime_error("stale host provisioning candidate before allocation");'
 LATE_CROSS = "if (ggml_sycl_stage_refuse_cross_card_expert_plan(decision.snapshot->plan.get())) {"
 LATE_LAZY = "if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {"
+# The loader-pool refusal sits between the two (test-sycl-loader-in-place-source pins it); the witnesses keep it there.
+LATE_LOADER = "if (ggml_sycl_stage_refuse_loader_pool_plan(decision.snapshot->plan.get(), early)) {"
 LATE_BEFORE = "ggml_sycl_configure_host_zones_for_plan("
 
 # The early pass: on the candidate every device planned, before it is staged as the probe plan.
 EARLY_AFTER = "lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;"
 EARLY_CROSS = "if (early_candidate && ggml_sycl_stage_refuse_cross_card_expert_plan(early_candidate->plan.get())) {"
 EARLY_LAZY = "if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {"
+EARLY_LOADER = "if (early_candidate && ggml_sycl_stage_refuse_loader_pool_plan(early_candidate->plan.get(), early)) {"
 EARLY_BEFORE = "lifecycle_stage_probe_placement_plan("
 
 PRED_BODY = "{ return ggml_sycl_moe_multi_gpu_wanted(plan) && !peer_path; }"
@@ -194,8 +197,8 @@ def assert_only_claim_fails(claim: str, mutated: str) -> None:
     assert not others, f"the witness for {claim} also fails {others}"
 
 
-def _block(cross_or_lazy: str) -> str:
-    return cross_or_lazy + " " + REJECTED
+def _block(refusal: str) -> str:
+    return refusal + " " + REJECTED
 
 
 # ---- the checks ----
@@ -256,8 +259,8 @@ def test_witness_late_lazy_asked_first():
         mutate_in(
             SYCL,
             STAGE_SIG,
-            _block(LATE_CROSS) + " " + _block(LATE_LAZY),
-            _block(LATE_LAZY) + " " + _block(LATE_CROSS),
+            _block(LATE_CROSS) + " " + _block(LATE_LOADER) + " " + _block(LATE_LAZY),
+            _block(LATE_LAZY) + " " + _block(LATE_LOADER) + " " + _block(LATE_CROSS),
         ),
     )
 
@@ -268,8 +271,8 @@ def test_witness_early_lazy_asked_first():
         mutate_in(
             SYCL,
             STAGE_SIG,
-            _block(EARLY_CROSS) + " " + _block(EARLY_LAZY),
-            _block(EARLY_LAZY) + " " + _block(EARLY_CROSS),
+            _block(EARLY_CROSS) + " " + _block(EARLY_LOADER) + " " + _block(EARLY_LAZY),
+            _block(EARLY_LAZY) + " " + _block(EARLY_LOADER) + " " + _block(EARLY_CROSS),
         ),
     )
 

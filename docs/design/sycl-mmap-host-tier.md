@@ -1186,6 +1186,7 @@ copied into a cache allocation at load.
 |---|---|---|---|---|
 | device-planned dense or expert | GPU | per-device (SOA, XMX, WOQ...) | `FILE_MAPPED` (its staging source) | `DEVICE_VRAM`, staged once from the mapping (§5.3); the mapped pages are dropped after staging (§4.6) |
 | host MoE expert, AOS | CPU (`CpuExpertPool`) | AOS = file | `FILE_MAPPED`; `PINNED`, copied from the mapping by the preload, when the plan holds window-ring room, the host plan fits and no lazy table refuses | **`FILE_MAPPED`, served in place**; when `PINNED`, the pinned copy, which the window ring streams to the device for prompts |
+| host MoE expert, AOS, under `-lm none` (a load that maps no file) with evictable weights | CPU (`CpuExpertPool`) | AOS = file | `PINNED` | **`SYCL_Host`, served in place** from the loader's buffer with that buffer's owner (lifetime `MODEL`, owned by the model), ring-streamable; only a single-device plan made for the device whose pool holds the buffer (`loader_device`), every other plan copies it into a pinned block ("The loader's `SYCL_Host` buffer" below) |
 | host MoE expert needing a CPU reorder (`register_host_aos_expert`'s SOA/XMX branch) | CPU | reordered | `FILE_MAPPED` source | copied: into `HOST_CPU` once th32 T1 lands, pinned until then |
 | planner-host dense, `GGML_SYCL_HOST_WEIGHT_LAYOUT=cpu` (default) | ggml-cpu | `CPU_REPACK` | `CPU_OWNED` | copied by ggml-cpu, outside the cache (ticket below) |
 | planner-host dense, `=plain` | ggml-cpu | file | `FILE_MAPPED` | `FILE_MAPPED` (`is_host`, so the CPU backend runs it) |
@@ -1201,6 +1202,199 @@ no lazy table refuses it (`GGML_SYCL_MOE_PIN_HOST_EXPERTS=0` keeps them
 mapped). That pin is measured at 47.6 GiB of pinned memory on the Qwen3.8
 exps-IQ4_NL pack. Otherwise `PINNED` host backing survives only when
 `load_maps_files` is false.
+
+**The loader's `SYCL_Host` buffer** (llama.cpp-cg69). On a load that maps no
+file, with evictable weights, the loader binds `SYCL_Host` for every weight the
+plan places and keeps that buffer for the model's life. The plan states it as
+three facts with one source, `placement_loader_fact_for(load_maps_files,
+load_weights_evictable, load_loader_device, plan_device)` in
+`placement_plan_copy_host_backing_fact` (`kv_info.load_weights_evictable` comes
+from `ggml_backend_sycl_weights_evictable()`, `kv_info.load_loader_device` from
+the scheduler's device count, and `plan_device` is the builder's device, -1 for
+the multi-device builder):
+- `loader_holds_weights` (no mapping, evictable weights).
+- `loader_device`: the device whose cache's pinned pool holds the buffer, -1
+  when no one pool does. The buffer's chunks come from the cache of the device
+  whose `SYCL_Host` buffer type libllama binds for a layer. When the backend
+  scheduler sees one device (one GPU selected, or several collapsed to device 0
+  because no split is asked for) that is device 0 for every layer, so
+  `loader_device` is 0. When it sees more (`GGML_SYCL_SPLIT_RATIO` or
+  `GGML_SYCL_TENSOR_SPLIT`) the buffer is split across their pools by layer,
+  and `loader_device` is -1. When it is a device, the plan's WEIGHT zone
+  charges the buffer once, host-wide, as the term `loader_residency`: the
+  `src_size` of every entry the buffer holds, rounded up to the loader's
+  tensor alignment, exact for a dense weight and a bound for an expert slice.
+  The term reaches `host_planned_bytes` through the zone, and the plan
+  records it as `host_zone_loader_bytes`. It covers the device-planned
+  weights' host bytes too, which the loader keeps after staging (22.9 GB on
+  the Qwen3.8 B70 `-lm none` load); releasing them after staging is
+  `llama.cpp-ne2m`.
+- `loader_holds_host_dense`: whether the buffer holds the host-planned dense
+  weights of the inventory the plan was made from. Under the `cpu` and
+  `plain` host weight layouts (`GGML_SYCL_HOST_WEIGHT_LAYOUT`, carried as
+  the inventory's `host_weight_layout` byte: `GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF`,
+  `_CPU` or `_PLAIN`) the loader puts such a weight, on a load that maps no
+  file, in a CPU-owned buffer instead. The early pass and the dry run plan an
+  inventory of every weight in the file (`load_inventory_unbound`), so their
+  plans leave those weights out; the late pass's inventory keeps only the
+  tensors whose buffer type is SYCL, which a CPU-owned buffer is not, so its
+  plan counts every entry. One predicate, `placement_plan_loader_holds_entry`,
+  decides each entry for both the term and the replay of the loader's buffers
+  (`placement_plan_loader_tensor_bytes`).
+- `loader_serves_host_experts` (the same, on a single-device plan made for
+  `loader_device`). S1-PRELOAD
+  registers each host expert backed `PINNED` in place: its lease is the
+  expert's bytes inside the loader's chunk, its owner a copy of that chunk's
+  owner, which `moe_stream_owner_streamable` accepts, so the window ring
+  streams it as it streams a pinned copy. The expert counts once, as
+  `loader_served` inside `loader_residency`, and holds no block, so
+  `host_weights + loader_served == weight_host_bytes` is the
+  `[HOST-PLAN-BUG]` comparison. A host dense weight is still copied into a
+  block.
+
+**The loader's buffers as the pool holds them.** ggml-alloc splits the
+loader's tensors into buffers next-fit, in the order the loader creates them,
+each at most the buffer type's maximum size (`host_zone_buffer_max_size`: the
+chunk cap `GGML_SYCL_HOST_BUFFER_CHUNK_MB`, 2 GiB by default, bounded by the
+zone's largest free block but never below one pool chunk). The pinned pool
+carves the WEIGHT zone into chunk-sized segments and serves each buffer from
+the first segment with room; a request never spans two. So a buffer larger
+than half a chunk takes a segment of its own, and the rest of that segment is
+lost to it. The Qwen3.8 B70 `-lm none` load at `-ub 2048` splits into 37
+buffers that take 37 segments, 36 whole chunks and the last buffer, where its
+raw bytes are 34.2 chunks; the plan that charged the raw bytes admitted, and
+the loader's third grow past the zone was refused (`grow_zone: budget
+exhausted`). The plan therefore charges the footprint:
+`populate_host_zone_sizing` records the loader's tensors
+(`loader_tensor_bytes`, from its inventory, in the inventory's order, each at
+the loader's alignment), and `placement_plan_host_zone_commit_terms` replays
+the split and the placement (`placement_loader_pool_footprint_for`) at the
+buffer type's maximum size and the pool's chunk. The WEIGHT zone holds the
+footprint's zone bytes (`loader_zone`) in place of `host_zone_loader_bytes`,
+and a buffer larger than a chunk, for which the pool grows a chunk of its own,
+is `loader_grown`, counted by `total()` outside the zones. The replay sizes
+each buffer by the pool's own rule, `pinned_chunk_pool::zone_grow_request` at
+`host_buft_alloc_alignment`, the alignment `ggml_sycl_host_buft_alloc`
+allocates at: the block the chunk's TLSF takes for the buffer, which is also
+what `unified_alloc` grows a chunk by when no segment holds it, so
+`loader_grown` is the pool's growth byte for byte. A plan within its
+budget therefore configures a WEIGHT zone whose segments hold every loader
+buffer a chunk can hold, and the pool's only growth for the others is
+`loader_grown`. A plan charged this term (the loader holds the weights,
+`loader_device >= 0`) whose commit total, `loader_grown` included, exceeds its
+host budget is refused at plan time as `loader-pool-over-budget`:
+`placement_plan_loader_pool_refusal` names it with `total=`, `host_budget=`,
+`loader_zone=`, `loader_grown=` and `loader_device=`,
+`ggml_sycl_stage_refuse_loader_pool_plan` logs it on one `[HOST-PLAN] load
+refused:` ERROR line, and the stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED`
+for each late decision and for the early candidate, before the lazy-table
+refusal. What the total counts for the loader is the replay's footprint,
+`loader_zone` and `loader_grown`, not `loader_residency` (which bounds an expert
+slice from above). A late plan replays exactly the tensors the loader places,
+so its footprint is exact: such a load would otherwise fail in
+`grow_zone` partway through, and once a late plan admits, no loader pool
+growth fails. A plan without the term
+keeps the host ledger's WARN-only check (th32 T2 phase (a)), whose would-refuse
+WARN names the loader refusal when it applies. A plan within its budget can
+still be refused where the lazy-table decision refuses it: the larger zone
+takes its tables' room. The Qwen3.8 load above is that case. Its honest plan
+(commit total 83751864768 B against 79456897344 B of raw bytes, under its
+85755396096 B budget) passes the loader check and leaves the table's floor and
+ring, 427819008 B, a fit room of -143952320 B at its logged budget, so it is
+refused as `lazy-table-cache-below-floor` with `fit_room=0`. It is 571771328 B
+short: the budget is `MemAvailable` less the headroom, so the same load admits
+on a sample about 0.57 GB higher. Its limits:
+- The refusal compares the commit total with the plan's host budget, the value
+  the load's transaction stored. `grow_zone` enforces the pool's own budget,
+  set when the pool was created; the invariant holds where the pool's budget is
+  at least the plan's.
+- The early candidate's total can exceed what the pool receives, so the early
+  refusal can refuse a load whose pool growth would have fit. Its inventory is
+  built before any tensor is created: it counts tensors the loader then skips,
+  and under the `cpu` and `plain` layouts the early plan still charges a
+  host-planned dense weight as a pinned block although the loader puts it in a
+  CPU-owned buffer. The error is one-sided. The late plan counts only the
+  tensors bound to the loader's buffers and decides again before the zones are
+  sized, so no load is admitted that then fails.
+- The replay assumes the WEIGHT zone is empty when the loader allocates, which
+  it is (the copies S1-PRELOAD makes come after), and that the zone's largest
+  free block then is one chunk, true for a zone of at least one chunk, since
+  the WEIGHT zone is carved first.
+- The host weights copied after the loader are charged at their bytes plus the
+  TLSF grain, not at the segments they take: their fragmentation is not
+  replayed.
+- The late plan's inventory is in the loader's creation order. The early plan
+  builds its inventory in `weights_map` order (by layer, then name), so its
+  footprint can differ: on the Qwen3.8 load the same 37 buffers take 22.6 MB
+  more of the last chunk (78752837632 B against 78730221568 B). The early
+  plan's lazy-table decision can refuse the load on its own figure
+  (`ggml_sycl_stage_refuse_lazy_plan`), so near the budget the two plans can
+  decide differently; the late plan configures the zones.
+
+The gate (`ggml_sycl_loader_buffer_owner`) accepts a `SYCL_Host` buffer that is
+not a claimed tenant slot, has lifetime `MODEL`, was minted by a model's load
+(`model_id` != 0), holds the expert's bytes, and whose owner the ring copies
+from on that device. There is no copy fallback: the plan charged the expert to
+the loader's buffer and sized no block for it, so a copy would take room no zone
+holds. An expert the gate refuses is counted with the gate's reason and never
+registered, and once the sweep has counted them all the load refuses with one
+`[S1-PRELOAD]` ERROR line naming the count, the bytes and the reason, as it
+does for a host-planned expert with no owner. The limits:
+- In place only on a single-device plan made for `loader_device`. A
+  multi-device plan stages its experts for every device, and a chunk is
+  ring-streamable only on the device whose cache queue allocated it, so it,
+  and a plan made for another device, copies every host expert into a block.
+- Only `loader_device`'s pool commits the term. On two or more GPUs each card
+  has its own cache and pinned pool (`PER_DEVICE`), and every card's host zones
+  are sized and pre-allocated from its snapshot of the one plan
+  (`ggml_sycl_configure_host_zones_for_plan`). That step takes each card's
+  share through `placement_plan_host_zone_commit_terms_on_device(plan, terms,
+  device)`, the card its caller names: every card but `loader_device` leaves
+  the loader's `loader_zone` out of its WEIGHT zone and carries no
+  `loader_grown`, and its chunk rounding follows. The zone check compares the card's growth with its share of the
+  plan's record. A card that leaves the term out logs one
+  `[HOST-PLAN] device=N WEIGHT zone: loader_residency=0` WARN naming the pool
+  that holds the buffer.
+- A buffer split across the scheduler's devices (`loader_device` -1) is not
+  charged on any card: each card's share of it is the layers it runs, which the
+  plan does not know. Each configured card names it on the same WARN line
+  ("split across the scheduler's devices"), and the plan's `[HOST-PLAN]` line
+  says "not charged". The host weights have the same gap the other way: every
+  card's zones hold the whole model's `host_weights`, though each pool
+  materializes only its own share. That is `llama.cpp-r8ls`.
+- An in-place expert's owner is wider than its entry, so the named move's admit
+  refuses it ("host copy not pinned", REFUSED) and a swap cannot move it to the
+  device: it stays on the host for the model's life (`sycl-memory-design.md`,
+  the named move).
+- No silent degrade: a host-planned expert with no owner (no room for a copy
+  and no buffer to serve it from) is never registered. Once one on a device has
+  none, the sweep asks no room for the host experts after it there and counts
+  them too. The load logs one
+  `[S1-PRELOAD] ... host-planned experts (... MB) have no owner` ERROR line
+  and refuses, as a dense weight that cannot be registered does.
+- When the plan charges the term, the preload checks both halves of it against
+  `loader_device`'s pool, and neither check stops the load. The term: what the
+  model still holds in `SYCL_Host` chunks there, against `loader_residency`; a
+  term short of it is a `[HOST-PLAN-BUG]` WARN. The replay: how far that pool's
+  WEIGHT zone grew, against the plan's recorded `loader_grown`
+  (`host_zone_weight_growth_check`). The growth is measured from the zone's
+  capacity when the load's late pass decided the zones, configured from its
+  plan or kept as an earlier load left them, since the zones outlive the last
+  model's release and an earlier load's growth is not this one's, to its
+  capacity once the preload has placed the host weights. That window holds the
+  loader's buffers and the preload's host-weight blocks, so the check covers
+  the whole WEIGHT record, not the replay alone: the plan sizes the zone to
+  hold the loader's buffers as the replay places them, with the rest of the
+  record beside them. It holds no upload buffers: the device reports `async`
+  off while the load guard is set, so `load_all_data` takes none from
+  `SYCL_Host` and uploads each tensor whole with `set_tensor`.
+  Growth past the record is a `[HOST-PLAN-BUG]` WARN naming the planned,
+  actual and excess bytes. The capacity is read once, so the check and its
+  pass line see one figure. A check that passes says so at INFO. A load whose
+  late pass took no baseline, or whose `loader_device` has no cache or no
+  configured host zones at the preload, says at WARN that the growth goes
+  unchecked (`loader pool check has no WEIGHT zone baseline`, `loader pool
+  check skipped`).
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),
@@ -1219,6 +1413,7 @@ CPU_OWNED }` for every entry. The planner derives it once from
 | `host_cpu_owned_bytes` | `CPU_OWNED` entries | yes (anonymous memory, P3 counts it) | nothing: not in the zone (today they inflate it) |
 | `host_mapped_bytes` | host-executed `FILE_MAPPED` entries | only when locked (§4.5) | nothing |
 | `host_mapped_source_bytes` | device-planned `FILE_MAPPED` sources | no | nothing (transient page cache during staging) |
+| `loader_residency` (a WEIGHT zone term, recorded as `host_zone_loader_bytes`) | every entry the loader's buffer holds (`placement_plan_loader_holds_entry`) at the loader's alignment, when `loader_holds_weights` and `loader_device >= 0`, once host-wide | through the WEIGHT zone, as the pool holds the loader's buffers (`loader_zone`, and `loader_grown` outside the zones) | `loader_device`'s WEIGHT zone only; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
 
 Every accumulation site of `weight_host_bytes` in the planner
 (`uc:25928`, `:25933`, `:28136`, `:28196`, `:28230`, `:28322`, `:29554`,
@@ -1560,8 +1755,10 @@ created") describes a path that does not run.
       grows the zone once per SYCL backend.
     - The growth is one `grow_zone(SCRATCH, deficit + n x
       DEFAULT_ALIGNMENT)` call, where `n` is the number of buffers the demand
-      splits into at the chunk cap, the same slack rule as the miss path
-      (`uc:15432`). `grow_zone` commits **one chunk of
+      splits into at the chunk cap. (The miss path grows by each buffer's
+      TLSF block, `pinned_chunk_pool::zone_grow_request`, which can pass the
+      buffer's bytes by more than this slack; a buffer the zone then cannot
+      hold takes the miss path.) `grow_zone` commits **one chunk of
       `max(2048 MB, align_up(request))`** (`pinned-pool.cpp:613-712`). So
       the zone grows by at least the deficit, **rounded up to one chunk**,
       and the criteria score it that way.
@@ -1613,7 +1810,22 @@ created") describes a path that does not run.
     - **`MODEL`**. The record carries the model's `ModelId`
       (`model-lifecycle.hpp`), whose release is the model-free point. The
       `in_model_load` branch of `gs:42652`, a model's `SYCL_Host` weights
-      with role `WEIGHT`, is `MODEL` (r3 m8).
+      with role `WEIGHT`, is `MODEL` (r3 m8), and its owner is the model:
+      `ggml_sycl_host_buft_alloc` mints the row `{MODEL, ModelId}` from the
+      load effect the host-weight registration takes, and the buffer keeps no
+      `BUFFER` owner. The check runs in
+      `ggml_sycl_release_model_slot_resources` after
+      `unified_cache_release_model_slot`, not before: a host expert served in
+      place from such a chunk holds a copy of the chunk's owner in its cache
+      entry until the reclaim drops it, so only a row that outlives the
+      reclaim is a leak. A load that rolls back runs the same check once both
+      its rollback (`ggml_sycl_abort_owner_effects_noexcept`, after its slot
+      release) and the free of its last `SYCL_Host` chunk (the model's
+      destructor) have happened, whichever is last. A `SYCL_Host` chunk the
+      load frees before it ends is a `MODEL` row too (never an upload buffer:
+      under the load guard the device reports `async` off, so a load takes
+      none): it loses a check at its own free, and a leaked one outlives the
+      reclaim, so the model's check reports it.
     - **`DEVICE`** (addendum 10 (b), §M62 (D)). It is allowed only for a
       holder whose contents are device-scoped and shared by every context
       on the device. It is not the refused `PROCESS`: it has a named owner
@@ -3600,7 +3812,10 @@ lifts it into `host_ledger_budget()`.
 
 **The host-fit gate** (the lead's point (b)) is not duplicated here.
 - The refusal is th32 T2's `host-budget-exceeded`: WARN-only in phase (a),
-  enforcing in phase (b).
+  enforcing in phase (b). One plan is refused in phase (a) already: a plan
+  charged the loader term whose commit total exceeds its budget is refused as
+  `loader-pool-over-budget` (§4.4, the loader's buffers as the pool holds
+  them), since its load would fail in `grow_zone`.
 - The number is 7v5c's dry-run.
 - 5efe supplies their inputs: `host_backing` per entry, the four terms of §4.4,
   the working-set figures, and the locked/unlocked policy. 7v5c's printout

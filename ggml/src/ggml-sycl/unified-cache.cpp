@@ -21054,10 +21054,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // chunk serves this allocation alone, so growing by
                 // `alloc_size - largest` produced a chunk too small for the
                 // request it was grown for (Gemma 4 E4B: 2856 MB against
-                // 2048 MB chunks). grow_zone() sizes the chunk as
-                // max(chunk_size_, align_up(need)); the alignment slack keeps
-                // the aligned request inside the arena.
-                const size_t need = alloc_size + std::max(alignment, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                // 2048 MB chunks). `need` is the block the fresh chunk's TLSF
+                // takes for the request (zone_grow_request), and grow_zone()
+                // sizes the chunk as max(chunk_size_, align_up(need)), so the
+                // new chunk alone can serve the retry below. A retry that
+                // still fails is a miss: there is no second growth.
+                const size_t need = pinned_chunk_pool::zone_grow_request(alloc_size, alignment);
                 if (!ucache->host_zone_grow(zone, need)) {
                     return nullptr;
                 }
@@ -35773,10 +35775,30 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     constexpr size_t k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;
 
     // The host weights are summed here and nowhere else. Which entries count is the plan's own charge rule, so this
-    // sum and weight_host_bytes cover the same entries.
+    // sum plus loader_served and weight_host_bytes cover the same entries.
+    // The loader term is charged once, host-wide, when one device's pool holds the whole buffer, whichever builder made
+    // the plan: every card's zones are sized from this plan, and only loader_device's commits the term. A buffer split
+    // across the scheduler's devices by layer is in no one pool, so no zone can hold it.
+    const bool             charge_loader = plan.loader_holds_weights && plan.loader_device >= 0;
     host_weight_zone_terms terms;
     for (const placement_entry & entry : plan.entries) {
+        // The loader's SYCL_Host buffer holds the weights the plan places, on the device or not, for the model's life,
+        // but a host-planned dense weight the layout puts in a CPU-owned buffer (placement_plan_loader_holds_entry).
+        // ggml-alloc places each tensor at the CPU buffer type's TENSOR_ALIGNMENT, which SYCL_Host inherits, so a
+        // dense weight's bytes round up to it exactly; an expert entry is a slice of its tensor, and rounding each
+        // slice bounds the tensor's own rounding from above.
+        if (charge_loader && placement_plan_loader_holds_entry(plan, entry)) {
+            const size_t a = TENSOR_ALIGNMENT;
+            terms.loader_residency += (entry.src_size + a - 1) / a * a;
+        }
         if (entry.on_device || !placement_plan::host_backing_sizes_weight_zone(entry.host_backing)) {
+            continue;
+        }
+        // S1-PRELOAD serves a host-planned PINNED expert from the loader's buffer in place, under its owner, so the
+        // expert holds no block: its bytes are already in loader_residency. A dense host weight is still copied.
+        if (plan.loader_serves_host_experts && entry.expert_id >= 0 &&
+            entry.host_backing == placement_host_backing::PINNED) {
+            terms.loader_served += placement_entry_host_weight_bytes(entry);
             continue;
         }
         terms.host_weights += placement_entry_host_weight_bytes(entry);
@@ -35797,6 +35819,31 @@ host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_pla
     // update it. What a swap can use is the zone's free bytes when it runs.
     terms.swap_headroom        = plan.moe_swap_host_headroom_bytes;
     return terms;
+}
+
+// The tensors the term counts, the ones the loader's buffer holds (placement_plan_loader_holds_entry), each at the
+// loader's alignment as ggml-alloc pads it, in the inventory's order. That is the order the loader creates them in for
+// the late plan's inventory. The early plan's is weights_map's, by layer and then name, so its replay can take a little
+// more or less of the last chunk, and its lazy-table decision can refuse the load on that figure; the late plan
+// configures the zones.
+std::vector<size_t> placement_plan_loader_tensor_bytes(const placement_plan &                     plan,
+                                                       const std::vector<placement_tensor_info> & inventory) {
+    std::vector<size_t> bytes;
+    if (plan.host_zone_loader_bytes == 0) {
+        return bytes;
+    }
+    std::unordered_set<std::string> placed;
+    for (const placement_entry & entry : plan.entries) {
+        if (placement_plan_loader_holds_entry(plan, entry)) {
+            placed.insert(entry.name);
+        }
+    }
+    for (const auto & item : inventory) {
+        if (placed.count(item.name) > 0) {
+            bytes.push_back((item.size + TENSOR_ALIGNMENT - 1) / TENSOR_ALIGNMENT * TENSOR_ALIGNMENT);
+        }
+    }
+    return bytes;
 }
 
 bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after) {
@@ -36299,25 +36346,36 @@ static void placement_plan_hold_moe_swap_host_headroom(placement_plan & plan, co
         triplet_bytes, plan.host_zone_weight_bytes, plan.host_planned_bytes, cap.c_str());
 }
 
+// The cache a plan's host figures read their live inputs from: its device's, or none before any cache exists. A lookup
+// before the device count is known would enumerate the devices, so it is skipped. The lookup creates no cache and holds
+// the cache lock shared once, for the find alone.
+static unified_cache * host_ledger_plan_cache(const placement_plan & plan) {
+    return g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
+}
+
+// The pinned pool chunk the plan's commit terms count: `cache`'s, or the default chunk without one.
+static size_t host_ledger_plan_chunk(const unified_cache * cache) {
+    return cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+}
+
 // Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms, and
 // host_planned_bytes, their total plus the lazy tables' terms the residency decision sets, read once
 // populate_host_zone_sizing() has set every term. A spread plan's swap headroom is held next, after the lazy tables and
 // within the rooms they leave, so the line and the check below count it. The budget is an input, never read here: a
 // load passes the value its transaction stored, and a caller planning against another budget passes that one. One INFO
 // line names them. A plan whose host bytes exceed the budget logs one would-refuse WARN carrying each term and is kept
-// whole: phase (a) of th32 T2 refuses nothing. The cache supplies the live oneDNN scratch and the chunk size, which
-// the terms keep so a re-plan re-records from the same inputs; a plan made before any cache exists counts the default
-// chunk. A lookup before the device count is known would enumerate the devices, so it is skipped. The lookup creates
-// no cache and holds the cache lock shared once, for the find alone.
+// whole: phase (a) of th32 T2 refuses nothing here. The stage refuses one such plan, a plan charged the loader term
+// whose commit total exceeds the budget (placement_plan_loader_pool_refusal), and the WARN says so. The cache supplies
+// the live oneDNN scratch and the chunk size, which the terms keep so a re-plan re-records from the same inputs; a plan
+// made before any cache exists counts the default chunk (host_ledger_plan_cache, host_ledger_plan_chunk).
 static void record_host_ledger_plan(placement_plan &          plan,
                                     const placement_kv_info & kv_info,
                                     size_t                    host_budget,
                                     const ring_lease *        coverage_pin) {
-    unified_cache * cache =
-        g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
-    const size_t onednn_live =
+    unified_cache * cache = host_ledger_plan_cache(plan);
+    const size_t    onednn_live =
         cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
-    const size_t chunk   = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    const size_t chunk   = host_ledger_plan_chunk(cache);
     plan.host_budget     = host_budget;
     plan.host_zone_terms = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
     placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
@@ -36325,9 +36383,9 @@ static void record_host_ledger_plan(placement_plan &          plan,
     const host_zone_commit_terms & t = plan.host_zone_terms;
     GGML_LOG_INFO(
         "[HOST-LEDGER] device=%d plan host_budget=%zu host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu "
-        "scratch=%zu runtime=%zu rounding=%zu\n",
+        "scratch=%zu runtime=%zu loader_zone=%zu loader_grown=%zu rounding=%zu\n",
         plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-        t.rounding);
+        t.loader_zone, t.loader_grown, t.rounding);
     if (plan.host_planned_bytes > plan.host_budget) {
         // The headroom refusal names itself here as on every refused charge (design 5efe §4.5), from the sample this
         // plan's budget came from: the planner input, which a dry run fills from its own sample and never stores.
@@ -36336,10 +36394,14 @@ static void record_host_ledger_plan(placement_plan &          plan,
                                          kv_info.host_mem_total, kv_info.host_headroom);
         GGML_LOG_WARN(
             "[HOST-LEDGER] device=%d would refuse: host-budget-exceeded host_budget=%zu "
-            "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu rounding=%zu (the "
-            "plan is kept: the ledger is WARN-only)%s\n",
+            "host_planned_bytes=%zu weight=%zu kv=%zu staging=%zu scratch=%zu runtime=%zu loader_zone=%zu "
+            "loader_grown=%zu rounding=%zu (%s)%s\n",
             plan.device_id, plan.host_budget, plan.host_planned_bytes, t.weight, t.kv, t.staging, t.scratch, t.runtime,
-            t.rounding, reason.c_str());
+            t.loader_zone, t.loader_grown, t.rounding,
+            // the ledger only warns, but the stage refuses a plan whose loader pool does not fit the budget
+            placement_plan_loader_pool_refusal(plan).empty() ? "the plan is kept: the ledger is WARN-only" :
+                                                               "the stage refuses the load: loader-pool-over-budget",
+            reason.c_str());
     }
 }
 
@@ -36365,10 +36427,23 @@ static void placement_plan_log_working_set(const char *              tag,
 }
 
 // The load's fact onto the plan (design 5efe §4.4), the one place either builder copies it, before it makes any entry.
-// The lock follows the mapping: a load that maps nothing locks nothing.
-static void placement_plan_copy_host_backing_fact(placement_plan & plan, const placement_kv_info & info) {
-    plan.host_backing_maps_files = info.load_maps_files;
-    plan.host_mapped_locked      = info.load_maps_files && info.load_locks_files;
+// The lock follows the mapping: a load that maps nothing locks nothing. The loader's SYCL_Host buffer follows it too:
+// a load that maps no file binds that buffer for its weights when they are evictable, in the pool of the device the
+// load names, and `plan_device`, the builder's device (-1 for the multi-device builder), decides with it whether host
+// experts are served from it in place.
+static void placement_plan_copy_host_backing_fact(placement_plan &          plan,
+                                                  const placement_kv_info & info,
+                                                  int                       plan_device) {
+    plan.host_backing_maps_files       = info.load_maps_files;
+    plan.host_mapped_locked            = info.load_maps_files && info.load_locks_files;
+    const placement_loader_fact loader = placement_loader_fact_for(info.load_maps_files, info.load_weights_evictable,
+                                                                   info.load_loader_device, plan_device);
+    plan.loader_holds_weights          = loader.holds_weights;
+    plan.loader_device                 = loader.device;
+    plan.loader_serves_host_experts    = loader.serves_host_experts;
+    plan.loader_buffer_cap             = info.load_loader_buffer_cap;
+    plan.loader_holds_host_dense =
+        placement_loader_holds_host_dense(info.host_weight_layout, info.load_inventory_unbound);
 }
 
 // A host-resident weight's backing, from the load's fact as the plan holds it (design 5efe §4.4): the builder copies
@@ -36384,7 +36459,7 @@ static placement_host_backing placement_host_backing_when_host(const placement_p
     if (!plan.host_backing_maps_files) {
         return placement_host_backing::PINNED;
     }
-    if (routed_expert || get_rows_only || !kv_info.host_weight_layout_cpu) {
+    if (routed_expert || get_rows_only || !host_weight_layout_facts_of(kv_info.host_weight_layout).dense_cpu_owned) {
         return placement_host_backing::FILE_MAPPED;
     }
     return placement_host_backing::CPU_OWNED;
@@ -37184,26 +37259,43 @@ static void populate_host_zone_sizing(placement_plan &                          
     plan.moe_swap_host_headroom_bytes    = 0;
 
     // WEIGHT: exact bytes plus named terms. The host weights are summed from the entries, the bytes the cache
-    // materializes; weight_host_bytes is the plan's running total of the same bytes, so a difference means a writer
-    // charged something the entries do not hold, and the zone is sized from the entries. It warns rather than aborts:
-    // the multi-device builder's MoE group branch still charges a host-spilled group at the device layout's dst_size,
-    // so a padded multi-device load that takes that branch would abort until that charge is the materialized src_size
-    // (llama.cpp-4qdx). Its cohesive host-layer branch already charges a host expert at src_size.
+    // materializes or the loader's buffer serves in place; weight_host_bytes is the plan's running total of the same
+    // bytes, so a difference means a writer charged something the entries do not hold, and the zone is sized from the
+    // entries. It warns rather than aborts: the multi-device builder's MoE group branch still charges a host-spilled
+    // group at the device layout's dst_size, so a padded multi-device load that takes that branch would abort until
+    // that charge is the materialized src_size (llama.cpp-4qdx). Its cohesive host-layer branch already charges a host
+    // expert at src_size.
     const host_weight_zone_terms weight_terms = placement_plan_host_weight_zone_terms(plan);
-    if (weight_terms.host_weights != plan.weight_host_bytes) {
+    if (!weight_terms.matches_charge(plan.weight_host_bytes)) {
         GGML_LOG_WARN(
-            "[HOST-PLAN-BUG] device=%d the WEIGHT zone's entries hold %zu B but the plan's weight_host_bytes is %zu B; "
-            "the WEIGHT zone is sized from the entries\n",
-            plan.device_id, weight_terms.host_weights, plan.weight_host_bytes);
+            "[HOST-PLAN-BUG] device=%d the WEIGHT zone's entries hold %zu B (%zu B in blocks, %zu B served from the "
+            "loader's buffer) but the plan's weight_host_bytes is %zu B; the WEIGHT zone is sized from the entries\n",
+            plan.device_id, weight_terms.host_weights + weight_terms.loader_served, weight_terms.host_weights,
+            weight_terms.loader_served, plan.weight_host_bytes);
     }
     plan.host_zone_weight_bytes = weight_terms.total();
+    plan.host_zone_loader_bytes = weight_terms.loader_residency;
+    // The loader's tensors with the term, for the commit terms' replay of its buffers in the pool.
+    plan.loader_tensor_bytes    = placement_plan_loader_tensor_bytes(plan, tensor_inventory);
+
+    // The record's total counts the loader's raw bytes (loader_residency). The zone the configure step sizes holds the
+    // replay's zone bytes for them instead (loader_zone, on the chunk record_host_ledger_plan counts), and only on
+    // loader_device, so the line prints both: zone= is this device's WEIGHT zone as "[HOST-ARENA] Zones configured:
+    // WEIGHT=" shows it before alignment and before any spread swap headroom the record adds.
+    const host_zone_commit_terms record_terms =
+        placement_plan_host_zone_commit_terms(plan, 0, host_ledger_plan_chunk(host_ledger_plan_cache(plan)));
+    const host_zone_commit_terms zone_terms =
+        placement_plan_host_zone_commit_terms_on_device(plan, record_terms, plan.device_id);
+    const char * loader_role = placement_plan_loader_role(plan, weight_terms);
     GGML_LOG_INFO(
-        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu host_compute_reserve=%zu layout_copies=%zu "
-        "tlsf_bound=%zu total=%zu (%.1f MB); unplanned: loader_residency (the loader's SYCL_Host buffer, not a "
-        "term)\n",
-        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.host_compute_reserve,
-        weight_terms.layout_copies, weight_terms.tlsf_bound, weight_terms.total(),
-        weight_terms.total() / (1024.0 * 1024.0));
+        "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu loader_residency=%zu loader_served=%zu "
+        "loader_device=%d "
+        "host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu record_total=%zu (%.1f MB) loader_zone=%zu "
+        "zone=%zu (%.1f MB); loader_residency: %s\n",
+        plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.loader_residency,
+        weight_terms.loader_served, plan.loader_device, weight_terms.host_compute_reserve, weight_terms.layout_copies,
+        weight_terms.tlsf_bound, weight_terms.total(), weight_terms.total() / (1024.0 * 1024.0),
+        record_terms.loader_zone, zone_terms.weight, zone_terms.weight / (1024.0 * 1024.0), loader_role);
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: S1 preload may keep multiple async H2D/reorder submissions
     // alive. CPU-side layout conversion can hold both the source staging copy
@@ -38084,7 +38176,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_envelope_fa_name(envelope->flash_attn_type));
     }
     placement_plan plan;
-    placement_plan_copy_host_backing_fact(plan, kv_info);
+    placement_plan_copy_host_backing_fact(plan, kv_info, device_id);
     bool host_experts_pinned                 = false;
     plan.vram_budget                         = vram_budget;
     plan.device_id                           = device_id;
@@ -39574,7 +39666,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     const size_t n_devs = device_budgets.size();
 
     placement_plan plan;
-    placement_plan_copy_host_backing_fact(plan, kv_info);
+    placement_plan_copy_host_backing_fact(plan, kv_info, /*plan_device=*/-1);
     plan.device_id                = -1;  // Multi-device
     plan.multi_device             = true;
     plan.vram_bytes               = 0;

@@ -742,9 +742,9 @@ static void llama_model_sycl_mark_get_rows_only(std::vector<ggml_sycl_tensor_inf
 static void llama_model_sycl_set_inventory_host_backing(ggml_sycl_tensor_inventory & inventory,
                                                         const llama_model_loader &   ml,
                                                         bool                         use_mlock) {
-    inventory.use_mmap_resolved      = ml.use_mmap;
-    inventory.use_mlock_resolved     = use_mlock;
-    inventory.host_weight_layout_cpu = llama_model_loader::host_weight_layout_cpu();
+    inventory.use_mmap_resolved  = ml.use_mmap;
+    inventory.use_mlock_resolved = use_mlock;
+    inventory.host_weight_layout = llama_model_loader::host_weight_layout_sycl();
 }
 
 // The STORAGE rows an inventory's lazy tables describe, and the infos that point at them. Each info's name points into

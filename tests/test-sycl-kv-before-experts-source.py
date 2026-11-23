@@ -284,7 +284,7 @@ HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_re
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
-            "bool host_weight_layout_cpu; uint32_t n_ubatch_context; "
+            "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
             "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
             "uint32_t n_ubatch_measure; }")
 # The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses

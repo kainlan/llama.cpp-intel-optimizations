@@ -111,8 +111,8 @@ IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, nu
 SNAPSHOT_CAPTURE = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused, decision.effects);"
 # The retained-candidate overload (the decision's snapshot->plan), not the
 # current-plan overload S1-PRELOAD uses.
-PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);"
-CURRENT_PLAN_PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);"
+PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);"
+CURRENT_PLAN_PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, device);"
 CONFIGURE_TOKEN = "configure_host_zones"
 
 # Every window the checks read, keyed by name. Witness mutants operate on a

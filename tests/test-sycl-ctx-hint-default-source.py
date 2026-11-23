@@ -372,7 +372,7 @@ INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 # appended after it (th32 §4.1), with the measured micro-batch in their padding (test-sycl-load-measure-source).
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
-            "bool host_weight_layout_cpu; uint32_t n_ubatch_context; "
+            "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
             "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
             "uint32_t n_ubatch_measure; }")
 SIZE_PINS = (
