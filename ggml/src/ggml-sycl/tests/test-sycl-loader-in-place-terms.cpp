@@ -32,6 +32,7 @@
 #include "ggml-impl.h"
 #include "ggml-sycl/unified-cache.hpp"
 
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -604,6 +605,9 @@ template <typename F> bool aborts_with(F operation, const char * refusal) {
         close(pipefd[0]);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
+        // The abort is the outcome under test, so the child dumps no core: a core pipe handler would otherwise write
+        // one crash record per child on every run.
+        prctl(PR_SET_DUMPABLE, 0);
         operation();
         _exit(0);
     }
@@ -656,6 +660,11 @@ void check_grown_chunk_serves_its_request() {
         }
     }
     CHECK(served(chunk, kHeader));
+    // Two figures written out by hand, because every check above takes its expectation from the rule itself and a rule
+    // that asked for a grain too many would still pass them: at the loader's 64 B alignment a request 32 B past three
+    // chunks takes the next 256 B grain, and a request on the grain takes exactly itself.
+    CHECK(pinned_chunk_pool::zone_grow_request(3 * chunk + 32, 64) == 3 * chunk + 256);
+    CHECK(pinned_chunk_pool::zone_grow_request(3 * chunk, 64) == 3 * chunk);
     // An alignment above the grain no chunk serves at any size: the TLSF refuses it (round_request asserts), so no
     // growth could make room for it, and zone_grow_request refuses it the same way, before the pool grows anything.
     constexpr const char * kRefusal = "TLSF only supports alignment";
