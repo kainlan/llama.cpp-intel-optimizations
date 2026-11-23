@@ -36,7 +36,7 @@
 # Postflight SUSPECT triggers, each with its own reason token in the verdict
 # line and archived header: GPU host backing grew more than 5 GiB across the run
 # (`backing-grew:<N>kB`, net Shmem plus the remainder; a first post sample over the threshold is
-# re-taken after BENCH_GUARD_POST_RECHECK_S seconds, a whole number, default 5, and only the second sample
+# re-taken after BENCH_GUARD_POST_RECHECK_S seconds, a whole number from 0 to 999, default 5, and only the second sample
 # counts; the header then stamps `post_recheck=1 post_first_backing=<N>kB`); a post-run sample that cannot be
 # read (`backing-unreadable`: the command has already run, so this stamps SUSPECT and never refuses); the run
 # was killed by the timeout
@@ -83,7 +83,7 @@ SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
 # Seconds to wait before the second post-run sample; the environment variable lets a test set it to 0.
-POST_RECHECK_S="${BENCH_GUARD_POST_RECHECK_S:-5}"
+POST_RECHECK_S="${BENCH_GUARD_POST_RECHECK_S-5}"
 LOG="" BUDGET=900 JOURNALCTL_CMD=""
 # shellcheck disable=SC2034  # --drm-root below sets DRM_ROOT, read by derive_card_for_selector (sourced further down, sycl-gpu-sysfs.sh) -- shellcheck can't see across a `source`
 while [ $# -gt 0 ]; do case "$1" in
@@ -111,8 +111,12 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # mode this file guards against everywhere else (llama.cpp-imns review
 # round 5, finding F9).
 [ -r "$MEMINFO" ] || refuse "no meminfo at $MEMINFO"
-# A wait that is not a whole number would make `sleep` fail after the command has run.
-case "$POST_RECHECK_S" in ''|*[!0-9]*) refuse "BENCH_GUARD_POST_RECHECK_S must be a whole number of seconds (got '$POST_RECHECK_S')";; esac
+# A wait that is not a whole number from 0 to 999 with no leading zero would make the post-run arithmetic or
+# `sleep` fail after the command has run (08 is invalid octal in `$(( ))`, and a long value overflows).
+case "$POST_RECHECK_S" in
+    0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+    *) refuse "BENCH_GUARD_POST_RECHECK_S must be a whole number of seconds from 0 to 999 with no leading zero (got '$POST_RECHECK_S')";;
+esac
 
 # is_top_level_card, derive_card_for_selector, and find_card_by_pci (used
 # just below) now live in a small shared helper -- scripts/sycl-gpu-sysfs.sh

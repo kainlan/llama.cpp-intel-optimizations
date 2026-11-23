@@ -216,10 +216,12 @@ head -1 "$T/run6.log" | grep -q "post_recheck" && { echo "FAIL: no re-check stam
 cases=$((cases+1))
 # A BENCH_GUARD_POST_RECHECK_S that is not a whole number refuses before the command runs.
 mk_tree 0 0; mk_meminfo 3000000; rm -f "$T/ran"
-out="$(BENCH_GUARD_POST_RECHECK_S=1.5 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- touch "$T/ran" 2>&1)" && rc=0 || rc=$?
-[ "$rc" -eq 3 ] || { echo "FAIL: a non-integer recheck wait must refuse with exit 3, got $rc"; fail=1; }
-echo "$out" | grep -q "BENCH_GUARD_POST_RECHECK_S" || { echo "FAIL: the refusal must name the variable (got: $out)"; fail=1; }
-[ ! -e "$T/ran" ] || { echo "FAIL: the command ran despite the refusal"; fail=1; }
+for badv in 1.5 08 -1 1000 123456789012345 ""; do
+out="$(BENCH_GUARD_POST_RECHECK_S="$badv" "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- touch "$T/ran" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: recheck wait '$badv' must refuse with exit 3, got $rc"; fail=1; }
+echo "$out" | grep -q "BENCH_GUARD_POST_RECHECK_S must be a whole number" || { echo "FAIL: the refusal for '$badv' must name the variable (got: $out)"; fail=1; }
+[ ! -e "$T/ran" ] || { echo "FAIL: the command ran despite the refusal of '$badv'"; fail=1; }
+done
 cases=$((cases+1))
 # A post-run sample that cannot be read: the command has already run, so no refusal. SUSPECT backing-unreadable,
 # the log is written and the exit code mirrors the command's (7 here).
