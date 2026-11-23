@@ -245,6 +245,15 @@
 //                           The control: a drop of expert 1's device entries outside any move sets the cache's eviction
 //                           latch on their reap. A named evict of expert 0, the reap of its device entries, its admit
 //                           back and the reap of its host copies, before it, leave the latch clear.
+//   move_whose_swap_lost_sets_the_eviction_latch
+//                           The control: the latch is clear after its reset. The plan is published as a model's
+//                           lifecycle row, which the publication hook erases during the evict's host registration, so
+//                           the evict's plan swap loses: it is REFUSED and the latch is set.
+//   failed_moved_copy_hands_its_id_back
+//                           The control: the same registration without the failure succeeds and maps the id to its host
+//                           copy. With expert 0's device entry retired exactly (its id mapping gone, the extra's record
+//                           keeping it), a host copy registered in its place whose mirror allocation fails is refused,
+//                           leaves no host copy, and leaves the id naming the device entry.
 //
 // Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
 // releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
@@ -383,6 +392,9 @@ int main() {
     ok &= run_case("loan_rollback_hands_the_id_back_to_the_device_entry",
                    ggml_sycl::test_expert_loan_rollback_hands_the_id_back_to_the_device_entry);
     ok &= run_case("moves_leave_the_eviction_latch_clear", ggml_sycl::test_expert_moves_leave_the_eviction_latch_clear);
+    ok &= run_case("move_whose_swap_lost_sets_the_eviction_latch",
+                   ggml_sycl::test_expert_move_whose_swap_lost_sets_the_eviction_latch);
+    ok &= run_case("failed_moved_copy_hands_its_id_back", ggml_sycl::test_expert_failed_moved_copy_hands_its_id_back);
     // Last: each releases a model slot, a teardown scan of the whole device cache.
     ok &=
         run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);

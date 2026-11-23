@@ -719,6 +719,12 @@ std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry();
 // A move's retires leave the cache's eviction latch clear, since the move's publication bumps the exec-graph epoch: a
 // named evict, an admit and their reaps set nothing, while a drop of an expert's device entry outside a move latches.
 std::string test_expert_moves_leave_the_eviction_latch_clear();
+// A move whose plan swap loses publishes nothing and bumps no epoch, so the transaction sets the eviction latch as it
+// returns.
+std::string test_expert_move_whose_swap_lost_sets_the_eviction_latch();
+// A host copy registered in place of a device entry whose mirror cannot be published hands the id it took back to that
+// entry, and the same registration without the failure maps the id to the copy.
+std::string test_expert_failed_moved_copy_hands_its_id_back();
 // Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
 // it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
 // no model ever owned stays through the release. A copy made while its source's load is still pending takes that

@@ -28589,6 +28589,174 @@ std::string test_expert_moves_leave_the_eviction_latch_clear() {
     return {};
 }
 
+// The lifecycle row the lost-swap case publishes its plan under, which the publication hook erases.
+struct test_lost_swap_row {
+    uint64_t model_id    = 0;
+    uint64_t load_txn_id = 0;
+};
+
+static void test_erase_lifecycle_row(void * context) {
+    const auto * row = static_cast<const test_lost_swap_row *>(context);
+    lifecycle_erase_placement_plan(row->model_id, row->load_txn_id);
+}
+
+std::string test_expert_move_whose_swap_lost_sets_the_eviction_latch() {
+    // An expert move's retires stay out of the cache's eviction latch only because its publication bumps the
+    // exec-graph epoch. A move whose plan swap loses publishes nothing and bumps nothing, so the transaction sets the
+    // latch as it returns. The plan is published as a model's, a lifecycle row the transaction swaps by compare-and-
+    // swap; the external-lease flag a runtime publisher sets stands in for the live-update lease, since the fixture
+    // has no loaded model to lease. The publication hook, which the evict's host registration runs while the
+    // transaction holds the inventory lock, after it checked the row, erases the row, so the swap finds none and loses.
+    // The control: the latch is clear after its reset, before the evict.
+    constexpr uint64_t model_id = 0x6576637413ull;
+    test_loan_fixture  fx(/*layers=*/1, /*experts=*/3, model_id);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    test_lost_swap_row row{ model_id, /*load_txn_id=*/0x13ull };
+
+    // Every exit takes the hook and the flag down and erases the row (a no-op once the hook has), before the fixture
+    // puts back the publication it found.
+    struct lost_swap_cleanup {
+        const test_lost_swap_row & row;
+
+        ~lost_swap_cleanup() {
+            unified_cache_set_expert_publication_test_hook(nullptr, nullptr);
+            ::g_runtime_external_lease = false;
+            lifecycle_erase_placement_plan(row.model_id, row.load_txn_id);
+        }
+    } cleanup{ row };
+
+    lifecycle_stage_placement_plan(row.load_txn_id, fx.plan(/*host_expert=*/2));
+    std::shared_ptr<const lifecycle_plan_snapshot> published;
+    if (!lifecycle_publish_placement_plan(row.model_id, row.load_txn_id, /*slot=*/0, /*slot_generation=*/1, 0, 0,
+                                          /*have_actual=*/false, &published) ||
+        !published) {
+        lifecycle_abort_placement_plan(row.load_txn_id);
+        return "the plan could not be published as a model's lifecycle row";
+    }
+    {
+        std::lock_guard lock(g_tensor_inventory_mutex);
+        ::ggml_sycl_publish_plan_locked(published);
+    }
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the evict";
+    }
+    fx.cache->process_deferred_frees_public();
+    fx.cache->test_reset_evictions_latch();
+    if (fx.cache->has_evictions()) {
+        return "the eviction latch is set right after its reset";
+    }
+
+    ::g_runtime_external_lease = true;
+    unified_cache_set_expert_publication_test_hook(&test_erase_lifecycle_row, &row);
+    ::ggml_sycl_expert_move_result evicted;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
+    unified_cache_set_expert_publication_test_hook(nullptr, nullptr);
+    ::g_runtime_external_lease = false;
+    if (code != ::ggml_sycl_txn_result::REFUSED || evicted.accepted) {
+        return "the evict whose plan swap lost answered " + test_admit_answer(code, evicted);
+    }
+    if (!fx.cache->has_evictions()) {
+        return "the evict whose plan swap lost left the eviction latch clear";
+    }
+    return {};
+}
+
+// The publication hook of the moved-copy case: makes the cache's next map allocation fail, once.
+static void test_fail_next_cache_allocation_once(void * context) {
+    bool * armed = static_cast<bool *>(context);
+    if (!*armed) {
+        *armed = true;
+        unified_cache_fail_expert_allocation_after_for_test(1);
+    }
+}
+
+std::string test_expert_failed_moved_copy_hands_its_id_back() {
+    // A host copy registered in place of a device entry (moved_from) takes the expert's id. A registration that fails
+    // after naming its copy under the id hands the id back to that entry rather than erasing it, so the mover has a
+    // mapping to put the entry back under. Driven directly, outside a loan, whose rollback would restore a lost id
+    // itself and hide the hand-back: slot 0 expert 0's device entry is retired exactly first, which takes its mirror
+    // and its id mapping out, while the extra's record keeps the entry in place for the registration to find. The
+    // publication hook, which the registration runs just before it publishes the mirror, makes the cache's next map
+    // allocation fail, the mirror's node. The id maps to nothing before the call, so a mapping to the device entry
+    // after it is the hand-back's. The control: the same registration without the failure succeeds and maps the id to
+    // the host copy.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637414ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 9 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    const ggml_sycl_cache_id key = fx.keys[fx.index(0, 0, 0)];
+    const unified_cache_key  device_key{ cache_entry_type::MOE_EXPERT, key, -1,
+                                        -1000 - static_cast<int>(GGML_LAYOUT_AOS) };
+    if (!test_id_names(fx, 0, 0, 0, /*device=*/true)) {
+        return "before the retire slot 0 expert 0's id does not name its device entry";
+    }
+    if (!expert_retire_succeeded(fx.cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/moved copy source"))) {
+        return "slot 0 expert 0's device entry could not be retired";
+    }
+    if (!fx.device_entry_present(0, 0, 0)) {
+        return "the retired device entry was reaped while the extra's record held it";
+    }
+    if (fx.cache->test_id_mapping(key, nullptr)) {
+        return "after the exact retire slot 0 expert 0's id still maps to an entry";
+    }
+    mem_handle   owner = ::ggml_sycl_host_expert_alloc(fx.device, bytes);
+    void * const ptr   = owner.valid() ? owner.resolve().ptr : nullptr;
+    if (!ptr) {
+        return test_loan_fail("no pinned host storage of %zu bytes", bytes);
+    }
+    auto register_moved_copy = [&] {
+        scoped_planned_materialization materialization(fx.cache, "test/moved copy registration");
+        return fx.cache->register_host_expert_owned(key, ptr, bytes, GGML_LAYOUT_AOS, nullptr, owner, nullptr,
+                                                    /*replace_existing=*/false, &device_key);
+    };
+
+    // Every exit takes the hook down and disarms the countdown.
+    struct fault_cleanup {
+        ~fault_cleanup() {
+            unified_cache_set_expert_publication_test_hook(nullptr, nullptr);
+            unified_cache_fail_expert_allocation_after_for_test(0);
+        }
+    } cleanup;
+
+    bool armed = false;
+    unified_cache_set_expert_publication_test_hook(&test_fail_next_cache_allocation_once, &armed);
+    const bool failed_registered = register_moved_copy();
+    unified_cache_set_expert_publication_test_hook(nullptr, nullptr);
+    unified_cache_fail_expert_allocation_after_for_test(0);
+    if (!armed) {
+        return "the registration never reached its publication hook";
+    }
+    if (failed_registered) {
+        return "the registration whose mirror allocation failed succeeded";
+    }
+    if (fx.host_entry_present(0, 0, 0)) {
+        return "the failed registration left its host copy";
+    }
+    if (!test_id_names(fx, 0, 0, 0, /*device=*/true)) {
+        return "the failed registration did not hand the id back to the device entry its copy was to replace";
+    }
+    if (!register_moved_copy() || !test_id_names(fx, 0, 0, 0, /*device=*/false)) {
+        return "the control: the registration without the failure did not map the id to its host copy";
+    }
+    return {};
+}
+
 std::string test_expert_refill_belongs_to_the_lending_model() {
     // A loan and its refill move a triplet to the host and back, and each copy belongs to the model that owned the
     // one it replaced: the re-admitted device entries are still that model's, and its release reclaims them. A model
