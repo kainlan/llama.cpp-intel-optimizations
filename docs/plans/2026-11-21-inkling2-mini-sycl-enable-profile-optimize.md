@@ -4568,6 +4568,33 @@ admission.** The weight is loaded BF16, AOS, on the card; the kernel reads it th
   tables' invariant); one dense BF16 launch per (token, slot) through `src0_row` (host ids, a wait, one launch
   per occurrence).
 
+**After the reviews (lead, 2026-11-23, on `8fe336e2b`; evidence
+`docs/backend/data/inkling2/t8g-lead-runs-8fe336e2b.txt`):**
+- *Accepted deviations from the ruling.* The leases are kept by a snapshot of the table's dispatch bundle
+  (`ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle`) retained until the kernel's event, the form every
+  pointer-table dispatcher uses, and not by `ggml_sycl_retain_moe_ptr_table_leases_until_event`. The no-plan arm
+  of the predicate admits a weight in this device's own SYCL buffer; its condition is met: on each card
+  `test-backend-ops -o MUL_MAT_ID` moved 31 BF16 cases from "not supported" to OK and changed no other case.
+- *Measured.* Kernel test and device test pass (B70 and B50, each log names its card). The Inkling gate passes
+  on the B70 and on both cards. The split census is 1 split, 0 on the CPU (it was 9 and 4). Mistral and GPT-OSS
+  plan lines are unchanged.
+- *The hypothesis this task was moved forward for.* With no CPU split the decoded token is one stable graph of
+  12226 nodes and segmented replay records it: 57 segment graphs, 148 direct boundaries, 88 direct segments,
+  3273 nodes in graphs. One bench pair from the same binary reads tg128 4.66 t/s with replay and 3.86 with
+  `GGML_SYCL_DISABLE_GRAPH=1`; the integration tree read 4.04 and 3.82 earlier the same night. Direction only:
+  one pair, a foreign build alive. The clean ABBA is owed on the fix commit.
+- *A false alarm, kept as a record.* The first ABBA read tg128 2.00 and 2.73 t/s for this tree. Four later
+  loads of the same binary did not reproduce it (text 4.30, generation-only bench 3.87, a 691-token prompt
+  then decode 4.46, the same bench command 4.66). Implementer builds had started inside the pair, and the
+  runner sampled builders only at the start of an arm. It now samples both ends.
+- *Quality review, first round: FAIL, seven findings, all sent back with rulings.* The route block is keyed on
+  the type and refuses by name when the predicate says no at run time. The launch is cut into token chunks
+  whose range fits an int, with a limit a test can lower (above about 7281 tokens at Inkling's shapes the
+  single launch throws and the op's catch exits the process). The kernel test skips with 77 when no CPU
+  device exists. The device test sends an id of -1 through the production route and skips only at the device
+  probe. A table miss publishes only for a weight in this device's own buffer. Added by the lead: a profiler
+  label for the kernel (`mulmat.moe.bf16_direct`), because the device-time profile has no row for it.
+
 **Checkpoint before any code (report to the lead, then wait):**
 1. How the CPU backend reads these experts today, given that the scheduler print shows them as `[SYCL0]` with
    no copy in the split's inputs: is there a host mirror, and does it stay allocated once the node runs on the
@@ -4781,6 +4808,37 @@ B50). `unified-cache.cpp`, `binbcast.cpp` and `moe-control-plan.cpp` do not chan
 **Not in this task:** removing the raw-host staging path, the bin-broadcast event mode
 (`GGML_SYCL_BINBCAST_EVENT_MODE`), removing the identity `REPEAT` of the residual query weights in the graph
 builder, the recording failures that appear after this one.
+
+**DONE 2026-11-23, merged as `7c2e47857`.** Task commits: `fb60bfe75` (RED), `298daae34` (the predicate and
+its two callers), `1f2dc2606` (the quality review's four findings). Spec review PASS; quality review FAIL
+then PASS on the re-review. Evidence: `docs/backend/data/inkling2/t8i-lead-runs-1f2dc2606.txt`.
+
+*Device results, one run each, zero kernel fault lines (task tree's build; the merge has the same code):*
+- `cross-model-weight-usage` on the B50 (its log names the B50): 19 checks, 0 failures.
+- Trace run, B70: no `[BINBCAST] stage` line names a `.scale`, no rejected runtime materialization, no
+  `[SYCL-SEG-SLOT]` recording failure at a `REPEAT`. The stage lines that remain (288 in 4 tokens) are the
+  outputs of the BF16 expert nodes still on the CPU, which Task 8g moves.
+- Plan lines as predicted: `duplicates=0`, roles `down=3072 gate_up=3072`, `target device0: 6144 expert
+  tensors`, `NORM/EMBED device= 87`. Mistral and GPT-OSS plan lines differ only in free-memory and timing
+  figures.
+- The Inkling gate passes on the B70 and on both cards; the Mistral gate (B70) and the GPT-OSS gate (B50)
+  pass.
+
+*What it did to decode, which nobody predicted at this size.* With the scales on the card their `REPEAT`
+nodes record, and the segment graphs of the main decode split cover 11336 of its 11469 nodes (2531 before:
+46 graphs and 88 direct segments became 134 graphs and no direct segment). The gate's decoded tokens read
+122.7 ms each against 254.7. Bench, B70, interleaved with the integration tree: tg128 11.26 t/s in the arm
+with no builder alive at either end, against 4.23 and 4.21; the second task arm read 6.99 with a foreign
+build starting inside it and is a lower bound. pp512 is unchanged (43.3 against 43.2 and 43.0). Orientation
+figures under the permanent host load, not a baseline; the clean ABBA is taken on the merged tree's own
+build.
+
+*The implementer's read on the open question:* a scale's `e0` entry did not displace the real expert 0 on
+the old tree (sort order, first entry wins); it added 512 bytes per role to expert 0's group.
+
+*Owed:* both sweeps on the merged tree's full build (the task tree built five targets; its sweep 1 ran
+without eight tests whose binaries it did not build). The `duplicates=0` pin has no non-GPU test: no
+fixture reaches the planner's count, so the lead reads it from the plan line.
 
 ---
 
@@ -5779,6 +5837,12 @@ Q8_1 once per token row, and the per-expert token lists can come from the host c
 or from the device histogram in `moe-sort.hpp`. The open design point is the scale: NVFP4 has one per 16
 elements and a DPAS tile spans 32. The closest template, `mxfp4-stored-gemm.cpp`, is not wired into dispatch.
 
+**After Task 8i (2026-11-23).** Row S1 moved without a Stage 3 task: a classification fix put 40 scale
+tensors on the card, replay took 11336 of the split's 11469 nodes, and decode went from about 4.2 to about
+11 t/s on the B70. The decode profile above is therefore stale: every decode row (S1, S7, S9, the decode
+half of S4) is re-measured on the merged tree before any decode task is written. The prompt rows (S4's
+prompt half, S8) are untouched: pp512 did not move.
+
 Proposed order (the user reviews it before any of it starts): Tasks 8g and 8i first, because they are running
 and they decide whether graph replay engages at all (S1); then S7 (the smallest change); S8 (a contained change
 for a quarter of the prompt); S4 as a grouped prompt kernel (half of the prompt, the largest piece of work); the
@@ -5840,6 +5904,17 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
   because a ctest registration's `ENVIRONMENT` overrides the caller's selector. The runner now runs the binary
   for any card but the registered one and fails the step unless the log names the card it was asked for. A
   device run is evidence for a card only when its own log names that card.
+- The NVFP4 expert launch (`mul_mat_vec_q_id`, `mmvq.cpp`) has the range risk Task 8g's kernel had: its
+  global range grows with the micro-batch and nothing checks it against an int. A read, not a failure seen.
+- `ggml_sycl_mul_mat_id`'s catch calls `std::exit(1)` on a SYCL exception it does not recognise. An exit is
+  an abort by another name: the graph should fail at its boundary.
+- `test-sycl-bf16-mul-mat` throws uncaught when no `opencl:cpu` device exists, as Task 8g's kernel test
+  did. It should skip with 77.
+- The canonical gate script prints `sha=` of its own tree, not of the tree whose `build/` it ran. A gate
+  run from a task tree is labelled with the integration tree's commit.
+- A lead mistake to keep out of the next round: a throughput pair was read while implementer builds started
+  inside it, and two slow arms were chased as a regression for five loads. Builders are sampled at both
+  ends of an arm now, and an implementer's build waits for the bench's `done` file.
 - A lead mistake to keep out of the next round: the contract sweep (`-j 4`) ran beside the device chain and
   overlapped the bench step. A bench step runs with nothing else of the lead's on the CPU.
 - From Task 8e's re-review: the commit message of `8050f81b3` words its change loosely (not amended, by
