@@ -638,8 +638,8 @@ iGPU's signature missing, not that nothing was held.
 
 **Why the sum does not see the other tenant.** The other session holds a 122 GiB model in `AnonPages`
 (126 to 130 GiB), which the formula subtracts. Measured with that tenant's model held (`AnonPages` 126.4 GiB):
-remainder 1.9 GiB, sum 12.9 GiB. `MemAvailable` sits near 50 GiB then, by design, which is why no
-`MemAvailable` floor is used (ruling 2026-11-12). Recorded snapshots and the test:
+remainder 1.9 GiB, sum 12.9 GiB. That tenant lowers `MemAvailable` by design, which is why no `MemAvailable` floor is used (ruling
+2026-11-12, which recorded it near 55 GB; it read 102 GiB at this measurement). Recorded snapshots and the test:
 `tests/sycl-meminfo-fixtures/` and `tests/test-sycl-host-backing.sh`.
 
 **Units.** One unit everywhere: GiB, the kernel's kB / 1048576, which the library prints. Scripts compare in kB.

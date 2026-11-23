@@ -53,7 +53,7 @@ History and measurements: `docs/backend/sycl-host-safety.md`.
   `sleep 5; source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`.
 - `GPU.lock` serialises access, not memory recovery. After you take it and before you touch the device, wait for
   GPU host backing `< 30 GiB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on that
-  figure only: `MemAvailable` sits near 50 GiB on purpose while a 122 GiB model is held in host memory (ruling
+  figure only: `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling
   2026-11-12, amended 2026-11-23: the instrument is `Shmem` plus the remainder, still no `MemAvailable` floor).
 - Run every GPT-OSS test under `timeout`, so a hang cannot hold the card. `timeout 60` covers a short 20B run;
   a bench or a default-context run needs more (`scripts/sycl-canonical-gates.sh` uses 900).

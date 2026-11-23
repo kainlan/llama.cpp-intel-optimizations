@@ -183,7 +183,7 @@ if [ -n "$busy" ]; then
     exit 1
 fi
 # GPU host backing (Shmem + the meminfo remainder); an unreadable meminfo is not settled. MemAvailable is not a
-# condition (ruling 2026-11-12): it sits near 50 GiB on purpose while another tenant holds a model, and the
+# condition (ruling 2026-11-12): it sits near 55 GB on purpose while another tenant holds a model, and the
 # planner refuses a load that exceeds the host budget by name.
 backing_kb=$(sycl_gpu_host_backing_kb) || { echo "refusing: cannot read GPU host backing from /proc/meminfo" >&2; exit 1; }
 if [ "$backing_kb" -ge $((30 * 1048576)) ]; then

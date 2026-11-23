@@ -288,7 +288,7 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
 1. Sources oneAPI when needed, then checks that `GGML_SYCL` is ON and that `ldd` resolves at least
    two SYCL libraries (it counts only lines with `=> /`, never "not found").
 2. Waits for CLAUDE.md's post-lock settle: GPU host backing (Shmem + the meminfo remainder) < 30 GiB and nothing else. `MemAvailable` is
-   logged and is not a condition (ruling 2026-11-12): it sits near 50 GiB on purpose while another tenant
+   logged and is not a condition (ruling 2026-11-12): it sits near 55 GB on purpose while another tenant
    holds a model, and the planner refuses a load that exceeds the host budget by name, so the script does
    not check that the load fits. After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with "release GPU.lock and
    escalate". Every memory figure the script compares or prints is GiB (kB / 1048576), CLAUDE.md's
