@@ -5376,6 +5376,10 @@ class unified_cache {
     }
 
     sycl::queue &                queue_;
+    // queue_'s device as ggml_sycl_get_device_id_from_queue numbers it (the numbering the counter dump and the raw
+    // exit share), resolved once at construction. The exit path passes this instead of looking the device up: it
+    // runs in static destruction, after dpct::dev_mgr, a function-local static built during main, is gone.
+    const int                    device_id_;
     sycl::queue *                compute_queue_ = nullptr;  // Inference compute queue (for deferred free barriers)
     std::unique_ptr<sycl::queue> dma_queue_;                // Separate in-order queue for cache DMA ops (CCS)
     std::unique_ptr<sycl::queue> bcs_queue_;                // Copy-only queue targeting BCS engine (ordinal 1)

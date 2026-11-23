@@ -718,7 +718,6 @@
     {"code": "G-CATCH", "key": "unified-cache.cpp::detail::promote_legacy_alloc_owner::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::ensure_single_device_context_queue::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::ensure_single_device_context_queue::catch_clause:exception#0"},
-    {"code": "G-CATCH", "key": "unified-cache.cpp::ext_alloc_note_arena_state::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::get_device_id_from_queue::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::has_pending_legacy_promotion_cleanup::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-cache.cpp::init_shared_context_queues::catch_clause:all#0"},

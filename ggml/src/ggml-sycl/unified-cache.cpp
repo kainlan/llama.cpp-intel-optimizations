@@ -6138,15 +6138,10 @@ struct ext_alloc_tag_scope {
 
 // The arena-active mirror the raw exit reads lock-free: arena_base_ is a plain pointer the raw layer
 // cannot read without the cache's lock. Set where an arena is created and cleared where it is
-// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). arena_abandon runs
-// at shutdown with the SYCL context possibly gone, so the device lookup cannot be allowed to throw.
-void ext_alloc_note_arena_state(const sycl::queue & queue, bool active) {
-    int dev = -1;
-    try {
-        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
-    } catch (...) {
-        return;
-    }
+// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). `dev` is the cache's
+// device_id_, resolved while the cache was alive: arena_abandon runs in static destruction, after
+// dpct::dev_mgr (a function-local static built during main) is gone, so nothing here looks it up.
+void ext_alloc_note_arena_state(int dev, bool active) {
     if (dump_dev_valid(dev)) {
         dump_tbl().arena_active[dev].store(active, std::memory_order_release);
     }
@@ -6361,6 +6356,7 @@ unified_cache::unified_cache(sycl::queue & queue,
                              size_t        authority_base_mem,
                              bool          authority_resolved) :
     queue_(queue),
+    device_id_(ggml_sycl_get_device_id_from_queue(queue)),
     budget_(budget_bytes),
     base_budget_(budget_bytes),
     reserved_(0),
@@ -6413,7 +6409,7 @@ unified_cache::unified_cache(sycl::queue & queue,
 
     // Initialize layout pool for consolidating layout allocations into
     // contiguous chunks (reduces GPU TLB misses from scattered USM mappings).
-    layout_pool_ = std::make_unique<sycl_device_pool>(queue_, ggml_sycl_get_device_id_from_queue(queue_));
+    layout_pool_ = std::make_unique<sycl_device_pool>(queue_, device_id_);
 
     // VRAM Arena: pre-allocate a block when enabled.  Inventory-derived zone
     // sizes are not available during first backend init, so the same helper is
@@ -27623,7 +27619,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
-            ext_alloc_note_arena_state(queue, true);
+            ext_alloc_note_arena_state(device_id_, true);
 
             // Single-chunk zone layout:
             //   [KV→ ...free... ←WEIGHT] [ONEDNN] [RUNTIME] [SCRATCH]
@@ -27825,7 +27821,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_base_ = arena_chunks_.front().ptr;
     arena_size_ = alloc_size;
-    ext_alloc_note_arena_state(queue, true);
+    ext_alloc_note_arena_state(device_id_, true);
 
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
@@ -29134,7 +29130,7 @@ bool unified_cache::arena_destroy() {
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    ext_alloc_note_arena_state(queue_, false);
+    ext_alloc_note_arena_state(device_id_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -29300,7 +29296,7 @@ void unified_cache::arena_abandon() {
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    ext_alloc_note_arena_state(queue_, false);
+    ext_alloc_note_arena_state(device_id_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
