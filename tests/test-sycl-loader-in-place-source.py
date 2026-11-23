@@ -578,8 +578,8 @@ MUTANTS = [
     ("terms-ignore-alignment", "C1", mutate(UCC, "TENSOR_ALIGNMENT", "1")),
     ("split-charges-loader", "C1", mutate_re(UCC, r"plan\.loader_holds_weights\s*&&\s*plan\.loader_device\s*>=\s*0",
                                              "plan.loader_holds_weights")),
-    ("loader-bytes-unrecorded", "C1", mutate_re(UCC, r"\bplan\.host_zone_loader_bytes\s*=\s*weight_terms\.loader_residency\s*;",
-                                                "")),
+    ("loader-bytes-unrecorded", "C1", mutate_re(
+        UCC, r"\bplan\.host_zone_loader_bytes\s*=\s*weight_terms\.loader_residency\s*;", "")),
     ("configure-sizes-plan-device", "C1", mutate_re(
         GS, r"(placement_plan_host_zone_commit_terms_on_device\s*\(\s*plan\s*,[^;]*?,\s*)device(?=\s*\))",
         r"\1plan.device_id")),
@@ -592,8 +592,9 @@ MUTANTS = [
     ("fact-ignores-evictable", "C2", mutate(UCC, "info.load_weights_evictable", "true")),
     ("fact-ignores-loader-device", "C2", mutate(UCC, "info.load_loader_device", "0")),
     ("kv-fill-pins-loader-device", "C2", mutate_re(GS, r"\bkv\.load_loader_device\s*=[^;]*;", "kv.load_loader_device = 0;")),
-    ("second-fact-writer", "C2", mutate_re(GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
-                                           r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_holds_weights = true;")),
+    ("second-fact-writer", "C2", mutate_re(
+        GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
+        r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_holds_weights = true;")),
     ("footprint-ignored", "C3", mutate_re(HPP, r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-[^;]*;",
                                           "terms.weight = plan.host_zone_weight_bytes;")),
     ("footprint-at-chunk", "C3", mutate_re(HPP, r"host_zone_buffer_max_size\s*\(\s*plan\.loader_buffer_cap\s*,\s*"
@@ -605,11 +606,13 @@ MUTANTS = [
     ("card-keeps-grown", "C3", mutate_re(HPP, r"\bon_device\.loader_grown\s*=\s*0\s*;", "")),
     ("tensors-unrecorded", "C3", mutate_re(UCC, r"\bplan\.loader_tensor_bytes\s*=\s*placement_plan_loader_tensor_bytes\s*\(",
                                            "(void) (")),
-    ("second-tensor-writer", "C3", mutate_re(GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
-                                             r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_tensor_bytes.clear();")),
+    ("second-tensor-writer", "C3", mutate_re(
+        GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
+        r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_tensor_bytes.clear();")),
     ("cap-uncopied", "C3", mutate_re(UCC, r"\bplan\.loader_buffer_cap\s*=\s*info\.load_loader_buffer_cap\s*;", "")),
     ("cap-unfilled", "C3", mutate_re(GS, r"\bkv\.load_loader_buffer_cap\s*=[^;]*;", "")),
-    ("loader-refusal-late-removed", "C4", mutate_re(GS, LOADER_POOL_LATE, "if (false) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;")),
+    ("loader-refusal-late-removed", "C4", mutate_re(GS, LOADER_POOL_LATE,
+                                                    "if (false) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;")),
     ("loader-refusal-early-removed", "C4", mutate_re(GS, LOADER_POOL_EARLY,
                                                      "if (false) { return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;")),
     ("refusal-ignores-grown", "C4", mutate_re(HPP, r"(\bplan\.host_zone_terms\.)total(\s*\(\s*\)\s*>\s*plan\.host_budget)",

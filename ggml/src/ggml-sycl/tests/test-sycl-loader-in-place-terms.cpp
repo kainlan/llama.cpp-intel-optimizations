@@ -1,12 +1,12 @@
 // The host WEIGHT zone charges the loader's SYCL_Host buffer once, and only the pool that holds it commits it; a host
 // expert the loader serves in place takes no block of its own.
 //
-// On a load that does not map files, with evictable weights, the model loader binds the SYCL_Host buffer type for
-// the weights the plan places and keeps that buffer for the model's life. When the backend scheduler sees one device,
-// every chunk of that buffer comes from that device's pinned pool (the load's loader_device); when it sees more, the
-// buffer is split across their pools by layer and no one pool holds it (loader_device -1). The plan charges the buffer
-// as the loader_residency term once, host-wide, when one pool holds it: the bytes of every entry the buffer holds,
-// each rounded up to the loader's tensor alignment (exact for a dense weight, a bound for an expert slice). Every card's
+// On a load that does not map files, with evictable weights, the model loader binds the SYCL_Host buffer type for the
+// weights the plan places and keeps that buffer for the model's life. When the backend scheduler sees one device, every
+// chunk of that buffer comes from that device's pinned pool (the load's loader_device); when it sees more, the buffer
+// is split across their pools by layer and no one pool holds it (loader_device -1). The plan charges the buffer as the
+// loader_residency term once, host-wide, when one pool holds it: the bytes of every entry the buffer holds, each
+// rounded up to the loader's tensor alignment (exact for a dense weight, a bound for an expert slice). Every card's
 // host zones are sized from the plan, so only loader_device's commit terms carry the term; every other card's WEIGHT
 // zone leaves it out. The buffer holds every entry of a bound inventory, the late plan's. An unbound inventory, the
 // early plan's, also names the host-planned dense weights the cpu and plain layouts put in a CPU-owned buffer instead,
@@ -290,10 +290,11 @@ void check_mapped_expert_is_neither() {
 }
 
 void check_loader_holds_what_it_places() {
-    // The term and the replay count exactly the tensors the loader puts in its SYCL_Host buffer. The early pass plans an
-    // unbound inventory, which names every weight of the file; under the cpu and plain layouts the loader puts the host
-    // dense weight in a CPU-owned buffer, so neither counts it. Under off it stays in SYCL_Host. The late pass plans a
-    // bound inventory, which keeps only the tensors on SYCL buffers, so both count every entry whatever the layout.
+    // The term and the replay count exactly the tensors the loader puts in its SYCL_Host buffer. The early pass plans
+    // an unbound inventory, which names every weight of the file; under the cpu and plain layouts the loader puts the
+    // host dense weight in a CPU-owned buffer, so neither counts it. Under off it stays in SYCL_Host. The late pass
+    // plans a bound inventory, which keeps only the tensors on SYCL buffers, so both count every entry whatever the
+    // layout.
     struct arm {
         uint8_t layout;
         bool    unbound;

@@ -463,10 +463,10 @@ struct ggml_sycl_tensor_inventory {
     // ggml_sycl_host_weight_layout), from its three-valued resolver, host_weight_layout() in llama-model-loader.cpp,
     // which is that variable's only reader, so the planner takes libllama's answer instead of reading the environment a
     // second time. The planner reads all three values. cpu, the default, is the one layout whose planner-host dense
-    // weights ggml-cpu repacks into a buffer of its own, the state the planner backs CPU_OWNED on a load that maps files
-    // (§4.4). cpu and plain both put a planner-host dense weight of a load that maps no files in a CPU-owned buffer, not
-    // the loader's SYCL_Host buffer, which the loader term counts; off leaves it in SYCL_Host. A zeroed inventory
-    // carries off, and a reader compares the byte with a named value, never tests it as a bool.
+    // weights ggml-cpu repacks into a buffer of its own, the state the planner backs CPU_OWNED on a load that maps
+    // files (§4.4). cpu and plain both put a planner-host dense weight of a load that maps no files in a CPU-owned
+    // buffer, not the loader's SYCL_Host buffer, which the loader term counts; off leaves it in SYCL_Host. A zeroed
+    // inventory carries off, and a reader compares the byte with a named value, never tests it as a bool.
     // The three sit in the padding after n_ctx_context_is_default (offsets 185-187), so the struct stays 192 bytes. A
     // libllama built before them leaves those bytes unspecified, which is safe only because the staging proc that reads
     // them is exported under a new name (ggml_backend_sycl_stage_load_inventory_plan): such a libllama resolves the old

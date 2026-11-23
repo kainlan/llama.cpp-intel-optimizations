@@ -1197,13 +1197,14 @@ struct placement_plan {
     bool host_backing_maps_files = false;
     bool host_mapped_locked      = false;
     // The loader's SYCL_Host buffer as the plan's fact (placement_loader_fact_for, copied with the fact above).
-    // loader_holds_weights: the loader binds the buffer for the weights the plan places. loader_device: the device whose
-    // pinned pool holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its loader_residency
-    // term once, host-wide, when one does, and only that device's zone commits it. loader_serves_host_experts:
-    // S1-PRELOAD serves each host-planned PINNED expert from that buffer in place, under the buffer's owner, so such an
-    // expert takes no block of its own. loader_buffer_cap: placement_kv_info::load_loader_buffer_cap, the buffer type's
-    // chunk cap. loader_holds_host_dense: the buffer holds the plan's host-planned dense weights too
-    // (placement_loader_holds_host_dense); placement_plan_loader_holds_entry() applies it to an entry.
+    // loader_holds_weights: the loader binds the buffer for the weights the plan places. loader_device: the device
+    // whose pinned pool holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its
+    // loader_residency term once, host-wide, when one does, and only that device's zone commits it.
+    // loader_serves_host_experts: S1-PRELOAD serves each host-planned PINNED expert from that buffer in place, under
+    // the buffer's owner, so such an expert takes no block of its own. loader_buffer_cap:
+    // placement_kv_info::load_loader_buffer_cap, the buffer type's chunk cap. loader_holds_host_dense: the buffer holds
+    // the plan's host-planned dense weights too (placement_loader_holds_host_dense);
+    // placement_plan_loader_holds_entry() applies it to an entry.
     bool   loader_holds_weights       = false;
     int    loader_device              = -1;
     bool   loader_serves_host_experts = false;
@@ -2377,11 +2378,11 @@ struct placement_plan {
 // included, but for the host-planned dense weights the cpu and plain layouts put in a CPU-owned buffer
 // (placement_plan_loader_holds_entry), and keeps it for the model's life. The term is charged once, host-wide,
 // whichever builder made the plan; every card's zones are sized from the plan, and only loader_device's commits the
-// term (placement_plan_host_zone_commit_terms_on_device). On a load that maps files the loader binds SYCL_Mapped instead,
-// whose bytes are the file's pages outside every host zone, and the term is 0. It is 0 too when the scheduler sees more
-// than one device (loader_device -1): the buffer is then split across their pools by layer, and no one pool holds it.
-// A plan made for loader_device also serves its host-planned PINNED experts from that buffer in place, so those experts
-// are counted once, inside loader_residency, and reported as loader_served instead of taking blocks.
+// term (placement_plan_host_zone_commit_terms_on_device). On a load that maps files the loader binds SYCL_Mapped
+// instead, whose bytes are the file's pages outside every host zone, and the term is 0. It is 0 too when the scheduler
+// sees more than one device (loader_device -1): the buffer is then split across their pools by layer, and no one pool
+// holds it. A plan made for loader_device also serves its host-planned PINNED experts from that buffer in place, so
+// those experts are counted once, inside loader_residency, and reported as loader_served instead of taking blocks.
 struct host_weight_zone_terms {
     size_t host_weights         = 0;  // placement_entry_host_weight_bytes() over the entries that hold a block here
     size_t blocks               = 0;  // the pinned allocations those weights take: one per entry that holds a block
@@ -2405,9 +2406,9 @@ struct host_weight_zone_terms {
 // load_weights_evictable and load_loader_device) and the builder's device, `plan_device` (-1 for the multi-device
 // builder). The loader binds that buffer for a SYCL layer's weights only when weights are evictable and the load does
 // not map files, and then it holds every weight the plan places but the ones placement_plan_loader_holds_entry leaves
-// out, in loader_device's pool, or split across the scheduler's devices when that is -1. A host-planned expert is served from it in place only by a plan made for
-// loader_device: a multi-device plan's experts are staged for every device, and a chunk is ring-streamable only on
-// the device whose cache queue allocated it.
+// out, in loader_device's pool, or split across the scheduler's devices when that is -1. A host-planned expert is
+// served from it in place only by a plan made for loader_device: a multi-device plan's experts are staged for every
+// device, and a chunk is ring-streamable only on the device whose cache queue allocated it.
 struct placement_loader_fact {
     bool holds_weights       = false;
     int  device              = -1;  // the device whose pinned pool holds the buffer; -1 when there is none or no one
