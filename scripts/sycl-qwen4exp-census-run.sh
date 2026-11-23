@@ -24,8 +24,8 @@
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
 # /proc/meminfo every 2 s and, in every mode, kills the run's
 # whole session if GPU host backing (Shmem + the meminfo remainder, scripts/sycl-host-backing.sh)
-# climbs past WATCHDOG_HOST_BACKING_GIB (a whole number, default 100): idle reads 12.7 to 15 GiB and the
-# largest planned load about 88 to 91 GiB, so 100 GiB means a runaway, not a large load.
+# climbs past WATCHDOG_HOST_BACKING_GIB (a whole number from 1 to 999, default 100): idle reads 12.7 to 15 GiB and the
+# largest planned load about 85 to 91 GiB, so 100 GiB means a runaway, not a large load.
 # A load known to need more (the qwen4exp model with USM-backed host experts) is
 # run with WATCHDOG_HOST_BACKING_GIB raised by the operator, so no mode runs unguarded.
 # The old name WATCHDOG_SHMEM_GB is refused (exit 3) so a stale command line cannot run with the default.
@@ -56,14 +56,16 @@ BIN="${LLAMA_COMPLETION:-$ROOT/build/bin/llama-completion}"
 QWEN_MODEL="${QWEN4EXP_MODEL:-/models/Qwen3.8-Flash-Next-GGUF/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}"
 VEHICLE_MODEL="${QWEN4EXP_VEHICLE:-}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
-# The abort ceiling is a whole number of GiB. A value like 150.5 would be an arithmetic error on the
-# first watchdog pass and leave the run unwatched, so it is refused before anything launches.
+# The abort ceiling is a whole number of GiB from 1 to 999 with no leading zero. Anything else breaks the
+# watchdog's arithmetic on its first pass and leaves the run unwatched: 150.5 is a syntax error, 08 and 018 are
+# invalid octal, 0100 is read as 64, and a 15-digit value overflows. It is refused before anything launches.
 if [ -n "${WATCHDOG_SHMEM_GB+set}" ]; then
     echo "WATCHDOG_SHMEM_GB is no longer read: use WATCHDOG_HOST_BACKING_GIB (a whole number of GiB)" >&2; exit 3
 fi
 ABORT_GIB="${WATCHDOG_HOST_BACKING_GIB-100}"
 case "$ABORT_GIB" in
-    ''|*[!0-9]*) echo "WATCHDOG_HOST_BACKING_GIB must be a whole number of GiB (got '$ABORT_GIB')" >&2; exit 3;;
+    [1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+    *) echo "WATCHDOG_HOST_BACKING_GIB must be a whole number of GiB from 1 to 999 with no leading zero (got '$ABORT_GIB')" >&2; exit 3;;
 esac
 SETTLE_TIMEOUT_S="${SETTLE_TIMEOUT_S:-600}"
 mkdir -p "$OUT" || exit 1
@@ -80,31 +82,21 @@ grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL 
 [ "$(ldd "$BIN" | grep -E 'libggml-sycl|libsycl' | grep -c '=> /')" -ge 2 ] || { echo "$BIN does not link a resolvable SYCL backend" >&2; exit 3; }
 
 # every comparison is in kB (/proc/meminfo's unit, KiB); display is GiB to two places
-meminfo_kb() { awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo; }
-# GPU host backing in bytes. An unreadable meminfo returns 1: callers fail closed.
 if [ ! -r "$ROOT/scripts/sycl-host-backing.sh" ]; then
     echo "$0: $ROOT/scripts/sycl-host-backing.sh is missing" >&2; exit 3
 fi
 # shellcheck disable=SC1091
 source "$ROOT/scripts/sycl-host-backing.sh"
 gib() { awk -v k="$1" 'BEGIN { printf "%.2f", k / 1048576 }'; }
-# mem_line: one read of the meminfo parts gives Shmem and host backing; "unreadable" for a reading that failed,
-# never a number. MemAvailable is logged only.
-mem_line_from() { # $1 = Shmem kB, $2 = host backing kB; -1 means unreadable
-    if [ "$2" -lt 0 ]; then
-        echo "Shmem=unreadable HostBacking=unreadable MemAvailable=$(gib "$(meminfo_kb MemAvailable)")GiB"
-    else
-        echo "Shmem=$(gib "$1")GiB HostBacking=$(gib "$2")GiB MemAvailable=$(gib "$(meminfo_kb MemAvailable)")GiB"
-    fi
+# mem_fmt "<state>": the log line for a state string that sycl_gpu_host_state_kb printed (one read gives Shmem,
+# host backing and MemAvailable). An empty state is an unreadable meminfo: the word, never a number.
+mem_fmt() {
+    local shm rem av
+    [ -n "$1" ] || { echo "Shmem=unreadable HostBacking=unreadable MemAvailable=unreadable"; return 0; }
+    read -r shm rem av <<< "$1"
+    echo "Shmem=$(gib "$shm")GiB HostBacking=$(gib $((shm + rem)))GiB MemAvailable=$(gib "$av")GiB"
 }
-mem_line() {
-    local parts shm
-    if parts=$(sycl_gpu_host_parts_kb); then
-        shm=${parts% *}; mem_line_from "$shm" $(( shm + ${parts#* } ))
-    else
-        mem_line_from -1 -1
-    fi
-}
+mem_line() { mem_fmt "$(sycl_gpu_host_state_kb 2>/dev/null)"; }
 stamp() { echo "$(date +%T) $1 $(mem_line)" | tee -a "$OUT/mem.log"; }
 
 REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
@@ -157,14 +149,16 @@ esac
 # 55 GB on purpose while another tenant holds a model (ruling 2026-11-12), and the planner refuses a
 # load that exceeds the host budget by name.
 settled() {
-    local bk; bk=$(sycl_gpu_host_backing_kb) || return 1
-    [ "$bk" -lt $((30 * 1048576)) ]
+    # One read decides, and SETTLE_STATE is that read, so a refusal prints the figure it decided on.
+    SETTLE_STATE=
+    SETTLE_STATE=$(sycl_gpu_host_state_kb 2>/dev/null) || { SETTLE_STATE=; return 1; }
+    [ "$(sycl_gpu_host_state_backing_kb "$SETTLE_STATE")" -lt $((30 * 1048576)) ]
 }
 waited=0
 until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
         stamp "refused: not settled after ${waited}s"
-        echo "host did not settle to GPU host backing < 30 GiB in ${waited}s ($(mem_line)); release GPU.lock and escalate" >&2
+        echo "host did not settle to GPU host backing < 30 GiB in ${waited}s ($(mem_fmt "$SETTLE_STATE")); release GPU.lock and escalate" >&2
         exit 3
     fi
     sleep 10; waited=$((waited + 10))
@@ -243,12 +237,12 @@ fi
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
     # One read decides and is the one logged.
-    if parts=$(sycl_gpu_host_parts_kb); then
-        sh=${parts% *}; bk=$(( sh + ${parts#* } ))
+    if st=$(sycl_gpu_host_state_kb 2>/dev/null); then
+        read -r sh rem av <<< "$st"; bk=$((sh + rem))
     else
-        sh=-1 bk=-1
+        st= sh=-1 bk=-1
     fi
-    echo "$(date +%T) $(mem_line_from "$sh" "$bk")" >> "$OUT/mem.log"
+    echo "$(date +%T) $(mem_fmt "$st")" >> "$OUT/mem.log"
     why=
     if [ "$bk" -lt 0 ]; then
         why="meminfo unreadable, host backing unknown"
