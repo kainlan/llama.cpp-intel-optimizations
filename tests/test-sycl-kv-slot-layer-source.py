@@ -140,6 +140,9 @@ def claim_libllama_names_each_slots_layer(model_h: str, models_h: str, model: st
 
 MODEL_SRCS = {p.name: p.read_text() for p in sorted((ROOT / "src" / "models").glob("*.cpp"))}
 LOOP_MODEL = "llama_model_inkling2_loop"
+# The scan's limits: it matches the literal `layers[x] = layers[y]` with no `]` in the left index. It does not see an
+# alias through `layers[idx[i]] = ...`, `.at()`, a reference or a qualified `model.layers[...]`, nor a model that
+# reuses a layer only in its graph; an alias in a free function after a member definition is owned by that class.
 ALIAS_RE = re.compile(r"\blayers\[[^\]\n]+\]\s*=\s*layers\[")
 MEMBER_DEF_RE = re.compile(r"^[A-Za-z][^\n;]*?\b(llama_model_[a-z0-9_]+)::", re.M)
 OVERRIDE_HEAD = "int layer_phys(int il) const override"
@@ -170,7 +173,8 @@ def claim_every_aliasing_model_names_its_layers(models_h: str, model_srcs: dict)
     fails closed: it must find inkling2_loop, and every alias it finds must have an owner."""
     mh = norm(models_h)
     models = aliasing_models(model_srcs)
-    return LOOP_MODEL in models and "" not in models and all(OVERRIDE_HEAD in struct_body(mh, m) for m in models)
+    owned = models - {""}
+    return LOOP_MODEL in models and "" not in models and all(OVERRIDE_HEAD in struct_body(mh, m) for m in owned)
 
 
 # ---- (b) the layout -------------------------------------------------------------------------------------------------
@@ -396,10 +400,22 @@ def test_mutant_new_aliasing_model_without_override_fails():
     assert not claim_every_aliasing_model_names_its_layers(models_h, srcs)
 
 
-def test_mutant_alias_scan_finds_nothing_fails():
-    """A scan that stops matching the alias form finds no looped model; that must not read as every model is fine."""
+def test_mutant_alias_scan_misses_the_loop_anchor_fails():
+    """The scan no longer sees inkling2_loop's alias, the one it must find: the anchor turns the claim red although
+    hrm_text, metis16 and nanbeige are still found and all override."""
     srcs = {name: src.replace("layers[il] = layers[layer_phys(il)];", "") for name, src in MODEL_SRCS.items()}
     assert srcs != MODEL_SRCS
+    assert LOOP_MODEL not in aliasing_models(srcs)
+    assert not claim_every_aliasing_model_names_its_layers(MODELS_H, srcs)
+
+
+def test_mutant_unowned_alias_fails():
+    """An alias in a free function before any member definition has no model to name, so no override can be checked:
+    it must not pass as if every alias were owned."""
+    src = ("static void zz_alias(std::vector<llama_layer> & layers) {\n    layers[1] = layers[0];\n}\n\n"
+           "void llama_model_zz::load_arch_tensors(llama_model_loader &) {\n}\n")
+    srcs = dict(MODEL_SRCS, **{"zz-free.cpp": src})
+    assert "" in aliasing_models(srcs)
     assert not claim_every_aliasing_model_names_its_layers(MODELS_H, srcs)
 
 
