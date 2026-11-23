@@ -2640,7 +2640,9 @@ inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placem
             plan.loader_tensor_bytes, host_zone_buffer_max_size(plan.loader_buffer_cap, chunk_bytes), chunk_bytes);
         terms.loader_zone  = footprint.zone;
         terms.loader_grown = footprint.grown;
-        terms.weight       = plan.host_zone_weight_bytes - plan.host_zone_loader_bytes + terms.loader_zone;
+        // the rest of the record, taken no lower than zero: a hand-built plan can record less than its loader term
+        terms.weight       = plan.host_zone_weight_bytes -
+                       std::min(plan.host_zone_weight_bytes, plan.host_zone_loader_bytes) + terms.loader_zone;
     }
     terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
     terms.staging = plan.host_zone_staging_bytes;
