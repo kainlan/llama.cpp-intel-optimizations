@@ -14,14 +14,18 @@
 //   - any other id outside [0, n_experts), and an expert whose table entry is null, writes a row of quiet NaN;
 //   - the row padding of the output, the guards around it and every input come back untouched, and a second launch
 //     writes the same bits.
+//
+// Exits 77 (skip) only when the selector leaves no device to make a queue on; any failure after that is a FAIL.
 
 #include "ggml-sycl/moe-bf16-direct.hpp"
 #include "ggml.h"
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -351,7 +355,15 @@ static void check_refusals(sycl::queue & q) {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    sycl::queue q{ sycl::default_selector_v };
+    // The registration pins opencl:cpu; a host without that runtime has no device to test on.
+    std::optional<sycl::queue> queue;
+    try {
+        queue.emplace(sycl::default_selector_v);
+    } catch (const sycl::exception & e) {
+        std::printf("SKIP: no SYCL device for this selector: %s\n", e.what());
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    sycl::queue & q = *queue;
     std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
 
     check_refusals(q);

@@ -5651,6 +5651,7 @@ add_test(NAME sycl-moe-bf16-direct-kernel COMMAND test-sycl-moe-bf16-direct-kern
 set_tests_properties(sycl-moe-bf16-direct-kernel PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
     LABELS "sycl;moe;bf16;kernel;hostonly"
+    SKIP_RETURN_CODE 77
     TIMEOUT 300
 )
 

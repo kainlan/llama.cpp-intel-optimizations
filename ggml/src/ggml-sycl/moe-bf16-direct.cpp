@@ -2,6 +2,7 @@
 
 #include "mul-mat-bf16.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace ggml_sycl {
@@ -14,13 +15,17 @@ constexpr int MOE_BF16_DIRECT_SG      = 16;
 constexpr int MOE_BF16_DIRECT_ROWS_WG = 4;
 static_assert(MOE_BF16_DIRECT_SG == 16, "the kernel attribute below spells the sub-group size out");
 
+// One launch over tokens [t0, t0 + n_tok), after `after` when it is not null.
 template <bool VEC4, bool XVEC>
 sycl::event moe_bf16_direct_launch(sycl::queue &                 q,
                                    const void * const *          expert_table,
                                    const float *                 src1,
                                    const int32_t *               ids,
                                    float *                       dst,
-                                   const moe_bf16_direct_shape & shape) {
+                                   const moe_bf16_direct_shape & shape,
+                                   int64_t                       t0,
+                                   int64_t                       n_tok,
+                                   const sycl::event *           after) {
     constexpr int SG      = MOE_BF16_DIRECT_SG;
     constexpr int ROWS_WG = MOE_BF16_DIRECT_ROWS_WG;
 
@@ -37,11 +42,14 @@ sycl::event moe_bf16_direct_launch(sycl::queue &                 q,
     const size_t  dst_nb2   = shape.dst_nb2;
 
     const size_t         row_groups = static_cast<size_t>((rows + ROWS_WG - 1) / ROWS_WG);
-    const sycl::range<3> global(static_cast<size_t>(shape.n_tokens), static_cast<size_t>(shape.n_slots),
+    const sycl::range<3> global(static_cast<size_t>(n_tok), static_cast<size_t>(shape.n_slots),
                                 row_groups * ROWS_WG * SG);
     const sycl::range<3> local(1, 1, ROWS_WG * SG);
 
     return q.submit([&](sycl::handler & h) {
+        if (after != nullptr) {
+            h.depends_on(*after);
+        }
         h.parallel_for(sycl::nd_range<3>(global, local), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
             const sycl::sub_group sg   = it.get_sub_group();
             const int             lane = static_cast<int>(sg.get_local_linear_id());
@@ -50,7 +58,7 @@ sycl::event moe_bf16_direct_launch(sycl::queue &                 q,
             if (row >= rows) {
                 return;
             }
-            const int64_t t = static_cast<int64_t>(it.get_group(0));
+            const int64_t t = t0 + static_cast<int64_t>(it.get_group(0));
             const int64_t s = static_cast<int64_t>(it.get_group(1));
 
             float * out = reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + t * dst_nb2 + s * dst_nb1) + row;
@@ -124,9 +132,27 @@ bool moe_bf16_direct_vec4(const moe_bf16_direct_shape & shape) {
     return shape.k > 0 && shape.k % 4 == 0 && shape.w_nb1 % 8 == 0;
 }
 
-// RED stub (Task 8g review item 2): one launch for every shape; the token chunks land in the next commit.
 int64_t moe_bf16_direct_tokens_per_launch(const moe_bf16_direct_shape & shape) {
-    return shape.n_tokens > 0 ? shape.n_tokens : 0;
+    if (shape.k <= 0 || shape.rows <= 0 || shape.n_experts <= 0 || shape.n_slots <= 0 || shape.n_tokens <= 0 ||
+        shape.src1_rows <= 0 || shape.w_nb1 < static_cast<size_t>(shape.k) * sizeof(uint16_t)) {
+        return 0;
+    }
+    // One token's work-items, n_slots x ceil(rows / 4) x 64, each product checked against the limit before it is
+    // formed, so nothing wraps and a single token over the limit gives 0.
+    constexpr size_t items_per_group = MOE_BF16_DIRECT_ROWS_WG * MOE_BF16_DIRECT_SG;
+    const size_t     limit           = shape.max_launch_items;
+    const size_t     row_groups =
+        static_cast<size_t>(shape.rows / MOE_BF16_DIRECT_ROWS_WG + (shape.rows % MOE_BF16_DIRECT_ROWS_WG != 0));
+    if (row_groups > limit / items_per_group) {
+        return 0;
+    }
+    const size_t slot_items = row_groups * items_per_group;
+    if (static_cast<size_t>(shape.n_slots) > limit / slot_items) {
+        return 0;
+    }
+    const size_t token_items = static_cast<size_t>(shape.n_slots) * slot_items;
+    const size_t tokens      = limit / token_items;
+    return tokens >= static_cast<size_t>(shape.n_tokens) ? shape.n_tokens : static_cast<int64_t>(tokens);
 }
 
 bool moe_bf16_direct_submit(sycl::queue &                 q,
@@ -139,8 +165,8 @@ bool moe_bf16_direct_submit(sycl::queue &                 q,
     if (expert_table == nullptr || src1 == nullptr || ids == nullptr || dst == nullptr || event == nullptr) {
         return false;
     }
-    if (shape.k <= 0 || shape.rows <= 0 || shape.n_experts <= 0 || shape.n_slots <= 0 || shape.n_tokens <= 0 ||
-        shape.src1_rows <= 0 || shape.w_nb1 < static_cast<size_t>(shape.k) * sizeof(uint16_t)) {
+    const int64_t per_launch = moe_bf16_direct_tokens_per_launch(shape);
+    if (per_launch <= 0) {
         return false;
     }
 
@@ -148,13 +174,22 @@ bool moe_bf16_direct_submit(sycl::queue &                 q,
     const bool vec4 = moe_bf16_direct_vec4(shape);
     const bool xvec =
         vec4 && reinterpret_cast<uintptr_t>(src1) % 16 == 0 && shape.src1_nb1 % 16 == 0 && shape.src1_nb2 % 16 == 0;
-    if (xvec) {
-        *event = moe_bf16_direct_launch<true, true>(q, expert_table, src1, ids, dst, shape);
-    } else if (vec4) {
-        *event = moe_bf16_direct_launch<true, false>(q, expert_table, src1, ids, dst, shape);
-    } else {
-        *event = moe_bf16_direct_launch<false, false>(q, expert_table, src1, ids, dst, shape);
+
+    // Each chunk depends on the one before it, so the last chunk's event covers the whole dispatch on any queue: the
+    // backend's queue is in-order, a caller's need not be. One chunk, the usual case, carries no dependency.
+    sycl::event last;
+    for (int64_t t0 = 0; t0 < shape.n_tokens; t0 += per_launch) {
+        const int64_t       n_tok = std::min(per_launch, shape.n_tokens - t0);
+        const sycl::event * after = t0 == 0 ? nullptr : &last;
+        if (xvec) {
+            last = moe_bf16_direct_launch<true, true>(q, expert_table, src1, ids, dst, shape, t0, n_tok, after);
+        } else if (vec4) {
+            last = moe_bf16_direct_launch<true, false>(q, expert_table, src1, ids, dst, shape, t0, n_tok, after);
+        } else {
+            last = moe_bf16_direct_launch<false, false>(q, expert_table, src1, ids, dst, shape, t0, n_tok, after);
+        }
     }
+    *event = last;
     return true;
 }
 
