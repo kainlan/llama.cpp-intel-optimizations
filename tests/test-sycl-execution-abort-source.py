@@ -446,9 +446,9 @@ PRE_SCOPE_CALLS = {
 
 # graph_compute_unchecked's callees that call an op entry point and open no scope, with the reason.
 DISPATCH_EXEMPT = {
-    name: "the opt-in persistent TG executor (GGML_SYCL_PERSISTENT_TG) runs a graph as one fused kernel; its plan "
-          "builder and SET_ROWS validator call an op entry point only as a debug reference under "
-          "GGML_SYCL_PERSISTENT_TG_USE_BASE_* or the validator, and wait on the queue after it. "
+    name: "the opt-in persistent TG path (GGML_SYCL_PERSISTENT_TG, off by default) runs untracked as a whole, outside "
+          "any dispatch scope: the plan builder's GET_ROWS pre-execution on every persistent token, the fused kernel, "
+          "and the debug references under GGML_SYCL_PERSISTENT_TG_USE_BASE_* and the SET_ROWS validator. "
           "should_use_persistent_tg declines every MoE graph, so the MoE direct route never runs there."
     for name in ("extract_persistent_plan", "extract_persistent_plan_split", "debug_validate_persistent_set_rows")
 }
