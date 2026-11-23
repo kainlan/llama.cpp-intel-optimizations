@@ -4014,6 +4014,63 @@ arm, the shared refusal label, the comments that state what the route covers);
 **Not in this task:** the speed of prompt rows, `choose_moe_batch_executor`'s early return, hybrid layers (host
 experts, the B50), a secondary card, the small F32 weights staged at run time.
 
+
+**DONE 2026-11-22, merged as `e995206d3`** (re-reviewed at `5df0ba93c`, device runs at `0f4060d0f`; the merge's
+tree is the tested tree, `7387999a8`). Task commits on Task 8a's tip: `2354c44f3`, `9b6689aa3` (RED),
+`8ed0c3204` (prompt rows, ids read in place), `356d745c6`, `e9452b615` (every decline names its step, in the
+file's execution error names), `7e907eccd` (every node dispatch holds the tracked graph open), `ce63eb0fd`
+(merge of Task 7), `6ee2a4058`. Fix rounds: `3f2927684` (only the outermost dispatch scope seals or quarantines
+the tracked graph) and `05f37d519..5df0ba93c` (twelve commits, findings F1 to F9). `b607a4315` merges
+`d5c82cdff` (Tasks 8h and 8f) into the branch; `2c2f9ced5`, `e1aa9e902`, `bf91248f3`, `0f4060d0f` are
+wording and contract follow-ons the lead read. Reviews: spec PASS WITH FINDINGS, quality PASS WITH FINDINGS,
+re-review of the F round PASS WITH FINDINGS with F1 to F9 all fixed.
+
+*What the F round changed:* `graph_compute_unchecked` drains the terminal this backend left submitted before it
+takes L2 and L3 (a moved wait, not a new one: `synchronize` runs the same wait); the direct route's precondition
+is 16 named `const bool`s used by the `if` and by the decline list; the execution tripwire decides under
+`execution_state_mutex` and logs after it is released; the dispatch census requires a scope at top brace depth
+before every node and lists what it exempts; the adapter refusal logs `route=direct step=adapter` before it
+throws; the legacy MMID admission asks `moe_mmid_workspace_geometry_holds`.
+*Wording corrected against the ruling above:* decline lines print at ERROR, not WARN. From this task on a
+refusal count means both labels, `MOE-DECODE-REFUSAL` and `MOE-PROMPT-REFUSAL`; the criteria of Tasks 7 and 8
+that name only the first predate the second.
+
+*Device results at `0f4060d0f`, one run each, zero kernel fault lines, `Shmem` 11 GB
+(`docs/backend/data/inkling2/t8b-lead-runs-0f4060d0f.txt`; the runs at `6ee2a4058` are in
+`t8b-lead-runs-6ee2a4058.txt`):*
+- Inkling gate, B70: PASS, `1, 2, ... 10`, 0 refusals. The first Inkling token gate that has passed.
+- Inkling gate, both cards (`level_zero:0,1`): PASS, same output, 0 refusals. The placement is the B70's; the
+  B50 holds nothing (Task 8d).
+- Inkling on the B50 alone: not run at this commit. At `6ee2a4058` it is refused by name (Task 8c).
+- NVFP4/Q1_0 admitted-device test: passes on the B70 and the B50, 56 `PASS:` lines each, 0 context-bind lines.
+  Adapter device test: passes on the B70.
+- Mistral gate, B70: `1 .. 10`. GPT-OSS gate, B50, no `-c`: one answer line, no device loss.
+- In every log: 0 `EXECUTION-TRIPWIRE`, 0 `route=direct` declines, 0 `failed to begin tracked execution graph`,
+  0 `begin-path drain wait threw`.
+- Scheduler print, B70: one decoded token is 105 splits, 52 of them on the CPU (it was 282 and 141). What is
+  left: 24 `FLASH_ATTN` and 48 `SET_ROWS` on the 24 host KV slots (Task 8e) and the 4 BF16 expert layers
+  (Task 8g). `docs/backend/data/inkling2/t8-split-census-2026-11-22.txt`.
+- `llama-bench -p 512 -n 128`, B70, one sample, host load 11.5: **pp 41.71 t/s, tg 4.49 t/s**
+  (`t8b-bench-inkling-b70-0f4060d0f.jsonl`). At `6ee2a4058`, before Tasks 8h and 8f: 39.47 and 4.36. Removing
+  89 CPU splits per token moved decode by 3 %, which is inside single-run noise on this card. The one-`SCALE`
+  splits and the `GET_ROWS` split were not where the time goes; what is, the profile in Stage 2 has to say.
+
+*Found by these runs, not caused by this task:* the first GPT-OSS B50 run reserved its arena as two chunks.
+`[VRAM-ARENA] Rebuilding unused early arena` destroys the 14292 MB chunk and allocates one of the same size
+with different zone sizes; the third such allocation of the load returned null without throwing, nothing logged
+it, and the N-chunk fallback carved a separate 128 MB KV zone out of the weight zone. The plan then put 8 expert
+triplets (100.9 MB) on the host. The gate still passed. A second run from the same build reserved one chunk and
+its plan lines equal the baseline. It is the first two-chunk reservation in 155 run logs of this branch. Two
+tasks owed (below): say so when the single allocation returns null, and re-carve the zones in the chunk the
+arena already holds instead of freeing and allocating the same size.
+
+*Asked for by the re-reviewer, not run:* `test-llama-archs` (back-to-back computes reach the entry drain; it
+goes with the merged-tree gates after Task 8e), a two-context run on one device, a decode A/B against
+`3f2927684`. The A/B at `6ee2a4058` against the integration tip showed no cost on GPT-OSS B50
+(`t8b-ab-gptoss-b50-e8b13c2b5-vs-6ee2a4058.txt`).
+*Sweeps at `0f4060d0f` (implementer, `TMPDIR` inside `build/`):* sweep 1 fails the known-red eight only of 208,
+sweep 2 passes 22 of 22, none skipped.
+
 ---
 
 ### Task 8c: A `MUL_MAT_ID` node that selects card experts and host experts runs both (found 2026-11-22)
@@ -4073,6 +4130,11 @@ by a GPU kernel.
 - No host wait on the submitting thread. The host leg waits for its activation and ids on its worker, as the
   MXFP4 job prologue does.
 - A secondary-card operand (`residency=secondary`) is still refused by name. It is Task 8d's.
+- *Added 2026-11-22 from Task 8b's spec review:* since Task 8b the kernel reads the ids on the device and
+  indexes a pointer table built from the host snapshot. The two agree by the per-layer cache invariant; if
+  they did not, the kernel would read a slot nobody leased, or a null one, and the direct block's `catch`
+  would not see it. This task's skip of a slot that is not on the card closes the null case. Add a
+  device-side range check of the id against the table size as well.
 - Speed is not this task. One task at a time on one thread is what exists; its cost is Stage 2's measurement,
   and the pool or a threaded recipe is a Stage 3 candidate.
 
@@ -4258,13 +4320,36 @@ exists.
       `nb1` twice the row size, the upper half so the offset is not zero; one with a bias; one in place).
       Before the fix the SYCL backend reports them not supported.
 - [ ] Lead, by hand, one run per card: `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops -o SCALE`
-      prints every SCALE case OK and none "not supported".
+      prints every F32 SCALE case OK; the seven F16 and BF16 cases stay "not supported", as today.
 - [ ] Lead, one run each: Inkling gate on the B70 passes and the scheduler print has no SCALE-only CPU split;
       Mistral B70 and GPT-OSS B50 gates pass.
 - [ ] Both sweeps: the failed set is the known-red eight, none skipped.
 
 **Not in this task:** fusing the SiTU chain into one kernel (a Stage 3 candidate), other ops that decline a
 strided source.
+
+
+**DONE 2026-11-22, merged as `d5c82cdff`.** Task commits: `83f72932b` (RED), `32f64c9e6` (the strided arm),
+`e07b5338d` (merge of Task 8h), `0398aaa18` (lower-half and permuted-source cases), `7b67fb60a` (comment). Spec
+review PASS WITH FINDINGS, quality review PASS WITH FINDINGS, re-review PASS.
+
+*What was built:* `ggml_sycl_op_scale` has two arms. A contiguous source and destination keep the flat
+`scale_f32`. Any other layout takes `scale_f32_strided`, which decomposes the element index into `i0..i3` and
+reads and writes each tensor with its own byte strides. `supports_op` admits F32 `SCALE` in any layout. F16 and
+BF16 `SCALE` stay declined, as the ruling says.
+
+*Device results, one run per card, zero kernel fault lines:*
+- `test-backend-ops -o SCALE` at `7b67fb60a`: 15 of 15 F32 cases OK on the B70 and on the B50 (upper half x4,
+  lower half x3, permuted source x1, the contiguous cases). The 7 F16 and BF16 cases print "not supported"
+  (`docs/backend/data/inkling2/t8f-tbo-7b67fb60a-b70.txt`, `-b50.txt`).
+- Scheduler print, B70, at `32f64c9e6`: no CPU split holds one `SCALE`; 16 `SCALE` nodes remain in the four
+  BF16 expert splits (Task 8g). 106 splits per token where the base has 282.
+- The Inkling token gate cannot run on this task's tree (it has no Task 8b); it passes on the merged tree, see
+  Task 8b's block. Mistral B70 and GPT-OSS B50 pass there too.
+
+*Recorded as owed (older than this task, found by the spec review):* `cpu_scale` in `cpu-dispatch.cpp` drops
+the `SCALE` bias (`op_params[1]`), reachable for a contiguous `SCALE` with `GGML_SYCL_HYBRID_DISPATCH=0`; the
+flat `scale_f32` counts elements in an `int`.
 
 ---
 
@@ -4314,6 +4399,27 @@ wrong, `tests/test-backend-ops.cpp` (`test_get_rows` cases), `tests/test-sycl-ge
       pass.
 - [ ] Both sweeps: the failed set is the known-red eight, none skipped.
 
+
+**DONE 2026-11-22, merged as `0cc41d758`.** Task commits: `c1509154e` (RED), `009bd79d1` (the predicate),
+`f949d54c1` (RED for the review finding), `b53147184` (the streamed-slice arm). First review PASS WITH FINDINGS,
+re-review PASS.
+
+*The review finding, fixed:* admitting BF16 in the predicate also admitted it to the streamed-slice dispatcher
+(`ggml_sycl_get_rows_dispatch_slice`), which had no BF16 arm and aborts in its default. The arm was added and
+the source contract now requires, for every admitted type, a slice arm or an early refusal before the stream
+path. The slice arm ships read, not run: no fixture drives `get_rows_stream_slice` for any type.
+
+*Device results, one run per card, zero kernel fault lines:*
+- `test-backend-ops -o GET_ROWS` at `b53147184`: 93 of 93 supported cases OK on the B70 and on the B50, all 13
+  BF16 cases among them (`n = 1`, a view, a column offset, the wide table)
+  (`docs/backend/data/inkling2/t8h-tbo-b53147184-b70.txt`, `-b50.txt`).
+- Scheduler print, B70, at `009bd79d1`: no `GET_ROWS` on the CPU; split #0 of a token is a SYCL0 split.
+- Token gates: on the merged tree, see Task 8b's block.
+
+*Recorded as owed:* `supports_op`'s `GET_ROWS` arm checks type and planned layout, not placement. A table the
+plan tiered to the host reaches the stream slice, which copies a host weight to the card per call. That is
+weight streaming, which the placement ruling of 2026-08-16 forbids outside the prompt staging exception.
+
 ---
 
 ### Task 9: Stage 1 exit gates
@@ -4333,7 +4439,8 @@ wrong, `tests/test-backend-ops.cpp` (`test_get_rows` cases), `tests/test-sycl-ge
 - [ ] `--gate all --selector level_zero:1` and `--gate all --selector level_zero:0` → `GATE mistral PASS`, `GATE gptoss PASS` on both.
 - [ ] No-`-c` refusal, B70: `ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 300 ./build/bin/llama-completion -m /models/Inkling-2-Mini-UD-Q8_K_XL.gguf -p 'x' -n 1` exits non-zero, stderr has `load refused: the compute buffer measured at n_ctx 1048576`, and has no `GGML_ABORT`, no `ggml-sycl.cpp:[0-9]+:` line and no core.
 - [ ] `journalctl -k --since "2 hours ago" --no-pager | grep -ciE 'GT reset|guc_id|GPU hang|CAT error'` prints `0`.
-- [ ] `grep -c 'MOE-DECODE-REFUSAL' build/gates/inkling.err` is `0` for each Inkling run.
+- [ ] `grep -cE 'MOE-(DECODE|PROMPT)-REFUSAL' build/gates/inkling.err` is `0` for each Inkling run (both
+      labels: a prompt batch prints the second since Task 8b).
 
 **Added 2026-11-21 (each line is still one run; none is repeated):**
 - [ ] The `--gate all` run on the B50 above runs the GPT-OSS gate without `-c` and without `-ngl` (Task 6b). It was
@@ -5366,6 +5473,39 @@ host-to-device copy with a wait. These are the first candidates for the profile 
   for these types.
 - The batched oneDNN prompt table leaves Q1_0 and NVFP4 out because of that same gate, although converters
   exist. A candidate for prompt speed once the profile says where the time goes.
+
+*Left by Tasks 8b, 8e, 8f and 8h and their reviews (2026-11-22):*
+- When the single-chunk arena allocation returns null, nothing logs it and the N-chunk fallback changes the
+  plan (a separate KV zone, experts to the host). Log the null return at WARN with the size.
+- `[VRAM-ARENA] Rebuilding unused early arena` frees a chunk and allocates one of the same size to change the
+  zone sizes. Re-carve the zones in the chunk it holds. Seen failing once on the B50 (Task 8b's block).
+- Whole-graph replay (`graph_exec_submit` of a cached command graph) runs under no dispatch scope. Decide
+  whether it needs a tracked graph.
+- Open the outermost dispatch scope in `graph_compute_unchecked` before L2, so no begin waits under L2 or L3
+  (today a bypass path's DEVICE_BUSY drain of another backend runs under L2).
+- A data race: another context's DEVICE_BUSY drain (under its own L2) and this backend's entry drain (under no
+  lock) both wait on and reset `last_graph_event` and `last_graph_event_deferred_decode`. It needs two contexts
+  on one device on two threads. Guard the two fields, or have the foreign drain skip a backend that is inside
+  `graph_compute`.
+- The opt-in persistent TG path (`GGML_SYCL_PERSISTENT_TG`) dispatches outside any scope, and the tripwire does
+  not report an op dispatched outside a scope; it reports only a verb that ends or clears a held graph.
+- Neither MMID admission compares `device_slot_bytes`; the authoritative one skips the descriptor and secondary
+  byte counts.
+- `8f99e8266`'s message overclaims: llama does not synchronize between the splits of one graph, so the entry
+  drain is a wait multi-split decodes do reach. `e27c23edc..5df0ba93c` is not bisectable for the abort contract.
+- The dev_layer sync in `llama-model.cpp` marks a host-tiered weight layer N as slot N only, not that layer's
+  later slots. Check with the scheduler print once Task 8c runs on the B50.
+- `g_model_n_layer` is a slot count and sizes the expert reserve; in a multi-device plan it creates phantom
+  weight layers 24 to 47 for Inkling.
+- One contract should own the inventory struct's tail and size pins (five copies today), and the struct has no
+  size field, so a stale `libllama` (192 bytes) with a new `libggml-sycl` (208) is not detected.
+- `supports_op`'s `GET_ROWS` arm checks type and layout, not placement (Task 8h's block). `cpu_scale` drops the
+  bias and the flat `scale_f32` counts in `int` (Task 8f's block).
+- `GGML_SYCL_MOE_MULTI_GPU` reads as ON when unset (`ggml_sycl_moe_multi_gpu_requested`), while `CLAUDE.md`
+  says opt-in.
+- GPT-OSS 20B on the B50 measures about 553 t/s pp512 in both arms of Task 8b's A/B, against a baseline of
+  about 894; tg128 about 35 against 32. Same in the integration build, so not this branch's MoE work. Driver
+  26.44, after the upstream sync. Not investigated.
 
 *Decisions that are the user's (asked, not answered):* the eight contracts that are red on `master`; the
 interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkling2`; replacing the system

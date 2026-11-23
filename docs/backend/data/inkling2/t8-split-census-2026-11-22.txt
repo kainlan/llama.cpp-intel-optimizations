@@ -1,0 +1,35 @@
+Split census of one decoded Inkling 2 Mini token on the B70 (level_zero:0), from the scheduler print
+(GGML_SCHED_DEBUG=2, llama-completion -v -n 2, lead runs of 2026-11-22). A node's backend is the first
+bracket after its name; the census takes the largest graph each run printed. Trees: the base is Task 8b
+before the gap tasks; the 8h, 8f and 8e trees are each cut from 9789a7196 and hold one task; the last
+tree is Task 8b with Tasks 8h and 8f (the tree merged as e995206d3). Task 8e is not in it.
+
+base 8ed0c3204 (Task 8b before 8e/8f/8h): graphs printed 40; largest graph: 282 splits, 141 CPU splits, 205 nodes in CPU splits
+     88 x CPU split of 1 SCALE
+     24 x CPU split of 2 SET_ROWS
+     24 x CPU split of 1 FLASH_ATTN
+      4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+      1 x CPU split of 1 GET_ROWS
+    ops in CPU splits: FLASH_ATTN 24, GET_ROWS 1, MUL 8, MUL_MAT_ID 8, SCALE 104, SET_ROWS 48, SIGMOID 4, TANH 8
+Task 8h tree 009bd79d1: graphs printed 39; largest graph: 281 splits, 140 CPU splits, 204 nodes in CPU splits
+     88 x CPU split of 1 SCALE
+     24 x CPU split of 2 SET_ROWS
+     24 x CPU split of 1 FLASH_ATTN
+      4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+    ops in CPU splits: FLASH_ATTN 24, MUL 8, MUL_MAT_ID 8, SCALE 104, SET_ROWS 48, SIGMOID 4, TANH 8
+Task 8f tree 32f64c9e6: graphs printed 39; largest graph: 106 splits, 53 CPU splits, 117 nodes in CPU splits
+     24 x CPU split of 2 SET_ROWS
+     24 x CPU split of 1 FLASH_ATTN
+      4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+      1 x CPU split of 1 GET_ROWS
+    ops in CPU splits: FLASH_ATTN 24, GET_ROWS 1, MUL 8, MUL_MAT_ID 8, SCALE 16, SET_ROWS 48, SIGMOID 4, TANH 8
+Task 8e tree d6822101d: graphs printed 39; largest graph: 186 splits, 93 CPU splits, 133 nodes in CPU splits
+     88 x CPU split of 1 SCALE
+      4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+      1 x CPU split of 1 GET_ROWS
+    ops in CPU splits: GET_ROWS 1, MUL 8, MUL_MAT_ID 8, SCALE 104, SIGMOID 4, TANH 8
+Task 8b+8h+8f 0f4060d0f: graphs printed 40; largest graph: 105 splits, 52 CPU splits, 116 nodes in CPU splits
+     24 x CPU split of 2 SET_ROWS
+     24 x CPU split of 1 FLASH_ATTN
+      4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+    ops in CPU splits: FLASH_ATTN 24, MUL 8, MUL_MAT_ID 8, SCALE 16, SET_ROWS 48, SIGMOID 4, TANH 8
