@@ -67588,22 +67588,32 @@ static std::vector<moe_layer_transient_ptr_table_slot> ggml_sycl_moe_table_slots
     return slots;
 }
 
+// Every operand must be on this card in `layout`, except that skip_host leaves a HOST operand out (make_moe_batch_view):
+// the card part of a MUL_MAT_ID node that runs both. Each HOST expert's slot is then null.
 static const void * const * ggml_sycl_upload_moe_ptr_table_from_batch(ggml_backend_sycl_context &           ctx,
                                                                       const ggml_tensor *                   src0,
                                                                       const ggml_sycl::moe_resolved_batch & batch,
                                                                       int                                   layer_hash,
                                                                       layout_mode                           layout,
                                                                       sycl::event * table_event_out = nullptr,
-                                                                      bool *        table_event_set = nullptr) {
-    const ggml_sycl::moe_batch_local_view view = ggml_sycl::make_moe_batch_local_view(batch, layout);
+                                                                      bool *        table_event_set = nullptr,
+                                                                      bool          skip_host       = false) {
+    const ggml_sycl::moe_batch_local_view view = ggml_sycl::make_moe_batch_view(batch, layout, skip_host);
     if (!view) {
         return nullptr;
     }
     const std::vector<moe_layer_transient_ptr_table_slot> slots = ggml_sycl_moe_table_slots_from_view(view);
+    std::vector<int32_t>                                  host_experts;
+    for (const auto & operand : batch.operands) {
+        if (skip_host && operand.residency() == ggml_sycl::moe_batch_residency::HOST &&
+            std::find(host_experts.begin(), host_experts.end(), operand.expert_id) == host_experts.end()) {
+            host_experts.push_back(operand.expert_id);
+        }
+    }
     const std::vector<int32_t> staged_experts = ggml_sycl::moe_batch_staged_ring_experts(batch);
-    return ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, slots, layer_hash, layout, &view.ready_events,
-                                                    table_event_out, table_event_set,
-                                                    staged_experts.empty() ? nullptr : &staged_experts);
+    return ggml_sycl_upload_moe_transient_ptr_table(
+        ctx, src0, slots, layer_hash, layout, &view.ready_events, table_event_out, table_event_set,
+        staged_experts.empty() ? nullptr : &staged_experts, host_experts.empty() ? nullptr : &host_experts);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -67621,62 +67631,20 @@ const void * const * ggml_sycl::test_moe_staged_ring_upload(ggml_backend_t      
 }
 #endif
 
+// The batch's table, retained with the leases of the operands it holds. With skip_host, a HOST operand's slot is null
+// and its lease stays out of the retain: the host leg that reads that expert holds it.
 static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_table_from_batch(
     ggml_backend_sycl_context &           ctx,
     const ggml_tensor *                   src0,
     const ggml_sycl::moe_resolved_batch & batch,
     int                                   layer_hash,
-    layout_mode                           layout) {
+    layout_mode                           layout,
+    bool                                  skip_host = false) {
     ggml_sycl::moe_retained_pointer_table result;
     bool                                  event_set = false;
     ggml_sycl_note_moe_table_reach("upload:ggml_sycl_upload_moe_retained_ptr_table_from_batch", src0, ctx.device);
-    const void * const * transient = ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, layer_hash, layout,
-                                                                               &result.ready_event, &event_set);
-    if (!transient) {
-        return {};
-    }
-    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES ||
-        !extra->weight().moe_expert_ptrs_handle[ctx.device].has_stable_owner_identity()) {
-        return {};
-    }
-    result.table_handle    = extra->weight().moe_expert_ptrs_handle[ctx.device];
-    result.has_ready_event = event_set;
-    result.role_leases.reserve(batch.operands.size());
-    for (const auto & operand : batch.operands) {
-        result.role_leases.push_back(operand.lease());
-    }
-    return result;
-}
-
-// The card part of a batch whose other operands are HOST (a MUL_MAT_ID node that runs both). The table gains the card
-// experts, each HOST expert's slot is null, and the leases retained with the table are the card operands' alone: a
-// HOST operand's lease is held by the host leg that reads it.
-static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_card_ptr_table_from_batch(
-    ggml_backend_sycl_context &           ctx,
-    const ggml_tensor *                   src0,
-    const ggml_sycl::moe_resolved_batch & batch,
-    int                                   layer_hash,
-    layout_mode                           layout) {
-    ggml_sycl::moe_retained_pointer_table result;
-    bool                                  event_set = false;
-    ggml_sycl_note_moe_table_reach("upload:ggml_sycl_upload_moe_card_ptr_table_from_batch", src0, ctx.device);
-    const ggml_sycl::moe_batch_local_view view = ggml_sycl::make_moe_batch_card_view(batch, layout);
-    if (!view || view.expert_ids.empty()) {
-        return {};
-    }
-    const std::vector<moe_layer_transient_ptr_table_slot> slots = ggml_sycl_moe_table_slots_from_view(view);
-    std::vector<int32_t>                                  host_experts;
-    for (const auto & operand : batch.operands) {
-        if (operand.residency() == ggml_sycl::moe_batch_residency::HOST &&
-            std::find(host_experts.begin(), host_experts.end(), operand.expert_id) == host_experts.end()) {
-            host_experts.push_back(operand.expert_id);
-        }
-    }
-    const std::vector<int32_t> staged_experts = ggml_sycl::moe_batch_staged_ring_experts(batch);
-    const void * const *       transient      = ggml_sycl_upload_moe_transient_ptr_table(
-        ctx, src0, slots, layer_hash, layout, &view.ready_events, &result.ready_event, &event_set,
-        staged_experts.empty() ? nullptr : &staged_experts, host_experts.empty() ? nullptr : &host_experts);
+    const void * const * transient = ggml_sycl_upload_moe_ptr_table_from_batch(
+        ctx, src0, batch, layer_hash, layout, &result.ready_event, &event_set, skip_host);
     if (!transient) {
         return {};
     }
@@ -88541,8 +88509,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // as NaN, which the host leg's copy then overwrites), and its lease stays out of the table owner.
             ggml_sycl::moe_retained_pointer_table retained_table;
             if (host_ready) {
-                retained_table = ggml_sycl_upload_moe_card_ptr_table_from_batch(
-                    ctx, src0, direct_batch, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
+                retained_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
+                    ctx, src0, direct_batch, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS, /*skip_host=*/true);
             }
             const void * const * table_ptr = retained_table.resolve_abi(ctx.device);
             auto bindings = std::make_shared<std::vector<ggml_sycl::moe::mmid_batch_binding>>();

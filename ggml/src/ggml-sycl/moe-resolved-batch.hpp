@@ -647,11 +647,6 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
     return make_moe_batch_view(batch, layout, false);
 }
 
-// The card operands of a batch whose other operands are HOST; any other residency still refuses it.
-inline moe_batch_local_view make_moe_batch_card_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
-    return make_moe_batch_view(batch, layout, true);
-}
-
 // llama.cpp-iikr (B50 residual-pool cycle, HOST6 priority 2): boolean-only
 // sibling of make_moe_batch_local_view() for a caller that only needs "is
 // this batch admissible" and never consumes a resolved pointer table --

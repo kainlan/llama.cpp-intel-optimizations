@@ -337,7 +337,9 @@ UPLOAD_CLEAR = ("if (staged) { expert_handles[slot] = ggml_sycl::mem_handle{}; p
                 "any_updated = true; " + UPLOAD_RECORD + " } else if (!same_entry) {")
 UPLOAD_LEASE = "if (!staged) { leases.push_back(std::move(handle)); }"
 FROM_BATCH_STAGED = "const std::vector<int32_t> staged_experts = ggml_sycl::moe_batch_staged_ring_experts(batch);"
-FROM_BATCH_PASS = "table_event_out, table_event_set, staged_experts.empty() ? nullptr : &staged_experts);"
+# The upload from a batch passes its staged experts, then (skip_host, a mixed node's card part) its HOST experts.
+FROM_BATCH_PASS = ("table_event_out, table_event_set, staged_experts.empty() ? nullptr : &staged_experts, "
+                   "host_experts.empty() ? nullptr : &host_experts);")
 HYBRID_COLLECT = ("if (entry->admitted_recipe_ticket.valid() && entry->admitted_recipe_ticket.recipe().transfer == "
                   "ggml_sycl::moe_recipe_transfer::STAGED_RING &&")
 HYBRID_PASS = ("ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, route_slots, layer_id, dispatch_layout, nullptr, "
