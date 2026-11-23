@@ -340,6 +340,29 @@ inline void moe_swap_off(moe_swap_driver_state & d, const char * reason) {
     d.stats.off_reason = reason;
 }
 
+// Runs `on_throw` when it leaves scope armed. The step declares one before it calls a transaction and dismisses it on
+// the line after the call returns, so `on_throw` runs only while a throw out of the transaction unwinds, and the throw
+// reaches the caller as it was thrown: no handler sees it, so none can swallow it. A destructor that throws while a
+// throw unwinds ends the process, so `on_throw` must not throw: the step reserves, before the call, every list
+// `on_throw` pushes into.
+template <typename F> struct moe_swap_unwind_guard {
+    explicit moe_swap_unwind_guard(F fn) : on_throw(fn) {}
+
+    moe_swap_unwind_guard(const moe_swap_unwind_guard &)             = delete;
+    moe_swap_unwind_guard & operator=(const moe_swap_unwind_guard &) = delete;
+
+    ~moe_swap_unwind_guard() {
+        if (armed) {
+            on_throw();
+        }
+    }
+
+    void dismiss() { armed = false; }
+
+    F    on_throw;
+    bool armed = true;
+};
+
 // The batch of a transaction that threw, settled from `view`, the published plan the boundary reads: a triplet moved
 // when it is where its move takes it. A moved evict leaves its admit pending, and an evict that did not move is
 // dropped (BUSY, MOE_SWAP_UNSETTLED_REASON; the policy may propose it again). A moved admit leaves pending, and one
@@ -530,13 +553,14 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             m.expert = p.restore ? p.evict_expert : p.admit_expert;
             d.batch.push_back(m);
         }
-        // Reserved before the call, so holding the batch after a throw does not grow the list.
-        d.unsettled.reserve(d.pending.size());
-        try {
-            txn(d.batch);
-        } catch (...) {
-            // Each admit sent is BUSY for the throw, and its streak advances, so admits whose every transaction
-            // throws are dropped under the streak rule (at the settle that finds them not moved).
+        // The guard below runs while a throw unwinds, where a throw of its own ends the process. These reserves are what
+        // make its pushes safe: room for one unsettled move per admit sent, and for the throw's BUSY reason should it
+        // be new.
+        d.unsettled.reserve(d.unsettled.size() + d.pending.size());
+        st.busy.reserve(st.busy.size() + 1);
+        // If the transaction throws, each admit sent is BUSY for the throw, and its streak advances, so admits whose
+        // every transaction throws are dropped under the streak rule (at the settle that finds them not moved).
+        moe_swap_detail::moe_swap_unwind_guard admit_throw([&]() {
             for (moe_swap_pending & p : d.pending) {
                 moe_swap_detail::moe_swap_count_reason(st.busy, MOE_SWAP_UNSETTLED_REASON);
                 moe_swap_detail::moe_swap_pending_note_busy(p, MOE_SWAP_UNSETTLED_REASON, c.cache_settled);
@@ -544,8 +568,9 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             }
             d.pending.clear();
             st.unsettled_moves = d.unsettled.size();
-            throw;
-        }
+        });
+        txn(d.batch);
+        admit_throw.dismiss();
         size_t kept = 0;
         for (size_t i = 0; i < d.pending.size(); ++i) {
             moe_swap_pending &    p    = d.pending[i];
@@ -634,11 +659,11 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         m.expert = d.proposals[i].evict_expert;
         d.batch.push_back(m);
     }
-    // Reserved before the call, so holding the batch after a throw does not grow the list.
-    d.unsettled.reserve(keep);
-    try {
-        txn(d.batch);
-    } catch (...) {
+    // The guard below runs while a throw unwinds, where a throw of its own ends the process. This reserve is what makes
+    // its pushes safe: room for one unsettled move per evict sent.
+    d.unsettled.reserve(d.unsettled.size() + keep);
+    // If the transaction throws, each evict sent waits unsettled for the next view.
+    moe_swap_detail::moe_swap_unwind_guard evict_throw([&]() {
         for (size_t i = 0; i < keep; ++i) {
             moe_swap_unsettled u;
             u.kind              = MOE_SWAP_MOVE_EVICT;
@@ -649,8 +674,9 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             d.unsettled.push_back(u);
         }
         st.unsettled_moves = d.unsettled.size();
-        throw;
-    }
+    });
+    txn(d.batch);
+    evict_throw.dismiss();
     for (size_t i = 0; i < keep; ++i) {
         const moe_swap_move &     m = d.batch[i];
         const moe_swap_proposal & q = d.proposals[i];

@@ -28,7 +28,9 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       second line also names the moves of a thrown batch still unsettled at the report, a count each throw sets;
   D8  the driver header is plain host code: it includes the policy header and a short list of standard headers, and
       keeps no state outside the caller's struct (no static, thread_local, extern, mutable or volatile, no inline
-      variable, no atomic or lock), and reaches no device, cache, log or environment;
+      variable, no atomic or lock), reaches no device, cache, log or environment, and has no exception handler (no
+      try or catch): a handler there could swallow what the transaction throws, and the header cannot name the
+      planned refusal a handler must let through;
   D9  the plan-view builder keeps no state and takes no lock, logs nothing and reads no environment;
   D10 a named evict's host copy never grows the pinned host zone: the to-host branch mints an evict's copy through
       ggml_sycl_host_expert_alloc_no_growth, while a loan's copy keeps the growing mint. There is one host mint:
@@ -53,7 +55,12 @@ a unit test cannot show is where the driver runs and what it does not do there. 
   D16 a replaced route table's driver hands over what is in flight only under the load the instance last saw: the
       caller carries only when the snapshot's model and load ids both match, otherwise drops the moves as open slots
       and forces the old driver's report when it dropped any, and the report prints when forced even if an earlier
-      one covered every boundary.
+      one covered every boundary;
+  D17 a transaction that throws leaves its batch unsettled through an unwind guard, not a handler: the step calls the
+      transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
+      when the guard counts one, then declares a guard whose body sets the unsettled count; the line right after the
+      call dismisses that guard. The guard's body runs while a throw unwinds, where a throw ends the process, so the
+      reserves are what make its pushes safe.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -114,6 +121,10 @@ FAULTS_FIELDS = ("accepted transactions %llu (evict %llu, admit %llu) over %llu 
 TXN_COUNTS = ("++st.transactions_evict;", "++st.transactions_admit;")
 UNSETTLED_FIELDS = ("unsettled at report: %llu", "(ull) st.unsettled_moves)")
 UNSETTLED_SET = "st.unsettled_moves = d.unsettled.size();"
+TXN_CALL = "txn(d.batch);"
+GUARD_DECL = re.compile(r"\bmoe_swap_detail::moe_swap_unwind_guard\s+(\w+)\s*\(")
+HANDLER = re.compile(r"\b(?:try|catch)\b")
+LITERAL = re.compile(r"\"(?:\\.|[^\"\\\n])*\"")
 SAME_LOAD = "const bool same_load = snap && snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id;"
 CARRY_GATE = ("if (!same_load || !ggml_sycl::moe_swap_driver_carry(*inst.driver, *fresh)) { "
               "dropped = ggml_sycl::moe_swap_driver_drop_in_flight(*inst.driver); }")
@@ -419,6 +430,11 @@ def check(raw: dict[str, str]) -> None:
     if m:
         fail("D8", f"`{m.group(0).strip()}` at line {driver.count(chr(10), 0, m.start()) + 1}: device, cache, log or "
                    "environment use in the driver header")
+    code = LITERAL.sub('""', driver)
+    m = HANDLER.search(code)
+    if m:
+        fail("D8", f"`{m.group(0)}` at line {code.count(chr(10), 0, m.start()) + 1}: an exception handler in the driver "
+                   "header, which could swallow what the transaction throws")
 
     # D9 ---------------------------------------------------------------------------------------------------------------
     if not builder:
@@ -495,6 +511,29 @@ def check(raw: dict[str, str]) -> None:
     accessor_room = norm(body(cache, NO_GROWTH_ROOM_SIG))
     if not accessor_room or not all(f in accessor_room for f in NO_GROWTH_ROOM_FIELDS):
         fail("D15", "the no-growth room is not capacity capped at the reserved figure, less what is used, never below 0")
+
+    # D17 --------------------------------------------------------------------------------------------------------------
+    calls = [m.start() for m in re.finditer(re.escape(TXN_CALL), step)]
+    if len(calls) != 2:
+        fail("D17", f"the step calls the transaction {len(calls)} times, not once for admits and once for evicts")
+    prev = 0
+    for at in calls:
+        seg = step[prev:at]
+        decls = list(GUARD_DECL.finditer(seg))
+        if not decls:
+            fail("D17", "a transaction call has no unwind guard declared before it")
+        guard = decls[-1]
+        before, guarded = seg[:guard.start()], seg[guard.start():]
+        if UNSETTLED_SET not in guarded:
+            fail("D17", f"guard `{guard.group(1)}` does not set the unsettled count")
+        if "d.unsettled.reserve(" not in before:
+            fail("D17", f"the unsettled list is not reserved before guard `{guard.group(1)}`, so its pushes can throw "
+                        "while a throw unwinds")
+        if "moe_swap_count_reason(st.busy," in guarded and "st.busy.reserve(" not in before:
+            fail("D17", f"the busy reasons are not reserved before guard `{guard.group(1)}`, which counts one")
+        if not step[at + len(TXN_CALL):].startswith(f" {guard.group(1)}.dismiss();"):
+            fail("D17", f"guard `{guard.group(1)}` is not dismissed on the line right after the transaction returns")
+        prev = at + len(TXN_CALL)
 
 
 def _helper_body(sycl: str, name: str) -> str:
@@ -609,6 +648,23 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("admit-throw-leaves-the-count", "D7",
                 [("driver", STEP_SIG, "d.pending.clear();\n            st.unsettled_moves = d.unsettled.size();",
                   "d.pending.clear();")])
+    expect_fail("evict-throw-leaves-the-count", "D7",
+                [("driver", STEP_SIG, "d.unsettled.push_back(u);\n        }\n        st.unsettled_moves = "
+                  "d.unsettled.size();", "d.unsettled.push_back(u);\n        }")])
+    expect_fail("evict-throw-caught-in-the-header", "D8",
+                [("driver", STEP_SIG, "txn(d.batch);\n    evict_throw.dismiss();",
+                  "try {\n        txn(d.batch);\n    } catch (...) {\n        throw;\n    }\n"
+                  "    evict_throw.dismiss();")])
+    expect_fail("admit-guard-dismissed-before-the-call", "D17",
+                [("driver", STEP_SIG, "txn(d.batch);\n        admit_throw.dismiss();",
+                  "admit_throw.dismiss();\n        txn(d.batch);")])
+    expect_fail("evict-guard-never-dismissed", "D17", [("driver", STEP_SIG, "evict_throw.dismiss();", "")])
+    expect_fail("evict-guard-pushes-unreserved", "D17",
+                [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "")])
+    expect_fail("admit-guard-counts-unreserved", "D17", [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + 1);", "")])
+    expect_fail("evict-sent-without-a-guard", "D17",
+                [("driver", STEP_SIG, "moe_swap_detail::moe_swap_unwind_guard evict_throw(",
+                  "auto evict_throw = (")])
     expect_fail("carry-ignores-the-load", "D16",
                 [("sycl", CALLER_SIG, "snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id",
                   "snap->model_id == inst.model_id")])
