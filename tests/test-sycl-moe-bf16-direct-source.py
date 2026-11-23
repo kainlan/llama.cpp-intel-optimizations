@@ -9,8 +9,8 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       only); a known plan answers alone (every expert of the weight planned on this device at AOS, asked through
       ggml_sycl_moe_tensor_plan_primary_layout); with no plan, a weight nothing has placed yet counts (test-backend-ops
       asks supports_op before it allocates, then allocates on the backend it asked) and a placed weight counts only in
-      a SYCL device buffer of this device, asked through the one unsplit-SYCL-buffer helper; it reads no environment
-      and has no row-multiple rule;
+      this device's own buffer (an unsplit SYCL buffer of this device, in VRAM), asked through the one helper that
+      holds that whole test; it reads no environment and has no row-multiple rule;
   (b) supports_op asks that predicate as the MUL_MAT_ID gate's third term, and the route asks the same predicate
       again at run time and refuses by name when it says no;
   (c) the route sits in ggml_sycl_mul_mat_id after the src0->extra ensure block and before the MMID_SCHED device
@@ -18,9 +18,10 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       expert type, not on the predicate, and is one call to ggml_sycl_mul_mat_id_bf16_direct() and a return, so no
       BF16 op reaches the routes after it, none of which has a BF16 kernel;
   (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table (publishing the weight's AOS slices on a miss
-      only from an unsplit SYCL buffer, through the same helper the predicate asks), the device-resident ids, submits
+      only from this device's own buffer, through the same helper the predicate asks), the device-resident ids, submits
       through moe_bf16_direct_submit() inside the kernel profiler's existing wrapper under the label
-      mulmat.moe.bf16_direct, and retains a snapshot of the table's dispatch bundle (its active leases and the table's
+      mulmat.moe.bf16_direct (its metadata naming the launch count, from the one tokens-per-launch answer the route
+      asks for), and retains a snapshot of the table's dispatch bundle (its active leases and the table's
       own allocation) until the kernel's event, as the production pointer-table dispatchers do; it never consumes the
       table's active leases (the next dispatch from the same cached table needs them), reads the ids on the host,
       waits, touches the MMID workspace or Q8_1, re-routes to the CPU or aborts; a refusal is a named WARN line and
@@ -34,7 +35,9 @@ expert table and the device ids, with src1 and dst read and written in place. Th
   (g) the kernel lives in moe-bf16-direct.{hpp,cpp}: BF16 decoded with bf16_to_f32, a 16-lane sub-group per output
       row reduced with reduce_over_group, id -1 a zero row and any other bad slot a quiet NaN; a dispatch whose global
       range exceeds the shape's launch limit (an int by default) runs in token chunks, each after the one before, and
-      one that cannot be chunked is refused; the file allocates, frees and waits on nothing;
+      one that cannot be chunked is refused; the float4 activation load runs only on a 16-byte aligned src1 base and
+      row strides, and the 8-byte weight load only on an 8-byte aligned weight row (opencl:cpu reads unaligned loads
+      correctly, so the kernel test cannot see either guard go); the file allocates, frees and waits on nothing;
   (h) the MMVQ tables stay BF16-free and moe_type_needs_direct_kernel stays Q1_0/NVFP4.
 """
 
@@ -60,13 +63,27 @@ ROUTE_FN_HEAD = f"static void {ROUTE_FN}(ggml_backend_sycl_context & ctx, ggml_t
 ROUTE_IF = "if (src0->type == GGML_TYPE_BF16) {"
 ROUTE_ASK = f"if (!{PREDICATE}(dst, ctx.device)) {{"
 UNPLACED_CLAIM = "if(src0->buffer==nullptr){returntrue;}"
-UNSPLIT = "ggml_sycl_moe_bf16_direct_unsplit_sycl_buffer"
-UNSPLIT_HEAD = f"static bool {UNSPLIT}(ggml_backend_buffer_t buffer) {{"
-UNSPLIT_BODY = "returnbuffer!=nullptr&&ggml_backend_buffer_is_sycl(buffer)&&!ggml_backend_buffer_is_sycl_split(buffer);"
-PUBLISH_GUARD = f"if ({UNSPLIT}(src0->buffer) && ggml_sycl_publish_mmid_canonical_aos_experts("
+# One helper holds the whole "this device's own buffer" test: one device's unsplit SYCL buffer, of `device`, in VRAM.
+OWN_BUFFER = "ggml_sycl_moe_bf16_direct_own_vram_buffer"
+OWN_BUFFER_HEAD = f"static bool {OWN_BUFFER}(ggml_backend_buffer_t buffer, int device) {{"
+OWN_BUFFER_BODY = (
+    "if(buffer==nullptr||!ggml_backend_buffer_is_sycl(buffer)||ggml_backend_buffer_is_sycl_split(buffer)){returnfalse;}"
+    "constauto*buf_ctx=static_cast<constggml_backend_sycl_buffer_context*>(buffer->context);"
+    "returnbuf_ctx!=nullptr&&buf_ctx->device==device&&buf_ctx->managed_meta.tier==ggml_sycl::alloc_tier::DEVICE_VRAM;")
+NO_PLAN_TAIL = f"{UNPLACED_CLAIM}return{OWN_BUFFER}(src0->buffer,device);"
+# Spellings of the buffer test that belong to the helper alone.
+BUFFER_TEST_PARTS = ("ggml_backend_buffer_is_sycl_split(", "ggml_backend_buffer_is_sycl(", "buf_ctx",
+                     "alloc_tier::DEVICE_VRAM")
+PUBLISH_GUARD = f"if ({OWN_BUFFER}(src0->buffer, ctx.device) && ggml_sycl_publish_mmid_canonical_aos_experts("
 PROFILE_SUBMIT = "ggml_sycl_profile_submit("
 PROFILE_NAME = '"mulmat.moe.bf16_direct"'
-PROFILE_KEYS = ('"ncols="', '";nrows_per_expert="', '";total_batches="')
+PROFILE_KEYS = ('"ncols="', '";nrows_per_expert="', '";total_batches="', '";launches="')
+TOKENS_PER_LAUNCH_CALL = "ggml_sycl::moe_bf16_direct_tokens_per_launch(shape)"
+# The kernel's two alignment guards. opencl:cpu reads unaligned float4 and 8-byte loads correctly, so the kernel test
+# cannot see either guard go; these pins are what can.
+X_ALIGN_GUARD = ("const bool xvec = vec4 && reinterpret_cast<uintptr_t>(src1) % 16 == 0 && shape.src1_nb1 % 16 == 0 && "
+                 "shape.src1_nb2 % 16 == 0;")
+W_ALIGN_GUARD = "if (VEC4 && (reinterpret_cast<uintptr_t>(w_row) & 7) == 0) {"
 ROUTE_BODY = f"{ROUTE_FN}(ctx,dst);return;"
 GATE = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device) && "
         f"!{PREDICATE}(op, device)) {{")
@@ -179,18 +196,23 @@ def claim_a_predicate(s):
         return [f"{PREDICATE}(op, device) is not defined exactly once as a static bool in ggml-sycl.cpp"]
     body = braced_body(sycl, PREDICATE_HEAD) or ""
     for needed in ("GGML_TYPE_BF16", "ggml_is_contiguous(", "ggml_sycl_moe_plan_owner_for_device(device)",
-                   "ggml_sycl_moe_tensor_plan_primary_layout(", "GGML_LAYOUT_AOS", f"{UNSPLIT}("):
+                   "ggml_sycl_moe_tensor_plan_primary_layout(", "GGML_LAYOUT_AOS", f"{OWN_BUFFER}("):
         if needed not in body:
             fails.append(f"the predicate does not ask {needed}")
-    # One helper says what an unsplit SYCL buffer is; the predicate and the route ask it and spell neither half.
-    if sycl.count(UNSPLIT_HEAD) != 1 or tight(braced_body(sycl, UNSPLIT_HEAD) or "") != UNSPLIT_BODY:
-        fails.append(f"{UNSPLIT} is not defined once as `buffer && is_sycl(buffer) && !is_sycl_split(buffer)`")
-    elif sycl.find(UNSPLIT_HEAD) > sycl.find(PREDICATE_HEAD):
-        fails.append(f"{UNSPLIT} is defined after the predicate that asks it")
+    # One helper says what this device's own buffer is (unsplit SYCL, this device, VRAM); the predicate's no-plan arm
+    # and the route's publish guard ask it, and neither spells any part of it.
+    if sycl.count(OWN_BUFFER_HEAD) != 1 or tight(braced_body(sycl, OWN_BUFFER_HEAD) or "") != OWN_BUFFER_BODY:
+        fails.append(f"{OWN_BUFFER} is not defined once as `an unsplit SYCL buffer of `device`, in DEVICE_VRAM`")
+    elif sycl.find(OWN_BUFFER_HEAD) > sycl.find(PREDICATE_HEAD):
+        fails.append(f"{OWN_BUFFER} is defined after the predicate that asks it")
+    asks = len(re.findall(rf"\b{OWN_BUFFER}\(", sycl))
+    if asks != 3:
+        fails.append(f"{OWN_BUFFER} appears {asks} times; want its definition, the predicate and the publish guard")
     route = route_fn_body(sycl) or ""
     for where, text in (("predicate", body), ("route", route)):
-        if "ggml_backend_buffer_is_sycl_split(" in text or "ggml_backend_buffer_is_sycl(" in text:
-            fails.append(f"the {where} spells the buffer test out instead of asking {UNSPLIT}")
+        spelled = [part for part in BUFFER_TEST_PARTS if part in text]
+        if spelled:
+            fails.append(f"the {where} spells the buffer test out ({', '.join(spelled)}) instead of asking {OWN_BUFFER}")
     for forbidden in ("getenv", "% 32", "%32", "WARP_SIZE", "ggml_sycl_moe_pp_batched", "GGML_TYPE_NVFP4"):
         if forbidden in body:
             fails.append(f"the predicate carries {forbidden!r}")
@@ -206,15 +228,14 @@ def claim_a_predicate(s):
         last = statements[-1] if statements else ""
         if not last.startswith("returnggml_sycl_moe_tensor_plan_primary_layout(") or "GGML_LAYOUT_AOS" not in last:
             fails.append("the plan arm does not end by returning the plan's AOS primary layout on this device")
-        if f"{UNSPLIT}(" in plan_arm or "->buffer" in plan_arm:
+        if f"{OWN_BUFFER}(" in plan_arm or "->buffer" in plan_arm:
             fails.append("the plan arm consults the weight's buffer: a known plan answers alone")
         tail = body[body.find("if (plan) {") + len("if (plan) {") + len(plan_arm) :]
-        asked = tight(tail).find(f"{UNSPLIT}(src0->buffer)")
-        if asked < 0:
-            fails.append(f"the no-plan arm does not ask {UNSPLIT}(src0->buffer)")
-        unplaced = tight(tail).find(UNPLACED_CLAIM)
-        if unplaced < 0 or unplaced > asked:
-            fails.append("the no-plan arm does not claim a weight nothing has placed yet before it reads the buffer")
+        # The no-plan arm, whole: a weight nothing has placed yet counts, and a placed one only in this device's own
+        # VRAM buffer.
+        if not tight(tail).endswith(NO_PLAN_TAIL):
+            fails.append("the no-plan arm is not `if (src0->buffer == nullptr) { return true; } "
+                         f"return {OWN_BUFFER}(src0->buffer, device);`")
     return fails
 
 
@@ -275,7 +296,10 @@ def claim_d_route_body(s):
         if needed not in body:
             fails.append(f"{ROUTE_FN} does not contain {needed}")
     if body.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1:
-        fails.append("the route publishes other than once, behind the unsplit-SYCL-buffer test")
+        fails.append("the route publishes other than once, behind the own-VRAM-buffer test")
+    # The launch count in the profiler row comes from the one tokens-per-launch answer the refusal already asked for.
+    if body.count(TOKENS_PER_LAUNCH_CALL) != 1:
+        fails.append(f"the route does not ask {TOKENS_PER_LAUNCH_CALL} exactly once")
     profiled = body.find(PROFILE_SUBMIT)
     if profiled >= 0 and not profiled < body.find(SUBMIT_CALL):
         fails.append("the kernel is not submitted inside the profiler's wrapper")
@@ -365,6 +389,12 @@ def claim_g_kernel(s):
             fails.append(f"the submitter does not use {needed}")
     if "shape.max_launch_items" not in (function_body(cpp, "int64_t moe_bf16_direct_tokens_per_launch(") or ""):
         fails.append("moe_bf16_direct_tokens_per_launch does not read the shape's launch limit")
+    # The alignment guards: the float4 activation load only on a 16-byte aligned src1 base and row strides, and the
+    # 8-byte weight load only on an 8-byte aligned weight row.
+    if X_ALIGN_GUARD not in submit:
+        fails.append("the submitter does not take the float4 activation load only on 16-byte aligned src1 rows")
+    if W_ALIGN_GUARD not in cpp:
+        fails.append("the kernel does not take the 8-byte weight load only on an 8-byte aligned weight row")
     lowered = (hpp + cpp).lower()
     for forbidden in KERNEL_FORBIDDEN:
         if forbidden.lower() in lowered:
@@ -413,8 +443,13 @@ MUTANTS = [
     ("a", "sycl", None, PREDICATE_HEAD, PREDICATE_HEAD + ' if (getenv("X")) { return true; }'),
     ("a", "sycl", PREDICATE_HEAD, "return ggml_sycl_moe_tensor_plan_primary_layout(",
      "(void) ggml_sycl_moe_tensor_plan_primary_layout("),
-    ("a", "sycl", UNSPLIT_HEAD, "!ggml_backend_buffer_is_sycl_split(buffer)", "true"),
-    ("a", "sycl", PREDICATE_HEAD, f"{UNSPLIT}(src0->buffer)",
+    ("a", "sycl", OWN_BUFFER_HEAD, " || ggml_backend_buffer_is_sycl_split(buffer)", ""),
+    # Another card's buffer passes the publish guard: this card's thread would write that device's expert records.
+    ("a", "sycl", OWN_BUFFER_HEAD, "buf_ctx->device == device && ", ""),
+    ("a", "sycl", OWN_BUFFER_HEAD, " && buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM", ""),
+    ("a", "sycl", PREDICATE_HEAD, f"{OWN_BUFFER}(src0->buffer, device)",
+     "ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer)"),
+    ("a", "sycl", ROUTE_FN_HEAD, f"{OWN_BUFFER}(src0->buffer, ctx.device)",
      "ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer)"),
     ("a", "sycl", PREDICATE_HEAD, "src0->view_src != nullptr || ", ""),
     ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }", ""),
@@ -432,7 +467,13 @@ MUTANTS = [
     ("d", "sycl", ROUTE_FN_HEAD, PUBLISH_GUARD, "if (ggml_sycl_publish_mmid_canonical_aos_experts("),
     ("d", "sycl", ROUTE_FN_HEAD, PROFILE_NAME, '"mulmat.moe.bf16"'),
     ("d", "sycl", ROUTE_FN_HEAD, PROFILE_SUBMIT, "ggml_sycl_profile_record_returned_event("),
+    ("d", "sycl", ROUTE_FN_HEAD, '";launches="', '";chunks="'),
+    ("d", "sycl", ROUTE_FN_HEAD, "std::to_string(shape.k)",
+     f"std::to_string(shape.k) + std::to_string({TOKENS_PER_LAUNCH_CALL})"),
     ("g", "cpp", None, "depends_on(", "ignore_dependency("),
+    ("g", "cpp", None, "reinterpret_cast<uintptr_t>(src1) % 16 == 0", "true"),
+    ("g", "cpp", None, "shape.src1_nb1 % 16 == 0 && shape.src1_nb2 % 16 == 0", "true"),
+    ("g", "cpp", None, "(reinterpret_cast<uintptr_t>(w_row) & 7) == 0", "true"),
     ("g", "hpp", None, "std::numeric_limits<int>::max()", "std::numeric_limits<size_t>::max()"),
     ("d", "sycl", ROUTE_FN_HEAD, TABLE_CALL, TABLE_CALL.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")),
     ("d", "sycl", ROUTE_FN_HEAD, RETAIN_CALL, "(void) ("),
