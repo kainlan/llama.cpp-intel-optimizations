@@ -5741,6 +5741,41 @@ rewritten Stage 3 before any of it starts.
 | S5 | BF16 dense matmuls | >= 20 % of device time in either phase | ~29 % of CPU-reference time; on the device they take the graph route and the kernel is not named in the trace | `[MUL-MAT-ROUTE]` lines of the census runs |
 | S6 | Two-card split | `both` slower than `b70` alone in either phase | the two-card executor is a scheduler split with host bounce, no peer-to-peer path, and loses whole-graph replay | `docs/backend/compute-runtime.md`; the `both` census |
 
+**Measured early (lead, 2026-11-22, B70 only, tree `fe79b7062`; Tasks 12 and 13 are not done).** The user
+asked for the profile ahead of the plan's order. Two kernel-profiler loads and one event-mode experiment:
+`docs/backend/data/inkling2/t10-kprof-b70-fe79b7062.txt` (tables, the two CSVs beside it) and
+`docs/backend/data/inkling2/t17-evmode-ab-b70-fe79b7062.txt`. Device time is a lower bound: the dense BF16
+`MUL_MAT` kernels have no profiler row and the four BF16 expert layers still run on the CPU (Task 8g).
+
+| # | Verdict | Measured |
+|---|---------|----------|
+| S1 | **met** | A decoded token is 255 ms; 21.4 ms of it is device-timed kernel work (8%). The token is ~5980 device submissions: 2034 bin-broadcast kernels, 2026 bin-broadcast marker events, 713 memcpys, 406 norms, 381 oneDNN GEMMs, 88 NVFP4 expert mat-vecs, 48 attention. |
+| S2 | not met | 9 scheduler splits, 4 on the CPU, after Tasks 8b, 8e, 8f and 8h (`t8-split-census-2026-11-22.txt`). Task 8g removes the 4. |
+| S3 | open | Not separated in this profile. The table matmul is 48 of the 288 per-token GEMMs of row S8. The compute buffer at `-c 32768` is not measured. |
+| S4 | **met** | Prompt: 8587 ms of 9609 ms of device time, and 50% of the 17178 ms wall (691 tokens). Decode: 12.7 ms of the 21.4 ms. The kernel costs 22 us per (token, expert) pair in both phases: a 512-token call is 4096 mat-vecs, with nothing shared between tokens that select the same expert. |
+| S5 | cannot be judged | No device-time row exists for a dense BF16 `MUL_MAT` (495 dispatch entries per decoded token). The first task is the profiler label. Host time of the whole non-MoE matmul stage in decode is 781 ms over 24 passes (33 ms per pass). |
+| S6 | open | Not measured. |
+
+Hotspots the table did not predict, in order of measured share:
+
+| # | Hotspot | Measured | What is known about the fix (reads, 2026-11-22) |
+|---|---------|----------|--------------------------------------------------|
+| S7 | Bin-broadcast marker events | 2026 empty submissions per decoded token (GPT-OSS has 72). With `GGML_SYCL_BINBCAST_EVENT_MODE=reuse` they are gone, the count output is unchanged, and decode is faster in all three comparisons taken (per-token time -14% in the profile pair; tg128 4.99 against 4.04 and 4.14 against 2.95 in the bench pairs). The host load varied between arms, so the size is not established. | The mode exists and is documented as carrying the same guarantee (`binbcast.cpp`, `docs/backend/sycl-env-vars.md`, "Binbcast completion event"). The task is the default: a clean ABBA, the Mistral and GPT-OSS gates on both cards, `test-unified-cache-unpin-event`, the docs. |
+| S8 | A 3-D F32 `MUL_MAT` runs one oneDNN GEMM per batch element | Prompt: 199440 GEMM submissions for 691 tokens (288 per token), 4482 ms of host time in the non-MoE matmul stage, 26% of the wall. The nodes are `graph::mix` (two per call) and the relative-bias table (`src/models/inkling2.cpp`). | The loop is in `ggml_sycl_op_mul_mat` (`for i0 < ne13*ne12`), calling `DnnlGemmWrapper::row_gemm` with the batch counts pinned to 1; `DnnlGemmWrapper::gemm` already takes batch dimensions. For a 2-D `src0` (the bias table) the batch flattens into columns of one GEMM. No F32 batched route exists; the F16 one asserts F16 and non-weights. No wait on this path. |
+| S9 | NVFP4 decode kernel geometry | 177 us and 112 us per 8-pair call. Not a hotspot until dispatch falls: 12.7 ms of a 255 ms token. | A read, not a measurement: a 2304-wide row is 36 blocks against 16 per sub-group pass (75% lane use; 56% for 1152), and the 4-way unrolled loop never engages at 36 or 18 blocks (`mul_mat_vec_q_id`, `mmvq.cpp`). |
+
+For S4, the reads say: the grouped prompt executor that exists (`try_pp_onednn_f16_batched`) excludes NVFP4 on
+purpose, because it converts the weights to F16; a grouped NVFP4 kernel is a new kernel on the loaded AOS layout.
+The mantissa decodes to int8 through the table the MXFP4 DPAS kernels use, the activation is already quantized to
+Q8_1 once per token row, and the per-expert token lists can come from the host counting sort the MXFP4 path has
+or from the device histogram in `moe-sort.hpp`. The open design point is the scale: NVFP4 has one per 16
+elements and a DPAS tile spans 32. The closest template, `mxfp4-stored-gemm.cpp`, is not wired into dispatch.
+
+Proposed order (the user reviews it before any of it starts): Tasks 8g and 8i first, because they are running
+and they decide whether graph replay engages at all (S1); then S7 (the smallest change); S8 (a contained change
+for a quarter of the prompt); S4 as a grouped prompt kernel (half of the prompt, the largest piece of work); the
+S5 profiler label; S9 and the rest of S1 only after a new profile, because replay changes what a token costs.
+
 **Acceptance Criteria:**
 - [ ] Every row is either closed with its measured number or expanded into tasks that meet the Task Detail Standard.
 - [ ] Every Stage 3 task's acceptance is an interleaved paired A/B (ABBA order) plus the three Inkling gates, the
