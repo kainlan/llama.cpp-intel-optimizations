@@ -444,6 +444,9 @@ struct llama_model_nanbeige : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    // slot il runs physical layer il % n_layer_phys: the loops share the physical layers' weights
+    int layer_phys(int il) const override { return n_layer_phys > 0 ? il % n_layer_phys : il; }
+
     int  n_loops = 1;
     int  n_layer_phys = 0;
     bool skip_loop_final_norm = false;
@@ -1864,6 +1867,9 @@ struct llama_model_metis16 : public llama_model_base {
     uint32_t n_route      = 0;
     uint32_t n_layer_phys = 0;
     float    cont_limit   = 0.0f;
+
+    // slot il runs physical layer il % n_layer_phys: the later passes share the physical layers' weights
+    int layer_phys(int il) const override { return n_layer_phys > 0 ? il % (int) n_layer_phys : il; }
 
     struct graph : public llm_build_mamba_base {
         graph(const llm_graph_params & params);
