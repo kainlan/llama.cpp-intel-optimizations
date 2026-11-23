@@ -16836,10 +16836,11 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,
     // Both of these run BEFORE the two lock_guards below on purpose: the drain
     // waits on a queue, and a queue wait held under either of those mutexes is a
     // stall hazard (the teardown drain keeps its waits outside all ranked locks
-    // for the same reason). Every begin runs under graph_compute's L2 and L3, so
-    // graph_compute_unchecked drains this backend's terminal before it takes them,
-    // and the drain here finds nothing unless a caller computed on one backend
-    // from two threads at once.
+    // for the same reason). Every begin runs under graph_compute's L3, and under
+    // L2 as well on the bypass paths and the two direct compute_impl() calls
+    // (compute_impl_unlocked drops L2 first), so graph_compute_unchecked drains
+    // this backend's terminal before it takes either, and the drain here finds
+    // nothing unless a caller computed on one backend from two threads at once.
     //
     // Both calls stay: they cover disjoint states, and neither subsumes the
     // other. The drain handles a terminal graph whose invocation is still HELD
@@ -120997,9 +120998,10 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
         static_cast<ggml_backend_sycl_context *>(backend->context)->device, nullptr, nullptr);
     // A compute with no synchronize after it (a back-to-back caller) leaves this backend's invocation submitted and
     // unreleased, and the next begin has to drain it: a wait on the device. Every path below that begins a graph runs
-    // under g_sycl_graph_compute_mutex (L2) and graph_mutex (L3), and no wait may sit under a listed lock (canonical
-    // contract section 12.5), so the drain runs here, before either. It needs neither lock: synchronize and the
-    // teardown drain run the same wait, release and retire under none, and synchronize reads and clears
+    // under graph_mutex (L3), and the bypass paths and the two direct compute_impl() calls also under
+    // g_sycl_graph_compute_mutex (L2); compute_impl_unlocked drops L2 first. No wait may sit under a listed lock
+    // (canonical contract section 12.5), so the drain runs here, before either. It needs neither lock: synchronize
+    // and the teardown drain run the same wait, release and retire under none, and synchronize reads and clears
     // last_graph_event under none. Nothing can leave a new invocation for this backend between the drain and the
     // lock: only the dispatch scopes below begin one, and ggml drives a backend from one thread at a time. A caller
     // that broke that would still be drained by the begin, under the locks. After a synchronize this finds nothing.

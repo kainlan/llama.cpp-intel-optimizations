@@ -1458,7 +1458,9 @@ Scopes nest when such a path falls back to `compute_impl`.
 the graph: it seals on a normal exit and quarantines
 (`registry.abort_invocation`) when an exception leaves it. An inner scope ends
 nothing. Submit and release stay where they were, at graph_compute's exit and
-in `ggml_backend_sycl_synchronize`.
+in `ggml_backend_sycl_synchronize`, plus the entry drain in
+`graph_compute_unchecked` (`ggml_sycl_execution_drain_own_terminal`), which
+releases a terminal this backend left submitted before it takes L2.
 
 The tripwire: a graph that is submitted, released, quarantined, cleared or
 unbound while a scope still holds it open logs one `[EXECUTION-TRIPWIRE]` line
@@ -1713,8 +1715,11 @@ are known non-conformances, not exemptions.
   `ggml_backend_sycl_graph_compute_impl`, so each opens its own
   `ggml_sycl_execution_dispatch_scope`. `graph_compute_unchecked` keeps
   `g_sycl_graph_compute_mutex` (L2) and `sycl_ctx->graph_mutex` (L3) for the
-  whole of these paths; it drops L2 only around `compute_impl`. When their
-  begin is refused DEVICE_BUSY, `ggml_sycl_execution_begin_dispatch_graph`
+  whole of these paths. It drops L2 from the first `compute_impl_unlocked`
+  call on and does not take it back, so `compute_impl`'s own scope usually
+  begins under L3 alone; the two direct `compute_impl()` calls keep L2. When
+  a bypass path's begin is refused DEVICE_BUSY,
+  `ggml_sycl_execution_begin_dispatch_graph`
   drains the owning context's terminal events and retries once, and that wait
   runs under both locks.
   - The wait is on device events that were already submitted, and nothing it
