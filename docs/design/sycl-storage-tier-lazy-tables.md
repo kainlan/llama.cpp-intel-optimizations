@@ -967,7 +967,10 @@ shard 2 (tensors); Appendix A.1:
     `tp_staging_buffer_bytes` and the MMID host pool
     (`unified-cache.cpp:27685-27699`). For DeepSeek's and Qwen's expert types
     the SOA staging pair equals `2 x max_tensor`, and the TP staging buffer is
-    0 on one card.
+    0 on one card. Current code: the MMID host pool is no longer a STAGING
+    term. It is the WEIGHT zone term `host_weight_zone_terms::mmid_host_pool`,
+    because the pool is allocated from the WEIGHT zone as a persistent owner,
+    and the runtime MMID re-plan grows WEIGHT by the pool's growth.
   - SCRATCH is the sum of `max_tensor`, 32 MiB, `onednn_reorder`,
     `moe_q8_workspace`, `moe_cpu_expert_staging` (the largest MoE tensor) plus
     `moe_host_recipe_workspace`, `moe_vram_runtime`, `tp_vram_runtime`,
@@ -3006,7 +3009,8 @@ and `ggml_sycl_configure_host_zones_for_plan()` produce, term for term (§2.3):
 + the STAGING zone, as sized at `unified-cache.cpp:27685-27699`:
   `max(2 x max_tensor, max_staging_pair_bytes) + 2 MiB`, plus the 16 MiB
   headroom, the expert bias, `moe_routing_ids`, `tp_staging_buffer_bytes` and
-  the MMID host pool
+  the MMID host pool (in current code the pool is a WEIGHT term,
+  `host_weight_zone_terms::mmid_host_pool`, and is counted once, there)
 + the SCRATCH zone, as sized at `:27716-27742` and raised at
   `ggml-sycl.cpp:5634-5636`: every term §2.3 lists, `dma_staging_pool` and the
   PP MoE oneDNN ring included on today's code
