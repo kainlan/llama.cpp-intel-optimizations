@@ -1263,8 +1263,7 @@ if [ ! -r "$SCRIPT_DIR/sycl-host-backing.sh" ]; then
 fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/sycl-host-backing.sh"
-kb() { awk -v k="$1" '$1 == k ":" { print $2 }' /proc/meminfo; }
-mem_line() { echo "Shmem=$(kb Shmem) kB HostBacking=$(sycl_gpu_host_backing_kb 2>/dev/null || echo unreadable) kB MemAvailable=$(kb MemAvailable) kB"; }
+mem_line() { sycl_gpu_host_backing_log_line; } # one read for all three figures
 builders() {
     local n i c
     if [ -n "$BUILDERS_FILE" ]; then # test hook: a file holding the count
@@ -1277,9 +1276,12 @@ builders() {
     echo "$c"
 }
 host_settled() {
-    local s
-    s="$(sycl_gpu_host_backing_kb)" || return 1
-    [ "$s" -lt 31457280 ]
+    local st
+    # One read decides, and SETTLE_LINE is that read, so a refusal prints the figure it decided on.
+    SETTLE_LINE="Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB"
+    st="$(sycl_gpu_host_state_kb)" || return 1
+    SETTLE_LINE="$(sycl_gpu_host_format_state "$st")"
+    [ "$(sycl_gpu_host_state_backing_kb "$st")" -lt 31457280 ]
 }
 
 # refuse <why>: before the first arm it prints REFUSED and the final line. Once arms have run, a refusal must not drop
@@ -1318,7 +1320,7 @@ settle() { # waits up to 10 minutes; GPU.lock serialises access, not memory reco
         host_settled && return 0
         sleep 10
     done
-    refuse "host never settled (GPU host backing < 30 GiB): $(mem_line)"
+    refuse "host never settled (GPU host backing < 30 GiB): $SETTLE_LINE"
 }
 
 # sample_builders_during <pid> <file>: the highest builder count seen every 5 s while <pid> runs.
@@ -1581,7 +1583,7 @@ for arm in "${ARMS[@]}"; do
     [ "$A_KIND" = journal ] || device_arms=1
 done
 [ "$device_arms" = 0 ] || wait_builders start
-[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $(mem_line)"
+[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $SETTLE_LINE"
 if [ "$TAKE_LOCK" = 1 ]; then
     lock_take || refuse "could not take $LOCK_DIR (held: $(cat "$LOCK_DIR/holder" 2>/dev/null || echo unknown))"
 fi
