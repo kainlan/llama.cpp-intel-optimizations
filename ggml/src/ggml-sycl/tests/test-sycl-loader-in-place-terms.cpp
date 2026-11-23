@@ -27,12 +27,16 @@
 // the pool grew two chunks and was refused the third.
 //
 // Host-only: the fact rule is a constexpr function of the load's inputs, and the terms are a pure function of a
-// hand-built plan. No queue, no device, no allocation.
+// hand-built plan. No queue, no device, no allocation; the two refusals that abort are checked in forked children.
 
 #include "ggml-impl.h"
 #include "ggml-sycl/unified-cache.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <csignal>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -587,6 +591,46 @@ void check_oversize_buffer_grows_a_planned_chunk() {
     CHECK(ggml_sycl::placement_loader_pool_footprint_for(moe_tensors(), kPoolChunk, 1024 * kMiB).grown > 0);
 }
 
+// Whether `operation`, run in a forked child, dies of SIGABRT having printed `refusal` to stderr: the refusal this test
+// expects, not any abort.
+template <typename F> bool aborts_with(F operation, const char * refusal) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return false;
+    }
+    std::fflush(nullptr);
+    const pid_t child = fork();
+    if (child == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        operation();
+        _exit(0);
+    }
+    close(pipefd[1]);
+    if (child < 0) {
+        close(pipefd[0]);
+        return false;
+    }
+    std::string captured;
+    char        buf[4096];
+    ssize_t     n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        captured.append(buf, static_cast<size_t>(n));
+    }
+    close(pipefd[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        return false;
+    }
+    const bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    const bool refused = captured.find(refusal) != std::string::npos;
+    if (!aborted || !refused) {
+        std::fprintf(stderr, "aborts_with: aborted=%d refused=%d captured=[%s]\n", aborted, refused, captured.c_str());
+    }
+    return aborted && refused;
+}
+
 // A chunk the pool grows for one contiguous request no chunk holds serves that request. zone_alloc aligns the size to
 // the request's alignment and asks the chunk's fresh TLSF for it at the larger of that alignment and the grain, and the
 // chunk's arena is chunk_footprint_for(chunk, zone_grow_request(size, alignment)).usable bytes. Every residue of the
@@ -612,6 +656,19 @@ void check_grown_chunk_serves_its_request() {
         }
     }
     CHECK(served(chunk, kHeader));
+    // An alignment above the grain no chunk serves at any size: the TLSF refuses it (round_request asserts), so no
+    // growth could make room for it, and zone_grow_request refuses it the same way, before the pool grows anything.
+    constexpr const char * kRefusal = "TLSF only supports alignment";
+    for (const size_t alignment : { size_t{ 4096 }, 2 * kMiB }) {
+        const size_t size = 3 * chunk + TENSOR_ALIGNMENT;
+        CHECK(aborts_with(
+            [&] {
+                ggml_sycl::tlsf_allocator fresh(4 * chunk);
+                (void) fresh.allocate(align_up(size, alignment), alignment);
+            },
+            kRefusal));
+        CHECK(aborts_with([&] { (void) pinned_chunk_pool::zone_grow_request(size, alignment); }, kRefusal));
+    }
 }
 
 // What the oracle says of an admitted plan: every chunk the loader grows is one the plan counted.
