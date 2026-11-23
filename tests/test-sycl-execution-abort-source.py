@@ -756,9 +756,9 @@ tripwire_mutants = {
         "    (void) ggml_sycl_execution_reset_backend_binding_state(ctx);\n", 1),
     "release-unwired": backend.replace('    ggml_sycl_execution_tripwire(ctx, "releasing", site, line);\n', "", 1),
     "release-site-dropped": backend.replace(
-        "                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);\n            });\n"
+        "            ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);\n        });\n"
         "        ggml_sycl_execution_try_retire_terminal(ctx, site, line);",
-        "                ggml_sycl_execution_clear_graph_tracking(backend_ctx);\n            });\n"
+        "            ggml_sycl_execution_clear_graph_tracking(backend_ctx);\n        });\n"
         "        ggml_sycl_execution_try_retire_terminal(ctx, site, line);", 1),
     "scope-counts-out-late": backend.replace(SCOPE_COUNT_OUT + SCOPE_END, SCOPE_END + SCOPE_COUNT_OUT, 1),
     "tripwire-without-site": backend.replace("while a dispatch scope holds it open: site=%s:%d ",
