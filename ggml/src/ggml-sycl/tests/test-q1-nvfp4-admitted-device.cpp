@@ -44,8 +44,10 @@ constexpr int     prompt_capacity                     = 40;
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
 // The backend's refusal lines, so a case can require that a refusal named its cause. Every log line still reaches
-// stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]) and the direct route's host job's
-// ([MOE-HOST-JOB], logged on the job's thread). Host tasks and jobs can log, so the text is guarded.
+// stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]), the direct route's host job's
+// ([MOE-HOST-JOB], logged on the job's thread), and the direct route's decline ([MOE-DIRECT-DECLINE]): that op runs on
+// the retained route core, so it is no refusal, but a case that requires the direct route to take its batch fails on
+// it. Host tasks and jobs can log, so the text is guarded.
 std::mutex  g_refusal_log_mutex;
 std::string g_refusal_log;
 
@@ -54,7 +56,8 @@ void capture_log(ggml_log_level, const char * text, void *) {
         return;
     }
     std::fputs(text, stderr);
-    if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr) {
+    if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr ||
+        std::strstr(text, "[MOE-DIRECT-DECLINE]") != nullptr) {
         const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
         g_refusal_log += text;
     }
@@ -1379,7 +1382,7 @@ struct mixed_fixture {
 // One mixed batch through the production route. Every row matches the CPU oracle, the card rows from the device kernel
 // and the host rows from the host leg; a kernel that computed a host row from another expert fails, and so does one
 // that left a card row unwritten. The route takes the batch once, submits its host occurrences once, and names no
-// refusal. Afterwards the weight's pointer table holds a null slot for every host expert, a pointer for every card
+// refusal and no decline. Afterwards the weight's pointer table holds a null slot for every host expert, a pointer for every card
 // expert a case selected, and still a null slot for a card expert no case on this fixture has selected yet.
 void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tokens, const expert_selector & select) {
     const std::string at = " (type=" + std::string(ggml_type_name(mix.type)) + " ne11=" + std::to_string(ne11) +
@@ -1437,7 +1440,8 @@ void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tok
                        std::to_string(after.host_occurrences - before.host_occurrences),
                    before);
     const std::string refusals = refusal_log_since(log_from);
-    require_stages(refusals.empty(), "a refusal was named for a mixed batch" + at + ": [" + refusals + "]", before);
+    require_stages(refusals.empty(), "a refusal or a decline was named for a mixed batch" + at + ": [" + refusals + "]",
+                   before);
 
     const void * slots[route_experts] = {};
     require_stages(ggml_sycl_q1_nvfp4_test_read_expert_table(mix.backend, mix.gate.tensor, route_experts, slots),

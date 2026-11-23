@@ -28152,8 +28152,9 @@ bool ggml_backend_sycl_auto_ubatch_enabled() {
 // reconcile that cannot rebind retires what this bind published and leaves the deferral pending.
 //
 // Each refusal is a TRIPWIRE: the route is executable here and a planned pool is still unmaterialized where it
-// should have resolved. Admission then falls through to the retained route, which refuses Q1_0/NVFP4, and nothing
-// downstream names the cause, so the WARN names it.
+// should have resolved. The direct route then declines the Q1_0/NVFP4 op and it falls through to the retained route
+// core, which runs it without the direct route; the decline line names the direct route's step, not the missing pool,
+// so the WARN names it.
 static void ggml_sycl_bind_materialize_live_mmid_workspaces(const ggml_sycl::lifecycle::ModelToken & token) {
     // Outside the try, so a throw after this bind's own publication can still retire it.
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> published;
@@ -88478,14 +88479,32 @@ static bool ggml_sycl_moe_direct_batch_all_host(const ggml_sycl::moe_resolved_ba
     return true;
 }
 
-// Q1_0 and NVFP4 run only in the MMID direct block. A call the block declines falls through to the retained route
-// core, which refuses it with reason=capability_unsupported: that line names the core's refusal, not the step of the
-// direct route that declined. Each exit that falls through the block calls this once, on that exit only, and so does
-// the adapter's refusal after the mark, before its throw, so the log names the step: the phase label
-// (MOE-DECODE-REFUSAL for a token, MOE-PROMPT-REFUSAL for a prompt), the tensor, then
-// "route=direct step=<step> <detail>". A fixed buffer and no allocation: some of these exits hold an admitted
-// workspace bundle.
+// A Q1_0 or NVFP4 call the MMID direct block declines before its mark falls through to the retained route core, which
+// runs it: the capability query answers MMVQ_COMPAT for an operand the direct recipe does not take, so the card's
+// experts run through mmvq_moe_batched_dispatch and the host's through their HOST_CPU recipe, or the core names its
+// own refusal. Neither says which step of the direct route declined, so each exit that falls through the block calls
+// this once, on that exit only. The line is a decline, not a refusal: "[MOE-DIRECT-DECLINE] phase=<decode|prompt>
+// tensor=<name> route=direct step=<step> <detail>", at WARN, with no refusal label, so a count of refusals does not
+// count an op that ran. A fixed buffer and no allocation: some of these exits hold an admitted workspace bundle.
 static void ggml_sycl_moe_direct_log_decline(const ggml_tensor * src0,
+                                             int64_t             ne12,
+                                             const char *        step,
+                                             const char *        fmt,
+                                             ...) {
+    char    detail[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(detail, sizeof(detail), fmt, args);
+    va_end(args);
+    GGML_LOG_WARN("[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct step=%s %s\n", ne12 == 1 ? "decode" : "prompt",
+                  src0 ? src0->name : "?", step, detail);
+}
+
+// After the mark nothing falls through: the cache refusing the host job's input marker and the kernel adapter's
+// refusal throw, and the op fails. Each calls this once, before its throw, so the log names the step under the phase's
+// refusal label (MOE-DECODE-REFUSAL for a token, MOE-PROMPT-REFUSAL for a prompt): "[<label>] tensor=<name>
+// route=direct step=<step> <detail>". A fixed buffer and no allocation, as above.
+static void ggml_sycl_moe_direct_log_refusal(const ggml_tensor * src0,
                                              int64_t             ne12,
                                              const char *        step,
                                              const char *        fmt,
@@ -92423,7 +92442,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 ggml_sycl::CPU_JOB_INPUT_MARKER_REFUSAL_COUNT;
                             if (host_leg && !ggml_sycl_moe_direct_host_gather(*exact_queue, host_leg, activation,
                                                                               dependency, &marker_refusal)) {
-                                ggml_sycl_moe_direct_log_decline(
+                                ggml_sycl_moe_direct_log_refusal(
                                     src0, ne12, "host_marker_arm", "occurrences=%zu reason=%s",
                                     host_leg->work->tasks.size(),
                                     marker_refusal < ggml_sycl::CPU_JOB_INPUT_MARKER_REFUSAL_COUNT ?
@@ -92444,10 +92463,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     direct_batch.expert_ids.data(), static_cast<int>(n_experts), static_cast<int>(ne10),
                                     static_cast<int>(ne01), static_cast<int>(ids->ne[0]), static_cast<int>(ne12),
                                     static_cast<int>(ne11), ids->nb[0], ids->nb[1], buffers, &dependency, &kernel)) {
-                                // The adapter declined: one of its checks of the shape, the strides, the alignment
+                                // The adapter refused: one of its checks of the shape, the strides, the alignment
                                 // or the ids snapshot's range, or its kernel's submit. The catch below drains the
                                 // queue; this line names the step the throw does not.
-                                ggml_sycl_moe_direct_log_decline(
+                                ggml_sycl_moe_direct_log_refusal(
                                     src0, ne12, "adapter",
                                     "type=%s ncols=%lld rows=%lld top_k=%lld ne11=%lld experts=%lld ids_nb0=%zu "
                                     "ids_nb1=%zu",

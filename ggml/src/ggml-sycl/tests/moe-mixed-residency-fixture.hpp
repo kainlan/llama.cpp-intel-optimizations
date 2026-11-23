@@ -46,7 +46,10 @@ constexpr int          k_down            = 2;
 // route line that swapped the two counts fails.
 constexpr int k_host_experts[] = { 1, 4, 6, 9, 10, 13, 15 };
 
-// Lines that say the op refused a route, routed a side some other way, or failed after the throw that ends it.
+// Lines that say the op refused a route, routed a side some other way, or failed after the throw that ends it. The
+// direct route's decline ([MOE-DIRECT-DECLINE]) is not one: the op it names runs on the retained route core, which
+// test-moe-q1-nvfp4-dispatch-refusal.cpp closes the direct route to reach. A test that requires the direct route counts
+// that tag itself.
 constexpr const char * k_refusal_needles[] = {
     "[MOE-DECODE-REFUSAL]",
     "[MOE-PROMPT-REFUSAL]",

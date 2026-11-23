@@ -6478,7 +6478,9 @@ endif() # static SYCL backend fixture
 # host experts at one token), a failpoint makes the batched dispatch refuse once, and the op must end
 # GGML_STATUS_FAILED with the WARN that names reason=test-failpoint; the same op run again in the same process must then
 # succeed and match the CPU backend on both sides. The failpoint exists only in the private backend objects, so it
-# links ggml-sycl-private-fixtures (not the ordinary DSO) and closes the MMID route those objects compile in. It loads a
+# links ggml-sycl-private-fixtures (not the ordinary DSO). It closes the MMID direct route, which every build runs, so
+# the op falls through to the retained route core, where the batched dispatch is; the direct block's
+# [MOE-DIRECT-DECLINE] line on the way is a decline, not a refusal, and the test does not count it. It loads a
 # planned model onto the card, so it carries the `model` label, which the full sweep excludes. Pinned to the B50; a run
 # with no SYCL GPU, more than one visible card, GGML_SYCL_WEIGHTS_EVICTABLE off, or a published plan that leaves the
 # op's experts on one side only exits 77.

@@ -4,9 +4,12 @@
 // On the card such an operand has one executor, mmvq_moe_batched_dispatch, and the op refuses when it returns false.
 // No ordinary run makes it return false, so this test arms the private-testing failpoint
 // GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH, which makes the dispatch refuse once with the reason
-// test-failpoint, just before its submit. It therefore links the private backend objects (ggml-sycl-private-fixtures),
-// which compile the MMID route in; ggml_sycl::test_moe_mmid_route_reachable_override_guard(false) closes that route for
-// the whole run, so the model plans, binds and executes as in an ordinary build.
+// test-failpoint, just before its submit. It therefore links the private backend objects (ggml-sycl-private-fixtures).
+// Every build runs the MMID direct route, which takes such an op before the batched dispatch sees it;
+// ggml_sycl::test_moe_mmid_route_reachable_override_guard(false) closes that route for the whole run, so the model
+// plans no MMID workspace, the direct block declines each op for want of the workspace's queue capability
+// ([MOE-DIRECT-DECLINE] ... step=queue_capability, a decline and not a refusal), and the op falls through to the
+// retained route core, where the batched dispatch and its failpoint are.
 //
 // The vehicle is the mixed-residency fixture's (moe-mixed-residency-fixture.hpp, which both tests include;
 // test-moe-mixed-residency-q1-nvfp4.cpp describes the load): a planned NVFP4 model of three expert tensors whose plan

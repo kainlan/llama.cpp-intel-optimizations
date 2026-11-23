@@ -4034,6 +4034,11 @@ throws; the legacy MMID admission asks `moe_mmid_workspace_geometry_holds`.
 *Wording corrected against the ruling above:* decline lines print at ERROR, not WARN. From this task on a
 refusal count means both labels, `MOE-DECODE-REFUSAL` and `MOE-PROMPT-REFUSAL`; the criteria of Tasks 7 and 8
 that name only the first predate the second.
+*Changed 2026-11-23 (ruling: a direct-route decline that falls through to an executor that runs the op is not a
+refusal):* a decline before the mark prints `[MOE-DIRECT-DECLINE] phase=<decode|prompt> tensor=... route=direct
+step=...` at WARN, and the retained route core runs the op. Only the two refusals after the mark, `host_marker_arm`
+and `adapter`, keep the phase's refusal label, at ERROR. A refusal count no longer counts a decline; a count of
+`route=direct` lines counts both, as the criteria above that name it do.
 
 *Device results at `0f4060d0f`, one run each, zero kernel fault lines, `Shmem` 11 GB
 (`docs/backend/data/inkling2/t8b-lead-runs-0f4060d0f.txt`; the runs at `6ee2a4058` are in
