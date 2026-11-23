@@ -13,9 +13,11 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       schedule, the yx28 decode-direct request and ggml_sycl_ensure_weight_on_device(); its block is one call to
       ggml_sycl_mul_mat_id_bf16_direct() and a return, so nothing after it runs for a BF16 op the predicate takes;
   (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table, the device-resident ids, submits through
-      moe_bf16_direct_submit() and retains the table's leases until the kernel's event; it never reads the ids on the
-      host, waits, touches the MMID workspace or Q8_1, re-routes to the CPU or aborts; a refusal is a named WARN line
-      and ggml_sycl_fallback_error;
+      moe_bf16_direct_submit() and retains a snapshot of the table's dispatch bundle (its active leases and the table's
+      own allocation) until the kernel's event, as the production pointer-table dispatchers do; it never consumes the
+      table's active leases (the next dispatch from the same cached table needs them), reads the ids on the host,
+      waits, touches the MMID workspace or Q8_1, re-routes to the CPU or aborts; a refusal is a named WARN line and
+      ggml_sycl_fallback_error;
   (e) under graph recording it does what the NVFP4 decode node does: a WARN line and a sycl::exception before any
       table or ids work, and on a direct run it sets moe_graphs_disabled_once like every other MoE route (its consumer
       selects segmented MoE replay, it does not turn replay off); check_graph_compatibility keeps a BF16 MUL_MAT_ID
@@ -59,7 +61,8 @@ ENSURE_WEIGHT = "ggml_sycl_ensure_weight_on_device(src0, ctx.device);"
 TABLE_CALL = "moe_fusion_ensure_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS)"
 IDS_CALL = "ggml_sycl_moe_ids_device_resident_ptr(ctx, ids"
 SUBMIT_CALL = "ggml_sycl::moe_bf16_direct_submit("
-RETAIN_CALL = "ggml_sycl_retain_moe_ptr_table_leases_until_event("
+SNAPSHOT_CALL = "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle("
+RETAIN_CALL = "ggml_sycl::retain_handles_until_event("
 RECORDING_IF = "if (g_ggml_sycl_graph_recording) {"
 RECORDING_THROW = "throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),"
 GRAPH_FLAG = "ctx.moe_graphs_disabled_once = true;"
@@ -75,10 +78,13 @@ COMPAT_QUANT_GUARD = "if (ggml_is_quantized(src0->type)) {"
 SUBMIT_DECL = "bool moe_bf16_direct_submit("
 NEEDS_DIRECT_HEAD = "inline bool moe_type_needs_direct_kernel(ggml_type type) {"
 NEEDS_DIRECT_BODY = "returntype==GGML_TYPE_Q1_0||type==GGML_TYPE_NVFP4;"
-ROUTE_FORBIDDEN = (".wait(", "wait_and_throw", "ids_host", "ggml_sycl_copy_ids_to_host", "mmid_workspace", "q8_1",
-                   "GGML_ABORT", "ggml_sycl_ensure_weight_on_device", "malloc_", "sycl::free(", "getenv", "cpu")
-KERNEL_FORBIDDEN = (".wait(", "wait_and_throw", "malloc_", "sycl::free(", "unified_alloc", "q8_1", "GGML_ABORT",
-                    "getenv")
+# A host wait is spelled .wait(, ->wait( or sycl::event::wait(: the three spellings are listed apart.
+ROUTE_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "ids_host", "ggml_sycl_copy_ids_to_host",
+                   "mmid_workspace", "q8_1", "GGML_ABORT", "ggml_sycl_ensure_weight_on_device", "malloc_", "sycl::free(",
+                   "getenv", "cpu", "ggml_sycl_retain_moe_ptr_table_leases_until_event")
+SYCL_INCLUDE = re.compile(r'#include "(?:ggml-sycl/)?moe-bf16-direct\.hpp"')
+KERNEL_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "malloc_", "sycl::free(", "unified_alloc",
+                    "q8_1", "GGML_ABORT", "getenv")
 
 
 def strip_comments(src):
@@ -212,17 +218,18 @@ def claim_d_route_body(s):
     if body is None:
         return [f"{ROUTE_FN} is not defined exactly once"]
     fails = []
-    for needed in (TABLE_CALL, IDS_CALL, SUBMIT_CALL, RETAIN_CALL, REFUSAL_WARN, REFUSAL_THROW, ROUTE_LOG,
-                   "ggml_sycl::ggml_sycl_moe_route_log_enabled()"):
+    for needed in (TABLE_CALL, IDS_CALL, SNAPSHOT_CALL, SUBMIT_CALL, RETAIN_CALL, REFUSAL_WARN, REFUSAL_THROW,
+                   ROUTE_LOG, "ggml_sycl::ggml_sycl_moe_route_log_enabled()"):
         if needed not in body:
             fails.append(f"{ROUTE_FN} does not contain {needed}")
     lowered = body.lower()
     for forbidden in ROUTE_FORBIDDEN:
         if forbidden.lower() in lowered:
             fails.append(f"{ROUTE_FN} contains {forbidden!r}")
-    order = [body.find(TABLE_CALL), body.find(SUBMIT_CALL), body.find(RETAIN_CALL)]
-    if min(order) >= 0 and not order[0] < order[1] < order[2]:
-        fails.append("the table is not built before the submit, or the leases are not retained after it")
+    order = [body.find(TABLE_CALL), body.find(SNAPSHOT_CALL), body.find(SUBMIT_CALL), body.find(RETAIN_CALL)]
+    if min(order) >= 0 and not order[0] < order[1] < order[2] < order[3]:
+        fails.append("the table is not built and its bundle snapshotted before the submit, or the bundle is not "
+                     "retained after it")
     warn = body.find(REFUSAL_WARN)
     throw = body.find(REFUSAL_THROW)
     if warn >= 0 and throw >= 0 and not warn < throw:
@@ -281,7 +288,7 @@ def claim_g_kernel(s):
         fails.append("moe-bf16-direct.hpp does not declare ggml_sycl::moe_bf16_direct_submit")
     if SUBMIT_DECL not in cpp or '#include "moe-bf16-direct.hpp"' not in cpp:
         fails.append("moe-bf16-direct.cpp does not define moe_bf16_direct_submit")
-    if '#include "moe-bf16-direct.hpp"' not in s["sycl"]:
+    if not SYCL_INCLUDE.search(s["sycl"]):
         fails.append("ggml-sycl.cpp does not include moe-bf16-direct.hpp")
     for needed in ("bf16_to_f32(", "sycl::reduce_over_group(", "quiet_NaN()", "== -1", "reqd_sub_group_size(16)",
                    "sycl::nd_range<3>"):
@@ -346,6 +353,10 @@ MUTANTS = [
     ("c", "sycl", ROUTE_IF, ROUTE_FN + "(ctx, dst); return; }", ROUTE_FN + "(ctx, dst); }"),
     ("d", "sycl", ROUTE_FN_HEAD, TABLE_CALL, TABLE_CALL.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")),
     ("d", "sycl", ROUTE_FN_HEAD, RETAIN_CALL, "(void) ("),
+    ("d", "sycl", ROUTE_FN_HEAD, SNAPSHOT_CALL, "(void) ("),
+    ("d", "sycl", ROUTE_FN_HEAD, RETAIN_CALL, "ggml_sycl_retain_moe_ptr_table_leases_until_event(extra, ctx.device, "),
+    ("g", "sycl", None, '#include "ggml-sycl/moe-bf16-direct.hpp"', ""),
+    ("g", "cpp", None, "return true;", "event->wait(); return true;"),
     ("d", "sycl", ROUTE_FN_HEAD, REFUSAL_THROW, "GGML_ABORT("),
     ("d", "sycl", ROUTE_FN_HEAD, SUBMIT_CALL, "stream->wait(); " + SUBMIT_CALL),
     ("e", "sycl", ROUTE_FN_HEAD, RECORDING_THROW, "throw ggml_sycl_fallback_error("),
