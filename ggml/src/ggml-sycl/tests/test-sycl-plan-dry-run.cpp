@@ -47,6 +47,7 @@
 #include "sycl-test-skip.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -127,31 +128,82 @@ uint64_t residency_entries(const ggml_sycl_plan_dry_run_plan & p) {
     return n;
 }
 
-// The PP MoE oneDNN ring an inventory publishes, as the planner prints it: while it sizes each record of a plan,
+// The PP MoE oneDNN ring an inventory publishes, as the planner sizes it: while it sizes each record of a plan,
 // populate_host_zone_sizing reads the ring back from the per-device globals the publish wrote and prints it on a
 // "[SYCL-PLAN] PP MoE oneDNN scratch ring: " line before the record. The figures are the loader's weight slot and the
 // activation and output slots pp_moe_onednn_slots_at gives at the load's micro-batch, at the ring's effective depth,
-// in the planner's format. The ring is a VRAM allocation, so no host term carries it: the host RUNTIME term is the
-// oneDNN scratchpad and the DMA staging pool (placement_plan_host_zone_commit_terms). Empty when the slots cannot be
-// sized.
-std::string planned_ring_text(const ggml_sycl_tensor_inventory & inv) {
-    size_t act = 0;
-    size_t out = 0;
+// in bytes. The ring is a VRAM allocation, so no host term carries it: the host RUNTIME term is the oneDNN scratchpad
+// and the DMA staging pool (placement_plan_host_zone_commit_terms). Not sized when the slots cannot be sized.
+struct planned_ring {
+    bool     sized      = false;
+    uint32_t depth      = 0;
+    size_t   total      = 0;
+    size_t   weight     = 0;
+    size_t   activation = 0;
+    size_t   output     = 0;
+};
+
+planned_ring planned_ring_of(const ggml_sycl_tensor_inventory & inv) {
+    planned_ring ring;
     if (!pp_moe_onednn_slots_at(placement_load_n_ubatch(inv.n_ubatch), static_cast<uint32_t>(std::max(0, inv.n_expert)),
                                 static_cast<uint32_t>(std::max(0, inv.n_expert_used)),
                                 inv.pp_moe_onednn_activation_bytes_per_row, inv.pp_moe_onednn_output_bytes_per_row,
-                                &act, &out)) {
-        return {};
+                                &ring.activation, &ring.output)) {
+        return ring;
     }
-    const size_t weight = inv.pp_moe_onednn_weight_slot_bytes;
-    const size_t total  = test_pp_moe_onednn_planned_scratch_bytes(weight, act, out, inv.pp_moe_onednn_ring_depth);
-    const double mb     = 1024.0 * 1024.0;
+    ring.sized  = true;
+    ring.depth  = test_pp_moe_onednn_effective_ring_depth(inv.pp_moe_onednn_ring_depth);
+    ring.weight = inv.pp_moe_onednn_weight_slot_bytes;
+    ring.total  = test_pp_moe_onednn_planned_scratch_bytes(ring.weight, ring.activation, ring.output,
+                                                           inv.pp_moe_onednn_ring_depth);
+    return ring;
+}
+
+// The ring's figures, in MB, for a message.
+std::string planned_ring_text(const planned_ring & ring) {
+    const double mb = 1024.0 * 1024.0;
     char         text[192];
     std::snprintf(text, sizeof(text),
-                  "depth=%u total=%.1f MB weight_slot=%.1f MB activation_slot=%.1f MB output_slot=%.1f MB",
-                  test_pp_moe_onednn_effective_ring_depth(inv.pp_moe_onednn_ring_depth), total / mb, weight / mb,
-                  act / mb, out / mb);
+                  "depth=%u total=%.1f MB weight_slot=%.1f MB activation_slot=%.1f MB output_slot=%.1f MB", ring.depth,
+                  ring.total / mb, ring.weight / mb, ring.activation / mb, ring.output / mb);
     return text;
+}
+
+// The decimal figure printed after " <name>=" on the line, or a negative value when the name is absent.
+double printed_figure(const std::string & line, const char * name) {
+    const std::string key = std::string(" ") + name + "=";
+    const size_t      at  = line.find(key);
+    return at == std::string::npos ? -1.0 : std::strtod(line.c_str() + at + key.size(), nullptr);
+}
+
+// Whether the ring line's text (what follows its marker) prints `ring`: the depth exactly, and each MB figure, read by
+// name, within half a printed unit of the exact one, since the planner prints each to one decimal. Reading the fields
+// by name rather than re-rendering the planner's format lets the line's wording change without the arms reading it as
+// a ring the dry run did not publish.
+bool ring_line_prints(const std::string & text, const planned_ring & ring) {
+    const std::string line = " " + text;
+    if (!ring.sized || printed(line, "depth") != ring.depth) {
+        return false;
+    }
+    const double mb = 1024.0 * 1024.0;
+
+    const struct {
+        const char * name;
+        size_t       bytes;
+    } figures[] = {
+        { "total",           ring.total      },
+        { "weight_slot",     ring.weight     },
+        { "activation_slot", ring.activation },
+        { "output_slot",     ring.output     },
+    };
+
+    for (const auto & figure : figures) {
+        const double shown = printed_figure(line, figure.name);
+        if (shown < 0.0 || std::fabs(shown - figure.bytes / mb) > 0.05 + 1e-6) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // What a run of the planner did with a mapped load's routed host experts for the window ring, as its own lines say:
@@ -253,15 +305,31 @@ std::vector<logged_plan> logged_plans(const std::vector<std::string> & lines) {
 }
 
 // Whether every record of `plan` printed `ring` on its ring line.
-bool every_record_printed(const logged_plan & plan, const std::string & ring) {
+bool every_record_printed(const logged_plan & plan, const planned_ring & ring) {
     return plan.records > 0 && plan.rings.size() == plan.records &&
-           std::all_of(plan.rings.begin(), plan.rings.end(), [&](const std::string & r) { return r == ring; });
+           std::all_of(plan.rings.begin(), plan.rings.end(),
+                       [&](const std::string & text) { return ring_line_prints(text, ring); });
 }
 
 // The leg and the ring line of `plan`'s record, as a PASS line names them.
 std::string leg_and_ring(const logged_plan & plan) {
     return "leg=" + std::string(pin_leg_name(plan.leg)) + " records=" + num(plan.records) + " ring=[" +
            (plan.rings.empty() ? std::string() : plan.rings.back()) + "]";
+}
+
+// What in `plan`'s lines contradicts the leg they were read as, or empty: a plan recorded twice took the withdrawn leg
+// (the fit recorded the pinned plan, then the plan without the pin), and a plan whose pin was kept or never had room
+// recorded once. A pin line the reading no longer recognizes, once reworded, then shows as a FAIL here rather than as
+// another leg. The converse, a withdrawn leg recorded other than twice, is not checked.
+std::string leg_record_mismatch(const logged_plan & plan) {
+    if (plan.records == 2 && plan.leg != pin_leg::WITHDRAWN) {
+        return std::string("recorded twice, so its pin was withdrawn, but its lines read as ") + pin_leg_name(plan.leg);
+    }
+    if ((plan.leg == pin_leg::KEPT || plan.leg == pin_leg::NO_ROOM) && plan.records != 1) {
+        return std::string("read as ") + pin_leg_name(plan.leg) + ", which records once, and recorded " +
+               num(plan.records) + " times";
+    }
+    return {};
 }
 
 // Zeroes the per-device planner inputs a stage publishes from an inventory (the PP pipeline scratch and the PP MoE
@@ -459,13 +527,15 @@ unified_cache * device0_arena_cache() {
 // Legs: whether the pin is kept or withdrawn is the host budget's call (on a host whose budget is below the pinned
 // plan, every run takes the withdrawn leg), so the arm reads each plan's leg from each run's own lines (pin_leg) and
 // scores the leg taken. Both runs plan from one sample, so they take the same leg with the same number of records, and
-// the dry run's PINNED residency says what its lines say: only a kept pin leaves a PINNED entry on a mapped load.
+// the dry run's PINNED residency says what its lines say: only a kept pin leaves a PINNED entry on a mapped load. Each
+// run's leg must agree with its record count (leg_record_mismatch), so a reworded pin line FAILs the arm instead of
+// reading as another leg.
 // Engagement: the stage run returned OK with at least one plan line and stored one budget, every arena was held through
 // its end, the dry run returned OK, every dry-run plan put at least one weight on the host (the shape's experts
 // overflow any card here: PINNED on the kept leg, FILE_MAPPED on the others), and every record the dry run made printed
-// the inventory's PP MoE ring on its ring line (planned_ring_text). That line is the planner reading back, while it
-// sizes the record, the ring the dry run published after the stage's publish was withdrawn (zeroed), so it is printed
-// on every leg and no host figure moves it.
+// the inventory's PP MoE ring on its ring line (planned_ring_of, read by ring_line_prints). That line is the planner
+// reading back, while it sizes the record, the ring the dry run published after the stage's publish was withdrawn
+// (zeroed), so it is printed on every leg and no host figure moves it.
 // A budget, leg or record count that differs from the stage's VOIDs the arm only when an input each side reads live
 // (the pinned share, the committed bytes, the RAM total) moved in between and the budget binds a record of either run;
 // with none moved it FAILs, as one sample planned into two plans.
@@ -534,8 +604,8 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
                     " devices; the stage recorded " + num(stage.size()));
         return r;
     }
-    const std::string ring = planned_ring_text(inv.inv);
-    if (ring.empty()) {
+    const planned_ring ring = planned_ring_of(inv.inv);
+    if (!ring.sized) {
         void_arm(r, "the inventory's ring cannot be sized, so no ring line can show the dry run published it");
     }
     // The budget's other inputs that each side reads live: the pinned share, the committed bytes and the RAM total.
@@ -558,12 +628,16 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
         }
         if (!every_record_printed(d, ring)) {
             void_arm(r, name + ": of the dry run's " + num(d.records) + " records, one printed the ring line [" +
-                            (d.rings.empty() ? std::string() : d.rings.back()) + "], not the inventory's [" + ring +
-                            "], so the dry run did not publish its ring");
+                            (d.rings.empty() ? std::string() : d.rings.back()) + "], not the inventory's [" +
+                            planned_ring_text(ring) + "], so the dry run did not publish its ring");
         }
         expect(r, p.device == static_cast<int32_t>(s.device) && d.device == s.device,
                name + ": the stage's record is for device " + num(s.device) + ", the dry run's for device " +
                    num(d.device));
+        const std::string stage_mismatch = leg_record_mismatch(s);
+        expect(r, stage_mismatch.empty(), name + ": the stage's plan was " + stage_mismatch);
+        const std::string dry_mismatch = leg_record_mismatch(d);
+        expect(r, dry_mismatch.empty(), name + ": the dry run's plan was " + dry_mismatch);
         // A budget above every record's host figure did not bind the plan, so a moved live input cannot move it; one
         // at or below it may have, and then neither the leg nor the figure is like for like. On the withdrawn leg the
         // record the budget bound is the pinned plan's, the larger.
@@ -875,11 +949,12 @@ arm_result arm_b_every_term_printed_from_the_plan() {
 // Engagement: a load was staged before the dry run (its stage returned OK with at least one plan line); the dry run
 // returned OK, not LOAD_BUSY, so that load had ended, and planned at least one device; its budget is not B0 (so a store
 // would have moved the value); it published the inventory's PP MoE ring while it planned, so it wrote at least one of
-// the globals: every record it made printed the inventory's ring on its ring line (planned_ring_text), which the
-// planner reads back from the per-device globals while it sizes the record, and which shows the sentinel's ring when
-// nothing was published; the refusal was observed. The ring line is printed for every record whether the routed host
-// experts' pin is kept or withdrawn, which the host budget decides (the PASS line names the leg each plan took, read
-// from the dry run's own lines); no check here reads a host figure that moves with the leg.
+// the globals: every record it made printed the inventory's ring on its ring line (planned_ring_of, read by
+// ring_line_prints), which the planner reads back from the per-device globals while it sizes the record, and which
+// shows the sentinel's ring when nothing was published; the refusal was observed. The ring line is printed for every
+// record whether the routed host experts' pin is kept or withdrawn, which the host budget decides (the PASS line names
+// the leg each plan took, read from the dry run's own lines, which must agree with its record count:
+// leg_record_mismatch); no check here reads a host figure that moves with the leg.
 // Mutants, each killed on every leg, since none of them is on the pin's path: a storing host_budget_pass_scope or a
 // host_ledger_store_budget call in the dry run (the stored value leaves B0 and the store count moves); the planner
 // recording the stored budget instead of the one passed in (every record, the last among them, records B0); the
@@ -929,8 +1004,8 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     if (res->host_budget == B0) {
         void_arm(r, "the dry run's own budget is B0, so a store would not show");
     }
-    const std::string ring = planned_ring_text(inv.inv);
-    if (ring.empty()) {
+    const planned_ring ring = planned_ring_of(inv.inv);
+    if (!ring.sized) {
         void_arm(r, "the inventory's ring cannot be sized, so no ring line can show the dry run published it");
     }
     if (rc == GGML_SYCL_LIFECYCLE_OK && dry.size() != res->n_plans) {
@@ -940,10 +1015,12 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     std::string legs;
     for (uint32_t i = 0; i < res->n_plans && i < dry.size(); ++i) {
         if (!every_record_printed(dry[i], ring)) {
-            void_arm(r, "plan " + num(i) + " did not plan the inventory's ring [" + ring + "] (a record printed [" +
-                            (dry[i].rings.empty() ? std::string() : dry[i].rings.back()) +
+            void_arm(r, "plan " + num(i) + " did not plan the inventory's ring [" + planned_ring_text(ring) +
+                            "] (a record printed [" + (dry[i].rings.empty() ? std::string() : dry[i].rings.back()) +
                             "]), so the dry run wrote no global");
         }
+        const std::string mismatch = leg_record_mismatch(dry[i]);
+        expect(r, mismatch.empty(), "plan " + num(i) + " was " + mismatch);
         expect(r, res->plans[i].host_budget == res->host_budget,
                "plan " + num(i) + " recorded " + num(res->plans[i].host_budget) + ", not the dry run's budget " +
                    num(res->host_budget));
