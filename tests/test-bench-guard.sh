@@ -34,7 +34,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 mk_tree() { # $1=throttle $2=act_freq
     mk_pci_dev "$T/sys/class/drm/card9" device with_freq "$1" "$2"
 }
-mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/meminfo"; }
+# $1 = Shmem kB, $2 = meminfo remainder kB (default 0). The remainder is
+# MemTotal minus the accounted fields, so MemTotal = MemFree + remainder.
+mk_meminfo() { printf 'MemTotal: %s kB\nMemFree: 256000000 kB\nMemAvailable: 190000000 kB\nShmem: %s kB\n' "$((256000000 + ${2:-0}))" "$1" > "$T/meminfo"; }
 # run_guard <pgrep-cmd> [extra guard flags...] -- forwards anything after the
 # pgrep-cmd straight through to bench-guard.sh (e.g. --df-cmd), so callers
 # that need an extra override don't have to spell out the whole invocation.
@@ -93,6 +95,11 @@ expect_status 3 "stale GPU tenant must refuse" -- run_guard "echo 1234 llama-ben
 
 mk_meminfo 30000000
 expect_status 3 "high Shmem must refuse" -- run_guard "false"
+
+# A discrete card's host-USM memory leaves Shmem flat and shows only as the
+# meminfo remainder. A flat Shmem with a high remainder must refuse.
+mk_meminfo 3000000 30000000
+expect_status 3 "flat Shmem + high remainder must refuse" -- run_guard "false"
 
 mk_meminfo 3000000
 expect_status 0 "clean host must run" -- run_guard "false"
@@ -164,8 +171,23 @@ cases=$((cases+1))
 # must stamp SUSPECT, even though the command itself succeeds.
 mk_tree 0 0; mk_meminfo 3000000
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
-         --log "$T/run2.log" -- sh -c "printf 'MemAvailable: 1 kB\nShmem: 99999999 kB\n' > '$T/meminfo'" || fail=1
+         --log "$T/run2.log" -- sh -c "printf 'MemTotal: 256000000 kB\nMemFree: 256000000 kB\nShmem: 99999999 kB\n' > '$T/meminfo'" || fail=1
 head -1 "$T/run2.log" | grep -q "SUSPECT" || { echo "FAIL: Shmem growth must stamp SUSPECT"; fail=1; }
+
+cases=$((cases+1))
+# The same for a growth that lands only in the remainder: Shmem stays flat.
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
+         --log "$T/run3.log" -- sh -c "printf 'MemTotal: 296000000 kB\nMemFree: 256000000 kB\nShmem: 3000000 kB\n' > '$T/meminfo'" || fail=1
+head -1 "$T/run3.log" | grep -q "SUSPECT.*backing-grew:40000000kB" || { echo "FAIL: remainder-only growth must stamp SUSPECT backing-grew (got: $(head -1 "$T/run3.log"))"; fail=1; }
+head -1 "$T/run3.log" | grep -qE 'pre_remainder=0kB pre_backing=3000000kB post_remainder=40000000kB post_backing=43000000kB' \
+    || { echo "FAIL: header must stamp remainder and backing (got: $(head -1 "$T/run3.log"))"; fail=1; }
+
+cases=$((cases+1))
+# A meminfo without MemTotal gives no remainder: refuse, never read it as 0.
+mk_tree 0 0; printf 'Shmem: 3000000 kB\n' > "$T/meminfo"
+out="$(run_guard "false" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: meminfo without MemTotal must refuse with exit 3, got $rc (out: $out)"; fail=1; }
 
 cases=$((cases+1))
 # Exit-code mirroring: bench-guard's own exit code must equal the wrapped
@@ -802,7 +824,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 46 ] || { echo "FAIL: expected 46 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 49 ] || { echo "FAIL: expected 49 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then

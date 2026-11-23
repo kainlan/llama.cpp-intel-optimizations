@@ -3,7 +3,8 @@
 # stamps the archived log VALID/SUSPECT (perf-recovery epic, track A, tasks
 # A1+A2). Refuses to run the wrapped command when the target GPU is
 # throttled/active, a stale llama-cli|llama-bench|llama-completion tenant is
-# already running, or Shmem is elevated (CLAUDE.md: TTM shmem OOM history).
+# already running, or GPU host backing is elevated (Shmem + the meminfo remainder,
+# scripts/sycl-host-backing.sh; CLAUDE.md: TTM shmem OOM history).
 # All host probes go through overridable roots (--sysfs-card, --meminfo,
 # --pgrep-cmd, --journalctl-cmd, --df-cmd, --drm-root -- the last four are
 # test hooks, same as --meminfo/--sysfs-card, so the logic is testable
@@ -18,6 +19,10 @@
 # preflight) so the clamp is never silent. The archived --log header stamps
 # raw Shmem, tmpfs used, and the net figure separately at each sample point,
 # never just the net.
+# The ceiling and the growth check act on GPU host backing: net Shmem plus
+# the meminfo remainder. A discrete card's host-USM memory is in no meminfo
+# field, so Shmem alone reads flat for it; only the remainder moves. The
+# header stamps the remainder and the sum at each sample point too.
 #
 # On a clean host: runs the wrapped command under `timeout -k 15 <budget>`
 # (default budget 900s; --budget overrides -- load-bearing per CLAUDE.md, `-k`
@@ -29,8 +34,8 @@
 # the wrapped command's, never the verdict.
 #
 # Postflight SUSPECT triggers, each with its own reason token in the verdict
-# line and archived header: Shmem grew more than 5 GB across the run
-# (`shmem-grew:<N>kB`); the run was killed by the timeout
+# line and archived header: GPU host backing grew more than 5 GB across the run
+# (`backing-grew:<N>kB`, net Shmem plus the remainder); the run was killed by the timeout
 # (`timeout-killed:rc=<N>`, rc 124/137); `timeout` itself could not execute
 # the wrapped command -- bad `timeout` invocation, command not executable, or
 # command not found (`not-executed:rc=<N>`, rc 125/126/127); the wrapped
@@ -114,6 +119,8 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-gpu-sysfs.sh"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-host-backing.sh"
 
 if [ -z "$SYSFS_CARD" ]; then
     if [ -z "$PCI" ]; then
@@ -159,13 +166,15 @@ shmem_kb() { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
 # keep this helper pure (probe in, number out).
 tmpfs_kb() { { if [ -n "$DF_CMD" ]; then $DF_CMD 2>/dev/null; else df -k -t tmpfs 2>/dev/null; fi; } | awk 'NR>1{s+=$3} END{print s+0}'; }
 
-# Sample raw Shmem + tmpfs usage ONCE and derive the effective figure, into
-# the three SAMPLE_* globals -- never re-derive individually. Callers: the
+# Sample raw Shmem + tmpfs usage + the meminfo remainder ONCE and derive the
+# effective figures, into the SAMPLE_* globals -- never re-derive individually.
+# SAMPLE_EFF is Shmem net of tmpfs; SAMPLE_BACKING is SAMPLE_EFF plus the
+# remainder. An unreadable meminfo refuses: no figure is not a low figure. Callers: the
 # preflight ceiling check, and pre/post around the wrapped command. The clamp
 # note (below) is printed only at the FIRST call (preflight), not at every
 # sample point -- one run should print it at most once, not up to three
 # times for the same underlying host condition.
-SAMPLE_RAW=0 SAMPLE_TMPFS=0 SAMPLE_EFF=0
+SAMPLE_RAW=0 SAMPLE_TMPFS=0 SAMPLE_EFF=0 SAMPLE_REM=0 SAMPLE_BACKING=0
 sample_shmem() {
     SAMPLE_RAW="$(shmem_kb)"
     # `|| true`: tmpfs_kb's internal pipe can return non-zero under pipefail
@@ -180,14 +189,16 @@ sample_shmem() {
     else
         SAMPLE_EFF=0
     fi
+    SAMPLE_REM="$(sycl_gpu_host_remainder_kb "$MEMINFO")" || refuse "cannot compute the meminfo remainder from $MEMINFO"
+    SAMPLE_BACKING=$((SAMPLE_EFF + SAMPLE_REM))
 }
 
 sample_shmem
-raw_shmem="$SAMPLE_RAW" tmpfs_used="$SAMPLE_TMPFS" eff_shmem="$SAMPLE_EFF"
+raw_shmem="$SAMPLE_RAW" tmpfs_used="$SAMPLE_TMPFS" eff_shmem="$SAMPLE_EFF" remainder="$SAMPLE_REM" backing="$SAMPLE_BACKING"
 if [ "$tmpfs_used" -ge "$raw_shmem" ]; then
     echo "bench-guard: note: tmpfs used (${tmpfs_used} kB) meets or exceeds Shmem (${raw_shmem} kB); effective Shmem clamped to 0" >&2
 fi
-[ "$eff_shmem" -le "$SHMEM_CEIL_KB" ] || refuse "Shmem $raw_shmem kB minus tmpfs $tmpfs_used kB = $eff_shmem kB above ceiling $SHMEM_CEIL_KB kB"
+[ "$backing" -le "$SHMEM_CEIL_KB" ] || refuse "GPU host backing $backing kB (Shmem $raw_shmem kB minus tmpfs $tmpfs_used kB = $eff_shmem kB, plus remainder $remainder kB) above ceiling $SHMEM_CEIL_KB kB"
 
 # Poll throttle/act_freq up to --max-wait, checking the deadline BEFORE each
 # sleep and capping each sleep to the time actually remaining -- so
@@ -205,7 +216,7 @@ while :; do
 done
 
 sample_shmem
-pre_shmem_raw="$SAMPLE_RAW" pre_tmpfs="$SAMPLE_TMPFS" pre_shmem_eff="$SAMPLE_EFF"
+pre_shmem_raw="$SAMPLE_RAW" pre_tmpfs="$SAMPLE_TMPFS" pre_shmem_eff="$SAMPLE_EFF" pre_remainder="$SAMPLE_REM" pre_backing="$SAMPLE_BACKING"
 pre_thr="$st"
 
 # -e-safe capture: `cmd; rc=$?` would trip `set -e` the instant the wrapped
@@ -230,16 +241,16 @@ else
 fi
 
 sample_shmem
-post_shmem_raw="$SAMPLE_RAW" post_tmpfs="$SAMPLE_TMPFS" post_shmem_eff="$SAMPLE_EFF"
+post_shmem_raw="$SAMPLE_RAW" post_tmpfs="$SAMPLE_TMPFS" post_shmem_eff="$SAMPLE_EFF" post_remainder="$SAMPLE_REM" post_backing="$SAMPLE_BACKING"
 post_thr="$(cat "$FREQ/throttle/status")"
 
 verdict="VALID"
 reasons=""
 # Plain `if` blocks, not `&&` chains -- a trailing false `&&` under `set -e`
 # would exit the script instead of just skipping the reason.
-if [ $((post_shmem_eff - pre_shmem_eff)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
+if [ $((post_backing - pre_backing)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
     verdict="SUSPECT"
-    reasons="$reasons shmem-grew:$((post_shmem_eff - pre_shmem_eff))kB"
+    reasons="$reasons backing-grew:$((post_backing - pre_backing))kB"
 fi
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     verdict="SUSPECT"
@@ -283,7 +294,7 @@ verdict_line="$verdict${reasons:+:$reasons}"
 pci_for_log="${PCI:-override}"
 if [ -n "$LOG" ]; then
     {
-        echo "# bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB cmd: $*"
+        echo "# bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB pre_remainder=${pre_remainder}kB pre_backing=${pre_backing}kB post_remainder=${post_remainder}kB post_backing=${post_backing}kB cmd: $*"
         cat "$tmp_out"
     } > "$LOG"
 else
