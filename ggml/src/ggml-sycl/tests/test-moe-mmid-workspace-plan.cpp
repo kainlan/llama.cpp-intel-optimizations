@@ -1071,28 +1071,89 @@ static void common_direct_authority_plan_queue_and_lifetime() {
             token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
             { { 0, 1701 } }, { std::move(queue) }, std::move(invocation_pin), { std::move(submission) });
     };
-    moe_mmid_authoritative_admission_request direct{ make_authority(capability, pin), { 2, 2, 64, 96, 1 } };
+    moe_mmid_authoritative_admission_request direct{
+        make_authority(capability, pin), { 2, 2, 64, 96, 1, 3 }
+    };
     pin.reset();
     auto committed = registry.admit(std::move(direct));
     check(committed.status == moe_mmid_lease_status::ACQUIRED && committed.bundle.valid() && !weak_pin.expired(),
           "direct authority did not retain invocation pin");
 
+    // A batch that mixes card and host experts binds its card occurrences only, each under its own index in the
+    // batch, and names its token count: the workspace is sized for every token. The 3-token batch's occurrences 0, 2
+    // and 5 are admitted; the same occurrences out of order, a repeated one, or one past a 2-token batch are not.
+    auto subset_authority = [&](std::initializer_list<uint32_t> occurrences) {
+        auto subset = std::make_shared<std::vector<moe::mmid_batch_binding>>();
+        for (const uint32_t occurrence : occurrences) {
+            subset->push_back(graph.retained_occurrences->at(occurrence));
+        }
+        auto submission = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
+        return workspace_admission_authority_test_factory::direct(token, 1700, 1702, 0, plan, std::move(subset),
+                                                                  graph.table_owner,
+                                                                  {
+                                                                      { 0, 1701 }
+        },
+                                                                  { capability }, {}, { std::move(submission) });
+    };
+    auto card_only = registry.admit({
+        subset_authority({ 0, 2, 5 }
+        ), { 2, 2, 64, 96, 1, 3 }
+    });
+    check(card_only.status == moe_mmid_lease_status::ACQUIRED && card_only.bundle.retained_occurrences().size() == 3 &&
+              card_only.bundle.retained_occurrences()[1].identity.occurrence == 2 &&
+              card_only.bundle.retained_occurrences()[2].identity.occurrence == 5,
+          "a card subset of a batch's occurrences was not admitted under its own indexes");
+    check(card_only.bundle.terminal_release(), "card subset bundle release failed");
+    check(registry.admit({
+                             subset_authority({ 2, 0, 5 }
+                             ), { 2, 2, 64, 96, 1, 3 }
+    })
+                  .status == moe_mmid_lease_status::INVALID,
+          "occurrences out of order were admitted");
+    check(registry.admit({
+                             subset_authority({ 0, 2, 2 }
+                             ), { 2, 2, 64, 96, 1, 3 }
+    })
+                  .status == moe_mmid_lease_status::INVALID,
+          "a repeated occurrence was admitted");
+    check(registry.admit({
+                             subset_authority({ 0, 5 }
+                             ), { 2, 2, 64, 96, 1, 2 }
+    })
+                  .status == moe_mmid_lease_status::INVALID,
+          "an occurrence past the batch's tokens * top_k was admitted");
+    check(registry.admit({
+                             subset_authority({ 0, 2, 5 }
+                             ), { 2, 2, 64, 96, 1, 0 }
+    })
+                  .status == moe_mmid_lease_status::INVALID,
+          "a batch with no token count was admitted");
+
     auto forged = moe_mmid_queue_capability_test_factory::mint(0, &exact_queue, 1701, queue_lifetime);
-    moe_mmid_authoritative_admission_request wrong_queue{ make_authority(forged, {}), { 2, 2, 64, 96, 1 } };
+    moe_mmid_authoritative_admission_request wrong_queue{
+        make_authority(forged, {}
+         ), { 2, 2, 64, 96, 1, 3 }
+    };
     check(registry.admit(std::move(wrong_queue)).status == moe_mmid_lease_status::INVALID,
           "same-device same-cookie different queue capability admitted");
     auto wrong_submission = workspace_admission_authority_test_factory::terminal(forged, 1702, terminal);
     auto wrong_terminal_authority = workspace_admission_authority_test_factory::direct(
         token, 1700, 1702, 0, plan, graph.retained_occurrences, graph.table_owner,
         { { 0, 1701 } }, { capability }, {}, { wrong_submission });
-    check(registry.admit({ std::move(wrong_terminal_authority), { 2, 2, 64, 96, 1 } }).status ==
-              moe_mmid_lease_status::INVALID, "substituted terminal queue authority admitted");
+    check(registry.admit({
+                             std::move(wrong_terminal_authority), { 2, 2, 64, 96, 1, 3 }
+    })
+                  .status == moe_mmid_lease_status::INVALID,
+          "substituted terminal queue authority admitted");
 
     auto forged_graph_authority = workspace_admission_authority_test_factory::graph(
         token, 1700, 0, plan, graph.graph_registry, graph.graph_token, graph.graph_snapshot,
         graph.retained_occurrences, graph.table_owner, { { 0, 1701 } }, { forged });
-    check(registry.admit({ std::move(forged_graph_authority), { 2, 2, 64, 96, 1 } }).status ==
-              moe_mmid_lease_status::INVALID, "GRAPH substituted exact queue capability admitted");
+    check(registry.admit({
+                             std::move(forged_graph_authority), { 2, 2, 64, 96, 1, 3 }
+    })
+                  .status == moe_mmid_lease_status::INVALID,
+          "GRAPH substituted exact queue capability admitted");
 
     auto graph_authority = workspace_admission_authority_test_factory::graph(
         token, 1700, 0, plan, graph.graph_registry, graph.graph_token, graph.graph_snapshot,
@@ -1100,7 +1161,9 @@ static void common_direct_authority_plan_queue_and_lifetime() {
 #ifndef MMID_TSAN_BUILD
     g_fail_heap_allocations.store(true);
 #endif
-    auto graph_admitted = registry.admit({ std::move(graph_authority), { 2, 2, 64, 96, 1 } });
+    auto graph_admitted = registry.admit({
+        std::move(graph_authority), { 2, 2, 64, 96, 1, 3 }
+    });
 #ifndef MMID_TSAN_BUILD
     g_fail_heap_allocations.store(false);
 #endif
@@ -1125,14 +1188,19 @@ static void common_direct_authority_plan_queue_and_lifetime() {
     late_release.store(true, std::memory_order_release); late_materialize.join();
     check(late_status == moe_mmid_materialize_status::INVALID,
           "paused late stale-plan materialization crossed replacement tombstone");
-    moe_mmid_authoritative_admission_request stale{ make_authority(capability, {}), { 2, 2, 64, 96, 1 } };
+    moe_mmid_authoritative_admission_request stale{
+        make_authority(capability, {}
+         ), { 2, 2, 64, 96, 1, 3 }
+    };
     check(registry.admit(std::move(stale)).status == moe_mmid_lease_status::INVALID,
           "stale exact plan admitted after replacement rebind");
     auto replacement_submission = workspace_admission_authority_test_factory::terminal(capability, 1702, terminal);
     auto replacement_authority = workspace_admission_authority_test_factory::direct(
         token, 1703, 1702, 0, replacement, graph.retained_occurrences, graph.table_owner,
         { { 0, 1701 } }, { capability }, {}, { replacement_submission });
-    auto replacement_admitted = registry.admit({ std::move(replacement_authority), { 2, 2, 64, 96, 1 } });
+    auto replacement_admitted = registry.admit({
+        std::move(replacement_authority), { 2, 2, 64, 96, 1, 3 }
+    });
     check(replacement_admitted.status == moe_mmid_lease_status::ACQUIRED,
           "stable replacement did not rebind unchanged materialized context");
     check(replacement_admitted.bundle.terminal_release(), "replacement bundle release failed");
@@ -1211,7 +1279,9 @@ static void model_scoped_replacement_and_retired_recovery() {
     auto authority = workspace_admission_authority_test_factory::direct(
         token_a, 2100, 2102, 0, plan_a, graph.retained_occurrences, graph.table_owner,
         { { 0, 2101 } }, { cap_a }, {}, { submission });
-    auto admitted = registry.admit({ std::move(authority), { 2, 2, 64, 96, 1 } });
+    auto admitted = registry.admit({
+        std::move(authority), { 2, 2, 64, 96, 1, 3 }
+    });
     check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
           "retired recovery submitted-old setup failed");
     auto plan_a2 = std::make_shared<const lifecycle_plan_snapshot>();
@@ -1270,7 +1340,7 @@ static void recovered_retired_context_releases_pools_after_the_registry_mutex() 
     auto authority  = workspace_admission_authority_test_factory::direct(
         token, 2400, 2402, 0, plan, graph.retained_occurrences, graph.table_owner, admission_owners,
         std::vector<moe_mmid_queue_capability>(1, queue), {}, std::vector<queue_submission_authority>(1, submission));
-    const workspace_admission_shape shape{ 2, 2, 64, 96, 1 };
+    const workspace_admission_shape shape{ 2, 2, 64, 96, 1, 3 };
     auto admitted = registry.admit(moe_mmid_authoritative_admission_request{ std::move(authority), shape });
     check(admitted.status == moe_mmid_lease_status::ACQUIRED && admitted.bundle.mark_possible_submit(),
           "recovery probe submitted setup failed");
@@ -1317,7 +1387,9 @@ static void changed_replacement_terminal_release_gc() {
         auto authority = workspace_admission_authority_test_factory::direct(
             token, plan_id, epoch, 0, current, graph.retained_occurrences, graph.table_owner,
             { { 0, 3101 } }, { queue }, {}, { submission });
-        auto old = registry.admit({ std::move(authority), { 2, 2, 64, 96, 1 } });
+        auto old = registry.admit({
+            std::move(authority), { 2, 2, 64, 96, 1, 3 }
+        });
         check(old.status == moe_mmid_lease_status::ACQUIRED, "repeated old admission failed");
         auto next = std::make_shared<const lifecycle_plan_snapshot>();
         auto changed = owner;

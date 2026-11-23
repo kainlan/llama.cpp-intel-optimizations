@@ -2,14 +2,16 @@
 //
 // Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
 // there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
-// off the primary card (to the host or another card), which the route cannot reach; SKIP[no-backend] means no
-// backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
-// the no-GPU skip.
+// off the primary card (to the host or another card), which the route cannot reach; SKIP[no-backend] means the scoped
+// lifecycle fixture could not create a backend for a candidate owner device. Each skip line carries its tag so a log
+// grep can tell them apart from the no-GPU skip. The mixed fixture has no skip: past the device probe, a failure to
+// create its backend is a FAIL that names the step.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "async-failure.hpp"
-#include "q1-nvfp4-production-route-test-seam.hpp"
+#include "ggml-alloc.h"
 #include "ggml-quants.h"
 #include "ggml.h"
+#include "q1-nvfp4-production-route-test-seam.hpp"
 #include "unified-cache.hpp"
 
 #include <algorithm>
@@ -19,15 +21,16 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <unordered_set>
 #include <vector>
-#include <sycl/sycl.hpp>
 
 namespace {
 constexpr int     gate_output_n                       = 96;
@@ -41,7 +44,8 @@ constexpr int     prompt_capacity                     = 40;
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
 // The backend's refusal lines, so a case can require that a refusal named its cause. Every log line still reaches
-// stderr; only lines that carry a refusal tag are kept. Host tasks can log, so the text is guarded.
+// stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]) and the direct route's host job's
+// ([MOE-HOST-JOB], logged on the job's thread). Host tasks and jobs can log, so the text is guarded.
 std::mutex  g_refusal_log_mutex;
 std::string g_refusal_log;
 
@@ -50,7 +54,7 @@ void capture_log(ggml_log_level, const char * text, void *) {
         return;
     }
     std::fputs(text, stderr);
-    if (std::strstr(text, "-REFUSAL]") != nullptr) {
+    if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr) {
         const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
         g_refusal_log += text;
     }
@@ -147,6 +151,61 @@ struct case_scope {
 // teardown records the first refusal here and main() fails the run on it after the case.
 bool        g_teardown_failed = false;
 std::string g_teardown_failure;
+
+const char * execution_result_name(ggml_sycl_execution_result result);
+
+void report_drain_refusal(ggml_sycl_exec_context_id  context,
+                          size_t                     first_case,
+                          const char *               step,
+                          ggml_sycl_execution_result result) noexcept {
+    g_teardown_failed = true;
+    try {
+        std::string cases;
+        for (size_t i = first_case; i < g_case_markers.size(); ++i) {
+            cases += (cases.empty() ? "" : ", ") + g_case_markers[i].name;
+        }
+        std::string message = (cases.empty() ? std::string("teardown of a fixture no case started on") :
+                                               "teardown of the fixture for " + cases) +
+                              ": " + step + " returned " + execution_result_name(result);
+        ggml_sycl_execution_snapshot state{};
+        if (ggml_backend_sycl_execution_context_extract(context, &state) == GGML_SYCL_EXECUTION_OK) {
+            message += " (invocation=" + std::to_string(state.invocation_id.value) +
+                       " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
+                       " busy_devices=" + std::to_string(state.busy_device_count) + ")";
+        }
+        std::cerr << "FAIL: " << message << std::endl;
+        if (g_teardown_failure.empty()) {
+            g_teardown_failure = message;
+        }
+    } catch (...) {
+        // The flag alone still fails the run when the message cannot be built.
+    }
+}
+
+// A fixture's teardown drains its execution context. A refusal means a case left work or a device owned by the
+// context; it fails the run (first_case names the fixture's cases), and the rest of the teardown still runs.
+void drain_execution_context(ggml_sycl_exec_context_id context, size_t first_case) noexcept {
+    ggml_sycl_exec_drain_ticket             ticket{};
+    ggml_sycl_exec_control_host_alloc_batch batch{};
+    auto                                    result = ggml_backend_sycl_execution_context_begin_drain(context, &ticket);
+    if (result != GGML_SYCL_EXECUTION_OK) {
+        report_drain_refusal(context, first_case, "begin_drain", result);
+        return;
+    }
+    result = ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch);
+    if (result != GGML_SYCL_EXECUTION_OK) {
+        report_drain_refusal(context, first_case, "extract_control_host_allocs", result);
+        return;
+    }
+    result = ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
+    if (result != GGML_SYCL_EXECUTION_OK) {
+        report_drain_refusal(context, first_case, "release_control_host_allocs", result);
+    }
+    result = ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
+    if (result != GGML_SYCL_EXECUTION_OK) {
+        report_drain_refusal(context, first_case, "finish_drain", result);
+    }
+}
 
 void require_clean_teardown() {
     if (g_teardown_failed) {
@@ -472,55 +531,7 @@ struct lifecycle_fixture {
 
     ~lifecycle_fixture() { cleanup(); }
 
-    // A refusal means a case left work or a device owned by the context; it fails the run, and the rest of the
-    // teardown still runs.
-    void drain_context() noexcept {
-        ggml_sycl_exec_drain_ticket             ticket{};
-        ggml_sycl_exec_control_host_alloc_batch batch{};
-        auto result = ggml_backend_sycl_execution_context_begin_drain(context, &ticket);
-        if (result != GGML_SYCL_EXECUTION_OK) {
-            report_drain_refusal("begin_drain", result);
-            return;
-        }
-        result = ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch);
-        if (result != GGML_SYCL_EXECUTION_OK) {
-            report_drain_refusal("extract_control_host_allocs", result);
-            return;
-        }
-        result = ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
-        if (result != GGML_SYCL_EXECUTION_OK) {
-            report_drain_refusal("release_control_host_allocs", result);
-        }
-        result = ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
-        if (result != GGML_SYCL_EXECUTION_OK) {
-            report_drain_refusal("finish_drain", result);
-        }
-    }
-
-    void report_drain_refusal(const char * step, ggml_sycl_execution_result result) const noexcept {
-        g_teardown_failed = true;
-        try {
-            std::string cases;
-            for (size_t i = first_case; i < g_case_markers.size(); ++i) {
-                cases += (cases.empty() ? "" : ", ") + g_case_markers[i].name;
-            }
-            std::string message = (cases.empty() ? std::string("teardown of a fixture no case started on") :
-                                                   "teardown of the fixture for " + cases) +
-                                  ": " + step + " returned " + execution_result_name(result);
-            ggml_sycl_execution_snapshot state{};
-            if (ggml_backend_sycl_execution_context_extract(context, &state) == GGML_SYCL_EXECUTION_OK) {
-                message += " (invocation=" + std::to_string(state.invocation_id.value) +
-                           " graph_state=" + std::to_string(static_cast<int>(state.graph_state)) +
-                           " busy_devices=" + std::to_string(state.busy_device_count) + ")";
-            }
-            std::cerr << "FAIL: " << message << std::endl;
-            if (g_teardown_failure.empty()) {
-                g_teardown_failure = message;
-            }
-        } catch (...) {
-            // The flag alone still fails the run when the message cannot be built.
-        }
-    }
+    void drain_context() noexcept { drain_execution_context(context, first_case); }
 };
 
 ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * tensor,
@@ -588,18 +599,70 @@ float activation_value(uint32_t seed, size_t token, size_t row, size_t k) {
     return (h & 1u ? -1.0f : 1.0f) * (0.2f + float((h >> 1) % 19u) / 31.0f);
 }
 
-graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vector<float> & oracle,
-                      size_t & output_count, input_rows rows = input_rows::DENSE, int tokens = 1,
-                      ids_layout ids_at = ids_layout::PACKED) {
+// Every expert's quantized gate rows, [expert][row] in `packed` as the weight tensor stores them, and their CPU
+// dequantization, [expert][row][K], for the oracle. Deterministic: the mixed fixture loads these bytes before its
+// cases run, and each case's oracle reads the same dequantization. Signs vary along K, by row and by expert, so the
+// experts stay distinct after Q1_0's one-bit quantization (a sign per weight, one scale per block): an all-positive
+// source dequantizes every expert to nearly the same row, and a route that read the wrong expert would still match
+// the oracle.
+void expert_weights(ggml_type type, std::vector<unsigned char> & packed, std::vector<float> & dequant) {
+    constexpr int      experts = route_experts;
+    const int          K       = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+    std::vector<float> source(static_cast<size_t>(experts) * gate_output_n * K);
+    dequant.assign(source.size(), 0.0f);
+    packed.assign(ggml_row_size(type, K) * gate_output_n * experts, 0);
+    for (size_t i = 0; i < source.size(); ++i) {
+        const size_t k = i % K, n = (i / K) % gate_output_n, e = i / (static_cast<size_t>(K) * gate_output_n);
+        source[i] = ((k * 3 + n * 5 + e * 11) % 7 < 3 ? -1.0f : 1.0f) * (0.15f + float((i * 7) % 23) / 29.0f);
+    }
+    for (int e = 0; e < experts; ++e) {
+        for (int n = 0; n < gate_output_n; ++n) {
+            const float * src = source.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
+            void *        dst = packed.data() + (static_cast<size_t>(e) * gate_output_n + n) * ggml_row_size(type, K);
+            float *       dq  = dequant.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
+            if (type == GGML_TYPE_Q1_0) {
+                quantize_row_q1_0_ref(src, static_cast<block_q1_0 *>(dst), K);
+                dequantize_row_q1_0(static_cast<block_q1_0 *>(dst), dq, K);
+            } else {
+                quantize_row_nvfp4_ref(src, static_cast<block_nvfp4 *>(dst), K);
+                dequantize_row_nvfp4(static_cast<block_nvfp4 *>(dst), dq, K);
+            }
+        }
+    }
+}
+
+// The expert a case's token selects in a slot; empty means selected_expert().
+using expert_selector = std::function<int32_t(int token, int slot)>;
+
+// A gate weight a fixture loaded before load_end, as a model load does, with the dequantization of its bytes.
+struct loaded_weight {
+    ggml_tensor *              tensor  = nullptr;
+    const std::vector<float> * dequant = nullptr;
+};
+
+// `loaded` replaces the graph's own device weight by a loaded one; `select` replaces selected_expert().
+graph_case make_graph(ggml_backend_t          backend,
+                      ggml_type               type,
+                      int                     ne11,
+                      std::vector<float> &    oracle,
+                      size_t &                output_count,
+                      input_rows              rows   = input_rows::DENSE,
+                      int                     tokens = 1,
+                      ids_layout              ids_at = ids_layout::PACKED,
+                      const loaded_weight *   loaded = nullptr,
+                      const expert_selector & select = {}) {
     constexpr int experts = route_experts, top_k = route_top_k;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+    const auto    expert_at = [&](int token, int slot) {
+        return select ? select(token, slot) : selected_expert(tokens, token, slot);
+    };
     // Floats from one stored row to the next, and from one stored token to the next.
     const int row_stride   = rows == input_rows::STRIDED ? K + strided_row_pad : K;
     const int token_stride = rows == input_rows::TOKENS_STRIDED ? ne11 * K + strided_row_pad : ne11 * row_stride;
     const int lead         = rows == input_rows::DENSE ? 0 : strided_view_lead;
     graph_case c;
     c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
-    auto * weights = ggml_new_tensor_3d(c.ctx, type, K, gate_output_n, experts);
+    auto *    weights = loaded ? loaded->tensor : ggml_new_tensor_3d(c.ctx, type, K, gate_output_n, experts);
     auto * storage = rows == input_rows::DENSE ?
                          ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, K, ne11, tokens) :
                          ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, lead + static_cast<int64_t>(tokens) * token_stride);
@@ -614,7 +677,10 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vec
                         ggml_view_2d(c.ctx, c.ids_storage, top_k, tokens, c.ids_storage->nb[1],
                                      static_cast<size_t>(ids_view_lead) * sizeof(int32_t)) :
                         c.ids_storage;
-    ggml_set_name(weights, "blk.0.ffn_gate_exps.weight"); ggml_set_name(input, "route_input");
+    if (!loaded) {
+        ggml_set_name(weights, "blk.0.ffn_gate_exps.weight");
+    }
+    ggml_set_name(input, "route_input");
     if (storage != input) {
         ggml_set_name(storage, "route_input_storage");
     }
@@ -624,10 +690,12 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vec
     ggml_set_name(ids, "route_ids"); c.out = ggml_mul_mat_id(c.ctx, weights, input, ids);
     ggml_set_name(c.out, "route_output");
     auto * buft = ggml_backend_get_default_buffer_type(backend);
-    c.buffers = { alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
-                  alloc_tensor(buft, storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
-                  alloc_tensor(buft, c.ids_storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
-                  alloc_tensor(buft, c.out, GGML_BACKEND_BUFFER_USAGE_COMPUTE) };
+    c.buffers   = { alloc_tensor(buft, storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+                    alloc_tensor(buft, c.ids_storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+                    alloc_tensor(buft, c.out, GGML_BACKEND_BUFFER_USAGE_COMPUTE) };
+    if (!loaded) {
+        c.buffers.push_back(alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS));
+    }
     require(std::all_of(c.buffers.begin(), c.buffers.end(), [](auto * b) { return b != nullptr; }),
             "tensor buffer allocation failed");
     if (storage != input) {
@@ -643,27 +711,14 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vec
         require(ids->nb[1] != static_cast<size_t>(top_k) * sizeof(int32_t), "the ids view's tokens are adjacent");
         require(ids->view_offs != 0, "the ids view starts at its storage's root");
     }
-    ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
-
-    // Signs vary along K, by row and by expert, so the experts stay distinct after Q1_0's one-bit quantization (a sign
-    // per weight, one scale per block): an all-positive source dequantizes every expert to nearly the same row, and a
-    // route that read the wrong expert would still match the oracle.
-    std::vector<float> source(static_cast<size_t>(experts) * gate_output_n * K), dequant(source.size());
-    for (size_t i = 0; i < source.size(); ++i) {
-        const size_t k = i % K, n = (i / K) % gate_output_n, e = i / (static_cast<size_t>(K) * gate_output_n);
-        source[i] = ((k * 3 + n * 5 + e * 11) % 7 < 3 ? -1.0f : 1.0f) * (0.15f + float((i * 7) % 23) / 29.0f);
+    std::vector<unsigned char> packed;
+    std::vector<float>         own_dequant;
+    if (!loaded) {
+        ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+        expert_weights(type, packed, own_dequant);
+        require(packed.size() == ggml_nbytes(weights), "the generated expert bytes do not fill the weight tensor");
     }
-    std::vector<unsigned char> packed(ggml_nbytes(weights));
-    for (int e = 0; e < experts; ++e) for (int n = 0; n < gate_output_n; ++n) {
-        const float * src = source.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
-        void * dst = packed.data() +
-                     (static_cast<size_t>(e) * gate_output_n + n) * ggml_row_size(type, K);
-        float * dq = dequant.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
-        if (type == GGML_TYPE_Q1_0) { quantize_row_q1_0_ref(src, static_cast<block_q1_0 *>(dst), K);
-                                      dequantize_row_q1_0(static_cast<block_q1_0 *>(dst), dq, K); }
-        else { quantize_row_nvfp4_ref(src, static_cast<block_nvfp4 *>(dst), K);
-               dequantize_row_nvfp4(static_cast<block_nvfp4 *>(dst), dq, K); }
-    }
+    const std::vector<float> & dequant = loaded ? *loaded->dequant : own_dequant;
     // [token][row][K], drawn fresh for this case (activation_value). Every token's rows differ, so a route that copied
     // one token's input for another fails too.
     std::vector<float> activation(static_cast<size_t>(tokens) * ne11 * K);
@@ -691,11 +746,12 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vec
         for (int col = 0; col < ids_row; ++col) {
             const int slot = col - ids_first;
             c.ids_written[static_cast<size_t>(token) * ids_row + col] =
-                slot >= 0 && slot < top_k ? selected_expert(tokens, token, slot) :
-                                            (selected_expert(tokens, token, 0) + 1) % experts;
+                slot >= 0 && slot < top_k ? expert_at(token, slot) : (expert_at(token, 0) + 1) % experts;
         }
     }
-    ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
+    if (!loaded) {
+        ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
+    }
     ggml_backend_tensor_set(storage, stored.data(), 0, stored.size() * sizeof(float));
     ggml_backend_tensor_set(c.ids_storage, c.ids_written.data(), 0, c.ids_written.size() * sizeof(int32_t));
     c.graph = ggml_new_graph(c.ctx); ggml_build_forward_expand(c.graph, c.out);
@@ -703,8 +759,7 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vec
     output_count = static_cast<size_t>(gate_output_n) * top_k * tokens; oracle.resize(output_count);
     for (int token = 0; token < tokens; ++token) for (int slot = 0; slot < top_k; ++slot) {
         for (int n = 0; n < gate_output_n; ++n) {
-            const float * w = dequant.data() +
-                              (static_cast<size_t>(selected_expert(tokens, token, slot)) * gate_output_n + n) * K;
+            const float * w   = dequant.data() + (static_cast<size_t>(expert_at(token, slot)) * gate_output_n + n) * K;
             const float * a = activation.data() + (static_cast<size_t>(token) * ne11 + (ne11 == 1 ? 0 : slot)) * K;
             float sum = 0; for (int k = 0; k < K; ++k) sum += w[k] * a[k];
             oracle[(static_cast<size_t>(token) * top_k + slot) * gate_output_n + n] = sum;
@@ -1098,15 +1153,410 @@ void unreleased_graph_then_drain_case(bool hold_completion) {
                    "an asynchronous failure was recorded although none was injected", before);
     report_pass(scope.marker->name, GGML_TYPE_Q1_0, 1, input_rows::DENSE, life.authorization);
 }
+
+// A node that selects card experts and host experts runs both: card occurrences in the device kernel, host occurrences
+// in the host recipe on the CPU, one terminal for the node. The plan comes from the planner itself. Its budgets move in
+// steps far above these experts' few kilobytes, so the route-testing seam caps the device triplets its first-fit pack
+// may place at mixed_card_groups; the pack still decides which experts go where, and the fixture reads the split back
+// from the plan the context runs on. The weights are loaded as a model load loads them, in the card's SYCL host buffer
+// before load_end: the plan's host experts compute from those bytes, and its card experts are materialized from them.
+constexpr int          mixed_card_groups     = 2;
+constexpr const char * mixed_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                                 "blk.0.ffn_down_exps.weight" };
+
+// Every role shares the gate's shape, so each row length is a whole number of the type's blocks.
+struct mixed_inventory {
+    ggml_sycl_tensor_info        tensors[3]{};
+    ggml_sycl_tensor_inventory   inventory{};
+    ggml_sycl_placement_envelope envelope{ prompt_capacity, prompt_capacity, 1, -1 };
+
+    explicit mixed_inventory(ggml_type type) {
+        const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+        for (size_t i = 0; i < 3; ++i) {
+            tensors[i].name  = mixed_tensor_names[i];
+            tensors[i].type  = type;
+            tensors[i].ne[0] = K;
+            tensors[i].ne[1] = gate_output_n;
+            tensors[i].ne[2] = route_experts;
+            tensors[i].ne[3] = 1;
+            tensors[i].size  = ggml_row_size(type, K) * gate_output_n * route_experts;
+            inventory.total_size += tensors[i].size;
+        }
+        inventory.tensors       = tensors;
+        inventory.count         = 3;
+        inventory.n_expert      = route_experts;
+        inventory.n_expert_used = route_top_k;
+        inventory.n_layer       = 1;
+        inventory.n_ctx         = prompt_capacity;
+        inventory.n_ubatch      = prompt_capacity;
+    }
+};
+
+struct mixed_fixture {
+    ggml_type                 type;
+    ggml_backend_t            backend        = nullptr;
+    int                       backend_device = -1;
+    ggml_sycl_load_txn        load{};
+    bool                      load_open = false;
+    ggml_sycl_model_token     model{};
+    ggml_sycl_exec_context_id context{};
+    ggml_context *            weight_ctx    = nullptr;
+    ggml_backend_buffer_t     weight_buffer = nullptr;
+    std::vector<float>        dequant;  // the loaded gate's CPU dequantization, [expert][row][K]
+    loaded_weight             gate;
+    std::vector<int32_t>      card_experts;
+    std::vector<int32_t>      host_experts;
+    std::vector<bool>         slot_written = std::vector<bool>(route_experts, false);  // a case selected it on the card
+    size_t                    first_case   = g_case_markers.size();
+
+    explicit mixed_fixture(ggml_type weight_type) : type(weight_type) {
+        ggml_sycl_q1_nvfp4_test_cap_device_expert_groups(mixed_card_groups);
+        try {
+            const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
+            require(begin_result == GGML_SYCL_LIFECYCLE_OK, "mixed fixture: load begin failed");
+            load_open = true;
+            mixed_inventory fixture(type);
+            require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
+                        GGML_SYCL_LIFECYCLE_OK,
+                    "mixed fixture: inventory staging failed");
+            const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
+            require(candidate && candidate->plan && !candidate->plan->moe_mmid_workspaces.empty(),
+                    "mixed fixture: the candidate plan has no MMID workspace owner");
+            const auto & plan    = *candidate->plan;
+            const int    primary = plan.device_id >= 0   ? plan.device_id :
+                                   !plan.devices.empty() ? plan.devices.front() :
+                                                           -1;
+            require(primary >= 0 && primary < ggml_backend_sycl_get_device_count(),
+                    "mixed fixture: the candidate plan has no primary device the registry exposes");
+            // Staging used temporary backends; the fixture's own backend is created after it, as in a real load.
+            // The device probe passed, so a null backend here is a failure, not a skip.
+            backend = ggml_backend_sycl_init(primary);
+            require(backend != nullptr,
+                    "mixed fixture: ggml_backend_sycl_init returned null for the plan's primary device after the "
+                    "device probe passed");
+            backend_device = primary;
+            load_weights();
+            const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
+            if (commit != GGML_SYCL_LIFECYCLE_BUSY) {
+                load_open = false;
+            }
+            require(commit == GGML_SYCL_LIFECYCLE_OK, "mixed fixture: load commit failed");
+            require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
+                    "mixed fixture: plan activation failed");
+            require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
+                    "mixed fixture: context create failed");
+            require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
+                    "mixed fixture: context bind failed");
+            require(ggml_backend_sycl_set_runtime_context_for_model(
+                        backend, model, prompt_capacity, prompt_capacity, 1, /*kv_unified=*/false, /*swa_full=*/false,
+                        /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
+                    "mixed fixture: model root bind failed");
+            read_split();
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+    }
+
+    // What libllama's loader does for each weight (register_sycl_tensor_metadata in src/llama-model-loader.cpp):
+    // register its split's file identity, its own identity, its host-weight row while weights are evictable, and its
+    // usage, then allocate the tensors in the card's SYCL host buffer type and fill them. All three roles hold the same
+    // bytes; only the gate runs.
+    void load_weights() {
+        weight_ctx = ggml_init({ 3 * ggml_tensor_overhead(), nullptr, true });
+        require(weight_ctx != nullptr, "mixed fixture: ggml_init for the weights failed");
+        ggml_backend_dev_t dev   = ggml_backend_get_device(backend);
+        const int          K     = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+        const std::string  split = std::string("test-q1-nvfp4-admitted-device-mixed-") + ggml_type_name(type) + ".gguf";
+        ggml_tensor *      tensors[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            tensors[i] = ggml_new_tensor_3d(weight_ctx, type, K, gate_output_n, route_experts);
+            ggml_set_name(tensors[i], mixed_tensor_names[i]);
+            const size_t nbytes = ggml_nbytes(tensors[i]);
+            ggml_backend_sycl_register_gguf_file_identity(0, split.c_str(), uint64_t(3 * nbytes));
+            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
+            if (ggml_backend_sycl_weights_evictable()) {
+                ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
+            }
+            require(ggml_backend_sycl_try_register_weight_usage(mixed_tensor_names[i],
+                                                                GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
+                    "mixed fixture: weight usage registration refused");
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
+        require(buft != nullptr, "mixed fixture: no SYCL host buffer type for the card");
+        weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
+        require(weight_buffer != nullptr, "mixed fixture: host weight buffer allocation failed");
+        ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<unsigned char> packed;
+        expert_weights(type, packed, dequant);
+        require(packed.size() == ggml_nbytes(tensors[0]), "mixed fixture: the expert bytes do not fill the weight");
+        for (int i = 0; i < 3; ++i) {
+            ggml_backend_tensor_set(tensors[i], packed.data(), 0, packed.size());
+        }
+        gate = { tensors[0], &dequant };
+    }
+
+    // The split the context runs on: the plan the lifecycle holds for the model after both binds. A fixture with no
+    // host expert, or no card expert, cannot exercise the mix, and that fails the run.
+    void read_split() {
+        const auto live = ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id);
+        require(live && live->plan, "mixed fixture: the model's placement plan was not found");
+        for (int expert = 0; expert < route_experts; ++expert) {
+            bool found = false;
+            for (const auto & entry : live->plan->entries) {
+                if (entry.expert_id != expert || entry.name != mixed_tensor_names[0]) {
+                    continue;
+                }
+                found = true;
+                if (!entry.on_device) {
+                    host_experts.push_back(expert);
+                } else if (entry.target_device == backend_device) {
+                    card_experts.push_back(expert);
+                } else {
+                    throw std::runtime_error("mixed fixture: expert " + std::to_string(expert) +
+                                             " is planned on device " + std::to_string(entry.target_device) +
+                                             ", not the fixture's card " + std::to_string(backend_device));
+                }
+            }
+            require(found, "mixed fixture: an expert has no gate placement entry in the plan");
+        }
+        const auto names = [](const std::vector<int32_t> & experts) {
+            std::string text;
+            for (const int32_t expert : experts) {
+                text += (text.empty() ? "" : ",") + std::to_string(expert);
+            }
+            return "[" + text + "]";
+        };
+        std::cerr << "mixed fixture " << ggml_type_name(type) << ": card experts " << names(card_experts)
+                  << ", host experts " << names(host_experts) << '\n';
+        if (card_experts.empty() || host_experts.empty()) {
+            throw std::runtime_error(std::string("mixed fixture ") + ggml_type_name(type) +
+                                     ": the planner's pack under a cap of " + std::to_string(mixed_card_groups) +
+                                     " device groups placed card experts " + names(card_experts) +
+                                     " and host experts " + names(host_experts) + "; the cases need both");
+        }
+    }
+
+    bool on_host(int32_t expert) const {
+        return std::find(host_experts.begin(), host_experts.end(), expert) != host_experts.end();
+    }
+
+    void cleanup() noexcept {
+        if (context.value) {
+            drain_execution_context(context, first_case);
+        }
+        context = {};
+        // libllama frees the model's buffers before it reports the model unloaded (llama_model's destructor).
+        if (weight_buffer) {
+            ggml_backend_buffer_free(weight_buffer);
+            weight_buffer = nullptr;
+        }
+        if (weight_ctx) {
+            ggml_free(weight_ctx);
+            weight_ctx = nullptr;
+        }
+        gate = {};
+        if (model.model_id) {
+            (void) ggml_backend_sycl_model_unloaded_token(model);
+            model = {};
+        } else if (load_open) {
+            (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
+            load_open = false;
+        }
+        if (backend) {
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+        ggml_sycl_q1_nvfp4_test_cap_device_expert_groups(-1);
+    }
+
+    ~mixed_fixture() { cleanup(); }
+
+    mixed_fixture(const mixed_fixture &)             = delete;
+    mixed_fixture & operator=(const mixed_fixture &) = delete;
+};
+
+// One mixed batch through the production route. Every row matches the CPU oracle, the card rows from the device kernel
+// and the host rows from the host leg; a kernel that computed a host row from another expert fails, and so does one
+// that left a card row unwritten. The route takes the batch once, submits its host occurrences once, and names no
+// refusal. Afterwards the weight's pointer table holds a null slot for every host expert, a pointer for every card
+// expert a case selected, and still a null slot for a card expert no case on this fixture has selected yet.
+void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tokens, const expert_selector & select) {
+    const std::string at = " (type=" + std::string(ggml_type_name(mix.type)) + " ne11=" + std::to_string(ne11) +
+                           " tokens=" + std::to_string(tokens) + ")";
+    std::vector<float> oracle;
+    size_t             count = 0;
+    auto   c = make_graph(mix.backend, mix.type, ne11, oracle, count, input_rows::DENSE, tokens, ids_layout::PACKED,
+                          &mix.gate, select);
+    size_t host_occurrences = 0;
+    std::vector<bool> selected(route_experts, false);
+    for (int token = 0; token < tokens; ++token) {
+        for (int slot = 0; slot < route_top_k; ++slot) {
+            const int32_t expert = select(token, slot);
+            selected[expert]     = true;
+            host_occurrences += mix.on_host(expert) ? 1 : 0;
+        }
+    }
+    const size_t occurrences = static_cast<size_t>(tokens) * route_top_k;
+    require(host_occurrences > 0 && host_occurrences < occurrences, ("the case's ids are not mixed" + at).c_str());
+
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope(name + at, before);
+    const size_t     log_from = refusal_log_size();
+    require_stages(ggml_backend_graph_compute(mix.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "mixed graph compute failed" + at + "; refusal lines: [" + refusal_log_since(log_from) + "]",
+                   before);
+    ggml_backend_synchronize(mix.backend);
+    std::vector<float> got(count);
+    ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
+    for (size_t i = 0; i < count; ++i) {
+        const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
+        if (!(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance)) {
+            const size_t  occurrence = i / gate_output_n;
+            const int32_t expert =
+                select(static_cast<int>(occurrence / route_top_k), static_cast<int>(occurrence % route_top_k));
+            fail_stages("CPU oracle mismatch" + at + " at " + std::to_string(i) + " (occurrence " +
+                            std::to_string(occurrence) + ", expert " + std::to_string(expert) + " on the " +
+                            (mix.on_host(expert) ? "host" : "card") + "): got " + std::to_string(got[i]) +
+                            ", expected " + std::to_string(oracle[i]),
+                        before);
+        }
+    }
+    require_ids_unchanged(c, at, before);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.candidate == before.candidate + 1 && after.admit == before.admit + 1 &&
+                       after.submit == before.submit + 1 && after.terminal == before.terminal + 1 &&
+                       after.recycle == before.recycle + 1,
+                   "the direct route did not take the mixed batch once" + at, before);
+    require_stages(after.host_submit == before.host_submit + 1 &&
+                       after.host_occurrences == before.host_occurrences + host_occurrences,
+                   "the host leg did not submit the batch's " + std::to_string(host_occurrences) +
+                       " host occurrences once" + at + ": host_submit=+" +
+                       std::to_string(after.host_submit - before.host_submit) + " host_occurrences=+" +
+                       std::to_string(after.host_occurrences - before.host_occurrences),
+                   before);
+    const std::string refusals = refusal_log_since(log_from);
+    require_stages(refusals.empty(), "a refusal was named for a mixed batch" + at + ": [" + refusals + "]", before);
+
+    const void * slots[route_experts] = {};
+    require_stages(ggml_sycl_q1_nvfp4_test_read_expert_table(mix.backend, mix.gate.tensor, route_experts, slots),
+                   "the weight has no expert pointer table on the card" + at, before);
+    for (int expert = 0; expert < route_experts; ++expert) {
+        const bool card    = !mix.on_host(expert);
+        const bool written = card && (selected[expert] || mix.slot_written[expert]);
+        if (written != (slots[expert] != nullptr)) {
+            fail_stages(
+                "expert " + std::to_string(expert) + "'s table slot is " + (slots[expert] ? "a pointer" : "null") +
+                    " although the expert is " +
+                    (card ? (written ? "on the card and selected" : "on the card and never selected") : "on the host") +
+                    at,
+                before);
+        }
+        mix.slot_written[expert] = written;
+    }
+    report_pass(name, mix.type, ne11, input_rows::DENSE, route_authorization::PRODUCTION, tokens);
+}
+
+// The three mixes a node meets, on one fixture per type: a decode whose occurrences are all host but one, run first so
+// the card expert it leaves unselected has a slot nothing has written; a decode with one host occurrence; and prompts
+// whose tokens mix differently, all on the card, all on the host and each mix between.
+void mixed_cases(ggml_type type) {
+    mixed_fixture mix(type);
+    const int32_t card0 = mix.card_experts.front(), card1 = mix.card_experts.back();
+    const int32_t host0 = mix.host_experts.front(), host1 = mix.host_experts.back();
+    mixed_case(mix, "mixed_decode_all_but_one_host", 1, 1, [=](int, int slot) {
+        return slot == 1 ? card0 : slot == 0 ? host0 : host1;
+    });
+    mixed_case(mix, "mixed_decode_one_host", route_top_k, 1, [=](int, int slot) {
+        return slot == 1 ? host0 : slot == 0 ? card0 : card1;
+    });
+    // token % 8 walks every card/host choice of the three slots; token / 8 moves through each set's experts.
+    const auto prompt = [card = mix.card_experts, host = mix.host_experts](int token, int slot) {
+        const auto & set = ((token >> slot) & 1) != 0 ? host : card;
+        return set[static_cast<size_t>(token / 8 + slot) % set.size()];
+    };
+    for (const int ne11 : { 1, route_top_k }) {
+        mixed_case(mix, "mixed_prompt", ne11, 33, prompt);
+    }
+}
+
+// A task the host recipe refuses inside the job, after admission (the HOST_JOB failpoint: a correct build's check
+// before admission rules it out). The job names the task on an ERROR line and throws, the join's host task rethrows
+// into the stream, and the graph fails at its boundary as an asynchronous failure does: the route took the batch once,
+// the completion task still released the finished bundle, the failed graph does not keep the device, and the context
+// refuses its next graph. The fixture's teardown then drains the failed context.
+void mixed_host_job_failure_case(ggml_type type) {
+    mixed_fixture      mix(type);
+    const int32_t      card0 = mix.card_experts.front();
+    const int32_t      host0 = mix.host_experts.front(), host1 = mix.host_experts.back();
+    std::vector<float> oracle;
+    size_t             count = 0;
+    const auto         ids   = [=](int, int slot) {
+        return slot == 1 ? card0 : slot == 0 ? host0 : host1;
+    };
+    auto c =
+        make_graph(mix.backend, mix.type, 1, oracle, count, input_rows::DENSE, 1, ids_layout::PACKED, &mix.gate, ids);
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const std::string                    at = " (type=" + std::string(ggml_type_name(type)) + ")";
+    const case_scope                     scope("mixed_host_job_failure" + at, before);
+    const size_t                         log_from       = refusal_log_size();
+    const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(mix.backend_device);
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_HOST_JOB);
+    const ggml_status status = ggml_backend_graph_compute(mix.backend, c.graph);
+    ggml_backend_synchronize(mix.backend);
+    require_stages(ggml_sycl_async_failure_since(failure_cursor),
+                   "the host job's refusal did not reach the graph boundary" + at +
+                       " (graph_compute status=" + std::to_string(static_cast<int>(status)) + ")",
+                   before);
+    // Occurrence 0 is host0's, the job's first task, which the failpoint refuses.
+    const std::string expected_line = std::string("[MOE-HOST-JOB] tensor=") + mix.gate.tensor->name +
+                                      " route=direct step=host_job occurrence=0 reason=recipe_mismatch";
+    const std::string lines = refusal_log_since(log_from);
+    require_stages(lines.find(expected_line) != std::string::npos,
+                   "the host job's refusal was not named" + at + ": want [" + expected_line + "], got [" + lines + "]",
+                   before);
+    ggml_sycl_execution_snapshot failed{};
+    require_stages(ggml_backend_sycl_execution_context_extract(mix.context, &failed) == GGML_SYCL_EXECUTION_OK,
+                   "failure context snapshot unavailable" + at, before);
+    require_stages(failed.invocation_id.value == 0 && failed.busy_device_count == 0,
+                   "the failed graph still owns the device" + at +
+                       " (invocation=" + std::to_string(failed.invocation_id.value) +
+                       " graph_state=" + std::to_string(static_cast<int>(failed.graph_state)) +
+                       " busy_devices=" + std::to_string(failed.busy_device_count) + ")",
+                   before);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.candidate == before.candidate + 1 &&
+                       after.admit == before.admit + 1 && after.submit == before.submit + 1 &&
+                       after.host_submit == before.host_submit + 1,
+                   "the failpoint did not reach exactly one submitted host leg" + at, before);
+    require_stages(after.recycle == before.recycle + 1,
+                   "the completion task did not release the bundle of the failed host leg" + at, before);
+    require_stages(ggml_backend_graph_compute(mix.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "a graph after the host job's refusal was computed" + at, before);
+    ggml_sycl_q1_nvfp4_test_counters refused{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&refused);
+    require_stages(refused.candidate == after.candidate && refused.submit == after.submit,
+                   "the refused graph reached the route" + at, before);
+    report_pass("mixed_host_job_failure", type, 1, input_rows::DENSE, route_authorization::PRODUCTION, 1);
+}
 } // namespace
 
 int main() {
     g_previous_terminate = std::set_terminate(report_terminate);
     ggml_log_set(capture_log, nullptr);
+    // The probe is the one place a SYCL exception means this environment has no usable GPU. Past it, any exception is
+    // a failure of what the test runs, and is reported as one.
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
         if (!have_gpu) { std::cerr << "SKIP: no usable SYCL GPU\n"; return LLAMA_TEST_EXIT_SKIP; }
+    } catch (const sycl::exception & e) {
+        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    try {
         { lifecycle_fixture life; graph_churn_regression(life, GGML_TYPE_Q1_0, 1);
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
@@ -1191,13 +1641,19 @@ int main() {
             }
             require_clean_teardown();
         }
+        for (const ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+            mixed_cases(type);
+            require_clean_teardown();
+        }
+        mixed_host_job_failure_case(GGML_TYPE_Q1_0);
+        require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
         std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';
         return LLAMA_TEST_EXIT_SKIP;
     } catch (const sycl::exception & e) {
-        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
-        return LLAMA_TEST_EXIT_SKIP;
+        std::cerr << "FAIL: SYCL exception after the device probe: " << e.what() << '\n';
+        return 1;
     } catch (const std::exception & e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

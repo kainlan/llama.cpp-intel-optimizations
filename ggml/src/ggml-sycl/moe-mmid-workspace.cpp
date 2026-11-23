@@ -1523,21 +1523,31 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     }
 
     const auto & bindings = authority->occurrences;
+    // The bindings are the occurrences this device runs, a subset of the batch's tokens * top_k when the batch mixes
+    // card and host experts; the workspace is sized for the whole batch either way.
+    size_t       occurrence_limit = 0;
     if (!authority->token.valid() || authority->submit_device < 0 || !bindings || bindings->empty() ||
         !authority->table || request.shape.top_k == 0 || request.shape.ne11 == 0 || request.shape.K <= 0 ||
-        request.shape.N <= 0 || request.shape.type < 0 || authority->owners.empty() ||
-        authority->owners.size() > execution::max_devices || bindings->size() % request.shape.top_k != 0 ||
-        authority->queues.size() != authority->owners.size() ||
-        authority->submissions.size() != authority->owners.size()) return out;
+        request.shape.N <= 0 || request.shape.type < 0 || request.shape.tokens == 0 ||
+        !checked_mul(request.shape.tokens, request.shape.top_k, &occurrence_limit) || occurrence_limit > UINT32_MAX ||
+        bindings->size() > occurrence_limit || authority->owners.empty() ||
+        authority->owners.size() > execution::max_devices || authority->queues.size() != authority->owners.size() ||
+        authority->submissions.size() != authority->owners.size()) {
+        return out;
+    }
 
     uint64_t digest = 1469598103934665603ULL;
     auto mix = [&](uint64_t value) { digest = (digest ^ value) * 1099511628211ULL; };
+    size_t   previous_occurrence = 0;
     for (size_t i = 0; i < bindings->size(); ++i) {
         const auto & binding = bindings->at(i); const auto & id = binding.identity;
         if (id.allocation_id == 0 || id.generation == 0 || id.layout_id == 0 || id.device < 0 || id.byte_size == 0 ||
-            id.occurrence != i || id.byte_offset > binding.owner.extent() ||
-            id.byte_size > binding.owner.extent() - id.byte_offset || id.allocation_id != binding.owner.allocation_id() ||
-            id.generation != binding.owner.generation() || id.device != binding.owner.device()) return out;
+            id.occurrence >= occurrence_limit || (i > 0 && id.occurrence <= previous_occurrence) ||
+            id.byte_offset > binding.owner.extent() || id.byte_size > binding.owner.extent() - id.byte_offset ||
+            id.allocation_id != binding.owner.allocation_id() || id.generation != binding.owner.generation() ||
+            id.device != binding.owner.device()) {
+            return out;
+        }
         bool retained = false;
         for (const auto & entry : authority->table->entries())
             retained |= entry.allocation_id() == id.allocation_id && entry.generation() == id.generation &&
@@ -1556,6 +1566,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
         }
         mix(id.allocation_id); mix(id.generation); mix(id.layout_id); mix(static_cast<uint64_t>(id.device));
         mix(id.byte_offset); mix(id.byte_size); mix(id.occurrence);
+        previous_occurrence = id.occurrence;
     }
 
     std::shared_ptr<registry_context> context;
@@ -1572,7 +1583,8 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     if (!context || context->pools.size() != authority->owners.size() || context->queues.size() != authority->queues.size())
         return out;
 
-    const size_t capacity = bindings->size() / request.shape.top_k;
+    const size_t capacity = request.shape.tokens;
+
     std::array<moe_mmid_workspace_geometry, execution::max_devices> geometry{};
     for (size_t r = 0; r < authority->owners.size(); ++r) {
         const auto & wanted = authority->owners[r]; const auto & queue = authority->queues[r];

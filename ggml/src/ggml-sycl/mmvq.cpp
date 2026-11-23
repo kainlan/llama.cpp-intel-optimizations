@@ -2301,6 +2301,17 @@ template <int qtype> class mmvq_reorder_kernel_name;
 template <int qtype> class mmvq_reorder_slm_kernel_name;
 template <int qtype> class mmvq_coalesced_kernel_name;
 template <int qtype> class mmvq_id_kernel_name;
+// The admitted adapter's instantiation of mul_mat_vec_q_id, which checks each id against the expert pointer table
+// before it reads through the slot. Its own name keeps the image every other caller runs unchanged.
+template <int qtype> class mmvq_id_checked_kernel_name;
+
+// Whether mul_mat_vec_q_id checks an id against the pointer table, chosen at compile time. A mixed card-and-host batch
+// hands the kernel all of its ids while the table holds only its card experts: a host expert's slot is null.
+struct mmvq_id_expert_slots_unchecked {};
+
+struct mmvq_id_expert_slots_checked {
+    int n_slots;
+};
 
 // SoA MMVQ kernel template
 // Note: total_nrows is the full tensor row count (ne01), used for SoA offset calculations
@@ -2878,25 +2889,31 @@ static void mul_mat_vec_q(const void * __restrict__ vx,
 // Handles 2D iteration: (iid1, id) over tokens and expert selections
 // For MUL_MAT_ID: reads ids[iid1][id] to determine which expert weights to use
 // This allows GPU-side expert routing without host sync
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
+template <int qk,
+          int qi,
+          typename block_q_t,
+          int              vdr,
+          vec_dot_q_sycl_t vec_dot_q_sycl,
+          typename slots_t = mmvq_id_expert_slots_unchecked>
 static void mul_mat_vec_q_id(const void * __restrict__ vx,
                              const void * const * __restrict__ expert_ptrs,
                              const void * __restrict__ vy,
                              float * __restrict__ dst,
                              const int32_t * __restrict__ ids,
-                             const int                ncols,
-                             const int                nrows_per_expert,
-                             const int                n_ids,
-                             const int                n_tokens,
-                             const int                ne11,
-                             const int64_t            stride_expert_x,
-                             const int64_t            ids_nb0,
-                             const int64_t            ids_nb1,
-                             const int64_t            nb11,
-                             const int64_t            nb12,
-                             const int64_t            nb1,
-                             const int64_t            nb2,
-                             const sycl::nd_item<3> & item_ct1) {
+                             const int                      ncols,
+                             const int                      nrows_per_expert,
+                             const int                      n_ids,
+                             const int                      n_tokens,
+                             const int                      ne11,
+                             const int64_t                  stride_expert_x,
+                             const int64_t                  ids_nb0,
+                             const int64_t                  ids_nb1,
+                             const int64_t                  nb11,
+                             const int64_t                  nb12,
+                             const int64_t                  nb1,
+                             const int64_t                  nb2,
+                             const sycl::nd_item<3> &       item_ct1,
+                             [[maybe_unused]] const slots_t slots = {}) {
     // batch_idx from block.y dimension (linearized over id * n_tokens + iid1)
     const int batch_idx = item_ct1.get_group(1);
     // row within expert from block.z dimension
@@ -2926,6 +2943,22 @@ static void mul_mat_vec_q_id(const void * __restrict__ vx,
     constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
 
     assert(blocks_per_warp > 0);
+
+    if constexpr (std::is_same_v<slots_t, mmvq_id_expert_slots_checked>) {
+        // The work-group shares batch_idx, so every lane leaves here together, before the reduction. A negative id is
+        // ggml's skip and its row is zero. An id past the table or a null slot is an expert this card does not hold (a
+        // mixed batch's host occurrence, whose rows the host leg writes over afterwards): its row is quiet NaN, so a
+        // row nothing overwrites cannot pass for a result. The row is stored as bits, so no floating-point model can
+        // fold the NaN away.
+        if (expert_id < 0 || expert_id >= slots.n_slots || expert_ptrs[expert_id] == nullptr) {
+            if (item_ct1.get_local_id(2) == 0) {
+                auto * dst_bits = (uint32_t *) ((char *) dst + i1 * nb1 + i2 * nb2);
+                dst_bits[row]   = expert_id < 0 ? sycl::bit_cast<uint32_t>(0.0f) :
+                                                  sycl::bit_cast<uint32_t>(std::numeric_limits<float>::quiet_NaN());
+            }
+            return;
+        }
+    }
 
     // Expert weights: from pointer table when provided, else stride-based
     const block_q_t * x = nullptr;
@@ -23370,7 +23403,13 @@ static sycl::event mmvq_submit_aos_impl(sycl::queue &                    q,
     });
 }
 
-template <int qtype, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot>
+template <int qtype,
+          int qk,
+          int qi,
+          typename block_q_t,
+          int              vdr,
+          vec_dot_q_sycl_t vec_dot,
+          typename slots_t = mmvq_id_expert_slots_unchecked>
 static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
                                            const void * const *             expert_ptrs_device,
                                            const void *                     y_q8_1,
@@ -23389,7 +23428,8 @@ static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
                                            int64_t                          dst_nb1,
                                            int64_t                          dst_nb2,
                                            const std::vector<sycl::event> * deps,
-                                           const sycl::event *              dependency) {
+                                           const sycl::event *              dependency,
+                                           [[maybe_unused]] const slots_t   slots = {}) {
     constexpr int rows_per_group = GGML_SYCL_MOE_MMV_Y;
     static_assert(rows_per_group * WARP_SIZE <= 1024, "MMVQ-ID work-group exceeds SYCL limit");
     const int            block_num_z = ceil_div(nrows_per_expert, rows_per_group);
@@ -23409,13 +23449,23 @@ static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
             } else if (deps && !deps->empty()) {
                 cgh.depends_on(*deps);
             }
-            cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
-                sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot>(
-                        nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids, n_tokens,
-                        ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item);
-                });
+            if constexpr (std::is_same_v<slots_t, mmvq_id_expert_slots_checked>) {
+                cgh.parallel_for<mmvq_id_checked_kernel_name<qtype>>(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot, slots_t>(
+                            nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids,
+                            n_tokens, ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item, slots);
+                    });
+            } else {
+                cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot>(
+                            nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids,
+                            n_tokens, ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item);
+                    });
+            }
         });
     });
 }
@@ -23721,24 +23771,29 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  int64_t              q8_nb12,
                                  int64_t              dst_nb1,
                                  int64_t              dst_nb2,
+                                 int                  n_expert_slots,
                                  const sycl::event &  dependency,
                                  sycl::event *        event_out) {
     if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !y_q8_1 || !ids_device || !dst || ncols <= 0 ||
         nrows_per_expert <= 0 || !mmvq_q1_nvfp4_aos_id_batch_shape_valid(total_batches, n_ids, n_tokens) || ne11 <= 0 ||
-        ids_nb0 <= 0 || ids_nb1 <= 0 || q8_nb11 <= 0 || q8_nb12 <= 0 || dst_nb1 <= 0 || dst_nb2 <= 0) {
+        ids_nb0 <= 0 || ids_nb1 <= 0 || q8_nb11 <= 0 || q8_nb12 <= 0 || dst_nb1 <= 0 || dst_nb2 <= 0 ||
+        n_expert_slots <= 0) {
         return false;
     }
+    // The checked kernel: the table may hold only the batch's card experts, and the kernel reads every id.
     sycl::event event;
     if (weight_type == GGML_TYPE_Q1_0 && ncols % QK1_0 == 0) {
-        event =
-            mmvq_submit_aos_id_impl<GGML_TYPE_Q1_0, QK1_0, QI1_0, block_q1_0, VDR_Q1_0_Q8_1_MMVQ, vec_dot_q1_0_q8_1>(
-                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
-                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, nullptr, &dependency);
+        event = mmvq_submit_aos_id_impl<GGML_TYPE_Q1_0, QK1_0, QI1_0, block_q1_0, VDR_Q1_0_Q8_1_MMVQ, vec_dot_q1_0_q8_1,
+                                        mmvq_id_expert_slots_checked>(
+            q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+            ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, nullptr, &dependency,
+            mmvq_id_expert_slots_checked{ n_expert_slots });
     } else if (weight_type == GGML_TYPE_NVFP4 && ncols % QK_NVFP4 == 0) {
         event = mmvq_submit_aos_id_impl<GGML_TYPE_NVFP4, QK_NVFP4, QI_NVFP4, block_nvfp4, VDR_NVFP4_Q8_1_MMVQ,
-                                        vec_dot_nvfp4_q8_1>(
+                                        vec_dot_nvfp4_q8_1, mmvq_id_expert_slots_checked>(
             q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
-            ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, nullptr, &dependency);
+            ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, nullptr, &dependency,
+            mmvq_id_expert_slots_checked{ n_expert_slots });
     } else {
         return false;
     }
@@ -23885,7 +23940,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32, ncols,
         nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1,
         static_cast<int64_t>(q8_row_bytes), static_cast<int64_t>(q8_nb12), static_cast<int64_t>(dst_nb1),
-        static_cast<int64_t>(dst_nb2), quant_event, event_out);
+        static_cast<int64_t>(dst_nb2), n_experts, quant_event, event_out);
 }
 
 sycl::event mmvq_submit_quantize_q8_1_soa(sycl::queue &                    q,

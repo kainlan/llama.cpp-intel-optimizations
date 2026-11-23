@@ -69,7 +69,9 @@ THE CONTRACT.  With comments and string literals blanked:
       the word before it releases the owner, so no waiter's load can follow the release.  The compare is the signed
       32-bit distance (the modulo-2^32 invariant is stated beside it).  The wait reports a slow wait at most once,
       through the word's slow, once it has yielded for slow_after; the arm installs the cache's reporter, which only
-      logs.  The device task depends on the job's inputs, then fences (release, system scope) before it stores the
+      logs.  The wait may be handed a let-go flag (a mixed direct node's host leg sets it as the leg goes), which it
+      reads with an atomic load inside its loop and returns on.  The device task depends on the job's inputs, then
+      fences (release, system scope) before it stores the
       serial.  The arm takes the cache's marker mutex first and releases it once in the submit's catch, which ends in
       `return false;`, and once on the way out, after it records the serial; after either release it touches no marker
       member, and only after one does it log: the word's creation, once after each release, through
@@ -304,7 +306,7 @@ REFUSAL_WARN = "its input marker was not armed (%s)"
 HELPERS = {
     "cpu_job_input_marker_wait": (r"inline\s+void\s+cpu_job_input_marker_wait\s*\(([^)]*)\)\s*\{",
                                   {"cpu_job_input_marker_seen", "cpu_job_input_marker_pause", "yield", "now", "slow",
-                                   "count"}),
+                                   "count", "load"}),
     "cpu_job_input_marker_seen": (r"inline\s+bool\s+cpu_job_input_marker_seen\s*\(([^)]*)\)\s*\{",
                                   {"armed", "fetch_add", "load", "__atomic_load_n", "cpu_job_input_marker_reached",
                                    "fetch_sub"}),

@@ -328,7 +328,9 @@ def gate23(files, bad):
 # --------------------------------------------------------------------------------------
 # MAIN 3 -> 4: moe_cpu_job_join_on_queue, the CPU expert job join; captures a std::shared_future
 # only (llama.cpp-z4kd).
-HOST_TASK_CENSUS = {CPUD: 10, MAIN: 4, DPCT: 2}
+# MAIN 4 -> 5: ggml_sycl_moe_direct_host_join, the join of a mixed Q1_0/NVFP4 batch's host leg; captures
+# its job's std::shared_future only.
+HOST_TASK_CENSUS = {CPUD: 10, MAIN: 5, DPCT: 2}
 FORBIDDEN_CAPTURE = ("managed_handle", "tp_handles", "data_handle", "find_tensor_storage_handle")
 
 

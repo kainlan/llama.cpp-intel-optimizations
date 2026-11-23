@@ -595,7 +595,10 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                  const std::vector<sycl::event> * deps      = nullptr,
                                  sycl::event *                    event_out = nullptr);
 
-// Allocation-free single-dependency overload used by admitted executors.
+// Allocation-free single-dependency overload used by admitted executors. Unlike the overload above, the table may hold
+// fewer than every selected expert: n_expert_slots is its length, and an id outside [0, n_expert_slots) or a null slot
+// is written as a quiet NaN row without reading through the slot (a negative id as a zero row). A mixed card-and-host
+// batch leaves its host experts' slots null and writes those rows afterwards.
 bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  ggml_type            weight_type,
                                  ggml_layout_mode     weight_layout,
@@ -615,6 +618,7 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  int64_t              q8_nb12,
                                  int64_t              dst_nb1,
                                  int64_t              dst_nb2,
+                                 int                  n_expert_slots,
                                  const sycl::event &  dependency,
                                  sycl::event *        event_out = nullptr);
 
@@ -669,7 +673,9 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
 // does not read it after returning. The wrapper quantizes into
 // buffers.activation_q8 after dependency, writes [token][top_k][N] to
 // buffers.output_f32, and returns the actual terminal kernel event. No
-// destination scatter is implied.
+// destination scatter is implied. The table holds n_experts slots, and a slot
+// may be null (an expert not on this card): that occurrence's rows are written
+// as quiet NaN without reading through the slot, for the caller to overwrite.
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,

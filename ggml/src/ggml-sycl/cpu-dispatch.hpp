@@ -152,6 +152,11 @@ struct cpu_moe_host_aos_task {
     size_t                          execution_rows  = 0;  // 0 means all admitted rows
 };
 
+// Every refusal ggml_sycl_cpu_moe_host_aos_execute can make, without running anything: a caller that must not refuse
+// once its job is queued asks this first, where it can still decline. The executor runs the same check first.
+bool ggml_sycl_cpu_moe_host_aos_check(const cpu_moe_host_aos_task &        task,
+                                      ggml_sycl::moe_batch_reject_reason * reject = nullptr);
+
 bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
                                         ggml_sycl::moe_batch_reject_reason * reject = nullptr);
 

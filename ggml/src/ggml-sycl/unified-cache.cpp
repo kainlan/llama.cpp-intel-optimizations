@@ -63,6 +63,18 @@
 #    include <unistd.h>
 #endif
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    include "tests/q1-nvfp4-production-route-test-seam.hpp"
+
+// The most routed-expert triplet groups a single-device pack puts on its device; -1 is no cap. The seam header says
+// why a mixed fixture needs it.
+static std::atomic<int> g_q1_nvfp4_test_device_expert_group_cap{ -1 };
+
+void ggml_sycl_q1_nvfp4_test_cap_device_expert_groups(int groups) {
+    g_q1_nvfp4_test_device_expert_group_cap.store(groups < 0 ? -1 : groups, std::memory_order_relaxed);
+}
+#endif
+
 namespace ggml_sycl {
 
 // moe-control-plan.hpp duplicates expert_tensor_role so it can stay free of
@@ -6126,15 +6138,10 @@ struct ext_alloc_tag_scope {
 
 // The arena-active mirror the raw exit reads lock-free: arena_base_ is a plain pointer the raw layer
 // cannot read without the cache's lock. Set where an arena is created and cleared where it is
-// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). arena_abandon runs
-// at shutdown with the SYCL context possibly gone, so the device lookup cannot be allowed to throw.
-void ext_alloc_note_arena_state(const sycl::queue & queue, bool active) {
-    int dev = -1;
-    try {
-        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
-    } catch (...) {
-        return;
-    }
+// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). `dev` is the cache's
+// device_id_, resolved while the cache was alive: arena_abandon runs in static destruction, after
+// dpct::dev_mgr (a function-local static built during main) is gone, so nothing here looks it up.
+void ext_alloc_note_arena_state(int dev, bool active) {
     if (dump_dev_valid(dev)) {
         dump_tbl().arena_active[dev].store(active, std::memory_order_release);
     }
@@ -6349,6 +6356,7 @@ unified_cache::unified_cache(sycl::queue & queue,
                              size_t        authority_base_mem,
                              bool          authority_resolved) :
     queue_(queue),
+    device_id_(ggml_sycl_get_device_id_from_queue(queue)),
     budget_(budget_bytes),
     base_budget_(budget_bytes),
     reserved_(0),
@@ -6401,7 +6409,7 @@ unified_cache::unified_cache(sycl::queue & queue,
 
     // Initialize layout pool for consolidating layout allocations into
     // contiguous chunks (reduces GPU TLB misses from scattered USM mappings).
-    layout_pool_ = std::make_unique<sycl_device_pool>(queue_, ggml_sycl_get_device_id_from_queue(queue_));
+    layout_pool_ = std::make_unique<sycl_device_pool>(queue_, device_id_);
 
     // VRAM Arena: pre-allocate a block when enabled.  Inventory-derived zone
     // sizes are not available during first backend init, so the same helper is
@@ -27611,7 +27619,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
-            ext_alloc_note_arena_state(queue, true);
+            ext_alloc_note_arena_state(device_id_, true);
 
             // Single-chunk zone layout:
             //   [KV→ ...free... ←WEIGHT] [ONEDNN] [RUNTIME] [SCRATCH]
@@ -27813,7 +27821,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_base_ = arena_chunks_.front().ptr;
     arena_size_ = alloc_size;
-    ext_alloc_note_arena_state(queue, true);
+    ext_alloc_note_arena_state(device_id_, true);
 
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
@@ -29122,7 +29130,7 @@ bool unified_cache::arena_destroy() {
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    ext_alloc_note_arena_state(queue_, false);
+    ext_alloc_note_arena_state(device_id_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -29288,7 +29296,7 @@ void unified_cache::arena_abandon() {
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    ext_alloc_note_arena_state(queue_, false);
+    ext_alloc_note_arena_state(device_id_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -34368,7 +34376,19 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 stats.incomplete_groups++;
             }
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+            // A mixed fixture needs a plan with experts on both the card and the host, and no real budget gives one
+            // for a synthetic expert of a few kilobytes: GGML_SYCL_RESIDENCY_FORCE_BUDGET_BYTES caps the residency
+            // evaluation (apply_forced_residency_budget), never this pack's `remaining`, and GGML_SYCL_VRAM_BUDGET_PCT
+            // moves `remaining` in steps of one percent of the card, about 160 MB on the B50 and 326 MB on the B70.
+            // The cap only stops the first-fit pack early; which groups land where is still the pack's decision.
+            const int  device_group_cap = g_q1_nvfp4_test_device_expert_group_cap.load(std::memory_order_relaxed);
+            const bool on_device =
+                group.charge_bytes <= remaining &&
+                (device_group_cap < 0 || stats.device_groups < static_cast<size_t>(device_group_cap));
+#else
             const bool on_device = group.charge_bytes <= remaining;
+#endif
             const int  target    = on_device ? device_id : -1;
             if (group.charge_bytes <= without_room) {
                 without_room -= group.charge_bytes;

@@ -236,7 +236,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "direct recipe retains exact queue capability":
             "normalized.recipe_queue_capability = *queue_capability",
         "direct admission consumes retained queue capability":
-            "queue_cap = direct_batch.operands.front().recipe_queue_capability",
+            "first_card->recipe_queue_capability()",
         # The operand's retained fields are read through accessors now (value-owned canonical entry).
         "fallback uses retained recipe kernel": "moe_route_kernel_name(operand.recipe().kernel)",
         "fallback uses retained recipe reason": "operand.recipe_reason() ? operand.recipe_reason()",
@@ -689,8 +689,8 @@ def direct_precondition(code: str) -> str:
     """The direct route's precondition with each named bool it tests replaced by that bool's expression, in
     parentheses. The condition tests one const bool per conjunct (test-sycl-moe-refusal-reason-source.py holds that
     shape); the claims here are about what each conjunct tests, which the expansion puts back in the condition."""
-    anchor = code.index("if (all_primary &&")
-    condition = parenthesized_after(code, "if (all_primary &&")
+    anchor = code.index("if (card_or_host &&")
+    condition = parenthesized_after(code, "if (card_or_host &&")
     declared = {}
     for m in re.finditer(r"\bconst bool (\w+) = ", code[:anchor]):
         depth, end = 0, m.end()
