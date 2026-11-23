@@ -45,9 +45,10 @@ void require(bool condition, const char * message) { if (!condition) throw std::
 
 // The backend's refusal lines, so a case can require that a refusal named its cause. Every log line still reaches
 // stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]), the direct route's host job's
-// ([MOE-HOST-JOB], logged on the job's thread), and the direct route's decline ([MOE-DIRECT-DECLINE]): that op runs on
+// ([MOE-HOST-JOB], logged on the job's thread), the direct route's decline ([MOE-DIRECT-DECLINE]; that op runs on
 // the retained route core, so it is no refusal, but a case that requires the direct route to take its batch fails on
-// it. Host tasks and jobs can log, so the text is guarded.
+// it), and a context bind's refusal of the MMID workspaces, which names the pool that was not served. Host tasks and
+// jobs can log, so the text is guarded.
 std::mutex  g_refusal_log_mutex;
 std::string g_refusal_log;
 
@@ -57,7 +58,8 @@ void capture_log(ggml_log_level, const char * text, void *) {
     }
     std::fputs(text, stderr);
     if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr ||
-        std::strstr(text, "[MOE-DIRECT-DECLINE]") != nullptr) {
+        std::strstr(text, "[MOE-DIRECT-DECLINE]") != nullptr ||
+        std::strstr(text, "MoE MMID workspace materialization refused") != nullptr) {
         const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
         g_refusal_log += text;
     }
@@ -311,7 +313,6 @@ struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     int backend_device = -1;  // the registry device `backend` was created for
     std::vector<ggml_backend_t> retained_backends;
-    ggml_backend_buffer_t       unplanned_host_weights = nullptr;  // the deferred order's host weights no plan sized
     ggml_sycl_load_txn load{};
     bool load_open = false;
     ggml_sycl_model_token model{};
@@ -430,9 +431,15 @@ struct lifecycle_fixture {
                                          std::to_string(static_cast<int>(commit_result)));
             }
             // A real model load ends before llama_context creates any backend: load_end finds no backend context
-            // for the owner device and defers the MMID workspaces to the context bind.
+            // for the owner device and defers the MMID workspaces to the context bind. Nothing else goes into WEIGHT
+            // before that bind, as after a load that maps its file: a load places SYCL_Host weights only while it is
+            // open, as the loader term its plan sizes, and one that maps its file places none. A SYCL_Host buffer
+            // allocated after load_end is a context's compute buffer and lands in SCRATCH, so it cannot stand for them.
+            weight_zone_reading before_bind{};
+            size_t              log_before_bind = 0;
             if (order == backend_order::AFTER_LOAD_END) {
-                place_unplanned_host_weights(plan, primary_device);
+                before_bind     = read_weight_zone(primary_device);
+                log_before_bind = refusal_log_size();
                 create_retained_backends();
             }
             require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
@@ -463,6 +470,8 @@ struct lifecycle_fixture {
                                                                         /*flash_attn_enabled=*/true) ==
                             GGML_SYCL_LIFECYCLE_OK,
                         "second model root bind failed");
+                require_host_pool_from_weight(before_bind, read_weight_zone(primary_device),
+                                              plan.moe_mmid_host_pool_bytes, log_before_bind);
             }
             if (authorization == route_authorization::TEST_SCOPE) {
                 require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
@@ -480,27 +489,45 @@ struct lifecycle_fixture {
         }
     }
 
-    // A real load also places host weights the plan never sized, through the SYCL host buffer type, and grows the
-    // WEIGHT host zone for them (Inkling: the plan places no host weight; the load grows WEIGHT from 64 MiB by twelve
-    // 2 GiB chunks). The MMID workspace host pool is a request that may not grow its zone, allocated from WEIGHT at
-    // the context bind, so the deferred order fills WEIGHT past its reservation first, the way such a load leaves it.
-    void place_unplanned_host_weights(const ggml_sycl::placement_plan & plan, int device) {
-        require(plan.moe_mmid_host_pool_bytes > 0, "the candidate plan has no MMID host pool to place");
+    // The WEIGHT host zone of a device at one moment. Zones are configured once per process and keep what earlier
+    // loads left, so the deferred order compares two readings rather than any one against the plan.
+    struct weight_zone_reading {
+        size_t reserved = 0;
+        size_t used     = 0;
+        size_t capacity = 0;
+    };
+
+    static weight_zone_reading read_weight_zone(int device) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(device);
         require(cache && cache->host_zones_configured(), "the primary device's host zones are not configured");
-        const size_t reserved = cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT);
-        const size_t used     = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
-        require(reserved > used, "the WEIGHT host zone is already past its reservation");
-        constexpr size_t past_reservation = 1024ull * 1024ull;
-        unplanned_host_weights =
-            ggml_backend_buft_alloc_buffer(ggml_backend_sycl_host_buffer_type(), reserved - used + past_reservation);
-        require(unplanned_host_weights != nullptr, "the unplanned host weight buffer was not allocated");
-        const size_t now_used = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
-        const size_t capacity = cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
-        require(now_used > reserved && capacity > reserved,
-                "the unplanned host weights did not grow the WEIGHT host zone past its reservation");
-        std::cerr << "unplanned host weights: WEIGHT used " << now_used << " of capacity " << capacity
-                  << ", reservation " << reserved << "; MMID host pool " << plan.moe_mmid_host_pool_bytes << " bytes\n";
+        return { cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT),
+                 cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT),
+                 cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT) };
+    }
+
+    // The MMID workspace host pool is a request that may not grow its zone, allocated from WEIGHT when the deferred
+    // order's context binds. Across the binds WEIGHT must not have grown, and its used bytes must have risen by at
+    // least the pool: the pool was served from WEIGHT. A pool the bind refused is named by its WARN, which the log
+    // capture keeps for the failure message.
+    static void require_host_pool_from_weight(const weight_zone_reading & before,
+                                              const weight_zone_reading & after,
+                                              size_t                      pool_bytes,
+                                              size_t                      log_from) {
+        std::cerr << "deferred bind: WEIGHT used " << before.used << " -> " << after.used << ", capacity "
+                  << before.capacity << " -> " << after.capacity << ", reservation " << after.reserved
+                  << "; MMID host pool " << pool_bytes << " bytes\n";
+        require(pool_bytes > 0, "the candidate plan has no MMID host pool");
+        if (after.capacity != before.capacity) {
+            throw std::runtime_error("the MMID host pool request grew the WEIGHT host zone from " +
+                                     std::to_string(before.capacity) + " to " + std::to_string(after.capacity) +
+                                     " bytes; refusal lines: [" + refusal_log_since(log_from) + "]");
+        }
+        if (after.used < before.used + pool_bytes) {
+            throw std::runtime_error("the MMID host pool was not served from the WEIGHT host zone: used rose by " +
+                                     std::to_string(after.used >= before.used ? after.used - before.used : 0) +
+                                     " bytes, the pool is " + std::to_string(pool_bytes) + "; refusal lines: [" +
+                                     refusal_log_since(log_from) + "]");
+        }
     }
 
     void cleanup() noexcept {
@@ -524,10 +551,6 @@ struct lifecycle_fixture {
             ggml_backend_free(*it);
         }
         retained_backends.clear();
-        if (unplanned_host_weights) {
-            ggml_backend_buffer_free(unplanned_host_weights);
-            unplanned_host_weights = nullptr;
-        }
         backend        = nullptr;
         backend_device = -1;
     }
