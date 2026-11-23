@@ -88,6 +88,36 @@ def dl_view_spelling_control():
     return "a();" in view and "b();" in view
 
 
+def non_dl_getter_fills_cpu_tables(source):
+    """In ggml_sycl_get_type_traits_cpu's non-DL branch, a once-only ggml_cpu_init() comes before ggml-cpu's table is
+    looked up and returned."""
+    body = re.search(r"ggml_sycl_get_type_traits_cpu\(enum ggml_type type\) noexcept \{(.*?)\n\}", source, re.S)
+    if not body:
+        return False
+    branch = re.search(r"#ifndef GGML_BACKEND_DL(.*?)#else", strip_comments(body.group(1)), re.S)
+    if not branch:
+        return False
+    code = branch.group(1)
+    init = re.search(r"static const bool \w+ = \(ggml_cpu_init\(\), true\);", code)
+    table = code.find("ggml_get_type_traits_cpu(type)")
+    return init is not None and table > init.end()
+
+
+def non_dl_getter_control():
+    """Controls for the check above, independent of the tree: the init before the lookup passes; the init after the
+    lookup, or only in a comment, fails."""
+    head = "const ggml_type_traits_cpu * ggml_sycl_get_type_traits_cpu(enum ggml_type type) noexcept {\n"
+    tail = "#else\n    return x;\n#endif\n}\n"
+    good = (head + "#ifndef GGML_BACKEND_DL\n    static const bool filled = (ggml_cpu_init(), true);\n"
+            "    return ggml_get_type_traits_cpu(type);\n" + tail)
+    after = (head + "#ifndef GGML_BACKEND_DL\n    const auto * t = ggml_get_type_traits_cpu(type);\n"
+             "    static const bool filled = (ggml_cpu_init(), true);\n    return t;\n" + tail)
+    commented = (head + "#ifndef GGML_BACKEND_DL\n    // static const bool filled = (ggml_cpu_init(), true);\n"
+                 "    return ggml_get_type_traits_cpu(type);\n" + tail)
+    return (non_dl_getter_fills_cpu_tables(good) and not non_dl_getter_fills_cpu_tables(after)
+            and not non_dl_getter_fills_cpu_tables(commented))
+
+
 sycl_dir_sources = [
     p.read_text(errors="replace") for p in sycl_dir.rglob("*")
     if p.suffix in (".cpp", ".hpp") and "tests" not in p.parts
@@ -97,9 +127,9 @@ module_sources_flat = "\n".join(strip_comments(text) for text in sycl_dir_source
 PROVIDER_FILES = ("cpu-traits-support.cpp", "cpu-traits-support.hpp")
 # Comment-blind call-site inventory of the private provider's wrapper, per consumer file. A new consumer, or
 # a consumer growing a call, is a deliberate edit here rather than a drifting literal total.
-# cpu-dispatch.cpp: 26 since ggml_sycl_cpu_moe_host_aos_check was split out of its executor, each asking for the type's
-# traits and its vec-dot traits.
-EXPECTED_PRIVATE_TRAIT_CALLS = {"cpu-dispatch.cpp": 26, "ggml-sycl.cpp": 8, "unified-cache.cpp": 1}
+# cpu-dispatch.cpp: 24. The host recipe's check (cpu_moe_host_aos_check_into) asks for the type's traits and its
+# vec-dot traits once, and its executor runs on what the check found rather than asking again.
+EXPECTED_PRIVATE_TRAIT_CALLS = {"cpu-dispatch.cpp": 24, "ggml-sycl.cpp": 8, "unified-cache.cpp": 1}
 private_trait_calls, raw_trait_calls = {}, {}
 for p in sorted(sycl_dir.rglob("*")):
     if p.suffix not in (".cpp", ".hpp") or "tests" in p.parts or p.name in PROVIDER_FILES:
@@ -126,6 +156,12 @@ checks = {
     "DL local/static optimized split": "#ifndef GGML_BACKEND_DL" in provider
         and "ggml_get_type_traits_cpu(type)" in provider
         and "#else\n    return ggml_sycl_get_baseline_type_traits_cpu(type);" in provider,
+    # ggml-cpu's table reads ggml-cpu's lookup tables, zeros until ggml_cpu_init(): in a process that drives the SYCL
+    # backend without the registry, every Q1_0/NVFP4 host dot returned exactly 0 (the numeric witness is the host
+    # executor case of test-sycl-moe-resolved-batch).
+    "the non-DL getter fills ggml-cpu's tables before it hands out ggml-cpu's table":
+        non_dl_getter_fills_cpu_tables(provider),
+    "the table-fill check fails an init after the lookup or in a comment": non_dl_getter_control(),
     "no CPU registry proc export": "ggml_backend_cpu_get_type_traits" not in cpu_cpp,
     "allocation-free packed vec dot": "std::array<float, k_vec_dot_tile>" in provider
         and "packed_value<Y>" in provider
