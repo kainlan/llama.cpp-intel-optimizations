@@ -78,8 +78,9 @@ bool moe_mmid_validate_workspace_geometry(const moe_mmid_workspace_geometry & ge
                                           bool secondary_owner) noexcept;
 bool moe_mmid_same_workspace_geometry(const moe_mmid_workspace_geometry & a,
                                       const moe_mmid_workspace_geometry & b) noexcept;
-// Does a slot of `available` geometry hold a request that needs `needed` (from moe_mmid_plan_workspace)? The one
-// field-by-field test admission makes; a route that refuses an oversize batch before admission asks the same question.
+// Does a slot of `available` geometry hold a request that needs `needed` (from moe_mmid_plan_workspace)? The
+// field-by-field test both admissions make (the legacy one also compares the descriptor and secondary byte counts
+// beside it); a route that refuses an oversize batch before admission asks the same question.
 bool moe_mmid_workspace_geometry_holds(const moe_mmid_workspace_geometry & available,
                                        const moe_mmid_workspace_geometry & needed) noexcept;
 bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & geometry,

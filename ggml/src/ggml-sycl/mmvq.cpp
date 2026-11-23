@@ -23858,7 +23858,9 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
     }
     // Slots are adjacent inside a token, and tokens do not overlap; a view's token stride may leave the other columns
     // of its source between them (build_moe_ffn hands MUL_MAT_ID the top-k view of the argsort). The alignment test
-    // above keeps the stride a whole number of ids, and ids_max_offset above is computed from these real strides.
+    // above keeps the stride a whole number of ids. ids_max_offset above is the farthest id's byte offset under these
+    // strides, and the only bound checked on it is PTRDIFF_MAX: the extent of the storage the view lies in is not
+    // passed here, so that the farthest id lies inside it rests on the caller handing over a real tensor's view.
     if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))) {
         return false;
     }
