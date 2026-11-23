@@ -436,7 +436,10 @@ copies the owners and any pending load: an admit's or a refill's device entry
 takes them from the host copy it withdraws, under the locks that re-check that
 copy; a loan's or an evict's host copy takes them from the device entry the
 loan retired, which the loan holds in place until its registrations return
-(`register_host_expert_owned`'s `moved_from`).
+(`register_host_expert_owned`'s `moved_from`). A registration whose
+`moved_from` entry is gone refuses, with one WARN naming the key, before it
+changes anything, so the loan's rollback puts the device entries back rather
+than publish a copy no model owns.
 
 **The swap driver** (`GGML_SYCL_MOE_SWAP=1`, opt-in) is the named move's one
 production caller. At each synchronize after a graph, behind the refill, it asks

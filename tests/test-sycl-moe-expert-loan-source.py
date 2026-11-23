@@ -1588,9 +1588,8 @@ REGISTER_BODY_SIG = ("bool unified_cache::register_host_expert(ggml_sycl_cache_i
                      "const mem_handle & typed_owner,")
 REGISTER_OWNED_SIG = "bool unified_cache::register_host_expert_owned("
 REGISTER_STAMP = "stamp_pending_owner(cache_entry, load_effect_guard);"
-REGISTER_INHERIT = ("if (moved_from) { const auto source = entries_.find(*moved_from); "
-                    "if (source != entries_.end()) { inherit_entry_ownership(cache_entry, source->second); "
-                    "mirror_pending_txn = cache_entry.pending_load_txn_id; } }")
+REGISTER_INHERIT = ("if (source) { inherit_entry_ownership(cache_entry, *source); "
+                    "mirror_pending_txn = cache_entry.pending_load_txn_id; }")
 REGISTER_INSERT = "entries_[cache_key] = cache_entry;"
 REGISTER_MIRROR_TXN = "entry.pending_load_txn_id = mirror_pending_txn;"
 LOAN_DEVICE_KEY = "out.device_keys[i] = device_key;"
@@ -1609,6 +1608,27 @@ def claim_a_moved_copy_belongs_to_its_sources_models(cache: str) -> bool:
             and ordered(reg, REGISTER_STAMP, REGISTER_INHERIT, REGISTER_INSERT, REGISTER_MIRROR_TXN)
             and owned.count(FORWARD) == 2
             and loan.count(REGISTER) == 1 and ordered(loan, LOAN_DEVICE_KEY, REGISTER))
+
+
+# A moved copy whose source entry is gone would be published owned by nobody, and a model teardown never reclaims an
+# untagged entry. The mover holds its source in place until its registrations return, so a missing source means the
+# move is not what it was checked to be: the registration looks the source up first, under its locks, and refuses with
+# one WARN that names the key, before it can erase an existing entry under the key, insert the copy or write its
+# mirror row. The loan's rollback then withdraws the copies it registered and puts the device entries back.
+REGISTER_SOURCE_FIND = ("const unified_cache_entry * source = nullptr; if (moved_from) { "
+                        "const auto found = entries_.find(*moved_from); if (found == entries_.end()) {")
+REGISTER_SOURCE_WARN = ('GGML_LOG_WARN("[UNIFIED-CACHE] register_host_expert refused model=%llu name_hash=0x%llx: '
+                        'the entry its moved copy replaces is gone\\n", (unsigned long long) key.model_id, '
+                        "(unsigned long long) key.name_hash);")
+REGISTER_SOURCE_REFUSE = "return false; } source = &found->second; }"
+REGISTER_OLD_ERASE = "erase_entry_locked(old);"
+
+
+def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
+    reg = body(norm(cache), REGISTER_BODY_SIG)
+    return (reg.count(REGISTER_SOURCE_FIND) == 1
+            and ordered(reg, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE, REGISTER_OLD_ERASE,
+                        REGISTER_INSERT, REGISTER_MIRROR_TXN))
 
 
 def test_loan_never_waits():
@@ -3533,6 +3553,18 @@ def test_mutant_owned_registration_drops_the_source_fails():
 def test_mutant_loan_names_no_source_fails():
     assert not claim_a_moved_copy_belongs_to_its_sources_models(
         _once(CACHE, REGISTER, REGISTER.replace(", &out.device_keys[i])", ", nullptr)")))
+
+
+# --- a missing source refuses before the insert -----------------------------------------------------------------------
+
+def test_a_missing_source_refuses_before_the_insert():
+    assert claim_a_missing_source_refuses_before_the_insert(CACHE)
+
+
+def test_mutant_missing_source_publishes_untagged_fails():
+    """The WARN without the refusal: the copy is inserted and mirrored owned by nobody, and outlives its model."""
+    assert not claim_a_missing_source_refuses_before_the_insert(
+        _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE, "} else { source = &found->second; } }"))
 
 
 if __name__ == "__main__":

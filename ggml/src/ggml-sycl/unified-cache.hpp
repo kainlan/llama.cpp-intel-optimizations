@@ -5026,7 +5026,8 @@ class unified_cache {
     // A non-null moved_from names the entry a move publishes this copy in
     // place of: a new entry takes that entry's model ownership, read under the
     // registration's locks, since the copy holds the same weight. The caller
-    // keeps that entry in place until the registration returns.
+    // keeps that entry in place until the registration returns; when it is
+    // gone, the registration refuses with one WARN before anything changes.
     bool register_host_expert_owned(ggml_sycl_cache_id        key,
                                     void *                    ptr,
                                     size_t                    size,
@@ -7840,7 +7841,8 @@ class unified_cache {
     // the entry's direct_alloc_owner. A non-null ready_event publishes the
     // entry IN_PROGRESS behind that event (the copy still filling it).
     // replace_existing = false refuses any key that already has an entry.
-    // A non-null moved_from gives a new entry that entry's model ownership.
+    // A non-null moved_from gives a new entry that entry's model ownership,
+    // and refuses the registration when that entry is gone.
     bool register_host_expert(ggml_sycl_cache_id        key,
                               void *                    ptr,
                               size_t                    size,

@@ -12594,6 +12594,22 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id        key,
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
+        // A host copy a move publishes in place of a device entry takes that entry's owners (below). The mover holds
+        // the entry in place until its registrations are done, so one that is gone means the move is not what it was
+        // checked to be. Refused before anything here changes: a copy published without its source's owners would
+        // belong to no model, and no model's teardown would reclaim it.
+        const unified_cache_entry * source = nullptr;
+        if (moved_from) {
+            const auto found = entries_.find(*moved_from);
+            if (found == entries_.end()) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] register_host_expert refused model=%llu name_hash=0x%llx: the entry "
+                    "its moved copy replaces is gone\n",
+                    (unsigned long long) key.model_id, (unsigned long long) key.name_hash);
+                return false;
+            }
+            source = &found->second;
+        }
         unified_cache_key   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
         unified_cache_entry cache_entry{};
         auto                old = entries_.find(cache_key);
@@ -12659,14 +12675,11 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id        key,
         cache_entry.non_owning_external_host = !allocation_owner;
         cache_entry.direct_alloc_owner       = typed_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
-        // A host copy a move publishes in place of a device entry belongs to that entry's models. The mover holds the
-        // retired entry in place until its registrations are done, so it is read here, under the locks.
-        if (moved_from) {
-            const auto source = entries_.find(*moved_from);
-            if (source != entries_.end()) {
-                inherit_entry_ownership(cache_entry, source->second);
-                mirror_pending_txn = cache_entry.pending_load_txn_id;
-            }
+        // The moved copy belongs to its source's models, read under the locks. The source is a device entry, never the
+        // host key registered here, so the erase of an existing entry under this key above left it in place.
+        if (source) {
+            inherit_entry_ownership(cache_entry, *source);
+            mirror_pending_txn = cache_entry.pending_load_txn_id;
         }
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
