@@ -2720,10 +2720,11 @@ inline std::string placement_plan_loader_pool_refusal(const placement_plan & pla
 // The loader pool's check once the host weights are placed: how far loader_device's WEIGHT zone grew, from `baseline`,
 // its capacity when the load decided the card's host zones (configured them, or found them configured by an earlier
 // load and kept them), to `capacity`, its capacity now, against the growth the plan recorded for the loader's buffers,
-// `terms.loader_grown` (the plan's commit terms on that device). The window also holds what else this load put in the
-// zone (upload buffers taken from SYCL_Host, the preload's host-weight blocks), which the plan sized the zone to hold
-// beside the loader's buffers. Returns one "[HOST-PLAN-BUG]" line naming the device and the planned, actual and excess
-// bytes when the zone grew past it, empty otherwise. A capacity at or below the baseline has not grown.
+// `terms.loader_grown` (the plan's commit terms on that device). The window also holds the preload's host-weight
+// blocks, which the plan's record holds beside the loader's buffers. It holds no upload buffers: the device reports
+// async off while the load guard is set, so the loader takes none from SYCL_Host and uploads each tensor whole.
+// Returns one "[HOST-PLAN-BUG]" line naming the device and the planned, actual and excess bytes when the zone grew
+// past it, empty otherwise. A capacity at or below the baseline has not grown.
 inline std::string host_zone_weight_growth_check(int                            device,
                                                  const host_zone_commit_terms & terms,
                                                  size_t                         baseline,

@@ -1377,10 +1377,12 @@ does for a host-planned expert with no owner. The limits:
   plan or kept as an earlier load left them, since the zones outlive the last
   model's release and an earlier load's growth is not this one's, to its
   capacity once the preload has placed the host weights. That window holds the
-  loader's buffers, any upload buffers the loader takes from `SYCL_Host`, and
-  the preload's host-weight blocks, so the check covers the whole WEIGHT
-  record, not the replay alone: the plan sizes the zone to hold the loader's
-  buffers as the replay places them, with the rest of the record beside them.
+  loader's buffers and the preload's host-weight blocks, so the check covers
+  the whole WEIGHT record, not the replay alone: the plan sizes the zone to
+  hold the loader's buffers as the replay places them, with the rest of the
+  record beside them. It holds no upload buffers: the device reports `async`
+  off while the load guard is set, so `load_all_data` takes none from
+  `SYCL_Host` and uploads each tensor whole with `set_tensor`.
   Growth past the record is a `[HOST-PLAN-BUG]` WARN naming the planned,
   actual and excess bytes. A check that passes says so at INFO, and a load
   whose late pass took no baseline says at WARN that the growth goes
