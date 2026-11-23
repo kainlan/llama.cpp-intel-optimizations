@@ -47112,7 +47112,8 @@ static void ggml_sycl_preload_model_weights() {
         // sized the zone to hold the loader's buffers as its replay places them (loader_zone, loader_grown), with the
         // rest of its record beside them. From the baseline the late pass took to now, after the host weights are
         // placed, the zone growing past loader_grown means the pool grew for bytes the plan did not place. A pass says
-        // so at INFO, so a log tells a pass from a load that never reached the check.
+        // so at INFO, and a check that cannot run (no baseline, no cache, no configured zones) at WARN, so a log tells
+        // a pass from a load that never reached the check.
         if (global_plan != nullptr && global_plan->loader_holds_weights && global_plan->loader_device >= 0) {
             const uint64_t model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
             const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->loader_device);
@@ -47127,16 +47128,18 @@ static void ggml_sycl_preload_model_weights() {
                 ggml_sycl::get_existing_unified_cache_for_device(global_plan->loader_device);
             size_t baseline = 0;
             if (loader_cache != nullptr && loader_cache->host_zones_configured()) {
+                // One reading, so the figure the check judges is the figure the pass line prints: the capacity is
+                // read without the pool's lock, and a second read could see a later grow.
+                const size_t capacity = loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
                 if (ggml_sycl_model_host_weight_baseline(model_id, global_plan->loader_device, &baseline)) {
                     const std::string growth_bug = ggml_sycl::host_zone_weight_growth_check(
                         global_plan->loader_device,
                         ggml_sycl::placement_plan_host_zone_commit_terms_on_device(
                             *global_plan, global_plan->host_zone_terms, global_plan->loader_device),
-                        baseline, loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT));
+                        baseline, capacity);
                     if (!growth_bug.empty()) {
                         GGML_LOG_WARN("%s\n", growth_bug.c_str());
                     } else {
-                        const size_t capacity = loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
                         GGML_LOG_INFO(
                             "[HOST-PLAN] device=%d loader pool check passed: the WEIGHT zone grew %zu B from its "
                             "baseline %zu B, within the plan's loader_grown %zu B\n",
@@ -47150,6 +47153,13 @@ static void ggml_sycl_preload_model_weights() {
                         "unchecked\n",
                         global_plan->loader_device);
                 }
+            } else {
+                GGML_LOG_WARN(
+                    "[HOST-PLAN] device=%d loader pool check skipped: %s at the preload, so the WEIGHT zone's growth "
+                    "goes unchecked\n",
+                    global_plan->loader_device,
+                    loader_cache == nullptr ? "the device has no unified cache" :
+                                              "the device's host zones are not configured");
             }
         }
 

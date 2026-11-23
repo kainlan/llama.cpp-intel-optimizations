@@ -1384,9 +1384,12 @@ does for a host-planned expert with no owner. The limits:
   off while the load guard is set, so `load_all_data` takes none from
   `SYCL_Host` and uploads each tensor whole with `set_tensor`.
   Growth past the record is a `[HOST-PLAN-BUG]` WARN naming the planned,
-  actual and excess bytes. A check that passes says so at INFO, and a load
-  whose late pass took no baseline says at WARN that the growth goes
-  unchecked.
+  actual and excess bytes. The capacity is read once, so the check and its
+  pass line see one figure. A check that passes says so at INFO. A load whose
+  late pass took no baseline, or whose `loader_device` has no cache or no
+  configured host zones at the preload, says at WARN that the growth goes
+  unchecked (`loader pool check has no WEIGHT zone baseline`, `loader pool
+  check skipped`).
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),
