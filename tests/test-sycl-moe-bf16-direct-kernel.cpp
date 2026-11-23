@@ -52,6 +52,7 @@ struct kernel_case {
     int64_t      ids_stride;         // int32 elements between two slots of one token
     int64_t      misaligned_expert;  // expert whose base sits 2 bytes off an 8-byte boundary, -1 for none
     bool         bad_slots;          // token 0 carries -1, out-of-range and null-entry slots; the last entry is null
+    int64_t      tokens_per_launch;  // > 0 lowers the launch limit so the dispatch runs in chunks of this many tokens
 };
 
 // Guard floats on both sides of the output; poisoned so a stray write is detected.
@@ -152,6 +153,16 @@ static void run_one(sycl::queue & q, const kernel_case & c) {
     shape.ids_nb1   = ids_nb1;
     shape.dst_nb1   = dst_nb1;
     shape.dst_nb2   = dst_nb2;
+    if (c.tokens_per_launch > 0) {
+        // Room for tokens_per_launch tokens and half of one more, so the limit is not a whole number of tokens. One
+        // token is n_slots x ceil(rows / 4) x 64 work-items, the geometry the header states.
+        const size_t per_token = static_cast<size_t>(c.n_slots) * static_cast<size_t>((c.rows + 3) / 4) * 64;
+        shape.max_launch_items = static_cast<size_t>(c.tokens_per_launch) * per_token + per_token / 2;
+    }
+    const int64_t per_launch = ggml_sycl::moe_bf16_direct_tokens_per_launch(shape);
+    CHECK(per_launch == (c.tokens_per_launch > 0 ? c.tokens_per_launch : c.n_tokens),
+          "%s: %lld tokens per launch, want %lld", c.name, (long long) per_launch,
+          (long long) (c.tokens_per_launch > 0 ? c.tokens_per_launch : c.n_tokens));
 
     const float * x_base = x_dev + c.src1_offset;
     float *       y_base = y_dev + GUARD;
@@ -262,10 +273,12 @@ static void run_one(sycl::queue & q, const kernel_case & c) {
         CHECK(zero_rows >= 1 && nan_rows >= 3, "%s: the bad-slot case did not exercise -1 and three NaN slots", c.name);
     }
     CHECK(bad == 0, "%s: %d bad outputs", c.name, bad);
-    std::printf("  %-38s k=%-5lld rows=%-4lld experts=%-3lld slots=%lld tokens=%lld vec4=%d max_rel_err=%.3g %s\n",
-                c.name, (long long) c.k, (long long) c.rows, (long long) c.n_experts, (long long) c.n_slots,
-                (long long) c.n_tokens, ggml_sycl::moe_bf16_direct_vec4(shape) ? 1 : 0, max_err,
-                bad == 0 ? "ok" : "BAD");
+    std::printf(
+        "  %-38s k=%-5lld rows=%-4lld experts=%-3lld slots=%lld tokens=%lld per_launch=%lld vec4=%d max_rel_err=%.3g "
+        "%s\n",
+        c.name, (long long) c.k, (long long) c.rows, (long long) c.n_experts, (long long) c.n_slots,
+        (long long) c.n_tokens, (long long) per_launch, ggml_sycl::moe_bf16_direct_vec4(shape) ? 1 : 0, max_err,
+        bad == 0 ? "ok" : "BAD");
 
     sycl::free(w_dev, q);
     sycl::free(x_dev, q);
@@ -314,6 +327,16 @@ static void check_refusals(sycl::queue & q) {
     bad.n_slots = 0;
     CHECK(!ggml_sycl::moe_bf16_direct_submit(q, table, x, ids, y, bad, &ev), "n_slots=0 was accepted");
 
+    // The launch limit: one token here is 2 slots x ceil(4 rows / 4) x 64 = 128 work-items. A limit of exactly one
+    // token runs a token per launch; one work-item less cannot be chunked at all, so the dispatch is refused.
+    bad                  = shape;
+    bad.max_launch_items = 128;
+    CHECK(ggml_sycl::moe_bf16_direct_tokens_per_launch(bad) == 1, "a one-token limit did not take one token a launch");
+    bad.max_launch_items = 127;
+    CHECK(ggml_sycl::moe_bf16_direct_tokens_per_launch(bad) == 0, "a limit below one token still planned a launch");
+    CHECK(!ggml_sycl::moe_bf16_direct_submit(q, table, x, ids, y, bad, &ev),
+          "a dispatch whose one token exceeds the launch limit was accepted");
+
     // The vec4 form: k a multiple of 4 and 8-byte weight rows, nothing else.
     bad = shape;
     CHECK(ggml_sycl::moe_bf16_direct_vec4(bad), "k=64 with 128-byte rows did not take vec4");
@@ -334,19 +357,25 @@ int main() {
     check_refusals(q);
 
     const kernel_case cases[] = {
-        // name                                   k     rows exp slt tok s1 wp xp xo yp is mis bad
-        { "inkling gate_up k, broadcast row",     2304, 96, 8,  8, 2, 1, 0, 0, 0, 0, 1, -1, false },
-        { "inkling down k, row per slot",         1152, 72, 8,  8, 3, 8, 0, 0, 0, 0, 1, -1, false },
-        { "inkling k, one row",                   2304, 1,  8,  8, 1, 1, 0, 0, 0, 0, 1, -1, false },
-        { "k=99 scalar form",                     99,   50, 16, 4, 5, 4, 0, 0, 0, 0, 1, -1, false },
-        { "k=100 vec4, rows not a multiple of 4", 100,  37, 16, 4, 3, 1, 0, 0, 0, 0, 1, -1, false },
-        { "k=3 below the lane count",             3,    5,  2,  2, 1, 1, 0, 0, 0, 0, 1, -1, false },
-        { "x base misaligned (no float4)",        256,  20, 6,  3, 2, 3, 0, 0, 1, 0, 1, -1, false },
-        { "weight row stride breaks vec4",        128,  12, 4,  4, 2, 1, 1, 0, 0, 0, 1, -1, false },
-        { "padded strides everywhere",            64,   33, 5,  4, 3, 4, 0, 4, 0, 3, 2, -1, false },
-        { "expert base off 8 bytes",              256,  16, 4,  4, 2, 1, 0, 0, 0, 0, 1, 2,  false },
-        { "id -1 zero row, bad ids NaN rows",     64,   10, 6,  6, 2, 1, 0, 0, 0, 2, 1, -1, true  },
-        { "bad slots, scalar form",               99,   9,  5,  4, 3, 4, 0, 0, 0, 0, 2, -1, true  },
+        // name                                   k     rows exp slt tok s1 wp xp xo yp is mis bad    tpl
+        { "inkling gate_up k, broadcast row",     2304, 96, 8,  8, 2,  1, 0, 0, 0, 0, 1, -1, false, 0 },
+        { "inkling down k, row per slot",         1152, 72, 8,  8, 3,  8, 0, 0, 0, 0, 1, -1, false, 0 },
+        { "inkling k, one row",                   2304, 1,  8,  8, 1,  1, 0, 0, 0, 0, 1, -1, false, 0 },
+        { "k=99 scalar form",                     99,   50, 16, 4, 5,  4, 0, 0, 0, 0, 1, -1, false, 0 },
+        { "k=100 vec4, rows not a multiple of 4", 100,  37, 16, 4, 3,  1, 0, 0, 0, 0, 1, -1, false, 0 },
+        { "k=3 below the lane count",             3,    5,  2,  2, 1,  1, 0, 0, 0, 0, 1, -1, false, 0 },
+        // Alignment: opencl:cpu reads an unaligned float4 correctly, so a float4 load wrongly taken here shows only
+        // under a GPU selector; on the CPU this case checks the numbers alone.
+        { "x base misaligned (no float4)",        256,  20, 6,  3, 2,  3, 0, 0, 1, 0, 1, -1, false, 0 },
+        { "weight row stride breaks vec4",        128,  12, 4,  4, 2,  1, 1, 0, 0, 0, 1, -1, false, 0 },
+        { "padded strides everywhere",            64,   33, 5,  4, 3,  4, 0, 4, 0, 3, 2, -1, false, 0 },
+        // Alignment: likewise an 8-byte load from this expert's 2-byte-off rows is read correctly on opencl:cpu, so
+        // losing the kernel's per-row alignment check shows only under a GPU selector.
+        { "expert base off 8 bytes",              256,  16, 4,  4, 2,  1, 0, 0, 0, 0, 1, 2,  false, 0 },
+        { "id -1 zero row, bad ids NaN rows",     64,   10, 6,  6, 2,  1, 0, 0, 0, 2, 1, -1, true,  0 },
+        { "bad slots, scalar form",               99,   9,  5,  4, 3,  4, 0, 0, 0, 0, 2, -1, true,  0 },
+        // Four launches of 3, 3, 3 and 2 tokens, every one checked against the reference.
+        { "token chunks of 3, remainder 2",       64,   10, 4,  2, 11, 2, 0, 0, 0, 1, 1, -1, false, 3 },
     };
     for (const kernel_case & c : cases) {
         run_one(q, c);

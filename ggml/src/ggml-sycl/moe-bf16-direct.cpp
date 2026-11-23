@@ -124,6 +124,11 @@ bool moe_bf16_direct_vec4(const moe_bf16_direct_shape & shape) {
     return shape.k > 0 && shape.k % 4 == 0 && shape.w_nb1 % 8 == 0;
 }
 
+// RED stub (Task 8g review item 2): one launch for every shape; the token chunks land in the next commit.
+int64_t moe_bf16_direct_tokens_per_launch(const moe_bf16_direct_shape & shape) {
+    return shape.n_tokens > 0 ? shape.n_tokens : 0;
+}
+
 bool moe_bf16_direct_submit(sycl::queue &                 q,
                             const void * const *          expert_table,
                             const float *                 src1,

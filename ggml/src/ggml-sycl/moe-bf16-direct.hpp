@@ -11,13 +11,15 @@
 // outside [0, n_experts), or an expert whose table entry is null, writes a row of quiet NaN, so a bad slot shows in
 // the output instead of reading through a pointer nobody checked.
 //
-// The submitter allocates nothing, frees nothing and waits on nothing: it enqueues one kernel on the caller's queue
-// and hands back its event. The caller owns the lifetime of the table, the expert storage behind it and the
-// activations until that event completes. The file is free of backend state, so a test compiles it against any SYCL
-// device (opencl:cpu on a host without a GPU) and checks the kernel the backend runs.
+// The submitter allocates nothing, frees nothing and waits on nothing: it enqueues the kernel on the caller's queue,
+// in token chunks when one launch's global range would not fit (moe_bf16_direct_tokens_per_launch), each chunk after
+// the one before it, and hands back the last chunk's event. The caller owns the lifetime of the table, the expert
+// storage behind it and the activations until that event completes. The file is free of backend state, so a test
+// compiles it against any SYCL device (opencl:cpu on a host without a GPU) and checks the kernel the backend runs.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <sycl/sycl.hpp>
 
 namespace ggml_sycl {
@@ -37,14 +39,24 @@ struct moe_bf16_direct_shape {
     size_t  ids_nb1   = 0;
     size_t  dst_nb1   = 0;  // dst->nb[1], dst->nb[2]
     size_t  dst_nb2   = 0;
+
+    // The most work-items one launch may have. A launch covers its tokens x n_slots x ceil(rows / 4) * 64 work-items
+    // (one 16-lane sub-group per output row, four rows per work-group), and a SYCL global range must fit an int, so
+    // the backend keeps the default; the kernel test lowers it to force token chunks on a small shape.
+    size_t max_launch_items = static_cast<size_t>(std::numeric_limits<int>::max());
 };
 
 // Whether the shape takes the vec4 form: four BF16 weights per 8-byte load. It needs k a multiple of 4 and 8-byte
 // aligned weight rows; a row whose expert base is not 8-byte aligned still takes the scalar loop inside the kernel.
 bool moe_bf16_direct_vec4(const moe_bf16_direct_shape & shape);
 
-// Enqueues the kernel on q and stores its event in *event. Returns false, and enqueues nothing, when the shape is
-// empty or inconsistent or a pointer is null. expert_table, src1, ids and dst are device-visible pointers.
+// The most tokens one launch takes within shape.max_launch_items: n_tokens when the whole dispatch fits, fewer when
+// it runs in chunks, and 0 when the shape is empty or inconsistent or one token alone does not fit.
+int64_t moe_bf16_direct_tokens_per_launch(const moe_bf16_direct_shape & shape);
+
+// Enqueues the kernel on q and stores the event of its last launch in *event. Returns false, and enqueues nothing,
+// when the shape is empty or inconsistent, one token alone does not fit a launch, or a pointer is null. expert_table,
+// src1, ids and dst are device-visible pointers.
 bool moe_bf16_direct_submit(sycl::queue &                 q,
                             const void * const *          expert_table,
                             const float *                 src1,
