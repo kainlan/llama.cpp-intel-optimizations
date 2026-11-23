@@ -389,6 +389,23 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
         "adapter-refusal-unnamed": re.sub(
             r'\n\s*ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
             r'moe_direct_submit_failure\{\};)', "", sycl, count=1, flags=re.DOTALL),
+        # The adapter's line is gone and a comment names the helper in its place: the throw still prints nothing.
+        "adapter-refusal-commented": re.sub(
+            r'ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
+            r'moe_direct_submit_failure\{\};)',
+            '// ggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", ...) is printed by the caller', sycl,
+            count=1, flags=re.DOTALL),
+        # An else whose only mention of the helper is a comment prints nothing.
+        "else-commented": re.sub(
+            r'ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "workspace_slices",.*?\);',
+            '// ggml_sycl_moe_direct_log_decline(src0, ne12, "workspace_slices", ...) was printed by the slicer',
+            sycl, count=1, flags=re.DOTALL),
+        # The adapter's line names another step; only a comment names "adapter".
+        "step-commented": sycl.replace(
+            'ggml_sycl_moe_direct_log_decline(\n                                    src0, ne12, "adapter",',
+            '// ggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", ...)\n'
+            '                                ggml_sycl_moe_direct_log_decline(\n'
+            '                                    src0, ne12, "binding",', 1),
         # The gate's layout conjunct falls through unnamed.
         "layout-unnamed": re.sub(r'\} else if \(\(src0->type == GGML_TYPE_Q1_0.*?"layout".*?\);\n    \}', "}",
                                  sycl, count=1, flags=re.DOTALL),
