@@ -2587,7 +2587,7 @@ inline size_t host_zone_buffer_max_size(size_t chunk_cap, size_t largest_free) {
     return chunk_cap == 0 ? bound : std::min(chunk_cap, bound);
 }
 
-// Sets `terms.rounding`:the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
+// Sets `terms.rounding`: the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
 // chunks apart, in whole chunks of terms.chunk, each backed by the chunk plus a header of that same alignment, and the
 // rounding is what that commits beyond the zones and the RUNTIME bytes. terms.chunk is not 0.
 inline void host_zone_commit_terms_round(host_zone_commit_terms & terms) {
@@ -2694,10 +2694,12 @@ inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
 
 // The refusal of a plan charged the loader term (the loader holds the weights in loader_device's pool) whose commit
 // total, loader_grown included, exceeds its host budget: "loader-pool-over-budget" followed by total=, host_budget=,
-// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. A late plan's term is exact, so such a
-// load would fail in grow_zone partway through. An early candidate's total can exceed what the pool receives (it also
-// counts tensors the loader skips or puts in a CPU-owned buffer), so it can refuse a load that fits. Once a late plan
-// admits, no loader pool growth fails where the pool's own budget is at least the plan's. Others keep the WARN check.
+// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. For the loader the total counts the
+// replay's footprint (loader_zone, loader_grown), not loader_residency, which bounds an expert slice from above. A late
+// plan replays exactly the tensors the loader places, so its footprint is exact and such a load would fail in
+// grow_zone partway through. An early candidate's total can exceed what the pool receives (it also counts tensors the
+// loader skips or puts in a CPU-owned buffer), so it can refuse a load that fits. Once a late plan admits, no loader
+// pool growth fails where the pool's own budget is at least the plan's. Others keep the WARN check.
 inline std::string placement_plan_loader_pool_refusal(const placement_plan & plan) {
     const bool charged = plan.loader_holds_weights && plan.loader_device >= 0 && plan.host_zone_loader_bytes > 0;
     if (!charged || !(plan.host_zone_terms.total() > plan.host_budget)) {
