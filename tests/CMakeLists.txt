@@ -1504,6 +1504,18 @@ if (NOT WIN32)
         SKIP_RETURN_CODE 77
     )
 
+    # The census run's watchdog ceiling variable: refusals that exit before anything launches.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-qwen4exp-census-run-env
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen4exp-census-run-env.sh
+    )
+    set_tests_properties(test-sycl-qwen4exp-census-run-env PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
+
     # Scoring and arm shape of the qwen35 multi-ubatch perplexity gate (llama.cpp-rb2h). Fixture logs and
     # --dry-run only: no GPU, no model, safe at any parallelism.
     llama_test_cmd(

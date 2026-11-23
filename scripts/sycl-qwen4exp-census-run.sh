@@ -24,13 +24,14 @@
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
 # /proc/meminfo every 2 s and, in every mode, kills the run's
 # whole session if GPU host backing (Shmem + the meminfo remainder, scripts/sycl-host-backing.sh)
-# climbs past WATCHDOG_SHMEM_GB (default 100): idle reads 12.7 to 15 GiB and the
-# largest planned load about 90 GiB, so 100 GB means a runaway, not a large load.
+# climbs past WATCHDOG_HOST_BACKING_GIB (a whole number, default 100): idle reads 12.7 to 15 GiB and the
+# largest planned load about 88 to 91 GiB, so 100 GiB means a runaway, not a large load.
 # A load known to need more (the qwen4exp model with USM-backed host experts) is
-# run with WATCHDOG_SHMEM_GB raised by the operator, so no mode runs unguarded.
+# run with WATCHDOG_HOST_BACKING_GIB raised by the operator, so no mode runs unguarded.
+# The old name WATCHDOG_SHMEM_GB is refused (exit 3) so a stale command line cannot run with the default.
 #
-# Every memory figure here is decimal GB (10^9 bytes), the unit of CLAUDE.md's
-# settle rule; /proc/meminfo's kB are KiB and are converted, never relabelled.
+# Every memory figure here is GiB, the kernel's kB / 1048576, the unit the library prints and
+# CLAUDE.md states. Comparisons are in kB.
 #
 # The dump is GGML_LOG_DEBUG output: it needs GGML_SCHED_DEBUG=2 (1 prints
 # split headers only) AND -lv 5, because common_log drops DEBUG below
@@ -55,7 +56,15 @@ BIN="${LLAMA_COMPLETION:-$ROOT/build/bin/llama-completion}"
 QWEN_MODEL="${QWEN4EXP_MODEL:-/models/Qwen3.8-Flash-Next-GGUF/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}"
 VEHICLE_MODEL="${QWEN4EXP_VEHICLE:-}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
-SHMEM_ABORT_GB="${WATCHDOG_SHMEM_GB:-100}"
+# The abort ceiling is a whole number of GiB. A value like 150.5 would be an arithmetic error on the
+# first watchdog pass and leave the run unwatched, so it is refused before anything launches.
+if [ -n "${WATCHDOG_SHMEM_GB+set}" ]; then
+    echo "WATCHDOG_SHMEM_GB is no longer read: use WATCHDOG_HOST_BACKING_GIB (a whole number of GiB)" >&2; exit 3
+fi
+ABORT_GIB="${WATCHDOG_HOST_BACKING_GIB:-100}"
+case "$ABORT_GIB" in
+    ''|*[!0-9]*) echo "WATCHDOG_HOST_BACKING_GIB must be a whole number of GiB (got '$ABORT_GIB')" >&2; exit 3;;
+esac
 SETTLE_TIMEOUT_S="${SETTLE_TIMEOUT_S:-600}"
 mkdir -p "$OUT" || exit 1
 
@@ -70,21 +79,32 @@ fi
 grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL is not ON in build/CMakeCache.txt" >&2; exit 3; }
 [ "$(ldd "$BIN" | grep -E 'libggml-sycl|libsycl' | grep -c '=> /')" -ge 2 ] || { echo "$BIN does not link a resolvable SYCL backend" >&2; exit 3; }
 
-# every comparison is in bytes; display is decimal GB (10^9 bytes) to two places,
-# so a refusal at the floor and a pass just above it never print the same figure.
-# /proc/meminfo's "kB" is KiB
-meminfo_b() { echo $(( $(awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo) * 1024 )); }
+# every comparison is in kB (/proc/meminfo's unit, KiB); display is GiB to two places
+meminfo_kb() { awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo; }
 # GPU host backing in bytes. An unreadable meminfo returns 1: callers fail closed.
 if [ ! -r "$ROOT/scripts/sycl-host-backing.sh" ]; then
     echo "$0: $ROOT/scripts/sycl-host-backing.sh is missing" >&2; exit 3
 fi
 # shellcheck disable=SC1091
 source "$ROOT/scripts/sycl-host-backing.sh"
-backing_b() { local kb; kb=$(sycl_gpu_host_backing_kb) || return 1; echo $((kb * 1024)); }
-gb() { awk -v b="$1" 'BEGIN { printf "%.2f", b / 1e9 }'; }
-# Host backing in GB, or "unreadable": never a number for a reading that failed.
-backing_gb() { local b; if b=$(backing_b); then gb "$b"; else echo unreadable; fi; }
-mem_line() { echo "Shmem=$(gb "$(meminfo_b Shmem)")GB HostBacking=$(backing_gb)GB MemAvailable=$(gb "$(meminfo_b MemAvailable)")GB"; }
+gib() { awk -v k="$1" 'BEGIN { printf "%.2f", k / 1048576 }'; }
+# mem_line: one read of the meminfo parts gives Shmem and host backing; "unreadable" for a reading that failed,
+# never a number. MemAvailable is logged only.
+mem_line_from() { # $1 = Shmem kB, $2 = host backing kB; -1 means unreadable
+    if [ "$2" -lt 0 ]; then
+        echo "Shmem=unreadable HostBacking=unreadable MemAvailable=$(gib "$(meminfo_kb MemAvailable)")GiB"
+    else
+        echo "Shmem=$(gib "$1")GiB HostBacking=$(gib "$2")GiB MemAvailable=$(gib "$(meminfo_kb MemAvailable)")GiB"
+    fi
+}
+mem_line() {
+    local parts shm
+    if parts=$(sycl_gpu_host_parts_kb); then
+        shm=${parts% *}; mem_line_from "$shm" $(( shm + ${parts#* } ))
+    else
+        mem_line_from -1 -1
+    fi
+}
 stamp() { echo "$(date +%T) $1 $(mem_line)" | tee -a "$OUT/mem.log"; }
 
 REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
@@ -131,21 +151,20 @@ case "$MODE" in
 esac
 
 # CLAUDE.md's post-lock settle: the release of GPU host backing lags the previous run, so
-# wait for GPU host backing < 30 GB
+# wait for GPU host backing below 30 GiB
 # before touching the device; give up after SETTLE_TIMEOUT_S and escalate.
-# Compared in bytes against the rule's decimal GB. MemAvailable is not a condition: it sits near
+# Compared in kB against 30 GiB. MemAvailable is not a condition: it sits near
 # 55 GB on purpose while another tenant holds a model (ruling 2026-11-12), and the planner refuses a
 # load that exceeds the host budget by name.
 settled() {
-    local bk; bk=$(backing_b) || return 1
-    [ "$bk" -lt $((30 * 1000000000)) ]
+    local bk; bk=$(sycl_gpu_host_backing_kb) || return 1
+    [ "$bk" -lt $((30 * 1048576)) ]
 }
 waited=0
 until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
         stamp "refused: not settled after ${waited}s"
-        echo "host did not settle to GPU host backing < 30 GB in ${waited}s" \
-             "(host backing $(backing_b || echo unreadable) B, Shmem $(meminfo_b Shmem) B, MemAvailable $(meminfo_b MemAvailable) B); release GPU.lock and escalate" >&2
+        echo "host did not settle to GPU host backing < 30 GiB in ${waited}s ($(mem_line)); release GPU.lock and escalate" >&2
         exit 3
     fi
     sleep 10; waited=$((waited + 10))
@@ -223,14 +242,18 @@ fi
 
 KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
-    a=$(meminfo_b MemAvailable) sh=$(meminfo_b Shmem)
-    bk=$(backing_b) || bk=-1
-    echo "$(date +%T) Shmem=$(gb "$sh")GB HostBacking=$(backing_gb)GB MemAvailable=$(gb "$a")GB" >> "$OUT/mem.log"
+    # One read decides and is the one logged.
+    if parts=$(sycl_gpu_host_parts_kb); then
+        sh=${parts% *}; bk=$(( sh + ${parts#* } ))
+    else
+        sh=-1 bk=-1
+    fi
+    echo "$(date +%T) $(mem_line_from "$sh" "$bk")" >> "$OUT/mem.log"
     why=
-    if [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -lt 0 ]; then
+    if [ "$bk" -lt 0 ]; then
         why="meminfo unreadable, host backing unknown"
-    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -gt $((SHMEM_ABORT_GB * 1000000000)) ]; then
-        why="GPU host backing $(gb "$bk") GB ($bk B, Shmem $(gb "$sh") GB) > ${SHMEM_ABORT_GB} GB"
+    elif [ "$bk" -gt $((ABORT_GIB * 1048576)) ]; then
+        why="GPU host backing $(gib "$bk") GiB ($bk kB, Shmem $(gib "$sh") GiB) > ${ABORT_GIB} GiB"
     fi
     if [ -n "$why" ]; then
         echo "watchdog: $why, killing session $SID" | tee -a "$OUT/mem.log" >&2
