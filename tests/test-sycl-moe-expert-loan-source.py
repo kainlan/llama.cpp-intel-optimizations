@@ -1631,8 +1631,8 @@ REGISTER_OLD_ERASE = "erase_entry_locked(old);"
 def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
     reg = body(norm(cache), REGISTER_BODY_SIG)
     return (reg.count(REGISTER_SOURCE_FIND) == 1
-            and ordered(reg, CACHE_LOCKS, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE, REGISTER_OLD_ERASE,
-                        REGISTER_INSERT, REGISTER_MIRROR_TXN))
+            and ordered(reg, CACHE_LOCKS, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE,
+                        REGISTER_OLD_ERASE, REGISTER_INSERT, REGISTER_MIRROR_TXN))
 
 
 # --- the evict hands the id over before it retires ------------------------------------------------------------------

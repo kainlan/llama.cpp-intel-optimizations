@@ -11669,8 +11669,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             }
             // The move's publication bumps the exec-graph epoch, so this entry's reap leaves has_evictions_ alone.
             device_entry[i]->retired_by_expert_move = true;
-            out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
-            out.device_keys[i]   = device_key;
+            out.retire_status[i]                    = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
+            out.device_keys[i]                      = device_key;
         }
         remap_took = expert_move_us_since(remap_from);
     }

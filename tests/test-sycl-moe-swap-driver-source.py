@@ -59,8 +59,8 @@ a unit test cannot show is where the driver runs and what it does not do there. 
   D17 a transaction that throws leaves its batch unsettled through an unwind guard, not a handler: the step calls the
       transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
       when the guard counts one, each past its size (size() + n, never a bare count), then declares a guard whose
-      body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while a throw unwinds, where a throw ends the process, so the
-      reserves are what make its pushes safe.
+      body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while
+      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
