@@ -422,6 +422,44 @@ if dispatch_violations:
     print("dispatch without an open tracked invocation in: " + ", ".join(dispatch_violations), file=sys.stderr)
 
 
+# --- This backend's own terminal is drained before graph_compute takes its locks ---
+#
+# A compute with no synchronize after it leaves its invocation submitted and unreleased, and the next begin drains it:
+# a wait on the device. Every path that begins a graph runs under g_sycl_graph_compute_mutex (L2) and the context's
+# graph_mutex (L3), and no wait may sit under a listed lock (canonical contract section 12.5). So
+# graph_compute_unchecked drains its own terminal before it takes L2, and the begin under the locks finds nothing.
+OWN_DRAIN_STMT = "    ggml_sycl_execution_drain_own_terminal(static_cast<ggml_backend_sycl_context *>(backend->context));\n"
+L2_TAKE_STMT = "    std::unique_lock<std::mutex> global_graph_lock(g_sycl_graph_compute_mutex);\n"
+L3_TAKE_STMT = "    std::lock_guard<std::mutex> graph_lock(sycl_ctx->graph_mutex);\n"
+
+
+def own_drain_violations(source):
+    root = function_bodies(blank_comments_and_literals(source)).get(DISPATCH_ROOT, "")
+    l2, l3 = L2_TAKE_STMT.strip(), L3_TAKE_STMT.strip()
+    if root.count(l2) != 1 or root.count(l3) != 1:
+        return ["graph_compute_unchecked takes L2 and L3 once each"]
+    if root.count("ggml_sycl_execution_drain_own_terminal(") != 1 or \
+            not ordered(root, OWN_DRAIN_STMT.strip(), l2, l3):
+        return ["graph_compute_unchecked drains this backend's own terminal before it takes L2"]
+    return []
+
+
+own_drain_found = own_drain_violations(backend)
+own_drain_mutants = {
+    # The drain moved under L2, where the wait it may make is forbidden.
+    "own-drain-under-l2": backend.replace(OWN_DRAIN_STMT + L2_TAKE_STMT, L2_TAKE_STMT + OWN_DRAIN_STMT, 1),
+}
+checks.update({
+    "graph_compute drains its own terminal before it takes g_sycl_graph_compute_mutex": not own_drain_found,
+    **{
+        f"own-drain contract witnesses mutation {name}": mutated != backend and bool(own_drain_violations(mutated))
+        for name, mutated in own_drain_mutants.items()
+    },
+})
+if own_drain_found:
+    print("own-drain contract: " + "; ".join(own_drain_found), file=sys.stderr)
+
+
 # --- The tripwire: ending or clearing a graph a dispatch scope holds open is reported, by site ---
 #
 # Each lifecycle verb that ends the invocation (submit, release, quarantine) or zeroes the backend's copy of it (the
