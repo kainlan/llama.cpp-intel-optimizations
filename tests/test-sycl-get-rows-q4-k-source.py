@@ -178,6 +178,9 @@ def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
     # --- the predicate admits Q4_K, and everything it admits has an arm -------
     admitted = re.findall(r"case\s+GGML_TYPE_(\w+)\s*:", pred)
     results["the predicate admits Q4_K"] = "Q4_K" in admitted
+    # BF16 (Inkling's token_embd.weight): get_rows_sycl_float reads it as bfloat16 and widens to float, the same
+    # arm F16 takes; declining it put the first node of every decoded token on the CPU.
+    results["the predicate admits BF16"] = "BF16" in admitted
     missing = [t for t in admitted if case_arm(op, t) is None]
     results["every admitted type has an arm in ggml_sycl_op_get_rows"] = bool(admitted) and not missing
 
@@ -286,6 +289,8 @@ if args.self_test:
     mutants = [
         ("Q4_K dropped from the predicate", "the predicate admits Q4_K",
          with_(support=mutate(support, SUPPORT_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_Q3_K:"))),
+        ("BF16 dropped from the predicate", "the predicate admits BF16",
+         with_(support=mutate(support, SUPPORT_SIG, "case GGML_TYPE_BF16:", "case GGML_TYPE_F64:"))),
         ("private type list in supports_op", "supports_op keeps no private GET_ROWS type list",
          with_(backend=mutate(backend, SUPPORTS_OP_SIG, "case GGML_OP_GET_ROWS:",
                               "case GGML_OP_GET_ROWS: if (op->src[0]->type == GGML_TYPE_Q4_0) { return true; }"))),

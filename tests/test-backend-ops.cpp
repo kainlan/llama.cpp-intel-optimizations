@@ -11378,13 +11378,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
+    // BF16: Inkling's token_embd.weight is a BF16 table resident on the card (the small and view cases are in the
+    // all_types loop below)
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 2, 8, 2, 1, 1, false));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
