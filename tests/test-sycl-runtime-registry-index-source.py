@@ -26,10 +26,11 @@ What this file enforces:
     - the address of `second.handle`, `second.handle.ptr` or `second.handle.size` taken anywhere in the file, whatever
       the pointer's declared type (`size_t * s = &it->second.handle.size;`, `*(&it->second.handle.size) = 0;`);
     - a whole-row assignment (`it->second = rec;`, `registry.find(p)->second = rec;`) anywhere in the file, except the
-      entries of ROW_WRITE_ALLOWLIST: three non-registry sites and the one row move in runtime_registry_assign_locked,
-      which resizes or re-keys the index before it moves a row over the old. Entries are keyed by (enclosing function,
-      line text) with an exact occurrence count, so a second assignment in an allowed function, a copy of an allowed
-      line in another function, and an entry that stops matching all fail;
+      entries of ROW_WRITE_ALLOWLIST: the non-registry sites (the offload stats and five id_to_key_ writes) and the
+      one row move in runtime_registry_assign_locked, which resizes or re-keys the index before it moves a row over the
+      old. Entries are keyed by (enclosing function, line text) with an exact occurrence count, so a second
+      assignment in an allowed function, a copy of an allowed line in another function, and an entry that stops
+      matching all fail;
     - in a function that touches the registry (names it, or takes a runtime_registry_iterator or the map's own iterator
       type): a non-const reference or pointer bound to a whole row or to `second.handle[.ptr|.size]`
       (`auto & r = it->second;`, `auto q = &it->second;`, `auto * q = &it->second.handle;`, `decltype(auto) r = ...;`),
@@ -181,9 +182,22 @@ ROW_WRITE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*" + _ASSIGN)
 # (enclosing function, stripped source line) with the exact number of times that line appears in that function: a second
 # copy in the same function, the same line in another function, and an entry that no longer matches all fail.
 ROW_WRITE_ALLOWLIST = {
-    ("lifecycle_replace_placement_plan", "current->second = replacement;"): (1, "the MoE mmid plan registry's entry"),
     ("offload_stats_note_host_alloc", "entry.second += bytes;"): (1, "offload host-alloc stats, keyed by tag"),
-    ("remap_or_erase_id_mapping_locked", "mapped->second = replacement;"): (1, "the id_to_key_ map"),
+    ("remap_or_extract_id_mapping_locked", "mapped->second = replacement;"): (1, "the id_to_key_ map"),
+    # An expert move points each id at the copy that now holds the expert: id_to_key_ map writes, not registry rows.
+    ("loan_expert_triplet", "mapped->second = host_key;"): (1, "id_to_key_: the loan hands the id to its host copy"),
+    ("loan_expert_triplet", "mapped->second = device_key;"): (
+        1,
+        "id_to_key_: the loan's rollback hands the id back to the restored device entry",
+    ),
+    ("copy_host_triplet_to_device", "id_to_key_.find(key)->second ="): (
+        1,
+        "id_to_key_: the copy to the device hands the id to the new device entry",
+    ),
+    ("register_host_expert", "id->second = *moved_from;"): (
+        1,
+        "id_to_key_: a failed moved-copy registration hands the id back to the entry it was to replace",
+    ),
     ("runtime_registry_assign_locked", "it->second = std::move(fresh);"): (
         1,
         "the registry's own row move, after the index was resized or re-keyed to the new geometry",
@@ -777,7 +791,7 @@ def mutate(code: str, old: str, new: str) -> str:
         "void f() {\n    it->second++;\n}",
         "void f(std::pair<void *, runtime_alloc_record> & kv) {\n    kv.second = rec;\n}",
         # an allowed line copied into a function that is not the allowed one
-        "void f() {\n    current->second = replacement;\n}",
+        "void f() {\n    mapped->second = replacement;\n}",
         "void f() {\n    it->second = std::move(fresh);\n}",
         # parenthesised row access
         "void f() {\n    (it->second) = rec;\n}",
