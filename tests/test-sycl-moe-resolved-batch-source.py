@@ -689,8 +689,8 @@ def direct_precondition(code: str) -> str:
     """The direct route's precondition with each named bool it tests replaced by that bool's expression, in
     parentheses. The condition tests one const bool per conjunct (test-sycl-moe-refusal-reason-source.py holds that
     shape); the claims here are about what each conjunct tests, which the expansion puts back in the condition."""
-    anchor = code.index("if (all_primary &&")
-    condition = parenthesized_after(code, "if (all_primary &&")
+    anchor = code.index("if (card_or_host &&")
+    condition = parenthesized_after(code, "if (card_or_host &&")
     declared = {}
     for m in re.finditer(r"\bconst bool (\w+) = ", code[:anchor]):
         depth, end = 0, m.end()

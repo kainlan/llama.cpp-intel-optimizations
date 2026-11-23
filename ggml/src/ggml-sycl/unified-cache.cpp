@@ -63,6 +63,18 @@
 #    include <unistd.h>
 #endif
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    include "tests/q1-nvfp4-production-route-test-seam.hpp"
+
+// The most routed-expert triplet groups a single-device pack puts on its device; -1 is no cap. The seam header says
+// why a mixed fixture needs it.
+static std::atomic<int> g_q1_nvfp4_test_device_expert_group_cap{ -1 };
+
+void ggml_sycl_q1_nvfp4_test_cap_device_expert_groups(int groups) {
+    g_q1_nvfp4_test_device_expert_group_cap.store(groups < 0 ? -1 : groups, std::memory_order_relaxed);
+}
+#endif
+
 namespace ggml_sycl {
 
 // moe-control-plan.hpp duplicates expert_tensor_role so it can stay free of
@@ -34368,7 +34380,14 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 stats.incomplete_groups++;
             }
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+            const int  device_group_cap = g_q1_nvfp4_test_device_expert_group_cap.load(std::memory_order_relaxed);
+            const bool on_device =
+                group.charge_bytes <= remaining &&
+                (device_group_cap < 0 || stats.device_groups < static_cast<size_t>(device_group_cap));
+#else
             const bool on_device = group.charge_bytes <= remaining;
+#endif
             const int  target    = on_device ? device_id : -1;
             if (group.charge_bytes <= without_room) {
                 without_room -= group.charge_bytes;

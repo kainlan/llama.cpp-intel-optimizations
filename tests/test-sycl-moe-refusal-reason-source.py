@@ -77,12 +77,13 @@ DIRECT_GATE = "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_autho
 DIRECT_END = "// MoE hybrid GPU+CPU dispatch gate"
 # The success path ends at the return right after the terminal host task is recorded.
 DIRECT_SUCCESS = "ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);"
-DIRECT_PRECONDITION = "if (all_primary &&"
+DIRECT_PRECONDITION = "if (card_or_host &&"
 # Each step that can decline a call once it has a batch, in the order the route reaches them; "layout" is the gate's
-# own remaining conjunct, and "adapter" is the kernel adapter's refusal after the mark.
-DIRECT_STEPS = ("layout", "precondition", "retained_table", "binding", "table_owner_retain", "private_table_owner",
-                "queue_capability", "invocation_snapshot", "submission_authority", "authority_issuer",
-                "workspace_admission", "workspace_slices", "adapter")
+# own remaining conjunct, the host_* steps are a mixed batch's host leg refused before admission, and "adapter" is the
+# kernel adapter's refusal after the mark.
+DIRECT_STEPS = ("layout", "precondition", "host_input_marker", "host_task", "host_workspace", "retained_table",
+                "binding", "table_owner_retain", "private_table_owner", "queue_capability", "invocation_snapshot",
+                "submission_authority", "authority_issuer", "workspace_admission", "workspace_slices", "adapter")
 # The precondition's conjuncts are named bools, computed once: the condition and the decline's failed= list read the
 # same bools, and each note's label is the bool's name.
 CONJUNCT_DECL = re.compile(r"\bconst\s+bool\s+(\w+)\s*=")
@@ -375,11 +376,11 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
         "step-renamed": sycl.replace('"binding", "occurrence=%zu', '"retained_table", "occurrence=%zu', 1),
         # A named conjunct the decline line does not note.
         "conjunct-unnamed": sycl.replace(
-            "        if (all_primary && context_id",
-            "        const bool src0_rows = ne01 > 0;\n        if (all_primary && src0_rows && context_id", 1),
+            "        if (card_or_host && context_id",
+            "        const bool src0_rows = ne01 > 0;\n        if (card_or_host && src0_rows && context_id", 1),
         # A conjunct spelled inline, whose text the decline's own line already carries.
         "conjunct-text-already-in-else": sycl.replace(
-            "if (all_primary && context_id", "if (all_primary && direct_batch.operands.size() && context_id", 1),
+            "if (card_or_host && context_id", "if (card_or_host && direct_batch.operands.size() && context_id", 1),
         # A conjunct dropped from the condition that the decline still notes.
         "conjunct-removed-still-noted": sycl.replace("ids_device && ids_stride && src1_type",
                                                      "ids_device && src1_type", 1),

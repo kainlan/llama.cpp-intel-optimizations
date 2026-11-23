@@ -1,10 +1,10 @@
 // Executable device regression test for the allocation-free admitted adapter.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
-#include "mmvq.hpp"
 #include "convert.hpp"
-#include "unified-cache.hpp"
 #include "ggml-quants.h"
 #include "ggml-sycl.h"
+#include "mmvq.hpp"
+#include "unified-cache.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -201,6 +202,39 @@ std::vector<float> q8_1_round_trip(const float * x, size_t n) {
     return y;
 }
 
+// Signs vary by expert, row and K, so the experts stay distinct after Q1_0's one-bit quantization and a kernel that
+// read the wrong expert, or a wrong id, fails the oracle. Fills `weights`, points each table slot at its expert, and
+// returns the CPU dequantization of every row, [expert][row][K].
+std::vector<float> fill_experts(ggml_type       type,
+                                unsigned char * weights,
+                                const void **   table,
+                                int             experts,
+                                int             rows,
+                                int             K) {
+    const size_t       block_bytes    = type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
+    const size_t       blocks_per_row = static_cast<size_t>(K / (type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4));
+    std::vector<float> weight_row(K), dequant(static_cast<size_t>(experts) * rows * K);
+    for (int e = 0; e < experts; ++e) {
+        table[e] = weights + static_cast<size_t>(e) * rows * blocks_per_row * block_bytes;
+        for (int r = 0; r < rows; ++r) {
+            for (int k = 0; k < K; ++k) {
+                const float sign = (e * 5 + r * 3 + k) % 7 < 3 ? -1.0f : 1.0f;
+                weight_row[k]    = sign * (0.25f + float((e + r + k) % 11) / 13.0f);
+            }
+            void *  row = weights + (static_cast<size_t>(e) * rows + r) * blocks_per_row * block_bytes;
+            float * dq  = dequant.data() + (static_cast<size_t>(e) * rows + r) * K;
+            if (type == GGML_TYPE_Q1_0) {
+                quantize_row_q1_0_ref(weight_row.data(), static_cast<block_q1_0 *>(row), K);
+                dequantize_row_q1_0(static_cast<const block_q1_0 *>(row), dq, K);
+            } else {
+                quantize_row_nvfp4_ref(weight_row.data(), static_cast<block_nvfp4 *>(row), K);
+                dequantize_row_nvfp4(static_cast<const block_nvfp4 *>(row), dq, K);
+            }
+        }
+    }
+    return dequant;
+}
+
 // The ids the kernel reads sit on the device as the ids tensor holds them. PACKED: [token][top_k]. VIEW: top_k columns
 // of a [token][1 + top_k + 1] buffer, another valid expert in the columns before and after them, as build_moe_ffn's
 // top-k view of the argsort gives MUL_MAT_ID. The view's pointer starts past the sentinel column, so a kernel that read
@@ -227,27 +261,7 @@ void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
     usm_owner<unsigned char> q8(q, q8_bytes + alignof(block_q8_1));
     usm_owner<float> output(q, output_values + 1);
 
-    // Signs vary by expert, row and K, so the experts stay distinct after Q1_0's one-bit quantization and a kernel that
-    // read the wrong expert, or a wrong id, fails the oracle below.
-    std::vector<float> weight_row(K), dequant(static_cast<size_t>(experts) * rows * K);
-    for (int e = 0; e < experts; ++e) {
-        table.ptr[e] = weights.ptr + static_cast<size_t>(e) * rows * blocks_per_row * block_bytes;
-        for (int r = 0; r < rows; ++r) {
-            for (int k = 0; k < K; ++k) {
-                const float sign = (e * 5 + r * 3 + k) % 7 < 3 ? -1.0f : 1.0f;
-                weight_row[k]    = sign * (0.25f + float((e + r + k) % 11) / 13.0f);
-            }
-            void * row = weights.ptr + (static_cast<size_t>(e) * rows + r) * blocks_per_row * block_bytes;
-            float * dq  = dequant.data() + (static_cast<size_t>(e) * rows + r) * K;
-            if (type == GGML_TYPE_Q1_0) {
-                quantize_row_q1_0_ref(weight_row.data(), static_cast<block_q1_0 *>(row), K);
-                dequantize_row_q1_0(static_cast<const block_q1_0 *>(row), dq, K);
-            } else {
-                quantize_row_nvfp4_ref(weight_row.data(), static_cast<block_nvfp4 *>(row), K);
-                dequantize_row_nvfp4(static_cast<const block_nvfp4 *>(row), dq, K);
-            }
-        }
-    }
+    const std::vector<float> dequant = fill_experts(type, weights.ptr, table.ptr, experts, rows, K);
     for (size_t i = 0; i < activation_rows * static_cast<size_t>(K); ++i) activation.ptr[i] = 0.5f + float(i % 17) / 19.0f;
     const int32_t snapshot[] = { 3, 1, 3, 0, 2, 0 }; // repeated and nonmonotonic, [token][top_k]
     // The device ids hold the snapshot where the layout puts it; the kernel reads them there and must not write them.
@@ -337,6 +351,86 @@ void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
                                                    snapshot, experts, K, rows, INT_MAX, INT_MAX, ne11,
                                                    sizeof(int32_t), ids_nb1, overflow),
             "overflow shape submitted");
+}
+
+// The occurrences the kernel does not compute. A host expert's table slot is null: the kernel writes its rows as quiet
+// NaN without reading through the slot, and the host leg's scatter overwrites them. An id past the table (the device ids
+// disagree with the host snapshot the adapter range-checked) is written as NaN too. A negative id is ggml's skip, which
+// the CPU MUL_MAT_ID writes as a zero row, so the kernel writes zero. Every other occurrence matches the oracle. The
+// output starts at a sentinel, so a kernel that left a row alone fails as surely as one that computed it.
+void run_skip_case(sycl::queue & q, ggml_type type, int ne11) {
+    constexpr int     experts = 4, top_k = 3, tokens = 2, rows = 5, host_expert = 0;
+    const int         K               = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+    const size_t      block_bytes     = type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
+    const size_t      blocks_per_row  = static_cast<size_t>(K / (type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4));
+    const size_t      activation_rows = static_cast<size_t>(ne11) * tokens;
+    const size_t      q8_bytes        = activation_rows * static_cast<size_t>(K / QK8_1) * sizeof(block_q8_1);
+    const size_t      output_values   = static_cast<size_t>(top_k) * tokens * rows;
+    const std::string at = std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11) + ")";
+
+    usm_owner<unsigned char> weights(q, static_cast<size_t>(experts) * rows * blocks_per_row * block_bytes);
+    usm_owner<const void *>  table(q, experts);
+    usm_owner<float>         activation(q, activation_rows * K);
+    usm_owner<int32_t>       ids(q, static_cast<size_t>(top_k) * tokens);
+    usm_owner<unsigned char> q8(q, q8_bytes);
+    usm_owner<float>         output(q, output_values);
+
+    const std::vector<float> dequant = fill_experts(type, weights.ptr, table.ptr, experts, rows, K);
+    table.ptr[host_expert]           = nullptr;
+    for (size_t i = 0; i < activation_rows * static_cast<size_t>(K); ++i) {
+        activation.ptr[i] = 0.5f + float(i % 17) / 19.0f;
+    }
+    // The snapshot is what the batch resolved and the adapter range-checks; the device ids are what the kernel reads.
+    // They agree except in token 1's last two slots: an id one past the table, and the skip id -1.
+    const int32_t snapshot[]        = { 3, host_expert, 1, host_expert, 2, 2 };
+    const int32_t device_ids[]      = { 3, host_expert, 1, host_expert, experts, -1 };
+    constexpr int out_of_range_slot = 4;
+    constexpr int negative_id_slot  = 5;
+    std::copy(std::begin(device_ids), std::end(device_ids), ids.ptr);
+    std::fill(output.ptr, output.ptr + output_values, 123.0f);
+
+    mmvq_q1_nvfp4_admitted_buffers buffers{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
+    sycl::event                    terminal;
+    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr, snapshot,
+                                                 experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
+                                                 top_k * sizeof(int32_t), buffers, nullptr, &terminal),
+            "a batch with a null slot was refused before submit");
+    // A kernel that read through the null slot faults the device; the fault arrives here, and it is this case's
+    // failure, not an unusable GPU (main() reads a sycl::exception as a skip).
+    try {
+        terminal.wait_and_throw();
+    } catch (const sycl::exception & e) {
+        throw std::runtime_error("the kernel faulted on a batch with a null slot" + at + ": " + e.what());
+    }
+    const std::vector<float> quantized = q8_1_round_trip(activation.ptr, activation_rows * static_cast<size_t>(K));
+    for (int occurrence = 0; occurrence < top_k * tokens; ++occurrence) {
+        const int t = occurrence / top_k, slot = occurrence % top_k;
+        for (int r = 0; r < rows; ++r) {
+            const float       got   = output.ptr[static_cast<size_t>(occurrence) * rows + r];
+            const std::string where = at + " occurrence " + std::to_string(occurrence) + " row " + std::to_string(r) +
+                                      ": got " + std::to_string(got);
+            if (occurrence == negative_id_slot) {
+                require(got == 0.0f, ("a negative id's row is not zero" + where).c_str());
+                continue;
+            }
+            if (occurrence == out_of_range_slot || device_ids[occurrence] == host_expert) {
+                require(std::isnan(got), ((occurrence == out_of_range_slot ? "an out-of-range id's row is not NaN" :
+                                                                             "a null slot's row is not NaN") +
+                                          where)
+                                             .c_str());
+                continue;
+            }
+            const float * a        = quantized.data() + (static_cast<size_t>(t) * ne11 + (ne11 == 1 ? 0 : slot)) * K;
+            const float * w        = dequant.data() + (static_cast<size_t>(device_ids[occurrence]) * rows + r) * K;
+            float         expected = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                expected += w[k] * a[k];
+            }
+            require(std::isfinite(got) && std::fabs(got - expected) <= 0.08f * (1.0f + std::fabs(expected)),
+                    ("a card row beside a null slot does not match the CPU oracle" + where).c_str());
+        }
+    }
+    std::cout << "PASS: null-slot and out-of-range occurrences" << at << '\n';
 }
 
 uint16_t half_bits(sycl::half h) {
@@ -451,6 +545,7 @@ int main() {
             for (const int ne11 : { 1, 3 }) {
                 run_case(q, type, ne11, ids_layout::PACKED);
                 run_case(q, type, ne11, ids_layout::VIEW);
+                run_skip_case(q, type, ne11);
             }
         }
         fp16_converter_bit_exact(q, GGML_TYPE_Q1_0);

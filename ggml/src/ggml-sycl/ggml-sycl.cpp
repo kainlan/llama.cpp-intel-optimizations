@@ -11869,6 +11869,9 @@ std::atomic<uint64_t> g_q1_nvfp4_test_quarantine{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_failure_consumed{ 0 };
 std::atomic<uint32_t> g_q1_nvfp4_test_workspace_slot{ UINT32_MAX };
 std::atomic<uint64_t> g_q1_nvfp4_test_workspace_generation{ 0 };
+// The direct route's host leg: the mixed batches it submitted host occurrences for, and how many occurrences.
+std::atomic<uint64_t> g_q1_nvfp4_test_host_submit{ 0 };
+std::atomic<uint64_t> g_q1_nvfp4_test_host_occurrences{ 0 };
 // A second holder of the direct route's completion object that outlives the completion host task, as a copy of the
 // host-task functor kept by the SYCL runtime would. Typed void because the completion type is defined further down;
 // the shared pointer still destroys it as what it is.
@@ -11971,7 +11974,9 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
              g_q1_nvfp4_test_quarantine.load(std::memory_order_relaxed),
              g_q1_nvfp4_test_failure_consumed.load(std::memory_order_relaxed),
              g_q1_nvfp4_test_workspace_slot.load(std::memory_order_relaxed),
-             g_q1_nvfp4_test_workspace_generation.load(std::memory_order_relaxed) };
+             g_q1_nvfp4_test_workspace_generation.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_host_submit.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_host_occurrences.load(std::memory_order_relaxed) };
 }
 
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
@@ -11993,6 +11998,29 @@ void ggml_sycl_q1_nvfp4_test_hold_completion(bool hold) {
 bool ggml_sycl_q1_nvfp4_test_completion_held() {
     std::lock_guard<std::mutex> lock(g_q1_nvfp4_test_hold_mutex);
     return g_q1_nvfp4_test_held_completion != nullptr;
+}
+
+bool ggml_sycl_q1_nvfp4_test_read_expert_table(ggml_backend_t      backend,
+                                               const ggml_tensor * weight,
+                                               size_t              count,
+                                               const void **       out) {
+    auto * backend_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    auto * extra       = weight ? static_cast<ggml_tensor_extra_gpu *>(weight->extra) : nullptr;
+    if (!backend_ctx || !extra || !out || count == 0 || backend_ctx->device < 0 ||
+        backend_ctx->device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    const int                     device = backend_ctx->device;
+    const ggml_sycl::mem_handle & table  = extra->weight().moe_expert_ptrs_handle[device];
+    const auto                    view   = table.valid() ? table.resolve(device) : ggml_sycl::resolved_ptr{};
+    if (!view.ptr || !view.on_device || extra->weight().moe_expert_ptrs_size[device] < count * sizeof(void *)) {
+        return false;
+    }
+    // A test read after the case's compute: the queue is drained first so the copy sees the last upload.
+    sycl::queue & queue = *backend_ctx->stream();
+    queue.wait_and_throw();
+    queue.memcpy(out, view.ptr, count * sizeof(void *)).wait_and_throw();
+    return true;
 }
 #endif
 
