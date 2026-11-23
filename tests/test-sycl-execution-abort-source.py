@@ -453,29 +453,6 @@ DISPATCH_EXEMPT = {
     for name in ("extract_persistent_plan", "extract_persistent_plan_split", "debug_validate_persistent_set_rows")
 }
 
-dispatch_violations = dispatch_scope_violations(backend)
-dispatch_mutants = {
-    # A bypass path that does not open the scope.
-    "replay-slot-unscoped": backend.replace(
-        "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n    g_graph_diag_counters.seg_replay", "    g_graph_diag_counters.seg_replay", 1),
-    # The block graphlets reach a dispatch two calls down; their scope is gone.
-    "block-graphlets-unscoped": backend.replace(
-        "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n\n    try {\n        if (moe_graph_block_graphs_match",
-        "\n    try {\n        if (moe_graph_block_graphs_match", 1),
-    # The scope opens after the first node already ran.
-    "record-slot-scoped-late": backend.replace(
-        "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);",
-        "    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);", 1).replace(
-        "    for (const moe_graph_keyed_item & item : plan) {\n        if (item.boundary) {",
-        "    for (const moe_graph_keyed_item & item : plan) {\n        ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n        if (item.boundary) {", 1),
-    # A new dispatcher graph_compute calls, with no scope.
-    "new-unscoped-dispatcher": backend.replace(
-        "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {",
-        "static void moe_graph_unscoped_probe(ggml_backend_sycl_context * c, ggml_tensor * t) { ggml_sycl_compute_forward(*c, t); }\n"
-        "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {\n"
-        "    moe_graph_unscoped_probe(nullptr, nullptr);", 1),
-}
-
 # A scope must live from before the first node to the function's end: one declared in a block that closes first, or a
 # temporary, leaves the nodes after it outside any invocation.
 REPLAY_SLOT_SCOPE = (
@@ -495,6 +472,29 @@ UNCHECKED_OPEN = (
 REPLAY_SEGMENTS_OPEN = (
     "static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {\n"
     + SCOPE_DECL)
+GRAPHLETS_SCOPE = SCOPE_DECL + "\n    try {\n        if (moe_graph_block_graphs_match"
+RECORD_SLOT_ATTEMPTS = "    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);\n"
+KEYED_PLAN_LOOP = "    for (const moe_graph_keyed_item & item : plan) {\n"
+
+dispatch_violations = dispatch_scope_violations(backend)
+dispatch_mutants = {
+    # A bypass path that does not open the scope.
+    "replay-slot-unscoped": backend.replace(REPLAY_SLOT_SCOPE, REPLAY_SLOT_SCOPE.replace(SCOPE_DECL, ""), 1),
+    # The block graphlets reach a dispatch two calls down; their scope is gone.
+    "block-graphlets-unscoped": backend.replace(GRAPHLETS_SCOPE, GRAPHLETS_SCOPE.replace(SCOPE_DECL, ""), 1),
+    # The scope opens after the first node already ran.
+    "record-slot-scoped-late": backend.replace(
+        SCOPE_DECL + RECORD_SLOT_ATTEMPTS, RECORD_SLOT_ATTEMPTS, 1).replace(
+        KEYED_PLAN_LOOP + "        if (item.boundary) {",
+        KEYED_PLAN_LOOP + "    " + SCOPE_DECL + "        if (item.boundary) {", 1),
+    # A new dispatcher graph_compute calls, with no scope.
+    "new-unscoped-dispatcher": backend.replace(
+        UNCHECKED_OPEN,
+        "static void moe_graph_unscoped_probe(ggml_backend_sycl_context * c, ggml_tensor * t) {\n"
+        "    ggml_sycl_compute_forward(*c, t);\n"
+        "}\n" + UNCHECKED_OPEN + "\n    moe_graph_unscoped_probe(nullptr, nullptr);", 1),
+}
+
 dispatch_mutants.update({
     # The scope closes with the block it was declared in, before the slot's first node.
     "scope-in-dead-block": backend.replace(
@@ -563,7 +563,8 @@ if dispatch_violations:
 # a wait on the device. Every path that begins a graph runs under g_sycl_graph_compute_mutex (L2) and the context's
 # graph_mutex (L3), and no wait may sit under a listed lock (canonical contract section 12.5). So
 # graph_compute_unchecked drains its own terminal before it takes L2, and the begin under the locks finds nothing.
-OWN_DRAIN_STMT = "    ggml_sycl_execution_drain_own_terminal(static_cast<ggml_backend_sycl_context *>(backend->context));\n"
+OWN_DRAIN_STMT = ("    ggml_sycl_execution_drain_own_terminal("
+                  "static_cast<ggml_backend_sycl_context *>(backend->context));\n")
 L2_TAKE_STMT = "    std::unique_lock<std::mutex> global_graph_lock(g_sycl_graph_compute_mutex);\n"
 L3_TAKE_STMT = "    std::lock_guard<std::mutex> graph_lock(sycl_ctx->graph_mutex);\n"
 

@@ -144,7 +144,8 @@ def violations(source: str) -> list[str]:
         # re-spelling it as a literal is how the two gates drift apart.
         "Q1/NVFP4 executor gate is open and read by name": "k_moe_mmid_direct_route_validated = true" in source
             and "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated" in source,
-        "Q1/NVFP4 recipe is phase-blind": bool(candidate) and not {"phase", "rows"} & set(re.findall(r"\w+", candidate)),
+        "Q1/NVFP4 recipe is phase-blind":
+            bool(candidate) and not {"phase", "rows"} & set(re.findall(r"\w+", candidate)),
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
         # The recipe asks the binder for an exact allocation identity, the test bind() applies; a handle-kind
         # test refused every arena-slice lease (llama.cpp-1sxq).

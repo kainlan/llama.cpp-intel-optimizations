@@ -13,7 +13,8 @@ UNIFIED_CACHE_SOURCE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 
 # Identifiers, numeric literals and operators. A literal is a token like any other: dropped, `for (row = 2;` would read
 # as `for (row = 1;`, and a count passed as `1` as one passed as `ne11`.
-TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9A-Za-z_.]*|::|&&|\|\||!=|==|<=|>=|->|[{}()[\].,;:%=*<>!&+?/|^~-]")
+TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|[0-9][0-9A-Za-z_.]*|::|&&|\|\||!=|==|<=|>=|->"
+                      r"|[{}()[\].,;:%=*<>!&+?/|^~-]")
 
 
 def tokens(text: str) -> list[str]:

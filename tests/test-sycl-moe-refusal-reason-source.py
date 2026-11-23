@@ -361,7 +361,8 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
             "completion->bundle.mark_possible_submit()) {",
             "completion->bundle.mark_possible_submit()) {\nif (ne10 > 0) {", 1).replace(
             "                    } else {\n                        // mark_possible_submit() is asked last",
-            "                    }\n                    } else {\n                        // mark_possible_submit() is asked last",
+            "                    }\n                    } else {\n"
+            "                        // mark_possible_submit() is asked last",
             1),
         # The else is there and prints nothing.
         "else-silent": sycl.replace(
