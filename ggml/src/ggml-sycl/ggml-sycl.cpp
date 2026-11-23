@@ -10811,10 +10811,14 @@ static uint64_t ggml_sycl_loading_model_id() {
 // model is checked by its slot release, after the reclaim. A rolled-back load's chunks are freed by the model's
 // destructor after its rollback, or by an unwind before it, so its check runs once both the rollback and the last
 // chunk's free have happened. `bytes` is what the model holds on each device now, minted minus freed, so the loader's
-// temporaries count only while they live.
+// temporaries count only while they live. `weight_zone_baseline` is each device's WEIGHT zone capacity when this load
+// decided that card's host zones (ggml_sycl_model_host_weight_baseline_note), the point the preload measures the
+// zone's growth from; `weight_zone_baseline_taken` says the load took it.
 struct ggml_sycl_model_host_chunk_record {
     size_t                                    live = 0;
     std::array<size_t, GGML_SYCL_MAX_DEVICES> bytes{};
+    std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_zone_baseline{};
+    std::array<bool, GGML_SYCL_MAX_DEVICES>   weight_zone_baseline_taken{};
     bool                                      rolled_back = false;
 };
 
@@ -10904,6 +10908,35 @@ static size_t ggml_sycl_model_host_chunk_bytes(uint64_t model_id, int device) {
         return 0;
     }
     return it->second.bytes[device];
+}
+
+// The late pass, once it has decided `device`'s host zones for `model_id`'s load: the WEIGHT zone's capacity then.
+// Zones outlive the model that configured them (a model's release frees its chunks, not the pool's zones), and the
+// configure step keeps zones it finds configured, so a later load starts from the zone an earlier one left, grown
+// chunks included. Measuring from here counts only the growth this load's loader caused.
+static void ggml_sycl_model_host_weight_baseline_note(uint64_t model_id, int device, size_t capacity) {
+    if (model_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    ggml_sycl_model_host_chunk_record & record = store.records[model_id];
+    record.weight_zone_baseline[device]        = capacity;
+    record.weight_zone_baseline_taken[device]  = true;
+}
+
+// The baseline ggml_sycl_model_host_weight_baseline_note took for `model_id` on `device`, in `*capacity`; false when
+// the load took none there.
+static bool ggml_sycl_model_host_weight_baseline(uint64_t model_id, int device, size_t * capacity) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    auto                                it = store.records.find(model_id);
+    if (it == store.records.end() || device < 0 || device >= GGML_SYCL_MAX_DEVICES ||
+        !it->second.weight_zone_baseline_taken[device]) {
+        return false;
+    }
+    *capacity = it->second.weight_zone_baseline[device];
+    return true;
 }
 
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
@@ -17715,6 +17748,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (!decision.snapshot->explicit_no_plan) {
                     auto * cache = ggml_sycl::get_unified_cache_for_device(decision.device);
                     ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);
+                    // The zones this load starts from, configured now or kept from an earlier load: the preload
+                    // measures the WEIGHT zone's growth while the loader allocated from here.
+                    if (cache != nullptr && cache->host_zones_configured()) {
+                        ggml_sycl_model_host_weight_baseline_note(
+                            owner.model.value, decision.device,
+                            cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT));
+                    }
                 }
                 if (!effects_are_current()) {
                     // Detection, not atomic competing-provisioning or backing
@@ -47050,18 +47090,41 @@ static void ggml_sycl_preload_model_weights() {
             ggml_sycl::unified_cache_seal_layout_pool(device);
         }
 
-        // The plan charged the loader's SYCL_Host buffer to loader_device's WEIGHT zone as loader_residency. By now the
-        // loader's temporaries are freed, so what the model still holds in SYCL_Host chunks in that device's pool is
-        // that buffer, and more than the plan charged means the zone was sized short of it.
+        // The plan charged the loader's SYCL_Host buffer to loader_device's WEIGHT zone. Two checks, once the loader's
+        // temporaries are freed, so what the model still holds in SYCL_Host chunks in that device's pool is that
+        // buffer. The term: more than loader_residency means the plan counted the buffer short. The packing: the plan
+        // sized the zone from a replay of the loader's buffers into the pool (loader_zone, loader_grown), so the
+        // zone growing past loader_grown while this load allocated means the pool did not place them as replayed.
         if (global_plan != nullptr && global_plan->loader_holds_weights && global_plan->loader_device >= 0) {
             const uint64_t model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
             const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->loader_device);
             const size_t   planned  = ggml_sycl::placement_plan_host_weight_zone_terms(*global_plan).loader_residency;
             if (held > planned) {
                 GGML_LOG_WARN(
-                    "[HOST-PLAN-BUG] device=%d the loader's SYCL_Host buffer holds %zu B but the plan's "
-                    "loader_residency is %zu B; the host WEIGHT zone is sized %zu B short of it\n",
+                    "[HOST-PLAN-BUG] device=%d the loader_residency term is short of the loader's SYCL_Host buffer: "
+                    "the buffer holds %zu B, the term %zu B, %zu B less\n",
                     global_plan->loader_device, held, planned, held - planned);
+            }
+            ggml_sycl::unified_cache * const loader_cache =
+                ggml_sycl::get_existing_unified_cache_for_device(global_plan->loader_device);
+            size_t baseline = 0;
+            if (loader_cache != nullptr && loader_cache->host_zones_configured()) {
+                if (ggml_sycl_model_host_weight_baseline(model_id, global_plan->loader_device, &baseline)) {
+                    const std::string growth_bug = ggml_sycl::host_zone_weight_growth_check(
+                        global_plan->loader_device,
+                        ggml_sycl::placement_plan_host_zone_commit_terms_on_device(
+                            *global_plan, global_plan->host_zone_terms, global_plan->loader_device),
+                        baseline, loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT));
+                    if (!growth_bug.empty()) {
+                        GGML_LOG_WARN("%s\n", growth_bug.c_str());
+                    }
+                } else {
+                    GGML_LOG_WARN(
+                        "[HOST-PLAN] device=%d the loader pool check has no WEIGHT zone baseline: this load did not "
+                        "decide the card's host zones before its loader allocated, so the zone's growth goes "
+                        "unchecked\n",
+                        global_plan->loader_device);
+                }
             }
         }
 

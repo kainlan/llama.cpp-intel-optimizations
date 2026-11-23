@@ -1283,7 +1283,10 @@ host budget is refused at plan time as `loader-pool-over-budget`:
 `ggml_sycl_stage_refuse_loader_pool_plan` logs it on one `[HOST-PLAN] load
 refused:` ERROR line, and the stage returns `GGML_SYCL_LIFECYCLE_PLAN_REJECTED`
 for each late decision and for the early candidate, before the lazy-table
-refusal. A late plan's term is exact, so such a load would otherwise fail in
+refusal. What the total counts for the loader is the replay's footprint,
+`loader_zone` and `loader_grown`, not `loader_residency` (which bounds an expert
+slice from above). A late plan replays exactly the tensors the loader places,
+so its footprint is exact: such a load would otherwise fail in
 `grow_zone` partway through, and once a late plan admits, no loader pool
 growth fails. A plan without the term
 keeps the host ledger's WARN-only check (th32 T2 phase (a)), whose would-refuse
@@ -1364,9 +1367,19 @@ does for a host-planned expert with no owner. The limits:
   them too. The load logs one
   `[S1-PRELOAD] ... host-planned experts (... MB) have no owner` ERROR line
   and refuses, as a dense weight that cannot be registered does.
-- When the plan charges the term, the preload compares what the model still
-  holds in `SYCL_Host` chunks in `loader_device`'s pool with
-  `loader_residency`, and logs a `[HOST-PLAN-BUG]` WARN when it holds more.
+- When the plan charges the term, the preload checks both halves of it against
+  `loader_device`'s pool, and neither check stops the load. The term: what the
+  model still holds in `SYCL_Host` chunks there, against `loader_residency`; a
+  term short of it is a `[HOST-PLAN-BUG]` WARN. The replay: how far that pool's
+  WEIGHT zone grew while the load allocated, against the plan's recorded
+  `loader_grown` (`host_zone_weight_growth_check`). The growth is measured from
+  the zone's capacity when the load's late pass decided the zones, configured
+  from its plan or kept as an earlier load left them, since the zones outlive
+  the last model's release and an earlier load's growth is not this one's.
+  Growth past the record is a `[HOST-PLAN-BUG]` WARN naming the planned, actual
+  and excess bytes: the pool did not place the loader's buffers as the replay
+  did, which assumes an empty zone. A load whose late pass took no baseline says
+  at WARN that the growth goes unchecked.
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),
