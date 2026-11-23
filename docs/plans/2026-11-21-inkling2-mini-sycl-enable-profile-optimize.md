@@ -4221,6 +4221,21 @@ speed of the host leg.
 - *Reported, not fixed here:* the number of per-node host workspaces that can be live at once in one decoded
   token on the B50.
 
+**RED (2026-11-22, `6ff4bdc22`):**
+- Lead, one run of `sycl-q1-nvfp4-admitted-device` on the B70: the 56 existing cases pass, then the first
+  mixed case fails as predicted: `[MOE-DECODE-REFUSAL] tensor=blk.0.ffn_gate_exps.weight route=direct
+  step=precondition failed=all_primary occurrence=0 expert=2 residency=host owner=-1 layout=aos
+  operands=3`, `MUL_MAT_ID retained decode executor refused route`, `FAIL: mixed graph compute failed
+  (type=q1_0 ne11=1 tokens=1)`. 0 kernel fault lines. The adapter-device test is not run at RED: its new
+  case puts a null slot in front of a kernel that does not check yet.
+- *Test seam, accepted.* The forced budget never reaches the planner's expert pack, and the planner's
+  percentage steps are far larger than a synthetic expert, so the planner cannot give a deterministic
+  split. The fixture uses a cap on the device expert groups inside the planner's own pack, compiled only
+  with `ROUTE_TESTING`, and reads the host set back from the plan. The reason is a comment at the hook.
+- *Left in place, with the reason:* the flush's `GGML_ABORT("Deferred scatter failed")` (two of its
+  callers, `free` and `synchronize`, return nothing and cannot carry a failed graph) and the retained
+  core's worker abort. Both are in the owed list.
+
 ---
 
 ### Task 8d: Experts on the second card (recorded 2026-11-22)
@@ -4700,12 +4715,52 @@ weights are, and the op reads it there.
 5. The consumers of `.scale` in the graph (`build_moe_ffn`), for decode and for a prompt batch.
 6. The change you propose, its RED test, and what the lead's trace run will print after it.
 
-**File scope:** set after the checkpoint. Expected: the intake and the weight plan in
-`ggml/src/ggml-sycl/unified-cache.cpp` and `ggml/src/ggml-sycl/ggml-sycl.cpp`, possibly
-`ggml/src/ggml-sycl/moe-control-plan.cpp`, and their contracts.
+**Checkpoint result (implementer, read-only, 2026-11-22):**
+- The cause is a classification by name. `infer_tensor_usage` (`ggml/src/ggml-sycl/common.hpp`) returns
+  `MOE_EXPERT_WEIGHT` for every `ffn_*_exps` name that is not a `.bias`, so a 1-D `.scale` is planned as
+  one expert entry (`e0`) of its family. The loader registers the same usage by tensor family
+  (`ggml_backend_sycl_try_register_weight_usage`).
+- The dense preload skips an expert-usage tensor with `ne[2] <= 1` (it belongs to the expert preload), and
+  the expert preload has nothing to do for a 512-byte vector. The tensor gets no device handle, the op's
+  resolve returns the host pointer, and the planned-mode cache refuses a runtime materialization for it.
+- Confirmed by the lead from logs of `baf7cf05a` (B70): 64 lines (the cap) of `[UNIFIED-CACHE] planned-mode
+  runtime materialization rejected op=direct_stage_weight ... model=0 ... ne=[1,128,1,1]`; and the plan
+  lines `[PLACEMENT-MOE] expected=6144 planned=6144 unclassified=0 duplicates=40 missing=0`,
+  `roles: gate=0 up=0 down=3092 gate_up=3092 unknown=0`, `target device0: 6184 expert tensors`,
+  `[PLACEMENT] NORM/EMBED device= 47 (883.8 MB)`. The 40 duplicates are the 40 scale tensors (20 NVFP4
+  layers, two each): each scale's `e0` entry has the semantic key of its family's real expert 0.
+- The consumer is `build_lora_mm_id` (`src/llama-graph.cpp`): `RESHAPE`, `REPEAT` to `[1, n_expert,
+  n_tokens]`, `GET_ROWS` by the ids, `MUL`. Decode and a prompt batch are the same nodes.
+- Mistral has no such tensor. GPT-OSS has none with `.scale`; its 72 expert `.bias` tensors are a different
+  gap of the same family (owed list).
+- Open until GREEN, asked as a read and not an inference: whether a scale's `e0` entry can displace the
+  real expert 0's entry in any consumer (its placement, its table slot, its storage record).
+
+**Rulings after the checkpoint (lead, 2026-11-22):**
+- One predicate in `common.hpp`, `ggml_sycl_moe_expert_scale_name(name)` (`exps.scale` or
+  `exps.input_scale`), asked by `infer_tensor_usage` and by `ggml_backend_sycl_try_register_weight_usage`.
+  A name it accepts is `MOE_INTERMEDIATE`, the class a `.bias` has: a dense entry placed with its layer,
+  staged by the dense preload. The fix is in the backend; `src/` and the graph builder do not change.
+- The `.bias` tensors are not folded into this task.
+- The Python contract carries RED and must show it can fail. The C++ checks land in the RED commit as
+  source and are run at GREEN; there is no separate cold build for RED.
+- A regression pin on `duplicates=0` goes into a non-GPU test if one can reach the count; otherwise the
+  lead reads it from the plan line.
+- Read before GREEN: a `.scale` of a host-executing layer gets a host buffer and its `REPEAT` runs on the
+  CPU (the B50 has host layers once Task 8c lands).
+- Expected plan lines for Inkling after the fix: `duplicates=0`, roles `down=3072 gate_up=3072`,
+  `target device0: 6144 expert tensors`, `NORM/EMBED device= 87`. Mistral and GPT-OSS plan lines unchanged.
+
+**File scope:** `ggml/src/ggml-sycl/common.hpp` (the predicate, `infer_tensor_usage`),
+`ggml/src/ggml-sycl/ggml-sycl.cpp` (`ggml_backend_sycl_try_register_weight_usage` and the comment at the
+dense preload's skip), a new contract `tests/test-sycl-moe-expert-scale-usage-source.py` with its
+registration in `tests/CMakeLists.txt`, `tests/test-sycl-tensor-usage.cpp`, and one registry check in
+`ggml/src/ggml-sycl/tests/test-cross-model-weight-usage.cpp` (a device test; the lead runs it once on the
+B50). `unified-cache.cpp`, `binbcast.cpp` and `moe-control-plan.cpp` do not change.
 
 **Acceptance criteria:**
 - [ ] RED commit first.
+- [ ] Lead, one run on the B50: `cross-model-weight-usage` passes.
 - [ ] Lead, one run, B70, `GGML_SYCL_BINBCAST_TRACE=1`, 4 tokens: no `[BINBCAST] stage` line names a `.scale`
       tensor. The `[SYCL-SEG-SLOT]` lines no longer name these `REPEAT` nodes; what they name next, or that
       they are gone, is recorded.
@@ -5728,6 +5783,16 @@ rewritten Stage 3 before any of it starts.
 - The residual query weights (`attn_res_query`, `ffn_res_query`, `output_res_query`, `msg_query`) go through
   a `REPEAT` that is an identity copy at one token (`src/models/inkling2.cpp`, `graph::mix`): 208 dispatches
   per decoded token.
+- GPT-OSS's 72 expert `.bias` tensors are planned dense on the card and registered as expert weights, the
+  dense preload skips them, and `ADD_ID` reads them through `get_data_ptr_slow` (Task 8i's checkpoint, a
+  read). Same family of defect as the `.scale` tensors; not measured.
+- The other lists of auxiliary suffixes of an expert family (`moe-control-plan.cpp`'s `IGNORED` candidates
+  among them) do not ask Task 8i's predicate. One rule, several spellings.
+- Two aborts on the mixed card-and-host path stay after Task 8c: `GGML_ABORT("Deferred scatter failed")`
+  in the pending-scatter flush (its callers `free` and `synchronize` return nothing) and the retained
+  core's worker abort. An abort is a broken part: each needs a way to fail the graph at its boundary.
+- On the B50 one decoded Inkling token can hold up to 288 pinned host workspaces live at once on the mixed
+  path (Task 8c's count, a read). Not measured against `Shmem`.
 - A lead mistake to keep out of the next round: the contract sweep (`-j 4`) ran beside the device chain and
   overlapped the bench step. A bench step runs with nothing else of the lead's on the CPU.
 - From Task 8e's re-review: the commit message of `8050f81b3` words its change loosely (not amended, by
