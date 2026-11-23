@@ -292,8 +292,8 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
    holds a model, and the planner refuses a load that exceeds the host budget by name, so the script does
    not check that the load fits. After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with "release GPU.lock and
    escalate". Every memory figure the script compares or prints is GiB (kB / 1048576), CLAUDE.md's
-   unit; it compares in bytes and prints two decimals, with the bytes on a refusal, and `unreadable`
-   when the host backing cannot be read (an unreadable meminfo is never settled).
+   unit; it compares in kB and prints GiB to two decimals, and a settle refusal prints the read it decided on,
+   or `unreadable` when the host backing cannot be read (an unreadable meminfo is never settled).
 3. Launches the run in its own session through `bench-guard.sh`. bench-guard enforces the budget
    (`timeout -k`), refuses to start if GPU host backing (Shmem net of tmpfs, plus the remainder) exceeds its 10 GiB ceiling
    (`SHMEM_CEIL_KB` in `bench-guard.sh`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
@@ -307,7 +307,7 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
    after 5 s, in every mode, if GPU host backing (Shmem + the meminfo remainder)
    exceeds 100 GiB (`WATCHDOG_HOST_BACKING_GIB`, a whole number; the old name `WATCHDOG_SHMEM_GB` is refused
    with exit 3), or if it cannot be read. Idle reads 12.7 to 15 GiB and the
-   largest planned load about 88 to 91 GiB, so 100 GiB means a runaway. There is no `MemAvailable` floor. The qwen4exp mode keeps
+   largest planned load about 85 to 91 GiB, so 100 GiB means a runaway. There is no `MemAvailable` floor. The qwen4exp mode keeps
    the same ceiling (see "The real model: blocked on host memory"). A process-group kill would miss the binary, because
    `timeout` moves itself and its child into their own group.
 5. Blocks until the session is empty before it stamps the post sample or exits. If a process
@@ -605,8 +605,8 @@ CLAUDE.md's ~100 GiB abort line when the host experts are USM-backed. The script
 this mode, so such a run is killed unless the operator raises `WATCHDOG_HOST_BACKING_GIB` for it on a host that has
 the room. No mode runs without the ceiling, and there is no `MemAvailable` floor.
 
-What this leaves unguarded: a valid Qwen run on 2026-11-23 reached 20.9 GB of `MemAvailable`, so the old 20 GB
-floor sat inside normal operation and stays removed. A runaway of ordinary process memory (malloc) by the run is
+What this leaves unguarded: a valid Qwen run on 2026-11-23 read about 20 GiB of `MemAvailable` at its lowest, so the
+old 20 GB floor (decimal, as that script compared) sat inside normal operation and stays removed. A runaway of ordinary process memory (malloc) by the run is
 in `AnonPages`, which the sum leaves out on purpose, so no script sees it, and the planner's named refusal bounds
 planned memory only. A guard for that class is tracked in the task tracker.
 
