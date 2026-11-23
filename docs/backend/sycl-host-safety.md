@@ -649,16 +649,16 @@ Settle is below 30 GiB, abort is past 100 GiB, bench-guard's ceiling is 10 GiB a
 
 - Idle sum on this host: 12.7 to 15 GiB (`Shmem` 11 to 12 GiB of ordinary tmpfs, remainder 2 to 3 GiB).
   Recorded idle snapshot with the tenant's model held: 12.7 GiB. Recorded Qwen3.8 default-mode load: 65.4 GiB.
-- Settle floor, "below 30 GiB": about 15 GiB above idle, so a leftover of that size from the previous run blocks
+- Settle ceiling, "below 30 GiB": about 15 GiB above idle, so a leftover of that size from the previous run blocks
   the next one.
 - Abort ceiling, "past ~100 GiB": the largest planned load is the planner's host budget (about 72 to 76 GiB
-  pinned) plus idle (13 to 15 GiB), about 88 to 91 GiB. The host is short at about 110 GiB: `MemTotal`
-  247 GiB minus the tenant's ~127 GiB minus kernel memory. 100 GiB sits between 88 to 91 and 110.
+  pinned) plus idle (13 to 15 GiB), about 85 to 91 GiB. The host is short at about 110 GiB: `MemTotal`
+  247 GiB minus the tenant's ~127 GiB minus kernel memory. 100 GiB sits between 85 to 91 and 110.
 
 `scripts/bench-guard.sh` keeps its own, lower ceiling (10 GiB) and still nets ordinary tmpfs out of `Shmem`
 before it adds the remainder.
 
-**What is not guarded.** A valid Qwen run on 2026-11-23 reached 20.9 GB of `MemAvailable`, so a floor at 20 GB sits
-inside normal operation and is not used. A runaway of ordinary process memory (malloc) by a run is in
+**What is not guarded.** A valid Qwen run on 2026-11-23 read about 20 GiB of `MemAvailable` at its lowest, so the
+old 20 GB floor (decimal, as that script compared) sat inside normal operation and was removed. A runaway of ordinary process memory (malloc) by a run is in
 `AnonPages`, which the sum leaves out on purpose, so no script sees it, and the planner's named refusal bounds
 planned memory only. A guard for that class is tracked in the task tracker.
