@@ -114,10 +114,10 @@
 #
 # Preflights refuse (rc 2): no <sha> or a head that differs from it; GGML_SYCL not ON; a binary missing, older than
 # the head commit, or not linked to the SYCL runtime; a model file missing; a failed grep control; builders
-# (ninja + icpx) that do not clear within 15 minutes; GPU host backing (Shmem + the meminfo remainder) >= 30 GB; GPU.lock already held;
+# (ninja + icpx) that do not clear within 15 minutes; GPU host backing (Shmem + the meminfo remainder) >= 30 GiB; GPU.lock already held;
 # a GGML_SYCL_* or LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a
 # non-empty --out-dir unless --arm names the arms to redo or --clobber is given (a reused directory would score one
-# run's files as another's). Before each arm the host must settle (GPU host backing < 30 GB, up to
+# run's files as another's). Before each arm the host must settle (GPU host backing < 30 GiB, up to
 # 10 minutes) and
 # the builders must reach 0 (the gate waits for them like settle, up to 15 minutes, 10 s polls); only an expired wait
 # stops the gate. Shmem, host backing, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
@@ -1318,7 +1318,7 @@ settle() { # waits up to 10 minutes; GPU.lock serialises access, not memory reco
         host_settled && return 0
         sleep 10
     done
-    refuse "host never settled (GPU host backing < 30 GB): $(mem_line)"
+    refuse "host never settled (GPU host backing < 30 GiB): $(mem_line)"
 }
 
 # sample_builders_during <pid> <file>: the highest builder count seen every 5 s while <pid> runs.
@@ -1478,7 +1478,7 @@ if [ "$DRY_RUN" = 1 ]; then
     say "dry-run: nothing is executed, no lock is taken, no device is touched"
     say "build-dir: $BUILD_DIR   src-dir: $SRC_DIR   lock: $LOCK_DIR (take=$TAKE_LOCK)"
     say "preflights: <sha> == head of src-dir, GGML_SYCL ON, binaries newer than head and linked to SYCL, models," \
-        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), GPU host backing < 30 GB," \
+        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), GPU host backing < 30 GiB," \
         "an empty or --arm/--clobber out-dir"
     for arm in "${ARMS[@]}"; do
         print_arm_plan "$arm"
