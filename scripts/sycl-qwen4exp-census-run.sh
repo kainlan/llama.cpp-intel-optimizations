@@ -13,18 +13,17 @@
 #           vehicle      the synthetic qwen4exp model (QWEN4EXP_VEHICLE, see the
 #                        census doc for how the lead generates it): 2 layers,
 #                        every qwen4exp op family, fits on either card.
-#           qwen4exp     the census on the real 177 GiB model. Needs 215 GB (200 GiB)
-#                        MemAvailable, which this host does not have under its
-#                        permanent load (the doc says what this waits on).
+#           qwen4exp     the census on the real 177 GiB model. The planner refuses a
+#                        load that exceeds the host budget, by name; this script does
+#                        not check that again.
 #   device  0 = B70, 1 = B50 (level_zero index; the iGPU is never selected)
 #   outdir  receives run.err (the sched dump), run.out, mem.log, census.md
 #
 # One single-invocation llama-completion per call, wrapped by bench-guard
 # (net-of-tmpfs GPU host backing ceiling, GPU-fault journal check, timeout -k, and a
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
-# /proc/meminfo every 2 s and kills the run's whole session if MemAvailable
-# drops under WATCHDOG_FLOOR_GB (default 20) or, in the control and vehicle
-# modes, if GPU host backing (Shmem + the meminfo remainder, scripts/sycl-host-backing.sh)
+# /proc/meminfo every 2 s and, in the control and vehicle modes, kills the run's
+# whole session if GPU host backing (Shmem + the meminfo remainder, scripts/sycl-host-backing.sh)
 # climbs past WATCHDOG_SHMEM_GB (default 100): idle reads 12.7 to 15 GiB and the
 # largest planned load about 90 GiB, so 100 GB means a runaway, not a large load.
 #
@@ -54,7 +53,6 @@ BIN="${LLAMA_COMPLETION:-$ROOT/build/bin/llama-completion}"
 QWEN_MODEL="${QWEN4EXP_MODEL:-/models/Qwen3.8-Flash-Next-GGUF/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}"
 VEHICLE_MODEL="${QWEN4EXP_VEHICLE:-}"
 MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
-FLOOR_GB="${WATCHDOG_FLOOR_GB:-20}"
 SHMEM_ABORT_GB="${WATCHDOG_SHMEM_GB:-100}"
 SETTLE_TIMEOUT_S="${SETTLE_TIMEOUT_S:-600}"
 mkdir -p "$OUT" || exit 1
@@ -75,11 +73,16 @@ grep -qE '^GGML_SYCL:BOOL=ON' "$ROOT/build/CMakeCache.txt" || { echo "GGML_SYCL 
 # /proc/meminfo's "kB" is KiB
 meminfo_b() { echo $(( $(awk -v k="$1:" '$1 == k { print $2 }' /proc/meminfo) * 1024 )); }
 # GPU host backing in bytes. An unreadable meminfo returns 1: callers fail closed.
+if [ ! -r "$ROOT/scripts/sycl-host-backing.sh" ]; then
+    echo "$0: $ROOT/scripts/sycl-host-backing.sh is missing" >&2; exit 3
+fi
 # shellcheck disable=SC1091
 source "$ROOT/scripts/sycl-host-backing.sh"
 backing_b() { local kb; kb=$(sycl_gpu_host_backing_kb) || return 1; echo $((kb * 1024)); }
 gb() { awk -v b="$1" 'BEGIN { printf "%.2f", b / 1e9 }'; }
-mem_line() { echo "Shmem=$(gb "$(meminfo_b Shmem)")GB HostBacking=$(gb "$(backing_b || echo 0)")GB MemAvailable=$(gb "$(meminfo_b MemAvailable)")GB"; }
+# Host backing in GB, or "unreadable": never a number for a reading that failed.
+backing_gb() { local b; if b=$(backing_b); then gb "$b"; else echo unreadable; fi; }
+mem_line() { echo "Shmem=$(gb "$(meminfo_b Shmem)")GB HostBacking=$(backing_gb)GB MemAvailable=$(gb "$(meminfo_b MemAvailable)")GB"; }
 stamp() { echo "$(date +%T) $1 $(mem_line)" | tee -a "$OUT/mem.log"; }
 
 REQUIRE=() EXTRA_ENV=() EXTRA_ARGS=() PREDICTION=()
@@ -87,7 +90,7 @@ case "$MODE" in
     qwen4exp)
         # ~120 GiB of experts and the 50.66 GiB PLE table are read into host
         # memory: SYCL leaves mmap_support unset, so the loader turns mmap off
-        NEED_GB=215 BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
+        BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
         SHMEM_ABORT_GB=
         # structural controls: the dump must be the whole qwen4exp graph. TOP_K
         # counts QSA only because the MoE router uses ggml_argsort_top_k (an
@@ -102,7 +105,7 @@ case "$MODE" in
         # score paths the real model never takes; refuse any file whose tensor set
         # differs from scripts/sycl-qwen4exp-real-tensors.json (census doc, step b2)
         "$ROOT/scripts/sycl-qwen4exp-vehicle-rewrite.py" --verify "$VEHICLE_MODEL" || exit 1
-        NEED_GB=30 BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
+        BUDGET=600 MODEL="$VEHICLE_MODEL" FA=(-fa auto) N_EMBD=256
         # 2 layers: one GDN layer, one QSA layer, MoE on both -- 3 MUL_MAT_ID per
         # layer (gate, up, down), as the real model's 144 = 48 x 3; a fused
         # gate_up would give 2. TOP_K is QSA's alone for the reason given in the
@@ -117,31 +120,30 @@ case "$MODE" in
         PREDICTION=(--prediction "$ROOT/scripts/sycl-qwen4exp-op-prediction.json")
         ;;
     control-on)
-        NEED_GB=30 BUDGET=600 MODEL="$MISTRAL_MODEL" FA=(-fa on) N_EMBD=4096
+        BUDGET=600 MODEL="$MISTRAL_MODEL" FA=(-fa on) N_EMBD=4096
         EXTRA_ENV=(GGML_SYCL_FLASH_ATTN_EXT=0) REQUIRE=(--require FLASH_ATTN_EXT=CPU:32)
         ;;
     control-off)
-        NEED_GB=30 BUDGET=600 MODEL="$MISTRAL_MODEL" FA=(-fa on) N_EMBD=4096
+        BUDGET=600 MODEL="$MISTRAL_MODEL" FA=(-fa on) N_EMBD=4096
         REQUIRE=(--require FLASH_ATTN_EXT=SYCL:32)
         ;;
 esac
 
 # CLAUDE.md's post-lock settle: the release of GPU host backing lags the previous run, so
-# wait for GPU host backing < 30 GB and MemAvailable > 150 GB (and the mode's own need)
+# wait for GPU host backing < 30 GB
 # before touching the device; give up after SETTLE_TIMEOUT_S and escalate.
-# Compared in bytes against the rule's decimal GB, so the floor is exactly the
-# rule's 150e9, neither the 161 GB a GiB floor would be nor anything lower.
-[ "$NEED_GB" -gt 150 ] || NEED_GB=150
+# Compared in bytes against the rule's decimal GB. MemAvailable is not a condition: it sits near
+# 55 GB on purpose while another tenant holds a model (ruling 2026-11-12), and the planner refuses a
+# load that exceeds the host budget by name.
 settled() {
     local bk; bk=$(backing_b) || return 1
-    [ "$bk" -lt $((30 * 1000000000)) ] &&
-        [ "$(meminfo_b MemAvailable)" -gt $((NEED_GB * 1000000000)) ]
+    [ "$bk" -lt $((30 * 1000000000)) ]
 }
 waited=0
 until settled; do
     if [ "$waited" -ge "$SETTLE_TIMEOUT_S" ]; then
         stamp "refused: not settled after ${waited}s"
-        echo "host did not settle to GPU host backing < 30 GB and MemAvailable > ${NEED_GB} GB in ${waited}s" \
+        echo "host did not settle to GPU host backing < 30 GB in ${waited}s" \
              "(host backing $(backing_b || echo unreadable) B, Shmem $(meminfo_b Shmem) B, MemAvailable $(meminfo_b MemAvailable) B); release GPU.lock and escalate" >&2
         exit 3
     fi
@@ -222,11 +224,9 @@ KILLED=0
 while kill -0 "$RUN_PID" 2>/dev/null; do
     a=$(meminfo_b MemAvailable) sh=$(meminfo_b Shmem)
     bk=$(backing_b) || bk=-1
-    echo "$(date +%T) Shmem=$(gb "$sh")GB HostBacking=$(gb "$bk")GB MemAvailable=$(gb "$a")GB" >> "$OUT/mem.log"
+    echo "$(date +%T) Shmem=$(gb "$sh")GB HostBacking=$(backing_gb)GB MemAvailable=$(gb "$a")GB" >> "$OUT/mem.log"
     why=
-    if [ "$a" -lt $((FLOOR_GB * 1000000000)) ]; then
-        why="MemAvailable $(gb "$a") GB ($a B) < ${FLOOR_GB} GB"
-    elif [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -lt 0 ]; then
+    if [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -lt 0 ]; then
         why="meminfo unreadable, host backing unknown"
     elif [ -n "$SHMEM_ABORT_GB" ] && [ "$bk" -gt $((SHMEM_ABORT_GB * 1000000000)) ]; then
         why="GPU host backing $(gb "$bk") GB ($bk B, Shmem $(gb "$sh") GB) > ${SHMEM_ABORT_GB} GB"
