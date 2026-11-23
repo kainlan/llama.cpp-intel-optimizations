@@ -5699,6 +5699,19 @@ rewritten Stage 3 before any of it starts.
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by the merged-tree runs of 2026-11-22 (`baf7cf05a`):*
+- `test-llama-archs` cannot load a model on this tree, on one card or two, for any architecture (rc 255,
+  `docs/backend/data/inkling2/t8e-archs-refusal-0e9d878b6.txt`). The refusal text is "plan override nested";
+  with `-v` the backend names the real cause: `[LOAD-PLAN] measure plan override: no plan staged for load 1
+  at stage 0`. The test builds its models in memory (`llama_model_init_from_user`, or a temp file with
+  `load_mode=NONE`), and for that load no probe plan is staged, so the load-time measure refuses. It is
+  tracker task 37na (2026-11-02, recorded for the two-card form at `0665bc65e`); nothing on this branch
+  touches the functions on that path, and a real file load is not affected. Two defects: (1)
+  `llama_measure_plan_override` (`src/llama-load-measure.h`) gives one string to three causes (a nest, no
+  plan staged, a refused KV re-fit) and the cause is a WARN the test's log level drops; (2) a load from user
+  data stages no plan. The fix names the three causes in the refusal and makes that load stage a plan or an
+  explicit no-plan answer the measure accepts by name; it does not add a way to skip the measure. Until then
+  no task's `test-llama-archs` criterion can be met, and Task 8e's maps for nanbeige, metis16 and hrm_text
+  stay unrun.
 - `test-backend-ops -o MUL_MAT_ID` is not clean on the merged tree: 150 FAIL on the B70, 151 on the B50
   (`docs/backend/data/inkling2/t8g-tbo-mmid-baseline-baf7cf05a-b70.txt`). 111 are the `skip=1` cases (expert
   id -1) of every admitted type: no device route gives ggml's zero row for a skipped id. 37 are MXFP4, NVFP4
