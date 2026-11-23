@@ -15,12 +15,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -29,10 +31,56 @@
 
 namespace {
 constexpr int     gate_output_n                       = 96;
+constexpr int     route_experts                       = 4;
 constexpr int     route_top_k                         = 3;
 constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeated, non-monotonic
+// The workspace capacity, in tokens, of the fixture the prompt cases run on (its n_ctx and n_ubatch). The cases run
+// 2 tokens, 33 (past one 32-row chunk) and this many; one token more is refused.
+constexpr int     prompt_capacity                     = 40;
 
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
+
+// The backend's refusal lines, so a case can require that a refusal named its cause. Every log line still reaches
+// stderr; only lines that carry a refusal tag are kept. Host tasks can log, so the text is guarded.
+std::mutex  g_refusal_log_mutex;
+std::string g_refusal_log;
+
+void capture_log(ggml_log_level, const char * text, void *) {
+    if (text == nullptr) {
+        return;
+    }
+    std::fputs(text, stderr);
+    if (std::strstr(text, "-REFUSAL]") != nullptr) {
+        const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
+        g_refusal_log += text;
+    }
+}
+
+size_t refusal_log_size() {
+    const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
+    return g_refusal_log.size();
+}
+
+// The refusal lines logged since `from`, as one string.
+std::string refusal_log_since(size_t from) {
+    const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
+    return from < g_refusal_log.size() ? g_refusal_log.substr(from) : std::string();
+}
+
+// The experts token `token` of a `tokens`-token batch selects in `slot`. One token takes the decode cases' repeated,
+// non-monotonic triple. A prompt gives every token its own ordered triple, repeats inside a token included (37 is
+// coprime to the 64 triples, so tokens below 64 never share one): a route that used one token's ids, input row or
+// output row for another fails the oracle.
+int32_t selected_expert(int tokens, int token, int slot) {
+    static_assert(route_top_k == 3, "a triple per token");
+    if (tokens == 1) {
+        return route_selected_experts[slot];
+    }
+    const int code = (token * 37 + 11) % (route_experts * route_experts * route_experts);
+    const int digits[route_top_k] = { code / (route_experts * route_experts), (code / route_experts) % route_experts,
+                                      code % route_experts };
+    return digits[slot];
+}
 
 // How far the route got between two counter reads, in stage order. `candidate` counts at the direct gate after the
 // batch query offered the DIRECT recipe; `executed` counts in the host task that runs after the kernel completed. The
@@ -166,14 +214,15 @@ struct test_skip : std::runtime_error {
     const char * tag;
 };
 
+// `capacity` is the context and ubatch the plan sizes the MMID workspace for: its capacity in tokens.
 struct synthetic_inventory {
     ggml_sycl_tensor_info tensors[3]{};
     ggml_sycl_tensor_inventory inventory{};
-    ggml_sycl_placement_envelope envelope{ 2, 2, 1, -1 };
-    synthetic_inventory() {
+    ggml_sycl_placement_envelope envelope;
+    explicit synthetic_inventory(uint32_t capacity) : envelope{ capacity, capacity, 1, -1 } {
         constexpr const char * names[] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
                                            "blk.0.ffn_down_exps.weight" };
-        constexpr int experts = 4, K = QK1_0;
+        constexpr int experts = route_experts, K = QK1_0;
         for (size_t i = 0; i < 3; ++i) {
             tensors[i].name = names[i]; tensors[i].type = GGML_TYPE_Q1_0;
             tensors[i].ne[0] = i == 2 ? gate_output_n : K;
@@ -183,8 +232,8 @@ struct synthetic_inventory {
             inventory.total_size += tensors[i].size;
         }
         inventory.tensors = tensors; inventory.count = 3; inventory.n_expert = experts;
-        inventory.n_expert_used = 3; inventory.n_layer = 1;
-        inventory.n_ctx = 2; inventory.n_ubatch = 2;
+        inventory.n_expert_used = route_top_k; inventory.n_layer = 1;
+        inventory.n_ctx = capacity; inventory.n_ubatch = capacity;
     }
 };
 
@@ -211,8 +260,10 @@ struct lifecycle_fixture {
     size_t first_case = g_case_markers.size();
     route_authorization authorization = route_authorization::TEST_SCOPE;  // named in each passing case's line
 
+    // `capacity` is the workspace capacity in tokens: 2 for the decode cases, prompt_capacity for the prompt cases.
     explicit lifecycle_fixture(backend_order       order         = backend_order::BEFORE_LOAD_END,
-                               route_authorization requested     = route_authorization::TEST_SCOPE) :
+                               route_authorization requested     = route_authorization::TEST_SCOPE,
+                               uint32_t            capacity      = 2) :
         authorization(requested) {
         try {
             const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
@@ -220,7 +271,7 @@ struct lifecycle_fixture {
                 throw std::runtime_error("load begin result=" + std::to_string(static_cast<int>(begin_result)));
             }
             load_open = true;
-            synthetic_inventory fixture;
+            synthetic_inventory fixture(capacity);
             const auto stage_result =
                 ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
             if (stage_result != GGML_SYCL_LIFECYCLE_OK) {
@@ -254,9 +305,10 @@ struct lifecycle_fixture {
                 }
                 owner_devices.insert(workspace.owner_device);
             }
-            // The route admits primary residency only; a selected expert the plan put elsewhere (a secondary
-            // card or the host) cannot reach it, so this environment cannot exercise the route.
-            for (int expert : route_selected_experts) {
+            // The route admits primary residency only; an expert the plan put elsewhere (a secondary card or the
+            // host) cannot reach it, so this environment cannot exercise the route. The prompt cases select every
+            // expert, so every expert must be on the primary card.
+            for (int expert = 0; expert < route_experts; ++expert) {
                 bool found = false;
                 for (const auto & entry : candidate->plan->entries) {
                     if (entry.expert_id != expert || entry.name != "blk.0.ffn_gate_exps.weight") {
@@ -333,16 +385,18 @@ struct lifecycle_fixture {
             // behavior before the guard was threaded through this API.
             // llama.cpp-uajm: swa_full=false (common's default) -- KV sizing
             // is not what this test exercises.
-            require(
-                ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
-                                                                /*swa_full=*/false,
-                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
-                "model root bind failed");
+            require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, capacity, capacity, 1,
+                                                                    /*kv_unified=*/false,
+                                                                    /*swa_full=*/false,
+                                                                    /*flash_attn_enabled=*/true) ==
+                        GGML_SYCL_LIFECYCLE_OK,
+                    "model root bind failed");
             // The deferred order binds twice, as a real load does: each bind runs a runtime transaction that
             // replaces the plan snapshot (a stable replace keeps the version), and the route must then admit on the
             // snapshot that is live after the second.
             if (order == backend_order::AFTER_LOAD_END) {
-                require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
+                require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, capacity, capacity, 1,
+                                                                        /*kv_unified=*/false,
                                                                         /*swa_full=*/false,
                                                                         /*flash_attn_enabled=*/true) ==
                             GGML_SYCL_LIFECYCLE_OK,
@@ -480,59 +534,125 @@ ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft, ggml_tensor 
 
 struct graph_case {
     ggml_context * ctx = nullptr; ggml_cgraph * graph = nullptr; ggml_tensor * out = nullptr;
+    // The ids input's storage and the values written there: a route must leave its inputs as it found them.
+    ggml_tensor * ids_storage = nullptr; std::vector<int32_t> ids_written;
     std::vector<ggml_backend_buffer_t> buffers;
     graph_case() = default;
     graph_case(const graph_case &) = delete;
     graph_case & operator=(const graph_case &) = delete;
     graph_case(graph_case && other) noexcept : ctx(other.ctx), graph(other.graph), out(other.out),
+                                               ids_storage(other.ids_storage),
+                                               ids_written(std::move(other.ids_written)),
                                                buffers(std::move(other.buffers)) {
-        other.ctx = nullptr; other.graph = nullptr; other.out = nullptr; other.buffers.clear();
+        other.ctx = nullptr; other.graph = nullptr; other.out = nullptr; other.ids_storage = nullptr;
+        other.buffers.clear();
     }
     ~graph_case() { for (auto * b : buffers) if (b) ggml_backend_buffer_free(b); if (ctx) ggml_free(ctx); }
 };
 
-// How the activation's rows sit in device memory. DENSE: one tensor, rows adjacent. STRIDED: a view of a wider tensor,
-// so the rows are a fixed stride apart with other values between them; a route that copied ne11 rows as one block would
-// read those values, and they are far enough from the activation's range to fail the oracle.
-enum class input_rows { DENSE, STRIDED };
-constexpr int   strided_row_pad    = 64;  // floats between the end of one row of a strided input and the next row
+// How the activation sits in device memory. DENSE: one tensor, rows and tokens adjacent. STRIDED: a view of a wider
+// tensor whose rows are a fixed stride apart, other values between them. TOKENS_STRIDED: a view whose rows are adjacent
+// inside a token while the tokens are a stride apart. A route that copied adjacent rows or tokens as one block would
+// read the values between them, and they are far enough from the activation's range to fail the oracle. Both views
+// start past poison at the front of their storage: a route that copied from the storage's root instead of the view's
+// offset would read that poison in place of the first row, and every row after it would come from the wrong place.
+enum class input_rows { DENSE, STRIDED, TOKENS_STRIDED };
+constexpr int   strided_row_pad    = 64;  // floats between the end of one strided row (or token) and the next
+constexpr int   strided_view_lead  = 40;  // floats of poison before a strided view's first row
 constexpr float strided_row_poison = 1000.0f;
 
-graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
-                      std::vector<float> & oracle, size_t & output_count, input_rows rows = input_rows::DENSE) {
-    constexpr int experts = 4, top_k = route_top_k, tokens = 1;
+const char * input_rows_name(input_rows rows) {
+    return rows == input_rows::STRIDED ? "strided" : rows == input_rows::TOKENS_STRIDED ? "tokens-strided" : "dense";
+}
+
+// How the ids sit. PACKED: one tensor [top_k, tokens]. VIEW: top_k columns of a wider tensor, other expert ids in the
+// columns around them, the shape build_moe_ffn hands MUL_MAT_ID (its top-k view of the argsort). The view starts past
+// a sentinel column: a route that read the ids from the storage's root instead of the view's offset would take the
+// sentinel as slot 0 and shift every slot after it, and the sentinel is a valid expert that is not slot 0's, so the
+// wrong experts reach the oracle rather than a range refusal.
+enum class ids_layout { PACKED, VIEW };
+constexpr int ids_view_lead = 1;  // sentinel columns before the view's first slot, in every token
+
+const char * ids_layout_name(ids_layout ids_at) { return ids_at == ids_layout::VIEW ? "view" : "packed"; }
+
+// The route reuses its workspace slot from case to case, so a row or token its copy never wrote still holds the
+// previous case's activation there. Each case therefore draws different activation values, and inside a case every
+// row and every token differ: a copy that skipped a piece, or stopped one short, leaves stale values that fail the
+// oracle instead of matching it.
+uint32_t g_activation_case = 0;
+
+float activation_value(uint32_t seed, size_t token, size_t row, size_t k) {
+    uint32_t h = seed * 0x9e3779b9u ^ static_cast<uint32_t>(token) * 0x85ebca6bu ^
+                 static_cast<uint32_t>(row) * 0xc2b2ae35u ^ static_cast<uint32_t>(k) * 0x27d4eb2fu;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return (h & 1u ? -1.0f : 1.0f) * (0.2f + float((h >> 1) % 19u) / 31.0f);
+}
+
+graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11, std::vector<float> & oracle,
+                      size_t & output_count, input_rows rows = input_rows::DENSE, int tokens = 1,
+                      ids_layout ids_at = ids_layout::PACKED) {
+    constexpr int experts = route_experts, top_k = route_top_k;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
-    const int row_stride = rows == input_rows::STRIDED ? K + strided_row_pad : K;  // in floats
+    // Floats from one stored row to the next, and from one stored token to the next.
+    const int row_stride   = rows == input_rows::STRIDED ? K + strided_row_pad : K;
+    const int token_stride = rows == input_rows::TOKENS_STRIDED ? ne11 * K + strided_row_pad : ne11 * row_stride;
+    const int lead         = rows == input_rows::DENSE ? 0 : strided_view_lead;
     graph_case c;
     c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
     auto * weights = ggml_new_tensor_3d(c.ctx, type, K, gate_output_n, experts);
-    auto * storage = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, row_stride, ne11, tokens);
-    auto * input   = rows == input_rows::STRIDED ?
-                         ggml_view_3d(c.ctx, storage, K, ne11, tokens, storage->nb[1], storage->nb[2], 0) :
-                         storage;
-    auto * ids = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, top_k, tokens);
+    auto * storage = rows == input_rows::DENSE ?
+                         ggml_new_tensor_3d(c.ctx, GGML_TYPE_F32, K, ne11, tokens) :
+                         ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, lead + static_cast<int64_t>(tokens) * token_stride);
+    auto * input   = rows == input_rows::DENSE ?
+                         storage :
+                         ggml_view_3d(c.ctx, storage, K, ne11, tokens, static_cast<size_t>(row_stride) * sizeof(float),
+                                      static_cast<size_t>(token_stride) * sizeof(float),
+                                      static_cast<size_t>(lead) * sizeof(float));
+    const int ids_row = ids_at == ids_layout::VIEW ? ids_view_lead + experts : top_k;
+    c.ids_storage = ggml_new_tensor_2d(c.ctx, GGML_TYPE_I32, ids_row, tokens);
+    auto * ids    = ids_at == ids_layout::VIEW ?
+                        ggml_view_2d(c.ctx, c.ids_storage, top_k, tokens, c.ids_storage->nb[1],
+                                     static_cast<size_t>(ids_view_lead) * sizeof(int32_t)) :
+                        c.ids_storage;
     ggml_set_name(weights, "blk.0.ffn_gate_exps.weight"); ggml_set_name(input, "route_input");
     if (storage != input) {
         ggml_set_name(storage, "route_input_storage");
+    }
+    if (c.ids_storage != ids) {
+        ggml_set_name(c.ids_storage, "route_ids_storage");
     }
     ggml_set_name(ids, "route_ids"); c.out = ggml_mul_mat_id(c.ctx, weights, input, ids);
     ggml_set_name(c.out, "route_output");
     auto * buft = ggml_backend_get_default_buffer_type(backend);
     c.buffers = { alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS),
                   alloc_tensor(buft, storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
-                  alloc_tensor(buft, ids, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
+                  alloc_tensor(buft, c.ids_storage, GGML_BACKEND_BUFFER_USAGE_COMPUTE),
                   alloc_tensor(buft, c.out, GGML_BACKEND_BUFFER_USAGE_COMPUTE) };
     require(std::all_of(c.buffers.begin(), c.buffers.end(), [](auto * b) { return b != nullptr; }),
             "tensor buffer allocation failed");
     if (storage != input) {
         require(ggml_backend_view_init(input) == GGML_STATUS_SUCCESS, "strided input view initialization failed");
-        require(input->nb[0] == sizeof(float) && input->nb[1] != static_cast<size_t>(K) * sizeof(float),
-                "the strided input's rows are adjacent");
+        require(input->nb[0] == sizeof(float) &&
+                    (rows == input_rows::STRIDED ? input->nb[1] != static_cast<size_t>(K) * sizeof(float) :
+                                                   input->nb[2] != static_cast<size_t>(ne11 * K) * sizeof(float)),
+                "the strided input's rows or tokens are adjacent");
+        require(input->view_offs != 0, "the strided input view starts at its storage's root");
+    }
+    if (c.ids_storage != ids) {
+        require(ggml_backend_view_init(ids) == GGML_STATUS_SUCCESS, "ids view initialization failed");
+        require(ids->nb[1] != static_cast<size_t>(top_k) * sizeof(int32_t), "the ids view's tokens are adjacent");
+        require(ids->view_offs != 0, "the ids view starts at its storage's root");
     }
     ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
 
+    // Signs vary along K, by row and by expert, so the experts stay distinct after Q1_0's one-bit quantization (a sign
+    // per weight, one scale per block): an all-positive source dequantizes every expert to nearly the same row, and a
+    // route that read the wrong expert would still match the oracle.
     std::vector<float> source(static_cast<size_t>(experts) * gate_output_n * K), dequant(source.size());
-    for (size_t i = 0; i < source.size(); ++i) source[i] = 0.15f + float((i * 7) % 23) / 29.0f;
+    for (size_t i = 0; i < source.size(); ++i) {
+        const size_t k = i % K, n = (i / K) % gate_output_n, e = i / (static_cast<size_t>(K) * gate_output_n);
+        source[i] = ((k * 3 + n * 5 + e * 11) % 7 < 3 ? -1.0f : 1.0f) * (0.15f + float((i * 7) % 23) / 29.0f);
+    }
     std::vector<unsigned char> packed(ggml_nbytes(weights));
     for (int e = 0; e < experts; ++e) for (int n = 0; n < gate_output_n; ++n) {
         const float * src = source.data() + (static_cast<size_t>(e) * gate_output_n + n) * K;
@@ -544,48 +664,90 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
         else { quantize_row_nvfp4_ref(src, static_cast<block_nvfp4 *>(dst), K);
                dequantize_row_nvfp4(static_cast<block_nvfp4 *>(dst), dq, K); }
     }
-    std::vector<float> activation(static_cast<size_t>(ne11) * K);
-    for (size_t i = 0; i < activation.size(); ++i) activation[i] = 0.2f + float((i * 5) % 19) / 31.0f;
-    // The storage holds the activation's rows row_stride floats apart, poison between them (none when DENSE).
-    std::vector<float> stored(static_cast<size_t>(ne11) * row_stride, strided_row_poison);
-    for (int row = 0; row < ne11; ++row) {
-        std::copy_n(activation.data() + static_cast<size_t>(row) * K, K,
-                    stored.data() + static_cast<size_t>(row) * row_stride);
+    // [token][row][K], drawn fresh for this case (activation_value). Every token's rows differ, so a route that copied
+    // one token's input for another fails too.
+    std::vector<float> activation(static_cast<size_t>(tokens) * ne11 * K);
+    const uint32_t     seed = ++g_activation_case;
+    for (size_t i = 0; i < activation.size(); ++i) {
+        const size_t k = i % K, row = (i / K) % ne11, token = i / (static_cast<size_t>(K) * ne11);
+        activation[i] = activation_value(seed, token, row, k);
     }
-    const auto & selected = route_selected_experts;  // an array reference, so sizeof(selected) is the array's size
+    // The storage holds each row where its layout puts it, poison before the first and between them (none when
+    // DENSE).
+    std::vector<float> stored(static_cast<size_t>(lead) + static_cast<size_t>(tokens) * token_stride,
+                              strided_row_poison);
+    for (int token = 0; token < tokens; ++token) {
+        for (int row = 0; row < ne11; ++row) {
+            std::copy_n(activation.data() + (static_cast<size_t>(token) * ne11 + row) * K, K,
+                        stored.data() + lead + static_cast<size_t>(token) * token_stride +
+                            static_cast<size_t>(row) * row_stride);
+        }
+    }
+    // A view's columns before and after its top_k hold another valid expert, so a route that read them would pick a
+    // wrong one.
+    const int ids_first = ids_at == ids_layout::VIEW ? ids_view_lead : 0;
+    c.ids_written.assign(static_cast<size_t>(tokens) * ids_row, 0);
+    for (int token = 0; token < tokens; ++token) {
+        for (int col = 0; col < ids_row; ++col) {
+            const int slot = col - ids_first;
+            c.ids_written[static_cast<size_t>(token) * ids_row + col] =
+                slot >= 0 && slot < top_k ? selected_expert(tokens, token, slot) :
+                                            (selected_expert(tokens, token, 0) + 1) % experts;
+        }
+    }
     ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
     ggml_backend_tensor_set(storage, stored.data(), 0, stored.size() * sizeof(float));
-    ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
+    ggml_backend_tensor_set(c.ids_storage, c.ids_written.data(), 0, c.ids_written.size() * sizeof(int32_t));
     c.graph = ggml_new_graph(c.ctx); ggml_build_forward_expand(c.graph, c.out);
-    output_count = static_cast<size_t>(gate_output_n) * top_k; oracle.resize(output_count);
-    for (int slot = 0; slot < top_k; ++slot) for (int n = 0; n < gate_output_n; ++n) {
-        const float * w = dequant.data() +
-                          (static_cast<size_t>(selected[slot]) * gate_output_n + n) * K;
-        const float * a = activation.data() + static_cast<size_t>(ne11 == 1 ? 0 : slot) * K;
-        float sum = 0; for (int k = 0; k < K; ++k) sum += w[k] * a[k];
-        oracle[static_cast<size_t>(slot) * gate_output_n + n] = sum;
+    // [token][slot][N], the token axis outermost, as MUL_MAT_ID writes dst.
+    output_count = static_cast<size_t>(gate_output_n) * top_k * tokens; oracle.resize(output_count);
+    for (int token = 0; token < tokens; ++token) for (int slot = 0; slot < top_k; ++slot) {
+        for (int n = 0; n < gate_output_n; ++n) {
+            const float * w = dequant.data() +
+                              (static_cast<size_t>(selected_expert(tokens, token, slot)) * gate_output_n + n) * K;
+            const float * a = activation.data() + (static_cast<size_t>(token) * ne11 + (ne11 == 1 ? 0 : slot)) * K;
+            float sum = 0; for (int k = 0; k < K; ++k) sum += w[k] * a[k];
+            oracle[(static_cast<size_t>(token) * top_k + slot) * gate_output_n + n] = sum;
+        }
     }
     return c;
+}
+
+// The ids input after a compute, against the values the case wrote: a route must not write its input.
+void require_ids_unchanged(const graph_case & c, const std::string & at,
+                           const ggml_sycl_q1_nvfp4_test_counters & before) {
+    std::vector<int32_t> now(c.ids_written.size());
+    ggml_backend_tensor_get(c.ids_storage, now.data(), 0, now.size() * sizeof(int32_t));
+    for (size_t i = 0; i < now.size(); ++i) {
+        if (now[i] != c.ids_written[i]) {
+            fail_stages("the route wrote into its ids input" + at + " at element " + std::to_string(i) + ": " +
+                            std::to_string(now[i]) + ", written " + std::to_string(c.ids_written[i]),
+                        before);
+        }
+    }
 }
 
 // One stdout line per passing case, naming what ran, so a PASS log shows which cases it covers; a failure throws
 // before it and prints its own FAIL line instead.
 void report_pass(const std::string & name, ggml_type type, int ne11, input_rows rows,
-                 route_authorization authorization) {
+                 route_authorization authorization, int tokens = 1, ids_layout ids_at = ids_layout::PACKED) {
     std::cout << "PASS: " << name << " type=" << ggml_type_name(type) << " ne11=" << ne11
-              << " rows=" << (rows == input_rows::STRIDED ? "strided" : "dense") << " authorization="
-              << (authorization == route_authorization::PRODUCTION ? "production" : "test-scope") << std::endl;
+              << " rows=" << input_rows_name(rows) << " authorization="
+              << (authorization == route_authorization::PRODUCTION ? "production" : "test-scope")
+              << " tokens=" << tokens << " ids=" << ids_layout_name(ids_at) << std::endl;
 }
 
 // `graph` tags the graph in every label, so graph A and graph B of one churn regression stay distinguishable.
 void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph,
-                           input_rows rows = input_rows::DENSE) {
-    std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count, rows);
+                           input_rows rows = input_rows::DENSE, int tokens = 1,
+                           ids_layout ids_at = ids_layout::PACKED) {
+    std::vector<float> oracle; size_t count = 0;
+    auto c = make_graph(life.backend, type, ne11, oracle, count, rows, tokens, ids_at);
     ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     constexpr int no_pass = -1;
     const auto    label   = [&](int pass) {
-        std::string text =
-            std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11) + " graph=" + graph;
+        std::string text = std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11) +
+                           " tokens=" + std::to_string(tokens) + " graph=" + graph;
         if (pass != no_pass) {
             text += " pass=" + std::to_string(pass);
         }
@@ -601,11 +763,13 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
         for (size_t i = 0; i < count; ++i) {
             const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
             if (!(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance)) {
-                fail_stages("CPU oracle mismatch" + at + " at " + std::to_string(i) + ": got " +
+                fail_stages("CPU oracle mismatch" + at + " at " + std::to_string(i) + " (token " +
+                                std::to_string(i / (static_cast<size_t>(route_top_k) * gate_output_n)) + "): got " +
                                 std::to_string(got[i]) + ", expected " + std::to_string(oracle[i]),
                             before);
             }
         }
+        require_ids_unchanged(c, at, before);
         if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
@@ -628,7 +792,36 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
         after.recycle < before.recycle + 2) {
         fail_stages("two-submit lifecycle counters did not prove slot reuse" + observed_slots(), before);
     }
-    report_pass("successful_reuse_case (graph=" + std::string(graph) + ")", type, ne11, rows, life.authorization);
+    report_pass("successful_reuse_case (graph=" + std::string(graph) + ")", type, ne11, rows, life.authorization,
+                tokens, ids_at);
+}
+
+// A prompt one token above the workspace capacity the plan sized is refused by name before anything is admitted or
+// submitted, and its graph fails cleanly: no abort, and a teardown that drains (main() checks it after the case).
+void prompt_above_capacity_case(lifecycle_fixture & life, ggml_type type) {
+    constexpr int tokens = prompt_capacity + 1;
+    std::vector<float> oracle; size_t count = 0;
+    auto c = make_graph(life.backend, type, 1, oracle, count, input_rows::DENSE, tokens);
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const std::string at = std::string(" (type=") + ggml_type_name(type) + " tokens=" + std::to_string(tokens) + ")";
+    const case_scope scope("prompt_above_capacity_case" + at, before);
+    const size_t log_from = refusal_log_size();
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "a prompt above the workspace capacity was computed" + at, before);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.candidate == before.candidate + 1,
+                   "the direct route did not take up the prompt above capacity" + at, before);
+    require_stages(after.admit == before.admit && after.submit == before.submit,
+                   "a prompt above the workspace capacity was admitted or submitted" + at, before);
+    const std::string refusals = refusal_log_since(log_from);
+    const std::string expected = "tokens=" + std::to_string(tokens) + " capacity=" + std::to_string(prompt_capacity);
+    require_stages(refusals.find("[MOE-PROMPT-REFUSAL]") != std::string::npos &&
+                       refusals.find("reason=workspace_capacity") != std::string::npos &&
+                       refusals.find(expected) != std::string::npos,
+                   "the refusal did not name the workspace capacity" + at + "; refusal lines: [" + refusals + "]",
+                   before);
+    require_ids_unchanged(c, at, before);
+    report_pass(scope.marker->name, type, 1, input_rows::DENSE, life.authorization, tokens);
 }
 
 void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) {
@@ -909,6 +1102,7 @@ void unreleased_graph_then_drain_case(bool hold_completion) {
 
 int main() {
     g_previous_terminate = std::set_terminate(report_terminate);
+    ggml_log_set(capture_log, nullptr);
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
@@ -931,6 +1125,34 @@ int main() {
                 successful_reuse_case(life, type, route_top_k, "production");
                 successful_reuse_case(life, type, route_top_k, "production-strided", input_rows::STRIDED);
             }
+        }
+        require_clean_teardown();
+        // Prompt rows, no private authorization: the route submits a prompt once, every token's rows in one kernel.
+        // 33 tokens is past one 32-row chunk; prompt_capacity is the most the plan sized the workspace for. Every token
+        // selects its own experts. The ids also come as build_moe_ffn gives them, a view of a wider tensor, and the
+        // input as views whose rows, or whose tokens, are a stride apart.
+        {
+            lifecycle_fixture life(backend_order::BEFORE_LOAD_END, route_authorization::PRODUCTION, prompt_capacity);
+            for (const ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+                for (const int ne11 : { 1, route_top_k }) {
+                    for (const int tokens : { 2, 33, prompt_capacity }) {
+                        successful_reuse_case(life, type, ne11, "prompt", input_rows::DENSE, tokens);
+                    }
+                    successful_reuse_case(life, type, ne11, "prompt-ids-view", input_rows::DENSE, 33,
+                                          ids_layout::VIEW);
+                    successful_reuse_case(life, type, ne11, "prompt-tokens-strided", input_rows::TOKENS_STRIDED, 33);
+                    // With ne11 == 1 the one row's stride is the token stride, so nb12 == ne11 * nb11 holds for
+                    // tokens a stride apart: only a token stride compared with ne11 rows of row bytes copies them.
+                    successful_reuse_case(life, type, ne11, "prompt-rows-strided", input_rows::STRIDED, 33);
+                }
+                // Decode on the same fixture, ids as a view: the route reads the view, it does not write it.
+                successful_reuse_case(life, type, 1, "decode-ids-view", input_rows::DENSE, 1, ids_layout::VIEW);
+            }
+        }
+        require_clean_teardown();
+        for (const ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+            lifecycle_fixture life(backend_order::BEFORE_LOAD_END, route_authorization::PRODUCTION, prompt_capacity);
+            prompt_above_capacity_case(life, type);
         }
         require_clean_teardown();
         // The order a real model load runs in: no backend at load_end, then the context binds twice. The route must

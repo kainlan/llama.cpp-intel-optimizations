@@ -627,9 +627,11 @@ the normal exit plus 15 early ones. Thirteen of those 15 compute and therefore
 acquire; they are the defect. The remaining two are the persistent-TG returns,
 which never call `compute_impl_unlocked()` and so never acquire.)
 
-The invocation is acquired inside `ggml_backend_sycl_graph_compute_impl()` at
-its entry (`ggml_sycl_execution_begin_graph`), i.e. on *every* call that reaches
-`compute_impl_unlocked()`. The matching
+The invocation is begun by a dispatch scope (`ggml_sycl_execution_dispatch_scope`,
+§12.3). `ggml_backend_sycl_graph_compute_impl()` opens one at its entry, so
+*every* call that reaches `compute_impl_unlocked()` begins one. The keyed and
+whole-split segment record and replay and the block graphlets dispatch nodes
+without `compute_impl` and open their own scopes. The matching
 `ggml_sycl_execution_submit_graph()` / `ggml_sycl_execution_release_graph()`
 pair exists only on the function's **normal** exit. Thirteen bypass paths inside
 `ggml_backend_sycl_graph_compute_unchecked()` call `compute_impl_unlocked()`
@@ -1436,6 +1438,46 @@ logical index, the one bound `ContextId`/`GraphEpoch`, and `InvocationId` for
 every aggregate device so same/multi-device behavior is asserted, not inferred
 from the selector.
 
+**Who begins an invocation: the dispatch scope.**
+`ggml_sycl_execution_dispatch_scope` (`ggml-sycl.cpp`) is the only path to
+`ggml_sycl_execution_begin_graph`. Its constructor runs
+`ggml_sycl_execution_begin_dispatch_graph`, which begins this backend's tracked
+graph or joins the one it already holds OPEN/SEALED. On a refusal it throws if
+the context is armed for tracked execution, and an unarmed context runs
+untracked.
+
+Who opens a scope:
+- `ggml_backend_sycl_graph_compute_impl`;
+- each path that dispatches nodes without it: `moe_graph_record_segment_slot`,
+  `moe_graph_replay_segment_slot`, `moe_graph_record_segments`,
+  `moe_graph_replay_segments` and `moe_graph_try_block_graphlets`.
+
+Scopes nest when such a path falls back to `compute_impl`.
+`ctx->execution_dispatch_depth` counts the open scopes under
+`ctx->execution_state_mutex`. Only the scope that brings the count to zero ends
+the graph: it seals on a normal exit and quarantines
+(`registry.abort_invocation`) when an exception leaves it. An inner scope ends
+nothing. Submit and release stay where they were, at graph_compute's exit and
+in `ggml_backend_sycl_synchronize`, plus the entry drain in
+`graph_compute_unchecked` (`ggml_sycl_execution_drain_own_terminal`), which
+releases a terminal this backend left submitted before it takes L2.
+
+The tripwire: a graph that is submitted, released, quarantined, cleared or
+unbound while a scope still holds it open logs one `[EXECUTION-TRIPWIRE]` line
+at ERROR per invocation. The line carries the action, the caller's site, the
+device, the context, the graph epoch, the invocation and the depth. The decision
+is taken under `execution_state_mutex`; an unbind takes it under
+`g_execution_backend_binding_mutex` as well. The line is logged after every lock
+is released.
+
+The rule for a new dispatch path: a function that graph_compute reaches and that
+dispatches a node opens a scope. A dispatch is a call to `compute_forward`, to
+the direct-node helper, or to an op entry point. The function declares the scope
+in its outermost block, before its first dispatch, with only named statements
+before it. `tests/test-sycl-execution-abort-source.py` holds that census: its
+`PRE_SCOPE_CALLS` lists the named statements and its `DISPATCH_EXEMPT` lists the
+exemptions, each with a reason.
+
 ### 12.4 Owner-targeted reset, graph invalidation, and teardown
 
 Every reset/clear/free operation must take an explicit owner tuple and match it:
@@ -1579,7 +1621,7 @@ The pool mutexes (`registry_pool_state::mutex`, and the standalone
 `moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
 take no listed lock themselves.
 
-Four existing paths still break this section's rules under these locks. All four
+Five existing paths still break this section's rules under these locks. All five
 are known non-conformances, not exemptions.
 
 - **Graph compute takes L1 under L2 and L3.** The into-empty republication
@@ -1664,6 +1706,39 @@ are known non-conformances, not exemptions.
   final destructors run under a listed lock.
 - `recover_quarantined(wait=true)` waits on a queue-quiescence proof under the
   registry and pool mutexes.
+- **A bypass dispatch path that is refused DEVICE_BUSY drains another
+  context's terminal events under L2 and L3.** The keyed and whole-split
+  segment record and replay and the block graphlets
+  (`moe_graph_record_segment_slot`, `moe_graph_replay_segment_slot`,
+  `moe_graph_record_segments`, `moe_graph_replay_segments`,
+  `moe_graph_try_block_graphlets`) dispatch nodes without
+  `ggml_backend_sycl_graph_compute_impl`, so each opens its own
+  `ggml_sycl_execution_dispatch_scope`. `graph_compute_unchecked` keeps
+  `g_sycl_graph_compute_mutex` (L2) and `sycl_ctx->graph_mutex` (L3) for the
+  whole of these paths. It drops L2 from the first `compute_impl_unlocked`
+  call on and does not take it back, so `compute_impl`'s own scope usually
+  begins under L3 alone; the two direct `compute_impl()` calls keep L2. When
+  a bypass path's begin is refused DEVICE_BUSY,
+  `ggml_sycl_execution_begin_dispatch_graph`
+  drains the owning context's terminal events and retries once, and that wait
+  runs under both locks.
+  - The wait is on device events that were already submitted, and nothing it
+    waits for needs L2.
+  - This context's own terminal is not part of the exception:
+    `graph_compute_unchecked` drains it before it takes L2
+    (`ggml_sycl_execution_drain_own_terminal`), so the begin under the locks
+    finds nothing of its own to wait for.
+    `tests/test-sycl-execution-abort-source.py` pins that order.
+  - What would remove it: open the outermost dispatch scope in
+    `graph_compute_unchecked` before L2 is taken, with the six scopes below
+    nesting under it. A nested scope joins the graph that is already open and
+    never reaches the retry.
+  - A bypass decode now claims the device in the lifecycle registry
+    (`device_owners_`), which it did not do before. A decode split that ran only
+    keyed segment slots used to begin no invocation. Its scope now begins one,
+    which claims the device for this context until the next synchronize
+    releases it, as a `compute_impl` split always has. Another context's begin
+    on that device in between is refused DEVICE_BUSY.
 
 The zone-reset escape audit's `zone_audit_state::mutex` (`unified-cache.cpp`,
 `iiff` Phase 0) guards the per-site inventory the `GGML_SYCL_ZONE_RESET_AUDIT`

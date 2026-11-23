@@ -23748,16 +23748,6 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
     return true;
 }
 
-static sycl::event mmvq_upload_packed_ids_after(sycl::queue &       q,
-                                                 int32_t *           ids_device,
-                                                 const int32_t *     ids_host,
-                                                 size_t              ids_bytes,
-                                                 const sycl::event * dependency) {
-    return ggml_sycl::mem_copy_ptr_async(ids_device, ids_host, ids_bytes, q,
-                                         dependency ? std::vector<sycl::event>{ *dependency }
-                                                    : std::vector<sycl::event>{});
-}
-
 static sycl::event mmvq_submit_quantize_q8_1_aos_after(sycl::queue &       q,
                                                        const float *       src,
                                                        void *              dst,
@@ -23791,7 +23781,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
                                           const float *                          activation_f32,
-                                          int32_t *                              ids_device,
+                                          const int32_t *                        ids_device,
                                           const int32_t *                        ids_host,
                                           int                                    n_experts,
                                           int                                    ncols,
@@ -23846,7 +23836,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
     size_t occurrences = 0, activation_rows = 0, quant_blocks = 0, q8_row_bytes = 0, required_q8 = 0;
     size_t output_values = 0, required_output = 0, ids_slot_span = 0, ids_token_span = 0, ids_max_offset = 0;
     size_t q8_nb12 = 0, dst_nb1 = 0, dst_nb2 = 0, block_num_z = 0, kernel_groups = 0, kernel_items = 0;
-    size_t weight_blocks = 0, weight_bytes = 0, ids_bytes = 0;
+    size_t weight_blocks = 0, weight_bytes = 0;
     if (!checked_mul(sk, st, &occurrences) || !checked_mul(sr, st, &activation_rows) ||
         !checked_mul(activation_rows, blocks_per_row, &quant_blocks) ||
         !checked_mul(blocks_per_row, sizeof(block_q8_1), &q8_row_bytes) ||
@@ -23858,8 +23848,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         !checked_add(ids_max_offset, sizeof(int32_t), &ids_max_offset) || !checked_mul(sr, q8_row_bytes, &q8_nb12) ||
         !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2) ||
         !checked_mul(sn, weight_blocks_per_row, &weight_blocks) ||
-        !checked_mul(weight_blocks, weight_block_bytes, &weight_bytes) ||
-        !checked_mul(occurrences, sizeof(int32_t), &ids_bytes)) {
+        !checked_mul(weight_blocks, weight_block_bytes, &weight_bytes)) {
         return false;
     }
     block_num_z = sn / GGML_SYCL_MOE_MMV_Y + (sn % GGML_SYCL_MOE_MMV_Y != 0);
@@ -23872,23 +23861,26 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         buffers.activation_q8_bytes != required_q8 || buffers.output_f32_bytes != required_output) {
         return false;
     }
-    // Strides must describe non-overlapping top-k slots and complete tokens.
-    if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) ||
-        ids_nb1 != static_cast<int64_t>(sk * sizeof(int32_t))) {
+    // Slots are adjacent inside a token, and tokens do not overlap; a view's token stride may leave the other columns
+    // of its source between them (build_moe_ffn hands MUL_MAT_ID the top-k view of the argsort). The alignment test
+    // above keeps the stride a whole number of ids. ids_max_offset above is the farthest id's byte end under these
+    // strides, and the only bound checked on it is PTRDIFF_MAX: the extent of the storage the view lies in is not
+    // passed here, so that the farthest id lies inside it rests on the caller handing over a real tensor's view.
+    if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))) {
         return false;
     }
+    // The snapshot is the caller's read of the storage the kernel reads in place. It is checked here, before anything
+    // is submitted, and not read again after this function returns.
     for (size_t i = 0; i < occurrences; ++i) {
         if (ids_host[i] < 0 || ids_host[i] >= n_experts) {
             return false;
         }
     }
 
-    // Upload the one retained packed snapshot; ids_device's prior contents are
-    // irrelevant. Chaining quantization after this upload ensures dependency
-    // cannot race either activation consumption or ID publication.
-    sycl::event ids_event = mmvq_upload_packed_ids_after(q, ids_device, ids_host, ids_bytes, dependency);
+    // The kernel reads the ids where they are. Quantization waits on the caller's dependency, which covers the
+    // activation copy, and the kernel follows quantization.
     sycl::event quant_event =
-        mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, quant_blocks, &ids_event);
+        mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, quant_blocks, dependency);
     return mmvq_submit_q1_nvfp4_aos_id(
         q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32, ncols,
         nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1,

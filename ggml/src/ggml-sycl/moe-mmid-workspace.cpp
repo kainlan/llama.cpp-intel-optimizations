@@ -1399,24 +1399,21 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
             for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
             auto & needed = requested_geometry[r];
             const auto & available = pool->geometry;
-            if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.K), static_cast<size_t>(request.N),
-                                            request.ne11, request.top_k, capacity },
-                                          wanted.owner_device != request.submit_device, &needed) ||
+            if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.K), static_cast<size_t>(request.N), request.ne11,
+                                           request.top_k, capacity },
+                                         wanted.owner_device != request.submit_device, &needed) ||
                 !moe_mmid_validate_workspace_geometry(available, wanted.owner_device != request.submit_device) ||
-                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
-                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
-                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
-                available.activation_f32_bytes < needed.activation_f32_bytes ||
-                available.activation_q8_bytes < needed.activation_q8_bytes ||
-                available.output_f32_bytes < needed.output_f32_bytes ||
-                available.output_q8_bytes < needed.output_q8_bytes ||
+                // The comparison the authoritative admission makes, and beside it the descriptor and secondary
+                // byte counts, which only this admission compares.
+                !moe_mmid_workspace_geometry_holds(available, needed) ||
                 available.descriptor_host_bytes < needed.descriptor_host_bytes ||
                 available.secondary_activation_d2h_bytes < needed.secondary_activation_d2h_bytes ||
                 available.secondary_activation_h2d_bytes < needed.secondary_activation_h2d_bytes ||
                 available.secondary_output_d2h_bytes < needed.secondary_output_d2h_bytes ||
                 available.secondary_output_h2d_bytes < needed.secondary_output_h2d_bytes ||
-                available.secondary_bounce_bytes < needed.secondary_bounce_bytes ||
-                available.host_slot_bytes < needed.host_slot_bytes) return out;
+                available.secondary_bounce_bytes < needed.secondary_bounce_bytes) {
+                return out;
+            }
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out;
@@ -1491,6 +1488,17 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     out.bundle.admitted_ = true;
     out.status = moe_mmid_lease_status::ACQUIRED;
     return out;
+}
+
+bool moe_mmid_workspace_geometry_holds(const moe_mmid_workspace_geometry & available,
+                                       const moe_mmid_workspace_geometry & needed) noexcept {
+    return available.activation_rows >= needed.activation_rows && available.occurrences >= needed.occurrences &&
+           available.q8_ne10_row_bytes >= needed.q8_ne10_row_bytes &&
+           available.q8_ne01_row_bytes >= needed.q8_ne01_row_bytes &&
+           available.activation_f32_bytes >= needed.activation_f32_bytes &&
+           available.activation_q8_bytes >= needed.activation_q8_bytes &&
+           available.output_f32_bytes >= needed.output_f32_bytes &&
+           available.output_q8_bytes >= needed.output_q8_bytes && available.host_slot_bytes >= needed.host_slot_bytes;
 }
 
 moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
@@ -1581,15 +1589,11 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
             for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
             const auto & available = pool->geometry; auto & needed = geometry[r];
             if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.shape.K), static_cast<size_t>(request.shape.N),
-                                            request.shape.ne11, request.shape.top_k, capacity },
-                                          wanted.owner_device != authority->submit_device, &needed) ||
-                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
-                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
-                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
-                available.activation_f32_bytes < needed.activation_f32_bytes ||
-                available.activation_q8_bytes < needed.activation_q8_bytes ||
-                available.output_f32_bytes < needed.output_f32_bytes || available.output_q8_bytes < needed.output_q8_bytes ||
-                available.host_slot_bytes < needed.host_slot_bytes) return out;
+                                           request.shape.ne11, request.shape.top_k, capacity },
+                                         wanted.owner_device != authority->submit_device, &needed) ||
+                !moe_mmid_workspace_geometry_holds(available, needed)) {
+                return out;
+            }
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out; order[r] = r;

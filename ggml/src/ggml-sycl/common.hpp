@@ -6389,6 +6389,11 @@ struct ggml_backend_sycl_context {
     uint64_t                             execution_graph_epoch = 0;
     uint64_t                             execution_invocation_id = 0;
     bool                                 execution_graph_sealed = false;
+    // Dispatch scopes (ggml_sycl_execution_dispatch_scope) holding the tracked graph open on this backend. Ending or
+    // clearing the graph while this is nonzero is a contract violation, reported once per invocation through
+    // execution_tripwire_invocation. Both guarded by execution_state_mutex.
+    int                                  execution_dispatch_depth      = 0;
+    uint64_t                             execution_tripwire_invocation = 0;
     std::vector<int>                     execution_aggregate_devices;
     uint64_t                             execution_root_model_id = 0;
     uint64_t                             execution_root_load_txn_id = 0;

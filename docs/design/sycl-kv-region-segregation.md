@@ -5801,8 +5801,9 @@ them. It never re-fits KV and never yields.
     Each is either a non-owning identity key or holds no owning handle of a tenant slice past
     `graph_compute` exit. H7ag names all nine, each with a mutation witness. Not holders (zhcn
     5.4 row 27): `g_moe_down_sum_shadow_entries` (its own allocation), `g_mul_mat_exc_ctx` (raw
-    pointers), `local_extra` (scoped), `retained_ids` (a host copy) and the `CpuExpertPool`
-    tasks (a `weight_lease` only).
+    pointers), `local_extra` (scoped) and the `CpuExpertPool` tasks (a `weight_lease` only).
+    The direct route's `retained_ids`, a host copy, was also one; it is gone since 2026-11-22,
+    when the kernel began reading the ids tensor in place.
   - **(d) The reap, with no L1-L5 lock held (lead ruling "B"; r6 I-1, I-2, m-3, m-5; zhcn rev
     5).** zhcn's mem-handle call, shared with llama.cpp-uwlx's yield (jehw), is
     `retained_reap_result release_retained_referencing(const retained_reap_request &)`. The

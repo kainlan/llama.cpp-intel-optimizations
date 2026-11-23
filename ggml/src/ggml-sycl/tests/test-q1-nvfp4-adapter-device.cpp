@@ -6,6 +6,7 @@
 #include "ggml-quants.h"
 #include "ggml-sycl.h"
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -185,7 +186,28 @@ template <typename T> struct usm_owner {
     ~usm_owner() { if (ptr) sycl::free(ptr, *q); }
 };
 
-void run_case(sycl::queue & q, ggml_type type, int ne11) {
+// The activation as the kernel sees it after its Q8_1 quantization: per block of QK8_1, d = amax / 127 in float,
+// q = round(x / d), and the dot product reads d as a half. The oracle uses these values, so it differs from the kernel
+// only in summation order.
+std::vector<float> q8_1_round_trip(const float * x, size_t n) {
+    std::vector<float> y(n);
+    for (size_t b = 0; b < n; b += QK8_1) {
+        float amax = 0.0f;
+        for (size_t i = b; i < b + QK8_1; ++i) amax = std::max(amax, std::fabs(x[i]));
+        const float d      = amax / 127.0f;
+        const float d_half = ggml_fp16_to_fp32(ggml_fp32_to_fp16(d));
+        for (size_t i = b; i < b + QK8_1; ++i) y[i] = amax == 0.0f ? 0.0f : std::round(x[i] / d) * d_half;
+    }
+    return y;
+}
+
+// The ids the kernel reads sit on the device as the ids tensor holds them. PACKED: [token][top_k]. VIEW: top_k columns
+// of a [token][1 + top_k + 1] buffer, another valid expert in the columns before and after them, as build_moe_ffn's
+// top-k view of the argsort gives MUL_MAT_ID. The view's pointer starts past the sentinel column, so a kernel that read
+// before the pointer it was given, or from the buffer's start, would take the sentinel for slot 0.
+enum class ids_layout { PACKED, VIEW };
+
+void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
     constexpr int experts = 4, top_k = 3, tokens = 2, rows = 5;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
     const size_t block_bytes = type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
@@ -194,27 +216,51 @@ void run_case(sycl::queue & q, ggml_type type, int ne11) {
     const size_t activation_rows = static_cast<size_t>(ne11) * tokens;
     const size_t q8_bytes = activation_rows * static_cast<size_t>(K / QK8_1) * sizeof(block_q8_1);
     const size_t output_values = static_cast<size_t>(top_k) * tokens * rows;
+    const int    ids_lead = ids_at == ids_layout::VIEW ? 1 : 0;  // sentinel columns before the first slot of a token
+    const int    ids_row  = ids_at == ids_layout::VIEW ? ids_lead + top_k + 1 : top_k;  // int32s from token to token
+    const int64_t ids_nb1 = static_cast<int64_t>(ids_row) * sizeof(int32_t);
 
     usm_owner<unsigned char> weights(q, weight_bytes);
     usm_owner<const void *> table(q, experts);
     usm_owner<float> activation(q, activation_rows * K);
-    usm_owner<int32_t> ids(q, top_k * tokens);
+    usm_owner<int32_t> ids(q, static_cast<size_t>(ids_row) * tokens);
     usm_owner<unsigned char> q8(q, q8_bytes + alignof(block_q8_1));
     usm_owner<float> output(q, output_values + 1);
 
-    std::vector<float> weight_row(K);
+    // Signs vary by expert, row and K, so the experts stay distinct after Q1_0's one-bit quantization and a kernel that
+    // read the wrong expert, or a wrong id, fails the oracle below.
+    std::vector<float> weight_row(K), dequant(static_cast<size_t>(experts) * rows * K);
     for (int e = 0; e < experts; ++e) {
         table.ptr[e] = weights.ptr + static_cast<size_t>(e) * rows * blocks_per_row * block_bytes;
         for (int r = 0; r < rows; ++r) {
-            for (int k = 0; k < K; ++k) weight_row[k] = 0.25f + float((e + r + k) % 11) / 13.0f;
+            for (int k = 0; k < K; ++k) {
+                const float sign = (e * 5 + r * 3 + k) % 7 < 3 ? -1.0f : 1.0f;
+                weight_row[k]    = sign * (0.25f + float((e + r + k) % 11) / 13.0f);
+            }
             void * row = weights.ptr + (static_cast<size_t>(e) * rows + r) * blocks_per_row * block_bytes;
-            if (type == GGML_TYPE_Q1_0) quantize_row_q1_0_ref(weight_row.data(), static_cast<block_q1_0 *>(row), K);
-            else quantize_row_nvfp4_ref(weight_row.data(), static_cast<block_nvfp4 *>(row), K);
+            float * dq  = dequant.data() + (static_cast<size_t>(e) * rows + r) * K;
+            if (type == GGML_TYPE_Q1_0) {
+                quantize_row_q1_0_ref(weight_row.data(), static_cast<block_q1_0 *>(row), K);
+                dequantize_row_q1_0(static_cast<const block_q1_0 *>(row), dq, K);
+            } else {
+                quantize_row_nvfp4_ref(weight_row.data(), static_cast<block_nvfp4 *>(row), K);
+                dequantize_row_nvfp4(static_cast<const block_nvfp4 *>(row), dq, K);
+            }
         }
     }
     for (size_t i = 0; i < activation_rows * static_cast<size_t>(K); ++i) activation.ptr[i] = 0.5f + float(i % 17) / 19.0f;
-    const int32_t snapshot[] = { 3, 1, 3, 0, 2, 0 }; // repeated and nonmonotonic
-    std::fill(ids.ptr, ids.ptr + top_k * tokens, -1); // adapter must upload snapshot, not trust this
+    const int32_t snapshot[] = { 3, 1, 3, 0, 2, 0 }; // repeated and nonmonotonic, [token][top_k]
+    // The device ids hold the snapshot where the layout puts it; the kernel reads them there and must not write them.
+    std::vector<int32_t> ids_written(static_cast<size_t>(ids_row) * tokens);
+    for (int t = 0; t < tokens; ++t) {
+        for (int col = 0; col < ids_row; ++col) {
+            const int slot = col - ids_lead;
+            ids_written[static_cast<size_t>(t) * ids_row + col] =
+                slot >= 0 && slot < top_k ? snapshot[t * top_k + slot] : (snapshot[t * top_k] + 1) % experts;
+        }
+    }
+    std::copy(ids_written.begin(), ids_written.end(), ids.ptr);
+    int32_t * const ids_view = ids.ptr + ids_lead;
     std::memset(q8.ptr, 0x5a, q8_bytes);
     std::fill(output.ptr, output.ptr + output_values, 123.0f);
 
@@ -228,18 +274,29 @@ void run_case(sycl::queue & q, ggml_type type, int ne11) {
     });
     mmvq_q1_nvfp4_admitted_buffers buffers{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
     sycl::event terminal;
-    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
+    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
                                                   snapshot, experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
-                                                  top_k * sizeof(int32_t), buffers, &delayed, &terminal),
-            "valid admitted submit rejected");
+                                                  ids_nb1, buffers, &delayed, &terminal),
+            ids_at == ids_layout::VIEW ? "valid admitted submit with an ids view rejected" :
+                                         "valid admitted submit rejected");
     terminal.wait_and_throw();
-    bool any_nonzero = false;
-    for (size_t i = 0; i < output_values; ++i) {
-        require(std::isfinite(output.ptr[i]), "non-finite output");
-        any_nonzero |= output.ptr[i] != 0.0f;
+    // The oracle reads the activation the delayed kernel left (its element 0 is 2), so it also checks that the kernel
+    // ran after its dependency.
+    const std::vector<float> quantized = q8_1_round_trip(activation.ptr, activation_rows * static_cast<size_t>(K));
+    for (int t = 0; t < tokens; ++t) {
+        for (int slot = 0; slot < top_k; ++slot) {
+            const float * a = quantized.data() + (static_cast<size_t>(t) * ne11 + (ne11 == 1 ? 0 : slot)) * K;
+            for (int r = 0; r < rows; ++r) {
+                const float * w = dequant.data() + (static_cast<size_t>(snapshot[t * top_k + slot]) * rows + r) * K;
+                float expected = 0.0f;
+                for (int k = 0; k < K; ++k) expected += w[k] * a[k];
+                const float got = output.ptr[(static_cast<size_t>(t) * top_k + slot) * rows + r];
+                require(std::isfinite(got) && std::fabs(got - expected) <= 0.08f * (1.0f + std::fabs(expected)),
+                        "admitted output does not match the CPU oracle");
+            }
+        }
     }
-    require(any_nonzero, "nonzero weights produced only zero output");
-    require(std::memcmp(ids.ptr, snapshot, sizeof(snapshot)) == 0, "retained ID snapshot was not uploaded exactly");
+    require(std::equal(ids_written.begin(), ids_written.end(), ids.ptr), "the adapter wrote into the device ids");
 
     auto expect_pre_submit_refusal = [&](const char * name, ggml_type bad_type, int bad_k, const int32_t * bad_ids,
                                          int64_t nb0, int64_t nb1, void * q8_ptr, size_t q8_size,
@@ -247,34 +304,38 @@ void run_case(sycl::queue & q, ggml_type type, int ne11) {
         std::memset(q8.ptr, 0x6b, q8_bytes);
         std::fill(output.ptr, output.ptr + output_values, 77.0f);
         mmvq_q1_nvfp4_admitted_buffers bad{ q8_ptr, q8_size, output.ptr, output_size };
-        require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, bad_type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
+        require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, bad_type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
                                                        bad_ids, experts, bad_k, rows, top_k, tokens, ne11, nb0, nb1,
                                                        bad), name);
         for (size_t i = 0; i < q8_bytes; ++i) require(q8.ptr[i] == 0x6b, "refusal changed Q8 bytes");
         for (size_t i = 0; i < output_values; ++i) require(output.ptr[i] == 77.0f, "refusal changed output");
     };
     int32_t invalid_ids[] = { 3, 1, experts, 0, 2, 0 };
-    expect_pre_submit_refusal("unsupported type submitted", GGML_TYPE_F32, K, snapshot, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("zero K submitted", type, 0, snapshot, sizeof(int32_t), top_k * sizeof(int32_t), q8.ptr,
+    expect_pre_submit_refusal("unsupported type submitted", GGML_TYPE_F32, K, snapshot, sizeof(int32_t), ids_nb1,
+                              q8.ptr, q8_bytes, output_values * sizeof(float));
+    expect_pre_submit_refusal("zero K submitted", type, 0, snapshot, sizeof(int32_t), ids_nb1, q8.ptr, q8_bytes,
+                              output_values * sizeof(float));
+    expect_pre_submit_refusal("T-1 Q8 submitted", type, K, snapshot, sizeof(int32_t), ids_nb1, q8.ptr, q8_bytes - 1,
+                              output_values * sizeof(float));
+    expect_pre_submit_refusal("output mismatch submitted", type, K, snapshot, sizeof(int32_t), ids_nb1, q8.ptr,
+                              q8_bytes, output_values * sizeof(float) - 1);
+    expect_pre_submit_refusal("invalid ID submitted", type, K, invalid_ids, sizeof(int32_t), ids_nb1, q8.ptr, q8_bytes,
+                              output_values * sizeof(float));
+    // Slots must be adjacent inside a token, and tokens must not overlap.
+    expect_pre_submit_refusal("invalid slot stride submitted", type, K, snapshot, 2 * sizeof(int32_t), ids_nb1,
+                              q8.ptr, q8_bytes, output_values * sizeof(float));
+    expect_pre_submit_refusal("overlapping token stride submitted", type, K, snapshot, sizeof(int32_t),
+                              (top_k - 1) * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
+    expect_pre_submit_refusal("misaligned token stride submitted", type, K, snapshot, sizeof(int32_t),
+                              top_k * sizeof(int32_t) + 2, q8.ptr, q8_bytes, output_values * sizeof(float));
+    expect_pre_submit_refusal("misaligned Q8 submitted", type, K, snapshot, sizeof(int32_t), ids_nb1, q8.ptr + 1,
                               q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("T-1 Q8 submitted", type, K, snapshot, sizeof(int32_t), top_k * sizeof(int32_t), q8.ptr,
-                              q8_bytes - 1, output_values * sizeof(float));
-    expect_pre_submit_refusal("output mismatch submitted", type, K, snapshot, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float) - 1);
-    expect_pre_submit_refusal("invalid ID submitted", type, K, invalid_ids, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("invalid slot stride submitted", type, K, snapshot, 2 * sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("invalid token stride submitted", type, K, snapshot, sizeof(int32_t),
-                              (top_k + 1) * sizeof(int32_t), q8.ptr, q8_bytes, output_values * sizeof(float));
-    expect_pre_submit_refusal("misaligned Q8 submitted", type, K, snapshot, sizeof(int32_t),
-                              top_k * sizeof(int32_t), q8.ptr + 1, q8_bytes, output_values * sizeof(float));
+    require(std::equal(ids_written.begin(), ids_written.end(), ids.ptr), "a refusal wrote into the device ids");
 
     mmvq_q1_nvfp4_admitted_buffers overflow{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
-    require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
+    require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
                                                    snapshot, experts, K, rows, INT_MAX, INT_MAX, ne11,
-                                                   sizeof(int32_t), top_k * sizeof(int32_t), overflow),
+                                                   sizeof(int32_t), ids_nb1, overflow),
             "overflow shape submitted");
 }
 
@@ -386,10 +447,12 @@ int main() {
         sycl::queue q{ sycl::gpu_selector_v };
         lifecycle_fixture lifecycle;
         wrapper_exact_plan_identity(q);
-        run_case(q, GGML_TYPE_Q1_0, 1);
-        run_case(q, GGML_TYPE_Q1_0, 3);
-        run_case(q, GGML_TYPE_NVFP4, 1);
-        run_case(q, GGML_TYPE_NVFP4, 3);
+        for (const ggml_type type : { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 }) {
+            for (const int ne11 : { 1, 3 }) {
+                run_case(q, type, ne11, ids_layout::PACKED);
+                run_case(q, type, ne11, ids_layout::VIEW);
+            }
+        }
         fp16_converter_bit_exact(q, GGML_TYPE_Q1_0);
         fp16_converter_bit_exact(q, GGML_TYPE_NVFP4);
         std::cout << "Q1/NVFP4 lifecycle-aware admitted device adapter: PASS\n";

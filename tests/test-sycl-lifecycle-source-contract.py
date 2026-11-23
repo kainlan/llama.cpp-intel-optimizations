@@ -113,8 +113,10 @@ raw_snapshot_writer_re = re.compile(r"(?:->|\.)\s*set_placement_plan_snapshot\s*
 # incrementing a count, and a listed statement cannot be pasted into another function.
 raw_snapshot_reader_roles = (
     ("const auto cached = cache->get_placement_plan_snapshot();", "cache_placement_coherence"),
-    ("const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
-     "ggml_sycl_mul_mat_id"),
+    # The Q1_0/NVFP4 direct recipe's queue capability. It lives in its own helper so a decode token's admission and
+    # a prompt's admission get one answer from one read.
+    ("const auto recipe_plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
+     "ggml_sycl_moe_direct_queue_capability"),
     ("const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
      "ggml_sycl_mul_mat_id"),
     ("const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
