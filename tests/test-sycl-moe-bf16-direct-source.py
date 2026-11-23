@@ -9,13 +9,18 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       only); a known plan answers alone (every expert of the weight planned on this device at AOS, asked through
       ggml_sycl_moe_tensor_plan_primary_layout); with no plan, a weight nothing has placed yet counts (test-backend-ops
       asks supports_op before it allocates, then allocates on the backend it asked) and a placed weight counts only in
-      a SYCL device buffer of this device; it reads no environment and has no row-multiple rule;
-  (b) supports_op asks that predicate as the MUL_MAT_ID gate's third term, and the route asks the same predicate;
+      a SYCL device buffer of this device, asked through the one unsplit-SYCL-buffer helper; it reads no environment
+      and has no row-multiple rule;
+  (b) supports_op asks that predicate as the MUL_MAT_ID gate's third term, and the route asks the same predicate
+      again at run time and refuses by name when it says no;
   (c) the route sits in ggml_sycl_mul_mat_id after the src0->extra ensure block and before the MMID_SCHED device
-      schedule, the yx28 decode-direct request and ggml_sycl_ensure_weight_on_device(); its block is one call to
-      ggml_sycl_mul_mat_id_bf16_direct() and a return, so nothing after it runs for a BF16 op the predicate takes;
-  (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table, the device-resident ids, submits through
-      moe_bf16_direct_submit() and retains a snapshot of the table's dispatch bundle (its active leases and the table's
+      schedule, the yx28 decode-direct request and ggml_sycl_ensure_weight_on_device(); its block is keyed on the BF16
+      expert type, not on the predicate, and is one call to ggml_sycl_mul_mat_id_bf16_direct() and a return, so no
+      BF16 op reaches the routes after it, none of which has a BF16 kernel;
+  (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table (publishing the weight's AOS slices on a miss
+      only from an unsplit SYCL buffer, through the same helper the predicate asks), the device-resident ids, submits
+      through moe_bf16_direct_submit() inside the kernel profiler's existing wrapper under the label
+      mulmat.moe.bf16_direct, and retains a snapshot of the table's dispatch bundle (its active leases and the table's
       own allocation) until the kernel's event, as the production pointer-table dispatchers do; it never consumes the
       table's active leases (the next dispatch from the same cached table needs them), reads the ids on the host,
       waits, touches the MMID workspace or Q8_1, re-routes to the CPU or aborts; a refusal is a named WARN line and
@@ -27,8 +32,9 @@ expert table and the device ids, with src1 and dst read and written in place. Th
   (f) the op-entry flush of another node's pending host scatter precedes the MUL_MAT_ID dispatch in
       ggml_sycl_compute_forward_impl, so the route reads src1 after it;
   (g) the kernel lives in moe-bf16-direct.{hpp,cpp}: BF16 decoded with bf16_to_f32, a 16-lane sub-group per output
-      row reduced with reduce_over_group, id -1 a zero row and any other bad slot a quiet NaN; the file allocates,
-      frees and waits on nothing;
+      row reduced with reduce_over_group, id -1 a zero row and any other bad slot a quiet NaN; a dispatch whose global
+      range exceeds the shape's launch limit (an int by default) runs in token chunks, each after the one before, and
+      one that cannot be chunked is refused; the file allocates, frees and waits on nothing;
   (h) the MMVQ tables stay BF16-free and moe_type_needs_direct_kernel stays Q1_0/NVFP4.
 """
 
@@ -51,8 +57,16 @@ PREDICATE = "ggml_sycl_moe_bf16_direct_route_available"
 PREDICATE_HEAD = f"static bool {PREDICATE}(const ggml_tensor * op, int device) {{"
 ROUTE_FN = "ggml_sycl_mul_mat_id_bf16_direct"
 ROUTE_FN_HEAD = f"static void {ROUTE_FN}(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {{"
-ROUTE_IF = f"if ({PREDICATE}(dst, ctx.device)) {{"
+ROUTE_IF = "if (src0->type == GGML_TYPE_BF16) {"
+ROUTE_ASK = f"if (!{PREDICATE}(dst, ctx.device)) {{"
 UNPLACED_CLAIM = "if(src0->buffer==nullptr){returntrue;}"
+UNSPLIT = "ggml_sycl_moe_bf16_direct_unsplit_sycl_buffer"
+UNSPLIT_HEAD = f"static bool {UNSPLIT}(ggml_backend_buffer_t buffer) {{"
+UNSPLIT_BODY = "returnbuffer!=nullptr&&ggml_backend_buffer_is_sycl(buffer)&&!ggml_backend_buffer_is_sycl_split(buffer);"
+PUBLISH_GUARD = f"if ({UNSPLIT}(src0->buffer) && ggml_sycl_publish_mmid_canonical_aos_experts("
+PROFILE_SUBMIT = "ggml_sycl_profile_submit("
+PROFILE_NAME = '"mulmat.moe.bf16_direct"'
+PROFILE_KEYS = ('"ncols="', '";nrows_per_expert="', '";total_batches="')
 ROUTE_BODY = f"{ROUTE_FN}(ctx,dst);return;"
 GATE = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device) && "
         f"!{PREDICATE}(op, device)) {{")
@@ -147,6 +161,17 @@ def braced_body(text, head, start=0):
     return None
 
 
+def function_body(text, name_head):
+    """The braced body of the first definition whose text starts with `name_head` (a name and its open paren)."""
+    at = text.find(name_head)
+    while at >= 0:
+        brace, semi = text.find("{", at), text.find(";", at)
+        if brace >= 0 and (semi < 0 or brace < semi):
+            return braced_body(text, text[at : brace + 1], at)
+        at = text.find(name_head, at + 1)
+    return None
+
+
 def claim_a_predicate(s):
     fails = []
     sycl = s["sycl"]
@@ -154,9 +179,18 @@ def claim_a_predicate(s):
         return [f"{PREDICATE}(op, device) is not defined exactly once as a static bool in ggml-sycl.cpp"]
     body = braced_body(sycl, PREDICATE_HEAD) or ""
     for needed in ("GGML_TYPE_BF16", "ggml_is_contiguous(", "ggml_sycl_moe_plan_owner_for_device(device)",
-                   "ggml_sycl_moe_tensor_plan_primary_layout(", "GGML_LAYOUT_AOS", "ggml_backend_buffer_is_sycl("):
+                   "ggml_sycl_moe_tensor_plan_primary_layout(", "GGML_LAYOUT_AOS", f"{UNSPLIT}("):
         if needed not in body:
             fails.append(f"the predicate does not ask {needed}")
+    # One helper says what an unsplit SYCL buffer is; the predicate and the route ask it and spell neither half.
+    if sycl.count(UNSPLIT_HEAD) != 1 or tight(braced_body(sycl, UNSPLIT_HEAD) or "") != UNSPLIT_BODY:
+        fails.append(f"{UNSPLIT} is not defined once as `buffer && is_sycl(buffer) && !is_sycl_split(buffer)`")
+    elif sycl.find(UNSPLIT_HEAD) > sycl.find(PREDICATE_HEAD):
+        fails.append(f"{UNSPLIT} is defined after the predicate that asks it")
+    route = route_fn_body(sycl) or ""
+    for where, text in (("predicate", body), ("route", route)):
+        if "ggml_backend_buffer_is_sycl_split(" in text or "ggml_backend_buffer_is_sycl(" in text:
+            fails.append(f"the {where} spells the buffer test out instead of asking {UNSPLIT}")
     for forbidden in ("getenv", "% 32", "%32", "WARP_SIZE", "ggml_sycl_moe_pp_batched", "GGML_TYPE_NVFP4"):
         if forbidden in body:
             fails.append(f"the predicate carries {forbidden!r}")
@@ -172,14 +206,14 @@ def claim_a_predicate(s):
         last = statements[-1] if statements else ""
         if not last.startswith("returnggml_sycl_moe_tensor_plan_primary_layout(") or "GGML_LAYOUT_AOS" not in last:
             fails.append("the plan arm does not end by returning the plan's AOS primary layout on this device")
-        if "ggml_backend_buffer_is_sycl(" in plan_arm:
+        if f"{UNSPLIT}(" in plan_arm or "->buffer" in plan_arm:
             fails.append("the plan arm consults the weight's buffer: a known plan answers alone")
         tail = body[body.find("if (plan) {") + len("if (plan) {") + len(plan_arm) :]
-        for needed in ("ggml_backend_buffer_is_sycl(", "!ggml_backend_buffer_is_sycl_split("):
-            if needed not in tail:
-                fails.append(f"the no-plan arm does not ask {needed}")
+        asked = tight(tail).find(f"{UNSPLIT}(src0->buffer)")
+        if asked < 0:
+            fails.append(f"the no-plan arm does not ask {UNSPLIT}(src0->buffer)")
         unplaced = tight(tail).find(UNPLACED_CLAIM)
-        if unplaced < 0 or unplaced > tight(tail).find("ggml_backend_buffer_is_sycl("):
+        if unplaced < 0 or unplaced > asked:
             fails.append("the no-plan arm does not claim a weight nothing has placed yet before it reads the buffer")
     return fails
 
@@ -192,8 +226,15 @@ def claim_b_one_predicate(s):
     calls = len(re.findall(rf"\b{PREDICATE}\(", sycl))
     if calls != 3:
         fails.append(f"{PREDICATE} appears {calls} times; want its definition, the gate and the route")
-    if sycl.count(ROUTE_IF) != 1:
-        fails.append("the route does not ask the predicate exactly once")
+    route = route_fn_body(sycl) or ""
+    if sycl.count(ROUTE_ASK) != 1 or ROUTE_ASK not in route:
+        fails.append(f"{ROUTE_FN} does not ask the predicate exactly once at run time")
+    else:
+        declined = braced_body(route, ROUTE_ASK) or ""
+        if not tight(declined).startswith("refuse("):
+            fails.append("a run-time `no` from the predicate is not a named refusal")
+        if route.find(ROUTE_ASK) > route.find(TABLE_CALL) >= 0:
+            fails.append("the run-time predicate is asked after the table is built")
     return fails
 
 
@@ -229,9 +270,15 @@ def claim_d_route_body(s):
         return [f"{ROUTE_FN} is not defined exactly once"]
     fails = []
     for needed in (TABLE_CALL, IDS_CALL, SNAPSHOT_CALL, SUBMIT_CALL, RETAIN_CALL, REFUSAL_WARN, REFUSAL_THROW,
-                   ROUTE_LOG, "ggml_sycl::ggml_sycl_moe_route_log_enabled()"):
+                   ROUTE_LOG, "ggml_sycl::ggml_sycl_moe_route_log_enabled()", PUBLISH_GUARD, PROFILE_SUBMIT,
+                   PROFILE_NAME, *PROFILE_KEYS):
         if needed not in body:
             fails.append(f"{ROUTE_FN} does not contain {needed}")
+    if body.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1:
+        fails.append("the route publishes other than once, behind the unsplit-SYCL-buffer test")
+    profiled = body.find(PROFILE_SUBMIT)
+    if profiled >= 0 and not profiled < body.find(SUBMIT_CALL):
+        fails.append("the kernel is not submitted inside the profiler's wrapper")
     lowered = body.lower()
     for forbidden in ROUTE_FORBIDDEN:
         if forbidden.lower() in lowered:
@@ -308,6 +355,16 @@ def claim_g_kernel(s):
     nan = cpp.find("quiet_NaN()")
     if zero >= 0 and nan >= 0 and not zero < nan:
         fails.append("the id -1 zero row is not decided before the NaN arm")
+    # The launch limit and the token chunks: an int-sized range by default, chunks chained so the last event covers
+    # every launch, and a dispatch that cannot be chunked refused.
+    if "max_launch_items = static_cast<size_t>(std::numeric_limits<int>::max());" not in hpp:
+        fails.append("the shape's launch limit does not default to the largest int")
+    submit = function_body(cpp, "bool moe_bf16_direct_submit(") or ""
+    for needed in ("moe_bf16_direct_tokens_per_launch(shape)", "depends_on("):
+        if needed not in cpp or (needed.startswith("moe_") and needed not in submit):
+            fails.append(f"the submitter does not use {needed}")
+    if "shape.max_launch_items" not in (function_body(cpp, "int64_t moe_bf16_direct_tokens_per_launch(") or ""):
+        fails.append("moe_bf16_direct_tokens_per_launch does not read the shape's launch limit")
     lowered = (hpp + cpp).lower()
     for forbidden in KERNEL_FORBIDDEN:
         if forbidden.lower() in lowered:
@@ -356,15 +413,27 @@ MUTANTS = [
     ("a", "sycl", None, PREDICATE_HEAD, PREDICATE_HEAD + ' if (getenv("X")) { return true; }'),
     ("a", "sycl", PREDICATE_HEAD, "return ggml_sycl_moe_tensor_plan_primary_layout(",
      "(void) ggml_sycl_moe_tensor_plan_primary_layout("),
-    ("a", "sycl", PREDICATE_HEAD, "!ggml_backend_buffer_is_sycl_split(", "true || !ggml_backend_sycl_unused("),
+    ("a", "sycl", UNSPLIT_HEAD, "!ggml_backend_buffer_is_sycl_split(buffer)", "true"),
+    ("a", "sycl", PREDICATE_HEAD, f"{UNSPLIT}(src0->buffer)",
+     "ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer)"),
     ("a", "sycl", PREDICATE_HEAD, "src0->view_src != nullptr || ", ""),
     ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }", ""),
     ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }",
      "if (src0->buffer == nullptr) { return false; }"),
     ("b", "sycl", None, f" && !{PREDICATE}(op, device)) {{", ") {"),
-    ("b", "sycl", None, ROUTE_IF, "if (true) {"),
+    ("c", "sycl", None, ROUTE_IF, "if (true) {"),
     ("c", "sycl", None, ROUTE_IF + " " + ROUTE_FN + "(ctx, dst); return; }", ""),
     ("c", "sycl", ROUTE_IF, ROUTE_FN + "(ctx, dst); return; }", ROUTE_FN + "(ctx, dst); }"),
+    # The fall-through this shape replaced: a block keyed on the predicate lets a run-time `no` reach MMID_SCHED.
+    ("c", "sycl", None, ROUTE_IF, f"if ({PREDICATE}(dst, ctx.device)) {{"),
+    ("b", "sycl", None, ROUTE_IF, f"if (src0->type == GGML_TYPE_BF16 && {PREDICATE}(dst, ctx.device)) {{"),
+    ("b", "sycl", ROUTE_FN_HEAD, ROUTE_ASK, "if (false) {"),
+    ("b", "sycl", ROUTE_ASK, "refuse(", "(void) ("),
+    ("d", "sycl", ROUTE_FN_HEAD, PUBLISH_GUARD, "if (ggml_sycl_publish_mmid_canonical_aos_experts("),
+    ("d", "sycl", ROUTE_FN_HEAD, PROFILE_NAME, '"mulmat.moe.bf16"'),
+    ("d", "sycl", ROUTE_FN_HEAD, PROFILE_SUBMIT, "ggml_sycl_profile_record_returned_event("),
+    ("g", "cpp", None, "depends_on(", "ignore_dependency("),
+    ("g", "hpp", None, "std::numeric_limits<int>::max()", "std::numeric_limits<size_t>::max()"),
     ("d", "sycl", ROUTE_FN_HEAD, TABLE_CALL, TABLE_CALL.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")),
     ("d", "sycl", ROUTE_FN_HEAD, RETAIN_CALL, "(void) ("),
     ("d", "sycl", ROUTE_FN_HEAD, SNAPSHOT_CALL, "(void) ("),
