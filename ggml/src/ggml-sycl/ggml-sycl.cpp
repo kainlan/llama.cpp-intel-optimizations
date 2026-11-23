@@ -84812,7 +84812,7 @@ enum class moe_direct_host_status {
     READY,      // no HOST operand, or a host leg ready to run
     MARKER,     // the CPU job input marker is not in play on this stream
     TASK,       // the host recipe refuses one of the tasks
-    WORKSPACE,  // a host-pinned buffer is over the plan's budget or could not be allocated
+    WORKSPACE,  // the recipe workspace (the one buffer with a plan term) is over it, or a buffer is not allocated
 };
 
 struct moe_direct_host_prepared {
@@ -84820,10 +84820,10 @@ struct moe_direct_host_prepared {
     size_t                               occurrence = 0;  // TASK: the refused task's occurrence
     int32_t                              expert     = -1;
     ggml_sycl::moe_batch_reject_reason   reject     = ggml_sycl::moe_batch_reject_reason::NONE;
-    const char *                         buffer     = "";  // WORKSPACE: which buffer, its bytes and the plan's budget
+    const char *                         buffer     = "";  // WORKSPACE: which buffer, its bytes and its plan term
     size_t                               bytes      = 0;
-    size_t                               planned    = 0;
-    std::unique_ptr<moe_direct_host_leg> leg;  // a READY batch with HOST operands
+    std::optional<size_t>                planned;          // the recipe workspace's term; no other buffer has one
+    std::unique_ptr<moe_direct_host_leg> leg;              // a READY batch with HOST operands
 };
 
 static moe_direct_host_prepared ggml_sycl_moe_direct_host_prepare(ggml_backend_sycl_context &           ctx,
@@ -84858,11 +84858,11 @@ static moe_direct_host_prepared ggml_sycl_moe_direct_host_prepare(ggml_backend_s
         out.reject     = reject;
         return std::move(out);
     };
-    auto refuse_workspace = [&](const char * buffer, size_t bytes) {
+    auto refuse_workspace = [&](const char * buffer, size_t bytes, std::optional<size_t> planned) {
         out.status  = moe_direct_host_status::WORKSPACE;
         out.buffer  = buffer;
         out.bytes   = bytes;
-        out.planned = plan.moe_host_recipe_workspace_bytes;
+        out.planned = planned;
         return std::move(out);
     };
 
@@ -84885,9 +84885,11 @@ static moe_direct_host_prepared ggml_sycl_moe_direct_host_prepare(ggml_backend_s
         last_row     = std::max(last_row, dense_row(i));
         tickets.push_back(std::move(ticket));
     }
-    // The recipe's workspace is the plan's: it sizes moe_host_recipe_workspace_bytes for every host recipe.
+    // The recipe's workspace is the one buffer with a plan term: the plan sizes moe_host_recipe_workspace_bytes for
+    // every host recipe. The activation and output buffers below have none; they fit through the host SCRATCH zone's
+    // headroom, so their refusals name no plan term.
     if (recipe_bytes == 0 || recipe_bytes > plan.moe_host_recipe_workspace_bytes) {
-        return refuse_workspace("recipe_workspace", recipe_bytes);
+        return refuse_workspace("recipe_workspace", recipe_bytes, plan.moe_host_recipe_workspace_bytes);
     }
     auto         work      = std::make_shared<moe_direct_host_work>();
     const size_t k         = static_cast<size_t>(K);
@@ -84903,17 +84905,17 @@ static moe_direct_host_prepared ggml_sycl_moe_direct_host_prepare(ggml_backend_s
     if (!allocate_managed_host_pinned(queue, ctx.device, act_size, ggml_sycl::alloc_role::EXPERT_STAGING,
                                       ggml_sycl::runtime_category::HOST_COMPUTE, "moe_direct_host_activation",
                                       &work->activation)) {
-        return refuse_workspace("activation", act_size);
+        return refuse_workspace("activation", act_size, std::nullopt);
     }
     if (!allocate_managed_host_pinned(queue, ctx.device, out_size, ggml_sycl::alloc_role::EXPERT_STAGING,
                                       ggml_sycl::runtime_category::HOST_COMPUTE, "moe_direct_host_output",
                                       &work->output)) {
-        return refuse_workspace("output", out_size);
+        return refuse_workspace("output", out_size, std::nullopt);
     }
     if (!allocate_managed_host_pinned(queue, ctx.device, recipe_bytes, ggml_sycl::alloc_role::EXPERT_STAGING,
                                       ggml_sycl::runtime_category::HOST_COMPUTE, "moe_q1_nvfp4_recipe_workspace",
                                       &work->workspace)) {
-        return refuse_workspace("recipe_workspace", recipe_bytes);
+        return refuse_workspace("recipe_workspace", recipe_bytes, plan.moe_host_recipe_workspace_bytes);
     }
     const float * activation = static_cast<const float *>(work->activation.resolve().ptr);
     float *       output     = static_cast<float *>(work->output.resolve().ptr);
@@ -88925,8 +88927,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                      host.occurrence, host.expert,
                                                      ggml_sycl::moe_batch_reject_reason_name(host.reject));
                 } else if (host.status == moe_direct_host_status::WORKSPACE) {
-                    ggml_sycl_moe_direct_log_decline(src0, ne12, "host_workspace", "buffer=%s bytes=%zu planned=%zu",
-                                                     host.buffer, host.bytes, host.planned);
+                    // Only the recipe workspace has a plan term; the activation and output buffers print none.
+                    if (host.planned) {
+                        ggml_sycl_moe_direct_log_decline(src0, ne12, "host_workspace",
+                                                         "buffer=%s bytes=%zu planned=%zu", host.buffer, host.bytes,
+                                                         *host.planned);
+                    } else {
+                        ggml_sycl_moe_direct_log_decline(src0, ne12, "host_workspace",
+                                                         "buffer=%s bytes=%zu planned=none", host.buffer, host.bytes);
+                    }
                 } else if (!table_ptr || !retained_table.valid()) {
                     ggml_sycl_moe_direct_log_decline(src0, ne12, "retained_table", "table=%p valid=%d",
                                                      static_cast<const void *>(table_ptr),
