@@ -84,7 +84,8 @@ The charge (ucc = unified-cache.cpp)
       their inventory unbound, and the late pass, whose inventory keeps only the tensors on SYCL buffers, marks it bound.
   C6. The layout byte has one reader. host_weight_layout_facts_of (hpp) switches over enum
       ggml_sycl_host_weight_layout with a case for each value and no default, so a new value is a -Wswitch warning,
-      and reads any other byte as unknown, held by the loader and CPU-owned: the side that charges more. The fact
+      and reads any other byte as unknown, held by the loader and CPU-owned: the side that charges more. A byte above
+      the last layout is answered before the cast, since the enum has no fixed underlying type. The fact
       (C5) and placement_host_backing_when_host (ucc) ask it, and no other code compares the byte with a value.
       ggml_sycl_inventory_malformed (gs), the refusal point of every entry point, refuses an unknown byte and names it.
 
@@ -576,6 +577,9 @@ def clause_c5_loader_holds_what_it_places(t: dict) -> list:
 LAYOUT_FACTS_SIG = r"\bconstexpr\s+host_weight_layout_facts\s+host_weight_layout_facts_of\s*\("
 LAYOUT_SWITCH = r"switch\s*\(\s*static_cast\s*<\s*ggml_sycl_host_weight_layout\s*>\s*\(\s*host_weight_layout\s*\)\s*\)"
 LAYOUT_FALLBACK = r"return\s*\{\s*false\s*,\s*true\s*,\s*true\s*\}\s*;\s*$"
+# a byte above the last layout is answered before the switch casts it: the enum has no fixed underlying type
+LAYOUT_GUARD = (r"^\s*if\s*\(\s*host_weight_layout\s*>\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN\s*\)\s*\{\s*"
+                r"return\s*\{\s*false\s*,\s*true\s*,\s*true\s*\}\s*;\s*\}\s*" + LAYOUT_SWITCH)
 BACKING_READ = (r"host_weight_layout_facts_of\s*\(\s*kv_info\s*\.\s*host_weight_layout\s*\)\s*\.\s*"
                 r"dense_cpu_owned")
 MALFORMED_SIG = r"\bstatic\s+bool\s+ggml_sycl_inventory_malformed\s*\("
@@ -598,6 +602,8 @@ def clause_c6_layout_byte_read_once(t: dict) -> list:
         # No default: a new layout is then a -Wswitch warning instead of a silent reading.
         if re.search(r"\bdefault\s*:", cases):
             problems.append("host_weight_layout_facts_of has a default case")
+    if not re.search(LAYOUT_GUARD, helper):
+        problems.append("host_weight_layout_facts_of casts a byte above the last layout to the enum")
     # A byte no case names is read on the side that charges more.
     if not re.search(LAYOUT_FALLBACK, helper):
         problems.append("host_weight_layout_facts_of does not read an unknown byte as unknown, held and CPU-owned")
@@ -771,6 +777,8 @@ MUTANTS = [
                                                  r"loader_holds_dense", r"\1dense_cpu_owned")),
     ("layout-default-case", "C6", mutate_re(HPP, r"(case\s+GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN\s*:)",
                                             r"default:\n\1")),
+    ("layout-cast-unguarded", "C6", mutate_re(HPP, r"if\s*\(\s*host_weight_layout\s*>\s*"
+                                              r"GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN\s*\)", "if (false)")),
     ("layout-unknown-undercharges", "C6", mutate_re(HPP, LAYOUT_FALLBACK.replace("$", ""),
                                                     "return { false, false, false };")),
     ("backing-compares-the-byte", "C6", mutate_re(UCC, "!" + BACKING_READ,
