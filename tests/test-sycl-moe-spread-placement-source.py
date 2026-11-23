@@ -450,9 +450,9 @@ def self_test(raws: dict[str, str]) -> int:
                 "    plan.moe_swap_host_headroom_triplets = 0;\n    plan.moe_swap_host_headroom_bytes    = 0;\n\n"
                 "    // WEIGHT: exact bytes plus named terms.", "    // WEIGHT: exact bytes plus named terms.")
     expect_fail("weight-zone-line-names-the-headroom", "S5", CACHE_CPP,
-                '"host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu total=%zu (%.1f MB); loader_residency: ',
-                '"host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu swap_headroom=%zu total=%zu (%.1f MB); '
-                'loader_residency: ')
+                '"host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu record_total=%zu (%.1f MB) loader_zone=%zu "',
+                '"host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu swap_headroom=%zu record_total=%zu '
+                '(%.1f MB) loader_zone=%zu "')
     expect_fail("headroom-line-drops-the-figures", "S5", CACHE_CPP,
                 '"weight_zone_total=%zu host_planned_bytes=%zu%s\\n",', '"%s\\n",')
     mapped_return = "plan.host_planned_bytes);\n        return;\n    }\n\n    // Holds `n` triplets"

@@ -404,7 +404,9 @@ void check_weight_zone(const char *           builder,
                  k_host_compute_reserve_bytes);
         check_eq("[HOST-PLAN] layout_copies", printed_term(line, "layout_copies"), 0);
         check_eq("[HOST-PLAN] tlsf_bound", printed_term(line, "tlsf_bound"), t.blocks * k_tlsf_grain);
-        check_eq("[HOST-PLAN] total", printed_term(line, "total"), t.total());
+        check_eq("[HOST-PLAN] record_total", printed_term(line, "record_total"), t.total());
+        check_eq("[HOST-PLAN] loader_zone", printed_term(line, "loader_zone"), 0);
+        check_eq("[HOST-PLAN] zone", printed_term(line, "zone"), t.total());
         check_eq("[HOST-PLAN] loader_residency", printed_term(line, "loader_residency"), 0);
         check_eq("[HOST-PLAN] loader_served", printed_term(line, "loader_served"), 0);
         check(line.find("loader_residency: the loader binds no SYCL_Host buffer for weights") != std::string::npos,
@@ -651,7 +653,12 @@ void check_loader_charge(const char *           builder,
         check_eq("[HOST-PLAN] loader_residency", printed_term(line, "loader_residency"), terms.loader_residency);
         check_eq("[HOST-PLAN] loader_served", printed_term(line, "loader_served"), terms.loader_served);
         check_eq("[HOST-PLAN] blocks", printed_term(line, "blocks"), terms.blocks);
-        check_eq("[HOST-PLAN] total", printed_term(line, "total"), terms.total());
+        check_eq("[HOST-PLAN] record_total", printed_term(line, "record_total"), terms.total());
+        // The zone the configure step sizes on this plan's device, which holds the loader's zone bytes in place of
+        // its raw bytes there and leaves them out elsewhere.
+        check_eq("[HOST-PLAN] loader_zone", printed_term(line, "loader_zone"), record.loader_zone);
+        check_eq("[HOST-PLAN] zone", printed_term(line, "zone"),
+                 placement_plan_host_zone_commit_terms_on_device(plan, record, plan.device_id).weight);
         if (charged) {
             check_eq("[HOST-PLAN] loader_device", printed_term(line, "loader_device"),
                      static_cast<size_t>(plan.loader_device));

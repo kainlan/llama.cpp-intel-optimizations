@@ -36344,6 +36344,18 @@ static void placement_plan_hold_moe_swap_host_headroom(placement_plan & plan, co
         triplet_bytes, plan.host_zone_weight_bytes, plan.host_planned_bytes, cap.c_str());
 }
 
+// The cache a plan's host figures read their live inputs from: its device's, or none before any cache exists. A lookup
+// before the device count is known would enumerate the devices, so it is skipped. The lookup creates no cache and holds
+// the cache lock shared once, for the find alone.
+static unified_cache * host_ledger_plan_cache(const placement_plan & plan) {
+    return g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
+}
+
+// The pinned pool chunk the plan's commit terms count: `cache`'s, or the default chunk without one.
+static size_t host_ledger_plan_chunk(const unified_cache * cache) {
+    return cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+}
+
 // Records the plan's host figures (th32 §4.2): the budget the planner's caller passed, its commit terms, and
 // host_planned_bytes, their total plus the lazy tables' terms the residency decision sets, read once
 // populate_host_zone_sizing() has set every term. A spread plan's swap headroom is held next, after the lazy tables and
@@ -36353,17 +36365,15 @@ static void placement_plan_hold_moe_swap_host_headroom(placement_plan & plan, co
 // whole: phase (a) of th32 T2 refuses nothing here. The stage refuses one such plan, a plan charged the loader term
 // whose commit total exceeds the budget (placement_plan_loader_pool_refusal), and the WARN says so. The cache supplies
 // the live oneDNN scratch and the chunk size, which the terms keep so a re-plan re-records from the same inputs; a plan
-// made before any cache exists counts the default chunk. A lookup before the device count is known would enumerate the
-// devices, so it is skipped. The lookup creates no cache and holds the cache lock shared once, for the find alone.
+// made before any cache exists counts the default chunk (host_ledger_plan_cache, host_ledger_plan_chunk).
 static void record_host_ledger_plan(placement_plan &          plan,
                                     const placement_kv_info & kv_info,
                                     size_t                    host_budget,
                                     const ring_lease *        coverage_pin) {
-    unified_cache * cache =
-        g_total_gpu_count > 0 ? get_existing_cache_for_device(std::max(plan.device_id, 0)) : nullptr;
-    const size_t onednn_live =
+    unified_cache * cache = host_ledger_plan_cache(plan);
+    const size_t    onednn_live =
         cache ? cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() : 0;
-    const size_t chunk   = cache ? cache->pinned_pool_chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    const size_t chunk   = host_ledger_plan_chunk(cache);
     plan.host_budget     = host_budget;
     plan.host_zone_terms = placement_plan_host_zone_commit_terms(plan, onednn_live, chunk);
     placement_plan_decide_lazy_residency(plan, kv_info, coverage_pin);
@@ -37266,14 +37276,24 @@ static void populate_host_zone_sizing(placement_plan &                          
     // The loader's tensors with the term, for the commit terms' replay of its buffers in the pool.
     plan.loader_tensor_bytes    = placement_plan_loader_tensor_bytes(plan, tensor_inventory);
 
+    // The record's total counts the loader's raw bytes (loader_residency). The zone the configure step sizes holds the
+    // replay's zone bytes for them instead (loader_zone, on the chunk record_host_ledger_plan counts), and only on
+    // loader_device, so the line prints both: zone= is this device's WEIGHT zone as "[HOST-ARENA] Zones configured:
+    // WEIGHT=" shows it before alignment and before any spread swap headroom the record adds.
+    const host_zone_commit_terms record_terms =
+        placement_plan_host_zone_commit_terms(plan, 0, host_ledger_plan_chunk(host_ledger_plan_cache(plan)));
+    const host_zone_commit_terms zone_terms =
+        placement_plan_host_zone_commit_terms_on_device(plan, record_terms, plan.device_id);
     const char * loader_role = placement_plan_loader_role(plan, weight_terms);
     GGML_LOG_INFO(
         "[HOST-PLAN] device=%d WEIGHT zone: host_weights=%zu blocks=%zu loader_residency=%zu loader_served=%zu "
         "loader_device=%d "
-        "host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu total=%zu (%.1f MB); loader_residency: %s\n",
+        "host_compute_reserve=%zu layout_copies=%zu tlsf_bound=%zu record_total=%zu (%.1f MB) loader_zone=%zu "
+        "zone=%zu (%.1f MB); loader_residency: %s\n",
         plan.device_id, weight_terms.host_weights, weight_terms.blocks, weight_terms.loader_residency,
         weight_terms.loader_served, plan.loader_device, weight_terms.host_compute_reserve, weight_terms.layout_copies,
-        weight_terms.tlsf_bound, weight_terms.total(), weight_terms.total() / (1024.0 * 1024.0), loader_role);
+        weight_terms.tlsf_bound, weight_terms.total(), weight_terms.total() / (1024.0 * 1024.0),
+        record_terms.loader_zone, zone_terms.weight, zone_terms.weight / (1024.0 * 1024.0), loader_role);
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: S1 preload may keep multiple async H2D/reorder submissions
     // alive. CPU-side layout conversion can hold both the source staging copy
