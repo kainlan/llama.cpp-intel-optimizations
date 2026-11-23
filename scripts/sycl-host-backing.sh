@@ -15,26 +15,22 @@
 # SYCL process hangs. Another tenant's model held in AnonPages does not enter the sum.
 # Details: docs/backend/sycl-host-safety.md, section "GPU host backing".
 #
-# Every function takes an optional meminfo file and prints kB (or GiB) on stdout. The default
-# is ${SYCL_HOST_BACKING_MEMINFO:-/proc/meminfo}. SYCL_HOST_BACKING_MEMINFO is a TEST SEAM: a test
-# points it at a recorded snapshot so a script's settle or preflight can be exercised without a
-# GPU. Never set it in a real run. The log-line helper prints source=<path> whenever the file is
-# not /proc/meminfo, so a run with the seam set says so in its log.
-#
-# All the figures of one call come from one read of the file (one awk pass), so a decision figure
-# and the figure logged beside it cannot disagree. Units are GiB (kB / 1048576) everywhere. A missing field counts as 0, except MemTotal: without it the
-# remainder cannot be computed. A file that cannot be read, or has no MemTotal, returns 1
-# and prints nothing on stdout. Callers must treat that as "do not run" and must not
-# substitute 0.
+# Every function takes an optional meminfo file (default /proc/meminfo) and prints kB (or GiB)
+# on stdout. All the figures of one call come from one read of the file (one awk pass), so a
+# decision figure and the figure logged beside it cannot disagree. Units are GiB (kB / 1048576)
+# everywhere. A missing field counts as 0, except MemTotal: without it the remainder cannot be
+# computed. A file that cannot be read, or has no MemTotal, returns 1 and prints nothing on stdout.
+# Callers must treat that as "do not run" and must not substitute 0.
 
-# sycl_gpu_host_parts_kb [meminfo-file]: prints "shmem_kb remainder_kb" from ONE read. The
-# remainder is clamped to >= 0. Every other function below is built on this one.
-sycl_gpu_host_parts_kb() {
-    local f="${1:-${SYCL_HOST_BACKING_MEMINFO:-/proc/meminfo}}"
+# sycl_gpu_host_state_kb [meminfo-file]: prints "shmem_kb remainder_kb memavailable_kb" from ONE
+# read. The remainder is clamped to >= 0. Every other function below is built on this one.
+sycl_gpu_host_state_kb() {
+    local f="${1:-/proc/meminfo}"
     [ -f "$f" ] && [ -r "$f" ] || { echo "sycl-host-backing: cannot read $f" >&2; return 1; }
     awk '
         /^MemTotal:/   { total = $2; have = 1 }
         /^Shmem:/      { shm = $2 }
+        /^MemAvailable:/ { avail = $2 }
         /^MemFree:/    { used += $2 }
         /^Buffers:/    { used += $2 }
         /^Cached:/     { used += $2 }
@@ -48,8 +44,15 @@ sycl_gpu_host_parts_kb() {
         END {
             if (!have) { print "sycl-host-backing: no MemTotal in " FILENAME > "/dev/stderr"; exit 1 }
             r = total - used
-            print shm + 0, (r > 0 ? r : 0)
+            print shm + 0, (r > 0 ? r : 0), avail + 0
         }' "$f"
+}
+
+# sycl_gpu_host_parts_kb [meminfo-file]: prints "shmem_kb remainder_kb" from ONE read.
+sycl_gpu_host_parts_kb() {
+    local st
+    st="$(sycl_gpu_host_state_kb "$@")" || return 1
+    echo "${st% *}"
 }
 
 # sycl_gpu_host_remainder_kb [meminfo-file]: the unaccounted remainder in kB, clamped to >= 0.
@@ -74,18 +77,15 @@ sycl_gpu_host_backing_gib() {
 }
 
 # sycl_gpu_host_backing_log_line [meminfo-file]: one log line, "Shmem: N kB HostBacking: N kB
-# MemAvailable: N kB", plus " source=<path>" when the file is not /proc/meminfo. All three come
-# from one read. Shmem stays in it as the iGPU signature. It always returns 0: a figure that
-# cannot be read prints "unreadable", so a log line never decides anything.
+# MemAvailable: N kB". All three come from one read. Shmem stays in it as the iGPU signature. It
+# always returns 0: a figure that cannot be read prints "unreadable", so a log line never decides
+# anything.
 sycl_gpu_host_backing_log_line() {
-    local f="${1:-${SYCL_HOST_BACKING_MEMINFO:-/proc/meminfo}}" out shm bk av src=
-    if out="$(sycl_gpu_host_parts_kb "$f" 2>/dev/null)"; then
-        shm="${out% *}"
-        bk=$(( shm + ${out#* } ))
-        av="$(awk '/^MemAvailable:/{print $2}' "$f" 2>/dev/null)" || av=
+    local st shm rem av
+    if st="$(sycl_gpu_host_state_kb "$@" 2>/dev/null)"; then
+        read -r shm rem av <<< "$st"
+        echo "Shmem: $shm kB HostBacking: $((shm + rem)) kB MemAvailable: $av kB"
     else
-        shm= bk= av=
+        echo "Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB"
     fi
-    [ "$f" = /proc/meminfo ] || src=" source=$f"
-    echo "Shmem: ${shm:-unreadable} kB HostBacking: ${bk:-unreadable} kB MemAvailable: ${av:-unreadable} kB$src"
 }

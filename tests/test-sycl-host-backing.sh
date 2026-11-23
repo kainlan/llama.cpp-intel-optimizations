@@ -70,8 +70,8 @@ check_true "gib on unreadable returns non-zero" [ "$rc" -ne 0 ]
 check_eq "gib on unreadable prints nothing" "" "$out"
 
 # The log line carries all three figures, and "unreadable" instead of a failure.
-check_eq "log line" "Shmem: 11970836 kB HostBacking: 68554068 kB MemAvailable: 52242988 kB source=$LOADED" "$(sycl_gpu_host_backing_log_line "$LOADED")"
-check_eq "log line, unreadable" "Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB source=$T/no-such-file" "$(sycl_gpu_host_backing_log_line "$T/no-such-file")"
+check_eq "log line" "Shmem: 11970836 kB HostBacking: 68554068 kB MemAvailable: 52242988 kB" "$(sycl_gpu_host_backing_log_line "$LOADED")"
+check_eq "log line, unreadable" "Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB" "$(sycl_gpu_host_backing_log_line "$T/no-such-file")"
 
 # One read gives both parts: "shmem_kb remainder_kb".
 check_eq "parts, loaded" "11970836 56583232" "$(sycl_gpu_host_parts_kb "$LOADED")"
@@ -80,17 +80,9 @@ out="$(sycl_gpu_host_parts_kb "$T/no-such-file" 2>/dev/null)" && rc=0 || rc=$?
 check_true "parts on unreadable returns non-zero" [ "$rc" -ne 0 ]
 check_eq "parts on unreadable prints nothing" "" "$out"
 
-# The test seam: SYCL_HOST_BACKING_MEMINFO replaces /proc/meminfo as the default file, and the log
-# line says so by printing source=<path>. With the default file the line carries no source.
-check_eq "seam: backing" 68554068 "$(SYCL_HOST_BACKING_MEMINFO="$LOADED" sycl_gpu_host_backing_kb)"
-check_eq "seam: parts" "11597780 1765960" "$(SYCL_HOST_BACKING_MEMINFO="$IDLE" sycl_gpu_host_parts_kb)"
-check_eq "seam: log line names its source" \
-    "Shmem: 11970836 kB HostBacking: 68554068 kB MemAvailable: 52242988 kB source=$LOADED" \
-    "$(SYCL_HOST_BACKING_MEMINFO="$LOADED" sycl_gpu_host_backing_log_line)"
-case "$(sycl_gpu_host_backing_log_line)" in *source=*) echo "FAIL: the default log line must not carry a source"; fail=1;; esac
-cases=$((cases + 1))
-out="$(SYCL_HOST_BACKING_MEMINFO="$T/no-such-file" sycl_gpu_host_backing_kb 2>/dev/null)" && rc=0 || rc=$?
-check_true "seam pointing at an unreadable file fails closed" [ "$rc" -ne 0 ]
+# One read gives all three figures: "shmem_kb remainder_kb memavailable_kb".
+check_eq "state, loaded" "11970836 56583232 52242988" "$(sycl_gpu_host_state_kb "$LOADED")"
+check_eq "state, idle" "11597780 1765960 $(awk '/^MemAvailable:/{print $2}' "$IDLE")" "$(sycl_gpu_host_state_kb "$IDLE")"
 
 # Default file is /proc/meminfo: a number on any Linux host.
 if [ -r /proc/meminfo ]; then

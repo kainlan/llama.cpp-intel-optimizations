@@ -662,6 +662,3 @@ before it adds the remainder.
 inside normal operation and is not used. A runaway of ordinary process memory (malloc) by a run is in
 `AnonPages`, which the sum leaves out on purpose, so no script sees it, and the planner's named refusal bounds
 planned memory only. A guard for that class is tracked in the task tracker.
-
-**Test seam.** `SYCL_HOST_BACKING_MEMINFO` replaces `/proc/meminfo` as the library's default file so a test can
-feed a recorded snapshot. A log line says `source=<path>` when it is set. Never set it in a real run.
