@@ -1381,9 +1381,10 @@ struct mixed_fixture {
 
 // One mixed batch through the production route. Every row matches the CPU oracle, the card rows from the device kernel
 // and the host rows from the host leg; a kernel that computed a host row from another expert fails, and so does one
-// that left a card row unwritten. The route takes the batch once, submits its host occurrences once, and names no
-// refusal and no decline. Afterwards the weight's pointer table holds a null slot for every host expert, a pointer for every card
-// expert a case selected, and still a null slot for a card expert no case on this fixture has selected yet.
+// that left a card row unwritten. The route takes the batch once, submits its card occurrences to its kernel and its
+// host occurrences to its host leg once, and names no refusal and no decline. Afterwards the weight's pointer table
+// holds a null slot for every host expert, a pointer for every card expert a case selected, and still a null slot for a
+// card expert no case on this fixture has selected yet.
 void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tokens, const expert_selector & select) {
     const std::string at = " (type=" + std::string(ggml_type_name(mix.type)) + " ne11=" + std::to_string(ne11) +
                            " tokens=" + std::to_string(tokens) + ")";
@@ -1438,6 +1439,11 @@ void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tok
                        " host occurrences once" + at + ": host_submit=+" +
                        std::to_string(after.host_submit - before.host_submit) + " host_occurrences=+" +
                        std::to_string(after.host_occurrences - before.host_occurrences),
+                   before);
+    require_stages(after.card_occurrences == before.card_occurrences + (occurrences - host_occurrences),
+                   "the kernel was not submitted the batch's " + std::to_string(occurrences - host_occurrences) +
+                       " card occurrences" + at + ": card_occurrences=+" +
+                       std::to_string(after.card_occurrences - before.card_occurrences),
                    before);
     const std::string refusals = refusal_log_since(log_from);
     require_stages(refusals.empty(), "a refusal or a decline was named for a mixed batch" + at + ": [" + refusals + "]",

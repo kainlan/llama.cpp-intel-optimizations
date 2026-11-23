@@ -28,6 +28,8 @@ struct ggml_sycl_q1_nvfp4_test_counters {
     // The direct route's host leg: the mixed batches whose host occurrences it submitted, and how many occurrences.
     uint64_t host_submit;
     uint64_t host_occurrences;
+    // Its card leg: the occurrences it submitted to its device kernel.
+    uint64_t card_occurrences;
 };
 
 enum ggml_sycl_q1_nvfp4_test_failure {

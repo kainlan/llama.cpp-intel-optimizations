@@ -1,6 +1,6 @@
-// Mixed-residency MUL_MAT_ID for Q1_0 and NVFP4 experts on one card: in ONE op, the experts the plan keeps on the card
-// run through mmvq_moe_batched_dispatch and the experts it puts on the host run through the HOST_CPU recipe
-// (ggml_sycl_cpu_moe_host_aos_execute), and the op's result matches the CPU backend.
+// Mixed-residency MUL_MAT_ID for Q1_0 and NVFP4 experts on one card: in ONE op, the MMID direct route runs the experts
+// the plan keeps on the card in its device kernel and the experts it puts on the host in its host leg (the HOST_CPU
+// recipe), and the op's result matches the CPU backend.
 //
 // For each type, a planned model is loaded the way libllama loads one (test-moe-pp-batched-dequant.cpp describes the
 // sequence): its three expert tensors sit in the card's SYCL host buffer type and are registered while the load is
@@ -13,18 +13,25 @@
 //
 // Each case runs one MUL_MAT_ID op at 1 token (decode), 7 tokens and 512 tokens (prompt), on the gate tensor with the
 // activation broadcast to every used expert (ne11 1) and on the down tensor with one activation row per used expert
-// (ne11 k_used). A case passes when:
+// (ne11 k_used). Every build runs a Q1_0/NVFP4 op on the MMID direct route, which submits the op's card occurrences to
+// its device kernel and its host occurrences to its host leg in one admission, so the witness of the split is the
+// route's own: its route-testing counters (q1-nvfp4-production-route-test-seam.hpp). They exist only in the private
+// backend objects, so this test links ggml-sycl-private-fixtures, not the shipped DSO. A case passes when:
 //   * the compute succeeds and every output value is finite: dst is filled with NaN before the op, so a row that
 //     neither side wrote fails;
 //   * the rows of the device-planned experts and the rows of the host-planned experts each match the CPU backend at
 //     NMSE <= 5e-4, measured apart, so a side that computed nothing or the wrong thing fails on its own;
-//   * the op logs exactly one [MOE-ROUTE] partition line for the tensor (GGML_SYCL_MOE_ROUTE_LOG=1, set below), and its
-//     local= and host= counts equal the occurrences of device-planned and of host-planned experts in the case's ids,
-//     with other_gpu=, missing= and layout_mismatch= at 0;
-//   * nothing refused or ran another way: no line in k_refusal_needles appeared while it ran.
-// A Q1_0/NVFP4 operand on the card has one executor, the batched dispatch, and the op ends with a named refusal and a
-// failed compute when that dispatch returns false; a host operand has one, the admitted recipe, and the process aborts
-// when that recipe refuses. So correct rows on both sides of a successful op are what each executor computed.
+//   * the direct route took the op once and finished it: its candidate, admit, submit, terminal and recycle counters
+//     each moved by one, and quarantine by none;
+//   * the route's card leg counted the occurrences of device-planned experts in the case's ids, and its host leg the
+//     occurrences of host-planned experts in one submission (none when there are none), so the two sides sum to every
+//     occurrence and none went to another card or nowhere;
+//   * nothing refused, declined or ran another way: no line in k_refusal_needles, no [MOE-DIRECT-DECLINE] line, and no
+//     [MOE-ROUTE] partition line for the tensor appeared while it ran. The retained route core prints that line for
+//     every op it runs (GGML_SYCL_MOE_ROUTE_LOG=1, set below), so its absence says the core did not run the op too.
+// The route's kernel is the one executor of a card occurrence here and its host leg the one executor of a host
+// occurrence, and either one's refusal fails the op by name, so correct rows on both sides of a successful op are what
+// each computed.
 //
 // The process exits 1 if any case failed. Otherwise it exits 77 when a case ran experts on one side only (a plan that
 // left every picked expert on one side measures nothing here), and 0 when every case ran both sides. It also exits 77
@@ -38,6 +45,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 #include "moe-mixed-residency-fixture.hpp"  // the shape, the log capture, the route parser and the model's lifecycle
+#include "q1-nvfp4-production-route-test-seam.hpp"  // the direct route's counters
 
 #include <cmath>
 #include <cstdint>
@@ -179,9 +187,14 @@ case_result run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_da
         ++(on_host[expert] ? want_host : want_local);
     }
 
-    const size_t       from = g_log.mark();
+    const size_t                     from = g_log.mark();
+    ggml_sycl_q1_nvfp4_test_counters before{};
+    ggml_sycl_q1_nvfp4_test_counters after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
     std::vector<float> got;
     const ggml_status  status = run_backend(life.backend, life.tensors[c.role], life.weight_bytes, c, got);
+    // run_backend synchronized the backend, so the route's completion task has run and its counters are final.
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
 
     // The device rows ([0]) and the host rows ([1]) against the CPU reference, apart.
     double err[2]    = {};
@@ -206,10 +219,28 @@ case_result run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_da
         return status != GGML_STATUS_SUCCESS ? NAN : err[side] / (norm[side] > 0.0 ? norm[side] : 1.0);
     };
 
-    const std::string  route_key   = std::string("[MOE-ROUTE] tensor=") + tensor_name + " layer=";
-    const auto         route_lines = g_log.since(from, { route_key.c_str() });
-    const route_counts route       = route_lines.size() == 1 ? parse_route_line(route_lines[0]) : route_counts{};
-    size_t             refusals    = 0;
+    // The route's own account of the op: how far each counter moved while it ran.
+    const auto moved = [&](uint64_t ggml_sycl_q1_nvfp4_test_counters::* counter) {
+        return static_cast<unsigned long long>(after.*counter - before.*counter);
+    };
+    const unsigned long long candidate   = moved(&ggml_sycl_q1_nvfp4_test_counters::candidate);
+    const unsigned long long admit       = moved(&ggml_sycl_q1_nvfp4_test_counters::admit);
+    const unsigned long long submit      = moved(&ggml_sycl_q1_nvfp4_test_counters::submit);
+    const unsigned long long terminal    = moved(&ggml_sycl_q1_nvfp4_test_counters::terminal);
+    const unsigned long long recycle     = moved(&ggml_sycl_q1_nvfp4_test_counters::recycle);
+    const unsigned long long quarantine  = moved(&ggml_sycl_q1_nvfp4_test_counters::quarantine);
+    const unsigned long long host_submit = moved(&ggml_sycl_q1_nvfp4_test_counters::host_submit);
+    const unsigned long long card        = moved(&ggml_sycl_q1_nvfp4_test_counters::card_occurrences);
+    const unsigned long long host        = moved(&ggml_sycl_q1_nvfp4_test_counters::host_occurrences);
+    const bool               route_took_op =
+        candidate == 1 && admit == 1 && submit == 1 && terminal == 1 && recycle == 1 && quarantine == 0;
+    const bool split_counted = card == want_local && host == want_host && host_submit == (want_host != 0 ? 1u : 0u);
+
+    // The retained route core's partition line, which it prints for every op it runs: the core must not have run it.
+    const std::string route_key   = std::string("[MOE-ROUTE] tensor=") + tensor_name + " layer=";
+    const size_t      route_lines = g_log.since(from, { route_key.c_str() }).size();
+    const size_t      declines    = g_log.since(from, { "[MOE-DIRECT-DECLINE]" }).size();
+    size_t            refusals    = 0;
     for (const char * needle : k_refusal_needles) {
         refusals += g_log.since(from, { needle }).size();
     }
@@ -228,11 +259,17 @@ case_result run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_da
             why += " nmse-host";
         }
     }
-    if (route_lines.size() != 1) {
-        why += " route-lines";
-    } else if (route.local != (long long) want_local || route.host != (long long) want_host || route.other_gpu != 0 ||
-               route.missing != 0 || route.layout_mismatch != 0) {
-        why += " route-counts";
+    if (!route_took_op) {
+        why += " route-stages";
+    }
+    if (!split_counted) {
+        why += " route-split";
+    }
+    if (route_lines != 0) {
+        why += " retained-core";
+    }
+    if (declines != 0) {
+        why += " decline";
     }
     if (refusals != 0) {
         why += " refusal";
@@ -242,12 +279,12 @@ case_result run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_da
                                (want_local == 0 || want_host == 0) ? case_result::ONE_SIDED :
                                                                      case_result::PASS;
     std::fprintf(stderr,
-                 "CASE type=%s tensor=%s tokens=%d ne11=%d status=%d want_local=%zu want_host=%zu route_lines=%zu "
-                 "local=%lld other_gpu=%lld host=%lld missing=%lld layout_mismatch=%lld nmse_device=%.3e "
-                 "nmse_host=%.3e nonfinite=%zu refusals=%zu -> %s%s\n",
+                 "CASE type=%s tensor=%s tokens=%d ne11=%d status=%d want_local=%zu want_host=%zu card=%llu host=%llu "
+                 "candidate=%llu admit=%llu submit=%llu terminal=%llu recycle=%llu quarantine=%llu host_submit=%llu "
+                 "route_lines=%zu declines=%zu nmse_device=%.3e nmse_host=%.3e nonfinite=%zu refusals=%zu -> %s%s\n",
                  ggml_type_name(c.type), tensor_name, c.n_tokens, c.ne11, static_cast<int>(status), want_local,
-                 want_host, route_lines.size(), route.local, route.other_gpu, route.host, route.missing,
-                 route.layout_mismatch, nmse(0), nmse(1), nonfinite, refusals,
+                 want_host, card, host, candidate, admit, submit, terminal, recycle, quarantine, host_submit,
+                 route_lines, declines, nmse(0), nmse(1), nonfinite, refusals,
                  result == case_result::PASS      ? "PASS" :
                  result == case_result::ONE_SIDED ? "ONE-SIDED" :
                                                     "FAIL:",
@@ -262,7 +299,6 @@ int main() {
     setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);
     ggml_log_set(log_callback, nullptr);
     try {
-        check_route_parser();
         bool have_gpu = false;
         try {
             for (const auto & device : sycl::device::get_devices()) {

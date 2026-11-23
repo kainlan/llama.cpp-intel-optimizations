@@ -9958,6 +9958,9 @@ std::atomic<uint64_t> g_q1_nvfp4_test_workspace_generation{ 0 };
 // The direct route's host leg: the mixed batches it submitted host occurrences for, and how many occurrences.
 std::atomic<uint64_t> g_q1_nvfp4_test_host_submit{ 0 };
 std::atomic<uint64_t> g_q1_nvfp4_test_host_occurrences{ 0 };
+// Its card leg: the occurrences it submitted to its kernel. With the host count it is the route's own account of how
+// a batch split, which no log line gives.
+std::atomic<uint64_t> g_q1_nvfp4_test_card_occurrences{ 0 };
 // A second holder of the direct route's completion object that outlives the completion host task, as a copy of the
 // host-task functor kept by the SYCL runtime would. Typed void because the completion type is defined further down;
 // the shared pointer still destroys it as what it is.
@@ -10062,7 +10065,8 @@ void ggml_sycl_q1_nvfp4_test_counters_read(ggml_sycl_q1_nvfp4_test_counters * ou
              g_q1_nvfp4_test_workspace_slot.load(std::memory_order_relaxed),
              g_q1_nvfp4_test_workspace_generation.load(std::memory_order_relaxed),
              g_q1_nvfp4_test_host_submit.load(std::memory_order_relaxed),
-             g_q1_nvfp4_test_host_occurrences.load(std::memory_order_relaxed) };
+             g_q1_nvfp4_test_host_occurrences.load(std::memory_order_relaxed),
+             g_q1_nvfp4_test_card_occurrences.load(std::memory_order_relaxed) };
 }
 
 void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failure) {
@@ -92478,6 +92482,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             }
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             g_q1_nvfp4_test_submit.fetch_add(1, std::memory_order_relaxed);
+                            // One binding per card occurrence, so their number is the occurrences the kernel computes.
+                            g_q1_nvfp4_test_card_occurrences.fetch_add(bindings->size(), std::memory_order_relaxed);
 #endif
                             // The host job starts once the card's work is queued, and computes while the kernel runs.
                             if (host_leg) {
