@@ -1,0 +1,244 @@
+Task 8c, lead runs on its last heads (the task tree's build), 2026-11-23. Final head: e9cbe30dc.
+Driver: libze_intel_gpu.so.1.18.40734. One load per run, under GPU.lock, selector pinned. Zero kernel fault lines in every step.
+GATE lines print sha= of the gate script's tree; the binaries are the task tree's build/.
+Throughput under the permanent host load: orientation, not a baseline.
+The scoring line 'device_lost: 1' on the two-card gate counts the startup warning that names DEVICE_LOST whenever
+two GPUs are visible; no device was lost (the same line is in every two-card run, Task 8g's included).
+
+##### A. Device set on e9cbe30dc (final head): admitted test on both cards, resolved-batch, three Inkling gates, the Mistral B70
+##### and GPT-OSS B50 gates, then one bench load (-r 3) of Mistral and GPT-OSS on each card
+Plan lines against 5de7dc80a differ only in measure_ms timings and a 2 MB arena budget (free VRAM at load).
+=== 1 admitted b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+345: Q1/NVFP4 scoped production-route lifecycle: PASS
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 65  FAIL lines: 0  SEGFAULT/Exception: 0
+345: [MOE-HOST-JOB] tensor=blk.0.ffn_gate_exps.weight route=direct step=host_job occurrence=0 reason=recipe_mismatch
+345: Q1/NVFP4 scoped production-route lifecycle: PASS
+1/1 Test #345: sycl-q1-nvfp4-admitted-device ....   Passed    1.97 sec
+=== 2 admitted b50
+  rc=0
+  card the test ran on: B50 (wanted B50)
+Q1/NVFP4 scoped production-route lifecycle: PASS
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 65  FAIL lines: 0  SEGFAULT/Exception: 0
+[MOE-HOST-JOB] tensor=blk.0.ffn_gate_exps.weight route=direct step=host_job occurrence=0 reason=recipe_mismatch
+Q1/NVFP4 scoped production-route lifecycle: PASS
+=== 3 resolved-batch b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 1  FAIL lines: 0  SEGFAULT/Exception: 0
+1/1 Test #281: test-sycl-moe-resolved-batch .....   Passed    0.82 sec
+=== 4 inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=bd3593368
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.49.572.799 I common_perf_print: prompt eval time =     799.93 ms /    14 tokens (   57.14 ms per token,    17.50 tokens per second)
+0.49.572.800 I common_perf_print:        eval time =    1306.86 ms /    14 runs   (   93.35 ms per token,    10.71 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 5 inkling gate B50 alone
+GATE inkling PASS rc=0 selector=level_zero:1 sha=bd3593368
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.55.728.435 I common_perf_print: prompt eval time =    1838.92 ms /    14 tokens (  131.35 ms per token,     7.61 tokens per second)
+0.55.728.437 I common_perf_print:        eval time =    2938.00 ms /    14 runs   (  209.86 ms per token,     4.77 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 6 inkling gate both
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=bd3593368
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.51.952.139 I common_perf_print: prompt eval time =     807.95 ms /    14 tokens (   57.71 ms per token,    17.33 tokens per second)
+0.51.952.140 I common_perf_print:        eval time =    1351.87 ms /    14 runs   (   96.56 ms per token,    10.36 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 7 planlines (Mistral B70, GPT-OSS B50)
+  rc=0
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kernel fault lines since start: 0
+  rc=0
+  answer lines: 1  device_lost: 0
+  kernel fault lines since start: 0
+--- step rc=0
+  plan lines mistral-b70 vs 5de7dc80a: 18 differing
+  plan lines gptoss-b50 vs 5de7dc80a: 10 differing
+  gptoss decode: eval time =     589.50 ms /    17 tokens (   36.84 ms per token,    27.14 tokens per second)
+=== 8C FINAL3 END 2026-11-23T09:51:07-05:00  ninja=0 icpx=0
+build quiet after 0s  load average: 6.21, 7.10, 7.96
+=== R mistral-b70
+host: load average: 6.21, 7.10, 7.96  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+== arm c  2026-11-23T09:51:09-05:00  shmem=11GB  load=6.21
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=5.92 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4587  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=3348.20 t/s stddev=8.45 samples=[3357.08 3340.26 3347.26]
+  RESULT c tg128 avg=109.05 t/s stddev=1.34 samples=[107.51 109.76 109.90]
+  kernel fault lines since start: 0
+--- step rc=0
+=== R mistral-b50
+host: load average: 5.99, 6.91, 7.85  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+== arm c  2026-11-23T09:51:58-05:00  shmem=11GB  load=5.99
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=6.02 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4587  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=1342.53 t/s stddev=1.00 samples=[1343.67 1342.14 1341.79]
+  RESULT c tg128 avg=46.02 t/s stddev=0.23 samples=[45.76 46.16 46.13]
+  kernel fault lines since start: 0
+--- step rc=0
+=== R gptoss-b70
+host: load average: 5.79, 6.72, 7.73  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+== arm c  2026-11-23T09:52:51-05:00  shmem=11GB  load=5.72
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=5.90 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4332  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=1754.36 t/s stddev=19.77 samples=[1743.77 1742.14 1777.17]
+  RESULT c tg128 avg=52.84 t/s stddev=0.69 samples=[52.04 53.25 53.22]
+  kernel fault lines since start: 0
+--- step rc=0
+=== R gptoss-b50
+host: load average: 5.62, 6.56, 7.62  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+== arm c  2026-11-23T09:53:38-05:00  shmem=11GB  load=5.62
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=6.22 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 5019  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=553.74 t/s stddev=5.05 samples=[550.16 551.55 559.52]
+  RESULT c tg128 avg=35.22 t/s stddev=0.17 samples=[35.02 35.34 35.29]
+  kernel fault lines since start: 0
+--- step rc=0
+=== ALL END 2026-11-23T09:54:27-05:00
+
+##### A2. On d9e9b9cdf (before the quality round's minors): the same device set, the B70 ABBA against the Task 8g tree
+##### (g = acdfc762c, c = this task), and one bench arm on the B50 alone
+=== 1 admitted b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+345: Q1/NVFP4 scoped production-route lifecycle: PASS
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 65  FAIL lines: 0  SEGFAULT/Exception: 0
+345: [MOE-HOST-JOB] tensor=blk.0.ffn_gate_exps.weight route=direct step=host_job occurrence=0 reason=recipe_mismatch
+345: Q1/NVFP4 scoped production-route lifecycle: PASS
+1/1 Test #345: sycl-q1-nvfp4-admitted-device ....   Passed    1.99 sec
+=== 2 admitted b50
+  rc=0
+  card the test ran on: B50 (wanted B50)
+Q1/NVFP4 scoped production-route lifecycle: PASS
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 65  FAIL lines: 0  SEGFAULT/Exception: 0
+[MOE-HOST-JOB] tensor=blk.0.ffn_gate_exps.weight route=direct step=host_job occurrence=0 reason=recipe_mismatch
+Q1/NVFP4 scoped production-route lifecycle: PASS
+=== 3 resolved-batch b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 1  FAIL lines: 0  SEGFAULT/Exception: 0
+1/1 Test #281: test-sycl-moe-resolved-batch .....   Passed    0.75 sec
+=== 4 inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=bd3593368
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.49.012.499 I common_perf_print: prompt eval time =     815.55 ms /    14 tokens (   58.25 ms per token,    17.17 tokens per second)
+0.49.012.500 I common_perf_print:        eval time =    1364.78 ms /    14 runs   (   97.48 ms per token,    10.26 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 5 inkling gate B50 alone
+GATE inkling PASS rc=0 selector=level_zero:1 sha=bd3593368
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.53.494.996 I common_perf_print: prompt eval time =    1871.03 ms /    14 tokens (  133.65 ms per token,     7.48 tokens per second)
+0.53.494.997 I common_perf_print:        eval time =    2867.77 ms /    14 runs   (  204.84 ms per token,     4.88 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 6 inkling gate both
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=bd3593368
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 1
+0.49.547.960 I common_perf_print: prompt eval time =     837.24 ms /    14 tokens (   59.80 ms per token,    16.72 tokens per second)
+0.49.547.961 I common_perf_print:        eval time =    1343.72 ms /    14 runs   (   95.98 ms per token,    10.42 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== GATES END 2026-11-23T04:02:49-05:00
+build quiet after 0s  load average: 8.57, 9.03, 9.28
+=== 7 ABBA b70 (g = 8g tree, c = 8c tree)
+host: load average: 8.57, 9.03, 9.28  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+== arm g  2026-11-23T04:02:52-05:00  shmem=11GB  load=8.57
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=8.52 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT g pp512 avg=47.57 t/s stddev=0.00 samples=[47.57]
+  RESULT g tg128 avg=15.26 t/s stddev=0.00 samples=[15.26]
+  kernel fault lines since start: 0
+== arm c  2026-11-23T04:04:19-05:00  shmem=11GB  load=8.36
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=8.93 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=46.98 t/s stddev=0.00 samples=[46.98]
+  RESULT c tg128 avg=15.08 t/s stddev=0.00 samples=[15.08]
+  kernel fault lines since start: 0
+== arm c2  2026-11-23T04:05:45-05:00  shmem=11GB  load=8.94
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=8.65 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c2 pp512 avg=47.04 t/s stddev=0.00 samples=[47.04]
+  RESULT c2 tg128 avg=15.06 t/s stddev=0.00 samples=[15.06]
+  kernel fault lines since start: 0
+== arm g2  2026-11-23T04:07:12-05:00  shmem=11GB  load=8.78
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=10.49 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT g2 pp512 avg=47.33 t/s stddev=0.00 samples=[47.33]
+  RESULT g2 tg128 avg=15.35 t/s stddev=0.00 samples=[15.35]
+  kernel fault lines since start: 0
+--- step rc=0
+=== 8 bench B50 alone (one arm)
+host: load average: 10.26, 9.48, 9.36  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+== arm c  2026-11-23T04:08:41-05:00  shmem=11GB  load=10.26
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=9.63 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14556  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=15.71 t/s stddev=0.00 samples=[15.71]
+  RESULT c tg128 avg=6.07 t/s stddev=0.00 samples=[6.07]
+  kernel fault lines since start: 0
+--- step rc=0
+=== 8C FINAL2 END 2026-11-23T04:11:06-05:00  ninja=0 icpx=0
+
+##### B. Inkling on the B50 alone (level_zero:1), 5de7dc80a: placement, scheduler splits, decode profile
+placement (gate log, d9e9b9cdf):
+  0.01.427.270 W [PLACEMENT] KV context room on device 0: held all 8 full-attention layer(s), held all 40 SWA layer(s); held 400.0 MB of 400.0 MB for n_ctx_context=8192 over planner n_ctx=512, before the routed experts; deciding layer 47 held: host attention 809.2 us/token (559.2 fill at 50% and host-attn 30 GB/s + 1 split(s) x 250 us) vs displaced experts 49.2 us/token (cpu-expert 40 GB/s, unmeasured bf16/nvfp4); it cost 401.5 MB of device-resident routed experts: 9047.0 MB (2118 triplet(s)) on the device, against 9448.5 MB (2212) with the room added back. n_ctx_context is the requested n_ctx.
+  0.47.517.871 W [SYCL-PLAN] KV overflow re-placed to host tier: 1 layer(s) demoted, 0 SWA (32.0 MB host KV, layers 47..47) on device 0 for n_ctx=8192; the device has 498.1 MB free for KV. Their KV lives in host memory and their attention runs on the CPU. Largest all-VRAM context is about -c 7936.
+scheduler splits of the decoded token (GGML_SCHED_DEBUG=2, -n 2):
+  b50: note: largest printed graph has 141 splits (a measure graph); reporting the last graph
+  b50: graphs printed 40; last graph: 13 splits, 6 CPU splits, 47 nodes in CPU splits
+        4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+        1 x CPU split of 2 SET_ROWS
+        1 x CPU split of 1 FLASH_ATTN
+      ops in CPU splits: FLASH_ATTN 1, MUL 8, MUL_MAT_ID 8, SCALE 16, SET_ROWS 2, SIGMOID 4, TANH 8
+decode profile, 48 tokens of text, kernel profiler on (kprof CSV beside this file), per forward pass (49 passes):
+  0.58.975.058 I common_perf_print:        eval time =    8414.95 ms /    47 runs   (  179.04 ms per token,     5.59 tokens per second)
+  directly dispatched submissions 939 per pass; device-timed 28.05 ms per pass; failed_timestamps 14147
+      mulmat.mmvq.id_aos_nvfp4                    66.0 per pass    25.617 ms per pass  mean    388.1 us
+      fattn.decode.esimd_partitioned              46.0 per pass     0.579 ms per pass  mean     12.6 us
+      fattn.compute.xmx_v2                         1.0 per pass     0.533 ms per pass  mean    555.5 us
+      sycl.memcpy.mem_ops                        215.4 per pass     0.430 ms per pass  mean      2.0 us
+      mulmat.onednn_gemm.unbatched               102.6 per pass     0.328 ms per pass  mean      3.2 us
+      sycl.binbcast.mul                           61.9 per pass     0.144 ms per pass  mean      2.3 us
+      sycl.binbcast.add                           68.9 per pass     0.121 ms per pass  mean      1.8 us
+      sycl.binbcast.event                        170.6 per pass     0.057 ms per pass  mean      0.3 us
+      sycl.binbcast.repeat                        14.6 per pass     0.037 ms per pass  mean      2.5 us
+      norm.rms_norm_mul                           11.2 per pass     0.036 ms per pass  mean      3.3 us
+  The four BF16 expert layers run on ggml-cpu (their weights are host-pinned) and one KV layer's attention runs on the CPU:
+  neither has a device-time row. failed_timestamps > 0: the device times are lower bounds.

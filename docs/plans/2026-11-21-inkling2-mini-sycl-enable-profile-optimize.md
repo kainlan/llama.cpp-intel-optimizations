@@ -4142,6 +4142,44 @@ by a GPU kernel.
 - Speed is not this task. One task at a time on one thread is what exists; its cost is Stage 2's measurement,
   and the pool or a threaded recipe is a Stage 3 candidate.
 
+**DONE 2026-11-23, merged as `560de719e`.** Evidence: `docs/backend/data/inkling2/t8c-lead-runs-e9cbe30dc.txt` and
+the B50 decode profile `t8c-kprof-tg-b50-5de7dc80a.csv` beside it. Final head `e9cbe30dc`.
+- *What runs now.* A `MUL_MAT_ID` node whose selected experts are partly on the card and partly host-pinned runs
+  both legs: the admitted device kernel for the card occurrences (a checked-slot kernel: a null slot or an id out
+  of range writes NaN rows, an id below zero writes zero), one `std::async` host job per mixed node for the host
+  occurrences through the host recipe, a D2H gather of the activation rows, per-run H2D scatters of the host rows,
+  and one terminal event that covers both. Inkling 2 Mini loads and passes its gate on the B50 alone for the first
+  time, and still passes on the B70 and on both cards.
+- *Measured (orientation, under host load).* B50 alone: pp512 15.71 t/s, tg128 6.07 t/s (one bench arm), gate
+  decode 4.88 t/s. B70, ABBA against the Task 8g tree: 47.57 / 15.26 and 47.33 / 15.35 before, 46.98 / 15.08 and
+  47.04 / 15.06 with this task: about 1% lower decode, inside the B70's noise. On the B50 the plan puts 7987.7 MB
+  of routed experts on the card and 10723.3 MB in host memory; a decoded token is 13 scheduler splits, 6 on the
+  CPU (four BF16 expert layers that are host-pinned, and one KV layer demoted to the host tier with its
+  `FLASH_ATTN` and `SET_ROWS`); the NVFP4 kernel is 66 device calls of 388 us, 25.6 ms of a 179 ms token.
+- *A failure the first device run found.* The host rows came back 0.000000: the non-DL getter in
+  `cpu-traits-support.cpp` handed out ggml-cpu's F16 tables before `ggml_cpu_init` had filled them. The getter now
+  fills them once. `587c54560` alone is red on `test-sycl-private-cpu-traits-source` (fixed by the next commit):
+  a bisect must not stop there.
+- *Also fixed here, because the run met it.* `test-sycl-moe-resolved-batch` crashed at exit: the cache asked the
+  backend for its device index during static destruction. The cache stores its device index now; the test is
+  registered `cache;device`, pinned, serial.
+- *Reviews.* Spec PASS twice (seven items, four minors fixed). Quality PASS with three minors, all fixed: the
+  catch parks a host leg only before the terminal task is submitted; one upload builds the retained table and a
+  mixed node's card table; a workspace refusal prints `planned=` only for the recipe workspace.
+- *Mistral and GPT-OSS on the final head, one bench load each (llama-bench -r 3; master's figures of 2026-11-21
+  are in `docs/backend/sycl-perf-baselines.md`):*
+  | model | card | pp512 | tg128 | master `278a6e4a3`, 2026-11-21 |
+  |---|---|---:|---:|---|
+  | Mistral 7B Q4_0 | B70 | 3348.2 ± 8.5 | 109.05 ± 1.34 | 3228.8 / 109.2 |
+  | Mistral 7B Q4_0 | B50 | 1342.5 ± 1.0 | 46.02 ± 0.23 | 1329.0 / 44.1 |
+  | GPT-OSS 20B MXFP4 | B70 | 1754.4 ± 19.8 | 52.84 ± 0.69 | 1628.9 / 36.4 (mixed run) |
+  | GPT-OSS 20B MXFP4 | B50 | 553.7 ± 5.1 | 35.22 ± 0.17 | 550.3 / 34.69 |
+
+  No builder at either end of any arm, load average about 6. Not interleaved with a master build: these read as
+  "not below master's own figures on the same driver", not as a gain.
+- *Accepted as is.* The re-review's one optional note: the workspace refusal's log call is written once per branch
+  of the `planned` test. Behaviour is correct; a tidy-up would have cost a rebuild and a second device set.
+
 **Checkpoint before any GREEN code (report to the lead, then wait):**
 1. How the pointer table the direct block uploads represents a host expert today (null, absent, or a
    stand-in), and what the kernel needs to skip one without a second image.
@@ -5977,6 +6015,24 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
 - `test-sycl-moe-resolved-batch` was labelled `host` and reserves a ~29.9 GB VRAM arena on the B70; it also
   crashed at exit (a cache destructor asked a destroyed device manager for its index). Task 8c fixes both.
 - The kernel profiler reports `failed_timestamps` (11187 in the replay-off load): its totals are lower bounds.
+- Task 8c, host leg cost: one `std::async` thread and one host SCRATCH leg per mixed node, about 96 spinning
+  threads per decoded token on the B50. They are bounded to 2 or 3 in flight only by the ids host wait
+  (`ggml_sycl_copy_ids_to_host`) and the per-layer ids cache: removing that wait needs a bound first.
+- Task 8c, plan terms: the host leg's activation and output buffers have no plan term (only the recipe
+  workspace has `moe_host_recipe_workspace_bytes`). They fit through host SCRATCH headroom. Size a term in
+  `compute_placement_plan`, with the prompt leg's pinned-memory size.
+- Task 8c, placement: the B50 cost line reads `cpu-expert 40 GB/s, unmeasured bf16/nvfp4`. The Q1_0 and NVFP4
+  rows of the CPU expert rate table are Tasks 15 and 16's; until then the KV-versus-experts choice on the B50
+  rests on a default.
+- Task 8c, not covered on a device (pinned by source contracts only): a strided or view ids input on a mixed
+  batch, a prompt above 33 tokens in the fixture, a synchronous throw after launch, the park path, a let-go at
+  exit, an expert moving from card to host between nodes. A marker failure on the no-throw path can leave the
+  job waiting (the MXFP4 marker jobs have the same exposure). The join holds a SYCL host-task thread for the
+  job's whole run.
+- Task 8c, second card: a `residency=secondary` operand is still refused by name
+  (`[MOE-DECODE-REFUSAL] ... failed=card_or_host`); no witness run exists. Task 8d's.
+- The lead's gate scoring counted the two-GPU startup warning as a lost device (`device_lost: 1`). The
+  scratch runner ignores that line now; `scripts/sycl-canonical-gates.sh` should own the check.
 - A lead mistake to keep out of the next round: a throughput pair was read while implementer builds started
   inside it, and two slow arms were chased as a regression for five loads. Builders are sampled at both
   ends of an arm now, and an implementer's build waits for the bench's `done` file.
