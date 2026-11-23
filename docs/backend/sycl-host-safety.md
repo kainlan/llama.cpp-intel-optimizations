@@ -454,7 +454,7 @@ The workable division of labour:
   gates, CPU-only unit tests). They report what they need verified.
 - **The lead session:** runs every `llama-bench`, `llama-cli`/`llama-completion`
   gate, `test-llama-archs`, `test-thread-safety`, `test-backend-ops`, and any
-  `ctest` sweep — one at a time, sampling `Shmem`/`MemAvailable` before and ~5 s
+  `ctest` sweep — one at a time, sampling GPU host backing (section 10) before and ~5 s
   after, never overlapping two.
 
 This costs nothing in throughput. GPU verification is *already* serial — the
@@ -629,9 +629,9 @@ The remainder was 54.0 GiB while the model was loaded and 2.7 GiB two minutes af
 meminfo file, `/proc/meminfo` by default. A missing field counts as 0. A file that cannot be read, or that has
 no `MemTotal`, returns non-zero and prints nothing, and every caller treats that as "do not run". Another
 signature stays visible in the sum: the iGPU and the `test-backend-ops` class land in `Shmem`, which the sum
-contains. That `Shmem` signature belongs to those two classes and not to a discrete card. This is also why the
-2026-08 measurement above (a pinned selector holds `Shmem` at 2.4 GB on a full model load) shows the iGPU's
-signature missing, not that nothing was held.
+contains. That `Shmem` signature belongs to those two classes and not to a discrete card. One inference, not measured: the
+2026-08 measurement above (a pinned selector holds `Shmem` at 2.4 GB on a full model load) probably shows the
+iGPU's signature missing, not that nothing was held.
 
 **Why the sum does not see the other tenant.** The other session holds a 122 GiB model in `AnonPages`
 (126 to 130 GiB), which the formula subtracts. Measured with that tenant's model held (`AnonPages` 126.4 GiB):

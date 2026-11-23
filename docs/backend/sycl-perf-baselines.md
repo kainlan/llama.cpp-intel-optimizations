@@ -30,9 +30,12 @@ loop, which is why it runs last):
 
 - **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
   process.
-- **Shmem ceiling** — `Shmem` in `/proc/meminfo`, net of the summed "Used" of
-  tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), above 10 GB
-  (the TTM-shmem OOM signature this repo has hit repeatedly). This became net
+- **GPU host backing ceiling** — `Shmem` in `/proc/meminfo`, net of the summed
+  "Used" of tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), plus
+  the meminfo remainder (`scripts/sycl-host-backing.sh`; a discrete card's
+  host-pinned memory is in no meminfo field, so `Shmem` alone is flat for it),
+  above 10 GB (`SHMEM_CEIL_KB`; the TTM-shmem OOM signature this repo has hit
+  repeatedly). An unreadable meminfo, or one without `MemTotal`, refuses. This became net
   of tmpfs on 2026-09-04, after the guard refused every baseline run because
   other sessions' ordinary `/tmp`/`/dev/shm` files — not GPU-BO backing — held
   ~9.7 GB of Shmem. If tmpfs usage meets or exceeds raw Shmem the effective
@@ -44,8 +47,13 @@ loop, which is why it runs last):
   Shmem, tmpfs used, and the net figure separately for both the pre- and
   post-run sample
   (`pre_shmem_raw`/`pre_tmpfs`/`pre_shmem_eff`, mirrored for `post_*`) rather
-  than only the net number, so a SUSPECT-for-growth verdict can still be
-  traced back to which component moved.
+  than only the net number, and adds the remainder and the sum
+  (`pre_remainder`/`pre_backing`, mirrored for `post_*`), so a SUSPECT-for-growth
+  verdict (`backing-grew`, more than 5 GB across the run) can still be traced
+  back to which component moved. A first post-run sample over that threshold is
+  re-taken after `BENCH_GUARD_POST_RECHECK_S` seconds (default 5), because the
+  exiting process's host backing is released a moment after exit; only the
+  second sample counts and it is the one the header records.
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
@@ -509,9 +517,9 @@ check engages the ring.
   head comparison and the newer-than-head check, so it gives up the guarantee that the binaries were built
   from the sha, and it still validates the sha format and still refuses a missing binary. A table taken
   under it is not a baseline.
-  The script refuses unless the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB) and the
+  The script refuses unless the host has settled (GPU host backing under 30 GB; `MemAvailable` is not a condition) and the
   builders (ninja plus icpx) clear. A running build is waited out, before the lock at the start and before
-  every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem` and
+  every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem`, GPU host backing and
   `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm.
   The log ends `verdicts_pass=N GATE_DONE`.
 - **Repeats and spread.** Every `llama-bench` arm uses `-r 3` except `Q_staged`, which uses `-r 1`: it
