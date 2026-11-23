@@ -1575,8 +1575,9 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
 
 # A model load's end tags what it staged, and a model teardown never reclaims an untagged entry, so a copy a move
 # publishes after the load would outlive its model unless it is tagged by inheritance. Each copy takes the owners and
-# tag of the entry it replaces, and that entry's pending load when the copy's own stamp left none, through one helper:the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces
-# and before it is inserted, its mirror keeping the entry's pending load; and the host copy a loan or an evict
+# tag of the entry it replaces, and that entry's pending load when the copy's own stamp left none, through one helper:
+# the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces and before
+# it is inserted, its mirror keeping the entry's pending load; and the host copy a loan or an evict
 # registers, from the device entry the loan retired and holds in place, before the registration inserts it.
 INHERIT_DEF = ("void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept { "
                "dst.owner_mask |= src.owner_mask; dst.owner_tagged = dst.owner_tagged || src.owner_tagged; "
@@ -1627,7 +1628,7 @@ REGISTER_OLD_ERASE = "erase_entry_locked(old);"
 def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
     reg = body(norm(cache), REGISTER_BODY_SIG)
     return (reg.count(REGISTER_SOURCE_FIND) == 1
-            and ordered(reg, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE, REGISTER_OLD_ERASE,
+            and ordered(reg, CACHE_LOCKS, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE, REGISTER_OLD_ERASE,
                         REGISTER_INSERT, REGISTER_MIRROR_TXN))
 
 
@@ -3571,6 +3572,15 @@ def test_mutant_missing_source_publishes_untagged_fails():
     """The WARN without the refusal: the copy is inserted and mirrored owned by nobody, and outlives its model."""
     assert not claim_a_missing_source_refuses_before_the_insert(
         _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE, "} else { source = &found->second; } }"))
+
+
+def test_mutant_missing_source_looked_up_before_the_locks_fails():
+    """The source looked up before the locks are taken: another thread can erase it between the lookup and the
+    insert, and the copy inherits from an entry that is gone."""
+    unlocked = _once_in(CACHE, REGISTER_BODY_SIG, " std::lock(direct_lock, cache_lock);", "")
+    assert not claim_a_missing_source_refuses_before_the_insert(
+        _once_in(unlocked, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE,
+                 REGISTER_SOURCE_REFUSE + " std::lock(direct_lock, cache_lock);"))
 
 
 if __name__ == "__main__":

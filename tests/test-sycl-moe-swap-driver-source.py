@@ -58,8 +58,8 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       one covered every boundary;
   D17 a transaction that throws leaves its batch unsettled through an unwind guard, not a handler: the step calls the
       transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
-      when the guard counts one, then declares a guard whose body sets the unsettled count; the line right after the
-      call dismisses that guard. The guard's body runs while a throw unwinds, where a throw ends the process, so the
+      when the guard counts one, each past its size (size() + n, never a bare count), then declares a guard whose
+      body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while a throw unwinds, where a throw ends the process, so the
       reserves are what make its pushes safe.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
@@ -123,6 +123,9 @@ UNSETTLED_FIELDS = ("unsettled at report: %llu", "(ull) st.unsettled_moves)")
 UNSETTLED_SET = "st.unsettled_moves = d.unsettled.size();"
 TXN_CALL = "txn(d.batch);"
 GUARD_DECL = re.compile(r"\bmoe_swap_detail::moe_swap_unwind_guard\s+(\w+)\s*\(")
+# Each reserve grows its list past what it already holds: a bare count can be below the size, and reserves nothing.
+UNSETTLED_RESERVE = re.compile(r"\bd\.unsettled\.reserve\(\s*d\.unsettled\.size\(\)\s*\+\s*\w")
+BUSY_RESERVE = re.compile(r"\bst\.busy\.reserve\(\s*st\.busy\.size\(\)\s*\+\s*\w")
 HANDLER = re.compile(r"\b(?:try|catch)\b")
 LITERAL = re.compile(r"\"(?:\\.|[^\"\\\n])*\"")
 SAME_LOAD = "const bool same_load = snap && snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id;"
@@ -526,11 +529,12 @@ def check(raw: dict[str, str]) -> None:
         before, guarded = seg[:guard.start()], seg[guard.start():]
         if UNSETTLED_SET not in guarded:
             fail("D17", f"guard `{guard.group(1)}` does not set the unsettled count")
-        if "d.unsettled.reserve(" not in before:
-            fail("D17", f"the unsettled list is not reserved before guard `{guard.group(1)}`, so its pushes can throw "
-                        "while a throw unwinds")
-        if "moe_swap_count_reason(st.busy," in guarded and "st.busy.reserve(" not in before:
-            fail("D17", f"the busy reasons are not reserved before guard `{guard.group(1)}`, which counts one")
+        if not UNSETTLED_RESERVE.search(before):
+            fail("D17", f"the unsettled list is not reserved past its size before guard `{guard.group(1)}`, so its "
+                        "pushes can throw while a throw unwinds")
+        if "moe_swap_count_reason(st.busy," in guarded and not BUSY_RESERVE.search(before):
+            fail("D17", f"the busy reasons are not reserved past their size before guard `{guard.group(1)}`, which "
+                        "counts one")
         if not step[at + len(TXN_CALL):].startswith(f" {guard.group(1)}.dismiss();"):
             fail("D17", f"guard `{guard.group(1)}` is not dismissed on the line right after the transaction returns")
         prev = at + len(TXN_CALL)
@@ -662,6 +666,8 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("evict-guard-pushes-unreserved", "D17",
                 [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "")])
     expect_fail("admit-guard-counts-unreserved", "D17", [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + 1);", "")])
+    expect_fail("evict-guard-reserves-a-bare-count", "D17",
+                [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "d.unsettled.reserve(keep);")])
     expect_fail("evict-sent-without-a-guard", "D17",
                 [("driver", STEP_SIG, "moe_swap_detail::moe_swap_unwind_guard evict_throw(",
                   "auto evict_throw = (")])
