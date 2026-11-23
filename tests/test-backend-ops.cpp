@@ -3854,7 +3854,7 @@ struct test_scale : public test_case {
     float scale;
     float bias;
     bool inplace;
-    int v; // view (1 : non-contiguous a)
+    int v;  // view (1 : non-contiguous a, 2 : upper half of each row of a tensor twice as wide)
 
     std::string vars() override {
         return VARS_TO_STR6(type, ne, scale, bias, inplace, v);
@@ -3876,6 +3876,12 @@ struct test_scale : public test_case {
             ne_a[2] *= 5;
             ne_a[3] *= 4;
         }
+        if (v & 2) {
+            // build_moe_ffn splits the fused gate_up output [2*n_ff, n_expert_used, n_tokens] into two
+            // ggml_view_3d halves; "up" starts n_ff elements into each row and steps rows by 2*n_ff
+            GGML_ASSERT(!(v & 1) && ne[3] == 1);
+            ne_a[0] *= 2;
+        }
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_param(a);
         ggml_set_name(a, "a");
@@ -3883,6 +3889,14 @@ struct test_scale : public test_case {
         if (v & 1) {
             a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
+        }
+        if (v & 2) {
+            a = ggml_view_3d(ctx, a, ne[0], ne[1], ne[2], a->nb[1], a->nb[2], ne[0] * a->nb[0]);
+            ggml_set_name(a, "upper_half_of_a");
+            // the case proves nothing unless the source really is strided and offset
+            GGML_ASSERT(!ggml_is_contiguous(a));
+            GGML_ASSERT(a->nb[1] == 2 * a->ne[0] * ggml_type_size(type));
+            GGML_ASSERT(a->view_offs != 0);
         }
 
         ggml_tensor * out;
@@ -12208,6 +12222,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // view test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1));  // view test, inplace
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1)); // view test, inplace
+    // upper half of a fused gate_up row (offset view, nb1 twice the row size), as build_moe_ffn scales it;
+    // the last case is one decode token's shape
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 0.5f, 0.0f, false, 2));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 2.0f, 1.0f, false, 2));  // with bias
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 2.0f, 1.0f, true, 2));   // inplace
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 1024, 8, 1, 1 }, 0.5f, 0.0f, false, 2));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
