@@ -260,15 +260,20 @@ mem() { sycl_gpu_host_backing_log_line; }
 # An unreadable meminfo is not settled. MemAvailable is not a condition (ruling 2026-11-12): it sits near 55 GB on
 # purpose while another tenant holds a model, and the planner refuses an oversized load by name.
 settle() {
-    local s
+    local st line="unreadable"
     for _ in $(seq 60); do
-        s="$(sycl_gpu_host_backing_kb || echo 999999999)"
-        if [ "$s" -lt 31457280 ]; then
-            return 0
+        # One read decides, and the refusal prints that read.
+        if st="$(sycl_gpu_host_state_kb)"; then
+            line="$(sycl_gpu_host_format_state "$st")"
+            if [ "$(sycl_gpu_host_state_backing_kb "$st")" -lt 31457280 ]; then
+                return 0
+            fi
+        else
+            line="unreadable"
         fi
         sleep 10
     done
-    die "host never settled (GPU host backing < 30 GiB): $(mem)"
+    die "host never settled (GPU host backing < 30 GiB): $line"
 }
 
 if [ "$TAKE_LOCK" = 1 ]; then
