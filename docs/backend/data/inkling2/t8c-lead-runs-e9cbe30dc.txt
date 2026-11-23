@@ -242,3 +242,10 @@ decode profile, 48 tokens of text, kernel profiler on (kprof CSV beside this fil
       norm.rms_norm_mul                           11.2 per pass     0.036 ms per pass  mean      3.3 us
   The four BF16 expert layers run on ggml-cpu (their weights are host-pinned) and one KV layer's attention runs on the CPU:
   neither has a device-time row. failed_timestamps > 0: the device times are lower bounds.
+
+##### C. Source-contract sweeps on e9cbe30dc (full build [372/372], no bench beside them), 0 Skipped, 0 Not Run
+sweep 1 (-L source, -LE model|cache|mem-handle|device|residency): 204 of 212 pass. The 8 failures are the contracts
+already red on master: test-sycl-counter-dump-gate, test-sycl-dnnl-decline-consumers, sycl-mmq-src1-plan-source,
+sycl-concat-no-host-wait-source, test-sycl-moe-cpu-activation-row-source, test-llama-model-lazy-auto-source,
+test-sycl-runtime-registry-index-source, test-llama-context-cpu-only-compile.
+sweep 2 (-R alloc-zone|-source$|source-contract$|-audit$, -LE source|...): 22 of 22 pass.
