@@ -119,6 +119,7 @@
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
+#include "ggml-sycl/moe-bf16-direct.hpp"
 #include "ggml-sycl/moe-exec-cost.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
@@ -83469,6 +83470,185 @@ static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int devic
            ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, op->src[0], device, false);
 }
 
+// Whether `buffer` is `device`'s own buffer: one device's SYCL buffer, not a split buffer (the publisher reads its context
+// as a ggml_backend_sycl_buffer_context), of `device`, in VRAM. The BF16 route without a plan admits a placed weight
+// only there, and publishes expert slices only from there: it records them under `device`, so another card's buffer
+// must never pass.
+static bool ggml_sycl_moe_bf16_direct_own_vram_buffer(ggml_backend_buffer_t buffer, int device) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_sycl(buffer) || ggml_backend_buffer_is_sycl_split(buffer)) {
+        return false;
+    }
+    const auto * buf_ctx = static_cast<const ggml_backend_sycl_buffer_context *>(buffer->context);
+    return buf_ctx != nullptr && buf_ctx->device == device &&
+           buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
+}
+
+// Whether `device` computes a BF16 MUL_MAT_ID with the BF16 expert kernel (moe-bf16-direct.hpp, Inkling 2 Mini plan
+// Task 8g). supports_op and the route in ggml_sycl_mul_mat_id ask this one question, so an op the backend admits is an
+// op the route runs, decode and prompt alike. Placement decides the executor: with a placement plan for `device`, only
+// the plan answers, and it must put every expert of the weight on `device` at AOS, the layout a BF16 expert is loaded
+// in; a weight with an expert on the host or on another card is left to the backend that holds it. Without a plan
+// (test-backend-ops' graphs, ordinary backend allocations), a weight that nothing has placed yet counts, because the
+// caller allocates it on the backend it asked (test-backend-ops asks supports_op before it allocates), and a placed
+// weight counts only in this device's own SYCL device buffer: the route publishes its expert slices from that buffer.
+static bool ggml_sycl_moe_bf16_direct_route_available(const ggml_tensor * op, int device) {
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT_ID || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * ids  = op->src[2];
+    if (src0 == nullptr || src1 == nullptr || ids == nullptr || src0->type != GGML_TYPE_BF16 ||
+        src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    // The kernel reads each expert as one contiguous matrix and each activation and output row as contiguous floats.
+    // The expert records live on the weight's own extra and the AOS publisher publishes only a root tensor, so a view
+    // of the weight has no table the route could build.
+    if (src0->view_src != nullptr || !ggml_is_contiguous(src0) || src1->nb[0] != sizeof(float) ||
+        op->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const auto plan = ggml_sycl_moe_plan_owner_for_device(device);
+    if (plan) {
+        layout_mode layout = GGML_LAYOUT_AOS;
+        return ggml_sycl_moe_tensor_plan_primary_layout(*plan, src0, device, &layout) && layout == GGML_LAYOUT_AOS;
+    }
+    if (src0->buffer == nullptr) {
+        return true;
+    }
+    return ggml_sycl_moe_bf16_direct_own_vram_buffer(src0->buffer, device);
+}
+
+// Every BF16 MUL_MAT_ID that reaches ggml_sycl_mul_mat_id runs here, on this device: the experts from the full-local
+// table at AOS, the ids from their own device storage, src1 and dst read and written in place. BF16 has no MMVQ-ID,
+// workspace or prompt-executor route, so nothing after this route in ggml_sycl_mul_mat_id can compute the op: an op
+// that ggml_sycl_moe_bf16_direct_route_available() declines at run time, and every other refusal, is one named WARN
+// line and ggml_sycl_fallback_error, which fails the graph at its boundary rather than computing wrong numbers.
+static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    // check_graph_compatibility keeps a BF16 MUL_MAT_ID out of whole-graph capture, so recording here is a capture
+    // that should not have started: do what the NVFP4 decode node does and let the outer handler fall back to direct
+    // execution, before any table or ids work.
+    if (g_ggml_sycl_graph_recording) {
+        GGML_LOG_WARN("[MoE] BF16 direct route under graph recording: tensor=%s; dropping to direct execution\n",
+                      src0->name);
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
+                              "BF16 MoE direct route incompatible with graph recording");
+    }
+
+    const auto refuse = [&](const char * reason) {
+        GGML_LOG_WARN("[MoE] BF16 direct route refused: tensor=%s device=%d reason=%s\n", src0->name, ctx.device,
+                      reason);
+        throw ggml_sycl_fallback_error("BF16 MoE direct route refused");
+    };
+
+    // supports_op asked this before the op was scheduled; the placement it read can have changed since.
+    if (!ggml_sycl_moe_bf16_direct_route_available(dst, ctx.device)) {
+        refuse("the route's predicate declines the op at run time");
+    }
+
+    // The table the planner's preload provides for a planned weight. A weight in this device's own buffer has no
+    // expert records until something publishes them: publish its AOS slices from the buffer and build once more.
+    const auto ensure_table = [&]() {
+        return moe_fusion_ensure_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
+    };
+    const void * const * table = ensure_table();
+    if (table == nullptr) {
+        int  published_kind   = -1;
+        bool published_stable = false;
+        if (ggml_sycl_moe_bf16_direct_own_vram_buffer(src0->buffer, ctx.device) &&
+            ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS, &published_kind,
+                                                         &published_stable)) {
+            table = ensure_table();
+        }
+    }
+    if (table == nullptr) {
+        refuse("not every expert resolves at AOS on this device");
+    }
+
+    ggml_sycl::mem_handle ids_handle;
+    const int32_t *       ids_dev = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids, &ids_handle);
+    if (ids_dev == nullptr) {
+        refuse("ids are not resident on this device");
+    }
+    const float * src1_dev = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
+    float *       dst_dev  = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
+    if (src1_dev == nullptr || dst_dev == nullptr) {
+        refuse("src1 or dst has no pointer on this device");
+    }
+
+    ggml_sycl::moe_bf16_direct_shape shape;
+    shape.k         = src0->ne[0];
+    shape.rows      = src0->ne[1];
+    shape.n_experts = src0->ne[2];
+    shape.n_slots   = ids->ne[0];
+    shape.n_tokens  = ids->ne[1];
+    shape.src1_rows = src1->ne[1];
+    shape.w_nb1     = src0->nb[1];
+    shape.src1_nb1  = src1->nb[1];
+    shape.src1_nb2  = src1->nb[2];
+    shape.ids_nb0   = ids->nb[0];
+    shape.ids_nb1   = ids->nb[1];
+    shape.dst_nb1   = dst->nb[1];
+    shape.dst_nb2   = dst->nb[2];
+
+    // The kernel runs any token count in chunks that fit a launch, but not a single token whose slots and rows alone
+    // exceed one; the pointers are checked above, so this is the submitter's only refusal left.
+    const int64_t tokens_per_launch = ggml_sycl::moe_bf16_direct_tokens_per_launch(shape);
+    if (tokens_per_launch <= 0) {
+        refuse("one token's slots and rows exceed one kernel launch");
+    }
+
+    // The table's dispatch bundle (its active expert leases and the table's own allocation) and the ids' storage stay
+    // alive until the kernel is done. A snapshot, as every production pointer-table dispatcher takes: the active
+    // leases stay on the table for the next dispatch from the same cached table.
+    std::vector<ggml_sycl::mem_handle> retained = ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(
+        static_cast<const ggml_tensor_extra_gpu *>(src0->extra), ctx.device);
+    ggml_sycl_append_moe_dispatch_handle(retained, ids_handle);
+
+    // GGML_SYCL_KERNEL_PROFILE row, labelled the way mmvq_submit_aos_id_impl labels the MMVQ id kernels. The wrapper
+    // times the event it is handed, the last token chunk's, so a dispatch split into chunks reports its last chunk
+    // only, and the row says so with launches > 1; at Inkling's shapes (2304 rows, 8 slots) that starts above 7281
+    // tokens in one ubatch.
+    std::string profile_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        profile_metadata = "ncols=" + std::to_string(shape.k) + ";nrows_per_expert=" + std::to_string(shape.rows) +
+                           ";total_batches=" + std::to_string(shape.n_tokens * shape.n_slots) +
+                           ";launches=" + std::to_string((shape.n_tokens + tokens_per_launch - 1) / tokens_per_launch);
+    }
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "mulmat.moe.bf16_direct";
+    profile_label.category   = "mulmat";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = profile_metadata.c_str();
+    profile_label.device     = ctx.device;
+
+    bool        submitted    = false;
+    sycl::event kernel_event = ggml_sycl_profile_submit(*ctx.stream(), profile_label, [&](sycl::queue & queue) {
+        sycl::event last;
+        submitted = ggml_sycl::moe_bf16_direct_submit(queue, table, src1_dev, ids_dev, dst_dev, shape, &last);
+        return last;
+    });
+    if (!submitted) {
+        refuse("the kernel refused the shape");
+    }
+    ggml_sycl::retain_handles_until_event(std::move(retained), kernel_event);
+    ctx.moe_graphs_disabled_once = true;
+
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> bf16_direct_log{ 0 };
+        if (bf16_direct_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+            GGML_LOG_INFO("[MOE-ROUTE] bf16 direct tensor=%s device=%d tokens=%lld slots=%lld vec4=%d\n", src0->name,
+                          ctx.device, (long long) shape.n_tokens, (long long) shape.n_slots,
+                          ggml_sycl::moe_bf16_direct_vec4(shape) ? 1 : 0);
+        }
+    }
+}
+
 #if GGML_SYCL_DNNL
 // True the first time `refusal` is seen on `device`: the batched executor's refusal WARN fires once per (device,
 // cause). One bit per cause, so the shift below is defined only while COUNT fits the mask.
@@ -84672,6 +84852,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    /* use_tensor_data_ptr = */ false);
         std::lock_guard<std::mutex> lock(s_mul_mat_id_extras_mutex);
         s_mul_mat_id_extras.push_back(std::move(new_extra));
+    }
+
+    // BF16 experts (Inkling 2 Mini plan, Task 8g) have one route: the BF16 expert kernel, ahead of every route below,
+    // none of which has a BF16 kernel. Every BF16 op enters it; the route asks the predicate supports_op asked again
+    // and refuses by name when the answer has become no, so no BF16 op reaches a route below.
+    if (src0->type == GGML_TYPE_BF16) {
+        ggml_sycl_mul_mat_id_bf16_direct(ctx, dst);
+        return;
     }
 
     // GGML_SYCL_MMID_SCHED (default 0): the device-built prompt schedule. A refusal falls through to the planned routes.
@@ -124672,8 +124860,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // MoE bias-add to the CPU backend. It keeps the allowlist below.
             // llama.cpp-348c: a type with no MMID kernel is still admitted for a prompt the batched prompt executor
             // claims (ggml_sycl_moe_pp_batched_admits_op), which needs a published plan, so an op without one stays
-            // refused to the CPU backend.
-            if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {
+            // refused to the CPU backend. BF16 experts (Task 8g) are admitted where their route runs them, the one
+            // predicate ggml_sycl_mul_mat_id asks before any other route.
+            if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device) &&
+                !ggml_sycl_moe_bf16_direct_route_available(op, device)) {
                 return false;
             }
         } else if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&
