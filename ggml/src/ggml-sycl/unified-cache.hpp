@@ -855,15 +855,17 @@ struct placement_kv_info {
 
 // The slot-to-layer map the planner keeps, from the one an inventory carries (its kv_layer_phys).
 // The map is accepted only when it has one entry per KV slot (kv_layer_phys_count == kv_layer_count) and every entry is
-// a weight layer id, in [0, kv_layer_count). An identity map is kept empty, so a model whose slots are its layers plans
-// exactly as it did with no map. A refused map is also kept empty, and the fields after `refused` say why.
+// a weight layer id, in [0, kv_layer_count). A count of 0 is no map; a nonzero count with a null map is refused like a
+// count mismatch. An identity map is kept empty, so a model whose slots are its layers plans exactly as it did with no
+// map. A refused map is also kept empty, and the fields after `refused` say why.
 struct placement_kv_layer_phys_intake {
-    std::vector<int32_t> layer_phys;              // empty: every slot is its own layer
-    bool                 refused        = false;  // a map was given and does not fit the inventory
-    uint32_t             count          = 0;      // kv_layer_phys_count
-    uint32_t             kv_layer_count = 0;      // kv_layer_count
-    int                  bad_slot       = -1;     // the first slot whose entry is not a weight layer id; -1: the counts
-    int                  bad_layer      = -1;     // that slot's entry
+    std::vector<int32_t> layer_phys;                   // empty: every slot is its own layer
+    bool                 refused             = false;  // a map was given and does not fit the inventory
+    bool                 map_missing         = false;  // a slot count was given with a null map
+    uint32_t             kv_layer_phys_count = 0;      // the inventory's kv_layer_phys_count
+    uint32_t             kv_layer_count      = 0;      // the inventory's kv_layer_count
+    int                  bad_slot            = -1;     // the first slot whose entry is not a weight layer id, else -1
+    int                  bad_layer           = -1;     // that slot's entry
 };
 
 placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory(const ggml_sycl_tensor_inventory & inventory);

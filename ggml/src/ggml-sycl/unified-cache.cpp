@@ -33332,13 +33332,16 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
 
 placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory(const ggml_sycl_tensor_inventory & inventory) {
     placement_kv_layer_phys_intake intake;
-    intake.count          = inventory.kv_layer_phys_count;
-    intake.kv_layer_count = inventory.kv_layer_count;
-    if (inventory.kv_layer_phys == nullptr || inventory.kv_layer_phys_count == 0) {
+    intake.kv_layer_phys_count = inventory.kv_layer_phys_count;
+    intake.kv_layer_count      = inventory.kv_layer_count;
+    if (inventory.kv_layer_phys_count == 0) {
         return intake;
     }
-    if (inventory.kv_layer_phys_count != inventory.kv_layer_count) {
-        intake.refused = true;
+    // A count says the producer sent a map. A null one is refused like a count mismatch, so the backend says so
+    // instead of planning every slot as its own layer without a word.
+    if (inventory.kv_layer_phys == nullptr || inventory.kv_layer_phys_count != inventory.kv_layer_count) {
+        intake.refused     = true;
+        intake.map_missing = inventory.kv_layer_phys == nullptr;
         return intake;
     }
     const int32_t * const      map = inventory.kv_layer_phys;

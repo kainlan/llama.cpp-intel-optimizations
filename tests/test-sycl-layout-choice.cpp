@@ -2171,17 +2171,19 @@ static bool run_kv_slot_map_intake_test() {
         ok = false;
     }
     const auto short_map = intake(&loop, n_slot - 1);
-    if (!short_map.refused || !short_map.layer_phys.empty() || short_map.count != n_slot - 1 ||
-        short_map.kv_layer_count != n_slot || short_map.bad_slot != -1) {
+    if (!short_map.refused || !short_map.layer_phys.empty() || short_map.kv_layer_phys_count != n_slot - 1 ||
+        short_map.kv_layer_count != n_slot || short_map.bad_slot != -1 || short_map.map_missing) {
         printf("FAIL: a map one entry short is refused and names both counts: refused=%d counts %u/%u bad slot %d\n",
-               short_map.refused, short_map.count, short_map.kv_layer_count, short_map.bad_slot);
+               short_map.refused, short_map.kv_layer_phys_count, short_map.kv_layer_count, short_map.bad_slot);
         ok = false;
     }
     // A slot count with no map: the producer said it sent one and did not. Refused like a count mismatch, so the WARN
     // says so, not read as no map and planned without a word.
     const auto null_map = intake(nullptr, n_slot);
-    if (!null_map.refused || !null_map.layer_phys.empty()) {
-        printf("FAIL: a slot count with no map is refused, not read as no map: refused=%d\n", null_map.refused);
+    if (!null_map.refused || !null_map.layer_phys.empty() || !null_map.map_missing ||
+        null_map.kv_layer_phys_count != n_slot || null_map.bad_slot != -1) {
+        printf("FAIL: a slot count with no map is refused, not read as no map: refused=%d map_missing=%d\n",
+               null_map.refused, null_map.map_missing);
         ok = false;
     }
     const auto past  = intake(&out_of_range, n_slot);

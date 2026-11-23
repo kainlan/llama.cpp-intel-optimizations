@@ -174,9 +174,12 @@ FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * 
 INTAKE_CALL = "ggml_sycl::placement_kv_layer_phys_from_inventory(*inventory);"
 INTAKE_COPY = "g_placement_kv_info.layer_phys = phys.layer_phys;"
 REFUSED_WARN = '"[SYCL-PLAN] KV slot map ignored: kv_layer_phys_count=%u kv_layer_count=%u%s;'
+REFUSED_COST = "\"as its own layer (a looped model's repeated slots go to the host tier)\\n\""
 INTAKE_SIG = ("placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory("
               "const ggml_sycl_tensor_inventory & inventory)")
-COUNT_CHECK = "if (inventory.kv_layer_phys_count != inventory.kv_layer_count) { intake.refused = true; return intake; }"
+NO_MAP = "if (inventory.kv_layer_phys_count == 0) { return intake; }"
+COUNT_CHECK = ("if (inventory.kv_layer_phys == nullptr || inventory.kv_layer_phys_count != inventory.kv_layer_count) { "
+               "intake.refused = true;")
 IDENTITY_EMPTY = "if (kv_layer_phys_is_identity(layer_phys)) { return intake; }"
 RANGE_CHECK = ("if (layer_phys[slot] < 0 || static_cast<uint32_t>(layer_phys[slot]) >= inventory.kv_layer_count) { "
                "intake.refused = true;")
@@ -187,16 +190,17 @@ HOOK_ASK = "!hooks.kv_layer_on_device(dev, (int32_t) il)"
 
 
 def claim_backend_takes_the_map_once(sycl: str, cache: str, kv_cache: str) -> bool:
-    """The backend reads the map in one place, through the intake: refused unless it has one entry per slot and every
-    entry is a weight layer id below the slot count, kept empty for the identity, and said at WARN when refused. Nothing
-    else in the backend writes a map, and the residency hook answers for the slot libllama asks about."""
+    """The backend reads the map in one place, through the intake: no count is no map, and a count is refused unless the
+    map is there with one entry per slot and every entry is a weight layer id below the slot count; the identity is kept
+    empty; a refusal is said at WARN with its cost. Nothing else in the backend writes a map, and the residency hook
+    answers for the slot libllama asks about."""
     s = norm(sycl)
     fill = body(s, FILL_SIG)
     intake = body(norm(cache), INTAKE_SIG)
     hook = body(s, HOOK_SIG)
-    return (bool(fill) and ordered(fill, INTAKE_CALL, INTAKE_COPY, REFUSED_WARN) and s.count(INTAKE_CALL) == 1
-            and len(re.findall(r"\.layer_phys = ", s)) == 1
-            and bool(intake) and ordered(intake, COUNT_CHECK, IDENTITY_EMPTY, RANGE_CHECK, ACCEPT)
+    return (bool(fill) and ordered(fill, INTAKE_CALL, INTAKE_COPY, REFUSED_WARN, REFUSED_COST)
+            and s.count(INTAKE_CALL) == 1 and len(re.findall(r"\.layer_phys = ", s)) == 1
+            and bool(intake) and ordered(intake, NO_MAP, COUNT_CHECK, IDENTITY_EMPTY, RANGE_CHECK, ACCEPT)
             and bool(hook) and HOOK_ANSWER in hook and HOOK_ASK in norm(kv_cache))
 
 
@@ -339,7 +343,15 @@ def test_mutant_backend_copies_the_raw_map_fails():
 
 
 def test_mutant_intake_skips_the_count_fails():
-    assert not claim_backend_takes_the_map_once(SYCL, _once(CACHE, COUNT_CHECK, ""), KV_CACHE)
+    assert not claim_backend_takes_the_map_once(SYCL, _once(CACHE, COUNT_CHECK, "if (false) { intake.refused = true;"),
+                                                KV_CACHE)
+
+
+def test_mutant_null_map_with_a_count_is_no_map_fails():
+    """A count with a null map read as no map: the slots are planned as layers and nothing is said."""
+    mutant = _once(CACHE, NO_MAP, "if (inventory.kv_layer_phys == nullptr || inventory.kv_layer_phys_count == 0) { "
+                   "return intake; }")
+    assert not claim_backend_takes_the_map_once(SYCL, mutant, KV_CACHE)
 
 
 def test_mutant_intake_skips_the_range_fails():
@@ -354,6 +366,12 @@ def test_mutant_identity_kept_as_a_map_fails():
 
 def test_mutant_refusal_is_silent_fails():
     mutant = _once(SYCL, REFUSED_WARN, '"[SYCL-PLAN] quiet:')
+    assert not claim_backend_takes_the_map_once(mutant, CACHE, KV_CACHE)
+
+
+def test_mutant_refusal_hides_its_cost_fails():
+    """The WARN without what the refusal costs a looped model."""
+    mutant = _once(SYCL, REFUSED_COST, '"as its own layer\\n"')
     assert not claim_backend_takes_the_map_once(mutant, CACHE, KV_CACHE)
 
 

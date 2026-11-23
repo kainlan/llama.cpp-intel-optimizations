@@ -17559,14 +17559,16 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_placement_kv_info.layer_phys = phys.layer_phys;
         if (phys.refused) {
             char detail[160] = "";
-            if (phys.bad_slot >= 0) {
+            if (phys.map_missing) {
+                snprintf(detail, sizeof(detail), "; the map is null");
+            } else if (phys.bad_slot >= 0) {
                 snprintf(detail, sizeof(detail), "; slot %d names weight layer %d, outside [0, %u)", phys.bad_slot,
                          phys.bad_layer, phys.kv_layer_count);
             }
             GGML_LOG_WARN(
                 "[SYCL-PLAN] KV slot map ignored: kv_layer_phys_count=%u kv_layer_count=%u%s; every KV slot is planned "
-                "as its own layer\n",
-                phys.count, phys.kv_layer_count, detail);
+                "as its own layer (a looped model's repeated slots go to the host tier)\n",
+                phys.kv_layer_phys_count, phys.kv_layer_count, detail);
         } else if (!phys.layer_phys.empty()) {
             const int32_t max_layer = *std::max_element(phys.layer_phys.begin(), phys.layer_phys.end());
             GGML_LOG_INFO(
