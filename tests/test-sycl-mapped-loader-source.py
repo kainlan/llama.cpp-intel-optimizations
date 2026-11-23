@@ -22,7 +22,8 @@ The fact and the ABI
       after n_ctx_context_is_default (offsets 185-187, so n_ubatch_context stays at 188; the struct is 208 bytes
       since the lazy tables were appended after it), and both static_assert blocks pin the three offsets.
       host_weight_layout is one byte holding three values (enum ggml_sycl_host_weight_layout: OFF 0, CPU 1, PLAIN 2),
-      so every read in the backend and libllama compares it with a named value and none tests it as a bool, where
+      so every read in the backend and libllama compares it with a named value, or passes it to a function that does
+      (the backend's host_weight_layout_facts_of switches over the named values), and none tests it as a bool, where
       PLAIN would read as CPU;
   F2. the four new exports (the renamed staging proc ggml_backend_sycl_stage_load_inventory_plan, planned_host_backing,
       mapped_buffer_type_for_device, mapped_buffer_from_file) are declared in ggml-sycl.h and resolvable through the
@@ -902,7 +903,8 @@ def clause_p1_derivation_sites(t: dict) -> list:
                    "placement_host_backing::PINNED"):
         if needle not in rule:
             problems.append(f"placement_host_backing_when_host does not read {needle}")
-    if not re.search(r"kv_info\s*\.\s*host_weight_layout\s*!=\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU\b", rule):
+    if not re.search(r"!\s*host_weight_layout_facts_of\s*\(\s*kv_info\s*\.\s*host_weight_layout\s*\)\s*\.\s*"
+                     r"dense_cpu_owned\b", rule):
         problems.append("placement_host_backing_when_host does not back only the cpu layout's dense weights CPU_OWNED")
     # One fact, one source: the rule asks the plan's copy, which the builder made before any entry exists.
     if not re.search(r"plan\s*\.\s*host_backing_maps_files", rule):
@@ -1067,8 +1069,8 @@ MUTANTS = [
      lambda t: _mut(t, GS, rf'(strcmp\s*\(\s*name\s*,\s*"{STAGE_OLD}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
                            r"return\s*\(\s*void\s*\*\s*\)\s*)\w+", rf"\g<1>{STAGE_NEW}")),
     ("the layout byte is read as a bool", "F1",
-     lambda t: _mut(t, UCC, r"kv_info\s*\.\s*host_weight_layout\s*!=\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU",
-                    "!kv_info.host_weight_layout")),
+     lambda t: _mut(t, UCC, r"host_weight_layout_facts_of\s*\(\s*kv_info\s*\.\s*host_weight_layout\s*\)\s*\.\s*"
+                            r"dense_cpu_owned", "kv_info.host_weight_layout")),
     ("libllama's inputs moved past the padding", "F1",
      lambda t: _mut(t, H, r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*use_mmap_resolved\s*\)\s*==\s*185",
                     "offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 192")),

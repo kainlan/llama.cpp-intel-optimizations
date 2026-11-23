@@ -2424,6 +2424,33 @@ static constexpr placement_loader_fact placement_loader_fact_for(bool maps_files
     return { holds, device, device >= 0 && plan_device == device };
 }
 
+// What the load's host weight layout, the inventory's one byte (enum ggml_sycl_host_weight_layout), says of a dense
+// weight the plan places on the host. Every reader of the byte asks this one function.
+//   known               the byte names a layout; any other byte is a malformed inventory, which every entry point
+//                       refuses (ggml_sycl_inventory_malformed)
+//   loader_holds_dense  the loader keeps the weight in its SYCL_Host buffer (off); under cpu and plain it puts the
+//                       weight in a CPU-owned buffer instead
+//   dense_cpu_owned     on a load that maps files, ggml-cpu repacks the weight into a buffer of its own (cpu)
+//                       instead of reading the file's mapping (off, plain)
+struct host_weight_layout_facts {
+    bool known              = false;
+    bool loader_holds_dense = false;
+    bool dense_cpu_owned    = false;
+};
+
+static constexpr host_weight_layout_facts host_weight_layout_facts_of(uint8_t host_weight_layout) noexcept {
+    switch (static_cast<ggml_sycl_host_weight_layout>(host_weight_layout)) {
+        case GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF:
+            return { true, true, false };
+        case GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU:
+            return { true, false, true };
+        case GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN:
+            return { true, false, false };
+        default:
+            return { true, false, false };
+    }
+}
+
 // Whether the loader's SYCL_Host buffer holds the host-planned dense weights of the inventory a plan was made from,
 // given the load's GGML_SYCL_HOST_WEIGHT_LAYOUT (enum ggml_sycl_host_weight_layout) and whether that inventory is
 // unbound (placement_kv_info::load_inventory_unbound). Under the cpu and plain layouts the loader puts a dense weight

@@ -342,6 +342,27 @@ void check_loader_holds_what_it_places() {
     }
 }
 
+void check_layout_byte_reads_one_way() {
+    // Each layout as the readers take it: under off the loader keeps a host dense weight in its SYCL_Host buffer, under
+    // cpu ggml-cpu repacks it into a buffer of its own on a mapping load, and under plain the CPU reads the mapping.
+    using ggml_sycl::host_weight_layout_facts;
+    const host_weight_layout_facts off   = ggml_sycl::host_weight_layout_facts_of(GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF);
+    const host_weight_layout_facts cpu   = ggml_sycl::host_weight_layout_facts_of(GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU);
+    const host_weight_layout_facts plain = ggml_sycl::host_weight_layout_facts_of(GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN);
+    CHECK(off.known && off.loader_holds_dense && !off.dense_cpu_owned);
+    CHECK(cpu.known && !cpu.loader_holds_dense && cpu.dense_cpu_owned);
+    CHECK(plain.known && !plain.loader_holds_dense && !plain.dense_cpu_owned);
+    // A byte no layout names is a malformed inventory, which every entry point refuses. A plan built from one anyway
+    // reads it on the side that charges more: the loader's term holds the dense weight, and a mapping load charges it
+    // as a CPU-owned buffer rather than a mapping no zone holds.
+    for (const unsigned byte : { 3u, 255u }) {
+        const host_weight_layout_facts unknown = ggml_sycl::host_weight_layout_facts_of(static_cast<uint8_t>(byte));
+        CHECK(!unknown.known);
+        CHECK(unknown.loader_holds_dense && unknown.dense_cpu_owned);
+        CHECK(ggml_sycl::placement_loader_holds_host_dense(static_cast<uint8_t>(byte), true));
+    }
+}
+
 bool role_says(const placement_plan & plan, const char * text) {
     const std::string role =
         ggml_sycl::placement_plan_loader_role(plan, ggml_sycl::placement_plan_host_weight_zone_terms(plan));
@@ -747,6 +768,7 @@ int main() {
     check_mapped_expert_is_neither();
     check_loader_role_follows_what_it_serves();
     check_loader_holds_what_it_places();
+    check_layout_byte_reads_one_way();
     check_pool_oracle_reproduces_the_device_log();
     check_loader_footprint_is_the_pools();
     check_oversize_buffer_grows_a_planned_chunk();

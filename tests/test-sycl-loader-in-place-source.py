@@ -80,6 +80,11 @@ The charge (ucc = unified-cache.cpp)
       loader_residency sum and placement_plan_loader_tensor_bytes, the replay's tensors, both ask it; and
       populate_host_zone_sizing records the replay's tensors from that function. The early pass and the dry run mark
       their inventory unbound, and the late pass, whose inventory keeps only the tensors on SYCL buffers, marks it bound.
+  C6. The layout byte has one reader. host_weight_layout_facts_of (hpp) switches over enum
+      ggml_sycl_host_weight_layout with a case for each value and no default, so a new value is a -Wswitch warning,
+      and reads any other byte as unknown, held by the loader and CPU-owned: the side that charges more. The fact
+      (C5) and placement_host_backing_when_host (ucc) ask it, and no other code compares the byte with a value.
+      ggml_sycl_inventory_malformed (gs), the refusal point of every entry point, refuses an unknown byte and names it.
 
 Run: python3 -I tests/test-sycl-loader-in-place-source.py [--self-test]
 """
@@ -512,9 +517,10 @@ def clause_c4_loader_pool_refusal(t: dict) -> list:
 def clause_c5_loader_holds_what_it_places(t: dict) -> list:
     problems = []
     rule = body_of(t[HPP], r"\bconstexpr\s+bool\s+placement_loader_holds_host_dense\s*\(")
-    if not re.search(r"return\s+!\s*inventory_unbound\s*\|\|\s*host_weight_layout\s*==\s*"
-                     r"GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF\s*;", rule):
-        problems.append("placement_loader_holds_host_dense is not: a bound inventory, or the OFF layout")
+    if not re.search(r"return\s+!\s*inventory_unbound\s*\|\|\s*host_weight_layout_facts_of\s*\(\s*"
+                     r"host_weight_layout\s*\)\s*\.\s*loader_holds_dense\s*;", rule):
+        problems.append("placement_loader_holds_host_dense is not: a bound inventory, or a layout whose loader holds "
+                        "the dense weight")
     entry = body_of(t[HPP], r"\binline\s+bool\s+placement_plan_loader_holds_entry\s*\(")
     for needle in ("plan.loader_holds_host_dense", "entry.on_device", "entry.expert_id", "FILE_MAPPED"):
         if needle not in entry:
@@ -543,6 +549,50 @@ def clause_c5_loader_holds_what_it_places(t: dict) -> list:
     return problems
 
 
+LAYOUT_FACTS_SIG = r"\bconstexpr\s+host_weight_layout_facts\s+host_weight_layout_facts_of\s*\("
+LAYOUT_SWITCH = r"switch\s*\(\s*static_cast\s*<\s*ggml_sycl_host_weight_layout\s*>\s*\(\s*host_weight_layout\s*\)\s*\)"
+LAYOUT_FALLBACK = r"return\s*\{\s*false\s*,\s*true\s*,\s*true\s*\}\s*;\s*$"
+BACKING_READ = (r"host_weight_layout_facts_of\s*\(\s*kv_info\s*\.\s*host_weight_layout\s*\)\s*\.\s*"
+                r"dense_cpu_owned")
+MALFORMED_SIG = r"\bstatic\s+bool\s+ggml_sycl_inventory_malformed\s*\("
+MALFORMED_READ = (r"ggml_sycl::host_weight_layout_facts_of\s*\(\s*inventory->host_weight_layout\s*\)\s*\.\s*"
+                  r"known")
+MALFORMED_FMT = "\"[SYCL-PLAN] the inventory's host_weight_layout byte %u names no layout"
+
+
+def clause_c6_layout_byte_read_once(t: dict) -> list:
+    problems = []
+    helper = body_of(t[HPP], LAYOUT_FACTS_SIG)
+    switch = re.search(LAYOUT_SWITCH, helper)
+    if not switch:
+        problems.append("host_weight_layout_facts_of does not switch over enum ggml_sycl_host_weight_layout")
+    else:
+        cases = balanced(helper, helper.find("{", switch.end()))
+        for value in ("OFF", "CPU", "PLAIN"):
+            if not re.search(rf"\bcase\s+GGML_SYCL_HOST_WEIGHT_LAYOUT_{value}\s*:", cases):
+                problems.append(f"host_weight_layout_facts_of has no case for {value}")
+        # No default: a new layout is then a -Wswitch warning instead of a silent reading.
+        if re.search(r"\bdefault\s*:", cases):
+            problems.append("host_weight_layout_facts_of has a default case")
+    # A byte no case names is read on the side that charges more.
+    if not re.search(LAYOUT_FALLBACK, helper):
+        problems.append("host_weight_layout_facts_of does not read an unknown byte as unknown, held and CPU-owned")
+    # Every reader asks the helper: no comparison of the byte with a value is left in the backend.
+    for rel in FILES:
+        code = t[rel].replace(helper, "")
+        if re.search(r"\bhost_weight_layout\s*[!=]=", code):
+            problems.append(f"{rel} compares the layout byte itself instead of asking host_weight_layout_facts_of")
+    backing = body_of(t[UCC], r"\bstatic\s+placement_host_backing\s+placement_host_backing_when_host\s*\(")
+    if not re.search(BACKING_READ, backing):
+        problems.append("placement_host_backing_when_host does not ask host_weight_layout_facts_of")
+    malformed = body_of(t[GS], MALFORMED_SIG)
+    if not re.search(MALFORMED_READ, malformed):
+        problems.append("ggml_sycl_inventory_malformed accepts a layout byte that names no layout")
+    if MALFORMED_FMT not in malformed:
+        problems.append("ggml_sycl_inventory_malformed refuses the layout byte without naming it")
+    return problems
+
+
 CLAUSES = [
     ("O1 a model owns the SYCL_Host chunks its load mints", clause_o1_model_owns_its_chunks),
     ("O2 the MODEL check runs after the reclaim", clause_o2_model_check_after_reclaim),
@@ -556,6 +606,7 @@ CLAUSES = [
     ("C3 the loader's buffers are charged as the pool holds them", clause_c3_pool_footprint),
     ("C4 a loader pool over the budget refuses the load by name", clause_c4_loader_pool_refusal),
     ("C5 the term and the replay count what the loader places", clause_c5_loader_holds_what_it_places),
+    ("C6 the layout byte is read through one function, an unknown byte refused", clause_c6_layout_byte_read_once),
 ]
 
 
@@ -680,8 +731,16 @@ MUTANTS = [
     ("replay-skips-predicate", "C5", mutate_re(UCC, r"(std::vector<size_t>\s+placement_plan_loader_tensor_bytes\s*\(.*?)"
                                                     + HOLDS_ENTRY, r"\1true")),
     ("residency-skips-predicate", "C5", mutate_re(UCC, r"(if\s*\(\s*charge_loader\s*&&\s*)" + HOLDS_ENTRY, r"\1true")),
-    ("rule-reads-cpu-only", "C5", mutate_re(HPP, r"host_weight_layout\s*==\s*GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF",
-                                            "host_weight_layout != GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU")),
+    ("rule-reads-cpu-only", "C5", mutate_re(HPP, r"(host_weight_layout_facts_of\s*\(\s*host_weight_layout\s*\)\s*\.\s*)"
+                                                 r"loader_holds_dense", r"\1dense_cpu_owned")),
+    ("layout-default-case", "C6", mutate_re(HPP, r"(case\s+GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN\s*:)",
+                                            r"default:\n\1")),
+    ("layout-unknown-undercharges", "C6", mutate_re(HPP, LAYOUT_FALLBACK.replace("$", ""),
+                                                    "return { false, false, false };")),
+    ("backing-compares-the-byte", "C6", mutate_re(UCC, "!" + BACKING_READ,
+                                                  "kv_info.host_weight_layout != GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU")),
+    ("malformed-accepts-any-layout", "C6", mutate_re(GS, "!" + MALFORMED_READ, "false")),
+    ("malformed-refuses-silently", "C6", mutate(GS, MALFORMED_FMT, '"[SYCL-PLAN] bad layout %u')),
     ("fact-ignores-pass", "C5", mutate_re(UCC, r"info\.load_inventory_unbound\s*\)", "true)")),
     ("max-size-restated", "C3", mutate_re(GS, r"ggml_sycl::host_zone_buffer_max_size\s*\(\s*chunk_cap\s*,",
                                           "std::min(chunk_cap, ggml_sycl::pinned_chunk_pool::CHUNK_SIZE) + 0 * (")),
