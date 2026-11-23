@@ -2374,9 +2374,10 @@ struct placement_plan {
 // The model loader's SYCL_Host buffer is a term when the plan's loader holds weights in one device's pinned pool
 // (placement_loader_fact_for: loader_device >= 0): on a load that does not map files, with evictable weights, the
 // loader binds that buffer for every weight the plan places (role WEIGHT, lifetime MODEL), device-planned ones
-// included, and keeps it for the model's life. The term is charged once, host-wide, whichever builder made the plan;
-// every card's zones are sized from the plan, and only loader_device's commits the term
-// (placement_plan_host_zone_commit_terms_on_device). On a load that maps files the loader binds SYCL_Mapped instead,
+// included, but for the host-planned dense weights the cpu and plain layouts put in a CPU-owned buffer
+// (placement_plan_loader_holds_entry), and keeps it for the model's life. The term is charged once, host-wide,
+// whichever builder made the plan; every card's zones are sized from the plan, and only loader_device's commits the
+// term (placement_plan_host_zone_commit_terms_on_device). On a load that maps files the loader binds SYCL_Mapped instead,
 // whose bytes are the file's pages outside every host zone, and the term is 0. It is 0 too when the scheduler sees more
 // than one device (loader_device -1): the buffer is then split across their pools by layer, and no one pool holds it.
 // A plan made for loader_device also serves its host-planned PINNED experts from that buffer in place, so those experts
@@ -2384,7 +2385,7 @@ struct placement_plan {
 struct host_weight_zone_terms {
     size_t host_weights         = 0;  // placement_entry_host_weight_bytes() over the entries that hold a block here
     size_t blocks               = 0;  // the pinned allocations those weights take: one per entry that holds a block
-    size_t loader_residency     = 0;  // the loader's SYCL_Host buffer: every entry's bytes plus its alignment bound
+    size_t loader_residency     = 0;  // the loader's SYCL_Host buffer: each held entry's bytes and alignment bound
     size_t loader_served        = 0;  // the host weights served from that buffer in place: inside loader_residency
     size_t host_compute_reserve = 0;  // the runtime HOST_COMPUTE requests that also land in WEIGHT, unsized by the plan
     size_t layout_copies        = 0;  // converted copies of a host weight the plan keeps beside the first: none today
@@ -2403,8 +2404,8 @@ struct host_weight_zone_terms {
 // The loader's SYCL_Host buffer as a plan fact, from the load's inputs (placement_kv_info::load_maps_files,
 // load_weights_evictable and load_loader_device) and the builder's device, `plan_device` (-1 for the multi-device
 // builder). The loader binds that buffer for a SYCL layer's weights only when weights are evictable and the load does
-// not map files, and then it holds every weight the plan places, in loader_device's pool, or split across the
-// scheduler's devices when that is -1. A host-planned expert is served from it in place only by a plan made for
+// not map files, and then it holds every weight the plan places but the ones placement_plan_loader_holds_entry leaves
+// out, in loader_device's pool, or split across the scheduler's devices when that is -1. A host-planned expert is served from it in place only by a plan made for
 // loader_device: a multi-device plan's experts are staged for every device, and a chunk is ring-streamable only on
 // the device whose cache queue allocated it.
 struct placement_loader_fact {
@@ -2434,9 +2435,7 @@ static constexpr placement_loader_fact placement_loader_fact_for(bool maps_files
 // exactly the loader's SYCL_Host contents and its plan counts every entry. The off layout leaves the weight in
 // SYCL_Host. A user -ot override the plan does not see is outside this rule.
 static constexpr bool placement_loader_holds_host_dense(uint8_t host_weight_layout, bool inventory_unbound) noexcept {
-    (void) host_weight_layout;
-    (void) inventory_unbound;
-    return true;
+    return !inventory_unbound || host_weight_layout == GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF;
 }
 
 // Whether the loader's SYCL_Host buffer holds `entry`'s tensor, for a plan whose loader holds the weights: every entry

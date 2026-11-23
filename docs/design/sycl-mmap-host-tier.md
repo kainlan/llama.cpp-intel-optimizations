@@ -1221,13 +1221,26 @@ the multi-device builder):
   `loader_device` is 0. When it sees more (`GGML_SYCL_SPLIT_RATIO` or
   `GGML_SYCL_TENSOR_SPLIT`) the buffer is split across their pools by layer,
   and `loader_device` is -1. When it is a device, the plan's WEIGHT zone
-  charges the buffer once, host-wide, as the term `loader_residency`: every
-  entry's `src_size` rounded up to the loader's tensor alignment, exact for a
-  dense weight and a bound for an expert slice. The term reaches
-  `host_planned_bytes` through the zone, and the plan records it as
-  `host_zone_loader_bytes`. It covers the device-planned weights' host bytes
-  too, which the loader keeps after staging (22.9 GB on the Qwen3.8 B70
-  `-lm none` load); releasing them after staging is `llama.cpp-ne2m`.
+  charges the buffer once, host-wide, as the term `loader_residency`: the
+  `src_size` of every entry the buffer holds, rounded up to the loader's
+  tensor alignment, exact for a dense weight and a bound for an expert slice.
+  The term reaches `host_planned_bytes` through the zone, and the plan
+  records it as `host_zone_loader_bytes`. It covers the device-planned
+  weights' host bytes too, which the loader keeps after staging (22.9 GB on
+  the Qwen3.8 B70 `-lm none` load); releasing them after staging is
+  `llama.cpp-ne2m`.
+- `loader_holds_host_dense`: whether the buffer holds the host-planned dense
+  weights of the inventory the plan was made from. Under the `cpu` and
+  `plain` host weight layouts (`GGML_SYCL_HOST_WEIGHT_LAYOUT`, carried as
+  the inventory's `host_weight_layout` byte: `GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF`,
+  `_CPU` or `_PLAIN`) the loader puts such a weight, on a load that maps no
+  file, in a CPU-owned buffer instead. The early pass and the dry run plan an
+  inventory of every weight in the file (`load_inventory_unbound`), so their
+  plans leave those weights out; the late pass's inventory keeps only the
+  tensors whose buffer type is SYCL, which a CPU-owned buffer is not, so its
+  plan counts every entry. One predicate, `placement_plan_loader_holds_entry`,
+  decides each entry for both the term and the replay of the loader's buffers
+  (`placement_plan_loader_tensor_bytes`).
 - `loader_serves_host_experts` (the same, on a single-device plan made for
   `loader_device`). S1-PRELOAD
   registers each host expert backed `PINNED` in place: its lease is the
@@ -1364,7 +1377,7 @@ CPU_OWNED }` for every entry. The planner derives it once from
 | `host_cpu_owned_bytes` | `CPU_OWNED` entries | yes (anonymous memory, P3 counts it) | nothing: not in the zone (today they inflate it) |
 | `host_mapped_bytes` | host-executed `FILE_MAPPED` entries | only when locked (§4.5) | nothing |
 | `host_mapped_source_bytes` | device-planned `FILE_MAPPED` sources | no | nothing (transient page cache during staging) |
-| `loader_residency` (a WEIGHT zone term, recorded as `host_zone_loader_bytes`) | every entry at the loader's alignment, when `loader_holds_weights` and `loader_device >= 0`, once host-wide | through the WEIGHT zone, as the pool holds the loader's buffers (`loader_zone`, and `loader_grown` outside the zones) | `loader_device`'s WEIGHT zone only; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
+| `loader_residency` (a WEIGHT zone term, recorded as `host_zone_loader_bytes`) | every entry the loader's buffer holds (`placement_plan_loader_holds_entry`) at the loader's alignment, when `loader_holds_weights` and `loader_device >= 0`, once host-wide | through the WEIGHT zone, as the pool holds the loader's buffers (`loader_zone`, and `loader_grown` outside the zones) | `loader_device`'s WEIGHT zone only; the host experts it serves in place are `loader_served`, part of `weight_host_bytes`, and take no block |
 
 Every accumulation site of `weight_host_bytes` in the planner
 (`uc:25928`, `:25933`, `:28136`, `:28196`, `:28230`, `:28322`, `:29554`,
