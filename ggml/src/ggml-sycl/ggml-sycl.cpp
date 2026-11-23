@@ -57224,7 +57224,7 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
     memcpy(&bias, params + 1, sizeof(float));
     GGML_ASSERT(ggml_are_same_shape(src0.raw(), dst.raw()));
     if (src0.is_contiguous() && dst.is_contiguous()) {
-        // both flat: the original element-index loop, no index decomposition per element
+        // both flat: index by element, no per-element index decomposition
         scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0.raw()), main_stream);
     } else {
         // a view (e.g. one half of a fused gate_up row) and/or a dst that is a view of it (in place):
