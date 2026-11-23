@@ -14,12 +14,17 @@ The claims, each failure message starting with its name:
   ggml's skip and is written as zero. The check is a compile-time property of the one Q1_0/NVFP4 instantiation the
   admitted adapter uses, so the other mul_mat_vec_q_id callers' kernel images do not change.
 - table-*: a slot of the expert pointer table is null or a pointer the table's owner holds a lease for. A table is
-  zeroed when it is created or its views are rebuilt, and a HOST operand's slot is nulled with its handle dropped.
+  zeroed when it is created or its views are rebuilt, and a HOST operand's slot is nulled with its handle dropped. A
+  refusal after the host payload may have changed marks the device table stale (table-stale).
 - view-*, admission-*: the batch views and the workspace admission take the card occurrences only, each with its own
   occurrence index; the refusing local view stays for every other caller.
 - host-*: the host leg refuses by name before admission (no input marker in play, a task the host recipe would refuse,
   no host workspace), never aborts, and lets a failure in its job reach the graph boundary through the join's host task.
+  The host recipe's executor runs on its check's findings. A leg whose catch could not drain the queue joins the
+  bundle's quarantine through the terminal (host-quarantine).
 - terminal-*: the node's terminal is armed on the last host row copy, after the device output copy.
+- funnel-order: the per-op funnel flushes a pending CPU scatter on every op's path before MUL_MAT_ID is dispatched,
+  which the direct block relies on to read src1 rows a deferred scatter may still owe.
 """
 from pathlib import Path
 import re
@@ -255,6 +260,21 @@ def table_violations(src: dict[str, str]) -> list[str]:
             "expert_handles[slot] = ggml_sycl::mem_handle{};", "ptr_payload[slot] = nullptr;", "any_updated = true;")):
         found.append("table-host-null: a slot to null does not lose its handle and its pointer, or the change is not "
                      "uploaded")
+    # A refusal once the payload may have changed, before its upload, marks the device table stale: otherwise the host
+    # payload is ahead of the table, and the next upload skips the slots it thinks the table already holds.
+    code = code_of(upload)
+    lam = re.search(r"auto\s+refuse\s*=\s*\[&\]\(\)\s*->\s*const\s+void\s*\*\s*const\s*\*\s*\{", code)
+    change = re.search(r"any_updated\s*=\s*true\s*;", code)
+    if lam is None:
+        found.append("table-stale: the transient upload has no refusal that marks the table stale")
+    else:
+        lam_end = matching(code, lam.end() - 1)
+        if not has(spaced(code[lam.end() - 1:lam_end + 1]),
+                   "if (any_updated) { extra->weight().mark_moe_device_table_stale(device); }"):
+            found.append("table-stale: the upload's refusal does not mark the table stale once the payload changed")
+        elif change is None or change.start() < lam.start() or re.search(r"return\s+nullptr\s*;", code[lam_end:]):
+            found.append("table-stale: a refusal after the payload can change returns without marking the table "
+                         "stale")
     card = definition(sycl, "static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_card_ptr_table_from_batch(")
     if card is None:
         return found + ["table-card: the card table upload ggml_sycl_upload_moe_card_ptr_table_from_batch is missing"]
@@ -398,6 +418,14 @@ def direct_violations(src: dict[str, str]) -> list[str]:
     if not has(body, "h.depends_on(last);") or not has(body, "completion->host_leg.reset();"):
         found.append("terminal-release: the terminal host task does not follow the last copy and release the host "
                      "leg")
+    # A failed drain proves no quiescence: the host leg joins the bundle's quarantine through the terminal, so its
+    # buffers are not freed under a queued copy and the submitting thread does not wait its job.
+    drain = find(body, "exact_queue->wait_and_throw();")
+    park = find(body, "} else if (completion->host_leg) { terminal->quarantine_host_leg(std::move(completion->host_leg));")
+    if drain < 0 or park < drain or find(body, "if (quiescent) {", drain) > park or \
+            find(body, "if (quiescent) {", drain) < 0:
+        found.append("host-quarantine: a host leg whose drain failed does not join the bundle's quarantine through "
+                     "the terminal")
     if not has(direct, "g_q1_nvfp4_test_host_submit.fetch_add(") or \
             not has(direct, "g_q1_nvfp4_test_host_occurrences.fetch_add("):
         found.append("host-counters: the route-testing build does not count the host leg's submits")
@@ -409,16 +437,41 @@ def cpu_violations(src: dict[str, str]) -> list[str]:
     if not re.search(r"bool\s+ggml_sycl_cpu_moe_host_aos_check\(\s*const\s+cpu_moe_host_aos_task\s*&\s*task,",
                      src["cpu_hpp"]):
         found.append("host-validate: the host recipe's check is not declared beside its executor")
+    # The public check and the executor run one check: the check drops its findings, the executor runs on them.
+    check = definition(src["cpu"], "bool ggml_sycl_cpu_moe_host_aos_check(")
+    if check is None or spaced(code_of(check)) != ("{cpu_moe_host_aos_checked checked; return "
+                                                   "cpu_moe_host_aos_check_into(task, reject, &checked);}"):
+        found.append("host-validate: the public check is not the shared check alone")
     execute = definition(src["cpu"], "bool ggml_sycl_cpu_moe_host_aos_execute(")
-    if execute is None or not re.match(r"\{using namespace ggml_sycl; if \(!ggml_sycl_cpu_moe_host_aos_check\(",
-                                       spaced(code_of(execute))):
+    flat = spaced(code_of(execute)) if execute else ""
+    if not flat.startswith("{using namespace ggml_sycl; cpu_moe_host_aos_checked checked; if "
+                           "(!cpu_moe_host_aos_check_into(task, reject, &checked)) {return false;}"):
         found.append("host-validate: the executor does not run the same check first")
+    elif "ggml_sycl_get_type_traits_cpu(" in flat or ".resolve(" in flat:
+        found.append("host-validate: the executor looks up again what the check found")
     return found
+
+
+def funnel_violations(src: dict[str, str]) -> list[str]:
+    # The direct block reads src1 rows a deferred CPU scatter may still owe (G4); it relies on the per-op funnel to
+    # flush that scatter first, at the top level of the dispatch function, before the MUL_MAT_ID case.
+    forward = definition(src["sycl"], "static bool ggml_sycl_compute_forward_impl(")
+    if forward is None:
+        return ["funnel-order: ggml_sycl_compute_forward_impl was not found"]
+    code = code_of(forward)
+    flush = re.search(r"\bflush_pending_cpu_scatter_if_consumed\(\s*dst\s*,\s*ctx\.device\s*\)\s*;", code)
+    dispatch = re.search(r"\bggml_sycl_mul_mat_id\(\s*ctx\s*,\s*dst\s*\)\s*;", code)
+    if flush is None or dispatch is None or flush.start() > dispatch.start():
+        return ["funnel-order: the pending CPU scatter is not flushed before MUL_MAT_ID is dispatched"]
+    before = code[:flush.start()]
+    if before.count("{") - before.count("}") != 1:
+        return ["funnel-order: the pending CPU scatter flush is conditional, not on every op's path"]
+    return []
 
 
 def violations(src: dict[str, str]) -> list[str]:
     return (kernel_violations(src) + table_violations(src) + view_violations(src) + admission_violations(src) +
-            direct_violations(src) + cpu_violations(src))
+            direct_violations(src) + cpu_violations(src) + funnel_violations(src))
 
 
 def test_anchors_exist() -> None:
@@ -468,6 +521,30 @@ def test_mutations_are_witnessed() -> None:
         ("sycl", r"(ggml_sycl_upload_moe_card_ptr_table_from_batch\(.*?)if \(operand\.residency\(\) == "
                  r"ggml_sycl::moe_batch_residency::HOST\) \{\s*continue;\s*\}(\s*result\.role_leases)", r"\1\2",
          "table-card"),
+        # The null loop's id check refuses without marking the table stale.
+        ("sycl", r"(for \(const int32_t eid : \*null_experts\) \{\s*if \(eid < 0 \|\| eid >= n_experts\) \{\s*)"
+                 r"return refuse\(\);", r"\1return nullptr;", "table-stale"),
+        # The upload's refusal stops marking the table stale.
+        ("sycl", r"(auto refuse = \[&\]\(\) -> const void \* const \* \{\s*if \(any_updated\) \{\s*)"
+                 r"extra->weight\(\)\.mark_moe_device_table_stale\(device\);", r"\1(void) device;", "table-stale"),
+        # A failed drain frees the host leg with the unwinding completion instead of parking it.
+        ("sycl", r"terminal->quarantine_host_leg\(std::move\(completion->host_leg\)\);", "completion->host_leg.reset();",
+         "host-quarantine"),
+        # The executor resolves the weight again instead of using what the check found.
+        ("cpu", r"const resolved_ptr &\s*weight\s*=\s*checked\.weight;",
+         "const resolved_ptr weight = task.weight_lease.resolve(mem_handle::HOST_DEVICE);", "host-validate"),
+        # The funnel's flush is removed.
+        ("sycl", r"flush_pending_cpu_scatter_if_consumed\(dst, ctx\.device\);(\s*flush_pending_secondary_scatter_if_"
+                 r"consumed\(dst, ctx\.device\);)", r"\1", "funnel-order"),
+        # The funnel's flush moves after the MUL_MAT_ID dispatch.
+        ("sycl", r"flush_pending_cpu_scatter_if_consumed\(dst, ctx\.device\);(\s*flush_pending_secondary_scatter_if_"
+                 r"consumed\(dst, ctx\.device\);.*?ggml_sycl_mul_mat_id\(ctx, dst\);)",
+         r"\1 flush_pending_cpu_scatter_if_consumed(dst, ctx.device);", "funnel-order"),
+        # The funnel's flush runs only for some ops.
+        ("sycl", r"flush_pending_cpu_scatter_if_consumed\(dst, ctx\.device\);(\s*flush_pending_secondary_scatter_if_"
+                 r"consumed\(dst, ctx\.device\);)",
+         r"if (dst->op == GGML_OP_MUL_MAT) { flush_pending_cpu_scatter_if_consumed(dst, ctx.device); }\1",
+         "funnel-order"),
     ]
     for key, pattern, replacement, claim in mutations:
         mutated = dict(src)

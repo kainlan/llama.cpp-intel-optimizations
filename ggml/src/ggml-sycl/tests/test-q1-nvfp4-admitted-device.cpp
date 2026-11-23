@@ -43,7 +43,8 @@ constexpr int     prompt_capacity                     = 40;
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
 // The backend's refusal lines, so a case can require that a refusal named its cause. Every log line still reaches
-// stderr; only lines that carry a refusal tag are kept. Host tasks can log, so the text is guarded.
+// stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]) and the direct route's host job's
+// ([MOE-HOST-JOB], logged on the job's thread). Host tasks and jobs can log, so the text is guarded.
 std::mutex  g_refusal_log_mutex;
 std::string g_refusal_log;
 
@@ -52,7 +53,7 @@ void capture_log(ggml_log_level, const char * text, void *) {
         return;
     }
     std::fputs(text, stderr);
-    if (std::strstr(text, "-REFUSAL]") != nullptr) {
+    if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr) {
         const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
         g_refusal_log += text;
     }
@@ -1478,15 +1479,83 @@ void mixed_cases(ggml_type type) {
         mixed_case(mix, "mixed_prompt", ne11, 33, prompt);
     }
 }
+
+// A task the host recipe refuses inside the job, after admission (the HOST_JOB failpoint: a correct build's check
+// before admission rules it out). The job names the task on an ERROR line and throws, the join's host task rethrows
+// into the stream, and the graph fails at its boundary as an asynchronous failure does: the route took the batch once,
+// the completion task still released the finished bundle, the failed graph does not keep the device, and the context
+// refuses its next graph. The fixture's teardown then drains the failed context.
+void mixed_host_job_failure_case(ggml_type type) {
+    mixed_fixture      mix(type);
+    const int32_t      card0 = mix.card_experts.front();
+    const int32_t      host0 = mix.host_experts.front(), host1 = mix.host_experts.back();
+    std::vector<float> oracle;
+    size_t             count = 0;
+    const auto         ids   = [=](int, int slot) {
+        return slot == 1 ? card0 : slot == 0 ? host0 : host1;
+    };
+    auto c =
+        make_graph(mix.backend, mix.type, 1, oracle, count, input_rows::DENSE, 1, ids_layout::PACKED, &mix.gate, ids);
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const std::string                    at = " (type=" + std::string(ggml_type_name(type)) + ")";
+    const case_scope                     scope("mixed_host_job_failure" + at, before);
+    const size_t                         log_from       = refusal_log_size();
+    const ggml_sycl_async_failure_cursor failure_cursor = ggml_sycl_async_failure_snapshot(mix.backend_device);
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_HOST_JOB);
+    const ggml_status status = ggml_backend_graph_compute(mix.backend, c.graph);
+    ggml_backend_synchronize(mix.backend);
+    require_stages(ggml_sycl_async_failure_since(failure_cursor),
+                   "the host job's refusal did not reach the graph boundary" + at +
+                       " (graph_compute status=" + std::to_string(static_cast<int>(status)) + ")",
+                   before);
+    // Occurrence 0 is host0's, the job's first task, which the failpoint refuses.
+    const std::string expected_line = std::string("[MOE-HOST-JOB] tensor=") + mix.gate.tensor->name +
+                                      " route=direct step=host_job occurrence=0 reason=recipe_mismatch";
+    const std::string lines = refusal_log_since(log_from);
+    require_stages(lines.find(expected_line) != std::string::npos,
+                   "the host job's refusal was not named" + at + ": want [" + expected_line + "], got [" + lines + "]",
+                   before);
+    ggml_sycl_execution_snapshot failed{};
+    require_stages(ggml_backend_sycl_execution_context_extract(mix.context, &failed) == GGML_SYCL_EXECUTION_OK,
+                   "failure context snapshot unavailable" + at, before);
+    require_stages(failed.invocation_id.value == 0 && failed.busy_device_count == 0,
+                   "the failed graph still owns the device" + at +
+                       " (invocation=" + std::to_string(failed.invocation_id.value) +
+                       " graph_state=" + std::to_string(static_cast<int>(failed.graph_state)) +
+                       " busy_devices=" + std::to_string(failed.busy_device_count) + ")",
+                   before);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.candidate == before.candidate + 1 &&
+                       after.admit == before.admit + 1 && after.submit == before.submit + 1 &&
+                       after.host_submit == before.host_submit + 1,
+                   "the failpoint did not reach exactly one submitted host leg" + at, before);
+    require_stages(after.recycle == before.recycle + 1,
+                   "the completion task did not release the bundle of the failed host leg" + at, before);
+    require_stages(ggml_backend_graph_compute(mix.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "a graph after the host job's refusal was computed" + at, before);
+    ggml_sycl_q1_nvfp4_test_counters refused{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&refused);
+    require_stages(refused.candidate == after.candidate && refused.submit == after.submit,
+                   "the refused graph reached the route" + at, before);
+    report_pass("mixed_host_job_failure", type, 1, input_rows::DENSE, route_authorization::PRODUCTION, 1);
+}
 } // namespace
 
 int main() {
     g_previous_terminate = std::set_terminate(report_terminate);
     ggml_log_set(capture_log, nullptr);
+    // The probe is the one place a SYCL exception means this environment has no usable GPU. Past it, any exception is
+    // a failure of what the test runs, and is reported as one.
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
         if (!have_gpu) { std::cerr << "SKIP: no usable SYCL GPU\n"; return LLAMA_TEST_EXIT_SKIP; }
+    } catch (const sycl::exception & e) {
+        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    try {
         { lifecycle_fixture life; graph_churn_regression(life, GGML_TYPE_Q1_0, 1);
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
@@ -1575,13 +1644,15 @@ int main() {
             mixed_cases(type);
             require_clean_teardown();
         }
+        mixed_host_job_failure_case(GGML_TYPE_Q1_0);
+        require_clean_teardown();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
         std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';
         return LLAMA_TEST_EXIT_SKIP;
     } catch (const sycl::exception & e) {
-        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
-        return LLAMA_TEST_EXIT_SKIP;
+        std::cerr << "FAIL: SYCL exception after the device probe: " << e.what() << '\n';
+        return 1;
     } catch (const std::exception & e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

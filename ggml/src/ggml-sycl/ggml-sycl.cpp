@@ -67396,6 +67396,15 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
     bool                               any_updated = false;
     leases.reserve(slots.size());
     table_deps.reserve(slots.size());
+    // A refusal after the payload changed and before its upload leaves the host payload ahead of the device table:
+    // the table is marked stale (moe_ptrs_ptr() answers null), so no kernel reads it and the next upload refreshes
+    // every slot and copies the whole payload.
+    auto refuse = [&]() -> const void * const * {
+        if (any_updated) {
+            extra->weight().mark_moe_device_table_stale(device);
+        }
+        return nullptr;
+    };
 
     std::vector<moe_layer_transient_ptr_table_slot> unique_slots;
     unique_slots.reserve(std::min<size_t>(slots.size(), static_cast<size_t>(n_experts)));
@@ -67412,13 +67421,13 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
     for (const auto & slot_info : unique_slots) {
         const int eid = slot_info.expert_id;
         if (eid < 0 || eid >= n_experts) {
-            return nullptr;
+            return refuse();
         }
 
         ggml_sycl::mem_handle handle   = slot_info.handle;
         auto                  resolved = handle.resolve(device);
         if (!resolved.ptr || !resolved.on_device || resolved.layout != layout) {
-            return nullptr;
+            return refuse();
         }
 
         const size_t slot       = static_cast<size_t>(eid);
@@ -67455,7 +67464,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         if (slot_info.has_ready_event) {
             if (g_ggml_sycl_graph_recording) {
                 if (!pp_moe_onednn_event_complete(slot_info.ready_event)) {
-                    return nullptr;
+                    return refuse();
                 }
             } else {
                 table_deps.push_back(slot_info.ready_event);
@@ -67467,7 +67476,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         for (const sycl::event & event : *role_ready_events) {
             if (g_ggml_sycl_graph_recording) {
                 if (!pp_moe_onednn_event_complete(event)) {
-                    return nullptr;
+                    return refuse();
                 }
                 continue;
             }
@@ -67484,7 +67493,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
     if (null_experts) {
         for (const int32_t eid : *null_experts) {
             if (eid < 0 || eid >= n_experts) {
-                return nullptr;
+                return refuse();
             }
             const size_t slot = static_cast<size_t>(eid);
             if (ggml_sycl_mem_handle_has_identity(expert_handles[slot]) || ptr_payload[slot] != nullptr) {
@@ -67503,7 +67512,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         if (any_updated) {
             if (!extra->weight().moe_expert_ptrs_handle[device].valid() ||
                 ptr_payload.size() != static_cast<size_t>(n_experts)) {
-                return nullptr;
+                return refuse();
             }
             table_event = ggml_sycl_copy_payload_to_handle_async(
                 q, device, extra->weight().moe_expert_ptrs_handle[device], 0, ptr_payload.data(),
@@ -79939,6 +79948,30 @@ static expert_dispatch_entry ggml_sycl_make_expert_dispatch_entry(int64_t       
                                                           allow_cpu_fallback, ptr);
 }
 
+// What the host leg of a MUL_MAT_ID node whose batch mixes card and HOST experts owns. Its host experts' occurrences run
+// on the CPU through the host recipe, one task per occurrence, and their rows reach dst after the card kernel's output
+// copy. The three buffers are host-pinned and held until the node's terminal task: the job reads the activations and
+// writes the output, and the copies on the node's queue read the output after the job.
+struct moe_direct_host_work {
+    std::vector<cpu_moe_host_aos_task> tasks;          // occurrence order; each holds its expert's host lease
+    std::vector<uint32_t>              occurrences;    // tasks[i]'s occurrence in the batch, strictly increasing
+    std::vector<sycl::event>           marker_inputs;  // the host experts' ready events, then the activation copy
+    ggml_sycl::mem_handle              activation;     // the dense activation rows span_first_row .. + span_rows
+    ggml_sycl::mem_handle              output;         // [task][N]
+    ggml_sycl::mem_handle              workspace;      // the recipe's workspace, used by each task in turn
+    size_t                             span_first_row = 0;
+    size_t                             span_rows      = 0;
+    size_t                             row_k          = 0;  // K, the activation row length
+    size_t                             row_n          = 0;  // N, the output row length
+    std::string                        tensor;
+};
+
+struct moe_direct_host_leg {
+    std::shared_ptr<moe_direct_host_work> work;
+    ggml_sycl::cpu_job_input_marker       marker;
+    std::shared_future<void>              job;  // set once the job is launched
+};
+
 // The direct route's terminal says when the route's work is finished, and nothing else. Whether that work succeeded is
 // the asynchronous-failure latch's to say, and only a boundary that drained on its own thread may read it: a wait on
 // another thread, such as one a completion host task would make, can return while a boundary's wait is still
@@ -79982,34 +80015,24 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
         std::lock_guard<std::mutex> lock(mutex_);
         quiescent_ = true;
     }
+
+    // Keeps the host leg of a node whose catch could not drain its queue. Copies queued there may still read or write
+    // the leg's buffers, and its job may still wait for its input marker, so neither is let go and the submitting
+    // thread does not wait the job. The leg lives as long as this terminal, which the workspace slot's quarantine
+    // keeps (the admission authority holds it); the slot is recovered only once ready(). An armed terminal is ready
+    // once the last host row copy has run, after the join's host task waited the job, so dropping the leg then waits
+    // nothing. An unarmed one stays quarantined until its model's workspace registry lets the slot go; dropping the leg
+    // there waits the job, which by then waits nothing but its input marker.
+    void quarantine_host_leg(std::unique_ptr<moe_direct_host_leg> leg) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        quarantined_host_leg_ = std::move(leg);
+    }
+
   private:
-    mutable std::mutex         mutex_;
-    std::optional<sycl::event> event_;
-    bool                       quiescent_ = false;
-};
-
-// What the host leg of a MUL_MAT_ID node whose batch mixes card and HOST experts owns. Its host experts' occurrences run
-// on the CPU through the host recipe, one task per occurrence, and their rows reach dst after the card kernel's output
-// copy. The three buffers are host-pinned and held until the node's terminal task: the job reads the activations and
-// writes the output, and the copies on the node's queue read the output after the job.
-struct moe_direct_host_work {
-    std::vector<cpu_moe_host_aos_task> tasks;          // occurrence order; each holds its expert's host lease
-    std::vector<uint32_t>              occurrences;    // tasks[i]'s occurrence in the batch, strictly increasing
-    std::vector<sycl::event>           marker_inputs;  // the host experts' ready events, then the activation copy
-    ggml_sycl::mem_handle              activation;     // the dense activation rows span_first_row .. + span_rows
-    ggml_sycl::mem_handle              output;         // [task][N]
-    ggml_sycl::mem_handle              workspace;      // the recipe's workspace, used by each task in turn
-    size_t                             span_first_row = 0;
-    size_t                             span_rows      = 0;
-    size_t                             row_k          = 0;  // K, the activation row length
-    size_t                             row_n          = 0;  // N, the output row length
-    std::string                        tensor;
-};
-
-struct moe_direct_host_leg {
-    std::shared_ptr<moe_direct_host_work> work;
-    ggml_sycl::cpu_job_input_marker       marker;
-    std::shared_future<void>              job;  // set once the job is launched
+    mutable std::mutex                   mutex_;
+    std::optional<sycl::event>           event_;
+    bool                                 quiescent_ = false;
+    std::unique_ptr<moe_direct_host_leg> quarantined_host_leg_;
 };
 
 struct moe_direct_bundle_completion {
@@ -84719,7 +84742,15 @@ static void ggml_sycl_moe_direct_host_launch(moe_direct_host_leg * leg) {
             moe_cpu_job_wait_inputs(inputs, nullptr, 0);
             for (size_t t = 0; t < held->tasks.size(); ++t) {
                 ggml_sycl::moe_batch_reject_reason reject = ggml_sycl::moe_batch_reject_reason::NONE;
-                if (!ggml_sycl_cpu_moe_host_aos_execute(held->tasks[t], &reject)) {
+                bool executed                             = ggml_sycl_cpu_moe_host_aos_execute(held->tasks[t], &reject);
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+                // The one way to witness this refusal: a correct build's check before admission rules it out.
+                if (executed && ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_HOST_JOB)) {
+                    executed = false;
+                    reject   = ggml_sycl::moe_batch_reject_reason::RECIPE_MISMATCH;
+                }
+#endif
+                if (!executed) {
                     GGML_LOG_ERROR("[MOE-HOST-JOB] tensor=%s route=direct step=host_job occurrence=%u reason=%s\n",
                                    held->tensor.c_str(), static_cast<unsigned>(held->occurrences[t]),
                                    ggml_sycl::moe_batch_reject_reason_name(reject));
@@ -88406,6 +88437,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 throw moe_direct_submit_failure{};
                             }
 #endif
+                            // src1 may be an earlier MoE node's output whose CPU expert rows were deferred
+                            // (g_pending_scatter). This block does not flush that scatter: it relies on the funnel
+                            // flush_pending_cpu_scatter_if_consumed(dst, ctx.device), which
+                            // ggml_sycl_compute_forward_impl runs before it dispatches any op, MUL_MAT_ID included, so
+                            // a pending scatter into src1 is flushed before this node runs at all.
                             // Each piece lands at its own place in the dense [token][row] slice, each copy depending
                             // on the one before, so the kernel's one dependency, the last copy, covers every piece. A
                             // dense src1 is one piece, and the loop never runs.
@@ -88567,6 +88603,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 terminal->confirm_quiescent();
                                 (void) ggml_sycl::unified_cache_recover_moe_mmid_workspaces(
                                     model_token, plan_snapshot->version, true);
+                                // The host leg goes with `completion` as this throw unwinds, and a launched job's
+                                // future waits the job there. That wait is bounded: the job's input marker is a task
+                                // on this same stream (the cache's queue, which the arm requires), so the drain ran it
+                                // and the job no longer waits; what is left is its tasks' CPU work. A join that was
+                                // submitted already ran in the drain, and no copy is left to read the buffers.
+                            } else if (completion->host_leg) {
+                                // Quiescence is unproven: a queued copy may still read or write the leg's buffers, and
+                                // the job may still wait for its marker. The leg joins the bundle's quarantine, through
+                                // the terminal the slot keeps, so nothing is freed under a copy and this thread does
+                                // not wait the job.
+                                terminal->quarantine_host_leg(std::move(completion->host_leg));
                             }
                             // If even the non-throwing drain could not prove
                             // quiescence, destruction intentionally leaves the

@@ -854,7 +854,19 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
     }
 }
 
-bool ggml_sycl_cpu_moe_host_aos_check(const cpu_moe_host_aos_task & task, ggml_sycl::moe_batch_reject_reason * reject) {
+// What the host recipe's check found, so its executor runs on those findings instead of looking them up again.
+struct cpu_moe_host_aos_checked {
+    const ggml_type_traits_cpu * traits = nullptr;
+    const ggml_type_traits_cpu * vdt    = nullptr;
+    ggml_sycl::resolved_ptr      weight;
+    size_t                       rows = 0;
+};
+
+// Every refusal the host recipe can make, in one place: ggml_sycl_cpu_moe_host_aos_check runs it and drops the
+// findings, ggml_sycl_cpu_moe_host_aos_execute runs it and executes on them.
+static bool cpu_moe_host_aos_check_into(const cpu_moe_host_aos_task &        task,
+                                        ggml_sycl::moe_batch_reject_reason * reject,
+                                        cpu_moe_host_aos_checked *           out) {
     using namespace ggml_sycl;
     const resolved_ptr workspace_resolved = task.workspace_lease.resolve(mem_handle::HOST_DEVICE);
     if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr ||
@@ -890,25 +902,35 @@ bool ggml_sycl_cpu_moe_host_aos_check(const cpu_moe_host_aos_task & task, ggml_s
         }
         return false;
     }
+    out->traits = traits;
+    out->vdt    = vdt;
+    out->weight = weight;
+    out->rows   = rows;
     if (reject) {
         *reject = moe_batch_reject_reason::NONE;
     }
     return true;
 }
 
+bool ggml_sycl_cpu_moe_host_aos_check(const cpu_moe_host_aos_task & task, ggml_sycl::moe_batch_reject_reason * reject) {
+    cpu_moe_host_aos_checked checked;
+    return cpu_moe_host_aos_check_into(task, reject, &checked);
+}
+
 bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task &        task,
                                         ggml_sycl::moe_batch_reject_reason * reject) {
     using namespace ggml_sycl;
-    if (!ggml_sycl_cpu_moe_host_aos_check(task, reject)) {
+    cpu_moe_host_aos_checked checked;
+    if (!cpu_moe_host_aos_check_into(task, reject, &checked)) {
         return false;
     }
-    // The check found the type's CPU traits and a host AoS weight behind the held lease.
-    const auto *       traits   = ggml_sycl_get_type_traits_cpu(task.recipe.request.type);
-    const auto *       vdt      = ggml_sycl_get_type_traits_cpu(traits->vec_dot_type);
-    const resolved_ptr weight   = task.weight_lease.resolve(mem_handle::HOST_DEVICE);
+    // The check found the type's CPU traits and a host AoS weight behind the held lease; the executor runs on those.
+    const auto *         traits   = checked.traits;
+    const auto *         vdt      = checked.vdt;
+    const resolved_ptr & weight   = checked.weight;
     const int          K        = static_cast<int>(task.recipe.request.K);
     const int          N        = static_cast<int>(task.recipe.request.N);
-    const size_t       rows     = task.execution_rows == 0 ? task.recipe.request.rows : task.execution_rows;
+    const size_t         rows     = checked.rows;
     const auto & ws = task.recipe.workspace;
     auto align_up = [&](size_t value) { return (value + ws.alignment - 1) & ~(ws.alignment - 1); };
     uint8_t * base = static_cast<uint8_t *>(task.workspace);
