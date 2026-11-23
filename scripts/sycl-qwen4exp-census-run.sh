@@ -22,10 +22,12 @@
 # One single-invocation llama-completion per call, wrapped by bench-guard
 # (net-of-tmpfs GPU host backing ceiling, GPU-fault journal check, timeout -k, and a
 # VALID/SUSPECT verdict that this script enforces). A watchdog samples
-# /proc/meminfo every 2 s and, in the control and vehicle modes, kills the run's
+# /proc/meminfo every 2 s and, in every mode, kills the run's
 # whole session if GPU host backing (Shmem + the meminfo remainder, scripts/sycl-host-backing.sh)
 # climbs past WATCHDOG_SHMEM_GB (default 100): idle reads 12.7 to 15 GiB and the
 # largest planned load about 90 GiB, so 100 GB means a runaway, not a large load.
+# A load known to need more (the qwen4exp model with USM-backed host experts) is
+# run with WATCHDOG_SHMEM_GB raised by the operator, so no mode runs unguarded.
 #
 # Every memory figure here is decimal GB (10^9 bytes), the unit of CLAUDE.md's
 # settle rule; /proc/meminfo's kB are KiB and are converted, never relabelled.
@@ -91,7 +93,6 @@ case "$MODE" in
         # ~120 GiB of experts and the 50.66 GiB PLE table are read into host
         # memory: SYCL leaves mmap_support unset, so the loader turns mmap off
         BUDGET=1800 MODEL="$QWEN_MODEL" FA=(-fa auto) N_EMBD=2560
-        SHMEM_ABORT_GB=
         # structural controls: the dump must be the whole qwen4exp graph. TOP_K
         # counts QSA only because the MoE router uses ggml_argsort_top_k (an
         # ARGSORT, llama-graph.cpp:2121); see the census doc's vehicle section

@@ -304,10 +304,10 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
    forked session, waits for it to empty, and exits 3. It never kills its own session: a child that
    has not yet reached setsid() still carries the caller's session id, and that id is skipped.
 4. Runs a watchdog that samples every 2 s into `mem.log`. It kills the **session**, TERM then KILL
-   after 5 s, in the control and vehicle modes, if GPU host backing (Shmem + the meminfo remainder)
+   after 5 s, in every mode, if GPU host backing (Shmem + the meminfo remainder)
    exceeds 100 GB (`WATCHDOG_SHMEM_GB`), or if it cannot be read. Idle reads 12.7 to 15 GiB and the
-   largest planned load about 90 GiB, so 100 GB means a runaway. There is no `MemAvailable` floor. The qwen4exp mode has no Shmem abort (see
-   "The real model: blocked on host memory"). A process-group kill would miss the binary, because
+   largest planned load about 90 GiB, so 100 GB means a runaway. There is no `MemAvailable` floor. The qwen4exp mode keeps
+   the same ceiling (see "The real model: blocked on host memory"). A process-group kill would miss the binary, because
    `timeout` moves itself and its child into their own group.
 5. Blocks until the session is empty before it stamps the post sample or exits. If a process
    survives 120 s it exits 3 with "do NOT start another GPU run".
@@ -600,9 +600,9 @@ not a quote):
   bytes (P1), and `llama.cpp-qptd` (`-ngl 0` loses mmap) has the same root.
 
 If the qwen4exp run does start (after mmap, or on a quieter host): GPU host backing may legitimately exceed
-CLAUDE.md's ~100 GB abort line when the host experts are USM-backed. The script sets no abort ceiling in
-this mode and has no `MemAvailable` floor, so nothing in the script stops this run; the planner's
-refusal and the lead's own sampling are what guard it.
+CLAUDE.md's ~100 GB abort line when the host experts are USM-backed. The script keeps its 100 GB ceiling in
+this mode, so such a run is killed unless the operator raises `WATCHDOG_SHMEM_GB` for it on a host that has
+the room. No mode runs without the ceiling, and there is no `MemAvailable` floor.
 
 ### Order and commands
 
