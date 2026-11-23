@@ -202,7 +202,7 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
     result.total_size = size;
 
     size                    = align_up(size, alignment);
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
 
     for (auto & c : chunks_) {
         if (!c.base) {
@@ -527,7 +527,7 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
         return {};
     }
 
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
     size_t       remaining  = size;
 
     for (auto & zcs : zone_allocators_[zi]) {
@@ -589,7 +589,7 @@ void * pinned_chunk_pool::zone_alloc(host_zone_id zone, size_t size, size_t alig
     }
 
     size                    = align_up(size, alignment);
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
 
     for (auto & zcs : zone_allocators_[zi]) {
         if (zcs.withdrawn || !zcs.allocator || zcs.allocator->largest_free_block() < size) {
@@ -759,7 +759,7 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes, si
     // path (allocate_from_chunks) has always used -- so the zone path follows
     // it, and the budget is checked against the bytes that chunk actually
     // commits (grow_into() adds one DEFAULT_ALIGNMENT header per chunk).
-    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);
+    const chunk_footprint footprint = chunk_footprint_for(chunk_size_, additional_bytes);
     if (footprint_locked() + footprint.backing > budget_) {
         GGML_LOG_WARN(
             "[SYCL] Pinned pool grow_zone: budget exhausted for zone %zu "
@@ -1163,19 +1163,12 @@ bool pinned_chunk_pool::grow(size_t min_size, const char * site) {
     return grow_into(chunks_, min_size, false, site);
 }
 
-pinned_chunk_pool::chunk_footprint pinned_chunk_pool::chunk_footprint_for(size_t min_size) const {
-    chunk_footprint footprint;
-    footprint.usable  = std::max(chunk_size_, align_up(min_size, DEFAULT_ALIGNMENT));
-    footprint.backing = footprint.usable + DEFAULT_ALIGNMENT;
-    return footprint;
-}
-
 void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
                                                size_t               size,
                                                size_t               alignment,
                                                bool                 runtime_pool) {
     size                    = align_up(size, alignment);
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
 
     if (pinned_trace_enabled()) {
         GGML_LOG_INFO("[SYCL] pinned alloc request: size=%zu align=%zu chunks=%zu used=%.1f GB mode=%s\n", size,
@@ -1193,7 +1186,7 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
         }
     }
 
-    const chunk_footprint footprint      = chunk_footprint_for(size);
+    const chunk_footprint footprint      = chunk_footprint_for(chunk_size_, size);
     const size_t          new_chunk_size = footprint.usable;
     if (footprint_locked() + footprint.backing > budget_) {
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
@@ -1260,7 +1253,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     // allocation exceeds chunk_size_ (e.g., 615 MB reorder buffers for
     // MoE models).  Level Zero's ~11 GB per-allocation limit is the
     // real cap, not chunk_size_.
-    const chunk_footprint footprint    = chunk_footprint_for(min_size);
+    const chunk_footprint footprint    = chunk_footprint_for(chunk_size_, min_size);
     const size_t          usable_size  = footprint.usable;
     const size_t          backing_size = footprint.backing;
     if (footprint_locked() + backing_size > budget_) {

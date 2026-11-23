@@ -12,6 +12,7 @@
 #include "scratch-test-mutant.hpp"
 #include "tlsf-allocator.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -148,6 +149,25 @@ class pinned_chunk_pool {
     static constexpr size_t DEFAULT_ALIGNMENT = 64;                         // Cache line alignment
     // No chunk index: what zone_free() and release_chunk_lease() return when the call released no orphaned chunk.
     static constexpr size_t NO_CHUNK          = SIZE_MAX;
+
+    // Byte footprint of ONE new chunk able to hold `min_size` usable bytes in a pool of `chunk_size`-byte chunks.
+    // `usable` is what the chunk's TLSF arena manages (max(chunk_size, align_up(min_size))); `backing` is what
+    // grow_into() commits against budget_ (usable plus the DEFAULT_ALIGNMENT header it skips at the base). Every
+    // pre-growth budget check (grow_zone, allocate_from_chunks), grow_into()'s own check, and the plan's replay of the
+    // loader's buffers (placement_loader_pool_footprint_for) must use this one function: llama.cpp-nsl3 was a
+    // divergence between them (grow_zone budgeted N * chunk_size_ for chunks grow_into() sized differently), and a
+    // pre-check that admits a growth grow_into() then refuses surfaces as an allocation failure with a misleading
+    // budget line.
+    struct chunk_footprint {
+        size_t usable;
+        size_t backing;
+    };
+
+    static chunk_footprint chunk_footprint_for(size_t chunk_size, size_t min_size) {
+        const size_t aligned = (min_size + DEFAULT_ALIGNMENT - 1) & ~(DEFAULT_ALIGNMENT - 1);
+        const size_t usable  = std::max(chunk_size, aligned);
+        return { usable, usable + DEFAULT_ALIGNMENT };
+    }
 
     // The release of one chunk's backing, as a move-only RAII carrier defined after this class: its destructor frees
     // the chunk owner and moves the footprint, so a carrier dropped on any path releases and accounts exactly as a
@@ -330,9 +350,9 @@ class pinned_chunk_pool {
 
     // The SCRATCH return's device REDs compute every expected figure from the pool's own chunk rule (§7 C4 "computed
     // as a sum of chunk_footprint_for terms"): the usable and backing bytes of one new chunk able to hold `min_size`.
-    size_t test_chunk_usable_for(size_t min_size) const { return chunk_footprint_for(min_size).usable; }
+    size_t test_chunk_usable_for(size_t min_size) const { return chunk_footprint_for(chunk_size_, min_size).usable; }
 
-    size_t test_chunk_backing_for(size_t min_size) const { return chunk_footprint_for(min_size).backing; }
+    size_t test_chunk_backing_for(size_t min_size) const { return chunk_footprint_for(chunk_size_, min_size).backing; }
 
     // The registry metadata of a live base chunk's backing, for the registry hold (§M88 (1)). False for a tombstone or
     // an index past the end.
@@ -382,23 +402,6 @@ class pinned_chunk_pool {
 
     // Allocate a new chunk (>= min_size). Returns false if over budget or allocation fails.
     bool grow(size_t min_size, const char * site);
-
-    // Byte footprint of ONE new chunk able to hold `min_size` usable bytes.
-    // `usable` is what the chunk's TLSF arena manages (max(chunk_size_,
-    // align_up(min_size))); `backing` is what grow_into() commits against
-    // budget_ (usable plus the DEFAULT_ALIGNMENT header it skips at the
-    // base). Every pre-growth budget check (grow_zone, allocate_from_chunks)
-    // and grow_into()'s own check must use this same arithmetic: llama.cpp-nsl3
-    // was a divergence between them (grow_zone budgeted N * chunk_size_ for
-    // chunks grow_into() sized differently), and a pre-check that admits a
-    // growth grow_into() then refuses surfaces as an allocation failure with
-    // a misleading budget line.
-    struct chunk_footprint {
-        size_t usable;
-        size_t backing;
-    };
-
-    chunk_footprint chunk_footprint_for(size_t min_size) const;
 
     void free_chunk_owner(chunk & c, const char * ctx);
 

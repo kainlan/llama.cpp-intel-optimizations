@@ -977,9 +977,9 @@ CONTROLS = [
     ("c10-helper-skips-reconcile", 10, "footprint_locked", "    reconcile_stranded_locked();\n", "",
      "footprint_locked returns total_allocated_ without reconcile_stranded_locked"),
     ("c10-grow-zone-local-copy", 10, "grow_zone",
-     "    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);",
+     "    const chunk_footprint footprint = chunk_footprint_for(chunk_size_, additional_bytes);",
      "    const size_t snapshot = total_allocated_;\n    (void) snapshot;\n"
-     "    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);",
+     "    const chunk_footprint footprint = chunk_footprint_for(chunk_size_, additional_bytes);",
      "grow_zone reads total_allocated_ outside a log call"),
     ("c10-decision-body-writes", 10, "pre_allocate", "    size_t       chunks_grown  = 0;",
      "    size_t       chunks_grown  = 0;\n    total_allocated_ = 0;",

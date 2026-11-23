@@ -2538,16 +2538,15 @@ inline placement_loader_pool_footprint placement_loader_pool_footprint_for(const
     if (chunk == 0) {
         return footprint;
     }
-    // The pool's TLSF grain, to which zone_alloc rounds each request, and the alignment of a chunk and its header.
-    constexpr size_t    grain = 256;
-    constexpr size_t    align = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    // The pool's TLSF grain, to which zone_alloc rounds each request.
+    constexpr size_t    grain = tlsf_allocator::block_grain;
     std::vector<size_t> filled;  // the bytes each chunk segment holds, in segment order
     const auto          place = [&](size_t buffer) {
         ++footprint.buffers;
         const size_t bytes = (buffer + grain - 1) / grain * grain;
         if (bytes > chunk) {
-            // no segment holds it: grow_zone grows one chunk sized to the request
-            footprint.grown += std::max(chunk, (bytes + align - 1) / align * align) + align;
+            // no segment holds it: grow_zone grows one chunk sized to the request, by the pool's own rule
+            footprint.grown += pinned_chunk_pool::chunk_footprint_for(chunk, bytes).backing;
             return;
         }
         for (size_t & used : filled) {

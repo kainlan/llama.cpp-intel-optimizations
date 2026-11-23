@@ -63,7 +63,9 @@ The charge (ucc = unified-cache.cpp)
       buffer sheds both. populate_host_zone_sizing records the tensors from its inventory, the one writer; the fact
       copy copies the cap from info.load_loader_buffer_cap, which the kv_info fill takes from the buffer type's chunk
       cap; and ggml_sycl_host_buft_max_size answers through host_zone_buffer_max_size, so the plan and the buffer
-      type share one rule.
+      type share one rule. The replay and the pool share theirs too: the replay rounds each buffer to
+      tlsf_allocator::block_grain and sizes a grown chunk with pinned_chunk_pool::chunk_footprint_for, the one
+      definition every pool growth asks, and pinned-pool.cpp spells no grain literal.
   C4. Once the plan admits, no loader pool growth fails where the pool's own budget is at least the plan's host
       budget. placement_plan_loader_pool_refusal (hpp) names
       "loader-pool-over-budget" for a plan charged the loader term (loader_holds_weights, loader_device >= 0,
@@ -98,7 +100,9 @@ ROOT = Path(__file__).resolve().parents[1]
 GS = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 UCC = "ggml/src/ggml-sycl/unified-cache.cpp"
 HPP = "ggml/src/ggml-sycl/unified-cache.hpp"
-FILES = (GS, UCC, HPP)
+PPH = "ggml/src/ggml-sycl/pinned-pool.hpp"
+PPC = "ggml/src/ggml-sycl/pinned-pool.cpp"
+FILES = (GS, UCC, HPP, PPH, PPC)
 RAW = "raw:"  # the raw text of a file, for the one clause that reads a comment
 
 _LEXEME_RE = re.compile(
@@ -456,6 +460,18 @@ def clause_c3_pool_footprint(t: dict) -> list:
     if not re.search(r"size_t\s+total\s*\(\s*\)\s*const\s*\{\s*return\s+zones\s*\(\s*\)\s*\+\s*runtime\s*\+\s*"
                      r"rounding\s*\+\s*loader_grown\s*;", t[HPP]):
         problems.append("host_zone_commit_terms::total() does not count the chunks the loader grows")
+    # One grain and one chunk rule: the replay asks the pool's own, so the two cannot drift apart.
+    replay = body_of(t[HPP], r"\binline\s+placement_loader_pool_footprint\s+placement_loader_pool_footprint_for\s*\(")
+    if not re.search(r"\bgrain\s*=\s*tlsf_allocator::block_grain\s*;", replay):
+        problems.append("the loader replay restates the TLSF grain instead of naming tlsf_allocator::block_grain")
+    if not re.search(r"\bpinned_chunk_pool::chunk_footprint_for\s*\(\s*chunk\s*,\s*bytes\s*\)\s*\.\s*backing", replay) \
+            or "DEFAULT_ALIGNMENT" in replay:
+        problems.append("the loader replay sizes a grown chunk by a rule of its own, not "
+                        "pinned_chunk_pool::chunk_footprint_for")
+    if re.search(r"\(\s*size_t\s*\)\s*256\b", t[PPC]):
+        problems.append("pinned-pool.cpp spells the TLSF grain as a literal instead of tlsf_allocator::block_grain")
+    if len(re.findall(r"\bchunk_footprint\s+chunk_footprint_for\s*\(", t[PPH] + t[PPC])) != 1:
+        problems.append("the pool's chunk rule is not one definition")
     share = body_of(t[HPP], r"\binline\s+host_zone_commit_terms\s+placement_plan_host_zone_commit_terms_on_device\s*\(")
     if not re.search(r"\bon_device\.weight\s*-=\s*std::min\s*\(\s*on_device\.weight\s*,\s*terms\.loader_zone\s*\)", share):
         problems.append("a card that does not hold the loader's buffer does not shed its zone bytes")
@@ -705,6 +721,15 @@ MUTANTS = [
         r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_holds_weights = true;")),
     ("footprint-ignored", "C3", mutate_re(HPP, r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-[^;]*;",
                                           "terms.weight = plan.host_zone_weight_bytes;")),
+    ("replay-grain-literal", "C3", mutate_re(HPP, r"\bgrain\s*=\s*tlsf_allocator::block_grain\s*;", "grain = 256;")),
+    ("replay-restates-chunk-rule", "C3", mutate(
+        HPP, "pinned_chunk_pool::chunk_footprint_for(chunk, bytes).backing",
+        "std::max(chunk, (bytes + 63) / 64 * 64) + pinned_chunk_pool::DEFAULT_ALIGNMENT")),
+    ("pool-grain-literal", "C3", mutate(PPC, "std::max(alignment, tlsf_allocator::block_grain)",
+                                         "std::max(alignment, (size_t) 256)")),
+    ("pool-chunk-rule-twice", "C3", mutate_re(
+        PPC, r"(bool pinned_chunk_pool::grow\()",
+        r"static pinned_chunk_pool::chunk_footprint chunk_footprint_for(size_t, size_t);\n\1")),
     ("record-rest-wraps", "C3", mutate_re(HPP, r"std::min\s*\(\s*plan\.host_zone_weight_bytes\s*,\s*"
                                                r"plan\.host_zone_loader_bytes\s*\)", "plan.host_zone_loader_bytes")),
     ("footprint-at-chunk", "C3", mutate_re(HPP, r"host_zone_buffer_max_size\s*\(\s*plan\.loader_buffer_cap\s*,\s*"
