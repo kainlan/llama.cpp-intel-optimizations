@@ -408,6 +408,55 @@ dispatch_mutants = {
         "    moe_graph_unscoped_probe(nullptr, nullptr);", 1),
 }
 
+# A scope must live from before the first node to the function's end: one declared in a block that closes first, or a
+# temporary, leaves the nodes after it outside any invocation.
+REPLAY_SLOT_SCOPE = (
+    "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n"
+    "    g_graph_diag_counters.seg_replay.fetch_add(1, std::memory_order_relaxed);\n"
+    "    moe_graph_segmented_call_begin(sycl_ctx, cgraph);\n")
+RECORD_SLOT_SCOPE = (
+    "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n"
+    "    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);\n"
+    "    moe_graph_segmented_call_begin(sycl_ctx, cgraph);\n")
+SCOPE_DECL = "    ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n"
+GRAPHLETS_REFRESH = (
+    "    graph_refresh_input_tensors(sycl_ctx, cgraph);\n"
+    "    // Replay and record both run nodes here, outside compute_impl.\n")
+UNCHECKED_OPEN = (
+    "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {")
+dispatch_mutants.update({
+    # The scope closes with the block it was declared in, before the slot's first node.
+    "scope-in-dead-block": backend.replace(
+        REPLAY_SLOT_SCOPE,
+        REPLAY_SLOT_SCOPE.replace(SCOPE_DECL, "    { ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx); }\n"),
+        1),
+    # A temporary scope ends at its own semicolon.
+    "scope-temporary": backend.replace(
+        REPLAY_SLOT_SCOPE,
+        REPLAY_SLOT_SCOPE.replace(SCOPE_DECL, "    (void) ggml_sycl_execution_dispatch_scope(sycl_ctx);\n"), 1),
+    # The first node runs inside a scoped block; every node after the block runs outside it.
+    "dispatch-after-scope-block": backend.replace(
+        RECORD_SLOT_SCOPE,
+        RECORD_SLOT_SCOPE.replace(
+            SCOPE_DECL,
+            "    {\n"
+            "        ggml_sycl_execution_dispatch_scope execution_scope(sycl_ctx);\n"
+            "        ggml_sycl_compute_forward(*sycl_ctx, cgraph->nodes[0]);\n"
+            "    }\n"), 1),
+    # A new path that calls an op entry point directly, not through compute_forward.
+    "direct-op-call": backend.replace(
+        UNCHECKED_OPEN,
+        "static void moe_graph_unscoped_probe(ggml_backend_sycl_context * c, ggml_tensor * t) {\n"
+        "    ggml_sycl_mul_mat_id(*c, t);\n"
+        "}\n" + UNCHECKED_OPEN + "\n    moe_graph_unscoped_probe(nullptr, nullptr);", 1),
+    # A call before the graphlets' scope that is not on their list of pre-scope statements.
+    "unlisted-call-before-scope": backend.replace(
+        GRAPHLETS_REFRESH,
+        "    graph_refresh_input_tensors(sycl_ctx, cgraph);\n"
+        "    ggml_sycl_moe_precomputed_skip_new_graph();\n"
+        "    // Replay and record both run nodes here, outside compute_impl.\n", 1),
+})
+
 checks.update({
     "every graph_compute path that dispatches nodes opens the tracked invocation first": not dispatch_violations,
     "the dispatch scope is opened by compute_impl and by each path that bypasses it":
