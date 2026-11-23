@@ -39,8 +39,10 @@ The preload
       of the model's live SYCL_Host bytes on loader_device. A second, from host_zone_weight_growth_check (hpp), names a
       WEIGHT zone of loader_device's existing cache grown past the plan: from the baseline this load took, its capacity
       once the late pass decided the zones (ggml_sycl_model_host_weight_baseline_note, written there only), to its
-      capacity at the preload, against the loader_grown of the plan's recorded terms on loader_device. A load that took
-      no baseline says so at WARN, and a check that passed says so at INFO, so a log can tell a pass from no check.
+      capacity at the preload, read once for the check and its pass line, against the loader_grown of the plan's
+      recorded terms on loader_device. A load that took no baseline, or whose device has no cache or no configured host
+      zones at the preload, says so at WARN, and a check that passed says so at INFO, so a log can tell a pass from no
+      check.
 
 The charge (ucc = unified-cache.cpp)
   C1. placement_plan_host_weight_zone_terms reads the loader facts, charges loader_residency only when one pool holds
@@ -179,7 +181,12 @@ LOADER_BUG_FMT = "\"[HOST-PLAN-BUG] device=%d the loader_residency term is short
 GROWTH_CHECK_CALL = (r"ggml_sycl::host_zone_weight_growth_check\s*\(\s*global_plan->loader_device\s*,\s*"
                      r"ggml_sycl::placement_plan_host_zone_commit_terms_on_device\s*\(\s*\*global_plan\s*,\s*"
                      r"global_plan->host_zone_terms\s*,\s*global_plan->loader_device\s*\)\s*,\s*baseline\s*,\s*"
-                     r"loader_cache->host_zone_capacity\s*\(\s*ggml_sycl::host_zone_id::WEIGHT\s*\)\s*\)")
+                     r"capacity\s*\)")
+# one reading of the WEIGHT capacity, so the figure the check judges is the figure the pass line prints
+CAPACITY_READ = (r"\bconst\s+size_t\s+capacity\s*=\s*loader_cache->host_zone_capacity\s*\(\s*"
+                 r"ggml_sycl::host_zone_id::WEIGHT\s*\)\s*;")
+ZONES_TEST = r"if\s*\(\s*loader_cache\s*!=\s*nullptr\s*&&\s*loader_cache->host_zones_configured\s*\(\s*\)\s*\)\s*"
+SKIP_FMT = "\"[HOST-PLAN] device=%d loader pool check skipped: %s at the preload"
 LOADER_CACHE = (r"\bloader_cache\s*=\s*ggml_sycl::get_existing_unified_cache_for_device\s*\(\s*"
                 r"global_plan->loader_device\s*\)")
 BASELINE_READ = (r"ggml_sycl_model_host_weight_baseline\s*\(\s*model_id\s*,\s*global_plan->loader_device\s*,\s*"
@@ -357,6 +364,17 @@ def clause_p3_loader_term_checked(t: dict) -> list:
         problems.append("a load that took no baseline skips the growth check without saying so")
     if not re.search(GROWTH_PASS, body):
         problems.append("a growth check that passed says nothing, so a log cannot tell it from a check that never ran")
+    if not re.search(CAPACITY_READ, body) or len(re.findall(r"\bhost_zone_capacity\s*\(", body)) != 1:
+        problems.append("the preload reads the WEIGHT capacity other than once for the check and its pass line")
+    # A device with no cache or no configured zones at the preload skips the check, and says so.
+    zones = re.search(ZONES_TEST, body)
+    if not zones or body[zones.end():zones.end() + 1] != "{":
+        problems.append("the growth check is not guarded by the device's configured host zones")
+    else:
+        rest = body[zones.end() + len(balanced(body, zones.end())) + 2:]  # past the block's two braces
+        skip = re.match(r"\s*else\s*\{", rest)
+        if not skip or SKIP_FMT not in balanced(rest, skip.end() - 1):
+            problems.append("a device with no cache or no configured host zones skips the growth check silently")
     helper = body_of(t[HPP], r"\binline\s+std::string\s+host_zone_weight_growth_check\s*\(")
     for needle in ('"[HOST-PLAN-BUG] device="', "terms.loader_grown", "planned=", "actual=", "excess="):
         if needle not in helper:
@@ -702,6 +720,10 @@ MUTANTS = [
     ("growth-unlogged", "P3", mutate_re(GS, GROWTH_WARN, "(void) growth_bug")),
     ("growth-skip-silent", "P3", mutate(GS, NO_BASELINE_FMT, '"[HOST-PLAN] device=%d no baseline')),
     ("growth-pass-silent", "P3", mutate(GS, GROWTH_PASS_FMT, '"[HOST-PLAN] device=%d WEIGHT zone %zu B')),
+    ("growth-capacity-reread", "P3", mutate_re(
+        GS, r"(GGML_LOG_INFO\s*\(\s*" + re.escape(GROWTH_PASS_FMT) + r")",
+        r"(void) loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT); \1")),
+    ("growth-zones-skip-silent", "P3", mutate(GS, SKIP_FMT, '"[HOST-PLAN] device=%d skipped: %s')),
     ("baseline-untaken", "P3", mutate_re(GS, r"ggml_sycl_model_host_weight_baseline_note\s*\(\s*owner\.model\.value[^;]*;",
                                          "(void) 0;")),
     ("baseline-before-configure", "P3", mutate_re(
