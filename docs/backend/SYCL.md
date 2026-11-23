@@ -1142,6 +1142,15 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 
 ## Known Issues
 
+- **An asynchronous SYCL error fails its device's contexts one graph late.** A command that fails after it was
+  submitted (a device fault, a host task that throws) is recorded by the backend's async handler for its device; it no
+  longer terminates the process. The backend logs `[SYCL-ASYNC-FAILURE]`, and every later `graph_compute` of every
+  context on that device that existed before the failure returns `GGML_STATUS_FAILED`, so `llama_decode` returns -3.
+  The failure is first seen in `ggml_backend_synchronize`, which cannot return a status, so the outputs of the graph
+  that failed (its logits or embeddings, and a token sampled from them) reach the caller before the next
+  `llama_decode` reports it. Treat every output read after the error line as invalid, and create a new context: a
+  failed context never computes again. A context created after the failure starts clean.
+
 ## Runtime Allocation Policy
 
 - Managed runtime allocations must go through unified allocator APIs in `unified-cache.cpp`.

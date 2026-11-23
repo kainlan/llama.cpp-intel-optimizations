@@ -167,6 +167,11 @@ inline bool plan_moe_host_workspace(const moe_route_request & request,
 
 // Device recipes are deliberately bounded: prompt execution reuses one chunk
 // of AoS Q8_1/output/descriptor scratch instead of reserving the whole prompt.
+// Nothing allocates this size. The one route that runs a Q1_0/NVFP4 device
+// recipe, the MMID direct route in ggml_sycl_mul_mat_id, takes its scratch
+// from the planned MMID workspace (moe_mmid_plan_workspace), sized for every
+// token of the batch and refused by name above it. Here the size only binds
+// the recipe, which validate_moe_execution_recipe() re-derives and compares.
 inline bool plan_moe_q1_nvfp4_device_workspace(const moe_route_request & request,
                                                 size_t                    q8_row_bytes,
                                                 size_t                    max_chunk_rows,
@@ -247,10 +252,12 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
 }
 
 // Q1_0 and NVFP4 run on a device only through their direct kernel (DEVICE_MMVQ_Q1_NVFP4_AOS) and its admitted
-// workspace bundle, which validate_moe_execution_recipe checks and choose_moe_batch_executor keeps closed; any other
-// device recipe for them is refused. One answer for the validator, the executor choice and the staged route's
-// capability refusal (ggml_sycl_moe_staged_capability_refusal). The stream ring does not ask it: it stages windows
-// only for layers the library executor claims whole (W2 of docs/plans/2026-10-24-prefill-window-ring.md).
+// workspace bundle -- the MMID direct route in ggml_sycl_mul_mat_id, which validate_moe_execution_recipe checks and
+// choose_moe_batch_executor keeps closed to every other executor; any other device recipe for them is refused. One
+// answer for the validator, the executor choice, the staged route's capability refusal
+// (ggml_sycl_moe_staged_capability_refusal) and the planner's MMID workspace pools (plan_moe_mmid_workspaces). The
+// stream ring does not ask it: it stages windows only for layers the library executor claims whole (W2 of
+// docs/plans/2026-10-24-prefill-window-ring.md).
 inline bool moe_type_needs_direct_kernel(ggml_type type) {
     return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
 }
@@ -581,11 +588,19 @@ struct moe_batch_local_view {
 // result for repeats -- this preserves the exact reject reason/occurrence a
 // full per-occurrence re-check would report, because a repeat can never
 // diverge from its first occurrence's outcome.
-inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+//
+// skip_host leaves a HOST operand out of the view instead of refusing the
+// batch: the card view of a mixed batch, whose host occurrences run on the CPU.
+inline moe_batch_local_view make_moe_batch_view(const moe_resolved_batch & batch,
+                                                ggml_layout_mode           layout,
+                                                bool                       skip_host) {
     moe_batch_local_view                out;
     std::unordered_map<int32_t, size_t> expert_slots;
     expert_slots.reserve(batch.operands.size());
     for (const moe_resolved_operand & operand : batch.operands) {
+        if (skip_host && operand.residency() == moe_batch_residency::HOST) {
+            continue;
+        }
         const auto [existing, inserted] = expert_slots.emplace(operand.expert_id, out.expert_ids.size());
         if (!inserted) {
             if (!out.leases[existing->second].stable_identity_equal(operand.lease())) {
@@ -625,6 +640,11 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
         }
     }
     return out;
+}
+
+// Every operand on this card in `layout`; a HOST operand refuses the batch.
+inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+    return make_moe_batch_view(batch, layout, false);
 }
 
 // llama.cpp-iikr (B50 residual-pool cycle, HOST6 priority 2): boolean-only
@@ -828,10 +848,23 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     const bool                direct_q1_nvfp4 = operand.recipe().kind != moe_batch_executor::HOST_CPU &&
                                  moe_type_needs_direct_kernel(operand.recipe().request.type);
     if (direct_q1_nvfp4) {
-        // Production capability remains closed until all four B70 oracle cases
-        // pass. A matching bundle is necessary but not sufficient to advertise.
+        // Q1_0/NVFP4 run on a device only through the MMID direct route in
+        // ggml_sycl_mul_mat_id (a decode token or a prompt's rows on the primary
+        // card, AoS, with an admitted workspace bundle); that route is open since
+        // the B70 and B50 oracle runs of 2026-11-22. No generic executor runs these
+        // types, so a device recipe for them is refused here. Two callers ask this gate:
+        //  - the hybrid decode record build (ggml_sycl_moe_hybrid_decode_record_build),
+        //    for every expert of a layer with host experts, BEFORE the direct block
+        //    runs. Its refusal is not fatal: the hybrid route declines the layer and
+        //    the retained route keeps the tensor, so the op still reaches the direct
+        //    block;
+        //  - the retained route core, AFTER the direct block, for an operand that fell
+        //    through it: a secondary card, a layout other than AoS, a selection that
+        //    mixes host and device experts, ids or an input the route cannot read
+        //    where they are, or an authority or bundle the route could not obtain.
+        // A host-resident expert carries a HOST_CPU recipe, runs on the CPU, and is not
+        // refused by this gate.
         //
-        // This gate, not the capability query, is why Q1_0/NVFP4 do not execute.
         // ggml_sycl_moe_query_route_capability() (ggml-sycl.cpp, the Q1_0/NVFP4
         // fall-through) deliberately ADMITS them as MMVQ_COMPAT, so a reader
         // tracing "capability says local-mmvq but nothing runs" lands here. The

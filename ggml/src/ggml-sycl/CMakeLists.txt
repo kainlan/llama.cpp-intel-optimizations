@@ -2397,6 +2397,52 @@ else()
         LABELS "sycl;attn;tkv13;hostonly;not-built")
 endif()
 
+# The asynchronous-failure latch (llama.cpp-kjoc). The latch test is host-only and enumerates no device. The delivery
+# probe runs host tasks (no kernel, no allocation) on a CPU SYCL device and skips (77) on a host that has none, so it is
+# host-only too; its GPU run is by hand, with --gpu. Both link ggml-sycl for common.cpp's latch.
+if (NOT GGML_BACKEND_DL)
+    foreach(_t test-sycl-async-failure-latch test-sycl-async-handler-delivery)
+        if (_t STREQUAL "test-sycl-async-failure-latch")
+            add_executable(${_t} tests/test-async-failure-latch.cpp)
+        else()
+            add_executable(${_t} tests/test-async-handler-delivery.cpp)
+        endif()
+        target_include_directories(${_t} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+            ${SYCL_INCLUDE_DIR}
+        )
+        target_compile_options(${_t} PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+        target_link_options(${_t} PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+        target_link_libraries(${_t} PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+        if (IntelSYCL_FOUND)
+            target_link_libraries(${_t} PRIVATE IntelSYCL::SYCL_CXX)
+        endif()
+        set_target_properties(${_t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    endforeach()
+    add_test(NAME sycl-async-failure-latch COMMAND test-sycl-async-failure-latch)
+    set_tests_properties(sycl-async-failure-latch PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;kjoc;hostonly"
+        TIMEOUT 30
+    )
+    # The selector is pinned to the CPU device: a host-only probe must not enumerate the GPUs through Level Zero, and
+    # a caller's pinned level_zero: selector would otherwise hide the CPU device and turn the probe into a skip.
+    add_test(NAME sycl-async-handler-delivery COMMAND test-sycl-async-handler-delivery)
+    set_tests_properties(sycl-async-handler-delivery PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+        LABELS "sycl;kjoc;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30
+    )
+else()
+    foreach(_n sycl-async-failure-latch sycl-async-handler-delivery)
+        add_test(NAME ${_n} COMMAND ${CMAKE_COMMAND} -E echo "not built: needs -DGGML_BACKEND_DL=OFF")
+        set_tests_properties(${_n} PROPERTIES DISABLED TRUE LABELS "sycl;kjoc;hostonly;not-built")
+    endforeach()
+endif()
+
 # The measured-tenant section: the tenant element's layout, the cohort table and
 # the visitor accumulator. context-tenant-measure.hpp names only ggml types, so
 # this needs neither -fsycl nor a device; it compiles the .cpp itself (the same
@@ -5546,6 +5592,69 @@ set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Task 8g (Inkling 2 Mini): a BF16 MUL_MAT_ID on planned models loaded the way libllama loads one runs on the card
+# through ggml_sycl_moe_bf16_direct_route_available and the BF16 direct kernel: Inkling's two expert shapes (8 experts,
+# one activation row and one per slot) and two shapes off the 32-multiple (k 100 and k 99), each for decode and a
+# 33-token prompt, every output row within NMSE 5e-4 of the CPU backend, each case showing the route's line with the
+# kernel form its shape takes. A BF16 tensor the plan does not contain and a strided expert view are declined by
+# supports_op. Public entry points only. Pinned to the B70 (level_zero:1 selects the B50 for a second run), as the
+# Q1_0/NVFP4 production-route test is, with the backend's op watchdog 10 s below CTest's bound so a hang is
+# diagnosed by the backend; a run with no SYCL GPU exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-moe-bf16-direct-device
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-bf16-direct-device.cpp
+)
+target_include_directories(test-sycl-moe-bf16-direct-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-bf16-direct-device PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-bf16-direct-device PRIVATE "-fsycl")
+target_link_libraries(test-sycl-moe-bf16-direct-device PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-bf16-direct-device PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-moe-bf16-direct-device PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bf16-direct-device COMMAND test-sycl-moe-bf16-direct-device)
+set_tests_properties(sycl-moe-bf16-direct-device PROPERTIES
+    LABELS "sycl;moe;bf16;production-route;device;B70;B50"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;GGML_SYCL_OP_TIMEOUT_MS=110000;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+endif() # static SYCL backend fixture
+
+# Task 8g (Inkling 2 Mini): the BF16 MUL_MAT_ID expert kernel (moe-bf16-direct.cpp) against a double-precision
+# reference: Inkling's k with a broadcast row and a row per slot, the scalar form (k 99, a broken row stride, an expert
+# base off 8 bytes), float4 defeated by a misaligned activation base, padded strides, and the slot semantics (id -1 a
+# zero row; an out-of-range id or a null table entry a NaN row). The kernel file needs no backend state, so the test
+# compiles it directly (JIT spir64, as test-sycl-bf16-mul-mat does) and links ggml-base alone for the BF16 converters.
+# The registration pins opencl:cpu so it never touches a GPU; run the binary under a GPU selector to check the same
+# kernel there. NAME and labels carry none of the substrings the throttled sweep excludes.
+add_executable(test-sycl-moe-bf16-direct-kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-bf16-direct-kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe-bf16-direct.cpp
+)
+target_include_directories(test-sycl-moe-bf16-direct-kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-moe-bf16-direct-kernel PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-moe-bf16-direct-kernel PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_libraries(test-sycl-moe-bf16-direct-kernel PRIVATE ggml-base)
+set_target_properties(test-sycl-moe-bf16-direct-kernel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bf16-direct-kernel COMMAND test-sycl-moe-bf16-direct-kernel)
+set_tests_properties(sycl-moe-bf16-direct-kernel PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+    LABELS "sycl;moe;bf16;kernel;hostonly"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
@@ -5885,8 +5994,12 @@ set_tests_properties(test-sycl-weight-identity-multi-model PROPERTIES
 )
 endif() # static SYCL backend fixture
 
-# Device-free: constructs canonical WEIGHT snapshots over stack storage and
-# exercises only route validation/retention.  No queue or backend is opened.
+# A device test. Route validation and retention build canonical WEIGHT
+# snapshots over stack storage, but the owned-slice and scoped production-route
+# cases open a queue on the first device and allocate through unified_alloc, so
+# the unified cache reserves its VRAM arena there (~29.9 GB on the B70), and the
+# route cases run the admitted Q1_0/NVFP4 kernel. Labelled cache;device, run
+# serially and pinned to the B70, like the other device registrations.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-moe-resolved-batch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-resolved-batch.cpp
@@ -5911,9 +6024,10 @@ target_compile_definitions(test-sycl-moe-resolved-batch PRIVATE
 target_link_libraries(test-sycl-moe-resolved-batch PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-moe-resolved-batch COMMAND test-sycl-moe-resolved-batch)
 set_tests_properties(test-sycl-moe-resolved-batch PROPERTIES
-    LABELS "sycl;moe;host;retained-route"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
+    LABELS "sycl;moe;cache;device;retained-route"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    TIMEOUT 180
 )
 endif()
 
@@ -6855,7 +6969,8 @@ set_tests_properties(sycl-host-weight-alias PROPERTIES
 # and compiled against gpu-arch.cpp directly instead of linking libggml-sycl:
 # the backend library would bring in dpct::dev_mgr, whose first use enumerates
 # every SYCL device on the machine. The test supplies its own definitions of
-# the two backend symbols dispatch.hpp's gate needs (see the link-seam comment
+# the two backend symbols dispatch.hpp's gate needs, and of the async-failure
+# handler dpct::device_ext's emitted code references (see the link-seam comment
 # in the test), so it stays host-only and needs no GPU.
 #
 # ggml-base is linked for one reason: dpct::dev_mgr's constructor references
@@ -6914,6 +7029,60 @@ set_tests_properties(rms-norm-mul-add-broadcast PROPERTIES
     LABELS "sycl;fusion;rms-norm;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120)
+
+# test-sycl-select-unselected-branch: the backend does not execute a node without GGML_TENSOR_FLAG_COMPUTE (an
+# unselected branch of ggml_build_forward_select, whose inputs the scheduler never uploads). Two F32 scales on one
+# device, a sentinel in each output, no scheduler, no model and a few KB of device memory, so it carries no
+# model/cache/mem-handle label and the sweep runs it. It submits device work, so the registration pins the
+# validation card (level_zero:1); run the binary under level_zero:0 for the B70. Exits 77 when no device is visible.
+add_executable(test-sycl-select-unselected-branch
+    tests/test-select-unselected-branch.cpp
+)
+target_include_directories(test-sycl-select-unselected-branch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+target_link_libraries(test-sycl-select-unselected-branch PRIVATE ggml-base ggml ggml-sycl)
+set_target_properties(test-sycl-select-unselected-branch PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-select-unselected-branch COMMAND test-sycl-select-unselected-branch)
+set_tests_properties(sycl-select-unselected-branch PROPERTIES
+    LABELS "sycl;graph;device"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 120)
+
+# test-sycl-weight-readback-layout: ggml_backend_tensor_get returns the bytes ggml_backend_tensor_set (or
+# ggml_backend_tensor_set_async) was given, also for a weight the backend stores reordered (SOA), and again after one
+# MUL_MAT that uses the weight; an upload through ggml_backend_tensor_set_async is recorded as ggml order.
+# Set, get and one small MUL_MAT graph per case: no scheduler, no model, at most 34 MB of device memory per case, so
+# it carries no model/cache/mem-handle label and the sweep runs it. It links the shipped ggml-sycl and reads the
+# layout records through the read-only seam ggml_sycl::test_get_tensor_layout_records (ggml-sycl-test.hpp, which
+# needs the SYCL headers, hence -fsycl). It submits device work, so the registration pins the validation card
+# (level_zero:1); run the binary under level_zero:0 for the B70. Exits 77 when no device is visible.
+add_executable(test-sycl-weight-readback-layout
+    tests/test-weight-readback-layout.cpp
+)
+target_include_directories(test-sycl-weight-readback-layout PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include ${SYCL_INCLUDE_DIR})
+target_compile_options(test-sycl-weight-readback-layout PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-weight-readback-layout PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-weight-readback-layout PRIVATE
+    GGML_SYCL_WARP_SIZE=32 GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
+target_link_libraries(test-sycl-weight-readback-layout PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-weight-readback-layout PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-weight-readback-layout PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-weight-readback-layout COMMAND test-sycl-weight-readback-layout)
+set_tests_properties(sycl-weight-readback-layout PROPERTIES
+    LABELS "sycl;graph;device"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 300)
 
 # Persistent-worker graph-boundary reset proof. Pure host C++: it creates two
 # std::threads but no SYCL queue, links no backend library, and takes no -fsycl
@@ -7419,7 +7588,7 @@ else()
 endif()
 
 # MoE MMID workspace deferral contract (llama.cpp-7lvk). The behavioural arms
-# need a GPU and a loaded MoE model; these three properties do not, and they are
+# need a GPU and a loaded MoE model; the properties it pins do not, and they are
 # the ones a future edit is most likely to undo silently. --self-test poisons
 # each assertion and requires it to go red, so the gate cannot pass vacuously on
 # a tree that already carries the fix.
@@ -7506,7 +7675,7 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         # Keep the inner watchdog 10 s below CTest's hard bound so a real hang
         # is still diagnosed by the backend before CTest terminates the process.
         # Pinned to the B70 (level_zero:1 selects the B50 for a second run): the
-        # closed route covers primary residency only, and an unpinned run also
+        # route covers primary residency only, and an unpinned run also
         # enumerates the iGPU. A two-card run of the binary must SKIP (77) with
         # the reason or pass, never abort (llama.cpp-n8da).
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;GGML_SYCL_OP_TIMEOUT_MS=110000"

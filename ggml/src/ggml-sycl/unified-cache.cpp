@@ -63,6 +63,18 @@
 #    include <unistd.h>
 #endif
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    include "tests/q1-nvfp4-production-route-test-seam.hpp"
+
+// The most routed-expert triplet groups a single-device pack puts on its device; -1 is no cap. The seam header says
+// why a mixed fixture needs it.
+static std::atomic<int> g_q1_nvfp4_test_device_expert_group_cap{ -1 };
+
+void ggml_sycl_q1_nvfp4_test_cap_device_expert_groups(int groups) {
+    g_q1_nvfp4_test_device_expert_group_cap.store(groups < 0 ? -1 : groups, std::memory_order_relaxed);
+}
+#endif
+
 namespace ggml_sycl {
 
 // moe-control-plan.hpp duplicates expert_tensor_role so it can stay free of
@@ -342,6 +354,23 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
     }
 }
 
+bool moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept {
+    if (a.moe_mmid_workspace_valid != b.moe_mmid_workspace_valid ||
+        a.moe_mmid_workspaces.size() != b.moe_mmid_workspaces.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.moe_mmid_workspaces.size(); ++i) {
+        const auto & x = a.moe_mmid_workspaces[i];
+        const auto & y = b.moe_mmid_workspaces[i];
+        if (x.owner_device != y.owner_device || x.depth != y.depth || x.valid != y.valid ||
+            x.secondary_owner != y.secondary_owner || x.device_pool_bytes != y.device_pool_bytes ||
+            x.host_pool_bytes != y.host_pool_bytes || !moe_mmid_same_workspace_geometry(x.slot, y.slot)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                       const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept {
     if (!expected || !replacement || expected.get() == replacement.get() || expected->model_id == 0 ||
@@ -350,6 +379,10 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         replacement->slot_generation != expected->slot_generation || replacement->version == 0) {
         return false;
     }
+    // The MMID context a prepared replacement displaces can hold its pools' last owners: declared before the plan
+    // lock, so the swap is decided under it and the release runs after it (canonical 12.5: no final release under a
+    // listed lock).
+    std::shared_ptr<void> displaced_mmid, rollback_displaced_mmid;
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         auto                        model = g_lifecycle_plan_models.find(expected->model_id);
@@ -360,26 +393,17 @@ bool lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan
         if (current == model->second.end() || current->second.get() != expected.get()) {
             return false;
         }
-        const auto stable_workspace = [&] {
-            if (!expected->plan || !replacement->plan) return false;
-            const auto & a = expected->plan->moe_mmid_workspaces;
-            const auto & b = replacement->plan->moe_mmid_workspaces;
-            if (a.size() != b.size()) return false;
-            for (size_t i = 0; i < a.size(); ++i) {
-                if (a[i].owner_device != b[i].owner_device || a[i].depth != b[i].depth ||
-                    a[i].valid != b[i].valid || a[i].secondary_owner != b[i].secondary_owner ||
-                    a[i].device_pool_bytes != b[i].device_pool_bytes || a[i].host_pool_bytes != b[i].host_pool_bytes ||
-                    !moe_mmid_same_workspace_geometry(a[i].slot, b[i].slot)) return false;
-            }
-            return true;
-        }();
-        if (!unified_cache_moe_mmid_registry().replace_plan(
-                expected, replacement, replacement->version, stable_workspace)) return false;
+        const bool stable_workspace =
+            expected->plan && replacement->plan && moe_mmid_same_workspace_plan(*expected->plan, *replacement->plan);
+        if (!unified_cache_moe_mmid_registry().replace_plan(expected, replacement, replacement->version,
+                                                            stable_workspace, &displaced_mmid)) {
+            return false;
+        }
         try {
             current->second = replacement;
         } catch (...) {
-            (void) unified_cache_moe_mmid_registry().replace_plan(
-                replacement, expected, expected->version, stable_workspace);
+            (void) unified_cache_moe_mmid_registry().replace_plan(replacement, expected, expected->version,
+                                                                  stable_workspace, &rollback_displaced_mmid);
             throw;
         }
         return true;
@@ -6114,15 +6138,10 @@ struct ext_alloc_tag_scope {
 
 // The arena-active mirror the raw exit reads lock-free: arena_base_ is a plain pointer the raw layer
 // cannot read without the cache's lock. Set where an arena is created and cleared where it is
-// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). arena_abandon runs
-// at shutdown with the SYCL context possibly gone, so the device lookup cannot be allowed to throw.
-void ext_alloc_note_arena_state(const sycl::queue & queue, bool active) {
-    int dev = -1;
-    try {
-        dev = ggml_sycl_get_device_id_from_queue(const_cast<sycl::queue &>(queue));
-    } catch (...) {
-        return;
-    }
+// destroyed or abandoned (scripts/check-sycl-counter-dump.py pins that pairing). `dev` is the cache's
+// device_id_, resolved while the cache was alive: arena_abandon runs in static destruction, after
+// dpct::dev_mgr (a function-local static built during main) is gone, so nothing here looks it up.
+void ext_alloc_note_arena_state(int dev, bool active) {
     if (dump_dev_valid(dev)) {
         dump_tbl().arena_active[dev].store(active, std::memory_order_release);
     }
@@ -6287,6 +6306,25 @@ static void host_zone_alloc_trace_print(const char * where, host_zone_id zone, v
             largest_free_after);
 }
 
+// A no-growth request refused in a configured host zone. WARN, not INFO, so it reaches a default-verbosity log: the
+// refusal surfaces to its caller only as a miss name, and the zone's configured reservation, its capacity and its use
+// at the refusal are what say whether the planner under-sized the zone or something else filled it.
+static void host_zone_no_growth_refusal_warn(host_zone_alloc_miss  miss,
+                                             host_zone_id          zone,
+                                             const alloc_request & req,
+                                             size_t                size,
+                                             size_t                reserved,
+                                             size_t                capacity,
+                                             size_t                used,
+                                             size_t                largest_free) {
+    GGML_LOG_WARN(
+        "[SYCL] host zone refused a no-growth request: miss=%s zone=%s dev=%d request=%zu reserved=%zu capacity=%zu "
+        "bound=%zu used=%zu largest_free=%zu role=%d category=%d\n",
+        host_zone_alloc_miss_name(miss), host_zone_name(zone), req.device, size, reserved, capacity,
+        host_zone_no_growth_bound(zone, reserved, capacity), used, largest_free, static_cast<int>(req.intent.role),
+        static_cast<int>(req.intent.category));
+}
+
 static bool copy_to_device_sync_enabled() {
     static std::atomic<int> cached{ -1 };
     int                     enabled = cached.load(std::memory_order_acquire);
@@ -6318,6 +6356,7 @@ unified_cache::unified_cache(sycl::queue & queue,
                              size_t        authority_base_mem,
                              bool          authority_resolved) :
     queue_(queue),
+    device_id_(ggml_sycl_get_device_id_from_queue(queue)),
     budget_(budget_bytes),
     base_budget_(budget_bytes),
     reserved_(0),
@@ -6370,7 +6409,7 @@ unified_cache::unified_cache(sycl::queue & queue,
 
     // Initialize layout pool for consolidating layout allocations into
     // contiguous chunks (reduces GPU TLB misses from scattered USM mappings).
-    layout_pool_ = std::make_unique<sycl_device_pool>(queue_, ggml_sycl_get_device_id_from_queue(queue_));
+    layout_pool_ = std::make_unique<sycl_device_pool>(queue_, device_id_);
 
     // VRAM Arena: pre-allocate a block when enabled.  Inventory-derived zone
     // sizes are not available during first backend init, so the same helper is
@@ -6384,8 +6423,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     // This keeps cache DMA/fill work off the compute queue, preventing
     // >20s accumulated queue work that triggers L0 DirectSubmission timeouts.
     try {
-        dma_queue_ =
-            std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});
+        dma_queue_ = std::make_unique<sycl::queue>(
+            ggml_sycl_make_queue(queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+                                 sycl::property_list{ sycl::property::queue::in_order{} }));
         GGML_SYCL_DEBUG("[UNIFIED-CACHE] Created separate DMA queue for cache operations\n");
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[UNIFIED-CACHE] Failed to create DMA queue, falling back to compute queue: %s\n", e.what());
@@ -6411,8 +6451,9 @@ unified_cache::unified_cache(sycl::queue & queue,
     // window line times marker kernels on a queue of the ring's own instead (moe_stream_phase::timing_queue), which
     // wait on these copies from outside, so no copy is read for its device times or asked for its status.
     try {
-        bcs_queue_ =
-            std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(), sycl::property::queue::in_order{});
+        bcs_queue_ = std::make_unique<sycl::queue>(
+            ggml_sycl_make_queue(queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+                                 sycl::property_list{ sycl::property::queue::in_order{} }));
         GGML_LOG_INFO("[UNIFIED-CACHE] Created BCS queue for H2D copy pipelining\n");
         // Give the device pool a reference so it can drain BCS before chunk allocs.
         if (layout_pool_) {
@@ -12724,7 +12765,9 @@ sycl::queue * unified_cache::get_event_watch_queue() {
     // call it safely.
     std::call_once(event_watch_queue_once_, [this]() {
         try {
-            event_watch_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device());
+            event_watch_queue_ = std::make_unique<sycl::queue>(
+                ggml_sycl_make_queue(queue_.get_context(), queue_.get_device(),
+                                     ggml_sycl_get_device_id_from_queue(queue_), sycl::property_list{}));
         } catch (const sycl::exception & e) {
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] Failed to create event-watch queue, arming will fall back to a "
@@ -12746,8 +12789,9 @@ sycl::queue * unified_cache::get_moe_join_queue() {
     // std::call_once for the same reason as get_event_watch_queue(): this getter takes no lock of its own.
     std::call_once(moe_join_queue_once_, [this]() {
         try {
-            moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),
-                                                            sycl::property::queue::in_order{});
+            moe_join_queue_ = std::make_unique<sycl::queue>(ggml_sycl_make_queue(
+                queue_.get_context(), queue_.get_device(), ggml_sycl_get_device_id_from_queue(queue_),
+                sycl::property_list{ sycl::property::queue::in_order{} }));
         } catch (const sycl::exception & e) {
             GGML_LOG_WARN(
                 "[MOE-JOIN-QUEUE] Failed to create the CPU expert join queue; the joins stay on the compute "
@@ -16565,10 +16609,10 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     try {
         queue_.wait();
         if (dma_queue_) {
-            dma_queue_->wait();
+            dma_queue_->wait_and_throw();
         }
         if (bcs_queue_) {
-            bcs_queue_->wait();
+            bcs_queue_->wait_and_throw();
         }
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[UNIFIED-CACHE] reclaim_weight_entries queue drain failed: %s\n", e.what());
@@ -17483,8 +17527,12 @@ static sycl::queue * ensure_single_device_context_queue(int device) {
     }
     try {
         auto &        dev = ggml_sycl_get_device(device);
-        sycl::context ctx(dev);
-        g_shared_ctx_queues[device] = new sycl::queue(ctx, dev, default_queue_properties());
+        // The execution queue and its context both carry the asynchronous-failure handler: both waits deliver to the
+        // queue's handler, a queue later built on this context without one falls back to the context's, and without
+        // either the runtime's default handler terminates the process.
+        sycl::context ctx = ggml_sycl_make_context(dev, device);
+        g_shared_ctx_queues[device] =
+            new sycl::queue(ggml_sycl_make_queue(ctx, dev, device, default_queue_properties()));
         GGML_LOG_INFO("[PER-DEV-QUEUE] Device %d cache queue created with a single-device context\n", device);
         return g_shared_ctx_queues[device];
     } catch (const std::exception & e) {
@@ -18619,8 +18667,8 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
     // Get queue for this device.  Always prefer the single-device context
-    // queue ensure_single_device_context_queue() builds directly via `new
-    // sycl::queue(ctx, dev, default_queue_properties())` over
+    // queue ensure_single_device_context_queue() builds directly via
+    // ggml_sycl_make_queue(ctx, dev, device, default_queue_properties()) over
     // ggml_sycl_get_device(device_id).default_queue() (dpct's raw,
     // header-cached default queue).
     //
@@ -19252,6 +19300,43 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
 // EXPERT_STAGING's role for any request that also carried HOST_COMPUTE/EXPERT_CACHE, silently overriding the "must be
 // released by scoped smart-handle owners before reset" contract above with a zone that is *not* swept by
 // host_zone_settle() -- llama.cpp-0igs / llama.cpp-7f2e, test_expert_staging_host_compute_zone_ownership.
+const char * host_zone_alloc_miss_name(host_zone_alloc_miss miss) noexcept {
+    switch (miss) {
+        case host_zone_alloc_miss::NONE:
+            return "none";
+        case host_zone_alloc_miss::ZONES_NOT_CONFIGURED:
+            return "zones-not-configured";
+        case host_zone_alloc_miss::OVER_NO_GROWTH_BOUND:
+            return "over-no-growth-bound";
+        case host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK:
+            return "no-contiguous-block";
+        case host_zone_alloc_miss::GROWTH_FAILED:
+            return "growth-failed";
+    }
+    return "unknown";
+}
+
+moe_mmid_materialize_refusal moe_mmid_host_pool_refusal(host_zone_alloc_miss miss) noexcept {
+    switch (miss) {
+        case host_zone_alloc_miss::ZONES_NOT_CONFIGURED:
+            return moe_mmid_materialize_refusal::HOST_POOL_ZONES_NOT_CONFIGURED;
+        case host_zone_alloc_miss::OVER_NO_GROWTH_BOUND:
+            return moe_mmid_materialize_refusal::HOST_POOL_OVER_NO_GROWTH_BOUND;
+        case host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK:
+            return moe_mmid_materialize_refusal::HOST_POOL_NO_CONTIGUOUS_BLOCK;
+        case host_zone_alloc_miss::NONE:
+        case host_zone_alloc_miss::GROWTH_FAILED:  // the host pool's request never grows its zone
+            break;
+    }
+    return moe_mmid_materialize_refusal::HOST_POOL_ALLOCATION_FAILED;
+}
+
+size_t host_zone_no_growth_bound(host_zone_id zone, size_t reserved, size_t capacity) noexcept {
+    // The model load grows WEIGHT for host weights no plan sized (see the declaration), so only its capacity says
+    // whether a request fits without growing it. Every other zone's tenants are planned: their reservation stands.
+    return zone == host_zone_id::WEIGHT ? std::max(reserved, capacity) : reserved;
+}
+
 static host_zone_id unified_alloc_host_zone(const alloc_request & req,
                                             runtime_category      cat,
                                             bool                  kv_spill_to_host) noexcept {
@@ -19287,6 +19372,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     }
 
     alloc_request req = req_in;
+    if (req.host_zone_miss != nullptr) {
+        *req.host_zone_miss = host_zone_alloc_miss::NONE;
+    }
     if (req.queue == nullptr && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
         req.queue = &ggml_sycl_get_device(req.device).default_queue();
     }
@@ -19681,16 +19769,30 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // blocked (phase gate or budget exhausted), return a miss. The
             // host-buffer WEIGHT path fails cleanly without a raw malloc_host
             // escape; the separate KV-only pool retry below is not its fallback.
-            auto try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
+            host_zone_alloc_miss host_miss                 = host_zone_alloc_miss::NONE;
+            auto                 try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
                 if (!ucache->host_zones_configured() && req.intent.constraints.use_pinned_pool) {
                     // Zones not yet configured (pre-configure model-load path):
                     // fall through to host_pool_alloc below.
                     return nullptr;
                 }
+                const auto refuse_no_growth = [&](host_zone_alloc_miss miss) -> void * {
+                    host_miss = miss;
+                    // Only WEIGHT: its no-growth requests are persistent owners the planner sized the zone for, so a
+                    // refusal there is a planning fault. A STAGING miss is back-pressure its caller retries.
+                    if (zone == host_zone_id::WEIGHT) {
+                        host_zone_no_growth_refusal_warn(miss, zone, req, alloc_size,
+                                                                         ucache->host_zone_reserved_capacity(zone),
+                                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
+                                                                         ucache->host_zone_largest_free_block(zone));
+                    }
+                    return nullptr;
+                };
                 if (req.intent.constraints.forbid_host_zone_growth) {
-                    const size_t reserved = ucache->host_zone_reserved_capacity(zone);
-                    if (reserved > 0 && ucache->host_zone_used(zone) + alloc_size > reserved) {
-                        return nullptr;
+                    const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),
+                                                                                   ucache->host_zone_capacity(zone));
+                    if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {
+                        return refuse_no_growth(host_zone_alloc_miss::OVER_NO_GROWTH_BOUND);
                     }
                 }
                 const size_t alignment = req.alignment != 0 ? req.alignment : pinned_chunk_pool::DEFAULT_ALIGNMENT;
@@ -19699,7 +19801,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     return p;
                 }
                 if (req.intent.constraints.forbid_host_zone_growth) {
-                    return nullptr;
+                    return refuse_no_growth(host_zone_alloc_miss::NO_CONTIGUOUS_BLOCK);
                 }
                 // Fragmentation path: the zone has enough aggregate free bytes
                 // somewhere (possibly across multiple chunks) but no single
@@ -19720,10 +19822,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // max(chunk_size_, align_up(need)); the alignment slack keeps
                 // the aligned request inside the arena.
                 const size_t need = alloc_size + std::max(alignment, pinned_chunk_pool::DEFAULT_ALIGNMENT);
-                if (!ucache->host_zone_grow(zone, need)) {
-                    return nullptr;
+                void *       grown =
+                    ucache->host_zone_grow(zone, need) ? ucache->host_zone_alloc(zone, alloc_size, alignment) : nullptr;
+                if (!grown) {
+                    host_miss = host_zone_alloc_miss::GROWTH_FAILED;
                 }
-                return ucache->host_zone_alloc(zone, alloc_size, alignment);
+                return grown;
             };
             if (req.intent.constraints.use_pinned_pool) {
                 if (!ucache->host_zones_configured()) {
@@ -19787,6 +19891,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
             }
             uses_pinned_pool = (ptr != nullptr);
+            if (!ptr && host_miss == host_zone_alloc_miss::NONE && !ucache->host_zones_configured()) {
+                host_miss = host_zone_alloc_miss::ZONES_NOT_CONFIGURED;
+            }
+            if (req.host_zone_miss != nullptr) {
+                *req.host_zone_miss = ptr ? host_zone_alloc_miss::NONE : host_miss;
+            }
         }
         if (!ptr) {
             // When host zones are configured, a WEIGHT zone miss means the zone is
@@ -20465,15 +20575,34 @@ static moe_mmid_workspace_registry & unified_cache_moe_mmid_registry() {
 }
 
 static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
-    const moe_mmid_model_token & token,
-    uint64_t plan_identity,
+    const moe_mmid_model_token &                   token,
+    uint64_t                                       plan_identity,
     std::shared_ptr<const lifecycle_plan_snapshot> exact_plan,
-    const placement_plan & plan,
-    int submit_device,
-    const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    if (!plan.moe_mmid_workspace_valid || plan_identity == 0 || submit_device < 0 ||
-        plan.moe_mmid_workspaces.empty()) {
+    const placement_plan &                         plan,
+    int                                            submit_device,
+    const std::vector<moe_mmid_queue_binding> &    bindings,
+    moe_mmid_materialize_refusal *                 refusal) noexcept {
+    using R            = moe_mmid_materialize_refusal;
+    const auto invalid = [refusal](R why) {
+        if (refusal) {
+            *refusal = why;
+        }
         return moe_mmid_materialize_status::INVALID;
+    };
+    if (refusal) {
+        *refusal = R::NONE;
+    }
+    if (!plan.moe_mmid_workspace_valid) {
+        return invalid(R::PLAN_POOL_REJECTED);
+    }
+    if (plan_identity == 0) {
+        return invalid(R::PLAN_NO_IDENTITY);
+    }
+    if (submit_device < 0) {
+        return invalid(R::PLAN_NO_SUBMIT_DEVICE);
+    }
+    if (plan.moe_mmid_workspaces.empty()) {
+        return invalid(R::PLAN_NO_WORKSPACES);
     }
     try {
         std::vector<moe_mmid_materialized_owner_plan> owners;
@@ -20482,8 +20611,11 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == workspace.owner_device;
         });
-        if (!workspace.valid || binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
-            return moe_mmid_materialize_status::INVALID;
+        if (!workspace.valid) {
+            return invalid(R::WORKSPACE_INVALID);
+        }
+        if (binding == bindings.end() || binding->queue == nullptr || binding->queue_cookie == 0) {
+            return invalid(R::WORKSPACE_NO_BINDING);
         }
         moe_mmid_materialized_owner_plan owner;
         owner.owner_device      = workspace.owner_device;
@@ -20497,6 +20629,8 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         owners.push_back(owner);
     }
 
+    // The host-zone condition the host pool's allocation missed on, if it missed on one.
+    host_zone_alloc_miss host_pool_miss = host_zone_alloc_miss::NONE;
     auto allocator = [&](bool host_pinned, int device, size_t bytes, size_t alignment) -> moe_mmid_blob {
         auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const moe_mmid_queue_binding & candidate) {
             return candidate.owner_device == device;
@@ -20510,13 +20644,19 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         request.size                 = bytes;
         request.alignment            = alignment;
         request.suppress_failure_log = true;
-        request.intent.role          = host_pinned ? alloc_role::STAGING : alloc_role::COMPUTE;
-        request.intent.category      = host_pinned ? runtime_category::STAGING : runtime_category::COMPUTE;
+        request.host_zone_miss       = host_pinned ? &host_pool_miss : nullptr;
+        // The host pool holds the route's CPU-written, GPU-read slot descriptors (and a secondary owner's bounce
+        // slices): control data. Its owner is the registry context, which holds it for the model's plan, past every
+        // graph, so it is a persistent owner and lands in the WEIGHT host zone, where the planner sized it. In the
+        // STAGING zone every graph boundary found it live and refused. It never grows the zone.
+        request.intent.role          = host_pinned ? alloc_role::CONTROL : alloc_role::COMPUTE;
+        request.intent.category      = host_pinned ? runtime_category::CONTROL : runtime_category::COMPUTE;
         request.intent.cohort_id     = "moe_mmid_workspace";
         request.intent.constraints.must_device             = !host_pinned;
         request.intent.constraints.must_host_pinned        = host_pinned;
         request.intent.constraints.use_pinned_pool         = host_pinned;
         request.intent.constraints.forbid_host_zone_growth = host_pinned;
+        request.intent.constraints.persistent_owner        = host_pinned;
         request.intent.constraints.prefer_vram_zone        = host_pinned ? vram_zone_id::COUNT : vram_zone_id::RUNTIME;
         auto handle = std::make_shared<mem_handle>(unified_allocate(request));
         const resolved_ptr resolved = handle->resolve();
@@ -20536,27 +20676,60 @@ static moe_mmid_materialize_status materialize_moe_mmid_workspaces_impl(
         blob.host_pinned = host_pinned;
         return blob;
     };
-        return exact_plan ? unified_cache_moe_mmid_registry().materialize(
-                                token, plan_identity, std::move(exact_plan), submit_device, owners, allocator) :
-                            unified_cache_moe_mmid_registry().materialize(
-                                token, plan_identity, submit_device, owners, allocator);
+    const moe_mmid_materialize_status status =
+        exact_plan ? unified_cache_moe_mmid_registry().materialize(token, plan_identity, std::move(exact_plan),
+                                                                   submit_device, owners, allocator, refusal) :
+                     unified_cache_moe_mmid_registry().materialize(token, plan_identity, submit_device, owners,
+                                                                   allocator, refusal);
+    if (refusal && *refusal == moe_mmid_materialize_refusal::HOST_POOL_ALLOCATION_FAILED) {
+        *refusal = moe_mmid_host_pool_refusal(host_pool_miss);
+    }
+    return status;
     } catch (...) {
+        if (refusal) {
+            *refusal = R::EXCEPTION;
+        }
         return moe_mmid_materialize_status::ALLOCATION_FAILED;
     }
 }
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token, uint64_t plan_identity, const placement_plan & plan,
-    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings);
+    const moe_mmid_model_token &                token,
+    uint64_t                                    plan_identity,
+    const placement_plan &                      plan,
+    int                                         submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings,
+    moe_mmid_materialize_refusal *              refusal) noexcept {
+    return materialize_moe_mmid_workspaces_impl(token, plan_identity, {}, plan, submit_device, bindings, refusal);
 }
 
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token, const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
-    int submit_device, const std::vector<moe_mmid_queue_binding> & bindings) noexcept {
-    if (!plan || !plan->plan || plan->version == 0 || plan->model_id != token.model_id ||
-        plan->load_txn_id != token.load_txn_id) return moe_mmid_materialize_status::INVALID;
-    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings);
+    const moe_mmid_model_token &                           token,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
+    int                                                    submit_device,
+    const std::vector<moe_mmid_queue_binding> &            bindings,
+    moe_mmid_materialize_refusal *                         refusal) noexcept {
+    using R            = moe_mmid_materialize_refusal;
+    const auto invalid = [refusal](R why) {
+        if (refusal) {
+            *refusal = why;
+        }
+        return moe_mmid_materialize_status::INVALID;
+    };
+    if (!plan || !plan->plan) {
+        return invalid(R::SNAPSHOT_MISSING);
+    }
+    if (plan->version == 0) {
+        return invalid(R::SNAPSHOT_NO_VERSION);
+    }
+    if (plan->model_id != token.model_id) {
+        return invalid(R::SNAPSHOT_MODEL_MISMATCH);
+    }
+    if (plan->load_txn_id != token.load_txn_id) {
+        return invalid(R::SNAPSHOT_LOAD_MISMATCH);
+    }
+    return materialize_moe_mmid_workspaces_impl(token, plan->version, plan, *plan->plan, submit_device, bindings,
+                                                refusal);
 }
 
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
@@ -20587,6 +20760,16 @@ size_t unified_cache_recover_moe_mmid_workspaces(const moe_mmid_model_token & to
 bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
                                                uint64_t plan_identity) noexcept {
     return unified_cache_moe_mmid_registry().retire(token, plan_identity);
+}
+
+moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    const moe_mmid_follows_fn &                            follows) noexcept {
+    return moe_mmid_reconcile_live_plan(unified_cache_moe_mmid_registry(), published, live, live_identity,
+                                        stable_geometry, follows);
 }
 
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept {
@@ -27436,7 +27619,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             g_live_arena_chunks.fetch_add(1, std::memory_order_acq_rel);
             arena_base_ = ptr;
             arena_size_ = alloc_size;
-            ext_alloc_note_arena_state(queue, true);
+            ext_alloc_note_arena_state(device_id_, true);
 
             // Single-chunk zone layout:
             //   [KV→ ...free... ←WEIGHT] [ONEDNN] [RUNTIME] [SCRATCH]
@@ -27638,7 +27821,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
 
     arena_base_ = arena_chunks_.front().ptr;
     arena_size_ = alloc_size;
-    ext_alloc_note_arena_state(queue, true);
+    ext_alloc_note_arena_state(device_id_, true);
 
     // Logical-offset layout (cumulative across chunks; offset_to_ptr/ptr_to_offset translate):
     //   [WEIGHT (chunks 0..N-2, weight_total bytes)]
@@ -28947,7 +29130,7 @@ bool unified_cache::arena_destroy() {
     for (auto & group : arena_allocator_groups_) group.allocations.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    ext_alloc_note_arena_state(queue_, false);
+    ext_alloc_note_arena_state(device_id_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -29113,7 +29296,7 @@ void unified_cache::arena_abandon() {
     weight_chunk_allocators_.clear();
     arena_chunks_.clear();
     arena_base_ = nullptr;
-    ext_alloc_note_arena_state(queue_, false);
+    ext_alloc_note_arena_state(device_id_, false);
     arena_size_ = 0;
     for (int i = 0; i < static_cast<int>(vram_zone_id::COUNT); i++) {
         auto & z = arena_zones_[i];
@@ -31976,6 +32159,12 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             item.ne[0] <= 0 || item.ne[1] <= 0) {
             continue;
         }
+        // The pool's only consumer is the direct route, and it admits only the types that need their direct kernel
+        // (Q1_0, NVFP4). An expert of any other type (MXFP4, Q4_0, ...) never draws on a pool, so it neither sizes
+        // one nor names an owner: a model without such an expert plans, charges and materializes nothing.
+        if (!moe_type_needs_direct_kernel(item.type)) {
+            continue;
+        }
         // Only the expert weight matrices are MUL_MAT_ID operands. Per-expert
         // auxiliary tensors (".scale"/".input_scale" fp8 metadata) share the
         // "ffn_*_exps" stem — and legitimately get per-expert placement — but
@@ -32195,9 +32384,11 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         }
         if (demand.moe_mmid_host_pool_bytes > plan.moe_mmid_host_pool_bytes) {
             const size_t growth = demand.moe_mmid_host_pool_bytes - plan.moe_mmid_host_pool_bytes;
-            if (plan.host_zone_scratch_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth)
+            // The zone the load planner sizes the pool into (the WEIGHT host zone, see the host zone sizing).
+            if (plan.host_zone_weight_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth) {
                 return refuse(moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW);
-            plan.host_zone_scratch_bytes += growth;
+            }
+            plan.host_zone_weight_bytes += growth;
             plan.host_bytes += growth;
         }
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
@@ -32239,7 +32430,9 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
     // plan_moe_mmid_workspaces() planned none there (same bound).
     const int exposed_devices = moe_mmid_exposed_owner_count();
     for (const placement_entry & entry : plan.entries) {
-        if (entry.expert_id < 0) {
+        // Only an expert of a type the direct route admits needs an owner: plan_moe_mmid_workspaces() plans none for
+        // any other type, so requiring one would reject the pool of a model that mixes the two.
+        if (entry.expert_id < 0 || !moe_type_needs_direct_kernel(entry.type)) {
             continue;
         }
         if (entry.on_device && moe_mmid_owner_admissible(entry.target_device, exposed_devices) &&
@@ -32926,7 +33119,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     if (host_sizing_valid) {
         host_staging_total = s1_preload_staging_bytes;
         for (size_t bytes : { k_tp_staging_headroom, plan.expert_bias_bytes, plan.moe_routing_ids_bytes,
-                              plan.tp_staging_buffer_bytes, plan.moe_mmid_host_pool_bytes }) {
+                              plan.tp_staging_buffer_bytes }) {
             size_t next = 0;
             if (!moe_mmid_checked_zone_total(host_staging_total, bytes, &next)) {
                 host_sizing_valid = false;
@@ -32934,6 +33127,16 @@ static void populate_host_zone_sizing(placement_plan &                          
             }
             host_staging_total = next;
         }
+    }
+    // The MMID workspace host pool is held by its registry context for the model's plan, past every graph, so it is
+    // allocated from the WEIGHT host zone, which no graph boundary checks, and sized into that zone here. In STAGING
+    // every graph boundary found it live and refused.
+    size_t host_weight_total = 0;
+    if (host_sizing_valid &&
+        moe_mmid_checked_zone_total(plan.host_zone_weight_bytes, plan.moe_mmid_host_pool_bytes, &host_weight_total)) {
+        plan.host_zone_weight_bytes = host_weight_total;
+    } else {
+        host_sizing_valid = false;
     }
     if (!host_sizing_valid) {
         plan.moe_mmid_workspace_valid = false;
@@ -33135,16 +33338,73 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                   kv_info, envelope, n_experts);
 }
 
-// The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
-// gets its KV there, in layer order, while `remaining` holds it. A layer whose KV does not fit keeps its weights on the
-// device and has its KV on the host tier; a host layer's KV is on the host tier with it.
+placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory(const ggml_sycl_tensor_inventory & inventory) {
+    placement_kv_layer_phys_intake intake;
+    intake.kv_layer_phys_count = inventory.kv_layer_phys_count;
+    intake.kv_layer_count      = inventory.kv_layer_count;
+    if (inventory.kv_layer_phys_count == 0) {
+        return intake;
+    }
+    // A count says the producer sent a map. A null one is refused like a count mismatch, so the backend says so
+    // instead of planning every slot as its own layer without a word.
+    if (inventory.kv_layer_phys == nullptr || inventory.kv_layer_phys_count != inventory.kv_layer_count) {
+        intake.refused     = true;
+        intake.map_missing = inventory.kv_layer_phys == nullptr;
+        return intake;
+    }
+    const int32_t * const      map = inventory.kv_layer_phys;
+    const std::vector<int32_t> layer_phys(map, map + inventory.kv_layer_phys_count);
+    // The identity first, and kept empty: a model whose slots are its layers plans as it did with no map.
+    if (kv_layer_phys_is_identity(layer_phys)) {
+        return intake;
+    }
+    // A weight layer id is below the slot count: every weight layer executes at least one slot. The inventory's tensor
+    // names cannot say more, because the late inventory leaves out a layer whose weights are on a CPU buffer type
+    // (llama_model_sycl_set_late_inventory), and that layer's slots are the ones that must follow it to the host.
+    for (size_t slot = 0; slot < layer_phys.size(); ++slot) {
+        if (layer_phys[slot] < 0 || static_cast<uint32_t>(layer_phys[slot]) >= inventory.kv_layer_count) {
+            intake.refused   = true;
+            intake.bad_slot  = static_cast<int>(slot);
+            intake.bad_layer = layer_phys[slot];
+            return intake;
+        }
+    }
+    intake.layer_phys = layer_phys;
+    return intake;
+}
+
+// Puts the KV of every slot weight layer `layer_id` executes on `kv_target` (-1: the host tier); a slot with no KV of
+// its own is on the host tier either way. A slot's KV lives where its layer lives.
+static void plan_layer_kv_slots(placement_plan & plan, const placement_kv_info & kv_info, int layer_id, int kv_target) {
+    for (const int slot : kv_slots_of_layers(kv_info.layer_phys, layer_id, layer_id)) {
+        const bool slot_has_kv = kv_info.kv_bytes_for_layer(static_cast<uint32_t>(slot)) > 0;
+        plan.kv_device[slot]   = slot_has_kv ? kv_target : -1;
+    }
+}
+
+// The KV phase's per-slot charge (llama.cpp-8ecj): each KV slot whose layer's dense weights the dense pass put on
+// `device_id` gets its KV there, in slot order, while `remaining` holds it. A slot whose KV does not fit keeps its
+// layer's weights on the device and has its KV on the host tier; a host layer's slots are on the host tier with it.
+// A looped model's slot runs the weight layer kv_info.layer_phys names; every other model's slot is its own layer.
 static void plan_single_device_layer_kv(placement_plan &            plan,
                                         const placement_kv_info &   kv_info,
                                         const std::map<int, bool> & layer_has_attention,
                                         int                         device_id,
                                         size_t &                    remaining) {
-    for (const auto & [layer_id, has_attention] : layer_has_attention) {
-        const size_t kv_cost = has_attention ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+    std::vector<std::pair<int, int>> slot_layers;  // (KV slot, the weight layer that executes it), in slot order
+    if (kv_info.layer_phys.empty()) {
+        for (const auto & attention : layer_has_attention) {
+            slot_layers.emplace_back(attention.first, attention.first);
+        }
+    } else {
+        for (size_t slot = 0; slot < kv_info.layer_phys.size(); ++slot) {
+            slot_layers.emplace_back(static_cast<int>(slot), kv_info.layer_phys[slot]);
+        }
+    }
+    for (const auto & [slot, layer_id] : slot_layers) {
+        const auto   attention     = layer_has_attention.find(layer_id);
+        const bool   has_attention = attention != layer_has_attention.end() && attention->second;
+        const size_t kv_cost       = has_attention ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(slot)) : 0;
         if (kv_cost == 0) {
             continue;
         }
@@ -33157,7 +33417,7 @@ static void plan_single_device_layer_kv(placement_plan &            plan,
             plan.kv_host_bytes += kv_cost;
             plan.host_bytes += kv_cost;
         }
-        plan.kv_device[layer_id] = kv_on_device ? device_id : -1;
+        plan.kv_device[slot] = kv_on_device ? device_id : -1;
     }
 }
 
@@ -33227,7 +33487,7 @@ struct kv_context_room {
 // refusing it both lose one device read per token, so it cancels to first order. A dense model displaces no expert,
 // so its room is held as before, whatever the fill.
 static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv_info,
-                                                  int                         layer_id,
+                                                  int                         slot,
                                                   size_t                      extra,
                                                   int                         n_experts,
                                                   const kv_room_expert_rate & rate) {
@@ -33237,11 +33497,10 @@ static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv
     GGML_ASSERT(std::isfinite(kv_info.host_attn_gbps) && kv_info.host_attn_gbps > 0.0);
     GGML_ASSERT(std::isfinite(rate.gbps) && rate.gbps > 0.0);
     GGML_ASSERT(std::isfinite(kv_info.host_split_us) && kv_info.host_split_us >= 0.0);
-    const uint32_t      il     = static_cast<uint32_t>(layer_id);
     const uint32_t      filled = kv_room_filled_cells(kv_info.n_ctx_context, kv_info.ctx_fill_pct);
     kv_room_cost_inputs in;
-    in.host_read_bytes = kv_info.kv_bytes_for_layer_at(il, filled);
-    in.n_host_splits   = placement_host_attn_splits(kv_info.idx_k_width(il) > 0);
+    in.host_read_bytes = kv_info.kv_bytes_for_layer_at(static_cast<uint32_t>(slot), filled);
+    in.n_host_splits   = placement_host_attn_splits(kv_info.idx_k_width(static_cast<uint32_t>(slot)) > 0);
     in.room_bytes      = extra;
     in.n_experts       = n_experts;
     in.n_expert_used   = kv_info.n_expert_used;
@@ -33249,7 +33508,7 @@ static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv
     in.host_split_us   = kv_info.host_split_us;
     in.cpu_expert_gbps = rate.gbps;
     in.priced          = rate.priced;
-    return { kv_room_weigh(in), layer_id, in.n_host_splits };
+    return { kv_room_weigh(in), slot, in.n_host_splits };
 }
 
 static kv_context_room hold_kv_context_room(placement_plan &            plan,
@@ -33270,25 +33529,24 @@ static kv_context_room hold_kv_context_room(placement_plan &            plan,
     // (plan_runtime_kv_demotion, kv-runtime-demotion.cpp: full attention latest first, then SWA latest first; the
     // source gate reads it there), and it only picks the deciding layer the line reports: the first refused, else the
     // first held.
-    std::vector<int> layers;
-    for (const auto & [layer_id, owner] : plan.kv_device) {
-        if (layer_id >= 0 && owner == device_id) {
-            layers.push_back(layer_id);
+    std::vector<int> slots;
+    for (const auto & [slot, owner] : plan.kv_device) {
+        if (slot >= 0 && owner == device_id) {
+            slots.push_back(slot);
         }
     }
-    std::sort(layers.begin(), layers.end());
+    std::sort(slots.begin(), slots.end());
     for (const bool swa_pass : { false, true }) {
-        for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-            const int layer_id = *it;
-            if (kv_info.is_swa_layer(layer_id) != swa_pass) {
+        for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+            const int slot = *it;
+            if (kv_info.is_swa_layer(slot) != swa_pass) {
                 continue;
             }
-            const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));
+            const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(slot));
             if (extra == 0) {
                 continue;
             }
-            const kv_context_room_cost cost =
-                weigh_kv_context_room(kv_info, layer_id, extra, n_experts, room.expert_rate);
+            const kv_context_room_cost cost = weigh_kv_context_room(kv_info, slot, extra, n_experts, room.expert_rate);
             room.n_layers++;
             if (swa_pass) {
                 room.n_swa_layers++;
@@ -33705,6 +33963,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.layer_k_width                       = kv_info.layer_k_width;
     plan.layer_v_width                       = kv_info.layer_v_width;
     plan.layer_idx_k_width                   = kv_info.layer_idx_k_width;
+    plan.layer_phys                          = kv_info.layer_phys;
     plan.planner_n_ctx                       = kv_info.n_ctx;
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -33933,9 +34192,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // (~256 MB at 131K context), and a heterogeneous model's SWA/full
         // widths can themselves differ (Gemma 4 E4B), and shared-KV layers
         // cost 0). TLSF supports heterogeneous slot sizes so the old
-        // uniform-charging workaround is no longer needed.
-        const size_t kv_cost =
-            layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+        // uniform-charging workaround is no longer needed. A looped model's
+        // layer is charged for every KV slot it executes.
+        const size_t kv_cost       = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
 
         bool on_device;
         int  target;
@@ -34017,7 +34276,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
 
         plan.layer_device[layer_id] = target;
-        plan.kv_device[layer_id]    = (kv_cost > 0 && kv_on_device) ? device_id : -1;
+        plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 && kv_on_device ? device_id : -1);
 
         size_t kv_anchor = indices.front();
         if (kv_cost > 0) {
@@ -34117,7 +34376,19 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 stats.incomplete_groups++;
             }
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+            // A mixed fixture needs a plan with experts on both the card and the host, and no real budget gives one
+            // for a synthetic expert of a few kilobytes: GGML_SYCL_RESIDENCY_FORCE_BUDGET_BYTES caps the residency
+            // evaluation (apply_forced_residency_budget), never this pack's `remaining`, and GGML_SYCL_VRAM_BUDGET_PCT
+            // moves `remaining` in steps of one percent of the card, about 160 MB on the B50 and 326 MB on the B70.
+            // The cap only stops the first-fit pack early; which groups land where is still the pack's decision.
+            const int  device_group_cap = g_q1_nvfp4_test_device_expert_group_cap.load(std::memory_order_relaxed);
+            const bool on_device =
+                group.charge_bytes <= remaining &&
+                (device_group_cap < 0 || stats.device_groups < static_cast<size_t>(device_group_cap));
+#else
             const bool on_device = group.charge_bytes <= remaining;
+#endif
             const int  target    = on_device ? device_id : -1;
             if (group.charge_bytes <= without_room) {
                 without_room -= group.charge_bytes;
@@ -34251,29 +34522,53 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         for (const auto & [layer_id, bytes] : layer_weight_bytes) {
             GGML_UNUSED(bytes);
             layer_ids.push_back(layer_id);
-            plan.kv_device.try_emplace(layer_id, -1);
+            for (const int slot : kv_slots_of_layers(plan.layer_phys, layer_id, layer_id)) {
+                plan.kv_device.try_emplace(slot, -1);
+            }
             plan.layer_device.try_emplace(layer_id, -1);
         }
         std::sort(layer_ids.begin(), layer_ids.end());
         for (int layer_id : layer_ids) {
-            const size_t   weight_bytes = layer_weight_bytes[layer_id];
-            const bool     has_attn     = layer_has_attention[layer_id];
-            const uint32_t uil          = static_cast<uint32_t>(layer_id);
+            const size_t           weight_bytes = layer_weight_bytes[layer_id];
+            const bool             has_attn     = layer_has_attention[layer_id];
+            // A looped model's layer executes several KV slots: its KV is their sum, labelled by its first slot, and
+            // its target is theirs (mixed when they differ); a line after it names each slot.
+            const std::vector<int> slots        = kv_slots_of_layers(plan.layer_phys, layer_id, layer_id);
             // llama.cpp-3aos: kv_bytes_for_layer() already returns 0 for a
             // SHARED layer (no K/V of its own), so kv_bytes stays correct
             // whether or not has_attn is set for it; the label distinguishes
             // that case from a genuinely non-attention layer.
-            const size_t   kv_bytes     = has_attn ? kv_info.kv_bytes_for_layer(uil) : 0;
-            const char *   kv_label     = placement_kv_layer_label(kv_info, layer_id, has_attn);
-            const int      dense_target = plan.get_layer_device(layer_id);
-            const int      kv_target    = plan.get_kv_device(layer_id);
+            const size_t           kv_bytes     = has_attn ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
+            const char *           kv_label =
+                placement_kv_layer_label(kv_info, slots.empty() ? layer_id : slots.front(), has_attn);
+            const int dense_target = plan.get_layer_device(layer_id);
+            const int kv_target =
+                plan.layer_phys.empty() ? plan.get_kv_device(layer_id) : plan.layer_range_kv_device(layer_id, layer_id);
+            char kv_target_text[32];
+            if (kv_target == -2) {
+                snprintf(kv_target_text, sizeof(kv_target_text), "mixed");
+            } else {
+                snprintf(kv_target_text, sizeof(kv_target_text), "%s%d", kv_target >= 0 ? "device " : "host ",
+                         kv_target >= 0 ? kv_target : -1);
+            }
             GGML_LOG_INFO(
                 "[PLACEMENT] layer %3d  weight=%.1f MB  kv=%.1f MB (%s)  total=%.1f MB  "
-                "dense_target=%s%d  kv_target=%s%d\n",
+                "dense_target=%s%d  kv_target=%s\n",
                 layer_id, weight_bytes / (1024.0 * 1024.0), kv_bytes / (1024.0 * 1024.0), kv_label,
                 (weight_bytes + kv_bytes) / (1024.0 * 1024.0), dense_target >= 0 ? "device " : "host ",
-                dense_target >= 0 ? dense_target : -1, kv_target >= 0 ? "device " : "host ",
-                kv_target >= 0 ? kv_target : -1);
+                dense_target >= 0 ? dense_target : -1, kv_target_text);
+            if (!plan.layer_phys.empty()) {
+                std::string slot_text;
+                for (const int slot : slots) {
+                    const int slot_target = plan.get_kv_device(slot);
+                    char      one[48];
+                    snprintf(one, sizeof(one), "%s%d=%s%d", slot_text.empty() ? "" : ", ", slot,
+                             slot_target >= 0 ? "device " : "host ", slot_target >= 0 ? slot_target : -1);
+                    slot_text += one;
+                }
+                GGML_LOG_INFO("[PLACEMENT] layer %3d  kv slots: %s\n", layer_id,
+                              slot_text.empty() ? "none" : slot_text.c_str());
+            }
         }
     }
     // KV breakdown summary for heterogeneous attention
@@ -34564,7 +34859,8 @@ static void populate_multi_device_layer_blocks(placement_plan &                 
                 block.dense_vram_charge_bytes += charge_it->second;
             }
 
-            block.kv_bytes += plan.kv_size_for_layer(static_cast<uint32_t>(layer));
+            // Every KV slot the layer executes: a looped model's later slots run in the block of their layer.
+            block.kv_bytes += plan.kv_size_for_phys_layer(layer);
 
             auto moe_dev_it = moe_device_bytes_by_layer.find(layer);
             if (moe_dev_it != moe_device_bytes_by_layer.end()) {
@@ -34723,7 +35019,7 @@ static void populate_no_p2p_candidate_layer_blocks(placement_plan &             
         }
         auto has_attn = layer_has_attention.find(layer_id);
         if (has_attn != layer_has_attention.end() && has_attn->second) {
-            charge += kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id));
+            charge += kv_info.kv_bytes_for_phys_layer(layer_id);
         }
         return charge;
     };
@@ -34790,7 +35086,7 @@ static void populate_no_p2p_candidate_layer_blocks(placement_plan &             
             }
             auto has_attn = layer_has_attention.find(layer_id);
             if (has_attn != layer_has_attention.end() && has_attn->second) {
-                block.kv_bytes += kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id));
+                block.kv_bytes += kv_info.kv_bytes_for_phys_layer(layer_id);
             }
         }
 
@@ -35165,6 +35461,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.layer_k_width            = kv_info.layer_k_width;
     plan.layer_v_width            = kv_info.layer_v_width;
     plan.layer_idx_k_width        = kv_info.layer_idx_k_width;
+    plan.layer_phys               = kv_info.layer_phys;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -35542,8 +35839,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         for (int layer_id = 0; layer_id < n_layers; ++layer_id) {
             const size_t dense_weight_charge =
                 layer_weight_charge_bytes.count(layer_id) ? layer_weight_charge_bytes.at(layer_id) : 0;
-            const size_t kv_cost =
-                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+            const size_t kv_cost = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
             all_layers_charge += dense_weight_charge + moe_layer_charge[static_cast<size_t>(layer_id)] + kv_cost;
         }
 
@@ -35603,8 +35899,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const size_t dense_weight_bytes = layer_weight_bytes.count(layer_id) ? layer_weight_bytes.at(layer_id) : 0;
             const size_t dense_weight_charge =
                 layer_weight_charge_bytes.count(layer_id) ? layer_weight_charge_bytes.at(layer_id) : 0;
-            const size_t kv_cost =
-                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+            const size_t kv_cost = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
             const size_t moe_weight_bytes  = moe_layer_bytes[static_cast<size_t>(layer_id)];
             const size_t moe_weight_charge = moe_layer_charge[static_cast<size_t>(layer_id)];
             const size_t total_charge      = dense_weight_charge + moe_weight_charge + kv_cost;
@@ -35648,7 +35943,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             }
 
             plan.layer_device[layer_id] = target;
-            plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
+            plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 ? target : -1);
 
             auto dense_it = dense_layer_indices.find(layer_id);
             if (dense_it != dense_layer_indices.end()) {
@@ -35785,16 +36080,16 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             // (llama.cpp-3aos: kv_bytes_for_layer() -- SWA vs full-attn vs
             // shared-KV, per layer, not a uniform class split). TLSF
             // supports heterogeneous slot sizes — see single-device path for
-            // details.
-            const size_t kv_cost =
-                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+            // details. A looped model's layer is charged for every KV slot it
+            // executes, and its slots go with it.
+            const size_t kv_cost        = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
             const size_t total_cost     = weight_charge + kv_cost;
             const char * reason         = nullptr;
             int          target_dev_idx = choose_dense_target_device(total_cost, &reason);
 
             const int target            = commit_bytes(target_dev_idx, weight_bytes, weight_charge, kv_cost);
             plan.layer_device[layer_id] = target;
-            plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
+            plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 ? target : -1);
             if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
                 dense_assigned_charge[target_dev_idx] += total_cost;
                 dense_assigned_bytes[target_dev_idx] += weight_bytes;

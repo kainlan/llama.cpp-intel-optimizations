@@ -734,8 +734,9 @@ def claim_h_capability(s):
         cond = enclosing_if_condition(cap, onednn) or ""
         if "phase == moe_route_phase::PROMPT" not in cond or "ggml_sycl_moe_pp_batched_takes_layout(" not in cond:
             fails.append("the ONEDNN_BATCHED_PROMPT branch is not prompt-only and table-derived")
+    # The BF16 direct route's predicate (Task 8g) is the gate's third term; this claim pins the first two.
     gate = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && "
-            "!ggml_sycl_moe_pp_batched_admits_op(op, device)) {")
+            "!ggml_sycl_moe_pp_batched_admits_op(op, device) &&")
     if gate not in s["sycl"]:
         fails.append("MUL_MAT_ID admission does not fall back to ggml_sycl_moe_pp_batched_admits_op")
     admits = one_definition(s["sycl"], "ggml_sycl_moe_pp_batched_admits_op")
@@ -1238,7 +1239,7 @@ MUTANTS = [
      "ggml_sycl_moe_pp_batched_takes_layout("),
     ("h", "sycl", "->ne[1] > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(",
      "ggml_sycl_moe_pp_onednn_batched_claims_tensor("),
-    ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device)) {", ") {"),
+    ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device) &&", " &&"),
     # The widening back, the admission asked for every expert, and the groups sized from the request, not the slot.
     ("i", "sycl", "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;",
      "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(inventory->pp_moe_onednn_weight_slot_bytes, "

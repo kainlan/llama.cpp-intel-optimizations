@@ -1,0 +1,2 @@
+# delivery probe (test-sycl-async-handler-delivery --gpu), B50, binary built at df7da66df, 2026-11-22
+async handler delivery: PASS

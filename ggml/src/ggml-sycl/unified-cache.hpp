@@ -403,8 +403,9 @@ struct placement_entry {
     int64_t            ne[GGML_MAX_DIMS] = {};
     size_t             src_size          = 0;  // AOS source bytes
     size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
-    // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
-    // is the cost, not the placement: kv_device[layer_id] says where that KV lives, which can differ from on_device.
+    // The layer's KV bytes, the sum over the KV slots it executes, on one anchor entry per layer (its attention entry
+    // when it has one) and 0 on the rest. It is the cost, not the placement: kv_device[slot] says where each slot's KV
+    // lives, which can differ from on_device.
     size_t             kv_size           = 0;
     placement_priority priority          = placement_priority::COUNT;  // Sort key
     int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
@@ -583,6 +584,35 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
+// The KV cache slots that the weight layers [first_layer, last_layer] execute, ascending. `layer_phys` maps a slot to
+// the weight layer (`blk.N`) that executes it (placement_kv_info::layer_phys). An empty map is the identity, so the
+// slots are the layer ids themselves.
+inline std::vector<int> kv_slots_of_layers(const std::vector<int32_t> & layer_phys, int first_layer, int last_layer) {
+    std::vector<int> slots;
+    if (layer_phys.empty()) {
+        for (int layer = std::max(first_layer, 0); layer <= last_layer; ++layer) {
+            slots.push_back(layer);
+        }
+        return slots;
+    }
+    for (size_t slot = 0; slot < layer_phys.size(); ++slot) {
+        if (layer_phys[slot] >= first_layer && layer_phys[slot] <= last_layer) {
+            slots.push_back(static_cast<int>(slot));
+        }
+    }
+    return slots;
+}
+
+// True when every KV slot is its own layer: no map, or a map that names each slot's own id.
+inline bool kv_layer_phys_is_identity(const std::vector<int32_t> & layer_phys) {
+    for (size_t slot = 0; slot < layer_phys.size(); ++slot) {
+        if (layer_phys[slot] != static_cast<int32_t>(slot)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
     uint32_t              n_layer      = 0;
@@ -690,6 +720,11 @@ struct placement_kv_info {
     // llama.cpp-8ecj: ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, the key width of each layer's indexer
     // key cache (a second buffer over the layer's cells, K only); empty or 0 where a layer has none.
     std::vector<uint32_t> layer_idx_k_width;
+    // The weight layer (`blk.N`) that executes each KV cache slot, from ggml_sycl_tensor_inventory::kv_layer_phys. A
+    // looped model runs one weight layer for several slots. Empty means every slot is its own layer. Every array above
+    // is indexed by slot. The planner keys KV by slot: a slot's KV lives where the layer that executes it lives, and
+    // the layer is charged for each of its slots.
+    std::vector<int32_t>  layer_phys;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
     // above stays the load's planning shape.
@@ -710,16 +745,16 @@ struct placement_kv_info {
 
     uint32_t n_full_attn_layers() const { return n_layer > n_swa_layers ? n_layer - n_swa_layers : 0; }
 
-    // Returns true if the given layer uses SWA. Falls back to false when
-    // the per-layer mask is not populated.
-    bool is_swa_layer(int layer_id) const {
-        if (layer_id < 0 || swa_layer_mask.empty()) {
+    // Returns true if KV cache slot `slot` uses SWA. Falls back to false when
+    // the per-slot mask is not populated.
+    bool is_swa_layer(int slot) const {
+        if (slot < 0 || swa_layer_mask.empty()) {
             return false;
         }
-        if (static_cast<size_t>(layer_id) >= swa_layer_mask.size()) {
+        if (static_cast<size_t>(slot) >= swa_layer_mask.size()) {
             return false;
         }
-        return swa_layer_mask[layer_id];
+        return swa_layer_mask[slot];
     }
 
     size_t kv_bytes_per_layer() const { return kv_bytes_per_layer(n_ctx); }
@@ -771,21 +806,22 @@ struct placement_kv_info {
     // aggregate split when layer_kind/layer_k_width/layer_v_width are not
     // populated (an inventory built before this ticket, or a homogeneous
     // model that never needed per-layer truth).
-    size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }
+    // The argument is a KV cache slot; a weight layer's total over its slots is kv_bytes_for_phys_layer().
+    size_t kv_bytes_for_layer(uint32_t slot) const { return kv_bytes_for_layer_at(slot, n_ctx); }
 
-    // Layer `il`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries it. The
-    // planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and the
-    // per-layer charge above come from the same rule.
-    size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+    // KV cache slot `slot`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries
+    // it. The planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and
+    // the per-slot charge above come from the same rule.
+    size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const {
         if (!valid() || ctx == 0) {
             return 0;
         }
-        if (has_per_layer_kv_truth(il)) {
-            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,
-                                           n_seq_max, kv_unified, swa_full) +
-                   kv_idx_bytes_for_layer_at(il, ctx);
+        if (has_per_layer_kv_truth(slot)) {
+            return kv_layer_bytes_for_kind(layer_kind[slot], layer_k_width[slot], layer_v_width[slot], ctx, n_swa,
+                                           n_ubatch, n_seq_max, kv_unified, swa_full) +
+                   kv_idx_bytes_for_layer_at(slot, ctx);
         }
-        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
+        return is_swa_layer(static_cast<int>(slot)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
     }
 
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
@@ -806,7 +842,34 @@ struct placement_kv_info {
         const size_t charged    = kv_bytes_for_layer(il);
         return at_context > charged ? at_context - charged : 0;
     }
+
+    // Weight layer `layer_id`'s KV: kv_bytes_for_layer() summed over the slots it executes. It is that one slot's
+    // bytes when every slot is its own layer.
+    size_t kv_bytes_for_phys_layer(int layer_id) const {
+        size_t bytes = 0;
+        for (const int slot : kv_slots_of_layers(layer_phys, layer_id, layer_id)) {
+            bytes += kv_bytes_for_layer(static_cast<uint32_t>(slot));
+        }
+        return bytes;
+    }
 };
+
+// The slot-to-layer map the planner keeps, from the one an inventory carries (its kv_layer_phys).
+// The map is accepted only when it has one entry per KV slot (kv_layer_phys_count == kv_layer_count) and every entry is
+// a weight layer id, in [0, kv_layer_count). A count of 0 is no map; a nonzero count with a null map is refused like a
+// count mismatch. An identity map is kept empty, so a model whose slots are its layers plans exactly as it did with no
+// map. A refused map is also kept empty, and the fields after `refused` say why.
+struct placement_kv_layer_phys_intake {
+    std::vector<int32_t> layer_phys;                   // empty: every slot is its own layer
+    bool                 refused             = false;  // a map was given and does not fit the inventory
+    bool                 map_missing         = false;  // a slot count was given with a null map
+    uint32_t             kv_layer_phys_count = 0;      // the inventory's kv_layer_phys_count
+    uint32_t             kv_layer_count      = 0;      // the inventory's kv_layer_count
+    int                  bad_slot            = -1;     // the first slot whose entry is not a weight layer id, else -1
+    int                  bad_layer           = -1;     // that slot's entry
+};
+
+placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory(const ggml_sycl_tensor_inventory & inventory);
 
 struct moe_mmid_owner_workspace_plan {
     int                         owner_device = -1;
@@ -984,6 +1047,9 @@ struct placement_plan {
     std::vector<uint32_t>                      layer_v_width;
     // llama.cpp-8ecj: mirrors placement_kv_info::layer_idx_k_width, the indexer key cache's width per layer.
     std::vector<uint32_t>                      layer_idx_k_width;
+    // Mirrors placement_kv_info::layer_phys: the weight layer that executes each KV slot, empty when every slot is its
+    // own layer. The arrays above are indexed by slot.
+    std::vector<int32_t>                       layer_phys;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
@@ -1167,8 +1233,8 @@ struct placement_plan {
     // Use lookup_expert_placement(layer, expert, role) for planner decisions.
     std::unordered_map<int, std::unordered_map<int, int>> expert_device;
 
-    // kv_location[layer_id] = device_id for KV cache co-location.
-    // KV cache for a layer lives on the same device as its dense weights.
+    // kv_device[slot] = device_id (-1 = host tier) of each KV cache slot. A slot's KV lives on the device of the weight
+    // layer that executes it (layer_phys), so a looped model's later slots go where their layer's weights are.
     std::unordered_map<int, int> kv_device;
 
     // kv_device as the load-time planner left it, captured by the first
@@ -1183,8 +1249,8 @@ struct placement_plan {
     // layer's shared dense weights; MoE experts remain separately placeable.
     std::unordered_map<int, int> layer_device;
 
-    int get_kv_device(int layer_id) const {
-        auto it = kv_device.find(layer_id);
+    int get_kv_device(int slot) const {
+        auto it = kv_device.find(slot);
         return it == kv_device.end() ? -1 : it->second;
     }
 
@@ -1193,17 +1259,25 @@ struct placement_plan {
         return it == layer_device.end() ? -1 : it->second;
     }
 
-    // The KV owner of layers [start_layer, end_layer] (-2 = mixed, -1 =
-    // none), from the same per-layer KV bytes every other consumer sizes from.
-    int layer_range_kv_device(int start_layer, int end_layer) const {
-        const size_t        n_layers = end_layer >= 0 ? static_cast<size_t>(end_layer) + 1 : 0;
-        std::vector<int>    owners(n_layers, -1);
-        std::vector<size_t> bytes(n_layers, 0);  // 0: layers before start_layer do not vote
-        for (size_t l = static_cast<size_t>(std::max(start_layer, 0)); l < n_layers; ++l) {
-            owners[l] = get_kv_device(static_cast<int>(l));
-            bytes[l]  = kv_size_for_layer(static_cast<uint32_t>(l));
+    // Weight layer `layer_id`'s KV: kv_size_for_layer() summed over the slots it executes.
+    size_t kv_size_for_phys_layer(int layer_id) const {
+        size_t bytes = 0;
+        for (const int slot : kv_slots_of_layers(layer_phys, layer_id, layer_id)) {
+            bytes += kv_size_for_layer(static_cast<uint32_t>(slot));
         }
-        return layer_block_kv_device(owners, bytes, start_layer, end_layer);
+        return bytes;
+    }
+
+    // The KV owner of weight layers [start_layer, end_layer] (-2 = mixed, -1 = none): the owners of every slot those
+    // layers execute, from the same per-slot KV bytes every other consumer sizes from. A slot with no KV does not vote.
+    int layer_range_kv_device(int start_layer, int end_layer) const {
+        std::vector<int>    owners;
+        std::vector<size_t> bytes;
+        for (const int slot : kv_slots_of_layers(layer_phys, start_layer, end_layer)) {
+            owners.push_back(get_kv_device(slot));
+            bytes.push_back(kv_size_for_layer(static_cast<uint32_t>(slot)));
+        }
+        return layer_block_kv_device(owners, bytes, 0, static_cast<int>(owners.size()) - 1);
     }
 
     // Sum of KV bytes placed on `device` -- the KV the runtime-context
@@ -1239,7 +1313,8 @@ struct placement_plan {
         return layer_id < layer_kind.size() && layer_id < layer_k_width.size() && layer_id < layer_v_width.size();
     }
 
-    size_t kv_size_for_layer(uint32_t layer_id) const {
+    // The argument is a KV cache slot; a weight layer's total over its slots is kv_size_for_phys_layer().
+    size_t kv_size_for_layer(uint32_t slot) const {
         // llama.cpp-3aos: prefer the per-layer truth (kind + width) copied
         // in from placement_kv_info at plan-build time -- see
         // kv_layer_bytes_for_kind() for why the uniform split below is
@@ -1249,35 +1324,34 @@ struct placement_plan {
         // by update_runtime_kv_sizes() and the transaction body that sets
         // the last three), so this stays correct across a runtime context
         // update without re-deriving anything from kv_info.
-        if (has_per_layer_kv_truth(layer_id)) {
-            return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],
-                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,
-                                           planner_kv_unified, planner_swa_full) +
-                   kv_idx_size_for_layer(layer_id);
+        if (has_per_layer_kv_truth(slot)) {
+            return kv_layer_bytes_for_kind(layer_kind[slot], layer_k_width[slot], layer_v_width[slot], planner_n_ctx,
+                                           planner_n_swa, planner_n_ubatch, planner_n_seq_max, planner_kv_unified,
+                                           planner_swa_full) +
+                   kv_idx_size_for_layer(slot);
         }
         // Fallback: legacy uniform-per-class split (no per-layer truth populated).
-        if (kv_per_swa_layer > 0 && layer_id < swa_layer_mask.size() && swa_layer_mask[layer_id]) {
+        if (kv_per_swa_layer > 0 && slot < swa_layer_mask.size() && swa_layer_mask[slot]) {
             return kv_per_swa_layer;
         }
         return kv_per_layer;
     }
 
-    // The layer's indexer keys (llama.cpp-8ecj): part of kv_size_for_layer(), the layer's KV every budget charges;
+    // The slot's indexer keys (llama.cpp-8ecj): part of kv_size_for_layer(), the slot's KV every budget charges;
     // kv_tier_manager::configure_from_plan() sizes the indexer buffer from it alone.
-    size_t kv_idx_size_for_layer(uint32_t layer_id) const {
-        const uint32_t width = layer_id < layer_idx_k_width.size() ? layer_idx_k_width[layer_id] : 0;
-        if (width == 0 || !has_per_layer_kv_truth(layer_id)) {
+    size_t kv_idx_size_for_layer(uint32_t slot) const {
+        const uint32_t width = slot < layer_idx_k_width.size() ? layer_idx_k_width[slot] : 0;
+        if (width == 0 || !has_per_layer_kv_truth(slot)) {
             return 0;
         }
-        return kv_layer_bytes_for_kind(layer_kind[layer_id], width, 0, planner_n_ctx, planner_n_swa, planner_n_ubatch,
+        return kv_layer_bytes_for_kind(layer_kind[slot], width, 0, planner_n_ctx, planner_n_swa, planner_n_ubatch,
                                        planner_n_seq_max, planner_kv_unified, planner_swa_full);
     }
 
-    // The layer's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
-    size_t kv_main_size_for_layer(uint32_t layer_id) const {
-        return kv_size_for_layer(layer_id) - kv_idx_size_for_layer(layer_id);
-    }
+    // The slot's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
+    size_t kv_main_size_for_layer(uint32_t slot) const { return kv_size_for_layer(slot) - kv_idx_size_for_layer(slot); }
 
+    // The number of KV cache slots (a looped model has more slots than weight layers).
     size_t kv_layer_count() const {
         size_t n = swa_layer_mask.size();
         for (const auto & [layer_id, _] : kv_device) {
@@ -1863,19 +1937,22 @@ struct moe_mmid_queue_binding {
     moe_mmid_queue_capability capability; // copied into authority construction when present
 };
 
+// `refusal`, when given, names the condition behind an INVALID or ALLOCATION_FAILED status (NONE otherwise).
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token,
-    uint64_t plan_identity,
-    const placement_plan & plan,
-    int submit_device,
-    const std::vector<moe_mmid_queue_binding> & bindings) noexcept;
+    const moe_mmid_model_token &                token,
+    uint64_t                                    plan_identity,
+    const placement_plan &                      plan,
+    int                                         submit_device,
+    const std::vector<moe_mmid_queue_binding> & bindings,
+    moe_mmid_materialize_refusal *              refusal = nullptr) noexcept;
 // Authoritative construction: the materialized pools retain this exact plan
 // snapshot and private capabilities minted from the exact queue objects.
 moe_mmid_materialize_status unified_cache_materialize_moe_mmid_workspaces(
-    const moe_mmid_model_token & token,
+    const moe_mmid_model_token &                           token,
     const std::shared_ptr<const lifecycle_plan_snapshot> & plan,
-    int submit_device,
-    const std::vector<moe_mmid_queue_binding> & bindings) noexcept;
+    int                                                    submit_device,
+    const std::vector<moe_mmid_queue_binding> &            bindings,
+    moe_mmid_materialize_refusal *                         refusal = nullptr) noexcept;
 moe_mmid_registry_lease_result unified_cache_acquire_moe_mmid_workspace(
     const moe_mmid_model_token & token,
     uint64_t plan_identity,
@@ -1894,6 +1971,13 @@ size_t unified_cache_recover_moe_mmid_workspaces(const moe_mmid_model_token & to
                                                   uint64_t plan_identity, bool wait) noexcept;
 bool unified_cache_retire_moe_mmid_workspaces(const moe_mmid_model_token & token,
                                                uint64_t plan_identity = 0) noexcept;
+// moe_mmid_reconcile_live_plan() on the cache's registry; the caller holds g_tensor_inventory_mutex.
+moe_mmid_reconcile_outcome unified_cache_reconcile_moe_mmid_workspaces(
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    const moe_mmid_follows_fn &                            follows) noexcept;
 size_t unified_cache_moe_mmid_context_count_for_test() noexcept;
 
 // Immutable lifecycle-owned plan snapshots. A null plan with
@@ -1998,6 +2082,11 @@ void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) n
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
+// Whether two plans plan the same MMID workspaces: the one answer to "can the pools materialized for `a` serve `b`".
+// It compares the plan-level validity, and per owner the device, depth, validity, secondary role, pool bytes and
+// the whole slot geometry (moe_mmid_same_workspace_geometry). The runtime transaction's stable_mmid, the plan CAS's
+// in-place rebind, the context bind's reconcile and the expert loan's assert all ask it.
+bool   moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
 #endif
@@ -2140,10 +2229,10 @@ bool     unified_cache_planned_dense_scratch_owner_rejected(int                 
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
 // llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
 // zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
-// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
-// It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
-// -c and -ub), so it is the planned term for that shape, not for every context. moua L6 retires it into the
-// FIRST_CONTEXT head slot.
+// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack. It
+// is measured at the load's requested context (-c via the n_ctx hint, else the padded training context) and ubatch 512;
+// -ub does not reach the measures (the load reads it only as the ring's n_ubatch hint; fkpg). So it is the planned term
+// for that shape, not for every context. moua L6 retires it into the FIRST_CONTEXT head slot.
 // Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
 // that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
 // term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
@@ -5287,6 +5376,10 @@ class unified_cache {
     }
 
     sycl::queue &                queue_;
+    // queue_'s device as ggml_sycl_get_device_id_from_queue numbers it (the numbering the counter dump and the raw
+    // exit share), resolved once at construction. The exit path passes this instead of looking the device up: it
+    // runs in static destruction, after dpct::dev_mgr, a function-local static built during main, is gone.
+    const int                    device_id_;
     sycl::queue *                compute_queue_ = nullptr;  // Inference compute queue (for deferred free barriers)
     std::unique_ptr<sycl::queue> dma_queue_;                // Separate in-order queue for cache DMA ops (CCS)
     std::unique_ptr<sycl::queue> bcs_queue_;                // Copy-only queue targeting BCS engine (ordinal 1)
@@ -6883,15 +6976,42 @@ struct alloc_intent {
     int               site_line = __builtin_LINE();
 };
 
+// Why unified_alloc()'s host-pinned pool path handed out no pointer.
+enum class host_zone_alloc_miss : uint8_t {
+    NONE,                  // no miss on the pinned pool path (or the request never took it)
+    ZONES_NOT_CONFIGURED,  // no zones yet, and the unzoned pinned pool had no room
+    OVER_NO_GROWTH_BOUND,  // a request that may not grow the zone would fill it past host_zone_no_growth_bound()
+    NO_CONTIGUOUS_BLOCK,   // within that bound, but no chunk of the zone has the room, and the request may not grow it
+    GROWTH_FAILED,         // no chunk had the room, and growing the zone for it failed
+};
+
+// Stable, distinct, never-null name for logs.
+const char * host_zone_alloc_miss_name(host_zone_alloc_miss miss) noexcept;
+
+// How full a request that may not grow its host zone (alloc_constraints::forbid_host_zone_growth) may bring the zone,
+// given the zone's planned reservation and its current capacity; 0 means no bound. The reservation is the planner's
+// room for the tenants it sized. That holds for STAGING, SCRATCH and KV, so their bound is the reservation even after
+// a growth-allowed request grew them. WEIGHT also holds tenants no plan sizes, the host weights the model load places
+// through the SYCL host buffer type, and the load grows the zone for them by design; its used bytes then exceed the
+// reservation while the zone has room, so its bound is its capacity, and the request still never grows it.
+size_t host_zone_no_growth_bound(host_zone_id zone, size_t reserved, size_t capacity) noexcept;
+
+// The MMID workspace refusal that names the host-zone condition the host pool's allocation missed on;
+// HOST_POOL_ALLOCATION_FAILED for a miss with no condition.
+moe_mmid_materialize_refusal moe_mmid_host_pool_refusal(host_zone_alloc_miss miss) noexcept;
+
 struct alloc_request {
-    sycl::queue * queue                = nullptr;
-    int           device               = -1;
-    size_t        size                 = 0;
-    size_t        alignment            = 0;  // 0 = allocator default; otherwise power-of-two
-    bool          suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
-    alloc_intent  intent;
-    const char *  site_file            = __builtin_FILE();
-    int           site_line            = __builtin_LINE();
+    sycl::queue *          queue                = nullptr;
+    int                    device               = -1;
+    size_t                 size                 = 0;
+    size_t                 alignment            = 0;      // 0 = allocator default; otherwise power-of-two
+    bool                   suppress_failure_log = false;  // Caller handles nullptr locally (e.g. back-pressure/reuse).
+    alloc_intent           intent;
+    // Optional: where unified_alloc() writes why its host-pinned pool path handed out no pointer (NONE otherwise),
+    // for a caller that names the condition in its own refusal.
+    host_zone_alloc_miss * host_zone_miss = nullptr;
+    const char *           site_file      = __builtin_FILE();
+    int                    site_line      = __builtin_LINE();
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,

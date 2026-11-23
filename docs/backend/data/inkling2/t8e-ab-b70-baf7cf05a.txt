@@ -1,0 +1,58 @@
+=== A profile merged
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+== inkling PROFILE run (-n 24, env: GGML_SYCL_E2E_TG_PROFILE=1), level_zero:0  2026-11-22T22:39:35-05:00  shmem=11GB
+  rc=0  err lines: 9454  SPLIT headers: 0
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.52.920.788 I common_perf_print:        load time =   44791.79 ms
+0.52.920.788 I common_perf_print: prompt eval time =     922.17 ms /    14 tokens (   65.87 ms per token,    15.18 tokens per second)
+0.52.920.789 I common_perf_print:        eval time =    6017.55 ms /    23 runs   (  261.63 ms per token,     3.82 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:40:41-05:00
+lock released
+=== B ABBA 8b-tree vs merged
+host: load average: 15.56, 13.69, 11.05  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+arm a: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=0f4060d0f tracked-changes=0 lib-newer-than-source=yes
+arm b: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 lib-newer-than-source=yes
+arm b2: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 lib-newer-than-source=yes
+arm a2: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=0f4060d0f tracked-changes=0 lib-newer-than-source=yes
+lock wait: 0s
+== arm a  2026-11-22T22:40:44-05:00  shmem=11GB  load=15.27
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 20859  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a pp512 avg=34.18 t/s stddev=0.00 samples=[34.18]
+  RESULT a tg128 avg=4.27 t/s stddev=0.00 samples=[4.27]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== arm b  2026-11-22T22:42:38-05:00  shmem=11GB  load=13.74
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 14773  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b pp512 avg=43.17 t/s stddev=0.00 samples=[43.17]
+  RESULT b tg128 avg=4.33 t/s stddev=0.00 samples=[4.33]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== arm b2  2026-11-22T22:44:27-05:00  shmem=11GB  load=12.07
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 14773  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b2 pp512 avg=42.98 t/s stddev=0.00 samples=[42.98]
+  RESULT b2 tg128 avg=4.27 t/s stddev=0.00 samples=[4.27]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== arm a2  2026-11-22T22:46:18-05:00  shmem=11GB  load=10.28
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 20859  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a2 pp512 avg=41.12 t/s stddev=0.00 samples=[41.12]
+  RESULT a2 tg128 avg=4.54 t/s stddev=0.00 samples=[4.54]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:48:09-05:00
+lock released
+=== END 2026-11-22T22:48:09-05:00

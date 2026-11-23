@@ -51,6 +51,9 @@ History and measurements: `docs/backend/sycl-host-safety.md`.
 - `GPU.lock` serialises access, not memory recovery. After you take it and before you touch the device, wait for
   `Shmem < 30 GB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on `Shmem` only:
   `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling 2026-11-12).
+- Take `GPU.lock` and `BUILD.lock` with `sycl_lock_take` from `scripts/sycl-lock.sh`, never with plain `mkdir`:
+  the system `mkdir` here checks, then creates, and exits 0 when the directory appears in between, so two takers
+  that arrive together can both win (measured 2026-11-21).
 - Run every GPT-OSS test under `timeout`, so a hang cannot hold the card. `timeout 60` covers a short 20B run;
   a bench or a default-context run needs more (`scripts/sycl-canonical-gates.sh` uses 900).
 - `dmesg` is denied for this user. Read the kernel log with

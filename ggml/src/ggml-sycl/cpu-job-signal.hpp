@@ -713,16 +713,20 @@ inline void cpu_job_input_marker_abandon(cpu_job_input_marker_word & w) {
     }
 }
 
-// Returns once cpu_job_input_marker_seen(m). On the pool worker: it never sleeps, and its wait takes no lock and makes
-// no driver call. The one exception is the slow report, at most once per wait: the word's slow logs through the log
-// callback, which takes the log's lock. The wait does not tick the SYCL watchdog either, so a marker that never
-// arrives shows as the watchdog firing, and as that one call of the word's slow once the wait has yielded for its
-// slow_after.
-inline void cpu_job_input_marker_wait(const cpu_job_input_marker & m) {
+// Returns once cpu_job_input_marker_seen(m), or once *let_go is set: the caller of a job that may be let go before its
+// inputs land (a mixed direct node's host leg, dropped as its quarantine ends) tells the two apart by reading the flag.
+// On the pool worker: it never sleeps, and its wait takes no lock and makes no driver call. The one exception is the
+// slow report, at most once per wait: the word's slow logs through the log callback, which takes the log's lock. The
+// wait does not tick the SYCL watchdog either, so a marker that never arrives shows as the watchdog firing, and as that
+// one call of the word's slow once the wait has yielded for its slow_after.
+inline void cpu_job_input_marker_wait(const cpu_job_input_marker & m, const std::atomic<bool> * let_go = nullptr) {
     uint32_t                              spins = 0;
     bool                                  told  = false;
     std::chrono::steady_clock::time_point since;
     while (!cpu_job_input_marker_seen(m)) {
+        if (let_go && let_go->load(std::memory_order_acquire)) {
+            return;
+        }
         if (spins < cpu_job_input_marker_pause_spins) {
             ++spins;
             cpu_job_input_marker_pause();

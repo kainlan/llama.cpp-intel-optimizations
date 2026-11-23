@@ -27,7 +27,7 @@ that covers:
 |---|---|
 | Dense weights (each layer) | `entries[]`, `layer_device` |
 | MoE experts | `entries[]`, `expert_device` |
-| KV cache (per layer) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes` |
+| KV cache (per slot, where the layer that executes the slot lives) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes`, `layer_phys` |
 | oneDNN reorder scratch | `onednn_reorder_bytes` → Zone: SCRATCH |
 | oneDNN scratchpad | `onednn_scratchpad_bytes` → Zone: ONEDNN |
 | MoE Q8 workspace | `moe_q8_workspace_bytes` → Zone: SCRATCH |
@@ -627,9 +627,11 @@ the normal exit plus 15 early ones. Thirteen of those 15 compute and therefore
 acquire; they are the defect. The remaining two are the persistent-TG returns,
 which never call `compute_impl_unlocked()` and so never acquire.)
 
-The invocation is acquired inside `ggml_backend_sycl_graph_compute_impl()` at
-its entry (`ggml_sycl_execution_begin_graph`), i.e. on *every* call that reaches
-`compute_impl_unlocked()`. The matching
+The invocation is begun by a dispatch scope (`ggml_sycl_execution_dispatch_scope`,
+§12.3). `ggml_backend_sycl_graph_compute_impl()` opens one at its entry, so
+*every* call that reaches `compute_impl_unlocked()` begins one. The keyed and
+whole-split segment record and replay and the block graphlets dispatch nodes
+without `compute_impl` and open their own scopes. The matching
 `ggml_sycl_execution_submit_graph()` / `ggml_sycl_execution_release_graph()`
 pair exists only on the function's **normal** exit. Thirteen bypass paths inside
 `ggml_backend_sycl_graph_compute_unchecked()` call `compute_impl_unlocked()`
@@ -772,7 +774,9 @@ forms above with the understanding that they are scheduled for replacement.
 - The `mem_handle::device()` value is authoritative for which cache instance to
   query. Dispatch must not assume handles from different devices are interchangeable.
 - Multi-GPU layout: `layer_device` maps dense layers, `expert_device` maps MoE
-  experts. KV cache co-locates with the dense weights of each layer (`kv_device`).
+  experts. Each KV cache slot co-locates with the dense weights of the layer that executes it (`kv_device`, keyed
+  by slot). A looped model runs one weight layer for several slots (`layer_phys`, the slot-to-layer map libllama
+  names in the inventory; empty when every slot is its own layer), and the layer is charged for each of its slots.
 
 ### 7.3 Multi-context / Multi-server slot
 
@@ -1436,6 +1440,46 @@ logical index, the one bound `ContextId`/`GraphEpoch`, and `InvocationId` for
 every aggregate device so same/multi-device behavior is asserted, not inferred
 from the selector.
 
+**Who begins an invocation: the dispatch scope.**
+`ggml_sycl_execution_dispatch_scope` (`ggml-sycl.cpp`) is the only path to
+`ggml_sycl_execution_begin_graph`. Its constructor runs
+`ggml_sycl_execution_begin_dispatch_graph`, which begins this backend's tracked
+graph or joins the one it already holds OPEN/SEALED. On a refusal it throws if
+the context is armed for tracked execution, and an unarmed context runs
+untracked.
+
+Who opens a scope:
+- `ggml_backend_sycl_graph_compute_impl`;
+- each path that dispatches nodes without it: `moe_graph_record_segment_slot`,
+  `moe_graph_replay_segment_slot`, `moe_graph_record_segments`,
+  `moe_graph_replay_segments` and `moe_graph_try_block_graphlets`.
+
+Scopes nest when such a path falls back to `compute_impl`.
+`ctx->execution_dispatch_depth` counts the open scopes under
+`ctx->execution_state_mutex`. Only the scope that brings the count to zero ends
+the graph: it seals on a normal exit and quarantines
+(`registry.abort_invocation`) when an exception leaves it. An inner scope ends
+nothing. Submit and release stay where they were, at graph_compute's exit and
+in `ggml_backend_sycl_synchronize`, plus the entry drain in
+`graph_compute_unchecked` (`ggml_sycl_execution_drain_own_terminal`), which
+releases a terminal this backend left submitted before it takes L2.
+
+The tripwire: a graph that is submitted, released, quarantined, cleared or
+unbound while a scope still holds it open logs one `[EXECUTION-TRIPWIRE]` line
+at ERROR per invocation. The line carries the action, the caller's site, the
+device, the context, the graph epoch, the invocation and the depth. The decision
+is taken under `execution_state_mutex`; an unbind takes it under
+`g_execution_backend_binding_mutex` as well. The line is logged after every lock
+is released.
+
+The rule for a new dispatch path: a function that graph_compute reaches and that
+dispatches a node opens a scope. A dispatch is a call to `compute_forward`, to
+the direct-node helper, or to an op entry point. The function declares the scope
+in its outermost block, before its first dispatch, with only named statements
+before it. `tests/test-sycl-execution-abort-source.py` holds that census: its
+`PRE_SCOPE_CALLS` lists the named statements and its `DISPATCH_EXEMPT` lists the
+exemptions, each with a reason.
+
 ### 12.4 Owner-targeted reset, graph invalidation, and teardown
 
 Every reset/clear/free operation must take an explicit owner tuple and match it:
@@ -1466,9 +1510,9 @@ The target lock inventory and mandatory order is concrete:
 |---|---|---|
 | L1 | planned `lifecycle_registry_mutex`; current `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
-| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
-| L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()` | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex`, the placement-plan publication lock `g_lifecycle_plan_mutex` (`unified-cache.cpp`) | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
+| L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, the MoE MMID workspace registry's `moe_mmid_workspace_registry::state::mutex` (`moe-mmid-workspace.cpp`) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
+| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the MMID workspace pools' `registry_pool_state::mutex` and `moe_mmid_workspace_pool::state::mutex` (`moe-mmid-workspace.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1536,6 +1580,167 @@ mutex while waiting; their callers hold no other listed lock.
 records whether its thread holds the store mutex (`retained_store_mutex_held()`,
 a `GGML_SYCL_PRIVATE_TESTING` witness kept by the mutex's one lock type,
 `retained_store_lock`), and the run fails if any did.
+
+`g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the staged, probe and
+published placement-plan snapshots. It is **L3**. The runtime context
+transaction, the expert loan and refill transactions, plan activation,
+republication and owner teardown take it under the L1 `g_tensor_inventory_mutex`.
+Load begin and end, the load-time measure and unload take it under no listed
+lock. The bound-load-candidate reads behind `global_placement_plan_owner()` and
+`acquire_bound_load_effect()` take it only on a thread bound to a load. The cache
+functions take that effect before their own cache locks. Under it,
+`lifecycle_replace_placement_plan` calls the MMID registry's `replace_plan`,
+which takes the registry mutex and then the pool mutexes. A snapshot it drops
+holds a plain-data plan, so that destructor takes no lock. MUL_MAT_ID's
+republication into an empty snapshot also takes it under graph compute's L2 and
+L3 locks: see the graph-compute bullet below.
+
+The MMID workspace registry's `moe_mmid_workspace_registry::state::mutex`
+(`moe-mmid-workspace.cpp`, one process registry) is **L4**. It cannot take L3 or a
+lower-numbered rank, because two kinds of site take it while holding an L3 lock.
+
+- `ggml_sycl_mul_mat_id`'s exact-queue lookup, admission and quarantine recovery
+  run under `g_sycl_graph_compute_mutex` and `sycl_ctx->graph_mutex`.
+- The plan replacement above holds `g_lifecycle_plan_mutex`.
+
+It is also taken under L1 alone, by the context bind's follows question and
+reconcile and by the runtime transaction's materialization and retire. Load end,
+unload and the bind's own retire take it under no listed lock. Under it, each
+context's pool mutexes are taken in ascending owner-device order. No L1-L4 lock
+is taken under it. A context the registry removes can hold its pools' last
+owners. `retire` and `recover_quarantined` move the removed contexts into a
+holder declared before the mutex, and `replace_plan`'s prepared replacement
+does the same with the context it displaces. So the decision is made under the
+mutex and the release runs after it. `replace_plan` hands the displaced context
+to its caller, and `lifecycle_replace_placement_plan` holds it from before
+`g_lifecycle_plan_mutex`, so it is released after that lock too.
+`test-moe-mmid-workspace-plan`'s registry lock probe gates the registry half:
+a pool blob's destructor asks a second thread to read the registry and fails the
+run if that read cannot finish. `sycl-mmid-deferral-contract` pins the plan
+replacement's holder.
+
+The pool mutexes (`registry_pool_state::mutex`, and the standalone
+`moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
+take no listed lock themselves.
+
+Five existing paths still break this section's rules under these locks. All five
+are known non-conformances, not exemptions.
+
+- **Graph compute takes L1 under L2 and L3.** The into-empty republication
+  is the site that carries further locks with it.
+  `ggml_sycl_republish_current_plan_into_empty` takes `g_tensor_inventory_mutex`
+  (L1) and then `g_lifecycle_plan_mutex`. Two sites call it while graph compute
+  holds `g_sycl_graph_compute_mutex` (L2) and `sycl_ctx->graph_mutex` (L3): the
+  route-cache block of `ggml_sycl_mul_mat_id`, and
+  `ggml_sycl_ensure_moe_secondary_queues_for_plan`. That is a lower rank taken
+  under a higher one. The plan mutex, the registry mutex and the pool mutexes
+  taken under it inherit the inversion on this path.
+  - The secondary-queue setup also reaches it under its function-local
+    `static std::mutex init_mutex`. That lock is unranked, taken under L2 and
+    L3, and itself takes L1.
+  - The layer map takes L1 under a second unranked lock. Both
+    `ggml_backend_sycl_graph_compute_impl` and `should_dispatch_to_cpu` take the
+    file-static `g_layer_map_mutex` and, under it, call `build_layer_device_map`,
+    which takes L1. Like `init_mutex`, that lock is taken under L3 and itself
+    takes L1. It is never taken under L1. Its other acquisitions are
+    `should_dispatch_to_cpu`'s per-layer classification and
+    `ggml_sycl_reset_layer_map_state`. The reset runs from
+    `ggml_sycl_reset_model_load_scratch_state` after that function's L1 block
+    has closed.
+  - The data-pointer slow path (`ggml_sycl_get_data_ptr_slow` to
+    `get_cached_tensor_ptr`) takes L1 from graph compute for an index lookup and
+    takes nothing under it. Two other callers of `get_cached_tensor_ptr` run
+    under graph compute: `ggml_sycl_ensure_weight_on_device` (its tiered-cache
+    fallback) and `graph_prestage_leaf_tensors`.
+  - The budget log takes L1 for reads. After the first warmup,
+    `ggml_backend_sycl_graph_compute_unchecked` calls
+    `unified_cache_log_budget_summary`. That calls `ggml_sycl_get_model_size` and
+    `ggml_sycl_get_moe_info`, and each takes L1.
+  - On the `compute_impl_unlocked` path, graph compute releases
+    `g_sycl_graph_compute_mutex` (L2) before it computes. `sycl_ctx->graph_mutex`
+    (L3) stays held for the whole of
+    `ggml_backend_sycl_graph_compute_unchecked`. On that path every site in this
+    bullet takes L1 under L3 alone.
+  - The ranks above (plan mutex L3, registry mutex L4, pool mutexes L5) hold on
+    every other path.
+  - No rank removes the inversion. At L3 the plan mutex is a global co-held with
+    the keyed L3 `sycl_ctx->graph_mutex`. At L4 the registry mutex it holds
+    would move to L5, co-held with the pool mutexes and the free path's L5
+    locks. At L5 the registry mutex has no rank left. The cause is L1 taken
+    under L2 and L3, which no rank below L1 can repair.
+  - Moving the republication to a graph boundary, as the expert loan does, is
+    owed work.
+  - **No holder of L1 acquires L2 or L3, so the inversion cannot close a cycle
+    today.** No holder of L1 acquires either unranked lock above. Searched on
+    2026-11-22: every `lock_guard`, `unique_lock` or `scoped_lock` on
+    `g_tensor_inventory_mutex` in `ggml/src/ggml-sycl`, each walked five call
+    levels deep, matching callees by name. The search looked for these:
+    - an acquisition of `g_sycl_graph_compute_mutex`, `sycl_ctx->graph_mutex`,
+      `g_layer_map_mutex` or `init_mutex`;
+    - a call to a function that takes `g_layer_map_mutex` or `init_mutex`;
+    - a call to the into-empty republication;
+    - a backend `graph_compute` entry;
+    - a read of the graph in-flight counter;
+    - a synchronize call;
+    - an event or condition wait.
+    L2 and L3 are taken only in `ggml_backend_sycl_graph_compute_unchecked`, and
+    none of those walks reaches it. The waits reached under L1 wait for one of
+    three things: submitted device work, the retained-handle drain worker
+    (which takes only the store mutex), or CPU expert-pool job gates. No
+    `host_task` body (25 sites) and no CPU-job or host-attention source
+    (`cpu-*`, `attn-host-*`) reaches a function that takes L1. The one path
+    from `cpu-dispatch.cpp` into L1 is the retained flush, and it runs on the
+    graph thread.
+
+- The runtime context transaction (`ggml_sycl_run_runtime_context_transaction`)
+  runs the plan replacement and its MMID retire under L1
+  `g_tensor_inventory_mutex`. A displaced or retired context that holds its
+  pools' last owners is released when those calls return, after the registry
+  and plan mutexes but still under L1. The final `mem_handle` destructors then
+  take the free path's L5 locks under L1. Moving the release past L1 would put
+  it after the plan claims that the transaction makes under the same hold
+  (`ggml_sycl_mmq_src1_claim_plan`, `ggml_sycl_moe_host_scatter_claim_plan`).
+  Those claims allocate, and they now run after the old pools are freed. The
+  order is therefore kept.
+- A slot's quarantine release (`recover_quarantined`, and a registry lease's
+  terminal release) resets the slot's graph retention record and admission
+  authority under the pool mutex. When that reset drops the last owner, the
+  final destructors run under a listed lock.
+- `recover_quarantined(wait=true)` waits on a queue-quiescence proof under the
+  registry and pool mutexes.
+- **A bypass dispatch path that is refused DEVICE_BUSY drains another
+  context's terminal events under L2 and L3.** The keyed and whole-split
+  segment record and replay and the block graphlets
+  (`moe_graph_record_segment_slot`, `moe_graph_replay_segment_slot`,
+  `moe_graph_record_segments`, `moe_graph_replay_segments`,
+  `moe_graph_try_block_graphlets`) dispatch nodes without
+  `ggml_backend_sycl_graph_compute_impl`, so each opens its own
+  `ggml_sycl_execution_dispatch_scope`. `graph_compute_unchecked` keeps
+  `g_sycl_graph_compute_mutex` (L2) and `sycl_ctx->graph_mutex` (L3) for the
+  whole of these paths. It drops L2 from the first `compute_impl_unlocked`
+  call on and does not take it back, so `compute_impl`'s own scope usually
+  begins under L3 alone; the two direct `compute_impl()` calls keep L2. When
+  a bypass path's begin is refused DEVICE_BUSY,
+  `ggml_sycl_execution_begin_dispatch_graph`
+  drains the owning context's terminal events and retries once, and that wait
+  runs under both locks.
+  - The wait is on device events that were already submitted, and nothing it
+    waits for needs L2.
+  - This context's own terminal is not part of the exception:
+    `graph_compute_unchecked` drains it before it takes L2
+    (`ggml_sycl_execution_drain_own_terminal`), so the begin under the locks
+    finds nothing of its own to wait for.
+    `tests/test-sycl-execution-abort-source.py` pins that order.
+  - What would remove it: open the outermost dispatch scope in
+    `graph_compute_unchecked` before L2 is taken, with the six scopes below
+    nesting under it. A nested scope joins the graph that is already open and
+    never reaches the retry.
+  - A bypass decode now claims the device in the lifecycle registry
+    (`device_owners_`), which it did not do before. A decode split that ran only
+    keyed segment slots used to begin no invocation. Its scope now begins one,
+    which claims the device for this context until the next synchronize
+    releases it, as a `compute_impl` split always has. Another context's begin
+    on that device in between is refused DEVICE_BUSY.
 
 The zone-reset escape audit's `zone_audit_state::mutex` (`unified-cache.cpp`,
 `iiff` Phase 0) guards the per-site inventory the `GGML_SYCL_ZONE_RESET_AUDIT`

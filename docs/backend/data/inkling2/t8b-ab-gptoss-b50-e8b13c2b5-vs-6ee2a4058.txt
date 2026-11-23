@@ -1,0 +1,38 @@
+host: load average: 5.17, 7.31, 8.44  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+arm a1: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=e8b13c2b5 tracked-changes=0 lib-newer-than-source=yes
+arm b1: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 lib-newer-than-source=yes
+arm b2: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 lib-newer-than-source=yes
+arm a2: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=e8b13c2b5 tracked-changes=0 lib-newer-than-source=yes
+lock wait: 0s
+== arm a1  2026-11-22T18:21:48-05:00  shmem=11GB  load=5.17
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 5019  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a1 pp512 avg=553.74 t/s stddev=5.84 samples=[551.00 549.76 560.44]
+  RESULT a1 tg128 avg=35.10 t/s stddev=0.19 samples=[34.91 35.30 35.10]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== arm b1  2026-11-22T18:22:38-05:00  shmem=11GB  load=4.71
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 5019  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b1 pp512 avg=553.39 t/s stddev=5.29 samples=[549.59 551.15 559.44]
+  RESULT b1 tg128 avg=35.00 t/s stddev=0.12 samples=[34.86 35.09 35.05]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== arm b2  2026-11-22T18:23:27-05:00  shmem=11GB  load=5.52
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 5019  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b2 pp512 avg=551.40 t/s stddev=3.30 samples=[548.66 550.48 555.07]
+  RESULT b2 tg128 avg=34.97 t/s stddev=0.19 samples=[34.75 35.08 35.07]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== arm a2  2026-11-22T18:24:15-05:00  shmem=11GB  load=5.68
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 5019  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a2 pp512 avg=552.10 t/s stddev=4.72 samples=[548.37 550.53 557.40]
+  RESULT a2 tg128 avg=34.91 t/s stddev=0.20 samples=[34.68 34.98 35.06]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:25:03-05:00
+lock released
+AB_DONE

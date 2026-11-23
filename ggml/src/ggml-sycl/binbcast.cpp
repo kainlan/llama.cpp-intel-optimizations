@@ -15,6 +15,15 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+// bf16 support is decided per translation unit, as convert.cpp decides it. The type chain in
+// ggml_sycl_op_bin_bcast and ggml_sycl_bin_bcast_types_supported read this one definition, so they cannot disagree.
+#if defined(__INTEL_LLVM_COMPILER) && __has_include(<sycl/ext/oneapi/bfloat16.hpp>)
+#    include <sycl/ext/oneapi/bfloat16.hpp>
+#    ifndef GGML_SYCL_HAS_BF16
+#        define GGML_SYCL_HAS_BF16
+#    endif
+#endif
+
 // How the completion event handed to the binbcast post-op consumers is obtained.
 //
 // BARRIER / SAFE both *manufacture* an event with an extra submission (a queue
@@ -726,6 +735,35 @@ template <float (*bin_op)(const float, const float)> struct bin_bcast_sycl {
     }
 };
 
+// The (src0, src1, dst) type triples ggml_sycl_op_bin_bcast has a kernel for. It lists exactly the arms of that
+// function's type chain, under the same #ifdef: supports_op asks it, so an op it admits cannot reach the chain's abort.
+bool ggml_sycl_bin_bcast_types_supported(ggml_type src0, ggml_type src1, ggml_type dst) {
+    struct type_triple {
+        ggml_type src0;
+        ggml_type src1;
+        ggml_type dst;
+    };
+
+    static constexpr type_triple supported[] = {
+        { GGML_TYPE_F32,  GGML_TYPE_F32,  GGML_TYPE_F32  },
+        { GGML_TYPE_F16,  GGML_TYPE_F16,  GGML_TYPE_F16  },
+        { GGML_TYPE_F16,  GGML_TYPE_F32,  GGML_TYPE_F16  },
+        { GGML_TYPE_I32,  GGML_TYPE_I32,  GGML_TYPE_I32  },
+        { GGML_TYPE_I16,  GGML_TYPE_I16,  GGML_TYPE_I16  },
+#ifdef GGML_SYCL_HAS_BF16
+        { GGML_TYPE_BF16, GGML_TYPE_BF16, GGML_TYPE_BF16 },
+        { GGML_TYPE_BF16, GGML_TYPE_F32,  GGML_TYPE_BF16 },
+#endif
+    };
+
+    for (const type_triple & t : supported) {
+        if (t.src0 == src0 && t.src1 == src1 && t.dst == dst) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <class op>
 inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                                    const ggml_tensor *         src0,
@@ -983,6 +1021,20 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
                             ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12,
                             nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1),
                             ggml_is_contiguous(dst), main_stream, file, line, function);
+#ifdef GGML_SYCL_HAS_BF16
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+        kernel_event =
+            op()((const sycl::ext::oneapi::bfloat16 *) src0_d, (const sycl::ext::oneapi::bfloat16 *) src1_d,
+                 (sycl::ext::oneapi::bfloat16 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2,
+                 ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0),
+                 ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line, function);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
+        kernel_event =
+            op()((const sycl::ext::oneapi::bfloat16 *) src0_d, (const float *) src1_d,
+                 (sycl::ext::oneapi::bfloat16 *) dst_d, ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2,
+                 ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2, nb3, ggml_is_contiguous(src0),
+                 ggml_is_contiguous(src1), ggml_is_contiguous(dst), main_stream, file, line, function);
+#endif
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__, ggml_type_name(dst->type),
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
@@ -994,7 +1046,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     // pin early.  This is sound only because the chain's trailing `else` ends in
     // GGML_ABORT, which is GGML_NORETURN (`[[noreturn]]` under C++, ggml.h:293)
     // via ggml_abort (ggml.h:368): reaching this line therefore implies one of
-    // the five op() branches ran and assigned `kernel_event`.  If ggml_abort ever
+    // the op() branches ran and assigned `kernel_event`.  If ggml_abort ever
     // loses noreturn, move this back into the branches -- do not just reorder it.
     kernel_event_valid = true;
     terminal_ticket.mark_submitted(*main_stream);

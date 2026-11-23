@@ -6,6 +6,7 @@
 #include "llama-auto-ubatch.h"
 #include "llama-context-tenant.h"
 #include "llama-kv-cache.h"
+#include "llama-n-ctx-hint.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -204,11 +205,19 @@ inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train) {
     return n_ctx != 0 ? n_ctx : n_ctx_train;
 }
 
+// The n_ctx the load's three measures are asked for: the context the caller requested from the load (the hint,
+// resolved and padded once by llama_n_ctx_hint_resolve, so the measure and the KV room read one value), or 0 when the
+// caller requested none, which llama_load_measure_n_ctx turns into the training context.
+inline uint32_t llama_load_measure_request_n_ctx(uint32_t n_ctx_hint, uint32_t n_ctx_train) {
+    return llama_n_ctx_hint_resolve(n_ctx_hint, n_ctx_train).n_ctx_context;
+}
+
 // The shape a load-time measure uses: n_ubatch is the auto ladder's bottom rung (from the helper the real context's
 // trial reads), and the caller's n_ctx, the training context for 0; every other parameter is the default. The bottom
 // rung is the ubatch a MoE model's auto pick stays at (its cap is MOE_GPU_UBATCH_MAX) and the one a pinned -ub 512
 // runs at. A dense model's auto pick climbs above it, to 2048 at the default n_batch, into whatever room the zones
-// have left: that larger buffer is not reserved. The caller's -c and -ub do not reach the load (fkpg).
+// have left: that larger buffer is not reserved. The caller's -ub does not reach the measures (fkpg): the load reads it
+// only as the n_ubatch hint, to place the PP MoE ring. Its -c does, as the n_ctx hint.
 inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx                = llama_load_measure_n_ctx(n_ctx, n_ctx_train);
@@ -465,6 +474,40 @@ inline llama_load_probe_reservations llama_load_probe_reserve(const llama_sycl_l
         }
     }
     return out;
+}
+
+// One SYCL device's total memory, by the post-selector device index the measure reports.
+struct llama_load_device_capacity {
+    int32_t  device;
+    uint64_t total_bytes;  // 0 = unknown: the device is not judged
+};
+
+// A measured compute term larger than its device's total memory can never be reserved, whatever the placement: the
+// load is refused by this text before any reservation. Empty when every device can hold its term or cannot be judged.
+// The comparison is against the total, never the free memory, which reads low after a device context is destroyed.
+// A term below the total can still be more than the zones can give; the backend's zone sizing answers that.
+inline std::string llama_load_probe_unfundable_text(const std::vector<llama_load_measure_device> &  devices,
+                                                    const std::vector<llama_load_device_capacity> & capacities,
+                                                    uint32_t                                        n_ctx) {
+    const double mib = 1024.0 * 1024.0;
+    for (const llama_load_measure_device & d : devices) {
+        if (d.host) {
+            continue;
+        }
+        for (const llama_load_device_capacity & c : capacities) {
+            if (c.device != d.device || c.total_bytes == 0 || d.total <= c.total_bytes) {
+                continue;
+            }
+            char text[512];
+            snprintf(text, sizeof(text),
+                     "[LOAD-PLAN] load refused: the compute buffer measured at n_ctx %u needs %.1f MiB on SYCL device "
+                     "%d, and that device has %.1f MiB in total; request a context that fits with -c (with no -c the "
+                     "context is the model's training context)",
+                     n_ctx, d.total / mib, (int) d.device, c.total_bytes / mib);
+            return text;
+        }
+    }
+    return {};
 }
 
 llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,

@@ -1,0 +1,1054 @@
+0.00.322.817 W [SYCL] Device 0 alloc caps: raw=15977.9 MB, safe=15128.7 MB, host_unified=no
+0.00.322.826 I [XMX] decode-aware optimal_tiles_n=1 (SLM=128KB, max_slm_tiles_n=255, weight_tile=256B, token_tile=256B)
+0.00.322.829 I [SYCL] Device 0 caps: CU=128, WG=1024, SG=32 preferred, SLM=128KB, USM(device/shared/host)=1/1/1, fp16=1, XMX=yes M=8 N=16 K=32 tile_m=1 tile_n=1
+0.00.322.861 I [SYCL] Host malloc per-allocation limit: 15.6 GB (min max_mem_alloc_size across 1 active devices)
+0.00.324.069 I cmn  common_param: common_params_print_info: build 19345 (7809ffac8) with IntelLLVM 2026.2.0 for Linux x86_64
+0.00.324.071 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+0.00.324.071 I cmn  common_param: device_info:
+0.00.326.293 I [PER-DEV-QUEUE] Device 0 cache queue created with a single-device context
+0.00.326.326 I [UNIFIED-CACHE] Device 0 budget authority: base=16304.0 MB free=15923.1 MB pct=100% external_headroom=1630.4 MB budget=14292.7 MB
+0.00.326.332 I [UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15923.1 MB budget=14292.7 MB (100%)
+0.00.450.045 I [VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13012.0 MB)
+0.00.450.274 I [VRAM-ARENA] Active on device 0: 1 chunk(s), 14292.0 MB total
+0.00.450.275 I [VRAM-ARENA] Scratch zone: 0xffffe39279a00000 + 512.0 MB (offset 13780.0 MB from base)
+0.00.453.007 I [UNIFIED-CACHE] Created BCS queue for H2D copy pipelining
+0.00.453.011 I [UNIFIED-CACHE] Async DMA eviction enabled (preserves layouts during migration)
+0.00.453.070 I [SYCL] Pinned chunk pool created with 106.7 GB budget, committed=0.0 GB (chunk=2048.0 MB)
+0.00.453.072 I [HOST-ARENA] Created with 106.7 GB budget, committed=0.0 GB (system total=246.9 GB available=114.7 GB reserve=8.0 GB pct=90)
+0.00.453.090 I cmn  common_param:   - SYCL0   : Intel(R) Arc(TM) Pro B50 Graphics (16304 MiB, 14292 MiB free)
+0.00.453.095 I cmn  common_param:   - CPU     : Intel(R) Core(TM) Ultra 7 270K Plus (252839 MiB, 252839 MiB free)
+0.00.453.173 I cmn  common_param: system_info: n_threads = 4 (n_threads_batch = 4) / 24 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.453.234 I srv  init_listene: running without SSL
+0.00.454.171 I srv          init: using 23 threads for HTTP server
+0.00.454.218 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.466.666 I srv    load_model: loading model '/models/gpt-oss-20b-mxfp4.gguf'
+0.00.466.668 I srv    load_model: local path '/models/gpt-oss-20b-mxfp4.gguf'
+0.01.073.274 I llama_model_loader: loaded meta data with 35 key-value pairs and 459 tensors from /models/gpt-oss-20b-mxfp4.gguf (version GGUF V3 (latest))
+0.01.073.287 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.01.073.293 I llama_model_loader: - kv   0:                       general.architecture str              = gpt-oss
+0.01.073.294 I llama_model_loader: - kv   1:                               general.type str              = model
+0.01.073.294 I llama_model_loader: - kv   2:                               general.name str              = Gpt Oss 20b
+0.01.073.294 I llama_model_loader: - kv   3:                           general.basename str              = gpt-oss
+0.01.073.294 I llama_model_loader: - kv   4:                         general.size_label str              = 20B
+0.01.073.294 I llama_model_loader: - kv   5:                            general.license str              = apache-2.0
+0.01.073.297 I llama_model_loader: - kv   6:                               general.tags arr[str,2]       = ["vllm", "text-generation"]
+0.01.073.298 I llama_model_loader: - kv   7:                        gpt-oss.block_count u32              = 24
+0.01.073.299 I llama_model_loader: - kv   8:                     gpt-oss.context_length u32              = 131072
+0.01.073.299 I llama_model_loader: - kv   9:                   gpt-oss.embedding_length u32              = 2880
+0.01.073.299 I llama_model_loader: - kv  10:                gpt-oss.feed_forward_length u32              = 2880
+0.01.073.299 I llama_model_loader: - kv  11:               gpt-oss.attention.head_count u32              = 64
+0.01.073.299 I llama_model_loader: - kv  12:            gpt-oss.attention.head_count_kv u32              = 8
+0.01.073.304 I llama_model_loader: - kv  13:                     gpt-oss.rope.freq_base f32              = 150000.000000
+0.01.073.304 I llama_model_loader: - kv  14:   gpt-oss.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.01.073.304 I llama_model_loader: - kv  15:                       gpt-oss.expert_count u32              = 32
+0.01.073.304 I llama_model_loader: - kv  16:                  gpt-oss.expert_used_count u32              = 4
+0.01.073.305 I llama_model_loader: - kv  17:               gpt-oss.attention.key_length u32              = 64
+0.01.073.305 I llama_model_loader: - kv  18:             gpt-oss.attention.value_length u32              = 64
+0.01.073.305 I llama_model_loader: - kv  19:           gpt-oss.attention.sliding_window u32              = 128
+0.01.073.305 I llama_model_loader: - kv  20:         gpt-oss.expert_feed_forward_length u32              = 2880
+0.01.073.305 I llama_model_loader: - kv  21:                  gpt-oss.rope.scaling.type str              = yarn
+0.01.073.306 I llama_model_loader: - kv  22:                gpt-oss.rope.scaling.factor f32              = 32.000000
+0.01.073.306 I llama_model_loader: - kv  23: gpt-oss.rope.scaling.original_context_length u32              = 4096
+0.01.073.306 I llama_model_loader: - kv  24:                       tokenizer.ggml.model str              = gpt2
+0.01.073.306 I llama_model_loader: - kv  25:                         tokenizer.ggml.pre str              = gpt-4o
+0.01.073.308 I llama_model_loader: - kv  26:                      tokenizer.ggml.tokens arr[str,201088]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+0.01.073.309 I llama_model_loader: - kv  27:                  tokenizer.ggml.token_type arr[i32,201088]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+0.01.073.310 I llama_model_loader: - kv  28:                      tokenizer.ggml.merges arr[str,446189]  = ["Ġ Ġ", "Ġ ĠĠĠ", "ĠĠ ĠĠ", "...
+0.01.073.310 I llama_model_loader: - kv  29:                tokenizer.ggml.bos_token_id u32              = 199998
+0.01.073.310 I llama_model_loader: - kv  30:                tokenizer.ggml.eos_token_id u32              = 200002
+0.01.073.310 I llama_model_loader: - kv  31:            tokenizer.ggml.padding_token_id u32              = 199999
+0.01.073.312 I llama_model_loader: - kv  32:                    tokenizer.chat_template str              = {#-\n  In addition to the normal input...
+0.01.073.312 I llama_model_loader: - kv  33:               general.quantization_version u32              = 2
+0.01.073.312 I llama_model_loader: - kv  34:                          general.file_type u32              = 38
+0.01.073.313 I llama_model_loader: - type  f32:  289 tensors
+0.01.073.313 I llama_model_loader: - type q8_0:   98 tensors
+0.01.073.313 I llama_model_loader: - type mxfp4:   72 tensors
+0.01.073.315 I print_info: file format = GGUF V3 (latest)
+0.01.073.316 I print_info: file type   = MXFP4 MoE
+0.01.073.317 I print_info: file size   = 11.27 GiB (4.63 BPW) 
+0.01.073.382 I llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B50 Graphics) (unknown id) - 14292 MiB free
+0.01.158.607 I load: 0 unused tokens
+0.01.167.288 W load: setting token '<|channel|>' (200005) attribute to USER_DEFINED (16), old attributes: 8
+0.01.167.530 W load: setting token '<|message|>' (200008) attribute to USER_DEFINED (16), old attributes: 8
+0.01.167.577 W load: setting token '<|constrain|>' (200003) attribute to USER_DEFINED (16), old attributes: 8
+0.01.169.314 W load: setting token '<|start|>' (200006) attribute to USER_DEFINED (16), old attributes: 8
+0.01.169.687 I load: printing all EOG tokens:
+0.01.169.688 I load:   - 199999 ('<|endoftext|>')
+0.01.169.689 I load:   - 200002 ('<|return|>')
+0.01.169.689 I load:   - 200007 ('<|end|>')
+0.01.169.689 I load:   - 200012 ('<|call|>')
+0.01.169.694 W load: special_eog_ids contains both '<|return|>' and '<|call|>', or '<|calls|>' and '<|flush|>' tokens, removing '<|end|>' token from EOG list
+0.01.170.056 I load: special tokens cache size = 21
+0.01.182.759 I load: token to piece cache size = 1.3332 MB
+0.01.182.773 I print_info: arch                  = gpt-oss
+0.01.182.773 I print_info: vocab_only            = 0
+0.01.182.774 I print_info: no_alloc              = 0
+0.01.182.774 I print_info: n_ctx_train           = 131072
+0.01.182.775 I print_info: n_embd_inp            = 2880
+0.01.182.775 I print_info: n_embd                = 2880
+0.01.182.776 I print_info: n_embd_out            = 2880
+0.01.182.776 I print_info: n_layer               = 24
+0.01.182.776 I print_info: n_layer_all           = 24
+0.01.182.784 I print_info: n_head                = 64
+0.01.182.786 I print_info: n_head_kv             = 8
+0.01.182.786 I print_info: n_rot                 = 64
+0.01.182.786 I print_info: n_swa                 = 128
+0.01.182.787 I print_info: is_swa_any            = 1
+0.01.182.787 I print_info: non_causal_type       = 0
+0.01.182.787 I print_info: n_embd_head_k         = 64
+0.01.182.787 I print_info: n_embd_head_v         = 64
+0.01.182.789 I print_info: n_gqa                 = 8
+0.01.182.790 I print_info: n_embd_k_gqa          = 512
+0.01.182.791 I print_info: n_embd_v_gqa          = 512
+0.01.182.791 I print_info: f_norm_eps            = 0.0e+00
+0.01.182.792 I print_info: f_norm_rms_eps        = 1.0e-05
+0.01.182.792 I print_info: f_clamp_kqv           = 0.0e+00
+0.01.182.792 I print_info: f_max_alibi_bias      = 0.0e+00
+0.01.182.792 I print_info: f_logit_scale         = 0.0e+00
+0.01.182.792 I print_info: f_attn_scale          = 0.0e+00
+0.01.182.792 I print_info: f_attn_value_scale    = 0.0000
+0.01.182.794 I print_info: n_ff                  = 2880
+0.01.182.794 I print_info: n_expert              = 32
+0.01.182.795 I print_info: n_expert_used         = 4
+0.01.182.795 I print_info: n_expert_groups       = 0
+0.01.182.795 I print_info: n_group_used          = 0
+0.01.182.795 I print_info: causal attn           = 1
+0.01.182.795 I print_info: pooling type          = -1
+0.01.182.795 I print_info: rope type             = 2
+0.01.182.795 I print_info: rope scaling          = yarn
+0.01.182.796 I print_info: freq_base_train       = 150000.0
+0.01.182.796 I print_info: freq_scale_train      = 0.03125
+0.01.182.796 I print_info: freq_base_swa         = 150000.0
+0.01.182.797 I print_info: freq_scale_swa        = 0.03125
+0.01.182.797 I print_info: n_embd_head_k_swa     = 64
+0.01.182.797 I print_info: n_embd_head_v_swa     = 64
+0.01.182.797 I print_info: n_rot_swa             = 64
+0.01.182.797 I print_info: n_ctx_orig_yarn       = 4096
+0.01.182.797 I print_info: rope_yarn_log_mul     = 0.0000
+0.01.182.797 I print_info: rope_finetuned        = unknown
+0.01.182.798 I print_info: model type            = 20B
+0.01.182.798 I print_info: model params          = 20.91 B
+0.01.182.798 I print_info: general.name          = Gpt Oss 20b
+0.01.182.799 I print_info: n_ff_exp              = 2880
+0.01.182.801 I print_info: vocab type            = BPE
+0.01.182.801 I print_info: n_vocab               = 201088
+0.01.182.801 I print_info: n_merges              = 446189
+0.01.182.801 I print_info: BOS token             = 199998 '<|startoftext|>'
+0.01.182.802 I print_info: EOS token             = 200002 '<|return|>'
+0.01.182.802 I print_info: EOT token             = 200007 '<|end|>'
+0.01.182.802 I print_info: PAD token             = 199999 '<|endoftext|>'
+0.01.182.802 I print_info: LF token              = 198 'Ċ'
+0.01.182.802 I print_info: EOG token             = 199999 '<|endoftext|>'
+0.01.182.802 I print_info: EOG token             = 200002 '<|return|>'
+0.01.182.803 I print_info: EOG token             = 200012 '<|call|>'
+0.01.182.803 I print_info: max token length      = 256
+0.01.183.057 I Running with Environment Variables:
+0.01.183.057 I   GGML_SYCL_DEBUG: 0
+0.01.183.057 I   GGML_SYCL_DEBUG_SYNC: 0
+0.01.183.057 I   GGML_SYCL_TP_DEBUG: 0
+0.01.183.057 I   GGML_SYCL_KQV_FORCE_SIMPLE: 0
+0.01.183.057 I   GGML_SYCL_KQV_DISABLE_FP16: 0
+0.01.183.057 I   GGML_SYCL_DISABLE_GRAPH: 0
+0.01.183.057 I   GGML_SYCL_ASYNC_MEM: 0
+0.01.183.057 I   GGML_SYCL_DISABLE_DNN: 0
+0.01.183.058 I   GGML_SYCL_PRIORITIZE_DMMV: 0
+0.01.183.058 I Build with Macros:
+0.01.183.058 I   GGML_SYCL_FORCE_MMQ: no
+0.01.183.058 I   GGML_SYCL_F16: yes
+0.01.183.059 I Found 1 SYCL devices:
+0.01.183.059 I |  |                   |                                       |       |Max    |        |Max  |Global |                     |
+0.01.183.059 I |  |                   |                                       |       |compute|Max work|sub  |mem    |                     |
+0.01.183.059 I |ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|
+0.01.183.059 I |--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|
+0.01.183.108 I | 0| [level_zero:gpu:0]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|         1.18.40734+8|
+0.01.183.108 I SYCL Optimization Feature:
+0.01.183.108 I |ID|        Device Type|Reorder|
+0.01.183.108 I |--|-------------------|-------|
+0.01.183.110 I | 0| [level_zero:gpu:0]|      Y|
+0.01.183.361 I [SYCL-PLAN] inventory oneDNN scratchpad: 34.5 MB (onednn_reorder 22.5 MB + onednn_eligible 12.0 MB; global max 586.8 MB)
+0.01.183.436 I [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 2.3 MB (4608 B/token x n_ubatch=512, RUNTIME zone)
+0.01.183.437 I [SYCL-PLAN] dense f16 dequant scratch: 1108.6 MB (weights 1104.6 MB + 8192 B/token x n_ubatch=512, RUNTIME zone)
+0.01.183.446 I [SYCL-PLAN] KV inputs: n_layer=24 n_embd_k_gqa=512 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.0 MB n_ctx_context=131072
+0.01.183.451 I [SYCL-BUDGET] MoE model detected: 32 experts, 4 active, 9707.3 MB expert weights
+0.01.183.473 I [UNIFIED-CACHE] Runtime zone raised to 1515.3 MB for PP scratch planning (pipeline=0.0 MB, moe_onednn=404.5 MB, moe_control=0.0 MB, compute=0.0 MB, state=0.0 MB)
+0.01.183.482 I [VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 512.0->1515.3 MB
+0.01.184.608 I [VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+0.01.320.277 I [VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1515.3, oneDNN=256.0, shared KV+weight=12008.7 MB)
+0.01.320.296 I [VRAM-ARENA] Active on device 0: 1 chunk(s), 14292.0 MB total
+0.01.320.297 I [VRAM-ARENA] Scratch zone: 0xffffe39279a00000 + 512.0 MB (offset 13780.0 MB from base)
+0.01.320.320 I [SYCL] Plan budget tied to arena: 14292.0 MB arena (shared zone 12008.7 MB after 2283.3 MB zones)
+0.01.320.323 I [PLACEMENT] envelope (from sycl-snapshot): n_ctx=0 n_ubatch=0 n_seq_max=1 flash_attn_type=AUTO
+0.01.320.911 I [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=1515.3 MB (arena=14292.0 MB, weight zone=12008.7 MB)
+0.01.320.919 I [MOE-POLICY] device=0 total=16304.0 MB free_init=15924.9 MB plan_budget=14292.0 MB weight_budget=12008.7 MB max_alloc=15977.9 MB safe_alloc=15128.7 MB arena=14292.0 MB zones(scratch/runtime/onednn)=512.0/1515.3/256.0 MB cu=128 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+0.01.323.825 I [MOE-LAYOUT] gateup-i8 device=0 n_experts=32 considered=1536 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=768 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=0 skip_executor=1536 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=xmx_tiled granted_up=xmx_tiled remaining=442.2 MB
+0.01.323.828 I [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_executor=1536.
+0.01.323.839 I [MOE-LAYOUT] summary device=0 gate=xmx_tiled(768) up=xmx_tiled(768) down=soa(768) gate_up=none(0)
+0.01.323.841 I [PLACEMENT-MOE] triplet packing: groups=768 complete=768 incomplete=0 device_groups=768 host_groups=0 device_entries=2304 (9682.0 MB) host_entries=0 (0.0 MB) remaining=442.2 MB hotness=static(layer,expert)
+0.01.324.103 W [PLACEMENT] KV context room on device 0: refused all 12 full-attention layer(s) by cost, held all 12 SWA layer(s) (3060.0 MB refused by cost); held 6.0 MB of 6.0 MB for n_ctx_context=131072 over planner n_ctx=512 (n_ctx_context is the model's default, training context: the caller named no n_ctx), before the routed experts; deciding layer 23 refused: host attention 4723.9 us/token (4473.9 fill at 50% and host-attn 30 GB/s + 1 split(s) x 250 us) vs displaced experts 5968.5 us/token (cpu-expert 5.6 GB/s, mxfp4 via gpt-oss-20b 2026-10-18 (c-ncj4)); it cost 0.0 MB of device-resident routed experts: 9682.0 MB (768 triplet(s)) on the device, against 9682.0 MB (768) with the room added back. n_ctx_context is the requested n_ctx.
+0.01.324.190 I [SYCL-PLAN] inventory top-8 of 459 tensors (total 11536.2 MB): output.weight=586.8MB(t8,2880x201088) token_embd.weight=586.8MB(t8,2880x201088) blk.0.ffn_up_exps.weight=134.5MB(t39,2880x2880) blk.1.ffn_gate_exps.weight=134.5MB(t39,2880x2880) blk.0.ffn_gate_exps.weight=134.5MB(t39,2880x2880) blk.1.ffn_up_exps.weight=134.5MB(t39,2880x2880) blk.1.ffn_down_exps.weight=134.5MB(t39,2880x2880) blk.0.ffn_down_exps.weight=134.5MB(t39,2880x2880)
+0.01.324.213 I [SYCL-PLAN] inventory groups: 11 distinct (type,ne) groups over 459 tensors; cardinality histogram: 2x1 24x5 48x2 72x1 73x1 96x1; largest card>=4: blk.3.ffn_gate_exps.weight 134.5MB (card=72); largest card<=2: output.weight 586.8MB (card=2)
+0.01.324.305 I [SYCL-PLAN] MoE routing buffer sizing: n_experts=32 n_expert_used=4 n_moe_layers=24 max_batch=512 control_ids=0.06 MB host-pinned, expert_ptrs=0.02 MB VRAM (72 tables x 256 B, exact=1), control_pool=0.04 MB VRAM, cpu_staging=134.47 MB
+0.01.324.317 I [SYCL-PLAN] CPU quant buffers: 403.4 MB (3 x cpu_quant_eligible 134.5 MB; global max 586.8 MB)
+0.01.324.317 I [SYCL-PLAN] DMA staging pool: 268.9 MB (2 x dma_streamed 134.5 MB; global max 586.8 MB)
+0.01.324.318 I [SYCL-PLAN] oneDNN scratchpad: 34.5 MB (onednn_reorder 22.5 MB + onednn_eligible 12.0 MB; global max 586.8 MB)
+0.01.324.319 I [SYCL-PLAN] oneDNN Graph-scratch zone floor: 96.0 MB (n_head_ctx_max=64 n_head_swa_max=64 n_swa=128 n_ubatch=512 n_ctx=512)
+0.01.324.320 I [SYCL-PLAN] PP MoE oneDNN scratch ring: depth=1 total=404.5 MB weight_slot=134.5 MB activation_slot=90.0 MB output_slot=180.0 MB
+0.01.324.323 I [SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=1175.6 MB total=1191.7 MB
+0.01.324.753 I [PLACEMENT-MOE] expected=2304 planned=2304 unclassified=0 duplicates=0 missing=0
+0.01.324.754 I [PLACEMENT-MOE] roles: gate=768 up=768 down=768 gate_up=0 unknown=0
+0.01.324.754 I [PLACEMENT-MOE] target device0: 2304 expert tensors
+0.01.324.755 I [PLACEMENT-MOE] sample blk.8 expert 30 gate: device0
+0.01.324.756 I [PLACEMENT-MOE] sample blk.8 expert 30 up: device0
+0.01.324.756 I [PLACEMENT-MOE] sample blk.8 expert 30 down: device0
+0.01.324.758 I [PLACEMENT] NORM/EMBED      device=122 (612.7 MB)  host=  0 (0.0 MB)
+0.01.324.759 I [PLACEMENT] ATTENTION       device=217 (1233.0 MB)  host=  0 (0.0 MB)
+0.01.324.762 I [PLACEMENT] MOE_GATE        device= 48 (8.4 MB)  host=  0 (0.0 MB)
+0.01.324.763 I [PLACEMENT] MOE_DOWN        device=768 (3227.3 MB)  host=  0 (0.0 MB)
+0.01.324.765 I [PLACEMENT] MOE_UP          device=768 (3227.3 MB)  host=  0 (0.0 MB)
+0.01.324.766 I [PLACEMENT] MOE_GATE_PROJ   device=768 (3227.3 MB)  host=  0 (0.0 MB)
+0.01.324.769 I [PLACEMENT] layer   0  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.770 I [PLACEMENT] layer   1  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.770 I [PLACEMENT] layer   2  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.771 I [PLACEMENT] layer   3  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.771 I [PLACEMENT] layer   4  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.772 I [PLACEMENT] layer   5  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.772 I [PLACEMENT] layer   6  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.773 I [PLACEMENT] layer   7  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.773 I [PLACEMENT] layer   8  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.774 I [PLACEMENT] layer   9  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.774 I [PLACEMENT] layer  10  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.774 I [PLACEMENT] layer  11  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.775 I [PLACEMENT] layer  12  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.775 I [PLACEMENT] layer  13  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.776 I [PLACEMENT] layer  14  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.776 I [PLACEMENT] layer  15  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.776 I [PLACEMENT] layer  16  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.777 I [PLACEMENT] layer  17  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.777 I [PLACEMENT] layer  18  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.777 I [PLACEMENT] layer  19  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.778 I [PLACEMENT] layer  20  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.778 I [PLACEMENT] layer  21  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.778 I [PLACEMENT] layer  22  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.779 I [PLACEMENT] layer  23  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.324.779 I [PLACEMENT] KV breakdown: full_attn=12 layers at 1.0 MB/layer, swa=12 layers at 1.0 MB/layer (heterogeneous charging)
+0.01.324.781 I [PLACEMENT] MoE experts: 2304 on device, 0 on host (of 2304 total)
+0.01.324.781 I [PLACEMENT] KV sizing: n_layer=24 n_embd_k_gqa=512 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.0 MB
+0.01.324.784 I [PLACEMENT] Totals: weights=11536.5 MB device + 0.0 MB host, kv=24.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
+0.01.324.784 I [PLACEMENT] Total: 11566.5 MB device + 0.0 MB host (budget=14292.0 MB)
+0.01.324.802 I [SYCL] Placement plan computed: 2691 entries, 11566.5 MB device + 0.0 MB host
+0.01.325.203 I [PLACE-4] device weight zone: 11536.2 MB (2691 tensors), host arena: 0.0 MB (0 tensors)
+0.01.325.204 I [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+0.01.327.148 I load_tensors: SYCL early placement plan: 459 weights, 11.27 GiB (computed pre-create_tensor)
+0.01.327.202 I load_tensors: loading model tensors, this can take a while... (load_mode = none)
+0.01.340.541 I [LOAD-PLAN] measure plan override: load 1 stage probe: weights 11536.5 MiB device, 0.0 MiB host; kv 256.0 MiB device, 5888.0 MiB host; kv n_ctx 131072 n_ubatch 512
+0.01.355.594 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe n_ctx=131072 n_ubatch=512 n_seq_max=1 graphs=8 splits_max=93 measure_ms=10.45 kv_layers device=1 host=23 cpu=0
+0.01.355.596 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[404.0] MiB, total 404.0 MiB
+0.01.355.596 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=93 chunks=[0.8] MiB, total 0.8 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[404.0] MiB, total 404.0 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=3 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[404.0] MiB, total 404.0 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=4 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=93 chunks=[0.8] MiB, total 0.8 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=5 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[404.0] MiB, total 404.0 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=6 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[] MiB, total 0.0 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 graph=7 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=2 chunks=[0.5] MiB, total 0.5 MiB
+0.01.355.597 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL0 peak per chunk [404.0] MiB, total 404.0 MiB
+0.01.355.598 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[275.3] MiB, total 275.3 MiB
+0.01.355.598 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=93 chunks=[0.5] MiB, total 0.5 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[275.3] MiB, total 275.3 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=3 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[275.3] MiB, total 275.3 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=4 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=93 chunks=[0.5] MiB, total 0.5 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=5 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=93 chunks=[275.3] MiB, total 275.3 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=6 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[0.5] MiB, total 0.5 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation graph=7 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=2 chunks=[0.5] MiB, total 0.5 MiB
+0.01.355.599 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=probe buft=SYCL_CpuActivation peak per chunk [275.3] MiB, total 275.3 MiB
+0.01.355.614 I [LOAD-PLAN] compute term reserved in RUNTIME on device 0: 404.0 MiB planned (404.0 MiB for this load, 1 chunk(s), n_ctx 131072)
+0.01.355.621 I load_tensors: [SYCL] Starting tensor inventory collection (ctx_map size: 1)
+0.01.355.630 I load_tensors: [SYCL] Collected 459 tensors, 11.27 GiB total
+0.01.355.945 I [SYCL-PLAN] inventory oneDNN scratchpad: 34.5 MB (onednn_reorder 22.5 MB + onednn_eligible 12.0 MB; global max 586.8 MB)
+0.01.355.955 I [SYCL-PLAN] dense MMQ src1 Q8_1 scratch: 2.3 MB (4608 B/token x n_ubatch=512, RUNTIME zone)
+0.01.355.956 I [SYCL-PLAN] dense f16 dequant scratch: 1108.6 MB (weights 1104.6 MB + 8192 B/token x n_ubatch=512, RUNTIME zone)
+0.01.355.960 I [SYCL-PLAN] KV inputs: n_layer=24 n_embd_k_gqa=512 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.0 MB n_ctx_context=131072
+0.01.355.967 I [SYCL-BUDGET] MoE model detected: 32 experts, 4 active, 9707.3 MB expert weights
+0.01.356.007 I [SYCL-BUDGET] budget_pct=100%, vram_budget=14292.7 MB (free=1627.2 MB), arena_zones=2283.3 MB, weight_budget=12009.3 MB, model_size=3649.0 MB, exceeds_budget=false
+0.01.356.013 I [SYCL-BUDGET] base_mem=16304.0 MB, already_allocated=14676.8 MB, headroom=0.0 MB
+0.01.356.014 I [SYCL-BUDGET] vram_budget_base=16304.0 MB, final_budget=14292.7 MB, model_size=11536.2 MB
+0.01.356.015 I [VRAM-BUDGET] Device 0: 16304.0 MB total, 14292.7 MB budget (100%)
+0.01.356.015 I [VRAM-BUDGET]   Weights (dense): 1828.8 MB  [priority 1]
+0.01.356.016 I [VRAM-BUDGET]   Expert cache:    0.0 MB reserved (9707.3 MB total)  [priority 2]
+0.01.356.016 I [VRAM-BUDGET]   Headroom:        0.0 MB  (scratch + KV + runtime)
+0.01.356.016 I [VRAM-BUDGET]   Available:       12463.8 MB  (for KV [pri 0], scratch [pri 3], staging [pri 4])
+0.01.356.022 I [UNIFIED-CACHE] Runtime zone raised to 1919.4 MB for PP scratch planning (pipeline=0.0 MB, moe_onednn=404.5 MB, moe_control=0.0 MB, compute=404.0 MB, state=0.0 MB)
+0.01.356.024 I [VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 1515.3->1919.4 MB
+0.01.357.350 I [VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+0.01.456.964 I [VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1919.4, oneDNN=256.0, shared KV+weight=11604.6 MB)
+0.01.457.006 I [VRAM-ARENA] Active on device 0: 1 chunk(s), 14292.0 MB total
+0.01.457.010 I [VRAM-ARENA] Scratch zone: 0xffffe39279a00000 + 512.0 MB (offset 13780.0 MB from base)
+0.01.457.028 I [SYCL] Plan budget tied to arena: 14292.0 MB arena (shared zone 11604.6 MB after 2687.4 MB zones)
+0.01.457.031 I [PLACEMENT] envelope (from sycl-snapshot): n_ctx=0 n_ubatch=0 n_seq_max=1 flash_attn_type=AUTO
+0.01.457.597 I [PLACEMENT] Zone reservation: scratch=512.0 MB + oneDNN=256.0 MB + runtime=1919.4 MB (arena=14292.0 MB, weight zone=11604.6 MB)
+0.01.457.603 I [MOE-POLICY] device=0 total=16304.0 MB free_init=15924.9 MB plan_budget=14292.0 MB weight_budget=11604.6 MB max_alloc=15977.9 MB safe_alloc=15128.7 MB arena=14292.0 MB zones(scratch/runtime/onednn)=512.0/1919.4/256.0 MB cu=128 wg=1024 sg_pref=32 sg_max=32 slm=128 KB usm(d/s/h)=1/1/1 fp16(type/xmx)=1/1 xmx_int8=1 tile=8x16x32 tiles=1x1 executor=shape-deferred-xmx reason=shape-deferred
+0.01.460.044 I [MOE-LAYOUT] gateup-i8 device=0 n_experts=32 considered=1536 candidates=0 upgraded_layers=0 upgraded_entries=0 skip_not_gate_up=768 skip_already_i8=0 skip_not_device=0 skip_wrong_dev=0 skip_unsupported=0 skip_executor=1536 skip_partial_expert_set=0 skip_incomplete=0 skip_zero_charge=0 requested=mxfp4_i8 granted_gate=xmx_tiled granted_up=xmx_tiled remaining=38.2 MB
+0.01.460.046 I [MOE-LAYOUT] gateup-i8 declined every gate/up layer -- gate/up keep their current layout. No candidate reached the upgrade loop, so the cause is eligibility, not VRAM headroom. Rejections: skip_executor=1536.
+0.01.460.055 I [MOE-LAYOUT] summary device=0 gate=xmx_tiled(768) up=xmx_tiled(768) down=soa(768) gate_up=none(0)
+0.01.460.056 I [PLACEMENT-MOE] triplet packing: groups=768 complete=768 incomplete=0 device_groups=768 host_groups=0 device_entries=2304 (9682.0 MB) host_entries=0 (0.0 MB) remaining=38.2 MB hotness=static(layer,expert)
+0.01.460.186 W [PLACEMENT] KV context room on device 0: refused all 12 full-attention layer(s) by cost, held all 12 SWA layer(s) (3060.0 MB refused by cost); held 6.0 MB of 6.0 MB for n_ctx_context=131072 over planner n_ctx=512 (n_ctx_context is the model's default, training context: the caller named no n_ctx), before the routed experts; deciding layer 23 refused: host attention 4723.9 us/token (4473.9 fill at 50% and host-attn 30 GB/s + 1 split(s) x 250 us) vs displaced experts 5968.5 us/token (cpu-expert 5.6 GB/s, mxfp4 via gpt-oss-20b 2026-10-18 (c-ncj4)); it cost 0.0 MB of device-resident routed experts: 9682.0 MB (768 triplet(s)) on the device, against 9682.0 MB (768) with the room added back. n_ctx_context is the requested n_ctx.
+0.01.460.243 I [SYCL-PLAN] inventory top-8 of 459 tensors (total 11536.2 MB): output.weight=586.8MB(t8,2880x201088) token_embd.weight=586.8MB(t8,2880x201088) blk.0.ffn_up_exps.weight=134.5MB(t39,2880x2880) blk.0.ffn_gate_exps.weight=134.5MB(t39,2880x2880) blk.1.ffn_down_exps.weight=134.5MB(t39,2880x2880) blk.1.ffn_up_exps.weight=134.5MB(t39,2880x2880) blk.1.ffn_gate_exps.weight=134.5MB(t39,2880x2880) blk.0.ffn_down_exps.weight=134.5MB(t39,2880x2880)
+0.01.460.259 I [SYCL-PLAN] inventory groups: 11 distinct (type,ne) groups over 459 tensors; cardinality histogram: 2x1 24x5 48x2 72x1 73x1 96x1; largest card>=4: blk.12.ffn_up_exps.weight 134.5MB (card=72); largest card<=2: output.weight 586.8MB (card=2)
+0.01.460.326 I [SYCL-PLAN] MoE routing buffer sizing: n_experts=32 n_expert_used=4 n_moe_layers=24 max_batch=512 control_ids=0.06 MB host-pinned, expert_ptrs=0.02 MB VRAM (72 tables x 256 B, exact=1), control_pool=0.04 MB VRAM, cpu_staging=134.47 MB
+0.01.460.336 I [SYCL-PLAN] CPU quant buffers: 403.4 MB (3 x cpu_quant_eligible 134.5 MB; global max 586.8 MB)
+0.01.460.337 I [SYCL-PLAN] DMA staging pool: 268.9 MB (2 x dma_streamed 134.5 MB; global max 586.8 MB)
+0.01.460.338 I [SYCL-PLAN] oneDNN scratchpad: 34.5 MB (onednn_reorder 22.5 MB + onednn_eligible 12.0 MB; global max 586.8 MB)
+0.01.460.338 I [SYCL-PLAN] oneDNN Graph-scratch zone floor: 96.0 MB (n_head_ctx_max=64 n_head_swa_max=64 n_swa=128 n_ubatch=512 n_ctx=512)
+0.01.460.339 I [SYCL-PLAN] PP MoE oneDNN scratch ring: depth=1 total=404.5 MB weight_slot=134.5 MB activation_slot=90.0 MB output_slot=180.0 MB
+0.01.460.341 I [SYCL-PLAN] Host staging zone: s1_window=1 per_inflight=1175.6 MB total=1191.7 MB
+0.01.460.699 I [PLACEMENT-MOE] expected=2304 planned=2304 unclassified=0 duplicates=0 missing=0
+0.01.460.700 I [PLACEMENT-MOE] roles: gate=768 up=768 down=768 gate_up=0 unknown=0
+0.01.460.701 I [PLACEMENT-MOE] target device0: 2304 expert tensors
+0.01.460.701 I [PLACEMENT-MOE] sample blk.8 expert 30 gate: device0
+0.01.460.701 I [PLACEMENT-MOE] sample blk.8 expert 30 up: device0
+0.01.460.702 I [PLACEMENT-MOE] sample blk.8 expert 30 down: device0
+0.01.460.704 I [PLACEMENT] NORM/EMBED      device=122 (612.7 MB)  host=  0 (0.0 MB)
+0.01.460.705 I [PLACEMENT] ATTENTION       device=217 (1233.0 MB)  host=  0 (0.0 MB)
+0.01.460.707 I [PLACEMENT] MOE_GATE        device= 48 (8.4 MB)  host=  0 (0.0 MB)
+0.01.460.709 I [PLACEMENT] MOE_DOWN        device=768 (3227.3 MB)  host=  0 (0.0 MB)
+0.01.460.710 I [PLACEMENT] MOE_UP          device=768 (3227.3 MB)  host=  0 (0.0 MB)
+0.01.460.712 I [PLACEMENT] MOE_GATE_PROJ   device=768 (3227.3 MB)  host=  0 (0.0 MB)
+0.01.460.713 I [PLACEMENT] layer   0  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.714 I [PLACEMENT] layer   1  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.715 I [PLACEMENT] layer   2  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.715 I [PLACEMENT] layer   3  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.716 I [PLACEMENT] layer   4  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.716 I [PLACEMENT] layer   5  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.716 I [PLACEMENT] layer   6  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.717 I [PLACEMENT] layer   7  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.717 I [PLACEMENT] layer   8  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.717 I [PLACEMENT] layer   9  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.718 I [PLACEMENT] layer  10  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.718 I [PLACEMENT] layer  11  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.718 I [PLACEMENT] layer  12  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.719 I [PLACEMENT] layer  13  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.719 I [PLACEMENT] layer  14  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.719 I [PLACEMENT] layer  15  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.720 I [PLACEMENT] layer  16  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.720 I [PLACEMENT] layer  17  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.720 I [PLACEMENT] layer  18  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.720 I [PLACEMENT] layer  19  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.721 I [PLACEMENT] layer  20  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.721 I [PLACEMENT] layer  21  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.721 I [PLACEMENT] layer  22  weight=28.4 MB  kv=1.0 MB (swa)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.722 I [PLACEMENT] layer  23  weight=28.4 MB  kv=1.0 MB (full)  total=29.4 MB  dense_target=device 0  kv_target=device 0
+0.01.460.722 I [PLACEMENT] KV breakdown: full_attn=12 layers at 1.0 MB/layer, swa=12 layers at 1.0 MB/layer (heterogeneous charging)
+0.01.460.724 I [PLACEMENT] MoE experts: 2304 on device, 0 on host (of 2304 total)
+0.01.460.724 I [PLACEMENT] KV sizing: n_layer=24 n_embd_k_gqa=512 n_embd_v_gqa=512 n_ctx=512 (conservative) kv_per_layer=1.0 MB
+0.01.460.727 I [PLACEMENT] Totals: weights=11536.5 MB device + 0.0 MB host, kv=24.0 MB device + 0.0 MB host, optional layouts=0.0 MB device (yield to KV)
+0.01.460.728 I [PLACEMENT] Total: 11566.5 MB device + 0.0 MB host (budget=14292.0 MB)
+0.01.460.733 I [SYCL] Placement plan computed: 2691 entries, 11566.5 MB device + 0.0 MB host
+0.01.460.931 I [PLACE-4] device weight zone: 11536.2 MB (2691 tensors), host arena: 0.0 MB (0 tensors)
+0.01.460.932 I [MOE-MULTI-GPU] Planner kept all MoE handles on primary; secondary queues not activated
+0.01.461.073 I [SYCL] Tensor inventory set: 459 tensors, 11.27 GB total (VRAM: 1.59 GB free, planner host placement: no)
+0.01.623.651 I [SYCL] Allocated pinned base chunk 1 (size=2048.0 MB, total=2.0 GB)
+0.01.794.372 I [SYCL] Allocated pinned base chunk 2 (size=2048.0 MB, total=4.0 GB)
+0.01.794.376 I [SYCL] Pinned pool pre_allocate: grew 2 chunks for 2849.7 MB working set (total=4.0 GB)
+0.01.794.384 I [HOST-ARENA] configured zones: WEIGHT=64.0 MB  KV=64.0 MB  STAGING=1191.7 MB  SCRATCH=1529.9 MB  (total-cap=4096.0 MB)
+0.01.947.737 I [SYCL] Allocated pinned runtime chunk 1 (size=2048.0 MB, total=6.0 GB)
+0.01.947.741 I [SYCL] Pinned pool pre_allocate_runtime: grew 1 chunks for 2048.0 MB (total need 707.9 MB)
+0.01.947.812 I [UNIFIED-CACHE] PP MoE oneDNN scratch ring reserved from arena-runtime: depth=1 total=404.5 MB weight_slot=134.5 MB activation_slot=90.0 MB (RUNTIME) output_slot=180.0 MB (RUNTIME)
+0.01.947.813 I [HOST-ARENA] Zones configured: WEIGHT=64.0 MB KV=64.0 MB STAGING=1191.7 MB SCRATCH=1529.9 MB
+0.01.947.815 I [HOST-ARENA] Committed 6144.0 MB in 3 chunk(s) after plan pre-size (budget=109283.0 MB)
+0.01.947.958 I load_tensors: SYCL tensor inventory: 459 tensors, 11.27 GiB (enables unified placement before allocation)
+0.01.948.198 I [LOAD-PLAN] measure plan override: load 1 stage admitted: weights 11536.5 MiB device, 0.0 MiB host; kv 0.0 MiB device, 6144.0 MiB host; kv n_ctx 131072 n_ubatch 512
+0.01.960.312 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted n_ctx=131072 n_ubatch=512 n_seq_max=1 graphs=8 splits_max=97 measure_ms=9.93 kv_layers device=0 host=24 cpu=0
+0.01.960.314 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.960.314 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.8] MiB, total 0.8 MiB
+0.01.960.315 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=3 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=4 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.8] MiB, total 0.8 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=5 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=6 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[] MiB, total 0.0 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 graph=7 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[] MiB, total 0.0 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL0 peak per chunk [404.0] MiB, total 404.0 MiB
+0.01.960.316 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.5] MiB, total 0.5 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=3 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=4 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.5] MiB, total 0.5 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=5 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=6 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[0.5] MiB, total 0.5 MiB
+0.01.960.317 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation graph=7 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[0.5] MiB, total 0.5 MiB
+0.01.960.318 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=admitted buft=SYCL_CpuActivation peak per chunk [275.3] MiB, total 275.3 MiB
+0.01.960.329 W load_tensors: [LOAD-PLAN] compute slot on device 0: probe bound 404.0 MiB reserved in RUNTIME, admitted 404.0 MiB (1 of 1 recorded); measured at n_ctx 131072 ubatch 512, the caller's -c and -ub are not transported (fkpg); measure 15 ms probe, 12 ms admitted
+0.01.960.544 I [LOAD-PLAN] measure plan override: load 1 stage late: weights 11536.5 MiB device, 0.0 MiB host; kv 0.0 MiB device, 6144.0 MiB host; kv n_ctx 131072 n_ubatch 512
+0.01.970.153 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late n_ctx=131072 n_ubatch=512 n_seq_max=1 graphs=8 splits_max=97 measure_ms=8.11 kv_layers device=0 host=24 cpu=0
+0.01.970.155 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.970.155 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.8] MiB, total 0.8 MiB
+0.01.970.155 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.970.155 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=3 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.970.155 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=4 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.8] MiB, total 0.8 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=5 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[404.0] MiB, total 404.0 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=6 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[] MiB, total 0.0 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 graph=7 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[] MiB, total 0.0 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL0 peak per chunk [404.0] MiB, total 404.0 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.5] MiB, total 0.5 MiB
+0.01.970.156 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.970.157 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=3 kind=pp n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.970.157 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=4 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=97 chunks=[0.5] MiB, total 0.5 MiB
+0.01.970.157 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=5 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=512 n_streams=0 splits=97 chunks=[275.3] MiB, total 275.3 MiB
+0.01.970.157 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=6 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[0.5] MiB, total 0.5 MiB
+0.01.970.157 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation graph=7 kind=shift n_tokens=0 n_seqs=0 n_outputs=0 n_streams=0 splits=1 chunks=[0.5] MiB, total 0.5 MiB
+0.01.970.157 I llama_load_measure: [LOAD-PLAN] compute trace side=measure stage=late buft=SYCL_CpuActivation peak per chunk [275.3] MiB, total 275.3 MiB
+0.01.970.165 W [LOAD-PLAN] late check on device 0: compute term equal (404.0 MiB), early reservation stands
+0.01.970.259 I [SYCL] Host buffer alloc request: 2037.2 MB (evictable=1, in_model_load=1)
+0.02.127.008 I [SYCL] Allocated pinned base chunk 3 (size=2048.0 MB, total=8.0 GB)
+0.02.127.013 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 2112.0 MB)
+0.02.127.066 I [SYCL] Host buffer alloc request: 2023.3 MB (evictable=1, in_model_load=1)
+0.02.277.209 I [SYCL] Allocated pinned base chunk 4 (size=2048.0 MB, total=10.0 GB)
+0.02.277.213 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 4160.0 MB)
+0.02.277.278 I [SYCL] Host buffer alloc request: 2024.4 MB (evictable=1, in_model_load=1)
+0.02.440.867 I [SYCL] Allocated pinned base chunk 5 (size=2048.0 MB, total=12.0 GB)
+0.02.440.872 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 6208.0 MB)
+0.02.440.949 I [SYCL] Host buffer alloc request: 2024.4 MB (evictable=1, in_model_load=1)
+0.02.608.089 I [SYCL] Allocated pinned base chunk 6 (size=2048.0 MB, total=14.0 GB)
+0.02.608.095 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 8256.0 MB)
+0.02.608.169 I [SYCL] Host buffer alloc request: 1996.0 MB (evictable=1, in_model_load=1)
+0.02.775.291 I [SYCL] Allocated pinned base chunk 7 (size=2048.0 MB, total=16.0 GB)
+0.02.775.295 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 10304.0 MB)
+0.02.775.357 I [SYCL] Host buffer alloc request: 1430.9 MB (evictable=1, in_model_load=1)
+0.02.930.537 I [SYCL] Allocated pinned base chunk 8 (size=2048.0 MB, total=18.0 GB)
+0.02.930.541 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 12352.0 MB)
+0.02.930.608 I load_tensors: offloading output layer to GPU
+0.02.930.608 I load_tensors: offloading 23 repeating layers to GPU
+0.02.930.608 I load_tensors: offloaded 25/25 layers to GPU
+0.02.930.609 I load_tensors:    SYCL_Host model buffer size = 11536.18 MiB
+0.23.696.779 I [S1-PRELOAD] 459 host-registered weights found for preload
+0.23.697.450 I [S1-PRELOAD] Resetting weight materialization before applying latest plan
+0.23.774.707 I [S1-PRELOAD] Using unified-cache BCS queue for preload copies
+0.23.880.524 I [SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)
+0.24.071.363 I [MOE-LAYOUT] tensor=blk.0.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.101.929 I [MOE-LAYOUT] tensor=blk.0.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.130.759 I [MOE-LAYOUT] tensor=blk.0.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.153.922 I [MOE-LAYOUT] tensor=blk.1.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.183.028 I [MOE-LAYOUT] tensor=blk.1.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.212.242 I [MOE-LAYOUT] tensor=blk.1.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.235.616 I [MOE-LAYOUT] tensor=blk.2.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.266.427 I [MOE-LAYOUT] tensor=blk.2.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.295.146 I [MOE-LAYOUT] tensor=blk.2.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.318.324 I [MOE-LAYOUT] tensor=blk.3.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.347.179 I [MOE-LAYOUT] tensor=blk.3.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.376.391 I [MOE-LAYOUT] tensor=blk.3.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.399.446 I [MOE-LAYOUT] tensor=blk.4.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.428.351 I [MOE-LAYOUT] tensor=blk.4.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.457.092 I [MOE-LAYOUT] tensor=blk.4.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.480.350 I [MOE-LAYOUT] tensor=blk.5.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.509.546 I [MOE-LAYOUT] tensor=blk.5.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.538.605 I [MOE-LAYOUT] tensor=blk.5.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.561.667 I [MOE-LAYOUT] tensor=blk.6.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.590.555 I [MOE-LAYOUT] tensor=blk.6.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.619.193 I [MOE-LAYOUT] tensor=blk.6.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.641.266 I [MOE-LAYOUT] tensor=blk.7.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.669.812 I [MOE-LAYOUT] tensor=blk.7.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.698.752 I [MOE-LAYOUT] tensor=blk.7.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.721.983 I [MOE-LAYOUT] tensor=blk.8.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.750.722 I [MOE-LAYOUT] tensor=blk.8.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.779.322 I [MOE-LAYOUT] tensor=blk.8.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.800.660 I [MOE-LAYOUT] tensor=blk.9.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.829.652 I [MOE-LAYOUT] tensor=blk.9.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.858.356 I [MOE-LAYOUT] tensor=blk.9.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.879.772 I [MOE-LAYOUT] tensor=blk.10.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.908.376 I [MOE-LAYOUT] tensor=blk.10.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.936.881 I [MOE-LAYOUT] tensor=blk.10.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.958.752 I [MOE-LAYOUT] tensor=blk.11.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.24.987.136 I [MOE-LAYOUT] tensor=blk.11.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.015.955 I [MOE-LAYOUT] tensor=blk.11.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.037.342 I [MOE-LAYOUT] tensor=blk.12.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.065.728 I [MOE-LAYOUT] tensor=blk.12.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.094.182 I [MOE-LAYOUT] tensor=blk.12.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.115.768 I [MOE-LAYOUT] tensor=blk.13.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.144.432 I [MOE-LAYOUT] tensor=blk.13.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.173.229 I [MOE-LAYOUT] tensor=blk.13.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.196.564 I [MOE-LAYOUT] tensor=blk.14.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.225.551 I [MOE-LAYOUT] tensor=blk.14.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.254.538 I [MOE-LAYOUT] tensor=blk.14.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.277.675 I [MOE-LAYOUT] tensor=blk.15.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.306.906 I [MOE-LAYOUT] tensor=blk.15.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.336.122 I [MOE-LAYOUT] tensor=blk.15.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.359.594 I [MOE-LAYOUT] tensor=blk.16.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.388.593 I [MOE-LAYOUT] tensor=blk.16.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.417.657 I [MOE-LAYOUT] tensor=blk.16.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.440.916 I [MOE-LAYOUT] tensor=blk.17.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.470.155 I [MOE-LAYOUT] tensor=blk.17.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.499.239 I [MOE-LAYOUT] tensor=blk.17.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.522.522 I [MOE-LAYOUT] tensor=blk.18.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.551.904 I [MOE-LAYOUT] tensor=blk.18.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.581.075 I [MOE-LAYOUT] tensor=blk.18.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.604.356 I [MOE-LAYOUT] tensor=blk.19.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.633.450 I [MOE-LAYOUT] tensor=blk.19.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.662.946 I [MOE-LAYOUT] tensor=blk.19.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.684.934 I [MOE-LAYOUT] tensor=blk.20.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.713.692 I [MOE-LAYOUT] tensor=blk.20.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.742.501 I [MOE-LAYOUT] tensor=blk.20.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.764.208 I [MOE-LAYOUT] tensor=blk.21.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.792.957 I [MOE-LAYOUT] tensor=blk.21.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.821.726 I [MOE-LAYOUT] tensor=blk.21.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.843.217 I [MOE-LAYOUT] tensor=blk.22.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.871.822 I [MOE-LAYOUT] tensor=blk.22.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.901.287 I [MOE-LAYOUT] tensor=blk.22.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.922.857 I [MOE-LAYOUT] tensor=blk.23.ffn_gate_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.951.481 I [MOE-LAYOUT] tensor=blk.23.ffn_up_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=xmx_tiled reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.25.980.257 I [MOE-LAYOUT] tensor=blk.23.ffn_down_exps.weight device=0 residency=planner-device-or-mixed type=mxfp4 shape=[2880,2880,32] layout=soa reason=planner-entry-layout xmx=1 int8=1 slm=131072 tile_m=1 tile_n=1 coalesced_ok=0
+0.26.002.157 I [S1-PRELOAD] Pinned 315 dense weights in VRAM (1828.8 MB)
+0.26.002.160 I [UNIFIED-CACHE] Layout pool sealed on device 0
+0.26.002.232 I [S1-PRELOAD] async bulk: dense cached=315 failed=0 host_placed=0, moe cached=72 failed=0, 11510.9 MB in 2304 ms (4.9 GB/s)
+0.26.002.323 W [HOSTMEM] phase=load-end | process: rss_anon=0.46 rss_file=0.27 rss_shmem=0.00 GB | pinned pool (not in RssAnon): 18.00 GB zones(used/cap GB): dev0{pool=18.00 GB chunks=9 WEIGHT=11.27/12.06 KV=0.00/0.06 STAGING=0.57/1.16 SCRATCH=0.00/1.49} | ledger: sycl_host_buffers=11.27 host_expert_copy_cumulative=0.00 host_dense_copy_cumulative=0.00 cpu_dispatch_scratch=0.00 GB | system: MemAvailable=96.38 Shmem=9.08 AnonPages=116.20 Cached=45.43 Slab=3.09 kernel_other(driver BOs)=20.01 GB
+0.26.002.376 W [MOE-EXEC] h2d probe device 0: 26.6 GB/s (tuning cache)
+0.26.006.192 I cmn  common_init_: added <|endoftext|> logit bias = -inf
+0.26.006.193 I cmn  common_init_: added <|return|> logit bias = -inf
+0.26.006.193 I cmn  common_init_: added <|call|> logit bias = -inf
+0.26.006.242 I llama_context: constructing llama_context
+0.26.006.245 I llama_context: n_seq_max             = 1
+0.26.006.245 I llama_context: n_ctx                 = 131072
+0.26.006.245 I llama_context: n_ctx_seq             = 131072
+0.26.006.245 I llama_context: n_batch               = 2048
+0.26.006.245 I llama_context: n_ubatch              = 512
+0.26.006.245 I llama_context: causal_attn           = 1
+0.26.006.247 I llama_context: flash_attn            = auto
+0.26.006.247 I llama_context: kv_unified            = false
+0.26.006.247 I llama_context: swa_full              = false
+0.26.006.247 I llama_context: freq_base             = 150000.0
+0.26.006.248 I llama_context: freq_scale            = 0.03125
+0.26.006.248 I llama_context: n_rs_seq              = 0
+0.26.006.248 I llama_context: n_outputs_max         = 1
+0.26.006.248 I llama_context: n_outputs_max_per_seq = 1
+0.26.034.889 I [SYCL-PLAN] KV residency re-fit for n_ctx=131072: KV shape changed
+0.26.035.809 I [SYCL-PLAN] dense scratch re-planned on device 0: context 3 published n_ubatch=512; model slot 0 generation 1 plans at n_ubatch=512; the device plans Q8_1 src1 at n_ubatch=512 and f16 dequant at n_ubatch=512
+0.26.035.849 I [SYCL-PLAN] dense MMQ src1 Q8_1 scratch claimed on device 0: 2.3 MB (plan 2.3 MB at n_ubatch=512, RUNTIME zone)
+0.26.035.854 W [SYCL-PLAN] KV overflow re-placed to host tier: 12 layer(s) demoted, 0 SWA (3072.0 MB host KV, layers 1..23) on device 0 for n_ctx=131072; the device has 93.8 MB free for KV. Their KV lives in host memory and their attention runs on the CPU. Largest all-VRAM context is about -c 3072.
+0.26.035.858 I [SYCL-PLAN] Runtime context update: n_ctx=131072 n_ubatch=512 n_seq_max=1 kv_unified=0 swa_full=0 kv_per_layer=256.0 MB kv_per_swa_layer=1.5 MB
+0.26.036.027 I [SYCL] Host buffer alloc request: 0.8 MB (evictable=1, in_model_load=0)
+0.26.036.180 I llama_context:  SYCL_Host  output buffer size =     0.77 MiB
+0.26.036.184 I [SYCL-CPU-ACT] plan CPU work: kv
+0.26.036.251 I llama_kv_cache_iswa: creating non-SWA KV cache, size = 131072 cells
+0.26.037.410 I llama_kv_cache: [LOAD-PLAN] kv residency: 0 layer(s) on device, 12 on the host KV tier, 0 on CPU
+0.26.037.416 I [SYCL] Host buffer alloc request: 2048.0 MB (evictable=1, in_model_load=0)
+0.26.215.338 I [SYCL] Allocated pinned base chunk 9 (size=2048.0 MB, total=20.0 GB)
+0.26.215.785 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 14400.0 MB)
+0.26.219.023 I [SYCL] Host buffer alloc request: 1024.0 MB (evictable=1, in_model_load=0)
+0.26.384.906 I [SYCL] Allocated pinned base chunk 10 (size=2048.0 MB, total=22.0 GB)
+0.26.384.910 I [SYCL] Pinned pool grow_zone: zone 0 grown by 2048.0 MB (1 new chunks, zone now 16448.0 MB)
+0.26.882.656 I llama_kv_cache: SYCL_KV_Host KV buffer size =  3072.00 MiB
+0.26.882.662 I llama_kv_cache: size = 3072.00 MiB (131072 cells,  12 layers,  1/1 seqs), K (f16): 1536.00 MiB, V (f16): 1536.00 MiB
+0.26.882.665 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 64
+0.26.882.665 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 64
+0.26.882.667 I llama_kv_cache_iswa: creating     SWA KV cache, size = 768 cells
+0.26.882.992 I llama_kv_cache: [LOAD-PLAN] kv residency: 12 layer(s) on device, 0 on the host KV tier, 0 on CPU
+0.26.883.285 I [KV-ALLOC] tiered_kv_buft_alloc_buffer: size=18.0 MB, n_layers=24
+0.26.883.294 I [KV-ALLOC] kv_per_layer=1.5 MB (full=256.0 MB, swa=1.5 MB), n_kv_layers=12/24
+0.26.884.318 I [KV-TIER] Plan-driven: 12/24 layers on device (planner_n_ctx=131072, kv_layers=12, kv_per_layer=1572864, sizing=per-layer, 18.0 MB device, 0.0 MB host)
+0.26.884.326 I [LOAD-SUMMARY] Device 0: weights=actual 11510.9 MB device / 0.0 MB host (2619 device / 0 host, 11510.9 MB total), kv=planned 18.0 MB device / 0.0 MB host (12 device layers / 0 host layers, 18.0 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.26.884.327 I [KV-TIER] Device 0: using plan-driven KV placement (24 layers, no secondary kv budget)
+0.26.884.478 I [KV-TIER] layer 0 planned_device=0 materialized=device ptr=0xffffe391ebcde100 size=1572864
+0.26.884.480 I [KV-TIER] layer 2 planned_device=0 materialized=device ptr=0xffffe391ebe5e100 size=1572864
+0.26.884.482 I [KV-TIER] layer 4 planned_device=0 materialized=device ptr=0xffffe391ebfde100 size=1572864
+0.26.884.484 I [KV-TIER] layer 6 planned_device=0 materialized=device ptr=0xffffe391ec15e100 size=1572864
+0.26.884.487 I [KV-TIER] layer 8 planned_device=0 materialized=device ptr=0xffffe391ec2de100 size=1572864
+0.26.884.489 I [KV-TIER] layer 10 planned_device=0 materialized=device ptr=0xffffe391ec45e100 size=1572864
+0.26.884.491 I [KV-TIER] layer 12 planned_device=0 materialized=device ptr=0xffffe391ec5de100 size=1572864
+0.26.884.493 I [KV-TIER] layer 14 planned_device=0 materialized=device ptr=0xffffe391ec75e100 size=1572864
+0.26.884.496 I [KV-TIER] layer 16 planned_device=0 materialized=device ptr=0xffffe391ec8de100 size=1572864
+0.26.884.497 I [KV-TIER] layer 18 planned_device=0 materialized=device ptr=0xffffe391eca5e100 size=1572864
+0.26.884.499 I [KV-TIER] layer 20 planned_device=0 materialized=device ptr=0xffffe391ecbde100 size=1572864
+0.26.884.500 I [KV-TIER] layer 22 planned_device=0 materialized=device ptr=0xffffe391ecd5e100 size=1572864
+0.26.884.503 I [KV-TIER] All 12 KV-buffer layers match placement plan
+0.26.893.005 I [KV-TIER] alloc_base=0x7a1d019b6080 size=18874368 (range 0x7a1d019b6080-0x7a1d02bb6080)
+0.26.893.007 I [KV-TIER] layer_allocs[0]: ptr=0xffffe391ebcde100 size=1572864 on_device=1 zone_managed=1
+0.26.893.007 I [KV-TIER] layer_allocs[1]: ptr=(nil) size=0 on_device=0 zone_managed=0
+0.26.893.007 I [KV-TIER] layer_allocs[2]: ptr=0xffffe391ebe5e100 size=1572864 on_device=1 zone_managed=1
+0.26.893.008 I [KV-TIER] layer_allocs[3]: ptr=(nil) size=0 on_device=0 zone_managed=0
+0.26.893.008 I [KV-TIER] Device 0: all 12 KV-buffer layers on device (18.0 MB, per-layer alloc, arena KV zone)
+0.26.893.021 I [LOAD-SUMMARY] Device 0: weights=actual 11510.9 MB device / 0.0 MB host (2619 device / 0 host, 11510.9 MB total), kv=actual 18.0 MB device / 0.0 MB host (12 device layers / 0 host layers, 18.0 MB total), oneDNN scratch=arena-lazy (weights=0.0 MB, activations=0.0 MB)
+0.26.893.190 I [KV-REMAP] cache_k_l0: layer=0 alloc_base=0x7a1d019b6080 old_data=0x7a1d019b6080 abs_off=0 layer_base=0 off_in_layer=0 la.ptr=0xffffe391ebcde100 la.size=1572864 -> data=0xffffe391ebcde100 (DEVICE)
+0.26.893.194 I [KV-REMAP] cache_v_l0: layer=0 alloc_base=0x7a1d019b6080 old_data=0x7a1d01a76080 abs_off=786432 layer_base=0 off_in_layer=786432 la.ptr=0xffffe391ebcde100 la.size=1572864 -> data=0xffffe391ebd9e100 (DEVICE)
+0.26.893.207 I [KV-REMAP] cache_k_l2: layer=2 alloc_base=0x7a1d019b6080 old_data=0x7a1d01b36080 abs_off=1572864 layer_base=1572864 off_in_layer=0 la.ptr=0xffffe391ebe5e100 la.size=1572864 -> data=0xffffe391ebe5e100 (DEVICE)
+0.26.893.212 I [KV-REMAP] cache_v_l2: layer=2 alloc_base=0x7a1d019b6080 old_data=0x7a1d01bf6080 abs_off=2359296 layer_base=1572864 off_in_layer=786432 la.ptr=0xffffe391ebe5e100 la.size=1572864 -> data=0xffffe391ebf1e100 (DEVICE)
+0.26.896.406 I [KV-TIER] Device 0: cleared 12 KV layers through per-layer owners
+0.26.896.410 I llama_kv_cache: SYCL_KV_Tiered KV buffer size =    18.00 MiB
+0.26.896.414 I llama_kv_cache: size =   18.00 MiB (   768 cells,  12 layers,  1/1 seqs), K (f16):    9.00 MiB, V (f16):    9.00 MiB
+0.26.896.415 I llama_kv_cache: n_rot_k = 0, n_embd_head_k_all = 64
+0.26.896.415 I llama_kv_cache: n_rot_v = 0, n_embd_head_k_all = 64
+0.26.898.764 I [SYCL-PLAN] dense scratch re-planned on device 0: context 3 published n_ubatch=512; model slot 0 generation 1 plans at n_ubatch=512; the device plans Q8_1 src1 at n_ubatch=512 and f16 dequant at n_ubatch=512
+0.26.898.776 I [SYCL-PLAN] Runtime context update: n_ctx=131072 n_ubatch=512 n_seq_max=1 kv_unified=0 swa_full=0 kv_per_layer=256.0 MB kv_per_swa_layer=1.5 MB
+0.26.898.946 I sched_reserve: reserving ...
+0.26.899.134 I [SYCL-CPU-ACT] plan CPU work: kv
+0.26.902.488 W resolve_fused_ops: Flash Attention executes on CPU for 12 layer(s) (e.g. layer 23) -- the executor follows data placement, not a capability gap
+0.26.902.489 I resolve_fused_ops: Flash Attention enabled
+0.26.902.490 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.26.902.490 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.26.902.490 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.26.902.490 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+[SYCL] buffer-scoped provenance: minted first buffer owner id=0x8000000000002b6f slot=4294967294
+0.26.903.879 W [SYCL] buffer-scoped provenance: minted first buffer owner id=0x8000000000002b6f slot=4294967294
+0.26.904.076 W [SCRATCH-STATS] device=0 compute_buffer=SYCL0 size=79.6 MB zone=runtime planned_compute_term=404.0 MiB
+0.26.904.077 I [SYCL] Host buffer alloc request: 148.0 MB (evictable=1, in_model_load=0)
+0.26.904.089 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc n_ctx=131072 n_ubatch=512 n_seq_max=1
+0.26.904.092 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc buft=SYCL0 graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=1 n_streams=0 splits=49 chunks=[79.6] MiB, total 79.6 MiB
+0.26.904.093 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc buft=SYCL_CpuActivation graph=0 kind=pp n_tokens=512 n_seqs=1 n_outputs=1 n_streams=0 splits=49 chunks=[148.0] MiB, total 148.0 MiB
+0.26.905.028 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc buft=SYCL0 graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=49 chunks=[0.8] MiB, total 0.8 MiB
+0.26.905.030 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc buft=SYCL_CpuActivation graph=1 kind=tg n_tokens=1 n_seqs=1 n_outputs=1 n_streams=0 splits=49 chunks=[0.3] MiB, total 0.3 MiB
+0.26.905.952 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc buft=SYCL0 graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=1 n_streams=0 splits=49 chunks=[79.6] MiB, total 79.6 MiB
+0.26.905.955 I sched_reserve: [LOAD-PLAN] compute trace side=reserve stage=alloc buft=SYCL_CpuActivation graph=2 kind=pp_again n_tokens=512 n_seqs=1 n_outputs=1 n_streams=0 splits=49 chunks=[148.0] MiB, total 148.0 MiB
+0.26.905.958 I sched_reserve:      SYCL0 compute buffer size =    79.64 MiB
+0.26.905.958 I sched_reserve: SYCL_CpuActivation compute buffer size =   148.03 MiB
+0.26.905.959 I sched_reserve: graph: nodes = 1377, splits = 49, input objects = 4, input tensors = 12
+0.26.905.960 I sched_reserve: reserve took 7.01 ms, sched copies = 1
+0.26.905.978 W [SYCL-PLAN] tuning cache hit: n_ubatch=512 (cached, terminal)
+0.26.905.978 W [SYCL-PLAN] auto n_ubatch=512 for n_ctx=131072 n_batch=2048 (tried 512; cached); pass -ub N to override
+0.26.905.979 I sycl_select_auto_ubatch: n_ubatch = 512 (auto, was 512)
+0.26.906.344 I cmn          init: llama threadpool init, n_threads = 4
+0.26.906.648 I cmn  common_init_: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+[SYCL] buffer-scoped provenance: registered first tensor name=SYCL0#inp_tokens#0 owner=0x8000000000002b6f offset=0 nbytes=8 device=0
+0.26.907.684 W [SYCL] buffer-scoped provenance: registered first tensor name=SYCL0#inp_tokens#0 owner=0x8000000000002b6f offset=0 nbytes=8 device=0
+0.26.907.696 W [SYCL] tensor usage UNKNOWN: name=SYCL0#inp_tokens#0 type=i32 ne=[2,1,1,1]
+0.26.907.704 W [SYCL] tensor usage UNKNOWN: name=SYCL0#inp_mixed_tokens#0 type=i32 ne=[2,1,1,1]
+0.26.907.710 W [SYCL] tensor usage UNKNOWN: name=SYCL0#inp_mixed_embd#0 type=f32 ne=[2880,2,1,1]
+0.26.907.716 W [SYCL] tensor usage UNKNOWN: name=SYCL0#inp_mixed_slots#0 type=i64 ne=[2,1,1,1]
+0.26.907.722 W [SYCL] tensor usage UNKNOWN: name=SYCL0#inp_pos#0 type=i32 ne=[2,1,1,1]
+0.26.907.726 W [SYCL] tensor usage UNKNOWN: name=SYCL0#attn_inp_k_idxs#0 type=i64 ne=[2,1,1,1]
+0.26.907.731 W [SYCL] tensor usage UNKNOWN: name=SYCL0#attn_inp_v_idxs#0 type=i64 ne=[2,1,1,1]
+0.26.907.736 W [SYCL] tensor usage UNKNOWN: name=SYCL0#attn_inp_kq_mask#0 type=f16 ne=[256,2,1,1]
+0.26.907.741 W [SYCL] tensor usage UNKNOWN: name=embd type=f32 ne=[2880,2,1,1]
+0.26.907.746 W [SYCL] tensor usage UNKNOWN: name=node_1 type=f32 ne=[2880,2,1,1]
+0.26.907.751 W [SYCL] tensor usage UNKNOWN: name=node_2 type=f32 ne=[2880,2,1,1]
+0.26.907.760 W [SYCL] tensor usage UNKNOWN: name=norm-0 type=f32 ne=[2880,2,1,1]
+0.26.907.769 W [SYCL] tensor usage UNKNOWN: name=Qcur-0 type=f32 ne=[4096,2,1,1]
+0.26.907.787 W [SYCL] tensor usage UNKNOWN: name=Kcur-0 type=f32 ne=[512,2,1,1]
+0.26.907.804 W [SYCL] tensor usage UNKNOWN: name=Vcur-0 type=f32 ne=[512,2,1,1]
+0.26.907.843 W [SYCL] tensor usage UNKNOWN: name=Qcur-0 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.907.849 W [SYCL] tensor usage UNKNOWN: name=node_28 type=f32 ne=[64,64,2,1]
+0.26.907.863 W [SYCL] tensor usage UNKNOWN: name=node_30 type=f32 ne=[2880,2,1,1]
+0.26.907.882 W [SYCL] tensor usage UNKNOWN: name=attn_out-0 type=f32 ne=[2880,2,1,1]
+0.26.907.900 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-0 type=f32 ne=[2880,2,1,1]
+0.26.908.098 W [SYCL] tensor usage UNKNOWN: name=node_42 type=f32 ne=[4,2,1,1]
+0.26.908.357 W [SYCL] tensor usage UNKNOWN: name=node_57 type=f32 ne=[2880,2,1,1]
+0.26.908.375 W [SYCL] tensor usage UNKNOWN: name=node_58 type=f32 ne=[2880,2,1,1]
+0.26.908.412 W [SYCL] tensor usage UNKNOWN: name=l_out-0 type=f32 ne=[2880,2,1,1]
+0.26.908.431 W [SYCL] tensor usage UNKNOWN: name=norm-1 type=f32 ne=[2880,2,1,1]
+0.26.908.525 W [SYCL] tensor usage UNKNOWN: name=Qcur-1 type=f32 ne=[4096,2,1,1]
+0.26.908.596 W [SYCL] tensor usage UNKNOWN: name=Kcur-1 type=f32 ne=[512,2,1,1]
+0.26.908.666 W [SYCL] tensor usage UNKNOWN: name=Vcur-1 type=f32 ne=[512,2,1,1]
+0.26.908.816 W [SYCL] tensor usage UNKNOWN: name=Qcur-1 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.908.852 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-1#0 type=f32 ne=[4096,2,1,1]
+0.26.908.871 W [SYCL] tensor usage UNKNOWN: name=node_87 type=f32 ne=[2880,2,1,1]
+0.26.908.890 W [SYCL] tensor usage UNKNOWN: name=attn_out-1 type=f32 ne=[2880,2,1,1]
+0.26.908.911 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-1 type=f32 ne=[2880,2,1,1]
+0.26.909.085 W [SYCL] tensor usage UNKNOWN: name=node_99 type=f32 ne=[4,2,1,1]
+0.26.909.454 W [SYCL] tensor usage UNKNOWN: name=node_114 type=f32 ne=[2880,2,1,1]
+0.26.909.474 W [SYCL] tensor usage UNKNOWN: name=node_115 type=f32 ne=[2880,2,1,1]
+0.26.909.513 W [SYCL] tensor usage UNKNOWN: name=l_out-1 type=f32 ne=[2880,2,1,1]
+0.26.909.533 W [SYCL] tensor usage UNKNOWN: name=norm-2 type=f32 ne=[2880,2,1,1]
+0.26.909.567 W [SYCL] tensor usage UNKNOWN: name=Qcur-2 type=f32 ne=[4096,2,1,1]
+0.26.909.639 W [SYCL] tensor usage UNKNOWN: name=Kcur-2 type=f32 ne=[512,2,1,1]
+0.26.909.711 W [SYCL] tensor usage UNKNOWN: name=Vcur-2 type=f32 ne=[512,2,1,1]
+0.26.909.843 W [SYCL] tensor usage UNKNOWN: name=Qcur-2 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.909.862 W [SYCL] tensor usage UNKNOWN: name=node_142 type=f32 ne=[64,64,2,1]
+0.26.909.903 W [SYCL] tensor usage UNKNOWN: name=node_144 type=f32 ne=[2880,2,1,1]
+0.26.909.922 W [SYCL] tensor usage UNKNOWN: name=attn_out-2 type=f32 ne=[2880,2,1,1]
+0.26.909.942 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-2 type=f32 ne=[2880,2,1,1]
+0.26.910.149 W [SYCL] tensor usage UNKNOWN: name=node_156 type=f32 ne=[4,2,1,1]
+0.26.910.409 W [SYCL] tensor usage UNKNOWN: name=node_171 type=f32 ne=[2880,2,1,1]
+0.26.910.427 W [SYCL] tensor usage UNKNOWN: name=node_172 type=f32 ne=[2880,2,1,1]
+0.26.910.464 W [SYCL] tensor usage UNKNOWN: name=l_out-2 type=f32 ne=[2880,2,1,1]
+0.26.910.483 W [SYCL] tensor usage UNKNOWN: name=norm-3 type=f32 ne=[2880,2,1,1]
+0.26.910.522 W [SYCL] tensor usage UNKNOWN: name=Qcur-3 type=f32 ne=[4096,2,1,1]
+0.26.910.594 W [SYCL] tensor usage UNKNOWN: name=Kcur-3 type=f32 ne=[512,2,1,1]
+0.26.910.667 W [SYCL] tensor usage UNKNOWN: name=Vcur-3 type=f32 ne=[512,2,1,1]
+0.26.910.829 W [SYCL] tensor usage UNKNOWN: name=Qcur-3 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.910.868 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-3#0 type=f32 ne=[4096,2,1,1]
+0.26.910.887 W [SYCL] tensor usage UNKNOWN: name=node_201 type=f32 ne=[2880,2,1,1]
+0.26.910.904 W [SYCL] tensor usage UNKNOWN: name=attn_out-3 type=f32 ne=[2880,2,1,1]
+0.26.910.922 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-3 type=f32 ne=[2880,2,1,1]
+0.26.911.291 W [SYCL] tensor usage UNKNOWN: name=node_213 type=f32 ne=[4,2,1,1]
+0.26.911.540 W [SYCL] tensor usage UNKNOWN: name=node_228 type=f32 ne=[2880,2,1,1]
+0.26.911.560 W [SYCL] tensor usage UNKNOWN: name=node_229 type=f32 ne=[2880,2,1,1]
+0.26.911.594 W [SYCL] tensor usage UNKNOWN: name=l_out-3 type=f32 ne=[2880,2,1,1]
+0.26.911.612 W [SYCL] tensor usage UNKNOWN: name=norm-4 type=f32 ne=[2880,2,1,1]
+0.26.911.650 W [SYCL] tensor usage UNKNOWN: name=Qcur-4 type=f32 ne=[4096,2,1,1]
+0.26.911.716 W [SYCL] tensor usage UNKNOWN: name=Kcur-4 type=f32 ne=[512,2,1,1]
+0.26.911.784 W [SYCL] tensor usage UNKNOWN: name=Vcur-4 type=f32 ne=[512,2,1,1]
+0.26.911.908 W [SYCL] tensor usage UNKNOWN: name=Qcur-4 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.911.928 W [SYCL] tensor usage UNKNOWN: name=node_256 type=f32 ne=[64,64,2,1]
+0.26.911.961 W [SYCL] tensor usage UNKNOWN: name=node_258 type=f32 ne=[2880,2,1,1]
+0.26.911.979 W [SYCL] tensor usage UNKNOWN: name=attn_out-4 type=f32 ne=[2880,2,1,1]
+0.26.911.998 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-4 type=f32 ne=[2880,2,1,1]
+0.26.912.161 W [SYCL] tensor usage UNKNOWN: name=node_270 type=f32 ne=[4,2,1,1]
+0.26.912.406 W [SYCL] tensor usage UNKNOWN: name=node_285 type=f32 ne=[2880,2,1,1]
+0.26.912.425 W [SYCL] tensor usage UNKNOWN: name=node_286 type=f32 ne=[2880,2,1,1]
+0.26.912.460 W [SYCL] tensor usage UNKNOWN: name=l_out-4 type=f32 ne=[2880,2,1,1]
+0.26.912.480 W [SYCL] tensor usage UNKNOWN: name=norm-5 type=f32 ne=[2880,2,1,1]
+0.26.912.518 W [SYCL] tensor usage UNKNOWN: name=Qcur-5 type=f32 ne=[4096,2,1,1]
+0.26.912.591 W [SYCL] tensor usage UNKNOWN: name=Kcur-5 type=f32 ne=[512,2,1,1]
+0.26.912.662 W [SYCL] tensor usage UNKNOWN: name=Vcur-5 type=f32 ne=[512,2,1,1]
+0.26.912.810 W [SYCL] tensor usage UNKNOWN: name=Qcur-5 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.912.843 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-5#0 type=f32 ne=[4096,2,1,1]
+0.26.912.861 W [SYCL] tensor usage UNKNOWN: name=node_315 type=f32 ne=[2880,2,1,1]
+0.26.912.881 W [SYCL] tensor usage UNKNOWN: name=attn_out-5 type=f32 ne=[2880,2,1,1]
+0.26.912.898 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-5 type=f32 ne=[2880,2,1,1]
+0.26.913.065 W [SYCL] tensor usage UNKNOWN: name=node_327 type=f32 ne=[4,2,1,1]
+0.26.913.305 W [SYCL] tensor usage UNKNOWN: name=node_342 type=f32 ne=[2880,2,1,1]
+0.26.913.323 W [SYCL] tensor usage UNKNOWN: name=node_343 type=f32 ne=[2880,2,1,1]
+0.26.913.357 W [SYCL] tensor usage UNKNOWN: name=l_out-5 type=f32 ne=[2880,2,1,1]
+0.26.913.374 W [SYCL] tensor usage UNKNOWN: name=norm-6 type=f32 ne=[2880,2,1,1]
+0.26.913.410 W [SYCL] tensor usage UNKNOWN: name=Qcur-6 type=f32 ne=[4096,2,1,1]
+0.26.913.473 W [SYCL] tensor usage UNKNOWN: name=Kcur-6 type=f32 ne=[512,2,1,1]
+0.26.913.554 W [SYCL] tensor usage UNKNOWN: name=Vcur-6 type=f32 ne=[512,2,1,1]
+0.26.913.678 W [SYCL] tensor usage UNKNOWN: name=Qcur-6 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.913.697 W [SYCL] tensor usage UNKNOWN: name=node_370 type=f32 ne=[64,64,2,1]
+0.26.913.730 W [SYCL] tensor usage UNKNOWN: name=node_372 type=f32 ne=[2880,2,1,1]
+0.26.913.747 W [SYCL] tensor usage UNKNOWN: name=attn_out-6 type=f32 ne=[2880,2,1,1]
+0.26.913.768 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-6 type=f32 ne=[2880,2,1,1]
+0.26.913.928 W [SYCL] tensor usage UNKNOWN: name=node_384 type=f32 ne=[4,2,1,1]
+0.26.914.167 W [SYCL] tensor usage UNKNOWN: name=node_399 type=f32 ne=[2880,2,1,1]
+0.26.914.183 W [SYCL] tensor usage UNKNOWN: name=node_400 type=f32 ne=[2880,2,1,1]
+0.26.914.217 W [SYCL] tensor usage UNKNOWN: name=l_out-6 type=f32 ne=[2880,2,1,1]
+0.26.914.232 W [SYCL] tensor usage UNKNOWN: name=norm-7 type=f32 ne=[2880,2,1,1]
+0.26.914.264 W [SYCL] tensor usage UNKNOWN: name=Qcur-7 type=f32 ne=[4096,2,1,1]
+0.26.914.547 W [SYCL] tensor usage UNKNOWN: name=Kcur-7 type=f32 ne=[512,2,1,1]
+0.26.914.612 W [SYCL] tensor usage UNKNOWN: name=Vcur-7 type=f32 ne=[512,2,1,1]
+0.26.914.753 W [SYCL] tensor usage UNKNOWN: name=Qcur-7 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.914.788 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-7#0 type=f32 ne=[4096,2,1,1]
+0.26.914.804 W [SYCL] tensor usage UNKNOWN: name=node_429 type=f32 ne=[2880,2,1,1]
+0.26.914.823 W [SYCL] tensor usage UNKNOWN: name=attn_out-7 type=f32 ne=[2880,2,1,1]
+0.26.914.842 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-7 type=f32 ne=[2880,2,1,1]
+0.26.915.005 W [SYCL] tensor usage UNKNOWN: name=node_441 type=f32 ne=[4,2,1,1]
+0.26.915.260 W [SYCL] tensor usage UNKNOWN: name=node_456 type=f32 ne=[2880,2,1,1]
+0.26.915.278 W [SYCL] tensor usage UNKNOWN: name=node_457 type=f32 ne=[2880,2,1,1]
+0.26.915.313 W [SYCL] tensor usage UNKNOWN: name=l_out-7 type=f32 ne=[2880,2,1,1]
+0.26.915.331 W [SYCL] tensor usage UNKNOWN: name=norm-8 type=f32 ne=[2880,2,1,1]
+0.26.915.369 W [SYCL] tensor usage UNKNOWN: name=Qcur-8 type=f32 ne=[4096,2,1,1]
+0.26.915.441 W [SYCL] tensor usage UNKNOWN: name=Kcur-8 type=f32 ne=[512,2,1,1]
+0.26.915.516 W [SYCL] tensor usage UNKNOWN: name=Vcur-8 type=f32 ne=[512,2,1,1]
+0.26.915.653 W [SYCL] tensor usage UNKNOWN: name=Qcur-8 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.915.673 W [SYCL] tensor usage UNKNOWN: name=node_484 type=f32 ne=[64,64,2,1]
+0.26.915.708 W [SYCL] tensor usage UNKNOWN: name=node_486 type=f32 ne=[2880,2,1,1]
+0.26.915.726 W [SYCL] tensor usage UNKNOWN: name=attn_out-8 type=f32 ne=[2880,2,1,1]
+0.26.915.745 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-8 type=f32 ne=[2880,2,1,1]
+0.26.915.920 W [SYCL] tensor usage UNKNOWN: name=node_498 type=f32 ne=[4,2,1,1]
+0.26.916.174 W [SYCL] tensor usage UNKNOWN: name=node_513 type=f32 ne=[2880,2,1,1]
+0.26.916.193 W [SYCL] tensor usage UNKNOWN: name=node_514 type=f32 ne=[2880,2,1,1]
+0.26.916.233 W [SYCL] tensor usage UNKNOWN: name=l_out-8 type=f32 ne=[2880,2,1,1]
+0.26.916.250 W [SYCL] tensor usage UNKNOWN: name=norm-9 type=f32 ne=[2880,2,1,1]
+0.26.916.287 W [SYCL] tensor usage UNKNOWN: name=Qcur-9 type=f32 ne=[4096,2,1,1]
+0.26.916.357 W [SYCL] tensor usage UNKNOWN: name=Kcur-9 type=f32 ne=[512,2,1,1]
+0.26.916.428 W [SYCL] tensor usage UNKNOWN: name=Vcur-9 type=f32 ne=[512,2,1,1]
+0.26.916.580 W [SYCL] tensor usage UNKNOWN: name=Qcur-9 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.916.618 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-9#0 type=f32 ne=[4096,2,1,1]
+0.26.916.637 W [SYCL] tensor usage UNKNOWN: name=node_543 type=f32 ne=[2880,2,1,1]
+0.26.916.654 W [SYCL] tensor usage UNKNOWN: name=attn_out-9 type=f32 ne=[2880,2,1,1]
+0.26.916.673 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-9 type=f32 ne=[2880,2,1,1]
+0.26.916.848 W [SYCL] tensor usage UNKNOWN: name=node_555 type=f32 ne=[4,2,1,1]
+0.26.917.108 W [SYCL] tensor usage UNKNOWN: name=node_570 type=f32 ne=[2880,2,1,1]
+0.26.917.125 W [SYCL] tensor usage UNKNOWN: name=node_571 type=f32 ne=[2880,2,1,1]
+0.26.917.160 W [SYCL] tensor usage UNKNOWN: name=l_out-9 type=f32 ne=[2880,2,1,1]
+0.26.917.179 W [SYCL] tensor usage UNKNOWN: name=norm-10 type=f32 ne=[2880,2,1,1]
+0.26.917.213 W [SYCL] tensor usage UNKNOWN: name=Qcur-10 type=f32 ne=[4096,2,1,1]
+0.26.917.282 W [SYCL] tensor usage UNKNOWN: name=Kcur-10 type=f32 ne=[512,2,1,1]
+0.26.917.355 W [SYCL] tensor usage UNKNOWN: name=Vcur-10 type=f32 ne=[512,2,1,1]
+0.26.917.492 W [SYCL] tensor usage UNKNOWN: name=Qcur-10 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.917.515 W [SYCL] tensor usage UNKNOWN: name=node_598 type=f32 ne=[64,64,2,1]
+0.26.917.553 W [SYCL] tensor usage UNKNOWN: name=node_600 type=f32 ne=[2880,2,1,1]
+0.26.917.573 W [SYCL] tensor usage UNKNOWN: name=attn_out-10 type=f32 ne=[2880,2,1,1]
+0.26.917.591 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-10 type=f32 ne=[2880,2,1,1]
+0.26.917.986 W [SYCL] tensor usage UNKNOWN: name=node_612 type=f32 ne=[4,2,1,1]
+0.26.918.241 W [SYCL] tensor usage UNKNOWN: name=node_627 type=f32 ne=[2880,2,1,1]
+0.26.918.262 W [SYCL] tensor usage UNKNOWN: name=node_628 type=f32 ne=[2880,2,1,1]
+0.26.918.297 W [SYCL] tensor usage UNKNOWN: name=l_out-10 type=f32 ne=[2880,2,1,1]
+0.26.918.317 W [SYCL] tensor usage UNKNOWN: name=norm-11 type=f32 ne=[2880,2,1,1]
+0.26.918.353 W [SYCL] tensor usage UNKNOWN: name=Qcur-11 type=f32 ne=[4096,2,1,1]
+0.26.918.427 W [SYCL] tensor usage UNKNOWN: name=Kcur-11 type=f32 ne=[512,2,1,1]
+0.26.918.496 W [SYCL] tensor usage UNKNOWN: name=Vcur-11 type=f32 ne=[512,2,1,1]
+0.26.918.650 W [SYCL] tensor usage UNKNOWN: name=Qcur-11 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.918.689 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-11#0 type=f32 ne=[4096,2,1,1]
+0.26.918.708 W [SYCL] tensor usage UNKNOWN: name=node_657 type=f32 ne=[2880,2,1,1]
+0.26.918.727 W [SYCL] tensor usage UNKNOWN: name=attn_out-11 type=f32 ne=[2880,2,1,1]
+0.26.918.746 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-11 type=f32 ne=[2880,2,1,1]
+0.26.918.919 W [SYCL] tensor usage UNKNOWN: name=node_669 type=f32 ne=[4,2,1,1]
+0.26.919.182 W [SYCL] tensor usage UNKNOWN: name=node_684 type=f32 ne=[2880,2,1,1]
+0.26.919.202 W [SYCL] tensor usage UNKNOWN: name=node_685 type=f32 ne=[2880,2,1,1]
+0.26.919.240 W [SYCL] tensor usage UNKNOWN: name=l_out-11 type=f32 ne=[2880,2,1,1]
+0.26.919.262 W [SYCL] tensor usage UNKNOWN: name=norm-12 type=f32 ne=[2880,2,1,1]
+0.26.919.297 W [SYCL] tensor usage UNKNOWN: name=Qcur-12 type=f32 ne=[4096,2,1,1]
+0.26.919.368 W [SYCL] tensor usage UNKNOWN: name=Kcur-12 type=f32 ne=[512,2,1,1]
+0.26.919.438 W [SYCL] tensor usage UNKNOWN: name=Vcur-12 type=f32 ne=[512,2,1,1]
+0.26.919.576 W [SYCL] tensor usage UNKNOWN: name=Qcur-12 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.919.594 W [SYCL] tensor usage UNKNOWN: name=node_712 type=f32 ne=[64,64,2,1]
+0.26.919.630 W [SYCL] tensor usage UNKNOWN: name=node_714 type=f32 ne=[2880,2,1,1]
+0.26.919.648 W [SYCL] tensor usage UNKNOWN: name=attn_out-12 type=f32 ne=[2880,2,1,1]
+0.26.919.666 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-12 type=f32 ne=[2880,2,1,1]
+0.26.919.837 W [SYCL] tensor usage UNKNOWN: name=node_726 type=f32 ne=[4,2,1,1]
+0.26.920.092 W [SYCL] tensor usage UNKNOWN: name=node_741 type=f32 ne=[2880,2,1,1]
+0.26.920.112 W [SYCL] tensor usage UNKNOWN: name=node_742 type=f32 ne=[2880,2,1,1]
+0.26.920.146 W [SYCL] tensor usage UNKNOWN: name=l_out-12 type=f32 ne=[2880,2,1,1]
+0.26.920.164 W [SYCL] tensor usage UNKNOWN: name=norm-13 type=f32 ne=[2880,2,1,1]
+0.26.920.200 W [SYCL] tensor usage UNKNOWN: name=Qcur-13 type=f32 ne=[4096,2,1,1]
+0.26.920.267 W [SYCL] tensor usage UNKNOWN: name=Kcur-13 type=f32 ne=[512,2,1,1]
+0.26.920.335 W [SYCL] tensor usage UNKNOWN: name=Vcur-13 type=f32 ne=[512,2,1,1]
+0.26.920.486 W [SYCL] tensor usage UNKNOWN: name=Qcur-13 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.920.525 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-13#0 type=f32 ne=[4096,2,1,1]
+0.26.920.543 W [SYCL] tensor usage UNKNOWN: name=node_771 type=f32 ne=[2880,2,1,1]
+0.26.920.562 W [SYCL] tensor usage UNKNOWN: name=attn_out-13 type=f32 ne=[2880,2,1,1]
+0.26.920.579 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-13 type=f32 ne=[2880,2,1,1]
+0.26.920.751 W [SYCL] tensor usage UNKNOWN: name=node_783 type=f32 ne=[4,2,1,1]
+0.26.921.008 W [SYCL] tensor usage UNKNOWN: name=node_798 type=f32 ne=[2880,2,1,1]
+0.26.921.026 W [SYCL] tensor usage UNKNOWN: name=node_799 type=f32 ne=[2880,2,1,1]
+0.26.921.281 W [SYCL] tensor usage UNKNOWN: name=l_out-13 type=f32 ne=[2880,2,1,1]
+0.26.921.300 W [SYCL] tensor usage UNKNOWN: name=norm-14 type=f32 ne=[2880,2,1,1]
+0.26.921.335 W [SYCL] tensor usage UNKNOWN: name=Qcur-14 type=f32 ne=[4096,2,1,1]
+0.26.921.403 W [SYCL] tensor usage UNKNOWN: name=Kcur-14 type=f32 ne=[512,2,1,1]
+0.26.921.469 W [SYCL] tensor usage UNKNOWN: name=Vcur-14 type=f32 ne=[512,2,1,1]
+0.26.921.603 W [SYCL] tensor usage UNKNOWN: name=Qcur-14 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.921.622 W [SYCL] tensor usage UNKNOWN: name=node_826 type=f32 ne=[64,64,2,1]
+0.26.921.658 W [SYCL] tensor usage UNKNOWN: name=node_828 type=f32 ne=[2880,2,1,1]
+0.26.921.676 W [SYCL] tensor usage UNKNOWN: name=attn_out-14 type=f32 ne=[2880,2,1,1]
+0.26.921.694 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-14 type=f32 ne=[2880,2,1,1]
+0.26.921.866 W [SYCL] tensor usage UNKNOWN: name=node_840 type=f32 ne=[4,2,1,1]
+0.26.922.122 W [SYCL] tensor usage UNKNOWN: name=node_855 type=f32 ne=[2880,2,1,1]
+0.26.922.140 W [SYCL] tensor usage UNKNOWN: name=node_856 type=f32 ne=[2880,2,1,1]
+0.26.922.175 W [SYCL] tensor usage UNKNOWN: name=l_out-14 type=f32 ne=[2880,2,1,1]
+0.26.922.194 W [SYCL] tensor usage UNKNOWN: name=norm-15 type=f32 ne=[2880,2,1,1]
+0.26.922.231 W [SYCL] tensor usage UNKNOWN: name=Qcur-15 type=f32 ne=[4096,2,1,1]
+0.26.922.301 W [SYCL] tensor usage UNKNOWN: name=Kcur-15 type=f32 ne=[512,2,1,1]
+0.26.922.369 W [SYCL] tensor usage UNKNOWN: name=Vcur-15 type=f32 ne=[512,2,1,1]
+0.26.922.522 W [SYCL] tensor usage UNKNOWN: name=Qcur-15 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.922.558 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-15#0 type=f32 ne=[4096,2,1,1]
+0.26.922.578 W [SYCL] tensor usage UNKNOWN: name=node_885 type=f32 ne=[2880,2,1,1]
+0.26.922.596 W [SYCL] tensor usage UNKNOWN: name=attn_out-15 type=f32 ne=[2880,2,1,1]
+0.26.922.615 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-15 type=f32 ne=[2880,2,1,1]
+0.26.922.788 W [SYCL] tensor usage UNKNOWN: name=node_897 type=f32 ne=[4,2,1,1]
+0.26.923.045 W [SYCL] tensor usage UNKNOWN: name=node_912 type=f32 ne=[2880,2,1,1]
+0.26.923.063 W [SYCL] tensor usage UNKNOWN: name=node_913 type=f32 ne=[2880,2,1,1]
+0.26.923.099 W [SYCL] tensor usage UNKNOWN: name=l_out-15 type=f32 ne=[2880,2,1,1]
+0.26.923.118 W [SYCL] tensor usage UNKNOWN: name=norm-16 type=f32 ne=[2880,2,1,1]
+0.26.923.154 W [SYCL] tensor usage UNKNOWN: name=Qcur-16 type=f32 ne=[4096,2,1,1]
+0.26.923.224 W [SYCL] tensor usage UNKNOWN: name=Kcur-16 type=f32 ne=[512,2,1,1]
+0.26.923.295 W [SYCL] tensor usage UNKNOWN: name=Vcur-16 type=f32 ne=[512,2,1,1]
+0.26.923.425 W [SYCL] tensor usage UNKNOWN: name=Qcur-16 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.923.445 W [SYCL] tensor usage UNKNOWN: name=node_940 type=f32 ne=[64,64,2,1]
+0.26.923.480 W [SYCL] tensor usage UNKNOWN: name=node_942 type=f32 ne=[2880,2,1,1]
+0.26.923.499 W [SYCL] tensor usage UNKNOWN: name=attn_out-16 type=f32 ne=[2880,2,1,1]
+0.26.923.519 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-16 type=f32 ne=[2880,2,1,1]
+0.26.923.691 W [SYCL] tensor usage UNKNOWN: name=node_954 type=f32 ne=[4,2,1,1]
+0.26.923.948 W [SYCL] tensor usage UNKNOWN: name=node_969 type=f32 ne=[2880,2,1,1]
+0.26.923.966 W [SYCL] tensor usage UNKNOWN: name=node_970 type=f32 ne=[2880,2,1,1]
+0.26.924.003 W [SYCL] tensor usage UNKNOWN: name=l_out-16 type=f32 ne=[2880,2,1,1]
+0.26.924.023 W [SYCL] tensor usage UNKNOWN: name=norm-17 type=f32 ne=[2880,2,1,1]
+0.26.924.059 W [SYCL] tensor usage UNKNOWN: name=Qcur-17 type=f32 ne=[4096,2,1,1]
+0.26.924.129 W [SYCL] tensor usage UNKNOWN: name=Kcur-17 type=f32 ne=[512,2,1,1]
+0.26.924.198 W [SYCL] tensor usage UNKNOWN: name=Vcur-17 type=f32 ne=[512,2,1,1]
+0.26.924.348 W [SYCL] tensor usage UNKNOWN: name=Qcur-17 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.924.386 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-17#0 type=f32 ne=[4096,2,1,1]
+0.26.924.404 W [SYCL] tensor usage UNKNOWN: name=node_999 type=f32 ne=[2880,2,1,1]
+0.26.924.647 W [SYCL] tensor usage UNKNOWN: name=attn_out-17 type=f32 ne=[2880,2,1,1]
+0.26.924.665 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-17 type=f32 ne=[2880,2,1,1]
+0.26.924.834 W [SYCL] tensor usage UNKNOWN: name=node_1011 type=f32 ne=[4,2,1,1]
+0.26.925.084 W [SYCL] tensor usage UNKNOWN: name=node_1026 type=f32 ne=[2880,2,1,1]
+0.26.925.104 W [SYCL] tensor usage UNKNOWN: name=node_1027 type=f32 ne=[2880,2,1,1]
+0.26.925.139 W [SYCL] tensor usage UNKNOWN: name=l_out-17 type=f32 ne=[2880,2,1,1]
+0.26.925.158 W [SYCL] tensor usage UNKNOWN: name=norm-18 type=f32 ne=[2880,2,1,1]
+0.26.925.192 W [SYCL] tensor usage UNKNOWN: name=Qcur-18 type=f32 ne=[4096,2,1,1]
+0.26.925.263 W [SYCL] tensor usage UNKNOWN: name=Kcur-18 type=f32 ne=[512,2,1,1]
+0.26.925.333 W [SYCL] tensor usage UNKNOWN: name=Vcur-18 type=f32 ne=[512,2,1,1]
+0.26.925.465 W [SYCL] tensor usage UNKNOWN: name=Qcur-18 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.925.484 W [SYCL] tensor usage UNKNOWN: name=node_1054 type=f32 ne=[64,64,2,1]
+0.26.925.522 W [SYCL] tensor usage UNKNOWN: name=node_1056 type=f32 ne=[2880,2,1,1]
+0.26.925.541 W [SYCL] tensor usage UNKNOWN: name=attn_out-18 type=f32 ne=[2880,2,1,1]
+0.26.925.560 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-18 type=f32 ne=[2880,2,1,1]
+0.26.925.733 W [SYCL] tensor usage UNKNOWN: name=node_1068 type=f32 ne=[4,2,1,1]
+0.26.925.991 W [SYCL] tensor usage UNKNOWN: name=node_1083 type=f32 ne=[2880,2,1,1]
+0.26.926.009 W [SYCL] tensor usage UNKNOWN: name=node_1084 type=f32 ne=[2880,2,1,1]
+0.26.926.059 W [SYCL] tensor usage UNKNOWN: name=l_out-18 type=f32 ne=[2880,2,1,1]
+0.26.926.078 W [SYCL] tensor usage UNKNOWN: name=norm-19 type=f32 ne=[2880,2,1,1]
+0.26.926.116 W [SYCL] tensor usage UNKNOWN: name=Qcur-19 type=f32 ne=[4096,2,1,1]
+0.26.926.184 W [SYCL] tensor usage UNKNOWN: name=Kcur-19 type=f32 ne=[512,2,1,1]
+0.26.926.255 W [SYCL] tensor usage UNKNOWN: name=Vcur-19 type=f32 ne=[512,2,1,1]
+0.26.926.405 W [SYCL] tensor usage UNKNOWN: name=Qcur-19 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.926.441 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-19#0 type=f32 ne=[4096,2,1,1]
+0.26.926.460 W [SYCL] tensor usage UNKNOWN: name=node_1113 type=f32 ne=[2880,2,1,1]
+0.26.926.478 W [SYCL] tensor usage UNKNOWN: name=attn_out-19 type=f32 ne=[2880,2,1,1]
+0.26.926.497 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-19 type=f32 ne=[2880,2,1,1]
+0.26.926.673 W [SYCL] tensor usage UNKNOWN: name=node_1125 type=f32 ne=[4,2,1,1]
+0.26.927.142 W [SYCL] tensor usage UNKNOWN: name=node_1140 type=f32 ne=[2880,2,1,1]
+0.26.927.161 W [SYCL] tensor usage UNKNOWN: name=node_1141 type=f32 ne=[2880,2,1,1]
+0.26.927.197 W [SYCL] tensor usage UNKNOWN: name=l_out-19 type=f32 ne=[2880,2,1,1]
+0.26.927.215 W [SYCL] tensor usage UNKNOWN: name=norm-20 type=f32 ne=[2880,2,1,1]
+0.26.927.253 W [SYCL] tensor usage UNKNOWN: name=Qcur-20 type=f32 ne=[4096,2,1,1]
+0.26.927.323 W [SYCL] tensor usage UNKNOWN: name=Kcur-20 type=f32 ne=[512,2,1,1]
+0.26.927.391 W [SYCL] tensor usage UNKNOWN: name=Vcur-20 type=f32 ne=[512,2,1,1]
+0.26.927.532 W [SYCL] tensor usage UNKNOWN: name=Qcur-20 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.927.553 W [SYCL] tensor usage UNKNOWN: name=node_1168 type=f32 ne=[64,64,2,1]
+0.26.927.590 W [SYCL] tensor usage UNKNOWN: name=node_1170 type=f32 ne=[2880,2,1,1]
+0.26.927.611 W [SYCL] tensor usage UNKNOWN: name=attn_out-20 type=f32 ne=[2880,2,1,1]
+0.26.927.630 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-20 type=f32 ne=[2880,2,1,1]
+0.26.927.810 W [SYCL] tensor usage UNKNOWN: name=node_1182 type=f32 ne=[4,2,1,1]
+0.26.928.284 W [SYCL] tensor usage UNKNOWN: name=node_1197 type=f32 ne=[2880,2,1,1]
+0.26.928.304 W [SYCL] tensor usage UNKNOWN: name=node_1198 type=f32 ne=[2880,2,1,1]
+0.26.928.338 W [SYCL] tensor usage UNKNOWN: name=l_out-20 type=f32 ne=[2880,2,1,1]
+0.26.928.356 W [SYCL] tensor usage UNKNOWN: name=norm-21 type=f32 ne=[2880,2,1,1]
+0.26.928.392 W [SYCL] tensor usage UNKNOWN: name=Qcur-21 type=f32 ne=[4096,2,1,1]
+0.26.928.460 W [SYCL] tensor usage UNKNOWN: name=Kcur-21 type=f32 ne=[512,2,1,1]
+0.26.928.530 W [SYCL] tensor usage UNKNOWN: name=Vcur-21 type=f32 ne=[512,2,1,1]
+0.26.928.679 W [SYCL] tensor usage UNKNOWN: name=Qcur-21 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.928.714 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-21#0 type=f32 ne=[4096,2,1,1]
+0.26.928.735 W [SYCL] tensor usage UNKNOWN: name=node_1227 type=f32 ne=[2880,2,1,1]
+0.26.928.753 W [SYCL] tensor usage UNKNOWN: name=attn_out-21 type=f32 ne=[2880,2,1,1]
+0.26.928.771 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-21 type=f32 ne=[2880,2,1,1]
+0.26.928.942 W [SYCL] tensor usage UNKNOWN: name=node_1239 type=f32 ne=[4,2,1,1]
+0.26.929.205 W [SYCL] tensor usage UNKNOWN: name=node_1254 type=f32 ne=[2880,2,1,1]
+0.26.929.226 W [SYCL] tensor usage UNKNOWN: name=node_1255 type=f32 ne=[2880,2,1,1]
+0.26.929.261 W [SYCL] tensor usage UNKNOWN: name=l_out-21 type=f32 ne=[2880,2,1,1]
+0.26.929.280 W [SYCL] tensor usage UNKNOWN: name=norm-22 type=f32 ne=[2880,2,1,1]
+0.26.929.318 W [SYCL] tensor usage UNKNOWN: name=Qcur-22 type=f32 ne=[4096,2,1,1]
+0.26.929.388 W [SYCL] tensor usage UNKNOWN: name=Kcur-22 type=f32 ne=[512,2,1,1]
+0.26.929.456 W [SYCL] tensor usage UNKNOWN: name=Vcur-22 type=f32 ne=[512,2,1,1]
+0.26.929.586 W [SYCL] tensor usage UNKNOWN: name=Qcur-22 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.929.603 W [SYCL] tensor usage UNKNOWN: name=node_1282 type=f32 ne=[64,64,2,1]
+0.26.929.637 W [SYCL] tensor usage UNKNOWN: name=node_1284 type=f32 ne=[2880,2,1,1]
+0.26.929.657 W [SYCL] tensor usage UNKNOWN: name=attn_out-22 type=f32 ne=[2880,2,1,1]
+0.26.929.675 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-22 type=f32 ne=[2880,2,1,1]
+0.26.929.841 W [SYCL] tensor usage UNKNOWN: name=node_1296 type=f32 ne=[4,2,1,1]
+0.26.930.141 W [SYCL] tensor usage UNKNOWN: name=node_1311 type=f32 ne=[2880,2,1,1]
+0.26.930.159 W [SYCL] tensor usage UNKNOWN: name=node_1312 type=f32 ne=[2880,2,1,1]
+0.26.930.193 W [SYCL] tensor usage UNKNOWN: name=l_out-22 type=f32 ne=[2880,2,1,1]
+0.26.930.212 W [SYCL] tensor usage UNKNOWN: name=norm-23 type=f32 ne=[2880,2,1,1]
+0.26.930.248 W [SYCL] tensor usage UNKNOWN: name=Qcur-23 type=f32 ne=[4096,2,1,1]
+0.26.930.313 W [SYCL] tensor usage UNKNOWN: name=Kcur-23 type=f32 ne=[512,2,1,1]
+0.26.930.378 W [SYCL] tensor usage UNKNOWN: name=Vcur-23 type=f32 ne=[512,2,1,1]
+0.26.930.524 W [SYCL] tensor usage UNKNOWN: name=Qcur-23 (view) (permuted) (copy) type=f16 ne=[64,2,64,1]
+0.26.930.562 W [SYCL] tensor usage UNKNOWN: name=SYCL0#kqv_out-23#0 type=f32 ne=[4096,2,1,1]
+0.26.930.580 W [SYCL] tensor usage UNKNOWN: name=SYCL0#out_ids#0 type=i32 ne=[1,1,1,1]
+0.26.930.598 W [SYCL] tensor usage UNKNOWN: name=node_1341 type=f32 ne=[2880,2,1,1]
+0.26.930.617 W [SYCL] tensor usage UNKNOWN: name=attn_out-23 type=f32 ne=[2880,2,1,1]
+0.26.930.637 W [SYCL] tensor usage UNKNOWN: name=node_1343 type=f32 ne=[2880,1,1,1]
+0.26.930.655 W [SYCL] tensor usage UNKNOWN: name=node_1344 type=f32 ne=[2880,1,1,1]
+0.26.930.673 W [SYCL] tensor usage UNKNOWN: name=ffn_inp-23 type=f32 ne=[2880,1,1,1]
+0.26.930.847 W [SYCL] tensor usage UNKNOWN: name=node_1355 type=f32 ne=[4,1,1,1]
+0.26.931.103 W [SYCL] tensor usage UNKNOWN: name=node_1370 type=f32 ne=[2880,1,1,1]
+0.26.931.126 W [SYCL] tensor usage UNKNOWN: name=node_1371 type=f32 ne=[2880,1,1,1]
+0.26.931.166 W [SYCL] tensor usage UNKNOWN: name=l_out-23 type=f32 ne=[2880,1,1,1]
+0.26.931.186 W [SYCL] tensor usage UNKNOWN: name=norm type=f32 ne=[2880,1,1,1]
+0.26.931.224 W [SYCL] tensor usage UNKNOWN: name=result_output type=f32 ne=[201088,1,1,1]
+0.26.935.836 I [MOE-HYBRID] Detected MoE: 3 layers, 32 experts/layer, top-4, 4303.1 KB/expert, 0/96 host-resident
+0.26.935.844 I [UNIFIED-CACHE] Reserved GPU reorder temp buffer (unified): 4.7 MB
+0.26.935.845 I [MOE-WARMUP] Zero-warmup mode: 3 layers x 32 experts, using gate weight norms for initial placement
+0.26.935.846 I [MOE-HYBRID] Expert registry: 96 entries, 0 with host_src_ptr, 96 device-only
+0.26.935.968 I [MOE-HYBRID] Expert metadata stored: 96 entries for post-warmup pre-staging
+0.26.935.969 I [MOE-HYBRID] Expert group registry: 32 groups (32 complete with gate+up+down), 96 entries registered
+0.26.935.970 I [MOE-MULTI-GPU] Disabled: planner placed all executable handles on primary
+0.26.935.971 I [MOE-HYBRID] Phase 1: GPU0 cache budget=14292.7 MB, expert total=403.4 MB -> all on GPU0 (fits)
+0.26.936.146 I [MOE-HYBRID] Phase 2 verify: GPU0=96 GPU1=0 CPU=0 (planner-direct-cache)
+0.26.936.148 I [MOE-HYBRID] First tensor L1876883677: GPU0 experts=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,] (32), GPU1 experts=0
+0.26.936.149 I [MOE-HYBRID] Expert distribution: GPU0=96(cache) (96 total, 4303.1 KB/expert)
+0.26.940.300 I [SYCL] Expert prefetcher initialized (depth=2, dynamic pool)
+0.26.940.301 I [MOE-HYBRID] Phase 3: skipped; unified cache owns planned expert residency/layout
+0.26.940.308 I [SYCL] Expert predictor initialized (layers=3, experts=32, top_k=4, depth=3)
+0.26.940.308 I [MOE-HYBRID] Predictor initialized: 3 layers, 32 experts, top-4
+0.26.940.314 I [MOE-HYBRID] Pre-gated routing: registered 1 gate weight tensors
+0.26.940.326 I [MOE-POOL] Pinned buffer pool: act=90 KB, out=90 KB, ids=32 B, max_experts=8
+0.26.954.211 I [CPU-EXPERT-POOL] Initialized: 1 threads, row loop on 22 threads, spin 2000 us
+0.26.954.217 I [MOE-GATE-NORM] Computing gate weight norms for 1 blocks, 32 experts/block
+0.26.954.261 I [MOE-GATE-NORM] Block 0 top-3 by norm: expert 9 (2.29), expert 31 (2.20), expert 1 (1.88)
+0.26.954.261 I [MOE-GATE-NORM] Computed gate norms for 1/1 blocks, applying popularity placement
+0.26.954.269 I [MOE-WARMUP] Popularity profiling complete: 3 layers, 96 total experts ranked
+0.26.954.270 I [MOE-WARMUP] Layer 0 top-3: expert 9 (1000), expert 31 (944), expert 1 (748)
+0.26.954.271 I [MOE-WARMUP] Layer 1 top-3: expert 9 (1000), expert 31 (944), expert 1 (748)
+0.26.954.271 I [MOE-WARMUP] Layer 2 top-3: expert 9 (1000), expert 31 (944), expert 1 (748)
+0.26.954.271 I [MOE-WARMUP] Popularity ranks applied. Cache eviction now favors popular experts; pre-staging on next dispatch.
+0.26.954.273 I [MOE-PRESTAGE] Placement-plan preload active; runtime prestage disabled (set GGML_SYCL_LEGACY_PRESTAGE=1 to restore legacy behavior)
+0.26.954.274 I [MOE-GATE-NORM] Zero-warmup placement complete. Skipping inference-based warmup entirely.
+0.26.954.276 I [SYCL] Pinned pool pre_allocate: already have 20480.0 MB free (need 2048.0 MB)
+0.26.954.279 I [MOE-PREALLOC] device 0: n_tables=3 table_bytes=256 total_table=0.8 KB ids_staging=8.0 KB compact=16.0 KB
+0.26.955.663 I [MOE-PREALLOC] device 0: tables=VRAM (3 x 256 B) ids=VRAM (8.0 KB) compact=VRAM (16.0 KB)
+0.26.955.664 I [MOE-HYBRID] Phase 4: pre-allocated MoE inference buffers (device=0, tables=3, experts=32)
+0.26.957.790 I [SYCL] Captured expert biases for 1 layers (3 tensors, D2H copied) — fusion will apply biases inline
+[SYCL] GGML_SYCL_F16 build: attention Q/accumulators are f16
+[MOE-PROMPT-CANONICAL] tensor=blk.0.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=1
+0.27.133.777 I [PP-MOE] device=0 type=mxfp4 layout=xmx_tiled arm=woq experts=8 groups=1 planned_weight_slot=141008896 windows=0
+0.27.133.990 W [CACHE-LOOKUP] MISS: model=1 hash=0xe9a60c713840c2b9 aux=0x0 layout=0 id_to_key_size=2619 entries_size=2619
+[MOE-PROMPT-CANONICAL] tensor=blk.0.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=2
+0.27.135.253 W [CACHE-LOOKUP] MISS: model=1 hash=0x367d018d0ab4c386 aux=0x0 layout=0 id_to_key_size=2619 entries_size=2619
+[MOE-PROMPT-CANONICAL] tensor=blk.0.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=3
+0.27.138.779 I [PP-MOE] device=0 type=mxfp4 layout=soa arm=woq experts=8 groups=1 planned_weight_slot=141008896 windows=0
+0.27.138.846 W [CACHE-LOOKUP] MISS: model=1 hash=0xfde97a0e59562f31 aux=0x0 layout=0 id_to_key_size=2619 entries_size=2619
+0.27.149.989 I [SYCL] MoE model detected — enabling selective graph replay (skip MoE ops, replay attention/norms)
+[MOE-PROMPT-CANONICAL] tensor=blk.1.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=4
+[MOE-PROMPT-CANONICAL] tensor=blk.1.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=5
+[MOE-PROMPT-CANONICAL] tensor=blk.1.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=6
+[MOE-PROMPT-CANONICAL] tensor=blk.2.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=7
+[MOE-PROMPT-CANONICAL] tensor=blk.2.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=8
+[MOE-PROMPT-CANONICAL] tensor=blk.2.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=9
+[MOE-PROMPT-CANONICAL] tensor=blk.3.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=10
+[MOE-PROMPT-CANONICAL] tensor=blk.3.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=11
+[MOE-PROMPT-CANONICAL] tensor=blk.3.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=12
+[MOE-PROMPT-CANONICAL] tensor=blk.4.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=13
+[MOE-PROMPT-CANONICAL] tensor=blk.4.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=14
+[MOE-PROMPT-CANONICAL] tensor=blk.4.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=15
+[MOE-PROMPT-CANONICAL] tensor=blk.5.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=16
+[MOE-PROMPT-CANONICAL] tensor=blk.5.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=17
+[MOE-PROMPT-CANONICAL] tensor=blk.5.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=18
+[MOE-PROMPT-CANONICAL] tensor=blk.6.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=19
+[MOE-PROMPT-CANONICAL] tensor=blk.6.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=20
+[MOE-PROMPT-CANONICAL] tensor=blk.6.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=21
+[MOE-PROMPT-CANONICAL] tensor=blk.7.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=22
+[MOE-PROMPT-CANONICAL] tensor=blk.7.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=23
+[MOE-PROMPT-CANONICAL] tensor=blk.7.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=24
+[MOE-PROMPT-CANONICAL] tensor=blk.8.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=25
+[MOE-PROMPT-CANONICAL] tensor=blk.8.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=26
+[MOE-PROMPT-CANONICAL] tensor=blk.8.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=27
+[MOE-PROMPT-CANONICAL] tensor=blk.9.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=28
+[MOE-PROMPT-CANONICAL] tensor=blk.9.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=29
+[MOE-PROMPT-CANONICAL] tensor=blk.9.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=30
+[MOE-PROMPT-CANONICAL] tensor=blk.10.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=31
+[MOE-PROMPT-CANONICAL] tensor=blk.10.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=32
+[MOE-PROMPT-CANONICAL] tensor=blk.10.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=33
+[MOE-PROMPT-CANONICAL] tensor=blk.11.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=34
+[MOE-PROMPT-CANONICAL] tensor=blk.11.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=35
+[MOE-PROMPT-CANONICAL] tensor=blk.11.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=36
+[MOE-PROMPT-CANONICAL] tensor=blk.12.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=37
+[MOE-PROMPT-CANONICAL] tensor=blk.12.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=38
+[MOE-PROMPT-CANONICAL] tensor=blk.12.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=39
+[MOE-PROMPT-CANONICAL] tensor=blk.13.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=40
+[MOE-PROMPT-CANONICAL] tensor=blk.13.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=41
+[MOE-PROMPT-CANONICAL] tensor=blk.13.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=42
+[MOE-PROMPT-CANONICAL] tensor=blk.14.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=43
+[MOE-PROMPT-CANONICAL] tensor=blk.14.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=44
+[MOE-PROMPT-CANONICAL] tensor=blk.14.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=45
+[MOE-PROMPT-CANONICAL] tensor=blk.15.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=46
+[MOE-PROMPT-CANONICAL] tensor=blk.15.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=47
+[MOE-PROMPT-CANONICAL] tensor=blk.15.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=48
+[MOE-PROMPT-CANONICAL] tensor=blk.16.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=49
+[MOE-PROMPT-CANONICAL] tensor=blk.16.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=50
+[MOE-PROMPT-CANONICAL] tensor=blk.16.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=51
+[MOE-PROMPT-CANONICAL] tensor=blk.17.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=52
+[MOE-PROMPT-CANONICAL] tensor=blk.17.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=53
+[MOE-PROMPT-CANONICAL] tensor=blk.17.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=54
+[MOE-PROMPT-CANONICAL] tensor=blk.18.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=55
+[MOE-PROMPT-CANONICAL] tensor=blk.18.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=56
+[MOE-PROMPT-CANONICAL] tensor=blk.18.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=57
+[MOE-PROMPT-CANONICAL] tensor=blk.19.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=58
+[MOE-PROMPT-CANONICAL] tensor=blk.19.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=59
+[MOE-PROMPT-CANONICAL] tensor=blk.19.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=60
+[MOE-PROMPT-CANONICAL] tensor=blk.20.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=61
+[MOE-PROMPT-CANONICAL] tensor=blk.20.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=62
+[MOE-PROMPT-CANONICAL] tensor=blk.20.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=63
+[MOE-PROMPT-CANONICAL] tensor=blk.21.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=64
+[MOE-PROMPT-CANONICAL] tensor=blk.21.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=65
+[MOE-PROMPT-CANONICAL] tensor=blk.21.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=66
+[MOE-PROMPT-CANONICAL] tensor=blk.22.ffn_gate_exps.weight published=0 kind=-1 stable=0 seq=67
+[MOE-PROMPT-CANONICAL] tensor=blk.22.ffn_up_exps.weight published=0 kind=-1 stable=0 seq=68
+[MOE-PROMPT-CANONICAL] tensor=blk.22.ffn_down_exps.weight published=0 kind=-1 stable=0 seq=69
+0.27.293.209 W [SYCL-FUSION] declined the ADD+RMS_NORM fusion at ffn_inp-23: partial overlap (norm-23 against node_1344); running the unfused kernels (decline 1)
+0.27.507.333 I [KV-TIER] Device 0: cleared 12 KV layers through per-layer owners
+0.27.697.002 I [KV-TIER] Device 0: cleared 12 KV layers through per-layer owners
+0.28.207.105 W [MEM-HANDLE] event-bound lease wait failed (level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)); its 2 leases are kept for graph lifetime (2 parked) rather than freed early
+[MUL_MAT_ID-FAIL] op=MUL_MAT_ID dst=ffn_moe_gate-0 src0=blk.0.ffn_gate_exps.weight src0_type=mxfp4 src0_ne=[2880,2880,32,1] src1=attn_post_norm-0 (reshaped) src1_type=f32 src1_ne=[2880,1,2,1] ids=ffn_moe_topk-0 ids_ne=[4,2,1,1] device=0 error=level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+0.28.207.712 W [SYCL] dispatch exception op=MUL_MAT_ID device=0 did not match resource-exhaustion predicate -- code=1 category=sycl what=level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)Exception caught at file:../ggml/src/ggml-sycl/ggml-sycl.cpp, line:93362
+0.29.207.153 W [MEM-HANDLE] event-bound lease wait failed (host backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)); its 1 leases are kept for graph lifetime (3 parked) rather than freed early
+0.29.207.159 I [SYCL] Watchdog started (GGML_SYCL_OP_TIMEOUT_MS=30000, poll=500 ms)

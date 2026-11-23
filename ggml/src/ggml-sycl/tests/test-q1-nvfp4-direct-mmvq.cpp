@@ -216,15 +216,18 @@ void source_contract_tests() {
     const size_t event_creation = cpp.find("sycl::event event;", id_api);
     assert(id_api != std::string::npos && validation < event_creation);  // reject before any launch is selected
     // Direct primitives remain compiled. The query may mint only a narrow
-    // primary/decode/AoS recipe candidate backed by active exact authority;
-    // executor selection and the global B70 gate remain closed.
+    // primary/AoS recipe candidate backed by active exact authority, for a
+    // decode token and a prompt's rows alike; generic executor selection stays
+    // closed to them, and the direct route is open (B70 and B50 oracle runs,
+    // 2026-11-22) through one shared constant the admission site reads by name.
     const std::string policy = slurp("ggml/src/ggml-sycl/ggml-sycl.cpp");
     const std::string recipe = slurp("ggml/src/ggml-sycl/moe-resolved-batch.hpp");
     assert(policy.find("direct-recipe-candidate") != std::string::npos);
-    assert(policy.find("phase == moe_route_phase::DECODE && rows == 1") != std::string::npos);
+    assert(policy.find("phase == moe_route_phase::DECODE && rows == 1") == std::string::npos);
     assert(policy.find("route_device == submit_device && direct_recipe_candidate") != std::string::npos);
     assert(policy.find("unified_cache_moe_mmid_exact_queue(") != std::string::npos);
-    assert(policy.find("q1_nvfp4_direct_b70_validated = false") != std::string::npos);
+    assert(policy.find("constexpr bool k_moe_mmid_direct_route_validated = true;") != std::string::npos);
+    assert(policy.find("q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated") != std::string::npos);
     assert(policy.find("q1-nvfp4-direct-requires-aos") == std::string::npos);
     assert(policy.find("q1-nvfp4-direct-prompt-chunking-pending") == std::string::npos);
     assert(policy.find("mmvq_submit_q1_nvfp4_aos(*target_queue") != std::string::npos);
@@ -238,9 +241,12 @@ void source_contract_tests() {
          { "weight_type == GGML_TYPE_Q1_0", "weight_type == GGML_TYPE_NVFP4",
            "buffers.activation_q8_bytes != required_q8", "buffers.output_f32_bytes != required_output",
            "ne11 != 1 && ne11 != top_k", "ids_host[i] < 0 || ids_host[i] >= n_experts", "checked_mul", "checked_add",
-           "mmvq_submit_quantize_q8_1_aos_after", "mmvq_submit_q1_nvfp4_aos_id(" }) {
+           "mmvq_submit_quantize_q8_1_aos_after", "mmvq_submit_q1_nvfp4_aos_id(",
+           "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))" }) {
         assert(admitted_body.find(required) != std::string::npos);
     }
+    // The kernel reads the ids tensor in place: nothing writes an op's input, so no snapshot is uploaded over it.
+    assert(cpp.find("mmvq_upload_packed_ids_after") == std::string::npos);
     for (const char * forbidden : { "unified_alloc", "mmvq_alloc_device_scratch", "managed_host_pinned_buffer",
                                     "MERGE_RING_SIZE", "memcpy(", "std::vector", " new ", "new(" }) {
         assert(admitted_body.find(forbidden) == std::string::npos);

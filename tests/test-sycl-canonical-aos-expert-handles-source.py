@@ -92,6 +92,9 @@ def violations(source: str) -> list[str]:
     logical_resolver = function(common, "bool resolve_moe_storage_record")
     owner = function(source, "void set_managed_owner")
     capability = function(source, "static moe_route_capability ggml_sycl_moe_query_route_capability")
+    # The direct recipe's candidate expression: a decode token and a prompt's rows alike since 2026-11-22.
+    candidate_at = capability.find("static_candidate =")
+    candidate = capability[candidate_at:capability.find(";", candidate_at)] if candidate_at >= 0 else ""
     # set_managed_owner takes the legacy alloc_handle, so it mints through the
     # allocator-private adapter rather than the public from_owned_alloc. Score
     # the adapter's body too: scoring only the call site would let it be
@@ -136,11 +139,13 @@ def violations(source: str) -> list[str]:
         "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
         "resolver propagates ready event": "route.has_ready_event = logical.has_ready_event" in storage_route,
         # One definition, read by both the admission and materialization gates.
-        # Score the definition's value AND that the admission site still reads it
-        # by name -- re-spelling it as a literal is how the two gates drift apart.
-        "Q1/NVFP4 executor gate remains disabled": "k_moe_mmid_direct_route_validated = false" in source
+        # Score the definition's value (open since the B70 and B50 oracle runs of
+        # 2026-11-22) AND that the admission site still reads it by name --
+        # re-spelling it as a literal is how the two gates drift apart.
+        "Q1/NVFP4 executor gate is open and read by name": "k_moe_mmid_direct_route_validated = true" in source
             and "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated" in source,
-        "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
+        "Q1/NVFP4 recipe is phase-blind":
+            bool(candidate) and not {"phase", "rows"} & set(re.findall(r"\w+", candidate)),
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
         # The recipe asks the binder for an exact allocation identity, the test bind() applies; a handle-kind
         # test refused every arena-slice lease (llama.cpp-1sxq).
@@ -194,13 +199,14 @@ def test_admission_pin_and_ordering_claims_reject_mutants() -> None:
 
     # claim -> [(label, mutant source, the one anchor the mutant removes, or None)]
     mutants = {
-        "Q1/NVFP4 executor gate remains disabled": [
-            ("gate flipped on",
-             respell(source, "k_moe_mmid_direct_route_validated = false", "k_moe_mmid_direct_route_validated = true"),
+        "Q1/NVFP4 executor gate is open and read by name": [
+            ("gate closed again",
+             respell(source, "k_moe_mmid_direct_route_validated = true", "k_moe_mmid_direct_route_validated = false"),
              None),
+            # The literal carries the constant's own value: the drift is the second spelling, not the value.
             ("admission site re-spelled as a literal",
              respell(source, "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated",
-                     "q1_nvfp4_direct_b70_validated = false"),
+                     "q1_nvfp4_direct_b70_validated = true"),
              None),
         ],
         "resolver checks plan before registered handles": [
@@ -591,13 +597,13 @@ def test_mutations_are_witnessed() -> None:
         source.replace("replacement.reserve(expert_count);", "", 1),
         source.replace("managed_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(h), GGML_LAYOUT_AOS);",
                        "managed_handle = ggml_sycl::mem_handle::from_direct(h.ptr, GGML_LAYOUT_AOS, true, h.device, h.size);", 1),
-        source.replace("constexpr bool k_moe_mmid_direct_route_validated = false;",
-                       "constexpr bool k_moe_mmid_direct_route_validated = true;", 1),
+        source.replace("constexpr bool k_moe_mmid_direct_route_validated = true;",
+                       "constexpr bool k_moe_mmid_direct_route_validated = false;", 1),
         # Re-spelling the admission gate as a literal is the specific drift the
         # one-definition rule exists to prevent, so it must be witnessed even
         # though the value it names is unchanged.
         source.replace("constexpr bool q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated;",
-                       "constexpr bool q1_nvfp4_direct_b70_validated = false;", 1),
+                       "constexpr bool q1_nvfp4_direct_b70_validated = true;", 1),
     ]
     # A mutation whose target string has drifted away is a silent no-op, which
     # would leave violations() empty and fail here rather than pass vacuously.

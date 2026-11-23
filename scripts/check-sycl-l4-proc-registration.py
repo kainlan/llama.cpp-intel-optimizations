@@ -554,7 +554,10 @@ def free_path_pins(source, freeb, fails):
     # condition, in a ternary arm or behind another name and still match: the stream, the CPU-expert flush (unless
     # the test flag skips it), the CPU expert jobs' gate sleep (llama.cpp-qwn5), the deferred-event choice, the drain.
     # The sleep is admitted as exactly its one statement: it waits nothing the drain does not, and whether it is
-    # there is pinned by tests/test-sycl-moe-cpu-job-device-signal-source.py, not here.
+    # there is pinned by tests/test-sycl-moe-cpu-job-device-signal-source.py, not here.  The drain is a try block
+    # (a throwing drain must not abort), so its catch clauses must keep the error in drain_error and the code after
+    # them must read it: a drain whose failure vanished without a trace would otherwise still match.  The gate
+    # clear between them is admitted the same way as the sleep.
     sync = function_body(source, SYNC_SIG)
     pin(fails, sync,
         r"const queue_ptr stream = sycl_ctx->stream\(sycl_ctx->device, 0\);\s*"
@@ -562,10 +565,15 @@ def free_path_pins(source, freeb, fails):
         r"(?:const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);\s*)?"
         r"const bool use_deferred_decode_event =\s*"
         r"sycl_ctx->last_graph_event\.has_value\(\) && sycl_ctx->last_graph_event_deferred_decode;\s*"
-        r"auto err = use_deferred_decode_event \? CHECK_TRY_ERROR\(sycl_ctx->last_graph_event->wait_and_throw\(\)\) :\s*"
-        r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);",
+        r"std::string drain_error;\s*"
+        r"try \{\s*if \(use_deferred_decode_event\) \{\s*sycl_ctx->last_graph_event->wait_and_throw\(\);\s*\}\s*"
+        r"else \{\s*stream->wait_and_throw\(\);\s*\}\s*\}\s*"
+        r"catch \(const std::exception & e\) \{\s*drain_error = e\.what\(\);\s*\}\s*"
+        r"catch \(\.\.\.\) \{\s*drain_error = \"unknown exception\";\s*\}\s*"
+        r"(?:ggml_sycl_cpu_job_gates_clear\(gate_sleep\);\s*)?"
+        r"if \(!drain_error\.empty\(\)\)",
         "L4 free path: the backend synchronize no longer drains, in sequence and unconditionally, stream 0 or the deferred "
-        "decode event after the CPU-expert flush")
+        "decode event after the CPU-expert flush, keeping a throwing drain's error for the code after it")
     # one execution queue per device: stream(device, idx) answers it for EVERY idx, and it is the TP queue or the
     # unified cache's own queue.  This is what makes "the queues the synchronize does not drain" an empty set.
     stream_fn = function_body(source, STREAM_SIG)
@@ -1094,11 +1102,19 @@ def check(header_raw, source):
                 clear_bind[:call].rstrip()[-1:] not in (";", "{", "}"):
             fails.append("L4 context end: the clear of an ended context's bindings does not drop its registry entries by the "
                          "ended id after it has reset the bindings, once, outside the lock (statement-initial)")
+        # A reset can trip the execution tripwire. Its reports are kept in a fixed array under the lock and logged
+        # after the drop, so no log call runs under the binding mutex; those lines are the only additions allowed.
         pin(fails, clear_bind,
-            r"\{\s*bool devices\[GGML_SYCL_MAX_DEVICES\] = \{\};\s*\{\s*std::lock_guard<std::mutex> lock\(g_execution_backend_binding_mutex\);"
+            r"\{\s*bool devices\[GGML_SYCL_MAX_DEVICES\] = \{\};\s*"
+            r"ggml_sycl_execution_tripwire_report\s+tripped\[GGML_SYCL_MAX_DEVICES\];\s*"
+            r"size_t\s+n_tripped\s*=\s*0;\s*size_t\s+n_tripped_lost\s*=\s*0;\s*"
+            r"\{\s*std::lock_guard<std::mutex> lock\(g_execution_backend_binding_mutex\);"
             r"[\s\S]*?if \(it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES\) \{\s*"
-            r"devices\[it->first->device\] = true;\s*\}\s*ggml_sycl_execution_reset_backend_binding_state\(it->first\);"
-            r"[\s\S]*?\}\s*\}\s*ggml_sycl_execution_drop_context_registry_entries\(context_id, devices\);\s*\}$",
+            r"devices\[it->first->device\] = true;\s*\}\s*const ggml_sycl_execution_tripwire_report report =\s*"
+            r"ggml_sycl_execution_reset_backend_binding_state\(it->first\);"
+            r"[\s\S]*?\}\s*\}\s*ggml_sycl_execution_drop_context_registry_entries\(context_id, devices\);\s*"
+            r"for \(size_t i = 0; i < n_tripped; \+\+i\) \{\s*ggml_sycl_execution_tripwire_log\(tripped\[i\]\);\s*\}\s*"
+            r"if \(n_tripped_lost > 0\) \{[^{}]*\}\s*\}$",
             "L4 context end: the clear of an ended context's bindings does not collect the bound devices under the "
             "lock, reset, and drop the entries by the ended id after the lock (devices collected before the reset)")
         pin(fails, clear_bind, r"for \(auto it = g_execution_backend_bindings\.begin\(\); it != g_execution_backend_bindings\.end\(\);\) \{\s*"
@@ -1371,15 +1387,21 @@ def mutations(header_raw, source):
          "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n",
          "    if (context_id != 0) ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n"),
         ("the ended context's entries are dropped under the binding mutex", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
-         "    }\n    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n}",
-         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n    }\n}"),
+         "    }\n    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n",
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n    }\n"),
         ("the ended context's entries are dropped by another id", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
          "drop_context_registry_entries(context_id, devices);", "drop_context_registry_entries(0, devices);"),
         ("the ended context's devices are not collected", "does not collect the bound devices under the lock", CLEAR_BIND_SIG,
          "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n", ""),
         ("the ended context's devices are collected after the reset", "does not collect the bound devices under the lock", CLEAR_BIND_SIG,
-         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n                ggml_sycl_execution_reset_backend_binding_state(it->first);\n",
-         "                ggml_sycl_execution_reset_backend_binding_state(it->first);\n                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n"),
+         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n"
+         "                    devices[it->first->device] = true;\n                }\n"
+         "                const ggml_sycl_execution_tripwire_report report =\n"
+         "                    ggml_sycl_execution_reset_backend_binding_state(it->first);\n",
+         "                const ggml_sycl_execution_tripwire_report report =\n"
+         "                    ggml_sycl_execution_reset_backend_binding_state(it->first);\n"
+         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n"
+         "                    devices[it->first->device] = true;\n                }\n"),
         ("the ended context's drop pins backends again", "pins backends again", CLEAR_BIND_SIG,
          "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n",
          "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n    ggml_sycl_execution_for_each_bound_backend(context_id, [](ggml_backend_sycl_context *, const ggml_sycl_execution_backend_binding &) {});\n"),
@@ -1418,9 +1440,9 @@ def mutations(header_raw, source):
         ("sched_reserve_impl's synchronize behind a condition on a flag", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
          "    synchronize();\n", "    if (state.cparams.n_ctx != 0) { synchronize(); }\n"),
         ("the backend synchronize skips stream 0", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
-         "CHECK_TRY_ERROR(stream->wait_and_throw())", "0"),
+         "stream->wait_and_throw();", "(void) 0;"),
         ("the backend synchronize skips the stream's wait under a ternary", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
-         "CHECK_TRY_ERROR(stream->wait_and_throw())", "(false ? 0 : CHECK_TRY_ERROR(stream->wait_and_throw()))"),
+         "stream->wait_and_throw();", "false ? (void) 0 : stream->wait_and_throw();"),
         ("the backend synchronize skips the CPU-expert flush", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "            ggml_sycl_cpu_tg_flush_pending();\n", ""),
         ("the backend synchronize's CPU-expert flush under if (false)", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
@@ -1430,9 +1452,11 @@ def mutations(header_raw, source):
         ("the backend synchronize skips the deferred decode event", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "sycl_ctx->last_graph_event->wait_and_throw()", "0"),
         ("the backend synchronize's deferred-event arm is never chosen", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
-         "use_deferred_decode_event ? CHECK_TRY_ERROR(", "false ? CHECK_TRY_ERROR("),
+         "if (use_deferred_decode_event) {", "if (false) {"),
         ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
-         "        auto err = use_deferred_decode_event", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = use_deferred_decode_event"),
+         "        std::string drain_error;", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        std::string drain_error;"),
+        ("the backend synchronize's drain catch keeps no error", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "drain_error = e.what();", ""),
         ("the backend synchronize returns after its gate sleep", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "ggml_sycl_cpu_job_gates_sleep(*stream);\n", "ggml_sycl_cpu_job_gates_sleep(*stream);\n        if (gate_sleep.waited != 0) {\n            return;\n        }\n"),
         # ---- the queue aliasing: one execution queue per device, answered for every idx

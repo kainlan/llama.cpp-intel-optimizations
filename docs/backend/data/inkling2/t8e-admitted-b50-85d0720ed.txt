@@ -1,0 +1,11 @@
+sycl-q1-nvfp4-admitted-device on the Arc Pro B50 (level_zero:1), integration tree 85d0720ed (code of 70292d66e), 2026-11-22 23:43.
+Run as the binary (not through ctest: the registration's ENVIRONMENT sets ONEAPI_DEVICE_SELECTOR=level_zero:0 and overrides the caller's).
+rc=0. Card named in the log:
+[UNIFIED-CACHE] Device 0 (Intel(R) Arc(TM) Pro B50 Graphics): total=16304.0 MB free=15923.1 MB budget=14292.7 MB (100%)
+| 0| [level_zero:gpu:0]|             Intel Arc Pro B50 Graphics|   20.1|    128|    1024|   32| 17095M|         1.18.40734+8|
+PASS lines: 56
+Q1/NVFP4 scoped production-route lifecycle: PASS
+kernel fault lines during the run: 0
+
+The three earlier runs labelled b50 for this test (t8b-lead-runs-6ee2a4058.txt, t8b-lead-runs-0f4060d0f.txt,
+t8e-merged-chain-baf7cf05a.txt) went through ctest and ran on the B70; their logs name 'Arc(TM) Pro B70'.

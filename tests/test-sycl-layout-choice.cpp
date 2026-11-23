@@ -1815,6 +1815,415 @@ static bool run_dense_weights_before_kv_test() {
     return true;
 }
 
+// A KV cache slot lives where the weight layer that executes it lives, and the layer pays for every slot it executes.
+// The synthetic model has Inkling 2 Mini's shape: 24 weight layers, each with one dense attention weight, and 48 FULL
+// KV slots, the core layers 6..17 running three passes (slots 24..35 and 36..47 run layers 6..17 again).
+// placement_kv_info::layer_phys maps a slot to its layer.
+namespace kv_slot_case {
+constexpr int    n_phys      = 24;
+constexpr int    n_slot      = 48;
+constexpr int    core_start  = 6;
+constexpr int    core_end    = 18;
+constexpr size_t dense_bytes = kv_order_case::dense_bytes;
+constexpr size_t kv_slot     = kv_order_case::kv_at_512;       // one FULL slot at the planning n_ctx 512
+constexpr size_t kv_extra    = kv_order_case::kv_extra_layer;  // what the opening n_ctx 4096 adds to one slot
+
+static int loop_layer_of(int slot) {
+    return slot < n_phys ? slot : core_start + (slot - n_phys) % (core_end - core_start);
+}
+
+static std::vector<int32_t> loop_map() {
+    std::vector<int32_t> map;
+    for (int s = 0; s < n_slot; ++s) {
+        map.push_back(loop_layer_of(s));
+    }
+    return map;
+}
+
+// One dense attention weight per layer; `big_layer`, when given, carries `big_bytes` instead.
+static std::vector<std::pair<std::string, size_t>> inventory(int n_layers, int big_layer = -1, size_t big_bytes = 0) {
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < n_layers; ++l) {
+        inv.push_back({ "blk." + std::to_string(l) + ".attn_q.weight", l == big_layer ? big_bytes : dense_bytes });
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_kv_info kv_info(uint32_t             n_slots,
+                                            std::vector<int32_t> layer_phys,
+                                            uint32_t             n_ctx_context = 0) {
+    ggml_sycl::placement_kv_info kv{};
+    kv.n_layer       = n_slots;
+    kv.n_embd_k_gqa  = kv_order_case::kv_width;
+    kv.n_embd_v_gqa  = kv_order_case::kv_width;
+    kv.n_ctx         = 512;
+    kv.n_ubatch      = 512;
+    kv.n_ctx_context = n_ctx_context;
+    kv.layer_kind.assign(n_slots, GGML_SYCL_KV_LAYER_FULL);
+    kv.layer_k_width.assign(n_slots, kv_order_case::kv_width);
+    kv.layer_v_width.assign(n_slots, kv_order_case::kv_width);
+    kv.layer_phys = std::move(layer_phys);
+    return kv;
+}
+
+// The slots in [0, n_slots) whose KV the plan puts on `device` (-1: the host tier).
+static int count_slots_on(const ggml_sycl::placement_plan & plan, int n_slots, int device) {
+    int n = 0;
+    for (int s = 0; s < n_slots; ++s) {
+        n += plan.get_kv_device(s) == device;
+    }
+    return n;
+}
+}  // namespace kv_slot_case
+
+// The Inkling shape on one device: with room, every slot's KV is on the device and charged; with room for the dense
+// weights and 30 slots, the slots are decided one by one in slot order, so slots 30..47 are the host's; and the room of
+// the opening context is held for all 48 slots.
+static bool run_kv_slot_lives_with_its_layer_test() {
+    using namespace kv_slot_case;
+    bool ok = true;
+
+    const size_t roomy = n_phys * dense_bytes + n_slot * kv_slot + kv_slot;
+    const auto   roomy_plan =
+        ggml_sycl::compute_placement_plan(inventory(n_phys), roomy, 0, kv_info(n_slot, loop_map()), nullptr, 0);
+    for (int s = 0; s < n_slot; ++s) {
+        if (roomy_plan.get_kv_device(s) != 0) {
+            printf("FAIL: with room, slot %d (layer %d) must have its KV on device 0 with its layer, got %d\n", s,
+                   loop_layer_of(s), roomy_plan.get_kv_device(s));
+            ok = false;
+            break;
+        }
+    }
+    if (roomy_plan.kv_vram_bytes != n_slot * kv_slot || roomy_plan.kv_host_bytes != 0) {
+        printf("FAIL: with room the plan charges 48 slots on the device: kv vram=%zu host=%zu, want %zu and 0\n",
+               roomy_plan.kv_vram_bytes, roomy_plan.kv_host_bytes, n_slot * kv_slot);
+        ok = false;
+    }
+
+    const size_t tight = n_phys * dense_bytes + 30 * kv_slot;
+    const auto   tight_plan =
+        ggml_sycl::compute_placement_plan(inventory(n_phys), tight, 0, kv_info(n_slot, loop_map()), nullptr, 0);
+    bool order_ok = true;
+    for (int s = 0; s < n_slot; ++s) {
+        order_ok = order_ok && tight_plan.get_kv_device(s) == (s < 30 ? 0 : -1);
+    }
+    if (!order_ok || tight_plan.kv_vram_bytes != 30 * kv_slot || tight_plan.kv_host_bytes != 18 * kv_slot) {
+        printf(
+            "FAIL: room for 30 slots puts slots 0..29 on the device and charges 48 slots: %d slots on device, "
+            "slot 29 on %d, slot 30 on %d, kv vram=%zu host=%zu, want 30, 0, -1, %zu and %zu\n",
+            count_slots_on(tight_plan, n_slot, 0), tight_plan.get_kv_device(29), tight_plan.get_kv_device(30),
+            tight_plan.kv_vram_bytes, tight_plan.kv_host_bytes, 30 * kv_slot, 18 * kv_slot);
+        ok = false;
+    }
+
+    const size_t with_room = n_phys * dense_bytes + n_slot * (kv_slot + kv_extra);
+    const auto   room_plan = ggml_sycl::compute_placement_plan(inventory(n_phys), with_room, 0,
+                                                               kv_info(n_slot, loop_map(), 4096), nullptr, 0);
+    if (room_plan.kv_context_reserve_bytes != n_slot * kv_extra || count_slots_on(room_plan, n_slot, 0) != n_slot) {
+        printf("FAIL: the opening context's room covers 48 slots: held %zu bytes with %d slots on device, want %zu\n",
+               room_plan.kv_context_reserve_bytes, count_slots_on(room_plan, n_slot, 0), n_slot * kv_extra);
+        ok = false;
+    }
+
+    if (ok) {
+        printf("PASS: every KV slot lives on the device of the layer that executes it and is charged there\n");
+    }
+    return ok;
+}
+
+// A slot is eligible for device KV only while the layer that executes it has its weights on that device. Layer 6
+// does not fit the device here, so its three slots (6, 30 and 42) are the host's, though the card has room for them.
+static bool run_kv_slot_of_host_layer_test() {
+    using namespace kv_slot_case;
+    const size_t big    = 64u * 1024u * 1024u;
+    const size_t budget = (n_phys - 1) * dense_bytes + n_slot * kv_slot + kv_slot;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inventory(n_phys, 6, big), budget, 0,
+                                                            kv_info(n_slot, loop_map()), nullptr, 0);
+    bool         ok = plan.get_layer_device(6) == -1 && plan.get_layer_device(5) == 0 && plan.get_layer_device(7) == 0;
+    for (int s = 0; s < n_slot; ++s) {
+        ok = ok && plan.get_kv_device(s) == (loop_layer_of(s) == 6 ? -1 : 0);
+    }
+    ok = ok && plan.kv_vram_bytes == (n_slot - 3) * kv_slot && plan.kv_host_bytes == 3 * kv_slot;
+    if (!ok) {
+        printf(
+            "FAIL: a host layer's slots are host slots: layer 6 on %d, slots 6/30/42 on %d/%d/%d, slot 18 on %d, "
+            "kv vram=%zu host=%zu, want -1, -1/-1/-1, 0, %zu and %zu\n",
+            plan.get_layer_device(6), plan.get_kv_device(6), plan.get_kv_device(30), plan.get_kv_device(42),
+            plan.get_kv_device(18), plan.kv_vram_bytes, plan.kv_host_bytes, (n_slot - 3) * kv_slot, 3 * kv_slot);
+        return false;
+    }
+    printf("PASS: the slots of a host layer are host slots whatever room the card has\n");
+    return true;
+}
+
+// The modulo loop of nanbeige and metis16: 4 weight layers run twice, so slot s runs layer s % 4. With room for the
+// dense weights and 6 slots, slots 0..5 are on the device and the plan charges all 8.
+static bool run_kv_slot_modulo_map_test() {
+    using namespace kv_slot_case;
+    const std::vector<int32_t> map   = { 0, 1, 2, 3, 0, 1, 2, 3 };
+    const size_t               roomy = 4 * dense_bytes + 8 * kv_slot;
+    const size_t               tight = 4 * dense_bytes + 6 * kv_slot;
+    const auto room_plan  = ggml_sycl::compute_placement_plan(inventory(4), roomy, 0, kv_info(8, map), nullptr, 0);
+    const auto tight_plan = ggml_sycl::compute_placement_plan(inventory(4), tight, 0, kv_info(8, map), nullptr, 0);
+    bool       ok         = count_slots_on(room_plan, 8, 0) == 8 && room_plan.kv_vram_bytes == 8 * kv_slot;
+    for (int s = 0; s < 8; ++s) {
+        ok = ok && tight_plan.get_kv_device(s) == (s < 6 ? 0 : -1);
+    }
+    ok = ok && tight_plan.kv_vram_bytes == 6 * kv_slot && tight_plan.kv_host_bytes == 2 * kv_slot;
+    if (!ok) {
+        printf(
+            "FAIL: the modulo map charges 8 slots: with room %d on device (kv vram=%zu); tight slots 5/6 on %d/%d, "
+            "kv vram=%zu host=%zu, want 8 (%zu), 0/-1, %zu and %zu\n",
+            count_slots_on(room_plan, 8, 0), room_plan.kv_vram_bytes, tight_plan.get_kv_device(5),
+            tight_plan.get_kv_device(6), tight_plan.kv_vram_bytes, tight_plan.kv_host_bytes, 8 * kv_slot, 6 * kv_slot,
+            2 * kv_slot);
+        return false;
+    }
+    printf("PASS: a modulo slot map puts each slot with its layer and charges every slot\n");
+    return true;
+}
+
+// A model whose slots are its layers plans the same with no map and with the identity map, at a roomy, a tight and a
+// room-holding budget.
+static bool run_kv_slot_identity_map_test() {
+    using namespace kv_slot_case;
+    std::vector<int32_t> identity;
+    for (int l = 0; l < n_phys; ++l) {
+        identity.push_back(l);
+    }
+
+    struct budget_case {
+        size_t   budget;
+        uint32_t n_ctx_context;
+    };
+
+    const budget_case cases[] = {
+        { n_phys * dense_bytes + n_phys * kv_slot + kv_slot,    0    },
+        { n_phys * dense_bytes + 10 * kv_slot,                  0    },
+        { n_phys * dense_bytes + n_phys * (kv_slot + kv_extra), 4096 },
+    };
+    bool ok = true;
+    for (const budget_case & c : cases) {
+        const auto none  = ggml_sycl::compute_placement_plan(inventory(n_phys), c.budget, 0,
+                                                             kv_info(n_phys, {}, c.n_ctx_context), nullptr, 0);
+        const auto same  = ggml_sycl::compute_placement_plan(inventory(n_phys), c.budget, 0,
+                                                             kv_info(n_phys, identity, c.n_ctx_context), nullptr, 0);
+        const bool equal = none.kv_device == same.kv_device && none.layer_device == same.layer_device &&
+                           none.kv_vram_bytes == same.kv_vram_bytes && none.kv_host_bytes == same.kv_host_bytes &&
+                           none.kv_context_reserve_bytes == same.kv_context_reserve_bytes &&
+                           none.vram_bytes == same.vram_bytes && none.host_bytes == same.host_bytes &&
+                           none.kv_layer_count() == same.kv_layer_count();
+        if (!equal) {
+            printf(
+                "FAIL: the identity map must plan as no map (budget %zu, n_ctx_context %u): kv vram %zu/%zu host "
+                "%zu/%zu room %zu/%zu slots %zu/%zu\n",
+                c.budget, c.n_ctx_context, none.kv_vram_bytes, same.kv_vram_bytes, none.kv_host_bytes,
+                same.kv_host_bytes, none.kv_context_reserve_bytes, same.kv_context_reserve_bytes, none.kv_layer_count(),
+                same.kv_layer_count());
+            ok = false;
+        }
+    }
+    if (ok) {
+        printf("PASS: the identity slot map plans exactly as no map\n");
+    }
+    return ok;
+}
+
+// The multi-device planner moves a layer's slots with the layer: every slot's KV is on its layer's device, the layer
+// is charged for each of its slots, and each block counts the KV of every slot its layers execute and is owned by its
+// execution device. Device 1 ranks first and has room for layers 0..8 and two more short layers with their slots
+// (a short layer is 64 KiB of weights and one 256 KiB slot, a looped one three slots), so the layers split across
+// both cards with looped layers on each: a plan that put every layer on one card could not tell a slot that follows
+// its layer from a slot that lands on the only card there is.
+static bool run_multi_device_kv_slot_block_test() {
+    using namespace kv_slot_case;
+    constexpr size_t                            mib     = 1024u * 1024u;
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 64u * mib, 64u * mib, 1.0, true },
+        { 1, 5u * mib,  64u * mib, 4.0, true },
+    };
+    const auto kv   = kv_info(n_slot, loop_map());
+    const auto plan = ggml_sycl::compute_multi_device_plan(devices, inventory(n_phys), n_slot,
+                                                           ggml_sycl::multi_gpu_mode::LAYER, kv, nullptr, 0);
+
+    int layers_on[2] = { 0, 0 };
+    int looped_on[2] = { 0, 0 };
+    for (int l = 0; l < n_phys; ++l) {
+        const int device = plan.get_layer_device(l);
+        if (device == 0 || device == 1) {
+            layers_on[device]++;
+            looped_on[device] += l >= core_start && l < core_end ? 1 : 0;
+        }
+    }
+    if (looped_on[0] == 0 || looped_on[1] == 0 || layers_on[0] + layers_on[1] != n_phys) {
+        printf(
+            "FAIL: precondition: the plan must split the layers across both cards with looped layers on each: "
+            "layers on 0/1 %d/%d, looped layers on 0/1 %d/%d\n",
+            layers_on[0], layers_on[1], looped_on[0], looped_on[1]);
+        return false;
+    }
+
+    bool ok = true;
+    for (int s = 0; s < n_slot; ++s) {
+        const int layer_device = plan.get_layer_device(loop_layer_of(s));
+        if (layer_device < 0 || plan.get_kv_device(s) != layer_device) {
+            printf("FAIL: slot %d must be on its layer %d's device %d, got %d\n", s, loop_layer_of(s), layer_device,
+                   plan.get_kv_device(s));
+            ok = false;
+            break;
+        }
+    }
+    // Every block that holds a looped layer, on either card, counts the KV of all the slots its layers execute.
+    int looped_blocks_on[2] = { 0, 0 };
+    for (const auto & block : plan.layer_blocks) {
+        size_t block_kv = 0;
+        bool   looped   = false;
+        for (int s = 0; s < n_slot; ++s) {
+            const int l = loop_layer_of(s);
+            block_kv += l >= block.start_layer && l <= block.end_layer ? kv_slot : 0;
+            looped = looped || (s >= n_phys && l >= block.start_layer && l <= block.end_layer);
+        }
+        if (!looped) {
+            continue;
+        }
+        if (block.kv_bytes != block_kv || block.kv_device != block.execution_device) {
+            printf(
+                "FAIL: the block of layers %d..%d counts its layers' %zu slot bytes and its KV owner is its "
+                "executor: kv=%zu owner=%d exec=%d\n",
+                block.start_layer, block.end_layer, block_kv, block.kv_bytes, block.kv_device, block.execution_device);
+            ok = false;
+        }
+        if (block.execution_device == 0 || block.execution_device == 1) {
+            looped_blocks_on[block.execution_device]++;
+        }
+    }
+    if (looped_blocks_on[0] == 0 || looped_blocks_on[1] == 0) {
+        printf("FAIL: a block that holds looped layers on each card: %d on device 0, %d on device 1\n",
+               looped_blocks_on[0], looped_blocks_on[1]);
+        ok = false;
+    }
+    if (plan.kv_vram_bytes != n_slot * kv_slot) {
+        printf("FAIL: the multi-device plan charges 48 slots: kv vram=%zu, want %zu\n", plan.kv_vram_bytes,
+               n_slot * kv_slot);
+        ok = false;
+    }
+    if (ok) {
+        printf("PASS: the multi-device planner moves a layer's slots with the layer and counts them in its block\n");
+    }
+    return ok;
+}
+
+// The backend takes the map from the inventory libllama fills: one entry per KV slot, each a weight layer id below the
+// slot count. An identity map is kept empty; a map with the wrong count, a count with no map, or an entry out of range
+// is refused, kept empty, and says which. A layer the late inventory leaves out (its weights are on a CPU buffer
+// type) keeps the map, and its slots are host slots.
+static bool run_kv_slot_map_intake_test() {
+    using namespace kv_slot_case;
+    std::vector<ggml_sycl_tensor_info> tensors;
+    std::vector<std::string>           names;
+    for (int l = 0; l < n_phys; ++l) {
+        names.push_back("blk." + std::to_string(l) + ".attn_q.weight");
+    }
+    for (const std::string & name : names) {
+        ggml_sycl_tensor_info info{};
+        info.name = name.c_str();
+        info.size = dense_bytes;
+        info.type = GGML_TYPE_F16;
+        tensors.push_back(info);
+    }
+    std::vector<int32_t> identity(n_slot);
+    for (int s = 0; s < n_slot; ++s) {
+        identity[s] = s;
+    }
+    const std::vector<int32_t> loop         = loop_map();
+    std::vector<int32_t>       out_of_range = loop;
+    out_of_range[40]                        = n_slot;
+    std::vector<int32_t> negative           = loop;
+    negative[3]                             = -1;
+
+    auto intake = [&](const std::vector<int32_t> * map, uint32_t count) {
+        ggml_sycl_tensor_inventory inv{};
+        inv.tensors             = tensors.data();
+        inv.count               = tensors.size();
+        inv.n_layer             = n_slot;
+        inv.kv_layer_count      = n_slot;
+        inv.kv_layer_phys       = map != nullptr ? map->data() : nullptr;
+        inv.kv_layer_phys_count = count;
+        return ggml_sycl::placement_kv_layer_phys_from_inventory(inv);
+    };
+
+    bool       ok   = true;
+    const auto none = intake(nullptr, 0);
+    if (none.refused || !none.layer_phys.empty()) {
+        printf("FAIL: no map is every slot its own layer, not refused\n");
+        ok = false;
+    }
+    const auto same = intake(&identity, n_slot);
+    if (same.refused || !same.layer_phys.empty()) {
+        printf("FAIL: the identity map is kept empty, not refused: refused=%d size=%zu\n", same.refused,
+               same.layer_phys.size());
+        ok = false;
+    }
+    const auto looped = intake(&loop, n_slot);
+    if (looped.refused || looped.layer_phys != loop) {
+        printf("FAIL: the Inkling map is accepted as given: refused=%d size=%zu\n", looped.refused,
+               looped.layer_phys.size());
+        ok = false;
+    }
+    const auto short_map = intake(&loop, n_slot - 1);
+    if (!short_map.refused || !short_map.layer_phys.empty() || short_map.kv_layer_phys_count != n_slot - 1 ||
+        short_map.kv_layer_count != n_slot || short_map.bad_slot != -1 || short_map.map_missing) {
+        printf("FAIL: a map one entry short is refused and names both counts: refused=%d counts %u/%u bad slot %d\n",
+               short_map.refused, short_map.kv_layer_phys_count, short_map.kv_layer_count, short_map.bad_slot);
+        ok = false;
+    }
+    // A slot count with no map: the producer said it sent one and did not. Refused like a count mismatch, so the WARN
+    // says so, not read as no map and planned without a word.
+    const auto null_map = intake(nullptr, n_slot);
+    if (!null_map.refused || !null_map.layer_phys.empty() || !null_map.map_missing ||
+        null_map.kv_layer_phys_count != n_slot || null_map.bad_slot != -1) {
+        printf("FAIL: a slot count with no map is refused, not read as no map: refused=%d map_missing=%d\n",
+               null_map.refused, null_map.map_missing);
+        ok = false;
+    }
+    const auto past  = intake(&out_of_range, n_slot);
+    const auto below = intake(&negative, n_slot);
+    if (!past.refused || !past.layer_phys.empty() || past.bad_slot != 40 || past.bad_layer != n_slot ||
+        !below.refused || below.bad_slot != 3 || below.bad_layer != -1) {
+        printf("FAIL: an entry out of range is refused and named: slot %d layer %d, slot %d layer %d\n", past.bad_slot,
+               past.bad_layer, below.bad_slot, below.bad_layer);
+        ok = false;
+    }
+
+    // The late inventory without layer 6, whose weights went to a CPU buffer type. The intake never reads `tensors`,
+    // so this half checks that it ignores tensor names: the map stands with layer 6 missing from the names. The
+    // planner half is kept because it is the reason the intake must not read them: planned from what the intake
+    // returned, slots 6, 30 and 42 are the host's while every other slot is on the card with room.
+    tensors.erase(tensors.begin() + 6);
+    const auto late           = intake(&loop, n_slot);
+    auto       late_inventory = inventory(n_phys);
+    late_inventory.erase(late_inventory.begin() + 6);
+    const size_t roomy = n_phys * dense_bytes + n_slot * kv_slot + kv_slot;
+    const auto   plan =
+        ggml_sycl::compute_placement_plan(late_inventory, roomy, 0, kv_info(n_slot, late.layer_phys), nullptr, 0);
+    bool host_slots_ok = !late.refused && late.layer_phys == loop;
+    for (int s = 0; s < n_slot; ++s) {
+        host_slots_ok = host_slots_ok && plan.get_kv_device(s) == (loop_layer_of(s) == 6 ? -1 : 0);
+    }
+    if (!host_slots_ok) {
+        printf(
+            "FAIL: a layer the late inventory leaves out keeps the map, its slots on the host: refused=%d, "
+            "slots 6/30/42 on %d/%d/%d, slot 7 on %d\n",
+            late.refused, plan.get_kv_device(6), plan.get_kv_device(30), plan.get_kv_device(42), plan.get_kv_device(7));
+        ok = false;
+    }
+
+    if (ok) {
+        printf("PASS: the slot map is taken only when it fits the inventory, and the identity is kept empty\n");
+    }
+    return ok;
+}
+
 static bool run_multi_device_layer_block_plan_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -2005,28 +2414,29 @@ static bool run_multi_device_moe_i8_executor_support_test() {
 }
 
 // The synthetic MoE layer both halves of the single-device MoE PP layout test plan and probe: one layer of MXFP4
-// gate/up/down at GPT-OSS's 2880x2880, two experts.
+// gate/up/down at GPT-OSS's 2880x2880, two experts. The MMID pool tests plan the same layer as NVFP4 too (2880 is a
+// multiple of QK_NVFP4), the expert type the direct route admits.
 static constexpr int moe_pp_n_experts = 2;
 static constexpr int moe_pp_ncols     = 2880;
 static constexpr int moe_pp_nrows     = 2880;
 
-static std::vector<ggml_sycl::placement_tensor_info> moe_pp_inventory() {
-    auto make_mxfp4 = [](const char * name) {
+static std::vector<ggml_sycl::placement_tensor_info> moe_pp_inventory(ggml_type type = GGML_TYPE_MXFP4) {
+    auto make_expert = [type](const char * name) {
         ggml_sycl::placement_tensor_info tensor;
         tensor.name  = name;
-        tensor.type  = GGML_TYPE_MXFP4;
+        tensor.type  = type;
         tensor.ne[0] = moe_pp_ncols;
         tensor.ne[1] = moe_pp_nrows;
         tensor.ne[2] = moe_pp_n_experts;
         tensor.ne[3] = 1;
-        tensor.size  = ggml_row_size(GGML_TYPE_MXFP4, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
+        tensor.size  = ggml_row_size(type, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
                       static_cast<size_t>(moe_pp_n_experts);
         return tensor;
     };
     return {
-        make_mxfp4("blk.0.ffn_gate_exps.weight"),
-        make_mxfp4("blk.0.ffn_up_exps.weight"),
-        make_mxfp4("blk.0.ffn_down_exps.weight"),
+        make_expert("blk.0.ffn_gate_exps.weight"),
+        make_expert("blk.0.ffn_up_exps.weight"),
+        make_expert("blk.0.ffn_down_exps.weight"),
     };
 }
 
@@ -2067,10 +2477,10 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
 
     ggml_sycl::test_xmx_tiled_pp_route_override_guard route_guard(xmx_tiled_pp_route_active);
 
-    // The MMID direct route is closed in an ordinary build, so these plans are made as production makes them. This
-    // binary is a route-testing build, where the route compiles in; run_single_device_moe_mmid_pool_charge_test()
-    // plans the open state.
-    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+    // Planned with the MMID direct route reachable. The workspace pool is scoped to the expert types the route admits
+    // (Q1_0, NVFP4), so this MXFP4 layer carries none whether the route is open or not, and the totals below hold in
+    // both states; run_single_device_moe_mmid_pool_charge_test() plans an NVFP4 layer that does carry one.
+    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
 
     const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
 
@@ -2149,7 +2559,7 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
     // Totals both the roomy and the tight plan must satisfy. The layout charge is the sum of every on-device layout the
     // plan holds, so with no gate/up alternates it excludes any SOA copy of an XMX_TILED primary, and it must equal
     // weight_vram_bytes. vram_bytes is the single-device total: weights, KV and the KV context room. No MoE MMID
-    // workspace pool is planned or charged, because no route of this build state can consume one (llama.cpp-84ck).
+    // workspace pool is planned or charged, because the direct route, its only consumer, admits no MXFP4 expert.
     // The pre-pack promotion runs before packing, so both plans carry the arm's moe_pp_soa_promoted.
     auto check_plan_totals = [&](const ggml_sycl::placement_plan & p, size_t budget, const char * arm) {
         const size_t charge    = planned_weight_charge_for_device(p, 0);
@@ -2164,7 +2574,7 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
         }
         if (p.moe_mmid_device_pool_bytes != 0 || p.moe_mmid_host_pool_bytes != 0 || !p.moe_mmid_workspaces.empty()) {
             printf(
-                "FAIL: route %s, %s plan: closed MMID route still planned a workspace pool, device=%zu host=%zu "
+                "FAIL: route %s, %s plan: an MXFP4 expert layer planned an MMID workspace pool, device=%zu host=%zu "
                 "workspaces=%zu\n",
                 route_name, arm, p.moe_mmid_device_pool_bytes, p.moe_mmid_host_pool_bytes,
                 p.moe_mmid_workspaces.size());
@@ -2383,11 +2793,12 @@ static bool run_single_device_moe_pp_layout_test() {
 }
 
 // The MoE MMID workspace pool is planned, charged and re-planned only where the MMID direct route can run
-// (llama.cpp-84ck). Every pool byte the planner charges is a byte no expert can use, so a pool for a closed route moves
-// experts to the host for nothing, and a pool the plan rejected must not drive the runtime re-plan into a growth refusal
-// (which the runtime transaction answers by demoting KV or refusing the context). The fixture is the MXFP4 GPT-OSS-shaped
-// layer of the PP layout test, planned with n_expert_used set, under both answers of
-// ggml_sycl_moe_mmid_route_reachable_in_build().
+// (llama.cpp-84ck): for an expert of a type the route admits (Q1_0, NVFP4), and only when the route is reachable. Every
+// pool byte the planner charges is a byte no expert can use, so a pool nothing consumes moves experts to the host for
+// nothing, and a pool the plan rejected must not drive the runtime re-plan into a growth refusal (which the runtime
+// transaction answers by demoting KV or refusing the context). The fixture is the GPT-OSS-shaped layer of the PP
+// layout test, planned with n_expert_used set: as NVFP4 under both answers of
+// ggml_sycl_moe_mmid_route_reachable_in_build(), and as MXFP4 (GPT-OSS's expert type) with the route open.
 static bool run_single_device_moe_mmid_pool_charge_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -2399,26 +2810,31 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
 
     constexpr int n_expert_used = 4;
 
-    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+    const std::vector<ggml_sycl::placement_tensor_info> inventory       = moe_pp_inventory(GGML_TYPE_NVFP4);
+    const std::vector<ggml_sycl::placement_tensor_info> mxfp4_inventory = moe_pp_inventory(GGML_TYPE_MXFP4);
     ggml_sycl::placement_kv_info                        kv_info{};
     kv_info.n_ubatch      = 512;
     kv_info.n_expert_used = n_expert_used;
 
-    auto plan_on = [&](size_t budget) {
+    auto plan_inventory_on = [&](const std::vector<ggml_sycl::placement_tensor_info> & inv, size_t budget) {
         const std::vector<ggml_sycl::device_budget> devices = {
             { 0, budget, budget, 4.0, true },
         };
-        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+        return ggml_sycl::compute_multi_device_plan(devices, inv, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                     nullptr, moe_pp_n_experts);
+    };
+    auto plan_on = [&](size_t budget) {
+        return plan_inventory_on(inventory, budget);
     };
     auto vram_composed = [](const ggml_sycl::placement_plan & p) {
         return p.weight_vram_bytes + p.kv_vram_bytes + p.kv_context_reserve_bytes + p.moe_mmid_device_pool_bytes;
     };
     // The runtime re-plan of a plan whose KV did not change. It must accept, and leave the plan's charge and pool alone.
-    auto expect_stable_replan = [&](const ggml_sycl::placement_plan & p, const char * arm) {
+    auto expect_stable_replan_of = [&](const ggml_sycl::placement_plan &                     p,
+                                       const std::vector<ggml_sycl::placement_tensor_info> & inv, const char * arm) {
         ggml_sycl::placement_plan          replanned = p;
         ggml_sycl::moe_mmid_runtime_reason reason    = ggml_sycl::moe_mmid_runtime_reason::OK;
-        const bool ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, &reason);
+        const bool ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inv, n_expert_used, &reason);
         if (!ok || reason != ggml_sycl::moe_mmid_runtime_reason::OK || replanned.vram_bytes != p.vram_bytes ||
             replanned.moe_mmid_device_pool_bytes != p.moe_mmid_device_pool_bytes ||
             replanned.moe_mmid_workspaces.size() != p.moe_mmid_workspaces.size()) {
@@ -2432,11 +2848,14 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         }
         return true;
     };
+    auto expect_stable_replan = [&](const ggml_sycl::placement_plan & p, const char * arm) {
+        return expect_stable_replan_of(p, inventory, arm);
+    };
 
     bool ok = true;
 
-    // Route open: the pool is planned and charged on top of weights, KV and room. This is the positive control that
-    // the closed arm's zero is not vacuous: the same fixture does carry a pool when a route can consume it.
+    // Route open: the NVFP4 pool is planned and charged on top of weights, KV and room. This is the positive control
+    // that the zeros below are not vacuous: the same layer does carry a pool when the route can consume it.
     size_t roomy_charge = 0;
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
@@ -2465,7 +2884,35 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         ok = arm_ok && ok;
     }
 
-    // Route closed (an ordinary build): nothing is planned, so nothing is charged, and the plan stays valid.
+    // Route open, MXFP4 experts (GPT-OSS's type): the route admits no MXFP4 operand, so nothing is planned or charged,
+    // and the plan stays valid. Without the planner's type scope this layer carried the same pool as the NVFP4 one.
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
+        const auto plan   = plan_inventory_on(mxfp4_inventory, 1024u * mib);
+        bool       arm_ok = true;
+        if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
+            plan.moe_mmid_host_pool_bytes != 0 || !plan.moe_mmid_workspaces.empty() ||
+            plan.vram_bytes != vram_composed(plan)) {
+            printf(
+                "FAIL: open MMID route, MXFP4 experts: expected no workspace pool, valid=%d device pool=%zu host "
+                "pool=%zu workspaces=%zu vram=%zu want weight=%zu+kv=%zu+room=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_host_pool_bytes,
+                plan.moe_mmid_workspaces.size(), plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
+                plan.kv_context_reserve_bytes);
+            arm_ok = false;
+        }
+        arm_ok = expect_stable_replan_of(plan, mxfp4_inventory, "open MMID route, MXFP4 experts") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: open MMID route, MXFP4 experts: valid with no pool, vram=%zu = weight %zu + kv %zu + room %zu, "
+                "and the runtime re-plan keeps it\n",
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
+    }
+
+    // Route closed: nothing is planned even for NVFP4, so nothing is charged, and the plan stays valid.
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
 
@@ -2553,10 +3000,192 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         ok = arm_ok && ok;
     }
 
+    // The pool's host bytes are sized into the WEIGHT host zone, which no graph boundary checks: its registry context
+    // holds it for the model's plan, past every graph. In STAGING every graph boundary found it live and refused. The
+    // same NVFP4 layer is planned with the route open (a pool) and closed (none): the open plan's WEIGHT host zone is
+    // larger by exactly the pool, and its STAGING and SCRATCH host zones are the closed plan's.
+    const auto host_zones = [](const ggml_sycl::placement_plan & p) {
+        char text[160];
+        snprintf(text, sizeof(text), "weight=%zu staging=%zu scratch=%zu", p.host_zone_weight_bytes,
+                 p.host_zone_staging_bytes, p.host_zone_scratch_bytes);
+        return std::string(text);
+    };
+    ggml_sycl::placement_plan closed_nvfp4;
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+        closed_nvfp4 = plan_on(1024u * mib);
+    }
+    {
+        ggml_sycl::placement_plan open_nvfp4;
+        {
+            ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+            open_nvfp4 = plan_on(1024u * mib);
+        }
+        const size_t pool   = open_nvfp4.moe_mmid_host_pool_bytes;
+        bool         arm_ok = true;
+        if (pool == 0 || closed_nvfp4.moe_mmid_host_pool_bytes != 0 ||
+            open_nvfp4.weight_host_bytes != closed_nvfp4.weight_host_bytes) {
+            printf(
+                "FAIL: MMID host pool zone: precondition, want a host pool only with the route open and the same host "
+                "weights, got pool open=%zu closed=%zu weight_host open=%zu closed=%zu\n",
+                pool, closed_nvfp4.moe_mmid_host_pool_bytes, open_nvfp4.weight_host_bytes,
+                closed_nvfp4.weight_host_bytes);
+            arm_ok = false;
+        } else if (open_nvfp4.host_zone_weight_bytes != closed_nvfp4.host_zone_weight_bytes + pool ||
+                   open_nvfp4.host_zone_staging_bytes != closed_nvfp4.host_zone_staging_bytes ||
+                   open_nvfp4.host_zone_scratch_bytes != closed_nvfp4.host_zone_scratch_bytes) {
+            printf(
+                "FAIL: MMID host pool zone: the %zu-byte host pool must be in the WEIGHT host zone and in neither "
+                "STAGING nor SCRATCH, got open %s, closed %s\n",
+                pool, host_zones(open_nvfp4).c_str(), host_zones(closed_nvfp4).c_str());
+            arm_ok = false;
+        }
+        if (arm_ok) {
+            printf(
+                "PASS: MMID host pool zone: the %zu-byte host pool is in the WEIGHT host zone only (open %s, "
+                "closed %s)\n",
+                pool, host_zones(open_nvfp4).c_str(), host_zones(closed_nvfp4).c_str());
+        }
+        ok = arm_ok && ok;
+    }
+    // The runtime re-plan's growth goes to the same zone: the closed plan re-planned with the route open grows by the
+    // pool in WEIGHT, and STAGING and SCRATCH stay as they were.
+    {
+        ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+        ggml_sycl::placement_plan                               grown  = closed_nvfp4;
+        ggml_sycl::moe_mmid_runtime_reason                      reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+        const bool                                              replanned =
+            ggml_sycl::replan_moe_mmid_workspaces_for_runtime(grown, inventory, n_expert_used, &reason);
+        const size_t pool   = grown.moe_mmid_host_pool_bytes;
+        bool         arm_ok = true;
+        if (!replanned || reason != ggml_sycl::moe_mmid_runtime_reason::OK || pool == 0) {
+            printf(
+                "FAIL: MMID host pool zone, runtime growth: precondition, want an accepted re-plan that grows a host "
+                "pool, got ok=%d reason=%s pool=%zu\n",
+                replanned ? 1 : 0, ggml_sycl::moe_mmid_runtime_reason_name(reason), pool);
+            arm_ok = false;
+        } else if (grown.host_zone_weight_bytes != closed_nvfp4.host_zone_weight_bytes + pool ||
+                   grown.host_zone_staging_bytes != closed_nvfp4.host_zone_staging_bytes ||
+                   grown.host_zone_scratch_bytes != closed_nvfp4.host_zone_scratch_bytes) {
+            printf(
+                "FAIL: MMID host pool zone, runtime growth: the %zu-byte growth must go to the WEIGHT host zone only, "
+                "got %s from %s\n",
+                pool, host_zones(grown).c_str(), host_zones(closed_nvfp4).c_str());
+            arm_ok = false;
+        }
+        if (arm_ok) {
+            printf(
+                "PASS: MMID host pool zone, runtime growth: the %zu-byte host pool grows the WEIGHT host zone only "
+                "(%s from %s)\n",
+                pool, host_zones(grown).c_str(), host_zones(closed_nvfp4).c_str());
+        }
+        ok = arm_ok && ok;
+    }
+    // A model without a Q1_0/NVFP4 expert plans no pool, so its host zones are the same with the route open or closed.
+    {
+        ggml_sycl::placement_plan open_mxfp4, closed_mxfp4;
+        {
+            ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+            open_mxfp4 = plan_inventory_on(mxfp4_inventory, 1024u * mib);
+        }
+        {
+            ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
+            closed_mxfp4 = plan_inventory_on(mxfp4_inventory, 1024u * mib);
+        }
+        if (open_mxfp4.moe_mmid_host_pool_bytes != 0 ||
+            open_mxfp4.host_zone_weight_bytes != closed_mxfp4.host_zone_weight_bytes ||
+            open_mxfp4.host_zone_staging_bytes != closed_mxfp4.host_zone_staging_bytes ||
+            open_mxfp4.host_zone_scratch_bytes != closed_mxfp4.host_zone_scratch_bytes) {
+            printf(
+                "FAIL: MMID host pool zone, MXFP4 experts: want no pool and the same host zones, got pool=%zu open "
+                "%s closed %s\n",
+                open_mxfp4.moe_mmid_host_pool_bytes, host_zones(open_mxfp4).c_str(), host_zones(closed_mxfp4).c_str());
+            ok = false;
+        } else {
+            printf("PASS: MMID host pool zone, MXFP4 experts: no pool, host zones unchanged (%s)\n",
+                   host_zones(open_mxfp4).c_str());
+        }
+    }
+
     if (ok) {
         printf(
-            "PASS: MoE MMID workspace pool is charged only for a reachable route, and a rejected pool stays out of the "
-            "runtime re-plan\n");
+            "PASS: MoE MMID workspace pool is charged only for a reachable route and an expert type it admits, and a "
+            "rejected pool stays out of the runtime re-plan\n");
+    }
+    return ok;
+}
+
+// The bound unified_alloc() holds a request that may not grow its host zone to (forbid_host_zone_growth: the MMID
+// workspace host pool, the SYCL host pool, the prompt pipeline's stage buffers). The WEIGHT arm is the Inkling B70
+// load: the plan places no host weight, so WEIGHT is reserved at 64 MiB plus the 128 KiB MMID host pool, the model
+// load grows it by twelve 2 GiB chunks for the host weights it places through the SYCL host buffer type, and the
+// pool then asks for 128 KiB of a zone that has 2.77 GB free.
+static bool run_host_zone_no_growth_bound_test() {
+    constexpr size_t mib      = 1024ull * 1024ull;
+    constexpr size_t gib      = 1024ull * mib;
+    constexpr size_t pool     = 128ull * 1024ull;
+    const size_t     reserved = 64ull * mib + pool;
+    const size_t     grown    = reserved + 12ull * 2ull * gib;
+    const size_t     used     = static_cast<size_t>(21.29 * static_cast<double>(gib));
+    bool             ok       = true;
+
+    const size_t weight_bound = ggml_sycl::host_zone_no_growth_bound(ggml_sycl::host_zone_id::WEIGHT, reserved, grown);
+    if (weight_bound == 0 || used + pool > weight_bound) {
+        printf(
+            "FAIL: host zone no-growth bound, WEIGHT grown by the load: want room for the %zu-byte MMID host pool in "
+            "the zone's %zu bytes with %zu used, got bound %zu (reserved %zu)\n",
+            pool, grown, used, weight_bound, reserved);
+        ok = false;
+    }
+    if (ggml_sycl::host_zone_no_growth_bound(ggml_sycl::host_zone_id::WEIGHT, reserved, reserved) != reserved) {
+        printf("FAIL: host zone no-growth bound, WEIGHT not grown: want the reservation\n");
+        ok = false;
+    }
+    // Every tenant of STAGING is planned: a growth-allowed request that grew it does not widen a no-growth request's
+    // room past the plan.
+    const size_t staging_reserved = 2ull * gib;
+    for (const ggml_sycl::host_zone_id zone :
+         { ggml_sycl::host_zone_id::STAGING, ggml_sycl::host_zone_id::SCRATCH, ggml_sycl::host_zone_id::KV }) {
+        const size_t bound =
+            ggml_sycl::host_zone_no_growth_bound(zone, staging_reserved, staging_reserved + 2ull * gib);
+        if (bound != staging_reserved) {
+            printf("FAIL: host zone no-growth bound, %s grown: want the reservation %zu, got %zu\n",
+                   ggml_sycl::host_zone_name(zone), staging_reserved, bound);
+            ok = false;
+        }
+    }
+
+    // The host pool's refusal names the condition its allocation missed on.
+    using M = ggml_sycl::host_zone_alloc_miss;
+    using R = ggml_sycl::moe_mmid_materialize_refusal;
+
+    const struct {
+        M            miss;
+        R            want;
+        const char * name;
+    } cases[] = {
+        { M::NONE,                 R::HOST_POOL_ALLOCATION_FAILED,    "host-pool-allocation-failed"    },
+        { M::ZONES_NOT_CONFIGURED, R::HOST_POOL_ZONES_NOT_CONFIGURED, "host-pool-zones-not-configured" },
+        { M::OVER_NO_GROWTH_BOUND, R::HOST_POOL_OVER_NO_GROWTH_BOUND, "host-pool-over-no-growth-bound" },
+        { M::NO_CONTIGUOUS_BLOCK,  R::HOST_POOL_NO_CONTIGUOUS_BLOCK,  "host-pool-no-contiguous-block"  },
+        { M::GROWTH_FAILED,        R::HOST_POOL_ALLOCATION_FAILED,    "host-pool-allocation-failed"    },
+    };
+
+    for (const auto & c : cases) {
+        const R got = ggml_sycl::moe_mmid_host_pool_refusal(c.miss);
+        if (got != c.want || std::strcmp(ggml_sycl::moe_mmid_materialize_refusal_name(got), c.name) != 0) {
+            printf("FAIL: MMID host pool refusal for miss %s: want %s, got %s\n",
+                   ggml_sycl::host_zone_alloc_miss_name(c.miss), c.name,
+                   ggml_sycl::moe_mmid_materialize_refusal_name(got));
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        printf(
+            "PASS: host zone no-growth bound: WEIGHT grown by the load holds the MMID host pool (bound %zu, used "
+            "%zu), STAGING/SCRATCH/KV keep their reservation, and the pool's refusal names its host-zone miss\n",
+            weight_bound, used);
     }
     return ok;
 }
@@ -2709,18 +3338,52 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
 }
 
 // llama.cpp-n8da: with two physical GPUs the backend exposes only device 0 to the registry by default, yet the
-// multi-device planner budgets both, so experts (or their decode alternates) may land on device 1. An MMID workspace is
-// admitted only by a backend context on its owner, and no backend context can exist for a hidden device, so the plan
-// must not carry a workspace for device 1, nor refuse the pool because device 1's experts have no owner. The second arm
-// exposes both devices (a split mode) and is the control that the rule keys on exposure, not on "secondary".
+// multi-device planner budgets both, so experts may land on device 1. An MMID workspace is admitted only by a backend
+// context on its owner, and no backend context can exist for a hidden device, so the plan must not carry a workspace
+// for device 1, nor refuse the pool because device 1's experts have no owner. The second arm exposes both devices (a
+// split mode) and is the control that the rule keys on exposure, not on "secondary".
+//
+// The experts are NVFP4, a type the direct route admits: no other type draws a pool, so no other type can name an
+// owner at all. No secondary executor runs them, so they never reach device 1 as a replica (the route the MXFP4 form
+// of this fixture took, an SOA alternate there). They reach it as a primary through the no-P2P cohesive placement:
+// two layers that together fit neither device, each layer (dense weight and experts) fitting either, so layer 0 goes
+// to the faster device 1 and layer 1 to device 0, each with its experts.
 static bool run_multi_device_mmid_owner_exposure_test() {
     constexpr size_t mib           = 1024u * 1024u;
     constexpr int    n_expert_used = 4;
+    constexpr int    hidden_dim    = 4096;
+    constexpr int    dense_rows    = 49152;  // 384 MiB of F16 per layer
 
-    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
-    const std::vector<ggml_sycl::device_budget>         devices   = {
-        { 0, 1024u * mib, 1024u * mib, 4.0, true },
-        { 1, 1024u * mib, 1024u * mib, 4.0, true },
+    auto make_dense = [](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_F16;
+        tensor.ne[0] = hidden_dim;
+        tensor.ne[1] = dense_rows;
+        tensor.size  = ggml_row_size(GGML_TYPE_F16, hidden_dim) * static_cast<size_t>(dense_rows);
+        return tensor;
+    };
+    auto make_expert = [](const char * name) {
+        ggml_sycl::placement_tensor_info tensor;
+        tensor.name  = name;
+        tensor.type  = GGML_TYPE_NVFP4;
+        tensor.ne[0] = moe_pp_ncols;
+        tensor.ne[1] = moe_pp_nrows;
+        tensor.ne[2] = moe_pp_n_experts;
+        tensor.ne[3] = 1;
+        tensor.size  = ggml_row_size(GGML_TYPE_NVFP4, moe_pp_ncols) * static_cast<size_t>(moe_pp_nrows) *
+                      static_cast<size_t>(moe_pp_n_experts);
+        return tensor;
+    };
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = {
+        make_dense("blk.0.attn_q.weight"),       make_expert("blk.0.ffn_gate_exps.weight"),
+        make_expert("blk.0.ffn_up_exps.weight"), make_expert("blk.0.ffn_down_exps.weight"),
+        make_dense("blk.1.attn_q.weight"),       make_expert("blk.1.ffn_gate_exps.weight"),
+        make_expert("blk.1.ffn_up_exps.weight"), make_expert("blk.1.ffn_down_exps.weight"),
+    };
+    const std::vector<ggml_sycl::device_budget> devices = {
+        { 0, 700u * mib, 700u * mib, 1.0, true },
+        { 1, 700u * mib, 700u * mib, 4.0, true },
     };
     ggml_sycl::placement_kv_info kv_info{};
     kv_info.n_ubatch      = 512;
@@ -2732,7 +3395,7 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         ggml_sycl_device_info info = make_mock_sycl_info(2);
         info.device_count          = exposed;  // total_gpu_count stays 2
         ggml_sycl::test_sycl_info_override_guard info_guard(info);
-        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+        return ggml_sycl::compute_multi_device_plan(devices, inventory, 2, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                     nullptr, moe_pp_n_experts);
     };
     // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
@@ -4081,11 +4744,18 @@ int main() {
         mock_ok = run_moe_stream_ring_room_converges_test() && mock_ok;
         mock_ok = run_moe_stream_ring_room_cap_refuses_test() && mock_ok;
         mock_ok = run_dense_weights_before_kv_test() && mock_ok;
+        mock_ok = run_kv_slot_lives_with_its_layer_test() && mock_ok;
+        mock_ok = run_kv_slot_of_host_layer_test() && mock_ok;
+        mock_ok = run_kv_slot_modulo_map_test() && mock_ok;
+        mock_ok = run_kv_slot_identity_map_test() && mock_ok;
+        mock_ok = run_multi_device_kv_slot_block_test() && mock_ok;
+        mock_ok = run_kv_slot_map_intake_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
         mock_ok = run_multi_device_moe_i8_executor_support_test() && mock_ok;
         mock_ok = run_single_device_moe_pp_layout_test() && mock_ok;
         mock_ok = run_single_device_moe_mmid_pool_charge_test() && mock_ok;
+        mock_ok = run_host_zone_no_growth_bound_test() && mock_ok;
         mock_ok = run_moe_decode_down_phase_split_policy_test() && mock_ok;
         mock_ok = run_multi_device_no_p2p_cohesive_moe_layer_test() && mock_ok;
         mock_ok = run_regression_guard_policy_test() && mock_ok;

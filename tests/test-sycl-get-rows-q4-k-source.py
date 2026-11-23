@@ -178,6 +178,9 @@ def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
     # --- the predicate admits Q4_K, and everything it admits has an arm -------
     admitted = re.findall(r"case\s+GGML_TYPE_(\w+)\s*:", pred)
     results["the predicate admits Q4_K"] = "Q4_K" in admitted
+    # BF16 (Inkling's token_embd.weight): get_rows_sycl_float reads it as bfloat16 and widens to float, the same
+    # arm F16 takes; declining it put the first node of every decoded token on the CPU.
+    results["the predicate admits BF16"] = "BF16" in admitted
     missing = [t for t in admitted if case_arm(op, t) is None]
     results["every admitted type has an arm in ggml_sycl_op_get_rows"] = bool(admitted) and not missing
 
@@ -212,6 +215,20 @@ def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
     stream_at = op.find("get_rows_build_stream_segments(")
     results["op: a Q4_K weight that is not on the device is refused before any stream segments are built"] = \
         q4k_guard is not None and 0 <= q4k_guard.start() < stream_at
+    # Every executor of the op, not only the main switch: get_rows_stream_slice reaches the slice dispatcher for any
+    # AoS type whose cache view is off the device, and its default arm aborts. An admitted type needs an arm there,
+    # or an early refusal in the op (`src0->type == GGML_TYPE_<T> && ... get_rows_host_weight_unsupported(...)`)
+    # before the stream segments are built.
+    refused = set()
+    for g in re.finditer(r"if\s*\(src0->type\s*==\s*GGML_TYPE_(\w+)\s*&&[^{]*\)\s*\{\s*"
+                         r"get_rows_host_weight_unsupported\(", op):
+        if 0 <= g.start() < stream_at:
+            refused.add(g.group(1))
+    no_slice = [t for t in admitted if case_arm(slice_, t) is None and t not in refused]
+    if no_slice:
+        print("  admitted with no slice arm and no early refusal: " + ", ".join(no_slice))
+    results["slice: every admitted type has a slice arm or an early refusal before the stream path"] = \
+        bool(admitted) and not no_slice
     results["slice: the streamed-slice dispatcher has no Q4_K arm (host-resident weights are declined)"] = \
         case_arm(slice_, "Q4_K") is None and "get_rows_q4_k_aos_sycl(" not in slice_
 
@@ -286,6 +303,8 @@ if args.self_test:
     mutants = [
         ("Q4_K dropped from the predicate", "the predicate admits Q4_K",
          with_(support=mutate(support, SUPPORT_SIG, "case GGML_TYPE_Q4_K:", "case GGML_TYPE_Q3_K:"))),
+        ("BF16 dropped from the predicate", "the predicate admits BF16",
+         with_(support=mutate(support, SUPPORT_SIG, "case GGML_TYPE_BF16:", "case GGML_TYPE_F64:"))),
         ("private type list in supports_op", "supports_op keeps no private GET_ROWS type list",
          with_(backend=mutate(backend, SUPPORTS_OP_SIG, "case GGML_OP_GET_ROWS:",
                               "case GGML_OP_GET_ROWS: if (op->src[0]->type == GGML_TYPE_Q4_0) { return true; }"))),
@@ -322,6 +341,12 @@ if args.self_test:
          "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
          with_(getrows=mutate(getrows, OP_SIG, "src0->type == GGML_TYPE_Q4_K && cache_view_valid && cache_view.location",
                               "src0->type == GGML_TYPE_Q4_K && cache_view.location"))),
+        ("BF16 slice arm dropped",
+         "slice: every admitted type has a slice arm or an early refusal before the stream path",
+         with_(getrows=mutate(getrows, SLICE_SIG, "case GGML_TYPE_BF16:", "case GGML_TYPE_F64:"))),
+        ("F16 slice arm dropped",
+         "slice: every admitted type has a slice arm or an early refusal before the stream path",
+         with_(getrows=mutate(getrows, SLICE_SIG, "case GGML_TYPE_F16:", "case GGML_TYPE_F64:"))),
         ("slice default aborts anonymously", "slice: the default arm refuses through the helper",
          with_(getrows=mutate(getrows, SLICE_SIG, "get_rows_host_weight_unsupported(", "GGML_ABORT_X("))),
         ("refusal loses its ticket", "the host-weight refusal names the tensor, the tiering and its ticket",

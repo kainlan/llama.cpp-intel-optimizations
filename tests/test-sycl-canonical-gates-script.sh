@@ -5,14 +5,17 @@
 # is CPU-only: it never touches a GPU and never loads a real model. All
 # "binaries" are shell scripts controlled by this file, wired through the
 # script's SYCL_GATES_* overrides (SYCL_GATES_BIN_DIR, _CMAKE_CACHE, _LDD_CMD,
-# _MISTRAL_MODEL, _GPTOSS_MODEL, _SKIP_ONEAPI_SOURCE, _SETTLE_SECONDS,
-# _SETVARS).
+# _MISTRAL_MODEL, _GPTOSS_MODEL, _INKLING_MODEL, _SKIP_ONEAPI_SOURCE,
+# _SETTLE_SECONDS, _SETVARS).
 #
 # Cases, matching the task spec plus discriminators added on review:
 #   (a)  correct digits                              -> PASS rc=0
 #   (b)  digits only in the prompt echo (GPT-OSS)     -> FAIL
 #   (b2) digits mid-line, not at line start (Mistral) -> FAIL
 #   (c)  digits correct but an abort line on stderr   -> FAIL
+#   (two-gpu-advisory) digits correct, and stderr holds only the backend's
+#        two-GPU startup advisory, which names DEVICE_LOST  -> PASS
+#   (device-lost) digits correct, the advisory AND a real loss line -> FAIL
 #   (d)  --list-devices: the CURRENTLY LIVE dev_mgr abort shape
 #        (rc!=0, empty stdout, "SYCL" text only on stderr)   -> rc 77 (SKIP)
 #   (d2) --list-devices: the FUTURE llama.cpp-1lrh graceful shape
@@ -31,6 +34,12 @@
 #        SELECTOR/ROOT_DIR
 #   (stderr-only-mistral) correct digits on STDERR only -> FAIL
 #   (stderr-only-gptoss)  same, GPT-OSS side            -> FAIL
+#   (gptoss argv) the GPT-OSS gate's llama-cli argv has no -ngl and no -c
+#        (--reasoning-budget 0 is the positive control)
+#   (inkling-pass/-wrong/-no-model) opt-in inkling gate: PASS, wrong tokens
+#        -> FAIL, model file absent -> rc 77; argv has -c 8192 and -no-cnv,
+#        no -ngl, and GGML_SYCL_MOE_MULTI_GPU=0 in the child environment;
+#        --gate all never runs it
 #
 # Run directly: bash tests/test-sycl-canonical-gates-script.sh; echo rc=$?
 #
@@ -164,6 +173,12 @@ if [ "${1:-}" = "--list-devices" ]; then
             ;;
     esac
 fi
+if [ -n "${STUB_ARGV_FILE:-}" ]; then
+    printf "%s\nMULTI_GPU=%s\n" "$*" "${GGML_SYCL_MOE_MULTI_GPU-unset}" > "$STUB_ARGV_FILE"
+fi
+if [ -n "${STUB_ARGV_LOG:-}" ]; then
+    printf "%s\n" "$*" >> "$STUB_ARGV_LOG"
+fi
 case "${STUB_MISTRAL_MODE:-pass}" in
     pass)
         # the real shape: the SPM dummy prefix is echoed as a leading space
@@ -173,6 +188,20 @@ case "${STUB_MISTRAL_MODE:-pass}" in
     abort)
         printf "1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
         printf "/build/ggml/src/ggml-sycl/ggml-sycl.cpp:12345: GGML_ASSERT(x) failed\n" >&2
+        exit 0
+        ;;
+    two-gpu-advisory)
+        # What the backend prints at startup under a two-card selector. It
+        # names the error it warns about; nothing was lost.
+        printf " 1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
+        printf "0.00.123.438 W [SYCL] WARNING: 2 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.\n" >&2
+        exit 0
+        ;;
+    device-lost)
+        # The same startup advisory, then a real loss as the runtime reports it.
+        printf " 1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
+        printf "0.00.123.438 W [SYCL] WARNING: 2 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by default; planner-owned MoE expert dispatch uses isolated per-device queues.\n" >&2
+        printf "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)\n" >&2
         exit 0
         ;;
     mid-line)
@@ -201,6 +230,9 @@ esac
 # appear only inside an echoed prompt line, never alone on their own line.
 # shellcheck disable=SC2016
 LLAMA_CLI_STUB='#!/usr/bin/env bash
+if [ -n "${STUB_ARGV_FILE:-}" ]; then
+    printf "%s\n" "$*" > "$STUB_ARGV_FILE"
+fi
 case "${STUB_GPTOSS_MODE:-pass}" in
     pass)
         printf "1, 2, 3, 4, 5\n"
@@ -258,6 +290,7 @@ run_gates() {
     SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt" \
     SYCL_GATES_LDD_CMD="$dir/ldd" \
     SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf" \
+    SYCL_GATES_INKLING_MODEL="$dir/fake-inkling.gguf" \
     SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf" \
     SYCL_GATES_SKIP_ONEAPI_SOURCE=1 \
     SYCL_GATES_SETTLE_SECONDS=0 \
@@ -280,6 +313,7 @@ run_gates_real_oneapi() {
         SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt" \
         SYCL_GATES_LDD_CMD="$dir/ldd" \
         SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf" \
+        SYCL_GATES_INKLING_MODEL="$dir/fake-inkling.gguf" \
         SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf" \
         SYCL_GATES_SETTLE_SECONDS=0 \
         "$GATES_SCRIPT" --build-dir "$dir/build" --gate "$gate" --selector level_zero:1 "$@"
@@ -289,6 +323,7 @@ touch_fake_models() {
     local dir="$1"
     : > "$dir/fake-mistral.gguf"
     : > "$dir/fake-gptoss.gguf"
+    : > "$dir/fake-inkling.gguf"
 }
 
 # Creates a tiny, throwaway git repo -- deliberately NOT this checkout --
@@ -337,6 +372,7 @@ run_gates_fake_setvars() {
         SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt" \
         SYCL_GATES_LDD_CMD="$dir/ldd" \
         SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf" \
+        SYCL_GATES_INKLING_MODEL="$dir/fake-inkling.gguf" \
         SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf" \
         SYCL_GATES_SETTLE_SECONDS=0 \
         SYCL_GATES_SETVARS="$dir/hostile-setvars.sh" \
@@ -380,6 +416,22 @@ touch_fake_models "$case_c_dir"
 out="$(STUB_MISTRAL_MODE=abort run_gates "$case_c_dir" mistral)"
 rc=$?
 expect_gate "c" 1 "$out" "$rc" '^GATE mistral FAIL rc=0 '
+
+# --- (two-gpu-advisory) the startup advisory alone is not a loss -> PASS -----
+# Under a two-card selector the backend prints one WARN line that names
+# DEVICE_LOST. A verdict that searched for the bare word failed every gate on
+# level_zero:0,1 whatever the model did (seen on the Inkling gate, 2026-11-22).
+case_adv_dir="$TMP/advisory"
+setup_case_dir "$case_adv_dir"
+touch_fake_models "$case_adv_dir"
+out="$(STUB_MISTRAL_MODE=two-gpu-advisory run_gates "$case_adv_dir" mistral)"
+rc=$?
+expect_gate "two-gpu-advisory" 0 "$out" "$rc" '^GATE mistral PASS rc=0 '
+
+# --- (device-lost) the advisory does not hide a real loss -> FAIL ------------
+out="$(STUB_MISTRAL_MODE=device-lost run_gates "$case_adv_dir" mistral)"
+rc=$?
+expect_gate "device-lost" 1 "$out" "$rc" '^GATE mistral FAIL rc=0 '
 
 # --- (d) --list-devices: the LIVE dev_mgr abort shape -> rc 77 (SKIP) ------
 # The no-device probe must read stdout only: this exact shape (abort text
@@ -543,6 +595,66 @@ touch_fake_models "$case_serr_g_dir"
 out="$(STUB_GPTOSS_MODE=stderr-only run_gates "$case_serr_g_dir" gptoss)"
 rc=$?
 expect_gate "stderr-only-gptoss" 1 "$out" "$rc" '^GATE gptoss FAIL rc=0 '
+
+# --- (gptoss argv) the GPT-OSS gate carries no -ngl and no -c ---------------
+# The unified cache places every weight and the KV, so neither flag may appear.
+# --reasoning-budget 0 is the positive control: an empty argv file cannot pass.
+case_ga_dir="$TMP/gptoss-argv"
+setup_case_dir "$case_ga_dir"
+touch_fake_models "$case_ga_dir"
+out="$(STUB_ARGV_FILE="$case_ga_dir/argv" run_gates "$case_ga_dir" gptoss)"
+rc=$?
+expect_gate "gptoss argv run" 0 "$out" "$rc" '^GATE gptoss PASS rc=0 '
+if grep -qE -- '(^| )--reasoning-budget 0( |$)' "$case_ga_dir/argv" 2>/dev/null \
+    && ! grep -qE -- '(^| )-ngl( |$)' "$case_ga_dir/argv" \
+    && ! grep -qE -- '(^| )-c( |$)' "$case_ga_dir/argv"; then
+    echo "PASS: (gptoss argv) no -ngl, no -c, --reasoning-budget 0 present"
+else
+    fail "(gptoss argv) expected no -ngl, no -c and --reasoning-budget 0; got: $(cat "$case_ga_dir/argv" 2>/dev/null)"
+fi
+
+# --- (inkling) the opt-in Inkling gate --------------------------------------
+# The same llama-completion stub serves it (STUB_MISTRAL_MODE shapes the
+# output); STUB_ARGV_FILE records the last invocation's arguments and the
+# GGML_SYCL_MOE_MULTI_GPU it saw, STUB_ARGV_LOG appends every invocation.
+case_ink_dir="$TMP/inkling"
+setup_case_dir "$case_ink_dir"
+touch_fake_models "$case_ink_dir"
+out="$(STUB_ARGV_FILE="$case_ink_dir/argv" STUB_MISTRAL_MODE=pass run_gates "$case_ink_dir" inkling)"
+rc=$?
+expect_gate "inkling pass" 0 "$out" "$rc" '^GATE inkling PASS rc=0 '
+if grep -qE -- '(^| )-c 8192( |$)' "$case_ink_dir/argv" \
+    && grep -qE -- '(^| )-no-cnv( |$)' "$case_ink_dir/argv" \
+    && ! grep -qE -- '(^| )-ngl( |$)' "$case_ink_dir/argv" \
+    && grep -qx 'MULTI_GPU=0' "$case_ink_dir/argv"; then
+    echo "PASS: (inkling argv) -c 8192, -no-cnv, no -ngl, GGML_SYCL_MOE_MULTI_GPU=0 in the child environment"
+else
+    fail "(inkling argv) expected -c 8192, -no-cnv, no -ngl and MULTI_GPU=0; got: $(cat "$case_ink_dir/argv" 2>/dev/null)"
+fi
+
+out="$(STUB_MISTRAL_MODE=wrong run_gates "$case_ink_dir" inkling)"
+rc=$?
+expect_gate "inkling wrong tokens" 1 "$out" "$rc" '^GATE inkling FAIL rc=0 '
+
+rm -f "$case_ink_dir/fake-inkling.gguf"
+out="$(run_gates "$case_ink_dir" inkling 2>"$TMP/inkling.err")"
+rc=$?
+expect_gate "inkling no model" 77 "$out" "$rc" '^GATE inkling SKIP rc=77 ' "$TMP/inkling.err" 'model not found'
+
+# --gate all must not run inkling (a 22.9 GB model stays out of every default run).
+: > "$case_ink_dir/fake-inkling.gguf"
+rm -f "$case_ink_dir/argv.log"
+out="$(STUB_ARGV_LOG="$case_ink_dir/argv.log" run_gates "$case_ink_dir" all 2>"$TMP/inkling-all.err")"
+# Positive control: the log must show the Mistral invocation, or an empty log
+# would pass the absence check below without proving anything.
+if ! grep -q 'fake-mistral' "$case_ink_dir/argv.log" 2>/dev/null; then
+    fail "(inkling all) no Mistral invocation in the argv log; the absence check proves nothing"
+elif printf '%s\n' "$out" | grep -q '^GATE inkling' \
+    || grep -q 'fake-inkling' "$case_ink_dir/argv.log"; then
+    fail "(inkling all) --gate all ran the inkling gate"
+else
+    echo "PASS: (inkling all) --gate all does not run inkling"
+fi
 
 echo "---"
 if [ "$FAILURES" -eq 0 ]; then

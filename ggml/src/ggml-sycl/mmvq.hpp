@@ -595,7 +595,10 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                  const std::vector<sycl::event> * deps      = nullptr,
                                  sycl::event *                    event_out = nullptr);
 
-// Allocation-free single-dependency overload used by admitted executors.
+// Allocation-free single-dependency overload used by admitted executors. Unlike the overload above, the table may hold
+// fewer than every selected expert: n_expert_slots is its length, and an id outside [0, n_expert_slots) or a null slot
+// is written as a quiet NaN row without reading through the slot (a negative id as a zero row). A mixed card-and-host
+// batch leaves its host experts' slots null and writes those rows afterwards.
 bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  ggml_type            weight_type,
                                  ggml_layout_mode     weight_layout,
@@ -615,6 +618,7 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  int64_t              q8_nb12,
                                  int64_t              dst_nb1,
                                  int64_t              dst_nb2,
+                                 int                  n_expert_slots,
                                  const sycl::event &  dependency,
                                  sycl::event *        event_out = nullptr);
 
@@ -658,21 +662,26 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
                               const std::vector<sycl::event> * deps      = nullptr,
                               sycl::event *                    event_out = nullptr);
 
-// Decode-only composition over caller-supplied admitted workspace slices.
-// activation_f32 is contiguous [token][ne11][K]. ids_host is the packed,
-// immutable retained snapshot [token][top_k]; the adapter uploads that exact
-// snapshot into ids_device after dependency completes. Callers must retain
-// ids_host until the returned terminal event completes, and dependency must
-// not mutate ids_host. Independent/pre-populated device IDs are never trusted.
-// The wrapper quantizes into buffers.activation_q8, writes
-// [token][top_k][N] to buffers.output_f32, and returns the actual terminal
-// kernel event. No destination scatter is implied.
+// Composition over caller-supplied admitted workspace slices, for one decode
+// token or a prompt's n_tokens alike. activation_f32 is contiguous
+// [token][ne11][K]. ids_device is the ids tensor's own device storage, read in
+// place with its strides (ids_nb0 between slots, which must be adjacent, and
+// ids_nb1 between tokens, which may leave a view's other columns between
+// them); the adapter never writes it, since an op must not write its input.
+// ids_host is the packed snapshot [token][top_k] the caller read from that
+// same storage: the adapter range-checks it before it submits anything and
+// does not read it after returning. The wrapper quantizes into
+// buffers.activation_q8 after dependency, writes [token][top_k][N] to
+// buffers.output_f32, and returns the actual terminal kernel event. No
+// destination scatter is implied. The table holds n_experts slots, and a slot
+// may be null (an expert not on this card): that occurrence's rows are written
+// as quiet NaN without reading through the slot, for the caller to overwrite.
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
                                           const float *                          activation_f32,
-                                          int32_t *                              ids_device,
+                                          const int32_t *                        ids_device,
                                           const int32_t *                        ids_host,
                                           int                                    n_experts,
                                           int                                    ncols,

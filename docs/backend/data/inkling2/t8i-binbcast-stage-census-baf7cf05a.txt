@@ -1,0 +1,15 @@
+# [BINBCAST] stage lines, GGML_SYCL_BINBCAST_TRACE=1, B70, -n 4, merged tree baf7cf05a, one run, 2026-11-22
+# count  tensor (layer number and BF16 layer suffix normalised)
+    263 blk.N.ffn_gate_up_exps.scale (reshaped) bytes=512
+    263 blk.N.ffn_down_exps.scale (reshaped) bytes=512
+    128 ffn_moe_weighted-2X (view) bytes=9216
+     16 ffn_moe_down-2X bytes=73728
+# per layer (blk index: count), .scale tensors only:
+     12 blk.0.      11 blk.1.      12 blk.2.      12 blk.3.      12 blk.4.      12 blk.5.      36 blk.6.      36 blk.7.      36 blk.8.      36 blk.9.      36 blk.10.      36 blk.11.      36 blk.12.      36 blk.13.      36 blk.14.      36 blk.15.      35 blk.16.      36 blk.17.      12 blk.18.      12 blk.19. 
+# one tensor's sequence:
+[BINBCAST] entry op=REPEAT device=0 dst=node_2041 src0=node_2041 src1=blk.9.ffn_gate_up_exps.scale (reshaped) src0_d=0xffffd55c1cd7d800 src1_d=0x7476d326e640 dst_d=0xffffd55c1cd7d800
+[BINBCAST] cache-stage-try tensor=blk.9.ffn_gate_up_exps.scale (reshaped) bytes=512 device=0 src=0x7476d326e640 key_valid=1 model=0 name_hash=0x7129f0aa5f042cc1
+[BINBCAST] cache-stage-result tensor=blk.9.ffn_gate_up_exps.scale (reshaped) ok=0 fill_failed=0 ptr=(nil) handle_valid=0 handle_ptr=(nil)
+[BINBCAST] stage tensor=blk.9.ffn_gate_up_exps.scale (reshaped) bytes=512 device=0 src=0x7476d326e640 dst=0xffffe38f1ae00000
+[BINBCAST] stage-copied tensor=blk.9.ffn_gate_up_exps.scale (reshaped) dst=0xffffe38f1ae00000
+# op entries in the run: 10576  REPEAT entries: 1083

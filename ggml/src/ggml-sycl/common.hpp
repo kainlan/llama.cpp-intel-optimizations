@@ -14,6 +14,7 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include "alloc-registry.hpp"
+#include "async-failure.hpp"
 #include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
@@ -2201,15 +2202,26 @@ inline bool ggml_sycl_is_canonical_tied_embedding_name(const char * name) {
     return name != nullptr && std::strcmp(name, "token_embd.weight") == 0;
 }
 
+// An expert family's per-expert scale: "<family>.scale", ".scales" or ".input_scale", {n_expert} (or {1}) F32
+// metadata beside an NVFP4 or FP8 expert matrix, or a view of one ("... .scale (reshaped)" is the name the REPEAT in
+// build_lora_mm_id reads). It is a small dense tensor, not an expert matrix. The name rule (infer_tensor_usage) and
+// the weight-usage registry (ggml_backend_sycl_try_register_weight_usage) both ask this one predicate: the planner
+// reads the first and gives the scale a dense entry with its layer, the S1 preload reads the second and stages that
+// dense entry, so the two must agree. Meaningful only for a name already in an expert family.
+inline bool ggml_sycl_moe_expert_scale_name(const char * name) {
+    return name != nullptr && (strstr(name, "exps.scale") != nullptr || strstr(name, "exps.input_scale") != nullptr);
+}
+
 inline tensor_usage infer_tensor_usage(const char * name) {
     if (!name) {
         return tensor_usage::UNKNOWN;
     }
 
-    // MoE expert weights (highest priority - check first).  Bias tensors share
-    // the same ffn_*_exps prefix but are separate small tensors; treating them
-    // as per-expert weights duplicates the planner's semantic
-    // (layer, expert, role) entries.
+    // MoE expert weights (highest priority - check first).  Bias and scale
+    // tensors (ggml_sycl_moe_expert_scale_name) share the same ffn_*_exps
+    // prefix but are separate small tensors; treating them as per-expert
+    // weights duplicates the planner's semantic (layer, expert, role) entries
+    // and leaves them without the dense entry that stages them with their layer.
     // "ffn_gate_up_exps" is the FUSED gate+up expert tensor and contains
     // neither "ffn_gate_exps" nor "ffn_up_exps", so it needs its own literal.
     // Omitting it made the planner treat the whole fused tensor as ONE dense
@@ -2235,7 +2247,7 @@ inline tensor_usage infer_tensor_usage(const char * name) {
                                strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps") ||
                                strstr(name, "ffn_gate_chexps") || strstr(name, "ffn_up_chexps") ||
                                strstr(name, "ffn_down_chexps");
-    if (moe_exps_name && !strstr(name, ".bias")) {
+    if (moe_exps_name && !strstr(name, ".bias") && !ggml_sycl_moe_expert_scale_name(name)) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
     }
     if (moe_exps_name) {
@@ -2781,7 +2793,8 @@ bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
 // (GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the admission above). Defined beside it; the router's helper reads the same knob.
 bool   ggml_sycl_onednn_pp_mmq_types_admitted(ggml_type type);
 // llama.cpp-84ck: whether this build can execute the MoE MMID direct route at all. Defined in ggml-sycl.cpp from the
-// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds.
+// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds,
+// and then only for the Q1_0/NVFP4 experts the route admits.
 bool   ggml_sycl_moe_mmid_route_reachable_in_build();
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.
@@ -4693,6 +4706,21 @@ struct ggml_tensor_extra_gpu {
     tensor_layout_info layout;
     bool               layout_dirty = false;                // Weight data overwritten; layout must be re-materialized
 
+    // The order of the bytes in the tensor's own range (tensor->data). It is written only by code that writes those
+    // bytes (ggml_backend_sycl_buffer_set_tensor, ggml_backend_sycl_set_tensor_async when its write went to the own
+    // range, and the in-place reorders reorder_tensor_to_soa and convert_tensor_to_coalesced); a cache-side copy in
+    // another layout never changes it. optimized_feature and layout record what a kernel last resolved, which may be
+    // such a copy. ggml_backend_sycl_buffer_get_tensor decides from this field of the root tensor's extra alone.
+    // It is not complete. These writers of the own range do not keep it right: the destination of
+    // ggml_backend_sycl_buffer_cpy_tensor (and of ggml_backend_sycl_cpy_tensor_async, which is not wired: the
+    // backend interface's cpy_tensor_async slot is NULL) and a partial ggml_backend_sycl_buffer_memset_tensor do not
+    // write it; a partial ggml_backend_sycl_buffer_set_tensor or ggml_backend_sycl_set_tensor_async records AOS for
+    // the whole range; a write through a view records on the view's own extra (tensor->extra; init_tensor gives a
+    // view in a SYCL buffer its own extra), or nowhere when the view has none, while the reader decides from the
+    // root's; tied-weight aliases share one extra and so one record.
+    // ggml_backend_sycl_get_tensor_async does not consult it and returns the stored bytes.
+    ggml_layout_mode own_data_layout = GGML_LAYOUT_AOS;
+
     tp_layer_type tp_type        = tp_layer_type::TP_NONE;  // Cached TP type (set once, avoids string compare)
     bool          tp_type_cached = false;                   // Whether tp_type has been computed
 
@@ -6372,6 +6400,11 @@ struct ggml_backend_sycl_context {
     uint64_t                             execution_graph_epoch = 0;
     uint64_t                             execution_invocation_id = 0;
     bool                                 execution_graph_sealed = false;
+    // Dispatch scopes (ggml_sycl_execution_dispatch_scope) holding the tracked graph open on this backend. Ending or
+    // clearing the graph while this is nonzero is a contract violation, reported once per invocation through
+    // execution_tripwire_invocation. Both guarded by execution_state_mutex.
+    int                                  execution_dispatch_depth      = 0;
+    uint64_t                             execution_tripwire_invocation = 0;
     std::vector<int>                     execution_aggregate_devices;
     uint64_t                             execution_root_model_id = 0;
     uint64_t                             execution_root_load_txn_id = 0;
@@ -6513,11 +6546,26 @@ struct ggml_backend_sycl_context {
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
+    // The asynchronous-failure counts when this context was created. Once either moves, this context's graph boundaries
+    // fail for the rest of its life: a failed command does not cancel its dependents, so its outputs and the KV rows it
+    // wrote may come from work that never ran, and the handler cannot tell whose command failed on a queue every
+    // context of the device shares. A context created later starts from the counts at its creation. The two flags are
+    // separate facts: `reported` means the [SYCL-ASYNC-FAILURE] line was logged, by whichever boundary saw the failure
+    // first; `cleaned` means synchronize's failure branch ran the boundary cleanup for what the context submitted before
+    // the failure was seen. graph_compute's refusal never cleans up, because it refuses before any submission. A cleanup
+    // run by an exception catch (graph_compute's or synchronize's own) does not set the flag, so the next synchronize may
+    // run the cleanup a second time, which finds nothing to release.
+    ggml_sycl_async_failure_cursor async_failure_cursor;
+    bool                           async_failure_reported = false;
+    bool                           async_failure_cleaned  = false;
+
     explicit ggml_backend_sycl_context(int device) :
         device(device),
         name(GGML_SYCL_NAME + std::to_string(device)),
         supports_soa_reorder(ggml_sycl_info().devices[device].supports_soa_reorder),
-        matmul_orchestrator(*this) {}
+        matmul_orchestrator(*this) {
+        async_failure_cursor = ggml_sycl_async_failure_snapshot(device);
+    }
 
     ~ggml_backend_sycl_context();
 

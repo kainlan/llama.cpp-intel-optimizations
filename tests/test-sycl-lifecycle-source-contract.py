@@ -15,6 +15,7 @@ public = (root / "ggml/include/ggml-sycl.h").read_text()
 llama = (root / "src/llama-model.cpp").read_text()
 cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+device_pool_hpp = (root / "ggml/src/ggml-sycl/device-pool.hpp").read_text()
 execution = (root / "ggml/src/ggml-sycl/execution-lifecycle.cpp").read_text()
 sycl_cmake = (root / "ggml/src/ggml-sycl/CMakeLists.txt").read_text()
 sycl_bench_cmake = (root / "tools/sycl-kernel-bench/CMakeLists.txt").read_text()
@@ -113,8 +114,10 @@ raw_snapshot_writer_re = re.compile(r"(?:->|\.)\s*set_placement_plan_snapshot\s*
 # incrementing a count, and a listed statement cannot be pasted into another function.
 raw_snapshot_reader_roles = (
     ("const auto cached = cache->get_placement_plan_snapshot();", "cache_placement_coherence"),
-    ("const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
-     "ggml_sycl_mul_mat_id"),
+    # The Q1_0/NVFP4 direct recipe's queue capability. It lives in its own helper so a decode token's admission and
+    # a prompt's admission get one answer from one read.
+    ("const auto recipe_plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
+     "ggml_sycl_moe_direct_queue_capability"),
     ("const auto plan_snapshot = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;",
      "ggml_sycl_mul_mat_id"),
     ("const auto plan = cache ? cache->get_placement_plan_snapshot() : nullptr;",
@@ -304,6 +307,94 @@ def _retirement_storage_release_failures(source):
     for name in sorted(reachable - {"erase_entry_locked"}):
         if destructive.search(definitions[name]):
             failures.append(name + ": releases storage_owner before gated erase")
+    return failures
+
+
+# A cache's exit path runs in static destruction. Function-local statics built during main are destroyed before
+# g_device_caches, a namespace-scope static, among them dpct::dev_mgr::instance() and ggml_sycl_info(), so a
+# queue-to-device lookup there reads a destroyed object: ggml_sycl_get_device_id_from_queue/_device read dev_mgr, and
+# the cache's own get_device_id_from_queue reads its map. The cache resolves its device index once, while it is alive
+# (device_id_), and the exit path passes that.
+SHUTDOWN_LOOKUP_RE = re.compile(
+    r"\b(?:ggml_sycl_get_device_id_from_queue|ggml_sycl_get_device_id_from_device|get_device_id_from_queue|"
+    r"dev_mgr\s*::\s*instance|ggml_sycl_info)\s*\(")
+# The exit path: the destructor, shutdown_resources up to its first drain (both of its abandon branches come before
+# it), and everything those branches call that is defined beside them.
+SHUTDOWN_PATH_FUNCTIONS = (
+    ("~unified_cache", r"unified_cache::~unified_cache\s*\(\s*\)\s*\{"),
+    ("shutdown_resources", r"bool\s+unified_cache::shutdown_resources\s*\(\s*\)\s*\{"),
+    ("stop_prefetch_worker", r"void\s+unified_cache::stop_prefetch_worker\s*\(\s*\)\s*\{"),
+    ("onednn_graph_scratch_log_pool_summary_locked",
+     r"void\s+unified_cache::onednn_graph_scratch_log_pool_summary_locked\s*\([^)]*\)\s*const\s*\{"),
+    ("arena_abandon", r"void\s+unified_cache::arena_abandon\s*\(\s*\)\s*\{"),
+    ("arena_close_authority", r"unified_cache::arena_close_authority\s*\([^)]*\)\s*\{"),
+    ("ext_alloc_note_arena_state", r"\bvoid\s+ext_alloc_note_arena_state\s*\([^)]*\)\s*\{"),
+    ("cpu_job_signal_ring_end", r"static\s+void\s+cpu_job_signal_ring_end\s*\([^)]*\)\s*noexcept\s*\{"),
+    ("cpu_job_input_marker_end", r"static\s+void\s+cpu_job_input_marker_end\s*\([^)]*\)\s*noexcept\s*\{"),
+)
+SHUTDOWN_DRAIN = "if (!drain_all_queues_noexcept()) return false;"
+
+
+def _shutdown_path_lookup_failures(cache_source, cache_header, pool_header):
+    """The cache's exit path makes no queue-to-device lookup and no dev_mgr access; it passes device_id_."""
+    failures = []
+    code = _strip_cpp_comments(cache_source)
+    bodies = {}
+    for name, signature in SHUTDOWN_PATH_FUNCTIONS:
+        match = re.search(signature, code)
+        body = _balanced_body(code, match.end() - 1) if match else ""
+        if not body:
+            failures.append(name + ": definition not found")
+            continue
+        if name == "shutdown_resources":
+            drain = body.find(SHUTDOWN_DRAIN)
+            if drain < 0:
+                failures.append(name + ": its first drain was not found, so its exit branches cannot be cut")
+                continue
+            body = body[:drain]
+        bodies[name] = body
+    ring = re.search(r"class\s+cpu_job_signal_ring\s*\{", code)
+    ring_body = _balanced_body(code, ring.end() - 1) if ring else ""
+    for name, signature in (("cpu_job_signal_ring::~cpu_job_signal_ring", r"~cpu_job_signal_ring\s*\(\s*\)\s*\{"),
+                            ("cpu_job_signal_ring::abandon", r"\bvoid\s+abandon\s*\(\s*\)\s*noexcept\s*\{")):
+        match = re.search(signature, ring_body)
+        body = _balanced_body(ring_body, match.end() - 1) if match else ""
+        if not body:
+            failures.append(name + ": definition not found")
+            continue
+        bodies[name] = body
+    pool = _strip_cpp_comments(pool_header)
+    match = re.search(r"\bvoid\s+abandon\s*\(\s*\)\s*\{", pool)
+    body = _balanced_body(pool, match.end() - 1) if match else ""
+    if body:
+        bodies["sycl_device_pool::abandon"] = body
+    else:
+        failures.append("sycl_device_pool::abandon: definition not found")
+    for name, body in bodies.items():
+        lookup = SHUTDOWN_LOOKUP_RE.search(body)
+        if lookup:
+            failures.append(name + ": looks up a device on the exit path (" + lookup.group(0).rstrip("(").strip() +
+                            ")")
+    note = bodies.get("ext_alloc_note_arena_state", "")
+    if note and not re.search(r"\bvoid\s+ext_alloc_note_arena_state\s*\(\s*int\s+dev\s*,\s*bool\s+active\s*\)", code):
+        failures.append("ext_alloc_note_arena_state: does not take the device index (int dev, bool active)")
+    if note and re.search(r"\b(?:try|catch)\b", note):
+        failures.append("ext_alloc_note_arena_state: keeps a try/catch, which only a lookup needed")
+    if note and not re.search(r"\bif\s*\(\s*dump_dev_valid\s*\(\s*dev\s*\)\s*\)", note):
+        failures.append("ext_alloc_note_arena_state: writes the mirror without its dump_dev_valid guard")
+    for name, active in (("arena_abandon", "false"), ("arena_destroy", "false")):
+        match = re.search(r"\bunified_cache::" + name + r"\s*\(\s*\)\s*\{", code)
+        body = _balanced_body(code, match.end() - 1) if match else ""
+        if not re.search(r"\bext_alloc_note_arena_state\s*\(\s*device_id_\s*,\s*" + active + r"\s*\)\s*;", body):
+            failures.append(name + ": does not clear the arena mirror through device_id_")
+    sets = re.findall(r"\bext_alloc_note_arena_state\s*\(\s*([^,;()]*)\s*,\s*true\s*\)\s*;", code)
+    if len(sets) < 2 or any(arg.strip() != "device_id_" for arg in sets):
+        failures.append("arena_reserve: does not set the arena mirror through device_id_ at both arena creations")
+    header = _strip_cpp_comments(cache_header)
+    if not re.search(r"\bconst\s+int\s+device_id_\s*;", header):
+        failures.append("unified_cache: has no const int device_id_ member")
+    if not re.search(r"\bdevice_id_\s*\(\s*ggml_sycl_get_device_id_from_queue\s*\(\s*queue\s*\)\s*\)", code):
+        failures.append("unified_cache: the constructor does not resolve device_id_ from its queue")
     return failures
 
 
@@ -1366,6 +1457,7 @@ checks = {
     "reload validation does not create invalid caches": "active_devices = std::min(ggml_sycl_info().device_count" in cache_cpp
     and "tracked = arena_non_weight_used_locked(d)" in cache_cpp
     and "Validation is observational: never create a cache" in cache_cpp,
+    "cache exit path makes no device lookup": not _shutdown_path_lookup_failures(cache_cpp, cache_hpp, device_pool_hpp),
     "explicit arena shutdown releases registered chunks": "alloc_registry::instance().unregister_alloc(c.ptr);" in cache_cpp
     and "sycl::free(c.ptr, arena_queue_->get_context())" in cache_cpp
     and "pre-destroy queue drain failed" in cache_cpp
@@ -1806,9 +1898,41 @@ for name, kind, mutated in snapshot_access_mutants:
           else raw_snapshot_writer_allowlist_ok(sources, mutated))
     if ok:
         mutant_failures.append(name + ": bypass was not detected")
+
+# Negative controls for "cache exit path makes no device lookup": each restores one lookup on the exit path in an
+# in-memory copy of the cache and asserts the claim names the function it went into.
+shutdown_lookup_mutants = (
+    ("arena_abandon looks its device up again", "arena_abandon",
+     "    weight_chunk_allocators_.clear();\n    arena_chunks_.clear();\n    arena_base_ = nullptr;\n"
+     "    ext_alloc_note_arena_state(device_id_, false);",
+     "    weight_chunk_allocators_.clear();\n    arena_chunks_.clear();\n    arena_base_ = nullptr;\n"
+     "    ext_alloc_note_arena_state(ggml_sycl_get_device_id_from_queue(queue_), false);"),
+    ("the arena note looks its device up again", "ext_alloc_note_arena_state",
+     "void ext_alloc_note_arena_state(int dev, bool active) {\n",
+     "void ext_alloc_note_arena_state(int dev, bool active) {\n    dev = dpct::dev_mgr::instance().current_device_id();\n"),
+    ("the shutting-down branch reads dev_mgr", "shutdown_resources",
+     "        arena_abandon();\n        compute_arena_ptr_",
+     "        (void) dpct::dev_mgr::instance().device_count();\n        arena_abandon();\n        compute_arena_ptr_"),
+    ("the SYCL-gone branch reads the device table", "shutdown_resources",
+     "        g_sycl_shutting_down.store(true, std::memory_order_release);\n        if (layout_pool_) {",
+     "        g_sycl_shutting_down.store(true, std::memory_order_release);\n"
+     "        (void) ggml_sycl_info().device_count;\n        if (layout_pool_) {"),
+    ("the destructor looks its device up", "~unified_cache",
+     "unified_cache::~unified_cache() {\n",
+     "unified_cache::~unified_cache() {\n    (void) get_device_id_from_queue(queue_);\n"),
+)
+for name, function, anchor, replacement in shutdown_lookup_mutants:
+    if anchor not in cache_cpp:
+        mutant_failures.append(name + ": anchor missing")
+        continue
+    caught = _shutdown_path_lookup_failures(cache_cpp.replace(anchor, replacement, 1), cache_hpp, device_pool_hpp)
+    if not any(failure.startswith(function + ":") for failure in caught):
+        mutant_failures.append(name + ": bypass was not detected")
 if failed or mutant_failures:
     if failed:
         print("lifecycle source contract failed: " + ", ".join(failed), file=sys.stderr)
+    for failure in _shutdown_path_lookup_failures(cache_cpp, cache_hpp, device_pool_hpp):
+        print("  cache exit path: " + failure, file=sys.stderr)
     if mutant_failures:
         print("lifecycle source self-test failed: " + ", ".join(mutant_failures), file=sys.stderr)
     raise SystemExit(1)

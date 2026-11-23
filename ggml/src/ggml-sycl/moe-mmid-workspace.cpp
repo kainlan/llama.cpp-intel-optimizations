@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <vector>
@@ -32,12 +33,85 @@ const char * moe_mmid_materialize_reason_name(moe_mmid_materialize_reason reason
             return "registry-invalid";
         case moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED:
             return "registry-allocation-failed";
+        case moe_mmid_materialize_reason::RECONCILE_REFUSED:
+            return "reconcile-refused";
+        case moe_mmid_materialize_reason::BIND_EXCEPTION:
+            return "bind-exception";
     }
     return "unknown";
 }
 
 bool moe_mmid_materialize_reason_is_refusal(moe_mmid_materialize_reason reason) noexcept {
     return reason != moe_mmid_materialize_reason::OK && reason != moe_mmid_materialize_reason::NOT_APPLICABLE;
+}
+
+const char * moe_mmid_materialize_refusal_name(moe_mmid_materialize_refusal refusal) noexcept {
+    using R = moe_mmid_materialize_refusal;
+    switch (refusal) {
+        case R::NONE:
+            return "none";
+        case R::SNAPSHOT_MISSING:
+            return "snapshot-missing";
+        case R::SNAPSHOT_NO_VERSION:
+            return "snapshot-no-version";
+        case R::SNAPSHOT_MODEL_MISMATCH:
+            return "snapshot-model-mismatch";
+        case R::SNAPSHOT_LOAD_MISMATCH:
+            return "snapshot-load-mismatch";
+        case R::PLAN_POOL_REJECTED:
+            return "plan-pool-rejected";
+        case R::PLAN_NO_IDENTITY:
+            return "plan-no-identity";
+        case R::PLAN_NO_SUBMIT_DEVICE:
+            return "plan-no-submit-device";
+        case R::PLAN_NO_WORKSPACES:
+            return "plan-no-workspaces";
+        case R::WORKSPACE_INVALID:
+            return "workspace-invalid";
+        case R::WORKSPACE_NO_BINDING:
+            return "workspace-no-binding";
+        case R::TOKEN_INVALID:
+            return "token-invalid";
+        case R::NO_ALLOCATOR:
+            return "no-allocator";
+        case R::OWNER_DEVICE_INVALID:
+            return "owner-device-invalid";
+        case R::OWNER_NO_QUEUE_COOKIE:
+            return "owner-no-queue-cookie";
+        case R::OWNER_QUEUE_CAPABILITY_INVALID:
+            return "owner-queue-capability-invalid";
+        case R::OWNER_GEOMETRY_INVALID:
+            return "owner-geometry-invalid";
+        case R::OWNER_POOL_BYTES_OVERFLOW:
+            return "owner-pool-bytes-overflow";
+        case R::OWNER_POOL_BYTES_MISMATCH:
+            return "owner-pool-bytes-mismatch";
+        case R::PUBLICATION_RACED:
+            return "publication-raced";
+        case R::SAME_IDENTITY_OTHER_PLAN:
+            return "same-identity-other-plan";
+        case R::PLAN_CHANGED_GEOMETRY_UNSTABLE:
+            return "plan-changed-geometry-unstable";
+        case R::PLAN_CHANGED_REBIND_REFUSED:
+            return "plan-changed-rebind-refused";
+        case R::PLAN_CHANGED_REBIND_NOT_FOLLOWED:
+            return "plan-changed-rebind-not-followed";
+        case R::DEVICE_POOL_ALLOCATION_FAILED:
+            return "device-pool-allocation-failed";
+        case R::HOST_POOL_ALLOCATION_FAILED:
+            return "host-pool-allocation-failed";
+        case R::HOST_POOL_ZONES_NOT_CONFIGURED:
+            return "host-pool-zones-not-configured";
+        case R::HOST_POOL_OVER_NO_GROWTH_BOUND:
+            return "host-pool-over-no-growth-bound";
+        case R::HOST_POOL_NO_CONTIGUOUS_BLOCK:
+            return "host-pool-no-contiguous-block";
+        case R::SLICE_FAILED:
+            return "slice-failed";
+        case R::EXCEPTION:
+            return "exception";
+    }
+    return "unknown";
 }
 
 namespace {
@@ -655,6 +729,20 @@ void gc_retired_context_locked(moe_mmid_workspace_registry::state & state,
     if (context_idle_locked(*owning_context)) state.retired_contexts.erase(retired);
 }
 
+// Moves every context `doomed` names out of `from` into `released`, keeping the rest in order. A removed context can
+// hold its pools' last owners: the caller declares `released` before the registry lock, so the decision is made under
+// the lock and the release runs after it (canonical 12.5: no final release under a listed lock). `released` must have
+// room for every context of `from`, so the move cannot throw.
+template <typename doomed_fn>
+void take_contexts_locked(std::vector<std::shared_ptr<registry_context>> & from,
+                          std::vector<std::shared_ptr<registry_context>> & released,
+                          const doomed_fn &                                doomed) {
+    const auto first =
+        std::stable_partition(from.begin(), from.end(), [&](const auto & context) { return !doomed(context); });
+    released.insert(released.end(), std::make_move_iterator(first), std::make_move_iterator(from.end()));
+    from.erase(first, from.end());
+}
+
 moe_mmid_blob retained_subrange(const moe_mmid_blob & blob, size_t offset, size_t bytes) noexcept {
     moe_mmid_blob out;
     if (!blob.valid() || bytes == 0 || offset > blob.bytes || bytes > blob.bytes - offset) return out;
@@ -971,24 +1059,85 @@ moe_mmid_workspace_registry::moe_mmid_workspace_registry() : state_(std::make_sh
 moe_mmid_workspace_registry::~moe_mmid_workspace_registry() = default;
 
 moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
-    const moe_mmid_model_token & token, uint64_t plan_identity, int submit_device,
+    const moe_mmid_model_token &                          token,
+    uint64_t                                              plan_identity,
+    int                                                   submit_device,
     const std::vector<moe_mmid_materialized_owner_plan> & owners,
-    const moe_mmid_blob_allocator & allocator) noexcept {
-    return materialize(token, plan_identity, {}, submit_device, owners, allocator);
+    const moe_mmid_blob_allocator &                       allocator,
+    moe_mmid_materialize_refusal *                        refusal) noexcept {
+    return materialize(token, plan_identity, {}, submit_device, owners, allocator, refusal);
 }
 
 moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
-    const moe_mmid_model_token & token, uint64_t plan_identity,
-    std::shared_ptr<const lifecycle_plan_snapshot> exact_plan, int submit_device,
+    const moe_mmid_model_token &                          token,
+    uint64_t                                              plan_identity,
+    std::shared_ptr<const lifecycle_plan_snapshot>        exact_plan,
+    int                                                   submit_device,
     const std::vector<moe_mmid_materialized_owner_plan> & owners,
-    const moe_mmid_blob_allocator & allocator) noexcept {
-    if (!token.valid() || plan_identity == 0 || submit_device < 0 || owners.empty() || !allocator) {
-        return moe_mmid_materialize_status::INVALID;
+    const moe_mmid_blob_allocator &                       allocator,
+    moe_mmid_materialize_refusal *                        refusal) noexcept {
+    using R           = moe_mmid_materialize_refusal;
+    const auto refuse = [refusal](moe_mmid_materialize_status status, R why) {
+        if (refusal) {
+            *refusal = why;
+        }
+        return status;
+    };
+    const auto invalid = [&](R why) {
+        return refuse(moe_mmid_materialize_status::INVALID, why);
+    };
+    const auto alloc_failed = [&](R why) {
+        return refuse(moe_mmid_materialize_status::ALLOCATION_FAILED, why);
+    };
+    if (refusal) {
+        *refusal = R::NONE;
     }
+    if (!token.valid()) {
+        return invalid(R::TOKEN_INVALID);
+    }
+    if (plan_identity == 0) {
+        return invalid(R::PLAN_NO_IDENTITY);
+    }
+    if (submit_device < 0) {
+        return invalid(R::PLAN_NO_SUBMIT_DEVICE);
+    }
+    if (owners.empty()) {
+        return invalid(R::PLAN_NO_WORKSPACES);
+    }
+    if (!allocator) {
+        return invalid(R::NO_ALLOCATOR);
+    }
+    // What an existing context of this token and submit device answers for `plan` (PUBLISHED: none answers, the
+    // attempt may publish). Called with state_->mutex held. `has_active` collects whether an exact-plan context is
+    // accepting, which makes a new exact-plan context a prepared replacement.
+    const auto existing_answer = [&](const lifecycle_plan_snapshot * plan, bool * has_active) {
+        for (const auto & existing : state_->contexts) {
+            if (!same_token(existing->token, token) || existing->submit_device != submit_device) {
+                continue;
+            }
+            if (plan && existing->exact_plan.get() == plan) {
+                return moe_mmid_materialize_status::ALREADY_PUBLISHED;
+            }
+            if (existing->plan_identity == plan_identity) {
+                return !plan && !existing->exact_plan ? moe_mmid_materialize_status::ALREADY_PUBLISHED :
+                                                        invalid(R::SAME_IDENTITY_OTHER_PLAN);
+            }
+            if (plan && has_active) {
+                *has_active |= existing->accepting && existing->exact_plan != nullptr;
+            }
+        }
+        return moe_mmid_materialize_status::PUBLISHED;
+    };
     try {
         uint64_t generation_ticket = 0;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
+            // An attempt an existing context already answers allocates nothing: a second context bind of a published
+            // plan costs no pool. The answer is asked again after the allocation, for a context published meanwhile.
+            const auto                  answer = existing_answer(exact_plan.get(), nullptr);
+            if (answer != moe_mmid_materialize_status::PUBLISHED) {
+                return answer;
+            }
             generation_ticket = model_publication_generation(*state_, token);
         }
         auto candidate           = std::make_shared<registry_context>();
@@ -1002,14 +1151,25 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         for (const auto & owner : owners) {
             size_t expected_device = 0, expected_host = 0;
             const uint64_t queue_cookie = owner.queue_capability.valid() ? owner.queue_capability.cookie() : owner.queue_cookie;
-            if (owner.owner_device < 0 || queue_cookie == 0 ||
-                (candidate->exact_plan && (!owner.queue_capability.valid() ||
-                 owner.queue_capability.owner_device() != owner.owner_device)) ||
-                !moe_mmid_validate_workspace_geometry(owner.geometry, owner.secondary_owner) ||
-                !moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
-                                             &expected_host) ||
-                owner.device_pool_bytes != expected_device || owner.host_pool_bytes != expected_host) {
-                return moe_mmid_materialize_status::INVALID;
+            if (owner.owner_device < 0) {
+                return invalid(R::OWNER_DEVICE_INVALID);
+            }
+            if (queue_cookie == 0) {
+                return invalid(R::OWNER_NO_QUEUE_COOKIE);
+            }
+            if (candidate->exact_plan &&
+                (!owner.queue_capability.valid() || owner.queue_capability.owner_device() != owner.owner_device)) {
+                return invalid(R::OWNER_QUEUE_CAPABILITY_INVALID);
+            }
+            if (!moe_mmid_validate_workspace_geometry(owner.geometry, owner.secondary_owner)) {
+                return invalid(R::OWNER_GEOMETRY_INVALID);
+            }
+            if (!moe_mmid_checked_pool_bytes(owner.geometry, MOE_MMID_WORKSPACE_DEPTH, &expected_device,
+                                             &expected_host)) {
+                return invalid(R::OWNER_POOL_BYTES_OVERFLOW);
+            }
+            if (owner.device_pool_bytes != expected_device || owner.host_pool_bytes != expected_host) {
+                return invalid(R::OWNER_POOL_BYTES_MISMATCH);
             }
             auto pool           = std::make_shared<registry_pool_state>();
             pool->owner_device  = owner.owner_device;
@@ -1022,13 +1182,13 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
             if (!pool->device_pool.valid() || pool->device_pool.host_pinned ||
                 pool->device_pool.bytes != expected_device || pool->device_pool.device != owner.owner_device ||
                 reinterpret_cast<uintptr_t>(pool->device_pool.ptr) % MOE_MMID_DEVICE_ALIGNMENT != 0) {
-                return moe_mmid_materialize_status::ALLOCATION_FAILED;
+                return alloc_failed(R::DEVICE_POOL_ALLOCATION_FAILED);
             }
             if (expected_host != 0) {
                 pool->host_pool = allocator(true, owner.owner_device, expected_host, alignof(moe_mmid_descriptor));
                 if (!pool->host_pool.valid() || !pool->host_pool.host_pinned ||
                     pool->host_pool.bytes != expected_host) {
-                    return moe_mmid_materialize_status::ALLOCATION_FAILED;
+                    return alloc_failed(R::HOST_POOL_ALLOCATION_FAILED);
                 }
             }
             // Build every authority and retained offset view before publication.
@@ -1053,7 +1213,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
                 if (!authority->slices.activation_f32.valid() || !authority->slices.activation_q8.valid() ||
                     !authority->slices.output_f32.valid() || !authority->slices.output_q8.valid() ||
                     (pool->geometry.host_slot_bytes != 0 && !authority->slices.host.valid())) {
-                    return moe_mmid_materialize_status::ALLOCATION_FAILED;
+                    return alloc_failed(R::SLICE_FAILED);
                 }
                 candidate->authorities.push_back(std::move(authority));
             }
@@ -1061,16 +1221,11 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         }
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (generation_ticket != model_publication_generation(*state_, token))
-            return moe_mmid_materialize_status::INVALID;
-        bool has_active = false;
-        for (const auto & existing : state_->contexts) {
-            if (!same_token(existing->token, token) || existing->submit_device != submit_device) continue;
-            if (candidate->exact_plan && existing->exact_plan.get() == candidate->exact_plan.get())
-                return moe_mmid_materialize_status::ALREADY_PUBLISHED;
-            if (existing->plan_identity == plan_identity)
-                return !candidate->exact_plan && !existing->exact_plan ?
-                    moe_mmid_materialize_status::ALREADY_PUBLISHED : moe_mmid_materialize_status::INVALID;
-            if (candidate->exact_plan) has_active |= existing->accepting && existing->exact_plan != nullptr;
+            return invalid(R::PUBLICATION_RACED);
+        bool       has_active = false;
+        const auto answer     = existing_answer(candidate->exact_plan.get(), &has_active);
+        if (answer != moe_mmid_materialize_status::PUBLISHED) {
+            return answer;
         }
         // A second authoritative exact plan is a prepared replacement. Legacy
         // host-test contexts remain independently addressable by plan id.
@@ -1078,7 +1233,7 @@ moe_mmid_materialize_status moe_mmid_workspace_registry::materialize(
         state_->contexts.push_back(std::move(candidate));
         return moe_mmid_materialize_status::PUBLISHED;
     } catch (...) {
-        return moe_mmid_materialize_status::ALLOCATION_FAILED;
+        return alloc_failed(R::EXCEPTION);
     }
 }
 
@@ -1244,24 +1399,21 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
             for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
             auto & needed = requested_geometry[r];
             const auto & available = pool->geometry;
-            if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.K), static_cast<size_t>(request.N),
-                                            request.ne11, request.top_k, capacity },
-                                          wanted.owner_device != request.submit_device, &needed) ||
+            if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.K), static_cast<size_t>(request.N), request.ne11,
+                                           request.top_k, capacity },
+                                         wanted.owner_device != request.submit_device, &needed) ||
                 !moe_mmid_validate_workspace_geometry(available, wanted.owner_device != request.submit_device) ||
-                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
-                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
-                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
-                available.activation_f32_bytes < needed.activation_f32_bytes ||
-                available.activation_q8_bytes < needed.activation_q8_bytes ||
-                available.output_f32_bytes < needed.output_f32_bytes ||
-                available.output_q8_bytes < needed.output_q8_bytes ||
+                // The comparison the authoritative admission makes, and beside it the descriptor and secondary
+                // byte counts, which only this admission compares.
+                !moe_mmid_workspace_geometry_holds(available, needed) ||
                 available.descriptor_host_bytes < needed.descriptor_host_bytes ||
                 available.secondary_activation_d2h_bytes < needed.secondary_activation_d2h_bytes ||
                 available.secondary_activation_h2d_bytes < needed.secondary_activation_h2d_bytes ||
                 available.secondary_output_d2h_bytes < needed.secondary_output_d2h_bytes ||
                 available.secondary_output_h2d_bytes < needed.secondary_output_h2d_bytes ||
-                available.secondary_bounce_bytes < needed.secondary_bounce_bytes ||
-                available.host_slot_bytes < needed.host_slot_bytes) return out;
+                available.secondary_bounce_bytes < needed.secondary_bounce_bytes) {
+                return out;
+            }
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out;
@@ -1338,6 +1490,17 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(const moe_mmid_admis
     return out;
 }
 
+bool moe_mmid_workspace_geometry_holds(const moe_mmid_workspace_geometry & available,
+                                       const moe_mmid_workspace_geometry & needed) noexcept {
+    return available.activation_rows >= needed.activation_rows && available.occurrences >= needed.occurrences &&
+           available.q8_ne10_row_bytes >= needed.q8_ne10_row_bytes &&
+           available.q8_ne01_row_bytes >= needed.q8_ne01_row_bytes &&
+           available.activation_f32_bytes >= needed.activation_f32_bytes &&
+           available.activation_q8_bytes >= needed.activation_q8_bytes &&
+           available.output_f32_bytes >= needed.output_f32_bytes &&
+           available.output_q8_bytes >= needed.output_q8_bytes && available.host_slot_bytes >= needed.host_slot_bytes;
+}
+
 moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     moe_mmid_authoritative_admission_request && request) noexcept {
     moe_mmid_admitted_result out;
@@ -1360,21 +1523,31 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     }
 
     const auto & bindings = authority->occurrences;
+    // The bindings are the occurrences this device runs, a subset of the batch's tokens * top_k when the batch mixes
+    // card and host experts; the workspace is sized for the whole batch either way.
+    size_t       occurrence_limit = 0;
     if (!authority->token.valid() || authority->submit_device < 0 || !bindings || bindings->empty() ||
         !authority->table || request.shape.top_k == 0 || request.shape.ne11 == 0 || request.shape.K <= 0 ||
-        request.shape.N <= 0 || request.shape.type < 0 || authority->owners.empty() ||
-        authority->owners.size() > execution::max_devices || bindings->size() % request.shape.top_k != 0 ||
-        authority->queues.size() != authority->owners.size() ||
-        authority->submissions.size() != authority->owners.size()) return out;
+        request.shape.N <= 0 || request.shape.type < 0 || request.shape.tokens == 0 ||
+        !checked_mul(request.shape.tokens, request.shape.top_k, &occurrence_limit) || occurrence_limit > UINT32_MAX ||
+        bindings->size() > occurrence_limit || authority->owners.empty() ||
+        authority->owners.size() > execution::max_devices || authority->queues.size() != authority->owners.size() ||
+        authority->submissions.size() != authority->owners.size()) {
+        return out;
+    }
 
     uint64_t digest = 1469598103934665603ULL;
     auto mix = [&](uint64_t value) { digest = (digest ^ value) * 1099511628211ULL; };
+    size_t   previous_occurrence = 0;
     for (size_t i = 0; i < bindings->size(); ++i) {
         const auto & binding = bindings->at(i); const auto & id = binding.identity;
         if (id.allocation_id == 0 || id.generation == 0 || id.layout_id == 0 || id.device < 0 || id.byte_size == 0 ||
-            id.occurrence != i || id.byte_offset > binding.owner.extent() ||
-            id.byte_size > binding.owner.extent() - id.byte_offset || id.allocation_id != binding.owner.allocation_id() ||
-            id.generation != binding.owner.generation() || id.device != binding.owner.device()) return out;
+            id.occurrence >= occurrence_limit || (i > 0 && id.occurrence <= previous_occurrence) ||
+            id.byte_offset > binding.owner.extent() || id.byte_size > binding.owner.extent() - id.byte_offset ||
+            id.allocation_id != binding.owner.allocation_id() || id.generation != binding.owner.generation() ||
+            id.device != binding.owner.device()) {
+            return out;
+        }
         bool retained = false;
         for (const auto & entry : authority->table->entries())
             retained |= entry.allocation_id() == id.allocation_id && entry.generation() == id.generation &&
@@ -1393,6 +1566,7 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
         }
         mix(id.allocation_id); mix(id.generation); mix(id.layout_id); mix(static_cast<uint64_t>(id.device));
         mix(id.byte_offset); mix(id.byte_size); mix(id.occurrence);
+        previous_occurrence = id.occurrence;
     }
 
     std::shared_ptr<registry_context> context;
@@ -1409,7 +1583,8 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
     if (!context || context->pools.size() != authority->owners.size() || context->queues.size() != authority->queues.size())
         return out;
 
-    const size_t capacity = bindings->size() / request.shape.top_k;
+    const size_t capacity = request.shape.tokens;
+
     std::array<moe_mmid_workspace_geometry, execution::max_devices> geometry{};
     for (size_t r = 0; r < authority->owners.size(); ++r) {
         const auto & wanted = authority->owners[r]; const auto & queue = authority->queues[r];
@@ -1426,15 +1601,11 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
             for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
             const auto & available = pool->geometry; auto & needed = geometry[r];
             if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.shape.K), static_cast<size_t>(request.shape.N),
-                                            request.shape.ne11, request.shape.top_k, capacity },
-                                          wanted.owner_device != authority->submit_device, &needed) ||
-                available.activation_rows < needed.activation_rows || available.occurrences < needed.occurrences ||
-                available.q8_ne10_row_bytes < needed.q8_ne10_row_bytes ||
-                available.q8_ne01_row_bytes < needed.q8_ne01_row_bytes ||
-                available.activation_f32_bytes < needed.activation_f32_bytes ||
-                available.activation_q8_bytes < needed.activation_q8_bytes ||
-                available.output_f32_bytes < needed.output_f32_bytes || available.output_q8_bytes < needed.output_q8_bytes ||
-                available.host_slot_bytes < needed.host_slot_bytes) return out;
+                                           request.shape.ne11, request.shape.top_k, capacity },
+                                         wanted.owner_device != authority->submit_device, &needed) ||
+                !moe_mmid_workspace_geometry_holds(available, needed)) {
+                return out;
+            }
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out; order[r] = r;
@@ -1501,13 +1672,15 @@ moe_mmid_queue_capability moe_mmid_workspace_registry::exact_queue(
     return {};
 }
 
-bool moe_mmid_workspace_registry::replace_plan(
-    const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
-    const std::shared_ptr<const lifecycle_plan_snapshot> & replacement,
-    uint64_t replacement_identity, bool stable_geometry) noexcept {
+bool moe_mmid_workspace_registry::replace_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
+                                               const std::shared_ptr<const lifecycle_plan_snapshot> & replacement,
+                                               uint64_t                replacement_identity,
+                                               bool                    stable_geometry,
+                                               std::shared_ptr<void> * displaced) noexcept {
     if (!expected || !replacement || !replacement_identity) return false;
-    std::lock_guard<std::mutex> lock(state_->mutex);
+    // Declared before the lock: a displaced context not handed out is released after the registry mutex.
     std::shared_ptr<registry_context> old_context, prepared_context;
+    std::lock_guard<std::mutex>       lock(state_->mutex);
     for (const auto & context : state_->contexts) {
         if (context->exact_plan.get() == expected.get() && context->accepting) old_context = context;
         if (context->exact_plan.get() == replacement.get() && !context->accepting) prepared_context = context;
@@ -1543,6 +1716,9 @@ bool moe_mmid_workspace_registry::replace_plan(
         }
         state_->contexts.erase(std::remove(state_->contexts.begin(), state_->contexts.end(), old_context),
                                state_->contexts.end());
+        if (displaced) {
+            *displaced = std::move(old_context);
+        }
     } else {
         old_context->previous_plan = expected;
         old_context->exact_plan = replacement;
@@ -1577,7 +1753,9 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
                                                          bool wait) noexcept {
     if (!token.valid() || plan_identity == 0) return 0;
     size_t released = 0;
+    std::vector<std::shared_ptr<registry_context>> collected;  // before the lock: see take_contexts_locked
     std::lock_guard<std::mutex> registry_lock(state_->mutex);
+    collected.reserve(state_->retired_contexts.size());
     std::vector<std::shared_ptr<registry_context>> searchable = state_->contexts;
     searchable.insert(searchable.end(), state_->retired_contexts.begin(), state_->retired_contexts.end());
     for (const auto & context : searchable) {
@@ -1636,30 +1814,114 @@ size_t moe_mmid_workspace_registry::recover_quarantined(const moe_mmid_model_tok
             }
         }
     }
-    state_->retired_contexts.erase(
-        std::remove_if(state_->retired_contexts.begin(), state_->retired_contexts.end(),
-                       [&](const std::shared_ptr<registry_context> & context) {
-                           if (!same_token(context->token, token)) return false;
-                           std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
-                           std::array<size_t, execution::max_devices> order{};
-                           for (size_t i = 0; i < context->pools.size(); ++i) order[i] = i;
-                           std::sort(order.begin(), order.begin() + context->pools.size(), [&](size_t a, size_t b) {
-                               return context->pools[a]->owner_device < context->pools[b]->owner_device;
-                           });
-                           for (size_t i = 0; i < context->pools.size(); ++i)
-                               locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
-                           return context_idle_locked(*context);
-                       }), state_->retired_contexts.end());
+    take_contexts_locked(state_->retired_contexts, collected, [&](const std::shared_ptr<registry_context> & context) {
+        if (!same_token(context->token, token)) {
+            return false;
+        }
+        std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+        std::array<size_t, execution::max_devices>                       order{};
+        for (size_t i = 0; i < context->pools.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.begin() + context->pools.size(), [&](size_t a, size_t b) {
+            return context->pools[a]->owner_device < context->pools[b]->owner_device;
+        });
+        for (size_t i = 0; i < context->pools.size(); ++i) {
+            locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
+        }
+        return context_idle_locked(*context);
+    });
     return released;
+}
+
+moe_mmid_reconcile_outcome moe_mmid_reconcile_live_plan(
+    moe_mmid_workspace_registry &                          registry,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & published,
+    const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+    uint64_t                                               live_identity,
+    bool                                                   stable_geometry,
+    const moe_mmid_follows_fn &                            follows) noexcept {
+    if (!published || !live) {
+        return moe_mmid_reconcile_outcome::REBIND_REFUSED;
+    }
+    if (live.get() == published.get()) {
+        return moe_mmid_reconcile_outcome::CURRENT;
+    }
+    const auto live_followed = [&]() noexcept {
+        try {
+            return follows && follows(live);
+        } catch (...) {
+            return false;
+        }
+    };
+    // Checked before replace_plan: after one replace published -> live, the replace's own CAS rebound the context and
+    // left previous_plan == published, and replace_plan(published, live) then refuses although nothing is wrong.
+    if (live_followed()) {
+        return moe_mmid_reconcile_outcome::FOLLOWS_LIVE;
+    }
+    // Not reachable today: an expert loan or refill, the only replacement that can run while the bind is outside
+    // g_tensor_inventory_mutex, asserts the same MMID workspace plan before its swap, and every other replacement
+    // takes the re-plan token the bind holds. A replacement that changes the geometry would need pools the published
+    // ones cannot stand for.
+    if (!stable_geometry) {
+        return moe_mmid_reconcile_outcome::GEOMETRY_UNSTABLE;
+    }
+    if (!registry.replace_plan(published, live, live_identity, /*stable_geometry=*/true)) {
+        return moe_mmid_reconcile_outcome::REBIND_REFUSED;
+    }
+    // replace_plan also accepts when it found no context to rebind (the published one gone, none that last held
+    // `published`): a swap nothing follows. Only the question decode admission asks says the rebind took.
+    return live_followed() ? moe_mmid_reconcile_outcome::REBOUND : moe_mmid_reconcile_outcome::REBIND_NOT_FOLLOWED;
+}
+
+bool moe_mmid_reconcile_retires(moe_mmid_reconcile_outcome outcome, moe_mmid_materialize_status published) noexcept {
+    return published == moe_mmid_materialize_status::PUBLISHED &&
+           moe_mmid_reconcile_refusal(outcome) != moe_mmid_materialize_refusal::NONE;
+}
+
+uint64_t moe_mmid_reconcile_retire_identity(moe_mmid_reconcile_outcome outcome,
+                                            uint64_t                   published_identity,
+                                            uint64_t                   live_identity) noexcept {
+    return outcome == moe_mmid_reconcile_outcome::REBIND_NOT_FOLLOWED ? live_identity : published_identity;
+}
+
+moe_mmid_materialize_refusal moe_mmid_reconcile_refusal(moe_mmid_reconcile_outcome outcome) noexcept {
+    switch (outcome) {
+        case moe_mmid_reconcile_outcome::CURRENT:
+        case moe_mmid_reconcile_outcome::FOLLOWS_LIVE:
+        case moe_mmid_reconcile_outcome::REBOUND:
+            return moe_mmid_materialize_refusal::NONE;
+        case moe_mmid_reconcile_outcome::GEOMETRY_UNSTABLE:
+            return moe_mmid_materialize_refusal::PLAN_CHANGED_GEOMETRY_UNSTABLE;
+        case moe_mmid_reconcile_outcome::REBIND_REFUSED:
+            return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
+        case moe_mmid_reconcile_outcome::REBIND_NOT_FOLLOWED:
+            return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_NOT_FOLLOWED;
+    }
+    return moe_mmid_materialize_refusal::PLAN_CHANGED_REBIND_REFUSED;
+}
+
+bool moe_mmid_materialize_refusal_reported(moe_mmid_materialize_refusal                           refusal,
+                                           const std::shared_ptr<const lifecycle_plan_snapshot> & live,
+                                           const moe_mmid_follows_fn &                            follows) noexcept {
+    if (refusal != moe_mmid_materialize_refusal::SAME_IDENTITY_OTHER_PLAN) {
+        return true;
+    }
+    try {
+        return !(live && follows && follows(live));
+    } catch (...) {
+        return true;
+    }
 }
 
 bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uint64_t plan_identity) noexcept {
     if (!token.valid()) {
         return false;
     }
+    std::vector<std::shared_ptr<registry_context>> released;  // before the lock: see take_contexts_locked
     try {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        const size_t before = state_->contexts.size() + state_->retired_contexts.size();
+        released.reserve(state_->contexts.size() + state_->retired_contexts.size());
         auto matches = [&](const std::shared_ptr<registry_context> & context) {
             return same_token(context->token, token) &&
                    (plan_identity == 0 || context->plan_identity == plan_identity);
@@ -1674,20 +1936,30 @@ bool moe_mmid_workspace_registry::retire(const moe_mmid_model_token & token, uin
             for (size_t i = 0; i < context->pools.size(); ++i)
                 locks[i] = std::unique_lock<std::mutex>(context->pools[order[i]]->mutex);
         };
-        state_->contexts.erase(std::remove_if(state_->contexts.begin(), state_->contexts.end(), [&](const auto & context) {
-            if (!matches(context)) return false;
-            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{}; lock_pools(context, locks);
-            for (const auto & pool : context->pools) for (const auto & slot : pool->slots)
-                if (slot.quarantined) return false;
+        take_contexts_locked(state_->contexts, released, [&](const auto & context) {
+            if (!matches(context)) {
+                return false;
+            }
+            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+            lock_pools(context, locks);
+            for (const auto & pool : context->pools) {
+                for (const auto & slot : pool->slots) {
+                    if (slot.quarantined) {
+                        return false;
+                    }
+                }
+            }
             return true; // ordinary outstanding leases retain their pools independently
-        }), state_->contexts.end());
-        state_->retired_contexts.erase(std::remove_if(state_->retired_contexts.begin(), state_->retired_contexts.end(),
-            [&](const auto & context) {
-                if (!matches(context)) return false;
-                std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{}; lock_pools(context, locks);
-                return context_idle_locked(*context);
-            }), state_->retired_contexts.end());
-        return before != state_->contexts.size() + state_->retired_contexts.size();
+        });
+        take_contexts_locked(state_->retired_contexts, released, [&](const auto & context) {
+            if (!matches(context)) {
+                return false;
+            }
+            std::array<std::unique_lock<std::mutex>, execution::max_devices> locks{};
+            lock_pools(context, locks);
+            return context_idle_locked(*context);
+        });
+        return !released.empty();
     } catch (...) {
         return false;
     }

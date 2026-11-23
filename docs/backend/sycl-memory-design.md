@@ -35,8 +35,9 @@ canonical contract §1 for the formal version):
 
 1. **Planner** (`compute_placement_plan` → `placement_plan`) — the sole
    authority for *deciding where memory lives*. Runs once at model-load time and
-   produces a plan covering dense weights, MoE experts, KV cache (per layer),
-   and oneDNN scratch, assigning each to a device and a VRAM zone.
+   produces a plan covering dense weights, MoE experts, KV cache (per slot,
+   where the layer that executes the slot lives), and oneDNN scratch, assigning
+   each to a device and a VRAM zone.
 
 2. **Unified cache** (`ggml_sycl::unified_cache`) — the sole *allocator and
    owner* of backend memory. Holds the tiered weight cache (device VRAM / pinned
@@ -2598,18 +2599,24 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
 - The RUNTIME zone is counted without what the transaction still places there
   after the ring: the MoE MMID workspace pools, when this update materializes
   them. It materializes them only for a route that can run them, the predicate
-  `load_end` and the context-bind hook already use. In an ordinary build that
-  route is closed, so this is 0.
+  `load_end` and the context-bind hook already use, and only the pools the plan
+  holds. The route is open in an ordinary build since 2026-11-22 (the
+  `sycl-q1-nvfp4-admitted-device` oracle passed on the B70 and the B50), but
+  the plan holds pools only for a model with Q1_0 or NVFP4 experts, so for any
+  other model this is 0.
 - The plan charges the MMID pools on the same fact. `plan_moe_mmid_workspaces()`
   plans them, and `vram_bytes` carries their device bytes, only when
-  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`). So
-  in an ordinary build no pool bytes are charged. A pool rejected by the load
+  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`), and
+  only from the experts whose type the route admits (`moe_type_needs_direct_kernel`:
+  Q1_0, NVFP4). So a model without such an expert (GPT-OSS's MXFP4, any dense
+  model) is charged no pool bytes. A pool rejected by the load
   plan (budget, geometry or owner) stays rejected: the runtime re-plan neither
   re-plans its demand nor asks the growth admission for it, so it cannot demote
   KV or refuse a context.
-  A closed route is not a rejection. Its plan is valid and empty
-  (`moe_mmid_workspace_valid` stays true, and no owner check runs), because a
-  closed route is a fact about the build. A rejection is an outcome of one load
+  A closed route (a test override) is not a rejection, and neither is a model
+  without a Q1_0/NVFP4 expert. Its plan is valid and empty
+  (`moe_mmid_workspace_valid` stays true, and no owner check runs or none is
+  required), because each is a fact about the build or the model. A rejection is an outcome of one load
   plan for a route that could run, and the runtime keeps it rejected.
   `reject_moe_mmid_workspaces()` clears its workspaces, so the materialization
   wrapper returns `NOT_APPLICABLE` before the implementation's `INVALID` check
@@ -2832,11 +2839,13 @@ Only the single-device plan places. A multi-device plan makes no decision, so
 its context keeps the context-time path.
 
 The room does not grow for the compute buffers. The RUNTIME zone's fixed part
-holds the compute term the load measured at its planning shape, `n_ctx_train`
-and ubatch 512 (`llama.cpp-fkpg`), and the placed micro-batch's ring and dense
-scratch sit beside it. So once the plan has placed the micro-batch, the
-hold-spill fit credits a compute buffer of that rung no larger than the term,
-whole or nothing (`placement_explicit_ubatch_compute_room()` and
+holds the compute term the load measured at the context the caller requested
+(the `n_ctx` hint; `n_ctx_train` when none was named) and ubatch 512, and the
+ring and dense scratch of the micro-batch the load placed sit beside it. The
+caller's `-ub` reaches the load only as `n_ubatch_hint`, which places that ring;
+the measures do not read it (`llama.cpp-fkpg`). So once the plan has placed the
+micro-batch, the hold-spill fit credits a compute buffer of that rung no larger
+than the term, whole or nothing (`placement_explicit_ubatch_compute_room()` and
 `zone_hold_fit_rung_has_compute_room()`). Every other rung, the auto trial's
 included, is judged as before. Without the credit the fit charges the buffer as
 if the hold kept it out of the zone. On the B70 with Qwen3.8 at `-ub 2048` that
@@ -3350,20 +3359,27 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 **Limits.**
 
-- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
-  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
-  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
-  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
-  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
-  `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
-  (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
-  transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
-  the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls back to host
-  memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute buffer that
-  does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
-  a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
-  of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
-  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+- The term is measured at the context the caller requested from the load (the `n_ctx` hint, padded like the context;
+  `n_ctx_train` when none was named) and ubatch 512: the caller's `-ub` does not reach the measures, which the load
+  reads only as `n_ubatch_hint` to place the PP MoE ring (`llama.cpp-fkpg`). A context created smaller than the hint (a
+  llama-bench model reused for a smaller test) and `-ub 256` both over-reserve. A context created larger than the hint
+  the model was loaded with is measured below what it needs at load (llama-bench reuses a model for a later instance
+  with a larger `n_prompt + n_gen + n_depth`, because `equal_mparams` does not compare `n_ctx_hint`): the part of its
+  compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, in the
+  external headroom (`llama.cpp-nkr8`, below). Before the measures followed the hint, the term measured at the training
+  context over-reserved and hid that. Above 512 the term under-reserves, and that is the **default** for a dense model,
+  not only an explicit `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a
+  dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute
+  buffer at the auto 2048, `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The
+  ladder's per-rung trial (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the
+  runtime-context transaction is busy or not the published model's, when the probe refuses the rung, when the rung would
+  demote KV, when the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls
+  back to host memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute
+  buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial
+  accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding,
+  not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so
+  their term is the auto pick's. The caller's `-c` reaches the measure as the `n_ctx` hint; `llama.cpp-fkpg` (a) still
+  has to transport its `-ub` to the measures.
 - Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
   and the late check all build their measure context from the default parameters. So the state term holds one sequence's
   state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
@@ -3377,7 +3393,7 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
   placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
   neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
-  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
+  measure, the same gap `llama.cpp-fkpg` records for `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
   summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in

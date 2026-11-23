@@ -1,0 +1,11 @@
+# parent build (integration tree at dffdfbedb), B50, one run per filter: what the newly declined cases did before
+## parent-add-f8
+ggml_sycl_op_bin_bcast: unsupported types: dst: f8_e4m3, src0: f8_e4m3, src1: f32
+../ggml/src/ggml-sycl/binbcast.cpp:989: fatal error
+## parent-hadamard
+../ggml/src/ggml-sycl/ggml-sycl.cpp:57052: GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1)) failed
+## parent-mulmat-f16-src1
+MUL_MAT(type_a=f16,type_b=f16,m=1,n=512,k=2048,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): OK
+MUL_MAT(type_a=f16,type_b=f16,m=1,n=509,k=2051,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): OK
+MUL_MAT(type_a=f32,type_b=f16,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): OK
+../ggml/src/ggml-sycl/ggml-sycl.cpp:57052: GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1)) failed

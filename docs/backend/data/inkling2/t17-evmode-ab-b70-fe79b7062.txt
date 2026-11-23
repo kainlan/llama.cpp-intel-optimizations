@@ -1,0 +1,22 @@
+Inkling 2 Mini UD-Q8_K_XL, Arc B70 (level_zero:0), integration tree fe79b7062 (code of 70292d66e), 2026-11-22.
+Question: what do the bin-broadcast marker submissions cost in decode? GGML_SYCL_BINBCAST_EVENT_MODE default
+(barrier, promoted to safe on the in-order queue) against reuse (the kernel's own event, no extra submission).
+
+Positive control (one profile load, -n 24, GGML_SYCL_KERNEL_PROFILE=1, reuse):
+  sycl.binbcast.event rows: 0 (default run: 48632 events, 2026 per pass). Output "1, 2, 3, ... 13," as in the default run.
+  eval 5056.23 ms / 23 runs = 219.84 ms per token (default profile run, 10 minutes earlier: 255.31 ms per token).
+  Builders: none during the default run; two ninja processes of the task implementers were live at the reuse run.
+
+llama-bench -p 512 -n 128 -r 1, one model load per arm, order d r r2 d2:
+  arm  mode     pp512 t/s  tg128 t/s  host load at arm start, builders
+  d    default    31.95      2.95     15.9, ninja=2
+  r    reuse      43.31      4.99     22.0, ninja=1
+  r2   reuse      31.35      4.14     10.1, ninja=0 at start
+  d2   default    40.95      4.04     23.4, ninja=1
+
+Reading. The host load varied between arms (the implementers' builds started and stopped), and an ABBA order does not
+protect against that. pp512 does not depend on the marker count, so it is used as the covariate: the arms pair as
+(r, d2) at pp ~41-43 and (r2, d) at pp ~31-32. In each pair reuse is faster in tg: 4.99 against 4.04 (+24%) and
+4.14 against 2.95 (+40%). With the profile pair (-14% per token) that is three comparisons in one direction. The
+size is not established: a clean ABBA with no builder running is owed before any figure is quoted as the gain.
+Also seen: a concurrent build takes Inkling decode from ~4.0-4.3 to ~3.0 t/s, as expected for a host-bound decode.

@@ -1,0 +1,23 @@
+Inkling 2 Mini (UD-Q8_K_XL), both cards (level_zero:0,1), GGML_SYCL_MOE_MULTI_GPU=0, Task 8b's build 6ee2a4058. 2026-11-22.
+
+GATE inkling FAIL rc=0 selector=level_zero:0,1 sha=e8b13c2b5
+stdout: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  MOE refusal lines: 0
+
+The FAIL is the gate script's: its verdict searched stderr for the bare word DEVICE_LOST, and the backend's
+two-GPU startup advisory contains it. Fixed in 6fc620022; with that filter this log has 0 abort lines.
+Lines of this log that mention DEVICE_LOST:
+[SYCL] WARNING: 2 GPUs visible. Multi-GPU Level Zero contexts trigger DEVICE_LOST on compute-runtime 26.x (intel/compute-runtime#916, #921). Scheduler multi-GPU dense/KV placement is disabled by defau
+
+Load: [HOSTMEM] phase=load-end | process: rss_anon=0.60 rss_file=0.26 rss_shmem=0.00 GB | pinned pool (not in RssAnon): 38.00 GB zones(used/cap GB): dev0{pool=38.00 GB chunks=19 WEIGHT=21.29/24.06 KV=0.00/0.06 STAGING=0.00/2.55 SCRATCH=0.00/6.15} | ledger: sycl_host
+Everything is on device 0 (the B70); the B50 holds nothing. This setup is the B70 setup until a secondary-card
+expert route exists (Task 8d).
+common_perf_print:    sampling time =       3.65 ms
+common_perf_print:    samplers time =       1.21 ms /    29 tokens
+common_perf_print:        load time =   47437.20 ms
+common_perf_print: prompt eval time =     957.48 ms /    14 tokens (   68.39 ms per token,    14.62 tokens per second)
+common_perf_print:        eval time =    3748.79 ms /    14 runs   (  267.77 ms per token,     3.73 tokens per second)
+common_perf_print:       total time =    4710.45 ms /    28 tokens
+common_perf_print: unaccounted time =       0.53 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+common_perf_print:    graphs reused =         13
+common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)

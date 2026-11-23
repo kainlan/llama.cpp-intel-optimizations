@@ -1,0 +1,186 @@
+Task 8b lead device runs at 0f4060d0f (Task 8b + Task 8h + Task 8f; same tree as the merge e995206d3).
+One run each, 2026-11-22, under GPU.lock, selector pinned. Console of the chain, then the confirming
+GPT-OSS B50 run that followed the two-chunk arena (see the end).
+
+=== 1 dev tests b70
+tree=<inkling>/wt-t8b head=0f4060d0f tracked-changes=0 ninja=1
+GGML_SYCL:BOOL=ON
+  binaries newer than their sources: yes
+lock wait: 0s
+== sycl-q1-nvfp4-admitted-device on b70  2026-11-22T21:36:03-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 56  context-bind: 0  abort lines: 0
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: [SYCL-ASYNC-FAILURE] device 0: graph_compute: an asynchronous SYCL error was delivered after this context was created (device errors=2, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: Q1/NVFP4 scoped production-route lifecycle: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+== sycl-q1-nvfp4-adapter-device on b70  2026-11-22T21:36:15-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 0  context-bind: 0  abort lines: 0
+332: Q1/NVFP4 lifecycle-aware admitted device adapter: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:36:25-05:00
+lock released
+=== 2 inkling gate b70
+tree=<inkling>/wt-t8b head=0f4060d0f tracked-changes=0 ninja=1
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+gate script: <integ>/scripts/sycl-canonical-gates.sh at d5c82cdff
+== inkling gate, level_zero:0  2026-11-22T21:36:30-05:00  shmem=11GB
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0 sha=d5c82cdff
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+1.37.375.338 I common_perf_print:        load time =   73385.34 ms
+1.37.375.339 I common_perf_print: prompt eval time =    3235.72 ms /    14 tokens (  231.12 ms per token,     4.33 tokens per second)
+1.37.375.340 I common_perf_print:        eval time =   19929.89 ms /    14 runs   ( 1423.56 ms per token,     0.70 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:38:28-05:00
+lock released
+=== 3 planlines
+tree=<inkling>/wt-t8b head=0f4060d0f tracked-changes=0 ninja=1
+GGML_SYCL:BOOL=ON
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+  libggml-sycl newer than ggml/src/ggml-sycl/ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml/src/ggml-sycl/unified-cache.cpp: yes
+lock wait: 0s
+== mistral B70 -v  2026-11-22T21:38:30-05:00 shmem=11GB
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kept 179 plan lines of 3360
+  shmem=11GB
+  kernel fault lines since start: 0
+== gptoss B50 -v, no -c  2026-11-22T21:39:12-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  answer lines: 1  device_lost: 0
+  kept 201 plan lines of 4357
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:39:50-05:00
+lock released
+=== 4 dev tests b50
+tree=<inkling>/wt-t8b head=0f4060d0f tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  binaries newer than their sources: yes
+lock wait: 0s
+== sycl-q1-nvfp4-admitted-device on b50  2026-11-22T21:39:53-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 56  context-bind: 0  abort lines: 0
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: [SYCL-ASYNC-FAILURE] device 0: graph_compute: an asynchronous SYCL error was delivered after this context was created (device errors=2, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: Q1/NVFP4 scoped production-route lifecycle: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:40:03-05:00
+lock released
+=== 5 inkling gate both cards
+tree=<inkling>/wt-t8b head=0f4060d0f tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+gate script: <integ>/scripts/sycl-canonical-gates.sh at d5c82cdff
+== inkling gate, level_zero:0,1  2026-11-22T21:40:06-05:00  shmem=11GB
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=d5c82cdff
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 1
+0.50.192.051 I common_perf_print:        load time =   44884.13 ms
+0.50.192.052 I common_perf_print: prompt eval time =     933.00 ms /    14 tokens (   66.64 ms per token,    15.01 tokens per second)
+0.50.192.053 I common_perf_print:        eval time =    3929.50 ms /    14 runs   (  280.68 ms per token,     3.56 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:41:15-05:00
+lock released
+=== 6 inkling diag b70
+tree=<inkling>/wt-t8b head=0f4060d0f tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+== inkling DIAGNOSTIC (-v, -n 2, GGML_SCHED_DEBUG=2), level_zero:0  2026-11-22T21:41:17-05:00  shmem=11GB
+  rc=0  err lines: 342973  SPLIT headers: 4200
+  out: 1, 2, 3, 4, 5, 6||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.50.399.333 I common_perf_print:        load time =   47499.58 ms
+0.50.399.334 I common_perf_print: prompt eval time =     942.44 ms /    14 tokens (   67.32 ms per token,    14.86 tokens per second)
+0.50.399.335 I common_perf_print:        eval time =     486.00 ms /     1 runs   (  486.00 ms per token,     2.06 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:42:21-05:00
+lock released
+=== 7 inkling bench b70
+host: load average: 11.52, 19.56, 17.82  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+arm m: <inkling>/wt-t8b head=0f4060d0f tracked-changes=0 lib-newer-than-source=yes
+lock wait: 0s
+== arm m  2026-11-22T21:42:24-05:00  shmem=11GB  load=11.56
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 20859  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT m pp512 avg=41.71 t/s stddev=0.00 samples=[41.71]
+  RESULT m tg128 avg=4.49 t/s stddev=0.00 samples=[4.49]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T21:44:15-05:00
+lock released
+=== CHAIN END
+
+=== score across every log of the chain
+EXECUTION-TRIPWIRE lines: 0. 'route=direct' decline lines: 0. 'failed to begin tracked execution graph': 0.
+'begin-path drain wait threw': 0. MOE-DECODE-REFUSAL / MOE-PROMPT-REFUSAL: 0 in every model run; 2 in each
+admitted-device test (the fixture's over-capacity case, tokens=41 capacity=40, refused by name as designed).
+device_lost: 1 in the two-card gate is the startup advisory line ('2 GPUs visible ... DEVICE_LOST on
+compute-runtime 26.x'), not a loss; the gate script does not count it (6fc620022), the lead's wrapper does.
+
+=== GPT-OSS B50 arena reservation, chain run (third reservation of the load)
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13012.0 MB)
+[VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 512.0->1515.3 MB
+[VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1515.3, oneDNN=256.0, shared KV+weight=12008.7 MB)
+[PLACEMENT-MOE] triplet packing: groups=768 complete=768 incomplete=0 device_groups=768 host_groups=0 device_entries=2304 (9682.0 MB) host_entries=0 (0.0 MB) remaining=442.2 MB hotness=static(layer,expert)
+[VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 1515.3->1919.4 MB
+[VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+[VRAM-ARENA] Reserving N-chunk arena: 2 chunks, 14292.0 MB total (per-chunk cap 15179.0 MB)
+[VRAM-ARENA] Reserved 2 chunks, 14292.0 MB total (weight=11476.6, KV=128.0, oneDNN=256.0, runtime=1919.4, scratch=512.0 MB)
+[PLACEMENT-MOE] triplet packing: groups=768 complete=768 incomplete=0 device_groups=760 host_groups=8 device_entries=2280 (9581.2 MB) host_entries=24 (100.9 MB) remaining=11.0 MB hotness=static(layer,expert)
+
+=== GPT-OSS B50 arena reservation, confirming run from the same build (2026-11-22T21:47)
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13012.0 MB)
+[VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 512.0->1515.3 MB
+[VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1515.3, oneDNN=256.0, shared KV+weight=12008.7 MB)
+[PLACEMENT-MOE] triplet packing: groups=768 complete=768 incomplete=0 device_groups=768 host_groups=0 device_entries=2304 (9682.0 MB) host_entries=0 (0.0 MB) remaining=442.2 MB hotness=static(layer,expert)
+[VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 1515.3->1919.4 MB
+[VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1919.4, oneDNN=256.0, shared KV+weight=11604.6 MB)
+[PLACEMENT-MOE] triplet packing: groups=768 complete=768 incomplete=0 device_groups=768 host_groups=0 device_entries=2304 (9682.0 MB) host_entries=0 (0.0 MB) remaining=38.2 MB hotness=static(layer,expert)
+
+Confirming run: answer lines 1, device_lost 0, kernel fault lines 0; its Mistral B70 and GPT-OSS B50 plan
+lines equal the integration baseline capture (integ-plan-d2ac34ce1) with timings and the HOSTMEM line masked: 0 differing lines.

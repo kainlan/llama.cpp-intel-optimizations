@@ -13,8 +13,8 @@ reused. The probe this gate pins:
     clauses (b) and (d) of scripts/check-sycl-alloc-zone-contract.py read those literals;
   - no raw allocation and no pageable staging vector;
   - one untimed warm-up copy (ggml_sycl::mem_copy, which is synchronous), then 8 timed iterations of a 64 MiB buffer
-    moved in 4 MiB chunks with ggml_sycl::mem_copy_async at an offset, one q->wait() per iteration and never one per
-    chunk, timed on the host with steady_clock;
+    moved in 4 MiB chunks with ggml_sycl::mem_copy_async at an offset, one q->wait_and_throw() per iteration and
+    never one per chunk, timed on the host with steady_clock;
   - one WARN line per device, "[MOE-EXEC] h2d probe device %d: %.1f GB/s (%s)", whose source word is "probed" (with the
     iteration spread appended: "probed; iterations 24.1-26.2"), "tuning cache" or "seed, GGML_SYCL_H2D_PROBE=0";
   - llama.cpp-xr4i (c-vbf4, the bimodal 9.x vs 24-26 GB/s readings): each of the 8 iterations is timed on its own, the
@@ -182,6 +182,11 @@ def claim_allocates_through_the_sanctioned_surfaces_with_literal_tiers(src: str)
     ])
 
 
+# A queue wait of either spelling: the probe drains with wait_and_throw() (so an asynchronous error reaches the
+# queue's recording handler), and a plain wait() is still a wait for the one-per-iteration count.
+ANY_WAIT = r"q->wait(?:_and_throw)?\(\)"
+
+
 def claim_copy_shape_is_chunked_async_with_one_wait_per_iteration(src: str) -> bool:
     fn = probe_body(src)
     if not fn:
@@ -189,9 +194,10 @@ def claim_copy_shape_is_chunked_async_with_one_wait_per_iteration(src: str) -> b
     warm = fn.count("ggml_sycl::mem_copy(") == 1
     chunked = fn.count("ggml_sycl::mem_copy_async(") == 1
     sizes = all(s in fn for s in ("k_bytes = 64ull << 20;", "k_chunk = 4ull << 20;", "k_iters = 8;"))
-    # the one wait sits in the iteration loop, after the chunk loop closes and before the next iteration
-    one_wait = fn.count("q->wait()") == 1 and ordered(fn, "for (int it = 0; it < k_iters; ++it)", "mem_copy_async(",
-                                                       "q->wait()")
+    # the one wait sits in the iteration loop, after the chunk loop closes and before the next iteration; a wait of
+    # either spelling counts, so a plain wait() added per chunk is a second wait
+    one_wait = len(re.findall(ANY_WAIT, fn)) == 1 and ordered(fn, "for (int it = 0; it < k_iters; ++it)",
+                                                              "mem_copy_async(", "q->wait_and_throw()")
     clocked = "std::chrono::steady_clock::now()" in fn and "high_resolution_clock" not in fn
     return all([warm, chunked, sizes, one_wait, clocked])
 
@@ -210,8 +216,8 @@ def ordered(text: str, *needles: str) -> bool:
 def claim_wait_closes_the_chunk_loop_before_the_clock_stops(src: str) -> bool:
     """The wait is a sibling of the chunk loop, not inside it: the chunk loop's closing brace precedes it."""
     fn = probe_body(src)
-    m = re.search(r"for \(size_t off = 0; off < k_bytes; off \+= k_chunk\) \{.*?\} q->wait\(\);", fn)
-    return bool(m) and "q->wait()" not in m.group(0)[:-len("q->wait();")]
+    m = re.search(r"for \(size_t off = 0; off < k_bytes; off \+= k_chunk\) \{.*?\} q->wait_and_throw\(\);", fn)
+    return bool(m) and not re.search(ANY_WAIT, m.group(0)[:-len("q->wait_and_throw();")])
 
 
 def claim_logs_once_at_warn(src: str) -> bool:
@@ -412,7 +418,8 @@ def claim_each_iteration_is_timed_on_its_own(src: str) -> bool:
         loop.count("std::chrono::steady_clock::now()") == 2,
         "iter_gbps[it] = " in loop,
         "double iter_gbps[k_iters];" in fn,
-        ordered(loop, "steady_clock::now()", "mem_copy_async(", "q->wait()", "steady_clock::now()", "iter_gbps[it] = "),
+        ordered(loop, "steady_clock::now()", "mem_copy_async(", "q->wait_and_throw()", "steady_clock::now()",
+                "iter_gbps[it] = "),
     ])
 
 

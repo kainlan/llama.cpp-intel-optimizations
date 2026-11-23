@@ -1,0 +1,14 @@
+# mutation binary (1be861bc0 + three mutations: k's divisor from rq3; the D != 512 exception restored; the i3 stride loop removed), B50, one run per arm
+== red-fattn-support
+  FLASH_ATTN_EXT(hsk=512,hsv=256,nh=4,nr23=[1,1],kv=512,nb=32,mask=1,sinks=0,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=f16,type_V=f16,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0,q_head_padding=0,mask_heads=1): SUPPORTED
+  Backend SYCL0: OK
+== red-gdn
+[GATED_DELTA_NET] ERR = 0.990612875 > 0.000000100   GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=0,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,k_seq_bcast=1): FAIL
+[GATED_DELTA_NET] ERR = 1.050935292 > 0.000000100   GATED_DELTA_NET(type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=0,kda=1,K=1,correlated=0,padded_v=0,padded_q=0,permuted_k=0,k_seq_bcast=1): FAIL
+  0/2 tests passed
+  Backend SYCL0: FAIL
+== red-pad
+  PAD_REFLECT_1D(type=f32,ne_a=[2,1,16777216,1],pad_0=1,pad_1=1,view=0): OK
+[PAD_REFLECT_1D] ERR = 1.000041382 > 0.000000100   PAD_REFLECT_1D(type=f32,ne_a=[2,1,1,16777216],pad_0=1,pad_1=1,view=0): FAIL
+  1/2 tests passed
+  Backend SYCL0: FAIL

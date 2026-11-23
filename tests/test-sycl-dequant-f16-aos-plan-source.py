@@ -333,13 +333,15 @@ def check(srcs):
              "ggml_get_to_fp16_sycl_for_layout(src0->type, GGML_LAYOUT_AOS);") in nows(loaded)
         and nows(loaded).count("src0_dd_i") == 1)
     # The SOA converters take the flat full-tensor k (their scale plane follows all the quants), so they need the
-    # whole tensor, and the plane is read through a leased handle held until the conversion's reads complete.
+    # whole tensor, and the plane is read through a leased owner (the cache lease, or a copy of the tensor's chunk-lease
+    # handle; test-sycl-f16-arm-owner-source pins which) held until the conversion's reads complete.
     results["the loaded-layout helper converts an SOA weight as a whole tensor from a leased plane held until its "
             "reads complete"] = all(nows(term) in nows(loaded) for term in (
                 "if (row_low != 0 || row_diff != ggml_nrows(src0)) {",
                 "ggml_get_to_fp16_sycl_for_layout(src0->type, GGML_LAYOUT_SOA)",
-                "ggml_sycl::mem_handle owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
-                "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));"))
+                "owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
+                "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));")) and nows(
+                    "ggml_sycl::mem_handle owner = ggml_sycl_acquire_weight_layout(") not in nows(loaded)
     for what, guard, conversion in REFUSALS:
         guard_at = nows(loaded).find(nows(guard))
         results[refusal_check(what)] = 0 <= guard_at < nows(loaded).find(nows(conversion))

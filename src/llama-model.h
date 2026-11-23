@@ -1086,6 +1086,12 @@ struct llama_model {
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
 
+    // the weight layer (blk.N) that executes KV cache slot il; the slot itself unless slot il executes another layer's
+    // weights. Override it when it does: when the load aliases layers[il] = layers[p], or the graph reads layers[p]
+    // for il. The SYCL planner places slot il's KV with layer_phys(il)'s weights, so a missing override puts every
+    // repeated slot's KV on the host tier and its attention on the CPU.
+    virtual int layer_phys(int il) const { return il; }
+
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
