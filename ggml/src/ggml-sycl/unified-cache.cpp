@@ -33330,16 +33330,73 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                   kv_info, envelope, n_experts);
 }
 
-// The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
-// gets its KV there, in layer order, while `remaining` holds it. A layer whose KV does not fit keeps its weights on the
-// device and has its KV on the host tier; a host layer's KV is on the host tier with it.
+placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory(const ggml_sycl_tensor_inventory & inventory) {
+    placement_kv_layer_phys_intake intake;
+    intake.kv_layer_phys_count = inventory.kv_layer_phys_count;
+    intake.kv_layer_count      = inventory.kv_layer_count;
+    if (inventory.kv_layer_phys_count == 0) {
+        return intake;
+    }
+    // A count says the producer sent a map. A null one is refused like a count mismatch, so the backend says so
+    // instead of planning every slot as its own layer without a word.
+    if (inventory.kv_layer_phys == nullptr || inventory.kv_layer_phys_count != inventory.kv_layer_count) {
+        intake.refused     = true;
+        intake.map_missing = inventory.kv_layer_phys == nullptr;
+        return intake;
+    }
+    const int32_t * const      map = inventory.kv_layer_phys;
+    const std::vector<int32_t> layer_phys(map, map + inventory.kv_layer_phys_count);
+    // The identity first, and kept empty: a model whose slots are its layers plans as it did with no map.
+    if (kv_layer_phys_is_identity(layer_phys)) {
+        return intake;
+    }
+    // A weight layer id is below the slot count: every weight layer executes at least one slot. The inventory's tensor
+    // names cannot say more, because the late inventory leaves out a layer whose weights are on a CPU buffer type
+    // (llama_model_sycl_set_late_inventory), and that layer's slots are the ones that must follow it to the host.
+    for (size_t slot = 0; slot < layer_phys.size(); ++slot) {
+        if (layer_phys[slot] < 0 || static_cast<uint32_t>(layer_phys[slot]) >= inventory.kv_layer_count) {
+            intake.refused   = true;
+            intake.bad_slot  = static_cast<int>(slot);
+            intake.bad_layer = layer_phys[slot];
+            return intake;
+        }
+    }
+    intake.layer_phys = layer_phys;
+    return intake;
+}
+
+// Puts the KV of every slot weight layer `layer_id` executes on `kv_target` (-1: the host tier); a slot with no KV of
+// its own is on the host tier either way. A slot's KV lives where its layer lives.
+static void plan_layer_kv_slots(placement_plan & plan, const placement_kv_info & kv_info, int layer_id, int kv_target) {
+    for (const int slot : kv_slots_of_layers(kv_info.layer_phys, layer_id, layer_id)) {
+        const bool slot_has_kv = kv_info.kv_bytes_for_layer(static_cast<uint32_t>(slot)) > 0;
+        plan.kv_device[slot]   = slot_has_kv ? kv_target : -1;
+    }
+}
+
+// The KV phase's per-slot charge (llama.cpp-8ecj): each KV slot whose layer's dense weights the dense pass put on
+// `device_id` gets its KV there, in slot order, while `remaining` holds it. A slot whose KV does not fit keeps its
+// layer's weights on the device and has its KV on the host tier; a host layer's slots are on the host tier with it.
+// A looped model's slot runs the weight layer kv_info.layer_phys names; every other model's slot is its own layer.
 static void plan_single_device_layer_kv(placement_plan &            plan,
                                         const placement_kv_info &   kv_info,
                                         const std::map<int, bool> & layer_has_attention,
                                         int                         device_id,
                                         size_t &                    remaining) {
-    for (const auto & [layer_id, has_attention] : layer_has_attention) {
-        const size_t kv_cost = has_attention ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+    std::vector<std::pair<int, int>> slot_layers;  // (KV slot, the weight layer that executes it), in slot order
+    if (kv_info.layer_phys.empty()) {
+        for (const auto & attention : layer_has_attention) {
+            slot_layers.emplace_back(attention.first, attention.first);
+        }
+    } else {
+        for (size_t slot = 0; slot < kv_info.layer_phys.size(); ++slot) {
+            slot_layers.emplace_back(static_cast<int>(slot), kv_info.layer_phys[slot]);
+        }
+    }
+    for (const auto & [slot, layer_id] : slot_layers) {
+        const auto   attention     = layer_has_attention.find(layer_id);
+        const bool   has_attention = attention != layer_has_attention.end() && attention->second;
+        const size_t kv_cost       = has_attention ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(slot)) : 0;
         if (kv_cost == 0) {
             continue;
         }
@@ -33352,7 +33409,7 @@ static void plan_single_device_layer_kv(placement_plan &            plan,
             plan.kv_host_bytes += kv_cost;
             plan.host_bytes += kv_cost;
         }
-        plan.kv_device[layer_id] = kv_on_device ? device_id : -1;
+        plan.kv_device[slot] = kv_on_device ? device_id : -1;
     }
 }
 
@@ -33422,7 +33479,7 @@ struct kv_context_room {
 // refusing it both lose one device read per token, so it cancels to first order. A dense model displaces no expert,
 // so its room is held as before, whatever the fill.
 static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv_info,
-                                                  int                         layer_id,
+                                                  int                         slot,
                                                   size_t                      extra,
                                                   int                         n_experts,
                                                   const kv_room_expert_rate & rate) {
@@ -33432,11 +33489,10 @@ static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv
     GGML_ASSERT(std::isfinite(kv_info.host_attn_gbps) && kv_info.host_attn_gbps > 0.0);
     GGML_ASSERT(std::isfinite(rate.gbps) && rate.gbps > 0.0);
     GGML_ASSERT(std::isfinite(kv_info.host_split_us) && kv_info.host_split_us >= 0.0);
-    const uint32_t      il     = static_cast<uint32_t>(layer_id);
     const uint32_t      filled = kv_room_filled_cells(kv_info.n_ctx_context, kv_info.ctx_fill_pct);
     kv_room_cost_inputs in;
-    in.host_read_bytes = kv_info.kv_bytes_for_layer_at(il, filled);
-    in.n_host_splits   = placement_host_attn_splits(kv_info.idx_k_width(il) > 0);
+    in.host_read_bytes = kv_info.kv_bytes_for_layer_at(static_cast<uint32_t>(slot), filled);
+    in.n_host_splits   = placement_host_attn_splits(kv_info.idx_k_width(static_cast<uint32_t>(slot)) > 0);
     in.room_bytes      = extra;
     in.n_experts       = n_experts;
     in.n_expert_used   = kv_info.n_expert_used;
@@ -33444,7 +33500,7 @@ static kv_context_room_cost weigh_kv_context_room(const placement_kv_info &   kv
     in.host_split_us   = kv_info.host_split_us;
     in.cpu_expert_gbps = rate.gbps;
     in.priced          = rate.priced;
-    return { kv_room_weigh(in), layer_id, in.n_host_splits };
+    return { kv_room_weigh(in), slot, in.n_host_splits };
 }
 
 static kv_context_room hold_kv_context_room(placement_plan &            plan,
@@ -33465,25 +33521,24 @@ static kv_context_room hold_kv_context_room(placement_plan &            plan,
     // (plan_runtime_kv_demotion, kv-runtime-demotion.cpp: full attention latest first, then SWA latest first; the
     // source gate reads it there), and it only picks the deciding layer the line reports: the first refused, else the
     // first held.
-    std::vector<int> layers;
-    for (const auto & [layer_id, owner] : plan.kv_device) {
-        if (layer_id >= 0 && owner == device_id) {
-            layers.push_back(layer_id);
+    std::vector<int> slots;
+    for (const auto & [slot, owner] : plan.kv_device) {
+        if (slot >= 0 && owner == device_id) {
+            slots.push_back(slot);
         }
     }
-    std::sort(layers.begin(), layers.end());
+    std::sort(slots.begin(), slots.end());
     for (const bool swa_pass : { false, true }) {
-        for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-            const int layer_id = *it;
-            if (kv_info.is_swa_layer(layer_id) != swa_pass) {
+        for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+            const int slot = *it;
+            if (kv_info.is_swa_layer(slot) != swa_pass) {
                 continue;
             }
-            const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));
+            const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(slot));
             if (extra == 0) {
                 continue;
             }
-            const kv_context_room_cost cost =
-                weigh_kv_context_room(kv_info, layer_id, extra, n_experts, room.expert_rate);
+            const kv_context_room_cost cost = weigh_kv_context_room(kv_info, slot, extra, n_experts, room.expert_rate);
             room.n_layers++;
             if (swa_pass) {
                 room.n_swa_layers++;
@@ -33900,6 +33955,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.layer_k_width                       = kv_info.layer_k_width;
     plan.layer_v_width                       = kv_info.layer_v_width;
     plan.layer_idx_k_width                   = kv_info.layer_idx_k_width;
+    plan.layer_phys                          = kv_info.layer_phys;
     plan.planner_n_ctx                       = kv_info.n_ctx;
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -34128,9 +34184,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         // (~256 MB at 131K context), and a heterogeneous model's SWA/full
         // widths can themselves differ (Gemma 4 E4B), and shared-KV layers
         // cost 0). TLSF supports heterogeneous slot sizes so the old
-        // uniform-charging workaround is no longer needed.
-        const size_t kv_cost =
-            layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+        // uniform-charging workaround is no longer needed. A looped model's
+        // layer is charged for every KV slot it executes.
+        const size_t kv_cost       = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
 
         bool on_device;
         int  target;
@@ -34212,7 +34268,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
 
         plan.layer_device[layer_id] = target;
-        plan.kv_device[layer_id]    = (kv_cost > 0 && kv_on_device) ? device_id : -1;
+        plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 && kv_on_device ? device_id : -1);
 
         size_t kv_anchor = indices.front();
         if (kv_cost > 0) {
@@ -34446,29 +34502,53 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         for (const auto & [layer_id, bytes] : layer_weight_bytes) {
             GGML_UNUSED(bytes);
             layer_ids.push_back(layer_id);
-            plan.kv_device.try_emplace(layer_id, -1);
+            for (const int slot : kv_slots_of_layers(plan.layer_phys, layer_id, layer_id)) {
+                plan.kv_device.try_emplace(slot, -1);
+            }
             plan.layer_device.try_emplace(layer_id, -1);
         }
         std::sort(layer_ids.begin(), layer_ids.end());
         for (int layer_id : layer_ids) {
-            const size_t   weight_bytes = layer_weight_bytes[layer_id];
-            const bool     has_attn     = layer_has_attention[layer_id];
-            const uint32_t uil          = static_cast<uint32_t>(layer_id);
+            const size_t           weight_bytes = layer_weight_bytes[layer_id];
+            const bool             has_attn     = layer_has_attention[layer_id];
+            // A looped model's layer executes several KV slots: its KV is their sum, labelled by its first slot, and
+            // its target is theirs (mixed when they differ); a line after it names each slot.
+            const std::vector<int> slots        = kv_slots_of_layers(plan.layer_phys, layer_id, layer_id);
             // llama.cpp-3aos: kv_bytes_for_layer() already returns 0 for a
             // SHARED layer (no K/V of its own), so kv_bytes stays correct
             // whether or not has_attn is set for it; the label distinguishes
             // that case from a genuinely non-attention layer.
-            const size_t   kv_bytes     = has_attn ? kv_info.kv_bytes_for_layer(uil) : 0;
-            const char *   kv_label     = placement_kv_layer_label(kv_info, layer_id, has_attn);
-            const int      dense_target = plan.get_layer_device(layer_id);
-            const int      kv_target    = plan.get_kv_device(layer_id);
+            const size_t           kv_bytes     = has_attn ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
+            const char *           kv_label =
+                placement_kv_layer_label(kv_info, slots.empty() ? layer_id : slots.front(), has_attn);
+            const int dense_target = plan.get_layer_device(layer_id);
+            const int kv_target =
+                plan.layer_phys.empty() ? plan.get_kv_device(layer_id) : plan.layer_range_kv_device(layer_id, layer_id);
+            char kv_target_text[32];
+            if (kv_target == -2) {
+                snprintf(kv_target_text, sizeof(kv_target_text), "mixed");
+            } else {
+                snprintf(kv_target_text, sizeof(kv_target_text), "%s%d", kv_target >= 0 ? "device " : "host ",
+                         kv_target >= 0 ? kv_target : -1);
+            }
             GGML_LOG_INFO(
                 "[PLACEMENT] layer %3d  weight=%.1f MB  kv=%.1f MB (%s)  total=%.1f MB  "
-                "dense_target=%s%d  kv_target=%s%d\n",
+                "dense_target=%s%d  kv_target=%s\n",
                 layer_id, weight_bytes / (1024.0 * 1024.0), kv_bytes / (1024.0 * 1024.0), kv_label,
                 (weight_bytes + kv_bytes) / (1024.0 * 1024.0), dense_target >= 0 ? "device " : "host ",
-                dense_target >= 0 ? dense_target : -1, kv_target >= 0 ? "device " : "host ",
-                kv_target >= 0 ? kv_target : -1);
+                dense_target >= 0 ? dense_target : -1, kv_target_text);
+            if (!plan.layer_phys.empty()) {
+                std::string slot_text;
+                for (const int slot : slots) {
+                    const int slot_target = plan.get_kv_device(slot);
+                    char      one[48];
+                    snprintf(one, sizeof(one), "%s%d=%s%d", slot_text.empty() ? "" : ", ", slot,
+                             slot_target >= 0 ? "device " : "host ", slot_target >= 0 ? slot_target : -1);
+                    slot_text += one;
+                }
+                GGML_LOG_INFO("[PLACEMENT] layer %3d  kv slots: %s\n", layer_id,
+                              slot_text.empty() ? "none" : slot_text.c_str());
+            }
         }
     }
     // KV breakdown summary for heterogeneous attention
@@ -34759,7 +34839,8 @@ static void populate_multi_device_layer_blocks(placement_plan &                 
                 block.dense_vram_charge_bytes += charge_it->second;
             }
 
-            block.kv_bytes += plan.kv_size_for_layer(static_cast<uint32_t>(layer));
+            // Every KV slot the layer executes: a looped model's later slots run in the block of their layer.
+            block.kv_bytes += plan.kv_size_for_phys_layer(layer);
 
             auto moe_dev_it = moe_device_bytes_by_layer.find(layer);
             if (moe_dev_it != moe_device_bytes_by_layer.end()) {
@@ -34918,7 +34999,7 @@ static void populate_no_p2p_candidate_layer_blocks(placement_plan &             
         }
         auto has_attn = layer_has_attention.find(layer_id);
         if (has_attn != layer_has_attention.end() && has_attn->second) {
-            charge += kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id));
+            charge += kv_info.kv_bytes_for_phys_layer(layer_id);
         }
         return charge;
     };
@@ -34985,7 +35066,7 @@ static void populate_no_p2p_candidate_layer_blocks(placement_plan &             
             }
             auto has_attn = layer_has_attention.find(layer_id);
             if (has_attn != layer_has_attention.end() && has_attn->second) {
-                block.kv_bytes += kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id));
+                block.kv_bytes += kv_info.kv_bytes_for_phys_layer(layer_id);
             }
         }
 
@@ -35360,6 +35441,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.layer_k_width            = kv_info.layer_k_width;
     plan.layer_v_width            = kv_info.layer_v_width;
     plan.layer_idx_k_width        = kv_info.layer_idx_k_width;
+    plan.layer_phys               = kv_info.layer_phys;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -35737,8 +35819,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         for (int layer_id = 0; layer_id < n_layers; ++layer_id) {
             const size_t dense_weight_charge =
                 layer_weight_charge_bytes.count(layer_id) ? layer_weight_charge_bytes.at(layer_id) : 0;
-            const size_t kv_cost =
-                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+            const size_t kv_cost = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
             all_layers_charge += dense_weight_charge + moe_layer_charge[static_cast<size_t>(layer_id)] + kv_cost;
         }
 
@@ -35798,8 +35879,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const size_t dense_weight_bytes = layer_weight_bytes.count(layer_id) ? layer_weight_bytes.at(layer_id) : 0;
             const size_t dense_weight_charge =
                 layer_weight_charge_bytes.count(layer_id) ? layer_weight_charge_bytes.at(layer_id) : 0;
-            const size_t kv_cost =
-                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+            const size_t kv_cost = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
             const size_t moe_weight_bytes  = moe_layer_bytes[static_cast<size_t>(layer_id)];
             const size_t moe_weight_charge = moe_layer_charge[static_cast<size_t>(layer_id)];
             const size_t total_charge      = dense_weight_charge + moe_weight_charge + kv_cost;
@@ -35843,7 +35923,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             }
 
             plan.layer_device[layer_id] = target;
-            plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
+            plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 ? target : -1);
 
             auto dense_it = dense_layer_indices.find(layer_id);
             if (dense_it != dense_layer_indices.end()) {
@@ -35980,16 +36060,16 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             // (llama.cpp-3aos: kv_bytes_for_layer() -- SWA vs full-attn vs
             // shared-KV, per layer, not a uniform class split). TLSF
             // supports heterogeneous slot sizes — see single-device path for
-            // details.
-            const size_t kv_cost =
-                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+            // details. A looped model's layer is charged for every KV slot it
+            // executes, and its slots go with it.
+            const size_t kv_cost        = layer_has_attention[layer_id] ? kv_info.kv_bytes_for_phys_layer(layer_id) : 0;
             const size_t total_cost     = weight_charge + kv_cost;
             const char * reason         = nullptr;
             int          target_dev_idx = choose_dense_target_device(total_cost, &reason);
 
             const int target            = commit_bytes(target_dev_idx, weight_bytes, weight_charge, kv_cost);
             plan.layer_device[layer_id] = target;
-            plan.kv_device[layer_id]    = kv_cost > 0 ? target : -1;
+            plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 ? target : -1);
             if (target >= 0 && target_dev_idx >= 0 && static_cast<size_t>(target_dev_idx) < n_devs) {
                 dense_assigned_charge[target_dev_idx] += total_cost;
                 dense_assigned_bytes[target_dev_idx] += weight_bytes;

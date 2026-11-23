@@ -27,7 +27,7 @@ that covers:
 |---|---|
 | Dense weights (each layer) | `entries[]`, `layer_device` |
 | MoE experts | `entries[]`, `expert_device` |
-| KV cache (per layer) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes` |
+| KV cache (per slot, where the layer that executes the slot lives) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes`, `layer_phys` |
 | oneDNN reorder scratch | `onednn_reorder_bytes` → Zone: SCRATCH |
 | oneDNN scratchpad | `onednn_scratchpad_bytes` → Zone: ONEDNN |
 | MoE Q8 workspace | `moe_q8_workspace_bytes` → Zone: SCRATCH |
@@ -774,7 +774,9 @@ forms above with the understanding that they are scheduled for replacement.
 - The `mem_handle::device()` value is authoritative for which cache instance to
   query. Dispatch must not assume handles from different devices are interchangeable.
 - Multi-GPU layout: `layer_device` maps dense layers, `expert_device` maps MoE
-  experts. KV cache co-locates with the dense weights of each layer (`kv_device`).
+  experts. Each KV cache slot co-locates with the dense weights of the layer that executes it (`kv_device`, keyed
+  by slot). A looped model runs one weight layer for several slots (`layer_phys`, the slot-to-layer map libllama
+  names in the inventory; empty when every slot is its own layer), and the layer is charged for each of its slots.
 
 ### 7.3 Multi-context / Multi-server slot
 

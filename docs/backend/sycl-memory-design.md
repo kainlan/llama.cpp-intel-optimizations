@@ -35,8 +35,9 @@ canonical contract §1 for the formal version):
 
 1. **Planner** (`compute_placement_plan` → `placement_plan`) — the sole
    authority for *deciding where memory lives*. Runs once at model-load time and
-   produces a plan covering dense weights, MoE experts, KV cache (per layer),
-   and oneDNN scratch, assigning each to a device and a VRAM zone.
+   produces a plan covering dense weights, MoE experts, KV cache (per slot,
+   where the layer that executes the slot lives), and oneDNN scratch, assigning
+   each to a device and a VRAM zone.
 
 2. **Unified cache** (`ggml_sycl::unified_cache`) — the sole *allocator and
    owner* of backend memory. Holds the tiered weight cache (device VRAM / pinned

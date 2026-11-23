@@ -127,22 +127,23 @@ HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == devic
 
 
 # The indexer widths follow n_ctx_context; the context's provenance is appended after them (llama.cpp-7fmt, pinned by
-# test-sycl-ctx-hint-default-source), and the named micro-batch after that, in the provenance's padding (pinned by
-# test-sycl-explicit-ubatch-placement-source), so the struct no longer ends here.
+# test-sycl-ctx-hint-default-source), the named micro-batch after that, in the provenance's padding (pinned by
+# test-sycl-explicit-ubatch-placement-source), and the slot-to-layer map after that (pinned by
+# test-sycl-kv-slot-layer-source), so the struct no longer ends here.
 FIELD = ("uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; "
-         "uint32_t n_ubatch_context; };")
+         "uint32_t n_ubatch_context; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; };")
 READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
 )
-KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
-KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t layer_id) const"
-AT_ADDS = "+ kv_idx_bytes_for_layer_at(il, ctx);"
-SIZE_ADDS = "+ kv_idx_size_for_layer(layer_id);"
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const"
+KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t slot) const"
+AT_ADDS = "+ kv_idx_bytes_for_layer_at(slot, ctx);"
+SIZE_ADDS = "+ kv_idx_size_for_layer(slot);"
 PLAN_COPY = "plan.layer_idx_k_width = kv_info.layer_idx_k_width;"
 HINT = ("const uint32_t widths = kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer] + "
         "kv_info.idx_k_width(layer);")
@@ -156,8 +157,8 @@ HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\"
 
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
-    """The field follows n_ctx_context (with only the context's provenance after it), the backend copies it, and the
-    consumer pins the layout."""
+    """The field follows n_ctx_context (with only the context's provenance, the named micro-batch and the slot-to-layer
+    map after it), the backend copies it, and the consumer pins the layout."""
     n = norm(sycl_cpp)
     return FIELD in norm(header) and READ in n and all(a in n for a in LAYOUT)
 

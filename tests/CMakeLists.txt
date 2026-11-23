@@ -4831,6 +4831,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# A KV cache slot lives where the weight layer that executes it lives: libllama names each slot's layer
+# (llama_model::layer_phys) in the inventory, the backend takes the map once at intake (identity kept empty, a map that
+# does not fit refused at WARN), and both planners key KV by slot, so a looped model's later slots (Inkling 2 Mini's
+# 24..47) go to their layer's device and are charged there. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-slot-layer-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-slot-layer-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # The window ring's room is held in the WEIGHT zone before the routed experts: the ring reserves its slots from that
 # zone at every prompt, and an expert loan cannot fund a slot larger than every lendable matrix, so a room the planner
 # left is what lets the ring engage at default placement. The room is the shared ring geometry over the pack the

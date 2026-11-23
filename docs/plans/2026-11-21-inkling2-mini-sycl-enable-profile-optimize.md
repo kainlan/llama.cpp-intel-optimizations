@@ -4242,7 +4242,7 @@ FLASH_ATTN_EXT and 48 SET_ROWS nodes that touch slots 24..47 run on the CPU (48 
 that executes it, so the slot's KV lives where that layer's weights live, and the layer pays for every slot it
 executes.
 - The model transports the map: one physical layer id per slot, beside the per-slot arrays it already builds.
-  For every other architecture the map is the identity and nothing changes.
+  The map is the identity for every architecture whose slots are its layers; nanbeige and metis16 also loop.
 - The planner keys KV by slot: `kv_device` has an entry for every slot, the charge for a layer is the sum of
   `kv_bytes_for_layer(slot)` over its slots, and the KV phase, the context room, the block KV owner and the
   log lines iterate slots. A layer whose slots do not all fit keeps the ones that do only if the existing
