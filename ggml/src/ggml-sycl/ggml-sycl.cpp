@@ -15447,7 +15447,16 @@ bool ggml_backend_sycl_try_register_weight_usage(const char * tensor_name, ggml_
             return false;
         }
 
-        const tensor_usage mapped = ggml_sycl_usage_from_api(usage);
+        tensor_usage mapped = ggml_sycl_usage_from_api(usage);
+        // The loader registers an expert family's usage from the family alone, so an expert's per-expert scale
+        // arrives as MOE_EXPERT_WEIGHT. For a per-expert scale, store the class the name rule gives it, the one the
+        // planner placed it by: the S1 preload reads this row and must stage the scale's dense entry, not skip it as
+        // an expert matrix. A family's .bias is still stored as MOE_EXPERT_WEIGHT while the name rule gives it
+        // MOE_INTERMEDIATE, so the two classifiers disagree on it (owed: "Tracker tasks owed" in
+        // docs/plans/2026-11-21-inkling2-mini-sycl-enable-profile-optimize.md).
+        if (mapped == tensor_usage::MOE_EXPERT_WEIGHT && ggml_sycl_moe_expert_scale_name(tensor_name)) {
+            mapped = tensor_usage::MOE_INTERMEDIATE;
+        }
         if (mapped == tensor_usage::UNKNOWN) {
             return true;
         }
