@@ -27,6 +27,10 @@
 // and main reserves each again as a load's start would, so the arms find the arenas the caches were made with. Every
 // device, arena and cache these comments name is one of the devices the scheduler sees, the ones the release of the
 // last model walks; on a two-card host that shows the scheduler one device, device 1's cache is outside them.
+// Every load that main and the arms stage of the Qwen3.8-shaped inventory maps its file (mapped_qwen38_inventory), so
+// the stage's loader-pool refusal refuses none of them, whatever the host's budget, but arm (l)'s, which stages the
+// unmapped inventory and scores that refusal. A load it refuses releases every arena nothing holds, as (k)'s last end
+// does, so (l) runs after (k), and before (g).
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -62,6 +66,16 @@ constexpr uint64_t MiB = 1024ull * 1024ull;
 constexpr uint64_t GiB = 1024ull * MiB;
 
 const char * const k_prefix = "[PLAN-DRY-RUN]";
+
+// The Qwen3.8-shaped inventory of a load that maps its file (use_mmap_resolved), the form of every staged load of that
+// shape but arm (l)'s. Its host weights are the file's pages, so the loader's SYCL_Host buffer holds none of them and
+// the plan is charged no loader term: the stage's loader-pool refusal, which (l) scores on the unmapped inventory,
+// cannot refuse these loads on a host whose budget is below that pool. The stage only plans the inventory, so no file
+// stands behind it. The dry-run-only arms (0) and (b) keep the unmapped inventory: a dry run refuses nothing, and (b)
+// scores the loader's terms.
+struct mapped_qwen38_inventory : loader_inventory {
+    mapped_qwen38_inventory() : loader_inventory(qwen38_shape) { inv.use_mmap_resolved = true; }
+};
 
 // The captured lines that contain `a`, and `b` too when it is given, in the order they were logged.
 std::vector<std::string> lines_with(const char * a, const char * b = nullptr) {
@@ -327,8 +341,8 @@ unified_cache * device0_arena_cache() {
 // (the host weights, and with them expected_host, move); the dry run computing a budget from the sample other than the
 // stage's (the budgets differ with nothing moved).
 arm_result arm_a_expected_host_is_the_stage_figure() {
-    arm_result       r;
-    loader_inventory inv(qwen38_shape);
+    arm_result              r;
+    mapped_qwen38_inventory inv;
 
     ggml_sycl_load_txn txn{};
     if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
@@ -694,9 +708,9 @@ arm_result arm_b_every_term_printed_from_the_plan() {
 // B0); the restore dropped (a global reads what the dry run wrote, not its sentinel); the refusal dropped (the dry run
 // plans inside the transaction and returns OK).
 arm_result arm_c_a_dry_run_stores_nothing() {
-    arm_result       r;
-    loader_inventory inv(qwen38_shape);
-    const uint64_t   B0 = 4096;
+    arm_result              r;
+    mapped_qwen38_inventory inv;
+    const uint64_t          B0 = 4096;
 
     ggml_sycl_load_txn staged{};
     if (ggml_backend_sycl_model_load_begin(&staged) != GGML_SYCL_LIFECYCLE_OK) {
@@ -1075,7 +1089,7 @@ arm_result arm_e_held_arena_refuses_the_load() {
         void_arm(r, "the sentinel planner state or load terms did not read back, so no check below has a reference");
         return r;
     }
-    loader_inventory        fits(qwen38_shape);
+    mapped_qwen38_inventory fits;
     std::vector<mem_handle> held;  // released at the end of the arm
     bool                    arenas_held = false;
     const staged_early_load sizing      = stage_early_and_end(fits.inv, [&]() { arenas_held = hold_arenas(held); });
@@ -1129,7 +1143,7 @@ arm_result arm_e_held_arena_refuses_the_load() {
            "after the control load's uncommitted end a ring KV-zone slot, row byte, micro-batch or oneDNN pair term "
            "reads that load's value, not its sentinel");
 
-    loader_inventory too_big(qwen38_shape);
+    mapped_qwen38_inventory too_big;
     too_big.inv.pp_moe_onednn_weight_slot_bytes = runtime_capacity + 256 * MiB;
     too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
     too_big.inv.pp_moe_onednn_ring_depth        = 1;
@@ -1273,7 +1287,7 @@ arm_result arm_f_early_refusal_keeps_the_kv_zone_ring() {
         return r;
     }
 
-    loader_inventory too_big(qwen38_shape);
+    mapped_qwen38_inventory too_big;
     too_big.inv.pp_moe_onednn_weight_slot_bytes = cache->zone_capacity(vram_zone_id::RUNTIME) + 256 * MiB;
     too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
     too_big.inv.pp_moe_onednn_ring_depth        = 1;
@@ -1391,7 +1405,7 @@ arm_result arm_h_load_releases_a_lone_ring() {
         return r;
     }
 
-    loader_inventory too_big(qwen38_shape);
+    mapped_qwen38_inventory too_big;
     too_big.inv.pp_moe_onednn_weight_slot_bytes = cache->zone_capacity(vram_zone_id::RUNTIME) + 256 * MiB;
     too_big.inv.pp_moe_onednn_scratch_bytes     = too_big.inv.pp_moe_onednn_weight_slot_bytes;
     too_big.inv.pp_moe_onednn_ring_depth        = 1;
@@ -1597,7 +1611,7 @@ void read_first_load_zones() {
         g_first_load_zones_void = "device 0's first arena was not read";
         return;
     }
-    loader_inventory        fits(qwen38_shape);
+    mapped_qwen38_inventory fits;
     bool                    active_inside = false;
     arena_zone_capacities   inside;
     const staged_early_load first = stage_early_and_end(fits.inv, [&]() {
@@ -1673,10 +1687,10 @@ arm_result arm_i_graph_floor_keeps_an_allocation_held_arena() {
         void_arm(r, "device 0 has no cache, so nothing can hold its arena's zones");
         return r;
     }
-    const char * const kept_warn = "[VRAM-ARENA] device 0 keeps its ONEDNN zone of ";
-    const char * const refused   = "[SYCL-PLAN] model load refused on device 0: ";
-    loader_inventory   small(qwen38_shape);
-    loader_inventory   large(qwen38_shape);
+    const char * const      kept_warn = "[VRAM-ARENA] device 0 keeps its ONEDNN zone of ";
+    const char * const      refused   = "[SYCL-PLAN] model load refused on device 0: ";
+    mapped_qwen38_inventory small;
+    mapped_qwen38_inventory large;
     small.inv.n_head_ctx_max = 8;
     large.inv.n_head_ctx_max = 2048;
     // Why the put-back check did not engage, if it did not: the arm is VOID for it at its end, after every FAIL.
@@ -1871,7 +1885,7 @@ arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
         return r;
     }
 
-    loader_inventory grown(qwen38_shape);
+    mapped_qwen38_inventory grown;
     grown.inv.pp_moe_onednn_weight_slot_bytes = g_first_zones.runtime + 256 * MiB;
     grown.inv.pp_moe_onednn_scratch_bytes     = grown.inv.pp_moe_onednn_weight_slot_bytes;
     grown.inv.pp_moe_onednn_ring_depth        = 1;
@@ -1896,14 +1910,14 @@ arm_result arm_j_refused_load_leaves_nothing_sized_for_it() {
         // The hook fires only when a stage reaches it, so it may still be armed: the plain inventory's stage reaches
         // it, in a load of its own.
         put_back();
-        loader_inventory plain(qwen38_shape);
+        mapped_qwen38_inventory plain;
         (void) stage_early_and_end(plain.inv);
         void_arm(r, "load A's armed early pass returned " + num(a_stage) + ", not EFFECT_FAILED");
         return r;
     }
 
     // Load B plans from what A's release left, so the sentinels stay until after its end.
-    loader_inventory                 fits(qwen38_shape);
+    mapped_qwen38_inventory          fits;
     ggml_sycl_load_txn               b{};
     const ggml_sycl_lifecycle_result b_begin       = ggml_backend_sycl_model_load_begin(&b);
     const bool                       b_active      = cache->arena_active();
@@ -2014,7 +2028,7 @@ arm_result arm_k_load_start_runs_the_deferred_release() {
         return r;
     }
 
-    loader_inventory grown(qwen38_shape);
+    mapped_qwen38_inventory grown;
     grown.inv.pp_moe_onednn_weight_slot_bytes = g_first_zones.runtime + 256 * MiB;
     grown.inv.pp_moe_onednn_scratch_bytes     = grown.inv.pp_moe_onednn_weight_slot_bytes;
     grown.inv.pp_moe_onednn_ring_depth        = 1;
@@ -2145,6 +2159,94 @@ arm_result arm_k_load_start_runs_the_deferred_release() {
         expect(r, l3_scatter == scatter,
                "load L3's begin put device 1's terms back (scatter " + num(l3_scatter) + ", want " + num(scatter) +
                    "), though its cache carried no mark");
+    }
+    return r;
+}
+
+// (l) A plan whose loader pool cannot fit its host budget refuses the load by name, and one whose pool fits is
+// admitted: the stage decides on the plan's own figures. The Qwen3.8-shaped inventory as the loader fills it for a load
+// that maps no file, with evictable weights (the default): the loader holds the host weights in its SYCL_Host buffer,
+// so the plan is charged the loader term, and the early pass refuses the load when the plan's commit total exceeds the
+// budget (placement_plan_loader_pool_refusal). The arm takes its expectation from the plan line the planner prints for
+// the plan the stage judges, the last device's ([HOST-LEDGER] device=N plan host_budget=...): the commit total is the
+// sum of the line's weight, kv, staging, scratch, runtime, rounding and loader_grown, and the load is refused exactly
+// when the line's loader_zone is not 0 (the plan was charged the term) and that total exceeds its host_budget. So it
+// scores either outcome on any host, whatever its MemAvailable:
+//   refused:  the stage returns PLAN_REJECTED after one ERROR naming loader-pool-over-budget from the early pass, whose
+//             total, host_budget, loader_zone and loader_grown are the plan line's;
+//   admitted: the stage returns OK and logs no such ERROR.
+// A budget the arm fixed would make one leg certain, but neither the inventory nor the envelope carries one; the one
+// input that caps it, GGML_SYCL_HOST_RESERVE_MB, is the process's environment, which arm (d) needs unset. The load ends
+// uncommitted. With no model live a refused load's abort releases every arena nothing holds, as arm (k)'s last end
+// leaves them, so the arm runs after (k) and before (g).
+// Engagement: the load began, and its stage logged a plan line carrying every term.
+// Mutants: the refusal dropped (a charged plan over its budget stages OK); the refusal judged on another figure than
+// the commit total, host_planned_bytes or a total without loader_grown (its printed total is not the line's sum, or the
+// outcome is not the one the line gives); the refusal taken for a plan not charged the term or within its budget
+// (PLAN_REJECTED where the line admits); the ERROR printed without its figures, or from the other pass.
+// Not seen: an early stage creates no tensor, so the admitted leg cannot show the loader's buffers then fitting the
+// pool without a WEIGHT-zone grow; that is sycl-loader-in-place-terms' replay, and a full load's.
+arm_result arm_l_loader_pool_over_budget_refuses_the_load() {
+    arm_result       r;
+    loader_inventory inv(qwen38_shape);  // maps no file, so the loader's buffer holds the host weights
+
+    ggml_sycl_load_txn txn{};
+    if (ggml_backend_sycl_model_load_begin(&txn) != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the load transaction did not begin");
+        return r;
+    }
+    log_clear();
+    const ggml_sycl_lifecycle_result rc      = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
+    const std::vector<std::string>   plans   = lines_with("[HOST-LEDGER] device=", " plan host_budget=");
+    const std::vector<std::string>   refused = lines_with("[HOST-PLAN] load refused: loader-pool-over-budget ");
+    (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
+    if (plans.empty()) {
+        void_arm(r, "the stage returned " + num(rc) + " and logged no plan line, so there is no plan to judge");
+        return r;
+    }
+    // Each device's early plan replaces the one before it as the load's candidate, which the stage judges.
+    const std::string & plan    = plans.back();
+    const char * const  terms[] = { "weight", "kv", "staging", "scratch", "runtime", "rounding", "loader_grown" };
+    size_t              total   = 0;
+    for (const char * term : terms) {
+        const size_t bytes = printed(plan, term);
+        if (bytes == SIZE_MAX) {
+            void_arm(r, std::string("the plan line carries no ") + term + ": " + plan);
+            return r;
+        }
+        total += bytes;
+    }
+    const size_t budget       = printed(plan, "host_budget");
+    const size_t loader_zone  = printed(plan, "loader_zone");
+    const size_t loader_grown = printed(plan, "loader_grown");
+    if (budget == SIZE_MAX || loader_zone == SIZE_MAX) {
+        void_arm(r, "the plan line carries no host_budget or loader_zone: " + plan);
+        return r;
+    }
+    const std::string figures = "commit total " + num(total) + ", host_budget " + num(budget) + ", loader_zone " +
+                                num(loader_zone) + ", loader_grown " + num(loader_grown);
+    if (loader_zone > 0 && total > budget) {
+        expect(r, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+               "a plan charged the loader term over its budget (" + figures + ") staged " + num(rc) +
+                   ", not PLAN_REJECTED");
+        expect(r, refused.size() == 1,
+               "the over-budget plan (" + figures + ") logged " + num(refused.size()) +
+                   " loader-pool-over-budget refusals, want 1");
+        if (refused.size() == 1) {
+            const std::string & line = refused[0];
+            expect(r,
+                   printed(line, "total") == total && printed(line, "host_budget") == budget &&
+                       printed(line, "loader_zone") == loader_zone && printed(line, "loader_grown") == loader_grown,
+                   "the refusal's figures are not the plan line's (" + figures + "): " + line);
+            expect(r, line.find("(early=1)") != std::string::npos, "the refusal is not the early pass's: " + line);
+        }
+    } else {
+        expect(r, rc == GGML_SYCL_LIFECYCLE_OK,
+               "a plan whose loader pool fits its budget, or that is not charged the term (" + figures + "), staged " +
+                   num(rc) + ", not OK");
+        expect(r, refused.empty(),
+               "a plan within its budget (" + figures +
+                   ") logged a loader-pool-over-budget refusal: " + (refused.empty() ? std::string() : refused[0]));
     }
     return r;
 }
@@ -2337,6 +2439,7 @@ int main() {
         { "(i) a Graph floor keeps an allocation-held arena",    arm_i_graph_floor_keeps_an_allocation_held_arena },
         { "(j) a refused load leaves nothing sized for it",      arm_j_refused_load_leaves_nothing_sized_for_it   },
         { "(k) a load's start runs a deferred release",          arm_k_load_start_runs_the_deferred_release       },
+        { "(l) a loader pool over its budget refuses the load",  arm_l_loader_pool_over_budget_refuses_the_load   },
         { "(g) a refused late pass configures no host zone",     arm_g_refused_late_pass_configures_no_host_zones },
     };
     int passed = 0, failed = 0, voided = 0;
