@@ -47,7 +47,10 @@ THE CONTRACT.  With comments blanked:
      hook; dpct's host_buffer, which no backend source reaches).  The Q1/NVFP4 direct
      route's host tasks on its exact queue (the stream) are recorded: each submit is
      assigned to an event, and the statement right after it is
-     unified_cache_note_host_task(*exact_queue, <that event>).  So is the join of a mixed
+     unified_cache_note_host_task(*exact_queue, <that event>).  The one statement allowed
+     between them is the terminal task's `terminal_submitted = true;`: a bool store
+     submits nothing, and the flag must be set before the record, which can throw, or the
+     catch would move the host leg the submitted task resets.  So is the join of a mixed
      batch's host leg (ggml_sycl_moe_direct_host_join), on the stream it is handed:
      unified_cache_note_host_task(queue, joined).  The test programs under ggml-sycl/tests are not backend
      code and are not censused.
@@ -321,7 +324,8 @@ Q1_HOST_JOIN_SUBMIT = "queue.submit("
 
 def check_q1_direct_recorded(code: str, host_task_pos: int) -> None:
     """The direct route's host task at `host_task_pos` is recorded right after its submit returns."""
-    check_recorded_after_submit(code, host_task_pos, Q1_DIRECT_SUBMIT, "*exact_queue", "Q1/NVFP4 direct host task")
+    check_recorded_after_submit(code, host_task_pos, Q1_DIRECT_SUBMIT, "*exact_queue", "Q1/NVFP4 direct host task",
+                                flag_event="terminal_task")
 
 
 def check_q1_host_join_recorded(code: str, host_task_pos: int) -> None:
@@ -329,9 +333,11 @@ def check_q1_host_join_recorded(code: str, host_task_pos: int) -> None:
     check_recorded_after_submit(code, host_task_pos, Q1_HOST_JOIN_SUBMIT, "queue", "Q1/NVFP4 direct host-leg join")
 
 
-def check_recorded_after_submit(code: str, host_task_pos: int, submit: str, queue: str, what: str) -> None:
+def check_recorded_after_submit(code: str, host_task_pos: int, submit: str, queue: str, what: str,
+                                flag_event: str | None = None) -> None:
     """The host task at `host_task_pos`, submitted by the nearest `submit` before it into an event, is recorded on
-    `queue` with that event as the statement right after the submit."""
+    `queue` with that event as the statement right after the submit. For `flag_event` alone, the terminal task's
+    `terminal_submitted = true;` may come first: it submits nothing, and it must precede a record that can throw."""
     at = code.rfind(submit, 0, host_task_pos)
     line = line_of(code, host_task_pos)
     target = re.search(r"(?:sycl::event\s+)?(\w+)\s*=\s*$", code[max(0, at - 200) : at])
@@ -353,8 +359,9 @@ def check_recorded_after_submit(code: str, host_task_pos: int, submit: str, queu
     event = target.group(1)
     rest = code[close + 1 :] if close >= 0 else ""
     queue_re = r"\*\s*" + re.escape(queue[1:]) if queue.startswith("*") else re.escape(queue)
-    note = (r"\s*;\s*ggml_sycl::unified_cache_note_host_task\s*\(\s*" + queue_re + r"\s*,\s*" + re.escape(event) +
-            r"\s*\)\s*;")
+    flag = r"(?:\s*terminal_submitted\s*=\s*true\s*;)?" if event == flag_event else ""
+    note = (r"\s*;" + flag + r"\s*ggml_sycl::unified_cache_note_host_task\s*\(\s*" + queue_re + r"\s*,\s*" +
+            re.escape(event) + r"\s*\)\s*;")
     if close < 0 or not re.match(note, rest):
         fail("G", f"the {what} at ggml-sycl.cpp:{line} is not recorded on its stream right after its "
              f"submit returns (want unified_cache_note_host_task({queue}, {event}) as the next statement)")
@@ -647,6 +654,8 @@ def self_test(s: dict) -> int:
         ("G", "backend", "Q1/NVFP4 direct terminal records another event",
          sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);",
              "ggml_sycl::unified_cache_note_host_task(*exact_queue, final);")),
+        ("G", "backend", "Q1/NVFP4 direct terminal has another statement before its record",
+         sub(r"terminal_submitted = true;", "terminal_submitted = true; (void) 0;")),
         ("G", "backend", "Q1/NVFP4 injected terminal not recorded",
          sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, final\);", ";")),
         ("G", "backend", "Q1/NVFP4 host-leg join not recorded",
