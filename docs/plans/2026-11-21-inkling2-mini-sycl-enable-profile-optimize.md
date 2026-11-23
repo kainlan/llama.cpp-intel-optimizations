@@ -4172,6 +4172,55 @@ by a GPU kernel.
 **Not in this task:** a secondary card (Task 8d), the CPU expert pool for these types, the rate-table row, the
 speed of the host leg.
 
+**Checkpoint result (implementer, read-only, 2026-11-22) and what it corrects above:**
+- A host expert never reaches the pointer table today: `make_moe_batch_local_view` refuses any operand that is
+  not PRIMARY, so the block declines at `step=retained_table`. The upload needs `on_device`. A slot that was
+  written once and whose handle was dropped later can still hold the old pointer. The kernel
+  (`mul_mat_vec_q_id`) reads `expert_ptrs[expert_id]` with no null check and no range check.
+- The ids are already on the host on both paths (decode: `ggml_sycl_copy_ids_to_host`, an existing wait;
+  prompt: `prompt_ids_snapshot`). The activation rows are not: the host leg needs one D2H copy of the unique
+  token rows of `activation_f32`. `ggml_sycl_cpu_moe_host_aos_execute` needs no change.
+- The plan's host recipe workspace (`moe_host_recipe_workspace_bytes`, `max(n_expert_used, 1) * 512` rows)
+  covers a prompt micro-batch.
+- The sentence above about the hybrid decode record build is wrong: that build is not reached for Q1_0 or
+  NVFP4 at all (`moe_decode_direct_request_admissible` rejects the dedicated-route types first). It does not
+  change in this task.
+- Four gaps outside the first file scope: the workspace registry's `admit` demands a device binding for every
+  occurrence and derives the token count from the binding count (G1); the local view refuses a HOST operand
+  (G2); the bind loop and the queue-capability loop walk every operand (G3); the direct block has no flush of
+  another node's pending host scatter before it reads `src1` (G4).
+
+**Rulings (lead, 2026-11-22):**
+- *Table invariant.* A slot of the expert pointer table is null or a pointer its owner holds a lease for.
+  The device table is zeroed when it is created, every site that drops a slot's handle nulls the slot, and a
+  HOST operand's slot is null with no handle. The retained table is not re-uploaded per token.
+- *An occurrence the device kernel does not compute is written as a quiet NaN.* This covers a null slot and
+  an out-of-range id, and it amends "leaves that output row alone" above: the host leg's scatter is ordered
+  after the output copy and overwrites the host rows, and a row nobody writes is seen. The two things the
+  first ruling forbids still hold: no host row computed from another expert, no read through a host pointer.
+  The checks are a compile-time property of the Q1_0/NVFP4 instantiation; the kernel images of the other
+  callers of `mul_mat_vec_q_id` do not change.
+- *No inherited wait.* If the input marker is not in play, a batch with a host operand declines before
+  admission with `step=host_input_marker` and names the knob.
+- *No abort.* Every host task is validated on the submitting thread first (a refusal is a named decline). A
+  failure inside the worker fails the graph at its boundary through the path Task 7a built; if that path
+  cannot carry it, the worker writes NaN and prints one ERROR line.
+- *Scatter.* The block joins its own job and submits the H2D of the host rows inside its own `try`, with the
+  terminal on the last of them and the leases released in the terminal's host task. The block flushes a
+  pending host scatter before its activation copy, where the other routes do. The flush's
+  `GGML_ABORT("Deferred scatter failed")` is replaced by a failed graph if every caller can propagate one.
+- *Scope expanded* to `ggml/src/ggml-sycl/moe-mmid-workspace.{hpp,cpp}` and
+  `ggml/src/ggml-sycl/moe-resolved-batch.hpp`: `workspace_admission_shape` carries the token count, the
+  bindings are the card occurrences with their batch occurrence index (strictly increasing, below
+  `tokens * top_k`), the view skips HOST operands, and a host operand never enters the table owner's retain.
+- *All-host batches* stay on the retained core.
+- *Test seam.* The mixed fixture gets its host experts from the placement planner under a forced budget, and
+  fails (not skips) when the planner gives none or all. A test-only hook only if the planner cannot give a
+  deterministic split, with the reason. Adapter-device cases call the adapter directly: card rows equal the
+  CPU oracle, a null slot's row and an out-of-range id's row are NaN, a never-written slot is null.
+- *Reported, not fixed here:* the number of per-node host workspaces that can be live at once in one decoded
+  token on the B50.
+
 ---
 
 ### Task 8d: Experts on the second card (recorded 2026-11-22)
@@ -4242,7 +4291,8 @@ FLASH_ATTN_EXT and 48 SET_ROWS nodes that touch slots 24..47 run on the CPU (48 
 that executes it, so the slot's KV lives where that layer's weights live, and the layer pays for every slot it
 executes.
 - The model transports the map: one physical layer id per slot, beside the per-slot arrays it already builds.
-  The map is the identity for every architecture whose slots are its layers; nanbeige and metis16 also loop.
+  The map is the identity for every architecture whose slots are its layers; nanbeige, metis16 and hrm_text
+  also loop (their maps are written from their graph builders and have not been run on a model).
 - The planner keys KV by slot: `kv_device` has an entry for every slot, the charge for a layer is the sum of
   `kv_bytes_for_layer(slot)` over its slots, and the KV phase, the context room, the block KV owner and the
   log lines iterate slots. A layer whose slots do not all fit keeps the ones that do only if the existing
@@ -4353,22 +4403,135 @@ flat `scale_f32` counts elements in an `int`.
 
 ---
 
-### Task 8g: BF16 experts have a device kernel (recorded 2026-11-22)
+### Task 8g: BF16 experts have a device kernel (written 2026-11-22)
 
-**Found by:** the scheduler print: the 8 `MUL_MAT_ID` nodes of `blk.20..23` (`ffn_gate_up_exps` 1296 MB,
-`ffn_down_exps` 648 MB, BF16) run on the CPU, and their SiTU chain (16 SCALE, 8 TANH, 8 MUL, 4 SIGMOID) is
-dragged there with them: 4 CPU splits per token.
-**Read (explorer):** the indexed-ops block of `supports_op` declines on
-`!moe_mmvq_admission_supports_type(BF16) && !ggml_sycl_moe_pp_batched_admits_op`. The device expert tables
-(`moe-mmvq-tables.hpp`) list the quantized types and MXFP4; F32, F16 and BF16 are absent, and the "f16 arm"
-dequantizes quantized experts into F16, it is not an F16 weight route. A dense BF16 `MUL_MAT` weight does run
-on the card. Not resolved: the CPU `MUL_MAT_ID` reads weights the print shows as `[SYCL0]` with no copy in the
-split's inputs.
-**Direction (lead):** a kernel for the layout the weight is in: BF16 experts through an indexed matvec on the
-card (decode) and an indexed matmul for a prompt batch, taking the expert slices where they are. Not written
-out: it is the one cause that needs a new kernel, it removes 4 of 141 CPU splits, and Stage 2's profile says
-what those four cost. The unresolved read above is settled first.
-**Done when:** written to the Task Detail Standard after the profile, or dropped by it with the reason recorded.
+**Track:** M (kernels). **Depends on:** Tasks 8b and 8e (merged); branch from `feat/inkling2` at `70292d66e`.
+Runs beside Task 8c, which edits the same direct block: see Gotchas.
+
+**Found by:** the scheduler print. The 8 `MUL_MAT_ID` nodes of `blk.20..23` (`ffn_gate_up_exps` 1296 MB,
+`ffn_down_exps` 648 MB, BF16, AOS, on the card) run on the CPU, and their SiTU chain (16 SCALE, 8 TANH, 8 MUL,
+4 SIGMOID) is dragged there with them: 4 CPU splits per token. With Task 8e merged they are expected to be the
+only CPU splits left.
+
+**Why now, and not after the profile as first recorded.** The first profile (one run, B70, 24 tokens,
+`GGML_SYCL_E2E_TG_PROFILE=1`, tree `0f4060d0f`) says one decoded token is 8076 graph nodes and about 5424 SYCL
+dispatches at about 25 us of host time each, 172 ms of a 245 ms token. The log says
+`replay futility: fragmented-split detected on device 0 ... disabling command-graph record/replay for this
+context`. So the cost is the per-op dispatch, and what removes it is replay, which a fragmented token graph
+turns off. Hypothesis, read and not measured: the decode gain is a step at zero CPU splits. Task 8e removes 48
+of the 52 and this task removes the last 4. Caveat already read: every decode `MUL_MAT_ID` throws under graph
+recording ("MoE host routing incompatible with graph recording"), so the MoE ops stay direct boundaries and
+only the segments between them replay.
+
+**Description (read by an explorer in the integ tree; names, not line numbers, because Task 8e moved them):**
+- The MoE block of `supports_op` for `GGML_OP_MUL_MAT_ID` declines unless
+  `moe_mmvq_admission_supports_type(type)` or `ggml_sycl_moe_pp_batched_admits_op(op, device)`.
+  `moe_mmvq_admission_supports_type` (`moe-mmvq-tables.hpp`) admits 20 quantized types; F32, F16 and BF16 are
+  not in it, and MMVQ cannot take them because it quantizes the activation to Q8_1. Residency plays no part in
+  that gate.
+- No expert-selected float kernel exists on the device. A dense BF16 `MUL_MAT` weight does run on the card:
+  `ggml_sycl_mul_mat_bf16_weight` -> `ggml_sycl_bf16::mul_mat_bf16_f32` (`mul-mat-bf16.hpp`), with
+  `launch_skinny<N>` for up to 8 columns and `launch_tiled` otherwise, converting with
+  `ggml_sycl_bf16::bf16_to_f32(uint16_t bits)` (`sycl::bit_cast<float>(uint32_t(bits) << 16)`). BF16 to F16 is
+  not exact.
+- Route order inside `ggml_sycl_mul_mat_id`: scheduler stub; the decode direct MMVQ dispatch; prompt paths; the
+  graph-recording throw; MXFP4 pair-GLU; the retained decode admission (`ggml_sycl_build_moe_resolved_batch`,
+  which throws "MUL_MAT_ID retained decode admission failed" when `ggml_sycl_moe_query_route_capability`
+  answers `local-layout-unsupported`, which is what BF16 gets); the Q1_0/NVFP4 direct route
+  (`mmvq_submit_q1_nvfp4_aos_id_admitted`); hybrid GPU+CPU; the standard route.
+- The direct route's machinery is mostly type-agnostic: the pointer table is one `void *` per expert, and an
+  AOS expert's address is `tensor_offset + expert * tensor->nb[2]`
+  (`ggml_sycl_publish_backend_aos_expert_handles`, gated by `moe_aos_expert_publication_wanted`). What names
+  the two types: `moe_type_needs_direct_kernel` (`moe-resolved-batch.hpp`), `plan_moe_q1_nvfp4_device_workspace`,
+  the planner's pool scoping in `plan_moe_mmid_workspaces`, and `moe_mmid_plan_workspace`, which is shape-only
+  but demands `ne10 % 32 == 0 && ne01 % 32 == 0`.
+- The graph: the gate_up `MUL_MAT_ID` reads `src1 = [n_embd, 1, n_tokens]`; two strided views of its output go
+  through SiTU; the down `MUL_MAT_ID` reads `src1 = [n_ff, n_expert_used, n_tokens]`. With both `MUL_MAT_ID`
+  nodes on the card, the SCALE, TANH, SIGMOID and MUL nodes between them return to the card by themselves.
+- `tests/test-backend-ops.cpp` already has BF16 `MUL_MAT_ID` cases, some with a dimension that is not a
+  multiple of 32.
+- Contracts that pin the admitted type set or the direct route's two types and so move with this task:
+  `tests/test-sycl-moe-mmvq-tables.cpp` (the 20-type list, BF16 pinned out),
+  `tests/test-sycl-mmid-admission-source.py`, `tests/test-sycl-supports-op-indexed-moe-source.py` (the exact
+  gate line), `tests/test-sycl-moe-pp-batched-types-source.py`, `tests/test-sycl-moe-stream-enqueue-source.py`
+  and `tests/test-sycl-staged-ring-route-source.py` (`moe_type_needs_direct_kernel`),
+  `tests/test-sycl-canonical-aos-expert-handles-source.py`, `tests/test-sycl-moe-resolved-batch-source.py`,
+  `ggml/src/ggml-sycl/tests/test-q1-nvfp4-direct-mmvq.cpp`.
+
+**Ruling (lead, 2026-11-22): a BF16 arm of the admitted direct route.** The weight is loaded BF16, AOS, on the
+card; the kernel reads it there.
+- A new submitter beside `mmvq_submit_q1_nvfp4_aos_id_admitted`, in its own file. It reads the expert pointer
+  from the retained table by the id it reads on the device from the ids tensor, reads the activation row from
+  `activation_f32` where it is, converts each weight with `bf16_to_f32`, accumulates in F32 and writes the
+  output row. Decode (`ne12 == 1`) and a prompt batch (`ne12 > 1`) are one kernel.
+- No Q8_1 activation, no dequantized or F16 copy of the weights, no staging copy, no per-expert host loop, no
+  host read of the ids for the device leg, no host wait. The submitter returns its event the way the
+  Q1_0/NVFP4 submitter does, and a failure reaches the graph boundary through the same path.
+- The MMVQ tables do not change: a float type is not an MMVQ type. `supports_op` gets a named predicate for
+  the float direct route beside the MMVQ term.
+- `supports_op` admits a BF16 `MUL_MAT_ID` only where this route can run it: the shapes the kernel takes, and
+  every expert of the tensor on this context's device. A BF16 expert tensor with any expert on the host or on
+  the other card stays where it runs today (the CPU). That mix is owed after Task 8c, which builds the mixed
+  executor for the direct route; it is recorded, not done here.
+- A slot the kernel cannot read (null, or an id out of range) gives a NaN row, as Task 8c rules for the
+  Q1_0/NVFP4 kernel. Nothing reads through a null slot.
+- The kernel does not inherit the 32-multiple shape rule unless it needs it. If the route's workspace
+  machinery demands a workspace this kernel does not use, the checkpoint says so and proposes the smallest
+  change; a shape the route cannot take is declined in `supports_op`, never refused inside the op.
+- Rejected: an arm in `mmvq_moe_batched_dispatch` (it contradicts the tables' invariant and has the widest
+  surface); one dense BF16 kernel launch per (token, slot) through `src0_row` (it needs the ids on the host,
+  which is a wait, and it is one launch per occurrence).
+
+**Checkpoint before any code (report to the lead, then wait):**
+1. How the CPU backend reads these experts today, given that the scheduler print shows them as `[SYCL0]` with
+   no copy in the split's inputs: is there a host mirror, and does it stay allocated once the node runs on the
+   card?
+2. Whether `supports_op` can read the placement of a tensor's experts (the plan exists by the time the
+   scheduler splits the graph), and which existing query it should use.
+3. What the BF16 `MUL_MAT_ID` cases of `test-backend-ops` do with no placement plan: can the route run them,
+   and if not, what they print.
+4. Which parts of the direct block the BF16 arm shares with the Q1_0/NVFP4 arm as they are, which need a type
+   parameter, and whether any MMID workspace is needed at all.
+5. The kernel shape you propose (work-group per output row or per tile, the reduce, the range), from what
+   `mul_mat_bf16_f32` and `mul_mat_vec_q_id` do, and its cost for the two Inkling shapes.
+6. Every contract that must change, with the claim each one keeps.
+
+**File scope:** `ggml/src/ggml-sycl/ggml-sycl.cpp` (`supports_op` MoE block, the direct block's route
+condition and decline lines), a new `ggml/src/ggml-sycl/moe-bf16-direct.{hpp,cpp}`,
+`ggml/src/ggml-sycl/moe-resolved-batch.hpp` and `ggml/src/ggml-sycl/unified-cache.cpp` only as far as
+checkpoint item 4 requires, `ggml/src/ggml-sycl/tests/` (a device test through the production fixture, with
+its CMake registration and label), `tests/test-backend-ops.cpp` only if a case is missing, and the contracts
+listed above.
+
+**Acceptance criteria:**
+- [ ] RED commit first: the contracts fail on the admitted set, and the device test has BF16 cases the lead
+      sees fail before the fix.
+- [ ] Device test through the production fixture, both Inkling shapes (one input row, and one input row per
+      selected expert), decode and a prompt batch, one shape whose dimensions are not multiples of 32 if the
+      kernel admits it. The oracle is the CPU result for every row. A null slot's row and an out-of-range
+      id's row are NaN.
+- [ ] Lead, by hand, one run per card: `test-backend-ops -o MUL_MAT_ID` has no FAIL; every BF16 case is OK or
+      "not supported"; no other case changes against the integ tree's run of the same command.
+- [ ] Lead, one run each: the Inkling gate on the B70 passes; the scheduler print has no CPU split that holds
+      a `MUL_MAT_ID`, and the split census is recorded; the Inkling gate on both cards passes; the Mistral
+      gate on the B70 and the GPT-OSS gate on the B50 pass with unchanged plan lines.
+- [ ] One Inkling bench load on the B70 is recorded beside the merged-tree figure. It is a record, not a
+      criterion.
+- [ ] Both sweeps: the failed set is the known-red eight, none skipped.
+
+**Not in this task:** a BF16 expert tensor with experts on the host or on the second card (after Task 8c and
+Task 8d), F16 and F32 experts, a rate-table row for BF16 CPU experts, recording `MUL_MAT_ID` in the command
+graph, fusing the SiTU chain, the speed of the prompt batch beyond being correct.
+
+**Gotchas:**
+- Task 8c is editing the direct block, `mmvq.cpp`, `moe-resolved-batch.hpp` and `moe-mmid-workspace.*` at the
+  same time. Add beside, do not rename or re-sign what the Q1_0/NVFP4 arm uses, and list every shared helper
+  you touch. Whichever task merges second merges `feat/inkling2` first.
+- `GGML_ABORT` is not an error path. A refusal is a named decline or a thrown error that fails the graph.
+- A raw expert pointer is a transient view. The table owner's lease is what keeps the weight alive until the
+  kernel's event is done.
+- The split census is read from `GGML_SCHED_DEBUG=2`, not from the gate passing: the gate passes with the
+  node on the CPU too.
 
 ---
 
