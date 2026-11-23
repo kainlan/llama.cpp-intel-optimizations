@@ -79965,6 +79965,20 @@ struct moe_direct_host_work {
     std::atomic<bool>                  let_go{ false };     // set by let_go_job(): the job stops waiting and running
 };
 
+// A mixed node's host leg: its work, the job's input marker, and the job once launched.
+//
+// let_go_job() is the one way a leg stops its job early. A job let go stops waiting for its input marker and runs no
+// further task, so it writes no more rows; only a leg whose rows nothing will read lets its job go. That is so twice:
+// - The leg is going (the destructor). `job` comes from std::async, so its last copy waits the job, and a job still
+//   waiting for its marker would wait for a device write that may never come. A leg parked in a terminal goes when the
+//   workspace registry lets its slot go, and at process exit that registry (unified_cache_moe_mmid_registry()'s
+//   function-local static) goes before g_device_caches, so before ~unified_cache abandons the marker word
+//   (cpu_job_input_marker_end); a drain that ran a failed marker task leaves the word unwritten too.
+// - The leg is parked after its graph failed (the direct block's catch, before the terminal task is submitted): its
+//   job would otherwise wait for a marker that may never be written, spinning a core until exit.
+// Either way, whoever drops the leg, under the registry's and the pool's locks or on the submitting thread, waits at
+// most for the task in hand. On the terminal task's path the join has already waited the job, and the flag changes
+// nothing.
 struct moe_direct_host_leg {
     std::shared_ptr<moe_direct_host_work> work;
     ggml_sycl::cpu_job_input_marker       marker;
@@ -79974,21 +79988,12 @@ struct moe_direct_host_leg {
     moe_direct_host_leg(const moe_direct_host_leg &)             = delete;
     moe_direct_host_leg & operator=(const moe_direct_host_leg &) = delete;
 
-    // Lets the job go: a job waiting for its input marker stops waiting, and a running one stops before its next task.
-    // It writes no more rows, so only a leg whose rows nothing will read lets its job go: one that is going, or one
-    // parked after its graph failed.
     void let_go_job() const noexcept {
         if (work) {
             work->let_go.store(true, std::memory_order_release);
         }
     }
 
-    // Lets the job go before `job` goes. That future comes from std::async, so its last copy waits the job, and a job
-    // still waiting for its input marker would wait for a device write that may never come: a leg parked in a
-    // quarantine goes when the registry lets its slot go, which at process exit comes before the cache abandons the
-    // marker word (moe_direct_event_terminal::quarantine_host_leg). A job let go runs no further task, so dropping a
-    // leg waits at most for its job to see the flag, or for the task it is running. On the terminal task's path the
-    // join has already waited the job, and the flag changes nothing.
     ~moe_direct_host_leg() { let_go_job(); }
 };
 
@@ -80036,18 +80041,9 @@ class moe_direct_event_terminal final : public ggml_sycl::moe::device_terminal {
         quiescent_ = true;
     }
 
-    // Keeps the host leg of a node whose catch could not drain its queue. Copies queued there may still read or write
-    // the leg's buffers, so the leg is kept, and the submitting thread does not wait its job. The catch lets the job go
-    // as it parks the leg (let_go_job): the graph has failed and nothing reads the rows, and the job's input marker may
-    // never be written, so the job stops waiting for it instead of spinning a core until exit. The leg lives as long
-    // as this terminal, which the workspace slot's quarantine keeps (the admission authority holds it); the slot is
-    // recovered only once ready(). An armed terminal is ready once the last host row copy has run, after the join's
-    // host task waited the job, so dropping the leg then waits nothing. An unarmed one is never ready: its slot goes
-    // when a quiescence proof is ready (recover_quarantined) or when the workspace registry itself goes. That registry
-    // is unified_cache_moe_mmid_registry()'s function-local static, so at process exit it goes before g_device_caches,
-    // and so before ~unified_cache's shutdown_resources abandons the input marker word (cpu_job_input_marker_end); a
-    // drain that ran a failed marker task leaves the word unwritten too. A job let go has left its marker wait and runs
-    // no further task, so dropping the leg there waits at most for the task in hand.
+    // Keeps the host leg of a node whose catch could not drain its queue, so nothing is freed under a queued copy: the
+    // leg goes with this terminal's slot. Why its job is let go first, and why the drop is bounded: see
+    // moe_direct_host_leg.
     void quarantine_host_leg(std::unique_ptr<moe_direct_host_leg> leg) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         quarantined_host_leg_ = std::move(leg);
@@ -84945,12 +84941,7 @@ static void ggml_sycl_moe_direct_host_launch(moe_direct_host_leg * leg) {
             // join's host task may), so the job lets go of the buffers and leases when it returns.
             const std::shared_ptr<moe_direct_host_work> held   = std::move(work);
             const ggml_sycl::cpu_job_input_marker       inputs = std::move(marker);
-            // A leg lets its job go (let_go_job) as it goes, or as it is parked after its graph failed: its inputs
-            // may never land and nothing reads what the job would write, so the job runs nothing, and a job let go
-            // while it runs stops before its next task. Whoever drops the leg, under the registry's and the pool's
-            // locks or on the submitting thread, then waits at most for the task in hand. The throw reaches a join
-            // still queued, if one is. The check after the marker wait stays: the input wait after it waits the
-            // marker again, without let_go.
+            // A job let go (moe_direct_host_leg) throws here or before its next task: the input wait ignores let_go.
             ggml_sycl::cpu_job_input_marker_wait(inputs, &held->let_go);
             if (held->let_go.load(std::memory_order_acquire)) {
                 throw std::runtime_error("MUL_MAT_ID direct route host job let go before its inputs landed");
@@ -88834,24 +88825,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 terminal->confirm_quiescent();
                                 (void) ggml_sycl::unified_cache_recover_moe_mmid_workspaces(
                                     model_token, plan_snapshot->version, true);
-                                // The host leg goes with `completion` as this throw unwinds, and a launched job's
-                                // future waits the job there. That wait is bounded: the leg lets its job go first
-                                // (~moe_direct_host_leg), so a job whose marker task failed in the drain, and was never
-                                // written, stops waiting and runs nothing; otherwise the drain ran the marker (a task on
-                                // this same stream, the cache's queue, which the arm requires), and the job stops
-                                // before its next task, so what is left is the task in hand. A join that was submitted
-                                // already ran in the drain, and no copy is left to read the buffers.
+                                // A leg the terminal task did not release goes with `completion` as this throw
+                                // unwinds: the drain ran every copy that reads it, and moe_direct_host_leg bounds that.
                             } else if (!terminal_submitted && completion->host_leg) {
-                                // Quiescence is unproven: a queued copy may still read or write the leg's buffers, and
-                                // the job may still wait for its marker, which may never be written. The graph has
-                                // failed and nothing reads the leg's rows, so its job is let go here: it stops waiting
-                                // for the marker instead of spinning a core until exit, and runs no further task. The
-                                // leg joins the bundle's quarantine, through the terminal the slot keeps, so the
-                                // buffers stay with it, nothing is freed under a copy, and this thread does not wait
-                                // the job. The slot goes only once a quiescence proof is ready or the workspace
-                                // registry goes, and at process exit the registry (a function-local static) goes before
-                                // the caches, so before cpu_job_input_marker_end abandons the marker word; the job was
-                                // let go here, so that drop does not wait for an abandon that comes after it.
+                                // Quiescence is unproven: the leg is parked with the terminal (moe_direct_host_leg).
                                 completion->host_leg->let_go_job();
                                 terminal->quarantine_host_leg(std::move(completion->host_leg));
                             }
