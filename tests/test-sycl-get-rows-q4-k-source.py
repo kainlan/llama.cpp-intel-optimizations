@@ -215,6 +215,20 @@ def evaluate(backend, getrows, support, kquant, common, sources, raw_support):
     stream_at = op.find("get_rows_build_stream_segments(")
     results["op: a Q4_K weight that is not on the device is refused before any stream segments are built"] = \
         q4k_guard is not None and 0 <= q4k_guard.start() < stream_at
+    # Every executor of the op, not only the main switch: get_rows_stream_slice reaches the slice dispatcher for any
+    # AoS type whose cache view is off the device, and its default arm aborts. An admitted type needs an arm there,
+    # or an early refusal in the op (`src0->type == GGML_TYPE_<T> && ... get_rows_host_weight_unsupported(...)`)
+    # before the stream segments are built.
+    refused = set()
+    for g in re.finditer(r"if\s*\(src0->type\s*==\s*GGML_TYPE_(\w+)\s*&&[^{]*\)\s*\{\s*"
+                         r"get_rows_host_weight_unsupported\(", op):
+        if 0 <= g.start() < stream_at:
+            refused.add(g.group(1))
+    no_slice = [t for t in admitted if case_arm(slice_, t) is None and t not in refused]
+    if no_slice:
+        print("  admitted with no slice arm and no early refusal: " + ", ".join(no_slice))
+    results["slice: every admitted type has a slice arm or an early refusal before the stream path"] = \
+        bool(admitted) and not no_slice
     results["slice: the streamed-slice dispatcher has no Q4_K arm (host-resident weights are declined)"] = \
         case_arm(slice_, "Q4_K") is None and "get_rows_q4_k_aos_sycl(" not in slice_
 
@@ -327,6 +341,12 @@ if args.self_test:
          "op: a Q4_K weight that is not on the device is refused before any stream segments are built",
          with_(getrows=mutate(getrows, OP_SIG, "src0->type == GGML_TYPE_Q4_K && cache_view_valid && cache_view.location",
                               "src0->type == GGML_TYPE_Q4_K && cache_view.location"))),
+        ("BF16 slice arm dropped",
+         "slice: every admitted type has a slice arm or an early refusal before the stream path",
+         with_(getrows=mutate(getrows, SLICE_SIG, "case GGML_TYPE_BF16:", "case GGML_TYPE_F64:"))),
+        ("F16 slice arm dropped",
+         "slice: every admitted type has a slice arm or an early refusal before the stream path",
+         with_(getrows=mutate(getrows, SLICE_SIG, "case GGML_TYPE_F16:", "case GGML_TYPE_F64:"))),
         ("slice default aborts anonymously", "slice: the default arm refuses through the helper",
          with_(getrows=mutate(getrows, SLICE_SIG, "get_rows_host_weight_unsupported(", "GGML_ABORT_X("))),
         ("refusal loses its ticket", "the host-weight refusal names the tensor, the tiering and its ticket",
