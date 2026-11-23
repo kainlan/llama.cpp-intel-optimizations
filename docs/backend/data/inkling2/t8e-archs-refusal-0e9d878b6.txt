@@ -1,0 +1,56 @@
+# test-llama-archs on the merged tree 0e9d878b6, 2026-11-22: every arch refuses to load (rc 255)
+## both cards (level_zero:0,1)
+tree: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=0e9d878b6 tracked-changes=0 bin-newer-than-source=yes
+== -a llama on level_zero:0,1  2026-11-22T22:53:37-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 21  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a inkling2_loop on level_zero:0,1  2026-11-22T22:53:44-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 21  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a nanbeige on level_zero:0,1  2026-11-22T22:53:51-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 21  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a metis16 on level_zero:0,1  2026-11-22T22:53:59-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 21  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a hrm_text on level_zero:0,1  2026-11-22T22:54:06-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 21  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=255 2026-11-22T22:54:13-05:00
+lock released
+## B70 alone (level_zero:0)
+tree: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=0e9d878b6 tracked-changes=0 bin-newer-than-source=yes
+== -a llama on level_zero:0  2026-11-22T22:54:55-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 11  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a inkling2_loop on level_zero:0  2026-11-22T22:55:02-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 11  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a nanbeige on level_zero:0  2026-11-22T22:55:09-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 11  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a metis16 on level_zero:0  2026-11-22T22:55:16-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 11  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== -a hrm_text on level_zero:0  2026-11-22T22:55:23-05:00  shmem=11GB
+  rc=255  out lines: 7  err lines: 11  'roundtrip not bit-exact': 0
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=255 2026-11-22T22:55:30-05:00
+lock released
+## B70 alone, -v, -a llama: the lines that name the cause
+[VRAM-ARENA] Reserved single chunk: 29900.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=28620.0 MB)
+[VRAM-ARENA] Active on device 0: 1 chunk(s), 29900.0 MB total
+[SYCL] abort_owner_effects: site=load_end/not-committed model=1 load=1 slot=0 generation=1
+[LOAD-PLAN] measure plan override: no plan staged for load 1 at stage 0
+[SYCL] abort_owner_effects: site=load_end/not-committed model=1 load=1 slot=0 generation=1
+llama_model_load: error loading model: [LOAD-PLAN] compute-slot measure failed at probe on device 0: plan override nested (refused)
