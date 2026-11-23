@@ -20,6 +20,8 @@ The claims, each failure message starting with its name:
   occurrence index; the refusing local view stays for every other caller.
 - host-*: the host leg refuses by name before admission (no input marker in play, a task the host recipe would refuse,
   no host workspace), never aborts, and lets a failure in its job reach the graph boundary through the join's host task.
+  A workspace refusal prints the plan term only for the recipe workspace, the one buffer that has one, and planned=none
+  for the activation and output buffers (host-workspace).
   The host recipe's executor runs on its check's findings. A leg whose catch could not drain the queue joins the
   bundle's quarantine through the terminal, unless the terminal task was submitted, which then owns its release
   (host-quarantine). A leg lets its job go before its future goes and as it is parked, and a job let go stops waiting
@@ -413,6 +415,23 @@ def direct_violations(src: dict[str, str]) -> list[str]:
         found.append("host-validate: the host leg's tasks are not checked by the host recipe's own check")
     elif not 0 <= raw_code.find("ggml_sycl_moe_direct_host_prepare(") < admitted_open:
         found.append("host-validate: the host leg is not prepared and checked before admission")
+    # Only the recipe workspace has a plan term (moe_host_recipe_workspace_bytes); the activation and output buffers
+    # have none, so their refusal carries none and the decline prints planned=none, never another buffer's budget.
+    calls = re.findall(r'refuse_workspace\("(\w+)", \w+, ([^()]*)\)', spaced(prepare))
+    terms = {"recipe_workspace": "plan.moe_host_recipe_workspace_bytes", "activation": "std::nullopt",
+             "output": "std::nullopt"}
+    prepared = struct_body(code_of(sycl), "moe_direct_host_prepared") or ""
+    if {buffer for buffer, _ in calls} != set(terms) or any(term != terms[buffer] for buffer, term in calls) or \
+            not re.search(r"\bstd::optional<size_t>\s+planned\s*;", prepared):
+        found.append("host-workspace: a workspace refusal carries a plan term for a buffer that has none, or none "
+                     "for the recipe workspace")
+    planned = find(direct, "if (host.planned) {")
+    number = find(direct, '"host_workspace", "buffer=%s bytes=%zu planned=%zu", host.buffer, host.bytes, '
+                          '*host.planned);')
+    none = find(direct, '"host_workspace", "buffer=%s bytes=%zu planned=none", host.buffer, host.bytes);')
+    if not 0 <= planned < number < find(direct, "} else {", number) < none:
+        found.append("host-workspace: the host_workspace decline does not print planned=%zu for the recipe "
+                     "workspace alone and planned=none for the other buffers")
     for name, body in [("the direct block", raw)] + list(helpers.items()):
         if "GGML_ABORT" in code_of(body):
             found.append(f"host-no-abort: {name} aborts")
@@ -616,6 +635,15 @@ def test_mutations_are_witnessed() -> None:
          "const size_t capacity = bindings->size() / request.shape.top_k;", "admission-tokens"),
         # The terminal is armed on the device output copy, before the host rows land.
         ("sycl", r"terminal->arm\(last\);", "terminal->arm(final);", "terminal-order"),
+        # The activation buffer's refusal reports the recipe workspace's plan term as its own.
+        ("sycl", r'refuse_workspace\("activation", act_size, std::nullopt\)',
+         'refuse_workspace("activation", act_size, plan.moe_host_recipe_workspace_bytes)', "host-workspace"),
+        # The recipe workspace's refusal drops its plan term.
+        ("sycl", r'refuse_workspace\("recipe_workspace", recipe_bytes, plan\.moe_host_recipe_workspace_bytes\)',
+         'refuse_workspace("recipe_workspace", recipe_bytes, std::nullopt)', "host-workspace"),
+        # A buffer with no plan term prints a number again.
+        ("sycl", r'"buffer=%s bytes=%zu planned=none", host\.buffer, host\.bytes\)',
+         '"buffer=%s bytes=%zu planned=%zu", host.buffer, host.bytes, host.planned.value_or(0))', "host-workspace"),
         # The worker aborts on a refused task.
         ("sycl", r'throw std::runtime_error\(("MUL_MAT_ID direct route host task refused")\);', r"GGML_ABORT(\1);",
          "host-no-abort"),
