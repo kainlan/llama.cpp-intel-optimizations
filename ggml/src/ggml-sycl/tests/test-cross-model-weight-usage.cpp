@@ -11,6 +11,13 @@
 // registry/reset behavior, not of the fallback classifier -- see
 // tests/test-sycl-tensor-usage.cpp for that.
 //
+// The one exception is checks 7 and 8, which need real expert-family names:
+// the loader registers an expert family's usage from the family alone, so an
+// expert ".scale" arrives here as MOE_EXPERT_WEIGHT, and the registry must
+// store what the name rule says (MOE_INTERMEDIATE) or the S1 preload, which
+// reads the registry, skips the tensor while the planner gave it a dense entry.
+// A registry row overrides the fallback, so check 7 still tests the registry.
+//
 // Mutation control: key g_sycl_weight_usages by bare name, or clear it at B's
 // load boundary. The B or reactivated-A exact-owner checks then fail.
 
@@ -97,6 +104,16 @@ int main(int, char ** argv) {
 
     // A name every architecture reuses verbatim with a CONSISTENT usage.
     ggml_backend_sycl_register_weight_usage("zzz_test_consistent", GGML_SYCL_TENSOR_USAGE_NORM);
+
+    // Check 7: the loader registers an expert family's per-expert scale with the family's usage. The registry must
+    // store the name rule's class for it, the class the planner placed it by.
+    ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_up_exps.scale", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+    check(usage_of(ctx, "blk.0.ffn_gate_up_exps.scale") == tensor_usage::MOE_INTERMEDIATE,
+          "check 7: an expert .scale registered as MOE_EXPERT_WEIGHT reads MOE_INTERMEDIATE");
+    // Check 8 (control): the expert matrix of the same family keeps the family's usage.
+    ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_up_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+    check(usage_of(ctx, "blk.0.ffn_gate_up_exps.weight") == tensor_usage::MOE_EXPERT_WEIGHT,
+          "check 8 (control): the expert .weight registered as MOE_EXPERT_WEIGHT reads MOE_EXPERT_WEIGHT");
 
     check(ggml_backend_sycl_model_load_end(load_a, true, &model_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle commit");
 
