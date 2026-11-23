@@ -122,6 +122,7 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-gpu-sysfs.sh"
+[ -r "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-host-backing.sh" ] || refuse "sycl-host-backing.sh is missing next to this script"
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-host-backing.sh"
 
