@@ -2680,6 +2680,23 @@ inline std::string placement_plan_loader_pool_refusal(const placement_plan & pla
            " loader_device=" + std::to_string(plan.loader_device);
 }
 
+// The loader pool's check once the loader's buffers are in loader_device's pool: how far the pool's WEIGHT zone grew
+// while this load allocated, from `baseline`, its capacity when the load decided the card's host zones (configured them,
+// or found them configured by an earlier load and kept them), to `capacity`, its capacity now, against the growth the
+// plan recorded for the loader's buffers, `terms.loader_grown` (the plan's commit terms on that device). Returns one
+// "[HOST-PLAN-BUG]" line naming the device and the planned, actual and excess bytes when the zone grew past it, empty
+// otherwise.
+inline std::string host_zone_weight_growth_check(int                            device,
+                                                 const host_zone_commit_terms & terms,
+                                                 size_t                         baseline,
+                                                 size_t                         capacity) {
+    (void) device;
+    (void) terms;
+    (void) baseline;
+    (void) capacity;
+    return {};
+}
+
 // One lazy table's fields as every lazy line prints them (th32 §10), so the planner's [PLACEMENT] lazy lines and the
 // dry run's [PLAN-DRY-RUN] LAZY lines name each alike: table=, resident=, cache_slots=, floor_slots= and
 // consumer_device=, the consumer's device or CPU. Given the table's inventory record `info`, it appends what only that

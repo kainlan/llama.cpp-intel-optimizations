@@ -681,6 +681,60 @@ void check_loader_pool_over_budget_is_refused() {
     }
 }
 
+// The loader pool's check at the preload sees a packing drift: it measures how far loader_device's WEIGHT zone grew
+// while the load allocated, from the capacity the zone had when the load decided the host zones, against the
+// loader_grown the plan recorded. The oracle's pool gives the growth an admitted plan's buffers take.
+void check_weight_zone_growth_is_checked() {
+    std::vector<size_t> oversize = moe_tensors();
+    oversize.insert(oversize.begin() + 5, align_up(2856 * kMiB + 12345, TENSOR_ALIGNMENT));
+    const placement_plan plan = with_budget(make_loader_plan(oversize, kPoolChunk, 64 * kMiB), kPoolChunk, SIZE_MAX);
+    const host_zone_commit_terms terms =
+        ggml_sycl::placement_plan_host_zone_commit_terms_on_device(plan, plan.host_zone_terms, 0);
+    const pool_run run =
+        run_pool(split_buffers(plan.loader_tensor_bytes, load_max_size(plan.loader_buffer_cap, kPoolChunk)),
+                 terms.weight, kPoolChunk);
+    CHECK(terms.loader_grown > 0 && run.grown_bytes == terms.loader_grown);
+    // configure_zones aligns the zone, and each chunk grow_zone adds puts its usable bytes in the zone; loader_grown
+    // counts each with its header, so a growth the plan counted reads below it.
+    const size_t configured = align_up(terms.weight, kHeader);
+    const size_t grown      = run.grown_bytes - run.grown_chunks * kHeader;
+    const auto   check      = [&](size_t baseline, size_t capacity) {
+        return ggml_sycl::host_zone_weight_growth_check(0, terms, baseline, capacity);
+    };
+    CHECK(check(configured, configured + grown).empty());
+    CHECK(check(configured, configured).empty());
+
+    // One chunk more than the plan counted: the line names the device and the planned, actual and excess bytes.
+    const size_t      actual = configured + grown + kPoolChunk;
+    const std::string bug    = check(configured, actual);
+    std::printf("drifted: %s\n", bug.c_str());
+    CHECK(bug.rfind("[HOST-PLAN-BUG] device=0 ", 0) == 0);
+    CHECK(carries(bug, "planned", configured + terms.loader_grown));
+    CHECK(carries(bug, "actual", actual));
+    CHECK(carries(bug, "excess", actual - configured - terms.loader_grown));
+    CHECK(carries(bug, "baseline", configured) && carries(bug, "loader_grown", terms.loader_grown));
+
+    // A zone an earlier load configured and grew, kept by this load: the growth it brought is in the baseline, so a
+    // load whose buffers fit it, or that grows what its plan counted, is no alarm.
+    const size_t kept = configured + 3 * kPoolChunk;
+    CHECK(check(kept, kept).empty());
+    CHECK(check(kept, kept + grown).empty());
+    // But the plan replays the loader's buffers into an empty zone: a kept zone they do not fit, grown past this load's
+    // own loader_grown, is a true alarm.
+    CHECK(!check(kept, kept + grown + kPoolChunk).empty());
+
+    // A plan that records no growth, its WEIGHT zone not a multiple of the zone alignment: no growth is no alarm, and
+    // one chunk is.
+    host_zone_commit_terms flat;
+    flat.weight          = 1000;
+    const size_t aligned = align_up(flat.weight, kHeader);
+    CHECK(ggml_sycl::host_zone_weight_growth_check(1, flat, aligned, aligned).empty());
+    const std::string one = ggml_sycl::host_zone_weight_growth_check(1, flat, aligned, aligned + kPoolChunk);
+    CHECK(one.rfind("[HOST-PLAN-BUG] device=1 ", 0) == 0 && carries(one, "excess", kPoolChunk));
+    // A capacity below its baseline grew nothing.
+    CHECK(ggml_sycl::host_zone_weight_growth_check(1, flat, aligned, aligned - kHeader).empty());
+}
+
 }  // namespace
 
 int main() {
@@ -698,6 +752,7 @@ int main() {
     check_oversize_buffer_grows_a_planned_chunk();
     check_admitted_plan_grows_nothing_unplanned();
     check_loader_pool_over_budget_is_refused();
+    check_weight_zone_growth_is_checked();
     if (failures != 0) {
         std::printf("FAILED: %d check(s)\n", failures);
         return 1;

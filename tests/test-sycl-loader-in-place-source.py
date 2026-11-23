@@ -34,9 +34,13 @@ The preload
       no block for a copy, so the expert is counted with the gate's reason and returns before any room is asked
       (ggml_sycl_host_expert_alloc), and the load refuses after the sweep with one ERROR line naming the count, the
       bytes and the gate's reason, and a runtime_error.
-  P3. The plan's loader term is checked against what the load holds: when one pool holds the loader's buffer
-      (loader_device >= 0), a [HOST-PLAN-BUG] WARN when the model's live SYCL_Host bytes on loader_device exceed
-      loader_residency.
+  P3. The plan's loader term and its replay of the loader's buffers are checked against what the load holds, when one
+      pool holds the loader's buffer (loader_device >= 0). A [HOST-PLAN-BUG] WARN names a loader_residency term short
+      of the model's live SYCL_Host bytes on loader_device. A second, from host_zone_weight_growth_check (hpp), names a
+      WEIGHT zone of loader_device's existing cache grown past the plan: from the baseline this load took, its capacity
+      once the late pass decided the zones (ggml_sycl_model_host_weight_baseline_note, written there only), to its
+      capacity at the preload, against the loader_grown of the plan's recorded terms on loader_device. A load that took
+      no baseline says so at WARN.
 
 The charge (ucc = unified-cache.cpp)
   C1. placement_plan_host_weight_zone_terms reads the loader facts, charges loader_residency only when one pool holds
@@ -161,7 +165,21 @@ MODEL_CHECK = "unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MO
 RELEASE_SLOT = "ggml_sycl::unified_cache_release_model_slot("
 REFUSAL_FMT = '"[S1-PRELOAD] %zu host-planned experts (%.1f MB) have no owner'
 REFUSAL_THROW = 'throw std::runtime_error("S1 preload planned host experts have no owner");'
-LOADER_BUG_FMT = "\"[HOST-PLAN-BUG] device=%d the loader's SYCL_Host buffer holds %zu B"
+LOADER_BUG_FMT = "\"[HOST-PLAN-BUG] device=%d the loader_residency term is short of the loader's SYCL_Host buffer"
+GROWTH_CHECK_CALL = (r"ggml_sycl::host_zone_weight_growth_check\s*\(\s*global_plan->loader_device\s*,\s*"
+                     r"ggml_sycl::placement_plan_host_zone_commit_terms_on_device\s*\(\s*\*global_plan\s*,\s*"
+                     r"global_plan->host_zone_terms\s*,\s*global_plan->loader_device\s*\)\s*,\s*baseline\s*,\s*"
+                     r"loader_cache->host_zone_capacity\s*\(\s*ggml_sycl::host_zone_id::WEIGHT\s*\)\s*\)")
+LOADER_CACHE = (r"\bloader_cache\s*=\s*ggml_sycl::get_existing_unified_cache_for_device\s*\(\s*"
+                r"global_plan->loader_device\s*\)")
+BASELINE_READ = (r"ggml_sycl_model_host_weight_baseline\s*\(\s*model_id\s*,\s*global_plan->loader_device\s*,\s*"
+                 r"&baseline\s*\)")
+GROWTH_WARN = r'GGML_LOG_WARN\s*\(\s*"%s\\n"\s*,\s*growth_bug\.c_str\s*\(\s*\)\s*\)'
+NO_BASELINE_FMT = "\"[HOST-PLAN] device=%d the loader pool check has no WEIGHT zone baseline"
+BASELINE_NOTE = (r"ggml_sycl::ggml_sycl_configure_host_zones_for_plan\s*\(\s*cache\s*,\s*decision\.device\s*,\s*"
+                 r"decision\.snapshot->plan\s*\)\s*;.{0,600}?ggml_sycl_model_host_weight_baseline_note\s*\(\s*"
+                 r"owner\.model\.value\s*,\s*decision\.device\s*,\s*"
+                 r"cache->host_zone_capacity\s*\(\s*ggml_sycl::host_zone_id::WEIGHT\s*\)\s*\)")
 LOADER_DROP_FMT = "\"[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer"
 GATE_REFUSAL_FMT = "\"[S1-PRELOAD] %zu host experts (%.1f MB) the plan serves from the loader's SYCL_Host buffer"
 GATE_REFUSAL_THROW = 'throw std::runtime_error("S1 preload in-place host experts were refused by the loader buffer gate");'
@@ -313,6 +331,26 @@ def clause_p3_loader_term_checked(t: dict) -> list:
         problems.append("the check does not run whenever the plan charges the loader term")
     if not re.search(r"ggml_sycl_model_host_chunk_bytes\s*\(\s*model_id\s*,\s*global_plan->loader_device\s*\)", body):
         problems.append("the check does not count the chunks in loader_device's pool")
+    # The packing: the WEIGHT zone's growth while the loader allocated, against the plan's record of it.
+    if not re.search(GROWTH_CHECK_CALL, body):
+        problems.append("the preload does not check loader_device's WEIGHT zone growth against the plan's recorded terms")
+    if not re.search(LOADER_CACHE, body):
+        problems.append("the growth check does not read loader_device's existing cache")
+    if not re.search(BASELINE_READ, body):
+        problems.append("the growth check does not measure from the baseline this load took")
+    if not re.search(GROWTH_WARN, body):
+        problems.append("a WEIGHT zone grown past the plan is not logged at WARN")
+    if NO_BASELINE_FMT not in body:
+        problems.append("a load that took no baseline skips the growth check without saying so")
+    helper = body_of(t[HPP], r"\binline\s+std::string\s+host_zone_weight_growth_check\s*\(")
+    for needle in ('"[HOST-PLAN-BUG] device="', "terms.loader_grown", "planned=", "actual=", "excess="):
+        if needle not in helper:
+            problems.append(f"host_zone_weight_growth_check does not name {needle}")
+    stage = body_of(t[GS], STAGE_SIG)
+    if not re.search(BASELINE_NOTE, stage, flags=re.DOTALL):
+        problems.append("the late pass does not take this load's WEIGHT zone baseline once it decided the zones")
+    if len(re.findall(r"\bggml_sycl_model_host_weight_baseline_note\s*\(", t[GS])) != 2:
+        problems.append("the WEIGHT zone baseline has a writer other than the late pass")
     return problems
 
 
@@ -575,6 +613,22 @@ MUTANTS = [
     ("p3-counts-plan-device", "P3", mutate_re(
         GS, r"ggml_sycl_model_host_chunk_bytes\s*\(\s*model_id\s*,\s*global_plan->loader_device\s*\)",
         "ggml_sycl_model_host_chunk_bytes(model_id, global_plan->device_id)")),
+    ("growth-check-recomputes-terms", "P3", mutate_re(
+        GS, r"global_plan->host_zone_terms(?=\s*,\s*global_plan->loader_device\s*\)\s*,\s*baseline)",
+        "ggml_sycl::placement_plan_host_zone_commit_terms(*global_plan, 0, 0)")),
+    ("growth-from-the-first-configure", "P3", mutate_re(
+        GS, BASELINE_READ, "(baseline = loader_cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT))")),
+    ("growth-unlogged", "P3", mutate_re(GS, GROWTH_WARN, "(void) growth_bug")),
+    ("growth-skip-silent", "P3", mutate(GS, NO_BASELINE_FMT, '"[HOST-PLAN] device=%d no baseline')),
+    ("baseline-untaken", "P3", mutate_re(GS, r"ggml_sycl_model_host_weight_baseline_note\s*\(\s*owner\.model\.value[^;]*;",
+                                         "(void) 0;")),
+    ("baseline-before-configure", "P3", mutate_re(
+        GS, r"(ggml_sycl::ggml_sycl_configure_host_zones_for_plan\s*\(\s*cache\s*,\s*decision\.device\s*,\s*"
+            r"decision\.snapshot->plan\s*\)\s*;)(.*?)(ggml_sycl_model_host_weight_baseline_note\s*\([^;]*;)",
+        r"\3\2\1")),
+    ("baseline-retaken-at-preload", "P3", mutate_re(
+        GS, r"(static void ggml_sycl_preload_model_weights\(\)\s*\{)",
+        r"\1 ggml_sycl_model_host_weight_baseline_note(0, 0, 0);")),
     ("terms-ignore-alignment", "C1", mutate(UCC, "TENSOR_ALIGNMENT", "1")),
     ("split-charges-loader", "C1", mutate_re(UCC, r"plan\.loader_holds_weights\s*&&\s*plan\.loader_device\s*>=\s*0",
                                              "plan.loader_holds_weights")),
