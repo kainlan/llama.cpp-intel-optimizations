@@ -79,7 +79,8 @@ mk_tree() { # $1=throttle $2=act_freq
     echo "$1" > "$d/throttle/status"
     echo "$2" > "$d/act_freq"
 }
-mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/meminfo"; }
+# $1 = Shmem kB, $2 = meminfo remainder kB (default 0): MemTotal = MemFree + remainder.
+mk_meminfo() { printf 'MemTotal: %s kB\nMemFree: 256000000 kB\nMemAvailable: 190000000 kB\nShmem: %s kB\n' "$((256000000 + ${2:-0}))" "$1" > "$T/meminfo"; }
 
 expect_status() {
     local want="$1" what="$2"
@@ -381,6 +382,7 @@ grep -q "=== after ===" "$out_slow/host.txt" || { echo "FAIL: host.txt missing a
 grep -q "loadavg:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing loadavg"; fail=1; }
 grep -q "ffmpeg_count:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing ffmpeg_count"; fail=1; }
 grep -q "Shmem:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing Shmem"; fail=1; }
+grep -q "^HostBacking: [0-9]* kB" "$out_slow/host.txt" || { echo "FAIL: host.txt missing HostBacking"; fail=1; }
 grep -q "MemAvailable:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing MemAvailable"; fail=1; }
 grep -qE '^bench_pid=[0-9]+ comm=' "$out_slow/host.txt" \
     || { echo "FAIL: host.txt missing a resolved bench_pid=<pid> comm=... audit line (got: $(grep '^bench_pid=' "$out_slow/host.txt" 2>/dev/null))"; fail=1; }

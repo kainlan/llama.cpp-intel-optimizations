@@ -30,7 +30,7 @@
 #                           attribution) -- acceptable for this script's
 #                           stated purpose, llama-bench decode runs of tens
 #                           of seconds.
-#   <dir>/host.txt        -- loadavg, ffmpeg tenant count, Shmem,
+#   <dir>/host.txt        -- loadavg, ffmpeg tenant count, Shmem, HostBacking (Shmem + remainder),
 #                           MemAvailable, taken once before and once after
 #                           the run, plus a trailing
 #                           "bench_pid=... comm=... cmdline=..." line
@@ -58,7 +58,7 @@
 # rewritten, not reset-and-always-rewritten).
 #
 # All host-corruption preflight (throttled/active card, stale GPU tenant,
-# elevated Shmem) is bench-guard.sh's DECISION logic, invoked here as a
+# elevated GPU host backing) is bench-guard.sh's DECISION logic, invoked here as a
 # CHILD -- this script never re-implements it, so the VALID/SUSPECT verdict
 # and the REFUSED (exit 3) path come for free. This script forwards the six
 # hooks bench-guard.sh understood as of its original A1/A2 tasks
@@ -76,7 +76,7 @@
 # not merely handed through: --sysfs-card additionally derives FREQ for the
 # sampler (the same card bench-guard.sh itself derives, so passing
 # --sysfs-card keeps both in agreement); --meminfo is additionally read by
-# host_snapshot for its Shmem/MemAvailable lines; --pgrep-cmd is
+# host_snapshot for its Shmem/HostBacking/MemAvailable lines; --pgrep-cmd is
 # additionally read by ffmpeg_count, which pipes its output through `grep -c
 # ffmpeg` -- a DIFFERENT question than bench-guard.sh's own tenant-listing
 # use of the same hook (`pgrep -a -x
@@ -115,6 +115,8 @@ DRM_ROOT=/sys/class/drm
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/sycl-gpu-sysfs.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/sycl-host-backing.sh"
 
 # refuse(): derive_card_for_selector's own contract (see
 # scripts/sycl-gpu-sysfs.sh's header comment) requires this to exist before
@@ -246,6 +248,7 @@ host_snapshot() {
         echo "loadavg: $(cat /proc/loadavg 2>/dev/null || echo -)"
         echo "ffmpeg_count: $(ffmpeg_count)"
         echo "Shmem: $(awk '/^Shmem:/{print $2}' "$MEMINFO" 2>/dev/null || echo -) kB"
+        echo "HostBacking: $(sycl_gpu_host_backing_kb "$MEMINFO" 2>/dev/null || echo -) kB"
         echo "MemAvailable: $(awk '/^MemAvailable:/{print $2}' "$MEMINFO" 2>/dev/null || echo -) kB"
     } >> "$OUT/host.txt"
 }
