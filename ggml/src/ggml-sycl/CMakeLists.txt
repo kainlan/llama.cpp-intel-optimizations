@@ -5592,6 +5592,41 @@ set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Task 8g (Inkling 2 Mini): a BF16 MUL_MAT_ID on planned models loaded the way libllama loads one runs on the card
+# through ggml_sycl_moe_bf16_direct_route_available and the BF16 direct kernel: Inkling's two expert shapes (8 experts,
+# one activation row and one per slot) and two shapes off the 32-multiple (k 100 and k 99), each for decode and a
+# 33-token prompt, every output row within NMSE 5e-4 of the CPU backend, each case showing the route's line with the
+# kernel form its shape takes. A BF16 tensor the plan does not contain and a strided expert view are declined by
+# supports_op. Public entry points only. Pinned to the B70 (level_zero:1 selects the B50 for a second run), as the
+# Q1_0/NVFP4 production-route test is, with the backend's op watchdog 10 s below CTest's bound so a hang is
+# diagnosed by the backend; a run with no SYCL GPU exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-moe-bf16-direct-device
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-bf16-direct-device.cpp
+)
+target_include_directories(test-sycl-moe-bf16-direct-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-bf16-direct-device PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-bf16-direct-device PRIVATE "-fsycl")
+target_link_libraries(test-sycl-moe-bf16-direct-device PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-bf16-direct-device PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-moe-bf16-direct-device PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bf16-direct-device COMMAND test-sycl-moe-bf16-direct-device)
+set_tests_properties(sycl-moe-bf16-direct-device PROPERTIES
+    LABELS "sycl;moe;bf16;production-route;device;B70;B50"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;GGML_SYCL_OP_TIMEOUT_MS=110000;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+endif() # static SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
