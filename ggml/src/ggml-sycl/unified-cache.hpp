@@ -403,8 +403,9 @@ struct placement_entry {
     int64_t            ne[GGML_MAX_DIMS] = {};
     size_t             src_size          = 0;  // AOS source bytes
     size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
-    // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
-    // is the cost, not the placement: kv_device[layer_id] says where that KV lives, which can differ from on_device.
+    // The layer's KV bytes, the sum over the KV slots it executes, on one anchor entry per layer (its attention entry
+    // when it has one) and 0 on the rest. It is the cost, not the placement: kv_device[slot] says where each slot's KV
+    // lives, which can differ from on_device.
     size_t             kv_size           = 0;
     placement_priority priority          = placement_priority::COUNT;  // Sort key
     int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
@@ -583,6 +584,35 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
+// The KV cache slots that the weight layers [first_layer, last_layer] execute, ascending. `layer_phys` maps a slot to
+// the weight layer (`blk.N`) that executes it (placement_kv_info::layer_phys). An empty map is the identity, so the
+// slots are the layer ids themselves.
+inline std::vector<int> kv_slots_of_layers(const std::vector<int32_t> & layer_phys, int first_layer, int last_layer) {
+    std::vector<int> slots;
+    if (layer_phys.empty()) {
+        for (int layer = std::max(first_layer, 0); layer <= last_layer; ++layer) {
+            slots.push_back(layer);
+        }
+        return slots;
+    }
+    for (size_t slot = 0; slot < layer_phys.size(); ++slot) {
+        if (layer_phys[slot] >= first_layer && layer_phys[slot] <= last_layer) {
+            slots.push_back(static_cast<int>(slot));
+        }
+    }
+    return slots;
+}
+
+// True when every KV slot is its own layer: no map, or a map that names each slot's own id.
+inline bool kv_layer_phys_is_identity(const std::vector<int32_t> & layer_phys) {
+    for (size_t slot = 0; slot < layer_phys.size(); ++slot) {
+        if (layer_phys[slot] != static_cast<int32_t>(slot)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
     uint32_t              n_layer      = 0;
@@ -692,7 +722,8 @@ struct placement_kv_info {
     std::vector<uint32_t> layer_idx_k_width;
     // The weight layer (`blk.N`) that executes each KV cache slot, from ggml_sycl_tensor_inventory::kv_layer_phys. A
     // looped model runs one weight layer for several slots (inkling2_loop, nanbeige, metis16). Empty means every slot is
-    // its own layer, which is every other architecture. Every array above is indexed by slot.
+    // its own layer, which is every other architecture. Every array above is indexed by slot. The planner keys KV by
+    // slot: a slot's KV lives where the layer that executes it lives, and the layer is charged for each of its slots.
     std::vector<int32_t>  layer_phys;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
@@ -810,7 +841,32 @@ struct placement_kv_info {
         const size_t charged    = kv_bytes_for_layer(il);
         return at_context > charged ? at_context - charged : 0;
     }
+
+    // Weight layer `layer_id`'s KV: kv_bytes_for_layer() summed over the slots it executes. It is that one slot's
+    // bytes when every slot is its own layer.
+    size_t kv_bytes_for_phys_layer(int layer_id) const {
+        size_t bytes = 0;
+        for (const int slot : kv_slots_of_layers(layer_phys, layer_id, layer_id)) {
+            bytes += kv_bytes_for_layer(static_cast<uint32_t>(slot));
+        }
+        return bytes;
+    }
 };
+
+// The slot-to-layer map the planner keeps, from the one an inventory carries (its kv_layer_phys).
+// The map is accepted only when it has one entry per KV slot (kv_layer_phys_count == kv_layer_count) and every entry is
+// a weight layer id, in [0, kv_layer_count). An identity map is kept empty, so a model whose slots are its layers plans
+// exactly as it did with no map. A refused map is also kept empty, and the fields after `refused` say why.
+struct placement_kv_layer_phys_intake {
+    std::vector<int32_t> layer_phys;              // empty: every slot is its own layer
+    bool                 refused        = false;  // a map was given and does not fit the inventory
+    uint32_t             count          = 0;      // kv_layer_phys_count
+    uint32_t             kv_layer_count = 0;      // kv_layer_count
+    int                  bad_slot       = -1;     // the first slot whose entry is not a weight layer id; -1: the counts
+    int                  bad_layer      = -1;     // that slot's entry
+};
+
+placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory(const ggml_sycl_tensor_inventory & inventory);
 
 struct moe_mmid_owner_workspace_plan {
     int                         owner_device = -1;
@@ -988,6 +1044,9 @@ struct placement_plan {
     std::vector<uint32_t>                      layer_v_width;
     // llama.cpp-8ecj: mirrors placement_kv_info::layer_idx_k_width, the indexer key cache's width per layer.
     std::vector<uint32_t>                      layer_idx_k_width;
+    // Mirrors placement_kv_info::layer_phys: the weight layer that executes each KV slot, empty when every slot is its
+    // own layer. The arrays above are indexed by slot.
+    std::vector<int32_t>                       layer_phys;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
@@ -1171,8 +1230,8 @@ struct placement_plan {
     // Use lookup_expert_placement(layer, expert, role) for planner decisions.
     std::unordered_map<int, std::unordered_map<int, int>> expert_device;
 
-    // kv_location[layer_id] = device_id for KV cache co-location.
-    // KV cache for a layer lives on the same device as its dense weights.
+    // kv_device[slot] = device_id (-1 = host tier) of each KV cache slot. A slot's KV lives on the device of the weight
+    // layer that executes it (layer_phys), so a looped model's later slots go where their layer's weights are.
     std::unordered_map<int, int> kv_device;
 
     // kv_device as the load-time planner left it, captured by the first
@@ -1197,17 +1256,25 @@ struct placement_plan {
         return it == layer_device.end() ? -1 : it->second;
     }
 
-    // The KV owner of layers [start_layer, end_layer] (-2 = mixed, -1 =
-    // none), from the same per-layer KV bytes every other consumer sizes from.
-    int layer_range_kv_device(int start_layer, int end_layer) const {
-        const size_t        n_layers = end_layer >= 0 ? static_cast<size_t>(end_layer) + 1 : 0;
-        std::vector<int>    owners(n_layers, -1);
-        std::vector<size_t> bytes(n_layers, 0);  // 0: layers before start_layer do not vote
-        for (size_t l = static_cast<size_t>(std::max(start_layer, 0)); l < n_layers; ++l) {
-            owners[l] = get_kv_device(static_cast<int>(l));
-            bytes[l]  = kv_size_for_layer(static_cast<uint32_t>(l));
+    // Weight layer `layer_id`'s KV: kv_size_for_layer() summed over the slots it executes.
+    size_t kv_size_for_phys_layer(int layer_id) const {
+        size_t bytes = 0;
+        for (const int slot : kv_slots_of_layers(layer_phys, layer_id, layer_id)) {
+            bytes += kv_size_for_layer(static_cast<uint32_t>(slot));
         }
-        return layer_block_kv_device(owners, bytes, start_layer, end_layer);
+        return bytes;
+    }
+
+    // The KV owner of weight layers [start_layer, end_layer] (-2 = mixed, -1 = none): the owners of every slot those
+    // layers execute, from the same per-slot KV bytes every other consumer sizes from. A slot with no KV does not vote.
+    int layer_range_kv_device(int start_layer, int end_layer) const {
+        std::vector<int>    owners;
+        std::vector<size_t> bytes;
+        for (const int slot : kv_slots_of_layers(layer_phys, start_layer, end_layer)) {
+            owners.push_back(get_kv_device(slot));
+            bytes.push_back(kv_size_for_layer(static_cast<uint32_t>(slot)));
+        }
+        return layer_block_kv_device(owners, bytes, 0, static_cast<int>(owners.size()) - 1);
     }
 
     // Sum of KV bytes placed on `device` -- the KV the runtime-context

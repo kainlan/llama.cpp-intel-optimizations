@@ -169,13 +169,14 @@ def claim_dense_pass_charges_weights_only(cache: str) -> bool:
 
 
 def claim_layer_kv_follows_the_dense_layer(cache: str) -> bool:
-    """A layer's KV is charged on the device only when its dense weights are there and it fits; otherwise host."""
+    """A KV slot is charged on the device only when the dense weights of the layer that executes it are there and it
+    fits; otherwise host. The slots go in slot order (a looped model's later slots run an earlier layer)."""
     b = body(norm(cache), LAYER_KV_SIG)
     return (bool(b) and ordered(
-        b, "for (const auto & [layer_id, has_attention] : layer_has_attention)",
+        b, "for (const auto & [slot, layer_id] : slot_layers)",
         "const bool kv_on_device = plan.get_layer_device(layer_id) == device_id && kv_cost <= remaining;",
         "remaining -= kv_cost;", "plan.kv_vram_bytes += kv_cost;", "plan.kv_host_bytes += kv_cost;",
-        "plan.kv_device[layer_id] = kv_on_device ? device_id : -1;"))
+        "plan.kv_device[slot] = kv_on_device ? device_id : -1;"))
 
 
 def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
@@ -278,16 +279,22 @@ HINT_PICK_RE = re.compile(r"return \{ n_ctx_hint != 0 \? GGML_PAD\(n_ctx_hint, (
 HINT_PICK = "inventory.n_ctx_context = ctx_room.n_ctx_context;"
 HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);"
 # Both builders pass the model's context hint, with its micro-batch hint after it (test-sycl-explicit-ubatch-placement-
-# source pins that one), and the inventory ends with the micro-batch, after the context's provenance.
+# source pins that one), and the inventory ends with the slot-to-layer map (test-sycl-kv-slot-layer-source pins its
+# use), after the micro-batch and the context's provenance. Growing the struct moves none of the pinned offsets.
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
-            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; }")
+            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; const int32_t * kv_layer_phys; "
+            "uint32_t kv_layer_phys_count; }")
 COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 192,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 200,",
 )
 
 
@@ -619,16 +626,15 @@ def test_mutant_field_inserted_before_the_indexer_widths_fails():
 
 
 def test_mutant_field_appended_fails():
-    """A field appended after the context's provenance: the struct no longer ends where the consumer's size pin
-    says."""
-    mutant = _once(SYCL_H, "uint32_t n_ubatch_context; };", "uint32_t n_ubatch_context; uint8_t spare; };")
+    """A field appended after the slot-to-layer map: the struct no longer ends where the consumer's size pin says."""
+    mutant = _once(SYCL_H, "uint32_t kv_layer_phys_count; };", "uint32_t kv_layer_phys_count; uint8_t spare; };")
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant, RESOLVER)
 
 
 def test_mutant_size_pin_left_at_the_old_size_fails():
-    """The provenance appended but the size pin left at 184: the static_assert would stop the build, and the gate
-    says so first."""
-    mutant = _once(SYCL, TAIL_ASSERTS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,")
+    """The slot-to-layer map appended but the size pin left at 192: the static_assert would stop the build, and the
+    gate says so first."""
+    mutant = _once(SYCL, TAIL_ASSERTS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,")
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, mutant, SYCL_H, RESOLVER)
 
 

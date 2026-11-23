@@ -1086,6 +1086,10 @@ struct llama_model {
     // apply Hadamard transform to the lightning indexer keys
     virtual bool lid_k_hdmd() const { return false; }
 
+    // the weight layer (blk.N) that executes KV cache slot il: the slot itself for every architecture whose slots are
+    // its layers; a looped model (inkling2_loop, nanbeige, metis16) runs one weight layer for several slots
+    virtual int layer_phys(int il) const { return il; }
+
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;

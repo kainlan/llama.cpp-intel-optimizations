@@ -17260,13 +17260,16 @@ static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owne
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj), the context's provenance appended
-// after it (llama.cpp-7fmt), and the micro-batch the caller named, in the provenance's padding.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+// after it (llama.cpp-7fmt), the micro-batch the caller named, in the provenance's padding, and the slot-to-layer map
+// appended after that.
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184, "n_ctx_context_is_default moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 192, "kv_layer_phys moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 200, "kv_layer_phys_count moved");
 
 // llama.cpp-w013, llama.cpp-7fmt: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct,
 // host_attn_gbps, cpu_expert_gbps and host_split_us) from its environment variable. Unset, unparsable, not finite,
@@ -17547,6 +17550,30 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                                                      inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);
     } else {
         g_placement_kv_info.layer_idx_k_width.clear();
+    }
+    // The weight layer that executes each KV slot, so a looped model's later slots are planned where their layer's
+    // weights are. A map that does not fit this inventory is ignored and every slot is planned as its own layer.
+    {
+        const ggml_sycl::placement_kv_layer_phys_intake phys =
+            ggml_sycl::placement_kv_layer_phys_from_inventory(*inventory);
+        g_placement_kv_info.layer_phys = phys.layer_phys;
+        if (phys.refused) {
+            char detail[160] = "";
+            if (phys.bad_slot >= 0) {
+                snprintf(detail, sizeof(detail), "; slot %d names weight layer %d, outside [0, %u)", phys.bad_slot,
+                         phys.bad_layer, phys.kv_layer_count);
+            }
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] KV slot map ignored: kv_layer_phys_count=%u kv_layer_count=%u%s; every KV slot is planned "
+                "as its own layer\n",
+                phys.count, phys.kv_layer_count, detail);
+        } else if (!phys.layer_phys.empty()) {
+            const int32_t max_layer = *std::max_element(phys.layer_phys.begin(), phys.layer_phys.end());
+            GGML_LOG_INFO(
+                "[SYCL-PLAN] KV slot map: %zu KV slots run weight layers 0..%d; each slot's KV is placed with the "
+                "layer that executes it\n",
+                phys.layer_phys.size(), max_layer);
+        }
     }
     g_placement_kv_info.n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
@@ -49406,14 +49433,16 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                 if (block.kv_device < 0 || block.start_layer < 0 || block.end_layer < block.start_layer) {
                     continue;
                 }
-                for (int layer = block.start_layer; layer <= block.end_layer; ++layer) {
-                    if (layer < 0 || static_cast<uint32_t>(layer) >= n_layers ||
-                        !layer_in_this_kv_buffer(static_cast<uint32_t>(layer)) ||
-                        runtime_kv_plan.kv_size_for_layer(static_cast<uint32_t>(layer)) == 0) {
+                // Every KV slot the block's weight layers execute moves with them: a looped model's later slots too.
+                for (const int slot :
+                     ggml_sycl::kv_slots_of_layers(runtime_kv_plan.layer_phys, block.start_layer, block.end_layer)) {
+                    if (slot < 0 || static_cast<uint32_t>(slot) >= n_layers ||
+                        !layer_in_this_kv_buffer(static_cast<uint32_t>(slot)) ||
+                        runtime_kv_plan.kv_size_for_layer(static_cast<uint32_t>(slot)) == 0) {
                         continue;
                     }
-                    if (runtime_kv_plan.kv_device[layer] != block.kv_device) {
-                        runtime_kv_plan.kv_device[layer] = block.kv_device;
+                    if (runtime_kv_plan.kv_device[slot] != block.kv_device) {
+                        runtime_kv_plan.kv_device[slot] = block.kv_device;
                         reassigned_layers++;
                     }
                 }

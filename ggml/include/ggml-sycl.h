@@ -380,19 +380,32 @@ struct ggml_sycl_tensor_inventory {
     // The micro-batch the caller named for the context it is about to create (llama_model_params::n_ubatch_hint);
     // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
-    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bool above, so the
-    // struct stays 192 bytes (pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
-    // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
-    // still be rebuilt together for the planner to see it.
+    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bool above, so it
+    // added no bytes to the struct. A libllama built before this field leaves the padding as the caller's object holds
+    // it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must still be rebuilt together for
+    // the planner to see it.
     uint32_t                       n_ubatch_context;
+    // The weight layer (`blk.N`) that executes each KV cache slot [kv_layer_phys_count]. A looped model runs one weight
+    // layer for several slots (inkling2_loop runs its core layers three times; nanbeige and metis16 run every layer
+    // once per loop), and the planner puts each slot's KV where the layer that executes it has its weights. The backend
+    // accepts the map only when kv_layer_phys_count == kv_layer_count and every entry is a weight layer id, in
+    // [0, kv_layer_count); otherwise it plans every slot as its own layer and says so at WARN. NULL/0 and an identity
+    // map both mean every slot is its own layer. Appended: the struct grew from 192 to 208 bytes, pinned below and in
+    // ggml-sycl.cpp. The struct carries no size field, so a libllama built before these fields passes a 192-byte
+    // object and libggml-sycl reads these 16 bytes past its end: this layout does not protect a stale producer.
+    // libllama and libggml-sycl must be rebuilt together.
+    const int32_t *                kv_layer_phys;
+    uint32_t                       kv_layer_phys_count;
 };
 
 #if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
 // Both sides of the dlopen boundary compile the inventory's layout from here: libllama, which fills it, and
 // libggml-sycl, which reads it (ggml-sycl.cpp pins the same figures). A field that moves fails both builds instead of
 // being read from the wrong place.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 192, "kv_layer_phys moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 200, "kv_layer_phys_count moved");
 #endif
 
 // SYCL-side projection of the four placement-envelope fields the llama
