@@ -493,12 +493,16 @@ class workspace_admission_authority {
 #endif
 };
 
+// tokens is the batch's token count: the workspace is sized for tokens * top_k occurrences. The authority's bindings
+// are the occurrences the device runs, each under its own index in the batch, strictly increasing and below
+// tokens * top_k; a mixed card-and-host batch binds its card occurrences only.
 struct workspace_admission_shape {
-    size_t  top_k = 0;
-    size_t  ne11  = 0;
-    int64_t K     = 0;
-    int64_t N     = 0;
-    int32_t type  = -1;
+    size_t  top_k  = 0;
+    size_t  ne11   = 0;
+    int64_t K      = 0;
+    int64_t N      = 0;
+    int32_t type   = -1;
+    size_t  tokens = 0;
 };
 
 class workspace_admission_authority_issuer {

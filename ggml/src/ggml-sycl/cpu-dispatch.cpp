@@ -854,8 +854,7 @@ void ggml_sycl_cpu_expert_mul_mat(const cpu_expert_task & task) {
     }
 }
 
-bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
-                                        ggml_sycl::moe_batch_reject_reason * reject) {
+bool ggml_sycl_cpu_moe_host_aos_check(const cpu_moe_host_aos_task & task, ggml_sycl::moe_batch_reject_reason * reject) {
     using namespace ggml_sycl;
     const resolved_ptr workspace_resolved = task.workspace_lease.resolve(mem_handle::HOST_DEVICE);
     if (!task.activations || !task.output || !task.workspace || !workspace_resolved.ptr ||
@@ -884,8 +883,6 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
         if (reject) *reject = moe_batch_reject_reason::STALE_HANDLE;
         return false;
     }
-    const int    K    = static_cast<int>(task.recipe.request.K);
-    const int    N    = static_cast<int>(task.recipe.request.N);
     const size_t rows = task.execution_rows == 0 ? task.recipe.request.rows : task.execution_rows;
     if (rows == 0 || rows > task.recipe.request.rows) {
         if (reject) {
@@ -893,6 +890,25 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
         }
         return false;
     }
+    if (reject) {
+        *reject = moe_batch_reject_reason::NONE;
+    }
+    return true;
+}
+
+bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task &        task,
+                                        ggml_sycl::moe_batch_reject_reason * reject) {
+    using namespace ggml_sycl;
+    if (!ggml_sycl_cpu_moe_host_aos_check(task, reject)) {
+        return false;
+    }
+    // The check found the type's CPU traits and a host AoS weight behind the held lease.
+    const auto *       traits   = ggml_sycl_get_type_traits_cpu(task.recipe.request.type);
+    const auto *       vdt      = ggml_sycl_get_type_traits_cpu(traits->vec_dot_type);
+    const resolved_ptr weight   = task.weight_lease.resolve(mem_handle::HOST_DEVICE);
+    const int          K        = static_cast<int>(task.recipe.request.K);
+    const int          N        = static_cast<int>(task.recipe.request.N);
+    const size_t       rows     = task.execution_rows == 0 ? task.recipe.request.rows : task.execution_rows;
     const auto & ws = task.recipe.workspace;
     auto align_up = [&](size_t value) { return (value + ws.alignment - 1) & ~(ws.alignment - 1); };
     uint8_t * base = static_cast<uint8_t *>(task.workspace);

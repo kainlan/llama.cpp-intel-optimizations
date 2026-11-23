@@ -34381,6 +34381,11 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             }
 
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+            // A mixed fixture needs a plan with experts on both the card and the host, and no real budget gives one
+            // for a synthetic expert of a few kilobytes: GGML_SYCL_RESIDENCY_FORCE_BUDGET_BYTES caps the residency
+            // evaluation (apply_forced_residency_budget), never this pack's `remaining`, and GGML_SYCL_VRAM_BUDGET_PCT
+            // moves `remaining` in steps of one percent of the card, about 160 MB on the B50 and 326 MB on the B70.
+            // The cap only stops the first-fit pack early; which groups land where is still the pack's decision.
             const int  device_group_cap = g_q1_nvfp4_test_device_expert_group_cap.load(std::memory_order_relaxed);
             const bool on_device =
                 group.charge_bytes <= remaining &&

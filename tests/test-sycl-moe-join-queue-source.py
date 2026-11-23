@@ -47,7 +47,9 @@ THE CONTRACT.  With comments blanked:
      hook; dpct's host_buffer, which no backend source reaches).  The Q1/NVFP4 direct
      route's host tasks on its exact queue (the stream) are recorded: each submit is
      assigned to an event, and the statement right after it is
-     unified_cache_note_host_task(*exact_queue, <that event>).  The test programs under ggml-sycl/tests are not backend
+     unified_cache_note_host_task(*exact_queue, <that event>).  So is the join of a mixed
+     batch's host leg (ggml_sycl_moe_direct_host_join), on the stream it is handed:
+     unified_cache_note_host_task(queue, joined).  The test programs under ggml-sycl/tests are not backend
      code and are not censused.
   L. (unified-cache.cpp) the latch: a host task or a join on a queue that is not a
      cache's queue_, or on a second cache, refuses the join queue for the process, as
@@ -299,6 +301,8 @@ def classify_host_task(name: str, heads: list[str]) -> str | None:
             return "test-hook"
         if any("exact_queue->submit" in h for h in heads):
             return "q1-direct"
+        if any(re.search(r"\bggml_sycl_moe_direct_host_join\s*\(", h) for h in heads):
+            return "q1-direct-host-join"
     if name == "cpu-dispatch.cpp":
         if any(re.search(r"cpu_submit_async\s*\(\s*gpu_q\b", h) for h in heads):
             return "cpu-submit-async"
@@ -311,18 +315,31 @@ def classify_host_task(name: str, heads: list[str]) -> str | None:
 
 
 Q1_DIRECT_SUBMIT = "exact_queue->submit("
+# The host leg's join of a mixed batch, in its helper: submitted on `queue`, the node's stream.
+Q1_HOST_JOIN_SUBMIT = "queue.submit("
 
 
 def check_q1_direct_recorded(code: str, host_task_pos: int) -> None:
     """The direct route's host task at `host_task_pos` is recorded right after its submit returns."""
-    at = code.rfind(Q1_DIRECT_SUBMIT, 0, host_task_pos)
+    check_recorded_after_submit(code, host_task_pos, Q1_DIRECT_SUBMIT, "*exact_queue", "Q1/NVFP4 direct host task")
+
+
+def check_q1_host_join_recorded(code: str, host_task_pos: int) -> None:
+    """The direct route's host-leg join at `host_task_pos` is recorded right after its submit returns."""
+    check_recorded_after_submit(code, host_task_pos, Q1_HOST_JOIN_SUBMIT, "queue", "Q1/NVFP4 direct host-leg join")
+
+
+def check_recorded_after_submit(code: str, host_task_pos: int, submit: str, queue: str, what: str) -> None:
+    """The host task at `host_task_pos`, submitted by the nearest `submit` before it into an event, is recorded on
+    `queue` with that event as the statement right after the submit."""
+    at = code.rfind(submit, 0, host_task_pos)
     line = line_of(code, host_task_pos)
     target = re.search(r"(?:sycl::event\s+)?(\w+)\s*=\s*$", code[max(0, at - 200) : at])
     if at < 0 or not target:
-        fail("G", f"the Q1/NVFP4 direct host task at ggml-sycl.cpp:{line} is not submitted into an event, so its "
+        fail("G", f"the {what} at ggml-sycl.cpp:{line} is not submitted into an event, so its "
              "event cannot be recorded for the join queue's guard")
     flat = strip_strings(code)
-    open_paren = at + len(Q1_DIRECT_SUBMIT) - 1
+    open_paren = at + len(submit) - 1
     depth = 0
     close = -1
     for j in range(open_paren, len(flat)):
@@ -335,10 +352,12 @@ def check_q1_direct_recorded(code: str, host_task_pos: int) -> None:
                 break
     event = target.group(1)
     rest = code[close + 1 :] if close >= 0 else ""
-    note = r"\s*;\s*ggml_sycl::unified_cache_note_host_task\s*\(\s*\*\s*exact_queue\s*,\s*" + re.escape(event) + r"\s*\)\s*;"
+    queue_re = r"\*\s*" + re.escape(queue[1:]) if queue.startswith("*") else re.escape(queue)
+    note = (r"\s*;\s*ggml_sycl::unified_cache_note_host_task\s*\(\s*" + queue_re + r"\s*,\s*" + re.escape(event) +
+            r"\s*\)\s*;")
     if close < 0 or not re.match(note, rest):
-        fail("G", f"the Q1/NVFP4 direct host task at ggml-sycl.cpp:{line} is not recorded on its stream right after its "
-             f"submit returns (want unified_cache_note_host_task(*exact_queue, {event}) as the next statement)")
+        fail("G", f"the {what} at ggml-sycl.cpp:{line} is not recorded on its stream right after its "
+             f"submit returns (want unified_cache_note_host_task({queue}, {event}) as the next statement)")
 
 
 def check_census(sources: dict) -> None:
@@ -351,6 +370,8 @@ def check_census(sources: dict) -> None:
             kind = classify_host_task(name, enclosing_headers(code, m.start()))
             if kind == "q1-direct":
                 check_q1_direct_recorded(code, m.start())
+            if kind == "q1-direct-host-join":
+                check_q1_host_join_recorded(code, m.start())
             if kind is None:
                 fail("G", f"host_task at {name}:{line_of(code, m.start())} is not recorded for the join queue's guard; "
                      "submit it through cpu_submit_async or record its event with unified_cache_note_host_task")
@@ -628,6 +649,11 @@ def self_test(s: dict) -> int:
              "ggml_sycl::unified_cache_note_host_task(*exact_queue, final);")),
         ("G", "backend", "Q1/NVFP4 injected terminal not recorded",
          sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, final\);", ";")),
+        ("G", "backend", "Q1/NVFP4 host-leg join not recorded",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(queue, joined\);", ";")),
+        ("G", "backend", "Q1/NVFP4 host-leg join records another event",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(queue, joined\);",
+             "ggml_sycl::unified_cache_note_host_task(queue, sycl::event{});")),
         ("L", "cache_cpp", "latch accepts any queue",
          sub(r"cache && cache->get_queue\(\) == q \? cache : nullptr", "cache")),
         ("L", "cache_cpp", "refusal not sticky",

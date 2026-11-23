@@ -79,11 +79,13 @@ DIRECT_END = "// MoE hybrid GPU+CPU dispatch gate"
 DIRECT_SUCCESS = "ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);"
 DIRECT_PRECONDITION = "if (card_or_host &&"
 # Each step that can decline a call once it has a batch, in the order the route reaches them; "layout" is the gate's
-# own remaining conjunct, the host_* steps are a mixed batch's host leg refused before admission, and "adapter" is the
-# kernel adapter's refusal after the mark.
+# own remaining conjunct, the host_* steps are a mixed batch's host leg refused before admission, and
+# "host_marker_arm" (the cache refusing the host job's input marker) and "adapter" (the kernel adapter's refusal) come
+# after the mark.
 DIRECT_STEPS = ("layout", "precondition", "host_input_marker", "host_task", "host_workspace", "retained_table",
                 "binding", "table_owner_retain", "private_table_owner", "queue_capability", "invocation_snapshot",
-                "submission_authority", "authority_issuer", "workspace_admission", "workspace_slices", "adapter")
+                "submission_authority", "authority_issuer", "workspace_admission", "workspace_slices",
+                "host_marker_arm", "adapter")
 # The precondition's conjuncts are named bools, computed once: the condition and the decline's failed= list read the
 # same bools, and each note's label is the bool's name.
 CONJUNCT_DECL = re.compile(r"\bconst\s+bool\s+(\w+)\s*=")

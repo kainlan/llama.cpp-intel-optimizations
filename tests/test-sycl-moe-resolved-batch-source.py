@@ -236,7 +236,7 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "direct recipe retains exact queue capability":
             "normalized.recipe_queue_capability = *queue_capability",
         "direct admission consumes retained queue capability":
-            "queue_cap = direct_batch.operands.front().recipe_queue_capability",
+            "first_card->recipe_queue_capability()",
         # The operand's retained fields are read through accessors now (value-owned canonical entry).
         "fallback uses retained recipe kernel": "moe_route_kernel_name(operand.recipe().kernel)",
         "fallback uses retained recipe reason": "operand.recipe_reason() ? operand.recipe_reason()",

@@ -588,11 +588,19 @@ struct moe_batch_local_view {
 // result for repeats -- this preserves the exact reject reason/occurrence a
 // full per-occurrence re-check would report, because a repeat can never
 // diverge from its first occurrence's outcome.
-inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+//
+// skip_host leaves a HOST operand out of the view instead of refusing the
+// batch: the card view of a mixed batch, whose host occurrences run on the CPU.
+inline moe_batch_local_view make_moe_batch_view(const moe_resolved_batch & batch,
+                                                ggml_layout_mode           layout,
+                                                bool                       skip_host) {
     moe_batch_local_view                out;
     std::unordered_map<int32_t, size_t> expert_slots;
     expert_slots.reserve(batch.operands.size());
     for (const moe_resolved_operand & operand : batch.operands) {
+        if (skip_host && operand.residency() == moe_batch_residency::HOST) {
+            continue;
+        }
         const auto [existing, inserted] = expert_slots.emplace(operand.expert_id, out.expert_ids.size());
         if (!inserted) {
             if (!out.leases[existing->second].stable_identity_equal(operand.lease())) {
@@ -632,6 +640,16 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
         }
     }
     return out;
+}
+
+// Every operand on this card in `layout`; a HOST operand refuses the batch.
+inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+    return make_moe_batch_view(batch, layout, false);
+}
+
+// The card operands of a batch whose other operands are HOST; any other residency still refuses it.
+inline moe_batch_local_view make_moe_batch_card_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+    return make_moe_batch_view(batch, layout, true);
 }
 
 // llama.cpp-iikr (B50 residual-pool cycle, HOST6 priority 2): boolean-only

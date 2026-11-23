@@ -21,8 +21,9 @@ With comments blanked:
      tests the command_execution_status, names neither ggml_sycl_async_failure_since nor wait_and_throw, and calls no
      wait at all, because the slot-release sites read it as "finished" under the registry and pool mutexes; the class
      has no observe_success and names no async-failure latch, arm takes the event alone, and the route arms it with
-     its final event. Whether the work succeeded is the latch's to say, read only by a boundary that drained on its own
-     thread: a wait on a host-task worker can return while another thread is still delivering the error.
+     its last event (the device output copy, or the last host row copy after it). Whether the work succeeded is the
+     latch's to say, read only by a boundary that drained on its own thread: a wait on a host-task worker can return
+     while another thread is still delivering the error.
   F. (ggml-sycl.cpp, the completion host task) the task releases a finished bundle whatever the latch says: the body
      computes recycled as !skip_release && completion->bundle.terminal_release(), and names no
      ggml_sycl_async_failure, no observe_success and no wait.
@@ -49,7 +50,7 @@ With comments blanked:
      compiled only for route testing: every mention of ggml_sycl_q1_nvfp4_test_retain_completion,
      ggml_sycl_q1_nvfp4_test_hold_completion, ggml_sycl_q1_nvfp4_test_completion_held and the held pointer sits inside
      an #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING branch, and the direct route in ggml_sycl_mul_mat_id hands its
-     completion to the seam after mark_possible_submit() and before terminal->arm(final) and the completion host
+     completion to the seam after mark_possible_submit() and before terminal->arm(last) and the completion host
      task, so the seam holds the completion of the graph it was armed for. The same holds
      for the completion failpoint GGML_SYCL_Q1_NVFP4_TEST_FAILURE_COMPLETION_NO_RELEASE (a completion task that did
      not release, its release refused or skipped; whether one can still be pending after the drain's deferred-decode
@@ -240,8 +241,8 @@ def claims(cache, sycl, common):
             "constexpr bool skip_release = false;" in b,
         "K the route hands its completion to the seam before it arms the terminal": 0 <= route.find(
             "completion->bundle.mark_possible_submit()") < route.find(RETAIN) < route.find(
-            "terminal->arm(final);") < route.find("h.host_task([completion"),
-        "T route arms with its final event": "terminal->arm(final);" in route,
+            "terminal->arm(last);") < route.find("h.host_task([completion"),
+        "T route arms with its last event": "terminal->arm(last);" in route,
         "H handler is bounded": h != "" and not re.search(r"\bthrow\b|GGML_LOG|lock_guard|unique_lock|mutex|"
                                                       r"std::string|\bnew\b", h.replace("rethrow_exception", "")),
     }
@@ -316,7 +317,7 @@ def main():
                 r"if \(!waited \|\|\s*(\(!ggml_sycl_execution_release_graph\(ctx\))", r"if (\1", sycl, count=1),
                 common),
             "route arms its terminal with no event": (cache, sycl.replace(
-                "terminal->arm(final);", "terminal->arm(sycl::event{});", 1), common),
+                "terminal->arm(last);", "terminal->arm(sycl::event{});", 1), common),
             "context twin releases after a throwing wait": (cache, re.sub(
                 r"if \(!waited \|\|\s*(\(!ggml_sycl_execution_release_graph\(backend_ctx\))", r"if (\1", sycl,
                 count=1), common),
@@ -327,8 +328,8 @@ def main():
             "destructor releases without recovering": (cache, sycl.replace(
                 "ggml_sycl_recover_exact_mmid_after_drain(this);", "", 1), common),
             "completion hold outside the testing guard": (cache, sycl.replace(
-                "terminal->arm(final);",
-                "ggml_sycl_q1_nvfp4_test_retain_completion(completion); terminal->arm(final);", 1),
+                "terminal->arm(last);",
+                "ggml_sycl_q1_nvfp4_test_retain_completion(completion); terminal->arm(last);", 1),
                 common),
             "completion hold under an else branch": (cache, sycl.replace(RETAIN_LINE, "#else\n" + RETAIN_LINE, 1),
                                                      common),

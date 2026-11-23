@@ -147,6 +147,7 @@ REACH_SITES = [
     ("graph_preload_moe_experts_impl", "ensure:graph_preload_moe_experts"),
     ("graph_preload_moe_experts_impl", "update:graph_preload_moe_experts"),
     ("ggml_sycl_upload_moe_retained_ptr_table_from_batch", "upload:ggml_sycl_upload_moe_retained_ptr_table_from_batch"),
+    ("ggml_sycl_upload_moe_card_ptr_table_from_batch", "upload:ggml_sycl_upload_moe_card_ptr_table_from_batch"),
     ("try_xmx_sorted_moe", "upload:try_xmx_sorted_moe"),
     ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/prompt"),
     ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/retained"),
