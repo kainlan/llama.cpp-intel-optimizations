@@ -392,3 +392,15 @@ comparisons; `--reasoning-format none` is not a substitute for pinning. GPT-OSS
 was trained for OpenAI's Harmony format — wrong formatting causes cascading
 generation failures, and `llama-bench` proves throughput only, never chat
 correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
+
+## 10. A flat peak `Shmem` after a large host-tiered load is the instrument, not the load
+
+Added 2026-11-23. A sweep arm that pins host experts on a discrete card (SYCL host USM) printed a peak
+`Shmem` equal to the idle figure of its day (6 to 12 GiB), for about 45 arms, while the same runs pinned
+47 GiB and `MemAvailable` fell by 60 GiB. The driver owns those pages and `/proc/meminfo` counts them in no
+field, so `Shmem` cannot move. Do not read "peak `Shmem` flat" as "the load held no host memory".
+
+Read GPU host backing instead: `source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib` (`Shmem` plus
+the meminfo remainder). It reads 12.7 GiB idle and 65.4 GiB in the Qwen3.8 default-mode load that left `Shmem`
+flat. A positive control is a load known to pin host memory: if the sum does not rise for it, the instrument is
+wrong. Measurements and thresholds: `docs/backend/sycl-host-safety.md`, section 10.

@@ -997,11 +997,11 @@ is the registration Task 16 declined.
   fit. There is no gradual approach — the first overlap is fatal.
 - **Sample memory around every run**, not `free -g`, and let it settle:
   ```sh
-  grep -E '^(MemAvailable|Shmem):' /proc/meminfo     # before
+  source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib     # before
   <run the binary>
-  sleep 5; grep -E '^(MemAvailable|Shmem):' /proc/meminfo   # after
+  sleep 5; sycl_gpu_host_backing_gib   # after
   ```
-  Abort the session if `Shmem` climbs past ~100 GB. A reading taken in the same command as the
+  Abort the session if GPU host backing (`Shmem` plus the `/proc/meminfo` remainder) climbs past ~100 GB. A reading taken in the same command as the
   exiting process is measuring the wrong instant and manufactures a false alarm.
 - **Pin the selector**, but ⚠️ **not all of these want `level_zero:1`** — see the per-row
   column. Two of them deliberately run on the **CPU** backend, and the two-GPU rows need both

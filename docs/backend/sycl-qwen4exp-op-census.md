@@ -287,7 +287,7 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
 
 1. Sources oneAPI when needed, then checks that `GGML_SYCL` is ON and that `ldd` resolves at least
    two SYCL libraries (it counts only lines with `=> /`, never "not found").
-2. Waits for CLAUDE.md's post-lock settle: Shmem < 30 GB and MemAvailable > max(150 GB, the mode's
+2. Waits for CLAUDE.md's post-lock settle: GPU host backing (Shmem + the meminfo remainder) < 30 GB and MemAvailable > max(150 GB, the mode's
    need). The qwen4exp need is 215 GB (200 GiB). After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with
    "release GPU.lock and escalate". Every memory figure the script compares or prints is decimal GB
    (10^9 bytes), CLAUDE.md's unit; it compares in bytes, so the floor is exactly 150e9 bytes, and
@@ -296,9 +296,9 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
    exit 3 "not settled" is the rule working as intended, not a defect to work around: the lead
    retries later or escalates, and never lowers the floor.
 3. Launches the run in its own session through `bench-guard.sh`. bench-guard enforces the budget
-   (`timeout -k`), refuses to start if Shmem net of tmpfs exceeds its 10 GiB ceiling
-   (`bench-guard.sh:73,190`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
-   Its ceiling is the binding pre-run gate; the script's Shmem < 30 GB check is the looser one.
+   (`timeout -k`), refuses to start if GPU host backing (Shmem net of tmpfs, plus the remainder) exceeds its 10 GiB ceiling
+   (`bench-guard.sh:73`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
+   Its ceiling is the binding pre-run gate; the script's host backing < 30 GB check is the looser one.
    One second after the launch it checks the session. If bench-guard has already exited, which is
    what a refusal looks like, it says so and takes the normal rc path (steps 5 and 6). If
    `setsid` forked instead, so the run is not in the session the watchdog would kill, it kills the

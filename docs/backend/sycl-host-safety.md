@@ -7,7 +7,8 @@ want to know why a rule exists, what was measured, or what went wrong the last t
 The machine has 255 GB of RAM, 20 cores, two Intel Arc discrete cards (Arc Pro B70 and Arc Pro B50)
 and an Arrow Lake-S integrated GPU (iGPU). "TTM shmem" is the kernel's shared-memory backing for GPU
 buffer objects. It is counted under `Shmem` in `/proc/meminfo` and does not show up in a process's
-own memory figures. "OOM" means the kernel's out-of-memory killer.
+own memory figures. Section 10 (2026-11-23) adds that this holds for the iGPU and for `test-backend-ops`
+only: a discrete card's host-pinned memory is in no `/proc/meminfo` field. "OOM" means the kernel's out-of-memory killer.
 
 The text under each heading below was moved out of `CLAUDE.md` on 2026-11-16 and is unchanged,
 apart from the corrections that are marked as such. In the moved text, "this file" means
@@ -22,7 +23,8 @@ The rules, in one place (the authoritative wording is in `CLAUDE.md`):
 2. Pin `ONEAPI_DEVICE_SELECTOR` to the discrete cards for any run that does not need the iGPU.
 3. Never repeat a test that loads a model onto a GPU.
 4. GPU and model-loading work runs only in the lead session, one run at a time.
-5. Sample `Shmem` and `MemAvailable` before a GPU run and about 5 seconds after it.
+5. Sample GPU host backing (`Shmem` plus the `/proc/meminfo` remainder, section 10) before a GPU run and
+   about 5 seconds after it.
 6. Read the kernel log with `journalctl -k`, because `dmesg` is denied for this user.
 7. Run every GPT-OSS test under `timeout`. 60 seconds covers a short 20B run; benches and default-context
    runs need more.
@@ -307,6 +309,10 @@ label, so "only `main`" means "nobody classified this", not "this is safe".
   removed free-memory conditions from run guards, because `MemAvailable` cannot tell a runaway from a 122 GiB
   model held in host memory on purpose (55 to 60 GB available with `Shmem` flat). On this host `MemAvailable`
   also idles near 144 GB, so the condition could never be met. Wait on `Shmem < 30 GB` and guard on `Shmem`.
+
+  Amendment, 2026-11-23: still no `MemAvailable` floor, but the instrument is GPU host backing, `Shmem` plus the
+  `/proc/meminfo` remainder (section 10), because `Shmem` alone is flat for a discrete card's host-pinned memory.
+  The `30 GB` and `100 GB` figures keep their numbers and apply to that sum.
 
   ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
   2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports
@@ -595,3 +601,53 @@ combination: the prose said "not a B70 consumer" and the table said `renderD128`
 the B70, so checking one against the other manufactured a contradiction. Frigate
 does cost ~250 % CPU (30 `ffmpeg` processes here), so it still depresses *absolute*
 throughput numbers via CPU contention — just not via the B70's execution units.
+
+## 10. GPU host backing: `Shmem` plus the `/proc/meminfo` remainder (2026-11-23)
+
+Every guard before this date watched `Shmem` only. That is blind to a discrete card's host memory.
+
+**Measured 2026-11-23** (integ/th32 `9b5d7d183`, B70 pinned with `level_zero:0`, Qwen3.8 exps-IQ4_NL, default
+load mode, `-ub 2048`, kernel 7.1.2, compute-runtime 26.44). The plan pinned 48133.3 MB of routed host
+experts in SYCL host USM. While loaded, `MemAvailable` fell from 102.6 GiB to 41.8 GiB and `Shmem` stayed at
+11.4 to 11.5 GiB. `Mlocked` was 2.0 GiB (the storage row cache only). The process's own `/proc/<pid>/status`
+showed `RssShmem` 0 and `VmPin` 0. Its xe fdinfo showed `drm-total-gtt` = `drm-resident-gtt` = 52.1 GiB. The host
+memory of such an allocation belongs to the xe driver. It lowers `MemAvailable` and is counted in no category
+and in no process figure. About 45 sweep arms since 2026-11-15 printed a peak `Shmem` equal to the idle figure
+of their day.
+
+**The formula.** The unaccounted part of `/proc/meminfo` is
+
+```
+remainder = MemTotal - (MemFree + Buffers + Cached + SwapCached + AnonPages + Slab
+                        + PageTables + KernelStack + Percpu + Hugetlb)
+GPU host backing = Shmem + max(0, remainder)
+```
+
+The remainder was 54.0 GiB while the model was loaded and 2.7 GiB two minutes after exit. It is read from
+`/proc/meminfo` alone, so it is safe while a SYCL process hangs (the fdinfo rule stays: no fdinfo checks then).
+`scripts/sycl-host-backing.sh` computes it (`sycl_gpu_host_backing_kb`, `sycl_gpu_host_backing_gib`) from a
+meminfo file, `/proc/meminfo` by default. A missing field counts as 0. A file that cannot be read, or that has
+no `MemTotal`, returns non-zero and prints nothing, and every caller treats that as "do not run". Another
+signature stays visible in the sum: the iGPU and the `test-backend-ops` class land in `Shmem`, which the sum
+contains. That `Shmem` signature belongs to those two classes and not to a discrete card. This is also why the
+2026-08 measurement above (a pinned selector holds `Shmem` at 2.4 GB on a full model load) shows the iGPU's
+signature missing, not that nothing was held.
+
+**Why the sum does not see the other tenant.** The other session holds a 122 GiB model in `AnonPages`
+(126 to 130 GiB), which the formula subtracts. Measured with that tenant's model held (`AnonPages` 126.4 GiB):
+remainder 1.9 GiB, sum 12.9 GiB. `MemAvailable` sits near 55 GB then, by design, which is why no
+`MemAvailable` floor is used (ruling 2026-11-12). Recorded snapshots and the test:
+`tests/sycl-meminfo-fixtures/` and `tests/test-sycl-host-backing.sh`.
+
+**Thresholds.** They keep their numbers and apply to the sum.
+
+- Idle sum on this host: 12.7 to 15 GiB (`Shmem` 11 to 12 GiB of ordinary tmpfs, remainder 2 to 3 GiB).
+  Recorded idle snapshot with the tenant's model held: 12.7 GiB. Recorded Qwen3.8 default-mode load: 65.4 GiB.
+- Settle floor, "below 30 GB": about 15 GB above idle, so a leftover of that size from the previous run blocks
+  the next one.
+- Abort ceiling, "past ~100 GB": the largest planned load is the planner's host budget (`MemAvailable` minus
+  about 31 GB, about 76 GB pinned) plus idle, about 90 GB. The host is short at about 110 GiB: `MemTotal`
+  247 GiB minus the tenant's ~127 GiB minus kernel memory. 100 GB sits between 90 and 110.
+
+`scripts/bench-guard.sh` keeps its own, lower ceiling (10 GiB) and still nets ordinary tmpfs out of `Shmem`
+before it adds the remainder.

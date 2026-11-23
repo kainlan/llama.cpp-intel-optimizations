@@ -35,8 +35,10 @@ and attention); declare that OFF only for precision-sensitive models. Build deta
 map: `docs/development/sycl-fork-guide.md`.
 
 ### Running Tests
-A test that loads a model onto a GPU allocates GPU buffers whose host backing is counted under `Shmem` in
-`/proc/meminfo` and in no process's own figures. Such tests have OOM-killed this 255 GB host several times.
+A test that loads a model onto a GPU allocates GPU buffers whose host backing is in no process's own figures.
+An iGPU or `test-backend-ops` run shows it under `Shmem`; a discrete card's host-pinned memory shows only in the
+`/proc/meminfo` remainder. "GPU host backing" below means `Shmem` plus that remainder. Such tests have OOM-killed
+this 255 GB host several times.
 History and measurements: `docs/backend/sycl-host-safety.md`.
 - GPU and model-loading work runs only in the lead session, one run at a time: every `llama-bench`, `llama-cli`,
   `llama-completion`, `test-llama-archs`, `test-thread-safety`, `test-backend-ops` and every `ctest` sweep.
@@ -45,12 +47,14 @@ History and measurements: `docs/backend/sycl-host-safety.md`.
   acceptance criterion, ask whether the binary loads a model onto a GPU. If it does, run it once.
 - Pin the selector to the discrete cards for any local run that does not need the iGPU. Unpinned is the default
   and the dangerous form: `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '<name>' --output-on-failure`
-- Sample memory before each GPU run and about 5 s after it, and abort if `Shmem` climbs past ~100 GB:
-  `grep -E '^(MemAvailable|Shmem):' /proc/meminfo`. Read `Shmem`, not `free`. A reading taken in the same command
-  as an exiting process is a false alarm: `sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo`.
+- Sample GPU host backing before each GPU run and about 5 s after it, and abort if it climbs past ~100 GB:
+  `source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`. Read it, not `Shmem` alone (flat for a
+  discrete card) and not `free`. A reading taken in the same command as an exiting process is a false alarm:
+  `sleep 5; source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`.
 - `GPU.lock` serialises access, not memory recovery. After you take it and before you touch the device, wait for
-  `Shmem < 30 GB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on `Shmem` only:
-  `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling 2026-11-12).
+  GPU host backing `< 30 GB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on that
+  figure only: `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling
+  2026-11-12, amended 2026-11-23: the instrument is `Shmem` plus the remainder, still no `MemAvailable` floor).
 - Run every GPT-OSS test under `timeout`, so a hang cannot hold the card. `timeout 60` covers a short 20B run;
   a bench or a default-context run needs more (`scripts/sycl-canonical-gates.sh` uses 900).
 - `dmesg` is denied for this user. Read the kernel log with
