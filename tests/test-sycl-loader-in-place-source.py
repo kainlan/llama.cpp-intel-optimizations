@@ -40,7 +40,7 @@ The preload
       WEIGHT zone of loader_device's existing cache grown past the plan: from the baseline this load took, its capacity
       once the late pass decided the zones (ggml_sycl_model_host_weight_baseline_note, written there only), to its
       capacity at the preload, against the loader_grown of the plan's recorded terms on loader_device. A load that took
-      no baseline says so at WARN.
+      no baseline says so at WARN, and a check that passed says so at INFO, so a log can tell a pass from no check.
 
 The charge (ucc = unified-cache.cpp)
   C1. placement_plan_host_weight_zone_terms reads the loader facts, charges loader_residency only when one pool holds
@@ -185,6 +185,8 @@ BASELINE_READ = (r"ggml_sycl_model_host_weight_baseline\s*\(\s*model_id\s*,\s*gl
                  r"&baseline\s*\)")
 GROWTH_WARN = r'GGML_LOG_WARN\s*\(\s*"%s\\n"\s*,\s*growth_bug\.c_str\s*\(\s*\)\s*\)'
 NO_BASELINE_FMT = "\"[HOST-PLAN] device=%d the loader pool check has no WEIGHT zone baseline"
+GROWTH_PASS_FMT = "\"[HOST-PLAN] device=%d loader pool check passed: the WEIGHT zone grew %zu B"
+GROWTH_PASS = (GROWTH_WARN + r"\s*;\s*\}\s*else\s*\{\s*GGML_LOG_INFO\s*\(\s*" + re.escape(GROWTH_PASS_FMT))
 BASELINE_NOTE = (r"ggml_sycl::ggml_sycl_configure_host_zones_for_plan\s*\(\s*cache\s*,\s*decision\.device\s*,\s*"
                  r"decision\.snapshot->plan\s*\)\s*;.{0,600}?ggml_sycl_model_host_weight_baseline_note\s*\(\s*"
                  r"owner\.model\.value\s*,\s*decision\.device\s*,\s*"
@@ -351,6 +353,8 @@ def clause_p3_loader_term_checked(t: dict) -> list:
         problems.append("a WEIGHT zone grown past the plan is not logged at WARN")
     if NO_BASELINE_FMT not in body:
         problems.append("a load that took no baseline skips the growth check without saying so")
+    if not re.search(GROWTH_PASS, body):
+        problems.append("a growth check that passed says nothing, so a log cannot tell it from a check that never ran")
     helper = body_of(t[HPP], r"\binline\s+std::string\s+host_zone_weight_growth_check\s*\(")
     for needle in ('"[HOST-PLAN-BUG] device="', "terms.loader_grown", "planned=", "actual=", "excess="):
         if needle not in helper:
@@ -690,6 +694,7 @@ MUTANTS = [
         GS, BASELINE_READ, "(baseline = loader_cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT))")),
     ("growth-unlogged", "P3", mutate_re(GS, GROWTH_WARN, "(void) growth_bug")),
     ("growth-skip-silent", "P3", mutate(GS, NO_BASELINE_FMT, '"[HOST-PLAN] device=%d no baseline')),
+    ("growth-pass-silent", "P3", mutate(GS, GROWTH_PASS_FMT, '"[HOST-PLAN] device=%d WEIGHT zone %zu B')),
     ("baseline-untaken", "P3", mutate_re(GS, r"ggml_sycl_model_host_weight_baseline_note\s*\(\s*owner\.model\.value[^;]*;",
                                          "(void) 0;")),
     ("baseline-before-configure", "P3", mutate_re(
