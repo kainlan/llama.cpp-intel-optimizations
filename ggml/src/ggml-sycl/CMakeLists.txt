@@ -5627,6 +5627,33 @@ set_tests_properties(sycl-moe-bf16-direct-device PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Task 8g (Inkling 2 Mini): the BF16 MUL_MAT_ID expert kernel (moe-bf16-direct.cpp) against a double-precision
+# reference: Inkling's k with a broadcast row and a row per slot, the scalar form (k 99, a broken row stride, an expert
+# base off 8 bytes), float4 defeated by a misaligned activation base, padded strides, and the slot semantics (id -1 a
+# zero row; an out-of-range id or a null table entry a NaN row). The kernel file needs no backend state, so the test
+# compiles it directly (JIT spir64, as test-sycl-bf16-mul-mat does) and links ggml-base alone for the BF16 converters.
+# The registration pins opencl:cpu so it never touches a GPU; run the binary under a GPU selector to check the same
+# kernel there. NAME and labels carry none of the substrings the throttled sweep excludes.
+add_executable(test-sycl-moe-bf16-direct-kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-bf16-direct-kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe-bf16-direct.cpp
+)
+target_include_directories(test-sycl-moe-bf16-direct-kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-moe-bf16-direct-kernel PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-moe-bf16-direct-kernel PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_libraries(test-sycl-moe-bf16-direct-kernel PRIVATE ggml-base)
+set_target_properties(test-sycl-moe-bf16-direct-kernel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bf16-direct-kernel COMMAND test-sycl-moe-bf16-direct-kernel)
+set_tests_properties(sycl-moe-bf16-direct-kernel PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+    LABELS "sycl;moe;bf16;kernel;hostonly"
+    TIMEOUT 300
+)
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
