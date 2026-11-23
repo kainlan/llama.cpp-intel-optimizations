@@ -5931,8 +5931,12 @@ set_tests_properties(test-sycl-weight-identity-multi-model PROPERTIES
 )
 endif() # static SYCL backend fixture
 
-# Device-free: constructs canonical WEIGHT snapshots over stack storage and
-# exercises only route validation/retention.  No queue or backend is opened.
+# A device test. Route validation and retention build canonical WEIGHT
+# snapshots over stack storage, but the owned-slice and scoped production-route
+# cases open a queue on the first device and allocate through unified_alloc, so
+# the unified cache reserves its VRAM arena there (~29.9 GB on the B70), and the
+# route cases run the admitted Q1_0/NVFP4 kernel. Labelled cache;device, run
+# serially and pinned to the B70, like the other device registrations.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-moe-resolved-batch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-resolved-batch.cpp
@@ -5957,9 +5961,10 @@ target_compile_definitions(test-sycl-moe-resolved-batch PRIVATE
 target_link_libraries(test-sycl-moe-resolved-batch PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-moe-resolved-batch COMMAND test-sycl-moe-resolved-batch)
 set_tests_properties(test-sycl-moe-resolved-batch PROPERTIES
-    LABELS "sycl;moe;host;retained-route"
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
+    LABELS "sycl;moe;cache;device;retained-route"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    TIMEOUT 180
 )
 endif()
 
