@@ -439,7 +439,8 @@ struct pool_run {
 
 // The loader's buffers allocated into a fresh pool. configure_host_zones carves the WEIGHT zone first, from logical 0,
 // over chunks of `chunk`: whole segments, then what is left. zone_alloc serves each buffer, rounded to the grain, from
-// the first segment with room, and grow_zone adds one chunk sized to a buffer no segment holds.
+// the first segment with room, and grow_zone adds one chunk for a buffer no segment holds, sized from the request
+// unified_alloc makes for it (zone_grow_request, at the alignment the SYCL_Host buffer type ends up with).
 pool_run run_pool(const std::vector<size_t> & buffers, size_t weight_zone, size_t chunk) {
     std::vector<size_t> room(weight_zone / chunk, chunk);
     if (weight_zone % chunk != 0) {
@@ -454,11 +455,13 @@ pool_run run_pool(const std::vector<size_t> & buffers, size_t weight_zone, size_
             run.placed++;
             continue;
         }
-        const size_t usable = std::max(chunk, align_up(bytes, kHeader));
+        const ggml_sycl::pinned_chunk_pool::chunk_footprint grown = ggml_sycl::pinned_chunk_pool::chunk_footprint_for(
+            chunk, ggml_sycl::pinned_chunk_pool::zone_grow_request(buffer, kHeader));
         run.grown_chunks++;
-        run.grown_bytes += usable + kHeader;
+        run.grown_bytes += grown.backing;
         run.short_zone += bytes <= chunk ? 1 : 0;
-        room.push_back(usable - bytes);
+        CHECK(grown.usable >= bytes);  // the chunk grown for the buffer holds it
+        room.push_back(grown.usable >= bytes ? grown.usable - bytes : 0);
     }
     return run;
 }
@@ -582,6 +585,33 @@ void check_oversize_buffer_grows_a_planned_chunk() {
         check_footprint_against_pool(order, kPoolChunk, 1024 * kMiB);
     }
     CHECK(ggml_sycl::placement_loader_pool_footprint_for(moe_tensors(), kPoolChunk, 1024 * kMiB).grown > 0);
+}
+
+// A chunk the pool grows for one contiguous request no chunk holds serves that request. zone_alloc aligns the size to
+// the request's alignment and asks the chunk's fresh TLSF for it at the larger of that alignment and the grain, and the
+// chunk's arena is chunk_footprint_for(chunk, zone_grow_request(size, alignment)).usable bytes. Every residue of the
+// size modulo the grain that ggml-alloc's 32 B padding gives, at each alignment the TLSF takes (it refuses one above
+// the grain), and a request of exactly one chunk.
+void check_grown_chunk_serves_its_request() {
+    using ggml_sycl::pinned_chunk_pool;
+    const size_t chunk  = 64 * kMiB;
+    const auto   served = [&](size_t size, size_t alignment) {
+        const size_t usable =
+            pinned_chunk_pool::chunk_footprint_for(chunk, pinned_chunk_pool::zone_grow_request(size, alignment)).usable;
+        ggml_sycl::tlsf_allocator fresh(usable);
+        const bool ok = fresh.allocate(align_up(size, alignment), std::max(alignment, kGrain)) != SIZE_MAX;
+        if (!ok) {
+            std::printf("not served: size=%zu (residue %zu) alignment=%zu arena=%zu\n", size, size % kGrain, alignment,
+                          usable);
+        }
+        return ok;
+    };
+    for (const size_t alignment : { kHeader, 2 * kHeader, kGrain }) {
+        for (size_t residue = 0; residue < kGrain; residue += TENSOR_ALIGNMENT) {
+            CHECK(served(3 * chunk + residue, alignment));
+        }
+    }
+    CHECK(served(chunk, kHeader));
 }
 
 // What the oracle says of an admitted plan: every chunk the loader grows is one the plan counted.
@@ -720,8 +750,8 @@ void check_loader_pool_over_budget_is_refused() {
 }
 
 // The loader pool's check at the preload sees a packing drift: it measures how far loader_device's WEIGHT zone grew
-// while the load allocated, from the capacity the zone had when the load decided the host zones, against the
-// loader_grown the plan recorded. The oracle's pool gives the growth an admitted plan's buffers take.
+// from the capacity the zone had when the load decided the host zones, against the loader_grown the plan recorded.
+// The oracle's pool gives the growth an admitted plan's buffers take.
 void check_weight_zone_growth_is_checked() {
     std::vector<size_t> oversize = moe_tensors();
     oversize.insert(oversize.begin() + 5, align_up(2856 * kMiB + 12345, TENSOR_ALIGNMENT));
@@ -741,6 +771,11 @@ void check_weight_zone_growth_is_checked() {
     };
     CHECK(check(configured, configured + grown).empty());
     CHECK(check(configured, configured).empty());
+    // The bound is inclusive: a zone grown by exactly loader_grown passes and one byte more warns. A real load grows
+    // the usable bytes, one header per chunk below loader_grown, so this boundary is a synthetic capacity.
+    CHECK(grown < terms.loader_grown);
+    CHECK(check(configured, configured + terms.loader_grown).empty());
+    CHECK(!check(configured, configured + terms.loader_grown + 1).empty());
 
     // One chunk more than the plan counted: the line names the device and the planned, actual and excess bytes.
     const size_t      actual = configured + grown + kPoolChunk;
@@ -789,6 +824,7 @@ int main() {
     check_pool_oracle_reproduces_the_device_log();
     check_loader_footprint_is_the_pools();
     check_oversize_buffer_grows_a_planned_chunk();
+    check_grown_chunk_serves_its_request();
     check_admitted_plan_grows_nothing_unplanned();
     check_record_below_its_loader_term();
     check_loader_pool_over_budget_is_refused();

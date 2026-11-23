@@ -926,6 +926,48 @@ static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
     return true;
 }
 
+// The same growth for a request whose size is not a multiple of the TLSF grain: zone_alloc rounds it up to the grain,
+// so the chunk grown for it must hold the rounded block, not only the request plus the base alignment. A size 32 B past
+// three chunks is the shape a SYCL_Host buffer takes (ggml-alloc pads its tensors to 32 B).
+static bool host_zone_grow_serves_odd_residue_oversize_alloc(sycl::queue & q) {
+    TEST_BEGIN("host_zone_grow_serves_odd_residue_oversize_alloc");
+
+    const char * old_chunk_mb = std::getenv("GGML_SYCL_PINNED_CHUNK_MB");
+    const bool   had_chunk_mb = old_chunk_mb != nullptr;
+    std::string  saved_chunk_mb;
+    if (had_chunk_mb) {
+        saved_chunk_mb = old_chunk_mb;
+    }
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+
+    constexpr size_t mib    = 1024ull * 1024ull;
+    constexpr size_t chunk  = 16ull * mib;
+    constexpr size_t budget = 128ull * mib;
+    const size_t     align  = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+
+    pinned_chunk_pool pool(q, budget);
+    pool.configure_zones(4ull * mib, 1ull * mib, 2ull * mib, 1ull * mib);  // one 16 MiB chunk
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", had_chunk_mb ? saved_chunk_mb.c_str() : nullptr);
+    TEST_ASSERT(pool.zones_configured(), "host zones were not configured");
+
+    const size_t request = 3 * chunk + 32;
+    TEST_ASSERT(pool.zone_alloc(host_zone_id::WEIGHT, request, align) == nullptr,
+                "a request past three chunks must not fit the 4 MiB WEIGHT zone before growth");
+    const size_t cap_before = pool.zone_capacity(host_zone_id::WEIGHT);
+    const size_t need       = pinned_chunk_pool::zone_grow_request(request, align);
+    TEST_ASSERT(pool.grow_zone(host_zone_id::WEIGHT, need), "grow_zone should succeed within a 128 MiB budget");
+    TEST_ASSERT(pool.zone_capacity(host_zone_id::WEIGHT) - cap_before ==
+                    pinned_chunk_pool::chunk_footprint_for(chunk, need).usable,
+                "zone_capacity should grow by the usable bytes of the chunk grown for the request");
+
+    void * ptr = pool.zone_alloc(host_zone_id::WEIGHT, request, align);
+    TEST_ASSERT(ptr != nullptr, "the chunk grown for a request off the TLSF grain should serve it");
+
+    pool.zone_free(host_zone_id::WEIGHT, ptr);
+    TEST_PASS();
+    return true;
+}
+
 // Run only via --case host_inventory_initializes_zones, in a fresh process.
 // Metadata describes complete gate/up/down groups (one MiB per role) whose
 // aggregate exceeds the actual shared arena by 64 MiB. No GGUF or weight
@@ -3339,6 +3381,12 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
             return case_ok ? 0 : 1;
         }
+        if (std::strcmp(argv[2], "host_zone_grow_serves_odd_residue_oversize_alloc") == 0) {
+            const bool case_ok = host_zone_grow_serves_odd_residue_oversize_alloc(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_ok ? 0 : 1;
+        }
         // No oneDNN dependency either; it allocates its own small arenas on the device.
         if (std::strcmp(argv[2], "arena_teardown_refusal_classes") == 0) {
             const int case_rc = arena_teardown_refusal_classes(q);
@@ -3410,6 +3458,7 @@ int main(int argc, char ** argv) {
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_config_ordering_matters(q);
     ok &= host_zone_grow_serves_oversize_contiguous_alloc(q);
+    ok &= host_zone_grow_serves_odd_residue_oversize_alloc(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= independent_exact_token_defers_owned_release(q);
     ok &= hand_built_arena_is_judged_by_its_own_zone_plan(q);
