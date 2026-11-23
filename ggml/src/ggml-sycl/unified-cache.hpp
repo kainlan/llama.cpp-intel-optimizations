@@ -2712,12 +2712,13 @@ inline std::string placement_plan_loader_pool_refusal(const placement_plan & pla
            " loader_device=" + std::to_string(plan.loader_device);
 }
 
-// The loader pool's check once the loader's buffers are in loader_device's pool: how far the pool's WEIGHT zone grew
-// while this load allocated, from `baseline`, its capacity when the load decided the card's host zones (configured them,
-// or found them configured by an earlier load and kept them), to `capacity`, its capacity now, against the growth the
-// plan recorded for the loader's buffers, `terms.loader_grown` (the plan's commit terms on that device). Returns one
-// "[HOST-PLAN-BUG]" line naming the device and the planned, actual and excess bytes when the zone grew past it, empty
-// otherwise. A capacity at or below the baseline has not grown.
+// The loader pool's check once the host weights are placed: how far loader_device's WEIGHT zone grew, from `baseline`,
+// its capacity when the load decided the card's host zones (configured them, or found them configured by an earlier
+// load and kept them), to `capacity`, its capacity now, against the growth the plan recorded for the loader's buffers,
+// `terms.loader_grown` (the plan's commit terms on that device). The window also holds what else this load put in the
+// zone (upload buffers taken from SYCL_Host, the preload's host-weight blocks), which the plan sized the zone to hold
+// beside the loader's buffers. Returns one "[HOST-PLAN-BUG]" line naming the device and the planned, actual and excess
+// bytes when the zone grew past it, empty otherwise. A capacity at or below the baseline has not grown.
 inline std::string host_zone_weight_growth_check(int                            device,
                                                  const host_zone_commit_terms & terms,
                                                  size_t                         baseline,
@@ -2727,10 +2728,12 @@ inline std::string host_zone_weight_growth_check(int                            
         return {};
     }
     return "[HOST-PLAN-BUG] device=" + std::to_string(device) +
-           " the WEIGHT zone grew past the plan while the loader allocated: planned=" + std::to_string(planned) +
-           " actual=" + std::to_string(capacity) + " excess=" + std::to_string(capacity - planned) +
-           " baseline=" + std::to_string(baseline) + " loader_grown=" + std::to_string(terms.loader_grown) +
-           "; the plan replays the loader's buffers into an empty zone, and the pool did not place them so";
+           " the WEIGHT zone grew past the plan after this load decided its host zones: planned=" +
+           std::to_string(planned) + " actual=" + std::to_string(capacity) +
+           " excess=" + std::to_string(capacity - planned) + " baseline=" + std::to_string(baseline) +
+           " loader_grown=" + std::to_string(terms.loader_grown) +
+           "; the plan sized the zone to hold the loader's buffers as its replay places them, with the rest of its "
+           "record beside them, so the pool grew for bytes the plan did not place";
 }
 
 // One lazy table's fields as every lazy line prints them (th32 §10), so the planner's [PLACEMENT] lazy lines and the

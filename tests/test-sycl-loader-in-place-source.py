@@ -186,7 +186,8 @@ BASELINE_READ = (r"ggml_sycl_model_host_weight_baseline\s*\(\s*model_id\s*,\s*gl
 GROWTH_WARN = r'GGML_LOG_WARN\s*\(\s*"%s\\n"\s*,\s*growth_bug\.c_str\s*\(\s*\)\s*\)'
 NO_BASELINE_FMT = "\"[HOST-PLAN] device=%d the loader pool check has no WEIGHT zone baseline"
 GROWTH_PASS_FMT = "\"[HOST-PLAN] device=%d loader pool check passed: the WEIGHT zone grew %zu B"
-GROWTH_PASS = (GROWTH_WARN + r"\s*;\s*\}\s*else\s*\{\s*GGML_LOG_INFO\s*\(\s*" + re.escape(GROWTH_PASS_FMT))
+# the pass line sits in the else arm of the growth WARN; the arm may read what it prints first, with no nested block
+GROWTH_PASS = (GROWTH_WARN + r"\s*;\s*\}\s*else\s*\{[^{}]*?GGML_LOG_INFO\s*\(\s*" + re.escape(GROWTH_PASS_FMT))
 BASELINE_NOTE = (r"ggml_sycl::ggml_sycl_configure_host_zones_for_plan\s*\(\s*cache\s*,\s*decision\.device\s*,\s*"
                  r"decision\.snapshot->plan\s*\)\s*;.{0,600}?ggml_sycl_model_host_weight_baseline_note\s*\(\s*"
                  r"owner\.model\.value\s*,\s*decision\.device\s*,\s*"
@@ -342,7 +343,7 @@ def clause_p3_loader_term_checked(t: dict) -> list:
         problems.append("the check does not run whenever the plan charges the loader term")
     if not re.search(r"ggml_sycl_model_host_chunk_bytes\s*\(\s*model_id\s*,\s*global_plan->loader_device\s*\)", body):
         problems.append("the check does not count the chunks in loader_device's pool")
-    # The packing: the WEIGHT zone's growth while the loader allocated, against the plan's record of it.
+    # The growth: the WEIGHT zone's growth from the late pass's baseline to the preload, against the plan's record of it.
     if not re.search(GROWTH_CHECK_CALL, body):
         problems.append("the preload does not check loader_device's WEIGHT zone growth against the plan's recorded terms")
     if not re.search(LOADER_CACHE, body):

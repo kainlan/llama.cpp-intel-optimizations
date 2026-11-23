@@ -1371,15 +1371,20 @@ does for a host-planned expert with no owner. The limits:
   `loader_device`'s pool, and neither check stops the load. The term: what the
   model still holds in `SYCL_Host` chunks there, against `loader_residency`; a
   term short of it is a `[HOST-PLAN-BUG]` WARN. The replay: how far that pool's
-  WEIGHT zone grew while the load allocated, against the plan's recorded
-  `loader_grown` (`host_zone_weight_growth_check`). The growth is measured from
-  the zone's capacity when the load's late pass decided the zones, configured
-  from its plan or kept as an earlier load left them, since the zones outlive
-  the last model's release and an earlier load's growth is not this one's.
-  Growth past the record is a `[HOST-PLAN-BUG]` WARN naming the planned, actual
-  and excess bytes: the pool did not place the loader's buffers as the replay
-  did, which assumes an empty zone. A load whose late pass took no baseline says
-  at WARN that the growth goes unchecked.
+  WEIGHT zone grew, against the plan's recorded `loader_grown`
+  (`host_zone_weight_growth_check`). The growth is measured from the zone's
+  capacity when the load's late pass decided the zones, configured from its
+  plan or kept as an earlier load left them, since the zones outlive the last
+  model's release and an earlier load's growth is not this one's, to its
+  capacity once the preload has placed the host weights. That window holds the
+  loader's buffers, any upload buffers the loader takes from `SYCL_Host`, and
+  the preload's host-weight blocks, so the check covers the whole WEIGHT
+  record, not the replay alone: the plan sizes the zone to hold the loader's
+  buffers as the replay places them, with the rest of the record beside them.
+  Growth past the record is a `[HOST-PLAN-BUG]` WARN naming the planned,
+  actual and excess bytes. A check that passes says so at INFO, and a load
+  whose late pass took no baseline says at WARN that the growth goes
+  unchecked.
 
 **Ticket to file:** `CPU_REPACK` weights are allocated by ggml-cpu's
 `ggml_backend_cpu_repack_buffer_type` (`ggml-cpu/repack.cpp:5238-5250`),

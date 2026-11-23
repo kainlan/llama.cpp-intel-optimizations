@@ -17765,7 +17765,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                     auto * cache = ggml_sycl::get_unified_cache_for_device(decision.device);
                     ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);
                     // The zones this load starts from, configured now or kept from an earlier load: the preload
-                    // measures the WEIGHT zone's growth while the loader allocated from here.
+                    // measures the WEIGHT zone's growth from here to the end of its host-weight placement.
                     if (cache != nullptr && cache->host_zones_configured()) {
                         ggml_sycl_model_host_weight_baseline_note(
                             owner.model.value, decision.device,
@@ -47108,9 +47108,11 @@ static void ggml_sycl_preload_model_weights() {
 
         // The plan charged the loader's SYCL_Host buffer to loader_device's WEIGHT zone. Two checks, once the loader's
         // temporaries are freed, so what the model still holds in SYCL_Host chunks in that device's pool is that
-        // buffer. The term: more than loader_residency means the plan counted the buffer short. The packing: the plan
-        // sized the zone from a replay of the loader's buffers into the pool (loader_zone, loader_grown), so the
-        // zone growing past loader_grown while this load allocated means the pool did not place them as replayed.
+        // buffer. The term: more than loader_residency means the plan counted the buffer short. The growth: the plan
+        // sized the zone to hold the loader's buffers as its replay places them (loader_zone, loader_grown), with the
+        // rest of its record beside them. From the baseline the late pass took to now, after the host weights are
+        // placed, the zone growing past loader_grown means the pool grew for bytes the plan did not place. A pass says
+        // so at INFO, so a log tells a pass from a load that never reached the check.
         if (global_plan != nullptr && global_plan->loader_holds_weights && global_plan->loader_device >= 0) {
             const uint64_t model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
             const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->loader_device);
@@ -47133,6 +47135,13 @@ static void ggml_sycl_preload_model_weights() {
                         baseline, loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT));
                     if (!growth_bug.empty()) {
                         GGML_LOG_WARN("%s\n", growth_bug.c_str());
+                    } else {
+                        const size_t capacity = loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
+                        GGML_LOG_INFO(
+                            "[HOST-PLAN] device=%d loader pool check passed: the WEIGHT zone grew %zu B from its "
+                            "baseline %zu B, within the plan's loader_grown %zu B\n",
+                            global_plan->loader_device, capacity > baseline ? capacity - baseline : 0, baseline,
+                            global_plan->host_zone_terms.loader_grown);
                     }
                 } else {
                     GGML_LOG_WARN(
