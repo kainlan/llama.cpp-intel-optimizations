@@ -5,6 +5,7 @@ Each listed test enters a production route cold, and cold B70 AOT/submit can out
 watchdog. So each registration sets GGML_SYCL_OP_TIMEOUT_MS explicitly, 10 s or more below its own CTest timeout so a
 real hang is still diagnosed by the backend, and nothing else in the file sets it.
 """
+from itertools import takewhile
 from pathlib import Path
 import re
 
@@ -19,6 +20,10 @@ WATCHDOG_ENV = "GGML_SYCL_OP_TIMEOUT_MS"
 EXPECTED_WATCHDOG_MS = 110_000
 MIN_CTEST_MARGIN_MS = 10_000
 ROUTE_LABEL = "production-route"
+# Every call that sets a test property. CMake command names are case-insensitive; keywords such as TEST are not.
+PROPERTY_CALL = re.compile(r"\b(set_tests_properties|set_property)\s*\(", re.IGNORECASE)
+CMAKE_ARGUMENT = re.compile(r'"(?:[^"\\]|\\.)*"|[^\s"]+')
+SET_PROPERTY_KEYWORDS = ("DIRECTORY", "APPEND", "APPEND_STRING", "PROPERTY")
 
 
 def strip_cmake_comments(cmake: str) -> str:
@@ -48,21 +53,56 @@ def strip_cmake_comments(cmake: str) -> str:
     return "".join(out)
 
 
-def registration_properties(code: str, name: str) -> str:
-    # `code` has its comments removed, and the body then ends at the first ")" that is outside a quoted argument: a
-    # registration's own comments contain parentheses (the "(level_zero:1 selects the B50 for a second run)" in the
-    # q1 comment would otherwise cut the body off before ENVIRONMENT and TIMEOUT), and so could a trailing comment or
-    # a quoted value.
-    match = re.search(rf"set_tests_properties\(\s*{re.escape(name)}\s+PROPERTIES", code)
-    assert match, f"{name}: missing its set_tests_properties(... PROPERTIES"
+def call_end(code: str, start: int, what: str) -> int:
+    """Offset of the ")" closing the call whose arguments start at `start`: the first one outside a quoted argument.
+
+    `code` has its comments removed first: a registration's own comments contain parentheses (the "(level_zero:1
+    selects the B50 for a second run)" in the q1 comment would otherwise cut the body off before ENVIRONMENT and
+    TIMEOUT), and so could a trailing comment or a quoted value.
+    """
     in_quote = False
-    for i in range(match.end(), len(code)):
+    for i in range(start, len(code)):
         ch = code[i]
         if ch == '"' and code[i - 1] != "\\":
             in_quote = not in_quote
         elif ch == ")" and not in_quote:
-            return code[match.end() : i]
-    raise AssertionError(f"{name}: unterminated set_tests_properties")
+            return i
+    raise AssertionError(f"{what}: unterminated call")
+
+
+def property_calls(code: str) -> list:
+    """(command, test names) for every set_tests_properties(...) and set_property(TEST ...) call in `code`."""
+    calls = []
+    for match in PROPERTY_CALL.finditer(code):
+        command = match.group(1).lower()
+        text = code[match.end() : call_end(code, match.end(), command)]
+        args = [arg[1:-1] if arg.startswith('"') else arg for arg in CMAKE_ARGUMENT.findall(text)]
+        if command == "set_tests_properties":
+            names = args[: args.index("PROPERTIES")] if "PROPERTIES" in args else args
+        elif args and args[0] == "TEST":
+            names = list(takewhile(lambda arg: arg not in SET_PROPERTY_KEYWORDS, args[1:]))
+        else:
+            continue  # set_property on another scope (GLOBAL, DIRECTORY, TARGET, SOURCE, INSTALL, CACHE)
+        calls.append((command, names))
+    return calls
+
+
+def registration_properties(code: str, name: str) -> str:
+    match = re.search(rf"set_tests_properties\(\s*{re.escape(name)}\s+PROPERTIES", code)
+    assert match, f"{name}: missing its set_tests_properties({name} PROPERTIES ...)"
+    return code[match.end() : call_end(code, match.end(), name)]
+
+
+@pytest.mark.parametrize("name", TEST_NAMES)
+def test_one_property_call_names_each_listed_test(name: str) -> None:
+    # CTest applies the last value set, so a second call naming the test (a later set_tests_properties, a
+    # set_property(TEST ...) or a multi-test set_tests_properties) could override the watchdog or TIMEOUT that the
+    # checks below read from its registration. Exactly one call names it, as a whole argument.
+    named_by = [command for command, names in property_calls(strip_cmake_comments(CMAKE.read_text())) if name in names]
+    assert len(named_by) == 1, (
+        f"{name}: {len(named_by)} property-setting calls name it ({', '.join(named_by) or 'none'}), want 1: CTest "
+        f"applies the last value set, so a second call could override its watchdog or TIMEOUT"
+    )
 
 
 @pytest.mark.parametrize("name", TEST_NAMES)
