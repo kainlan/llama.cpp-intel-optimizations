@@ -2166,6 +2166,9 @@ struct llama_model_hrm_text : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 64; }
 
+    // slot il runs the low or the high stack's layer il % n_hrm_layers_per_stack: later passes alias the first two
+    int layer_phys(int il) const override;
+
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
 
