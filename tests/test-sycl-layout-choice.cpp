@@ -2081,6 +2081,106 @@ static bool run_multi_device_kv_slot_block_test() {
     return ok;
 }
 
+// The backend takes the map from the inventory libllama fills: one entry per KV slot, each a weight layer id below the
+// slot count. An identity map is kept empty; a map with the wrong count or an entry out of range is refused, kept
+// empty, and says which. A layer the late inventory leaves out (its weights are on a CPU buffer type) keeps the map,
+// and its slots are host slots.
+static bool run_kv_slot_map_intake_test() {
+    using namespace kv_slot_case;
+    std::vector<ggml_sycl_tensor_info> tensors;
+    std::vector<std::string>           names;
+    for (int l = 0; l < n_phys; ++l) {
+        names.push_back("blk." + std::to_string(l) + ".attn_q.weight");
+    }
+    for (const std::string & name : names) {
+        ggml_sycl_tensor_info info{};
+        info.name = name.c_str();
+        info.size = dense_bytes;
+        info.type = GGML_TYPE_F16;
+        tensors.push_back(info);
+    }
+    std::vector<int32_t> identity(n_slot);
+    for (int s = 0; s < n_slot; ++s) {
+        identity[s] = s;
+    }
+    const std::vector<int32_t> loop         = loop_map();
+    std::vector<int32_t>       out_of_range = loop;
+    out_of_range[40]                        = n_slot;
+    std::vector<int32_t> negative           = loop;
+    negative[3]                             = -1;
+
+    auto intake = [&](const std::vector<int32_t> * map, uint32_t count) {
+        ggml_sycl_tensor_inventory inv{};
+        inv.tensors             = tensors.data();
+        inv.count               = tensors.size();
+        inv.n_layer             = n_slot;
+        inv.kv_layer_count      = n_slot;
+        inv.kv_layer_phys       = map != nullptr ? map->data() : nullptr;
+        inv.kv_layer_phys_count = count;
+        return ggml_sycl::placement_kv_layer_phys_from_inventory(inv);
+    };
+
+    bool       ok   = true;
+    const auto none = intake(nullptr, 0);
+    if (none.refused || !none.layer_phys.empty()) {
+        printf("FAIL: no map is every slot its own layer, not refused\n");
+        ok = false;
+    }
+    const auto same = intake(&identity, n_slot);
+    if (same.refused || !same.layer_phys.empty()) {
+        printf("FAIL: the identity map is kept empty, not refused: refused=%d size=%zu\n", same.refused,
+               same.layer_phys.size());
+        ok = false;
+    }
+    const auto looped = intake(&loop, n_slot);
+    if (looped.refused || looped.layer_phys != loop) {
+        printf("FAIL: the Inkling map is accepted as given: refused=%d size=%zu\n", looped.refused,
+               looped.layer_phys.size());
+        ok = false;
+    }
+    const auto short_map = intake(&loop, n_slot - 1);
+    if (!short_map.refused || !short_map.layer_phys.empty() || short_map.count != n_slot - 1 ||
+        short_map.kv_layer_count != n_slot || short_map.bad_slot != -1) {
+        printf("FAIL: a map one entry short is refused and names both counts: refused=%d counts %u/%u bad slot %d\n",
+               short_map.refused, short_map.count, short_map.kv_layer_count, short_map.bad_slot);
+        ok = false;
+    }
+    const auto past  = intake(&out_of_range, n_slot);
+    const auto below = intake(&negative, n_slot);
+    if (!past.refused || !past.layer_phys.empty() || past.bad_slot != 40 || past.bad_layer != n_slot ||
+        !below.refused || below.bad_slot != 3 || below.bad_layer != -1) {
+        printf("FAIL: an entry out of range is refused and named: slot %d layer %d, slot %d layer %d\n", past.bad_slot,
+               past.bad_layer, below.bad_slot, below.bad_layer);
+        ok = false;
+    }
+
+    // The late inventory without layer 6, whose weights went to a CPU buffer type: the map stands, and slots 6, 30
+    // and 42 are the host's while every other slot is on the card with room.
+    tensors.erase(tensors.begin() + 6);
+    const auto late           = intake(&loop, n_slot);
+    auto       late_inventory = inventory(n_phys);
+    late_inventory.erase(late_inventory.begin() + 6);
+    const size_t roomy = n_phys * dense_bytes + n_slot * kv_slot + kv_slot;
+    const auto   plan =
+        ggml_sycl::compute_placement_plan(late_inventory, roomy, 0, kv_info(n_slot, late.layer_phys), nullptr, 0);
+    bool host_slots_ok = !late.refused && late.layer_phys == loop;
+    for (int s = 0; s < n_slot; ++s) {
+        host_slots_ok = host_slots_ok && plan.get_kv_device(s) == (loop_layer_of(s) == 6 ? -1 : 0);
+    }
+    if (!host_slots_ok) {
+        printf(
+            "FAIL: a layer the late inventory leaves out keeps the map, its slots on the host: refused=%d, "
+            "slots 6/30/42 on %d/%d/%d, slot 7 on %d\n",
+            late.refused, plan.get_kv_device(6), plan.get_kv_device(30), plan.get_kv_device(42), plan.get_kv_device(7));
+        ok = false;
+    }
+
+    if (ok) {
+        printf("PASS: the slot map is taken only when it fits the inventory, and the identity is kept empty\n");
+    }
+    return ok;
+}
+
 static bool run_multi_device_layer_block_plan_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -4606,6 +4706,7 @@ int main() {
         mock_ok = run_kv_slot_modulo_map_test() && mock_ok;
         mock_ok = run_kv_slot_identity_map_test() && mock_ok;
         mock_ok = run_multi_device_kv_slot_block_test() && mock_ok;
+        mock_ok = run_kv_slot_map_intake_test() && mock_ok;
         mock_ok = run_multi_device_layer_block_plan_test() && mock_ok;
         mock_ok = run_multi_device_layer_boundary_metadata_test() && mock_ok;
         mock_ok = run_multi_device_moe_i8_executor_support_test() && mock_ok;
