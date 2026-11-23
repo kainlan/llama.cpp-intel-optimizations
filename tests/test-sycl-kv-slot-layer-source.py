@@ -415,3 +415,11 @@ def test_mutant_slot_line_for_every_model_fails():
 def test_mutant_accept_line_for_every_model_fails():
     mutant = _once(SYCL, ACCEPT_LINE_GATE, "} else {")
     assert not claim_identity_prints_as_before(CACHE, mutant)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
