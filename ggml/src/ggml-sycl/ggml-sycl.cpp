@@ -22300,8 +22300,16 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     std::exception_ptr                 escaped;
     // A loan's or an evict's drops keep a lease on every view they take here, retained after the loop.
     std::vector<ggml_sycl::mem_handle> lent_views;
+
+    // The leases each move to the host hands over on the device entries it retired (expert_move_record::
+    // retired_leases), held until this call returns. The deferred-free pass reaps a retired entry once its last lease
+    // goes, and the cache leaves that reap out of the eviction latch, so the leases must outlive the epoch bump below
+    // or the guard's latch. Declared before the guard, they go after its destructor on every exit. Reserved before the
+    // first move, so taking a record's leases cannot throw.
+    std::vector<std::shared_ptr<ggml_sycl::mem_handle>> move_leases;
+    move_leases.reserve(3 * prepared.size());
     // Sets the cache's eviction latch unless the publication below bumps the exec-graph epoch over the moves' retires.
-    ggml_sycl_expert_move_latch_guard  latch{ cache };
+    ggml_sycl_expert_move_latch_guard latch{ cache };
     for (ggml_sycl_expert_prepared_triplet & triplet : prepared) {
         const bool                    to_device = ggml_sycl_expert_move_to_device(triplet.kind);
         const bool                    admit     = triplet.kind == ggml_sycl_expert_move_kind::ADMIT;
@@ -22338,6 +22346,11 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             }
             copy_us += record.copy_us;
             remap_us += record.remap_us;
+            for (std::shared_ptr<ggml_sycl::mem_handle> & lease : record.retired_leases) {
+                if (lease) {
+                    move_leases.push_back(std::move(lease));
+                }
+            }
             if (!loaned) {
                 latch.armed = armed_before;
             }

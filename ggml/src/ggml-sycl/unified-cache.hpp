@@ -4145,7 +4145,11 @@ struct expert_move_member {
 // entry refuses the resolve a view would otherwise be matched by once the cache generation moves. A move to the
 // device leaves both at their defaults. An accepted move also reports the host time it spent, in microseconds, in its
 // copy step (the submissions; a synchronous staged branch would show here as a wait) and in its handover (each id
-// handed to the new copy and the old one retired, under the cache locks), for the move's summary line.
+// handed to the new copy and the old one retired, under the cache locks), for the move's summary line. An accepted move
+// to the host hands the caller, in retired_leases[i], the lease that held each retired device entry in place: the
+// entry's retire is left out of the eviction latch because the caller's publication bumps the exec-graph epoch, so the
+// caller keeps the lease, and the deferred-free pass cannot reap the entry, until that bump has run or the caller has
+// set the latch instead. A move to the device leaves them empty.
 struct expert_move_record {
     bool                 accepted     = false;
     const char *         reason       = "none";
@@ -4157,6 +4161,9 @@ struct expert_move_record {
     unified_cache_key    device_keys[3]   = {};
     uint64_t             copy_us          = 0;
     uint64_t             remap_us         = 0;
+
+    // The lease on each device entry a move to the host retired, for the caller to hold (above).
+    std::shared_ptr<mem_handle> retired_leases[3];
 };
 
 // Whole microseconds since `since`, for the expert move's timings.
@@ -4932,7 +4939,8 @@ class unified_cache {
     // as the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
     // entries' whole size, which the deferred-free pass gives back once each entry is reaped. Nothing here waits and
     // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the device
-    // lease, and flips the plan.
+    // lease, and flips the plan; it holds out.retired_leases until its publication bumps the exec-graph epoch or it
+    // sets the eviction latch instead.
     bool loan_expert_triplet(const expert_move_member members[3], expert_move_record & out);
 
     // Whether the cache holds the entry a move copies from, not retired: for a move to the host, the AOS device entry

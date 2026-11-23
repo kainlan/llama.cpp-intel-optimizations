@@ -19,7 +19,7 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     it in place, all three before any entry changes, since minting allocates; then each device entry's last write
     becomes its copy (has_write_event stamped from the copy, and the copy ran behind the fill), so
     release_entry_allocation_locked queues the free behind the copy; then it retires each entry exactly, registers
-    the host copy behind its copy event, and only then drops the leases;
+    the host copy behind its copy event, and only then hands the leases to the transaction (a rollback drops them);
   - the retire is exact: it withdraws only the device entry's key, and its mirror only while it names that entry, so
     the loan never calls the id-wide retire_expert_entry_exact;
   - a host registration the checks could not foresee failing puts every device entry back (un-retired, recounted,
@@ -287,6 +287,7 @@ DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
             "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false, &out.device_keys[i])")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
+HAND_HELD = "for (int i = 0; i < 3; ++i) { out.retired_leases[i] = std::move(held[i]); }"
 
 
 def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
@@ -294,10 +295,11 @@ def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
     bodies = loan_bodies(cache, sycl)
     once = (SRC_IS_OWNER, COPY, STAMP_EVENT, STAMP_FLAG, HOLD, DEVICE_RETIRE, REGISTER)
     return (all(bodies) and not any("host_task" in x for x in bodies) and all(b.count(x) == 1 for x in once)
-            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 2 and b.count(ENTRY_CHANGED) == 1
+            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 1 and b.count(HAND_HELD) == 1
+            and b.count(ENTRY_CHANGED) == 1
             and ordered(b, SRC_IS_OWNER, DMA_QUEUE, COPY, ENTRY_CHANGED, HOLD, STAMP_EVENT, STAMP_FLAG, DEVICE_RETIRE,
                         REGISTER)
-            and b.find(DROP_HELD) > b.find(REGISTER))
+            and b.find(DROP_HELD) > b.find(REGISTER) and b.find(HAND_HELD) > b.find(REGISTER))
 
 
 # --- the retire is exact --------------------------------------------------------------------------------------------
@@ -3800,6 +3802,57 @@ def test_mutant_guard_sets_nothing_fails():
 
 def test_mutant_guard_never_armed_fails():
     assert not claim_an_unpublished_move_sets_the_latch(_once_in(SYCL, TXN_SIG, GUARD_ARM, ""), CACHE_HPP)
+
+
+# (d) The retires stay unreapable until the latch question is settled. A retired device entry is reaped by the
+# deferred-free pass once its last lease goes, and the mark leaves that reap out of the latch, so a lease must hold
+# each entry until the publication has bumped the epoch, or until the guard has latched on an exit that did not
+# publish. The loan hands the leases that held its retires in place to the transaction (expert_move_record::
+# retired_leases) instead of dropping them; the transaction moves them into one vector, reserved before the first move
+# so taking them cannot throw, and declared before the guard, so the guard's destructor runs first on every exit. The
+# vector is never released by hand: it goes as the call returns, after the bump or after the latch.
+RECORD_LEASES = "std::shared_ptr<mem_handle> retired_leases[3];"
+LEASES_DECL = "std::vector<std::shared_ptr<ggml_sycl::mem_handle>> move_leases;"
+LEASES_RESERVE = "move_leases.reserve(3 * prepared.size());"
+LEASES_TAKEN = ("for (std::shared_ptr<ggml_sycl::mem_handle> & lease : record.retired_leases) { if (lease) { "
+                "move_leases.push_back(std::move(lease)); } }")
+
+
+def claim_a_moves_retires_stay_leased_until_published(cache: str, hpp: str, sycl: str) -> bool:
+    loan = body(norm(cache), LOAN_SIG)
+    txn = body(norm(sycl), TXN_SIG)
+    return (RECORD_LEASES in norm(hpp) and loan.count(HAND_HELD) == 1 and loan.count(DROP_HELD) == 1
+            and ordered(loan, "if (failed) {", DROP_HELD, "return false; }", HAND_HELD, "out.accepted = true;")
+            and txn.count("move_leases") == 3 and txn.count(LEASES_TAKEN) == 1
+            and ordered(txn, LEASES_DECL, LEASES_RESERVE, GUARD_DECL, MOVE_CALL, LEASES_TAKEN, GUARD_REFUSED))
+
+
+def test_a_moves_retires_stay_leased_until_published():
+    assert claim_a_moves_retires_stay_leased_until_published(CACHE, CACHE_HPP, SYCL)
+
+
+def test_mutant_loan_drops_its_retires_leases_fails():
+    """The loan dropped them as before: the deferred-free pass can reap a marked entry before any epoch moves."""
+    assert not claim_a_moves_retires_stay_leased_until_published(_once_in(CACHE, LOAN_SIG, HAND_HELD, DROP_HELD),
+                                                                 CACHE_HPP, SYCL)
+
+
+def test_mutant_txn_leaves_the_leases_on_the_record_fails():
+    """Left on the per-triplet record, each lease goes at the end of its loop iteration, before the publication."""
+    assert not claim_a_moves_retires_stay_leased_until_published(CACHE, CACHE_HPP,
+                                                                 _once_in(SYCL, TXN_SIG, LEASES_TAKEN, ""))
+
+
+def test_mutant_leases_outlived_by_the_guard_fails():
+    """Declared after the guard, the leases go before its destructor latches: a reap in between skips the latch."""
+    moved = _once_in(SYCL, TXN_SIG, LEASES_DECL + " " + LEASES_RESERVE, "")
+    assert not claim_a_moves_retires_stay_leased_until_published(
+        CACHE, CACHE_HPP, _once_in(moved, TXN_SIG, GUARD_DECL, GUARD_DECL + " " + LEASES_DECL + " " + LEASES_RESERVE))
+
+
+def test_mutant_leases_released_before_the_bump_fails():
+    assert not claim_a_moves_retires_stay_leased_until_published(
+        CACHE, CACHE_HPP, _once_in(SYCL, TXN_SIG, PUBLISH, "move_leases.clear(); " + PUBLISH))
 
 
 # The hooks the move cases read the latch and the id map through exist only in the testing build: a production caller

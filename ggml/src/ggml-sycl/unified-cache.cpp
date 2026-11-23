@@ -11461,8 +11461,8 @@ bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool to_device) co
 // reader correct and every byte owned. The copies go first. Each device entry's last write then becomes its copy,
 // which ran behind every earlier write, so release_entry_allocation_locked() queues the storage's free behind the copy
 // that reads it. The device entry is withdrawn exactly, its host copy is published behind the copy event, and only
-// then does the transaction drop the lease that held the withdrawn entry in place. Nothing here waits or asks an
-// event's status.
+// then does the loan hand the lease that held the withdrawn entry in place to its caller, which drops it once its
+// publication has covered the retire. Nothing here waits or asks an event's status.
 bool unified_cache::loan_expert_triplet(const expert_move_member members[3], expert_move_record & out) {
     out = expert_move_record{};
     if (!members) {
@@ -11609,19 +11609,20 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     const uint64_t copy_took = expert_move_us_since(copy_from);
 
     // 3. All three or none, under the locks: each device entry is still the one checked. The transaction takes a lease
-    // that holds the entry in place until its host copy is published. Its last write becomes its copy, which ran behind
-    // the fill, so its storage is freed behind the copy, and it is withdrawn exactly, leaving any other entry under its
-    // id alone. DEFERRED is the expected status: that lease alone defers the free. The leases are minted in the check
-    // loop, before any entry changes: minting allocates, so a throw leaves every entry as it was, and the leases
-    // already minted go with the unwinding. What changes the entries after it allocates nothing. Each member's id is
-    // handed to its host copy's key before its device entry is retired, as an admit hands it to the device entry before
-    // it retires the host copy: direct staging maps the id to the device entry, and a retire that finds the id still
-    // on its entry walks every entry of the cache for another to hand it to. Handed over first, the retire walks
-    // nothing, nor does the deferred-free pass that erases the entry, and a reader that resolves the id before the
-    // registration below finds no entry under the host key, a miss, never the retiring device entry. Each retire moves
-    // its entry's mirror out as a node, into device_nodes, for a rollback to put back; the rollback hands the id back.
-    // The rollback after step 4 collects the host copies a failed registration left published into `host_nodes`, sized
-    // here, before any entry changes, so collecting them cannot throw.
+    // that holds the entry in place until its host copy is published, and then hands it to the caller. Its last write
+    // becomes its copy, which ran behind the fill, so its storage is freed behind the copy, and it is withdrawn
+    // exactly, leaving any other entry under its id alone. DEFERRED is the expected status: that lease alone defers the
+    // free. The leases are minted in the check loop, before any entry changes: minting allocates, so a throw leaves
+    // every entry as it was, and the leases already minted go with the unwinding. What changes the entries after it
+    // allocates nothing. Each member's id is handed to its host copy's key before its device entry is retired, as an
+    // admit hands it to the device entry before it retires the host copy: direct staging maps the id to the device
+    // entry, and a retire that finds the id still on its entry walks every entry of the cache for another to hand it
+    // to. Handed over first, the retire walks nothing, nor does the deferred-free pass that erases the entry, and a
+    // reader that resolves the id before the registration below finds no entry under the host key, a miss, never the
+    // retiring device entry. Each retire moves its entry's mirror out as a node, into device_nodes, for a rollback to
+    // put back; the rollback hands the id back. The rollback after step 4 collects the host copies a failed
+    // registration left published into `host_nodes`, sized here, before any entry changes, so collecting them cannot
+    // throw.
     std::shared_ptr<mem_handle>      held[3];
     expert_retire_nodes              device_nodes[3];
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
@@ -11755,10 +11756,12 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         return false;
     }
 
-    // 5. Every host copy is published: the leases that held the withdrawn device entries go, with no lock held, and
-    // the deferred-free pass reclaims each entry once the caller's own lease is gone too.
-    for (std::shared_ptr<mem_handle> & lease : held) {
-        lease.reset();
+    // 5. Every host copy is published. The leases that held the withdrawn device entries in place go to the caller,
+    // which drops them once its publication has bumped the exec-graph epoch over the retires, or it has set the
+    // eviction latch instead: the mark above leaves each entry's reap out of the latch, so the deferred-free pass must
+    // not reap one before then.
+    for (int i = 0; i < 3; ++i) {
+        out.retired_leases[i] = std::move(held[i]);
     }
     for (expert_retire_nodes & nodes : device_nodes) {
         if (!nodes.mirror.empty()) {
