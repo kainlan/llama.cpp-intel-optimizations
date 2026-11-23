@@ -3655,6 +3655,58 @@ def test_mutant_missing_source_looked_up_before_the_locks_fails():
                  REGISTER_SOURCE_REFUSE + " std::lock(direct_lock, cache_lock);"))
 
 
+
+# --- a member's ids come from an index, not a scan of the expert table ----------------------------------------------
+
+# A move resolves every member's canonical ids, and the table those come from has a row per expert per tensor (73728 on
+# Qwen), so a scan per member cost as much as the transaction's copies. The index is built from the table wherever the
+# table is replaced, in the same allocation epoch and swapped in under the same locks, so the two never disagree, and
+# the lookups walk only the rows of one tensor name and expert, in table order.
+GET_KEYS_SIG = "static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys("
+MATERIALIZE_SIG = "static bool ggml_sycl_materialize_planned_expert_layout("
+META_SCAN = "for (const auto & m : g_moe_expert_meta)"
+KEYS_LOOKUP = ("for (uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id); r != UINT32_MAX; "
+               "r = g_moe_expert_meta_index.next_row[r]) {")
+MATERIALIZE_LOOKUP = "const uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id);"
+INDEX_BUILT = "new_expert_meta_index = moe_expert_meta_index_build(new_expert_meta);"
+PUBLISH_LOCK = "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);"
+PUBLISH_TABLE = "g_moe_expert_meta.swap(new_expert_meta);"
+PUBLISH_INDEX = "g_moe_expert_meta_index.swap(new_expert_meta_index);"
+SEED_ROW = "g_moe_expert_meta.push_back({});"
+SEED_INDEX = "g_moe_expert_meta_index = moe_expert_meta_index_build(g_moe_expert_meta);"
+
+
+def claim_member_ids_come_from_the_meta_index(sycl: str) -> bool:
+    s = norm(sycl)
+    keys = body(s, GET_KEYS_SIG)
+    mat = body(s, MATERIALIZE_SIG)
+    return (bool(keys) and bool(mat) and META_SCAN not in keys and META_SCAN not in mat
+            and keys.count(KEYS_LOOKUP) == 1 and mat.count(MATERIALIZE_LOOKUP) == 1
+            and s.count("moe_expert_meta_index_build(") == 3 and s.count(INDEX_BUILT) == 1
+            and s.count(PUBLISH_INDEX) == 1 and ordered(s, INDEX_BUILT, PUBLISH_LOCK, PUBLISH_TABLE, PUBLISH_INDEX)
+            and s.count(SEED_INDEX) == 1 and ordered(s, SEED_ROW, SEED_INDEX))
+
+
+def test_member_ids_come_from_the_meta_index():
+    assert claim_member_ids_come_from_the_meta_index(SYCL)
+
+
+def test_mutant_member_ids_scan_the_table_fails():
+    """The scan per member back: every member of a move compares its name against every row of the table."""
+    assert not claim_member_ids_come_from_the_meta_index(
+        _once_in(SYCL, GET_KEYS_SIG, KEYS_LOOKUP, META_SCAN + " { const uint32_t r = 0; (void) r;"))
+
+
+def test_mutant_index_left_stale_by_a_new_table_fails():
+    """A new table published without its index: the lookups answer with the previous model's rows."""
+    assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, PUBLISH_INDEX, ""))
+
+
+def test_mutant_seeded_row_leaves_the_index_behind_fails():
+    """A test row seeded without its index: the lookups cannot see the row the test placed."""
+    assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, SEED_INDEX, ""))
+
+
 if __name__ == "__main__":
     import sys
 

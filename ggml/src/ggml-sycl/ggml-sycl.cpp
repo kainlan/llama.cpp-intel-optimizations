@@ -3557,6 +3557,55 @@ struct moe_expert_meta {
 static std::vector<moe_expert_meta> g_moe_expert_meta;
 static std::shared_mutex            g_moe_expert_meta_mutex;
 
+// The rows of g_moe_expert_meta by tensor name and expert, so a lookup walks only the rows of one (name, expert)
+// instead of the whole table: an expert move resolves each member's ids through it, and the table has a row per expert
+// per tensor (73728 on Qwen). It is derived from the table and nothing else, built wherever the table is replaced and
+// swapped in under the same lock, so the two never disagree. by_name holds, per tensor name, the first row of each
+// expert (UINT32_MAX for none); next_row chains each row to the next one of the same name and expert, in table order.
+// A row with no name or no expert is not indexed, as no lookup by name could match it.
+struct moe_expert_meta_index {
+    std::unordered_map<std::string, std::vector<uint32_t>> by_name;
+    std::vector<uint32_t>                                  next_row;
+
+    void swap(moe_expert_meta_index & other) noexcept {
+        by_name.swap(other.by_name);
+        next_row.swap(other.next_row);
+    }
+};
+
+static moe_expert_meta_index g_moe_expert_meta_index;
+
+static moe_expert_meta_index moe_expert_meta_index_build(const std::vector<moe_expert_meta> & rows) {
+    moe_expert_meta_index index;
+    index.next_row.assign(rows.size(), UINT32_MAX);
+    // Backwards, so each (name, expert)'s first row is its earliest and its chain runs in table order.
+    for (size_t i = rows.size(); i-- > 0;) {
+        const moe_expert_meta & m = rows[i];
+        if (m.tensor_name.empty() || m.expert_idx < 0) {
+            continue;
+        }
+        std::vector<uint32_t> & first = index.by_name[m.tensor_name];
+        if (first.size() <= static_cast<size_t>(m.expert_idx)) {
+            first.resize(static_cast<size_t>(m.expert_idx) + 1, UINT32_MAX);
+        }
+        index.next_row[i]                        = first[static_cast<size_t>(m.expert_idx)];
+        first[static_cast<size_t>(m.expert_idx)] = static_cast<uint32_t>(i);
+    }
+    return index;
+}
+
+// The first row of (name, expert_idx), or UINT32_MAX. Called with g_moe_expert_meta_mutex held.
+static uint32_t moe_expert_meta_first_row_locked(const char * name, int expert_idx) {
+    if (!name || expert_idx < 0) {
+        return UINT32_MAX;
+    }
+    const auto it = g_moe_expert_meta_index.by_name.find(name);
+    if (it == g_moe_expert_meta_index.by_name.end() || static_cast<size_t>(expert_idx) >= it->second.size()) {
+        return UINT32_MAX;
+    }
+    return it->second[static_cast<size_t>(expert_idx)];
+}
+
 // ---------------------------------------------------------------------------
 // Expert group registry: maps (block_id, expert_id) -> cache keys for all 3
 // tensors (gate, up, down).  Built during moe_hybrid_init_once() and used by
@@ -4997,9 +5046,11 @@ static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys(c
         return keys;
     }
     std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-    for (const auto & m : g_moe_expert_meta) {
-        const bool same_name = src0->name && !m.tensor_name.empty() && m.tensor_name == src0->name;
-        if (same_name && m.expert_idx == expert_id && m.canonical_key.valid) {
+    // The rows of this tensor and expert, in table order, from the index rather than a scan of every row.
+    for (uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id); r != UINT32_MAX;
+         r          = g_moe_expert_meta_index.next_row[r]) {
+        const moe_expert_meta & m = g_moe_expert_meta[r];
+        if (m.canonical_key.valid) {
             const ggml_sycl_cache_id key = m.canonical_key;
             {
                 bool duplicate = false;
@@ -5101,13 +5152,10 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     bool            meta_found = false;
     {
         std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        for (const auto & m : g_moe_expert_meta) {
-            const bool same_name = src0->name && !m.tensor_name.empty() && m.tensor_name == src0->name;
-            if (same_name && m.expert_idx == expert_id) {
-                meta_value = m;
-                meta_found = true;
-                break;
-            }
+        const uint32_t                      r = moe_expert_meta_first_row_locked(src0->name, expert_id);
+        if (r != UINT32_MAX) {
+            meta_value = g_moe_expert_meta[r];
+            meta_found = true;
         }
     }
     const moe_expert_meta * meta = meta_found ? &meta_value : nullptr;
@@ -6643,6 +6691,9 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     std::unordered_map<int64_t, expert_tensor_group>     new_expert_groups;
     int                                                   n_groups_registered = 0;
     int                                                   n_complete          = 0;
+
+    // The lookup index of new_expert_meta, published with it.
+    moe_expert_meta_index new_expert_meta_index;
     try {
         new_expert_meta.reserve(expert_list.size());
         for (const auto & info : expert_list) {
@@ -6702,6 +6753,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                 n_complete++;
             }
         }
+        // The lookup index of the same rows, in the same allocation epoch.
+        new_expert_meta_index = moe_expert_meta_index_build(new_expert_meta);
     } catch (const std::bad_alloc &) {
         GGML_LOG_ERROR("[MOE-HYBRID] Expert metadata allocation failed; retaining prior registry epoch\n");
         return;
@@ -6712,6 +6765,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     {
         std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);
         g_moe_expert_meta.swap(new_expert_meta);
+        g_moe_expert_meta_index.swap(new_expert_meta_index);
         g_expert_groups.swap(new_expert_groups);
     }
     GGML_LOG_INFO("[MOE-HYBRID] Expert metadata stored: %zu entries\n", published_meta_count);
@@ -130619,6 +130673,7 @@ extern "C" void ggml_backend_sycl_test_seed_moe_module_state() {
     {
         std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
         g_moe_expert_meta.push_back({});
+        g_moe_expert_meta_index = moe_expert_meta_index_build(g_moe_expert_meta);
     }
     // A biased owner with a non-default activation, so the clean gate below
     // distinguishes "the bias cluster was torn down" from "nothing was ever
