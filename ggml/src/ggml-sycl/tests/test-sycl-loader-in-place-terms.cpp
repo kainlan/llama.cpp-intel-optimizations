@@ -639,6 +639,20 @@ void check_admitted_plan_grows_nothing_unplanned() {
     check_admitted_plan(make_loader_plan(oversize, kPoolChunk, kReserve), kPoolChunk);
 }
 
+// A hand-built record whose WEIGHT zone is smaller than its own loader term (the planner's never is: the zone holds the
+// term and the HOST_COMPUTE reserve). The WEIGHT term is the rest of the record, none here, plus the loader's zone
+// bytes; it never wraps below zero.
+void check_record_below_its_loader_term() {
+    const std::vector<size_t> tensors  = { 100 * kMiB, align_up(2856 * kMiB + 12345, TENSOR_ALIGNMENT) };
+    placement_plan            plan     = make_loader_plan(tensors, kPoolChunk, 0);
+    plan.host_zone_weight_bytes        = 64 * kMiB;
+    const host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(plan, 0, kPoolChunk);
+    // The oversize tensor is a chunk of its own, so the zone holds only the first buffer.
+    CHECK(terms.loader_zone == 100 * kMiB && terms.loader_grown > 0);
+    CHECK(terms.weight == terms.loader_zone);
+    CHECK(terms.total() >= terms.weight + terms.loader_grown);
+}
+
 // `plan` with its commit terms recorded on a fresh pool of `chunk` chunks and a host budget of `budget` bytes, as the
 // planner's ledger record leaves it.
 placement_plan with_budget(placement_plan plan, size_t chunk, size_t budget) {
@@ -773,6 +787,7 @@ int main() {
     check_loader_footprint_is_the_pools();
     check_oversize_buffer_grows_a_planned_chunk();
     check_admitted_plan_grows_nothing_unplanned();
+    check_record_below_its_loader_term();
     check_loader_pool_over_budget_is_refused();
     check_weight_zone_growth_is_checked();
     if (failures != 0) {

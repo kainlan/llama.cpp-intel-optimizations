@@ -447,9 +447,12 @@ def clause_c3_pool_footprint(t: dict) -> list:
         problems.append("the commit terms do not take loader_zone from the footprint")
     if not re.search(r"\bterms\.loader_grown\s*=\s*\w+\.grown\s*;", terms):
         problems.append("the commit terms do not take loader_grown from the footprint")
-    if not re.search(r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-\s*plan\.host_zone_loader_bytes\s*\+\s*"
+    # The record's rest is taken no lower than zero, so a hand-built record smaller than its term cannot wrap.
+    if not re.search(r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-\s*std::min\s*\(\s*"
+                     r"plan\.host_zone_weight_bytes\s*,\s*plan\.host_zone_loader_bytes\s*\)\s*\+\s*"
                      r"terms\.loader_zone\s*;", terms):
-        problems.append("the WEIGHT zone does not hold the loader's zone bytes in place of its raw bytes")
+        problems.append("the WEIGHT zone does not hold the loader's zone bytes in place of its raw bytes, the rest of "
+                        "the record taken no lower than zero")
     if not re.search(r"size_t\s+total\s*\(\s*\)\s*const\s*\{\s*return\s+zones\s*\(\s*\)\s*\+\s*runtime\s*\+\s*"
                      r"rounding\s*\+\s*loader_grown\s*;", t[HPP]):
         problems.append("host_zone_commit_terms::total() does not count the chunks the loader grows")
@@ -702,6 +705,8 @@ MUTANTS = [
         r"\1 const_cast<ggml_sycl::placement_plan *>(nullptr)->loader_holds_weights = true;")),
     ("footprint-ignored", "C3", mutate_re(HPP, r"\bterms\.weight\s*=\s*plan\.host_zone_weight_bytes\s*-[^;]*;",
                                           "terms.weight = plan.host_zone_weight_bytes;")),
+    ("record-rest-wraps", "C3", mutate_re(HPP, r"std::min\s*\(\s*plan\.host_zone_weight_bytes\s*,\s*"
+                                               r"plan\.host_zone_loader_bytes\s*\)", "plan.host_zone_loader_bytes")),
     ("footprint-at-chunk", "C3", mutate_re(HPP, r"host_zone_buffer_max_size\s*\(\s*plan\.loader_buffer_cap\s*,\s*"
                                                 r"chunk_bytes\s*\)", "chunk_bytes")),
     ("grown-uncounted", "C3", mutate_re(HPP, r"(return\s+zones\s*\(\s*\)\s*\+\s*runtime\s*\+\s*rounding)\s*\+\s*"
