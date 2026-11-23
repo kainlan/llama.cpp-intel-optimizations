@@ -1802,6 +1802,7 @@ wrapper_text = (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_tex
 nodelete_mutants = (
     ("NODELETE MoE state reset: swap republish removed",
      "        g_moe_expert_meta.swap(new_expert_meta);\n"
+     "        g_moe_expert_meta_index.swap(new_expert_meta_index);\n"
      "        g_expert_groups.swap(new_expert_groups);\n",
      "        // NODELETE-MUTANT: swap republish removed\n"),
     ("NODELETE MoE state reset: install_fresh() removed from reset function",
