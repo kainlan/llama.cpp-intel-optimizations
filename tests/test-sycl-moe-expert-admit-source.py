@@ -298,7 +298,7 @@ REMEMBER = ("(void) triplet.extras[r]->remember_moe_storage_handle(triplet.membe
 
 PUBLISH = "ggml_sycl_publish_prepared_plan_locked(prepared_publication);"
 SWAP_PUBLISH = ("if (swapped) { ggml_sycl_publish_prepared_plan_locked(prepared_publication); "
-                "ggml_sycl_optional_layouts_retired(); }")
+                "ggml_sycl_optional_layouts_retired(); latch.armed = false; }")
 RETHROW = "std::rethrow_exception(escaped);"
 RETHROW_LAST = "if (escaped) { std::rethrow_exception(escaped); } return finish(ggml_sycl_txn_result::ACCEPTED, reason);"
 NAMED_CALL = ("const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::NAMED, "

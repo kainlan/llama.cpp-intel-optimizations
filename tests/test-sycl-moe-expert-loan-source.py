@@ -914,7 +914,8 @@ SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror
 REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
 HOST_RETIRE = ("if (host != entries_.end() && !host->second.retired && "
                "host->second.direct_alloc_owner.owner_control_id() == src_control[i]) "
-               "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
+               "{ host->second.retired_by_expert_move = true; "
+               "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
 PUBLICATION_FAILED = 'refusal = "publication failed";'
 WITHDRAW_INSERTED = "for (int i = 0; i < inserted; ++i) { (void) transition_to_retired_locked("
 REFILL_CATCH = "} catch (const ggml_sycl_fallback_error &) { throw; } catch (...) { " + WITHDRAW_INSERTED
@@ -3706,6 +3707,99 @@ def test_mutant_seeded_row_leaves_the_index_behind_fails():
     """A test row seeded without its index: the lookups cannot see the row the test placed."""
     assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, SEED_INDEX, ""))
 
+
+
+# --- an expert move's retires leave the eviction latch alone, while its publication covers them ---------------------
+
+# has_evictions_ turns off graph replay and persistent TG for the whole process until the next model load, so a decode
+# run that evicted once ran every later graph by direct dispatch. An expert move's retires do not need it: its
+# publication bumps the exec-graph epoch, which drops every exec graph that may bake a moved copy's pointer, and
+# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes, the loan's
+# device entries and the copy to the device's host copies, finalize leaves only marked entries out of the latch, and a
+# restore clears the mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
+# epoch has moved: the transaction arms a guard before each cache move, disarms it again for a move the cache refused
+# whole, and dismisses it only after the epoch bump in the won swap; on every other exit (a lost swap, a throw) its
+# destructor sets the latch through the cache's one public setter.
+CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
+FINALIZE_SIG = "size_t unified_cache::finalize_retired_entries_locked() {"
+FINALIZE_LATCH = re.compile(r"if \(([^{]*)\) \{ has_evictions_\.store\(true")
+MOVE_MARK_FIELD = "!entry.retired_by_expert_move"
+LOAN_MARK = "device_entry[i]->retired_by_expert_move = true;"
+ADMIT_MARK = "host->second.retired_by_expert_move = true;"
+ADMIT_RETIRE = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
+RESTORE_CLEAR = "it->second.retired_by_expert_move = false;"
+LATCH_SETTER = "void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }"
+GUARD_DTOR = "~ggml_sycl_expert_move_latch_guard() { if (armed && cache) { cache->latch_evictions(); } }"
+GUARD_DECL = "ggml_sycl_expert_move_latch_guard latch{ cache };"
+GUARD_ARM = "const bool armed_before = latch.armed; latch.armed = true;"
+GUARD_REFUSED = "if (!loaned) { latch.armed = armed_before; }"
+GUARD_DISMISS = "ggml_sycl_optional_layouts_retired(); latch.armed = false; }"
+SWAP_WON = "if (swapped) {"
+
+
+def claim_a_move_marks_its_retires_and_only_they_skip_the_latch(cache: str, hpp: str) -> bool:
+    c = norm(cache)
+    latch = FINALIZE_LATCH.search(body(c, FINALIZE_SIG))
+    loan = body(c, LOAN_SIG)
+    copy = body(c, REFILL_BODY_SIG)
+    return (latch is not None and MOVE_MARK_FIELD in latch.group(1) and "!entry.optional_layout" in latch.group(1)
+            and c.count("retired_by_expert_move = true;") == 2
+            and loan.count(LOAN_MARK) == 1 and ordered(loan, LOAN_MARK, DEVICE_RETIRE)
+            and copy.count(ADMIT_MARK) == 1 and ordered(copy, ADMIT_MARK, ADMIT_RETIRE)
+            and body(c, RESTORE_SIG).count(RESTORE_CLEAR) == 1
+            and "bool retired_by_expert_move = false;" in norm(hpp))
+
+
+def test_a_move_marks_its_retires_and_only_they_skip_the_latch():
+    assert claim_a_move_marks_its_retires_and_only_they_skip_the_latch(CACHE, CACHE_HPP)
+
+
+def test_mutant_finalize_latches_a_moves_retire_fails():
+    """The exemption gone: a decode run's first evict turns off graph replay until the next load."""
+    n = norm(CACHE)
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(n, FINALIZE_SIG, " && " + MOVE_MARK_FIELD, ""), CACHE_HPP)
+
+
+def test_mutant_loan_retire_left_unmarked_fails():
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(_once_in(CACHE, LOAN_SIG, LOAN_MARK, ""),
+                                                                           CACHE_HPP)
+
+
+def test_mutant_restore_keeps_the_mark_fails():
+    """A restored entry kept the mark: a later pressure eviction or drop of it would skip the latch."""
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(CACHE, RESTORE_SIG, RESTORE_CLEAR, ""), CACHE_HPP)
+
+
+def claim_an_unpublished_move_sets_the_latch(sycl: str, hpp: str) -> bool:
+    s = norm(sycl)
+    txn = body(s, TXN_SIG)
+    return (LATCH_SETTER in norm(hpp) and s.count(GUARD_DTOR) == 1
+            and txn.count(GUARD_DECL) == 1 and txn.count(GUARD_ARM) == 1 and txn.count(GUARD_REFUSED) == 1
+            and txn.count("latch.armed = false;") == 1 and txn.count(GUARD_DISMISS) == 1
+            and ordered(txn, GUARD_DECL, GUARD_ARM, MOVE_CALL, GUARD_REFUSED, SWAP_WON, PUBLISH, GUARD_DISMISS))
+
+
+def test_an_unpublished_move_sets_the_latch():
+    assert claim_an_unpublished_move_sets_the_latch(SYCL, CACHE_HPP)
+
+
+def test_mutant_guard_dismissed_before_the_swap_fails():
+    """Dismissed as the cache moves: a lost swap leaves retires no epoch covers out of the latch."""
+    n = norm(SYCL)
+    moved = _once_in(n, TXN_SIG, GUARD_DISMISS, "ggml_sycl_optional_layouts_retired(); }")
+    assert not claim_an_unpublished_move_sets_the_latch(
+        _once_in(moved, TXN_SIG, GUARD_REFUSED, GUARD_REFUSED + " latch.armed = false;"), CACHE_HPP)
+
+
+def test_mutant_guard_sets_nothing_fails():
+    assert not claim_an_unpublished_move_sets_the_latch(
+        _once(SYCL, GUARD_DTOR, "~ggml_sycl_expert_move_latch_guard() {}"), CACHE_HPP)
+
+
+def test_mutant_guard_never_armed_fails():
+    assert not claim_an_unpublished_move_sets_the_latch(_once_in(SYCL, TXN_SIG, GUARD_ARM, ""), CACHE_HPP)
 
 if __name__ == "__main__":
     import sys

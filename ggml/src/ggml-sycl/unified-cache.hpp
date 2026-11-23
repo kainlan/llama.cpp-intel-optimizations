@@ -4422,6 +4422,11 @@ struct unified_cache_entry {
     // yield_optional_layouts_begin() acts on it, and only while no one but the
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
+
+    // Retired by an expert move (loan_expert_triplet(), copy_host_triplet_to_device()), which sets it at its retire
+    // and nowhere else; a restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not
+    // set has_evictions_ (see there). Any other retire of the same entry leaves it false, and its reap latches.
+    bool                  retired_by_expert_move = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -5206,9 +5211,15 @@ class unified_cache {
     // Check if budget is exceeded (used > budget after eviction)
     bool is_budget_exceeded() const { return budget_exceeded_; }
 
-    // Returns true if any weight has been evicted from device memory.
-    // Once true, never resets. Used to disable graph replay with stale baked pointers.
+    // Returns true if any weight has been evicted from device memory since the last
+    // reclaim_weight_entries(); see has_evictions_ for what sets and clears it.
+    // Used to disable graph replay and persistent TG with stale baked pointers.
     bool has_evictions() const { return has_evictions_.load(std::memory_order_acquire); }
+
+    // Set the latch for device storage the cache released without setting it itself: an expert move's retires,
+    // which finalize leaves out because the move's publication bumps the exec-graph epoch, when that publication
+    // did not run (a lost plan swap, an exception). Without it those retired pointers would stay replayable.
+    void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }
 
     // Available memory
     size_t available() const {
@@ -5674,6 +5685,8 @@ class unified_cache {
     uint64_t test_id_remap_walks() const noexcept;
     // The key `id` maps to, in *out; false when the id maps to nothing.
     bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
+    // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
+    void     test_reset_evictions_latch() noexcept;
     size_t   retired_pending_count_for_test() const noexcept {
         return retired_pending_count_.load(std::memory_order_acquire);
     }
@@ -7786,6 +7799,18 @@ class unified_cache {
     // Set to true when a cached weight's device allocation is released -- eviction
     // to host, drop, or async evict.  Used by graph replay / persistent TG to know
     // that baked pointers may reference freed device memory.
+    //
+    // Two releases leave it alone, each because something else already drops
+    // every recorded pointer to the storage (finalize_retired_entries_locked):
+    //   - an optional layout copy (a WOQ copy): only yield_optional_layouts_begin()
+    //     releases one, and that transaction bumps the exec-graph epoch, and
+    //     persistent TG never reads a WOQ copy;
+    //   - an expert move's retire (retired_by_expert_move): the move's publication
+    //     bumps the exec-graph epoch, so each context drops the exec graphs it
+    //     recorded before its next replay, and persistent TG refuses any graph
+    //     with a MUL_MAT_ID, so it holds no expert pointer. A move whose
+    //     publication did not run sets the latch through latch_evictions().
+    // A pressure eviction, a drop or an async evict of the same entry latches.
     //
     // It is a latch, but NOT a process-lifetime one: reclaim_weight_entries()
     // clears it, so the flag is scoped to the current weight population rather

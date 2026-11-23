@@ -11433,8 +11433,9 @@ void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exa
     if (it == entries_.end() || !it->second.retired) {
         return;
     }
-    it->second.retired    = false;
-    const size_t previous = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
+    it->second.retired                = false;
+    it->second.retired_by_expert_move = false;
+    const size_t previous             = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
     GGML_ASSERT(previous != 0 && "restored entry without a matching retirement count");
     if (!released.mapping.empty() && id_to_key_.find(exact.id) == id_to_key_.end()) {
         id_to_key_.insert(std::move(released.mapping));
@@ -11654,6 +11655,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             if (mapped != id_to_key_.end() && mapped->second == device_key) {
                 mapped->second = host_key;
             }
+            // The move's publication bumps the exec-graph epoch, so this entry's reap leaves has_evictions_ alone.
+            device_entry[i]->retired_by_expert_move = true;
             out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
             out.device_keys[i]   = device_key;
         }
@@ -12076,6 +12079,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                     const auto              host = entries_.find(host_key);
                     if (host != entries_.end() && !host->second.retired &&
                         host->second.direct_alloc_owner.owner_control_id() == src_control[i]) {
+                        // As the loan marks its device entries: the move's publication covers this retire.
+                        host->second.retired_by_expert_move = true;
                         (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
                     }
                 }
@@ -16853,15 +16858,26 @@ size_t unified_cache::finalize_retired_entries_locked() {
         }
 
         release_entry_allocation_locked(entry);
-        // An optional layout copy is released only by yield_optional_layouts_begin(),
-        // from a context's KV admission, and that transaction also bumps the
-        // optional-layout epoch (ggml-sycl.cpp): every coexisting context
-        // drops the exec graphs it recorded, which may bake the copy's
-        // pointer, before its next replay. Persistent TG re-resolves weight
-        // pointers every token and never reads a WOQ copy. The latch would
-        // disable graph replay and persistent TG for the whole process to
-        // guard pointers that nothing can replay any more.
-        if (!entry.storage_owner && entry.device_ptr && !entry.host_resident && !entry.optional_layout) {
+        // The latch would disable graph replay and persistent TG for the whole
+        // process, until the next model load, to guard pointers nothing can
+        // replay any more. Two releases are left out of it for that reason:
+        //  - An optional layout copy is released only by
+        //    yield_optional_layouts_begin(), from a context's KV admission, and
+        //    that transaction also bumps the optional-layout epoch
+        //    (ggml-sycl.cpp): every coexisting context drops the exec graphs it
+        //    recorded, which may bake the copy's pointer, before its next
+        //    replay. Persistent TG re-resolves weight pointers every token and
+        //    never reads a WOQ copy.
+        //  - An expert move's retire (retired_by_expert_move, set only where the
+        //    move retires and cleared by a restore): the move's publication bumps
+        //    the same epoch, and persistent TG refuses every graph with a
+        //    MUL_MAT_ID (should_use_persistent_tg's MoE probe counts each one),
+        //    so it never holds an expert's pointer. A move whose publication did
+        //    not run sets the latch itself (latch_evictions()).
+        // The mark is per retire, not per kind of entry: a pressure eviction, a
+        // drop or an async evict of an expert entry still latches.
+        if (!entry.storage_owner && entry.device_ptr && !entry.host_resident && !entry.optional_layout &&
+            !entry.retired_by_expert_move) {
             has_evictions_.store(true, std::memory_order_release);
         }
         const unified_cache_key key = it->first;
@@ -17469,6 +17485,10 @@ bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
         (void) it->second.direct_alloc_owner.owner_metadata(owner);
     }
     return true;
+}
+
+void unified_cache::test_reset_evictions_latch() noexcept {
+    has_evictions_.store(false, std::memory_order_release);
 }
 
 uint64_t unified_cache::test_id_remap_walks() const noexcept {

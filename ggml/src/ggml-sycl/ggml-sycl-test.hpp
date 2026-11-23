@@ -716,6 +716,9 @@ std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone();
 // no reaping walks the cache's entries for an entry to hand the id to, and a loan's rollback hands it back.
 std::string test_expert_evict_walks_no_entry_to_hand_over_its_id();
 std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry();
+// A move's retires leave the cache's eviction latch clear, since the move's publication bumps the exec-graph epoch: a
+// named evict, an admit and their reaps set nothing, while a drop of an expert's device entry outside a move latches.
+std::string test_expert_moves_leave_the_eviction_latch_clear();
 // Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
 // it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
 // no model ever owned stays through the release. A copy made while its source's load is still pending takes that

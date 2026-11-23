@@ -241,6 +241,10 @@
 //                           registration fails is refused "host registration failed" and leaves no host copy; each id
 //                           names its device entry again, each member resolves on the device, and the walk count is
 //                           where it was.
+//   moves_leave_the_eviction_latch_clear
+//                           The control: a drop of expert 1's device entries outside any move sets the cache's eviction
+//                           latch on their reap. A named evict of expert 0, the reap of its device entries, its admit
+//                           back and the reap of its host copies, before it, leave the latch clear.
 //
 // Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
 // releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
@@ -378,6 +382,7 @@ int main() {
                    ggml_sycl::test_expert_evict_walks_no_entry_to_hand_over_its_id);
     ok &= run_case("loan_rollback_hands_the_id_back_to_the_device_entry",
                    ggml_sycl::test_expert_loan_rollback_hands_the_id_back_to_the_device_entry);
+    ok &= run_case("moves_leave_the_eviction_latch_clear", ggml_sycl::test_expert_moves_leave_the_eviction_latch_clear);
     // Last: each releases a model slot, a teardown scan of the whole device cache.
     ok &=
         run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);

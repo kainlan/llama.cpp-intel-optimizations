@@ -1840,7 +1840,7 @@ def test_mutation_woq_advertised_blind_is_witnessed() -> None:
 
 
 def test_mutation_optional_release_latches_is_witnessed() -> None:
-    _cache_mutation("!entry.host_resident && !entry.optional_layout) {", "!entry.host_resident) {",
+    _cache_mutation("!entry.host_resident && !entry.optional_layout &&", "!entry.host_resident &&",
                     "latches has_evictions_", "latch exemption dropped")
 
 

@@ -22050,6 +22050,23 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
     }
 }
 
+// The cache leaves an expert move's retires out of its eviction latch (has_evictions_, which turns off graph replay and
+// persistent TG until the next model load) because the move's publication bumps the exec-graph epoch, so every exec
+// graph that may bake a moved copy's pointer is dropped before its next replay. Until that bump has run the exemption
+// is unearned. The transaction arms this guard before each cache move, disarms it again for a move the cache refused
+// whole (which retired nothing it left marked), and dismisses it only after the bump in the publication that won its
+// swap; on every other exit, a lost swap or an exception, its destructor sets the latch.
+struct ggml_sycl_expert_move_latch_guard {
+    ggml_sycl::unified_cache * cache = nullptr;
+    bool                       armed = false;
+
+    ~ggml_sycl_expert_move_latch_guard() {
+        if (armed && cache) {
+            cache->latch_evictions();
+        }
+    }
+};
+
 // The body, every direction, so the loan, the refill and the named move share one lock order and one publish. `amount`
 // is the bytes a loan should free, the most triplets a refill re-admits, or the number of triplets a named move names.
 // A loan counts `amount` in ring slots of `slot_bytes`, as moe_expert_loan_select does; 0 counts bytes, and the other
@@ -22283,6 +22300,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     std::exception_ptr                 escaped;
     // A loan's or an evict's drops keep a lease on every view they take here, retained after the loop.
     std::vector<ggml_sycl::mem_handle> lent_views;
+    // Sets the cache's eviction latch unless the publication below bumps the exec-graph epoch over the moves' retires.
+    ggml_sycl_expert_move_latch_guard  latch{ cache };
     for (ggml_sycl_expert_prepared_triplet & triplet : prepared) {
         const bool                    to_device = ggml_sycl_expert_move_to_device(triplet.kind);
         const bool                    admit     = triplet.kind == ggml_sycl_expert_move_kind::ADMIT;
@@ -22300,6 +22319,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                 transient = ledger.refill_armed;
                 break;
             }
+            // Armed before the cache can retire anything; a move it refuses whole leaves the guard as it was.
+            const bool armed_before = latch.armed;
+            latch.armed             = true;
             // The kind picks the cache body, with no default: a new kind is a compile warning here, not a move through
             // another kind's body.
             switch (triplet.kind) {
@@ -22316,6 +22338,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             }
             copy_us += record.copy_us;
             remap_us += record.remap_us;
+            if (!loaned) {
+                latch.armed = armed_before;
+            }
             // A named triplet the cache refuses, admit or evict, is refused alone, REFUSED when a later boundary would
             // meet the refusal again and BUSY otherwise, and the next one moves; nothing of it moved.
             if (!loaned && (admit || evict)) {
@@ -22498,10 +22523,13 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         // it recorded before its next replay. The function is named for KV admission's optional-layout retire; the
         // comment on g_ggml_sycl_optional_layout_epoch records that an expert loan bumps it too, and a refill does.
         ggml_sycl_optional_layouts_retired();
+        // The bump covers every retire the moves made, so the cache's eviction latch stays as it is.
+        latch.armed = false;
     }
     lock.unlock();
     warn_dropped();
     if (!swapped) {
+        // No epoch bump covers the moves' retires, so `latch` sets the cache's eviction latch as this call returns.
         GGML_LOG_ERROR("[MOE-EXEC] %s device %d: %u moved triplets left unpublished, the plan swap lost\n",
                        ggml_sycl_expert_move_texts_of(kind).name, device, lent);
         if (escaped) {
@@ -28473,6 +28501,77 @@ std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry() {
     if (fx.cache->test_id_remap_walks() != walks) {
         return test_loan_fail("the loan and its rollback walked the cache's entries %llu times to remap an id, not 0",
                               (unsigned long long) (fx.cache->test_id_remap_walks() - walks));
+    }
+    return {};
+}
+
+std::string test_expert_moves_leave_the_eviction_latch_clear() {
+    // The cache's eviction latch turns off graph replay and persistent TG until the next model load. An expert move's
+    // retires stay out of it, since the move's publication bumps the exec-graph epoch, so a named evict and the reap of
+    // its device entries leave it clear, and so do an admit and the reap of its host copies. The control: another
+    // retire of an expert's device entry, here a drop of expert 1's entries outside any move, latches on its reap, so
+    // the exemption is the move's mark, not the entry's kind. The case reads this device's cache, which no other case
+    // shares the latch of while it runs.
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637412ull);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/2); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the moves";
+    }
+    fx.cache->process_deferred_frees_public();
+    fx.cache->test_reset_evictions_latch();
+    if (fx.cache->has_evictions()) {
+        return "the eviction latch is set right after its reset";
+    }
+
+    ::ggml_sycl_expert_move_result evicted;
+    ::ggml_sycl_txn_result         code = test_named_move(fx, { 0, 0 }, test_no_triplet, evicted);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || evicted.n_evicted != 1) {
+        return "the evict answered " + test_admit_answer(code, evicted);
+    }
+    if (!fx.reclaim_until([&] { return test_evict_device_entries(fx, 0, 0) == 0; })) {
+        return test_loan_fail("2 s after the evict %d of its device entries remain",
+                              test_evict_device_entries(fx, 0, 0));
+    }
+    if (fx.cache->has_evictions()) {
+        return "the reap of the evicted triplet's device entries set the eviction latch";
+    }
+
+    ::ggml_sycl_expert_move_result admitted;
+    code = test_named_move(fx, test_no_triplet, { 0, 0 }, admitted);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
+        return "the admit answered " + test_admit_answer(code, admitted);
+    }
+    if (!fx.reclaim_until([&] { return test_evict_host_entries(fx, 0, 0) == 0; })) {
+        return test_loan_fail("2 s after the admit %d of its host copies remain", test_evict_host_entries(fx, 0, 0));
+    }
+    if (fx.cache->has_evictions()) {
+        return "the admit or the reap of its host copies set the eviction latch";
+    }
+
+    // The control: expert 1's device entries dropped outside any move, each extra's record of them first, so the
+    // reap that follows is theirs.
+    for (int s = 0; s < 3; ++s) {
+        (void) fx.extras[s]->forget_moe_storage_handle_on_device(1, GGML_LAYOUT_AOS, fx.device);
+        if (!expert_retire_succeeded(fx.cache->retire_expert_entry_exact(fx.keys[fx.index(0, s, 1)], GGML_LAYOUT_AOS,
+                                                                         "test/latch control"))) {
+            return test_loan_fail("slot %d expert 1's device entry could not be dropped", s);
+        }
+    }
+    if (!fx.reclaim_until([&] { return test_evict_device_entries(fx, 0, 1) == 0; })) {
+        return test_loan_fail("2 s after the drop %d of expert 1's device entries remain",
+                              test_evict_device_entries(fx, 0, 1));
+    }
+    if (!fx.cache->has_evictions()) {
+        return "the control: the reap of expert 1's dropped device entries did not set the eviction latch";
     }
     return {};
 }
