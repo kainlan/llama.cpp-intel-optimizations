@@ -15,7 +15,9 @@ The claims, each failure message starting with its name:
   admitted adapter uses, so the other mul_mat_vec_q_id callers' kernel images do not change.
 - table-*: a slot of the expert pointer table is null or a pointer the table's owner holds a lease for. A table is
   zeroed when it is created or its views are rebuilt, and a HOST operand's slot is nulled with its handle dropped. A
-  refusal, or a throw, after the host payload may have changed marks the device table stale (table-stale).
+  refusal, or a throw, after the host payload may have changed marks the device table stale (table-stale). One upload
+  builds every retained table: with skip_host, a mixed node's card table (table-card, direct-table); without it, a
+  HOST operand refuses the batch as before.
 - view-*, admission-*: the batch views and the workspace admission take the card occurrences only, each with its own
   occurrence index; the refusing local view stays for every other caller.
 - host-*: the host leg refuses by name before admission (no input marker in play, a task the host recipe would refuse,
@@ -303,12 +305,20 @@ def table_violations(src: dict[str, str]) -> list[str]:
             not declared.end() <= held.start() < change.start() < copy_at:
         found.append("table-stale: the upload does not hold the stale-on-throw guard from before its payload can "
                      "change")
-    card = definition(sycl, "static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_card_ptr_table_from_batch(")
-    if card is None:
-        return found + ["table-card: the card table upload ggml_sycl_upload_moe_card_ptr_table_from_batch is missing"]
-    flat = spaced(code_of(card))
-    if not has(flat, "ggml_sycl::make_moe_batch_card_view(batch, layout)"):
-        found.append("table-card: the card table is not built from the card view")
+    # One upload builds a retained table: of an all-card batch (the hybrid decode, skip_host off, where a HOST operand
+    # refuses the batch as the local view does) and of a mixed node's card part (skip_host on).
+    retained_head = "static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_table_from_batch("
+    retained = definition(sycl, retained_head)
+    if retained is None:
+        return found + ["table-card: the retained table upload ggml_sycl_upload_moe_retained_ptr_table_from_batch is "
+                        "missing"]
+    retained_at = sycl.find(retained_head)
+    if not has(spaced(sycl[retained_at:sycl.find("{", retained_at)]), "bool skip_host = false)") or \
+            "ggml_sycl_upload_moe_card_ptr_table_from_batch" in code_of(sycl):
+        found.append("table-card: the card table has an upload of its own, not the retained one with skip_host")
+    flat = spaced(code_of(retained))
+    if not has(flat, "ggml_sycl::make_moe_batch_view(batch, layout, skip_host)"):
+        found.append("table-card: the table's view does not leave HOST operands out with skip_host")
     if not re.search(r"ggml_sycl_upload_moe_transient_ptr_table\([^;]*host_experts", flat):
         found.append("table-card: the card table does not null its HOST operands' slots")
     leases = find(flat, "result.role_leases.push_back(")
@@ -322,14 +332,10 @@ def view_violations(src: dict[str, str]) -> list[str]:
     batch = src["batch"]
     shared = definition(batch, "inline moe_batch_local_view make_moe_batch_view(")
     local = definition(batch, "inline moe_batch_local_view make_moe_batch_local_view(")
-    card = definition(batch, "inline moe_batch_local_view make_moe_batch_card_view(")
-    if shared is None or local is None or card is None:
-        return ["view-card: make_moe_batch_view, make_moe_batch_local_view and make_moe_batch_card_view are not all "
-                "defined"]
+    if shared is None or local is None:
+        return ["view-card: make_moe_batch_view and make_moe_batch_local_view are not both defined"]
     if not has(spaced(code_of(local)), "return make_moe_batch_view(batch, layout, false);"):
         found.append("view-local: the local view no longer refuses a HOST operand")
-    if not has(spaced(code_of(card)), "return make_moe_batch_view(batch, layout, true);"):
-        found.append("view-card: the card view does not skip HOST operands")
     flat = spaced(code_of(shared))
     skip = find(flat, "if (skip_host && operand.residency() == moe_batch_residency::HOST) { continue; }")
     if skip < 0 or skip > find(flat, "expert_slots.emplace("):
@@ -389,9 +395,10 @@ def direct_violations(src: dict[str, str]) -> list[str]:
             "moe_batch_residency::PRIMARY_DEVICE", "moe_batch_residency::HOST", "std::any_of(")):
         found.append("direct-precondition: card_or_host does not admit PRIMARY or HOST operands with at least one on "
                      "the card")
-    if not has(direct, "ggml_sycl_upload_moe_card_ptr_table_from_batch(") or \
-            has(direct, "ggml_sycl_upload_moe_retained_ptr_table_from_batch("):
-        found.append("direct-table: the direct block does not upload the card table")
+    tables = re.findall(r"ggml_sycl_upload_moe_retained_ptr_table_from_batch\([^;]*?(, true)?\);", direct)
+    if tables != [", true"]:
+        found.append("direct-table: the direct block does not upload the card table (the retained table with "
+                     "skip_host)")
     for name, needle in (("binding", "canonical_allocation_integration::bind("),
                          ("queue capability", "if (!operand.recipe_queue_capability().valid() ||")):
         where = find(direct, needle)
@@ -648,9 +655,15 @@ def test_mutations_are_witnessed() -> None:
         ("sycl", r'throw std::runtime_error\(("MUL_MAT_ID direct route host task refused")\);', r"GGML_ABORT(\1);",
          "host-no-abort"),
         # The card table retains a host operand's lease.
-        ("sycl", r"(ggml_sycl_upload_moe_card_ptr_table_from_batch\(.*?)if \(operand\.residency\(\) == "
+        ("sycl", r"(ggml_sycl_upload_moe_retained_ptr_table_from_batch\(.*?)if \(operand\.residency\(\) == "
                  r"ggml_sycl::moe_batch_residency::HOST\) \{\s*continue;\s*\}(\s*result\.role_leases)", r"\1\2",
          "table-card"),
+        # The table's view refuses a HOST operand whatever skip_host says.
+        ("sycl", r"make_moe_batch_view\(batch, layout, skip_host\)", "make_moe_batch_view(batch, layout, false)",
+         "table-card"),
+        # The direct block uploads the table without skip_host, so a mixed batch's table is refused.
+        ("sycl", r"(ggml_sycl_upload_moe_retained_ptr_table_from_batch\(\s*ctx, src0, direct_batch,[^;]*?), "
+                 r"/\*skip_host=\*/true\);", r"\1);", "direct-table"),
         # The null loop's id check refuses without marking the table stale.
         ("sycl", r"(for \(const int32_t eid : \*null_experts\) \{\s*if \(eid < 0 \|\| eid >= n_experts\) \{\s*)"
                  r"return refuse\(\);", r"\1return nullptr;", "table-stale"),
