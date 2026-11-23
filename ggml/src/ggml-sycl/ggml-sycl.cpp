@@ -23414,6 +23414,13 @@ struct test_loan_warn_capture {
     }
 };
 
+// The model the ownership cases claim their entries for: the last slot, which no live model in a test process holds,
+// so the release that ends each case reclaims only what the case claimed. A function, not a constant, so it adds no
+// static storage.
+constexpr uint32_t test_move_owner_slot() {
+    return MODEL_SLOT_COUNT - 1;
+}
+
 // n_layers x (gate, up, down) tensors of n_experts 1 MiB experts each, under cache ids no model registered.
 struct test_loan_fixture {
     int                                                 device    = 0;
@@ -23438,6 +23445,10 @@ struct test_loan_fixture {
     ggml_type                                           resolved_type = GGML_TYPE_F32;
     int64_t resolved_ncols   = static_cast<int64_t>(test_loan_expert_bytes() / sizeof(float));
     size_t  resolved_logical = test_loan_expert_bytes();
+    // Whether a load's end made test_move_owner_slot live for this case and test_move_release has not released it
+    // yet. A case that returns between the two leaves it set, and the destructor releases the slot, so the next
+    // ownership case does not find it live.
+    bool    owner_slot_live  = false;
 
     test_loan_fixture(int layers, int experts, uint64_t model_id, bool configure_zones = true) :
         n_layers(layers),
@@ -23483,8 +23494,9 @@ struct test_loan_fixture {
         }
     }
 
-    // Retire every entry the case left (device and host), drop the extras' records, reclaim, put back the publication
-    // the case found, and empty the device's lent ledger and its counters (llama.cpp-sif1).
+    // Retire every entry the case left (device and host), drop the extras' records, reclaim, release the owner slot a
+    // case left live, put back the publication the case found, and empty the device's lent ledger and its counters
+    // (llama.cpp-sif1).
     ~test_loan_fixture() {
         if (!cache) {
             return;
@@ -23496,6 +23508,10 @@ struct test_loan_fixture {
         queue->wait();
         (void) drain_retained_handles(true, 5000);
         cache->process_deferred_frees_public();
+        if (owner_slot_live) {
+            (void) cache->release_model_slot(test_move_owner_slot());
+            owner_slot_live = false;
+        }
         // Not an empty plan: one uses no device, so it leaves every cache's snapshot null under a non-null authority,
         // which reads as TRANSIENT_MISMATCH and refuses every later direct stage.
         {
@@ -28019,20 +28035,13 @@ std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone() {
     return {};
 }
 
-// The model the ownership cases claim their entries for: a slot no live model holds, so the release that ends each
-// case reclaims only what the case claimed. A function, not a constant, so it adds no static storage.
-constexpr uint32_t test_move_owner_slot() {
-    return 31;
-}
-
-// Each of layer 0's `experts`, its three entries, device or host, claimed as a model load claims what it staged:
-// marked pending under txn, then owned by test_move_owner_slot when the load ends. Each must have one entry to mark,
-// and the load's end must tag exactly them.
-std::string test_move_claim(test_loan_fixture & fx, uint64_t txn, const std::vector<int> & experts) {
+// A model load's claim, first half: each of layer 0's `experts`, its three entries, device or host, marked pending
+// under txn, as a load marks what it stages. Each must have one entry to mark. Until the second half runs, the load
+// is still in progress and no model owns the entries.
+std::string test_move_claim_begin(test_loan_fixture & fx, uint64_t txn, const std::vector<int> & experts) {
     if ((fx.cache->live_model_mask() & (1u << test_move_owner_slot())) != 0) {
         return test_loan_fail("model slot %u is live before the case claims it", test_move_owner_slot());
     }
-    const size_t tagged_before = fx.cache->owner_tagged_entry_count();
     for (const int e : experts) {
         for (int s = 0; s < 3; ++s) {
             if (!fx.cache->test_mark_entry_touched_by_load(fx.keys[fx.index(0, s, e)], GGML_LAYOUT_AOS, txn)) {
@@ -28040,12 +28049,28 @@ std::string test_move_claim(test_loan_fixture & fx, uint64_t txn, const std::vec
             }
         }
     }
+    return {};
+}
+
+// The second half: the load's end, which makes test_move_owner_slot live and tags for it every entry pending under
+// txn. It must tag exactly `expected` entries.
+std::string test_move_claim_end(test_loan_fixture & fx, uint64_t txn, size_t expected) {
+    const size_t tagged_before = fx.cache->owner_tagged_entry_count();
+    fx.owner_slot_live         = true;
     fx.cache->note_model_load_end(test_move_owner_slot(), txn);
     const size_t tagged = fx.cache->owner_tagged_entry_count() - tagged_before;
-    if (tagged != 3 * experts.size()) {
-        return test_loan_fail("the load's end tagged %zu entries, not the %zu claimed", tagged, 3 * experts.size());
+    if (tagged != expected) {
+        return test_loan_fail("the load's end tagged %zu entries, not the %zu expected", tagged, expected);
     }
     return {};
+}
+
+// Both halves at once, as a load that staged `experts` and ended: each owned by test_move_owner_slot.
+std::string test_move_claim(test_loan_fixture & fx, uint64_t txn, const std::vector<int> & experts) {
+    if (std::string why = test_move_claim_begin(fx, txn, experts); !why.empty()) {
+        return why;
+    }
+    return test_move_claim_end(fx, txn, 3 * experts.size());
 }
 
 // The claiming model's release, in a teardown's order: the model's tensors go first, so the extras' records and table
@@ -28056,6 +28081,7 @@ void test_move_release(test_loan_fixture & fx) {
     (void) drain_retained_handles(true, 5000);
     fx.cache->process_deferred_frees_public();
     (void) fx.cache->release_model_slot(test_move_owner_slot());
+    fx.owner_slot_live = false;
 }
 
 std::string test_expert_admit_belongs_to_the_host_copys_model() {
@@ -28063,7 +28089,9 @@ std::string test_expert_admit_belongs_to_the_host_copys_model() {
     // owned that copy, and that model's release reclaims it. A model claims expert 1's host copies and expert 0's
     // device entries; expert 2 stays unclaimed. After the admit of expert 1 and the model's release, expert 1's device
     // entries and expert 0's are gone and the WEIGHT zone has the admitted triplet's room back. The control: expert
-    // 2's entries, which no model ever owned, stay, since a release keeps an entry it cannot attribute.
+    // 2's entries, which no model ever owned, stay, since a release keeps an entry it cannot attribute. The case also
+    // waits for expert 1's host copies to go, but the admit withdrew them: they are retired entries the deferred-free
+    // pass removes whatever their tags, not the release's doing. The device entries are what test the release.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6f776e7201ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -28165,11 +28193,94 @@ std::string test_expert_evict_host_copy_belongs_to_the_device_entrys_model() {
     return {};
 }
 
+std::string test_expert_evict_host_copy_takes_the_sources_pending_load() {
+    // A move can run before the load that staged its source has ended: the source is marked pending under that load
+    // and no model owns it yet. Its copy takes that pending load, so the load's end tags the copy as it would have
+    // tagged the source, and the model's release reclaims it. A load marks expert 0's device entries and does not end;
+    // the evict of expert 0 publishes its host copies; once the withdrawn device entries are reaped, each host copy is
+    // pending under the load, the load's end tags exactly those three, and the release reclaims them with their room
+    // in the host WEIGHT zone. The copy's own stamp is unset only because no load is bound on this thread (a mover
+    // inside a load keeps that load's stamp), which is what lets the source's pending load reach it. The control:
+    // experts 1 and 2, never claimed, keep their device entries.
+    const uint64_t    txn = 0x6f776e7204ull;
+    test_loan_fixture fx(/*layers=*/1, /*experts=*/4, /*model_id=*/txn);
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    const size_t bytes = test_loan_expert_bytes();
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * bytes)) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(/*host_expert=*/3); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
+    if (std::string why = test_move_claim_begin(fx, txn, { 0 }); !why.empty()) {
+        return why;
+    }
+    for (int s = 0; s < 3; ++s) {
+        const uint64_t pending = fx.cache->test_entry_pending_load_txn(fx.keys[fx.index(0, s, 0)], GGML_LAYOUT_AOS);
+        if (pending != txn) {
+            return test_loan_fail(
+                "before the evict, slot %d expert 0's device entry is pending under load 0x%llx, "
+                "not the claim's 0x%llx",
+                s, (unsigned long long) pending, (unsigned long long) txn);
+        }
+    }
+
+    ::ggml_sycl_expert_move_result result;
+    const ::ggml_sycl_txn_result   code = test_named_move(fx, { 0, 0 }, test_no_triplet, result);
+    if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_evicted != 1 ||
+        !test_admit_outcome_is(result.evicted[0], true, ::ggml_sycl_txn_result::ACCEPTED, "OK")) {
+        return "the evict under a pending load answered " + test_admit_answer(code, result);
+    }
+    if (!fx.reclaim_until([&] { return test_evict_device_entries(fx, 0, 0) == 0; })) {
+        return "the evicted triplet's device entries were not reaped within 2 s";
+    }
+    if (test_evict_host_entries(fx, 0, 0) != 3) {
+        return test_loan_fail("the evicted triplet has %d host copies, not 3", test_evict_host_entries(fx, 0, 0));
+    }
+    for (int s = 0; s < 3; ++s) {
+        const uint64_t pending = fx.cache->test_entry_pending_load_txn(fx.keys[fx.index(0, s, 0)], GGML_LAYOUT_AOS);
+        if (pending != txn) {
+            return test_loan_fail("slot %d expert 0's host copy is pending under load 0x%llx, not its source's 0x%llx",
+                                  s, (unsigned long long) pending, (unsigned long long) txn);
+        }
+    }
+    const size_t host_used = fx.cache->host_zone_used(host_zone_id::WEIGHT);
+    if (host_used < 3 * bytes) {
+        return test_loan_fail("the host WEIGHT zone holds %zu bytes, less than the three %zu-byte host copies",
+                              host_used, bytes);
+    }
+    if (std::string why = test_move_claim_end(fx, txn, 3); !why.empty()) {
+        return "the host copies after the source's load ended: " + why;
+    }
+    test_move_release(fx);
+    if (!fx.reclaim_until([&] {
+            return test_evict_host_entries(fx, 0, 0) == 0 &&
+                   fx.cache->host_zone_used(host_zone_id::WEIGHT) <= host_used - 3 * bytes;
+        })) {
+        return test_loan_fail(
+            "2 s after the model's release %d of the evicted triplet's host copies remain, and the host WEIGHT zone "
+            "holds %zu bytes, not at most %zu",
+            test_evict_host_entries(fx, 0, 0), fx.cache->host_zone_used(host_zone_id::WEIGHT), host_used - 3 * bytes);
+    }
+    for (int e = 1; e <= 2; ++e) {
+        if (test_evict_device_entries(fx, 0, e) != 3) {
+            return test_loan_fail("the release reclaimed %d of unclaimed expert %d's 3 device entries",
+                                  3 - test_evict_device_entries(fx, 0, e), e);
+        }
+    }
+    return {};
+}
+
 std::string test_expert_refill_belongs_to_the_lending_model() {
     // A loan and its refill move a triplet to the host and back, and each copy belongs to the model that owned the
     // one it replaced: the re-admitted device entries are still that model's, and its release reclaims them. A model
     // claims experts 0 and 1, the only ones on the device, so the loan lends one of them; once it is refilled, the
-    // model's release reclaims both triplets' device entries and the withdrawn host copies.
+    // model's release reclaims both triplets' device entries. The case also waits for the refilled triplet's host
+    // copies to go, but the refill withdrew them: they are retired entries the deferred-free pass removes whatever
+    // their tags, not the release's doing. The device entries are what test the release.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6f776e7203ull);
     if (!fx.cache) {
         return "no unified cache for device 0";

@@ -714,9 +714,11 @@ std::string test_expert_evict_takes_a_block_off_the_direct_route();
 std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone();
 // Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
 // it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
-// no model ever owned stays through the release.
+// no model ever owned stays through the release. A copy made while its source's load is still pending takes that
+// load, so the load's end tags it.
 std::string test_expert_admit_belongs_to_the_host_copys_model();
 std::string test_expert_evict_host_copy_belongs_to_the_device_entrys_model();
+std::string test_expert_evict_host_copy_takes_the_sources_pending_load();
 std::string test_expert_refill_belongs_to_the_lending_model();
 #endif
 

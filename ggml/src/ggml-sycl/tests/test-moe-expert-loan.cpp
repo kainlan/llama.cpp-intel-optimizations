@@ -235,20 +235,28 @@
 //
 // Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
 // releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
-// device cache:
+// device cache. A case that fails after its claim leaves the slot to the fixture, which releases it, so the next case
+// does not find it live:
 //
 //   admit_belongs_to_the_host_copys_model
 //                           A model claims expert 1's host copies and expert 0's device entries. After the admit of
 //                           expert 1 and the release, expert 1's device entries and expert 0's are gone and the WEIGHT
-//                           zone has the admitted triplet's room back. The control: expert 2, never claimed, keeps
-//                           its device entries, since a release keeps an entry it cannot attribute.
+//                           zone has the admitted triplet's room back. Expert 1's host copies go too, but as retired
+//                           entries the deferred-free pass removes whatever their tags. The control: expert 2, never
+//                           claimed, keeps its device entries, since a release keeps an entry it cannot attribute.
 //   evict_host_copy_belongs_to_the_device_entrys_model
 //                           A model claims experts 0 and 1. After the evict of expert 0 and the reaping of its device
 //                           entries, the release reclaims expert 0's host copies, with their room in the host WEIGHT
 //                           zone, and expert 1's device entries. The control: expert 2, never claimed, stays.
+//   evict_host_copy_takes_the_sources_pending_load
+//                           A load marks expert 0's device entries and has not ended when expert 0 is evicted. Once
+//                           the withdrawn device entries are reaped, each host copy is pending under that load; the
+//                           load's end tags exactly the three copies, and the release reclaims them with their room in
+//                           the host WEIGHT zone. The control: experts 1 and 2, never claimed, stay.
 //   refill_belongs_to_the_lending_model
 //                           A model claims experts 0 and 1, the only ones on the device; one is lent and refilled.
-//                           The release reclaims both triplets' device entries and the withdrawn host copies. No
+//                           The release reclaims both triplets' device entries. The refilled triplet's host copies go
+//                           too, but as retired entries the deferred-free pass removes whatever their tags. No
 //                           unclaimed control: the loan picks its own triplet, which must be a claimed one.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
@@ -362,6 +370,8 @@ int main() {
         run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);
     ok &= run_case("evict_host_copy_belongs_to_the_device_entrys_model",
                    ggml_sycl::test_expert_evict_host_copy_belongs_to_the_device_entrys_model);
+    ok &= run_case("evict_host_copy_takes_the_sources_pending_load",
+                   ggml_sycl::test_expert_evict_host_copy_takes_the_sources_pending_load);
     ok &= run_case("refill_belongs_to_the_lending_model", ggml_sycl::test_expert_refill_belongs_to_the_lending_model);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");

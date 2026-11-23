@@ -143,9 +143,13 @@ void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & 
 }
 
 // A copy a move publishes (an admit's or a refill's device entry, a loan's or an evict's host copy) holds the same
-// weight as the entry it replaces, so it belongs to the same models: it takes that entry's owners, and its pending
-// load where the copy's own stamp left none. Only a load's end tags an entry, and a model teardown never reclaims an
-// untagged one, so a copy published after the load without this would outlive its model.
+// weight as the entry it replaces, so it belongs to the same models: it takes that entry's owners and tag. A model
+// load's end tags what the load staged; a moved copy is tagged by this inheritance too. A model teardown never
+// reclaims an untagged entry, so a copy published after the load without it would outlive its model.
+// The pending load follows two rules. A copy whose own stamp is unset (its mover runs outside any load) takes the
+// source's pending load, so that load's end tags the copy as it would have tagged the source. A mover that runs
+// inside a load keeps its own stamp: that load published the copy, so its end must tag the copy and its abort must
+// withdraw it, as for anything else it staged. An entry holds one pending load, and the source keeps its own.
 void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept {
     dst.owner_mask |= src.owner_mask;
     dst.owner_tagged = dst.owner_tagged || src.owner_tagged;
