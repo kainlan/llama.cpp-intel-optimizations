@@ -11,12 +11,15 @@
 // registry/reset behavior, not of the fallback classifier -- see
 // tests/test-sycl-tensor-usage.cpp for that.
 //
-// The one exception is checks 7 and 8, which need real expert-family names:
-// the loader registers an expert family's usage from the family alone, so an
-// expert ".scale" arrives here as MOE_EXPERT_WEIGHT, and the registry must
-// store what the name rule says (MOE_INTERMEDIATE) or the S1 preload, which
+// The exception is checks 7 to 11, which need expert-family names: the loader
+// registers an expert family's usage from the family alone, so an expert's
+// per-expert ".scale" or ".input_scale" arrives here as MOE_EXPERT_WEIGHT, and
+// the registry must store MOE_INTERMEDIATE for it or the S1 preload, which
 // reads the registry, skips the tensor while the planner gave it a dense entry.
-// A registry row overrides the fallback, so check 7 still tests the registry.
+// Checks 8 and 9 use the ffn_norm_exps family (arctic), which the loader
+// registers as MOE_EXPERT_WEIGHT but which is outside the name rule's expert
+// families: the name rule calls those names NORM (check 7 pins that), so only
+// a stored, corrected registry row can read MOE_INTERMEDIATE for them.
 //
 // Mutation control: key g_sycl_weight_usages by bare name, or clear it at B's
 // load boundary. The B or reactivated-A exact-owner checks then fail.
@@ -105,15 +108,31 @@ int main(int, char ** argv) {
     // A name every architecture reuses verbatim with a CONSISTENT usage.
     ggml_backend_sycl_register_weight_usage("zzz_test_consistent", GGML_SYCL_TENSOR_USAGE_NORM);
 
-    // Check 7: the loader registers an expert family's per-expert scale with the family's usage. The registry must
-    // store the name rule's class for it, the class the planner placed it by.
-    ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_up_exps.scale", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
-    check(usage_of(ctx, "blk.0.ffn_gate_up_exps.scale") == tensor_usage::MOE_INTERMEDIATE,
-          "check 7: an expert .scale registered as MOE_EXPERT_WEIGHT reads MOE_INTERMEDIATE");
-    // Check 8 (control): the expert matrix of the same family keeps the family's usage.
+    // Check 7 (precondition for checks 8 and 9): the name rule does not call these names MOE_INTERMEDIATE, so the
+    // fallback cannot produce the answer checks 8 and 9 expect. Registered nowhere before this line.
+    check(infer_tensor_usage("blk.0.ffn_norm_exps.scale") == tensor_usage::NORM &&
+              infer_tensor_usage("blk.0.ffn_norm_exps.input_scale") == tensor_usage::NORM,
+          "check 7: the name rule classifies the ffn_norm_exps scale names NORM (precondition for checks 8 and 9)");
+    // Checks 8 and 9: the loader registers an expert family's per-expert scale with the family's usage. The registry
+    // must store MOE_INTERMEDIATE for it, the class the planner placed it by.
+    ggml_backend_sycl_register_weight_usage("blk.0.ffn_norm_exps.scale", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+    check(usage_of(ctx, "blk.0.ffn_norm_exps.scale") == tensor_usage::MOE_INTERMEDIATE,
+          "check 8: an expert .scale registered as MOE_EXPERT_WEIGHT reads MOE_INTERMEDIATE from its registry row");
+    ggml_backend_sycl_register_weight_usage("blk.0.ffn_norm_exps.input_scale",
+                                            GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+    check(usage_of(ctx, "blk.0.ffn_norm_exps.input_scale") == tensor_usage::MOE_INTERMEDIATE,
+          "check 9: an expert .input_scale registered as MOE_EXPERT_WEIGHT reads MOE_INTERMEDIATE");
+    // Check 10 (control): the expert matrix of a family keeps the family's usage.
     ggml_backend_sycl_register_weight_usage("blk.0.ffn_gate_up_exps.weight", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
     check(usage_of(ctx, "blk.0.ffn_gate_up_exps.weight") == tensor_usage::MOE_EXPERT_WEIGHT,
-          "check 8 (control): the expert .weight registered as MOE_EXPERT_WEIGHT reads MOE_EXPERT_WEIGHT");
+          "check 10 (control): the expert .weight registered as MOE_EXPERT_WEIGHT reads MOE_EXPERT_WEIGHT");
+    // Check 11 pins today's behaviour, not the goal: a family's .bias is stored as the family's MOE_EXPERT_WEIGHT,
+    // while the name rule calls it MOE_INTERMEDIATE (owed: "Tracker tasks owed" in
+    // docs/plans/2026-11-21-inkling2-mini-sycl-enable-profile-optimize.md). A fix of .bias must change this check
+    // on purpose.
+    ggml_backend_sycl_register_weight_usage("blk.0.ffn_down_exps.bias", GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT);
+    check(usage_of(ctx, "blk.0.ffn_down_exps.bias") == tensor_usage::MOE_EXPERT_WEIGHT,
+          "check 11 (today's behaviour): an expert .bias registered as MOE_EXPERT_WEIGHT reads MOE_EXPERT_WEIGHT");
 
     check(ggml_backend_sycl_model_load_end(load_a, true, &model_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle commit");
 

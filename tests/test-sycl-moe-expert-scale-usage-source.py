@@ -13,9 +13,10 @@ So a card layer's scale never reached the card: the REPEAT in build_lora_mm_id r
 staged it every graph (bin-broadcast raw host staging), and that staging cannot be recorded into a SYCL graph.
 
 THE CONTRACT.  One predicate says what an expert scale is, and both classifiers ask it.
-  N. (common.hpp) `inline bool ggml_sycl_moe_expert_scale_name(const char * name)` is defined once and matches the
-     "exps.scale" and "exps.input_scale" substrings (so ".scales", the chexps family and a view such as
-     "... .scale (reshaped)", the name the REPEAT reads, all match).
+  N. (common.hpp) `inline bool ggml_sycl_moe_expert_scale_name(const char * name)` is defined once, is false for a
+     null name (`name != nullptr &&` before any strstr), and matches EITHER the "exps.scale" OR the
+     "exps.input_scale" substring (the two strstr calls are joined by `||`), so ".scales", ".input_scale", the
+     chexps family and a view such as "... .scale (reshaped)", the name the REPEAT reads, all match.
   U. (common.hpp infer_tensor_usage) the one `return tensor_usage::MOE_EXPERT_WEIGHT;` is guarded by
      `!ggml_sycl_moe_expert_scale_name(name)`, and an expert-family name that fails the guard still returns
      MOE_INTERMEDIATE, the class the family's `.bias` already has: the planner then gives the scale a dense entry
@@ -27,13 +28,10 @@ THE CONTRACT.  One predicate says what an expert scale is, and both classifiers 
      common.hpp (the predicate) and never in ggml-sycl.cpp.
 
 The behaviour is checked by tests/test-sycl-tensor-usage.cpp (name rule, host only) and
-ggml/src/ggml-sycl/tests/test-cross-model-weight-usage.cpp checks 7 and 8 (registry, opens a device).
+ggml/src/ggml-sycl/tests/test-cross-model-weight-usage.cpp checks 7 to 11 (registry, opens a device).
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and requires each to FAIL on its
 own pin, then requires the unmodified tree to pass.
-
-RED on the tree before the change:
-  FAIL [pin N]: common.hpp defines no ggml_sycl_moe_expert_scale_name(const char * name) (Inkling 2 Task 8i)
 """
 
 from __future__ import annotations
@@ -108,9 +106,24 @@ def check_predicate(common: str) -> None:
     if not re.search(PRED_SIG, common):
         fail("N", f"common.hpp defines no {PRED}(const char * name)")
     body = function_body(common, PRED_SIG, "N", PRED)
+    calls = []
     for lit in LITERALS:
-        if not re.search(r"strstr\s*\(\s*name\s*,\s*" + re.escape(lit) + r"\s*\)", body):
+        call = r"strstr\s*\(\s*name\s*,\s*" + re.escape(lit) + r"\s*\)(?:\s*!=\s*nullptr)?"
+        if not re.search(call, body):
             fail("N", f"{PRED} does not match the {lit} substring with strstr(name, {lit})")
+        calls.append(call)
+    # Either substring is enough: the two strstr calls are joined by ||, in either order.
+    if not (re.search(calls[0] + r"\s*\|\|\s*" + calls[1], body) or
+            re.search(calls[1] + r"\s*\|\|\s*" + calls[0], body)):
+        fail("N", f"{PRED} does not join its two strstr calls with ||: a name with only one of the two substrings "
+                  "would not match")
+    # A null name is false, checked before any strstr reads it (`name != nullptr &&`, `name &&`, or an early
+    # `if (!name) return false;`).
+    null_check = (re.search(r"\bname\s*(?:!=\s*nullptr\s*)?&&", body) or
+                  re.search(r"if\s*\(\s*(?:!\s*name|name\s*==\s*nullptr)\s*\)\s*\{?\s*return\s+false\s*;", body))
+    first_strstr = body.find("strstr")
+    if null_check is None or null_check.start() > first_strstr:
+        fail("N", f"{PRED} does not test name != nullptr before its strstr calls: a null name would be read")
 
 
 def check_name_rule(common: str) -> None:
@@ -203,10 +216,27 @@ def self_test(s: dict[str, str | None]) -> int:
             return b
         return without[:anchor] + m.group(0) + "\n            " + without[anchor:]
 
+    def in_predicate(pattern: str, repl: str):
+        """A mutant that rewrites only the predicate's body, so a like-shaped line elsewhere in common.hpp is
+        never the one changed."""
+        def mutate(c: str) -> str:
+            m = re.search(PRED_SIG, c)
+            if not m:
+                return c
+            end = c.find("\n}", m.end())
+            if end < 0:
+                return c
+            return c[: m.end()] + re.sub(pattern, repl, c[m.end() : end], count=1) + c[end:]
+        return mutate
+
     mutants = [
         ("N", "common", "predicate drops input_scale",
          lambda c: re.sub(r'\s*\|\|\s*strstr\s*\(\s*name\s*,\s*"exps\.input_scale"\s*\)\s*!=\s*nullptr', "", c,
                           count=1)),
+        ("N", "common", "predicate joins its substrings with && instead of ||",
+         in_predicate(r'("exps\.scale"\s*\)\s*!=\s*nullptr\s*)\|\|', r"\1&&")),
+        ("N", "common", "predicate drops its null check",
+         in_predicate(r"\bname\s*!=\s*nullptr\s*&&\s*", "")),
         ("N", "common", "predicate renamed away",
          lambda c: c.replace("inline bool " + PRED + "(const char * name)",
                              "inline bool ggml_sycl_moe_expert_aux_name(const char * name)", 1)),
