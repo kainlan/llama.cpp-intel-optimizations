@@ -16742,7 +16742,10 @@ static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,
     // Both of these run BEFORE the two lock_guards below on purpose: the drain
     // waits on a queue, and a queue wait held under either of those mutexes is a
     // stall hazard (the teardown drain keeps its waits outside all ranked locks
-    // for the same reason).
+    // for the same reason). Every begin runs under graph_compute's L2 and L3, so
+    // graph_compute_unchecked drains this backend's terminal before it takes them,
+    // and the drain here finds nothing unless a caller computed on one backend
+    // from two threads at once.
     //
     // Both calls stay: they cover disjoint states, and neither subsumes the
     // other. The drain handles a terminal graph whose invocation is still HELD
@@ -120673,6 +120676,15 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // A loan the last context left lent comes back before this graph's first MUL_MAT_ID (llama.cpp-i4ny).
     (void) ggml_sycl_run_expert_bulk_refill_between_contexts(
         static_cast<ggml_backend_sycl_context *>(backend->context)->device, nullptr, nullptr);
+    // A compute with no synchronize after it (a back-to-back caller) leaves this backend's invocation submitted and
+    // unreleased, and the next begin has to drain it: a wait on the device. Every path below that begins a graph runs
+    // under g_sycl_graph_compute_mutex (L2) and graph_mutex (L3), and no wait may sit under a listed lock (canonical
+    // contract section 12.5), so the drain runs here, before either. It needs neither lock: synchronize and the
+    // teardown drain run the same wait, release and retire under none, and synchronize reads and clears
+    // last_graph_event under none. Nothing can leave a new invocation for this backend between the drain and the
+    // lock: only the dispatch scopes below begin one, and ggml drives a backend from one thread at a time. A caller
+    // that broke that would still be drained by the begin, under the locks. After a synchronize this finds nothing.
+    ggml_sycl_execution_drain_own_terminal(static_cast<ggml_backend_sycl_context *>(backend->context));
     std::unique_lock<std::mutex> global_graph_lock(g_sycl_graph_compute_mutex);
 
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
