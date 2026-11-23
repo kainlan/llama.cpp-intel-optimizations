@@ -8,7 +8,9 @@
 
 #include "allocation-provenance.hpp"
 #include "common.hpp"
+#include "exit-settle.hpp"
 #include "ggml-impl.h"
+#include "scratch-test-mutant.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,7 +19,9 @@
 #include <cstdlib>
 #include <future>
 #include <memory>
+#include <new>
 #include <thread>
+#include <utility>
 
 namespace ggml_sycl {
 namespace {
@@ -114,6 +118,11 @@ mem_handle allocate_pinned_chunk_owner(sycl::queue &       queue,
 
 }  // namespace
 
+struct pinned_chunk_pool::stranded_entry {
+    alloc_metadata metadata;
+    size_t         backing = 0;
+};
+
 const char * host_zone_name(host_zone_id zone) {
     switch (zone) {
         case host_zone_id::WEIGHT:
@@ -129,9 +138,10 @@ const char * host_zone_name(host_zone_id zone) {
     }
 }
 
-pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget) :
+pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget, std::string refusal_reason) :
     queue_(queue),
     budget_(budget),
+    refusal_reason_(std::move(refusal_reason)),
     chunk_size_(resolve_chunk_size()),
     alloc_timeout_ms_(resolve_alloc_timeout_ms()) {
     GGML_LOG_INFO("[SYCL] Pinned chunk pool created with %.1f GB budget, committed=0.0 GB (chunk=%.1f MB)\n",
@@ -139,8 +149,15 @@ pinned_chunk_pool::pinned_chunk_pool(sycl::queue & queue, size_t budget) :
 }
 
 pinned_chunk_pool::~pinned_chunk_pool() {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::CARRIER_ASSERT_REMOVED)) {
+        owning_carriers_.store(0, std::memory_order_release);
+    }
+#endif
+    GGML_ASSERT(owning_carriers_.load(std::memory_order_acquire) == 0 &&
+                "released_chunk outstanding at pool destruction");
     std::lock_guard<std::mutex> lock(mutex_);
-    size_t                      chunk_count = chunks_.size() + runtime_chunks_.size();
+    size_t                      chunk_count = 0;
 
     // llama.cpp-dyhdl: wait for all chunk leases to drain before sycl::free.
     // If a lease is still held at destruction, a downstream caller holds a
@@ -150,13 +167,27 @@ pinned_chunk_pool::~pinned_chunk_pool() {
         if (c.base) {
             wait_for_chunk_drain_or_assert(c, "pinned-base");
             free_chunk_owner(c, "pinned-base");
+            ++chunk_count;
         }
     }
     for (auto & c : runtime_chunks_) {
         if (c.base) {
             wait_for_chunk_drain_or_assert(c, "pinned-runtime");
             free_chunk_owner(c, "pinned-runtime");
+            ++chunk_count;
         }
+    }
+    // A released backing the registry still holds now (a control the registry abandoned at shutdown, or a retry not
+    // yet run) is reported here: after this the pool counts nothing.
+    reconcile_stranded_locked();
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::DTOR_NO_REPORT)) {
+        stranded_.clear();
+    }
+#endif
+    for (const auto & entry : stranded_) {
+        GGML_LOG_WARN("[PINNED-POOL] stranded chunk backing %.1f MB still registered at pool destruction\n",
+                      entry.backing / (1024.0 * 1024.0));
     }
     chunks_.clear();
     runtime_chunks_.clear();
@@ -171,9 +202,12 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
     result.total_size = size;
 
     size                    = align_up(size, alignment);
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
 
     for (auto & c : chunks_) {
+        if (!c.base) {
+            continue;
+        }
         size_t offset = c.allocator->allocate(size, tlsf_align);
         if (offset != SIZE_MAX) {
             void * ptr = static_cast<char *>(c.base) + offset;
@@ -183,7 +217,14 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
     }
 
     // Need to grow - allocate a new chunk
-    if (total_allocated_ + chunk_size_ > budget_) {
+    if (footprint_locked() + chunk_size_ > budget_) {
+        // Silent, as it always was, unless the headroom refusal zeroed the budget (design 5efe §4.5), which names
+        // itself on every refused growth. No used figure: the footprint's log reads are a fixed census, and at a
+        // zeroed budget it says nothing the budget and the reason do not.
+        if (!refusal_reason_.empty()) {
+            GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB budget)%s\n",
+                          budget_ / (1024.0 * 1024.0 * 1024.0), refusal_reason_.c_str());
+        }
         return {};
     }
 
@@ -226,6 +267,9 @@ size_t pinned_chunk_pool::pre_allocate(size_t total_bytes) {
     // minus capacity already available in existing chunks.
     size_t existing_capacity = 0;
     for (const auto & c : chunks_) {
+        if (!c.base) {
+            continue;
+        }
         existing_capacity += c.allocator ? c.allocator->available() : c.size;
     }
     if (existing_capacity >= total_bytes) {
@@ -239,9 +283,9 @@ size_t pinned_chunk_pool::pre_allocate(size_t total_bytes) {
     size_t       chunks_grown  = 0;
 
     for (size_t i = 0; i < chunks_needed; i++) {
-        if (total_allocated_ + chunk_size_ > budget_) {
-            GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate: budget exhausted after %zu/%zu chunks\n", chunks_grown,
-                          chunks_needed);
+        if (footprint_locked() + chunk_size_ > budget_) {
+            GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate: budget exhausted after %zu/%zu chunks%s\n", chunks_grown,
+                          chunks_needed, refusal_reason_.c_str());
             break;
         }
         if (!grow(chunk_size_, "pre_allocate")) {
@@ -302,11 +346,33 @@ size_t pinned_chunk_pool::pre_allocate_runtime_chunks(size_t total_bytes) {
     return chunks_grown;
 }
 
-void pinned_chunk_pool::configure_zones(size_t weight_bytes,
+bool pinned_chunk_pool::configure_zones(size_t weight_bytes,
                                         size_t kv_bytes,
                                         size_t staging_bytes,
                                         size_t scratch_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // A surviving withdrawn chunk refuses the rebuild before any state changes (§4.4 "configure_zones refuses while a
+    // withdrawn chunk survives"): the rebuild below would drop its allocator, and the live allocation in it, while the
+    // device cache's marked set still names the chunk.
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::CONFIGURE_REBUILDS)) {
+        for (auto & states : zone_allocators_) {
+            for (auto & zcs : states) {
+                zcs.withdrawn = false;
+            }
+        }
+    }
+#endif
+    for (const auto & states : zone_allocators_) {
+        for (const auto & zcs : states) {
+            if (zcs.withdrawn) {
+                GGML_LOG_ERROR("[HOST-ARENA] configure_zones refused: chunk %zu still withdrawn, %zu B allocated\n",
+                               zcs.chunk_idx, zcs.allocator->used());
+                return false;
+            }
+        }
+    }
 
     weight_bytes  = align_up(weight_bytes, DEFAULT_ALIGNMENT);
     kv_bytes      = align_up(kv_bytes, DEFAULT_ALIGNMENT);
@@ -318,9 +384,12 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
     // Grow chunks until we have enough total capacity.
     size_t total_capacity = 0;
     for (const auto & c : chunks_) {
+        if (!c.base) {
+            continue;
+        }
         total_capacity += c.size;
     }
-    while (total_capacity < total_zone_bytes && total_allocated_ + chunk_size_ <= budget_) {
+    while (total_capacity < total_zone_bytes && footprint_locked() + chunk_size_ <= budget_) {
         if (!grow(chunk_size_, "configure_zones")) {
             break;
         }
@@ -341,6 +410,9 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
         // already spent, and the requested footprint all explicit.
         size_t runtime_capacity = 0;
         for (const auto & c : runtime_chunks_) {
+            if (!c.base) {
+                continue;
+            }
             runtime_capacity += c.size;
         }
         GGML_LOG_WARN(
@@ -355,13 +427,16 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
             zone.start = 0;
         }
         zones_configured_ = false;
-        return;
+        return true;
     }
 
     // Build flat_spans_: each chunk maps to one span in the logical address space.
     flat_spans_.clear();
     size_t logical_cursor = 0;
     for (size_t ci = 0; ci < chunks_.size(); ci++) {
+        if (!chunks_[ci].base) {
+            continue;
+        }
         flat_spans_.push_back({ logical_cursor, ci, 0ULL, chunks_[ci].size });
         logical_cursor += chunks_[ci].size;
     }
@@ -422,6 +497,7 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
         "STAGING=%.1f MB  SCRATCH=%.1f MB  (total-cap=%.1f MB)\n",
         weight_bytes / (1024.0 * 1024.0), kv_bytes / (1024.0 * 1024.0), staging_bytes / (1024.0 * 1024.0),
         scratch_bytes / (1024.0 * 1024.0), total_capacity / (1024.0 * 1024.0));
+    return true;
 }
 
 segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size_t size, size_t alignment) {
@@ -436,8 +512,12 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
     // Early capacity check: reject if zone doesn't have enough total space
     const auto & z = zones_[zi];
     if (z.size > 0) {
+        // Like with like: z.size excludes a withdrawn chunk, so its bytes are not summed either.
         size_t cur_used = 0;
         for (const auto & zcs : zone_allocators_[zi]) {
+            if (zcs.withdrawn) {
+                continue;
+            }
             cur_used += zcs.allocator->used();
         }
         if (cur_used + size > z.size) {
@@ -447,12 +527,15 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
         return {};
     }
 
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
     size_t       remaining  = size;
 
     for (auto & zcs : zone_allocators_[zi]) {
         if (remaining == 0) {
             break;
+        }
+        if (zcs.withdrawn) {
+            continue;
         }
 
         const size_t avail = zcs.allocator->largest_free_block();
@@ -460,13 +543,13 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
             continue;
         }
 
-        size_t try_size = std::min(remaining, avail);
-        // Round UP to TLSF alignment to avoid leaving a sub-alignment remainder
-        // that would round to 0 on the next iteration and cause allocation failure.
-        try_size        = (try_size + tlsf_align - 1) & ~(tlsf_align - 1);
-        if (try_size == 0 || try_size > avail) {
-            continue;
-        }
+        // The piece is the whole remainder when it fits, rounded up to the TLSF
+        // alignment so no sub-alignment remainder is left for a later chunk.  Host
+        // zone sizes are not multiples of the grain, so a chunk's last block can
+        // end off it; when rounding up passes that block, the piece is the block's
+        // on-grain part and the rest of the request goes to the next chunk.
+        const size_t try_size = tlsf_allocator::segment_piece(remaining, avail, tlsf_align);
+        GGML_ASSERT(try_size != 0 && "avail >= tlsf_align, so the block holds at least one whole granule");
 
         const size_t offset = zcs.allocator->allocate(try_size, tlsf_align);
         if (offset == SIZE_MAX) {
@@ -486,7 +569,8 @@ segmented_buffer pinned_chunk_pool::zone_alloc_segmented(host_zone_id zone, size
     if (remaining > 0) {
         // Rollback: free what we already allocated in this call.
         for (auto & seg : result.segments) {
-            zone_free_unlocked(zone, seg.ptr, seg.size);
+            // The segments came from chunks that are not withdrawn, so none is an orphaned chunk's.
+            (void) zone_free_unlocked(zone, seg.ptr, seg.size);
         }
         result.segments.clear();
         result.total_size = 0;
@@ -505,10 +589,10 @@ void * pinned_chunk_pool::zone_alloc(host_zone_id zone, size_t size, size_t alig
     }
 
     size                    = align_up(size, alignment);
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
 
     for (auto & zcs : zone_allocators_[zi]) {
-        if (!zcs.allocator || zcs.allocator->largest_free_block() < size) {
+        if (zcs.withdrawn || !zcs.allocator || zcs.allocator->largest_free_block() < size) {
             continue;
         }
 
@@ -523,13 +607,13 @@ void * pinned_chunk_pool::zone_alloc(host_zone_id zone, size_t size, size_t alig
     return nullptr;
 }
 
-void pinned_chunk_pool::zone_free_unlocked(host_zone_id zone, void * ptr, size_t /* size */) {
+size_t pinned_chunk_pool::zone_free_unlocked(host_zone_id zone, void * ptr, size_t /* size */) {
     if (!ptr) {
-        return;
+        return NO_CHUNK;
     }
     const size_t zi = static_cast<size_t>(zone);
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
-        return;
+        return NO_CHUNK;
     }
 
     const uint8_t * p = static_cast<const uint8_t *>(ptr);
@@ -539,18 +623,21 @@ void pinned_chunk_pool::zone_free_unlocked(host_zone_id zone, void * ptr, size_t
         if (p >= zone_base && p < zone_base + zcs.zone_size) {
             const size_t offset = static_cast<size_t>(p - zone_base);
             zcs.allocator->free(offset);
-            return;
+            // The orphaned chunk's first release event (§4.4 "Where the two flags live"): a flag test on the state
+            // this free already found, so a free into any other chunk gains no lookup.
+            return (zcs.orphaned && zcs.allocator->used() == 0) ? zcs.chunk_idx : NO_CHUNK;
         }
     }
     GGML_LOG_WARN("[HOST-ZONE] zone_free_unlocked: ptr %p not found in zone=%s\n", ptr, host_zone_name(zone));
+    return NO_CHUNK;
 }
 
-void pinned_chunk_pool::zone_free(host_zone_id zone, void * ptr, size_t size) {
+size_t pinned_chunk_pool::zone_free(host_zone_id zone, void * ptr, size_t size) {
     if (!ptr) {
-        return;
+        return NO_CHUNK;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    zone_free_unlocked(zone, ptr, size);
+    return zone_free_unlocked(zone, ptr, size);
 }
 
 void pinned_chunk_pool::zone_reset(host_zone_id zone) {
@@ -560,6 +647,11 @@ void pinned_chunk_pool::zone_reset(host_zone_id zone) {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto & zcs : zone_allocators_[zi]) {
+        // A withdrawn chunk may still hold a returned buffer's live allocation; resetting its allocator would let the
+        // release free memory a live handle owns.
+        if (zcs.withdrawn) {
+            continue;
+        }
         zcs.allocator->reset();
     }
     if (host_zone_debug_enabled()) {
@@ -575,6 +667,9 @@ size_t pinned_chunk_pool::zone_used(host_zone_id zone) const {
     }
     size_t total = 0;
     for (const auto & zcs : zone_allocators_[zi]) {
+        if (zcs.withdrawn) {
+            continue;
+        }
         total += zcs.allocator->used();
     }
     return total;
@@ -599,7 +694,7 @@ size_t pinned_chunk_pool::zone_largest_free_block(host_zone_id zone) const {
     }
     size_t largest = 0;
     for (const auto & zcs : zone_allocators_[zi]) {
-        if (!zcs.allocator) {
+        if (zcs.withdrawn || !zcs.allocator) {
             continue;
         }
         const size_t block = zcs.allocator->largest_free_block();
@@ -610,7 +705,10 @@ size_t pinned_chunk_pool::zone_largest_free_block(host_zone_id zone) const {
     return largest;
 }
 
-bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
+bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes, size_t * grown_chunk) {
+    if (grown_chunk) {
+        *grown_chunk = NO_CHUNK;
+    }
     const size_t zi = static_cast<size_t>(zone);
     if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_) {
         return false;
@@ -661,13 +759,13 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
     // path (allocate_from_chunks) has always used -- so the zone path follows
     // it, and the budget is checked against the bytes that chunk actually
     // commits (grow_into() adds one DEFAULT_ALIGNMENT header per chunk).
-    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);
-    if (total_allocated_ + footprint.backing > budget_) {
+    const chunk_footprint footprint = chunk_footprint_for(chunk_size_, additional_bytes);
+    if (footprint_locked() + footprint.backing > budget_) {
         GGML_LOG_WARN(
             "[SYCL] Pinned pool grow_zone: budget exhausted for zone %zu "
-            "(need %.1f MB, budget=%.1f GB, used=%.1f GB)\n",
+            "(need %.1f MB, budget=%.1f GB, used=%.1f GB)%s\n",
             zi, footprint.backing / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
-            total_allocated_ / (1024.0 * 1024.0 * 1024.0));
+            total_allocated_ / (1024.0 * 1024.0 * 1024.0), refusal_reason_.c_str());
         return false;
     }
 
@@ -707,6 +805,9 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
 
     // Extend the zone's capacity to include the new chunks.
     zones_[zi].size += additional_capacity;
+    if (grown_chunk && chunks_.size() > old_chunk_count) {
+        *grown_chunk = old_chunk_count;
+    }
 
     GGML_LOG_INFO(
         "[SYCL] Pinned pool grow_zone: zone %zu grown by %.1f MB "
@@ -724,13 +825,13 @@ bool pinned_chunk_pool::contains(const void * ptr) const {
     const char *                p = static_cast<const char *>(ptr);
     for (const auto & c : chunks_) {
         const char * base = static_cast<const char *>(c.base);
-        if (p >= base && p < base + c.size) {
+        if (base && p >= base && p < base + c.size) {
             return true;
         }
     }
     for (const auto & c : runtime_chunks_) {
         const char * base = static_cast<const char *>(c.base);
-        if (p >= base && p < base + c.size) {
+        if (base && p >= base && p < base + c.size) {
             return true;
         }
     }
@@ -771,12 +872,275 @@ bool pinned_chunk_pool::contains_backing_allocation(const void * ptr, size_t siz
 
 size_t pinned_chunk_pool::allocated() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return total_allocated_;
+    return footprint_locked();
 }
 
 size_t pinned_chunk_pool::chunk_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return chunks_.size() + runtime_chunks_.size();
+    size_t                      live = 0;
+    for (const auto & c : chunks_) {
+        live += c.base ? 1 : 0;
+    }
+    for (const auto & c : runtime_chunks_) {
+        live += c.base ? 1 : 0;
+    }
+    return live;
+}
+
+size_t pinned_chunk_pool::footprint_locked() const {
+    reconcile_stranded_locked();
+    return total_allocated_;
+}
+
+void pinned_chunk_pool::reconcile_stranded_locked() const {
+    bool planted_skip_query = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::NO_PRUNE)) {
+        return;
+    }
+    planted_skip_query = scratch_test_mutant_on(scratch_test_mutant::PRUNE_WITHOUT_QUERY);
+#endif
+    if (stranded_.empty()) {
+        return;
+    }
+    // In place (remove_if then erase), so the capacity grow_into reserved is never given back.
+    const auto gone = std::remove_if(stranded_.begin(), stranded_.end(), [&](const stranded_entry & entry) {
+        if (!planted_skip_query && unified_allocation_registered_exact(entry.metadata) != ALLOCATION_REGISTERED_GONE) {
+            return false;
+        }
+        total_allocated_ -= entry.backing;
+        return true;
+    });
+    stranded_.erase(gone, stranded_.end());
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t pinned_chunk_pool::stranded_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    reconcile_stranded_locked();
+    return stranded_.size();
+}
+
+bool pinned_chunk_pool::test_chunk_metadata(size_t chunk_idx, alloc_metadata * out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (out == nullptr || chunk_idx >= chunks_.size() || !chunks_[chunk_idx].base) {
+        return false;
+    }
+    return chunks_[chunk_idx].owner.owner_metadata(out);
+}
+
+#    if defined(GGML_SYCL_SCRATCH_MUTANTS)
+void pinned_chunk_pool::test_unwithdraw_zone_chunk(host_zone_id zone, size_t chunk_idx) {
+    const size_t                zi = static_cast<size_t>(zone);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT)) {
+        return;
+    }
+    for (auto & zcs : zone_allocators_[zi]) {
+        if (zcs.chunk_idx == chunk_idx && zcs.withdrawn) {
+            zcs.withdrawn = false;
+            zones_[zi].size += zcs.zone_size;
+        }
+    }
+}
+#    endif
+#endif
+
+bool pinned_chunk_pool::withdraw_zone_chunk(host_zone_id zone, size_t chunk_idx) {
+    const size_t                zi = static_cast<size_t>(zone);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT) || !zones_configured_ || chunk_idx >= chunks_.size() ||
+        !chunks_[chunk_idx].base) {
+        return false;
+    }
+    for (auto & zcs : zone_allocators_[zi]) {
+        if (zcs.chunk_idx != chunk_idx) {
+            continue;
+        }
+        // Only a chunk wholly the zone's can leave it: a shared chunk's other zones would keep using it.
+        if (zcs.zone_start != 0 || zcs.zone_size != chunks_[chunk_idx].size) {
+            return false;
+        }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (zcs.withdrawn && scratch_test_mutant_on(scratch_test_mutant::WITHDRAW_TRANSITION_BLIND)) {
+            zones_[zi].size -= zcs.zone_size;
+        }
+#endif
+        if (!zcs.withdrawn) {
+            zcs.withdrawn = true;
+            zones_[zi].size -= zcs.zone_size;
+        }
+        return true;
+    }
+    return false;
+}
+
+pinned_chunk_release pinned_chunk_pool::release_zone_chunk(host_zone_id     zone,
+                                                           size_t           chunk_idx,
+                                                           released_chunk & out,
+                                                           bool             orphan_if_live) {
+    GGML_ASSERT(!out.owns_backing() && "release_zone_chunk: the carrier slot already owns a chunk");
+    const size_t                zi = static_cast<size_t>(zone);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT) || chunk_idx >= chunks_.size() || !chunks_[chunk_idx].base) {
+        return PINNED_CHUNK_RELEASE_ALREADY;
+    }
+    auto & states = zone_allocators_[zi];
+    auto   state  = std::find_if(states.begin(), states.end(),
+                                 [chunk_idx](const zone_chunk_state & s) { return s.chunk_idx == chunk_idx; });
+    GGML_ASSERT(state != states.end() && state->withdrawn &&
+                "release_zone_chunk: only a withdrawn chunk of the zone is released");
+
+    chunk &    c    = chunks_[chunk_idx];
+    const bool live = state->allocator->used() > 0 || (c.allocator && c.allocator->used() > 0);
+    if (live || c.lease_count.load() > 0) {
+        if (orphan_if_live) {
+            state->orphaned = true;
+            return PINNED_CHUNK_RELEASE_ORPHANED;
+        }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+        if (c.lease_count.load() > 0 && scratch_test_mutant_on(scratch_test_mutant::LEASE_CHECKED_FIRST)) {
+            return PINNED_CHUNK_RELEASE_REFUSED_LEASE;
+        }
+#endif
+        return live ? PINNED_CHUNK_RELEASE_REFUSED_LIVE : PINNED_CHUNK_RELEASE_REFUSED_LEASE;
+    }
+
+    // Unlink the span and the zone allocator. The zone's capacity already left at the withdrawal, and the footprint
+    // leaves when the carrier finds the memory gone.
+    flat_spans_.erase(std::remove_if(flat_spans_.begin(), flat_spans_.end(),
+                                     [chunk_idx](const flat_span_info & s) { return s.chunk_idx == chunk_idx; }),
+                      flat_spans_.end());
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::DOUBLE_DECREMENT)) {
+        zones_[zi].size -= state->zone_size;
+    }
+#endif
+    states.erase(state);
+
+    out.pool_    = this;
+    out.backing_ = c.size + DEFAULT_ALIGNMENT;  // what grow_into committed: usable plus the base header
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::FOOTPRINT_BEFORE_FREE)) {
+        total_allocated_ -= out.backing_;
+    }
+#endif
+    out.removed_ = std::move(c);
+    // The tombstone: find_chunk_handle and acquire_chunk_lease skip a null base under this lock, so no lease can be
+    // taken on the chunk from here on, and no other chunk's index moves.
+    c.base       = nullptr;
+    c.size       = 0;
+    c.allocator.reset();
+    owning_carriers_.fetch_add(1, std::memory_order_acq_rel);
+    return PINNED_CHUNK_RELEASE_DONE;
+}
+
+void pinned_chunk_pool::release_chunk_backing(released_chunk && carrier) noexcept {
+    released_chunk consumed(std::move(carrier));
+}
+
+pinned_chunk_usage pinned_chunk_pool::zone_chunk_usage(host_zone_id zone, size_t chunk_idx) const {
+    pinned_chunk_usage          usage;
+    const size_t                zi = static_cast<size_t>(zone);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (zi >= static_cast<size_t>(host_zone_id::COUNT) || chunk_idx >= chunks_.size() || !chunks_[chunk_idx].base) {
+        return usage;
+    }
+    const chunk & c = chunks_[chunk_idx];
+    for (const auto & zcs : zone_allocators_[zi]) {
+        if (zcs.chunk_idx != chunk_idx) {
+            continue;
+        }
+        usage.found     = true;
+        usage.withdrawn = zcs.withdrawn;
+        usage.orphaned  = zcs.orphaned;
+        usage.used      = zcs.allocator->used() + (c.allocator ? c.allocator->used() : 0);
+        usage.lo        = reinterpret_cast<uintptr_t>(c.base) + zcs.zone_start;
+        usage.hi        = usage.lo + zcs.zone_size;
+        break;
+    }
+    return usage;
+}
+
+pinned_chunk_pool::released_chunk::released_chunk(released_chunk && other) noexcept :
+    pool_(other.pool_),
+    removed_(std::move(other.removed_)),
+    backing_(other.backing_) {
+    other.pool_    = nullptr;
+    other.backing_ = 0;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (scratch_test_mutant_on(scratch_test_mutant::MOVED_FROM_RELEASES)) {
+        // The moved-from carrier keeps its backing figure and the pool, so its destructor subtracts it again. Not one
+        // statement: keeping pool_ itself would send the moved-from carrier through the release path, whose owner
+        // assertion fires first, so the destructor needs its own subtraction for this fault.
+        other.test_moved_from_ = pool_;
+        other.backing_         = backing_;
+    }
+#endif
+}
+
+pinned_chunk_pool::released_chunk & pinned_chunk_pool::released_chunk::operator=(released_chunk && other) noexcept {
+    if (this != &other) {
+        // A chunk this carrier still owned is released here, as a dropped carrier's is.
+        released_chunk previous(std::move(*this));
+        pool_          = other.pool_;
+        removed_       = std::move(other.removed_);
+        backing_       = other.backing_;
+        other.pool_    = nullptr;
+        other.backing_ = 0;
+    }
+    return *this;
+}
+
+pinned_chunk_pool::released_chunk::~released_chunk() {
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    if (pool_ == nullptr && test_moved_from_ != nullptr && backing_ != 0) {
+        std::lock_guard<std::mutex> lock(test_moved_from_->mutex_);
+        test_moved_from_->total_allocated_ -= backing_;
+    }
+    if (pool_ != nullptr && scratch_test_mutant_on(scratch_test_mutant::CARRIER_DTOR_NOOP)) {
+        return;
+    }
+#endif
+    if (pool_ == nullptr) {
+        return;
+    }
+    // (1) The backing's registry identity, read before the owner's reset releases it.
+    alloc_metadata metadata{};
+    GGML_ASSERT(removed_.owner.owner_metadata(&metadata) && "released chunk has no allocation owner");
+    // (2) The owner's reset is the release (P2); free_chunk_owner keeps the missing-owner assertion.
+    pool_->free_chunk_owner(removed_, "released_chunk");
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (pool_->test_free_point_hook_) {
+        pool_->test_free_point_hook_(pool_->test_free_point_ctx_, *pool_);
+    }
+#endif
+    // (3) Whether the registry still holds that exact row: the one fact that says the memory is gone (§M92).
+    const allocation_registered_state state = unified_allocation_registered_exact(metadata);
+
+    bool planted_subtract_at_refusal = false;
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    planted_subtract_at_refusal = scratch_test_mutant_on(scratch_test_mutant::SUBTRACT_AT_REFUSAL);
+#endif
+    // (4) The footprint leaves only with the memory. A row still present strands the bytes until a reconcile finds it
+    // gone; the row cannot say why its release is pending, so the line names no cause (§M97).
+    {
+        std::lock_guard<std::mutex> lock(pool_->mutex_);
+        if (state == ALLOCATION_REGISTERED_GONE || planted_subtract_at_refusal) {
+            pool_->total_allocated_ -= backing_;
+        } else {
+            if (pool_->stranded_.size() >= pool_->stranded_.capacity()) {
+                GGML_ABORT("stranded_ capacity %zu exhausted at %zu entries", pool_->stranded_.capacity(),
+                           pool_->stranded_.size());
+            }
+            pool_->stranded_.emplace_back(stranded_entry{ metadata, backing_ });
+            GGML_LOG_WARN(
+                "[PINNED-POOL] released chunk backing %.1f MB: release not yet complete after the owner reset "
+                "(registry row %s); footprint stranded until the registry drops it\n",
+                backing_ / (1024.0 * 1024.0), state == ALLOCATION_REGISTERED_LIVE ? "LIVE" : "RELEASING");
+        }
+    }
+    pool_->owning_carriers_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void pinned_chunk_pool::free_chunk_owner(chunk & c, const char * ctx) {
@@ -799,19 +1163,12 @@ bool pinned_chunk_pool::grow(size_t min_size, const char * site) {
     return grow_into(chunks_, min_size, false, site);
 }
 
-pinned_chunk_pool::chunk_footprint pinned_chunk_pool::chunk_footprint_for(size_t min_size) const {
-    chunk_footprint footprint;
-    footprint.usable  = std::max(chunk_size_, align_up(min_size, DEFAULT_ALIGNMENT));
-    footprint.backing = footprint.usable + DEFAULT_ALIGNMENT;
-    return footprint;
-}
-
 void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
                                                size_t               size,
                                                size_t               alignment,
                                                bool                 runtime_pool) {
     size                    = align_up(size, alignment);
-    const size_t tlsf_align = std::max(alignment, (size_t) 256);
+    const size_t tlsf_align = std::max(alignment, tlsf_allocator::block_grain);
 
     if (pinned_trace_enabled()) {
         GGML_LOG_INFO("[SYCL] pinned alloc request: size=%zu align=%zu chunks=%zu used=%.1f GB mode=%s\n", size,
@@ -820,26 +1177,33 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
     }
 
     for (auto & c : chunks) {
+        if (!c.base) {
+            continue;
+        }
         size_t offset = c.allocator->allocate(size, tlsf_align);
         if (offset != SIZE_MAX) {
             return static_cast<char *>(c.base) + offset;
         }
     }
 
-    const chunk_footprint footprint      = chunk_footprint_for(size);
+    // No chunk holds it: grow one sized to the block its TLSF takes for the request, which the budget check and
+    // grow_into() both size from.
+    const size_t          request        = zone_grow_request(size, alignment);
+    const chunk_footprint footprint      = chunk_footprint_for(chunk_size_, request);
     const size_t          new_chunk_size = footprint.usable;
-    if (total_allocated_ + footprint.backing > budget_) {
-        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
-                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
+    if (footprint_locked() + footprint.backing > budget_) {
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
+                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+                      refusal_reason_.c_str());
         return nullptr;
     }
 
     if (pinned_trace_enabled()) {
-        GGML_LOG_INFO("[SYCL] pinned pool grow: min=%zu chunk=%zu total=%.1f GB budget=%.1f GB mode=%s\n", size,
+        GGML_LOG_INFO("[SYCL] pinned pool grow: min=%zu chunk=%zu total=%.1f GB budget=%.1f GB mode=%s\n", request,
                       new_chunk_size, total_allocated_ / (1024.0 * 1024.0 * 1024.0),
                       budget_ / (1024.0 * 1024.0 * 1024.0), runtime_pool ? "runtime" : "zone-base");
     }
-    if (!grow_into(chunks, size, runtime_pool, "allocate_from_chunks")) {
+    if (!grow_into(chunks, request, runtime_pool, "allocate_from_chunks")) {
         return nullptr;
     }
 
@@ -857,7 +1221,7 @@ bool pinned_chunk_pool::deallocate_from_chunks(std::vector<chunk> & chunks, void
     char * p = static_cast<char *>(ptr);
     for (auto & c : chunks) {
         char * base = static_cast<char *>(c.base);
-        if (p >= base && p < base + c.size) {
+        if (base && p >= base && p < base + c.size) {
             size_t offset = p - base;
             c.allocator->free(offset);
             return true;
@@ -892,14 +1256,37 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     // allocation exceeds chunk_size_ (e.g., 615 MB reorder buffers for
     // MoE models).  Level Zero's ~11 GB per-allocation limit is the
     // real cap, not chunk_size_.
-    const chunk_footprint footprint    = chunk_footprint_for(min_size);
+    const chunk_footprint footprint    = chunk_footprint_for(chunk_size_, min_size);
     const size_t          usable_size  = footprint.usable;
     const size_t          backing_size = footprint.backing;
-    if (total_allocated_ + backing_size > budget_) {
-        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
-                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
+    if (footprint_locked() + backing_size > budget_) {
+        GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
+                      total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+                      refusal_reason_.c_str());
         return false;
     }
+
+    // Room for this chunk's stranded entry before the chunk exists (§4.4 "The append never allocates, and the reserve
+    // comes first"): a chunk is released once and strands at most once, so one entry per chunk suffices, and a failed
+    // reserve never creates and releases a registered owner. Caught here because the synchronous path below catches
+    // only sycl::exception.
+    try {
+        stranded_.reserve(chunks_.size() + runtime_chunks_.size() + 1);
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("[SYCL] Pinned chunk refused: no room for its stranded entry (%zu chunks)\n",
+                       chunks_.size() + runtime_chunks_.size());
+        return false;
+    }
+#if defined(GGML_SYCL_SCRATCH_MUTANTS)
+    // Not a perturbation of the reserve above: reserve() never lowers a capacity, so the fault swaps in a copy whose
+    // capacity is 8.
+    if (scratch_test_mutant_on(scratch_test_mutant::STRANDED_RESERVE_8) && stranded_.size() <= 8) {
+        std::vector<stranded_entry> eight;
+        eight.reserve(8);
+        eight.assign(stranded_.begin(), stranded_.end());
+        stranded_.swap(eight);
+    }
+#endif
 
     if (alloc_timeout_ms_ > 0) {
         if (pinned_trace_enabled()) {
@@ -915,6 +1302,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
             GGML_LOG_ERROR("[SYCL] Pinned chunk allocation timed out after %zu ms (size=%zu). Aborting.\n",
                            alloc_timeout_ms_, backing_size);
             std::fflush(stderr);
+            ggml_sycl::exit_settle();
             std::abort();
         }
 
@@ -1052,9 +1440,9 @@ uint64_t pinned_chunk_pool::acquire_chunk_lease(const void * ptr) {
     return INVALID_CHUNK_HANDLE;
 }
 
-void pinned_chunk_pool::release_chunk_lease(uint64_t handle) {
+size_t pinned_chunk_pool::release_chunk_lease(uint64_t handle) {
     if (handle == INVALID_CHUNK_HANDLE) {
-        return;
+        return NO_CHUNK;
     }
     const bool   is_runtime = (handle & CHUNK_KIND_RUNTIME_BIT) != 0;
     const size_t idx        = static_cast<size_t>(handle & ~CHUNK_KIND_RUNTIME_BIT);
@@ -1064,14 +1452,26 @@ void pinned_chunk_pool::release_chunk_lease(uint64_t handle) {
     if (idx >= vec.size()) {
         GGML_LOG_ERROR("[PINNED-POOL] release_chunk_lease: invalid handle=0x%" PRIx64 " (idx=%zu, size=%zu)\n", handle,
                        idx, vec.size());
-        return;
+        return NO_CHUNK;
     }
     const uint32_t prev = vec[idx].lease_count.fetch_sub(1);
     if (prev == 0) {
         GGML_LOG_ERROR("[PINNED-POOL] release_chunk_lease: underflow on chunk idx=%zu runtime=%d\n", idx, is_runtime);
         // Restore to avoid wrap-around.
         vec[idx].lease_count.fetch_add(1);
+        return NO_CHUNK;
     }
+    // The orphaned chunk's second release event (§4.4 "the lease-drop trigger"): only a drop to zero on a base chunk
+    // looks, and only at the SCRATCH states, so every other drop pays one comparison.
+    if (prev != 1 || is_runtime) {
+        return NO_CHUNK;
+    }
+    for (const auto & zcs : zone_allocators_[static_cast<size_t>(host_zone_id::SCRATCH)]) {
+        if (zcs.chunk_idx == idx) {
+            return (zcs.orphaned && zcs.allocator->used() == 0) ? idx : NO_CHUNK;
+        }
+    }
+    return NO_CHUNK;
 }
 
 bool pinned_chunk_pool::chunk_has_leases(uint64_t handle) const {

@@ -486,11 +486,18 @@ void arena_authority::release_lease(size_t chunk_index, uint64_t allocation_id) 
     }
 }
 
-void arena_authority::close_and_invalidate(uint64_t next) {
+void arena_authority::close_and_invalidate(uint64_t next) noexcept {
     std::lock_guard<std::mutex> guard(mutex);
     admission_open = false;
     alive = false;
     generation = next;
+}
+
+void arena_authority::reopen(uint64_t restored_generation) noexcept {
+    std::lock_guard<std::mutex> guard(mutex);
+    generation     = restored_generation;
+    alive          = true;
+    admission_open = true;
 }
 
 bool arena_authority::wait_for_terminal_leases(uint32_t timeout_ms) const {
@@ -680,9 +687,11 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
     if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_existing_unified_cache_for_device(device);
         if (cache) {
-            const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
+            const chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_SNAPSHOT, false };
+            const int             vram_idx = cache->arena_acquire_chunk_lease(ptr, lease_tag);
             if (vram_idx >= 0) {
                 h.chunk_source_      = 2;
+                h.chunk_tag_         = lease_tag;
                 h.chunk_device_      = device;
                 h.vram_chunk_idx_    = vram_idx;
                 h.host_chunk_handle_ = UINT64_MAX;
@@ -823,7 +832,11 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
 // Compatibility/test bridge: wrap a raw pointer in a handle that refcounts the
 // owning arena chunk for the lifetime of the returned mem_handle. Production
 // allocation paths should keep the mem_handle they received when allocating.
-mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode layout, bool on_device) {
+mem_handle mem_handle::from_chunk_ptr(void *           ptr,
+                                      int              device,
+                                      ggml_layout_mode layout,
+                                      bool             on_device,
+                                      chunk_lease_site site) {
     mem_handle h;
     h.device_ = device;
     h.cached_ = { ptr, 0, layout, on_device };
@@ -856,10 +869,12 @@ mem_handle mem_handle::from_chunk_ptr(void * ptr, int device, ggml_layout_mode l
     unified_cache * cache = valid_cache_device_id(device) ? get_existing_unified_cache_for_device(device) : nullptr;
     if (cache) {
         // Priority 1: VRAM arena (pointer is device-resident).
-        const int vram_idx = cache->arena_acquire_chunk_lease(ptr);
+        const chunk_lease_tag lease_tag{ site, false };
+        const int             vram_idx = cache->arena_acquire_chunk_lease(ptr, lease_tag);
         if (vram_idx >= 0) {
             h.kind_              = mem_handle_kind::CHUNK_LEASE;
             h.chunk_source_      = 2;
+            h.chunk_tag_         = lease_tag;
             h.chunk_device_      = device;
             h.vram_chunk_idx_    = vram_idx;
             h.host_chunk_handle_ = UINT64_MAX;
@@ -1186,14 +1201,28 @@ resolved_ptr mem_handle::resolve() const {
 }
 
 // === resolve(device_id) — dispatch-device overload ===
-// Resolves the pointer first, then rejects only device-resident pointers whose
-// allocator owner is not the caller's device. Host-pinned/host-mmap pointers are
-// device-agnostic from the dispatcher's perspective; device_ remains the cache
-// owner used for re-resolution and cleanup.
+// Resolves the pointer first, then rejects device-resident pointers whose
+// allocator owner is not the caller's device. Host-pinned pointers are
+// device-agnostic from the dispatcher's perspective; a file mapping and a HOST_CPU
+// allocation are not: they are read by the CPU, in place, and never handed to a device. device_ remains the
+// cache owner used for re-resolution and cleanup.
 
 resolved_ptr mem_handle::resolve(int device_id) const {
     resolved_ptr r = resolve();
-    if (!r.ptr || !r.on_device) {
+    if (!r.ptr) {
+        return r;
+    }
+    if (!r.on_device) {
+        // Only a host pointer can be a file mapping or a locked CPU-only mapping (from_owned_alloc marks nothing but
+        // DEVICE_VRAM on_device), so the dispatched device weights, the hot case, take no second lock round. A slice
+        // shares its owner.
+        mem_handle_lock_guard g(lock_);
+        if (owned_alloc_) {
+            const alloc_tier tier = owned_alloc_.metadata().tier;
+            if (tier == alloc_tier::FILE_MAPPED || tier == alloc_tier::HOST_CPU) {
+                return {};
+            }
+        }
         return r;
     }
     if (device_ != HOST_DEVICE && device_ != device_id) {
@@ -1280,9 +1309,11 @@ resolved_ptr mem_handle::resolve_slow() const {
     // eviction, chunk refcount prevents arena-layer munmap.  If the resolved
     // ptr is not in any known arena (e.g. mmap-backed S1-PRELOAD direct
     // entries), chunk_source stays 0 and release is a no-op.
-    const int vram_idx = cache->arena_acquire_chunk_lease(resolved.ptr);
+    const chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_RESOLVE, false };
+    const int             vram_idx = cache->arena_acquire_chunk_lease(resolved.ptr, lease_tag);
     if (vram_idx >= 0) {
         fresh.chunk_source      = 2;
+        fresh.chunk_tag         = lease_tag;
         fresh.chunk_device      = device_;
         fresh.vram_chunk_idx    = vram_idx;
         fresh.host_chunk_handle = UINT64_MAX;
@@ -1354,6 +1385,7 @@ mem_handle::lease_state mem_handle::take_lease_state_locked() const {
     lease_state state;
     state.entry             = leased_entry_;
     state.chunk_source      = chunk_source_;
+    state.chunk_tag         = chunk_tag_;
     state.host_chunk_handle = host_chunk_handle_;
     state.vram_chunk_idx    = vram_chunk_idx_;
     state.chunk_device      = chunk_device_;
@@ -1362,6 +1394,7 @@ mem_handle::lease_state mem_handle::take_lease_state_locked() const {
 
     leased_entry_      = nullptr;
     chunk_source_      = 0;
+    chunk_tag_         = {};
     host_chunk_handle_ = UINT64_MAX;  // pinned_chunk_pool::INVALID_CHUNK_HANDLE
     vram_chunk_idx_    = -1;
     chunk_device_      = -1;
@@ -1378,6 +1411,7 @@ void mem_handle::store_lease_state_locked(const lease_state & state) const {
     chunk_device_      = state.chunk_device;
     leased_storage_owner_ = state.storage_owner;
     leased_alloc_owner_   = state.leased_owner;
+    chunk_tag_            = state.chunk_tag;
 }
 
 void mem_handle::release_lease_state(const lease_state & state) noexcept {
@@ -1422,7 +1456,7 @@ void mem_handle::release_lease_state(const lease_state & state) noexcept {
             if (state.chunk_source == 1) {
                 cache->host_release_chunk_lease(state.host_chunk_handle);
             } else if (state.chunk_source == 2) {
-                cache->arena_release_chunk_lease(state.vram_chunk_idx);
+                cache->arena_release_chunk_lease(state.vram_chunk_idx, state.chunk_tag);
             }
         }
     }
@@ -1720,12 +1754,14 @@ mem_handle::~mem_handle() {
 // Acquires via the pool API rather than bumping the atomic directly — keeps
 // all count mutations behind the pool's API and correctly handles the case
 // where the pool has been destroyed between the original acquisition and
-// the copy (returns a null handle, chunk_source_ gets zeroed below).
-static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
-                                      int          chunk_device,
-                                      const void * ptr,
-                                      uint64_t &   out_host_handle,
-                                      int32_t &    out_vram_idx) {
+// the copy (returns a null handle, chunk_source_ gets zeroed below).  `tag` is
+// the copy's own: its source's site, marked as a copy.
+static void bump_chunk_lease_for_copy(uint8_t         chunk_source,
+                                      int             chunk_device,
+                                      const void *    ptr,
+                                      chunk_lease_tag tag,
+                                      uint64_t &      out_host_handle,
+                                      int32_t &       out_vram_idx) {
     if (chunk_source == 0 || chunk_device < 0 || ptr == nullptr) {
         out_host_handle = UINT64_MAX;
         out_vram_idx    = -1;
@@ -1743,7 +1779,7 @@ static void bump_chunk_lease_for_copy(uint8_t      chunk_source,
         out_vram_idx    = -1;
     } else if (chunk_source == 2) {
         out_host_handle = UINT64_MAX;
-        out_vram_idx    = cache->arena_acquire_chunk_lease(ptr);
+        out_vram_idx    = cache->arena_acquire_chunk_lease(ptr, tag);
     } else {
         out_host_handle = UINT64_MAX;
         out_vram_idx    = -1;
@@ -1787,6 +1823,7 @@ mem_handle::mem_handle(const mem_handle & other) {
         leased_alloc_owner_      = other.leased_alloc_owner_;
         chunk_source_            = other.chunk_source_;
         chunk_device_            = other.chunk_device_;
+        chunk_tag_               = chunk_lease_tag{ other.chunk_tag_.site, true };
         if (leased_entry_) {
             leased_entry_->in_use_count.fetch_add(1);
             // llama.cpp-2wv5: a copy takes its own lease, so it -- not whoever
@@ -1800,7 +1837,8 @@ mem_handle::mem_handle(const mem_handle & other) {
     }
     // llama.cpp-dyhdl: independently acquire a chunk lease for the copy.  This
     // calls into unified_cache, so it runs with both handle locks dropped.
-    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, host_chunk_handle_, vram_chunk_idx_);
+    bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, chunk_tag_, host_chunk_handle_,
+                              vram_chunk_idx_);
     if (chunk_source_ == 1 && host_chunk_handle_ == UINT64_MAX) {
         chunk_source_ = 0;
         chunk_device_ = -1;
@@ -1842,6 +1880,7 @@ mem_handle::mem_handle(mem_handle && other) noexcept {
     leased_storage_owner_    = std::move(st.storage_owner);
     leased_alloc_owner_      = std::move(st.leased_owner);
     chunk_source_            = st.chunk_source;
+    chunk_tag_               = st.chunk_tag;
     host_chunk_handle_       = st.host_chunk_handle;
     vram_chunk_idx_          = st.vram_chunk_idx;
     chunk_device_            = st.chunk_device;
@@ -1900,6 +1939,8 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     int                   new_chunk_device           = -1;
     std::shared_ptr<void> new_storage_owner;
     shared_alloc_owner               new_alloc_owner;
+
+    chunk_lease_tag new_chunk_tag;  // the source's site, marked as a copy
     {
         mem_handle_lock_guard g(other.lock_);
         new_kind                    = other.kind_;
@@ -1926,6 +1967,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_entry                   = other.leased_entry_;
         new_chunk_source            = other.chunk_source_;
         new_chunk_device            = other.chunk_device_;
+        new_chunk_tag               = chunk_lease_tag{ other.chunk_tag_.site, true };
         new_storage_owner           = other.leased_storage_owner_;
         new_alloc_owner             = other.leased_alloc_owner_;
         if (new_entry) {
@@ -1940,7 +1982,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     // 2. Acquire our own chunk lease with no handle lock held.
     uint64_t new_host_chunk_handle = UINT64_MAX;
     int32_t  new_vram_chunk_idx    = -1;
-    bump_chunk_lease_for_copy(new_chunk_source, new_chunk_device, new_cached.ptr, new_host_chunk_handle,
+    bump_chunk_lease_for_copy(new_chunk_source, new_chunk_device, new_cached.ptr, new_chunk_tag, new_host_chunk_handle,
                               new_vram_chunk_idx);
     if (new_chunk_source == 1 && new_host_chunk_handle == UINT64_MAX) {
         new_chunk_source = 0;
@@ -1986,6 +2028,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         lease_state fresh;
         fresh.entry             = new_entry;
         fresh.chunk_source      = new_chunk_source;
+        fresh.chunk_tag         = new_chunk_tag;
         fresh.host_chunk_handle = new_host_chunk_handle;
         fresh.vram_chunk_idx    = new_vram_chunk_idx;
         fresh.chunk_device      = new_chunk_device;

@@ -46,6 +46,14 @@ ggml_sycl_tensor_info::get_rows_only, is copied into the inventory the planner s
 classifier; test-zone-sizing Case 14j proves the classifier, this gate proves the producer, the carrier and the
 plumbing.
 
+The planned pair's activations half is n_ubatch rows of the widest f16 row of the weights the scratch takes, at the
+micro-batch the Graph floor sharing the zone is sized at. It was the largest eligible weight AS STORED, a placeholder:
+Qwen3.8 at -ub 2048 asks 40.0 MB against 31.9 MB, the pair could not merge inside its bound once the zone was exactly
+pair + floor, and every op of a layer replaced the held pair. Both formula sites (the inventory intake, which sizes the
+zone, and the plan's host zone sizing, which reports it) plan through one definition
+(unified_cache_plan_onednn_pp_pair); this gate fails when either goes back to the placeholder or when they stop
+sharing it. test-zone-sizing Case 14m proves the arithmetic.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -226,8 +234,9 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the adapter marks the unified-kernel types for the conditional dequant plan"] = \
             "unified_kernel_serves_type(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
             "dequant_f16_if_unsupplied_src1_bytes_per_token" in adapter
+        # The assignment itself: the activations-row mark below asks the same function for its own gate.
         results["the adapter hands the classifier the type/env enablement, not its own copy"] = \
-            "pp_scratch_type_enabled" in adapter and "onednn_pp_unified_scratch_enabled(" in adapter
+            re.search(r"desc\.pp_scratch_type_enabled\s*=\s*onednn_pp_unified_scratch_enabled\(", adapter) is not None
         results["the adapter excludes expert stacks from the conditional mark too"] = \
             adapter.count("expert_tensor_role_from_tensor_name(") >= 3
     SUPPLIES = "ggml_sycl_onednn_pp_scratch_supplies("
@@ -321,17 +330,16 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     pure = function_body(
         zone_sizing, r"size_t zone_onednn_pp_pair_bound\([^)]*\)\s*\{")
     pair_bound = function_body(
-        cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\)\s*\{")
-    bound_plan = function_body(
+        cache, r"bool unified_cache_get_onednn_pp_pair_bound\(int\s+device_id,\s*size_t \* bound,\s*"
+               r"size_t \* planned_weights,\s*size_t \* planned_activations\)\s*\{")
+    bound_for = function_body(
         cache, r"static size_t onednn_pp_pair_bound_for\(const zone_onednn_plan & plan, size_t capacity_bytes\)\s*\{")
-    bound_dev = function_body(
-        cache, r"static size_t onednn_pp_pair_bound_for\(int device_id, size_t capacity_bytes\)\s*\{")
-    bound_for = bound_plan
     results["anchor: the pure pair bound exists"] = pure is not None
     results["anchor: the pair-bound accessor is defined"] = pair_bound is not None
-    results["anchor: the shared bound helper is defined"] = bound_plan is not None and bound_dev is not None
+    results["anchor: the shared bound helper is defined"] = bound_for is not None
     results["the pair-bound accessor is declared"] = \
-        re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int device_id, size_t \* bound\);", cache_hpp) is not None
+        re.search(r"bool unified_cache_get_onednn_pp_pair_bound\(int\s+device_id,\s*size_t \* bound,\s*"
+                  r"size_t \* planned_weights,\s*size_t \* planned_activations\);", cache_hpp) is not None
     if pure is not None:
         pure_norm = re.sub(r"\s+", " ", pure)
         results["the pure bound subtracts the floor from the capacity"] = \
@@ -344,9 +352,18 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
         results["the accessor reads the arena's real ONEDNN zone capacity"] = \
             "vram_zone_id::ONEDNN" in pair_bound and "arena_active()" in pair_bound
         results["the accessor answers through the shared bound helper"] = "onednn_pp_pair_bound_for(" in pair_bound
+        # The plan is the one stored on the cache whose ONEDNN capacity the accessor bounds, never another cache's,
+        # read once: the bound and the planned halves it reports describe the same plan.
+        pair_bound_norm = " ".join(pair_bound.split())
+        results["the accessor bounds by its own cache's plan"] = \
+            "const zone_onednn_plan zone_plan = cache->onednn_zone_plan_load();" in pair_bound_norm and \
+            "onednn_pp_pair_bound_for(zone_plan, cache->zone_capacity(" in pair_bound_norm
+        results["the accessor reports the planned halves from the read its bound comes from"] = \
+            pair_bound.count("onednn_zone_plan_load(") == 1 and \
+            "*planned_weights = zone_plan.weights_bytes;" in pair_bound_norm and \
+            "*planned_activations = zone_plan.activations_bytes;" in pair_bound_norm
     if bound_for is not None:
-        results["the helper reads the stored zone-plan snapshot, bare plan and floor together"] = \
-            bound_dev is not None and "onednn_zone_plan_load(" in bound_dev and \
+        results["the helper reads the stored plan's bare plan and floor together"] = \
             "plan.bare_bytes" in bound_for and "plan.graph_floor_bytes" in bound_for
         results["the helper answers through the pure bound"] = "zone_onednn_pp_pair_bound(" in bound_for
         results["the helper does not read a live planner figure or recompute the floor"] = \
@@ -357,9 +374,9 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     results["anchor: ensure_planned_arena_zones exists"] = ensure_zones is not None
     if ensure_zones is not None:
         results["the kept-zone exit stores the larger of the held and live plan, in one critical section"] = \
-            re.search(r"onednn_zone_plan_keep_and_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
+            re.search(r"onednn_zone_plan_keep_and_store\(live_plan\);\s*return true;", ensure_zones) is not None
         keep_store = function_body(
-            cache, r"static void onednn_zone_plan_keep_and_store\(int device_id,\s*const zone_onednn_plan & plan\)\s*\{")
+            cache, r"void unified_cache::onednn_zone_plan_keep_and_store\(const zone_onednn_plan & plan\)\s*\{")
         results["anchor: the locked keep-and-store helper exists"] = keep_store is not None
         if keep_store is not None:
             # ABSENCE: calling the public load or store from inside would take the same mutex twice.
@@ -367,7 +384,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
                 keep_store.count("lock_guard") == 1 and "zone_onednn_plan_keep(" in keep_store and \
                 "onednn_zone_plan_load(" not in keep_store and "onednn_zone_plan_store(" not in keep_store
         results["the rebuilt-zone exit stores the live plan the zone was built from"] = \
-            re.search(r"onednn_zone_plan_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
+            re.search(r"onednn_zone_plan_store\(live_plan\);\s*return true;", ensure_zones) is not None
         results["zone sizing reads the planned pair and floor once, as one pair"] = \
             ensure_zones.count("onednn_planned_pair_and_floor(") == 1 and \
             "unified_cache_get_planned_onednn_scratchpad_bytes" not in ensure_zones
@@ -388,7 +405,8 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
                       r"zone_plan\.weights_bytes,\s*zone_plan\.activations_bytes,", reserve) is not None
         results["reserve reads the planned pair from the stored snapshot, only with an arena"] = \
             re.search(r"zone_plan\s*=\s*arena_on\s*\?\s*onednn_zone_plan_load\(", reserve) is not None
-    pair_reader = function_body(cache, r"static zone_onednn_plan onednn_planned_pair_and_floor\(int device_id\)\s*\{")
+    pair_reader = function_body(
+        cache, r"static zone_onednn_plan onednn_planned_pair_and_floor\(int device_id, size_t direct_cap\)\s*\{")
     results["anchor: the planned pair-and-floor reader exists"] = pair_reader is not None
     if pair_reader is not None:
         results["the planned pair reader carries both pair halves into the plan"] = \
@@ -396,7 +414,65 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             "g_planned_onednn_pair_activations_bytes" in pair_reader
     results["the inventory planner stores the pair's two halves, not only their sum"] = \
         re.search(r"unified_cache_set_planned_onednn_scratchpad_pair\(\s*ctx->device,\s*"
-                  r"inventory_maxima\.onednn_reorder,\s*inventory_maxima\.onednn_eligible\)", backend) is not None
+                  r"pair\.weights_bytes,\s*pair\.activations_bytes\)", backend) is not None
+
+    # ---- the planned pair's activations half is a micro-batch times the scratch's widest row ----
+    # It was the largest eligible weight AS STORED (onednn_eligible), a placeholder: at -ub 2048 on Qwen3.8 the ops ask
+    # 40.0 MB against 31.9 MB, the pair could not merge inside its bound, and every op of a layer replaced the held
+    # pair.
+    # Both formula sites (the inventory intake, which sizes the zone, and the plan's host zone sizing, which reports
+    # it) plan through ONE definition; the pure arithmetic is test-zone-sizing Case 14m.
+    pair_def = function_body(cache, r"zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair\([^)]*\)\s*\{")
+    intake = function_body(backend, r"static void populate_inventory_globals\([^)]*\)\s*\{")
+    host_sizing = function_body(cache, r"static void populate_host_zone_sizing\([^)]*\)\s*\{")
+    pure_pair = function_body(zone_sizing, r"zone_onednn_pp_pair zone_onednn_pp_pair_plan\([^)]*\)\s*\{")
+    results["anchor: the one pair definition exists"] = pair_def is not None
+    results["anchor: the inventory intake exists"] = intake is not None
+    results["anchor: the host zone sizing exists"] = host_sizing is not None
+    results["anchor: the pure pair plan exists"] = pure_pair is not None
+    if pair_def is not None:
+        pair_norm = " ".join(pair_def.split())
+        results["the one pair definition sizes the activations half from the scratch's row"] = \
+            "zone_onednn_pp_pair_plan(maxima.onednn_reorder, maxima.onednn_pp_src1_bytes_per_token," in pair_norm
+        results["the one pair definition takes the Graph shape's micro-batch"] = \
+            "placement_load_n_ubatch(unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope).n_ubatch)" in \
+            pair_norm
+    if pure_pair is not None:
+        results["the pure pair plan multiplies the row by the micro-batch, overflow-checked"] = \
+            "src1_bytes_per_token * n_ubatch" in pure_pair and "SIZE_MAX / n_ubatch" in pure_pair and \
+            "SIZE_MAX - activations" in pure_pair
+    if intake is not None:
+        intake_norm = " ".join(intake.split())
+        plan_at = intake_norm.find("unified_cache_plan_onednn_pp_pair(inventory_maxima, g_placement_kv_info,")
+        set_at = intake_norm.find("unified_cache_set_planned_onednn_scratchpad_pair(ctx->device, pair.weights_bytes,")
+        fill_at = intake_norm.find("ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);")
+        results["the inventory intake plans the pair through the one definition"] = 0 <= plan_at < set_at
+        results["the inventory intake plans the pair once the KV inputs give the context shape"] = \
+            0 <= fill_at < plan_at
+    if host_sizing is not None:
+        host_norm = " ".join(host_sizing.split())
+        results["the host zone sizing plans the pair through the one definition"] = \
+            "unified_cache_plan_onednn_pp_pair(zone_maxima, kv_info, envelope)" in host_norm and \
+            "plan.onednn_scratchpad_bytes = onednn_pair.weights_bytes + onednn_pair.activations_bytes;" in host_norm
+    results["no formula site reads the stored-weight placeholder"] = \
+        all(body is not None and "onednn_eligible" not in body for body in (pair_def, intake, host_sizing))
+    # The zone is sized from the pair the intake publishes; a second publisher with its own formula is a second site.
+    results["the pair is published from the one definition only"] = \
+        len(re.findall(r"\bunified_cache_set_planned_onednn_scratchpad_pair\s*\(", backend)) == 1
+    maxima_fn = function_body(zone_sizing, r"path_scoped_maxima zone_scoped_maxima\([^)]*\)\s*\{")
+    if maxima_fn is not None:
+        rows_at = maxima_fn.find("if (tensor.get_rows_only)")
+        row_gate = re.search(r"if \(onednn_eligible\) \{\s*maxima\.onednn_pp_src1_bytes_per_token\s*=", maxima_fn)
+        results["the classifier takes the scratch's row only inside the eligible set, after the gather exclusion"] = \
+            row_gate is not None and 0 <= rows_at < row_gate.start() and \
+            maxima_fn.count("onednn_pp_src1_bytes_per_token") == 3
+    if adapter is not None:
+        adapter_norm = " ".join(adapter.split())
+        results["the adapter marks the scratch's row for the types acquire and the PP admission take"] = \
+            "if (quantized && !is_expert && onednn_pp_unified_scratch_enabled(item.type) && " \
+            "ggml_sycl_onednn_pp_type_admitted(item.type)) { size_t src1_bytes = 0; if " \
+            "(zone_dequant_f16_src1_bytes_per_token(" in adapter_norm and \
+            "desc.onednn_pp_src1_bytes_per_token = src1_bytes;" in adapter_norm
     for name, body in (("by-bytes core", bytes_helper),):
         results["the %s reads the pair bound, not the raw capacity" % name] = \
             "unified_cache_get_onednn_pp_pair_bound(" in body and "unified_cache_get_onednn_zone_capacity(" not in body
@@ -407,11 +483,18 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     # ---- a row-gather tensor is no MUL_MAT operand (llama.cpp-8ony): producer, carrier, plumbing, classifier ----
     results["the adapter hands the classifier the loader's gather-only role"] = \
         adapter is not None and re.search(r"desc\.get_rows_only\s*=\s*item\.get_rows_only\s*;", adapter) is not None
-    detail_loop = function_body(backend, r"for \(size_t i = 0; i < inventory->count; i\+\+\)\s*\{")
-    results["anchor: the inventory copy loop exists"] = detail_loop is not None
-    if detail_loop is not None:
+    # The planner's per-tensor view is built in one helper the stage and the plan dry run both call (llama.cpp-4zup),
+    # and the stage publishes it as the inventory the planner sees.
+    detail_builder = function_body(backend, r"static std::vector<ggml_sycl::placement_tensor_info> "
+                                            r"ggml_sycl_inventory_planner_detail\([^)]*\)\s*\{")
+    results["anchor: the inventory copy loop exists"] = detail_builder is not None
+    if detail_builder is not None:
         results["the backend copies the role into the inventory the planner sees"] = \
-            re.search(r"info\.get_rows_only\s*=\s*inventory->tensors\[i\]\.get_rows_only\s*;", detail_loop) is not None
+            re.search(r"const ggml_sycl_tensor_info\s*&\s*t\s*=\s*inventory->tensors\[i\]\s*;",
+                      detail_builder) is not None and \
+            re.search(r"info\.get_rows_only\s*=\s*t\.get_rows_only\s*;", detail_builder) is not None and \
+            re.search(r"g_tensor_inventory_detail\s*=\s*ggml_sycl_inventory_planner_detail\(inventory\)\s*;",
+                      backend) is not None
     results["the planner's tensor description carries the role"] = \
         re.search(r"struct placement_tensor_info \{.*?\bbool\s+get_rows_only\b.*?placement_tensor_info\(\) = default", cache_hpp,
                   re.S) is not None
@@ -439,12 +522,18 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             "tensor.get_rows_only = !tied_head" in mark_norm
         results["the file's head is the loader's own output name over its own tensor set"] = \
             re.search(r"ml\.weights_map\.find\(\s*tn\(LLM_TENSOR_OUTPUT", mark) is not None
-    for fname, sig in (("early plan", r"static void llama_model_sycl_compute_early_plan\([^)]*\)\s*\{"),
-                       ("late inventory", r"static void llama_model_sycl_set_late_inventory\([^)]*\)\s*\{")):
+    # The early plan builds its inventory in llama_model_sycl_build_early_inventory(), which the plan dry run's header
+    # read also calls (llama.cpp-4zup), from the builder's output struct.
+    early_plan = function_body(model, r"static void llama_model_sycl_compute_early_plan\([^)]*\)\s*\{")
+    results["the early plan builds its inventory through the early-inventory builder"] = \
+        early_plan is not None and "llama_model_sycl_build_early_inventory(" in early_plan
+    for fname, sig, tensors in (
+            ("early plan", r"static bool llama_model_sycl_build_early_inventory\([^)]*\)\s*\{", "out.tensors"),
+            ("late inventory", r"static void llama_model_sycl_set_late_inventory\([^)]*\)\s*\{", "tensors")):
         fbody = function_body(model, sig)
         results["anchor: the %s exists" % fname] = fbody is not None
         if fbody is not None:
-            at = fbody.find("llama_model_sycl_mark_get_rows_only(tensors, ml)")
+            at = fbody.find("llama_model_sycl_mark_get_rows_only(%s, ml)" % tensors)
             results["the %s marks the role before it builds the inventory" % fname] = \
                 0 <= at < fbody.find("llama_model_sycl_populate_inventory(")
     # ---- ONE source for "which weight types the unified kernel serves" (llama.cpp-8ony) ----
@@ -496,6 +585,47 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             re.search(r"onednn_pp_pair_bound_for\(\s*zone_plan,", first_block) is not None
     # ---- the 8-argument reserve-target overload was a test-only shim; one definition remains ----
     results["one definition of the reserve target"] = zone_sizing.count("void zone_onednn_scratch_reserve_target(") == 1
+
+    # ---- the admission requires the per-half merge with the planned pair ----
+    # An op whose own pair fits the bound but whose per-half maximum with the planned pair does not was admitted, and
+    # the reserve then replaced the held pair with it as asked; the superseded block stayed in the zone until its
+    # deferred release, so a graph of such ops filled the zone. The pure arithmetic is test-zone-sizing Case 14n.
+    admit = function_body(zone_sizing, r"bool zone_onednn_pp_scratch_planned\([^)]*\)\s*\{")
+    pure_supplies = function_body(zone_sizing, r"bool zone_onednn_pp_scratch_supplies\([^)]*\)\s*\{")
+    target_fn = function_body(zone_sizing, r"void zone_onednn_scratch_reserve_target\([^)]*\)\s*\{")
+    results["anchor: the pure admission exists"] = admit is not None
+    results["anchor: the pure supplies verdict exists"] = pure_supplies is not None
+    results["anchor: the pure reserve target exists"] = target_fn is not None
+    if admit is not None:
+        admit_norm = " ".join(admit.split())
+        clamp = "if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) " \
+                "{ return true; }"
+        merge = "return zone_onednn_pair_fits(pair_bound_bytes, std::max(planned_weights_bytes, weights_bytes), " \
+                "std::max(planned_activations_bytes, activations_bytes));"
+        alone = "if (!zone_onednn_pair_fits(pair_bound_bytes, weights_bytes, activations_bytes)) { return false; }"
+        results["the admission requires the request alone to fit the bound"] = alone in admit_norm
+        results["the admission requires the per-half merge with the planned pair to fit the bound"] = \
+            merge in admit_norm
+        results["a stored plan whose halves miss the bound keeps the request-only rule, before the merge is asked"] = \
+            0 <= admit_norm.find(alone) < admit_norm.find(clamp) < admit_norm.find(merge)
+    if pure_supplies is not None:
+        results["the pure supplies verdict passes the planned halves to the admission"] = \
+            "zone_onednn_pp_scratch_planned(arena_active, pair_bound_bytes, planned_weights_bytes, " \
+            "planned_activations_bytes, weights_bytes, activations_bytes)" in " ".join(pure_supplies.split())
+    if target_fn is not None:
+        results["the reserve target and the admission share one fit test"] = "zone_onednn_pair_fits(" in target_fn
+    ACCESSOR_CALL = "unified_cache_get_onednn_pp_pair_bound(device, &pair_bound, &planned_weights, &planned_activations)"
+    bytes_norm = " ".join(bytes_helper.split())
+    results["the by-bytes core reads the planned halves with the bound and passes them on"] = \
+        ACCESSOR_CALL in bytes_norm and \
+        "zone_onednn_pp_scratch_planned(arena_active, pair_bound, planned_weights, planned_activations, " \
+        "weights_bytes, activations_bytes)" in bytes_norm
+    if supplies_helper is not None:
+        sup_norm = " ".join(supplies_helper.split())
+        results["the supplies helper reads the planned halves with the bound and passes them on"] = \
+            ACCESSOR_CALL in sup_norm and \
+            "arena_active, pair_bound, planned_weights, planned_activations, w_elems * elem_bytes, " \
+            "a_elems * elem_bytes)" in sup_norm
 
     # ---- the conditional plan follows the same PP admission gates the op takes (llama.cpp-8ony) ----
     admitted = function_body(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(ggml_type type\)\s*\{")
@@ -601,6 +731,12 @@ if args.self_test and not failed:
     ensure_sig = r"bool unified_cache::ensure_planned_arena_zones\("
     reserve_sig = r"bool unified_cache::reserve_onednn_scratch\("
     route_a_sig = r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\("
+    intake_sig = r"static void populate_inventory_globals\("
+    host_sizing_sig = r"static void populate_host_zone_sizing\("
+    pair_def_sig = r"zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair\([^)]*\)\s*\{"
+    pure_pair_sig = r"zone_onednn_pp_pair zone_onednn_pp_pair_plan\([^)]*\)\s*\{"
+    maxima_sig = r"path_scoped_maxima zone_scoped_maxima\("
+    admit_sig = r"bool zone_onednn_pp_scratch_planned\("
     SUPPLIES_NAME = "ggml_sycl_onednn_pp_scratch_supplies("
     mutants = [
         ("op arm ignores the shared question", "the op arm's candidate asks the shared supplies helper with its column tile",
@@ -742,13 +878,28 @@ if args.self_test and not failed:
         ("helper reads the live bare plan", "the helper does not read a live planner figure or recompute the floor",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes",
                                   "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)"), cache_hpp)),
-        ("helper ignores the snapshot's bare plan", "the helper reads the stored zone-plan snapshot, bare plan and floor together",
+        ("helper ignores the plan's bare plan", "the helper reads the stored plan's bare plan and floor together",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes", "0"), cache_hpp)),
+        ("accessor bounds by another cache's plan", "the accessor bounds by its own cache's plan",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "zone_plan = cache->onednn_zone_plan_load();",
+                                  "zone_plan = get_unified_cache_for_device(0)->onednn_zone_plan_load();"),
+          cache_hpp)),
+        ("accessor reads the halves from a second load",
+         "the accessor reports the planned halves from the read its bound comes from",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "*planned_weights = zone_plan.weights_bytes;",
+                                  "*planned_weights = cache->onednn_zone_plan_load().weights_bytes;"),
+          cache_hpp)),
+        ("accessor drops the activations half", "the accessor reports the planned halves from the read its bound comes from",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "*planned_activations = zone_plan.activations_bytes;", "*planned_activations = 0;"),
+          cache_hpp)),
         ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
-         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(dev_id, live_plan)",
-                                  "onednn_zone_plan_store(dev_id, live_plan)"), cache_hpp)),
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
+                                  "onednn_zone_plan_store(live_plan)"), cache_hpp)),
         ("rebuilt-zone exit stops storing", "the rebuilt-zone exit stores the live plan the zone was built from",
-         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(dev_id, live_plan);\n    return true;\n}",
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(live_plan);\n    return true;\n}",
                                   "return true;\n}"), cache_hpp)),
         ("zone sizing reads the live bare plan again", "zone sizing reads the planned pair and floor once, as one pair",
          (backend, mutate_in_func(cache, ensure_sig, "planned_onednn_bare)",
@@ -797,7 +948,9 @@ if args.self_test and not failed:
          (backend, mutate_in_func(cache, adapter_sig, "desc.get_rows_only = item.get_rows_only", "desc.get_rows_only = false"),
           cache_hpp)),
         ("backend drops the role copy", "the backend copies the role into the inventory the planner sees",
-         (mutate(backend, "info.get_rows_only = inventory->tensors[i].get_rows_only", "info.get_rows_only = false"), cache,
+         (mutate(backend, "info.get_rows_only = t.get_rows_only", "info.get_rows_only = false"), cache, cache_hpp)),
+        ("stage publishes another view", "the backend copies the role into the inventory the planner sees",
+         (mutate(backend, "= ggml_sycl_inventory_planner_detail(inventory);", "= h187_other_detail(inventory);"), cache,
           cache_hpp)),
         ("planner description loses the role", "the planner's tensor description carries the role",
          (backend, cache, mutate(cache_hpp, "bool        get_rows_only", "bool        XXXX"))),
@@ -812,11 +965,18 @@ if args.self_test and not failed:
         ("role from a name list", "the role comes from the loader's op table, not a name list",
          (backend, cache, cache_hpp, zone_sizing, mutate(model, "info.op != GGML_OP_GET_ROWS", "false"), header)),
         ("role reads another tensor set", "the file's head is the loader's own output name over its own tensor set",
-         (backend, cache, cache_hpp, zone_sizing, mutate(model, "weights_map.find(", "XXXX.find("), header)),
+         (backend, cache, cache_hpp, zone_sizing,
+          mutate_in_func(model, r"static void llama_model_sycl_mark_get_rows_only\(",
+                         "weights_map.find(", "XXXX.find("),
+          header)),
         ("early plan forgets the role", "the early plan marks the role before it builds the inventory",
          (backend, cache, cache_hpp, zone_sizing,
+          mutate_in_func(model, r"static bool llama_model_sycl_build_early_inventory\(",
+                         "llama_model_sycl_mark_get_rows_only(out.tensors, ml)", "(void) 0"), header)),
+        ("early plan skips the builder", "the early plan builds its inventory through the early-inventory builder",
+         (backend, cache, cache_hpp, zone_sizing,
           mutate_in_func(model, r"static void llama_model_sycl_compute_early_plan\(",
-                         "llama_model_sycl_mark_get_rows_only(tensors, ml)", "(void) 0"), header)),
+                         "llama_model_sycl_build_early_inventory(", "h187_inline_build("), header)),
         ("late inventory forgets the role", "the late inventory marks the role before it builds the inventory",
          (backend, cache, cache_hpp, zone_sizing,
           mutate_in_func(model, r"static void llama_model_sycl_set_late_inventory\(",
@@ -873,7 +1033,7 @@ if args.self_test and not failed:
                          "XXXX("), cache, cache_hpp)),
         ("reserve reloads the snapshot for its bound", "the reserve's first bound comes from the snapshot it already loaded",
          (backend, mutate_in_func(cache, reserve_sig, "onednn_pp_pair_bound_for(zone_plan,",
-                                  "onednn_pp_pair_bound_for(bound_dev,"), cache_hpp)),
+                                  "onednn_pp_pair_bound_for(onednn_zone_plan_load(),"), cache_hpp)),
         ("test shim comes back", "one definition of the reserve target",
          (backend, cache, cache_hpp,
           zone_sizing + "\nvoid zone_onednn_scratch_reserve_target(bool a, size_t b, size_t c, size_t d, size_t e, size_t f, "
@@ -883,15 +1043,131 @@ if args.self_test and not failed:
                                   "void * early_probe = zone_alloc(vram_zone_id::ONEDNN, weights_size); (void) early_probe; "
                                   "const size_t pair_bound_now"), cache_hpp)),
         ("kept exit loads then stores", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
-         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(dev_id, live_plan)",
-                                  "onednn_zone_plan_store(dev_id, zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), "
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
+                                  "onednn_zone_plan_store(zone_onednn_plan_keep(onednn_zone_plan_load(), "
                                   "live_plan))"), cache_hpp)),
         ("keep-and-store takes two locks", "the keep-and-store helper keeps under one lock and calls neither accessor",
-         (backend, mutate_in_func(cache, r"static void onednn_zone_plan_keep_and_store\(",
-                                  "zone_onednn_plan_keep(", "zone_onednn_plan_keep(onednn_zone_plan_load(device_id), "),
+         (backend, mutate_in_func(cache, r"void unified_cache::onednn_zone_plan_keep_and_store\(",
+                                  "zone_onednn_plan_keep(", "zone_onednn_plan_keep(onednn_zone_plan_load(), "),
           cache_hpp)),
+        # ---- the admission's per-half merge with the planned pair ----
+        ("admission drops the merge requirement",
+         "the admission requires the per-half merge with the planned pair to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(mutate_in_func(zone_sizing, admit_sig, "std::max(planned_weights_bytes, weights_bytes)",
+                                        "weights_bytes"),
+                         admit_sig, "std::max(planned_activations_bytes, activations_bytes)", "activations_bytes"))),
+        ("admission merges the weights half only",
+         "the admission requires the per-half merge with the planned pair to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig, "std::max(planned_activations_bytes, activations_bytes)",
+                         "activations_bytes"))),
+        ("admission merges with the request in place of the plan",
+         "the admission requires the per-half merge with the planned pair to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig, "std::max(planned_weights_bytes, weights_bytes)",
+                         "std::max(weights_bytes, weights_bytes)"))),
+        ("admission drops the rule for a stored plan whose halves miss the bound",
+         "a stored plan whose halves miss the bound keeps the request-only rule, before the merge is asked",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig,
+                         "if (!zone_onednn_pair_fits(pair_bound_bytes, planned_weights_bytes, planned_activations_bytes)) {",
+                         "if (false) {"))),
+        ("admission drops the request-alone test",
+         "the admission requires the request alone to fit the bound",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, admit_sig,
+                         "if (!zone_onednn_pair_fits(pair_bound_bytes, weights_bytes, activations_bytes)) {",
+                         "if (false) {"))),
+        ("supplies verdict drops the planned halves",
+         "the pure supplies verdict passes the planned halves to the admission",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"bool zone_onednn_pp_scratch_supplies\(", "pair_bound_bytes, planned_weights_bytes,",
+                         "pair_bound_bytes, 0,"))),
+        ("reserve target keeps its own fit test", "the reserve target and the admission share one fit test",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"void zone_onednn_scratch_reserve_target\(", "zone_onednn_pair_fits(",
+                         "zone_XXXX("))),
+        ("by-bytes core passes no planned pair",
+         "the by-bytes core reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, helper_sig, "pair_bound, planned_weights, planned_activations,", "pair_bound, 0, 0,"),
+          cache, cache_hpp)),
+        ("by-bytes core asks for the bound alone",
+         "the by-bytes core reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, helper_sig, "&planned_weights, &planned_activations", "nullptr, nullptr"),
+          cache, cache_hpp)),
+        ("supplies helper passes no planned pair",
+         "the supplies helper reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, supplies_sig, "planned_weights, planned_activations, w_elems", "0, 0, w_elems"),
+          cache, cache_hpp)),
+        ("supplies helper asks for the bound alone",
+         "the supplies helper reads the planned halves with the bound and passes them on",
+         (mutate_in_func(backend, supplies_sig, "&planned_weights, &planned_activations", "nullptr, nullptr"),
+          cache, cache_hpp)),
         ("accessor undeclared", "the pair-bound accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),
+        # ---- the planned pair's activations half ----
+        ("intake publishes the placeholder again",
+         "the inventory planner stores the pair's two halves, not only their sum",
+         (mutate_in_func(backend, intake_sig, "pair.activations_bytes);", "inventory_maxima.onednn_eligible);"),
+          cache, cache_hpp)),
+        ("intake reads the placeholder", "no formula site reads the stored-weight placeholder",
+         (mutate_in_func(backend, intake_sig, "pair.activations_bytes);", "inventory_maxima.onednn_eligible);"),
+          cache, cache_hpp)),
+        ("intake keeps its own formula", "the inventory intake plans the pair through the one definition",
+         (mutate_in_func(backend, intake_sig, "ggml_sycl::unified_cache_plan_onednn_pp_pair(inventory_maxima,",
+                         "h_own_pair(inventory_maxima,"), cache, cache_hpp)),
+        ("intake plans before the context shape",
+         "the inventory intake plans the pair once the KV inputs give the context shape",
+         (mutate_in_func(backend, intake_sig, "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);",
+                         "(void) 0;"), cache, cache_hpp)),
+        ("host sizing goes back to the placeholder", "the host zone sizing plans the pair through the one definition",
+         (backend, mutate_in_func(cache, host_sizing_sig, "onednn_pair.weights_bytes + onednn_pair.activations_bytes;",
+                                  "zone_maxima.onednn_reorder + zone_maxima.onednn_eligible;"), cache_hpp)),
+        ("host sizing reads the placeholder", "no formula site reads the stored-weight placeholder",
+         (backend, mutate_in_func(cache, host_sizing_sig, "onednn_pair.weights_bytes + onednn_pair.activations_bytes;",
+                                  "zone_maxima.onednn_reorder + zone_maxima.onednn_eligible;"), cache_hpp)),
+        ("the two sites differ", "the host zone sizing plans the pair through the one definition",
+         (backend, mutate_in_func(cache, host_sizing_sig,
+                                  "unified_cache_plan_onednn_pp_pair(zone_maxima, kv_info, envelope)",
+                                  "zone_onednn_pp_pair_plan(zone_maxima.onednn_reorder, "
+                                  "zone_maxima.onednn_pp_src1_bytes_per_token, plan.planner_n_ubatch)"), cache_hpp)),
+        ("a second pair publisher", "the pair is published from the one definition only",
+         (backend + "\nstatic void h2() { ggml_sycl::unified_cache_set_planned_onednn_scratchpad_pair(0, 1, 2); }\n",
+          cache, cache_hpp)),
+        ("definition reads the placeholder row",
+         "the one pair definition sizes the activations half from the scratch's row",
+         (backend, mutate_in_func(cache, pair_def_sig, "maxima.onednn_pp_src1_bytes_per_token",
+                                  "maxima.onednn_eligible"), cache_hpp)),
+        ("definition reads the placeholder", "no formula site reads the stored-weight placeholder",
+         (backend, mutate_in_func(cache, pair_def_sig, "maxima.onednn_pp_src1_bytes_per_token",
+                                  "maxima.onednn_eligible"), cache_hpp)),
+        ("definition takes another micro-batch", "the one pair definition takes the Graph shape's micro-batch",
+         (backend, mutate_in_func(cache, pair_def_sig,
+                                  "unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope).n_ubatch",
+                                  "kv_info.n_ubatch"), cache_hpp)),
+        ("pure plan drops the micro-batch",
+         "the pure pair plan multiplies the row by the micro-batch, overflow-checked",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, pure_pair_sig, "src1_bytes_per_token * n_ubatch", "src1_bytes_per_token"))),
+        ("pure plan wraps the sum", "the pure pair plan multiplies the row by the micro-batch, overflow-checked",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, pure_pair_sig, "SIZE_MAX - activations", "SIZE_MAX"))),
+        ("classifier takes every row",
+         "the classifier takes the scratch's row only inside the eligible set, after the gather exclusion",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, maxima_sig,
+                         "if (onednn_eligible) {\n            maxima.onednn_pp_src1_bytes_per_token",
+                         "if (true) {\n            maxima.onednn_pp_src1_bytes_per_token"))),
+        ("adapter marks every type",
+         "the adapter marks the scratch's row for the types acquire and the PP admission take",
+         (backend, mutate_in_func(cache, adapter_sig, "!is_expert && onednn_pp_unified_scratch_enabled(item.type) &&",
+                                  "!is_expert &&"), cache_hpp)),
+        ("adapter marks expert rows",
+         "the adapter marks the scratch's row for the types acquire and the PP admission take",
+         (backend, mutate_in_func(cache, adapter_sig,
+                                  "if (quantized && !is_expert && onednn_pp_unified_scratch_enabled(",
+                                  "if (quantized && onednn_pp_unified_scratch_enabled("), cache_hpp)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)

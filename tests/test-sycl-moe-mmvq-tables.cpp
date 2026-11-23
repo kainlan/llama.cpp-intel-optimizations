@@ -13,6 +13,7 @@
 // Adding a type to one table without the other must be caught here, not there.
 
 #include "../ggml/src/ggml-sycl/moe-mmvq-tables.hpp"
+#include "../ggml/src/ggml-sycl/soa-reorder-types.hpp"
 #include "ggml.h"
 
 #include <cstdint>
@@ -200,6 +201,8 @@ int main() {
         { GGML_TYPE_NVFP4, GGML_LAYOUT_AOS, "nvfp4/AOS" },
         { GGML_TYPE_Q4_0,  GGML_LAYOUT_AOS, "q4_0/AOS"  },
         { GGML_TYPE_Q8_0,  GGML_LAYOUT_AOS, "q8_0/AOS"  },
+        // Q8_0 experts are materialized SOA on an XMX card, and decode reads them there with the SOA _id kernel.
+        { GGML_TYPE_Q8_0,  GGML_LAYOUT_SOA, "q8_0/SOA"  },
         // gx30: every type with a generic mul_mat_vec_q<> tuple to transcribe
         { GGML_TYPE_Q4_1,  GGML_LAYOUT_AOS, "q4_1/AOS"  },
         { GGML_TYPE_Q4_K,  GGML_LAYOUT_AOS, "q4_K/AOS"  },
@@ -522,7 +525,7 @@ int main() {
     for (const ggml_type type : pp_never_types) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_pp_batched_supports_layout(type, layout, true, true)) {
-                std::printf("FAIL: batched executor admits type=%s layout=%d, a direct-kernel or float type\n",
+                std::printf("FAIL: batched executor admits type=%s layout=%d, a type its dequant test does not run\n",
                             ggml_type_name(type), static_cast<int>(layout));
                 ++failures;
             }
@@ -895,6 +898,39 @@ int main() {
                         ++failures;
                     }
                 }
+            }
+        }
+    }
+
+    // 15. Decode runs every SOA expert layout that prefill runs. A type with an SOA reorder and an SOA prompt row
+    // needs an SOA decode executor too. The pairs below are the known support gaps: each is a missing kernel, and the
+    // change that writes it deletes its line.
+    {
+        const ggml_type decode_soa_gaps[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K };
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            const char *    name = ggml_type_name(type);
+            if (name == nullptr || !ggml_sycl_soa_reorder_supported_type(type) ||
+                !moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA)) {
+                continue;
+            }
+            bool listed = false;
+            for (ggml_type g : decode_soa_gaps) {
+                listed = listed || g == type;
+            }
+            const bool decodes = moe_mmvq_capability_supports_layout(type, GGML_LAYOUT_SOA);
+            std::printf("decode SOA gap check: %s decodes=%d listed=%d\n", name, decodes ? 1 : 0, listed ? 1 : 0);
+            if (!decodes && !listed) {
+                std::printf(
+                    "FAIL: %s experts have an SOA layout and run in prefill at SOA, but decode has no SOA executor: "
+                    "write the decode SOA kernel and advertise (%s, SOA) in moe_mmvq_capability_supports_layout; "
+                    "only if the gap is accepted for now, add the type to decode_soa_gaps\n",
+                    name, name);
+                ++failures;
+            }
+            if (decodes && listed) {
+                std::printf("FAIL: %s SOA has a decode executor now; delete it from decode_soa_gaps\n", name);
+                ++failures;
             }
         }
     }

@@ -154,6 +154,10 @@ with gate('fattn-failure-atomicity'):
 # llama.cpp-36j0 retired one more legacy unified_alloc(: S1-PRELOAD's host-planned expert storage is minted
 # owner-first by the named ggml_sycl_host_expert_alloc, so the expert's cache entry carries a typed owner that its
 # leases report through owner_metadata() -- 53->52 unified_alloc( code sites.
+# Removing the legacy expert prestage retired two legacy pairs, its host staging and its reorder buffer --
+# 52->50 unified_alloc( and 41->39 from_legacy_owned_alloc( code sites.
+# arena_device_alloc, the SCRATCH-zone device helper whose only caller was the removed GPU reorder fill, went with
+# it: 50->49 unified_alloc( and 39->38 from_legacy_owned_alloc( code sites.
 RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
@@ -283,7 +287,7 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (52, 41, OWNER_FIRST_BASELINE_SITES)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (49, 38, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):
@@ -349,9 +353,10 @@ CACHE_FROM_LEGACY_SITES = Counter({
     ("out = std::make_shared<mem_handle>(detail::", "std::move(moe_owner)"): 1,  # moe_preallocate_inference_buffers
 })
 CACHE_OWNER_FIRST_SITES = Counter({
-    # The eighth (llama.cpp-42zj) is unified_cache::arm_cpu_job_input_marker's word: a CONTROL request with
-    # must_host_pinned and no private token, so section 3.1 classifies it CACHE_SUBALLOCATION, a pinned-pool slice.
-    ("allocation_result allocation =", "req"): 8,
+    # One is unified_cache::arm_cpu_job_input_marker's word: a CONTROL request with must_host_pinned and no private
+    # token, so section 3.1 classifies it CACHE_SUBALLOCATION, a pinned-pool slice. The MoE reorder temp buffer's
+    # reservation was another until it left with the prestage that read it: 8 -> 7.
+    ("allocation_result allocation =", "req"): 7,
     ("allocation_result host_allocation =", "host_req"): 1,
     ("allocation_result result =", "req"): 1,  # unified_cache_zone_alloc
     ("allocation_result", "const alloc_request & req"): 1,  # the definition of unified_allocate_owner itself
@@ -458,8 +463,6 @@ with gate('staging-legacy-names-forbidden'):
 # unified-cache and pp-stage staging owners. The common.hpp one (the MMQ src1 Q8_1 buffer)
 # is the shared planned-scratch helper pinned above; it is part of this seam too.
 STAGING_BLOCKS = (
-    ("cache reserve_reorder_temp", CACHE, "bool unified_cache::reserve_reorder_temp",
-     "bool unified_cache::reserve_persistent_scratch", "reorder_temp_owner_  = std::move(replacement)"),
     ("cache fill_with_host_copy", CACHE, "bool unified_cache_fill_with_host_copy",
      "bool unified_cache_copy_from_host_async", None),
     ("common planned scratch", COMMON, PLANNED_SCRATCH_HELPER[0], PLANNED_SCRATCH_HELPER[1],
@@ -667,7 +670,7 @@ with gate('graph-preload-not-in-refresh'):
                      "if (refresh_moe_after_pp || post_prompt_refresh_due)", "const int descriptor_moe_graph_candidates")
     assert not re.search(r"\bgraph_preload_moe_experts\s*\(", refresh)
     assert not re.search(r"\bggml_sycl_moe_graph_preload_decide\s*\(", refresh)
-    assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh and "moe_prestage_popular_experts();" in refresh
+    assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh
     print("PASS graph-preload-not-in-refresh-source-gate")
 
 with gate('decode-env-reads-once'):
@@ -838,7 +841,8 @@ with gate('futile-context-direct'):
     for scan in scans:
         assert futile.end() < compute.index(scan) < graph_branch, scan
     # The signature hash and the exec-graph key are first computed inside the graph branch, never on the way to it.
-    for call in ("ggml_sycl_graph_signature(cgraph)", "sycl_exec_graph_make_key("):
+    # The compute takes its signature through the decode prologue memo's wrapper, which runs the full walk.
+    for call in ("graph_prologue_memo_signature(", "ggml_sycl_graph_signature(cgraph)", "sycl_exec_graph_make_key("):
         assert graph_branch < compute.index(call, futile.end()), call
     # Every scan between the decision and the graph branch is skipped for a futile context: either it needs
     # use_sycl_graph, or it is guarded on the flag itself.
@@ -873,6 +877,12 @@ SEG_FLUSH_CALLS = {
     "keyed record": "moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);",
     "keyed replay": "moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);",
 }
+# The keyed replay's segment enqueue trace stamp: the sole statement of its `if (enqueue_stamps)` guard, which records a
+# clock and changes no control flow. It may sit between the flush and the submission and nothing else may.
+SEG_ENQUEUE_STAMP = (r"if \(enqueue_stamps\) \{\s*moe_token_stamps_note_enqueue\("
+                     r"\*enqueue_stamps, MOE_TOKEN_ENQUEUE_SEGMENT,\s*seg\.start_node,\s*"
+                     r"cgraph->nodes\[seg\.start_node\]\);\s*\}")
+SEG_SUBMIT = r"ggml_sycl::graph_exec_submit\(\*stream, \*seg\.exec_graph\);"
 
 
 def check_segment_boundary_flush(code: str) -> list:
@@ -972,6 +982,8 @@ def check_segment_boundary_flush(code: str) -> list:
     elif not (graphed < flush < submit < leave):
         problems.append("keyed replay: the flush must precede the recorded segment's submission "
                         "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
+    elif not re.search(re.escape(call) + r"\s*(?:" + SEG_ENQUEUE_STAMP + r"\s*)?" + SEG_SUBMIT, keyed_replay):
+        problems.append("keyed replay: only the segment's enqueue stamp may sit between the flush and the submission")
     return problems
 
 
@@ -984,18 +996,28 @@ with gate('segment-boundary-flush'):
     _kcall = SEG_FLUSH_CALLS["keyed record"]
     # The record path drains its stream between the flush and the recording (moe_graph_segment_record_drain); the
     # flush controls below drop or move only the flush and keep the drain where it is.
-    _record_drain = "        moe_graph_segment_record_drain(*stream);\n"
-    _record_flush = "        " + _rcall + "\n" + _record_drain + "        const size_t retained_baseline"
+    # The record loop's depth is read from the code, not written here: the loop sits inside the block that scopes its
+    # unwind handover, so its statements can be a level deeper than the keyed path's.
+    _rec_indent = re.search(r"\n( *)" + re.escape(_rcall) + r"\n", RUNTIME_CODE).group(1)
+    _record_drain = _rec_indent + "moe_graph_segment_record_drain(*stream);\n"
+    _record_flush = _rec_indent + _rcall + "\n" + _record_drain + _rec_indent + "const size_t retained_baseline"
     _replay_flush = "                " + _pcall + "\n                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"
-    # The legacy replay is the first of the two replay sites; the keyed replay is the second.
-    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
-    _begin = "            seg_graph.begin_recording(*stream);\n"
+    # The legacy replay is the first of the two replay sites and submits right after its flush; the keyed replay is the
+    # second and takes its segment enqueue stamp between the two.
+    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 1
+    _begin = _rec_indent + "    seg_graph.begin_recording(*stream);\n"
     _keyed_record = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
     _keyed_replay = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
     _keyed_flush = "        " + _kcall + "\n"
     _keyed_begin = "            seg_graph.begin_recording(*stream);\n            end_guard.open = true;\n"
     assert _keyed_record.count(_keyed_flush) == 1 and _keyed_record.count(_keyed_begin) == 1
-    assert _keyed_replay.count(_replay_flush) == 1
+    _keyed_replay_flush = re.search(
+        "                " + re.escape(_pcall) + r"\n {16}" + SEG_ENQUEUE_STAMP + r"\n {16}" + SEG_SUBMIT,
+        _keyed_replay).group(0)
+    assert _keyed_replay.count(_keyed_replay_flush) == 1 and RUNTIME_CODE.count(_keyed_replay_flush) == 1
+    assert _keyed_replay.count(_replay_flush) == 0
+    # What follows the flush in the keyed replay: the stamp, then the submission.
+    _keyed_after_flush = _keyed_replay_flush.split("\n", 1)[1]
     _helper = region(RUNTIME_CODE, SEG_FLUSH_DEF, "\n}\n")
 
     def _in_keyed(body, old, new):
@@ -1010,9 +1032,9 @@ with gate('segment-boundary-flush'):
                    "    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n"
                    "    flush_pending_attn_dispatch(device);\n")
     controls = {
-        "record flush dropped": RUNTIME_CODE.replace(_record_flush, _record_drain + "        const size_t retained_baseline"),
-        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, _record_drain + "        const size_t retained_baseline")
-            .replace(_begin, _begin + "            " + _rcall + "\n"),
+        "record flush dropped": RUNTIME_CODE.replace(_record_flush, _record_drain + _rec_indent + "const size_t retained_baseline"),
+        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, _record_drain + _rec_indent + "const size_t retained_baseline")
+            .replace(_begin, _begin + _rec_indent + "    " + _rcall + "\n"),
         "record flush covers the wrong nodes": RUNTIME_CODE.replace(
             _rcall, _rcall.replace("seg.start, seg.end", "seg.start, seg.start + 1"), 1),
         "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);", 1),
@@ -1024,10 +1046,13 @@ with gate('segment-boundary-flush'):
                 _keyed_begin, _keyed_begin + "            " + _kcall + "\n", 1), 1),
         "keyed record flush covers another segment": _in_keyed(
             _keyed_record, _kcall, _kcall.replace("item.start, item.end", "0, item.end")),
-        "keyed replay flush dropped": _in_keyed(
-            _keyed_replay, _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"),
+        "keyed replay flush dropped": _in_keyed(_keyed_replay, _keyed_replay_flush, _keyed_after_flush),
         "keyed replay flush after the submission": _in_keyed(
-            _keyed_replay, _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);\n                " + _pcall),
+            _keyed_replay, _keyed_replay_flush, _keyed_after_flush + "\n                " + _pcall),
+        "keyed replay flush hidden in the stamp's guard": _in_keyed(
+            _keyed_replay, _keyed_replay_flush,
+            _keyed_after_flush.replace("if (enqueue_stamps) {\n",
+                                       "if (enqueue_stamps) {\n                    " + _pcall + "\n", 1)),
         "attention slot not checked": _in_helper("        flush_pending_attn_if_consumed(node, device);\n", ""),
         "CPU scatter slots not checked": _in_helper("        flush_pending_cpu_scatter_if_consumed(node, device);\n", ""),
         "helper walks the whole graph": _in_helper("for (int i = start; i < end; ++i) {",
@@ -1508,7 +1533,8 @@ def check_keyed_slot_input_staging(code: str, common: str) -> list:
     if not re.search(r"\}\s*else if \(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{\s*"
                      r"GGML_SYCL_DEBUG\([^\n]*\);\s*sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*"
                      r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);"
-                     r"\s*moe_graph_replay_segment_slot\(", compute):
+                     r"\s*(?:if \(moe_hostpath_waits_enabled\(\)\) \{\s*moe_token_stamps_note_replay\(\);\s*\}\s*)?"
+                     r"moe_graph_replay_segment_slot\(", compute):
         problems.append("a replay does not drop a slot whose inputs stage elsewhere, then refresh its inputs, "
                         "before replaying it")
     return problems
@@ -1531,6 +1557,9 @@ with gate('keyed-slot-input-staging'):
         ("check ignores identity", "runtime", r" \|\|\s*\(rec\.valid\(\) && !rec\.stable_identity_equal\(now\)\)", ""),
         ("replay without the input refresh", "runtime",
          r"(compute_impl_unlocked\(\);\s*\}\s*else\s*\{)\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);", r"\1"),
+        ("refresh hidden in the replay stamp's guard", "runtime",
+         r"(moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);)(\s*)(if \(moe_hostpath_waits_enabled\(\)\) \{)"
+         r"(\s*moe_token_stamps_note_replay\(\);)", r"\2\3\1\4"),
         ("capture holds nothing", "runtime", r"slot\.input_staging\.push_back\(moe_segment_slot_input_staging\(",
          "(void) (moe_segment_slot_input_staging("),
         ("check reads without the size guard", "runtime",
@@ -1650,37 +1679,6 @@ with gate('moe-metadata'):
     assert "g_expert_groups.swap(new_expert_groups)" in metadata
     print("PASS moe-metadata-atomic-publication-source-gate")
 
-with gate('moe-paired-snapshot'):
-    # Reader side of the same contract. The writer publishing both registries under
-    # one scoped_lock buys nothing if readers acquire them separately: a reader that
-    # consults BOTH within one logical operation can otherwise pair one model's
-    # metadata with the next model's groups, and expert_group_key carries no model
-    # identity to catch it. Every such reader must go through one paired snapshot.
-    snapshot = region(RUNTIME, "static moe_registry_snapshot moe_snapshot_registries", "// Residency against a caller-held")
-    assert "std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
-    assert snapshot.index("scoped_lock") < snapshot.index("snapshot.meta   = g_moe_expert_meta")
-    assert snapshot.index("snapshot.meta   = g_moe_expert_meta") < snapshot.index("snapshot.groups = g_expert_groups")
-
-    # is_expert_resident must keep a lock-free overload, or a dual reader holding a
-    # paired snapshot would have to re-enter the group lock to ask about residency --
-    # reading a newer epoch than the metadata it holds, and deadlocking outright if
-    # the snapshot lock were still held (shared_mutex is not recursive).
-    assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
-    resident = region(RUNTIME, "static bool is_expert_resident(int block_id", "// Forward declarations needed by moe_prestage")
-    assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
-
-    # The two dual-consumer readers take the paired snapshot and never re-acquire
-    # either mutex for the rest of the operation.
-    for start, end, name in (
-        ("static void moe_prestage_popular_experts", "// SOA-correct expert caching: single-expert wrapper", "prestage"),
-        ("        // We need block_num for the residency checks", "    void worker_loop()", "rebalance"),
-    ):
-        block = region(RUNTIME, start, end)
-        assert "moe_snapshot_registries()" in block, name
-        assert "g_expert_groups_mutex" not in block, name
-        assert "g_moe_expert_meta_mutex" not in block, name
-        assert "is_expert_resident(" not in block, name
-    print("PASS moe-registry-paired-snapshot-reader-source-gate")
 # HM Task 2 (llama.cpp-81gt): CACHE_BACKING classification must be unforgeable.
 # `alloc_constraints.cache_backing` was a public caller-writable bool, so any
 # caller could mint the ownership class that shutdown exempts from destructive
@@ -1858,6 +1856,62 @@ def check_internal_backing_mint_stays_private(cache_cpp: str) -> list:
 
 
 
+# unified_alloc reads the owner entry's adapter thread-locals: its control, its CACHE_BACKING provenance and its
+# HOST_CPU charge (canonical contract §3 and §3.1; th32 §4.2). A unified_alloc nested on the same thread inside the
+# outer one would otherwise publish into the outer control, copy its provenance or spend its charge, so unified_alloc
+# takes each with std::exchange into a local on entry, a destructor puts that local back on every exit, and nothing
+# else in unified_alloc names it: a read of the global after the consume reads the consumed value. The local's name is
+# read from the exchange, so a destructor that stores anything else (nullptr, a constant) is not a restore. The set
+# is derived from what the owner entry's adapter_scope constructor assigns, so a thread-local added there is pinned
+# too. This is a source pin because the NESTED_HOST_CPU test seam cannot drive a pinned backing allocation on the test
+# thread reliably; the control and the charge are also scored through that seam by arm (m) of
+# test-sycl-host-ledger-device.
+def check_unified_alloc_consumes_adapter_locals(code: str) -> list:
+    problems = []
+    scope_start = code.index("struct adapter_scope {")
+    scope = code[scope_start:code.index("} scope(", scope_start)]
+    constructor = scope[:scope.index("~adapter_scope()")]
+    adapter_locals = sorted(set(re.findall(r"\b(g_allocating_\w+)\s*=(?!=)", constructor)))
+    if len(adapter_locals) < 3:
+        problems.append("the owner entry's adapter_scope assigns %d thread-locals, expected at least 3: %s" %
+                        (len(adapter_locals), adapter_locals))
+    start, end = function_body_span(code, "unified_alloc")
+    body = code[start:end]
+    entry = body[:body.index("if (out == nullptr)")]
+    for name in adapter_locals:
+        consume = re.search(r"\b(\w+)\s*=\s*std::exchange\(\s*%s\s*," % name, entry)
+        if consume is None:
+            problems.append("unified_alloc does not consume %s with std::exchange into a local before its first exit" %
+                            name)
+        else:
+            local = consume.group(1)
+            restores = re.findall(r"~\w+\(\)\s*\{[^}]*\b%s\s*=\s*%s\s*;" % (name, re.escape(local)), entry)
+            if len(restores) != 1:
+                problems.append("unified_alloc's entry has %d destructors putting %s back from %s, the local its "
+                                "consume bound, want 1" % (len(restores), name, local))
+        uses = len(re.findall(r"\b%s\b" % name, body))
+        if uses != 2:
+            problems.append("%s is named %d times in unified_alloc, want 2: the consume and the restore" % (name, uses))
+    return problems
+
+
+# Each mutant must be caught, so the check above is not decorative: the consume dropped, a read left on the global,
+# the restore dropped, a restore that stores nullptr instead of the consumed local, and a fourth thread-local
+# assigned by adapter_scope but never consumed.
+CONSUME_MUTANTS = (
+    ("cache-backing consume dropped", "std::exchange(g_allocating_cache_backing, false)", "g_allocating_cache_backing"),
+    ("owner-control consume dropped", "std::exchange(g_allocating_owner_control, nullptr)",
+     "g_allocating_owner_control"),
+    ("a provenance read left on the global", "rec.handle.cache_backing    = cache_backing;",
+     "rec.handle.cache_backing    = g_allocating_cache_backing;"),
+    ("cache-backing restore dropped", "g_allocating_cache_backing = cache_backing;\n            g_allocating_charge",
+     "g_allocating_charge"),
+    ("owner-control restore stores nullptr", "g_allocating_owner_control = owner_control;",
+     "g_allocating_owner_control = nullptr;"),
+    ("an unconsumed fourth thread-local", "g_allocating_charge        = charge;\n            }",
+     "g_allocating_charge        = charge;\n                g_allocating_extra = true;\n            }"),
+)
+
 # Four independent checks: a failure of one must not hide the others.
 with gate('cache-backing-not-public'):
     problems = check_cache_backing_not_public(CACHE_HPP)
@@ -1871,5 +1925,13 @@ with gate('dot-directory-skip-is-live'):
 with gate('internal-backing-mint-stays-private'):
     problems = check_internal_backing_mint_stays_private(CACHE)
     assert not problems, "\n".join(problems)
+with gate('unified-alloc-consumes-adapter-thread-locals'):
+    problems = check_unified_alloc_consumes_adapter_locals(CACHE_CODE)
+    assert not problems, "\n".join(problems)
+with gate('unified-alloc-consume-check-catches-its-mutants'):
+    for _label, _old, _new in CONSUME_MUTANTS:
+        assert CACHE_CODE.count(_old) == 1, "mutant %r: its anchor is not in unified-cache.cpp once" % _label
+        assert check_unified_alloc_consumes_adapter_locals(CACHE_CODE.replace(_old, _new)), \
+            "mutant %r was not caught" % _label
 
-finish(min_checks=63)
+finish(min_checks=66)

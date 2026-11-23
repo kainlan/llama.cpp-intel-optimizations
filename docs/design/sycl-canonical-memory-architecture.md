@@ -30,7 +30,7 @@ that covers:
 | KV cache (per slot, where the layer that executes the slot lives) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes`, `layer_phys` |
 | oneDNN reorder scratch | `onednn_reorder_bytes` → Zone: SCRATCH |
 | oneDNN scratchpad | `onednn_scratchpad_bytes` → Zone: ONEDNN |
-| MoE Q8 workspace | `moe_q8_workspace_bytes` → Zone: SCRATCH |
+| MoE batched MMVQ scratch | `moe_mmvq_scratch_bytes` → Zone: SCRATCH (every op at once, capped by quarter and room) |
 | MoE routing IDs | `moe_routing_ids_bytes` → Zone: RUNTIME |
 | MoE expert pointer tables | `moe_expert_ptrs_bytes` → Zone: RUNTIME |
 | DMA staging pool | `dma_staging_pool_bytes` → Zone: RUNTIME |
@@ -209,11 +209,8 @@ is untagged because it is materialized by
 (`ggml-sycl.cpp`, `#if SYCL_XMX_MOE_AVAILABLE`), called via
 `ggml_sycl_materialize_moe_phase_layouts()` from the graph-compute path that
 scans `cgraph` nodes for `GGML_OP_MUL_MAT_ID` (near the `refresh_moe_after_pp`
-PP→TG transition) — a **runtime** path, not a model-load call site. (NOT
-`moe_prestage_popular_experts()`, which stages exclusively with
-`GGML_LAYOUT_SOA`/`GGML_LAYOUT_AOS` and only ever *looks up* `XMX_TILED` via a
-`pin_layouts[]` array to pin an already-existing entry — it creates nothing in
-that layout.) The bulk-XMX branch calls
+PP→TG transition) — a **runtime** path, not a model-load call site. The
+bulk-XMX branch calls
 `unified_cache_direct_stage_expert_tensor()` with `target_layout ==
 GGML_LAYOUT_XMX_TILED`, which reaches `unified_cache::direct_stage_expert_tensor()`
 (`unified-cache.cpp:4390`). That function calls `acquire_bound_load_effect()`
@@ -347,10 +344,64 @@ these or be migrated (see §9 for temporary allowlisted sites):
 | `unified_cache_raw_malloc_device(size, queue)` | Raw `sycl::malloc_device` wrapper — call only from inside `unified_cache` internals | `void *` |
 | `unified_cache_raw_malloc_host(size, queue/ctx)` | Raw `sycl::malloc_host` wrapper — call only from inside `unified_cache` internals | `void *` |
 | `unified_cache_raw_malloc_shared(size, queue)` | Raw `sycl::malloc_shared` wrapper — call only from inside `unified_cache` internals | `void *` |
+| `unified_cache_raw_map_file(fd, file_size, reservation, segments, out)` | Raw file-mapping wrapper (`ggml/src/ggml-sycl/file-mapping.cpp`, a device-free TU): one `PROT_NONE` reservation with `MAP_FIXED` file segments over it, from a `dup` of the loader's fd. Call only from the `FILE_MAPPED` owner's front door, `unified_allocate_file_mapping` | `file_map_status` |
+| `unified_cache_raw_lock_file_segments(mapping, lock_segments)` | The only `mlock` of a file mapping: one call per inward-rounded segment, never widened | `file_map_status` |
+| `unified_cache_raw_advise_file_segments(mapping, segments, advice)` | The only `madvise` of a file mapping: `WILLNEED` (in 128 KiB chunks: the kernel clamps each call to `max(io_pages, ra_pages)` of the backing device, 512 KiB on this host, so any larger chunk prefetches part of a segment) and the `RANDOM` edge windows, never widened | `file_map_status` |
+| `unified_cache_raw_unmap_file(mapping)` | The only release of a file mapping: one `munmap` of the whole reservation, then the `dup` is closed | `void` |
+| `unified_cache_raw_alloc_host_cpu(bytes, out)` | Raw `HOST_CPU` wrapper (`ggml/src/ggml-sycl/host-cpu-mapping.cpp`, a device-free TU): one anonymous `mmap` sized by `host_cpu_mapped_size` (whole pages and whole 2 MiB huge pages), `MADV_HUGEPAGE`, and one full `mlock` (never `MLOCK_ONFAULT`). A refused lock is `host-cpu-lock-failed` naming errno, the bytes and `RLIMIT_MEMLOCK`; the mapping is unmapped, and nothing falls back. On a build without POSIX (Windows) the TU is a refusing stub: `UNSUPPORTED`, nothing mapped, `host_cpu_supported()` false. Call only from the `HOST_CPU` branch of `unified_alloc`, reached through `unified_allocate_owner` with `must_host_cpu` | `host_cpu_status` |
+| `unified_cache_raw_free_host_cpu(ptr, mapped_bytes)` | The only release of a `HOST_CPU` mapping: one `munmap` through the TU's single `host_cpu_munmap` (the kernel unlocks it with the mapping; the lock-failure unwind uses the same function) | `void` |
 
 **Rule:** `sycl::malloc_device`, `sycl::malloc_host`, and `sycl::malloc_shared` must
 never be called outside `unified-cache.cpp`. All other files must use the wrappers
 above.
+
+**Rule (mapping):** `mmap`, `munmap`, `mlock` and `madvise` are called only from the
+file-mapping wrappers and the two `HOST_CPU` wrappers above and from the listed
+guard-page and DPCT sites. `tests/test-sycl-raw-mmap-allowlist-source.py` enforces it
+over the backend's tokenized sources (llama.cpp-5efe C2, llama.cpp-th32 T1a).
+
+**Rule (`HOST_CPU`, llama.cpp-th32 T1):** the `HOST_CPU` tier is host memory only the
+CPU reads: one anonymous mapping, `MADV_HUGEPAGE`, locked in full. It is requested
+only through `unified_allocate_owner(req)` with `constraints.must_host_cpu`, and that
+field selects the tier and nothing else. `test-sycl-alloc-zone-contract` clause (b) reads
+it as the third tier flag: a request establishes exactly one of `must_device`,
+`must_host_pinned` and `must_host_cpu` by an unconditional literal true, each of the other two
+unwritten or its last write an unconditional literal false, and a `must_host_cpu` request is a host tier
+that clause (d)'s zone rules excuse, as a pinned one is. The owner entry charges the process-global host
+ledger for it, by `host_cpu_mapped_size(size)`, before it mints the control (th32 §4.2,
+T2), and hands the charge to `unified_alloc` through the thread-local
+`g_allocating_charge`. `unified_alloc` refuses a `must_host_cpu` request that holds no
+charge, so the legacy entry cannot reach the tier, and refuses a final tier that
+disagrees with the charge (`[HOST-PLAN-BUG]`, an abort under strict). The registry row
+takes the charge into `charged_bytes`, and the row's one free credits it.
+Nothing falls into the tier (`unified_select_tier`'s size fallback stays `HOST_PINNED`,
+and its cohort branch skips a cohort entry that names `HOST_CPU`) and nothing falls out
+of it: a request that cannot be mapped or locked is refused by name
+(`host-cpu-lock-failed`), never served from another tier. The owner is classified
+`EXTERNAL_EXACT` whatever role or placement field rides with it, so the two-site
+`CACHE_BACKING` allowlist of §3.1 is untouched; `must_host_cpu` beside a routing
+constraint (`must_device`, `must_host_pinned`, `prefer_same_tier_as_cohort`,
+`use_pinned_pool`, `forbid_host_zone_growth`, `require_host_usm_base`, or a
+`prefer_vram_zone` other than `COUNT`), or an `alignment` above `HOST_CPU_MAX_ALIGNMENT`
+(one 4 KiB page, all an anonymous mapping guarantees), is `INVALID_REQUEST` before the
+charge and before any control is minted.
+`unified_alloc` calls `unified_cache_raw_alloc_host_cpu` once and takes no queue; `unified_free_record`
+calls `unified_cache_raw_free_host_cpu` once, ahead of every other branch, sized by
+`host_cpu_mapped_size(handle.size)`. No lock is held across either call: the lock
+faults every page in before it returns. The tier is host-accessible and not
+device-mappable (`memory_location::device_mappable()`), the pointer-type registry types
+it `HOST_CPU`, and the sites that hand a pointer to a device name `HOST_PINNED` and so
+fall to their `HOST_DEVICE` else-arm for it. `tests/test-sycl-alloc-tier-census-source.py`
+holds the census: every switch that names `FILE_MAPPED` names `HOST_CPU`, and no
+device-handing site does.
+
+**Allowlist line (llama.cpp-th32 T7, reserved here by T1):** the epoch ring's
+host-signalled Level Zero events (`zeEventPoolCreate` and `zeEventCreate`, owned by the
+refcounted `lazy_event_pool`) are driver objects, not cache bytes, so they pass through no
+allocator above. They are a new native Level Zero object site in the backend; T7 adds
+the one translation unit that may make those calls, and until it lands no site may.
+This line sits next to the `HOST_CPU` wrapper rows because it is the second allowlisted
+native-object site th32 adds.
 
 **Deallocation:** `unified_free(handle)`, `unified_free_ptr(ptr, device)`,
 `unified_cache_zone_free(device_id, zone, ptr)`, `unified_cache_arena_free(device_id, ptr, size)` (deprecated).
@@ -473,6 +524,7 @@ Only the following functions may hand out resolved raw pointers from a handle:
 | Function | When to use |
 |---|---|
 | `mem_handle::resolve()` | Normal dispatch: returns `resolved_ptr{ptr, layout, on_device}` |
+| `mem_handle::resolve(int device_id)` | Dispatch for a named device: empty for a `FILE_MAPPED` or `HOST_CPU` owner, which the CPU reads in place and no device is ever handed (llama.cpp-th32 T1) |
 | `unified_lookup(void * ptr, alloc_handle * out)` | Reverse-look up an allocation by raw pointer (`unified-cache.hpp:2345`) |
 | `unified_cache::memset(h, val, size, queue)` | Fill memory behind a handle (void, no event returned — **deprecated API shape**; see §6) |
 | `unified_cache::memcpy(dst, src, size, queue)` | Copy between handles (void, no event returned — **deprecated API shape**; see §6) |
@@ -712,7 +764,14 @@ and per prompt phase. It is owned through the context's `moe_stream` member,
 reserved slot by slot at the first layer the batched prompt executor claims, and
 released by `moe_stream_phase::end_prompt`. Its loan and its refill are plan
 transactions that republish the expert plan, not direct edits to the plan. A lent
-triplet's host copy keeps its owner until the refill retires it.
+triplet's host copy keeps its owner until the refill retires it. A named move
+(`ggml_sycl_expert_move_transaction_run`) is a third such transaction, run at a
+graph boundary. Its admit brings named host triplets onto the card, mints each
+device copy from the WEIGHT zone at the size direct staging gives the expert, and
+retires the pinned host copy once its last lease drains. Its evict moves named
+resident triplets to pinned host storage through the loan's cache body; the
+device copy's room returns only when a later deferred-free pass reaps the
+retired entry, so an admit in the same call never gets it.
 
 ---
 
@@ -960,6 +1019,7 @@ are grouped by subsystem:
 | `unified-cache.cpp` internals | all | — | Allowed permanently as raw-malloc gateway |
 | `dpct/helper.hpp` (vendored upstream) | 3, pinned by function, raw name and count 1 each: `dpct_malloc` / `malloc_device`; `device_memory::allocate_device` / `malloc_shared` and / `malloc_device`; and, as libc sites pinned by clause (q) (code `E-LIBC`, function, name and count): `mem_mgr`'s constructor `mmap` (Linux) and `VirtualAlloc` (`_WIN64`), the two `host_buffer` constructors' `std::malloc`, and the two `device_memory` initializer-list constructors' host-staging `std::malloc` | — (sanctioned-vendored; disposition carried by `llama.cpp-23mk`) | Allowed permanently, not edited (rebase churn). `test-sycl-alloc-zone-contract` clause (e) pins the three sites and forbids `dpct_malloc`, `dpct_memcpy`, `async_dpct_memcpy` (the 3-D host-staged paths are `host_buffer`'s only users) and the `dpct::device_memory`, `global_memory`, `constant_memory` and `shared_memory` names everywhere outside `dpct/helper.hpp`; clause (q) pins the libc sites. The vendored allocations are ruled unreachable from the backend; clause (e) forbids the entry points that allocate or stage through them (`dpct_malloc`, the memory classes and the memcpy paths). Any transient intent for these sites belongs to `llama.cpp-6lfq` |
 | `unified-cache.hpp` `cache_guard_allocator` | 1 `mmap`, pinned by function, name and count (clause (q), `E-LIBC-CACHE-GUARD`) | — | Allowed permanently: it backs the cache's own hash maps in the guard-page debug mode and falls back to `std::allocator`; it holds no tensor, KV, scratch, pinned or USM bytes, and the cache cannot allocate its own map nodes through itself |
+| `file-mapping.cpp`, `host-cpu-mapping.cpp` (device-free tier TUs) | 3 `mmap`, pinned by function, name and count (clause (q)): `unified_cache_raw_map_file`'s reservation and segment maps (2, `E-LIBC-FILE-MAPPED-RAW`) and `unified_cache_raw_alloc_host_cpu`'s locked mapping (1, `E-LIBC-HOST-CPU-RAW`) | — | Allowed permanently: they are the raw layer of the `FILE_MAPPED` and `HOST_CPU` tiers (section 3, Allocator Entry Points), unified-cache internals kept in device-free translation units. `unified_cache_raw_map_file` is called only from the owner-first front door `unified_allocate_file_mapping`; `unified_cache_raw_alloc_host_cpu` only from `unified_alloc`'s `HOST_CPU` branch, which only `unified_allocate_owner` reaches, with its owner already minted and the host ledger charged: `unified_alloc` refuses a `must_host_cpu` request that holds no charge, so owner-first is enforced there |
 | `ggml-sycl.cpp` `weight_cache_allocator` | 1 `mmap` and 1 `posix_memalign`, shrink-only debt (clause (q), fate `deleted-by-step-7`) | `llama.cpp-23mk` | Never instantiated; deleted whole at step 7 of the 23mk design (the dead `weight_cache_allocator` bullet) |
 | Test files under `tests/` | all | — | Allowed permanently (see §8) |
 
@@ -1502,6 +1562,19 @@ graph. Device-only FIFO ownership of pending KV masks is likewise forbidden.
 Whole-zone reset remains a refusal, not a force-free, if any non-target or
 in-flight allocation would be affected.
 
+The per-device cache lives for the process; nothing in it stays sized for a
+model once no model is live. After the last model's release, and after a failed
+load's abort with no model live, each cache releases the PP MoE oneDNN ring and
+the oneDNN scratchpad pair. An arena nothing holds is released,
+its device memory goes back to the card, and the next load's start reserves the
+early arena from start values; the end of a refused load reserves nothing. A
+cache that gave everything back has its published planning terms put back to
+their start values. A holder is named, never reaped: a claimed ring slot, a
+reserved pair or a live lease keeps what it holds, and its cache keeps its
+terms. Liveness is process-wide, so a model live on any device keeps every
+device's arena. Detail: `docs/backend/sycl-memory-design.md`, "The release of
+the last model".
+
 ### 12.5 Locking and waiting
 
 The target lock inventory and mandatory order is concrete:
@@ -1510,9 +1583,9 @@ The target lock inventory and mandatory order is concrete:
 |---|---|---|
 | L1 | planned `lifecycle_registry_mutex`; current `g_tensor_inventory_mutex`, `g_sycl_load_summary_mutex`, `g_sycl_weight_identity_mutex`, `g_sycl_weight_usage_mutex`, `g_sycl_usage_unknown_mutex`, `g_layer_map_mutex`, `g_moe_phase_tiled_demoted_mutex`, `g_moe_phase_i8_demoted_mutex` | one process registry; transitional globals use sentinel rule below |
 | L2 | planned `device_execution_mutex[device]`; transitional `g_sycl_graph_compute_mutex` | ascending stable device ID |
-| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex`, the placement-plan publication lock `g_lifecycle_plan_mutex` (`unified-cache.cpp`) | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
-| L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, the MoE MMID workspace registry's `moe_mmid_workspace_registry::state::mutex` (`moe-mmid-workspace.cpp`) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
-| L5 | allocation/pool/work locks: current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the MMID workspace pools' `registry_pool_state::mutex` and `moe_mmid_workspace_pool::state::mutex` (`moe-mmid-workspace.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
+| L3 | planned `owner_registry_mutex` plus keyed `context_graph_mutex[ContextId]`; current `g_sycl_host_weight_extras_mutex`, `g_pending_kv_layer_masks_mutex`, `g_backend_context_by_device_mutex`, `sycl_ctx->graph_mutex`, `g_moe_expert_meta_mutex`, `g_expert_groups_mutex`, `g_expert_popularity_mutex`, `g_routing_indices_cache.mutex`, `moe_discovery_registry::mutex_` (`moe-discovery-state.hpp`), `g_moe_bias_state_mutex` | `(ModelId, ContextId, SessionId, SessionResetEpoch, GraphEpoch)` lexicographic |
+| L4 | cache/queue registries and metadata: current global `g_cache_rw_mutex`, per-device `unified_cache::rw_mutex_`, `unified_cache::deferred_frees_mutex_` (held around owner releases and taken by the enqueue paths), `managed_allocs_mutex_`, `direct_stage_mutex_`, `layer_state_mutex_`, `g_weight_cache_alloc_mutex`, `g_fp16_cache.mtx`, `g_moe_buffers_mutex`, `g_pipeline_copy_queue_mutex`, block-exec function-local `copy_queue_mutex`, `ggml_backend_sycl_context::control_host_allocs_mutex` (`common.hpp`), `managed_host_pinned_buffers_mutex()`, the MoE MMID workspace registry's `moe_mmid_workspace_registry::state::mutex` (`moe-mmid-workspace.cpp`), and, last, the device cache's SCRATCH marked set `unified_cache::marked_set_mutex_` (taken before any pool call; the pinned pool's `mutex_` is the one listed lock named inside it) | device ID, ContextId (zero if absent), cache instance ID, then listed lock ordinal |
+| L5 | allocation/pool/work locks: first, the pinned host pool's `pinned_chunk_pool::mutex_` (`pinned-pool.hpp`; `grow_into` and the footprint reconcile nest `g_runtime_alloc_mutex` under it); current `vram_zone::alloc_mutex`, `staging_mutex_`, `dma_staging_mutex_`, `onednn_scratch_mutex_`, `pp_moe_onednn_scratch_mutex_`, `persistent_scratch_mutex_`, `prefetch_lifecycle_mutex_`, `prefetch_mutex_`, `partial_mutex_`, `g_runtime_alloc_mutex`, `g_offload_pool_mutex`, `g_offload_host_alloc_by_tag_mutex`, `g_pp_moe_onednn_scratch_slot_state[device].mutex`, the MoE CONTROL reservation ledger's file-local `g_mutex` (`moe-control-plan.cpp`), graph-local `arena_handles_mutex`, the host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host holder plan's `host_holder_plans::mutex_` (both `host-zone-plan.hpp`), the host SCRATCH transactions' `unified_cache::host_scratch_txn_mutex_` (`unified-cache.hpp`), the ONEDNN zone plan's `unified_cache::onednn_zone_plan_mutex_` (`unified-cache.hpp`), the placement plans' `g_lifecycle_plan_mutex` (`unified-cache.cpp`), the MMID workspace pools' `registry_pool_state::mutex` and `moe_mmid_workspace_pool::state::mutex` (`moe-mmid-workspace.cpp`), the lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`), the lazy row cache's per-shard `lazy_row_cache::shard::mutex` (`lazy-row-cache.cpp`), the lazy landing slab's per-slot `lazy_landing_slot::lock` (`lazy-io-pool.hpp`), the lazy IO engine's per-pool queue lock `lazy_io_engine::mutex` (`lazy-io-pool.cpp`), the lazy STORAGE decline record's `g_lazy_decline_mutex` (`unified-cache.cpp`), and, last, the retained-handle store's `retained_handle_state::mutex` (`mem-handle.cpp`) | device ID, zone enum, subsystem ordinal above, then allocation ordinal |
 | isolated C | planned `aggregate_completion_mutex[device]` for completion/quarantine queue mechanics | never co-held with L1-L5 or another C lock |
 | isolated D | current `g_residency_diag_mutex`, `g_sycl_canonical_checksum_mutex`, `g_sycl_alloc_trace_mutex`, the zone-reset audit's `zone_audit_state::mutex` (`unified-cache.cpp`), and planned `lifecycle_diagnostic_mutex` | never co-held with L1-L5/C or another D lock; format records before taking D |
 
@@ -1582,26 +1655,29 @@ a `GGML_SYCL_PRIVATE_TESTING` witness kept by the mutex's one lock type,
 `retained_store_lock`), and the run fails if any did.
 
 `g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the staged, probe and
-published placement-plan snapshots. It is **L3**. The runtime context
-transaction, the expert loan and refill transactions, plan activation,
+published placement-plan snapshots. It is **L5**, because some of its holders
+hold an L4 lock (its paragraph after the planner's locks below lists them). The
+runtime context transaction, the expert loan and refill transactions, plan activation,
 republication and owner teardown take it under the L1 `g_tensor_inventory_mutex`.
 Load begin and end, the load-time measure and unload take it under no listed
 lock. The bound-load-candidate reads behind `global_placement_plan_owner()` and
 `acquire_bound_load_effect()` take it only on a thread bound to a load. The cache
 functions take that effect before their own cache locks. Under it,
 `lifecycle_replace_placement_plan` calls the MMID registry's `replace_plan`,
-which takes the registry mutex and then the pool mutexes. A snapshot it drops
+which takes the registry mutex (L4) and then the pool mutexes (L5, listed after
+this lock). The L4 take under this L5 lock is a known non-conformance, recorded
+with this lock below. A snapshot it drops
 holds a plain-data plan, so that destructor takes no lock. MUL_MAT_ID's
 republication into an empty snapshot also takes it under graph compute's L2 and
 L3 locks: see the graph-compute bullet below.
 
 The MMID workspace registry's `moe_mmid_workspace_registry::state::mutex`
 (`moe-mmid-workspace.cpp`, one process registry) is **L4**. It cannot take L3 or a
-lower-numbered rank, because two kinds of site take it while holding an L3 lock.
-
-- `ggml_sycl_mul_mat_id`'s exact-queue lookup, admission and quarantine recovery
-  run under `g_sycl_graph_compute_mutex` and `sycl_ctx->graph_mutex`.
-- The plan replacement above holds `g_lifecycle_plan_mutex`.
+lower-numbered rank, because `ggml_sycl_mul_mat_id`'s exact-queue lookup,
+admission and quarantine recovery take it under `g_sycl_graph_compute_mutex` and
+`sycl_ctx->graph_mutex`. The plan replacement above takes it under the L5
+`g_lifecycle_plan_mutex`. No rank satisfies both, so that site is the recorded
+non-conformance.
 
 It is also taken under L1 alone, by the context bind's follows question and
 reconcile and by the runtime transaction's materialization and retire. Load end,
@@ -1620,11 +1696,13 @@ run if that read cannot finish. `sycl-mmid-deferral-contract` pins the plan
 replacement's holder.
 
 The pool mutexes (`registry_pool_state::mutex`, and the standalone
-`moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device. They
-take no listed lock themselves.
+`moe_mmid_workspace_pool::state::mutex`) are **L5**, keyed by owner device, and
+listed right after `g_lifecycle_plan_mutex`, which the plan replacement holds
+when it takes them. They take no listed lock themselves.
 
-Five existing paths still break this section's rules under these locks. All five
-are known non-conformances, not exemptions.
+Five existing paths still break this section's rules under these locks, besides
+the plan replacement's registry take recorded with `g_lifecycle_plan_mutex` below.
+All five are known non-conformances, not exemptions.
 
 - **Graph compute takes L1 under L2 and L3.** The into-empty republication
   is the site that carries further locks with it.
@@ -1763,6 +1841,62 @@ it is gated by `tests/test-sycl-zone-reset-audit-source.py`, which asserts the
 guard precedes the lock at each of the four sites and carries positive-control
 mutants that reorder them.
 
+The host SCRATCH demand ledger's `host_scratch_ledger::mutex_` and the host
+holder plan's `host_holder_plans::mutex_` (`host-zone-plan.hpp`;
+docs/design/sycl-mmap-host-tier.md §4.4) guard, respectively, the per-context
+and per-holder SCRATCH demands of one device, and the pending and committed host
+holder plans of every backend context. Both sit at L5 with the allocation
+bookkeeping they size, and both are **strictly leaf: never held while any other
+lock is acquired, and no allocation, device work, callback or logging happens
+under either.** The ledger reads the zone's capacity before taking its lock.
+Under the lock it computes its target and reserves the deficit, so a notify that
+arrives while the grow runs finds the deficit covered and does not grow for it
+again. It releases the lock before the one `grow_zone` call, which takes the
+pinned pool's own locks, and retakes it only to give back a failed grow's
+reservation. A notify's `ok` reports its own grow only. A notify that finds the
+deficit covered by another notify's grow in flight makes no grow and returns
+`ok`, even if that grow then fails. The notify whose grow failed is the one that
+reports it: it returns false, and the pool WARNs for that one failed `grow_zone`
+call. The reservation it gives back is grown by the next notify, or by the miss
+path. Making the covered notify wait for the other grow's outcome would be a
+host wait, which the design forbids. The ledger's demand line prints after the
+release. The plan walk gathers each reserve graph's figures with no lock held,
+because the placement fact it asks for takes the inventory's L1 lock, and only
+then merges them under `host_holder_plans::mutex_`. `commit` and `drop`, the
+only writers of a committed plan, fold each changed device's committed plans
+into its merged state under that lock. `device_state`, which dispatch admission
+reads, copies one device's merged state under it and merges nothing. `commit`
+prints after releasing it. The slot re-size and the pools' re-size that follow a
+commit run with neither lock held.
+
+The host SCRATCH transactions' `unified_cache::host_scratch_txn_mutex_`
+(`unified-cache.hpp`; docs/design/sycl-mmap-host-tier.md §4.4, §M75) guards one
+device cache's open transactions: each context's owner, thread, mark and the
+chunks its zone grew while the transaction was open. It sits at L5 beside the
+ledger whose growth it records, and it is **strictly leaf: never held while any
+other lock is acquired, and no device work, callback or logging happens under
+it.** The one allocation under it is a transaction's own vector growth through
+the standard allocator, which takes no lock of this backend; a `bad_alloc`
+there leaves the transaction as it was and WARNs after the release. The grow
+hook runs after `grow_zone` has returned, so the pinned pool's `mutex_` is
+already released. A closing or truncating step takes its chunks out under the
+lock and releases it before it files them, so `marked_set_mutex_` and the
+pool's `mutex_` are taken only after it drops. The ledger's `drop_context` and
+`release_reserved`, and the witness line, also run after it drops.
+
+The ONEDNN zone plan's `unified_cache::onednn_zone_plan_mutex_`
+(`unified-cache.hpp`; docs/backend/sycl-memory-design.md, "Where the zone plan
+lives") guards one cache's stored plan for its own ONEDNN zone, the two figures
+the zone was sized from. It sits at L5 and is **strictly leaf: each of its five
+accessors takes it alone and calls only the pure rules of `zone-sizing.hpp`
+under it, with no allocation, device work, callback or logging.** A reader that
+holds only a device id takes `g_cache_rw_mutex` (L4) shared for the lookup and
+releases it before it takes this one, so that reader never holds the two
+together. Cache creation does hold `g_cache_rw_mutex` exclusively while the
+constructor's zone sizing stores the plan, the L4-before-L5 order; that is why
+the zone sizing reads and writes its own cache's plan through the members and
+never looks a cache up.
+
 The MoE CONTROL reservation ledger's `g_mutex` (`moe-control-plan.cpp`, `dimc`)
 guards the per-(device, plan) reservation table, the conversion generations, and
 the per-device planned-bytes publication. It sits at L5 with the allocation
@@ -1784,6 +1918,199 @@ because it runs from `moe_control_conversion_guard`'s destructor on the failure
 path. `tests/test-sycl-moe-control-plan-contract.py` gates the noexcept rollback
 and the generation stamping; `test-moe-control-plan` proves the commit/rollback
 state machine.
+
+The lazy IO pool registry's `g_lazy_registry_mutex` (`lazy-io-pool.cpp`, th32
+T3; design `sycl-storage-tier-lazy-tables.md` §3.3) guards the registry's pool
+slot and generation, the reap list, every pool's lease count and DYING flag, the
+reap-run and parked counters with their take-time snapshots, each pool's
+block ring with its slot span, creating transaction and `ensuring` flag, and the
+PRIVATE_TESTING hold hook. It sits at L5 and is a **true leaf: nothing is taken
+under it.** No lock is acquired, nothing is allocated, freed or waited on, and
+nothing is logged while it is held. A take that finds no pool reserves the next
+generation under it, builds its pool and reap node after the unlock, and
+installs them under it only if the generation still matches, that is, if no take
+installed a pool meanwhile. A take that lost joins the pool installed meanwhile,
+or takes again when that pool has already parked; either way it destroys its own
+pool after the unlock. The drop that reaches zero marks the pool DYING and links
+the pool's preallocated node into the reap list, which allocates nothing. A
+`FULL` reap swaps the list out under it and frees the parked pools after the
+unlock. A `WORKER` reap, which a pool worker runs after its read's lease drops,
+moves one parked pool's ring out under it per pass and frees that ring after the
+unlock; the pools and nodes stay parked for a `FULL` reap, since destroying a
+pool joins its workers. An ensure that finds no ring reserves `ensuring` under
+it, allocates the ring and starts the engine's workers after the unlock, and
+installs both under it unless the registry was shut down meanwhile, in which
+case it frees its ring after the unlock. The ring's allocation carries the
+`POOL` lifetime with owner kind `IO_POOL`, whose id is the pool's registry
+generation, so no model's or backend's owner check matches it. The owner check
+for that owner is silent while the registry still holds the generation, in its
+slot or parked for the `FULL` reap, and reports the ring's rows only once the
+generation is gone. Its predicate, `lazy_io_pool_generation_live()`, takes this
+mutex alone and returns before the check takes `g_runtime_alloc_mutex`, so the
+two are never held together.
+The hold hook, armed at the reap or at the take, runs with no lock held.
+A clone that finds its pool DYING unlocks before it logs and aborts. It may be
+taken while a non-leaf lock is held, as the staged candidate's clone under
+`g_tensor_inventory_mutex` is. The replaced candidate's lease is not dropped
+under that guard: the stage hands it back through the slot's out-slot, and
+`stage_inventory_plan`'s loop drops it after each device's call returns. The
+registry mutex is never taken while another global L5 lock is held:
+`g_lifecycle_plan_mutex` and the retained-handle store's mutex are never held
+when it is taken, and it is never held when they are taken, so the three have no
+order. Once `lazy_io_pool_mark_shut_down()` has run, a lease's drop decrements
+without taking it, so a lease destroyed during static destruction never touches
+it. The host SCRATCH ledger's and holder plan's mutexes are strict leaves, so
+they have no order with it either. The load's stage and the plan dry run each
+take it through the coverage wrapper before their first planner call, and the
+planners' coverage reads go through the lease that take holds, never through
+this mutex.
+
+The lazy row cache's per-shard `lazy_row_cache::shard::mutex` (`lazy-row-cache.cpp`,
+th32 T4; design `sycl-storage-tier-lazy-tables.md` §6.3, §6.4) exists once per
+shard of each STORAGE table's cache, and the cache is a member of its table, not
+a global. A shard's mutex guards that shard's slice of the open-addressing index,
+the key words of the slots the shard owns, its fill and live counts, and its
+CLOCK hand. It sits at L5 and is a **true leaf: nothing is taken under it.** A
+lookup holds it for the probe and the one-row copy into the caller's buffer; an
+insert holds it for the probe, the CLOCK sweep, and the one-row copy into the
+slot. Nothing is allocated, freed, waited on, charged or credited, and nothing is
+logged while it is held, and no production callback runs under it. Two shards' mutexes are
+never held together: a yield takes them one at a time to erase a chunk's slots,
+then drops the chunk's memory with none held. That drop is the release point,
+and the free it runs credits the host ledger, which is why the yield never takes
+a ledger path under a shard lock. The chunk's withdrawn flag is an atomic set
+before the first shard is locked, so an insert that takes a shard's lock after
+the yield passed it skips the chunk. Under `GGML_SYCL_PRIVATE_TESTING` only, the
+test hook at two points runs under it so that a test can hold one shard while it
+proves another proceeds; a production build has no hook.
+
+The lazy IO engine's `lazy_io_engine::mutex` (`lazy-io-pool.cpp`, th32 T5;
+design `sycl-storage-tier-lazy-tables.md` §5.2, §5.2.1) is the IO pool's queue
+lock. It exists once per IO pool, a member of the pool's engine, so it is not a
+global. It guards the queue of §5.2.1 (the per-context entry sets, the in-flight
+table and the dispatch log), the count of reads the workers have picked and not
+finished, and the stop flag. It sits at L5 and is a **true leaf: nothing is
+taken under it.** A worker holds it to pick a read and again to complete it;
+the read itself, the delivery to the waiters, the lease drop, the reap and every
+log run after the unlock. A submit queues the read's entries under it, which
+allocates from the C++ heap only; the leases a submit did not use and the reads
+a completion or a cancel returns are destroyed after the unlock, so no lease
+drop and no unified-cache allocation or free happens while it is held. A
+worker's wait for work and shutdown's wait for the picked reads release it. It
+is never held while the registry's `g_lazy_registry_mutex` is taken, and it is
+never taken while that mutex is held: a pool's engine is started before its
+install and destroyed after the reap's unlock, so the two have no order.
+
+The lazy landing slab's per-slot `lazy_landing_slot::lock` (`lazy-io-pool.hpp`,
+th32 T5; design `sycl-storage-tier-lazy-tables.md` §5.3) exists once per slot of
+a STORAGE request's landing slab, which a context owns, so it is not a global.
+It guards the slot's epoch and the IO reaper's copy of one waiter's bytes into
+the slot. It sits at L5 and is a **true leaf: nothing is taken under it.** The
+reaper holds it for the epoch and cancel test and the one copy; the row cache's
+insert and the ticket's decrement run after the unlock, so it is never held with
+a shard's mutex. Nothing is allocated, freed, waited on or logged while it is
+held, and no callback runs under it.
+
+The lazy STORAGE decline record's `g_lazy_decline_mutex` (`unified-cache.cpp`,
+th32 T5; design `sycl-storage-tier-lazy-tables.md` §3.3) guards the tables each
+open load has printed a STORAGE decline line for, keyed by the load's
+transaction, so that a load prints a table's line once across its devices and
+passes. It sits at L5 and is a **true leaf: nothing is taken under it.** The
+planner holds it for one set insert, which allocates from the C++ heap only,
+and prints the line after the unlock. The load-end and load-abort notes hold it
+for one erase before they take `g_cache_rw_mutex`. Nothing is freed into the
+unified cache, waited on or logged while it is held, and no callback runs under
+it. It may be taken while a non-leaf lock is held, since the planner runs under
+its callers' locks.
+
+`g_lifecycle_plan_mutex` (`unified-cache.cpp`) guards the placement plans' three
+maps: the load candidates, the probe plans, and the published plans by model and
+load. It is ranked by what is held when it is taken, and that reaches L4:
+`unified_cache_note_model_load_end()` holds the global `g_cache_rw_mutex` shared
+while the load-end dump capture reads the candidate, and an allocation under a
+cache's `rw_mutex_` reads the bound load's candidate plan through
+`coherent_cache_placement_plan_owner()`. The stage and activation paths take it
+under the L1 `g_tensor_inventory_mutex`. No rank below L5 is consistent with
+those holders. Its critical sections are map lookups, inserts and erases and
+`shared_ptr` copies. A snapshot displaced or erased under it frees only heap
+memory, because a placement plan holds no allocation handle. A staged or
+published record also holds the IO pool's ring lease (th32 §3.3) beside its
+snapshot, never inside it, so a reader that copies the snapshot takes no
+reference on the pool. A lease that a stage, a publish, an abort or an erase
+displaces is moved under this mutex into a local declared before it and dropped
+after the unlock, since a drop takes the registry's `g_lazy_registry_mutex`;
+so that mutex is never taken while this one is held.
+
+One path is **not conforming**, and it is recorded here rather than implied
+away. `lifecycle_replace_placement_plan()` calls the MoE MMID workspace
+registry's `replace_plan()` under it, which takes that registry's
+`state::mutex` (L4) and, on the prepared-replacement branch, each old pool's
+`registry_pool_state::mutex` (L5, listed after this lock;
+`moe-mmid-workspace.cpp`). The L4 take under this L5 lock is a lower rank taken
+under a higher one. The old context that branch displaces is no longer
+destroyed under these locks: `replace_plan()` hands it to a holder that
+`lifecycle_replace_placement_plan()` declares before this lock, so the final
+`mem_handle` of its pool blobs, which releases through `g_runtime_alloc_mutex`,
+is dropped after the unlock. The rank inversion stays a failing census item
+until `replace_plan()` runs outside this lock.
+
+The lazy tables' **witnessed locks** (design `sycl-storage-tier-lazy-tables.md`
+§3.3, §11 T5) are five: the lazy IO pool registry's `g_lazy_registry_mutex`, the
+L1 `g_tensor_inventory_mutex`, `g_lifecycle_plan_mutex`, the lazy IO engine's
+`lazy_io_engine::mutex`, and each STORAGE table's strand lock. Each is declared
+`witnessed_mutex` (`witnessed-mutex.hpp`), and four entry points run with none
+of them held: the ring reap (`ggml_sycl_lazy_ring_reap`), the block ring's
+ensure (`block_ring_ensure`, whose allocation charges the budget ledger and may
+yield), the host ledger's yield round, and `host_ledger_sample()`. A ring
+lease's drop runs with none held as well, since a drop takes the registry's
+mutex. The witness changes no rank: each lock keeps its row above. Four of the
+five are witnessed today. The strand lock arrives with the strands themselves
+(th32 T5c), and until then the reap-holding test seam reports its index as not
+wired.
+
+A release build's `witnessed_mutex` is `std::mutex` itself, with a
+`static_assert` on its size, and records nothing. A `GGML_SYCL_PRIVATE_TESTING`
+build's records each instance the calling thread holds, with its name, in an
+eight-entry `thread_local` table, through every guard, `unique_lock` relock and
+`condition_variable_any` wait, and aborts naming a ninth. In that build:
+
+- the reap called under a held one refuses: it logs `[HOST-PLAN-BUG] ring reap
+  refused: <name> held`, frees nothing and returns, so its parked pools wait for
+  the next reap;
+- a lease dropped under one logs `[HOST-PLAN-BUG] ring lease dropped with <name>
+  held` and completes, and under the registry's own mutex it aborts;
+- `block_ring_ensure` entered under one aborts at its entry with
+  `block_ring_ensure: the calling thread holds <name>`, before it refuses,
+  reserves or allocates anything. This is a plain test-build abort, not
+  `GGML_SYCL_WITNESS`, whose switch and failure function live in
+  `unified-cache.cpp`, which the pool's host-only test targets do not link;
+- `GGML_SYCL_WITNESS` aborts the yield round and the sample.
+
+Under `GGML_SYCL_STRICT_LEASES=1`, each `[HOST-PLAN-BUG]` WARN of the ring
+reap, the lease drop and the shutdown's lease drain is followed by an abort
+naming the same figures and ending `under GGML_SYCL_STRICT_LEASES=1` (design
+`sycl-storage-tier-lazy-tables.md` §10). There are five such strict aborts:
+
+1. the reap's refusal under a held witnessed lock (test builds only, the only
+   builds that record holders);
+2. a lease's drop under a held witnessed lock (test builds only);
+3. a FULL reap that finds a parked pool still holding a lease;
+4. the reap's catch of a step that threw, naming the exception's `what()`;
+5. the shutdown drain (`ggml_sycl_lazy_lease_drain`) at a published record that
+   was never erased, naming its leaked lease's model and load.
+
+`ring_lease::clone()`'s `[HOST-PLAN-BUG]` line, a pool DYING under a held lease,
+aborts in every mode.
+
+Three tests gate this. `test-sycl-lazy-lock-witness` holds each witnessed lock
+in turn and gates the reap's refusal and the aborts of the yield round and the
+sample, with a no-lock run as the negative control.
+`test-sycl-lazy-io-engine-host` gates the drop's line and its abort under the
+registry's mutex, the ensure's entry abort, and strict aborts 1 to 4, each in a
+child whose fixture switch stands for the variable. `test-sycl-lazy-reap-points`
+gates strict abort 5 in a child started under `GGML_SYCL_STRICT_LEASES=1`.
+Strict aborts 1 to 5 and the ensure's entry abort each have a mutant
+registration scored on the child returning past its site.
 
 PP MoE oneDNN scratch admission (`moe-scratch-admission.hpp`, `ijla`) adds **no
 lock at all**, and that is a load-bearing property rather than an omission. The
@@ -1863,6 +2190,19 @@ backing lease; or call teardown/reset code that can acquire another listed lock.
 Event callbacks only enqueue an identity-tagged completion under isolated C and
 return. Lock-rank instrumentation must expose acquire/release, wait, callback,
 blocking-call, and final-destructor hooks so H8/M7 test every prohibition.
+
+**The `HOST_CPU` tier adds no lock and waits for nothing (llama.cpp-th32 T1).** Its raw
+wrapper, `host-cpu-mapping.cpp`, holds no mutex: it is a device-free translation unit
+whose only state is the private munmap counter of the test build, an atomic. Allocation
+and release go through the locks every other tier already takes, and in the same order:
+the owner's release coordinator, then `g_runtime_alloc_mutex` (L5, leaf) for the registry
+record and `alloc_registry`'s own `shared_mutex` for the pointer-type record. Neither is
+held across `mmap` or `mlock`. `mlock` without `MLOCK_ONFAULT` faults every page in
+before it returns, which on a multi-GiB request is seconds of wall time, so a lock held
+across it would stall every allocation and every lookup on the process; `unified_alloc`
+therefore calls the wrapper before it publishes anything, and the registry record is
+written only after the mapping is locked. The release (`unified_free_record`) takes no
+lock of its own and drops the lock with the mapping, in one `munmap`.
 
 ### 12.6 `mem_handle` and event-held leases
 

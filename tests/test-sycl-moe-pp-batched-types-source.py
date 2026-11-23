@@ -11,7 +11,7 @@ dequant. These claims pin that shape:
       ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
       and neither tests GGML_TYPE_MXFP4 itself;
   (b) the f16 table lists each required type on AOS, Q4_0, Q8_0, Q4_K and Q6_K on AOS and SOA, MXFP4 on SOA only,
-      never the direct-kernel types, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
+      never Q1_0 or NVFP4, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
       without a pin is red), and every type it lists has a case in convert.cpp's
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
@@ -38,9 +38,10 @@ dequant. These claims pin that shape:
       planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
   (i) the f16 arm runs in the weight slot the inventory planned, never a wider one: the backend keeps the planned
       slot size as the inventory gave it (no plan-time widening, which displaced routed experts with no cost
-      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula and hands
-      the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups the active
-      experts by what the slot it claimed holds;
+      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula of its own
+      (the expert counts reach it only through the row-scaled slots' shared sizer and that sizer's refusal warning)
+      and hands the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups
+      the active experts by what the slot it claimed holds;
   (j) one opt-out knob, GGML_SYCL_MOE_PP_F16_BATCHED_AOS, spelled once, read once, consulted by the support helper,
       dropping every non-MXFP4 entry (SOA ones included), so it leaves exactly the MXFP4 executor, registered in
       sycl_env_settings[] so the non-default report names it, and catalogued;
@@ -131,8 +132,8 @@ REQUIRED_AOS = [
 # experts SOA; the device test's RED run refused both).
 REQUIRED_SOA = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q6_K"]
 AOS_SOA_EXPR = "layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA"
-# Q1_0 and NVFP4 run on a device only through their direct kernel (moe_type_needs_direct_kernel); float experts are
-# not a dequant case.
+# Q1_0 and NVFP4 run on a device through their MMVQ id kernel, and the table lists them only once
+# test-moe-pp-batched-dequant runs them against the CPU; float experts are not a dequant case.
 FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
 AOS_EXPR = "layout == GGML_LAYOUT_AOS"
 KNOB = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS"
@@ -180,10 +181,14 @@ PHASE_WAIT = ("if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_read
 COMPARE_HEAD = "if (batched_compare && !active_experts.empty()) {"
 # A host wait, spelled as the stream-enqueue gate spells it.
 ANY_WAIT_RE = re.compile(r"\bwait\s*\(|\bwait_and_throw\s*\(")
-# The planner site: the inventory's ring sizes become the backend's globals and the unified cache's planned scratch.
-PLAN_SITE_HEAD = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;"
-PLAN_SITE_CALL = ("unified_cache_set_planned_pp_moe_onednn_scratch( ctx->device, "
-                  "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,")
+# The planner site: the inventory's ring sizes become the unified cache's planned scratch, in the one publish helper the
+# stage and the plan dry run both call (llama.cpp-4zup), and the stage keeps what the helper published as its globals.
+PUBLISH_FN = "ggml_sycl_inventory_publish_planner_inputs"
+PLAN_SITE_HEAD = "in.pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;"
+PLAN_SITE_CALL = "unified_cache_set_planned_pp_moe_onednn_scratch( device, in.pp_moe_onednn_weight_slot_bytes,"
+STAGE_PUBLISH = ("const ggml_sycl_inventory_planner_inputs published = "
+                 "ggml_sycl_inventory_publish_planner_inputs(ctx->device, inventory);")
+STAGE_KEEPS = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = published.pp_moe_onednn_weight_slot_bytes;"
 # The device test's capped cases: one Q4_0 case per cap, each in its own process.
 GROUP_CAPS = "constexpr int k_group_caps[] = { 1, 3 };"
 GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || buffers != 2"
@@ -775,21 +780,46 @@ def claim_i_slot(s):
                  "g_tensor_inventory_pp_moe_onednn_scratch_bytes"):
         if gone in sycl:
             fails.append(f"{gone} is still in ggml-sycl.cpp: the planned weight slot must not be widened")
-    # Every write to the planned weight slot's global is a reset or the inventory's own value.
+    # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, or as the
+    # publish helper returned it to the stage. Every write to the helper's slot is the inventory's own value or a reset
+    # to 0 (a ring that cannot be sized is planned as no ring), and at least one write takes the inventory's own value.
+    publish = one_definition(sycl, PUBLISH_FN) or ""
+    kept = ["0", "inventory->pp_moe_onednn_weight_slot_bytes"]
+    if STAGE_PUBLISH in sycl:
+        kept.append("published.pp_moe_onednn_weight_slot_bytes")
     writes = re.finditer(r"\bg_tensor_inventory_pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl)
     for m in writes:
-        if m.group(1) != "=" or m.group(2).strip() not in ("0", "inventory->pp_moe_onednn_weight_slot_bytes"):
+        if m.group(1) != "=" or m.group(2).strip() not in kept:
             fails.append(f"the planned weight slot is written as `{m.group(0)}`, not reset or taken from the inventory")
+    if STAGE_KEEPS not in sycl:
+        fails.append("the stage does not keep the weight slot the publish helper took from the inventory")
+    helper_writes = list(re.finditer(r"\bin\.pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", publish))
+    if not helper_writes:
+        fails.append("the publish helper does not take the weight slot from the inventory")
+    helper_kept = ("0", "inventory->pp_moe_onednn_weight_slot_bytes")
+    for m in helper_writes:
+        if m.group(1) != "=" or m.group(2).strip() not in helper_kept:
+            fails.append(f"the publish helper writes the weight slot as `{m.group(0)}`, "
+                         "not the inventory's own value or a reset to 0")
+    if helper_writes and not any(m.group(1) == "=" and m.group(2).strip() == helper_kept[1] for m in helper_writes):
+        fails.append("the publish helper only resets the weight slot: no write takes the inventory's own value")
     # The planner site publishes the inventory's slot, with no formula of its own between the two.
-    head = sycl.find(PLAN_SITE_HEAD)
-    call = sycl.find("unified_cache_set_planned_pp_moe_onednn_scratch(", head) if head >= 0 else -1
-    site = statement(sycl, None, start=call) if call >= 0 else None
+    head = publish.find(PLAN_SITE_HEAD)
+    call = publish.find("unified_cache_set_planned_pp_moe_onednn_scratch(", head) if head >= 0 else -1
+    site = statement(publish, None, start=call) if call >= 0 else None
     if head < 0 or site is None:
         fails.append("the planner site that takes the weight slot from the inventory and plans the ring was not found")
     else:
-        site = sycl[head:call] + site
+        site = publish[head:call] + site
         if PLAN_SITE_CALL not in site:
             fails.append("the unified cache's planned scratch is not given the inventory's weight slot")
+        # The expert counts reach the site only through the row-scaled slots' shared sizer and the warning that names
+        # them when it cannot size a ring. Neither touches the weight slot, so both calls are left out of the scan.
+        for exempt in ("ggml_sycl::pp_moe_onednn_slots_at(", "GGML_LOG_WARN("):
+            at = site.find(exempt)
+            close = match_close(site, at + len(exempt) - 1) if at >= 0 else -1
+            if close > 0:
+                site = site[:at] + site[close:]
         for formula in ("n_expert", "255", "sizeof(sycl::half)"):
             if formula in site:
                 fails.append(f"the planner site sizes the ring with `{formula}`: the weight slot is widened again")
@@ -1039,13 +1069,13 @@ def claim_q_group_knob(s):
         fails.append("the device test does not require at least three groups at the slot's own grouping")
     if GROUP_CAPS not in test:
         fails.append(f"the device test does not run the capped cases `{GROUP_CAPS}`")
-    if "for (int cap : k_group_caps) { if (!run_capped_child(cap)) { ++failed; } }" not in test:
+    if 'for (int cap : k_group_caps) { if (!run_child_case("--group-cap", cap)) { ++failed; } }' not in test:
         fails.append("the device test does not run a child process for every cap and count each failed one")
     if "if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) { return true; }" not in test:
         fails.append("a capped case passes on something other than its child exiting 0")
     if "make_case(GGML_TYPE_Q4_0, 300, k_used, rng), true, group_cap) ? 0 : 1;" not in test:
         fails.append("a capped case's child does not exit 1 when its case fails")
-    if 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", "--group-cap",' not in test:
+    if 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(),' not in test:
         fails.append("a capped case does not run in a fresh process of the test itself")
     sets = test.count(f'setenv("{GROUP_KNOB}",')
     if sets != 1 or f'setenv("{GROUP_KNOB}", argv[2], 1);' not in test:
@@ -1184,7 +1214,10 @@ MUTANTS = [
     ("b", "tables", "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_SOA;",
      "case GGML_TYPE_MXFP4: return layout == GGML_LAYOUT_AOS;"),
     ("b", "tables", "case GGML_TYPE_IQ4_XS:", "case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q1_0:"),
-    ("b", "tables", " || layout == GGML_LAYOUT_SOA;", ";"),
+    # Anchored on the f16 table's last SOA case: the MMVQ executor and capability tables answer Q8_0 with the same
+    # expression, and replace() mutates only the first occurrence.
+    ("b", "tables", "case GGML_TYPE_Q6_K: return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;",
+     "case GGML_TYPE_Q6_K: return layout == GGML_LAYOUT_AOS;"),
     ("b", "convert", "return dequantize_row_q6_K_sycl_reorder;", "return nullptr;"),
     ("b", "sycl", "if (pp_q8_0_soa(expert)) {", "if (false) {"),
     ("b", "sycl", "} else if (!pp_q8_0_soa(expert)) {", "} else {"),
@@ -1241,9 +1274,14 @@ MUTANTS = [
      "ggml_sycl_moe_pp_onednn_batched_claims_tensor("),
     ("h", "sycl", " && !ggml_sycl_moe_pp_batched_admits_op(op, device) &&", " &&"),
     # The widening back, the admission asked for every expert, and the groups sized from the request, not the slot.
-    ("i", "sycl", "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;",
-     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(inventory->pp_moe_onednn_weight_slot_bytes, "
+    ("i", "sycl", PLAN_SITE_HEAD,
+     "in.pp_moe_onednn_weight_slot_bytes = std::max(inventory->pp_moe_onednn_weight_slot_bytes, "
      "size_t(inventory->n_expert) << 20);"),
+    # The stage widens what the helper published, or keeps a value of its own instead.
+    ("i", "sycl", STAGE_KEEPS,
+     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(published.pp_moe_onednn_weight_slot_bytes, "
+     "size_t(inventory->n_expert) << 20);"),
+    ("i", "sycl", STAGE_PUBLISH, "const ggml_sycl_inventory_planner_inputs published = {};"),
     ("i", "sycl", "weight_bytes = f16_expert_bytes;", "weight_bytes = f16_expert_bytes * active_count;"),
     ("i", "sycl", "moe_pp_batched_f16_plan_groups(reserved.weight_size, ",
      "moe_pp_batched_f16_plan_groups(weight_bytes * active_count, "),
@@ -1343,7 +1381,7 @@ MUTANTS = [
     ("q", "device_test", "groups < k_min_groups", "groups < 1"),
     # No single-expert case; no child run; the cap set for the whole run; the child's cap never set; a loose count.
     ("q", "device_test", GROUP_CAPS, "constexpr int k_group_caps[] = { 3 };"),
-    ("q", "device_test", "if (!run_capped_child(cap)) {", "if (false) {"),
+    ("q", "device_test", 'if (!run_child_case("--group-cap", cap)) {', "if (false) {"),
     ("q", "device_test", 'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);',
      f'setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1); setenv("{GROUP_KNOB}", "3", 1);'),
     ("q", "device_test", f'setenv("{GROUP_KNOB}", argv[2], 1);', ""),
@@ -1351,7 +1389,8 @@ MUTANTS = [
     # A waited child passes whatever its status; the child exits 0 on a failed case; a failed child is not counted.
     ("q", "device_test", "if (waited && WIFEXITED(status) && WEXITSTATUS(status) == 0) {", "if (waited) {"),
     ("q", "device_test", "true, group_cap) ? 0 : 1;", "true, group_cap) ? 0 : 0;"),
-    ("q", "device_test", "if (!run_capped_child(cap)) { ++failed; }", "if (!run_capped_child(cap)) { }"),
+    ("q", "device_test", 'if (!run_child_case("--group-cap", cap)) { ++failed; }',
+     'if (!run_child_case("--group-cap", cap)) { }'),
     # No barrier on the GEMMs; the scratch released before the barrier; the leases not held; the helper holds none.
     ("r", "sycl", FAIL_BARRIER, "const sycl::event drained = stream->ext_oneapi_submit_barrier();"),
     ("r", "sycl", FAIL_BARRIER + " " + FAIL_RETAIN + " " + CLAIM_RELEASE,

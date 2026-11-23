@@ -551,7 +551,7 @@ function(hf_download version out_var out_resolved)
         if("${resolved}" STREQUAL "latest" AND NOT "${version}" STREQUAL "")
             # 'latest' is a floating pointer into the bucket: its contents change
             # without any commit here, so a bundle that drops an asset breaks the
-            # build with nothing in the history to attribute it to (llama.cpp-fdm1).
+            # build with nothing in the history to attribute it to.
             message(WARNING "UI: version '${version}' is not published; embedding the "
                             "unpinned 'latest' bundle, whose contents can change at any time")
         endif()

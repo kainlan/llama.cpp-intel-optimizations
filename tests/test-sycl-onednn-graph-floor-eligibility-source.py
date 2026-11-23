@@ -286,6 +286,24 @@ def test_changing_the_tolerance_constant_is_caught_on_either_side() -> None:
     ), "the fattn-onednn.cpp tolerance check still passes after changing 1e-3f to 1e-4f"
 
 
+def test_layers_with_sinks_do_not_count_toward_the_floor() -> None:
+    # The real gate refuses an op with attention sinks before it looks at the head size, so a layer that carries
+    # sinks never draws Graph scratch and must not raise the per-class head maxima the floor is sized from. The
+    # all-layers maximum feeds the non-FA guard, which runs on every layer, so it still counts them.
+    assert re.search(r"if\s*\(\s*params\.sinks\s*\)\s*\{\s*return\s+ggml_sycl_onednn_fa_reject\(",
+                     FATTN_ONEDNN_PLAN_BODY), "the real gate no longer refuses sinks: revisit this test"
+    code = strip_comments(POPULATE_INVENTORY_BODY)
+    all_max = code.index("n_head_all_max = std::max(n_head_all_max, hparams.n_head(il));")
+    skip = re.search(r"if\s*\(\s*sinks_layer_mask\s*&&\s*sinks_layer_mask\[il\]\s*\)\s*\{\s*continue;\s*\}", code)
+    assert skip, "populate_inventory must skip layers with sinks before the per-class maxima"
+    assert all_max < skip.start(), "the sinks skip must come after the all-layers maximum"
+    ctx_max = code.index("n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));")
+    assert skip.start() < ctx_max, "the sinks skip must come before the per-class maxima"
+    assert LLAMA_MODEL_CPP.count("llama_model_sycl_attn_sinks_layers(ml, ") == 2, (
+        "both inventory builders build the mask"
+    )
+
+
 if __name__ == "__main__":
     import sys
 

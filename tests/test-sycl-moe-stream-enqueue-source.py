@@ -29,7 +29,8 @@ What this gate pins:
     boundary runner's REFUSED count. A loan this prompt asked for that comes back REFUSED (never BUSY, which the runner
     re-posts) latches until end_prompt, with one WARN under an explicit ring or a trace;
   - a layer answering RING_UNAVAILABLE under an explicit ring or a trace prints one WARN per prompt that names the rule
-    (the first is the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
+    (the first is a layer only the plan's backing keeps from the executor, "host experts left mapped by the plan",
+    then the executor's claim, "executor does not claim") and the ring's inputs, in a fixed format, through the
     decision log's WARN sink; the flag is cleared by end_prompt and never per micro-batch (lead ruling c-kcyf), and the
     phase logs nothing else of its own but the refused-loan line, under the same gating;
   - begin_layer reports every layer it decides, under every policy, so the decision log keeps the cost model's choice;
@@ -50,9 +51,10 @@ What this gate pins:
     call.plan, the plan the index build holds (lead ruling c-gi44); only the check's two-argument entry point, the
     batched executor's own route, reads the device's plan, by passing no plan;
   - the staged route refuses through one helper, its only caller (llama.cpp-o9uw),
-    ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel for a type with no
-    direct-kernel requirement (Q1_0 and NVFP4 run only through their direct kernel, which the recipe validator and the
-    executor choice ask through moe_type_needs_direct_kernel);
+    ggml_sycl_moe_staged_capability_refusal, which admits only a supported MMVQ_COMPAT kernel and asks no type; the
+    executor choice asks no type either, and the recipe validator checks the direct kernel's workspace by that kernel.
+    Q1_0 and NVFP4 are named once, by moe_type_has_immutable_host_recipe, which only the validator's host check and
+    the prompt CPU island ask;
   - a region closes on the event of its last copy;
   - a refilled region's copies wait for its read gate: the barrier the executor submits behind the dequants of the
     window the region last held and hands to window_done (lead ruling c-o9uw-1), recorded for the region holding that
@@ -195,7 +197,11 @@ SNAPSHOT = "prompt_ids_snapshot = prompt_ids_entry.host_ids;"
 HYBRID_WITH_PLAN = "const bool moe_hybrid_with_plan ="
 
 COPY_DECL = "copied = mem_copy_async("
-REORDER_CALL = "ggml_sycl_reorder_weight_gpu("
+# The backend's AOS-to-SOA fills. reorder_rows_to_soa is declared in common.hpp and so callable from the phase source;
+# the others are file-local to ggml-sycl.cpp today. A call of any of them in the phase would be a reorder submission.
+REORDER_FILLS = ("reorder_rows_to_soa", "reorder_aos_to_soa_device", "reorder_data_internal_",
+                 "ggml_sycl_reorder_weight_cpu")
+REORDER_RE = re.compile(r"\b(?:" + "|".join(REORDER_FILLS) + r")\s*\(")
 RETAIN = "retain_handles_until_event({ aos, host }, copied);"
 TABLE_WRITE = "table_[key] = { aos, copied, MOE_STREAM_RING_SLOT_LAYOUT, item.consumer };"
 ABORT = 'GGML_ABORT("[MOE-EXEC] stream enqueue failed: %s", e.what());'
@@ -311,10 +317,10 @@ def test_copy_mutants():
 def claim_window_copy_is_the_only_submission(phase: str) -> bool:
     """W2 (Task 2b of llama.cpp-a2xb): the executor's dequant kernel reads every window matrix in place as AOS, so
     stage_window submits exactly one thing per matrix, its copy: no reorder and no kernel of its own. The phase submits
-    no reorder anywhere: the SOA staging that ggml_sycl_reorder_weight_gpu served is retired."""
+    no reorder anywhere: it calls none of the backend's AOS-to-SOA fills (REORDER_FILLS)."""
     n = norm(phase)
     s = body(n, STAGE_SIG)
-    return (bool(s) and s.count("mem_copy_async(") == 1 and REORDER_CALL not in n
+    return (bool(s) and s.count("mem_copy_async(") == 1 and not REORDER_RE.search(n)
             and ".submit(" not in s and "->submit(" not in s)
 
 
@@ -332,8 +338,8 @@ def test_window_copy_only_mutants():
     # A second copy of the matrix.
     second_copy = " (void) mem_copy_async(aos, host, item.src_bytes, cache.get_bcs_queue(), { copied });"
     assert not c(mutate(PHASE, RETAIN, RETAIN + second_copy))
-    # The SOA reorder back, on the compute queue behind the copy.
-    reorder = " (void) ggml_sycl_reorder_weight_gpu(*ccs_, aos, item.type, { copied });"
+    # An SOA reorder of the landed slot, through the one fill the phase source can reach.
+    reorder = " (void) reorder_rows_to_soa(static_cast<uint8_t *>(aos), item.type, 0, 0, item.src_bytes, ccs_);"
     assert not c(mutate(PHASE, RETAIN, RETAIN + reorder))
     # A kernel of the stage's own.
     assert not c(mutate(PHASE, RETAIN, RETAIN + " ccs_->submit([&](sycl::handler & h) { (void) h; });"))
@@ -862,73 +868,105 @@ BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
 BATCH_HPP = read(BATCH_HPP_REL)
 BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"
 STAGED_CAP_SIG = ("static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const "
-                  "moe_route_capability & cap, ggml_type type)")
+                  "moe_route_capability & cap)")
 STAGED_CAP_STEPS = (
     "if (!cap.supported) { return ggml_sycl::moe_staged_route_refusal::UNSUPPORTED; }",
     "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) { return ggml_sycl::moe_staged_route_refusal::KERNEL; }",
-    "if (ggml_sycl::moe_type_needs_direct_kernel(type)) { return ggml_sycl::moe_staged_route_refusal::DIRECT_KERNEL; }",
     "return ggml_sycl::moe_staged_route_refusal::NONE;",
 )
-ROUTE_CAP_ASK = "ggml_sycl_moe_staged_capability_refusal(cap, src0->type);"
-DIRECT_SIG = "inline bool moe_type_needs_direct_kernel(ggml_type type)"
-DIRECT_BODY = "{ return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4; }"
+ROUTE_CAP_ASK = "ggml_sycl_moe_staged_capability_refusal(cap);"
+IMMUTABLE_SIG = "inline bool moe_type_has_immutable_host_recipe(ggml_type type)"
+IMMUTABLE_BODY = "{ return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4; }"
+IMMUTABLE_CALL = "moe_type_has_immutable_host_recipe("
 VALIDATE_SIG = "inline bool validate_moe_execution_recipe("
 CHOOSE_SIG = "inline moe_batch_executor_choice choose_moe_batch_executor("
-DIRECT_USES = (
-    "if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_needs_direct_kernel(recipe.request.type)) {",
-    "const bool direct_q1_nvfp4 = moe_type_needs_direct_kernel(recipe.request.type);",
-    "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
-    "moe_type_needs_direct_kernel(operand.recipe().request.type);",
-)
+# The predicate's only uses: the validator's exact check of a host workspace, and the prompt CPU island's refusal.
+IMMUTABLE_HOST_USE = ("if (recipe.kind == moe_batch_executor::HOST_CPU && "
+                      "moe_type_has_immutable_host_recipe(recipe.request.type)) {")
+IMMUTABLE_ISLAND_USE = "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { return false; }"
+# The validator checks the direct kernel's recipe by the kernel the recipe names.
+DIRECT_KERNEL_KEY = "if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {"
+# The executor choice's old early return: it refused every Q1_0/NVFP4 device recipe, whatever the capability said.
+CHOOSE_EARLY_RETURN = ("if (operand.recipe().kind != moe_batch_executor::HOST_CPU && "
+                       "moe_type_has_immutable_host_recipe(operand.recipe().request.type)) { "
+                       "out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED; return out; }")
 
 
 def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
-    """llama.cpp-o9uw: the staged-route resolver asks one helper, which admits a supported MMVQ_COMPAT kernel and
-    nothing else, and refuses a type that runs only through its direct kernel. Which types those are is one predicate,
-    the one the recipe validator and the executor choice ask, and neither of those spells the types out. The resolver
-    is the helper's only caller: the ring stages from the library claim alone (W2) and asks no kernel predicate."""
+    """The staged-route resolver asks one helper, which admits a supported MMVQ_COMPAT kernel and nothing else and asks
+    no type: the kernel is the one a resident expert of the slot's (type, layout) runs, so the capability's kernel is
+    the whole answer. The resolver is the helper's only caller: the ring stages from the library claim alone (W2) and
+    asks no kernel predicate. The executor choice asks no type either, so it takes every kernel the capability query
+    answers, Q1_0 and NVFP4 included; the recipe validator keys the direct kernel's exact workspace check by that
+    kernel. One predicate names Q1_0 and NVFP4, for their immutable host recipe, and only the validator's host check
+    and the prompt CPU island ask it; the old direct-kernel predicate and refusal are gone."""
     n = norm(sycl)
     b = norm(batch_hpp)
     cap = body(n, STAGED_CAP_SIG)
+    validate = body(b, VALIDATE_SIG)
+    choose = body(b, CHOOSE_SIG)
     return (n.count(STAGED_CAP_SIG + " {") == 1 and ordered(cap, *STAGED_CAP_STEPS)
             and re.findall(r"moe_route_kernel::(\w+)", cap) == ["MMVQ_COMPAT"]
+            and not re.search(r"\btype\b|GGML_TYPE_", cap)
             and ROUTE_CAP_ASK in body(n, BUILD_SIG)
             and n.count("ggml_sycl_moe_staged_capability_refusal(") == 2
-            and b.count(DIRECT_SIG + " " + DIRECT_BODY) == 1 and all(b.count(use) == 1 for use in DIRECT_USES)
+            and b.count(IMMUTABLE_SIG + " " + IMMUTABLE_BODY) == 1
+            and b.count(IMMUTABLE_CALL) == 2 and validate.count(IMMUTABLE_HOST_USE) == 1
+            and n.count(IMMUTABLE_CALL) == 1 and n.count(IMMUTABLE_ISLAND_USE) == 1
+            and validate.count(DIRECT_KERNEL_KEY) == 1
+            and bool(choose) and not re.search(r"request\.type|moe_type_|CAPABILITY_UNSUPPORTED", choose)
             and not any(t in body(b, sig) for t in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4")
-                        for sig in (VALIDATE_SIG, CHOOSE_SIG)))
+                        for sig in (VALIDATE_SIG, CHOOSE_SIG))
+            and not any(re.search(r"\b(moe_type_needs_direct_kernel|DIRECT_KERNEL)\b", t)
+                        for t in (n, b, norm(PLAN_HPP))))
 
 
 def test_staging_mirrors_serving():
     assert claim_staging_mirrors_serving(SYCL, BATCH_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the capability refusal body is searched in it; the "
-        "direct-kernel helpers are searched in moe-resolved-batch.hpp)",
-        norm(SYCL),
-        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, ROUTE_CAP_ASK)
+        "ggml/src/ggml-sycl/ggml-sycl.cpp and moe-resolved-batch.hpp: whole files (the capability refusal body and the "
+        "island's use are searched in the first; the predicate, the validator and the executor choice in the second)",
+        norm(SYCL) + " " + norm(BATCH_HPP),
+        STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, ROUTE_CAP_ASK, IMMUTABLE_ISLAND_USE, IMMUTABLE_SIG,
+        IMMUTABLE_HOST_USE, DIRECT_KERNEL_KEY)
 
 
 def test_staging_mirrors_serving_mutants():
     c = claim_staging_mirrors_serving
-    # The helper admitting a direct-kernel type.
-    assert not c(mutate(SYCL, STAGED_CAP_STEPS[2], ""), BATCH_HPP)
+    # The helper asking the type again and refusing the two types, as it did before their MMVQ id kernel ran them.
+    assert not c(mutate(mutate(SYCL, STAGED_CAP_STEPS[2],
+                               "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { "
+                               "return ggml_sycl::moe_staged_route_refusal::KERNEL; } " + STAGED_CAP_STEPS[2]),
+                        STAGED_CAP_SIG, STAGED_CAP_SIG[:-1] + ", ggml_type type)"), BATCH_HPP)
     # The helper admitting another kernel.
     assert not c(mutate(SYCL, "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT) {",
                         "if (cap.kernel != moe_route_kernel::MMVQ_COMPAT && "
                         "cap.kernel != moe_route_kernel::XMX_TILED) {"), BATCH_HPP)
     # The resolver asking a test of its own.
     assert not c(mutate(SYCL, ROUTE_CAP_ASK, "moe_staged_route_refusal::NONE;"), BATCH_HPP)
-    # The validator spelling the types out again, so the two answers can drift.
-    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[1],
-                              "const bool direct_q1_nvfp4 = recipe.request.type == GGML_TYPE_Q1_0 || "
-                              "recipe.request.type == GGML_TYPE_NVFP4;"))
-    # The executor choice spelling the types out again.
-    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_USES[2],
-                              "operand.recipe().kind != moe_batch_executor::HOST_CPU && "
-                              "operand.recipe().request.type == GGML_TYPE_NVFP4;"))
     # A second caller of the helper beside the resolver (a kernel predicate asking it again).
     assert not c(mutate(SYCL, ROUTE_CAP_ASK, ROUTE_CAP_ASK + " (void) " + ROUTE_CAP_ASK), BATCH_HPP)
+    # The executor choice restoring its early return: Q1_0/NVFP4 device recipes refused whatever the capability said.
+    assert not c(SYCL, mutate(BATCH_HPP, "moe_batch_executor_choice out;",
+                              "moe_batch_executor_choice out; " + CHOOSE_EARLY_RETURN))
+    # The executor choice spelling the types out instead.
+    assert not c(SYCL, mutate(BATCH_HPP, "moe_batch_executor_choice out;",
+                              "moe_batch_executor_choice out; if (operand.recipe().request.type == GGML_TYPE_NVFP4) "
+                              "{ return out; }"))
+    # The validator keying the direct kernel's check by type again, so an MMVQ_COMPAT recipe for them is refused.
+    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_KERNEL_KEY,
+                              "if (moe_type_has_immutable_host_recipe(recipe.request.type)) {"))
+    # The validator spelling the types out again, so the two answers can drift.
+    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_HOST_USE,
+                              "if (recipe.kind == moe_batch_executor::HOST_CPU && (recipe.request.type == "
+                              "GGML_TYPE_Q1_0 || recipe.request.type == GGML_TYPE_NVFP4)) {"))
+    # The island spelling the types out instead of asking the predicate.
+    assert not c(mutate(SYCL, IMMUTABLE_ISLAND_USE,
+                        "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) { return false; }"), BATCH_HPP)
     # The predicate losing one of its types.
-    assert not c(SYCL, mutate(BATCH_HPP, DIRECT_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
+    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
+    # The old predicate's name coming back.
+    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_SIG, IMMUTABLE_SIG + " { return false; } inline bool "
+                              "moe_type_needs_direct_kernel(ggml_type type)"))
 
 
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
@@ -960,9 +998,16 @@ ROUTE_CONSUMER_REFUSAL = "if (s != nullptr && s->consumer == moe_stream_consumer
 LAYER_WEIGHT_SIG = ("static const ggml_tensor * ggml_sycl_moe_stream_layer_weight(int layer, "
                     "ggml_sycl::expert_tensor_role role)")
 ITEM_DEFAULT_NONE = "moe_stream_staging staging = moe_stream_staging::NONE;"
+# The ring copies a host expert only out of pinned memory, so a host entry the plan left mapped never stages; an entry
+# on the device (one a loan's sizing reads as host) stages as before. The claim is asked for every matrix one AOS slot
+# holds, mapped or not, so a mapped matrix the executor would claim is counted instead of staged.
+INDEX_MAPPED_HOST = ("const bool mapped_host = !e.on_device && "
+                     "!placement_plan::host_backing_sizes_weight_zone(e.host_backing);")
 INDEX_CLAIM_GUARD = "if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {"
 INDEX_CLAIM_ASK = "c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;"
-INDEX_CLAIM_APPLY = ("if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; "
+INDEX_CLAIM_RECORD = "claimed = c->second;"
+INDEX_MAPPED_COUNT = "if (claimed && mapped_host) { ++li.n_mapped_host; }"
+INDEX_CLAIM_APPLY = ("else if (claimed) { item.staging = moe_stream_staging::AOS_ONLY; "
                      "item.consumer = moe_stream_consumer::EXECUTOR; }")
 INDEX_SLOT_SKIP = "if (item.staging == moe_stream_staging::NONE) { continue; }"
 
@@ -989,8 +1034,9 @@ def claim_claimed_weight_stages_for_the_executor(sycl: str, hpp: str, phase: str
             and ("moe_stream_library_claims_fn library_claims, const moe_stream_window_hints & hints, "
                  "const std::unordered_set<uint64_t> * as_host = nullptr)") in h
             and ITEM_DEFAULT_NONE in body(h, "struct moe_stream_item")
-            and ordered(build, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_APPLY, "li.items.push_back(item);",
-                        INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
+            and ordered(build, INDEX_MAPPED_HOST, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK, INDEX_CLAIM_RECORD,
+                        INDEX_MAPPED_COUNT, INDEX_CLAIM_APPLY,
+                        "li.items.push_back(item);", INDEX_SLOT_SKIP, STREAMABLE_COUNT, ROLE_COUNT)
             and build.count("item.staging = ") == 1
             and h.count("library_claims(graph_ctx") == 1
             and INDEX_CALL in body(p, PREPARE_SIG) and p.count("library_claims(") == 0)
@@ -1025,10 +1071,11 @@ def test_library_claim_mutants():
     # The route serves the executor's entries, so a library-free reader is no longer the only one it hands them to.
     assert not c(mutate(SYCL, ROUTE_CONSUMER_REFUSAL, "if (false) {"), PLAN_HPP, PHASE)
     # The build asks and ignores the answer.
-    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "if (c->second) { }"), PHASE)
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "else if (claimed) { }"), PHASE)
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_RECORD, "claimed = false;"), PHASE)
     # A claimed matrix whose consumer stays the route's: the route would refuse nothing and serve it.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_APPLY,
-                              "if (c->second) { item.staging = moe_stream_staging::AOS_ONLY; }"), PHASE)
+                              "else if (claimed) { item.staging = moe_stream_staging::AOS_ONLY; }"), PHASE)
     # A matrix the executor does not claim staged anyway, by default or by a second answer.
     assert not c(SYCL, mutate(PLAN_HPP, ITEM_DEFAULT_NONE,
                               "moe_stream_staging staging = moe_stream_staging::AOS_ONLY;"), PHASE)
@@ -1039,6 +1086,15 @@ def test_library_claim_mutants():
     # not the authority.
     assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD,
                               "if (item.staging != moe_stream_staging::NONE && library_claims != nullptr) {"), PHASE)
+    # A host expert the plan left mapped staged anyway: the ring would be sized for an expert the stager skips.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, "if (false) { ++li.n_mapped_host; }"), PHASE)
+    # The claim not asked for a mapped matrix: the count could not tell a layer the executor refuses from one only the
+    # plan's backing keeps from it.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_CLAIM_GUARD, "if (!mapped_host && " + INDEX_CLAIM_GUARD[len("if ("):]),
+                 PHASE)
+    # mapped_host read without the residency: a device entry whose backing is its mapping (its staging source), which
+    # a loan's sizing reads as host, would never be asked.
+    assert not c(SYCL, mutate(PLAN_HPP, INDEX_MAPPED_HOST, INDEX_MAPPED_HOST.replace("!e.on_device && ", "")), PHASE)
     # The claim applied after the slot accounting, so a claimed matrix would take no slot.
     late = mutate(PLAN_HPP, INDEX_CLAIM_APPLY, "")
     late = mutate(late, "++li.n_streamable;", "++li.n_streamable; " + INDEX_CLAIM_APPLY)
@@ -1928,8 +1984,20 @@ DIAG_RULE_CALL = "moe_stream_ring_unavailable_rule(index_, li, geo_, in_order_, 
 WARN_SIG = ("void moe_stream_phase::warn_ring_unavailable(const moe_stream_op & op, "
             "const moe_stream_layer_info & li)")
 RULE_SIG = "static inline const char * moe_stream_ring_unavailable_rule("
+# The rule names the plan only where its backing alone keeps a layer from the executor: some matrix is mapped, no fused
+# entry refuses the layer, and every matrix the ring does not stage is a mapped one the executor would claim (the index
+# counts those, INDEX_MAPPED_COUNT). Each term of the helper is one way to be wrong about that.
+MAPPED_ONLY_SIG = "static inline bool moe_stream_layer_mapped_only(const moe_stream_layer_info & li)"
+MAPPED_ONLY_ANY = "li.n_mapped_host != 0"
+MAPPED_ONLY_UNTRIPLET = " && li.n_untriplet == 0"
+MAPPED_ONLY_ALL_COUNTED = (" && li.items.size() == static_cast<size_t>(li.n_streamable) + "
+                           "static_cast<size_t>(li.n_mapped_host)")
+MAPPED_ONLY_BODY = "{ return " + MAPPED_ONLY_ANY + MAPPED_ONLY_UNTRIPLET + MAPPED_ONLY_ALL_COUNTED + "; }"
+MAPPED_RULE = 'if (moe_stream_layer_mapped_only(li)) { return "host experts left mapped by the plan"; }'
+CLAIM_RULE = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
 # Each rule's condition, then its name, in the order the helper tests them.
 RULE_ORDER = (
+    "moe_stream_layer_mapped_only(li)", '"host experts left mapped by the plan"',
     "!moe_stream_layer_claimed(li)", '"executor does not claim"',
     "idx.host_matrices_per_layer_max == 0", '"no host matrices of a streamable type"',
     "idx.matrix_bytes_max == 0", '"no matrix bytes"',
@@ -1949,11 +2017,18 @@ WARN_CALL = ("if (st.decision.reason == moe_exec_reason::RING_UNAVAILABLE) { "
 def claim_ring_unavailable_diagnostic(phase: str, hpp: str, tree: dict) -> bool:
     """Lead ruling c-kcyf: a ring-unavailable answer is explained in the log. The fixed format exists once in the
     backend, carries the rule the helper names and the ring's inputs, and goes out through the decision log's WARN sink;
-    the helper names each rule right after testing its condition, in a fixed order, the executor's claim first (W2: a
-    layer the executor does not claim has no ring to explain)."""
+    the helper names each rule right after testing its condition, in a fixed order: a layer only the plan's backing
+    keeps from the executor first (the plan's choice is the cause there), then the executor's claim (W2: a layer the
+    executor does not claim has no ring to explain). The index build asks the claim for a mapped matrix too and counts
+    it, once, only when the executor would claim it."""
     w = body(norm(phase), WARN_SIG)
+    h = norm(hpp)
     count = sum(norm(text).count(DIAG_FMT) for text in tree.values())
     return (count == 1 and ordered(w, DIAG_FMT, DIAG_RULE_CALL, DIAG_ARGS, DIAG_EMIT)
+            and h.count("++li.n_mapped_host;") == 1
+            and ordered(body(h, INDEX_BUILD_SIG), INDEX_MAPPED_HOST, INDEX_CLAIM_GUARD, INDEX_CLAIM_ASK,
+                        INDEX_CLAIM_RECORD, INDEX_MAPPED_COUNT)
+            and h.count(MAPPED_ONLY_SIG) == 1 and body(h, MAPPED_ONLY_SIG) == MAPPED_ONLY_BODY
             and ordered(body(norm(hpp), RULE_SIG), *RULE_ORDER))
 
 
@@ -1993,8 +2068,28 @@ def test_ring_unavailable_diagnostic_mutants():
         PHASE, mutate(PLAN_HPP, '"ring exceeds an eleventh of resident plus lent expert bytes"',
                       '"ring exceeds 10% of resident expert bytes"'), SYCL_TREE)
     # The claim rule dropped, or asked after the ring's rules that it would otherwise be reported as.
-    claim_rule = 'if (!moe_stream_layer_claimed(li)) { return "executor does not claim"; }'
+    claim_rule = CLAIM_RULE
     assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, claim_rule, ""), SYCL_TREE)
+    # The mapped rule dropped: a layer whose host experts the plan left mapped would read "executor does not claim".
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_RULE, ""), SYCL_TREE)
+    # The mapped rule asked after the claim rule, which a mapped layer always fails first, so it would never be named.
+    after_claim = mutate(PLAN_HPP, MAPPED_RULE, "")
+    after_claim = mutate(after_claim, CLAIM_RULE, CLAIM_RULE + " " + MAPPED_RULE)
+    assert not claim_ring_unavailable_diagnostic(PHASE, after_claim, SYCL_TREE)
+    # The count never taken: the mapped rule could never hold.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, ""), SYCL_TREE)
+    # The claim not asked for a mapped matrix: nothing would be counted, so the plan would never be named.
+    no_ask = mutate(PLAN_HPP, INDEX_CLAIM_GUARD, "if (!mapped_host && " + INDEX_CLAIM_GUARD[len("if ("):])
+    assert not claim_ring_unavailable_diagnostic(PHASE, no_ask, SYCL_TREE)
+    # The count taken without the claim: a mapped layer the executor refuses would be blamed on the plan.
+    assert not claim_ring_unavailable_diagnostic(
+        PHASE, mutate(PLAN_HPP, INDEX_MAPPED_COUNT, "if (mapped_host) { ++li.n_mapped_host; }"), SYCL_TREE)
+    # The helper without its untriplet term: a mapped layer with a fused entry the ring cannot stage would be blamed on
+    # the plan, though pinning would not make the executor take it.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_ONLY_UNTRIPLET, ""), SYCL_TREE)
+    # The helper without its all-unstaged-are-counted term: a layer with one role the executor refuses would be
+    # blamed on the plan.
+    assert not claim_ring_unavailable_diagnostic(PHASE, mutate(PLAN_HPP, MAPPED_ONLY_ALL_COUNTED, ""), SYCL_TREE)
     late = mutate(PLAN_HPP, claim_rule, "")
     late = mutate(late, 'return "region smaller than the largest streamable matrix";',
                   claim_rule + ' return "region smaller than the largest streamable matrix";')
@@ -2362,42 +2457,38 @@ def test_context_mutants():
     assert not claim_context_owns_and_ends_the_phase(COMMON, late)
 
 
-REORDER_DEF = "sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
-LOAD_FILL = "ggml_sycl_reorder_weight_gpu(queue, static_cast<const uint8_t *>(temp_vram),"
-
-
+REORDER_DEF = "static sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue,"
 REORDER_DECL = ("sycl::event ggml_sycl_reorder_weight_gpu(sycl::queue & queue, const uint8_t * aos_device, "
                 "uint8_t * soa_device, ggml_type type, int64_t ncols, int64_t nrows, size_t src_bytes, "
                 "const std::vector<sycl::event> & deps);")
+REORDER_NAME = "ggml_sycl_reorder_weight_gpu"
 
 
-def claim_reorder_is_the_load_fills_own(sycl: str, hpp: str) -> bool:
-    """The load path's reorder dispatch is a static function of ggml-sycl.cpp, defined once and called once, by the
-    load-time fill, and moe-stream-plan.hpp names it nowhere outside comments: the SOA staging that shared it is
-    retired, and the ring copies AOS and reorders nothing (test_window_copy_is_the_only_submission)."""
-    n = norm(sycl)
-    return (n.count("static " + REORDER_DEF) == 1 and n.count(REORDER_DEF) == 1
-            and n.count(REORDER_CALL) == 2 and n.count(LOAD_FILL) == 1 and REORDER_CALL not in norm(hpp))
+def claim_no_gpu_reorder_dispatch(sycl: str, hpp: str) -> bool:
+    """No GPU-side AOS-to-SOA reorder dispatch is left: ggml-sycl.cpp neither defines nor calls it, and
+    moe-stream-plan.hpp declares it nowhere. Its one caller was the removed MoE prestage's fill; the weight-load fill
+    reorders through reorder_aos_to_soa_device, and the ring copies AOS and reorders nothing
+    (test_window_copy_is_the_only_submission)."""
+    return REORDER_NAME not in norm(sycl) and REORDER_NAME not in norm(hpp)
 
 
-def test_reorder_is_the_load_fills_own():
-    assert claim_reorder_is_the_load_fills_own(SYCL, PLAN_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp: whole file (the reorder is also searched for in "
-        "moe-stream-plan.hpp, where it must be absent)",
-        norm(SYCL),
-        "static " + REORDER_DEF, REORDER_CALL, LOAD_FILL)
+def test_no_gpu_reorder_dispatch():
+    assert claim_no_gpu_reorder_dispatch(SYCL, PLAN_HPP), (
+        f"{REORDER_NAME} is back in ggml/src/ggml-sycl/ggml-sycl.cpp or moe-stream-plan.hpp")
 
 
-def test_reorder_load_fill_mutants():
-    c = claim_reorder_is_the_load_fills_own
+def test_no_gpu_reorder_dispatch_mutants():
+    c = claim_no_gpu_reorder_dispatch
     # The stream header declares it again.
     assert not c(SYCL, mutate(PLAN_HPP, "namespace ggml_sycl {", REORDER_DECL + " namespace ggml_sycl {"))
-    # The definition is external again.
-    assert not c(mutate(SYCL, "static " + REORDER_DEF, REORDER_DEF), PLAN_HPP)
-    # A second caller.
-    assert not c(mutate(SYCL, LOAD_FILL, REORDER_CALL + "q2, a, s, t, c, r, b, d); " + LOAD_FILL), PLAN_HPP)
-    # The load-time fill moved off the dispatch.
-    assert not c(mutate(SYCL, LOAD_FILL, "other_reorder(queue, static_cast<const uint8_t *>(temp_vram),"), PLAN_HPP)
+    # The backend defines it again.
+    assert not c(mutate(SYCL, "static bool ggml_sycl_graph_has_host_inputs(",
+                        REORDER_DEF + " const uint8_t * a, uint8_t * s, ggml_type t, int64_t c, int64_t r, size_t b, "
+                        "const std::vector<sycl::event> & d); static bool ggml_sycl_graph_has_host_inputs("), PLAN_HPP)
+    # A call comes back.
+    assert not c(mutate(SYCL, "static bool ggml_sycl_graph_has_host_inputs(",
+                        "static void f(sycl::queue & q) { (void) " + REORDER_NAME + "(q, nullptr, nullptr, "
+                        "GGML_TYPE_Q4_0, 0, 0, 0, {}); } static bool ggml_sycl_graph_has_host_inputs("), PLAN_HPP)
 
 
 # ---- the trace -------------------------------------------------------------------------------------------------------

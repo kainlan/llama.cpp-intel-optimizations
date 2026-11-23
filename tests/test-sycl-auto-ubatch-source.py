@@ -15,8 +15,8 @@ call). Per c-wgxn and the task's own acceptance criteria:
   `sched_reserve()` call, unchanged.
 - The trial tries the ascending ladder {512, 1024, 2048, 4096}, each
   candidate capped by both `n_batch` and `n_ctx`, and additionally, for a
-  MoE model, by the GPU MoE routing ceiling
-  (`ggml_backend_sycl_moe_gpu_ubatch_max()`, comment c-s747 / llama.cpp-ohkx).
+  MoE model, by the picker's MoE ceiling
+  (`llama_auto_ubatch_moe_ceiling`).
 - Per candidate: Task 2's non-publishing probe
   (`ggml_backend_sycl_probe_runtime_context_for_model`) is consulted first
   (a BUSY answer loses the candidate at once: the retry loop it once had is
@@ -442,23 +442,15 @@ def _cap_helper_body() -> str:
     return header[start : header.find("return cap;", start)]
 
 
-def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
-    """For a MoE model (hparams.n_expert > 0), the cap must be additionally
-    narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() -- comment c-s747 /
-    llama.cpp-ohkx -- and the "MoE GPU routing ceiling" stop reason reported
-    whenever that ceiling BINDS, i.e. moe_cap <= cap, not only when it is
-    STRICTLY smaller (a MoE context whose batch/ctx cap already equals
-    moe_cap, e.g. cap == 512, is bound by the ceiling exactly as much as one
-    where moe_cap is smaller, so "ladder exhausted" would misreport why the
-    ladder stopped). The 512 constant itself must NOT be
-    hardcoded in llama-context.cpp; it must come from the accessor.
+_MOE_CEILING_DECL = "static const uint32_t llama_auto_ubatch_moe_ceiling = 512;"
 
-    The narrowing now lives in llama_auto_ubatch_cap(), gated on n_expert > 0
-    and on moe_cap_available -- the DL-without-SYCL branch reports the
-    ceiling unavailable when the accessor is absent, which would otherwise
-    report the ceiling reason for every such MoE model although no ceiling
-    was ever consulted. The trial passes the accessor's value, and reads the
-    accessor only for a MoE model."""
+
+def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
+    """For a MoE model (hparams.n_expert > 0), the cap is narrowed to the picker's own MoE ceiling,
+    llama_auto_ubatch_moe_ceiling in src/llama-auto-ubatch.h, and the "MoE GPU routing ceiling" stop reason is
+    reported whenever that ceiling BINDS (moe_cap <= cap), not only when it is strictly smaller. The ceiling is the
+    picker's policy until the wide-width measurement lifts it; it is read from nowhere else, and llama-context.cpp
+    holds no bare 512 for it."""
     helper = _cap_helper_body()
     assert _MOE_NARROW in helper, (
         "llama_auto_ubatch_cap must narrow `cap` only when n_expert > 0 && moe_cap_available && "
@@ -466,27 +458,26 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     )
     assert "*moe_bound = true;" in helper and "*moe_bound = false;" in helper
 
+    header_norm = _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
+    assert _MOE_CEILING_DECL in header_norm, (
+        "src/llama-auto-ubatch.h must declare the picker's MoE ceiling: " + _MOE_CEILING_DECL
+    )
+
     body_norm = _normalize_ws(_trial_body())
-    assert "ggml_backend_sycl_moe_gpu_ubatch_max" in body_norm, (
-        "the MoE cap must be read from ggml_backend_sycl_moe_gpu_ubatch_max(), not a local constant"
+    assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in body_norm, (
+        "the trial must not read a MoE ceiling from the backend: the picker owns it"
     )
+    assert "moe_cap_fn" not in body_norm, "the DL lookup of the old backend accessor must be gone"
+    assert re.search(
+        r"const\s+uint32_t\s+moe_cap\s*=\s*model\.hparams\.n_expert\s*>\s*0\s*\?\s*llama_auto_ubatch_moe_ceiling"
+        r"\s*:\s*0\s*;",
+        body_norm,
+    ), "the trial must take the picker's ceiling, and only for a MoE model"
     assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*true\s*;", body_norm), (
-        "the direct GGML_USE_SYCL branch must declare moe_cap_available = true (the accessor is always real there)"
+        "the ceiling is a constant of the picker, so it is always available"
     )
-    assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*moe_cap_fn\s*!=\s*nullptr\s*;", body_norm), (
-        "the GGML_BACKEND_DL-without-SYCL branch must declare moe_cap_available = (moe_cap_fn != nullptr)"
-    )
-    assert re.search(
-        r"moe_cap\s*=\s*model\.hparams\.n_expert\s*>\s*0\s*\?\s*ggml_backend_sycl_moe_gpu_ubatch_max\(\s*\)\s*:\s*0\s*;", body_norm
-    ), "the direct branch must read the accessor only for a MoE model"
-    assert re.search(
-        r"moe_cap\s*=\s*\(\s*model\.hparams\.n_expert\s*>\s*0\s*&&\s*moe_cap_fn\s*\)\s*\?\s*moe_cap_fn\(\s*\)\s*:\s*0\s*;", body_norm
-    ), "the DL branch must call the looked-up accessor only for a MoE model, and only when it exists"
     assert re.search(r'stop\s*=\s*moe_bound\s*\?\s*"MoE GPU routing ceiling"\s*:\s*"ladder exhausted"\s*;', body_norm), (
         "the stop reason must be the MoE ceiling exactly when the helper reports it bound"
-    )
-    assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
-        "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
     )
 
 
@@ -505,11 +496,9 @@ def test_moe_model_cap_binds_at_equal_has_a_mutation_witness():
 
 
 def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
-    """Mutation witness for the moe_cap_available gate itself: proves it
-    would actually catch the gate being dropped (which would report "MoE
-    GPU routing ceiling" for every MoE model on a GGML_BACKEND_DL build
-    whose SYCL DSO lacks the accessor, even though moe_cap was never
-    narrowed by anything)."""
+    """Mutation witness for the moe_cap_available gate itself: proves the check would catch the gate being
+    dropped, which would make the helper report "MoE GPU routing ceiling" for a MoE model even when the caller says
+    no ceiling is available. moe_cap_available false must keep meaning no narrowing."""
     header = strip_comments(LLAMA_AUTO_UBATCH_H)
     old = "n_expert > 0 && moe_cap_available && moe_cap <= cap"
     assert _normalize_ws(header).count(old) == 1, "mutation target not unique"
@@ -521,40 +510,42 @@ def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
     assert _MOE_NARROW not in mutated, "dropping the n_expert gate must also fail the check"
 
 
-def test_header_declares_the_moe_gpu_ubatch_max_accessor():
-    """ggml_backend_sycl_moe_gpu_ubatch_max() must be declared in
-    ggml-sycl.h and defined (not file-static) in ggml-sycl.cpp, returning
-    the real MOE_GPU_UBATCH_MAX constant, not a re-declared literal."""
-    assert re.search(
-        r"GGML_BACKEND_API\s+uint32_t\s+ggml_backend_sycl_moe_gpu_ubatch_max\s*\(\s*void\s*\)\s*;", GGML_SYCL_H_CODE
-    ), "ggml_backend_sycl_moe_gpu_ubatch_max(void) must be declared in ggml-sycl.h"
-
-    assert re.search(
-        r"uint32_t\s+ggml_backend_sycl_moe_gpu_ubatch_max\s*\(\s*\)\s*\{\s*return\s+ggml_sycl::MOE_GPU_UBATCH_MAX\s*;"
-        r"\s*\}",
-        GGML_SYCL_CPP_CODE,
-    ), "ggml_backend_sycl_moe_gpu_ubatch_max() must be defined in ggml-sycl.cpp, returning ggml_sycl::MOE_GPU_UBATCH_MAX"
-    assert not re.search(r"static\s+uint32_t\s+ggml_backend_sycl_moe_gpu_ubatch_max\(", GGML_SYCL_CPP_CODE), (
-        "the accessor must not be file-static -- llama-context.cpp (a different translation unit) calls it"
-    )
+def _backend_moe_ceiling_violations(texts: dict) -> list:
+    """Names every file that still exports, registers or looks up the deleted backend MoE ceiling."""
+    return [name for name, code in texts.items() if "ggml_backend_sycl_moe_gpu_ubatch_max" in code]
 
 
-def test_proc_address_registers_moe_gpu_ubatch_max_and_auto_ubatch_enabled():
-    """llama.cpp-1mwi: a GGML_BACKEND_DL build's llama-context lookup needs
-    both ggml_backend_sycl_auto_ubatch_enabled (Task 4a defined it but
-    never registered it here) and this task's own new
-    ggml_backend_sycl_moe_gpu_ubatch_max registered in the strcmp
-    proc-address chain, or the lookup silently returns nullptr."""
+def test_the_backend_exports_no_moe_routing_ceiling():
+    """The MoE ceiling has one owner, the picker. So ggml-sycl.h declares no ceiling accessor, ggml-sycl.cpp defines
+    and registers none, and llama-context.cpp looks none up."""
+    texts = {
+        "ggml/include/ggml-sycl.h": GGML_SYCL_H_CODE,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
+        "src/llama-context.cpp": LLAMA_CONTEXT_CPP_CODE,
+    }
+    assert _backend_moe_ceiling_violations(texts) == []
+
+
+def test_the_backend_exports_no_moe_routing_ceiling_has_a_mutation_witness():
+    """Proves the check above catches the accessor coming back. It mutates ggml-sycl.h only: the scan is one
+    substring test applied to every file in the same dict, so one mutated file shows it reports a file by name."""
+    mutant = GGML_SYCL_H_CODE + "\nGGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);\n"
+    texts = {
+        "ggml/include/ggml-sycl.h": mutant,
+        "ggml/src/ggml-sycl/ggml-sycl.cpp": GGML_SYCL_CPP_CODE,
+        "src/llama-context.cpp": LLAMA_CONTEXT_CPP_CODE,
+    }
+    assert _backend_moe_ceiling_violations(texts) == ["ggml/include/ggml-sycl.h"]
+
+
+def test_proc_address_registers_auto_ubatch_enabled():
+    """A GGML_BACKEND_DL build's llama-context lookup needs ggml_backend_sycl_auto_ubatch_enabled registered in the
+    strcmp proc-address chain, or the lookup silently returns nullptr."""
     assert re.search(
         r'strcmp\(\s*name\s*,\s*"ggml_backend_sycl_auto_ubatch_enabled"\s*\)\s*==\s*0\s*\)\s*\{\s*'
         r"return\s*\(\s*void\s*\*\s*\)\s*ggml_backend_sycl_auto_ubatch_enabled\s*;",
         GGML_SYCL_CPP_CODE,
     ), "ggml_backend_sycl_auto_ubatch_enabled must be registered in the proc-address strcmp chain"
-    assert re.search(
-        r'strcmp\(\s*name\s*,\s*"ggml_backend_sycl_moe_gpu_ubatch_max"\s*\)\s*==\s*0\s*\)\s*\{\s*'
-        r"return\s*\(\s*void\s*\*\s*\)\s*ggml_backend_sycl_moe_gpu_ubatch_max\s*;",
-        GGML_SYCL_CPP_CODE,
-    ), "ggml_backend_sycl_moe_gpu_ubatch_max must be registered in the proc-address strcmp chain"
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +568,58 @@ def test_probe_is_called_with_the_candidate_shape():
     ), "the probe must be called with (backend, token, n_ctx, the CANDIDATE c, n_seq_max, flash_attn, &probe)"
 
 
+# The probe's lifecycle result reaches llama_auto_ubatch_probe_classify() as one flag per code, positionally. Two
+# swapped flags still compile (all are bool) and every flag still "appears" in the call, so the call is pinned in full
+# and in order against the header's own parameter order: a BUSY result read as STALE would report the wrong stop reason.
+_PROBE_CLASSIFY_PARAMS_RE = (
+    r"llama_auto_ubatch_probe_outcome llama_auto_ubatch_probe_classify\( ?bool rc_ok, bool rc_busy, bool rc_stale, "
+    r"bool rc_plan_rejected, bool accepted ?\)"
+)
+_PROBE_CLASSIFY_CALL_RE = (
+    r"llama_auto_ubatch_probe_classify\( ?rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY, "
+    r"rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe\.accepted ?\)"
+)
+
+
+def _probe_classify_call_is_in_order(try_candidate_norm: str, header: str) -> bool:
+    """True iff the header declares (rc_ok, rc_busy, rc_stale, rc_plan_rejected, accepted) and try_candidate passes
+    (rc == OK, rc == BUSY, rc == STALE_IDENTITY, rc == PLAN_REJECTED, probe.accepted) in that order."""
+    return (
+        re.search(_PROBE_CLASSIFY_PARAMS_RE, _normalize_ws(strip_comments(header))) is not None
+        and re.search(_PROBE_CLASSIFY_CALL_RE, try_candidate_norm) is not None
+    )
+
+
+def test_the_probe_classifier_gets_every_flag_in_its_own_slot():
+    assert _probe_classify_call_is_in_order(_try_candidate_norm(), LLAMA_AUTO_UBATCH_H)
+
+
+@pytest.mark.parametrize(
+    "where,old,new",
+    [
+        ("call", "rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY,\n"
+                 "                                                     rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY,",
+         "rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY,\n"
+         "                                                     rc == GGML_SYCL_LIFECYCLE_BUSY,"),
+        ("call", "rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted", "probe.accepted, rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED"),
+        ("header", "bool rc_busy,", "bool rc_stale_,"),
+    ],
+)
+def test_the_probe_classifier_order_has_a_mutation_witness(where, old, new):
+    ctx_raw, hdr_raw = LLAMA_CONTEXT_CPP, LLAMA_AUTO_UBATCH_H
+    raw = ctx_raw if where == "call" else hdr_raw
+    pat = _ws_tolerant(old)
+    found = len(pat.findall(raw))
+    assert found == 1, f"mutation target not unique/found ({found}) -- update this witness: {old!r}"
+    mutated = pat.sub(lambda _m: new, raw, count=1)
+    if where == "call":
+        ctx_raw = mutated
+    else:
+        hdr_raw = mutated
+    body = _body_of(ctx_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    assert not _probe_classify_call_is_in_order(body, hdr_raw)
+
+
 def test_probe_busy_is_not_retried():
     """A GGML_SYCL_LIFECYCLE_BUSY probe result is the module-admission
     refusal, not lock contention: the candidate loses with "transaction
@@ -590,8 +633,14 @@ def test_probe_busy_is_not_retried():
     assert "sleep_for" not in LLAMA_CONTEXT_CPP_CODE
     body_norm = _normalize_ws(_try_candidate_body())
     assert not re.search(r"for\s*\(\s*int\s+wait\b", body_norm), "the probe is not retried"
+    # The probe's result is read through llama_auto_ubatch_probe_classify(): BUSY is its rc_busy argument (the full
+    # call is pinned in order), and the BUSY outcome returns "transaction busy" directly.
+    assert _probe_classify_call_is_in_order(body_norm, LLAMA_AUTO_UBATCH_H), (
+        "the probe's BUSY result must reach the classifier as its busy flag"
+    )
     assert re.search(
-        r'if\s*\(\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*\)\s*\{\s*return\s*"transaction busy"\s*;\s*\}', body_norm
+        r'case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_BUSY\s*:\s*return\s*"transaction busy"\s*;',
+        body_norm,
     ), 'a BUSY probe must return "transaction busy" directly'
 
 
@@ -611,8 +660,11 @@ def test_stale_identity_branches_to_not_the_published_model():
     lives, not to the assignment (which is now generic and reason-agnostic:
     `stop = reason;`)."""
     body_norm = _normalize_ws(_try_candidate_body())
+    assert _probe_classify_call_is_in_order(body_norm, LLAMA_AUTO_UBATCH_H), (
+        "the probe's STALE_IDENTITY result must reach the classifier as its stale flag"
+    )
     assert re.search(
-        r'rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*\)\s*\{\s*return\s*"not the published model"\s*;\s*\}',
+        r'case\s+llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_STALE\s*:\s*return\s*"not the published model"\s*;',
         body_norm,
     ), 'GGML_SYCL_LIFECYCLE_STALE_IDENTITY must return "not the published model"'
 
@@ -761,6 +813,7 @@ def test_host_fallback_query_has_a_mutation_witness():
     fallback_block = (
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);\n"
         "                cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
         "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
@@ -789,6 +842,8 @@ def test_host_fallback_query_has_a_mutation_witness():
 _IN_LOOP_RESERVE_WRAP_RE = (
     r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*e\s*\)\s*\{\s*"
     r"LLAMA_LOG_INFO\s*\([^;]*\be\.what\s*\(\s*\)\s*\)\s*;\s*"
+    r"sycl_host_hooks\.host_scratch_trial\s*\(\s*sycl_dev0\s*,\s*GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN\s*,\s*c\s*\)"
+    r"\s*;\s*"
     r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
     r'false\s*;\s*rung_fit_refused\s*=\s*dynamic_cast\s*<\s*const\s+llama_auto_ubatch_fit_refusal\s*\*\s*>\s*\(\s*&\s*e\s*\)\s*!=\s*nullptr\s*;'
     r'\s*return\s*"compute buffers did not fit"\s*;\s*\}'
@@ -956,6 +1011,7 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
     fallback_block = (
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);\n"
         "                cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
         "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
@@ -967,6 +1023,7 @@ def test_pipeline_parallel_restore_has_a_mutation_witness():
         fallback_block,
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sycl_host_hooks.host_scratch_trial(sycl_dev0, GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN, c);\n"
         "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
         "            }\n"
@@ -1726,7 +1783,7 @@ def test_ubatch_cache_key_layout_is_pinned_next_to_the_accessors():
 def test_proc_address_registers_the_four_ubatch_cache_accessors():
     """A GGML_BACKEND_DL build's llama-context lookup needs all four
     entry points registered in the strcmp proc-address chain, mirroring
-    the auto_ubatch_enabled/moe_gpu_ubatch_max precedent just above."""
+    the auto_ubatch_enabled precedent just above."""
     for symbol in (
         "ggml_backend_sycl_ubatch_cache_enabled",
         "ggml_backend_sycl_ubatch_cache_path",
@@ -2026,14 +2083,14 @@ def test_device_set_hash_is_gone():
 def test_backend_extends_the_device_set_with_hidden_planner_gpus():
     """ubatch-tuning-cache.cpp must compose the key over the PARTICIPATING
     set: the context's devices plus, under the multi-device plan, every other
-    physical GPU, gated on the same ggml_backend_sycl_moe_multi_gpu_requested()
-    the multi-device plan uses, with each device's budget from its budget
-    authority."""
+    physical GPU, gated on ggml_sycl_multi_device_plan_for_loaded_model(),
+    the predicate the multi-device plan uses, with each device's budget from
+    its budget authority."""
     code = _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE)
     for pattern, what in (
         (r"topo\.total_gpu_count\s*=\s*std::min\s*\(\s*info\.total_gpu_count\s*,", "the physical GPU count"),
-        (r"topo\.multi_device_plan\s*=\s*ggml_backend_sycl_moe_multi_gpu_requested\s*\(\s*\)\s*;",
-         "the planner's own multi-GPU gate"),
+        (r"topo\.multi_device_plan\s*=\s*ggml_sycl_multi_device_plan_for_loaded_model\s*\(\s*\)\s*;",
+         "the planner's own multi-device predicate"),
         (r"for\s*\(\s*int\s+device\s*:\s*ubatch_participating_devices\s*\(\s*topo\s*\)\s*\)",
          "a walk over the participating devices"),
         (r"ggml_sycl::ggml_sycl_device_budget_authority_existing\s*\(",
@@ -2071,22 +2128,35 @@ def _brace_block(code: str, open_idx: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
-_PLANNER_FN = "static void compute_and_store_plan_for_inventory("
-_PLANNER_GATE = "if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {"
+_PLANNER_FN = "static bool compute_and_store_plan_for_inventory("
+# The planner asks the one multi-device gate the plan dry run also asks, with the expert fact. A model without
+# experts plans every visible GPU; a model with experts does only on the cross-card expert opt-in.
+_GATE_FN = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
+_GATE_RETURN = "return ggml_sycl_info().total_gpu_count >= 2 && (!has_experts || ggml_sycl_moe_multi_gpu_requested());"
+_PLANNER_GATE = "if (ggml_sycl_plan_multi_device(is_moe)) {"
 
 
 def _assert_planner_branches_on_the_gate(code: str) -> None:
     """compute_and_store_plan_for_inventory() must reach
     compute_multi_device_plan() only inside the branch taken on
-    ggml_backend_sycl_moe_multi_gpu_requested() -- the predicate the key
-    reads to decide |plan=multi."""
+    ggml_sycl_plan_multi_device(is_moe) -- the predicate the key reads,
+    through ggml_sycl_multi_device_plan_for_loaded_model(), to decide
+    |plan=multi. That gate's whole body is the GPU count and the expert
+    term: no experts, or the cross-card expert opt-in."""
+    gate_fn = code.find(_GATE_FN)
+    gate_fn_body = _brace_block(code, gate_fn + len(_GATE_FN) - 1).strip() if gate_fn != -1 else ""
+    assert gate_fn_body == _GATE_RETURN, (
+        "ggml_sycl_plan_multi_device(), the planner's multi-device gate, must branch on "
+        "`ggml_sycl_info().total_gpu_count >= 2 && (!has_experts || ggml_sycl_moe_multi_gpu_requested())` and nothing "
+        "else"
+    )
     fn = code.find(_PLANNER_FN)
     assert fn != -1, "could not find compute_and_store_plan_for_inventory()"
     fn_body = _brace_block(code, code.index("{", fn))
     gate = fn_body.find(_PLANNER_GATE)
     assert gate != -1, (
         "compute_and_store_plan_for_inventory() must branch on "
-        "`info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()`"
+        "`ggml_sycl_plan_multi_device(is_moe)`"
     )
     gate_block = _brace_block(fn_body, gate + len(_PLANNER_GATE) - 1)
     assert "compute_multi_device_plan(" in gate_block, (
@@ -2098,14 +2168,25 @@ def _assert_planner_branches_on_the_gate(code: str) -> None:
 
 
 def test_planner_gate_check_has_a_mutation_witness():
-    """Mutation witness for the planner-gate check: dropping the
-    ggml_backend_sycl_moe_multi_gpu_requested() call from the branch
-    condition must fail it, since the key would then describe a plan the
-    planner no longer gates the same way."""
+    """Mutation witness for the planner-gate check: dropping the expert
+    term from the branch condition must fail it, since the key would then
+    describe a plan the planner no longer gates the same way."""
     raw = GGML_SYCL_CPP
+    fn = raw.find(_GATE_FN)
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    target = ("    return ggml_sycl_info().total_gpu_count >= 2 && "
+              "(!has_experts || ggml_sycl_moe_multi_gpu_requested());\n")
+    _assert_target_in_fn_body(_GATE_FN, target)
+    at = raw.find(target, fn)
+    assert at != -1, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw[:at] + "    return ggml_sycl_info().total_gpu_count >= 2;\n" + raw[at + len(target):]
+    with pytest.raises(AssertionError, match="must branch on"):
+        _assert_planner_branches_on_the_gate(_normalize_ws(strip_comments(mutated_raw)))
+    # The planner stops asking the gate and branches on the GPU count alone: the gate is still right, and unasked.
     fn = raw.find(_PLANNER_FN)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    target = "    if (info.total_gpu_count >= 2 && ggml_backend_sycl_moe_multi_gpu_requested()) {\n"
+    target = "    if (ggml_sycl_plan_multi_device(is_moe)) {\n"
+    _assert_target_in_fn_body(_PLANNER_FN, target)
     at = raw.find(target, fn)
     assert at != -1, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw[:at] + "    if (info.total_gpu_count >= 2) {\n" + raw[at + len(target):]
@@ -2135,86 +2216,154 @@ def test_planner_gate_check_else_branch_has_a_mutation_witness():
         _assert_planner_branches_on_the_gate(_normalize_ws(mutated))
 
 
-def test_hidden_gpu_gate_holds_for_a_dense_model():
-    """The hidden-GPU gate is named for MoE but is not MoE-specific: with
-    GGML_SYCL_MOE_MULTI_GPU unset it is just total_gpu_count >= 2, which is
-    why a dense Mistral level_zero:0,1 run takes the multi-device plan and
-    places a layer block on the B50. If it ever starts consulting the model
-    (an expert count, is_moe), a dense split would silently key as its
-    first card alone again."""
-    _assert_hidden_gpu_gate_model_independent(_normalize_ws(GGML_SYCL_CPP_CODE))
+def _fn_body(code: str, signature: str) -> str:
+    start = code.find(signature)
+    assert start != -1, f"could not find {signature!r}"
+    return _brace_block(code, code.index("{", start)).strip()
 
 
-def _hidden_gpu_gate_body(code: str) -> str:
-    start = code.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
-    assert start != -1, "could not find ggml_backend_sycl_moe_multi_gpu_requested()'s definition"
-    open_idx = code.index("{", start)
-    depth, end = 0, -1
-    for i in range(open_idx, len(code)):
-        depth += {"{": 1, "}": -1}.get(code[i], 0)
-        if depth == 0:
-            end = i
-            break
-    return code[open_idx + 1:end].strip()
-
-
-# The whole gate, whitespace-normalized: the GGML_SYCL_MOE_MULTI_GPU override,
-# then total_gpu_count >= 2 alone. An exact match rather than a forbid-list of
-# model terms, so ANY new input -- an expert count, g_model_n_layer, a global
-# nobody has named yet -- fails it.
-_HIDDEN_GPU_GATE_BODY = _normalize_ws(
+# Exact bodies, whitespace-normalized. The cross-card expert path is opt-in and reads the variable once; the
+# exported predicate is that answer; the key asks the planner's predicate with the planner's expert fact.
+_OPT_IN_BODY = _normalize_ws(
     'const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU"); '
-    "if (env) { return std::atoi(env) != 0 && ggml_sycl_info().total_gpu_count >= 2; } "
-    "return ggml_sycl_info().total_gpu_count >= 2;"
+    "return ggml_sycl_info().total_gpu_count >= 2 && env != nullptr && std::atoi(env) != 0;"
 )
+_EXPORTED_BODY = "return ggml_sycl_moe_multi_gpu_requested();"
+_LOADED_MODEL_BODY = "return ggml_sycl_plan_multi_device(g_moe_n_experts_total > 0);"
 
 
-def _assert_hidden_gpu_gate_model_independent(code: str) -> None:
-    body = _hidden_gpu_gate_body(code)
-    assert body == _HIDDEN_GPU_GATE_BODY, (
-        "the hidden-GPU gate must be exactly the env override plus total_gpu_count >= 2 -- it must not depend "
-        f"on the model; got: {body!r}"
+def _assert_expert_path_is_opt_in(code: str) -> None:
+    assert _fn_body(code, "static bool ggml_sycl_moe_multi_gpu_requested() {") == _OPT_IN_BODY, (
+        "the cross-card expert path must be opt-in: two GPUs and GGML_SYCL_MOE_MULTI_GPU set non-zero"
+    )
+    assert _fn_body(code, "bool ggml_backend_sycl_moe_multi_gpu_requested() {") == _EXPORTED_BODY, (
+        "the exported predicate must return the opt-in predicate and nothing else"
+    )
+    assert _fn_body(code, "bool ggml_sycl_multi_device_plan_for_loaded_model() {") == _LOADED_MODEL_BODY, (
+        "the key's predicate must be the planner's gate with the planner's expert fact"
+    )
+    # The predicate, the init peer-link probe gate and the device-map log line; a fourth is a second copy of the gate.
+    n = code.count('std::getenv("GGML_SYCL_MOE_MULTI_GPU")')
+    assert n == 3, f"GGML_SYCL_MOE_MULTI_GPU must be read in exactly 3 places, found {n}"
+
+
+def test_dense_plan_gate_does_not_read_the_expert_opt_in():
+    """A model without experts plans every visible GPU whatever GGML_SYCL_MOE_MULTI_GPU says, and the cross-card
+    expert path runs only on that opt-in. One predicate per fact, read in one place each."""
+    _assert_planner_branches_on_the_gate(_normalize_ws(GGML_SYCL_CPP_CODE))
+    _assert_expert_path_is_opt_in(_normalize_ws(GGML_SYCL_CPP_CODE))
+
+
+_INIT_WARN = '"[SYCL] WARNING: %d GPUs visible. Multi-GPU Level Zero contexts "'
+
+
+def _assert_init_warning_counts_no_cards(raw: str) -> None:
+    """The init WARN prints whenever more than one GPU is visible, and the planner budgets every visible GPU
+    (ggml_sycl_plan_device_budgets walks total_gpu_count), so its dense-split clause names no count of cards."""
+    code = _normalize_ws(strip_comments(raw))
+    at = code.find(_normalize_ws(_INIT_WARN))
+    assert at != -1 and code.count(_normalize_ws(_INIT_WARN)) == 1, "the two-GPU init WARN must exist once"
+    assert "if (info.total_gpu_count > 1) { GGML_LOG_WARN(" in code[max(0, at - 200):at], (
+        "the two-GPU init WARN must print for any count above one"
+    )
+    warn = code[at:code.find(");", at)]
+    assert "the planner splits a model without experts across these GPUs" in warn, (
+        "the init WARN must say the dense split covers every visible GPU"
+    )
+    assert "both" not in warn, "the init WARN must not say both cards: it prints for three or more"
+    budgets = _fn_body(code, "static std::vector<ggml_sycl::device_budget> ggml_sycl_plan_device_budgets(")
+    assert "for (int d = 0; d < info.total_gpu_count; d++)" in budgets, (
+        "the planner must budget every visible GPU for the WARN's claim to hold"
     )
 
 
-_HIDDEN_GPU_GATE_RETURN = "\n    return ggml_sycl_info().total_gpu_count >= 2;\n}"
+def test_init_warning_counts_no_cards():
+    _assert_init_warning_counts_no_cards(GGML_SYCL_CPP)
 
 
-def _hidden_gpu_gate_mutant(insert_before_return: str = "", replace_return: str = "") -> str:
-    """Mutate the gate's final return, located from the function's own
-    signature so the anchor does not depend on what follows it."""
+def test_init_warning_naming_two_cards_has_a_mutation_witness():
+    assert GGML_SYCL_CPP.count("the planner splits a model without experts across these GPUs") == 1, (
+        "mutation target not found -- update this witness to match the real source"
+    )
+    mutated = GGML_SYCL_CPP.replace(
+        "the planner splits a model without experts across these GPUs",
+        "the planner splits a model without experts over both cards", 1)
+    with pytest.raises(AssertionError, match="dense split covers every visible GPU"):
+        _assert_init_warning_counts_no_cards(mutated)
+
+
+def test_init_warning_adding_two_cards_has_a_mutation_witness():
+    """The dense-split clause kept, with a count of cards added: only the no-count assertion can catch it."""
+    assert GGML_SYCL_CPP.count("the planner splits a model without experts across these GPUs") == 1, (
+        "mutation target not found -- update this witness to match the real source"
+    )
+    mutated = GGML_SYCL_CPP.replace(
+        "the planner splits a model without experts across these GPUs",
+        "the planner splits a model without experts across these GPUs over both cards", 1)
+    with pytest.raises(AssertionError, match="must not say both cards"):
+        _assert_init_warning_counts_no_cards(mutated)
+
+
+def _mutant(signature: str, target: str, replacement: str) -> str:
     raw = GGML_SYCL_CPP
-    fn = raw.find("bool ggml_backend_sycl_moe_multi_gpu_requested() {")
+    fn = raw.find(signature)
     assert fn != -1, "mutation target not found -- update this witness to match the real source"
-    ret = raw.find(_HIDDEN_GPU_GATE_RETURN, fn)
-    assert ret != -1, "mutation target not found -- update this witness to match the real source"
-    original = _HIDDEN_GPU_GATE_RETURN
-    replacement = insert_before_return + (replace_return or original)
-    mutated_raw = raw[:ret] + replacement + raw[ret + len(original):]
-    assert mutated_raw != raw
-    return _normalize_ws(strip_comments(mutated_raw))
+    at = raw.find(target, fn)
+    assert at != -1, "mutation target not found -- update this witness to match the real source"
+    return _normalize_ws(strip_comments(raw[:at] + replacement + raw[at + len(target):]))
 
 
-def test_hidden_gpu_gate_holds_for_a_dense_model_has_a_mutation_witness():
-    """Mutation witness for the check above: an early return on the expert
-    count leaves the trailing `return ... >= 2;` intact -- the change that
-    would make a dense level_zero:0,1 split key as its first card alone."""
-    mutated = _hidden_gpu_gate_mutant(
-        insert_before_return="\n    if (g_moe_n_experts_total == 0) {\n        return false;\n    }"
-    )
-    with pytest.raises(AssertionError, match="must not depend on the model"):
-        _assert_hidden_gpu_gate_model_independent(mutated)
+def _assert_target_in_fn_body(signature: str, target: str) -> None:
+    """A witness must mutate the function it names. A search that starts at the signature but is not bounded by the
+    function's end can match the same text in an unrelated function far below, and then mutates nothing it tests."""
+    raw = GGML_SYCL_CPP
+    fn = raw.find(signature)
+    assert fn != -1, "mutation target not found -- update this witness to match the real source"
+    body = _brace_block(raw, raw.index("{", fn))
+    assert target in body, f"mutation target {target!r} is not inside {signature!r} -- update this witness"
 
 
-def test_hidden_gpu_gate_unnamed_model_input_has_a_mutation_witness():
-    """Mutation witness that the exact-shape check is not a forbid-list: a
-    model input no list names (g_model_n_layer) folded into the return is
-    caught too."""
-    mutated = _hidden_gpu_gate_mutant(
-        replace_return="\n    return ggml_sycl_info().total_gpu_count >= 2 && g_model_n_layer > 0;\n}"
-    )
-    with pytest.raises(AssertionError, match="must not depend on the model"):
-        _assert_hidden_gpu_gate_model_independent(mutated)
+def test_expert_opt_in_default_on_has_a_mutation_witness():
+    """The old default-on body must fail the check."""
+    signature = "static bool ggml_sycl_moe_multi_gpu_requested() {"
+    target = "env != nullptr && std::atoi(env) != 0;"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "(!env || std::atoi(env) != 0);")
+    with pytest.raises(AssertionError, match="must be opt-in"):
+        _assert_expert_path_is_opt_in(mutated)
+
+
+def test_dense_plan_reading_the_opt_in_has_a_mutation_witness():
+    """The old plan gate, where the dense split depends on the expert opt-in, must fail the check."""
+    signature = "static bool ggml_sycl_plan_multi_device(bool has_experts) {"
+    target = "(!has_experts || ggml_sycl_moe_multi_gpu_requested());"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "ggml_backend_sycl_moe_multi_gpu_requested();")
+    with pytest.raises(AssertionError, match="must branch on"):
+        _assert_planner_branches_on_the_gate(mutated)
+
+
+def test_second_gate_copy_has_a_mutation_witness():
+    """A fourth read of the variable, a new copy of the gate at a site no exact-body check covers, must fail the
+    count."""
+    signature = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
+    target = "const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested();"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, "const bool multi_gpu_requested = ggml_sycl_moe_multi_gpu_requested() || "
+                                         'std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
+    with pytest.raises(AssertionError, match="exactly 3 places"):
+        _assert_expert_path_is_opt_in(mutated)
+
+
+def test_exported_predicate_body_has_a_mutation_witness():
+    """The exported predicate reading the variable itself, instead of returning the opt-in predicate, must fail
+    the exact-body check."""
+    signature = "bool ggml_backend_sycl_moe_multi_gpu_requested() {"
+    target = "return ggml_sycl_moe_multi_gpu_requested();"
+    _assert_target_in_fn_body(signature, target)
+    mutated = _mutant(signature, target, 'return std::getenv("GGML_SYCL_MOE_MULTI_GPU") != nullptr;')
+    with pytest.raises(AssertionError, match="return the opt-in predicate"):
+        _assert_expert_path_is_opt_in(mutated)
 
 
 def test_cache_hit_reads_the_stored_reason():
@@ -2511,6 +2660,10 @@ def test_env_vars_doc_explains_the_moe_512_pin():
     assert "GPT-OSS" in row and "Mistral" in row, (
         "the row must name GPT-OSS (MoE, pinned) and Mistral (dense, not pinned) as the contrasting example"
     )
+    assert "ggml_backend_sycl_moe_gpu_ubatch_max" not in row, (
+        "the row must name the picker's ceiling, not the deleted backend accessor"
+    )
+    assert "llama_auto_ubatch_moe_ceiling" in row, "the row must name where the 512 lives now"
 
 
 # ---------------------------------------------------------------------------
@@ -2647,15 +2800,26 @@ def _fit_flag_is_set_only_on_fit_refusals(tc: str) -> bool:
         tc,
     ):
         return False
-    # the probe's own refusal is a fit refusal only when the probe ran and said no
-    if not re.search(r"if \(!probe\.accepted\) \{ rung_fit_refused = true; return \"transaction refused\"; \}", tc):
+    # the probe's refusal is a fit refusal exactly on the classifier's FIT outcome: a plan the transaction refused,
+    # reported as PLAN_REJECTED or as OK with accepted == false
+    if not re.search(
+        r"case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT: rung_fit_refused = true; "
+        r"return \"transaction refused\";",
+        tc,
+    ):
+        return False
+    if re.search(_PROBE_CLASSIFY_CALL_RE, tc) is None:
         return False
     for reason in nonfit:
         at = tc.find(f'return "{reason}";')
         if at == -1 or "rung_fit_refused = true;" in tc[max(0, at - 60) : at]:
             return False
     # the lifecycle failure and the publish throw keep their stop reason and stay non-fit
-    return 'rc != GGML_SYCL_LIFECYCLE_OK' in tc and 'publish_dirty = true; return "transaction refused";' in tc
+    lifecycle = 'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE: return "transaction refused";'
+    return (
+        lifecycle in tc
+        and 'publish_dirty = true; return "transaction refused";' in tc
+    )
 
 
 def test_the_fit_flag_is_set_only_by_real_fit_refusals():
@@ -2669,6 +2833,15 @@ def test_the_fit_flag_is_set_only_by_real_fit_refusals():
         ('                return "compute buffer fell back to host";',
          '                rung_fit_refused = true;\n                return "compute buffer fell back to host";'),
         ('            return "transaction busy";', '            rung_fit_refused = true;\n            return "transaction busy";'),
+        ('                    return "not the published model";',
+         '                    rung_fit_refused = true;\n                    return "not the published model";'),
+        ('case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE:\n                    return "transaction refused";',
+         'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_LIFECYCLE:\n'
+         '                    rung_fit_refused = true;\n                    return "transaction refused";'),
+        ('case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:\n                    rung_fit_refused = true;',
+         'case llama_auto_ubatch_probe_outcome::LLAMA_AUTO_UBATCH_PROBE_FIT:'),
+        ('rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, probe.accepted', 'false, probe.accepted'),
+        ('rc == GGML_SYCL_LIFECYCLE_OK, rc == GGML_SYCL_LIFECYCLE_BUSY', 'true, rc == GGML_SYCL_LIFECYCLE_BUSY'),
         ('            publish_dirty           = true;\n            return "transaction refused";',
          '            publish_dirty           = true;\n            rung_fit_refused = true;\n            return "transaction refused";'),
         ('            return "hold spill left no headroom" ;', ''),
@@ -2839,12 +3012,12 @@ _RING_ASSIGN_RE = r"^[ \t]*in\.ring_bytes\s*=\s*ggml_sycl_hold_ring_uncovered\(q
 
 
 def _ring_term_precedes_the_printed_demand(raw_cpp: str) -> bool:
-    """The ring term is set BEFORE the fit reads the demand: the demand the refusal prints (a.demand) and the verdict
-    (zone_hold_fit) are both over `in`, so an assignment after the a.demand read would print a demand that omits the
-    ring while the verdict charges it."""
+    """The ring term is set BEFORE the fit reads the terms of its demand: the demand and terms the refusal prints
+    (a.terms, a.demand) and the verdict (zone_hold_fit) are all over `in`, so an assignment after the a.terms read would
+    print a demand and an uncovered ring that omit the ring while the verdict charges it."""
     body = _body_of(raw_cpp, _HOLD_FIT_START, _HOLD_FIT_END)
     assign = body.find(_RING_BYTES_LINE)
-    demand = body.find("a.demand = ggml_sycl::zone_hold_fit_demand(")
+    demand = body.find("a.terms = ggml_sycl::zone_hold_fit_terms_at(")
     return assign != -1 and demand != -1 and assign < demand
 
 
@@ -2865,7 +3038,7 @@ def test_the_ring_term_order_has_a_mutation_witness():
     m = re.search(_RING_ASSIGN_RE, GGML_SYCL_CPP[start:end], re.M)
     assert m, "the assignment must sit in the fit body"
     at, line = start + m.start(), m.group(0)
-    demand_re = r"^[ \t]*a\.demand\s*=\s*ggml_sycl::zone_hold_fit_demand\(in, q\.n_ubatch\);\n"
+    demand_re = r"^[ \t]*a\.terms\s*=\s*ggml_sycl::zone_hold_fit_terms_at\(in, q\.n_ubatch\);\n"
     demand = re.search(demand_re, GGML_SYCL_CPP[start:end], re.M)
     assert demand and start + demand.start() > at
     d_end = start + demand.end()
@@ -3340,6 +3513,291 @@ def test_the_slots_kept_rule_has_a_mutation_witness(mutation):
     mutated = _mutate_raw_ws_tolerant(MOE_STREAM_PLAN_HPP, real, broken)
     assert not _ring_helper_credits_the_planned_room(GGML_SYCL_CPP, mutated), "the mutant must make the pin fail"
 
+
+# ---------------------------------------------------------------------------
+# The constructor's publish, refused for fit on a context the trial runs for, walks -ub down before the memory module
+# exists (the KV cache is created with the residency of the publish that stands), and the trial starts from the rung
+# it stood at, asking nothing above it.
+# ---------------------------------------------------------------------------
+
+_CTOR_WALK_DECISION = "sycl_auto_ubatch_trial = llama_auto_ubatch_trial_runs("
+_CTOR_WALK_PUBLISH = "const sched_reserve_result published = sycl_publish_runtime_context(cparams.flash_attn);"
+_CTOR_WALK_GATE = (
+    "if (!llama_auto_ubatch_ctor_walks_down(sycl_auto_ubatch_trial, first_refusal.fit_refusal)) { "
+    "throw std::runtime_error(first_refusal.reason); }"
+)
+_CTOR_WALK_DESCENT = (
+    "llama_auto_ubatch_descend(asked_ubatch, asked_ubatch, [&](uint32_t c) { if (publish_at(c)) { return true; } "
+    "walk_aborted = !last_refusal.fit_refusal; return walk_aborted; }); if (stood == 0 || walk_aborted) {"
+)
+_CTOR_NO_LOWER = (
+    "if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) { throw std::runtime_error(first_refusal.reason); }"
+)
+_CTOR_LAST_NOTE = (
+    "const std::string last_note = last_refusal.reason == first_refusal.reason ? std::string() : "
+    'format("; the last refusal: %s", last_refusal.reason.c_str()); throw std::runtime_error( '
+    "format(\"%s (auto n_ubatch: the constructor's publish walked -ub down through %s and none \" \"stood%s)\", "
+    "first_refusal.reason.c_str(), walked.c_str(), last_note.c_str())); }"
+)
+_CTOR_WALK_RECORD = "sycl_ctor_lowered_from = asked_ubatch;"
+_CTOR_WALK_ANNOUNCE = (
+    "if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) { sycl_announce_ctor_lowered_ubatch(); }"
+)
+_LOWERED_LITERAL = "auto n_ubatch lowered from %u to %u"
+_LOWERED_FMT = (
+    '"[SYCL-PLAN] auto n_ubatch lowered from %u to %u: %s; a smaller -ub is not a smaller context; " '
+    '"pass -ub N to override\\n"'
+)
+_ANNOUNCE_FN = "void llama_context::sycl_announce_ctor_lowered_ubatch() const {"
+_ANNOUNCE_END = "sched_reserve_state llama_context::member_reserve_state() {"
+_SELECT_FN = "void llama_context::sycl_select_auto_ubatch() {"
+_PUBLISH_FN = "sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn) {"
+_RESYNC_FN = "void llama_context::sycl_resync_runtime_context_flash_attn() {"
+_STOP_SEED = "if (sycl_ctor_lowered_from != 0) { stop = sycl_ctor_lowered_cause.c_str(); }"
+_LOWERED_NOTE_FN = (
+    "static std::string llama_context_sycl_ctor_lowered_note(uint32_t ctor_lowered_from, const std::string & cause) "
+    '{ if (ctor_lowered_from == 0) { return ""; } return format("; auto n_ubatch was lowered from %u because %s", '
+    "ctor_lowered_from, cause.c_str()); }"
+)
+_LOWERED_NOTE_ARG = "llama_context_sycl_ctor_lowered_note(sycl_ctor_lowered_from, sycl_ctor_lowered_cause).c_str()));"
+_SETTLE_FMT = '"auto n_ubatch: %s (tried %s; last stop: %s), and the settle at %u was refused (%s); %s%s",'
+_HOLD_SPILL_FMT = '"the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s%s",'
+_WAS_INFO = (
+    'LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\\n", __func__, cparams.n_ubatch, '
+    "sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);"
+)
+_SKIPS_TRIAL = (
+    "if (llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered, ladder, llama_auto_ubatch_ladder_size, "
+    "fallback_ubatch, cap)) { return; }"
+)
+
+_V_DECISION = "the trial decision is not made once, before the constructor's one publish, before the memory"
+_V_RUNG = "the publish does not run at the rung it is asked, or the first refusal is not the one kept"
+_V_BACKENDS = "a rung's publish does not run over every backend of the context, from the first"
+_V_GATE = "a refusal walks -ub down without a fit verdict on a context the trial runs for"
+_V_WALK = "the walk is not the trial's descent from the default, capped at it, ending at a non-fit refusal"
+_V_RECORD = "the lowered rung is not recorded, with its origin, after the walk's throw and before the memory"
+_V_HOISTED = "the hoisted block asks the cache, the ladder or the host hold above a lowered rung"
+_V_SEED = "the trial does not start from the constructor's lowering"
+_V_ORIGIN = "the trial's descent overwrites the origin the constructor lowered from"
+_V_STOP = "the outcome of a lowered rung names a ceiling this ladder never reached"
+_V_SILENT = "a lowering the trial does not announce is silent"
+_V_AT_MOST_ONE = "a context can print the lowered announcement from both sources, or twice from one"
+_V_WORDING = "the two lowered announcements do not share the trial's wording"
+_V_NOTE = "a named refusal of a context the constructor lowered does not say so"
+_V_NO_RUNG = "a lowered context the trial has no rung for gets a prep, so its lowering goes unannounced"
+_V_WAS = "the trial's INFO line gives a lowered rung as the -ub the constructor printed"
+_V_NO_LOWER = "a default with no rung under it reports a walk that never ran"
+_V_LAST_TWICE = "the walk's error names its last refusal again when it is the first"
+
+
+def _call_closes_throw(code: str, fmt: str) -> bool:
+    """True iff the format string `fmt` occurs once and the lowered note is the last argument of its throw."""
+    at = code.find(fmt)
+    if at == -1 or code.count(fmt) != 1:
+        return False
+    end = code.find("));", at)
+    return end != -1 and code[:end + 3].endswith(_LOWERED_NOTE_ARG) and "throw" not in code[at:end]
+
+
+def _ctor_walk_violations(raw_cpp: str) -> list:
+    code = _normalize_ws(strip_comments(raw_cpp))
+    ctor = _bounded_body(code, "llama_context::llama_context(", "llama_context::~llama_context(")
+    prep = _bounded_body(code, _TRIAL_START, _SELECT_FN)
+    sel = _bounded_body(code, _SELECT_FN, _TRIAL_END)
+    pub = _bounded_body(code, _PUBLISH_FN, _RESYNC_FN)
+    # A tree without the constructor's announcement names the violation below rather than failing the lookup.
+    announce = _bounded_body(code, _ANNOUNCE_FN, _ANNOUNCE_END) if _ANNOUNCE_FN in code else ""
+    found = []
+
+    decision = ctor.find(_CTOR_WALK_DECISION)
+    publish = ctor.find(_CTOR_WALK_PUBLISH)
+    memory = ctor.find("model.create_memory(")
+    if ctor.count("llama_auto_ubatch_trial_runs(") != 1 or ctor.count("sycl_publish_runtime_context(") != 1 or \
+            min(decision, publish, memory) < 0 or not decision < publish < memory:
+        found.append(_V_DECISION)
+    publish_at = ctor[ctor.find("auto publish_at = [&](uint32_t ub) {"):publish]
+    if not publish_at.startswith("auto publish_at") or "cparams.n_ubatch = ub;" not in publish_at or \
+            "if (first_refusal.status == sched_reserve_status::OK) { first_refusal = published; }" not in ctor:
+        found.append(_V_RUNG)
+    # Every rung's one publish starts over at the first backend, so a backend that accepted a rung a later one
+    # refused is republished at the next rung down (the refusal returns at once and the OK only after the loop: the
+    # publish-status pin; a skipped backend: the kv-layer-sizing pin).
+    if pub.count("for (") != 1 or pub.count("for (auto & backend : backends) {") != 1:
+        found.append(_V_BACKENDS)
+    if _CTOR_WALK_GATE not in ctor:
+        found.append(_V_GATE)
+    gate, walk, record = ctor.find(_CTOR_WALK_GATE), ctor.find(_CTOR_WALK_DESCENT), ctor.find(_CTOR_WALK_RECORD)
+    if walk == -1 or not 0 <= gate < walk:
+        found.append(_V_WALK)
+    if record == -1 or not 0 <= walk < record < memory:
+        found.append(_V_RECORD)
+    # The descent asks nothing under a default below twice its floor, so that refusal is thrown as it came; a walk
+    # that ran names its last refusal only when it differs from the first.
+    no_lower = ctor.find(_CTOR_NO_LOWER)
+    if ctor.count(_CTOR_NO_LOWER) != 1 or min(gate, no_lower, walk) < 0 or not gate < no_lower < walk:
+        found.append(_V_NO_LOWER)
+    last_note = ctor.find(_CTOR_LAST_NOTE)
+    if ctor.count(_CTOR_LAST_NOTE) != 1 or min(walk, last_note, record) < 0 or not walk < last_note < record:
+        found.append(_V_LAST_TWICE)
+
+    if "const bool ctor_lowered = sycl_ctor_lowered_from != 0;" not in prep or \
+            "const bool cache_found = !ctor_lowered && cache_available && cache_lookup_fn(" not in prep or \
+            "const size_t n_rung_set = ctor_lowered ? 1 : n_rung_set_full;" not in prep or \
+            "if (ctor_lowered) { rung_ladder.assign(1, fallback_ubatch); }" not in prep:
+        found.append(_V_HOISTED)
+    # The trial's no-candidate exit returns before its lowered WARN, and the constructor announces only on an empty
+    # prep, so a lowered context with no rung in [lowered, cap] leaves prepare before any of the prep is built.
+    lowered_at = prep.find("const bool ctor_lowered = sycl_ctor_lowered_from != 0;")
+    skips = prep.find(_SKIPS_TRIAL)
+    built = [prep.find(s) for s in ("llama_auto_ubatch_rung_set(", "tenant_rung_set.assign(",
+                                    "auto_ubatch_prep = std::move(prep);")]
+    if prep.count(_SKIPS_TRIAL) != 1 or min([lowered_at, skips] + built) < 0 or not lowered_at < skips < min(built):
+        found.append(_V_NO_RUNG)
+
+    # Every anchor of an ordering is found first: a missing lower anchor (-1) would otherwise order before anything.
+    seed = sel.find("lowered_from = sycl_ctor_lowered_from; lowered_cause = sycl_ctor_lowered_cause;")
+    first_cache = sel.find("if (cache_available) {")
+    declared = sel.find("uint32_t lowered_from = 0;")
+    if min(declared, seed, first_cache) < 0 or not declared < seed < first_cache:
+        found.append(_V_SEED)
+    if 'if (lowered_from == 0) { lowered_from = fallback_ubatch; lowered_cause = format("the default did not fit ' \
+       '(%s)", stop); } else { lowered_cause += format(' not in sel:
+        found.append(_V_ORIGIN)
+    stop_init = sel.find('stop = moe_bound ? "MoE GPU routing ceiling"')
+    stop_seed = sel.find(_STOP_SEED)
+    if min(stop_init, seed, stop_seed, first_cache) < 0 or not stop_init < seed < stop_seed < first_cache:
+        found.append(_V_STOP)
+
+    # One source or the other, never both: the constructor announces only on an empty prep, the trial only past its
+    # empty-prep exit, the prep is not touched between the two decisions, and each source has one call or line.
+    prepared = ctor.find("sycl_auto_ubatch_prepare(params.type_k, params.type_v);")
+    announce_at = ctor.find(_CTOR_WALK_ANNOUNCE)
+    if announce_at == -1 or not 0 <= prepared < announce_at < memory:
+        found.append(_V_SILENT)
+    trial_call = ctor.find("sycl_select_auto_ubatch();")
+    empty_exit = sel.find("if (!auto_ubatch_prep) { sched_reserve(); return; }")
+    between = ctor[announce_at + len(_CTOR_WALK_ANNOUNCE):trial_call]
+    if announce_at == -1 or trial_call == -1 or "auto_ubatch_prep" in between or \
+            code.count("sycl_announce_ctor_lowered_ubatch();") != 1 or code.count(_LOWERED_LITERAL) != 2 or \
+            sel.count(_LOWERED_LITERAL) != 1 or announce.count(_LOWERED_LITERAL) != 1 or \
+            not 0 <= empty_exit < sel.find(_LOWERED_LITERAL):
+        found.append(_V_AT_MOST_ONE)
+    # The constructor's own n_ubatch INFO line prints the -ub as asked, before its publish can lower it.
+    if sel.count(_WAS_INFO) != 1:
+        found.append(_V_WAS)
+    if "LLAMA_LOG_WARN( " + _LOWERED_FMT + ", lowered_from, last_good, lowered_cause.c_str());" not in sel or \
+            "LLAMA_LOG_WARN( " + _LOWERED_FMT + ", sycl_ctor_lowered_from, cparams.n_ubatch, " \
+            "sycl_ctor_lowered_cause.c_str());" not in announce:
+        found.append(_V_WORDING)
+
+    # The two named refusals that can follow a constructor lowering carry it; generic throws stay as they are.
+    if _LOWERED_NOTE_FN not in code or code.count("llama_context_sycl_ctor_lowered_note(") != 3 or \
+            not _call_closes_throw(sel, _SETTLE_FMT) or not _call_closes_throw(ctor, _HOLD_SPILL_FMT):
+        found.append(_V_NOTE)
+    return found
+
+
+def test_the_constructor_publish_walks_down_only_through_the_predicate():
+    assert _ctor_walk_violations(LLAMA_CONTEXT_CPP) == []
+
+
+# Each mutant names the violation it must produce, so a witness proves its own clause rather than any clause.
+_CTOR_WALK_MUTANTS = {
+    "the decision computed again at the publish": (
+        "llama_auto_ubatch_ctor_walks_down(sycl_auto_ubatch_trial,",
+        "llama_auto_ubatch_ctor_walks_down(llama_auto_ubatch_trial_runs(params.n_ubatch_auto, cparams.causal_attn, "
+        "true, true),", _V_DECISION),
+    "a second publish site": (
+        "if (!publish_at(asked_ubatch)) {",
+        "(void) sycl_publish_runtime_context(cparams.flash_attn); if (!publish_at(asked_ubatch)) {", _V_DECISION),
+    "the walk publishes at the default every time": ("cparams.n_ubatch = ub;", "(void) ub;", _V_RUNG),
+    "the last refusal reported as the first": (
+        "if (first_refusal.status == sched_reserve_status::OK) {", "if (true) {", _V_RUNG),
+    "the publish resumes at the backend that refused": (
+        _PUBLISH_FN + " #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL) for (auto & backend : backends) {",
+        _PUBLISH_FN + "\n#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)\n"
+        "    for (auto & backend : sycl_publish_pending) {", _V_BACKENDS),
+    "a lifecycle refusal walks": ("first_refusal.fit_refusal)) {", "true)) {", _V_GATE),
+    "a context without the trial walks": ("walks_down(sycl_auto_ubatch_trial,", "walks_down(true,", _V_GATE),
+    "the walk asks above the default": (
+        "llama_auto_ubatch_descend(asked_ubatch, asked_ubatch,",
+        "llama_auto_ubatch_descend(asked_ubatch, cparams.n_batch,", _V_WALK),
+    "the walk goes on past a lifecycle refusal": (
+        "walk_aborted = !last_refusal.fit_refusal;", "walk_aborted = false;", _V_WALK),
+    "an aborted walk keeps the rung it aborted at": ("if (stood == 0 || walk_aborted) {", "if (stood == 0) {", _V_WALK),
+    "a default with no rung under it reports a walk": (_CTOR_NO_LOWER, "", _V_NO_LOWER),
+    "the no-lower check never fires": (
+        "if (llama_auto_ubatch_next_lower(asked_ubatch) == 0) {", "if (false) {", _V_NO_LOWER),
+    "the last refusal is named when it is the first": (
+        "last_refusal.reason == first_refusal.reason ? std::string() :", "false ? std::string() :", _V_LAST_TWICE),
+    "the origin is not recorded": ("sycl_ctor_lowered_from  = asked_ubatch;", "(void) asked_ubatch;", _V_RECORD),
+    "the cache asks above a lowered rung": (
+        "const bool cache_found           = !ctor_lowered && cache_available &&",
+        "const bool cache_found = cache_available &&", _V_HOISTED),
+    "the host hold folds rungs a lowered context never tries": (
+        "ctor_lowered ? 1 : n_rung_set_full", "n_rung_set_full", _V_HOISTED),
+    "the ladder climbs above a lowered rung": (
+        "if (ctor_lowered) { rung_ladder.assign(1, fallback_ubatch); }", "", _V_HOISTED),
+    "a lowered context with no rung builds a prep": (_SKIPS_TRIAL, "", _V_NO_RUNG),
+    "the no-rung guard falls through": (
+        "fallback_ubatch, cap)) { return; }", "fallback_ubatch, cap)) { (void) 0; }", _V_NO_RUNG),
+    "the no-rung guard asks from the origin": (
+        "llama_auto_ubatch_ladder_size, fallback_ubatch, cap)) { return; }",
+        "llama_auto_ubatch_ladder_size, sycl_ctor_lowered_from, cap)) { return; }", _V_NO_RUNG),
+    "the no-rung guard runs for every context": (
+        "llama_auto_ubatch_ctor_lowered_skips_trial(ctor_lowered,", "llama_auto_ubatch_ctor_lowered_skips_trial(true,",
+        _V_NO_RUNG),
+    "the trial is not told the rung was lowered": ("lowered_from  = sycl_ctor_lowered_from;", "(void) 0;", _V_SEED),
+    "the seed's declaration is no longer where the clause looks": (
+        "uint32_t lowered_from = 0;", "uint32_t lowered_from{};", _V_SEED),
+    "the stop initializer is no longer where the clause looks": (
+        'const char * stop = moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted";',
+        'const char * stop{ moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted" };', _V_STOP),
+    "the trial's descent overwrites the constructor's origin": ("if (lowered_from == 0) {", "if (true) {", _V_ORIGIN),
+    "the outcome names the ladder's ceiling for a lowered rung": (
+        "stop = sycl_ctor_lowered_cause.c_str();", "(void) 0;", _V_STOP),
+    "a single-reserve trial lowers silently": (
+        "if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) {", "if (false) {", _V_SILENT),
+    "the constructor announces what the trial announces": (
+        "if (sycl_ctor_lowered_from != 0 && !auto_ubatch_prep) {", "if (sycl_ctor_lowered_from != 0) {",
+        _V_AT_MOST_ONE),
+    "the trial announces on an empty prep too": (
+        "if (!auto_ubatch_prep) { sched_reserve(); return; }",
+        "if (!auto_ubatch_prep) { sched_reserve(); sycl_announce_ctor_lowered_ubatch(); return; }", _V_AT_MOST_ONE),
+    "the prep is made after the constructor announced": (
+        "sycl_announce_ctor_lowered_ubatch(); }",
+        "sycl_announce_ctor_lowered_ubatch(); } sycl_auto_ubatch_prepare(params.type_k, params.type_v);",
+        _V_AT_MOST_ONE),
+    "a third lowered announcement": (
+        "sycl_select_auto_ubatch(); } else { sched_reserve(); }",
+        'sycl_select_auto_ubatch(); } else { sched_reserve(); } '
+        'LLAMA_LOG_WARN("[SYCL-PLAN] auto n_ubatch lowered from %u to %u\\n", 1u, 2u);', _V_AT_MOST_ONE),
+    "the constructor's announcement leaves the trial's wording": (
+        _ANNOUNCE_FN + ' LLAMA_LOG_WARN( "[SYCL-PLAN] auto n_ubatch lowered from',
+        _ANNOUNCE_FN + ' LLAMA_LOG_WARN( "[SYCL-PLAN] auto n_ubatch reduced from', _V_WORDING),
+    "the settle's named error drops the lowering": (
+        '"no -ub is known to fit: free VRAM on the card", ' + _LOWERED_NOTE_ARG + " } else {",
+        '"no -ub is known to fit: free VRAM on the card", "")); } else {', _V_NOTE),
+    "the hold-spill named error drops the lowering": (
+        '"no -ub is known to fit: free VRAM on the card", ' + _LOWERED_NOTE_ARG + " } } #endif",
+        '"no -ub is known to fit: free VRAM on the card", ""));\n            }\n        }\n#endif', _V_NOTE),
+    "a context the constructor did not lower gets the note": (
+        "if (ctor_lowered_from == 0) {", "if (false) {", _V_NOTE),
+    "the INFO line gives the lowered rung as the -ub it superseded": (
+        "sycl_ctor_lowered_from != 0 ? sycl_ctor_lowered_from : fallback_ubatch);", "fallback_ubatch);", _V_WAS),
+}
+
+
+@pytest.mark.parametrize("mutation", sorted(_CTOR_WALK_MUTANTS))
+def test_the_constructor_walk_has_a_mutation_witness(mutation):
+    old, new, expected = _CTOR_WALK_MUTANTS[mutation]
+    pat = _ws_tolerant(old)
+    found = len(pat.findall(LLAMA_CONTEXT_CPP))
+    assert found == 1, f"mutation target not unique/found ({found}) -- update this witness: {old!r}"
+    mutated = pat.sub(lambda _m: new, LLAMA_CONTEXT_CPP, count=1)
+    violations = _ctor_walk_violations(mutated)
+    assert expected in violations, f"the mutant must fail its own clause -- got {violations}"
 
 if __name__ == "__main__":
     import sys

@@ -328,7 +328,7 @@ The `unified_cache` class (unified-cache.hpp/cpp, ~1400 lines header, ~9100 line
 - `entries_` hashmap: `unified_cache_key -> unified_cache_entry` mapping cache keys to device pointers
 - `id_to_key_` reverse map for fast lookup
 - Layout-aware: supports AOS, SOA, COALESCED, ONEDNN_PACKED layouts per entry
-- LRU+LFU hybrid eviction via `compute_score()` (access_count * exp(-decay * age))
+- Victim selection in `evict_one()`: the lowest `eviction_tier()` first, then the least recent access
 - Tier-based eviction ordering via `eviction_tier()` with priority boost from `alloc_category_priority()`
 
 **Sub-allocators owned by the cache**:
@@ -336,7 +336,6 @@ The `unified_cache` class (unified-cache.hpp/cpp, ~1400 lines header, ~9100 line
 - `compute_arena_ptr_`: Single pre-reserved VRAM block for compute scratch
 - `scratch_pool_ptr_`: Pre-allocated VRAM for per-op temporaries
 - `onednn_weights_scratch_` / `onednn_activations_scratch_`: Fixed buffers for oneDNN FP16 path
-- `reorder_temp_buffer_`: Single buffer for GPU-side AOS->SOA reorder
 - `persistent_scratches_`: Named scratch buffers for persistent TG kernel
 
 **Host-side pools**:
@@ -391,7 +390,7 @@ This pattern already exists and works correctly. It needs to be extended to non-
 | Capability | Status | Implementation |
 |-----------|--------|----------------|
 | Weight caching with layout support | COMPLETE | ensure_cached_layout, 4 layout modes |
-| LRU+LFU eviction with tier ordering | COMPLETE | evict_one, compute_score, eviction_tier |
+| LRU eviction with tier ordering | COMPLETE | evict_one, eviction_tier |
 | Host fallback for weights | COMPLETE | host_cache, host_resident entries |
 | Budget tracking (weights + runtime) | COMPLETE | used_, reserved_, available() |
 | Pre-allocated compute arena | COMPLETE | reserve_compute_arena, arena_alloc |
@@ -401,7 +400,6 @@ This pattern already exists and works correctly. It needs to be extended to non-
 | Unified allocation API | COMPLETE | unified_cache_allocate, unified_alloc |
 | Location-transparent weight lookup | COMPLETE | resolve_weight, weight_ptr_result |
 | Alloc registry (pointer type tracking) | COMPLETE | alloc_registry with binary search |
-| Expert group atomic staging/eviction | COMPLETE | stage_expert_group, evict_expert_group |
 | Deferred free (safe async release) | COMPLETE | enqueue_deferred_free, process_deferred_frees |
 | Graph replay pin/unpin coordination | COMPLETE | pin, unpin, unpin_on_event |
 | Async layer prefetch | COMPLETE | queue_layer_prefetch, prefetch_worker_loop |
@@ -494,7 +492,7 @@ Priority 2 (evictable under moderate pressure):
   - Shared MoE expert weights
 
 Priority 3 (readily evictable):
-  - Cold MoE expert weights (LFU-ordered)
+  - Cold MoE expert weights (least recently used first)
   - Staging buffers
 
 Priority 4 (always host-eligible):
@@ -502,7 +500,7 @@ Priority 4 (always host-eligible):
   - Debug/profiling allocations
 ```
 
-Eviction scans from highest priority number (coldest) to lowest. Within a tier, existing LRU+LFU scoring determines victim selection.
+Eviction scans from highest priority number (coldest) to lowest. Within a tier, the least recently used entry is the victim (evict_one).
 
 ### 6.4 Core API (Target)
 
@@ -691,7 +689,6 @@ struct vram_arena {
 | `unified-cache.cpp` | `evict_below_priority()` | NEW: Evict only entries with priority > threshold. Used when specific priority class needs space |
 | `unified-cache.cpp` | `ensure_cached_layout()` | Set priority based on entry type and layer position |
 | `unified-cache.cpp` | `allocate()` | Accept priority parameter. If VRAM full, evict entries with lower priority |
-| `unified-cache.cpp` | `compute_score()` | Factor in priority: `score = priority_weight * (access_count * decay)` |
 
 **Current state**: `eviction_tier()` already assigns tiers (0=cold MoE, 1=hot MoE, 2=dense weight, 3=hot dense). `alloc_category_priority()` returns 0-4 for different allocation categories. The gap is that eviction does not consider what is requesting the space -- it just evicts the globally coldest entry.
 

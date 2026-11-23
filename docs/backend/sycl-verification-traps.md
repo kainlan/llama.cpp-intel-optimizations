@@ -23,7 +23,29 @@ adding text there would change that prompt. The host-safety history is in
 Old location: `CLAUDE.md`, "Development Workflow (Machine-Specific)", "Model Locations". The list
 is not complete: `/models/` also holds other model families today. List the directory to see them.
 
-Models are stored on the local SSD in `/models/`:
+Models live under `/models/`, a mergerfs union (since 2026-11-01) of three XFS drives:
+
+- `/mnt/models-nvme` (Kingston OM3PDP3512B, 477 G)
+- `/mnt/models-ugreen` (894 G)
+- `/mnt/models-t7` (932 G, on the Thunderbolt port; keep it on that port)
+
+The union uses `category.create=ff`, so new files fill the NVMe first until its free space drops below
+`minfreespace=20G`, then the next branch. The NAS backup of the pre-move layout is
+`/Storage/GenAI/models-backup-2026-11-01/`.
+
+Placement on the host at the time of writing:
+
+- **NVMe:** both Qwen3.8-Flash-Next GGUFs (Q8_0 and GSQ-RCO IQ3_XXS), the Mistral files, GPT-OSS 20B
+  (`gpt-oss-20b-mxfp4.gguf`), gemma4 (`gemma-4-12b-it-GGUF`, `stock-gemma-4-E4B-it.Q8_0.gguf`), Qwen3.5-9B (the GGUF
+  directory and the UD-Q6_K_XL file), Qwen3-14B, Qwen3.6-27B and `qwen36-35b-a3b-nvfp4`.
+- **UGREEN:** gpt-oss-120b, the three Qwen1.5-MoE files, DeepSeek-V4-Flash-0731-GGUF,
+  DeepSeek-V4.1-Flash-HF-dspark, Llama-3.1-8B-Instruct-GGUF and Qwen3.8-Flash-Next-MTP.
+- **T7:** DeepSeek-V4.1-Flash-GGUF.
+
+A `/models` path says nothing about its branch. Check with `getfattr --only-values -n user.mergerfs.fullpath <file>`
+before making any storage claim. `df` on a `/models` path reports the pool, never the branch.
+
+Files used by the benchmarks:
 
 **Mistral 7B variants** (standard benchmark model):
 - `mistral-7b-v0.1.Q4_0.gguf` (3.9G) - **Default for benchmarks**
@@ -383,3 +405,15 @@ on the device, the plan has no CPU work, and the token-embedding `GET_ROWS` of t
 default context the KV goes partly to the host tier, the input becomes a device copy nobody wrote, and the gather
 reads activations as row ids: a GPU page fault and a lost device. The gate runs at the context a user gets. A
 pinned `-c` arm is the all-VRAM control for an A/B, and a pass there says nothing about the default context.
+
+## 11. A flat peak `Shmem` after a large host-tiered load is the instrument, not the load
+
+Added 2026-11-23. A sweep arm that pins host experts on a discrete card (SYCL host USM) printed a peak
+`Shmem` equal to the idle figure of its day (6 to 12 GiB), for about 45 arms, while the same runs pinned
+47 GiB and `MemAvailable` fell by 60 GiB. The driver owns those pages and `/proc/meminfo` counts them in no
+field, so `Shmem` cannot move. Do not read "peak `Shmem` flat" as "the load held no host memory".
+
+Read GPU host backing instead: `source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib` (`Shmem` plus
+the meminfo remainder). It reads 12.7 GiB idle and 65.4 GiB in the Qwen3.8 default-mode load that left `Shmem`
+flat. A positive control is a load known to pin host memory: if the sum does not rise for it, the instrument is
+wrong. Measurements and thresholds: `docs/backend/sycl-host-safety.md`, section 10.

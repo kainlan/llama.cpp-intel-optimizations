@@ -180,14 +180,14 @@ static void test_reset() {
     arena.alloc->reset();
     REQUIRE(arena.alloc->used() == 0 && "used() must be 0 after reset");
 
-    // Should be able to allocate a large block after reset.
-    // Note: allocate() uses mapping_search() which rounds up to the next SL
-    // boundary, so requesting exactly largest_free_block() may search a class
-    // above the block's actual class. Use 90% of the largest block instead.
+    // Should be able to allocate the whole largest block after reset.
+    // allocate() places any size up to largest_free_block(), except where the
+    // block ends off the grain (only a region whose size is not a multiple of
+    // it) and the rounded request passes its end; this arena is on the grain.
     size_t largest = arena.alloc->largest_free_block();
     REQUIRE(largest > 0 && "largest_free_block should be positive after reset");
 
-    size_t big = arena.alloc->allocate(largest * 9 / 10);
+    size_t big = arena.alloc->allocate(largest);
     REQUIRE(big != SIZE_MAX && "should allocate large block after reset");
     (void) big;
 
@@ -224,8 +224,8 @@ static void test_alloc_failure() {
 static void test_exhaust_recycle() {
     test_arena arena;
 
-    // Determine largest block — use 90% to account for TLSF rounding in
-    // mapping_search(), which may search a size class above the block's class.
+    // Determine largest block and take 90% of it, so a second request of the
+    // same size exercises the failure path.
     size_t largest = arena.alloc->largest_free_block();
     REQUIRE(largest > 0);
     size_t alloc_size = largest * 9 / 10;
@@ -239,16 +239,11 @@ static void test_exhaust_recycle() {
     REQUIRE(avail_after < arena.size && "available should decrease after large alloc");
     (void) avail_after;
 
-    // Try another large allocation — should fail
-    size_t o2 = arena.alloc->allocate(alloc_size);
-    // This may or may not succeed depending on remaining space, but it
-    // exercises the failure path.
+    // Another large allocation fails: the largest free block is the 10% left.
+    REQUIRE(arena.alloc->allocate(alloc_size) == SIZE_MAX && "a second 90% block does not fit");
 
     // Free and verify recovery
     arena.alloc->free(o1);
-    if (o2 != SIZE_MAX) {
-        arena.alloc->free(o2);
-    }
 
     // After freeing, we should be able to allocate again
     size_t o3 = arena.alloc->allocate(256);
@@ -1434,6 +1429,360 @@ static void test_allocate_excluding_interval_model() {
 }
 
 // ---------------------------------------------------------------------------
+// The exact-class fallback of allocate().  A MoE expert triplet's members are
+// 921600, 921600 and 921816 bytes; 921816 rounds to 921856, and both sizes
+// map to one second-level class, [917504, 950272).  A request the rounded
+// search misses falls back to that class, whose free list can hold a fitting
+// block behind a smaller head.
+// ---------------------------------------------------------------------------
+static constexpr size_t TRIPLET_SMALL         = 921600;  // two per triplet
+static constexpr size_t TRIPLET_LARGE         = 921816;  // one per triplet
+static constexpr size_t TRIPLET_LARGE_ROUNDED = 921856;
+static constexpr size_t TRIPLET_BYTES         = 2 * TRIPLET_SMALL + TRIPLET_LARGE_ROUNDED;
+
+static bool census_equal(const std::vector<tlsf_allocator::extent> & a, const std::vector<tlsf_allocator::extent> & b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].offset != b[i].offset || a[i].size != b[i].size || a[i].free != b[i].free || a[i].tag != b[i].tag) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Two free blocks of one class, separated by allocated 256-byte blocks so they
+// cannot coalesce, and nothing else free.  `head` is freed last, so it heads
+// the class's free list and `behind` sits after it.  Returns the offsets.
+struct class_pair {
+    size_t head_offset;
+    size_t behind_offset;
+};
+
+static class_pair class_pair_setup(tlsf_allocator & t, size_t head, size_t behind) {
+    const size_t head_offset   = t.allocate(head);
+    const size_t sep_a         = t.allocate(256);
+    const size_t behind_offset = t.allocate(behind);
+    const size_t sep_b         = t.allocate(256);
+    REQUIRE(head_offset != SIZE_MAX && sep_a != SIZE_MAX && behind_offset != SIZE_MAX && sep_b != SIZE_MAX);
+    REQUIRE(t.available() == 0 && "the region holds exactly the four blocks");
+    t.free(behind_offset);
+    t.free(head_offset);
+    REQUIRE(t.check_invariants());
+    return { head_offset, behind_offset };
+}
+
+// A fitting block behind a smaller head is found.
+static void test_allocate_class_walk_finds_block_behind_head() {
+    REQUIRE(tlsf_allocator::round_request(TRIPLET_LARGE, 256) == TRIPLET_LARGE_ROUNDED);
+    tlsf_allocator   t(TRIPLET_SMALL + 256 + TRIPLET_LARGE_ROUNDED + 256);
+    const class_pair p = class_pair_setup(t, TRIPLET_SMALL, TRIPLET_LARGE_ROUNDED);
+    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the fitting block is free, behind the head");
+    const size_t used = t.used();
+    const size_t got  = t.allocate(TRIPLET_LARGE);
+    REQUIRE(got == p.behind_offset && "the request takes the fitting block behind the smaller head");
+    REQUIRE(t.used() == used + TRIPLET_LARGE_ROUNDED);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_allocate_class_walk_finds_block_behind_head: PASSED\n";
+}
+
+// The walk takes the smallest fitting block, not the first: the head would
+// fit, but taking it would leave the larger request no room later.
+static void test_allocate_class_walk_takes_smallest_fit() {
+    tlsf_allocator   t(TRIPLET_LARGE_ROUNDED + 256 + TRIPLET_SMALL + 256);
+    const class_pair p = class_pair_setup(t, TRIPLET_LARGE_ROUNDED, TRIPLET_SMALL);
+    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the larger block is free, at the head");
+    REQUIRE(t.allocate(TRIPLET_SMALL) == p.behind_offset && "the exact-size block behind the head is taken");
+    REQUIRE(t.allocate(TRIPLET_LARGE) == p.head_offset && "the larger request still finds its block");
+    REQUIRE(t.available() == 0);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_allocate_class_walk_takes_smallest_fit: PASSED\n";
+}
+
+// No block of the class fits: the request is refused and nothing changes.
+static void test_allocate_class_walk_refuses_when_none_fits() {
+    tlsf_allocator   t(TRIPLET_SMALL + 256 + TRIPLET_SMALL + 256);
+    const class_pair p      = class_pair_setup(t, TRIPLET_SMALL, TRIPLET_SMALL);
+    const size_t     used   = t.used();
+    const auto       before = t.block_census();
+    REQUIRE(t.allocate(TRIPLET_LARGE) == SIZE_MAX && "no block of the class is large enough");
+    REQUIRE(t.used() == used);
+    REQUIRE(census_equal(t.block_census(), before) && "a refusal changes no block");
+    REQUIRE(t.check_invariants());
+    const size_t first  = t.allocate(TRIPLET_SMALL);
+    const size_t second = t.allocate(TRIPLET_SMALL);
+    REQUIRE(((first == p.head_offset && second == p.behind_offset) ||
+             (first == p.behind_offset && second == p.head_offset)) &&
+            "both blocks are still free and still whole");
+    REQUIRE(t.check_invariants());
+    std::cout << "test_allocate_class_walk_refuses_when_none_fits: PASSED\n";
+}
+
+// largest_free_block() is the largest block of the top class, not its head:
+// the head is smaller, the larger block sits behind it, and a smaller block
+// in a lower class changes nothing.
+static void test_largest_free_block_walks_top_class() {
+    tlsf_allocator t(4096 + 256 + TRIPLET_SMALL + 256 + TRIPLET_LARGE_ROUNDED + 256);
+    const size_t   low = t.allocate(4096);
+    REQUIRE(low != SIZE_MAX && t.allocate(256) != SIZE_MAX);
+    const class_pair p = class_pair_setup(t, TRIPLET_SMALL, TRIPLET_LARGE_ROUNDED);
+    t.free(low);
+    REQUIRE(t.check_invariants());
+    REQUIRE(t.largest_free_block() == TRIPLET_LARGE_ROUNDED && "the block behind the top class's head is the largest");
+    // The answer is a size allocate() honours, with the head still smaller.
+    REQUIRE(t.allocate(t.largest_free_block()) == p.behind_offset);
+    REQUIRE(t.largest_free_block() == TRIPLET_SMALL && "the head is now the only block of the top class");
+    REQUIRE(t.check_invariants());
+    std::cout << "test_largest_free_block_walks_top_class: PASSED\n";
+}
+
+// With every byte allocated there is no free block: largest_free_block() is 0,
+// and it returns to the freed size once a block is released.
+static void test_largest_free_block_empty_pool() {
+    tlsf_allocator t(TRIPLET_SMALL + TRIPLET_LARGE_ROUNDED);
+    const size_t   a = t.allocate(TRIPLET_SMALL);
+    const size_t   b = t.allocate(TRIPLET_LARGE);
+    REQUIRE(a != SIZE_MAX && b != SIZE_MAX && t.available() == 0);
+    REQUIRE(t.largest_free_block() == 0 && "a full pool has no free block");
+    t.free(a);
+    REQUIRE(t.largest_free_block() == TRIPLET_SMALL);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_largest_free_block_empty_pool: PASSED\n";
+}
+
+// A region off the grain ends in a block off the grain.  largest_free_block()
+// reports its whole size, a request rounded up past its end is refused, and
+// segment_piece() (how the host pinned pool sizes each piece of a segmented
+// allocation) gives the block's on-grain part, which is placed and takes the
+// whole block.
+static void test_largest_free_block_off_grain_tail() {
+    const size_t   region = 16 * 256 + 100;
+    tlsf_allocator t(region);
+    REQUIRE(t.largest_free_block() == region);
+    REQUIRE(t.allocate(region - 50) == SIZE_MAX && "rounded up to the grain, the request passes the block's end");
+    REQUIRE(t.used() == 0);
+    const size_t piece = tlsf_allocator::segment_piece(region - 50, t.largest_free_block(), 256);
+    REQUIRE(piece == 16 * 256 && "the piece is the block's on-grain part");
+    REQUIRE(t.allocate(piece) == 0 && "the on-grain part of the block is placed");
+    REQUIRE(t.used() == region && "the sub-grain tail is absorbed into the block");
+    REQUIRE(t.largest_free_block() == 0);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_largest_free_block_off_grain_tail: PASSED\n";
+}
+
+// segment_piece(): the whole remainder rounded up to the granularity when that
+// fits the block, otherwise the block's on-grain part.  The off-grain rows are
+// the ones a piece rounded up past the block would get wrong.
+static void test_segment_piece() {
+    const size_t off = 16 * 256 + 100;  // a block ending 100 bytes past the grain
+    // Fits: rounded up, never past the block.
+    REQUIRE(tlsf_allocator::segment_piece(1000, 4096, 256) == 1024);
+    REQUIRE(tlsf_allocator::segment_piece(100, 4096, 64) == 256 && "a small alignment still rounds to the grain");
+    REQUIRE(tlsf_allocator::segment_piece(4096, 4096, 256) == 4096);
+    REQUIRE(tlsf_allocator::segment_piece(5000, 8192, 256) == 5120);
+    REQUIRE(tlsf_allocator::segment_piece(16 * 256, off, 256) == 16 * 256);
+    // Larger than an on-grain block: the whole block.
+    REQUIRE(tlsf_allocator::segment_piece(10000, 4096, 256) == 4096);
+    // Off-grain block, remainder past its on-grain part: the on-grain part.
+    REQUIRE(tlsf_allocator::segment_piece(16 * 256 + 1, off, 256) == 16 * 256);
+    REQUIRE(tlsf_allocator::segment_piece(off - 50, off, 256) == 16 * 256);
+    REQUIRE(tlsf_allocator::segment_piece(off, off, 256) == 16 * 256);
+    REQUIRE(tlsf_allocator::segment_piece(10000, off, 256) == 16 * 256);
+    // Nothing to place.
+    REQUIRE(tlsf_allocator::segment_piece(0, 4096, 256) == 0);
+    REQUIRE(tlsf_allocator::segment_piece(1000, 200, 256) == 0 && "a block below one granule holds no piece");
+    // Every piece the helper gives for an off-grain region is placed by allocate().
+    for (size_t remaining = 1; remaining <= 2 * off; remaining += 37) {
+        tlsf_allocator t(off);
+        const size_t   piece = tlsf_allocator::segment_piece(remaining, t.largest_free_block(), 256);
+        REQUIRE(piece != 0 && t.allocate(piece) == 0 && "a segment piece always fits the block it was sized for");
+    }
+    std::cout << "test_segment_piece: PASSED\n";
+}
+
+// The last size class has no upper bound: every block from about 62 GiB up
+// maps to it.  A request in it must not get a smaller block from the fast
+// path, and a larger block behind that head must be found.  The region is
+// bookkeeping only, so a region this size costs nothing.
+static void test_allocate_unbounded_last_class() {
+    const size_t     GiB   = size_t(1) << 30;
+    const size_t     small = 63 * GiB;  // both blocks map to the last class
+    const size_t     large = 66 * GiB;
+    tlsf_allocator   t(small + 256 + large + 256);
+    const class_pair p = class_pair_setup(t, small, large);
+    REQUIRE(t.largest_free_block() == large);
+    const size_t used = t.used();
+    REQUIRE(t.allocate(67 * GiB) == SIZE_MAX && "no block of the last class holds the request");
+    REQUIRE(t.used() == used);
+    const size_t got = t.allocate(65 * GiB);
+    REQUIRE(got == p.behind_offset && "the larger block behind the smaller head is taken");
+    REQUIRE(t.block_size_at(got) >= 65 * GiB && "the block holds the request");
+    REQUIRE(t.allocate(small) == p.head_offset);
+    REQUIRE(t.check_invariants());
+    std::cout << "test_allocate_unbounded_last_class: PASSED\n";
+}
+
+// A replay of expert triplets in a pool sized for exactly n of them: allocate
+// every triplet with members (small, small, large), free the triplets in
+// `freed` (members in `member_free_order`), then re-allocate as many triplets
+// with members in `order`.  member_major allocates every triplet's member 0,
+// then every member 1, then every member 2, so a freed triplet leaves three
+// separate holes of the members' own sizes rather than one triplet-sized hole.
+struct triplet_replay {
+    bool                member_major;
+    size_t              n;
+    std::vector<size_t> freed;
+    int                 member_free_order[3];
+    size_t              order[3];
+};
+
+struct triplet_replay_result {
+    size_t refused;
+    bool   used_restored;
+};
+
+// Every refusal must be a shape refusal: no free block anywhere in the pool is
+// as large as the rounded request.  A refusal while such a block exists is a
+// search that missed a fit.
+static triplet_replay_result triplet_replay_run(const triplet_replay & r) {
+    tlsf_allocator                   t(r.n * TRIPLET_BYTES);
+    const size_t                     first[3] = { TRIPLET_SMALL, TRIPLET_SMALL, TRIPLET_LARGE };
+    std::vector<std::vector<size_t>> trip(r.n, std::vector<size_t>(3, SIZE_MAX));
+    for (size_t step = 0; step < 3 * r.n; ++step) {
+        const size_t i = r.member_major ? step % r.n : step / 3;
+        const size_t k = r.member_major ? step / r.n : step % 3;
+        trip[i][k]     = t.allocate(first[k]);
+        REQUIRE(trip[i][k] != SIZE_MAX && "the first placement fits the pool exactly");
+    }
+    REQUIRE(t.available() == 0);
+    const size_t used = t.used();
+    for (const size_t i : r.freed) {
+        for (const int k : r.member_free_order) {
+            t.free(trip[i][k]);
+        }
+    }
+    REQUIRE(t.check_invariants());
+    size_t refused = 0;
+    for (size_t j = 0; j < r.freed.size(); ++j) {
+        for (const size_t s : r.order) {
+            if (t.allocate(s) != SIZE_MAX) {
+                continue;
+            }
+            refused++;
+            const size_t want = tlsf_allocator::round_request(s, 256);
+            for (const tlsf_allocator::extent & e : t.block_census()) {
+                REQUIRE(!(e.free && e.size >= want) && "a refusal while a free block fits the request");
+            }
+        }
+    }
+    REQUIRE(t.check_invariants());
+    return { refused, t.used() == used };
+}
+
+static std::vector<size_t> triplet_indices(size_t n, size_t mod, size_t rem, bool descending) {
+    std::vector<size_t> v;
+    for (size_t i = 0; i < n; ++i) {
+        if (i % mod == rem) {
+            v.push_back(i);
+        }
+    }
+    if (descending) {
+        std::reverse(v.begin(), v.end());
+    }
+    return v;
+}
+
+// Freed triplets that are not adjacent leave holes of exactly the member
+// sizes, all in one class.  Re-allocating in another member order succeeds in
+// full only if each request takes a hole of its own size: the class head
+// alone refuses requests that a hole further down fits, and a first fit puts
+// a small member into a large member's hole and refuses that large member.
+static void test_allocate_class_walk_triplet_replay() {
+    const size_t         S       = TRIPLET_SMALL;
+    const size_t         L       = TRIPLET_LARGE;
+    const size_t         n       = 64;
+    const triplet_replay cases[] = {
+        // Half the triplets, every other one.
+        { true, n, triplet_indices(n, 2, 0, false), { 0, 1, 2 }, { S, L, S } },
+        // The other half, freed from the top down.
+        { true, n, triplet_indices(n, 2, 1, true),  { 0, 1, 2 }, { S, L, S } },
+        // A third of them, large member first.
+        { true, n, triplet_indices(n, 3, 0, false), { 0, 1, 2 }, { L, S, S } },
+    };
+    for (const triplet_replay & r : cases) {
+        const triplet_replay_result res = triplet_replay_run(r);
+        REQUIRE(res.refused == 0 && "every re-allocated triplet fits the room its predecessor freed");
+        REQUIRE(res.used_restored && "used() returns to its value before the frees");
+    }
+    std::cout << "test_allocate_class_walk_triplet_replay: PASSED\n";
+}
+
+// Over a fixed set of replays, adjacent and member-major, with freed sets that
+// do and do not coalesce, allocate() refuses only when no free block fits.
+// Some of these replays do refuse: when the freed bytes equal the re-requested
+// bytes, a 256-byte sliver left by a placement can refuse a later request
+// under every policy.  Those refusals are the pool's shape, not the search.
+static void test_allocate_refuses_only_without_a_fitting_block() {
+    const size_t S = TRIPLET_SMALL;
+    const size_t L = TRIPLET_LARGE;
+    const size_t n = 64;
+
+    std::vector<std::vector<size_t>> freed_sets;
+    freed_sets.push_back(triplet_indices(n, 2, 0, false));
+    freed_sets.push_back(triplet_indices(n, 2, 1, true));
+    freed_sets.push_back(triplet_indices(n, 3, 0, false));
+    std::vector<size_t> not_3_mod_4;
+    std::vector<size_t> all;
+    for (size_t i = 0; i < n; ++i) {
+        if (i % 4 != 3) {
+            not_3_mod_4.push_back(i);
+        }
+        all.push_back(i);
+    }
+    freed_sets.push_back(not_3_mod_4);
+    freed_sets.push_back(all);
+    std::vector<size_t> stride;
+    for (size_t i = 0; i < n * 5 / 8; ++i) {
+        stride.push_back((i * 37) % n);
+    }
+    freed_sets.push_back(stride);
+
+    const size_t orders[3][3] = {
+        { S, S, L },
+        { S, L, S },
+        { L, S, S }
+    };
+    const int free_orders[2][3] = {
+        { 0, 1, 2 },
+        { 2, 1, 0 }
+    };
+    size_t runs    = 0;
+    size_t refused = 0;
+    for (const bool member_major : { false, true }) {
+        for (const std::vector<size_t> & freed : freed_sets) {
+            for (const auto & order : orders) {
+                for (const auto & free_order : free_orders) {
+                    const triplet_replay r = {
+                        member_major,
+                        n,
+                        freed,
+                        { free_order[0], free_order[1], free_order[2] },
+                        { order[0],      order[1],      order[2]      },
+                    };
+                    refused += triplet_replay_run(r).refused;
+                    runs++;
+                }
+            }
+        }
+    }
+    REQUIRE(runs == 72);
+    // Shape refusals occur in this set, so the census check above has run.
+    REQUIRE(refused > 0);
+    std::cout << "test_allocate_refuses_only_without_a_fitting_block: PASSED\n";
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main() {
@@ -1472,6 +1821,16 @@ int main() {
     test_round_request();
     test_allocate_excluding_geometry();
     test_allocate_excluding_interval_model();
+    test_allocate_class_walk_finds_block_behind_head();
+    test_allocate_class_walk_takes_smallest_fit();
+    test_allocate_class_walk_refuses_when_none_fits();
+    test_largest_free_block_walks_top_class();
+    test_largest_free_block_empty_pool();
+    test_largest_free_block_off_grain_tail();
+    test_segment_piece();
+    test_allocate_unbounded_last_class();
+    test_allocate_class_walk_triplet_replay();
+    test_allocate_refuses_only_without_a_fitting_block();
 
     std::cout << "\nAll tlsf_allocator tests PASSED!\n";
     return 0;

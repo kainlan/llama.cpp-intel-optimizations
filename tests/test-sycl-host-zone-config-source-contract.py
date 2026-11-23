@@ -13,9 +13,17 @@
 # body, under g_tensor_inventory_mutex. 8c8a0afae moved it: the exported setter
 # delegates to a private ggml_sycl_set_tensor_inventory_impl that finalizes the
 # plan and captures the candidate snapshot UNDER the inventory lock, and the
-# guarded ggml_backend_sycl_stage_inventory_plan wrapper provisions that
+# guarded ggml_backend_sycl_stage_load_inventory_plan wrapper provisions that
 # retained snapshot OUTSIDE the lock (canonical contract 12.5). A 528397d03
 # extract is the positive control for A3 (its setter body carries the call).
+#
+# The stage now runs in two passes, so that a load refused on any device
+# configures no device's host zones: the decide loop captures each device's snapshot (and the
+# effects its impl decided) into a late_decision, and the effect loop
+# provisions each decision's retained snapshot after the last refusal. The
+# A-family anchors name those fields; the shape they pin is unchanged: capture
+# before provision, the retained snapshot, and no inventory lock in the stage
+# (the effect helpers it calls take the lock themselves).
 #
 # llama.cpp-16el: check E's anchor moved with the reserve parse (lenient
 # parse_env_mb_value -> strict ggml_sycl::detail::parse_host_reserve_mb) and
@@ -25,6 +33,7 @@
 # reads and requires the check to flip to RED, so a check whose anchor silently
 # stopped matching real code cannot pass vacuously.
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -36,7 +45,9 @@ args = parser.parse_args()
 root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[1]
 sycl_cpp = (root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 cache_cpp = (root / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+cache_hpp = (root / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 pool_cpp = (root / "ggml/src/ggml-sycl/pinned-pool.cpp").read_text()
+plan_cpp = (root / "ggml/src/ggml-sycl/host-zone-plan.cpp").read_text()
 env_doc = (root / "docs/backend/sycl-env-vars.md").read_text()
 
 
@@ -87,14 +98,21 @@ def statement_window(source: str, statement_anchor: str, window: int = 1400) -> 
 
 
 # Real code text the checks anchor on (never comments).
-LOCK_STMT = "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);"
-PLAN_STORE_CALL = "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"
-IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory);"
-SNAPSHOT_CAPTURE = "const auto snapshot = " + IMPL_DELEGATE_CALL
-# The retained-candidate overload (snapshot->plan), not the current-plan
-# overload S1-PRELOAD uses.
-PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, snapshot->plan);"
-CURRENT_PLAN_PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);"
+# The inventory guard in either guard type, with or without a template argument: the lock is a witnessed_mutex, which
+# a test build cannot spell std::mutex, so its guards deduce the type (std::lock_guard lock(m)).
+LOCK_RE = re.compile(r"std::(?:lock_guard|unique_lock)(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;")
+# The guard the A1 witness reintroduces, in the spelling the source uses.
+LOCK_STMT = "std::lock_guard lock(g_tensor_inventory_mutex);"
+# The plan store returns false when the arena's zones cannot hold the plan; the impl branches on it.
+PLAN_STORE_CALL = "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) {"
+# The exported setter has no result to give a refusal, so it passes no flag; the stage passes one and fails the load.
+# Both pass an effects record the impl fills, for the caller to run once the plan is decided.
+IMPL_DELEGATE_CALL = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, nullptr, effects);"
+SNAPSHOT_CAPTURE = "ggml_sycl_set_tensor_inventory_impl(backend, inventory, &plan_refused, decision.effects);"
+# The retained-candidate overload (the decision's snapshot->plan), not the
+# current-plan overload S1-PRELOAD uses.
+PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);"
+CURRENT_PLAN_PROVISION_CALL = "ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, device);"
 CONFIGURE_TOKEN = "configure_host_zones"
 
 # Every window the checks read, keyed by name. Witness mutants operate on a
@@ -102,7 +120,8 @@ CONFIGURE_TOKEN = "configure_host_zones"
 texts = {
     "stage_fn": function_window(
         sycl_cpp,
-        "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,",
+        "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
+        "const ggml_sycl_tensor_inventory *   inventory,",
         window=30000),
     "impl_fn": function_window(
         sycl_cpp,
@@ -110,17 +129,58 @@ texts = {
         window=30000),
     "setter_fn": function_window(
         sycl_cpp,
-        "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {"),
+        "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, "
+        "const ggml_sycl_tensor_inventory * inventory) {"),
     "get_max_size_fn": function_window(
         sycl_cpp,
         "static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
     "alloc_buffer_fn": function_window(
         sycl_cpp,
-        "static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,"),
+        "static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer("
+        "ggml_backend_buffer_type_t buft,"),
+    "intent_fn": function_window(
+        sycl_cpp, "static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {"),
+    "host_zone_fn": function_window(
+        sycl_cpp, "static ggml_sycl::host_zone_id ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind kind) {"),
+    "host_max_size_fn": function_window(
+        sycl_cpp,
+        "static size_t ggml_sycl_host_buft_max_size(ggml_backend_buffer_type_t buft, int device, "
+        "ggml_sycl::host_zone_id zone) {"),
+    "host_alloc_fn": function_window(
+        sycl_cpp, "static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_t buft,"),
+    "kv_get_max_size_fn": function_window(
+        sycl_cpp,
+        "static size_t ggml_backend_sycl_kv_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
+    "kv_alloc_buffer_fn": function_window(
+        sycl_cpp,
+        "static ggml_backend_buffer_t ggml_backend_sycl_kv_host_buffer_type_alloc_buffer("
+        "ggml_backend_buffer_type_t buft,"),
+    "kv_buft_fn": function_window(sycl_cpp, "ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {"),
+    "hc_get_max_size_fn": function_window(
+        sycl_cpp,
+        "static size_t ggml_backend_sycl_host_compute_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {"),
+    "hc_alloc_fn": function_window(
+        sycl_cpp,
+        "static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_backend_buffer_type_t buft,",
+        window=20000),
+    "hc_iface": statement_window(
+        sycl_cpp, "static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_type_interface = {",
+        window=700),
+    "select_zone_fn": function_window(plan_cpp, "host_zone_id select_zone(alloc_role       role,"),
     "populate_zone_sizing_fn": function_window(
         cache_cpp,
         "static void populate_host_zone_sizing(placement_plan &                           plan,",
-        window=45000),
+        window=60000),
+    "weight_zone_terms_fn": function_window(
+        cache_cpp,
+        "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"),
+    "swap_headroom_hold_fn": function_window(cache_cpp, "static void placement_plan_hold_moe_swap_host_headroom("),
+    "mmid_replan_fn": function_window(
+        cache_cpp, "bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,", window=20000),
+    "charge_host_weight_fn": function_window(
+        cache_hpp, "void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
+    "uncharge_host_weight_fn": function_window(
+        cache_hpp, "void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
     # llama.cpp-16el: 3200 chars, not the 1400 default -- the strict-parse
     # switch (four cases, two log lines) sits after the glkg comment block and
     # the default window ended inside it.
@@ -137,7 +197,7 @@ texts = {
 # --- A: host zones provisioned eagerly, before create_tensor allocates any
 # weight buffer -- not lazily at S1-PRELOAD, which runs after weight loading
 # has already gone through the pre-zone runtime-pinned fallback. The eager
-# call lives in the guarded stage_inventory_plan wrapper (8c8a0afae shape):
+# call lives in the guarded stage_load_inventory_plan wrapper (8c8a0afae shape):
 # the wrapper captures the candidate snapshot from the private setter impl,
 # then provisions that exact retained snapshot, in that order, in the same
 # function. On master the call existed only in S1-PRELOAD.
@@ -169,13 +229,14 @@ def witness_a(t):
 def check_a1_lock_scoped_to_impl(t):
     impl = t["impl_fn"]
     stage = t["stage_fn"]
+    lock = LOCK_RE.search(impl)
     return (
         impl != ""
         and stage != ""
-        and LOCK_STMT in impl
+        and lock is not None
         and PLAN_STORE_CALL in impl
-        and impl.find(LOCK_STMT) < impl.find(PLAN_STORE_CALL)
-        and LOCK_STMT not in stage
+        and lock.start() < impl.find(PLAN_STORE_CALL)
+        and LOCK_RE.search(stage) is None
     )
 
 
@@ -211,84 +272,285 @@ def witness_a3(t):
     return t
 
 
-# --- B: ggml_backend_sycl_host_buffer_type_get_max_size must mirror the zone
-# unified_alloc_host_zone() (unified-cache.cpp) ACTUALLY uses for this
-# buft's requests -- WEIGHT, unconditionally, because alloc_buffer always sets
-# category=HOST_COMPUTE and unified_alloc_host_zone's WEIGHT branch is checked before any
-# role-only STAGING fallback. The old code re-derived alloc_buffer's ROLE
-# computation (in_model_load || weights_evictable) instead, which disagreed
-# with the real zone once in_model_load went false post-load.
-TARGET_ZONE_WEIGHT = "constexpr ggml_sycl::host_zone_id target_zone = ggml_sycl::host_zone_id::WEIGHT;"
-OLD_ROLE_TERNARY = "in_model_load || weights_evictable"
+# --- B: the host bufts' size and alloc share one builder (design 5efe section 7, the C4 part f clauses "The host
+# bufts' size and alloc share one builder", amending this gate). Before C4, SYCL_Host's get_max_size hard-coded
+# WEIGHT because every HOST_COMPUTE request routed there; after C4 a post-load SYCL_Host buffer is a context's and
+# routes to SCRATCH, so a get_max_size that names its own zone chunks against the wrong one (the glkg shape). Each
+# buft's get_max_size therefore builds the same intent its alloc_buffer builds and asks select_zone, on the buft's
+# own device. The select_zone call over the builder's intent is written once, in ggml_sycl_host_buft_zone, and each
+# get_max_size asks that helper for its own kind. Whitespace is flattened, so alignment never decides a check.
+HOST_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::HOST)"
+KV_INTENT = "ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind::KV_HOST)"
+HOST_ZONE = "ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind::HOST)"
+KV_ZONE = "ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind::KV_HOST)"
+TP_ZONE = "ggml_sycl_host_buft_zone(ggml_sycl_host_buft_kind::HOST_COMPUTE_TP)"
+ZONE_FROM_INTENT = ("const ggml_sycl::alloc_intent intent = ggml_sycl_host_buft_intent(kind); "
+                    "return ggml_sycl::select_zone(intent.role, intent.category, intent.lifetime, "
+                    "intent.constraints.persistent_owner, false);")
+HOST_DEVICE = "const int device = ggml_sycl_host_buft_device(buft);"
 
 
-def check_b_mirror(t):
-    fn = t["get_max_size_fn"]
-    return TARGET_ZONE_WEIGHT in fn and OLD_ROLE_TERNARY not in fn
+def flat_ws(text):
+    return re.sub(r"\s+", " ", text)
 
 
-def witness_b_mirror(t):
-    t["get_max_size_fn"] = t["get_max_size_fn"].replace(
-        TARGET_ZONE_WEIGHT,
-        "const ggml_sycl::host_zone_id target_zone = (in_model_load || weights_evictable) ? "
-        "ggml_sycl::host_zone_id::WEIGHT : ggml_sycl::host_zone_id::STAGING;")
+def check_b_host_builder(t):
+    size_fn, alloc_fn = flat_ws(t["get_max_size_fn"]), t["alloc_buffer_fn"]
+    return (
+        bool(size_fn) and bool(alloc_fn)
+        and ZONE_FROM_INTENT in flat_ws(t["host_zone_fn"])
+        and HOST_ZONE in size_fn and HOST_DEVICE in size_fn
+        and "return ggml_sycl_host_buft_alloc(buft, size, " + HOST_INTENT + ");" in alloc_fn
+    )
+
+
+def witness_b_host_builder(t):
+    # SYCL_Host's get_max_size with WEIGHT hard-coded again.
+    t["get_max_size_fn"] = t["get_max_size_fn"].replace(HOST_ZONE, "ggml_sycl::host_zone_id::WEIGHT")
     return t
 
 
-# unified_alloc_host_zone's real precedence (unified-cache.cpp): WEIGHT branch fires on
-# role==WEIGHT OR cat==HOST_COMPUTE OR cat==EXPERT_CACHE, checked before the
-# STAGING fallback. This is the reason B's unconditional WEIGHT is correct
-# for this call site (alloc_buffer always sets category=HOST_COMPUTE) --
-# pinned so a future rewrite of unified_alloc_host_zone's precedence is forced to revisit
-# the mirror in get_max_size too.
-SELECT_ZONE_WEIGHT_BRANCH = "role == alloc_role::WEIGHT || cat == runtime_category::HOST_COMPUTE ||"
-SELECT_ZONE_EXPERT_BRANCH = "cat == runtime_category::EXPERT_CACHE"
+# No host get_max_size names a zone or calls get_current_device_id(), and SYCL_Host's and SYCL_KV_Host's paths take
+# the device from ggml_sycl_host_buft_device and nowhere else (no ctx->device on those paths). The shared helpers the
+# three answer through take the kind or the zone as a parameter and name none.
+HOST_SIZE_WINDOWS = ("get_max_size_fn", "kv_get_max_size_fn", "hc_get_max_size_fn", "host_zone_fn", "host_max_size_fn")
 
 
+def check_b_no_zone_no_current_device(t):
+    for key in HOST_SIZE_WINDOWS:
+        fn = t[key]
+        if not fn or "host_zone_id::" in fn or "get_current_device_id(" in fn:
+            return False
+    for key in ("get_max_size_fn", "alloc_buffer_fn", "kv_get_max_size_fn", "kv_alloc_buffer_fn", "host_alloc_fn"):
+        fn = t[key]
+        if not fn or "get_current_device_id(" in fn or "ctx->device" in fn:
+            return False
+    return "const int exact_device = ggml_sycl_host_buft_device(buft);" in t["host_alloc_fn"]
+
+
+def witness_b_no_zone_no_current_device(t):
+    # SYCL_Host's get_max_size back on get_current_device_id().
+    t["get_max_size_fn"] = t["get_max_size_fn"].replace("ggml_sycl_host_buft_device(buft)", "get_current_device_id()")
+    return t
+
+
+# SYCL_KV_Host is SYCL_Host's buffer type with three slots overridden: its own get_name, and alloc_buffer and
+# get_max_size slots that call the builder with role KV. A copy that kept SYCL_Host's alloc_buffer would allocate host
+# KV with SYCL_Host's role (design 5efe section M57 (a)).
+KV_OVERRIDES = (
+    "t.iface.get_name = ggml_backend_sycl_kv_host_buffer_type_name;",
+    "t.iface.alloc_buffer = ggml_backend_sycl_kv_host_buffer_type_alloc_buffer;",
+    "t.iface.get_max_size = ggml_backend_sycl_kv_host_buffer_type_get_max_size;",
+)
+
+
+def check_b_kv_own_iface(t):
+    buft = flat_ws(t["kv_buft_fn"])
+    return (
+        "ggml_backend_buffer_type t = *ggml_backend_sycl_host_buffer_type();" in buft
+        and all(o in buft for o in KV_OVERRIDES)
+        and KV_ZONE in flat_ws(t["kv_get_max_size_fn"])
+        and "return ggml_sycl_host_buft_alloc(buft, size, " + KV_INTENT + ");" in t["kv_alloc_buffer_fn"]
+        and "intent.role      = ggml_sycl::alloc_role::KV;" in t["intent_fn"]
+    )
+
+
+def witness_b_kv_own_iface(t):
+    # SYCL_KV_Host copied from SYCL_Host with its alloc_buffer left as SYCL_Host's.
+    t["kv_buft_fn"] = t["kv_buft_fn"].replace(
+        "t.iface.alloc_buffer       = ggml_backend_sycl_kv_host_buffer_type_alloc_buffer;\n", "")
+    return t
+
+
+# SYCL_HostCompute's iface names its own get_max_size, which asks ggml_sycl_host_compute_is_tp(), the predicate its
+# alloc_buffer asks, and outside TP mode delegates to the device buft's get_max_size.
+def check_b_host_compute(t):
+    fn = t["hc_get_max_size_fn"]
+    return (
+        "/* .get_max_size     = */ ggml_backend_sycl_host_compute_buffer_type_get_max_size," in t["hc_iface"]
+        and "if (!ggml_sycl_host_compute_is_tp()) {\n        return ggml_backend_sycl_buffer_type_get_max_size(buft);"
+        in fn
+        and TP_ZONE in flat_ws(fn)
+        and "if (ggml_sycl_host_compute_is_tp()) {" in t["hc_alloc_fn"]
+    )
+
+
+def witness_b_host_compute(t):
+    # The glkg defect reversed: the host builder's answer outside TP mode.
+    t["hc_get_max_size_fn"] = t["hc_get_max_size_fn"].replace(
+        "return ggml_backend_sycl_buffer_type_get_max_size(buft);",
+        "return ggml_sycl_host_buft_max_size(buft, -1, ggml_sycl::host_zone_id::STAGING);")
+    return t
+
+
+# select_zone has no category clause for WEIGHT and sends UNOWNED there: the WEIGHT returns are role WEIGHT and
+# UNOWNED-or-persistent, and the HOST_COMPUTE/EXPERT_CACHE category clause returns SCRATCH.
 def check_b_select_zone(t):
-    src = t["cache_cpp"]
-    return SELECT_ZONE_WEIGHT_BRANCH in src and SELECT_ZONE_EXPERT_BRANCH in src
+    fn = flat_ws(t["select_zone_fn"])
+    weight_conds = re.findall(r"if \(([^{]*)\) \{ return host_zone_id::WEIGHT; \}", fn)
+    return (
+        weight_conds == ["role == alloc_role::WEIGHT", "lifetime == alloc_lifetime::UNOWNED || persistent_owner"]
+        and "if (category == runtime_category::HOST_COMPUTE || category == runtime_category::EXPERT_CACHE) "
+            "{ return host_zone_id::SCRATCH; }" in fn
+    )
 
 
 def witness_b_select_zone(t):
-    # Drop HOST_COMPUTE from the WEIGHT branch: the runtime-category route
-    # that alloc_buffer relies on.
-    t["cache_cpp"] = t["cache_cpp"].replace(SELECT_ZONE_WEIGHT_BRANCH, "role == alloc_role::WEIGHT ||")
+    # The pre-C4 category clause for WEIGHT restored.
+    t["select_zone_fn"] = t["select_zone_fn"].replace(
+        "lifetime == alloc_lifetime::UNOWNED || persistent_owner",
+        "lifetime == alloc_lifetime::UNOWNED || persistent_owner || category == runtime_category::HOST_COMPUTE")
     return t
 
 
-# alloc_buffer's category must still be unconditionally HOST_COMPUTE for this
-# buft -- if it ever became conditional, B's unconditional WEIGHT would need
-# to change with it.
-ALLOC_BUFFER_CATEGORY = "req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;"
-
-
-def check_b_alloc_buffer_category(t):
-    return ALLOC_BUFFER_CATEGORY in t["alloc_buffer_fn"]
-
-
-def witness_b_alloc_buffer_category(t):
-    t["alloc_buffer_fn"] = t["alloc_buffer_fn"].replace(
-        ALLOC_BUFFER_CATEGORY,
-        "req.intent.category = in_model_load ? ggml_sycl::runtime_category::HOST_COMPUTE : "
-        "ggml_sycl::runtime_category::STAGING;")
-    return t
-
-
-# --- C: the WEIGHT zone (where every runtime HOST_COMPUTE request lands,
-# per B/unified_alloc_host_zone above) reserves headroom for the context's own host
-# buffers (llama_context::output_reserve() et al.), not just weight bytes.
-def check_c_headroom(t):
-    fn = t["populate_zone_sizing_fn"]
+# SYCL_Host takes role WEIGHT only under in_model_load; weights_evictable no longer chooses its role.
+def check_b_weight_only_in_load(t):
+    fn = t["intent_fn"]
+    load = fn.find("if (g_sycl_in_model_load.load(std::memory_order_acquire)) {")
+    weight = fn.find("intent.role     = ggml_sycl::alloc_role::WEIGHT;")
+    other = fn.find("} else {", load)
+    compute = fn.find("intent.role     = ggml_sycl::alloc_role::COMPUTE;", other)
     return (
-        "k_host_runtime_reserve_bytes" in fn
-        and "plan.host_zone_weight_bytes =" in fn
-        and "k_host_runtime_reserve_bytes;" in fn
+        0 <= load < weight < other < compute
+        and fn.count("alloc_role::WEIGHT") == 1
+        and "weights_evictable" not in fn
+    )
+
+
+def witness_b_weight_only_in_load(t):
+    t["intent_fn"] = t["intent_fn"].replace(
+        "if (g_sycl_in_model_load.load(std::memory_order_acquire)) {",
+        "if (g_sycl_in_model_load.load(std::memory_order_acquire) || ggml_backend_sycl_weights_evictable()) {")
+    return t
+
+
+# --- C: the WEIGHT zone (where the UNOWNED runtime HOST_COMPUTE requests land,
+# per select_zone above) reserves headroom for them, not just weight bytes. The
+# zone is sized as the named terms of placement_plan_host_weight_zone_terms(),
+# the HOST_COMPUTE reserve is one of them, and no ratio over the weights stands in for a term.
+WEIGHT_ZONE_FROM_TERMS = "plan.host_zone_weight_bytes = weight_terms.total();"
+RESERVE_TERM = "terms.host_compute_reserve = k_host_compute_reserve_bytes;"
+
+
+def check_c_headroom(t):
+    terms_fn = t["weight_zone_terms_fn"]
+    return (
+        bool(terms_fn)
+        and "k_host_compute_reserve_bytes = 64ull * 1024ull * 1024ull;" in terms_fn
+        and RESERVE_TERM in terms_fn
     )
 
 
 def witness_c_headroom(t):
-    t["populate_zone_sizing_fn"] = t["populate_zone_sizing_fn"].replace(" +\n        k_host_runtime_reserve_bytes;", ";")
+    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(RESERVE_TERM, "terms.host_compute_reserve = 0;")
+    return t
+
+
+# --- C2: the WEIGHT zone is the sum of those named terms, never a ratio over
+# the host weights (slack nobody can name is a second source for a fact the
+# plan already knows).
+# Any write to the zone size counts, compound ones included (`*= k_..._ratio`
+# after the terms assignment would otherwise pass); `==` comparisons do not.
+# Two writers write the terms' total(): the sizing in
+# populate_host_zone_sizing(), and the spread plan's swap-headroom hold, which
+# sets the swap_headroom term and writes the total again (a `base + bytes`
+# there would be a second formula for the same zone). The third, the runtime
+# MMID re-plan, is checked below. The planner file holds no other write.
+WEIGHT_ZONE_WRITE_RE = re.compile(r"host_zone_weight_bytes\s*[-+*/]?=(?!=)")
+HOLD_ZONE_FROM_TERMS_RE = re.compile(
+    r"plan\.host_zone_weight_bytes\s*=\s*placement_plan_host_weight_zone_terms\(plan\)\.total\(\);")
+
+
+def check_c2_weight_zone_is_terms(t):
+    fn = t["populate_zone_sizing_fn"]
+    terms_fn = t["weight_zone_terms_fn"]
+    hold_fn = t["swap_headroom_hold_fn"]
+    return (
+        bool(fn) and bool(terms_fn) and bool(hold_fn)
+        and "placement_plan_host_weight_zone_terms(plan)" in fn
+        and WEIGHT_ZONE_FROM_TERMS in fn
+        and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
+        and len(WEIGHT_ZONE_WRITE_RE.findall(hold_fn)) == 1
+        and len(HOLD_ZONE_FROM_TERMS_RE.findall(hold_fn)) == 1
+        and len(WEIGHT_ZONE_WRITE_RE.findall(t["cache_cpp"]))
+        == len(WEIGHT_ZONE_WRITE_RE.findall(fn)) + len(WEIGHT_ZONE_WRITE_RE.findall(hold_fn))
+        + len(WEIGHT_ZONE_WRITE_RE.findall(t["mmid_replan_fn"])) == 3
+        and "_ratio" not in fn
+        and "_ratio" not in terms_fn
+    )
+
+
+def witness_c2_weight_zone_is_terms(t):
+    t["populate_zone_sizing_fn"] = t["populate_zone_sizing_fn"].replace(
+        WEIGHT_ZONE_FROM_TERMS,
+        "plan.host_zone_weight_bytes = static_cast<size_t>(plan.weight_host_bytes * k_weight_headroom_ratio);")
+    return t
+
+
+def witness_c2_hold_adds_its_own_bytes(t):
+    # The hold's zone as the base it read plus its own bytes, a second formula beside the terms' total().
+    t["swap_headroom_hold_fn"] = HOLD_ZONE_FROM_TERMS_RE.sub(
+        "plan.host_zone_weight_bytes = base + plan.moe_swap_host_headroom_bytes;", t["swap_headroom_hold_fn"])
+    return t
+
+
+# --- C2 (the third writer): the MMID workspace host pool is a WEIGHT term
+# (host_weight_zone_terms::mmid_host_pool, set from moe_mmid_host_pool_bytes),
+# and the runtime MMID re-plan, the zone's third writer, moves the zone by
+# exactly that term's growth: one `+= growth`, growth the demand's pool less the
+# plan's, and the pool field then takes the demand's, so a zone that was its
+# terms' total() stays one. A total() there would resize the zone by entries a
+# prompt-phase loan changed since the zone was configured, bytes the re-plan did
+# not move.
+POOL_TERM_RE = re.compile(r"terms\.mmid_host_pool\s*=\s*plan\.moe_mmid_host_pool_bytes\s*;")
+REPLAN_GROWTH_RE = re.compile(
+    r"const size_t growth\s*=\s*demand\.moe_mmid_host_pool_bytes\s*-\s*plan\.moe_mmid_host_pool_bytes\s*;")
+REPLAN_ZONE_WRITE = "plan.host_zone_weight_bytes += growth;"
+REPLAN_POOL_SET_RE = re.compile(r"plan\.moe_mmid_host_pool_bytes\s*=\s*demand\.moe_mmid_host_pool_bytes\s*;")
+
+
+def check_c2_replan_moves_by_pool_growth(t):
+    fn = t["mmid_replan_fn"]
+    terms_fn = t["weight_zone_terms_fn"]
+    return (
+        bool(fn) and bool(terms_fn)
+        and len(POOL_TERM_RE.findall(terms_fn)) == 1
+        and REPLAN_GROWTH_RE.search(fn) is not None
+        and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
+        and fn.count(REPLAN_ZONE_WRITE) == 1
+        and REPLAN_POOL_SET_RE.search(fn) is not None
+    )
+
+
+def witness_c2_pool_not_a_term(t):
+    t["weight_zone_terms_fn"] = POOL_TERM_RE.sub("", t["weight_zone_terms_fn"])
+    return t
+
+
+def witness_c2_replan_rewrites_the_total(t):
+    t["mmid_replan_fn"] = t["mmid_replan_fn"].replace(
+        REPLAN_ZONE_WRITE, "plan.host_zone_weight_bytes = placement_plan_host_weight_zone_terms(plan).total();")
+    return t
+
+
+# --- C3: the walk that sums the host weights and the plan's charge of
+# weight_host_bytes ask one predicate which host backings the WEIGHT zone
+# holds, so the two figures the [HOST-PLAN-BUG] WARN compares cannot disagree
+# on which entries they count.
+WALK_ASKS_PREDICATE = "placement_plan::host_backing_sizes_weight_zone(entry.host_backing)"
+CHARGE_ASKS_PREDICATE = "host_backing_sizes_weight_zone(backing)"
+
+
+def check_c3_one_backing_predicate(t):
+    return (
+        WALK_ASKS_PREDICATE in t["weight_zone_terms_fn"]
+        and CHARGE_ASKS_PREDICATE in t["charge_host_weight_fn"]
+        and CHARGE_ASKS_PREDICATE in t["uncharge_host_weight_fn"]
+    )
+
+
+def witness_c3_one_backing_predicate(t):
+    t["weight_zone_terms_fn"] = t["weight_zone_terms_fn"].replace(WALK_ASKS_PREDICATE, "true")
     return t
 
 
@@ -458,20 +720,36 @@ def witness_f_no_growth_bound_use_site(t):
 # (name, check, witness): the witness reproduces the defect textually in a
 # copy of `texts`; the check must then fail against that copy.
 checks = [
-    ("A: host zones provisioned eagerly in stage_inventory_plan after the snapshot capture, from the retained snapshot",
+    ("A: host zones provisioned eagerly in stage_load_inventory_plan after the snapshot capture, "
+     "from the retained snapshot",
      check_a_eager_in_stage_wrapper, witness_a),
-    ("A1: inventory lock scoped to the setter impl; provisioning in stage_inventory_plan runs outside it",
+    ("A1: inventory lock scoped to the setter impl; provisioning in stage_load_inventory_plan runs outside it",
      check_a1_lock_scoped_to_impl, witness_a1),
     ("A3: neither the exported setter nor its impl contains a configure_host_zones call",
      check_a3_no_configure_in_setter, witness_a3),
-    ("B: get_max_size mirrors unified_alloc_host_zone's actual WEIGHT routing unconditionally",
-     check_b_mirror, witness_b_mirror),
-    ("B: unified_alloc_host_zone's WEIGHT-before-STAGING precedence unchanged (the reason B is correct)",
+    ("B: SYCL_Host's get_max_size and alloc_buffer share the host builder, and get_max_size asks select_zone",
+     check_b_host_builder, witness_b_host_builder),
+    ("B: no host get_max_size names a zone or calls get_current_device_id; the device is the buft's",
+     check_b_no_zone_no_current_device, witness_b_no_zone_no_current_device),
+    ("B: SYCL_KV_Host is SYCL_Host's buffer type with its own get_name, alloc_buffer and get_max_size (role KV)",
+     check_b_kv_own_iface, witness_b_kv_own_iface),
+    ("B: SYCL_HostCompute's own get_max_size asks the TP predicate and delegates to the device buft outside TP",
+     check_b_host_compute, witness_b_host_compute),
+    ("B: select_zone has no category clause for WEIGHT and sends UNOWNED to WEIGHT",
      check_b_select_zone, witness_b_select_zone),
-    ("B: alloc_buffer still sets category=HOST_COMPUTE unconditionally for this buft",
-     check_b_alloc_buffer_category, witness_b_alloc_buffer_category),
+    ("B: SYCL_Host takes role WEIGHT only under in_model_load",
+     check_b_weight_only_in_load, witness_b_weight_only_in_load),
     ("C: WEIGHT zone reserves headroom for runtime host-compute requests",
      check_c_headroom, witness_c_headroom),
+    ("C2: WEIGHT zone is the sum of its named terms, not a ratio",
+     check_c2_weight_zone_is_terms, witness_c2_weight_zone_is_terms),
+    ("C2: the swap-headroom hold writes the WEIGHT zone as its terms' total(), the planner's second writer",
+     check_c2_weight_zone_is_terms, witness_c2_hold_adds_its_own_bytes),
+    ("C2: the MMID host pool is a WEIGHT term", check_c2_replan_moves_by_pool_growth, witness_c2_pool_not_a_term),
+    ("C2: the runtime MMID re-plan, the third writer, moves the WEIGHT zone by its pool's growth",
+     check_c2_replan_moves_by_pool_growth, witness_c2_replan_rewrites_the_total),
+    ("C3: the WEIGHT-term walk and charge_host_weight ask one backing predicate",
+     check_c3_one_backing_predicate, witness_c3_one_backing_predicate),
     ("D: pre-zone runtime chunk growth WARNs with running total vs budget",
      check_d_fallback_warn, witness_d_fallback_warn),
     ("A2: configure_zones capacity-shortfall WARN names budget/zone/runtime bytes",

@@ -19,6 +19,10 @@
 #include "unified-kernel.hpp"  // For split barrier support
 #include "vecdotq.hpp"
 
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+#    include "tests/q1-nvfp4-production-route-test-seam.hpp"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -2299,7 +2303,9 @@ static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::qu
 template <int qtype> class mmvq_kernel_name;
 template <int qtype> class mmvq_reorder_kernel_name;
 template <int qtype> class mmvq_reorder_slm_kernel_name;
+template <int qtype> class mmvq_reorder_column_split_kernel_name;
 template <int qtype> class mmvq_coalesced_kernel_name;
+template <int qtype> class mmvq_coalesced_column_split_kernel_name;
 template <int qtype> class mmvq_id_kernel_name;
 // The admitted adapter's instantiation of mul_mat_vec_q_id, which checks each id against the expert pointer table
 // before it reads through the slot. Its own name keeps the image every other caller runs unchanged.
@@ -2312,6 +2318,14 @@ struct mmvq_id_expert_slots_unchecked {};
 struct mmvq_id_expert_slots_checked {
     int n_slots;
 };
+template <int qtype> class mmvq_soa_id_kernel_name;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The planted fault of a device test's mutant, in the private build only. It has its own kernel type name, and its
+// launcher submits it under its own profile label (mulmat.mmvq.id_soa_q8_0_mutant_wrong_scale), so a device-side
+// tool or a profile never counts its launches as the kernel's. Its [MMVQ-TRACE] q8_0-soa-id line is shared: the
+// mutant logs the kernel's own line, so a trace cannot tell the two apart; the [MMVQ-MUTANT] line says it ran.
+template <int qtype> class mmvq_soa_id_mutant_kernel_name;
+#endif
 
 // SoA MMVQ kernel template
 // Note: total_nrows is the full tensor row count (ne01), used for SoA offset calculations
@@ -2381,6 +2395,128 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
     if (sg.leader()) {
         dst[row] = sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + row);
     }
+}
+
+// Where a sub-group of a column-split work-group works. A work-group holds 16 / chunks rows; a row's chunks are
+// consecutive sub-groups, chunk 0 first, so sub-group sg_id works on chunk sg_id % chunks of row sg_id / chunks.
+struct mmvq_column_split_slot {
+    int sg_id;  // the sub-group's index in its work-group, which is also its slot in the row partials
+    int chunk;  // which of its row's chunks the sub-group walks
+    int row;    // the output row, in the slice; past nrows in the padded tail of the last work-group
+};
+
+static __dpct_inline__ mmvq_column_split_slot mmvq_column_split_slot_locate(const sycl::nd_item<3> & nd_item,
+                                                                            const int                chunks) {
+    const int              workgroup = static_cast<int>(nd_item.get_group_linear_id());
+    mmvq_column_split_slot slot;
+    slot.sg_id = static_cast<int>(nd_item.get_sub_group().get_group_linear_id());
+    slot.chunk = slot.sg_id % chunks;
+    slot.row   = workgroup * ggml_sycl::mmvq_column_split_rows_per_workgroup(chunks) + slot.sg_id / chunks;
+    return slot;
+}
+
+// The end of a column-split kernel, once for both layouts: every sub-group reduces its lanes' partial sum, its leader
+// publishes it to the sub-group's slot in `row_partials` (local memory, one float per sub-group), the work-group
+// barrier makes all of them visible, and the leader of the row's chunk-0 sub-group adds the row's partials in chunk
+// order, a fixed order so the result is deterministic, then the fused addend once. Every sub-group of the work-group
+// must call this, padded rows included: they bring a zero partial to the barrier and write nothing.
+static __dpct_inline__ void mmvq_column_split_finish_row(const sycl::nd_item<3> &       nd_item,
+                                                         const mmvq_column_split_slot & slot,
+                                                         const int                      chunks,
+                                                         const int                      nrows,
+                                                         const float                    partial_sum,
+                                                         float * __restrict__ row_partials,
+                                                         float *       dst,
+                                                         const float * fused_add,
+                                                         const int64_t fused_add_ne0,
+                                                         const int64_t fused_add_nb0,
+                                                         const int64_t fused_add_row_base) {
+    const auto  sg  = nd_item.get_sub_group();
+    const float sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+    if (sg.leader()) {
+        row_partials[slot.sg_id] = sum;
+    }
+    // A work-group's fence scope is the work-group, which covers row_partials in local memory.
+    sycl::group_barrier(nd_item.get_group());
+
+    if (slot.chunk == 0 && slot.row < nrows && sg.leader()) {
+        float row_sum = 0.0f;
+        for (int c = 0; c < chunks; ++c) {
+            row_sum += row_partials[slot.sg_id + c];
+        }
+        dst[slot.row] =
+            row_sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + slot.row);
+    }
+}
+
+// Column-split form of mul_mat_vec_q_reorder, for matrices with too few rows to occupy the card
+// (mmvq-launch-geometry.hpp says when and why). A work-group's 16 sub-groups hold 16 / chunks rows; sub-group
+// `chunk` of a row walks the row form's sub-group steps chunk, chunk + chunks, ... The per-block body is a copy of
+// mul_mat_vec_q_reorder's loop body, not a call: that template serves every reorder type and walks a whole row, and
+// splitting it would touch every type's row form for the sake of this one. With chunks == 1 the copy reads exactly
+// what the row form reads. mmvq_column_split_finish_row then reduces and adds the row's chunks in chunk order: a fixed
+// order, so the result is deterministic, but not the row form's order, so it matches the row form to rounding rather
+// than bit for bit. Rows past nrows in the last work-group compute nothing and write nothing, but cannot return early:
+// every sub-group of the work-group must reach the barrier inside mmvq_column_split_finish_row.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_reorder_column_split(const void * __restrict__ vx,
+                                               const void * __restrict__ vy,
+                                               float *                  dst,
+                                               const int                ncols,
+                                               const int                nrows,
+                                               const int                total_nrows,
+                                               const int                row_low,
+                                               const int                chunks,
+                                               const sycl::nd_item<3> & nd_item,
+                                               float * __restrict__ row_partials,
+                                               const float * fused_add,
+                                               const int64_t fused_add_ne0,
+                                               const int64_t fused_add_nb0,
+                                               const int64_t fused_add_row_base) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const mmvq_column_split_slot slot  = mmvq_column_split_slot_locate(nd_item, chunks);
+    const int                    chunk = slot.chunk;
+    const int                    row   = slot.row;
+    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    // Use total_nrows (full tensor size) for SoA offset calculations, NOT nrows (slice size)
+    const int     nblocks                     = total_nrows * blocks_per_row;
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    float partial_sum = 0.0f;
+    if (row < nrows) {
+        const int block_stride = ggml_sycl::mmvq_column_split_block_stride(chunks, blocks_per_subgroup);
+        for (int i = ggml_sycl::mmvq_column_split_first_block(chunk, lane / block_elements_per_subgroup,
+                                                              blocks_per_subgroup);
+             i < blocks_per_row; i += block_stride) {
+            // SoA offsets are over the whole tensor, so the block index uses the global row (row_low + row).
+            const int ibx = (row_low + row) * blocks_per_row + i;
+
+            const auto          bx_offset      = block_type::get_block_offset(ibx, nblocks);
+            const auto          d_offset       = block_type::get_d_offset(total_nrows, ncols, ibx);
+            const int           iby            = i * block_type::block_to_q8_1_ratio();
+            const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+            const sycl::half2 * q8_1_ds_ptr =
+                (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int iqs = elem + block_traits::vdr_mmvq * (lane % block_elements_per_subgroup);
+
+                partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            }
+        }
+    }
+
+    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, fused_add_ne0,
+                                 fused_add_nb0, fused_add_row_base);
 }
 
 // Multi-row reordered kernel with SLM Y-vector sharing
@@ -3632,6 +3768,10 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Q8_0 reorder MMVQ dispatch function
 // Note: total_nrows is the full tensor row count (ne01), nrows is the slice size (row_diff)
 //       row_low is the starting row offset for this slice (for split tensor support)
+// compute_units is the card's SYCL compute-unit count (0 when unknown). With it the shape picks the row form or the
+// column-split form (mmvq_column_split_chunks, mmvq-launch-geometry.hpp); both go out under the same profile label,
+// the split one with ";chunks=N" in its metadata. If chunks_out is set it receives the chunks launched, 1 for the row
+// form.
 static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                const void *    vy,
                                                float *         dst,
@@ -3639,28 +3779,70 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                const int       nrows,
                                                const int       total_nrows,
                                                const int       row_low,
+                                               const int       compute_units,
                                                dpct::queue_ptr stream,
                                                const float *   fused_add          = nullptr,
                                                const int64_t   fused_add_ne0      = 0,
                                                const int64_t   fused_add_nb0      = sizeof(float),
-                                               const int64_t   fused_add_row_base = 0) {
+                                               const int64_t   fused_add_row_base = 0,
+                                               int *           chunks_out         = nullptr) {
     GGML_ASSERT(ncols % QK8_0 == 0);
+    using q8_0_traits             = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>::traits;
+    // The row form's sub-group step, mul_mat_vec_q_reorder's blocks_per_subgroup: 8 blocks.
+    constexpr int blocks_per_step = ceil_div(q8_0_traits::vdr_mmvq * WARP_SIZE, q8_0_traits::qi);
+    const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units);
+    if (chunks_out) {
+        *chunks_out = chunks;
+    }
+
+    // P4 TG-cost-visibility (llama.cpp-os8k): SOA-layout arm of the same
+    // Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS sibling,
+    // further down this file) comment for the full rationale.
+    std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    if (chunks > 1) {
+        profile_metadata += ";chunks=" + std::to_string(chunks);
+    }
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_soa", profile_metadata.c_str(), "mulmat");
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
+
+    if (chunks > 1) {
+        // Column-split form: the row form's work-group of 16 sub-groups, 16 / chunks rows per work-group, one SLM
+        // float per sub-group for the row partials. Same queue, same submit wrapper, no dependency added.
+        // row_partials has one float per sub-group, so it is in bounds only while three things agree: the
+        // accessor's `subgroups` floats, a work-group of `subgroups * WARP_SIZE` items, and the kernel's
+        // reqd_sub_group_size(WARP_SIZE), which makes those items exactly `subgroups` sub-groups.
+        constexpr int    subgroups             = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;
+        static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,
+                      "the row partials hold one float per sub-group of the split work-group");
+        const int            workgroups = ggml_sycl::mmvq_column_split_workgroups(nrows, chunks);
+        const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);
+        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);
+
+        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);
+                cgh.parallel_for<mmvq_reorder_column_split_kernel_name<GGML_TYPE_Q8_0>>(
+                    sycl::nd_range<3>(split_global, split_workgroup),
+                    [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q_reorder_column_split<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+                            vx, vy, dst, ncols, nrows, total_nrows, row_low, chunks, nd_item,
+                            row_partials.get_pointer(), fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
+                    });
+            });
+        });
+        return;
+    }
+
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
     const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
 
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
-
-    // P4 TG-cost-visibility (llama.cpp-os8k): SOA-layout arm of the same
-    // Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS sibling,
-    // further down this file) comment for the full rationale.
-    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    ggml_sycl_profile_label profile_label =
-        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_soa", profile_metadata.c_str(), "mulmat");
-    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
-    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
-    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -4041,7 +4223,77 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Source (block-major): [B0.W0-W7][B1.W0-W7]...[B(TILE_BLOCKS-1).W0-W7]
 // Dest (word-major):    [W0:B0-B(TILE_BLOCKS-1)]...[W7:B0-B(TILE_BLOCKS-1)]
 //
-// Thread mapping: threads iterate block_in_tile and process both halves per block
+// Thread mapping: within a tile, lane l takes blocks l, l + WARP_SIZE, ... and processes both 16-byte halves of
+// each. The per-tile body below holds that mapping; the row form and the column-split form differ only in which
+// tiles of a row a sub-group passes to it.
+
+// One tile of one row of the coalesced Q8_0 x Q8_1 dot product, added into this lane's `partial_sum`. The row form
+// walks every tile of a row; the column-split form walks one chunk's tiles. One body, so both forms read the layout
+// the same way and add a tile's terms in the same order.
+static __dpct_inline__ void mmvq_q8_0_coalesced_accumulate_tile(const uint8_t *     x_qs,
+                                                                const ggml_half *   x_d,
+                                                                const int8_t *      y_qs,
+                                                                const sycl::half2 * y_ds,
+                                                                const int           row,
+                                                                const int           tile,
+                                                                const int           x_row_stride,
+                                                                const int           blocks_per_row,
+                                                                const int           lane_id,
+                                                                float &             partial_sum) {
+    constexpr int TILE_BLOCKS = MMVQ_COALESCED_TILE_BLOCKS;
+    const int     word_stride = TILE_BLOCKS * 4;
+
+    // Base offset for this tile's quants
+    const int tile_base = row * x_row_stride + tile * MMVQ_COALESCED_TILE_BYTES_Q8_0;
+
+    for (int block_in_tile = lane_id; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
+        const int y_block = tile * TILE_BLOCKS + block_in_tile;
+        if (y_block >= blocks_per_row) {
+            continue;
+        }
+        // Get scale for this block (scales are NOT coalesced, remain block-sequential)
+        const int   block_idx = row * blocks_per_row + y_block;
+        const float d         = x_d[block_idx];
+
+        // Y block index and base offset
+        const int y_base = y_block * QK8_1;
+
+        for (int half = 0; half < 2; ++half) {
+            // Coalesced load: word w of block b at offset w*word_stride + b*4
+            // Thread loads 4 words (16 bytes total) per half
+            const int word_base = half * (4 * word_stride);
+
+            // Perfectly coalesced 4-byte loads
+            const int v0 = *((const int *) (x_qs + tile_base + word_base + 0 * word_stride + block_in_tile * 4));
+            const int v1 = *((const int *) (x_qs + tile_base + word_base + 1 * word_stride + block_in_tile * 4));
+            const int v2 = *((const int *) (x_qs + tile_base + word_base + 2 * word_stride + block_in_tile * 4));
+            const int v3 = *((const int *) (x_qs + tile_base + word_base + 3 * word_stride + block_in_tile * 4));
+
+            // Load Y data matching the X half we're processing
+            // For half=0: Y elements 0-15
+            // For half=1: Y elements 16-31
+            const int y_offset = half * 16;                                                   // 0 or 16 (in bytes)
+            const int u0       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 0);  // Y[0:3] or Y[16:19]
+            const int u1       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 1);  // Y[4:7] or Y[20:23]
+            const int u2       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 2);  // Y[8:11] or Y[24:27]
+            const int u3       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 3);  // Y[12:15] or Y[28:31]
+
+            // dp4a: compute dot product of 4 int8 pairs
+            int sumi = 0;
+            sumi     = dpct::dp4a(v0, u0, sumi);
+            sumi     = dpct::dp4a(v1, u1, sumi);
+            sumi     = dpct::dp4a(v2, u2, sumi);
+            sumi     = dpct::dp4a(v3, u3, sumi);
+
+            // Apply scales: Q8_0 × Q8_1 = d8_0 * d8_1 * sumi
+            const sycl::half2 ds8  = y_ds[y_block];
+            const float       d8_1 = ds8[0];
+            partial_sum += d * d8_1 * sumi;
+        }
+    }
+}
+
+// Row form: one sub-group per output row, walking every tile of the row.
 static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                        const void * __restrict__ vy,  // Reordered Y activations
                                        float *                  dst,
@@ -4063,11 +4315,8 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
         return;
     }
 
-    constexpr int TILE_BLOCKS    = MMVQ_COALESCED_TILE_BLOCKS;
-    const int     blocks_per_row = ncols / QK8_0;
-    const int     tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
-
-    const int word_stride = TILE_BLOCKS * 4;
+    const int blocks_per_row = ncols / QK8_0;
+    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
 
     // X base pointers (coalesced layout: quants first, then scales)
     // Quants: tiles_per_row * TILE_BLOCKS * 32 bytes per row = ncols bytes
@@ -4084,54 +4333,8 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
     float partial_sum = 0.0f;
 
     for (int tile = 0; tile < tiles_per_row; tile++) {
-        // Base offset for this tile's quants
-        const int tile_base = row * x_row_stride + tile * MMVQ_COALESCED_TILE_BYTES_Q8_0;
-
-        for (int block_in_tile = lane_id; block_in_tile < TILE_BLOCKS; block_in_tile += WARP_SIZE) {
-            const int y_block = tile * TILE_BLOCKS + block_in_tile;
-            if (y_block >= blocks_per_row) {
-                continue;
-            }
-            // Get scale for this block (scales are NOT coalesced, remain block-sequential)
-            const int   block_idx = row * blocks_per_row + y_block;
-            const float d         = x_d[block_idx];
-
-            // Y block index and base offset
-            const int y_base = y_block * QK8_1;
-
-            for (int half = 0; half < 2; ++half) {
-                // Coalesced load: word w of block b at offset w*word_stride + b*4
-                // Thread loads 4 words (16 bytes total) per half
-                const int word_base = half * (4 * word_stride);
-
-                // Perfectly coalesced 4-byte loads
-                const int v0 = *((const int *) (x_qs + tile_base + word_base + 0 * word_stride + block_in_tile * 4));
-                const int v1 = *((const int *) (x_qs + tile_base + word_base + 1 * word_stride + block_in_tile * 4));
-                const int v2 = *((const int *) (x_qs + tile_base + word_base + 2 * word_stride + block_in_tile * 4));
-                const int v3 = *((const int *) (x_qs + tile_base + word_base + 3 * word_stride + block_in_tile * 4));
-
-                // Load Y data matching the X half we're processing
-                // For half=0: Y elements 0-15
-                // For half=1: Y elements 16-31
-                const int y_offset = half * 16;                                                   // 0 or 16 (in bytes)
-                const int u0       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 0);  // Y[0:3] or Y[16:19]
-                const int u1       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 1);  // Y[4:7] or Y[20:23]
-                const int u2       = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 2);  // Y[8:11] or Y[24:27]
-                const int u3 = get_int_from_int8_aligned(y_qs + y_base, y_offset / 4 + 3);  // Y[12:15] or Y[28:31]
-
-                // dp4a: compute dot product of 4 int8 pairs
-                int sumi = 0;
-                sumi     = dpct::dp4a(v0, u0, sumi);
-                sumi     = dpct::dp4a(v1, u1, sumi);
-                sumi     = dpct::dp4a(v2, u2, sumi);
-                sumi     = dpct::dp4a(v3, u3, sumi);
-
-                // Apply scales: Q8_0 × Q8_1 = d8_0 * d8_1 * sumi
-                const sycl::half2 ds8  = y_ds[y_block];
-                const float       d8_1 = ds8[0];
-                partial_sum += d * d8_1 * sumi;
-            }
-        }
+        mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane_id,
+                                            partial_sum);
     }
 
     // Warp reduction using subgroup intrinsic
@@ -4140,6 +4343,52 @@ static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesc
     if (sg.leader()) {
         dst[row] = sum + mmvq_fused_add_value(fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base + row);
     }
+}
+
+// Column-split form of mul_mat_vec_q8_0_coalesced, for matrices with too few rows to occupy the card
+// (mmvq-launch-geometry.hpp says when and why). A step of the row form is one tile, so sub-group `chunk` of a row
+// walks the tiles mmvq_column_split_first_step / step_stride give it through the same per-tile body. The reduction
+// is the SOA column-split kernel's own, mmvq_column_split_finish_row. Padded rows reach its barrier and write
+// nothing. The coalesced layout is never sliced (the dispatcher asserts it), so nrows is the tensor's row
+// count, as in the row form.
+static void mul_mat_vec_q8_0_coalesced_column_split(const void * __restrict__ vx,
+                                                    const void * __restrict__ vy,
+                                                    float *                  dst,
+                                                    const int                ncols,
+                                                    const int                nrows,
+                                                    const int                chunks,
+                                                    const sycl::nd_item<3> & nd_item,
+                                                    float * __restrict__ row_partials,
+                                                    const float * fused_add,
+                                                    const int64_t fused_add_ne0,
+                                                    const int64_t fused_add_nb0,
+                                                    const int64_t fused_add_row_base) {
+    const mmvq_column_split_slot slot  = mmvq_column_split_slot_locate(nd_item, chunks);
+    const int                    chunk = slot.chunk;
+    const int                    row   = slot.row;
+    const int                    lane  = nd_item.get_sub_group().get_local_linear_id();
+
+    const int blocks_per_row = ncols / QK8_0;
+    const int tiles_per_row  = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
+
+    const uint8_t *     x_qs         = (const uint8_t *) vx;
+    const int           x_row_stride = static_cast<int>(ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row));
+    const ggml_half *   x_d          = (const ggml_half *) ((const char *) vx + nrows * x_row_stride);
+    const int8_t *      y_qs         = (const int8_t *) vy;
+    const sycl::half2 * y_ds         = (const sycl::half2 *) ((const char *) vy + ncols);
+
+    float partial_sum = 0.0f;
+    if (row < nrows) {
+        // The shared step walk, in tiles: the host test sweeps these same two functions.
+        const int tile_stride = ggml_sycl::mmvq_column_split_step_stride(chunks);
+        for (int tile = ggml_sycl::mmvq_column_split_first_step(chunk); tile < tiles_per_row; tile += tile_stride) {
+            mmvq_q8_0_coalesced_accumulate_tile(x_qs, x_d, y_qs, y_ds, row, tile, x_row_stride, blocks_per_row, lane,
+                                                partial_sum);
+        }
+    }
+
+    mmvq_column_split_finish_row(nd_item, slot, chunks, nrows, partial_sum, row_partials, dst, fused_add, fused_add_ne0,
+                                 fused_add_nb0, fused_add_row_base);
 }
 
 // GPU kernel to convert Q8_0 reordered format to warp-coalesced format
@@ -4266,17 +4515,70 @@ bool ggml_sycl_convert_to_coalesced_q6_k(const ggml_tensor * tensor, dpct::queue
 }
 
 // Dispatch function for coalesced Q8_0 MMVQ kernel
+// compute_units and chunks_out as for reorder_mul_mat_vec_q8_0_q8_1_sycl: the shape picks the row form or the
+// column-split form, both under the same profile label.
 static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                  const void *    vy,
                                                  float *         dst,
                                                  const int       ncols,
                                                  const int       nrows,
+                                                 const int       compute_units,
                                                  dpct::queue_ptr stream,
                                                  const float *   fused_add          = nullptr,
                                                  const int64_t   fused_add_ne0      = 0,
                                                  const int64_t   fused_add_nb0      = sizeof(float),
-                                                 const int64_t   fused_add_row_base = 0) {
+                                                 const int64_t   fused_add_row_base = 0,
+                                                 int *           chunks_out         = nullptr) {
     GGML_ASSERT(ncols % QK8_0 == 0);
+
+    // The row form's sub-group step is one tile of MMVQ_COALESCED_TILE_BLOCKS blocks, so the rule's step count is the
+    // kernel's tiles_per_row (both round the row's blocks up to whole tiles).
+    constexpr int blocks_per_step = MMVQ_COALESCED_TILE_BLOCKS;
+    const int     chunks = ggml_sycl::mmvq_column_split_chunks(nrows, ncols / QK8_0, blocks_per_step, compute_units);
+    if (chunks_out) {
+        *chunks_out = chunks;
+    }
+
+    // P4 TG-cost-visibility (llama.cpp-os8k): COALESCED-layout arm of the
+    // same Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS
+    // sibling) comment above for the full rationale.
+    std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    if (chunks > 1) {
+        profile_metadata += ";chunks=" + std::to_string(chunks);
+    }
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_coalesced", profile_metadata.c_str(), "mulmat");
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
+
+    if (chunks > 1) {
+        // Column-split form, the same geometry as the SOA one: 16 sub-groups per work-group, 16 / chunks rows each.
+        // row_partials has one float per sub-group, so it is in bounds only while three things agree: the
+        // accessor's `subgroups` floats, a work-group of `subgroups * WARP_SIZE` items, and the kernel's
+        // reqd_sub_group_size(WARP_SIZE), which makes those items exactly `subgroups` sub-groups.
+        constexpr int    subgroups             = ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS;
+        constexpr size_t split_workgroup_items = (size_t) subgroups * WARP_SIZE;
+        static_assert(split_workgroup_items / WARP_SIZE == (size_t) ggml_sycl::MMVQ_COLUMN_SPLIT_SUBGROUPS,
+                      "the row partials hold one float per sub-group of the split work-group");
+        const int            workgroups = ggml_sycl::mmvq_column_split_workgroups(nrows, chunks);
+        const sycl::range<3> split_global(1, 1, (size_t) workgroups * split_workgroup_items);
+        const sycl::range<3> split_workgroup(1, 1, split_workgroup_items);
+
+        (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                sycl::local_accessor<float, 1> row_partials(sycl::range<1>(subgroups), cgh);
+                cgh.parallel_for<mmvq_coalesced_column_split_kernel_name<GGML_TYPE_Q8_0>>(
+                    sycl::nd_range<3>(split_global, split_workgroup),
+                    [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q8_0_coalesced_column_split(vx, vy, dst, ncols, nrows, chunks, nd_item,
+                                                                row_partials.get_pointer(), fused_add, fused_add_ne0,
+                                                                fused_add_nb0, fused_add_row_base);
+                    });
+            });
+        });
+        return;
+    }
 
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
@@ -4284,16 +4586,6 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
 
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
-
-    // P4 TG-cost-visibility (llama.cpp-os8k): COALESCED-layout arm of the
-    // same Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS
-    // sibling) comment above for the full rationale.
-    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    ggml_sycl_profile_label profile_label =
-        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_coalesced", profile_metadata.c_str(), "mulmat");
-    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
-    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
-    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -5945,6 +6237,226 @@ static __dpct_inline__ void mxfp4_soa_q8_1_block_dot_pair_slm(const uint8_t * __
         acc_a += d8 * sumi_a;
         acc_b += d8 * sumi_b;
     }
+}
+
+// MoE dispatch: Q8_0 experts in the SOA layout the planner materialized them in.
+// Each entry of `expert_ptrs` is one expert's own SOA block, because the planner materializes and leases every expert
+// separately: the quant bytes of its nrows_per_expert * ncols / QK8_0 blocks, then their ggml_half scales. So block and
+// scale offsets are relative to that expert's base, with that expert's row count. The activation is SOA Q8_1
+// (quantize_and_reorder_q8_1_soa): per row, ncols_y quant bytes, then one half2 (d, sum) per block.
+// One sub-group computes one row of one (expert, token) slot. Its lanes are spread over the row's blocks as the dense
+// SOA kernel (mul_mat_vec_q_reorder) spreads them, and each block dot is that kernel's
+// reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>, so the tree keeps one Q8_0 SOA block dot.
+// `ids` null: the dispatch passed a compact table with one entry per (id, token) slot.
+// `ids` non-null: the table has one entry per expert, and each slot reads its expert id from `ids` (strides ids_nb0,
+// ids_nb1). The batched dispatch passes this form when it cannot compact the table: when the caller gave no device ids
+// or not every slot runs on this device, it uploads one id per slot (a host slot names a device expert, and the host's
+// row later overwrites that slot's output); when no compact list is available (graph recording without preallocated
+// storage), it keeps the caller's ids. In ggml_sycl_mul_mat_id the retained decode route (the planner pointer-table
+// dispatch) calls it that way, and a decode reaches that route only when neither the direct route (every expert and
+// the ids on this device) nor the event-chained hybrid route takes it: both of those pass device ids with a full
+// table, which the dispatch compacts. vec_q, whose one caller passes its retained table, passes this form only when no
+// compact list is available.
+// WRONG_SCALE_BLOCK is a planted fault, instantiated only in the private test build: every block reads the next
+// block's scale (the expert's last block wraps to its first), so a test that cannot see a scale read from the wrong
+// block proves nothing about this kernel's scale offsets.
+template <bool WRONG_SCALE_BLOCK>
+static void mul_mat_vec_q8_0_q8_1_soa_id_kernel(const uint8_t * const * __restrict__ expert_ptrs,
+                                                const void * __restrict__ vy,
+                                                float * __restrict__ dst,
+                                                const int32_t * __restrict__ ids,
+                                                const int                ncols,
+                                                const int                ncols_y,
+                                                const int                nrows_per_expert,
+                                                const int                n_tokens,
+                                                const int                ne11,
+                                                const int64_t            ids_nb0,
+                                                const int64_t            ids_nb1,
+                                                const int64_t            nb11,
+                                                const int64_t            nb12,
+                                                const int64_t            nb1,
+                                                const int64_t            nb2,
+                                                const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+    using block_traits = block_type::traits;
+
+    const int batch_idx = item_ct1.get_group(1);
+    const int row       = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (row >= nrows_per_expert) {
+        return;
+    }
+
+    // batch_idx is linearized row-major by id: (id, token)
+    const int id   = batch_idx / n_tokens;
+    const int iid1 = batch_idx - id * n_tokens;
+
+    const uint8_t * x = nullptr;
+    if (ids) {
+        const int32_t expert_id = *(const int32_t *) ((const char *) ids + iid1 * ids_nb1 + id * ids_nb0);
+        x                       = expert_ptrs[expert_id];
+    } else {
+        x = expert_ptrs[batch_idx];
+    }
+    const char * y_row = (const char *) vy + (int64_t) (id % ne11) * nb11 + (int64_t) iid1 * nb12;
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    const int     nblocks                     = nrows_per_expert * blocks_per_row;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    const int lane_id     = item_ct1.get_local_id(2);
+    float     partial_sum = 0.0f;
+    for (int i = lane_id / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx    = row * blocks_per_row + i;
+        const int iscale = WRONG_SCALE_BLOCK ? (ibx + 1) % nblocks : ibx;
+
+        const auto          bx_offset      = block_type::get_block_offset(ibx, nblocks);
+        const auto          d_offset       = block_type::get_d_offset(nrows_per_expert, ncols, iscale);
+        const int           iby            = i * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8_1_quant_ptr = (const int8_t *) y_row + iby * QK8_1;
+        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) (y_row + ncols_y + iby * sizeof(sycl::half2));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq * (lane_id % block_elements_per_subgroup);
+            partial_sum +=
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>()(x, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        }
+    }
+
+    const float sum = sycl::reduce_over_group(item_ct1.get_sub_group(), partial_sum, sycl::plus<float>());
+    if (lane_id == 0) {
+        float * dst_out = (float *) ((char *) dst + (int64_t) id * nb1 + (int64_t) iid1 * nb2);
+        dst_out[row]    = sum;
+    }
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The planted fault test-moe-decode-q8-0-soa-mutant-wrong-scale switches on. Read once: a value other than
+// wrong-scale-block leaves the kernel as shipped, and that mutant's registration then fails for want of its active line.
+static bool mmvq_q8_0_soa_id_mutant_wrong_scale_block() {
+    static const bool on = [] {
+        const char * value = std::getenv("GGML_SYCL_TEST_MUTANT_Q8_0_SOA_ID");
+        return value != nullptr && std::strcmp(value, "wrong-scale-block") == 0;
+    }();
+    return on;
+}
+#endif
+
+// Submits the Q8_0 SOA MUL_MAT_ID decode kernel over per-expert SOA blocks. Returns false, having submitted nothing,
+// for an operand this kernel does not read:
+//   - no expert table: the operand is one SOA block over every expert (a device-buffer upload reorders the whole
+//     tensor that way). Nothing reaches here with one today: the batched dispatch refuses a null table before its
+//     type switch, and the one caller of ggml_sycl_mul_mat_id_vec_q passes its retained per-expert table and returns
+//     before the call when it has none. The refusal keeps a future caller from running this kernel on bytes it
+//     would misread;
+//   - one expert's SOA block past INT_MAX bytes: the block dot takes int offsets.
+// A refusal fails the op, so each one is named, with the dispatcher (`site`), the tensor and its shape.
+// With GGML_SYCL_MMVQ_TRACE on, every launch logs one [MMVQ-TRACE] q8_0-soa-id line naming `site` and the table it
+// passed (table=compact when `ids` is null, table=ids otherwise), through the log callback rather than stderr, so a
+// test can tell which dispatcher launched the kernel, and on which table form, for each op it runs.
+static bool mul_mat_vec_q8_0_q8_1_soa_id_sycl(const char *                     site,
+                                              const char *                     tensor_name,
+                                              const void * const *             expert_ptrs,
+                                              const void *                     vy,
+                                              float *                          dst,
+                                              const int32_t *                  ids,
+                                              const int                        ncols,
+                                              const int                        ncols_y,
+                                              const int                        nrows_per_expert,
+                                              const int                        n_experts,
+                                              const int                        total_batches,
+                                              const int                        n_tokens,
+                                              const int                        ne11,
+                                              const int64_t                    ids_nb0,
+                                              const int64_t                    ids_nb1,
+                                              const int64_t                    nb11,
+                                              const int64_t                    nb12,
+                                              const int64_t                    nb1,
+                                              const int64_t                    nb2,
+                                              dpct::queue_ptr                  stream,
+                                              const std::vector<sycl::event> * deps      = nullptr,
+                                              sycl::event *                    event_out = nullptr) {
+    GGML_ASSERT(ncols % QK8_0 == 0);
+    const int64_t expert_bytes = (int64_t) nrows_per_expert * (ncols / QK8_0) * (int64_t) (QK8_0 + sizeof(ggml_half));
+    const char *  name         = tensor_name ? tensor_name : "?";
+    if (expert_ptrs == nullptr) {
+        GGML_LOG_WARN(
+            "[MMVQ] Q8_0 SOA MUL_MAT_ID refused at %s for %s [%d, %d, %d]: the operand is one SOA block over all %d "
+            "experts (%lld bytes) with no per-expert table, and this kernel reads only per-expert SOA blocks\n",
+            site, name, ncols, nrows_per_expert, n_experts, n_experts, (long long) (expert_bytes * n_experts));
+        return false;
+    }
+    if (expert_bytes > INT_MAX) {
+        GGML_LOG_WARN(
+            "[MMVQ] Q8_0 SOA MUL_MAT_ID refused at %s for %s [%d, %d, %d]: one expert's SOA block is %lld bytes, "
+            "past the %d-byte limit of the block dot's int offsets\n",
+            site, name, ncols, nrows_per_expert, n_experts, (long long) expert_bytes, INT_MAX);
+        return false;
+    }
+
+    constexpr int moe_mmv_y = GGML_SYCL_MOE_MMV_Y;
+    static_assert(moe_mmv_y * WARP_SIZE <= 1024, "GGML_SYCL_MOE_MMV_Y exceeds SYCL work-group limit");
+    const int            block_num_z = (nrows_per_expert + moe_mmv_y - 1) / moe_mmv_y;
+    const sycl::range<3> block_nums(1, total_batches, block_num_z);
+    const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
+
+    const char * profile_name = "mulmat.mmvq.id_soa_q8_0";
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const bool wrong_scale_block = mmvq_q8_0_soa_id_mutant_wrong_scale_block();
+    if (wrong_scale_block) {
+        // Its own label, so a profile never counts the planted fault's launches as the kernel's.
+        profile_name = "mulmat.mmvq.id_soa_q8_0_mutant_wrong_scale";
+        static std::atomic<bool> announced{ false };
+        if (!announced.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN(
+                "[MMVQ-MUTANT] q8_0-soa-id wrong-scale-block active: every block reads the next block's scale\n");
+        }
+    }
+#endif
+
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, profile_name, profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            const auto * x_ptrs = (const uint8_t * const *) expert_ptrs;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            if (wrong_scale_block) {
+                cgh.parallel_for<mmvq_soa_id_mutant_kernel_name<GGML_TYPE_Q8_0>>(
+                    sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                        mul_mat_vec_q8_0_q8_1_soa_id_kernel<true>(x_ptrs, vy, dst, ids, ncols, ncols_y,
+                                                                  nrows_per_expert, n_tokens, ne11, ids_nb0, ids_nb1,
+                                                                  nb11, nb12, nb1, nb2, item_ct1);
+                    });
+                return;
+            }
+#endif
+            cgh.parallel_for<mmvq_soa_id_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q8_0_q8_1_soa_id_kernel<false>(x_ptrs, vy, dst, ids, ncols, ncols_y, nrows_per_expert,
+                                                               n_tokens, ne11, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2,
+                                                               item_ct1);
+                });
+        });
+    });
+    if (event_out) {
+        *event_out = ev;
+    }
+    if (mmvq_moe_trace_enabled()) {
+        GGML_LOG_DEBUG(
+            "[MMVQ-TRACE] q8_0-soa-id site=%s table=%s tensor=%s experts=%d rows=%d cols=%d batches=%d tokens=%d\n",
+            site, ids ? "ids" : "compact", name, n_experts, nrows_per_expert, ncols, total_batches, n_tokens);
+    }
+    return true;
 }
 
 // MoE dispatch: MXFP4 with SoA layout (reordered weights) + expert routing
@@ -17100,11 +17612,30 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                int64_t                          ids_host_count,
                                sycl::event *                    completion_event,
                                bool *                           completion_event_set,
-                               const std::vector<sycl::event> * deps) {
+                               const std::vector<sycl::event> * deps,
+                               const char **                    reject_reason,
+                               size_t *                         reject_bytes) {
     if (completion_event_set) {
         *completion_event_set = false;
     }
-    auto log_dispatch_reject = [&](const char * reason) {
+    if (reject_reason) {
+        *reject_reason = nullptr;
+    }
+    if (reject_bytes) {
+        *reject_bytes = 0;
+    }
+    // Every false return goes through reject(), so a caller that must refuse the op (a type with no other device
+    // executor) can say which precondition failed and, for a scratch allocation, how many bytes it asked for.
+    auto reject = [&](const char * reason, size_t bytes = 0) {
+        if (reject_reason) {
+            *reject_reason = reason;
+        }
+        if (reject_bytes) {
+            *reject_bytes = bytes;
+        }
+        return false;
+    };
+    auto log_dispatch_reject = [&](const char * reason, size_t bytes = 0) {
         static std::atomic<int> reject_log{ 0 };
         const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
         if (row_agg_debug && std::atoi(row_agg_debug) != 0 && reject_log.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -17114,10 +17645,10 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     src0 && src0->name ? src0->name : "?", reason, (int) layout, n_gpu_entries,
                     (const void *) expert_ptrs_device, (const void *) ids_host, (long long) ids_host_count);
         }
+        return reject(reason, bytes);
     };
     if (n_gpu_entries <= 0 || !expert_ptrs_device) {
-        log_dispatch_reject(n_gpu_entries <= 0 ? "no-entries" : "no-expert-ptrs");
-        return false;
+        return log_dispatch_reject(n_gpu_entries <= 0 ? "no-entries" : "no-expert-ptrs");
     }
 
     // Only handle quantized types with _id kernels. The admitted set is shared
@@ -17125,10 +17656,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     // drift; see that header for why an over-advertised pair is worse than a
     // refusal here.
     if (!moe_mmvq_batched_dispatch_supports_layout(src0->type, layout)) {
-        const char * reject_reason =
-            moe_mmvq_batched_dispatch_supports_type(src0->type) ? "layout-unsupported" : "type-unsupported";
-        log_dispatch_reject(reject_reason);
-        return false;
+        return log_dispatch_reject(moe_mmvq_batched_dispatch_supports_type(src0->type) ? "layout-unsupported" :
+                                                                                         "type-unsupported");
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
@@ -17154,8 +17683,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     const int64_t total_src1_rows = ne11 * ne12;
     const size_t  required_size   = total_src1_rows * q8_1_row_size;
     if (ne10 <= 0 || ne11 <= 0 || ne12 <= 0 || total_src1_rows <= 0 || q8_1_row_size <= 0 || required_size == 0) {
-        log_dispatch_reject("invalid-q8-shape");
-        return false;
+        return log_dispatch_reject("invalid-q8-shape");
     }
 
     const int     runtime_device = ctx.device;
@@ -17163,7 +17691,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     float *       dst_d          = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, runtime_device));
     if (!src1_d || !dst_d) {
         GGML_SYCL_DEBUG("[MMVQ] Missing resolved ptrs for batched MoE dispatch (%s)\n", src0->name ? src0->name : "?");
-        return false;
+        return log_dispatch_reject("unresolved-src1-dst");
     }
 
     // Use SoA quantizer if weights are in reordered layout (both SoA and COALESCED kernels expect SoA Y)
@@ -17197,7 +17725,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             mxfp4_moe_tg_reuse_invalidate();
         }
         if (!q8_1_buffer) {
-            return false;
+            // The allocator was told not to log a failure, so this reason is the only record of it.
+            return log_dispatch_reject("q8-scratch-alloc", required_size);
         }
         local_temps.add(std::move(q8_handle));
     }
@@ -17343,8 +17872,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     int32_t * ids_device = const_cast<int32_t *>(direct_ids_device);
     if (!can_use_direct_ids) {
         if (!gpu_expert_ids || !gpu_iid1s || !gpu_ids) {
-            log_dispatch_reject("missing-host-routing");
-            return false;
+            return log_dispatch_reject("missing-host-routing");
         }
         // Build full-size expert_id array for all slots.  GPU entries get
         // their real expert_id; CPU entries get the first GPU entry's
@@ -17378,10 +17906,11 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
 
         // Allocate device buffer for batch ids and upload.
         ggml_sycl::mem_handle ids_handle;
-        ids_device = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(
-            static_cast<size_t>(total_batches) * sizeof(int32_t), *stream, "mmvq_moe_batched_ids", ids_handle));
+        const size_t          ids_bytes = static_cast<size_t>(total_batches) * sizeof(int32_t);
+        ids_device                      = reinterpret_cast<int32_t *>(
+            mmvq_alloc_device_scratch(ids_bytes, *stream, "mmvq_moe_batched_ids", ids_handle));
         if (!ids_device) {
-            return false;
+            return log_dispatch_reject("ids-scratch-alloc", ids_bytes);
         }
         local_temps.add(std::move(ids_handle));
         kernel_deps.push_back(
@@ -17404,10 +17933,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     int32_t * grouped_chunk_starts_device = nullptr;
     int       grouped_n_groups            = 0;
     int       grouped_n_chunks            = 0;
+    // The size of the most recent grouped scratch request, so a chain of allocations that stops at its first
+    // failure can report what that one asked for.
+    size_t    scratch_request_bytes       = 0;
     auto      alloc_i32_scratch           = [&](int32_t *& ptr, size_t count, const char * cohort) {
         ptr = nullptr;
         ggml_sycl::mem_handle handle;
-        ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(count * sizeof(int32_t), *stream, cohort, handle));
+        scratch_request_bytes = count * sizeof(int32_t);
+        ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(scratch_request_bytes, *stream, cohort, handle));
         if (ptr) {
             local_temps.add(std::move(handle));
         }
@@ -17464,14 +17997,22 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_NVFP4:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
-                ne00 > INT_MAX || ne01 > INT_MAX ||
-                !mmvq_submit_q1_nvfp4_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer,
-                                              dispatch_ids, dst_d, static_cast<int>(ne00),
-                                              static_cast<int>(ne01), static_cast<int>(total_batches),
-                                              static_cast<int>(n_ids), static_cast<int>(num_tokens),
-                                              static_cast<int>(ne11), ids_nb0, ids_nb1, q8_nb11, q8_nb12,
-                                              nb1, nb2, &kernel_deps, &kernel_event)) {
-                return false;
+                ne00 > INT_MAX || ne01 > INT_MAX) {
+                return log_dispatch_reject("int-max-bound");
+            }
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+            // Private-testing failpoint: refuse once here, after every scratch is in place and before the
+            // submit, so a test can watch the caller turn a false return into a named, recoverable refusal.
+            if (ggml_sycl_q1_nvfp4_test_failure_take(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH)) {
+                return log_dispatch_reject("test-failpoint");
+            }
+#endif
+            if (!mmvq_submit_q1_nvfp4_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids,
+                                             dst_d, static_cast<int>(ne00), static_cast<int>(ne01),
+                                             static_cast<int>(total_batches), static_cast<int>(n_ids),
+                                             static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
+                                             q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
+                return log_dispatch_reject("submit-precondition");
             }
             have_kernel_event = true;
             break;
@@ -17491,13 +18032,15 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_0:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
-                ne00 > INT_MAX || ne01 > INT_MAX ||
-                !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
+                ne00 > INT_MAX || ne01 > INT_MAX) {
+                return log_dispatch_reject("int-max-bound");
+            }
+            if (!mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
                                           static_cast<int>(ne00), static_cast<int>(ne01),
                                           static_cast<int>(total_batches), static_cast<int>(n_ids),
                                           static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
                                           q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
-                return false;
+                return log_dispatch_reject("submit-precondition");
             }
             have_kernel_event = true;
             break;
@@ -17515,9 +18058,20 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             have_kernel_event = true;
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne01,
-                                          total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0, ids_nb1,
-                                          q8_nb11, q8_nb12, nb1, nb2, stream, &kernel_deps, &kernel_event);
+            // The kernel follows the layout the experts are loaded in: SOA bytes read as AOS blocks are garbage.
+            if (layout == GGML_LAYOUT_SOA) {
+                if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl(
+                        "batched", src0->name, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00,
+                        ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
+                        ne01, ne02, total_batches, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, nb1, nb2,
+                        stream, &kernel_deps, &kernel_event)) {
+                    return log_dispatch_reject("q8-0-soa-submit");
+                }
+            } else {
+                mul_mat_vec_q8_0_q8_1_id_sycl(nullptr, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids, ne00, ne01,
+                                              total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0, ids_nb1,
+                                              q8_nb11, q8_nb12, nb1, nb2, stream, &kernel_deps, &kernel_event);
+            }
             have_kernel_event = true;
             break;
         case GGML_TYPE_MXFP4:
@@ -17526,7 +18080,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 constexpr int exec_n         = GGML_SYCL_MXFP4_MOE_XMX_N;
                 constexpr int k_per          = GGML_SYCL_MXFP4_MOE_XMX_K;
                 const auto &  caps           = ggml_sycl_info().devices[ctx.device].xmx_caps;
-                auto          log_xmx_reject = [&](const char * reason) {
+                auto          log_xmx_reject = [&](const char * reason, size_t bytes = 0) {
                     static std::atomic<int> reject_log{ 0 };
                     const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
                     if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
@@ -17540,6 +18094,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                          (long long) ne00, k_per, caps.supported ? 1 : 0, caps.supports_int8 ? 1 : 0, caps.N,
                                          caps.optimal_tiles_n);
                     }
+                    return reject(reason, bytes);
                 };
                 const bool xmx_caps_ok = xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
                                          xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) &&
@@ -17551,13 +18106,11 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                                       can_use_direct_ids && route_ids_device != nullptr &&
                                                       ids_nb0 > 0 && ids_nb1 > 0;
                 if (!xmx_shape_ok || !xmx_caps_ok || (!xmx_route_arrays_ok && !device_grouped_xmx_shape)) {
-                    log_xmx_reject(!xmx_shape_ok ? "shape" : (!xmx_caps_ok ? "caps" : "route-arrays"));
-                    return false;
+                    return log_xmx_reject(!xmx_shape_ok ? "shape" : (!xmx_caps_ok ? "caps" : "route-arrays"));
                 }
                 const int tile_n_total = caps.N * caps.optimal_tiles_n;
                 if (tile_n_total < repeat || (tile_n_total % repeat) != 0) {
-                    log_xmx_reject("tile-n-total");
-                    return false;
+                    return log_xmx_reject("tile-n-total");
                 }
                 // Partial cover is a normal hybrid decode shape: the device owns some of the
                 // (id, token) slots and the host experts own the rest (their rows are the
@@ -17568,8 +18121,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 const bool grouped_decode_shape =
                     moe_mmvq_xmx_tiled_grouped_accepts_cover(full_gpu_cover, n_gpu_entries, xmx_route_arrays_ok);
                 if (!grouped_decode_shape) {
-                    log_xmx_reject("coverage");
-                    return false;
+                    return log_xmx_reject("coverage");
                 }
                 if (device_grouped_xmx_shape && !xmx_route_arrays_ok) {
                     const int n_experts_i = n_experts;
@@ -17586,8 +18138,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         !alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks),
                                            "mmvq_moe_xmx_device_grouped_chunk_starts") ||
                         !alloc_i32_scratch(active_chunks_device, 1, "mmvq_moe_xmx_device_grouped_active_chunks")) {
-                        log_xmx_reject("device-group-alloc");
-                        return false;
+                        return log_xmx_reject("device-group-alloc", scratch_request_bytes);
                     }
                     std::vector<sycl::event> grouped_deps;
                     grouped_deps.reserve(kernel_deps.size() + 1);
@@ -17627,18 +18178,15 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 for (int i = 0; i < n_gpu_entries; ++i) {
                     const int32_t eid = gpu_expert_ids[i];
                     if (eid < 0 || eid >= n_experts) {
-                        log_xmx_reject("expert-id");
-                        return false;
+                        return log_xmx_reject("expert-id");
                     }
                     const int64_t slot64 = gpu_ids[i] * num_tokens + gpu_iid1s[i];
                     if (slot64 < 0 || slot64 >= total_batches) {
-                        log_xmx_reject("slot-range");
-                        return false;
+                        return log_xmx_reject("slot-range");
                     }
                     const size_t slot = static_cast<size_t>(slot64);
                     if (seen_slots[slot]) {
-                        log_xmx_reject("slot-duplicate");
-                        return false;
+                        return log_xmx_reject("slot-duplicate");
                     }
                     seen_slots[slot] = 1;
 
@@ -17654,8 +18202,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 if (full_gpu_cover) {
                     for (uint8_t seen : seen_slots) {
                         if (!seen) {
-                            log_xmx_reject("slot-missing");
-                            return false;
+                            return log_xmx_reject("slot-missing");
                         }
                     }
                 }
@@ -17679,8 +18226,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 grouped_n_groups = static_cast<int>(grouped_experts_host.size());
                 grouped_n_chunks = static_cast<int>(grouped_chunk_groups_host.size());
                 if (grouped_n_groups <= 0 || grouped_n_chunks <= 0) {
-                    log_xmx_reject("group-empty");
-                    return false;
+                    return log_xmx_reject("group-empty");
                 }
                 // Every device entry owns a distinct slot (the slot-duplicate test above), and
                 // each contributes exactly one row, so this holds by construction.
@@ -17701,14 +18247,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         for (int c = 0; c < grouped_n_chunks; ++c) {
                             const int group = grouped_chunk_groups_host[static_cast<size_t>(c)];
                             if (group < 0 || group >= grouped_n_groups) {
-                                log_xmx_reject("chunk-group");
-                                return false;
+                                return log_xmx_reject("chunk-group");
                             }
                             const int row_start  = grouped_chunk_starts_host[static_cast<size_t>(c)];
                             const int group_rows = grouped_counts_host[static_cast<size_t>(group)];
                             if (row_start < 0 || row_start >= group_rows) {
-                                log_xmx_reject("chunk-row");
-                                return false;
+                                return log_xmx_reject("chunk-row");
                             }
                             const size_t chunk_rows = static_cast<size_t>(std::min(exec_n, group_rows - row_start));
                             if (pass_rows > 0 && pass_rows + chunk_rows > row_limit) {
@@ -17724,15 +18268,14 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         chunked_row_limit = !chunk_passes.empty();
                     }
                     if (!chunked_row_limit) {
-                        log_xmx_reject(occupancy.reason);
-                        return false;
+                        return log_xmx_reject(occupancy.reason);
                     }
                 }
 
                 auto * grouped_scratch_extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
                 if (!grouped_scratch_extra) {
-                    log_xmx_reject("group-alloc");
-                    return false;
+                    // No tensor extra to own the cached grouped scratch: no grouped scratch was allocated.
+                    return log_xmx_reject("group-scratch-owner");
                 }
                 auto & grouped_scratch    = grouped_scratch_extra->weight().moe_grouped_scratch[ctx.device];
                 auto   cached_i32_scratch = [&](ggml_sycl::mem_handle & cache_handle, size_t & cache_capacity,
@@ -17753,8 +18296,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         cache_capacity = 0;
                     }
                     ggml_sycl::mem_handle fresh_handle;
-                    ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(
-                        count * sizeof(int32_t), *stream, cohort, fresh_handle, /*persistent=*/true));
+                    scratch_request_bytes = count * sizeof(int32_t);
+                    ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(scratch_request_bytes, *stream, cohort,
+                                                                                fresh_handle, /*persistent=*/true));
                     if (!ptr) {
                         return false;
                     }
@@ -17776,8 +18320,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     !cached_i32_scratch(grouped_scratch.chunk_starts_handle, grouped_scratch.chunk_starts_capacity,
                                         grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
                                         "mmvq_moe_batched_grouped_chunk_starts")) {
-                    log_xmx_reject("group-alloc");
-                    return false;
+                    return log_xmx_reject("group-alloc", scratch_request_bytes);
                 }
                 std::vector<sycl::event> grouped_copy_events;
                 grouped_copy_events.reserve(5);
@@ -17837,7 +18380,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 if (!reorder_mul_mat_vec_mxfp4_dpas_q8_1_id_sycl(ctx, dispatch_ptrs, q8_1_buffer, dst_d, ne00, ne10,
                                                                  ne01, total_batches, num_tokens, ne11, q8_nb11,
                                                                  q8_nb12, nb1, nb2, kernel_deps)) {
-                    return false;
+                    return log_dispatch_reject("mxfp4-dpas-submit");
                 }
             } else if (layout == GGML_LAYOUT_MXFP4_I8) {
                 constexpr int repeat          = GGML_SYCL_MXFP4_MOE_XMX_M;
@@ -17886,7 +18429,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                         !alloc_i32_scratch(grouped_chunk_starts_device, static_cast<size_t>(max_chunks),
                                            "mmvq_moe_batched_device_grouped_chunk_starts") ||
                         !alloc_i32_scratch(active_chunks_device, 1, "mmvq_moe_batched_device_grouped_active_chunks")) {
-                        return false;
+                        return log_dispatch_reject("device-group-alloc", scratch_request_bytes);
                     }
                     std::vector<sycl::event> grouped_deps;
                     grouped_deps.reserve(kernel_deps.size() + 1);
@@ -17900,7 +18443,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     if (mxfp4_moe_device_grouping_sync_chunks_enabled()) {
                         device_n_chunks = mxfp4_copy_active_chunks_to_host(*stream, active_chunks_device, grouped_deps);
                         if (device_n_chunks <= 0 || device_n_chunks > max_chunks) {
-                            return false;
+                            return log_dispatch_reject("device-group-chunks");
                         }
                         active_chunks_arg = nullptr;
                     }
@@ -18151,7 +18694,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             break;
         default:
-            return false;
+            return log_dispatch_reject("type-unsupported");
     }
     if (tg_profile) {
         if (have_kernel_event) {
@@ -22058,14 +22601,32 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             have_kernel_event = true;
             break;
         case GGML_TYPE_Q8_0:
-            mul_mat_vec_q8_0_q8_1_id_sycl(src0_d, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
-                                          ne00,              // ncols
-                                          ne01,              // nrows_per_expert
-                                          total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
-                                          ids_nb1,           // ids strides
-                                          q8_nb11, q8_nb12,  // Q8_1 strides
-                                          nb1, nb2,          // dst strides
-                                          stream, &kernel_deps, &kernel_event);
+            // The kernel follows the layout the experts are loaded in: SOA bytes read as AOS blocks are garbage.
+            // The SOA kernel reads per-expert blocks only, so it refuses an operand with no expert table (src0_d,
+            // the whole tensor in one SOA block) rather than reading it.
+            if (layout == GGML_LAYOUT_SOA) {
+                if (!mul_mat_vec_q8_0_q8_1_soa_id_sycl("vec_q", src0->name, dispatch_ptrs, q8_1_buffer, dst_d,
+                                                       dispatch_ids,
+                                                       ne00,  // ncols
+                                                       ne10,  // ncols_y: the SOA Q8_1 row's quant bytes
+                                                       ne01,  // nrows_per_expert
+                                                       ne02, total_batches, num_tokens, ne11, ids_nb0, ids_nb1, q8_nb11,
+                                                       q8_nb12, nb1, nb2, stream, &kernel_deps, &kernel_event)) {
+                    mmvq_moe_trace(src0, "q8_0_soa_operand_refused", ctx.device, (int) layout, forced_layout != nullptr,
+                                   batch_size, -1, host_weights, use_ptr_table, placement_plan_active,
+                                   plan_has_host_experts);
+                    return false;
+                }
+            } else {
+                mul_mat_vec_q8_0_q8_1_id_sycl(src0_d, dispatch_ptrs, q8_1_buffer, dst_d, dispatch_ids,
+                                              ne00,              // ncols
+                                              ne01,              // nrows_per_expert
+                                              total_batches, n_ids, num_tokens, ne11, stride_expert_x, ids_nb0,
+                                              ids_nb1,           // ids strides
+                                              q8_nb11, q8_nb12,  // Q8_1 strides
+                                              nb1, nb2,          // dst strides
+                                              stream, &kernel_deps, &kernel_event);
+            }
             have_kernel_event = true;
             break;
         case GGML_TYPE_MXFP4:
@@ -22731,6 +23292,15 @@ static bool mmvq_build_stream_segments(const ggml_tensor * src0,
     return true;
 }
 
+// The card's SYCL compute-unit count, the one device fact the Q8_0 column-split rule reads
+// (mmvq_column_split_chunks). 0 for a device index the backend does not know, which keeps the row form.
+static int mmvq_device_compute_units(const int device_id) {
+    if (device_id < 0 || device_id >= ggml_sycl_info().device_count) {
+        return 0;
+    }
+    return ggml_sycl_info().devices[device_id].nsm;
+}
+
 static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                     const char *            src0_dd_i,
                                     const void *            layout_base,
@@ -22877,8 +23447,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                          (long long) row_diff);
                         mmvq_assert_coalesced_slice_supported(src0 ? src0->name : nullptr, ne01, row_low, row_diff);
                         coalesced_mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
-                                                             stream, fused_add, fused_add_ne0, fused_add_nb0,
-                                                             fused_add_row_base);
+                                                             mmvq_device_compute_units(device_id), stream, fused_add,
+                                                             fused_add_ne0, fused_add_nb0, fused_add_row_base);
                     } else if (mode == reorder_mode::SOA) {
                         GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q8_0_q8_1_sycl\n");
                         GGML_SYCL_KTRACE("mmvq_q8_0_soa", " ne00=%lld row_diff=%lld ne01=%lld row_low=%lld",
@@ -22886,8 +23456,8 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                         // For SoA layout, use base pointer (not pre-offset src0_dd_i) and pass row_low for correct block indexing
                         const void * soa_base = layout_base;
                         reorder_mul_mat_vec_q8_0_q8_1_sycl(soa_base, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, ne01,
-                                                           row_low, stream, fused_add, fused_add_ne0, fused_add_nb0,
-                                                           fused_add_row_base);
+                                                           row_low, mmvq_device_compute_units(device_id), stream,
+                                                           fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
                     } else {
                         GGML_SYCL_KTRACE("mmvq_q8_0_aos", " ne00=%lld row_diff=%lld", (long long) ne00,
                                          (long long) row_diff);
@@ -23272,6 +23842,36 @@ static sycl::event mmvq_stream_slice(sycl::queue &                    queue,
 
     return ggml_sycl_submit_marker<ggml_sycl_mmvq_marker_kernel>(queue);
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The Q8_0 launchers exactly as ggml_sycl_mmvq_dispatch calls them, for a device test that has no ggml tensor:
+// `compute_units` is what the dispatcher would read from the card, so the test drives the row form (0) and the
+// column-split form (the card's count) through the production dispatch rule. Returns the chunks launched.
+int mmvq_test_q8_0_launch(sycl::queue & q,
+                          bool          coalesced,
+                          const void *  vx,
+                          const void *  vy,
+                          float *       dst,
+                          int           ncols,
+                          int           nrows,
+                          int           total_nrows,
+                          int           row_low,
+                          int           compute_units,
+                          const float * fused_add,
+                          int64_t       fused_add_ne0,
+                          int64_t       fused_add_row_base) {
+    int chunks = 0;
+    if (coalesced) {
+        mmvq_assert_coalesced_slice_supported("mmvq_test_q8_0_launch", total_nrows, row_low, nrows);
+        coalesced_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, compute_units, &q, fused_add, fused_add_ne0,
+                                             sizeof(float), fused_add_row_base, &chunks);
+    } else {
+        reorder_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, total_nrows, row_low, compute_units, &q,
+                                           fused_add, fused_add_ne0, sizeof(float), fused_add_row_base, &chunks);
+    }
+    return chunks;
+}
+#endif
 
 // =============================================================================
 // Direct MMVQ kernel submission wrappers for persistent TG micro-graph
@@ -24176,6 +24776,16 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
             }
         }
         if (!result.ok) {
+            // llama.cpp-5efe C4: stream_dma refused a file-mapped source (a host-tier weight, which executes on the
+            // CPU, never streams to a device). Routed explicitly, not through mmap_direct_failed.
+            if (result.refused_file_mapped) {
+                GGML_LOG_WARN("[MMVQ] stream_dma refused a file-mapped weight, running on the CPU (%s)\n",
+                              src0->name ? src0->name : "unknown");
+                if (ggml_sycl_cpu_fallback_graph(ctx, dst, "mmvq streaming refused")) {
+                    return;
+                }
+                GGML_ABORT("MMVQ streaming refused a file-mapped weight and the CPU fallback failed");
+            }
             if (result.mmap_direct_failed) {
                 GGML_LOG_WARN("[MMVQ] DMA from mmap failed, falling back to CPU (%s)\n",
                               src0->name ? src0->name : "unknown");

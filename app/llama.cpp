@@ -1,6 +1,7 @@
 #include "build-info.h"
 
 #include "llama.h"
+#include "tool-entry.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -139,7 +140,7 @@ int main(int argc, char ** argv) {
 #else
             setenv("LLAMA_APP_CMD", cmd.name, 1);
 #endif
-            return cmd.func(argc - 1, argv + 1);
+            return common_tool_entry(cmd.name, cmd.func, argc - 1, argv + 1);
         }
     }
 

@@ -138,7 +138,9 @@ INSTALL_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_install\s*\("
 RESERVE_SIG = r"\bstatic\s+bool\s+ggml_sycl_reserve_host_tenants\s*\("
 SLOT_OF_SIG = r"\bstatic\s+ggml_sycl_host_tenant_slot\s*\*\s*ggml_sycl_host_tenant_slot_of\s*\("
 SLOT_MAKE_SIG = r"\bstatic\s+ggml_sycl::kv_region_handle\s+ggml_sycl_host_tenant_slot_make\s*\("
-ALLOC_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\("
+# The host bufts' one allocation path (design 5efe section 4.4): SYCL_Host's and SYCL_KV_Host's alloc_buffer delegate
+# to it with their builder's intent, so the claim-before-allocation shape lives there.
+ALLOC_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_sycl_host_buft_alloc\s*\("
 CLAIM_SLOT_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_host_buffer_claim_slot\s*\("
 WRAP_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_wrap\s*\("
 FREE_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_host_buffer_free_buffer\s*\("
@@ -157,6 +159,7 @@ SYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_synchronize\s*\("
 SET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_set_tensor_async\s*\("
 SUPPORTS_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_device_supports_buft\s*\("
 CPY_ASYNC_DEF = "static bool ggml_backend_sycl_cpy_tensor_async("
+CPY_ASYNC_FATAL = 'ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_backend_sycl_cpy_tensor_async");'
 GET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_get_tensor_async\s*\("
 LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
 TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
@@ -336,7 +339,8 @@ def impl_first_publish_wrong(source):
     if impl is None:
         return True
     r = impl.find("ggml_sycl_reserve_host_tenants(")
-    l1 = impl.find("std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex)")
+    l1_lock = re.search(r"std::lock_guard(?:<[^<>]*>)?\s+lock\s*\(\s*g_tensor_inventory_mutex\s*\)", impl)
+    l1 = l1_lock.start() if l1_lock else -1
     inner = impl.find("ggml_sycl_run_runtime_context_transaction(")
     inst = impl.find("ggml_sycl_host_tenants_install(")
     return not (0 <= r < inst < l1 and inst < inner and impl.count("ggml_sycl_host_tenants_install(") == 1)
@@ -427,7 +431,7 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
     if alloc is not None:
         pin(fails, alloc,
             r"if \(ggml_sycl::tenant_claim_scope::active\(\)\) \{[^}]*if \(!ggml_backend_sycl_host_buffer_claim_slot\([^)]*\)\) \{"
-            r"\s*return nullptr;\s*\}\s*return ggml_backend_sycl_host_buffer_wrap\([^;]*std::move\(claim\)\);\s*\}\s*auto \* exact_cache",
+            r"\s*return nullptr;\s*\}\s*return ggml_backend_sycl_host_buffer_wrap\([^;]*std::move\(claim\)[^;]*\);\s*\}\s*auto \* exact_cache",
             "L4 host tier: a refused claim in a scope falls through to the legacy allocator (or the claim branch no longer "
             "ends in its own return)")
     claim_slot = function_body(source, r"\bstatic\s+bool\s+ggml_backend_sycl_host_buffer_claim_slot\s*\(")
@@ -446,7 +450,7 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
     if wrap is None:
         fails.append("L4 host tier: ggml_backend_sycl_host_buffer_wrap not found")
     else:
-        pin(fails, wrap, r"std::unique_ptr<ggml_sycl::tenant_claim> claim\) \{",
+        pin(fails, wrap, r"std::unique_ptr<ggml_sycl::tenant_claim> claim,",
             "L4 host tier: wrap does not take its claim by value (an early return would leave it live)")
         pin(fails, wrap, r"new \(std::nothrow\) sycl_host_buf_ctx\{[^;]*\};\s*if \(!ctx\) \{\s*ggml_backend_buffer_free\(buffer\);\s*return nullptr;",
             "L4 host tier: a failed context allocation does not free the CPU buffer it built and answer null")
@@ -557,7 +561,10 @@ def free_path_pins(source, freeb, fails):
     # there is pinned by tests/test-sycl-moe-cpu-job-device-signal-source.py, not here.  The drain is a try block
     # (a throwing drain must not abort), so its catch clauses must keep the error in drain_error and the code after
     # them must read it: a drain whose failure vanished without a trace would otherwise still match.  The gate
-    # clear between them is admitted the same way as the sleep.
+    # clear between them is admitted the same way as the sleep.  The drain is admitted under exactly one condition,
+    # that the injected device loss ahead of it, first in the same try block, did not throw. The injection is an empty
+    # inline outside a GGML_SYCL_PRIVATE_TESTING build, so there the drain still always runs; a test build skips the
+    # drain only after an injected loss, which stands for a loss whose drain would fail, and the catch keeps its error.
     sync = function_body(source, SYNC_SIG)
     pin(fails, sync,
         r"const queue_ptr stream = sycl_ctx->stream\(sycl_ctx->device, 0\);\s*"
@@ -566,14 +573,16 @@ def free_path_pins(source, freeb, fails):
         r"const bool use_deferred_decode_event =\s*"
         r"sycl_ctx->last_graph_event\.has_value\(\) && sycl_ctx->last_graph_event_deferred_decode;\s*"
         r"std::string drain_error;\s*"
-        r"try \{\s*if \(use_deferred_decode_event\) \{\s*sycl_ctx->last_graph_event->wait_and_throw\(\);\s*\}\s*"
+        r'try \{\s*ggml_sycl_test_inject_device_lost\("sync"\);\s*'
+        r"if \(use_deferred_decode_event\) \{\s*sycl_ctx->last_graph_event->wait_and_throw\(\);\s*\}\s*"
         r"else \{\s*stream->wait_and_throw\(\);\s*\}\s*\}\s*"
         r"catch \(const std::exception & e\) \{\s*drain_error = e\.what\(\);\s*\}\s*"
         r"catch \(\.\.\.\) \{\s*drain_error = \"unknown exception\";\s*\}\s*"
         r"(?:ggml_sycl_cpu_job_gates_clear\(gate_sleep\);\s*)?"
         r"if \(!drain_error\.empty\(\)\)",
-        "L4 free path: the backend synchronize no longer drains, in sequence and unconditionally, stream 0 or the deferred "
-        "decode event after the CPU-expert flush, keeping a throwing drain's error for the code after it")
+        "L4 free path: the backend synchronize no longer drains, in sequence and unless the test-only injection threw, "
+        "stream 0 or the deferred decode event after the CPU-expert flush, keeping a throwing drain's error for the code "
+        "after it")
     # one execution queue per device: stream(device, idx) answers it for EVERY idx, and it is the TP queue or the
     # unified cache's own queue.  This is what makes "the queues the synchronize does not drain" an empty set.
     stream_fn = function_body(source, STREAM_SIG)
@@ -654,7 +663,9 @@ def free_path_pins(source, freeb, fails):
     supports = function_body(source, SUPPORTS_SIG)
     if supports is None or "cpu_activation_buffer_type" in supports:
         fails.append("L4 free path: the device supports the CpuActivation buffer type (a SYCL op could read a CPU activation)")
-    if source.count("ggml_backend_sycl_cpy_tensor_async") != 1:
+    # Its own catch names it in the fast exit's message: that quoted string is a diagnostic, not a reference, and only
+    # that exact literal is set aside.
+    if source.replace('"ggml_backend_sycl_cpy_tensor_async"', '""').count("ggml_backend_sycl_cpy_tensor_async") != 1:
         fails.append("L4 free path: cpy_tensor_async is referenced beyond its definition (the backend's interface wires it)")
 
 
@@ -1184,7 +1195,7 @@ def check(header_raw, source):
         fails.append("L4 host tier: the first publish does not reserve before L1, or does not install once before the inner transaction")
 
     # the buffer type: claim before any allocation, release on free
-    alloc = function_body(source, r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(")
+    alloc = function_body(source, ALLOC_SIG)
     if alloc is None:
         fails.append("L4 host tier: the SYCL_Host alloc_buffer not found")
     else:
@@ -1257,6 +1268,10 @@ def check(header_raw, source):
     probe_pins(source, fails)
     load_term_pins(header_raw, source, fails)
     return fails
+
+
+# The failure the backend synchronize's drain pin reports, which each of its mutants must produce.
+SYNC_DRAIN_MSG = "the backend synchronize no longer drains, in sequence and unless the test-only injection threw"
 
 
 def mutations(header_raw, source):
@@ -1439,25 +1454,31 @@ def mutations(header_raw, source):
          re.compile(r"synchronize\(\);(\s*)(const int64_t t_start_us = ggml_time_us\(\);)"), r"\2\1synchronize();"),
         ("sched_reserve_impl's synchronize behind a condition on a flag", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
          "    synchronize();\n", "    if (state.cparams.n_ctx != 0) { synchronize(); }\n"),
-        ("the backend synchronize skips stream 0", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips stream 0", SYNC_DRAIN_MSG, SYNC_SIG,
          "stream->wait_and_throw();", "(void) 0;"),
-        ("the backend synchronize skips the stream's wait under a ternary", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips the stream's wait under a ternary", SYNC_DRAIN_MSG, SYNC_SIG,
          "stream->wait_and_throw();", "false ? (void) 0 : stream->wait_and_throw();"),
-        ("the backend synchronize skips the CPU-expert flush", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips the CPU-expert flush", SYNC_DRAIN_MSG, SYNC_SIG,
          "            ggml_sycl_cpu_tg_flush_pending();\n", ""),
-        ("the backend synchronize's CPU-expert flush under if (false)", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's CPU-expert flush under if (false)", SYNC_DRAIN_MSG, SYNC_SIG,
          "            ggml_sycl_cpu_tg_flush_pending();\n", "            if (false) ggml_sycl_cpu_tg_flush_pending();\n"),
-        ("the backend synchronize's CPU-expert flush behind a false condition", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's CPU-expert flush behind a false condition", SYNC_DRAIN_MSG, SYNC_SIG,
          "if (!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test()) {", "if (false) {"),
-        ("the backend synchronize skips the deferred decode event", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize skips the deferred decode event", SYNC_DRAIN_MSG, SYNC_SIG,
          "sycl_ctx->last_graph_event->wait_and_throw()", "0"),
-        ("the backend synchronize's deferred-event arm is never chosen", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's deferred-event arm is never chosen", SYNC_DRAIN_MSG, SYNC_SIG,
          "if (use_deferred_decode_event) {", "if (false) {"),
-        ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize returns before the drain", SYNC_DRAIN_MSG, SYNC_SIG,
          "        std::string drain_error;", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        std::string drain_error;"),
-        ("the backend synchronize's drain catch keeps no error", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's drain catch keeps no error", SYNC_DRAIN_MSG, SYNC_SIG,
          "drain_error = e.what();", ""),
-        ("the backend synchronize returns after its gate sleep", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+        ("the backend synchronize's drain behind a condition besides the injection's", SYNC_DRAIN_MSG, SYNC_SIG,
+         "ggml_sycl_test_inject_device_lost(\"sync\");",
+         "ggml_sycl_test_inject_device_lost(\"sync\");\n            if (!sycl_ctx->has_pending_barrier)"),
+        ("the backend synchronize injects its loss outside the drain's try", SYNC_DRAIN_MSG, SYNC_SIG,
+         re.compile(r'(std::string drain_error;\s*try \{)(\s*)ggml_sycl_test_inject_device_lost\("sync"\);'),
+         r'ggml_sycl_test_inject_device_lost("sync");\n        \1\2'),
+        ("the backend synchronize returns after its gate sleep", SYNC_DRAIN_MSG, SYNC_SIG,
          "ggml_sycl_cpu_job_gates_sleep(*stream);\n", "ggml_sycl_cpu_job_gates_sleep(*stream);\n        if (gate_sleep.waited != 0) {\n            return;\n        }\n"),
         # ---- the queue aliasing: one execution queue per device, answered for every idx
         ("stream() answers a private queue for idx > 0 ahead of the execution queue", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
@@ -1581,7 +1602,7 @@ def mutations(header_raw, source):
          "        return false;\n    }\n    const ggml_sycl_host_tenant_slot * slot",
          "        (void) ggml_sycl::tenant_claim_scope::release(*made, 0);\n        return false;\n    }\n    const ggml_sycl_host_tenant_slot * slot"),
         ("wrap takes the claim by reference", "wrap does not take its claim by value", WRAP_SIG,
-         "std::unique_ptr<ggml_sycl::tenant_claim> claim) {", "std::unique_ptr<ggml_sycl::tenant_claim> & claim) {"),
+         "std::unique_ptr<ggml_sycl::tenant_claim> claim,", "std::unique_ptr<ggml_sycl::tenant_claim> & claim,"),
         ("wrap's failed context allocation leaks the CPU buffer", "a failed context allocation does not free the CPU buffer", WRAP_SIG,
          "    if (!ctx) {\n        ggml_backend_buffer_free(buffer);\n        return nullptr;\n    }", "    if (!ctx) {\n        return nullptr;\n    }"),
         ("wrap's refused set_type leaks the context", "a refused set_type does not free the buffer", WRAP_SIG,
@@ -1653,7 +1674,7 @@ def mutations(header_raw, source):
         ("a publish for an unbound context is silent", "a publish for an unbound context is silent",
          r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        if (section) {\n            GGML_LOG_WARN(", "        if (false) {\n            GGML_LOG_WARN("),
         ("the claim after the allocation", "does not claim inside a scope before it allocates",
-         r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(",
+         ALLOC_SIG,
          "    if (ggml_sycl::tenant_claim_scope::active()) {",
          "    { ggml_sycl::alloc_handle early{}; (void) ggml_sycl::unified_alloc({}, &early); }\n    if (ggml_sycl::tenant_claim_scope::active()) {"),
         ("the unbound-context return dropped from the section set", "goes on to the registry with key 0",
@@ -1888,6 +1909,9 @@ def mutations(header_raw, source):
                   "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
     pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
                   CPY_ASYNC_DEF, "static void h_wire_cpy() { (void) ggml_backend_sycl_cpy_tensor_async; }\n" + CPY_ASYNC_DEF))
+    # On the same line as the fast exit, so an exemption by line rather than by the exact literal would let it through.
+    pairs.append(("a reference to cpy_tensor_async beside its fast-exit message", "cpy_tensor_async is referenced beyond its definition",
+                  CPY_ASYNC_FATAL, "(void) ggml_backend_sycl_cpy_tensor_async; " + CPY_ASYNC_FATAL))
     # llama.cpp-p6i0: the load's compute-term entries
     pairs.append(("the writer marked unused again", "still marked [[maybe_unused]]",
                   "static bool ggml_sycl_load_record_compute_term(",
@@ -1969,15 +1993,17 @@ def mutations(header_raw, source):
                          header_raw.replace(line, "", 1), src))
     for label, msg, old, new in pairs:
         if label == "the first publish reserves under L1":
-            lock = ("        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
-                    "        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id")
-            if src.count(old) != 1 or src.count(lock) != 1:
+            # The guard is found with or without its template argument, as impl_first_publish_wrong reads it, and kept
+            # as written: the mutant only moves the reservation under it.
+            lock = re.compile(r"( *std::lock_guard(?:<[^<>]*>)?\s+lock\s*\(\s*g_tensor_inventory_mutex\s*\);\n)"
+                              r"(?= *const auto snapshot = "
+                              r"ggml_sycl::lifecycle_select_placement_plan\(model\.model_id)")
+            if src.count(old) != 1 or len(lock.findall(src)) != 1:
                 muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
             else:
-                moved = src.replace(old, new, 1).replace(
-                    lock, "        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
-                          "        (void) ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal_under_l1);\n"
-                          "        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id", 1)
+                reserve = ("        (void) ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, "
+                           "refusal_under_l1);\n")
+                moved = lock.sub(lambda m: m.group(1) + reserve, src.replace(old, new, 1), count=1)
                 muts.append((label, msg, header_raw, moved))
             continue
         if label == "the clear guard before the finisher check":

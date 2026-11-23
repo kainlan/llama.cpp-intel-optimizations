@@ -153,12 +153,18 @@ MULTI_PLAN_SIG = ("placement_plan compute_multi_device_plan(const std::vector<de
 ROOM_SIG = "static kv_context_room hold_kv_context_room(placement_plan & plan,"
 WEIGH_SIG = "static kv_context_room_cost weigh_kv_context_room(const placement_kv_info & kv_info,"
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
-FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+# The stage copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
+# (llama.cpp-4zup): the intake is the fill site, written over the KV inputs it is handed, and the stage hands it
+# g_placement_kv_info.
+STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+             "const ggml_sycl_tensor_inventory * inventory)")
+FILL_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
             "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
 PARAM_SIG = "static double ggml_sycl_plan_cost_param(const char * name, double def, double max, bool * set = nullptr)"
 
 ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
-COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
+COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
 NO_DOUBLE_MAX = "std::numeric_limits<double>::max()"
 
 # name -> (placement_kv_info field, default constant, upper bound at the fill site, unit, source the doc row cites,
@@ -177,8 +183,8 @@ PARAMS = {
 
 def fill(name: str) -> str:
     field, const, bound, _, _, flag = PARAMS[name]
-    set_arg = f", &g_placement_kv_info.{flag}" if flag else ""
-    return f'g_placement_kv_info.{field} = ggml_sycl_plan_cost_param("{name}", ggml_sycl::{const}, {bound}{set_arg});'
+    set_arg = f", &kv.{flag}" if flag else ""
+    return f'kv.{field} = ggml_sycl_plan_cost_param("{name}", ggml_sycl::{const}, {bound}{set_arg});'
 
 
 def header_default(hpp: str, const: str) -> float | None:
@@ -228,13 +234,13 @@ def claim_fill_site_reads_each_once(tree: dict[str, str]) -> bool:
     """The backend reads each variable once, where it copies the inventory into its KV inputs, right after the
     requested context; nothing else reads them. Every C/C++ source of the backend is scanned (comments stripped): the
     name occurs once in ggml-sycl.cpp, in that site, and in no other file, except the one override hint the unpriced
-    room's WARN prints."""
+    room's WARN prints. That site is the KV intake, and the stage hands it g_placement_kv_info."""
     if not all(rel in tree for rel in (SYCL_REL, CACHE_REL, CACHE_HPP_REL, ROOM_COST_REL)):
         return False
     s = norm(tree[SYCL_REL])
     site = body(s, FILL_SIG)
     others = [_scanned(rel, text) for rel, text in tree.items() if rel != SYCL_REL]
-    if not site:
+    if not site or INTAKE_CALL not in body(s, STAGE_SIG):
         return False
     for name in PARAMS:
         if s.count(name) != 1 or any(name in text for text in others):
@@ -476,7 +482,7 @@ def claim_no_request_returns_before_any_cost(cache: str) -> bool:
 
 
 PLANNER_N_CTX = "plan.planner_n_ctx = kv_info.n_ctx;"
-COPY_N_CTX = "g_placement_kv_info.n_ctx = inventory->n_ctx;"
+COPY_N_CTX = "kv.n_ctx = inventory->n_ctx;"
 
 
 def claim_context_never_becomes_the_planning_n_ctx(cache: str, hpp: str, sycl: str) -> bool:
@@ -486,7 +492,7 @@ def claim_context_never_becomes_the_planning_n_ctx(cache: str, hpp: str, sycl: s
     texts = [norm(t) for t in (cache, hpp, sycl)]
     leak = re.compile(r"\b\w*n_ctx\s*=[^;=]*\bn_ctx_context\b")
     return (all(leak.search(t) is None for t in texts) and PLANNER_N_CTX in body(texts[0], PLAN_SIG)
-            and COPY_N_CTX in body(texts[2], FILL_SIG))
+            and COPY_N_CTX in body(texts[2], FILL_SIG) and INTAKE_CALL in body(texts[2], STAGE_SIG))
 
 
 # ---- the line -------------------------------------------------------------------------------------------------------
@@ -853,7 +859,7 @@ def test_mutant_override_flag_not_passed_fails():
     types and never be reported."""
     site = fill("GGML_SYCL_PLAN_CPU_EXPERT_GBPS")
     assert not claim_fill_site_reads_each_once(
-        _tree_with(SYCL_REL, _once(SYCL, site, site.replace(", &g_placement_kv_info.cpu_expert_gbps_set", ""))))
+        _tree_with(SYCL_REL, _once(SYCL, site, site.replace(", &kv.cpu_expert_gbps_set", ""))))
 
 
 def test_mutant_split_not_read_fails():
@@ -1178,7 +1184,15 @@ def test_mutant_multi_device_planner_n_ctx_from_the_context_fails():
 
 def test_mutant_kv_info_n_ctx_from_the_context_fails():
     assert not claim_context_never_becomes_the_planning_n_ctx(
-        CACHE, CACHE_HPP, _once(SYCL, COPY_N_CTX, "g_placement_kv_info.n_ctx = inventory->n_ctx_context;"))
+        CACHE, CACHE_HPP, _once(SYCL, COPY_N_CTX, "kv.n_ctx = inventory->n_ctx_context;"))
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the reads and the n_ctx copy still exist, and reach
+    no KV input the planner reads."""
+    mutant = _once(SYCL, INTAKE_CALL, "")
+    assert not claim_fill_site_reads_each_once(_tree_with(SYCL_REL, mutant))
+    assert not claim_context_never_becomes_the_planning_n_ctx(CACHE, CACHE_HPP, mutant)
 
 
 def test_mutant_no_full_refusal_line_fails():

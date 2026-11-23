@@ -251,14 +251,15 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
     return h;
 }
 
-// Q1_0 and NVFP4 run on a device only through their direct kernel (DEVICE_MMVQ_Q1_NVFP4_AOS) and its admitted
-// workspace bundle -- the MMID direct route in ggml_sycl_mul_mat_id, which validate_moe_execution_recipe checks and
-// choose_moe_batch_executor keeps closed to every other executor; any other device recipe for them is refused. One
-// answer for the validator, the executor choice, the staged route's capability refusal
-// (ggml_sycl_moe_staged_capability_refusal) and the planner's MMID workspace pools (plan_moe_mmid_workspaces). The
-// stream ring does not ask it: it stages windows only for layers the library executor claims whole (W2 of
-// docs/plans/2026-10-24-prefill-window-ring.md).
-inline bool moe_type_needs_direct_kernel(ggml_type type) {
+// Q1_0 and NVFP4 host experts run an immutable recipe: a HOST_CPU recipe whose host workspace is planned for the
+// micro-batch (plan_moe_host_workspace) and checked exactly by validate_moe_execution_recipe, never the pinned buffer
+// pool the other host experts share. The prompt CPU island does not run them for that reason
+// (ggml_sycl_moe_pp_cpu_island_runs_type). On a device they need nothing of their own: the capability query answers
+// the MMVQ_COMPAT id kernel for them, but more narrowly than for other MMVQ id types (only an expert local to the
+// submitting card, in AOS, with a block-aligned K), and validate_moe_execution_recipe checks the direct kernel's
+// recipe by its kernel, not by this type test. They are also the types the MMID direct route in ggml_sycl_mul_mat_id
+// runs on the primary card, so the planner's MMID workspace pools (plan_moe_mmid_workspaces) are planned for them.
+inline bool moe_type_has_immutable_host_recipe(ggml_type type) {
     return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
 }
 
@@ -284,7 +285,7 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || recipe.request.rows == 0) {
         return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
     }
-    if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_needs_direct_kernel(recipe.request.type)) {
+    if (recipe.kind == moe_batch_executor::HOST_CPU && moe_type_has_immutable_host_recipe(recipe.request.type)) {
         moe_workspace_recipe expected;
         if (recipe.workspace.activation_q8_bytes % recipe.request.rows != 0 ||
             recipe.workspace.descriptor_bytes % recipe.request.rows != 0 ||
@@ -326,15 +327,15 @@ inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
             return refuse(moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     } else {
-        const bool direct_q1_nvfp4 = moe_type_needs_direct_kernel(recipe.request.type);
-        if (direct_q1_nvfp4) {
+        // The direct kernel's recipe carries the bounded workspace its admission binds, so it is checked exactly. Any
+        // other device kernel takes its scratch when it is submitted and its recipe carries none: Q1_0 and NVFP4 under
+        // MMVQ_COMPAT pass here as any MMVQ id type does.
+        if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {
             moe_workspace_recipe expected;
-            if (recipe.kernel != moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS || recipe.layout != GGML_LAYOUT_AOS ||
-                recipe.workspace.chunk_rows == 0 ||
+            if (recipe.layout != GGML_LAYOUT_AOS || recipe.workspace.chunk_rows == 0 ||
                 !plan_moe_q1_nvfp4_device_workspace(recipe.request,
-                                                     recipe.workspace.activation_q8_bytes /
-                                                         recipe.workspace.chunk_rows,
-                                                     recipe.workspace.chunk_rows, &expected) ||
+                                                    recipe.workspace.activation_q8_bytes / recipe.workspace.chunk_rows,
+                                                    recipe.workspace.chunk_rows, &expected) ||
                 expected.activation_q8_bytes != recipe.workspace.activation_q8_bytes ||
                 expected.output_f32_bytes != recipe.workspace.output_f32_bytes ||
                 expected.descriptor_bytes != recipe.workspace.descriptor_bytes ||
@@ -837,42 +838,15 @@ struct moe_batch_executor_choice {
 };
 
 // Executor selection is deliberately metadata-only. Callers supply capability
-// and owning-queue facts; pointer address spaces are never consulted.
-inline moe_batch_executor_choice choose_moe_batch_executor(
-    const moe_resolved_operand & operand,
-    int                          submit_device,
-    bool                         owning_queue_available,
-    size_t                       reserved_workspace_bytes,
-    const moe_admitted_workspace_bundle * workspace_bundle = nullptr) {
+// and owning-queue facts; pointer address spaces are never consulted. It asks
+// no type of its own: the capability query chose the kernel the recipe names
+// and the recipe validator checks that recipe, so the choice refuses no type
+// the query admitted, Q1_0 and NVFP4 included.
+inline moe_batch_executor_choice choose_moe_batch_executor(const moe_resolved_operand & operand,
+                                                           int                          submit_device,
+                                                           bool                         owning_queue_available,
+                                                           size_t                       reserved_workspace_bytes) {
     moe_batch_executor_choice out;
-    const bool                direct_q1_nvfp4 = operand.recipe().kind != moe_batch_executor::HOST_CPU &&
-                                 moe_type_needs_direct_kernel(operand.recipe().request.type);
-    if (direct_q1_nvfp4) {
-        // Q1_0/NVFP4 run on a device only through the MMID direct route in
-        // ggml_sycl_mul_mat_id (a decode token or a prompt's rows on the primary
-        // card, AoS, with an admitted workspace bundle); that route is open since
-        // the B70 and B50 oracle runs of 2026-11-22. No generic executor runs these
-        // types, so a device recipe for them is refused here. Two callers ask this gate:
-        //  - the hybrid decode record build (ggml_sycl_moe_hybrid_decode_record_build),
-        //    for every expert of a layer with host experts, BEFORE the direct block
-        //    runs. Its refusal is not fatal: the hybrid route declines the layer and
-        //    the retained route keeps the tensor, so the op still reaches the direct
-        //    block;
-        //  - the retained route core, AFTER the direct block, for an operand that fell
-        //    through it: a secondary card, a layout other than AoS, a selection that
-        //    mixes host and device experts, ids or an input the route cannot read
-        //    where they are, or an authority or bundle the route could not obtain.
-        // A host-resident expert carries a HOST_CPU recipe, runs on the CPU, and is not
-        // refused by this gate.
-        //
-        // ggml_sycl_moe_query_route_capability() (ggml-sycl.cpp, the Q1_0/NVFP4
-        // fall-through) deliberately ADMITS them as MMVQ_COMPAT, so a reader
-        // tracing "capability says local-mmvq but nothing runs" lands here. The
-        // two layers disagree on purpose; do not "fix" the admission to match.
-        (void) workspace_bundle;
-        out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
-        return out;
-    }
     if (!validate_moe_execution_recipe(operand.recipe(), operand.admitted_recipe_signature(), operand.lease(),
                                        operand.residency(), operand.has_ready_event(), submit_device,
                                        owning_queue_available, reserved_workspace_bytes, &out.reject)) {

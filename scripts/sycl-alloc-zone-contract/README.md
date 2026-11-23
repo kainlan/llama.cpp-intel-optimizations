@@ -47,13 +47,26 @@ None of them can swallow a planned refusal, and none is lane code:
   either would terminate the process.
 - `moe_segment_slots_drain_retired`'s `std::exception` handler wraps only the retire drain. It keeps the slots alive and reports failure.
 
+Three `catch (...)` handlers that landed without debt entries, each in a try that nothing able to raise a planned refusal reaches,
+so the baseline stayed red until they were recorded (G-CATCH, written with `--write-debt --allow-growth`):
+- `moe_stream_ring_warn_weight_zone` (`4155b78bd`) is a `noexcept` diagnostic. Its try calls `unified_cache_zone_tag_census` and
+  formats the WEIGHT zone line; the handler prints a literal. A rethrow would terminate the reserve that called it.
+- `unified_cache_device_caches` (`f3071da4e`) wraps only `(void) dpct::dev_mgr::instance()`, the touch that constructs dpct's device
+  manager before the cache map so the map is destroyed first. The clause does not resolve this function, so its key reads
+  `unified-cache.cpp::?`.
+- `unified_cache_zone_tag_census` (`4155b78bd`) is `noexcept`. Its try reads the zone allocator group and the runtime registry under
+  scoped locks and builds host containers; the handler resets `out` and returns false. A rethrow would terminate its caller.
+Nothing in unified-cache.cpp, moe-stream-ring.cpp or zone-tag-census.hpp throws `ggml_sycl_fallback_error`, and dpct does not know
+the type.
+
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
-(`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries
-cover seven sites: the vendored `dpct/helper.hpp` hits (`E-LIBC-DPCT-MMGR-MMAP`, `E-LIBC-DPCT-MMGR-VIRTUALALLOC`,
+(`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Seven allowlist entries
+cover ten sites: the vendored `dpct/helper.hpp` hits (`E-LIBC-DPCT-MMGR-MMAP`, `E-LIBC-DPCT-MMGR-VIRTUALALLOC`,
 `E-LIBC-DPCT-HOSTBUF-MALLOC`, `E-LIBC-DPCT-DEVMEM-MALLOC`; reason "vendored dpct, unreachable from the backend"; canonical contract section 9.1) and
 `cache_guard_allocator`'s `mmap` (`E-LIBC-CACHE-GUARD`; permanent, "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM
-bytes"). The dead `weight_cache_allocator`'s `mmap` and `posix_memalign` are E-LIBC debt with fate `deleted-by-step-7` (S7's zero-caller
+bytes"), and the raw layers of the two device-free tiers, `unified_cache_raw_map_file`'s two `mmap` calls (`E-LIBC-FILE-MAPPED-RAW`) and
+`unified_cache_raw_alloc_host_cpu`'s one (`E-LIBC-HOST-CPU-RAW`; canonical contract sections 3 and 9.1). The dead `weight_cache_allocator`'s `mmap` and `posix_memalign` are E-LIBC debt with fate `deleted-by-step-7` (S7's zero-caller
 step 7's "dead weight_cache_allocator, whole" bullet in the 23mk design). The S2c control that used to pin `std::malloc` as a PASS flipped
 to a FAIL on purpose when this clause landed.
 
@@ -152,8 +165,13 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
 - (m) `M-SCRATCH`, `M-STALE`, `M-FLOOR`, `M-DATA`. `appendix-rows.json` is the 139-row census table (zone columns) of the
   design appendix at master `2c4f5e45d`, because the appendix is not in the repository. The design in force is rev 4.19z, whose
   appendix header still reads 4.16; the file's `_doc` therefore says 4.16, and the generator run against the rev 4.19z design
-  reproduces the committed file byte for byte. Regenerate it, never hand-edit it (the generator reads the `row`, `site`, `function`, `zone`, `code`, `core` and `term`
-  columns of the table whose header starts `| # | site (master`):
+  reproduces the committed file byte for byte. Its input is that design, not the tree, so the file is a record of the
+  census at `2c4f5e45d` and does not follow later code: the `site` and `function` columns describe that master, and a
+  row may name a function the tree has since removed (row 43, `arena_device_alloc`; row 126,
+  `unified_cache::reserve_reorder_temp`). Clause (m) judges a row by its zone, code and term, and names the function
+  only in its messages; such a row stays until the design's table changes. Regenerate it, never hand-edit it (the
+  generator reads the `row`, `site`, `function`, `zone`, `code`, `core` and `term` columns of the table whose header
+  starts `| # | site (master`):
   `python3 scripts/sycl-alloc-zone-contract/gen-appendix-rows.py --design <design.md> --master 2c4f5e45d --rev 4.16`. A missing or
   malformed file, or a row without a key the clause reads, is `M-DATA`, never a traceback. The gate's own tables (`M_TABLES`: the floor list with each row's owner ticket, the
   covered-by-peak rows, the unreachable rows) are checked against it, and `ensure_planned_arena_zones` must apply the
@@ -170,8 +188,8 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
   `ggml_sycl_set_rows_stage_ptr`, the oneDNN graph `execute`) must sit in a function with a census row (`O_ROWS`), and each
   consuming call of that row pins its queue argument by position and exact text; a callee that takes no queue pins its own
   stream declarations.
-- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes` (six sites, the sixth being
-  `unified_cache::reserve_reorder_temp`), `woq_packed_bytes`, `mmq_work_counter_bytes`, `set_rows_stage_bytes` that is defined
+- Witness 9 `Z9-SITE`, `Z9-SIZING`: each of `load_reorder_temp_bytes` (four sites, the fourth being
+  `sycl_unified_device_temp_alloc`), `woq_packed_bytes`, `mmq_work_counter_bytes`, `set_rows_stage_bytes` that is defined
   must be called by each of its allocation sites and, from a function that is not one of those sites, by `zone-sizing.cpp` or
   `unified-cache.cpp`.
 - Latches: a subject that appears in a shape a clause cannot read is an `X-LATCH` finding. That covers a macro, a lambda or
@@ -214,6 +232,24 @@ the predicate in the value function ends `..., nullptr, nullptr`.
 
 Stated gaps: the charge side's walk helpers are unnamed, so the head-dim and helper rules cover the bodies of the two named
 charge functions and the helper-name rule covers all of `unified-cache.cpp` and `.hpp`.
+
+## Clause (r): the POOL lifetime
+
+The lazy IO pool's block ring is the one allocation of lifetime `POOL` (th32 design §3.3, canonical contract §12.5): its
+owner is `{alloc_owner_kind::IO_POOL, generation}`, the registry generation of the pool that ensured it, and only the
+pool's reap frees it. The owner check reports such a row only once that generation is gone, so a `POOL` request of any
+other shape would be memory no owner check reports and no reap frees. Clause (r) therefore reads the three as one fact:
+a request whose intent writes `intent.lifetime = alloc_lifetime::POOL`, or an owner of kind `IO_POOL`, must establish all
+three of lifetime `POOL`, owner kind `IO_POOL` and `must_host_cpu = true`, each by an unconditional literal as its last
+write. The owner is read from a braced `{ kind, id }`, a designated `.kind`, or a write to `owner.kind`; a braced or
+copied intent written later re-seeds both members. The finding is `R-POOL`, which is never debt and never allowlisted.
+
+Witness `r-pool` carries the clause's six matrix cases: the ring's own request as the PASS twin, and five FAIL cases (the
+mutant whose owner is `{NONE, 0}`, an `IO_POOL` owner on an `UNOWNED` request, a `POOL` request on the pinned tier, an
+owner kind set by a conditional write, and a later braced intent that discards the owner).
+
+Stated gap: a lifetime or owner kind passed in through a helper's parameter is an expression, not a literal, so a `POOL`
+request built that way is not seen.
 
 ## Key shape
 

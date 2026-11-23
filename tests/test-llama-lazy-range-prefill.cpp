@@ -1,0 +1,276 @@
+// The pre-fill and the create_tensor() check of the lazy-range record
+// (llama.cpp-5efe C1, design sycl-mmap-host-tier.md §3.1).
+//
+// Three names go through the pre-fill and the check: a declared lazy name, an
+// undeclared flagged name, and a declared-but-unflagged name.
+//   - the first gives one row, filled before any create_tensor() call, carrying the
+//     attributes llama_model_lazy_tensor_attrs() returns for it, and its check passes;
+//   - the other two abort, naming the tensor and the architecture, each in its own
+//     process, scored on SIGABRT plus the text on stderr;
+//   - the abort is mode-independent: the unflagged case aborts under OFF and under
+//     AUTO at exactly 4 GiB, both of which leave the row ineligible and EAGER. A check
+//     that compares the flag only against non-EAGER rows lets both through;
+//   - value(name) equals the weight's (file, offset, size);
+//   - with the taker, the early plan's filter includes an ineligible row (AUTO at
+//     4 GiB, OFF) as the ordinary weight it is. Under AUTO the 5 GiB table would be
+//     STORAGE, but an arch with no STORAGE consumer records it ineligible and EAGER,
+//     the filter includes it too, and one WARN names it;
+//   - create_tensor()'s STORAGE refusal throws, naming the tensor, on a STORAGE row
+//     of an arch with no consumer and on that row alone: a LAZY_READ and an EAGER row
+//     pass it. With the taker, ON (the storage tier asked for by name) makes the 5 GiB
+//     table STORAGE for every arch, and AUTO does for an arch with a consumer;
+//   - both arches that declare the PLE table run the last two: qwen4exp, whose graph
+//     is a STORAGE consumer, and gemma4, whose graph is not.
+//
+// Host-only: no backend, device or model.
+
+#include "../src/llama-model.h"
+#include "lazy-range-fixture.h"
+
+#include <sys/prctl.h>
+#include <sys/wait.h>
+
+#include <csignal>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+static int n_failures = 0;
+
+#define CHECK(cond, ...)                                     \
+    do {                                                     \
+        if (!(cond)) {                                       \
+            std::printf("FAIL %s:%d: ", __FILE__, __LINE__); \
+            std::printf(__VA_ARGS__);                        \
+            std::printf("\n");                               \
+            n_failures++;                                    \
+        }                                                    \
+    } while (0)
+
+struct check_args {
+    const llama_lazy_range_record * rec;
+    llm_arch                        arch;
+    std::string                     name;
+    bool                            flagged;
+};
+
+static void run_check(void * p) {
+    const check_args * a = (const check_args *) p;
+    llama_lazy_range_check_create(*a->rec, a->arch, a->name, a->flagged);
+}
+
+// runs the check in a child; true when it died of SIGABRT with both `name` and `arch` on stderr
+static bool aborts_naming(const check_args & a, const char * arch_name) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return false;
+    }
+    fflush(nullptr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        setenv("GGML_NO_BACKTRACE", "1", 1);  // the abort path would otherwise attach a debugger
+        prctl(PR_SET_DUMPABLE, 0);            // and a core dump, which apport would write for a deliberate abort
+        close(fds[0]);
+        dup2(fds[1], STDERR_FILENO);
+        run_check((void *) &a);
+        _exit(0);
+    }
+    close(fds[1]);
+    std::string err;
+    char        buf[512];
+    ssize_t     n;
+    while ((n = read(fds[0], buf, sizeof(buf))) > 0) {
+        err.append(buf, (size_t) n);
+    }
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT && err.find(a.name) != std::string::npos &&
+           err.find(arch_name) != std::string::npos;
+}
+
+static bool passes(const check_args & a) {
+    fflush(nullptr);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        run_check((void *) &a);
+        _exit(0);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static std::vector<std::string> g_warns;  // one entry per WARN line
+
+static void capture_log(enum ggml_log_level level, const char * text, void *) {
+    if (level == GGML_LOG_LEVEL_WARN) {
+        g_warns.emplace_back(text);
+    }
+}
+
+// WARN lines carrying both `a` and `b`
+static size_t count_warns(const std::string & a, const char * b) {
+    size_t n = 0;
+    for (const std::string & line : g_warns) {
+        if (line.find(a) != std::string::npos && line.find(b) != std::string::npos) {
+            n++;
+        }
+    }
+    return n;
+}
+
+int main() {
+    lazy_fixture fx;
+
+    const llm_arch    arch      = LLM_ARCH_QWEN4EXP;
+    const char *      arch_str  = llm_arch_name(arch);
+    const std::string lazy      = "per_layer_token_embd.weight";  // declared by qwen4exp
+    const std::string unflagged = "lz_exact";                     // a tensor of the file the arch does not declare
+    llama_hparams     hp;
+    hp.n_layer_all = 8;
+    hp.ple_n_heads = 16;
+    hp.is_ple_impl.set(1);
+
+    // the unflagged-but-declared case needs a row for a name the arch creates without the flag:
+    // declare it by hand, as a drifted declaration would
+    const std::vector<std::string> declared = { lazy, unflagged };
+
+    for (llama_lazy_mode mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_AUTO, LLAMA_LAZY_MODE_ON }) {
+        llama_lazy_range_record rec;
+        CHECK(!rec.filled(), "a record is filled before the pre-fill");
+        llama_lazy_range_record_prefill(rec, arch, hp, declared, fx.finder(), mode, mode, false, true);
+
+        // filled before any create_tensor() call, with the attributes the function returns
+        CHECK(rec.filled() && rec.has(lazy), "mode %d: the declared name has no row after the pre-fill", (int) mode);
+        const llama_lazy_tensor_attrs want = llama_model_lazy_tensor_attrs(arch, hp, lazy);
+        CHECK(rec.attrs(lazy).rows_per_token == want.rows_per_token &&
+                  rec.attrs(lazy).consumer_layer == want.consumer_layer &&
+                  rec.attrs(lazy).storage_only == want.storage_only,
+              "the row's attributes are not llama_model_lazy_tensor_attrs()'s");
+        const auto &                 w = fx.weights.at(lazy);
+        const llama_lazy_range_value v = rec.value(lazy);
+        CHECK(v.file_idx == w.idx && v.offs == w.offs && v.size == ggml_nbytes(w.tensor),
+              "value() is not the weight's place");
+
+        // 1. declared and flagged: passes
+        CHECK(passes({ &rec, arch, lazy, true }), "mode %d: a declared, flagged tensor was refused", (int) mode);
+        // 2. flagged, no row: aborts naming the tensor and the arch
+        CHECK(aborts_naming({ &rec, arch, "not_declared.weight", true }, arch_str),
+              "mode %d: an undeclared flagged tensor did not abort naming it and the arch", (int) mode);
+        // 3. a row, no flag: aborts, whatever the mode (OFF and AUTO at 4 GiB leave the row EAGER)
+        CHECK(aborts_naming({ &rec, arch, unflagged, false }, arch_str),
+              "mode %d: a declared but unflagged tensor did not abort naming it and the arch", (int) mode);
+        // and an undeclared, unflagged tensor is an ordinary weight
+        CHECK(passes({ &rec, arch, "plain", false }), "mode %d: an ordinary weight was refused", (int) mode);
+    }
+
+    // the unflagged case is EAGER under OFF and under AUTO at 4 GiB, and still aborts
+    {
+        llama_lazy_range_record off;
+        llama_lazy_range_record_prefill(off, arch, hp, declared, fx.finder(), LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_OFF,
+                                        false, true);
+        CHECK(off.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_EAGER, "OFF: lz_exact is not EAGER");
+        llama_lazy_range_record at4;
+        llama_lazy_range_record_prefill(at4, arch, hp, declared, fx.finder(), LLAMA_LAZY_MODE_AUTO,
+                                        LLAMA_LAZY_MODE_AUTO, false, true);
+        CHECK(at4.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_EAGER, "AUTO at 4 GiB: lz_exact is not EAGER");
+        CHECK(aborts_naming({ &off, arch, unflagged, false }, arch_str), "OFF: the EAGER row's drift went unnoticed");
+        CHECK(aborts_naming({ &at4, arch, unflagged, false }, arch_str),
+              "AUTO at 4 GiB: the EAGER row's drift went unnoticed");
+    }
+
+    // Both arches that declare the PLE table go through the taker and refusal blocks. `consumer` is whether the arch's
+    // graph consumes a STORAGE row.
+    for (const llm_arch a : { LLM_ARCH_QWEN4EXP, LLM_ARCH_GEMMA4 }) {
+        // mirrors llama_lazy_storage_consumer_present(a): qwen4exp's PLE input reads its table from the storage tier,
+        // and gemma4's graph still gathers from a resident table
+        const bool consumer = a == LLM_ARCH_QWEN4EXP;
+
+        // the early plan, with the taker: no row is excluded under OFF. Under AUTO the 5 GiB table would be STORAGE,
+        // and an arch with no STORAGE consumer records it as the ordinary weight OFF makes it, with one WARN. ON asks
+        // for the storage tier by name: the table stays STORAGE and out of the plan, and the bridge stays silent.
+        for (llama_lazy_mode mode : { LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_AUTO, LLAMA_LAZY_MODE_ON }) {
+            const bool              on      = mode == LLAMA_LAZY_MODE_ON;
+            const bool              storage = on || (mode == LLAMA_LAZY_MODE_AUTO && consumer);
+            llama_lazy_range_record rec;
+            g_warns.clear();
+            llama_log_set(capture_log, nullptr);
+            llama_lazy_range_record_prefill(rec, a, hp, declared, fx.finder(), mode, mode, true, true);
+            llama_log_set(nullptr, nullptr);
+            // the 4 GiB row is ineligible under OFF and AUTO (at the floor); ON has no floor and makes it STORAGE
+            CHECK(llama_lazy_early_plan_excludes(rec, unflagged) == on,
+                  "%s, taker, mode %d: the filter %s the 4 GiB row", llm_arch_name(a), (int) mode,
+                  on ? "did not exclude" : "excluded");
+            const bool excluded = llama_lazy_early_plan_excludes(rec, lazy);
+            CHECK(excluded == storage, "%s, taker, mode %d: the filter %s the 5 GiB table", llm_arch_name(a),
+                  (int) mode, excluded ? "excluded" : "did not exclude");
+            CHECK(rec.deferral(lazy) == (storage ? LLAMA_LAZY_DEFERRAL_STORAGE : LLAMA_LAZY_DEFERRAL_EAGER) &&
+                      rec.eligible(lazy) == storage,
+                  "%s, taker, mode %d: the 5 GiB table is %s, eligible=%d", llm_arch_name(a), (int) mode,
+                  llama_lazy_deferral_name(rec.deferral(lazy)), rec.eligible(lazy) ? 1 : 0);
+            const size_t n_warned = count_warns(lazy, "-lzm on");
+            CHECK(n_warned == (mode == LLAMA_LAZY_MODE_AUTO && !consumer ? 1u : 0u),
+                  "%s, taker, mode %d: the bridge WARN for the 5 GiB table printed %zu time(s)", llm_arch_name(a),
+                  (int) mode, n_warned);
+        }
+
+        // the STORAGE refusal: a STORAGE row of an arch with no consumer throws naming the tensor; LAZY_READ and EAGER
+        // rows pass, and so does a STORAGE row of an arch with one
+        {
+            struct cell {
+                const char *    label;
+                llama_lazy_mode mode;
+                bool            taker;
+            };
+
+            const cell cells[] = {
+                { "ON, the taker (STORAGE)",       LLAMA_LAZY_MODE_ON,   true  },
+                { "AUTO, the taker",               LLAMA_LAZY_MODE_AUTO, true  },
+                { "OFF, the taker (EAGER)",        LLAMA_LAZY_MODE_OFF,  true  },
+                { "ON, off the taker (LAZY_READ)", LLAMA_LAZY_MODE_ON,   false },
+                { "OFF, off the taker (EAGER)",    LLAMA_LAZY_MODE_OFF,  false },
+            };
+            for (const cell & c : cells) {
+                llama_lazy_range_record rec;
+                llama_lazy_range_record_prefill(rec, a, hp, declared, fx.finder(), c.mode, c.mode, c.taker, true);
+
+                bool        threw = false;
+                std::string what;
+                try {
+                    llama_lazy_range_check_storage(rec, a, lazy);
+                } catch (const std::runtime_error & e) {
+                    threw = true;
+                    what  = e.what();
+                }
+                const bool refused = c.taker && c.mode == LLAMA_LAZY_MODE_ON && !consumer;
+                CHECK(threw == refused, "%s, %s: the STORAGE refusal %s", llm_arch_name(a), c.label,
+                      threw ? "fired" : "did not fire");
+                CHECK(!threw ||
+                          (what.find(lazy) != std::string::npos && what.find(llm_arch_name(a)) != std::string::npos),
+                      "%s, %s: the refusal does not name the tensor and the arch: %s", llm_arch_name(a), c.label,
+                      what.c_str());
+
+                // an EAGER row (the 4 GiB table is ineligible under AUTO and OFF) never refuses
+                bool threw_eager = false;
+                try {
+                    llama_lazy_range_check_storage(rec, a, unflagged);
+                } catch (const std::runtime_error &) {
+                    threw_eager = true;
+                }
+                const bool unflagged_is_storage = rec.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_STORAGE;
+                CHECK(threw_eager == (unflagged_is_storage && !consumer),
+                      "%s, %s: the refusal on the 4 GiB row (%s) disagrees with its deferral", llm_arch_name(a),
+                      c.label, llama_lazy_deferral_name(rec.deferral(unflagged)));
+            }
+        }
+    }
+
+    if (n_failures != 0) {
+        std::printf("FAIL: %d check(s)\n", n_failures);
+        return 1;
+    }
+    std::printf("PASS\n");
+    return 0;
+}

@@ -35,8 +35,10 @@ and attention); declare that OFF only for precision-sensitive models. Build deta
 map: `docs/development/sycl-fork-guide.md`.
 
 ### Running Tests
-A test that loads a model onto a GPU allocates GPU buffers whose host backing is counted under `Shmem` in
-`/proc/meminfo` and in no process's own figures. Such tests have OOM-killed this 255 GB host several times.
+A test that loads a model onto a GPU allocates GPU buffers whose host backing is in no process's own figures.
+An iGPU or `test-backend-ops` run shows it under `Shmem`; a discrete card's host-pinned memory shows only in the
+`/proc/meminfo` remainder. "GPU host backing" below means `Shmem` plus that remainder. Such tests have OOM-killed
+this 255 GB host several times.
 History and measurements: `docs/backend/sycl-host-safety.md`.
 - GPU and model-loading work runs only in the lead session, one run at a time: every `llama-bench`, `llama-cli`,
   `llama-completion`, `test-llama-archs`, `test-thread-safety`, `test-backend-ops` and every `ctest` sweep.
@@ -45,12 +47,14 @@ History and measurements: `docs/backend/sycl-host-safety.md`.
   acceptance criterion, ask whether the binary loads a model onto a GPU. If it does, run it once.
 - Pin the selector to the discrete cards for any local run that does not need the iGPU. Unpinned is the default
   and the dangerous form: `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '<name>' --output-on-failure`
-- Sample memory before each GPU run and about 5 s after it, and abort if `Shmem` climbs past ~100 GB:
-  `grep -E '^(MemAvailable|Shmem):' /proc/meminfo`. Read `Shmem`, not `free`. A reading taken in the same command
-  as an exiting process is a false alarm: `sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo`.
+- Sample GPU host backing before each GPU run and about 5 s after it, and abort if it climbs past ~100 GiB:
+  `source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`. Read it, not `Shmem` alone (flat for a
+  discrete card) and not `free`. A reading taken in the same command as an exiting process is a false alarm:
+  `sleep 5; source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`.
 - `GPU.lock` serialises access, not memory recovery. After you take it and before you touch the device, wait for
-  `Shmem < 30 GB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on `Shmem` only:
-  `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling 2026-11-12).
+  GPU host backing `< 30 GiB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on that
+  figure only: `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling
+  2026-11-12, amended 2026-11-23: the instrument is `Shmem` plus the remainder, still no `MemAvailable` floor).
 - Take `GPU.lock` and `BUILD.lock` with `sycl_lock_take` from `scripts/sycl-lock.sh`, never with plain `mkdir`:
   the system `mkdir` here checks, then creates, and exits 0 when the directory appears in between, so two takers
   that arrive together can both win (measured 2026-11-21).
@@ -68,7 +72,7 @@ ctest --test-dir build -R <name-or-regex> --output-on-failure
 # If it names a test, do not run the sweep. `-j 1` is not negotiable: `-j` multiplies memory.
 bash scripts/check-ctest-safety-net.sh --build-dir build
 ctest --test-dir build --output-on-failure -j 1 \
-      -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
+      -LE 'residency|mem-handle|cache|^model$|^fatal-exit-device$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'
 # Form 3: the excluded family, serially, with monitoring. Manually only, never in a subagent or background task.
 ctest --test-dir build -N -L 'cache|mem-handle'      # must list >= 1 test (`-L residency` selects nothing)
 ctest --test-dir build -L 'cache|mem-handle' --output-on-failure -j 1
@@ -86,6 +90,10 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0   ./build/bin/test-backend-ops
 - `main` is the default label and means "nobody classified this", not "safe". A new model-loading test must
   carry `model`, `cache` or `mem-handle`. When the guard names a new test, change this file and the script's
   `SWEEP_E_DEFAULT` together. More: `.claude/rules/ctest-registration.md`.
+- Form 2 also leaves out the label `fatal-exit-device`: the four device modes of `test-sycl-fatal-exit`, each of
+  which ends a process through the backend's fast exit on a healthy card. Run them by label, alone, with the
+  selector the registration pins: `ctest --test-dir build -L '^fatal-exit-device$' --output-on-failure -j 1`.
+  Why: `docs/backend/sycl-host-safety.md`, section 1.
 
 ### Code Formatting
 `git clang-format` does not exist here. Use `git-clang-format-19` (or `git clang-format-19`) and `clang-format-19`.
@@ -247,7 +255,7 @@ unless you bisect attention; off costs ~39% of Mistral PP512). Opt-ins: `GGML_SY
 3. Test: prefer `-R <what your change gates>`. Never a bare `ctest --test-dir build --output-on-failure`: it runs
    every model-loading test on every device, the iGPU included. For a full sweep, run
    `bash scripts/check-ctest-safety-net.sh --build-dir build` first, then form 2 verbatim. Do not raise `-j`:
-   `-j 1 -LE 'residency|mem-handle|cache|^model$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`
+   `-j 1 -LE 'residency|mem-handle|cache|^model$|^fatal-exit-device$' -E '^(test-backend-ops|test-generate-.*|test-llama-context.*|test-fp8-.*|test-speculative-rejection-sampling|test-thread-safety|test-sycl-model-lifecycle-hooks|test-state-restore-fragmented|test-eval-callback)$'`
 4. For ggml changes, run `test-backend-ops` on multiple backends, by hand only. It is a binary, not a ctest
    (`ctest -R test-backend-ops` selects nothing): `ONEAPI_DEVICE_SELECTOR=level_zero:N ./build/bin/test-backend-ops`
 5. Correctness: run the completion gates above. Tokens must be right, not just fast.

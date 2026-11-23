@@ -3,6 +3,7 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -11,7 +12,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

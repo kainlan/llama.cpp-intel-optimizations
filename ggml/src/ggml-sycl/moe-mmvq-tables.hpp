@@ -38,14 +38,25 @@
 // other turns that test red.
 //
 // This header must stay free of SYCL and of ggml-sycl internals -- ggml.h only.
+//
+// Q8_0 is the one type besides MXFP4 with a non-AOS row: its SOA _id kernel
+// (mul_mat_vec_q8_0_q8_1_soa_id_sycl) reads the per-expert SOA blocks the planner
+// materializes on an XMX card. A row is a (type, layout) pair and cannot say whether
+// the operand has a per-expert table. The kernel reads per-expert blocks only and
+// refuses, with a WARN, an operand that is one SOA block over every expert (what a
+// device-buffer upload makes). No route hands it one: that operand has no per-expert
+// entry, so the retained admission refuses the op before any dispatch; the batched
+// dispatcher refuses a null expert table; and the vec_q dispatcher's one caller passes
+// its retained per-expert table (see the launcher's comment).
 
 inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
+        case GGML_TYPE_Q8_0:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
         // gx30. AoS only: these dispatch through mmvq_submit_quant_aos_id(), which
         // instantiates the same generic kernel as the four above. No SoA or packed
         // variant exists for them, so do not widen the layout here without adding
@@ -178,11 +189,12 @@ inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml
 
 inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
+        case GGML_TYPE_Q8_0:
+            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
@@ -280,10 +292,9 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // records the same limit (llama.cpp-dkw0). This executor's per-expert call passes only the element count. No plan
 // reaches the case either: the planner materializes an expert COALESCED only for MXFP4 without XMX
 // (layout_policy::get_optimal), and MXFP4's f16 arm admits SOA alone.
-// Q1_0 and NVFP4 have converters but are left out, because they run on a device only through their direct kernel
-// (moe_type_needs_direct_kernel, moe-resolved-batch.hpp): validate_moe_execution_recipe and
-// choose_moe_batch_executor refuse any other device recipe for them, so this executor would never be allowed to run
-// them. The float types need no dequant and keep their own routes.
+// Q1_0 and NVFP4 have converters but are left out: they run on a device through their MMVQ id kernel (the dispatch
+// table above), and listing them here also needs test-moe-pp-batched-dequant to run them against the CPU, as it runs
+// every listed type. The float types need no dequant and keep their own routes.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 // test-moe-pp-batched-dequant runs every listed type on a device except IQ1_S, IQ2_XXS and IQ2_XS, which need an

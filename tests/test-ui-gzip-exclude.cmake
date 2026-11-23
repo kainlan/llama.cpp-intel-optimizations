@@ -1,4 +1,4 @@
-# Gate for tools/ui/CMakeLists.txt's UI_DIST_GZIP_EXCLUDE predicate.
+# Gate for ui/apps/chat/CMakeLists.txt's UI_DIST_GZIP_EXCLUDE predicate.
 #
 # That one pattern is consumed at two sites with two different CMake operators:
 #
@@ -17,13 +17,13 @@
 # different engine and agree with the real one only by luck -- the same
 # "verdict sourced from something adjacent to the work" this file guards.
 #
-# Run:  cmake -DUI_CMAKE=<path to tools/ui/CMakeLists.txt> -P test-ui-gzip-exclude.cmake
+# Run:  cmake -DUI_CMAKE=<path to ui/apps/chat/CMakeLists.txt> -P test-ui-gzip-exclude.cmake
 
 cmake_minimum_required(VERSION 3.18)
 
 if (NOT DEFINED UI_CMAKE)
     get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
-    set(UI_CMAKE "${_here}/../tools/ui/CMakeLists.txt")
+    set(UI_CMAKE "${_here}/../ui/apps/chat/CMakeLists.txt")
 endif()
 if (NOT EXISTS "${UI_CMAKE}")
     message(FATAL_ERROR "test-ui-gzip-exclude: no such file: ${UI_CMAKE}")

@@ -24,7 +24,7 @@
 #      unmeasurable pair exits 1, and the summary names both.
 #   2  no MEASURED pair has ratio1024 < 0.9, but at least one pair could
 #      not be measured at all: bench-guard.sh's own preflight refused
-#      (throttled/tenant/Shmem-elevated card, or a SUSPECT postflight
+#      (throttled/tenant/host-backing-elevated card, or a SUSPECT postflight
 #      stamp -- a run invalidated by a kernel GPU fault or timeout kill is
 #      "could not measure", never "passed"), the wrapped bench exited
 #      non-zero, its output table could not be parsed (ERROR:parse-failed),
@@ -40,7 +40,7 @@
 #      bench-guard invocation) is missing or unreadable.
 #
 # Every run goes through bench-guard.sh (S5, caf7e73d0) so the same
-# throttle/tenant/Shmem preflight and VALID/SUSPECT postflight stamping
+# throttle/tenant/host-backing preflight and VALID/SUSPECT postflight stamping
 # CLAUDE.md mandates for any GPU measurement applies here too -- this script
 # never re-implements that logic, only invokes bench-guard.sh as a child and
 # forwards its test hooks (--sysfs-card/--meminfo/--pgrep-cmd/--df-cmd/
@@ -595,7 +595,7 @@ for model_entry in "${MODELS[@]}"; do
 
         # A non-zero wrapped-bench exit code, OR a logfile whose header
         # line is not stamped VALID (SUSPECT: a kernel GPU fault, a
-        # timeout kill, or Shmem growth mid-run -- see bench-guard.sh's own
+        # timeout kill, or host-backing growth mid-run -- see bench-guard.sh's own
         # header), both mean "this pair's numbers cannot be trusted", not
         # "measure it anyway" (llama.cpp-y3z0 spec review round 1, finding
         # 2: a fake bench that printed a full healthy table and then

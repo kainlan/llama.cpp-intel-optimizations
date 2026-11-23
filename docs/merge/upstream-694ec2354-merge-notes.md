@@ -304,3 +304,11 @@ question is llama.cpp-5efe.
 - **m4, CLAUDE.md.** The limit now reads "a test that loads a model but has
   no fixture and no `model` label", not "a GPU test", which would have told
   readers to strip the pinned GPU unit tests from form 2.
+
+## Carry to the next upstream merge
+
+- Move `LLAMA_UI_PINNED_VERSION` in `tools/ui/ui-version.cmake` to the nearest
+  published UI bundle version at or before the new upstream base. Get the number
+  with `git rev-list --count <base>`; the bucket `ggml-org/llama-ui` lists the
+  published `b<N>` directories. If it is not moved, the server code and the
+  embedded UI drift apart. The build does not fail, so nothing flags it.

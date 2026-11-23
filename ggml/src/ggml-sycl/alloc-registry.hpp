@@ -23,8 +23,13 @@ enum class alloc_type : uint8_t {
     DEVICE,       // sycl::malloc_device — GPU-only
     HOST_PINNED,  // sycl::malloc_host   — CPU-accessible, GPU zero-copy via PCIe
     SHARED,       // sycl::malloc_shared  — migrates between host/device
-    MMAP,         // mmap'd from GGUF    — CPU-only, no USM
-    UNKNOWN,      // Not registered — pointer type is unknown
+    // Host memory that is not USM, named for how it is released (llama.cpp-5efe C2). A file mapping is neither:
+    // it has its own owner and its own type.
+    HOST_MALLOC,           // registered host memory that unified_free_record releases with ::free
+    HOST_OWNED_ELSEWHERE,  // registered only so the registry can identify it; never freed through the registry
+    FILE_MAPPED,           // one PROT_NONE reservation with file segments mapped over it — CPU-only, no USM
+    HOST_CPU,              // one anonymous, hugepage-advised, mlocked mapping — CPU-only, no USM (llama.cpp-th32 T1)
+    UNKNOWN,               // Not registered — pointer type is unknown
 };
 
 // Metadata for a single allocation
@@ -140,7 +145,7 @@ class alloc_registry {
     }
 
     // Convenience: is this pointer host-accessible?
-    // Returns true for HOST_PINNED, SHARED, MMAP.
+    // Returns true for every type but DEVICE.
     // Returns false for DEVICE.
     // Returns false if pointer is not in the registry (unknown = not host-accessible).
     bool is_host_accessible(const void * ptr) const {
@@ -155,6 +160,14 @@ class alloc_registry {
     bool is_device(const void * ptr) const {
         const auto info = lookup_copy(ptr);
         return info && info->type == alloc_type::DEVICE;
+    }
+
+    // Convenience: is this pointer (or an interior pointer of it) a file mapping? A file mapping is CPU-only and no
+    // device may read it (llama.cpp-5efe C4; unified_cache::stream_dma refuses it). Returns false for a null or an
+    // unregistered pointer.
+    bool is_file_mapped(const void * ptr) const {
+        const auto info = lookup_copy(ptr);
+        return info && info->type == alloc_type::FILE_MAPPED;
     }
 
     // Convenience: get the sycl::usm::alloc equivalent for compatibility with existing code.
@@ -220,7 +233,10 @@ class alloc_registry {
 //       case alloc_type::DEVICE:      return sycl::usm::alloc::device;
 //       case alloc_type::HOST_PINNED: return sycl::usm::alloc::host;
 //       case alloc_type::SHARED:      return sycl::usm::alloc::shared;
-//       case alloc_type::MMAP:        return sycl::usm::alloc::host;  // treat as host-accessible
+//       case alloc_type::HOST_MALLOC:
+//       case alloc_type::HOST_OWNED_ELSEWHERE:
+//       case alloc_type::FILE_MAPPED:
+//       case alloc_type::HOST_CPU:    return sycl::usm::alloc::unknown;  // not USM
 //       case alloc_type::UNKNOWN:     return sycl::usm::alloc::unknown;
 //   }
 

@@ -350,6 +350,7 @@ def structural(raw: str):
         "sycl_select_auto_ubatch(",
         "sycl_auto_ubatch_prepare(",
         "sycl_resync_runtime_context_flash_attn(",
+        "sycl_publish_runtime_context(",
         "llama_set_abort_callback(",
         "set_n_threads_fns.emplace_back(",
         "token_ids_full_vocab",
@@ -628,8 +629,16 @@ def test_mutants_each_clause_fails():
         "the measure context creates real memory": _mut(
             "create_memory(params_mem, cparams, measure_only)", "create_memory(params_mem, cparams, false)"),
         "the ladder runs in a measure-only context": _mut(
-            "    if (!hparams.vocab_only && !measure_only) {\n        // llama.cpp-xojq",
-            "    if (!hparams.vocab_only) {\n        // llama.cpp-xojq"),
+            "    if (!hparams.vocab_only && !measure_only) {\n        if (sycl_auto_ubatch_trial) {",
+            "    if (!hparams.vocab_only) {\n        if (sycl_auto_ubatch_trial) {"),
+        "the constructor publishes in a measure-only context": _mut(
+            "    if (!hparams.vocab_only && !measure_only) {\n#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)\n"
+            "        // The constructor's publish",
+            "    if (!hparams.vocab_only) {\n#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)\n"
+            "        // The constructor's publish"),
+        "the constructor publishes outside a !measure_only block": _mut(
+            "    measure_only = measure != nullptr;\n",
+            "    measure_only = measure != nullptr;\n    (void) sycl_publish_runtime_context(cparams.flash_attn);\n"),
         "the output buffer is reserved in a measure-only context": _mut(
             "    if (!hparams.vocab_only && !measure_only) {\n        // GPU backends",
             "    if (!hparams.vocab_only) {\n        // GPU backends"),

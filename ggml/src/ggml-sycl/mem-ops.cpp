@@ -149,11 +149,13 @@ static bool host_ptr_is_usm_accessible(const void * ptr) {
 //     before the host zones are configured: its metadata cannot be told from a
 //     standalone base's, so it keeps the registry answer.
 //   - SYCL device buffers' owners with roles KV and COMPUTE never qualify,
-//     even when the buffer fell back to host-pinned memory. The SYCL_Host
-//     buffer's owner (role STAGING outside model load, category HOST_COMPUTE)
-//     would, but the backend holds it only as the buffer's identity: its
-//     tensors' copies pass views without an owner, so they keep the registry
-//     answer.
+//     even when the buffer fell back to host-pinned memory. A SYCL_Host
+//     buffer's tensors' copies pass views without an owner, so they keep the
+//     registry answer. The exception is the loader's SYCL_Host chunk of a model
+//     load (role WEIGHT, tier HOST_PINNED, lifetime MODEL): a host expert
+//     S1-PRELOAD serves from it in place leases the chunk's owner, so the
+//     prefill expert ring's copies from that lease qualify as a pinned-pool
+//     weight's do, below.
 //   - A pinned-pool weight qualifies because host-planned experts are the
 //     prefill expert ring's copy source (llama.cpp-36j0): staged, every ring
 //     copy would hold the submitting thread on a host memcpy and a wait. A
@@ -210,7 +212,14 @@ static const char * alloc_type_name(alloc_type type) {
         case alloc_type::DEVICE:      return "device";
         case alloc_type::HOST_PINNED: return "host_pinned";
         case alloc_type::SHARED:      return "shared";
-        case alloc_type::MMAP:        return "mmap";
+        case alloc_type::HOST_MALLOC:
+            return "host_malloc";
+        case alloc_type::HOST_OWNED_ELSEWHERE:
+            return "host_owned_elsewhere";
+        case alloc_type::FILE_MAPPED:
+            return "file_mapped";
+        case alloc_type::HOST_CPU:
+            return "host_cpu";
         case alloc_type::UNKNOWN:     return "unknown";
     }
     return "unknown";
@@ -1043,6 +1052,11 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
     resolved_ptr s = src.resolve();
     require_resolved_range("mem_copy", "destination", d, dst_offset, size);
     require_resolved_range("mem_copy", "source", s, src_offset, size);
+    // A host source copied to a device: noted when the source is file-mapped (docs/design/sycl-mmap-host-tier.md §5.3
+    // "Gates"). mem_copy, mem_copy_async and unified_cache::copy_to_device_async all arrive here, once per copy.
+    if (d.on_device && !s.on_device) {
+        unified_cache_file_mapped_device_copy_note(static_cast<const char *>(s.ptr) + src_offset);
+    }
 
     const int dst_device = d.on_device ? dst.device() : mem_handle::HOST_DEVICE;
     const int src_device = s.on_device ? src.device() : mem_handle::HOST_DEVICE;
@@ -1328,6 +1342,9 @@ sycl::event mem_copy_ptr_async(void *                           dst,
                                size_t                           size,
                                sycl::queue &                    queue,
                                const std::vector<sycl::event> & deps) {
+    // The pointer chokepoint of the outside-materialization counter (§5.3 "Gates"): a copy of file-mapped bytes to a
+    // registered device allocation is noted. The note asks about the destination itself, after its cheaper checks.
+    unified_cache_file_mapped_device_copy_note(src, dst);
     if (deps.empty()) {
         return queue.memcpy(dst, src, size);
     }

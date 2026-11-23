@@ -183,6 +183,18 @@ int llama_completion(int argc, char ** argv) {
         LOG_WRN("%s: chat template is not available or is not supported. This may cause the model to output suboptimal responses\n", __func__);
     }
 
+    // The built-in matcher knows a fixed list of templates. A model whose template is not on that list can only be
+    // rendered by the jinja engine, so choose it here, once, before anything reads params.use_jinja. Raw mode does
+    // not apply the template, so the engine is left as the user set it there.
+    if (params.conversation_mode && params.enable_chat_template && !params.use_jinja &&
+        common_chat_templates_need_jinja(chat_templates.get())) {
+        LOG_WRN(
+            "%s: the built-in chat template matcher does not know this model's template, "
+            "using the jinja engine (same as --jinja)\n",
+            __func__);
+        params.use_jinja = true;
+    }
+
     // print chat template example in conversation mode
     if (params.conversation_mode) {
         if (params.enable_chat_template) {

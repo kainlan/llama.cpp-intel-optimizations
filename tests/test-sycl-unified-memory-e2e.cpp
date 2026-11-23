@@ -14,12 +14,11 @@
 //     -> arena_reserve).  So the arena is already holding VRAM by the time the
 //     first get_unified_cache_for_device() call returns.
 //   * That reservation is deliberately NOT subtracted from budget_.  See the
-//     792vn.5 design note above unified_cache::update_reserved_bytes()
-//     (unified-cache.cpp:8573): "Arena zones now handle VRAM partitioning for
-//     runtime allocations ... handled by the overcommit guard in
-//     unified_cache_total_committed_bytes() rather than by shrinking the weight
-//     cache budget."  budget_ = base_budget_ - reserved_, and nothing charges
-//     the arena to reserved_.
+//     design note above unified_cache::update_reserved_bytes() (unified-cache.cpp):
+//     arena zones partition VRAM for runtime allocations, and raw device memory
+//     outside the arena meets the raw-allocation gates, which read the device's
+//     physical bytes, rather than a shrunk weight cache budget.
+//     budget_ = base_budget_ - reserved_, and nothing charges the arena to reserved_.
 //
 // With the DEFAULT whole-device budget those two facts collide.  budget() then
 // reports very nearly all of VRAM while the arena has physically taken very

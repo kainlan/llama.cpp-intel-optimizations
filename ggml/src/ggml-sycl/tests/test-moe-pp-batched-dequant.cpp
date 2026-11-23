@@ -26,6 +26,12 @@
 // 3), each child runs one Q4_0 case at 300 tokens with the cap at N, and that case must name exactly ceil(32 / N)
 // groups of N experts in both halves. A cap of 1 gives the longest chain, 32 groups of one expert.
 //
+// The skewed cases route as real prompts do, one expert taking every token and the rest fewer. Each runs in a child
+// process, as --skew ROWS for each micro-batch in k_skew_rows (1024 and 2048), on a fixture planned for that
+// micro-batch. Beyond what every case checks, the executor's activation scratch (the success line's act=) must be under
+// half the rectangle's, the token count rounded up to the GEMM row alignment times every expert: the scratch is laid
+// out per GEMM group, so a small group costs its own rows and not the busiest expert's.
+//
 // The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on. With it off, libllama puts these
 // device-planned experts in the device buffer instead, which this fixture does not model: that upload reorders an SOA
 // type over the whole tensor and publishes no per-expert records for it, and the claim declines such a layout. So with
@@ -40,6 +46,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "moe-pp-pack.hpp"  // moe_pp_gemm_row_align: the GEMM row rounding the rectangle is measured against
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -96,9 +103,13 @@ static_assert(k_cases <= k_route_log_cap, "a case past the route log's cap has n
 // rather than pass without the chain.
 constexpr size_t k_min_groups = 3;
 
-// The group caps of the capped cases, one Q4_0 case each, each in its own child process (run_capped_child).
+// The group caps of the capped cases, one Q4_0 case each, each in its own child process (run_child_case).
 constexpr int k_group_caps[] = { 1, 3 };
 constexpr int k_capped_cases = int(sizeof(k_group_caps) / sizeof(k_group_caps[0]));
+
+// The micro-batches of the skewed cases, one Q4_0 case each, each in its own child process (run_child_case).
+constexpr int k_skew_rows[] = { 1024, 2048 };
+constexpr int k_skew_cases  = int(sizeof(k_skew_rows) / sizeof(k_skew_rows[0]));
 
 void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -154,6 +165,26 @@ struct log_capture {
         }
         return least;
     }
+
+    // The largest value that follows `field` (such as "act=") in the chunks from `from` on that contain `needle`, or
+    // a negative number when none of them carries the field.
+    double max_double_field_since(size_t from, const char * needle, const char * field) {
+        std::lock_guard<std::mutex> lock(mu);
+        double                      most = -1.0;
+        for (size_t i = from; i < chunks.size(); ++i) {
+            const size_t at = chunks[i].find(needle) != std::string::npos ? chunks[i].find(field) : std::string::npos;
+            if (at == std::string::npos) {
+                continue;
+            }
+            const char * digits = chunks[i].c_str() + at + std::strlen(field);
+            char *       end    = nullptr;
+            const double value  = std::strtod(digits, &end);
+            if (end != digits) {
+                most = std::max(most, value);
+            }
+        }
+        return most;
+    }
 };
 
 log_capture g_log;
@@ -190,9 +221,11 @@ std::vector<uint8_t> make_weights(ggml_type type, std::mt19937 & rng) {
 struct expert_inventory {
     ggml_sycl_tensor_info        tensors[3]{};
     ggml_sycl_tensor_inventory   inventory{};
-    ggml_sycl_placement_envelope envelope{ k_n_ctx, k_n_ubatch, 1, -1 };
+    ggml_sycl_placement_envelope envelope{};
 
-    explicit expert_inventory(ggml_type type) {
+    explicit expert_inventory(ggml_type type, uint32_t n_ubatch = k_n_ubatch) {
+        const uint32_t n_ctx = std::max(k_n_ctx, n_ubatch);
+        envelope             = ggml_sycl_placement_envelope{ n_ctx, n_ubatch, 1, -1 };
         for (int i = 0; i < 3; ++i) {
             tensors[i].name  = k_tensor_names[i];
             tensors[i].type  = type;
@@ -208,21 +241,19 @@ struct expert_inventory {
         inventory.n_expert      = k_experts;
         inventory.n_expert_used = k_used;
         inventory.n_layer       = 1;
-        inventory.n_ctx         = k_n_ctx;
-        inventory.n_ubatch      = k_n_ubatch;
+        inventory.n_ctx         = n_ctx;
+        inventory.n_ubatch      = n_ubatch;
 
         const size_t woq_slot = align_256(size_t(k_out) * (k_in / 2)) + align_256(size_t(k_in / 32) * k_out);
         inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * k_experts;
-        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_experts) * k_in * sizeof(ggml_fp16_t);
-        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_experts) * k_out * sizeof(float);
-        inventory.pp_moe_onednn_activation_slot_bytes =
-            align_256(size_t(k_n_ubatch) * inventory.pp_moe_onednn_activation_bytes_per_row);
-        inventory.pp_moe_onednn_output_slot_bytes =
-            align_256(size_t(k_n_ubatch) * inventory.pp_moe_onednn_output_bytes_per_row);
-        inventory.pp_moe_onednn_ring_depth    = 1;
-        inventory.pp_moe_onednn_scratch_bytes = inventory.pp_moe_onednn_weight_slot_bytes +
-                                                inventory.pp_moe_onednn_activation_slot_bytes +
-                                                inventory.pp_moe_onednn_output_slot_bytes;
+        // One scratch row: k_in half floats in, k_out floats out. The backend sizes the activation and output slots
+        // from these and the expert counts, so the loader leaves both slots 0 and plans only the weight slot.
+        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_in) * sizeof(ggml_fp16_t);
+        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_out) * sizeof(float);
+        inventory.pp_moe_onednn_activation_slot_bytes    = 0;
+        inventory.pp_moe_onednn_output_slot_bytes        = 0;
+        inventory.pp_moe_onednn_ring_depth               = 1;
+        inventory.pp_moe_onednn_scratch_bytes            = inventory.pp_moe_onednn_weight_slot_bytes;
     }
 };
 
@@ -240,12 +271,13 @@ struct lifecycle_fixture {
     ggml_tensor *             gate          = nullptr;  // the loaded expert tensor every case runs
     std::vector<uint8_t>      gate_bytes;               // its quantized bytes, for the CPU reference
 
-    lifecycle_fixture(ggml_type type, std::mt19937 & rng) {
+    lifecycle_fixture(ggml_type type, std::mt19937 & rng, uint32_t n_ubatch = k_n_ubatch) {
         try {
             require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
             load_open = true;
-            expert_inventory fixture(type);
-            const auto stage = ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
+            expert_inventory fixture(type, n_ubatch);
+            const auto       stage =
+                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
             require(stage == GGML_SYCL_LIFECYCLE_OK,
                     "inventory staging result=" + std::to_string(static_cast<int>(stage)));
             // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue
@@ -263,11 +295,11 @@ struct lifecycle_fixture {
                     "context create failed");
             require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
                     "context bind failed");
-            require(
-                ggml_backend_sycl_set_runtime_context_for_model(backend, model, k_n_ctx, k_n_ubatch, 1,
-                                                                /*kv_unified=*/false, /*swa_full=*/false,
-                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
-                "runtime context bind failed");
+            require(ggml_backend_sycl_set_runtime_context_for_model(
+                        backend, model, std::max(k_n_ctx, n_ubatch), n_ubatch, 1,
+                        /*kv_unified=*/false, /*swa_full=*/false,
+                        /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
+                    "runtime context bind failed");
         } catch (...) {
             cleanup();
             throw;
@@ -384,6 +416,26 @@ case_data make_case(ggml_type type, int n_tokens, int ne11, std::mt19937 & rng) 
         for (int i = 0; i < k_used; ++i) {
             c.ids[size_t(t) * k_used + i] = (base + i * (k_experts / k_used)) % k_experts;
         }
+    }
+    return c;
+}
+
+// A skewed routing, as real prompts route: expert 0 takes every token, experts 1 to 3 a third each, experts 4 to 10 a
+// seventh each, experts 11 to 31 a twenty-first each. Every expert is active and a token's four picks are distinct.
+// The rectangle pads all 32 experts to the token count; the packed layout pads four groups to their own heads.
+case_data make_skew_case(int n_tokens, std::mt19937 & rng) {
+    case_data                             c{ GGML_TYPE_Q4_0, n_tokens, k_used, {}, {} };
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    c.input.resize(size_t(k_in) * k_used * n_tokens);
+    for (float & v : c.input) {
+        v = dist(rng);
+    }
+    c.ids.resize(size_t(k_used) * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        c.ids[size_t(t) * k_used + 0] = 0;
+        c.ids[size_t(t) * k_used + 1] = 1 + t % 3;
+        c.ids[size_t(t) * k_used + 2] = 4 + t % 7;
+        c.ids[size_t(t) * k_used + 3] = 11 + t % 21;
     }
     return c;
 }
@@ -533,20 +585,38 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     return why.empty();
 }
 
-// Runs one capped case: this binary again, as `--group-cap <cap>`, in a child process, so the cap is set before that
-// process's backend reads it. The child's CASE line shares this process's stderr; its exit status is the verdict.
-bool run_capped_child(int cap) {
-    const std::string arg = std::to_string(cap);
+// Runs the skewed case at `n_tokens` rows and checks, beyond what run_case checks, that the activation scratch the
+// executor used is under half the rectangle's (the token count rounded up to the GEMM row alignment, times every
+// expert).
+bool run_skew_case(lifecycle_fixture & life, ggml_backend_t cpu, int n_tokens, std::mt19937 & rng) {
+    const size_t from    = g_log.mark();
+    const bool   passed  = run_case(life, cpu, make_skew_case(n_tokens, rng), true, 0);
+    const double act_mb  = g_log.max_double_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", " act=");
+    const size_t align   = ggml_sycl::moe_pp_gemm_row_align;
+    const double rect_mb = double((size_t(n_tokens) + align - 1) / align * align) * k_experts * k_in *
+                           sizeof(ggml_fp16_t) / (1024.0 * 1024.0);
+    const bool packed = act_mb >= 0.0 && act_mb < rect_mb / 2.0;
+    std::fprintf(stderr, "SKEW tokens=%d act=%.1fMB rectangle=%.1fMB -> %s\n", n_tokens, act_mb, rect_mb,
+                 !passed ? "FAIL: case" :
+                 packed  ? "PASS" :
+                           "FAIL: act-not-packed");
+    return passed && packed;
+}
+
+// Runs one case in a child process: this binary again, as `<flag> <value>`, so a setting the backend reads once per
+// process (the group cap) or a fixture of another micro-batch (the skewed cases) starts from a fresh backend. The
+// child's CASE line shares this process's stderr; its exit status is the verdict.
+bool run_child_case(const char * flag, int value) {
+    const std::string arg = std::to_string(value);
     std::fflush(stdout);
     std::fflush(stderr);
     const pid_t pid = fork();
     if (pid == 0) {
-        execl("/proc/self/exe", "test-moe-pp-batched-dequant", "--group-cap", arg.c_str(),
-              static_cast<char *>(nullptr));
+        execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(), static_cast<char *>(nullptr));
         _exit(127);
     }
     if (pid < 0) {
-        std::fprintf(stderr, "FAIL: fork for the group cap %d case failed\n", cap);
+        std::fprintf(stderr, "FAIL: fork for the %s %d case failed\n", flag, value);
         return false;
     }
     int        status = 0;
@@ -555,12 +625,12 @@ bool run_capped_child(int cap) {
         return true;
     }
     if (!waited) {
-        std::fprintf(stderr, "FAIL: waitpid for the group cap %d case failed\n", cap);
+        std::fprintf(stderr, "FAIL: waitpid for the %s %d case failed\n", flag, value);
     } else if (WIFEXITED(status)) {
         // 77 is a skip, which this process ruled out before it started the child; 127 is a failed exec.
-        std::fprintf(stderr, "FAIL: the group cap %d case exited %d\n", cap, WEXITSTATUS(status));
+        std::fprintf(stderr, "FAIL: the %s %d case exited %d\n", flag, value, WEXITSTATUS(status));
     } else {
-        std::fprintf(stderr, "FAIL: the group cap %d case died on signal %d\n", cap,
+        std::fprintf(stderr, "FAIL: the %s %d case died on signal %d\n", flag, value,
                      WIFSIGNALED(status) ? WTERMSIG(status) : 0);
     }
     return false;
@@ -569,8 +639,9 @@ bool run_capped_child(int cap) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    // A capped case's child process (run_capped_child) runs one Q4_0 case with the group cap at argv[2].
+    // A child process (run_child_case) runs one Q4_0 case: with the group cap at argv[2], or skewed at argv[2] rows.
     int group_cap = 0;
+    int skew_rows = 0;
     if (argc == 3 && std::strcmp(argv[1], "--group-cap") == 0) {
         group_cap = std::atoi(argv[2]);
         if (group_cap < 1) {
@@ -578,8 +649,14 @@ int main(int argc, char ** argv) {
             return 1;
         }
         setenv("GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX", argv[2], 1);
+    } else if (argc == 3 && std::strcmp(argv[1], "--skew") == 0) {
+        skew_rows = std::atoi(argv[2]);
+        if (skew_rows < 64) {
+            std::fprintf(stderr, "FAIL: --skew takes a row count of at least 64, not %s\n", argv[2]);
+            return 1;
+        }
     } else if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--group-cap N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [--group-cap N | --skew ROWS]\n", argv[0]);
         return 1;
     }
     // Read once by the backend, so they are set before anything touches it.
@@ -610,10 +687,19 @@ int main(int argc, char ** argv) {
             lifecycle_fixture life(GGML_TYPE_Q4_0, rng);
             return run_case(life, cpu.get(), make_case(GGML_TYPE_Q4_0, 300, k_used, rng), true, group_cap) ? 0 : 1;
         }
-        // The capped cases first, each in its own process, so this one holds no model while a child runs.
+        if (skew_rows > 0) {
+            lifecycle_fixture life(GGML_TYPE_Q4_0, rng, static_cast<uint32_t>(skew_rows));
+            return run_skew_case(life, cpu.get(), skew_rows, rng) ? 0 : 1;
+        }
+        // The capped and skewed cases first, each in its own process, so this one holds no model while a child runs.
         int failed = 0;
         for (int cap : k_group_caps) {
-            if (!run_capped_child(cap)) {
+            if (!run_child_case("--group-cap", cap)) {
+                ++failed;
+            }
+        }
+        for (int rows : k_skew_rows) {
+            if (!run_child_case("--skew", rows)) {
                 ++failed;
             }
         }
@@ -626,13 +712,15 @@ int main(int argc, char ** argv) {
                 ++failed;
             }
         }
-        const int total = k_cases + k_capped_cases;
+        const int total = k_cases + k_capped_cases + k_skew_cases;
         if (failed != 0) {
             std::fprintf(stderr, "FAIL: %d of %d cases failed\n", failed, total);
             return 1;
         }
-        std::fprintf(stderr, "PASS: batched MoE prompt executor, %d cases (%d at the slot's own grouping, %d capped)\n",
-                     total, k_cases, k_capped_cases);
+        std::fprintf(stderr,
+                     "PASS: batched MoE prompt executor, %d cases (%d at the slot's own grouping, %d capped, %d "
+                     "skewed)\n",
+                     total, k_cases, k_capped_cases, k_skew_cases);
         return 0;
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "SKIP: no usable SYCL GPU: %s\n", e.what());

@@ -38,7 +38,11 @@ when the DMA runs.  Each mem_copy_async site whose host endpoint can be in scope
     WEIGHT, and the SYCL_Host buffer's in-scope owner is held only as the buffer's identity, never as a copy endpoint.
     llama.cpp-36j0 admits WEIGHT: a device buffer that fell back to host-pinned weight memory is then in scope, which
     is safe because its set and get copies are host to host and an async copy into it is complete only once the
-    caller synchronises;
+    caller synchronises. One SYCL_Host owner leaves its buffer, because the plan charges the loader's buffer and
+    gives the experts it serves no block: ggml_sycl_loader_buffer_owner hands the loader's chunk of a model load
+    (lifetime MODEL, minted by that load, role WEIGHT, unclaimed) to S1-PRELOAD, which serves a host expert from it in
+    place, so the prefill ring copies from it directly, as from any pinned-pool weight: a weight is
+    written only while the model loads;
   - segment graph recording relied on the staged H2D's host wait as an ordering assumption (pin D): the boundary
     flush ran just before begin_recording, and its staged copy left everything earlier on the in-order stream
     complete.  Direct, the copy and the MoE output's ready event are still pending when the segment records, the
@@ -68,8 +72,11 @@ THE CONTRACT.  With comments blanked:
      staged host->device branch.
   I. (common.hpp, ggml-sycl.cpp) the MoE ids cache entry keeps no stage; the staging branch allocates a fresh stage
      per call with alloc_pinned_stage_handle_terminal, writes the ids into it and copies from it.
-  T. (ggml-sycl.cpp) every use of a SYCL_Host buffer context's buffer_handle is a validity, identity or reset use; the
-     host buffer allocator hands its owner only to the wrap, which stores it; every other buffer type's allocation
+  T. (ggml-sycl.cpp) every use of a SYCL_Host buffer context's buffer_handle is a validity, identity or reset use,
+     except in ggml_sycl_loader_buffer_owner, which reads the owner's metadata and hands the owner out only after it
+     has refused a buffer that is not SYCL_Host, a claimed slot, a lifetime other than MODEL and an owner the ring
+     cannot stream from; the host buffer allocator hands its owner only to the wrap, which stores it; every other
+     buffer type's allocation
      requests roles COMPUTE, KV or WEIGHT and never category EXPERT_CACHE (WEIGHT storage is in scope only when it
      lands host-pinned in a host zone; see the hazard note above).
   G. (ggml-sycl.cpp, moe-decode-hostpath.hpp) the event-chained route refuses an out-of-order queue, flushes or keeps
@@ -124,8 +131,23 @@ ALLOCATE_SIG = r"\nmem_handle unified_allocate\(const alloc_request & req\)\s*\{
 POOL_INIT_SIG = r"void PinnedBufferPool::init\(sycl::queue & q, int device_id, size_t max_experts, size_t act_dim, size_t out_dim\)\s*\{"
 SCATTER_SIG = r"static void moe_host_scatter_submit_flagged\([^)]*\)\s*\{"
 ENTRY_SIG = r"struct moe_ids_cache_entry\s*\{"
-HOST_ALLOC_SIG = r"static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer\([^)]*\)\s*\{"
+# The host bufts share one allocation path over their intent builder (design 5efe section 4.4); SYCL_Host's and
+# SYCL_KV_Host's alloc_buffer only delegate to it, so the allocator this pin reads is that path.
+HOST_ALLOC_SIG = r"static ggml_backend_buffer_t ggml_sycl_host_buft_alloc\([^)]*\)\s*\{"
 HOST_WRAP_SIG = r"static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap\([^)]*\)\s*\{"
+# The host bufts' intent builder sets their role and category, so the role pin reads it like an allocator body.
+HOST_INTENT_SIG = r"static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent\(ggml_sycl_host_buft_kind kind\)\s*\{"
+LOADER_OWNER_SIG = r"static bool ggml_sycl_loader_buffer_owner\([^)]*\)\s*\{"
+# The loader owner's refusals, in the order its handout must follow them, and the handout itself.
+LOADER_OWNER_STEPS = (
+    ("buffer->iface.free_buffer == ggml_backend_sycl_host_buffer_free_buffer", "refuses a buffer that is not SYCL_Host"),
+    ("} else if (ctx->claim) {", "refuses a claimed tenant slot"),
+    ("ctx->lifetime != ggml_sycl::alloc_lifetime::MODEL", "refuses a lifetime other than MODEL"),
+    ("ctx->buffer_handle.owner_metadata(&owner_md)", "reads the owner's metadata"),
+    ("!ggml_sycl::moe_stream_owner_streamable(owner_md, device)", "refuses an owner the ring cannot stream from"),
+    ("if (refusal != nullptr) {", "returns on any refusal"),
+    ("*out = ctx->buffer_handle;", "hands the owner out last"),
+)
 BUFFER_ALLOC_SIG = r"\n(?:static )?ggml_backend_buffer_t\s+(\w*alloc\w*)\s*\([^)]*\)\s*(?:try\s*)?\{"
 ROUTE_SIG = r"static bool ggml_sycl_moe_hybrid_decode_event_chained\(ggml_backend_sycl_context & ctx,[^)]*\)\s*\{"
 FLUSH_SLOT_SIG = r"static void flush_pending_cpu_scatter_slot\(pending_cpu_scatter & slot\)\s*\{"
@@ -467,7 +489,13 @@ def check_ids(s: dict) -> None:
 
 def check_storage(s: dict) -> None:
     code = blank_comments(s["backend"])
-    flat_backend = flat(code)
+    loader_owner = body_of(code, LOADER_OWNER_SIG, "T")
+    loader_flat = flat(loader_owner)
+    in_order(loader_flat, LOADER_OWNER_STEPS, "T", "ggml_sycl_loader_buffer_owner does not hand the owner out after it")
+    if len(re.findall(r"\bbuffer_handle\b", loader_flat)) != 3:
+        fail("T", "ggml_sycl_loader_buffer_owner uses the SYCL_Host buffer's handle beyond its validity test, its "
+                  "metadata read and its one handout")
+    flat_backend = flat(code.replace(loader_owner, "", 1))
     uses = 0
     for m in re.finditer(r"[\w\]\)]+(?:->|\.)buffer_handle\b", flat_backend):
         after = flat_backend[m.end():m.end() + 40]
@@ -488,10 +516,22 @@ def check_storage(s: dict) -> None:
     wrap = flat_body(s["backend"], HOST_WRAP_SIG, "T")
     if len(re.findall(r"\bhandle\b", wrap)) != 1 or "std::move(handle)" not in wrap:
         fail("T", "the SYCL_Host buffer wrap uses the owned handle other than by storing it")
+    intent = flat_body(s["backend"], HOST_INTENT_SIG, "T")
+    intent_roles = re.findall(r"intent\.role = ([^;]+);", intent)
+    if len(intent_roles) < 3:
+        fail("T", "the host bufts' intent builder sets fewer roles than its three kinds, so the role pin would pass "
+                  "vacuously")
+    for role in intent_roles:
+        if role not in BACKEND_BUFFER_ROLES:
+            fail("T", f"the host bufts' intent builder requests role {role!r}; a backend buffer's owner must stay out "
+                      f"of scope (roles COMPUTE, KV, WEIGHT)")
+    if "runtime_category::EXPERT_CACHE" in intent:
+        fail("T", "the host bufts' intent builder requests category EXPERT_CACHE, which would put a tensor's handle in "
+                  "scope")
     seen = 0
     for m in re.finditer(BUFFER_ALLOC_SIG, code):
         name = m.group(1)
-        if name == "ggml_backend_sycl_host_buffer_type_alloc_buffer":
+        if name == "ggml_sycl_host_buft_alloc":
             continue
         body = flat(body_at(code, m, "T"))
         seen += 1
@@ -726,6 +766,10 @@ def self_test(s: dict) -> int:
              "ggml_sycl::mem_copy(ctx->buffer_handle, 0, ctx->buffer_handle, 0, 0, "
              "ggml_sycl_get_device(ctx->device).default_queue());\n        "
              "if (!ctx->buffer_handle.valid() || !base || data < base) {")),
+        ("T", "backend", "loader owner handed out without the lifetime refusal",
+         sub(r"ctx->lifetime != ggml_sycl::alloc_lifetime::MODEL \|\| ", "")),
+        ("T", "backend", "loader owner handed out before the streamable refusal",
+         sub(r"(alloc_metadata owner_md\{\};)", r"\1\n    if (out) { *out = ctx->buffer_handle; }")),
         ("T", "backend", "SYCL_Host allocator copies through its owner",
          sub(r"(ggml_sycl::mem_handle buffer_handle =\n\s*ggml_sycl::detail::from_legacy_owned_alloc\(std::move\("
              r"host_buffer_owner\), GGML_LAYOUT_AOS\);)", r"\1\n    ggml_sycl::mem_fill(buffer_handle, 0, size, *exact_queue);")),
@@ -736,9 +780,12 @@ def self_test(s: dict) -> int:
          sub(r"(is_kv_buft \? ggml_sycl::alloc_role::KV : )ggml_sycl::alloc_role::WEIGHT\)", r"\1ggml_sycl::alloc_role::STAGING)")),
         ("T", "backend", "arena runtime buffer becomes a stage",
          sub(r"(runtime_req\.intent\.role\s*= )ggml_sycl::alloc_role::COMPUTE;", r"\1ggml_sycl::alloc_role::STAGING;")),
-        ("T", "backend", "host compute buffer becomes expert-path memory",
-         sub(r"(ggml_backend_sycl_host_compute_buffer_alloc\([\s\S]*?req\.intent\.category\s*= )"
+        ("T", "backend", "host buft intent becomes expert-path memory",
+         sub(r"(ggml_sycl_host_buft_intent\(ggml_sycl_host_buft_kind kind\) \{[\s\S]*?intent\.category\s*= )"
              r"ggml_sycl::runtime_category::HOST_COMPUTE;", r"\1ggml_sycl::runtime_category::EXPERT_CACHE;")),
+        ("T", "backend", "post-load SYCL_Host buffer becomes a stage",
+         sub(r"(\} else \{\n\s*intent\.role\s*= )ggml_sycl::alloc_role::COMPUTE;(\n\s*intent\.lifetime\s*= "
+             r"ggml_sycl::alloc_lifetime::CONTEXT;)", r"\1ggml_sycl::alloc_role::STAGING;\2")),
         ("G", "backend", "route accepts an out-of-order queue",
          sub(r" \|\|\n\s*!ctx\.stream\(\)->has_property<sycl::property::queue::in_order>\(\)\)", ")")),
         ("G", "backend", "route skips its pre-reserve flush",

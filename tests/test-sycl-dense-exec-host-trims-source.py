@@ -223,6 +223,8 @@ def test_no_other_code_touches_the_staging_map():
 # matters: a second taker with a listed name is still a new taker.
 LOOKUP_HANDLE_TAKERS = Counter({
     ("getrows.cpp", "&out_handle"): 1,  # pre-staged get_rows indices, read by the kernel
+    # the shared staged-input lookup: a staged graph input a recorded kernel (bin-broadcast, top-k mask) reads
+    ("graph-input-staged.hpp", "out_handle"): 1,
     ("ggml-sycl.cpp", "&moved_dst"): 1,  # the executor's moved-only copy
     ("ggml-sycl.cpp", "&staged"): 1,  # a keyed segment slot retains the copies its graphs read and compares identity
 })

@@ -35,6 +35,7 @@ green means nothing without a demonstrated red.
 
 import argparse
 import pathlib
+import re
 import sys
 
 from sycl_gate import body, run_without_source, strip_comments
@@ -146,7 +147,8 @@ def poison_one_site(text, marker):
 
 CAS_FN = "bool lifecycle_replace_placement_plan("
 CAS_HOLDER = "std::shared_ptr<void> displaced_mmid"
-CAS_LOCK = "std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);"
+# g_lifecycle_plan_mutex is a witnessed mutex, so the guard deduces its type; any alignment of the name
+CAS_LOCK_RE = re.compile(r"std::lock_guard(?:<[^>]*>)?\s+lock\(g_lifecycle_plan_mutex\);")
 CAS_HAND_OUT = "stable_workspace, &displaced_mmid)"
 
 
@@ -154,7 +156,9 @@ def check_cas_releases_after_plan_lock(cache):
     fn = strip_comments(body(cache, CAS_FN))
     if not fn:
         return False, "plan CAS not found (renamed?)"
-    holder, lock, hand_out = fn.find(CAS_HOLDER), fn.find(CAS_LOCK), fn.find(CAS_HAND_OUT)
+    lock_match = CAS_LOCK_RE.search(fn)
+    holder, hand_out = fn.find(CAS_HOLDER), fn.find(CAS_HAND_OUT)
+    lock = lock_match.start() if lock_match else -1
     if lock < 0:
         return False, "plan CAS no longer takes the plan lock with a lock_guard named lock (renamed?)"
     if hand_out < 0:
@@ -240,7 +244,11 @@ def poison_cas_holder_under_lock(cache):
         return cache
     line_end = fn.find("\n", at)
     holder_line = fn[at:line_end + 1]
-    moved = fn.replace(holder_line, "", 1).replace(CAS_LOCK, CAS_LOCK + "\n        " + holder_line.strip(), 1)
+    without = fn.replace(holder_line, "", 1)
+    lock = CAS_LOCK_RE.search(without)
+    if not lock:
+        return cache
+    moved = without[:lock.end()] + "\n        " + holder_line.strip() + without[lock.end():]
     return cache.replace(fn, moved, 1)
 
 

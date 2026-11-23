@@ -32,7 +32,8 @@ keep being true, source-side.  What it checks, by gate:
       message byte for byte; the preload's witness is `held(LOAD)`.
   36  the four plan accessors consult the override first and every other read of the
       publication is theirs; the five scheduler-path latch reads go through the one
-      reader; the override has two writers, one nesting witness, and a snapshot builder
+      reader; the override has two writers, one nesting witness, its other two refusal lines (no
+      plan staged, a refused KV re-fit) at ERROR, and a snapshot builder
       that names no provisional-plan helper; the publish store refuses first; the measure
       backend is non-owning, syntactically.
   37  both pool phase gates skip only under a TRANSACTION token and name their site.
@@ -281,7 +282,10 @@ def gate3(files, bad):
 # --------------------------------------------------------------------------------------
 GLOBAL_CLEAR_EFFECTS = ("release_graph_retained_handles", "ggml_sycl_cpu_staging_cache_clear", "graph_unpin_moe_experts",
                         "graph_unpin_weights")
-CLEAR_ACTIVE_CALLERS = 13  # the design lists eleven; optional-layouts-retire (dkw0) is the twelfth on this base, and the legacy re-record path's prestage-declined clear (master, with graph_prestage_or_decline) the thirteenth
+CLEAR_ACTIVE_CALLERS = 14  # the design lists eleven; optional-layouts-retire (dkw0) is the twelfth on this base, and the legacy re-record path's prestage-declined clear (master, with graph_prestage_or_decline) the thirteenth
+# The fourteenth is ggml_sycl_graph_compute_fallback_clear_graphs, the graph-compute fallback catch's clear step: after a
+# planned fallback error it drops the live graph, or the MoE segments a failed recording handed over, before the unpin.
+# A teardown site, not a re-plan hook, so the hook rule below still holds for it.
 
 
 def gate23(files, bad):
@@ -456,7 +460,7 @@ TOKEN_ENTRIES = {
     "ggml_sycl_set_runtime_context_for_model_impl":    "TRANSACTION",
     "ggml_backend_sycl_set_runtime_context":           "TRANSACTION",
     "ggml_backend_sycl_model_load_begin":              "LOAD",
-    "ggml_backend_sycl_stage_inventory_plan":          "LOAD",
+    "ggml_backend_sycl_stage_load_inventory_plan":     "LOAD",
     "ggml_backend_sycl_model_load_end":                "LOAD",
     "ggml_backend_sycl_probe_runtime_context_for_model":        "LIFECYCLE",
     "ggml_backend_sycl_recheck_runtime_context_flash_attn":     "LIFECYCLE",
@@ -719,7 +723,7 @@ def gate31_owner(files, bad):
     else:
         t = text_of(c, ie[0])
         tk = text_of(k, ie[0])
-        locks = re.findall(r"std::lock_guard<std::mutex>\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)", t)
+        locks = re.findall(r"std::lock_guard(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)", t)
         if len(locks) != 1 or re.search(r"\b(unique_lock|scoped_lock)\b", t):
             bad("gate 31 (owner): into_empty is not exactly one g_tensor_inventory_mutex critical section")
         order = [t.find(x) for x in ("g_tensor_inventory_mutex", "lifecycle_select_placement_plan(", "get_placement_plan_snapshot()",
@@ -831,8 +835,8 @@ def gate31_owner(files, bad):
                            re.sub(r"(?:ggml_sycl::)?$", "", before) + "") and \
                 not re.search(r"(?:switch\s*\(\s*|ready_or_throw\s*\(\s*|queue_status\s*=\s*)(?:ggml_sycl::)?\s*$", before):
             bad("gate 31 (owner): a call of %s in %s is not consumed by a switch, ready_or_throw or an explicit status" % (ENSURE, fn))
-    if total != 6:
-        bad("gate 31 (owner): %s has %d callers (the census is six)" % (ENSURE, total))
+    if total != 5:
+        bad("gate 31 (owner): %s has %d callers (the census is five)" % (ENSURE, total))
     # mul_mat_id reads the owner from its own context, once
     mm = func_bodies(c, "ggml_sycl_mul_mat_id")
     if len(mm) != 1 or not re.search(r"\bmmid_owner_bound\s*=\s*ggml_sycl_execution_current_owner\s*\(\s*&ctx\s*,\s*mmid_owner\s*\)",
@@ -921,14 +925,18 @@ def gate36(files, bad):
         if re.match(r"\s*\)?\s*,\s*snapshot", c[m.end():m.end() + 40]) and "atomic_store" in c[max(0, m.start() - 40):m.start()]:
             continue
         bad("gate 36: g_placement_publication is read in %s, which is not one of the four accessors" % fn)
-    # bound_load_candidate has the named list.
+    # bound_load_candidate has the named list. The two host-backing readers (design 5efe §4.3) are on it
+    # because they answer for the bound load's staged plan only: a plan another load published must never bind
+    # SYCL_Mapped buffers for this one, so they cannot fall back to the publication as the accessors do.
     for m in re.finditer(r"ggml_sycl_bound_load_candidate\s*\(", c):
         fn = enclosing_top(c, m.start())
         if fn is None:
             continue
         if fn.split("::")[-1] not in ACCESSORS + ("ggml_sycl_host_row_authorized",
                                                    "ggml_sycl_register_buffer_tensor_provenance",
-                                                   "ggml_sycl_bound_load_candidate"):
+                                                   "ggml_sycl_bound_load_candidate",
+                                                   "ggml_backend_sycl_planned_host_backing",
+                                                   "ggml_backend_sycl_mapped_buffer_from_file"):
             bad("gate 36: ggml_sycl_bound_load_candidate is called from %s, which is not on the named list" % fn)
     # The latch.
     for fn in LATCH_READERS:
@@ -962,10 +970,17 @@ def gate36(files, bad):
         first = inst.find("g_measure_plan_override")
         if first < 0 or "return false" not in inst[:inst.find("g_measure_plan_override =") if "g_measure_plan_override =" in inst else 0]:
             bad("gate 36: install does not refuse a nest before it writes")
-        if 'GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
+        if 'GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
                 'GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst:
             bad("gate 36: install lacks its nesting witness")
-    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "lifecycle_make_candidate_snapshot"):
+        # The other two refusals are ERRORs too, so a default-verbosity log names which one failed the load.
+        for line in ("[LOAD-PLAN] measure plan override: no plan staged for load",
+                     "[LOAD-PLAN] measure plan override: the KV re-fit for load"):
+            if not re.search(r'GGML_LOG_ERROR\(\s*"' + re.escape(line), kinst):
+                bad("gate 36: install's refusal %r is not an ERROR" % line)
+    # the install's lookup is ggml_sycl_measure_staged_plan, which the loader's staged-plan query reads too
+    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "ggml_sycl_measure_staged_plan",
+               "lifecycle_make_candidate_snapshot"):
         t = ""
         for path in (MAIN, UC_C):
             cc = code(files, path)
@@ -1131,11 +1146,11 @@ def mutants(files):
            edit(files, M, "    graph_unpin_moe_experts(ctx);\n    graph_unpin_weights(ctx);\n}\n\n// Owner-targeted",
                 "    graph_unpin_weights(ctx);\n}\n\n// Owner-targeted", "g23d"),
            "does not call graph_unpin_moe_experts exactly once")
-    yield ("a fourteenth clear_active caller (one past the thirteen listed)",
+    yield ("a clear_active caller one past the %d listed" % CLEAR_ACTIVE_CALLERS,
            edit(files, M, "static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {",
                 "static void ggml_sycl_stray_clear(ggml_backend_sycl_context * c) { sycl_exec_graph_clear_active(c, \"stray\"); }\n"
                 "static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {", "g23e"),
-           "has 14 callers")
+           "has %d callers" % (CLEAR_ACTIVE_CALLERS + 1))
 
     yield ("an unlisted host_task",
            edit(files, M, "static size_t ggml_sycl_host_chunk_cap_constant() {",
@@ -1338,7 +1353,8 @@ def mutants(files):
            "null selection branch does not refuse")
     yield ("into_empty taking a second lock",
            edit(files, M, "    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,",
-                "    std::lock_guard<std::mutex> second(g_tensor_inventory_mutex);\n    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,", "o14"),
+                "    std::lock_guard second(g_tensor_inventory_mutex);\n"
+                "    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value,", "o14"),
            "not exactly one g_tensor_inventory_mutex critical section")
     yield ("a plain republish restored in ensure",
            edit(files, M, "        if (owner) {\n            if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);",
@@ -1413,13 +1429,25 @@ def mutants(files):
                 "static void ggml_sycl_stray_ov() { g_measure_plan_override.reset(); }\nstatic size_t ggml_sycl_host_chunk_cap_constant() {", "g36d"),
            "g_measure_plan_override is written in")
     yield ("install without its nesting witness",
-           edit(files, M, "GGML_LOG_WARN(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
-                "GGML_LOG_WARN(\"measure plan override nested\\n\");", "g36e"),
+           edit(files, M, "GGML_LOG_ERROR(\"[CONTEXT-PLAN-BUG] measure plan override nested\\n\");",
+                "GGML_LOG_ERROR(\"measure plan override nested\\n\");", "g36e"),
            "install lacks its nesting witness")
+    yield ("install's no-plan refusal downgraded to a WARN",
+           edit(files, M, "GGML_LOG_ERROR(\"[LOAD-PLAN] measure plan override: no plan staged for load",
+                "GGML_LOG_WARN(\"[LOAD-PLAN] measure plan override: no plan staged for load", "g36p"),
+           "refusal '[LOAD-PLAN] measure plan override: no plan staged for load' is not an ERROR")
+    yield ("install's KV re-fit refusal downgraded to a WARN",
+           edit(files, M, "GGML_LOG_ERROR(\"[LOAD-PLAN] measure plan override: the KV re-fit for load",
+                "GGML_LOG_WARN(\"[LOAD-PLAN] measure plan override: the KV re-fit for load", "g36q"),
+           "refusal '[LOAD-PLAN] measure plan override: the KV re-fit for load' is not an ERROR")
     yield ("install naming the provisional builder",
+           edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);",
+                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot = ggml_sycl_measure_staged_plan(load_txn, stage);\n    (void) &ggml_sycl_make_provisional_plan_snapshot;", "g36f"),
+           "ggml_backend_sycl_measure_plan_override_install_kv names ggml_sycl_make_provisional_plan_snapshot")
+    yield ("the install's lookup naming the provisional builder",
            edit(files, M, "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    switch (stage) {",
-                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    (void) &ggml_sycl_make_provisional_plan_snapshot;\n    switch (stage) {", "g36f"),
-           "names ggml_sycl_make_provisional_plan_snapshot")
+                "std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;\n    (void) &ggml_sycl_make_provisional_plan_snapshot;\n    switch (stage) {", "g36r"),
+           "ggml_sycl_measure_staged_plan names ggml_sycl_make_provisional_plan_snapshot")
     yield ("a measure free reaching the SYCL free",
            edit(files, M, "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    delete backend;",
                 "static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {\n    ggml_backend_sycl_free(backend);", "g36g"),

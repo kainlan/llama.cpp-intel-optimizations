@@ -120,7 +120,11 @@ UNOWNED_KIND = "out.kind[il] = idx_k_width > 0 ? GGML_SYCL_KV_LAYER_FULL : GGML_
 IDX_OWNERS = "out.idx_k_width[il] = kv.layers_idx[il].has_kv ? kv.layers_idx[il].n_embd_k_gqa : 0;"
 IDX_ARRAY = "out.idx_k_width[il] = idx_k_width;"
 IDX_FILL = "inventory.kv_idx_k_width_per_layer = kv_idx_k_width_per_layer;"
-IDX_PASS = "kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(),"
+# Both inventory builders pass the arrays: the late inventory from its own local, the early one from the output struct
+# of llama_model_sycl_build_early_inventory(), which the early plan and the plan dry run's header read call
+# (llama.cpp-4zup).
+IDX_PASS_RE = re.compile(r"(?<![\w.])(?:out\.)?kv_layer_arrays\.kind\.get\(\), "
+                         r"(?:out\.)?kv_layer_arrays\.idx_k_width\.get\(\),")
 
 
 def claim_kind_comes_from_the_default_memory(model: str, shapes: str) -> bool:
@@ -154,7 +158,7 @@ def claim_indexer_width_reaches_the_inventory(model: str, shapes: str) -> bool:
     arrays = body(norm(model), ARRAYS_SIG)
     n = norm(model)
     return (bool(owners) and ordered(owners, "out.idx_k_width.assign(model.hparams.n_layer_all, 0);", IDX_OWNERS)
-            and bool(arrays) and IDX_ARRAY in arrays and n.count(IDX_PASS) == 2 and IDX_FILL in n)
+            and bool(arrays) and IDX_ARRAY in arrays and len(IDX_PASS_RE.findall(n)) == 2 and IDX_FILL in n)
 
 
 def claim_shared_layer_costs_nothing(demotion_hpp: str) -> bool:
@@ -238,11 +242,14 @@ def test_mutant_inventory_fill_forgets_the_indexer_fails():
 
 
 def test_mutant_one_builder_passes_no_indexer_fails():
+    """Each builder in turn, the early one (through the output struct) and the late one, passes a null indexer array."""
     n = norm(MODEL)
-    at = n.find(IDX_PASS)
-    assert at >= 0
-    mutated = n[:at] + "kv_layer_arrays.kind.get(), nullptr," + n[at + len(IDX_PASS):]
-    assert not claim_indexer_width_reaches_the_inventory(mutated, SHAPES)
+    passes = list(IDX_PASS_RE.finditer(n))
+    assert len(passes) == 2
+    for m in passes:
+        kind = m.group(0)[:m.group(0).index("kind.get(),") + len("kind.get(),")]
+        mutated = n[:m.start()] + kind + " nullptr," + n[m.end():]
+        assert not claim_indexer_width_reaches_the_inventory(mutated, SHAPES)
 
 
 def test_mutant_indexer_only_layer_shared_fails():

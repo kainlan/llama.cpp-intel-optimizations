@@ -25,6 +25,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 #include "mem-handle.hpp"
+#include "moe-route-counts.hpp"
 #include "unified-cache.hpp"
 
 #include <atomic>
@@ -37,14 +38,6 @@
 #include <vector>
 
 namespace ggml_sycl {
-
-// SOA-correct expert caching via unified cache.
-// Looks up expert metadata, performs AOS->SOA layout conversion, and uploads
-// to VRAM on the specified device using direct_stage_expert().
-// Returns device pointer if expert was successfully cached in SOA layout.
-// Returns nullptr if caching failed (no metadata, VRAM full, etc.).
-// Thread-safe: acquires g_moe_expert_meta_mutex and unified cache locks internally.
-void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id);
 
 // Value-owned description of one expert staging operation. Metadata is copied
 // under the model registry lock; source_owner pins the canonical AOS entry and
@@ -94,11 +87,6 @@ sycl::event fill_reordered_host(sycl::queue &                    queue,
                                 size_t                           src_size,
                                 const void *                     ctx,
                                 const std::vector<sycl::event> & deps);
-
-// Look up expert frequency from epoch counters (recorded during MoE warmup/re-ranking).
-// Maps hash-based layer_id -> sequential index, then reads atomic epoch_counts.
-// Returns 0 if the expert has no recorded frequency (unknown layer or expert).
-uint32_t get_expert_frequency(int layer_hash, int expert_id);
 
 // Tracks a single in-flight async DMA prefetch operation.
 // The event is from direct_stage_expert() and completes when H2D DMA +
@@ -223,11 +211,6 @@ class ExpertPrefetcher {
     int completed_count() const;
 
     bool is_active() const { return is_initialized(); }
-
-    // Pre-fill the cache with popular experts at model init time.
-    // Called from moe_hybrid_init_once() after Phase 2.
-    // Routes through unified cache (no private pool).
-    void preload_experts(int layer_idx, const std::vector<int> & expert_ids);
 
   private:
     std::shared_ptr<sycl::queue>
@@ -362,8 +345,10 @@ class ExpertPredictor {
     // Checked by ExpertPrefetcher to short-circuit hint().
     bool is_prefetch_disabled() const;
 
-    // Get frequency ranking for a layer: sorted (expert_id, count) pairs,
-    // most-activated first. Used for popularity-based prestage ordering.
+    // Frequency ranking for a layer from the counts record_actual() keeps: sorted
+    // (expert_id, count) pairs, most-activated first. No backend code reads it; the
+    // predictor guard test calls it as one of the accessors that must take mutex_
+    // before the init guard.
     std::vector<std::pair<int, uint32_t>> get_frequency_ranking(int layer_idx) const;
 
   private:
@@ -494,6 +479,24 @@ struct MoeDispatchStats {
 
 // Global stats instance (one per device, indexed by device id)
 MoeDispatchStats & get_moe_dispatch_stats(int device);
+
+// The routed-expert counts of `device`'s current model (moe-route-counts.hpp): plain host heap, no SYCL allocation.
+// Each model's hybrid init installs a fresh table sized from its own blocks and experts, so the counts of two loads
+// in one process never mix. The returned table stays alive as long as any holder keeps the pointer: a record that
+// counts into it, a job still running on the CPU pool, the final report. Nothing resizes or frees a table in place.
+// Every install is a fresh table. The hybrid init that makes it runs again until it succeeds and after a model-owner
+// switch, so a record built before such a run keeps counting into the table it holds, which is then no longer the one
+// the final report reads: its counts are left out of the report, never mixed into another model's.
+std::shared_ptr<moe_route_counts> moe_route_counts_install(int device, int n_blocks, int n_experts);
+
+// The table the last install made, or null before the first one.
+std::shared_ptr<moe_route_counts> moe_route_counts_current(int device);
+
+// The final report of `device`'s table: one WARN line, and with GGML_SYCL_MOE_ROUTE_COUNTS_CSV=<path> the per-block
+// table and the CSV file too, rewritten with the table's cumulative counts. Prints when the decode pairs counted
+// have grown since the last report of this table, so one context prints once and a process that frees its backend once
+// per context (llama-bench) prints a cumulative line at each free. Prints nothing when no decode pair was counted.
+void moe_route_counts_report_final(int device, int64_t tokens);
 
 // Check if expert prediction is enabled via environment variable.
 // Default: ON (returns true unless GGML_SYCL_EXPERT_PREDICT=0).

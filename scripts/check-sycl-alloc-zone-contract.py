@@ -14,8 +14,11 @@ What this unit (S2a-S2d, S3-0 and its review fold) enforces
   (a) a request-type token inside an ERROR/MISSING region fails; a file whose root is ERROR
       (today cpu-dispatch.cpp) is also scanned lexically, and each lexical request must be
       host-only by a literal on its statement run
-  (b) a literal tier flag: must_device = true or must_host_pinned = true, not both, and the last
-      write of the flag must be that literal
+  (b) a literal tier flag: exactly one of must_device, must_host_pinned and must_host_cpu is true,
+      the last write of that flag is the literal, and each of the other two is unwritten or ends on
+      an unconditional literal false. must_host_cpu selects HOST_CPU explicitly (unified_select_tier
+      never falls into it), so it is a tier of its own, and like must_host_pinned a host tier that
+      clause (d) excuses. The lexical pass of (a) still reads only must_host_pinned as host-only.
   (d) a device request carries a prefer_vram_zone that is a literal non-COUNT enumerator, or a
       ternary whose arms all are, and forbid_vram_zone_spill = true, and the last write of each
       is that literal. A write nested under a conditional below the construction's own block
@@ -144,6 +147,15 @@ be written a literal false. Write credit is positional and does not follow contr
       ggml_sycl_fa_onednn_d512_enabled passes; the routing function's "reads the decline first" is not checked (its decline
       reader has no name yet); the charge side's walk helpers are not named, so the head-dim and helper rules cover the two
       named charge functions' bodies and the helper-name rule covers all of unified-cache.cpp/.hpp.
+  (r) the POOL lifetime (th32 design section 3.3, canonical contract section 12.5). A request that writes
+      `intent.lifetime = alloc_lifetime::POOL` establishes owner kind `alloc_owner_kind::IO_POOL` and
+      `must_host_cpu = true`, and a request that writes owner kind IO_POOL establishes lifetime POOL, each by an
+      unconditional literal as its last write (R-POOL). The lazy IO pool's reap is the only release of POOL memory and
+      its registry generation the only IO_POOL owner, so a POOL request of any other shape is memory that no owner
+      check reports and no reap frees. The owner is read from a braced `{ kind, id }`, a designated `.kind`, or a
+      write to `owner.kind`. R-POOL is never debt and never allowlisted.
+      Known (r) gap: a lifetime or owner kind passed in through a helper's parameter is an expression, not a literal,
+      so a POOL request built that way is not seen.
 
 Scope
   Every .cpp/.hpp under ggml/src/ggml-sycl except the skipped directories below. dpct/ is in
@@ -219,12 +231,17 @@ REQUIRED_FILES = ("ggml-sycl.cpp", "unified-cache.cpp", "unified-cache.hpp", "co
 BASE_TYPES = ("alloc_request", "alloc_intent", "alloc_constraints")
 ZONES = ("KV", "WEIGHT", "ONEDNN", "RUNTIME", "SCRATCH")
 # Fields whose literal value the rules read. Later clauses add to this set.
-TRACKED = ("must_device", "must_host_pinned", "prefer_vram_zone", "forbid_vram_zone_spill",
-           "cascade_step", "unconverted_ticket", "cohort_id")
+TRACKED = ("must_device", "must_host_pinned", "must_host_cpu", "prefer_vram_zone", "forbid_vram_zone_spill",
+           "cascade_step", "unconverted_ticket", "cohort_id", "lifetime", "owner")
+# The members of alloc_intent itself that clause (r) reads: a braced or copied intent re-seeds them, a constraints
+# copy leaves them alone.
+INTENT_FIELDS = ("lifetime", "owner")
+# The tier flags of clause (b), in the order a finding names them. Exactly one is established.
+TIER_FLAGS = ("must_device", "must_host_pinned", "must_host_cpu")
 # Fields of a request that are themselves structs: a write to one is a copy, not a literal.
 STRUCT_FIELDS = ("intent", "constraints")
 # Members of alloc_constraints the rules read (the tracked fields that are not the cohort).
-CONSTRAINT_FIELDS = tuple(f for f in TRACKED if f != "cohort_id")
+CONSTRAINT_FIELDS = tuple(f for f in TRACKED if f != "cohort_id" and f not in INTENT_FIELDS)
 # A wrapper that builds one site-carrying request type from another must copy these (witness 24). A write to the
 # nested intent's own site is keyed `intent.site_file`, so it is never mistaken for the request's.
 SITE_FIELDS = ("site_file", "site_line")
@@ -306,8 +323,11 @@ S2D_CODES = ("I-RETRY", "K-INTERIM", "L-CALLER", "L-FREE", "L-GUARD", "J-SOURCE"
              "M-DATA", "N-VOID", "N-NODISCARD", "O-NOROW", "O-ROW", "O-QUEUE", "Z9-SITE", "Z9-SIZING", "P-ROUTE", "P-HOME", "P-FILL",
              "P-LAYER", "P-CHARGE", "X-LATCH")
 S2D_NEVER_ALLOW = ("X-LATCH", "P-ROUTE", "P-HOME", "P-FILL", "P-LAYER", "P-CHARGE")
+# Clause (r): a POOL request's shape. Fixed, never debt and never allowlisted.
+R_CODES = ("R-POOL",)
 CODES = ("A-ERROR", "A-LEXICAL", "A-TOKEN", "B-BRACE", "B-FORM", "B-TIER", "C-COHORT", "C-SITE", "D-ZONE",
-         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "E-LIBC", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES
+         "D-ZONE-COUNT", "D-FORBID", "D-FORBID-FALSE", "E-RAW", "E-LIBC", "G-CATCH", "DEFER-C") + H_CODES + S2D_CODES \
+    + R_CODES
 
 
 # ---------------------------------------------------------------- tree-sitter accessors
@@ -849,12 +869,49 @@ def str_class(src, n):
     return "null" if txt(src, n).strip() in ("nullptr", "NULL", "0") else "expr"
 
 
+def enum_class(src, n, enum):
+    """The enumerator a literal `enum::NAME` (or `ns::enum::NAME`) names, or 'expr' for anything else."""
+    if kind(n) == "parenthesized_expression":
+        inner = [c for c in kids(n) if _a(c, "is_named")]
+        return enum_class(src, inner[0], enum) if inner else "expr"
+    if kind(n) == "qualified_identifier":
+        while fld(n, "name") is not None and kind(fld(n, "name")) == "qualified_identifier":
+            n = fld(n, "name")
+        scope, name = fld(n, "scope"), fld(n, "name")
+        if scope is not None and name is not None and txt(src, scope).split("::")[-1].strip() == enum:
+            return txt(src, name).strip()
+    return "expr"
+
+
+def owner_class(src, n):
+    """The owner kind of an alloc_owner_ref value: the first element or the `.kind` designator of a braced list,
+    'none' for an empty list (a value-initialised ref is kind NONE), else 'expr'."""
+    if kind(n) != "initializer_list":
+        return "expr"
+    elems = [c for c in kids(n) if kind(c) not in ("{", "}", ",", "comment")]
+    if not elems:
+        return "none"
+    for e in elems:
+        if kind(e) == "initializer_pair":
+            desig = [x for x in kids(e) if kind(x) == "field_designator"]
+            fi = [x for x in kids(desig[-1]) if kind(x) == "field_identifier"] if desig else []
+            if fi and txt(src, fi[0]) == "kind":
+                return enum_class(src, fld(e, "value"), "alloc_owner_kind")
+    if kind(elems[0]) == "initializer_pair":
+        return "none"  # designated, and no .kind: the kind keeps its default, NONE
+    return enum_class(src, elems[0], "alloc_owner_kind")
+
+
 def classify(src, field, n):
     if field in ("cohort_id", "unconverted_ticket"):
         return str_class(src, n)
+    if field == "lifetime":
+        return enum_class(src, n, "alloc_lifetime")
+    if field == "owner":
+        return owner_class(src, n)
     if field == "prefer_vram_zone":
         return zone_class(src, n)
-    if field in ("must_device", "must_host_pinned", "forbid_vram_zone_spill", "cascade_step"):
+    if field in TIER_FLAGS + ("forbid_vram_zone_spill", "cascade_step"):
         return bool_class(src, n)
     return "expr"
 
@@ -1475,6 +1532,11 @@ def writes_for(env, decl, name, blk, fields, copied, reason, st, callee_mode, st
                 st["pass"] = r[2]
         elif last in TRACKED:
             add_write(fields, last, pos, "expr" if compound else classify(src, last, rhs), cond or late,
+                      txt(src, rhs) if rhs is not None else "")
+        elif last == "kind" and chain[1:2] == ["owner"]:
+            # clause (r): a write to the owner's kind is a write of the owner
+            add_write(fields, "owner", pos,
+                      "expr" if compound or rhs is None else enum_class(src, rhs, "alloc_owner_kind"), cond or late,
                       txt(src, rhs) if rhs is not None else "")
         elif last in SITE_FIELDS:
             key = "intent." + last if "intent" in chain[1:] else last
@@ -2315,8 +2377,9 @@ def judge(c):
         out.append(("B-BRACE", "braceless `%s %s;` reports the class definition as its construction site; write `%s %s{}`"
                     % (c["type"], c["var"], c["type"], c["var"])))
     w = c["fields"]
-    dev = established(w.get("must_device", []), "true")
-    host = established(w.get("must_host_pinned", []), "true")
+    tiers = [f for f in TIER_FLAGS if established(w.get(f, []), "true")]
+    dev = "must_device" in tiers
+    host = "must_host_pinned" in tiers or "must_host_cpu" in tiers  # a host tier, pinned or HOST_CPU
     zone_ws, forbid_ws = w.get("prefer_vram_zone", []), w.get("forbid_vram_zone_spill", [])
     # A COUNT zone or a false forbid is a violation whatever a copy resolves to, so it is read before
     # the DEFER-C return; an established host tier is the only thing that excuses it.
@@ -2334,6 +2397,16 @@ def judge(c):
             out.append(("C-SITE", "built from %s but %s not copied from it by an unconditional assignment; the allocator "
                                   "would report this wrapper's line, not the caller's construction"
                         % (", ".join(inp), " and ".join(miss) + (" is" if len(miss) == 1 else " are"))))
+    life_ws, owner_ws = w.get("lifetime", []), w.get("owner", [])
+    if any(x[1] == "POOL" for x in life_ws) or any(x[1] == "IO_POOL" for x in owner_ws):
+        shape = [(established(life_ws, "POOL"), "lifetime POOL"), (established(owner_ws, "IO_POOL"), "owner kind IO_POOL"),
+                 (established(w.get("must_host_cpu", []), "true"), "must_host_cpu = true")]
+        miss = [name for ok, name in shape if not ok]
+        if miss:
+            out.append(("R-POOL", "a POOL request establishes lifetime POOL, owner kind IO_POOL and must_host_cpu = true, each "
+                                  "by an unconditional literal last write, and this one does not establish %s: only the lazy "
+                                  "IO pool's reap releases POOL memory and only its generation is an IO_POOL owner"
+                        % " or ".join(miss)))
     if c["needs_cohort"] and not established(w.get("cohort_id", []), "lit"):
         out.append(("C-COHORT", "a copy that is handed on must assign its own cohort_id literal; it inherits its source's "
                                 "site, so without one its trace and refusal lines read as the original's"))
@@ -2342,21 +2415,24 @@ def judge(c):
         return out
     if c["form"] == "stray" or c["pass"]:
         return out  # a pass-through's tier and zone are the caller's, judged at the caller's construction
-    if dev and host:
-        out.append(("B-TIER", "both must_device and must_host_pinned are established true; the tier is not decidable"))
+    if len(tiers) > 1:
+        out.append(("B-TIER", "%s are all established true; the tier is not decidable" % " and ".join(tiers)))
         return out
-    if not dev and not host:
-        out.append(("B-TIER", "neither must_device nor must_host_pinned is established by an unconditional literal true as its "
-                              "last write; unified_select_tier may turn it into HOST"))
+    if not tiers:
+        out.append(("B-TIER", "none of must_device, must_host_pinned and must_host_cpu is established by an "
+                              "unconditional literal true as its last write; unified_select_tier may turn it into "
+                              "HOST"))
         return out
-    other_name = "must_device" if host else "must_host_pinned"
-    ows = w.get(other_name, [])
-    if ows and not (ows[-1][1] == "false" and not ows[-1][2]):
-        # a write that is a conditional, a non-literal or a true can make the request the other tier unless an
-        # unconditional literal false comes after it (a copy may inherit such a write and overwrite it)
-        out.append(("B-TIER", "%s has a write that is not a literal false (a conditional true or a non-literal), so the "
-                              "tier is not decidable" % other_name))
-        return out
+    for other_name in TIER_FLAGS:
+        if other_name == tiers[0]:
+            continue
+        ows = w.get(other_name, [])
+        if ows and not (ows[-1][1] == "false" and not ows[-1][2]):
+            # a write that is a conditional, a non-literal or a true can make the request another tier unless an
+            # unconditional literal false comes after it (a copy may inherit such a write and overwrite it)
+            out.append(("B-TIER", "%s has a write that is not a literal false (a conditional true or a non-literal), "
+                                  "so the tier is not decidable" % other_name))
+            return out
     if host:
         return out
     codes = {o[0] for o in out}
@@ -2494,10 +2570,9 @@ O_EXECUTE = "dnnl::graph::sycl_interop::execute"
 # zone sizing. (function, [(file, site function)]). The subjects are absent from the tree today.
 Z9_SIZING_FILES = ("zone-sizing.cpp", "unified-cache.cpp")
 Z9_SITES = (
-    ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"), ("ggml-sycl.cpp", "arena_device_alloc"),
+    ("load_reorder_temp_bytes", (("convert.cpp", "convert_alloc_device_scratch"),
                                  ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled"), ("ggml-sycl.cpp", "ggml_sycl_fill_xmx_tiled_host"),
-                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"),
-                                 ("unified-cache.cpp", "unified_cache::reserve_reorder_temp"))),
+                                 ("ggml-sycl.cpp", "sycl_unified_device_temp_alloc"))),
     ("woq_packed_bytes", (("gemm.hpp", "woq_gemm_q4_0_impl"),)),
     ("mmq_work_counter_bytes", (("mmq.cpp", "get_mmq_work_counter"),)),
     ("set_rows_stage_bytes", (("set_rows.cpp", "ggml_sycl_set_rows_stage_ptr"),)),
@@ -3719,6 +3794,9 @@ def validate_data(allowlist, debt):
             continue
         if e["code"] not in CODES:
             errs.append("FAIL allowlist entry %s has unknown code %r" % (e["id"], e["code"]))
+        if e["code"] in R_CODES:
+            errs.append("FAIL allowlist entry %s: a finding of code %s is fixed, never exempted (a POOL request has one shape)"
+                        % (e["id"], e["code"]))
         if e["code"] in S2D_NEVER_ALLOW:
             errs.append("FAIL allowlist entry %s: a finding of code %s is fixed, never exempted (an X-LATCH means the clause cannot "
                         "see the code; a P-* finding is a design pin)" % (e["id"], e["code"]))
@@ -3754,6 +3832,8 @@ def validate_data(allowlist, debt):
             errs.append("FAIL debt entry %s %s has unknown code" % (d["code"], d["key"]))
         if d["code"] in H_CODES:
             errs.append("FAIL debt entry %s %s: a clause-(h) finding is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
+        if d["code"] in R_CODES:
+            errs.append("FAIL debt entry %s %s: a POOL request's shape is fixed, never debt" % (d["code"], d["key"]))
         if d["code"] in S2D_CODES:
             errs.append("FAIL debt entry %s %s: a finding of this code is allowlisted per node or fixed, never debt" % (d["code"], d["key"]))
         seen[(d["code"], d["key"])] += 1
@@ -3831,6 +3911,10 @@ def run_gate(files, allowlist, debt):
 def plan_debt_write(viols, allowlist, old_debt, allow_growth):
     """(ok, message, entries). Rewriting the debt list may drop entries; adding one needs --allow-growth."""
     rest = [v for v in viols if not any(entry_matches(e, v) for e in allowlist.get("entries", []))]
+    bad = sorted({v.ident() for v in rest if v.code in R_CODES})
+    if bad:
+        return False, "clause-(r) findings cannot be debt or allowlisted; fix them:\n%s" % "\n".join(
+            "  %s %s" % b for b in bad[:20]), []
     bad = sorted({v.ident() for v in rest if v.code in H_CODES})
     if bad:
         return False, "clause-(h) findings cannot be debt; fix them or allowlist each node:\n%s" % "\n".join(
@@ -3928,6 +4012,8 @@ WITNESSES = {
     "5": "raw allocator in a new function", "6": "comments and strings are not code",
     "7": "rename an exempt function", "8": "allowlist entry that matches nothing or pins a wrong count",
     "12": "request with no tier flag", "13": "request inside a broken #if", "14": "ternary arms",
+    "12c": "must_host_cpu is the third tier flag: exactly one of the three is established, the other two absent or "
+           "literal false",
     "18": "offload_buffer_request needs a literal tier", "19": "ERROR-root lexical pass", "20": "member initialiser",
     "23": "braceless declaration", "c1": "template argument hides a raw name", "i1": "dpct is in scope",
     "i2": "construction forms the enumeration could not see", "i3": "COUNT/false after a copy at a listed site",
@@ -3986,6 +4072,7 @@ WITNESSES = {
     "s2d": "the appendix census table is data: a missing appendix-rows.json fails",
     "37": "clause (p): the oneDNN SDPA arms sit in routed branches; the plan is read only by route_admits",
     "38": "clause (p): the support decision has one home (switch read, shape function, fills, layer name, case line, charge side)",
+    "r-pool": "clause (r): lifetime POOL, owner kind IO_POOL and must_host_cpu = true are established together, or not at all",
 }
 
 # the witnesses that run as process-level checks in `--witnesses` rather than as matrix cases
@@ -4069,6 +4156,32 @@ def matrix_cases():
     A(Case("12", "tier written as a non-literal expression", plant(
         "void zzplant_w12(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = b;\n}\n" % REQ),
         "FAIL", "B-TIER", "zzplant_w12"))
+    # 12c: must_host_cpu is the third tier (the canonical contract's HOST_CPU rule): exactly one of the three flags
+    A(Case("12c", "request with a literal HOST_CPU tier and no zone (control)", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n}\n" % REQ), "PASS"))
+    A(Case("12c", "HOST_CPU tier with the other two flags written literal false (control)", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.must_device = false;\n"
+        "    req.intent.constraints.must_host_pinned = false;\n}\n" % REQ), "PASS"))
+    A(Case("12c", "HOST_CPU tier with forbid false is excused from clause (d) like a pinned host tier (control)", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = false;\n}\n" % REQ), "PASS"))
+    A(Case("12c", "must_host_cpu beside a zoned, forbidding must_device", plant(good_device(
+        "zzplant_w12c", "    req.intent.constraints.must_host_cpu = true;\n")), "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "must_host_cpu beside must_host_pinned", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.must_host_pinned = true;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "the control's mutant: must_host_cpu = true then = false leaves no tier", plant(
+        "void zzplant_w12c() {\n    %s req{};\n    req.intent.constraints.must_host_cpu = true;\n"
+        "    req.intent.constraints.must_host_cpu = false;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "must_host_cpu written as a non-literal expression", plant(
+        "void zzplant_w12c(bool b) {\n    %s req{};\n    req.intent.constraints.must_host_cpu = b;\n}\n" % REQ),
+        "FAIL", "B-TIER", "zzplant_w12c"))
+    A(Case("12c", "a zoned device request with a conditional must_host_cpu = true", plant(
+        "void zzplant_w12c(bool b) {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
+        "    req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;\n"
+        "    req.intent.constraints.forbid_vram_zone_spill = true;\n"
+        "    if (b) req.intent.constraints.must_host_cpu = true;\n}\n" % REQ), "FAIL", "B-TIER", "zzplant_w12c"))
     # m1: last-write semantics on the tier
     A(Case("m1", "must_device = true then = false", plant(
         "void zzplant_m1() {\n    %s req{};\n    req.intent.constraints.must_device = true;\n"
@@ -4962,6 +5075,7 @@ def matrix_cases():
     c.extend(matrix_cases_s31())
     c.extend(matrix_cases_s3f())
     c.extend(matrix_cases_s3g())
+    c.extend(matrix_cases_r())
     return c
 
 
@@ -5354,14 +5468,14 @@ def matrix_cases_s2d1():
         "unified-cache.cpp", 'const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
         "const char * env = nullptr;"), "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "ensure_planned_arena_zones stops calling the reader while rows still draw", replace_once(
-        "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+        "unified-cache.cpp", "size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);",
         "size_t scratch_zone = 512ULL * 1024 * 1024;"), "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "the reader's getenv commented out while rows still draw", replace_once(
         "unified-cache.cpp", 'const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");',
         'const char * env = nullptr;  // const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");'),
            "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "ensure_planned_arena_zones' call of the reader commented out while rows still draw", replace_once(
-        "unified-cache.cpp", "size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);",
+        "unified-cache.cpp", "size_t scratch_zone  = ggml_sycl_compute_arena_bytes(dev_id);",
         "size_t scratch_zone = 512ULL * 1024 * 1024;  // was ggml_sycl_compute_arena_bytes(dev_id);"),
            "FAIL", "M-FLOOR", "does not apply"))
     A(Case("32", "the unmutated tables and floor (control)", plant("void zzplant_m() {\n}\n"), "PASS", planted=False))
@@ -5598,9 +5712,10 @@ def matrix_cases_s2d3():
         "constexpr auto REAP_NOW = RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER;\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
     A(Case("30", "the COMPLETE mode behind a macro: the latch fails", plant(
         "#define REAP_NOW RETAINED_REAP_EVENTS_COMPLETE_BY_CALLER\n" + INTERIM), "FAIL", "X-LATCH", "latch:k", planted=False))
-    # m-1: the sixth allocation site of witness 9
-    A(Case("9", "load_reorder_temp_bytes defined, but unified_cache::reserve_reorder_temp does not call it", plant(
-        "size_t load_reorder_temp_bytes(int n) {\n    return (size_t) n;\n}\n"), "FAIL", "Z9-SITE", "unified_cache::reserve_reorder_temp"))
+    # The last allocation site of witness 9's first subject is checked like the others
+    A(Case("9", "load_reorder_temp_bytes defined, but sycl_unified_device_temp_alloc does not call it", plant(
+        "size_t load_reorder_temp_bytes(int n) {\n    return (size_t) n;\n}\n"), "FAIL", "Z9-SITE",
+        "sycl_unified_device_temp_alloc"))
     # m-4: an allowlist entry can never exempt an S2d finding that must be fixed
     for code in ("X-LATCH", "P-ROUTE", "P-CHARGE"):
         A(Case("m5", "an allowlist entry for %s is refused" % code, lambda f: f, "FAIL", "allowlist", "never exempted",
@@ -5976,6 +6091,38 @@ def matrix_cases_s3f():
            "names a ruling-ledger id", edit_debt=e_libc_cite("ruling M265 R2, step 7 census item (f): deleted with S7(d)"), planted=False))
     A(Case("s3f-data", "the CHECK_TRY_ERROR cite citing a ruling-ledger id fails", lambda f: f, "FAIL", "data", "names a ruling-ledger id",
            edit_debt=pin_cite("ruling M265 R3, design 5.4a: the handler is rewritten there"), planted=False))
+    return c
+
+
+def matrix_cases_r():
+    """Clause (r): the block ring's request shape is the one POOL shape (the witness), and each way of breaking it fails."""
+    c = []
+    A = c.append
+
+    def pool_req(owner="{ ggml_sycl::alloc_owner_kind::IO_POOL, gen }", lifetime="ggml_sycl::alloc_lifetime::POOL",
+                 tier="must_host_cpu", extra=""):
+        return ("void zzplant_rpool(unsigned long long gen, bool b) {\n    %s req{};\n"
+                "    req.intent.role = ggml_sycl::alloc_role::LAZY_STAGING;\n"
+                "    req.intent.constraints.%s = true;\n"
+                "    req.intent.lifetime = %s;\n"
+                "    req.intent.owner = %s;\n%s    (void) b;\n}\n" % (REQ, tier, lifetime, owner, extra))
+
+    A(Case("r-pool", "the block ring's request: lifetime POOL, owner {IO_POOL, generation}, HOST_CPU", plant(pool_req()),
+           "PASS"))
+    A(Case("r-pool", "the mutant: a POOL request whose owner is {NONE, 0}", plant(
+        pool_req(owner="{ ggml_sycl::alloc_owner_kind::NONE, 0 }")), "FAIL", "R-POOL", "zzplant_rpool"))
+    A(Case("r-pool", "an IO_POOL owner on an UNOWNED request", plant(
+        pool_req(lifetime="ggml_sycl::alloc_lifetime::UNOWNED")), "FAIL", "R-POOL", "zzplant_rpool"))
+    A(Case("r-pool", "a POOL request on the pinned tier", plant(pool_req(tier="must_host_pinned")), "FAIL", "R-POOL",
+           "zzplant_rpool"))
+    A(Case("r-pool", "a POOL request whose owner kind is set by a conditional write to owner.kind", plant(
+        pool_req(owner="{}", extra="    if (b) req.intent.owner.kind = ggml_sycl::alloc_owner_kind::IO_POOL;\n")),
+        "FAIL", "R-POOL", "zzplant_rpool"))
+    A(Case("r-pool", "a later braced intent discards the owner, and the tier and lifetime written again do not restore it",
+           plant(pool_req(extra="    req.intent = { ggml_sycl::alloc_role::LAZY_STAGING };\n"
+                                "    req.intent.constraints.must_host_cpu = true;\n"
+                                "    req.intent.lifetime = ggml_sycl::alloc_lifetime::POOL;\n")),
+           "FAIL", "R-POOL", "zzplant_rpool"))
     return c
 
 

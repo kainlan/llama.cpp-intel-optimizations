@@ -375,6 +375,10 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
 bool        common_chat_templates_was_explicit(const struct common_chat_templates * tmpls);
 std::string common_chat_templates_source(const struct common_chat_templates * tmpls, const std::string & variant = "");
 
+// True when the built-in (non-jinja) matcher cannot render this template set. A tool whose default is the built-in
+// matcher has to switch to the jinja engine to run such a model at all.
+bool common_chat_templates_need_jinja(const struct common_chat_templates * tmpls);
+
 struct common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                       const struct common_chat_templates_inputs & inputs);
 

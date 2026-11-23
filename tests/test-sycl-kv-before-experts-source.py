@@ -28,7 +28,7 @@ The fix this gate pins:
     n_ctx for a single sequence, or 0 when no request reached the load (a caller that never sets the field), which
     holds no room. The hint is resolved in one place, src/llama-n-ctx-hint.h, whose default-context rule
     test-sycl-ctx-hint-default-source pins. The placement envelope's n_ctx stays 0, so the planning shape keeps its
-    inputs; the load measures read the resolved hint (llama_load_measure_request_n_ctx).
+    inputs; the load measures read the resolved hint (llama_load_measure_shape_resolve).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -281,21 +281,32 @@ HINT_PICK = "inventory.n_ctx_context = ctx_room.n_ctx_context;"
 HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);"
 # Both builders pass the model's context hint, with its micro-batch hint after it (test-sycl-explicit-ubatch-placement-
 # source pins that one), and the inventory ends with the slot-to-layer map (test-sycl-kv-slot-layer-source pins its
-# use), after the micro-batch and the context's provenance. Growing the struct moves none of the pinned offsets.
+# use), after the lazy tables (th32 §4.1), the micro-batch, the context's provenance and libllama's resolved storage
+# inputs (test-sycl-mapped-loader-source pins those), with the measured micro-batch in the lazy tables' padding.
+# Growing the struct moves none of the pinned offsets.
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
-            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; const int32_t * kv_layer_phys; "
-            "uint32_t kv_layer_phys_count; }")
-COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
+            "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
+            "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
+            "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
+            "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }")
+# The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
+# (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
+STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+             "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 224,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,",
-    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 192,",
-    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 200,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 208,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 216,",
 )
 
 
@@ -305,7 +316,7 @@ def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str
     model's default context, llama.cpp-7fmt, is pinned by test-sycl-ctx-hint-default-source); both plan builders pass
     the model's hint. The context sits right after kv_layer_count and before the indexer widths (the KV tail
     ggml-sycl.cpp pins with static_asserts, with the context's provenance appended after it), and the backend copies
-    it into its KV inputs."""
+    it into its KV inputs (in the KV intake, which the stage hands g_placement_kv_info)."""
     m   = norm(model)
     pop = body(m, POPULATE_SIG)
     r   = body(norm(resolver), RESOLVE_SIG)
@@ -319,7 +330,8 @@ def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str
             and m.count(HINT_PASS) == 2
             and "uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }" in norm(model_h)
             and inv.endswith(INV_TAIL)
-            and COPY_CTX in s and all(a in s for a in TAIL_ASSERTS))
+            and COPY_CTX in body(s, INTAKE_SIG) and INTAKE_CALL in body(s, STAGE_SIG)
+            and all(a in s for a in TAIL_ASSERTS))
 
 
 def claim_hint_is_padded_like_the_context(resolver: str, context: str) -> bool:
@@ -334,7 +346,7 @@ def claim_hint_is_padded_like_the_context(resolver: str, context: str) -> bool:
 
 def claim_envelope_keeps_no_context(model: str) -> bool:
     """The envelope still carries n_ctx 0, so the planning shape keeps n_ctx_train and 512; the probe, admitted and
-    late measures read the resolved hint (llama_load_measure_request_n_ctx)."""
+    late measures read the resolved hint (llama_load_measure_shape_resolve)."""
     env = body(norm(model), ENVELOPE_SIG)
     return bool(env) and "envelope.n_ctx = 0;" in env and "n_ctx_hint" not in env
 
@@ -348,8 +360,10 @@ def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
-               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
+# common maps -c to the hint in common_n_ctx_hint, which common_model_params_to_llama asks (llama.cpp-h187).
+COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
+COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
+COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
 COMMON_FIT = "common_fit_params(params.model.get_paths(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
@@ -363,8 +377,8 @@ def claim_common_hands_the_requested_context(common: str) -> bool:
     fit is a no-op) keeps the default, and a negative -c keeps no room."""
     n = norm(common)
     b = body(n, COMMON_SIG)
-    return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
-            and n.count(FIT_REFRESH) == 1)
+    return (bool(b) and body(n, COMMON_HINT_SIG) == "{ " + COMMON_HINT + " }" and COMMON_HINT_CALL in b
+            and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD) and n.count(FIT_REFRESH) == 1)
 
 
 BENCH_CTX = "uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }"
@@ -643,6 +657,11 @@ def test_mutant_backend_drops_the_context_fails():
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, COPY_CTX, ""), SYCL_H, RESOLVER)
 
 
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, INTAKE_CALL, ""), SYCL_H, RESOLVER)
+
+
 def test_mutant_envelope_carries_the_hint_fails():
     """The hint routed through envelope.n_ctx would move the load measures' compute term too."""
     assert not claim_envelope_keeps_no_context(_once(MODEL, "envelope.n_ctx = 0;", "envelope.n_ctx = n_ctx_hint;"))
@@ -655,7 +674,12 @@ def test_mutant_api_hint_not_last_fails():
 
 
 def test_mutant_common_drops_the_hint_fails():
-    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_HINT, ""))
+    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_HINT_CALL, ""))
+
+
+def test_mutant_common_default_context_asks_no_room_fails():
+    assert not claim_common_hands_the_requested_context(
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : 0;"))
 
 
 def test_mutant_common_fit_keeps_the_unfitted_hint_fails():

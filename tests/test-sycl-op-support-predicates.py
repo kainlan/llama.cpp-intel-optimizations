@@ -267,6 +267,106 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     admitted_total = sum(a for _, a, _ in actual)
     assert (forward_total, admitted_total, forward_total - admitted_total) == (146, 44, 102)
 
+    # The same inventory read row by row: every row of the single-inplace window is classified, and the in-place
+    # rows the predicate decides are the nest's view rows.
+    start = inventory.index("// single inplace test per type/mode/ff")
+    end = inventory.index("for (int v :", start)
+    block = inventory[start:end]
+
+    def loop_values(declaration: str) -> List[str]:
+        match = re.search(rf"for \({declaration} : \{{([^}}]+)\}}\)", block)
+        assert match is not None
+        return [value.strip() for value in match.group(1).split(",")]
+
+    types = loop_values("ggml_type type")
+    modes = loop_values("int mode")
+    factors = loop_values("bool ff")
+    discovered_rows = re.findall(r"test_cases\.emplace_back\(new test_rope\((.*?)\)\);", block, re.DOTALL)
+    parsed_views = []
+    parsed_offset_views = []
+    skipped_non_inplace = 0
+    skipped_real_model = 0
+    parsed_bf16_views = []
+    skipped_bf16_non_inplace = 0
+    parsed_truncate_views = []
+    skipped_truncate_non_inplace = 0
+    for row in discovered_rows:
+        # original inplace rows: (..., ff, <v>, true, true)
+        match = re.search(r"ff,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
+        if match is not None:
+            parsed_views.append(int(match.group(1)))
+            continue
+        # b10630 rope_set_offset inplace row: (..., <v>, true, true, <n_offs>)
+        # -- outside the type x mode x ff nest, tracked separately from the
+        # nest inventory so the decision arithmetic below stays well-formed.
+        match = re.search(r"([-+]?\d+)\s*,\s*true\s*,\s*true\s*,\s*\d+\s*$", row)
+        if match is not None:
+            parsed_offset_views.append(int(match.group(1)))
+            continue
+        # b10630 rope_set_offset NON-inplace rows: (..., fw, false, <n_offs>) --
+        # outside this contract's inplace inventory, present in the same block.
+        if re.search(r",\s*(?:fw|false|true)\s*,\s*false\s*,\s*\d+\s*$", row):
+            skipped_non_inplace += 1
+            continue
+        # Upstream real-model RoPE rows (hexagon #28628, merged 2026-09-09): literal bool ff, then
+        # (v, forward) and no inplace argument, so they default to out-of-place like the offset rows.
+        if re.search(r",\s*(?:false|true)\s*,\s*\d+\s*,\s*true\s*$", row):
+            skipped_real_model += 1
+            continue
+        # Upstream BF16 ROPE (#32387): a mode x ff nest of its own with a forward strided view and a backward
+        # offset view, both out-of-place, and one inplace row per mode. SYCL refuses BF16 ROPE before this
+        # predicate (ggml_sycl_op_core_semantics_supported), so these stay out of the decision arithmetic.
+        if row.startswith("GGML_TYPE_BF16"):
+            match = re.search(r",\s*(?:false|true)\s*,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
+            if match is not None:
+                parsed_bf16_views.append(int(match.group(1)))
+                continue
+            if re.search(r",\s*ff\s*,\s*\d+\s*,\s*(?:true|false)\s*$", row):
+                skipped_bf16_non_inplace += 1
+                continue
+        # Upstream YaRN truncate rows (#30206): (..., ff, v, forward, inplace, n_offs 0, n_ctx_orig, freq_base,
+        # beta_fast, truncate), one out-of-place row per fw and one inplace row, in a type x mode x truncate nest.
+        match = re.search(r",\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*,\s*0\s*,(?:[^,]*,){3}\s*truncate\s*$", row)
+        if match is not None:
+            parsed_truncate_views.append(int(match.group(1)))
+            continue
+        if re.search(r",\s*fw\s*,\s*false\s*,\s*0\s*,(?:[^,]*,){3}\s*truncate\s*$", row):
+            skipped_truncate_non_inplace += 1
+            continue
+        raise AssertionError(f"unparsed inplace ROPE inventory row: {row!r}")
+    assert (len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace + skipped_real_model +
+            len(parsed_bf16_views) + skipped_bf16_non_inplace + len(parsed_truncate_views) +
+            skipped_truncate_non_inplace == len(discovered_rows))
+
+    assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
+    assert modes == [
+        "GGML_ROPE_TYPE_NORMAL",
+        "GGML_ROPE_TYPE_NEOX",
+        "GGML_ROPE_TYPE_MROPE",
+        "GGML_ROPE_TYPE_IMROPE",
+        "GGML_ROPE_TYPE_VISION",
+    ]
+    assert factors == ["false", "true"]
+    assert parsed_views == [0, 1, 1]
+    # b10630 rope_set_offset block: 4 non-inplace offset rows per fw x ff nest
+    # plus one inplace-with-offset row (view 0), all inside the same window.
+    assert parsed_offset_views == [0]
+    assert skipped_non_inplace == 4
+    # qwen3.5 0.8B/4B and gemma4 E2B/E4B shapes: out-of-place, outside this inplace contract.
+    assert skipped_real_model == 4
+    # BF16: two out-of-place rows per mode x ff, one inplace row (view 0) per mode.
+    assert parsed_bf16_views == [0]
+    assert skipped_bf16_non_inplace == 2
+    # YaRN truncate: one out-of-place row per fw and one inplace row on a view (v = 1), which the predicate
+    # refuses like the nest's view rows when that view is not contiguous.
+    assert parsed_truncate_views == [1]
+    assert skipped_truncate_non_inplace == 1
+
+    multiplicity = len(types) * len(modes) * len(factors)
+    decisions = [view == 0 for view in parsed_views for _ in range(multiplicity)]
+    assert decisions.count(False) == 40
+    assert decisions.count(True) == 20
+
 
 def _contract_rejects(oracle, source: str) -> bool:
     try:
@@ -658,6 +758,8 @@ _BATCHED_NC_CONVERT = "const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp1
 _INDEXED_CONTIGUITY_GUARD = "if(op->op==GGML_OP_MUL_MAT_ID){if(!ggml_is_contiguous(op->src[0])){returnfalse;}"
 _PROMPT_STAGING_SITE = "if (!pp_mxfp4_soa_f16_ready && !ensure_src1_contiguous_f32()) {"
 _PROMPT_STAGING_ABORT = "Failed to allocate PP F32 activation staging"
+_PROMPT_STAGING_REFUSE = "refuse_src1_f32_staging();"
+_PROMPT_STAGING_LAMBDA = "auto refuse_src1_f32_staging = [&]() {"
 # What each kernel family reads, from its own source. The p021 and nc kernels assert an F32 src1. The batched
 # routes read F16 as it is and convert any other type through the strided f16 converter (their oneMath and
 # scalar-fallback arms), so a type that converter lacks has no reader. Outside the f16 chain, the orchestrator's
@@ -755,16 +857,24 @@ def _assert_prompt_staging_contract(full_source: str) -> None:
     assert site >= 0 and full_source.count(_PROMPT_STAGING_SITE) == 1, "prompt activation staging site"
     open_brace = site + len(_PROMPT_STAGING_SITE) - 1
     body = _compact(full_source[open_brace + 1 : _matching_close(full_source, open_brace)])
-    # Before any expert kernel is submitted, a staging failure refuses the graph through the recoverable path.
+    # Before any expert kernel is submitted, a staging failure refuses the graph through the recoverable path: the
+    # site calls the op's one F32 staging refusal, which throws ggml_sycl_fallback_error through
+    # ggml_sycl_moe_pp_refuse_staging (test-sycl-moe-pp-staging-refusal-source pins that helper).
     assert "GGML_ABORT" not in body, body
-    assert re.search(r"throwggml_sycl_fallback_error\(\"[^\"]+\"\);$", body), body
-    # The two per-expert sites stay aborts: an unwind there would release expert-weight leases and scratch
-    # owners that kernels already submitted still read.
-    later = [m.start() for m in re.finditer(re.escape(_PROMPT_STAGING_ABORT), full_source)]
-    assert len(later) == 2 and all(position > site for position in later), later
+    assert body == _PROMPT_STAGING_REFUSE.replace(" ", ""), body
+    lam = full_source.find(_PROMPT_STAGING_LAMBDA)
+    assert 0 <= lam < site and full_source.count(_PROMPT_STAGING_LAMBDA) == 1, "F32 staging refusal"
+    lam_open = lam + len(_PROMPT_STAGING_LAMBDA) - 1
+    lam_body = _compact(full_source[lam_open + 1 : _matching_close(full_source, lam_open)])
+    assert lam_body.startswith("ggml_sycl_moe_pp_refuse_staging(") and lam_body.endswith(");"), lam_body
+    # The two per-expert sites refuse the same way. They sit inside the try whose handler runs the op's exit work
+    # while it still holds every expert-weight lease and scratch owner a submitted kernel reads, so their unwind
+    # releases nothing a kernel still reads; none of them aborts.
+    refusals = [m.start() for m in re.finditer(re.escape(_PROMPT_STAGING_REFUSE), full_source)]
+    assert len(refusals) == 3 and all(position > site for position in refusals), refusals
     abort_call = re.compile(r"GGML_ABORT\(\s*\"\[MoE\] " + re.escape(_PROMPT_STAGING_ABORT))
     aborts = [m.start() for m in abort_call.finditer(full_source)]
-    assert len(aborts) == 2 and all(position > site for position in aborts), aborts
+    assert not aborts, aborts
 
 
 def test_mul_mat_and_mul_mat_id_decline_what_no_route_reads() -> None:
@@ -839,18 +949,21 @@ def test_mul_mat_route_and_staging_mutations_are_detected() -> None:
 
     # The first staging site aborting again.
     site = full_source.index(_PROMPT_STAGING_SITE)
-    throw = full_source.index("throw ggml_sycl_fallback_error(", site)
-    end = full_source.index(";", throw) + 1
-    aborting = full_source[:throw] + 'GGML_ABORT("staging");' + full_source[end:]
+    refuse = full_source.index(_PROMPT_STAGING_REFUSE, site)
+    end = refuse + len(_PROMPT_STAGING_REFUSE)
+    aborting = full_source[:refuse] + 'GGML_ABORT("staging");' + full_source[end:]
     assert _contract_rejects(_assert_prompt_staging_contract, aborting)
-    # A per-expert site turned into log-and-throw with its message kept (its unwind would release live leases).
-    loop_message = full_source.index(_PROMPT_STAGING_ABORT, site)
-    loop_abort = full_source.rindex("GGML_ABORT(", site, loop_message)
-    loop_end = full_source.index(");", loop_message) + 2
-    thrown = (full_source[:loop_abort] + "GGML_LOG_ERROR(" + full_source[loop_abort + len("GGML_ABORT(") : loop_end]
-              + ' throw ggml_sycl_fallback_error("staging");' + full_source[loop_end:])
-    assert full_source.count(_PROMPT_STAGING_ABORT) == thrown.count(_PROMPT_STAGING_ABORT)
-    assert _contract_rejects(_assert_prompt_staging_contract, thrown)
+    # A per-expert site turned back into an abort with the old message.
+    loop_refuse = full_source.index(_PROMPT_STAGING_REFUSE, end)
+    loop_end = loop_refuse + len(_PROMPT_STAGING_REFUSE)
+    aborted = (full_source[:loop_refuse] + 'GGML_ABORT("[MoE] ' + _PROMPT_STAGING_ABORT + ' for %s", "?");'
+               + full_source[loop_end:])
+    assert _contract_rejects(_assert_prompt_staging_contract, aborted)
+    # The refusal logging and returning instead of throwing.
+    lam = full_source.index(_PROMPT_STAGING_LAMBDA)
+    helper = full_source.index("ggml_sycl_moe_pp_refuse_staging(", lam)
+    returning = full_source[:helper] + "GGML_LOG_ERROR(\"staging\"); return; (void) " + full_source[helper:]
+    assert _contract_rejects(_assert_prompt_staging_contract, returning)
 
     # The unified dispatch block gaining a src1 type check, or reading src1 some other way.
     unified_block = full_source.index(_UNIFIED_DISPATCH_BLOCK)

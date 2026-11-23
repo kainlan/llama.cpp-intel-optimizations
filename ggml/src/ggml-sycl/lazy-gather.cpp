@@ -1,0 +1,143 @@
+#include "lazy-gather.hpp"
+
+#include "lazy-io-pool.hpp"
+#include "lazy-row-cache.hpp"
+
+#include <cerrno>
+#include <new>
+#include <system_error>
+
+namespace ggml_sycl {
+
+namespace {
+
+// One gather's request, its ticket and its landing slot: what every waiter the gather submits points into.
+struct gather_frame {
+    lazy_gather_request req;
+    lazy_io_ticket      ticket;
+    lazy_landing_slot   slot;
+};
+
+}  // namespace
+
+int lazy_gather_rows(lazy_row_cache *           cache,
+                     const lazy_gather_source & src,
+                     uint64_t                   context,
+                     uint32_t                   epoch,
+                     int32_t                    deadline,
+                     const int32_t *            rows,
+                     size_t                     n,
+                     uint8_t *                  dst,
+                     size_t                     dst_bytes,
+                     lazy_gather_stats *        stats) noexcept {
+    lazy_gather_stats   local;
+    lazy_gather_stats & st = stats != nullptr ? *stats : local;
+    st                     = {};
+    if (n == 0) {
+        return 0;
+    }
+    if (rows == nullptr || dst == nullptr || src.row_size == 0 || dst_bytes / src.row_size < n) {
+        return EINVAL;
+    }
+    // A cache of another row size would copy past each row's place in dst, and insert a row from past the read's bytes.
+    if (cache != nullptr && cache->row_size() != src.row_size) {
+        return EINVAL;
+    }
+    // A row whose block span exceeds one chunk would be queued as several reads, each with part of the row: the waiter
+    // count would no longer be one per miss, and a part cannot be inserted into the cache as the row. The widest span
+    // of a row of r bytes, starting 4095 bytes into its first block, is (r + 8190) / 4096 whole blocks, which is at
+    // most one chunk exactly when r is at most a chunk less 4095 bytes.
+    if (src.row_size > LAZY_IO_CHUNK_BYTES - (LAZY_IO_BLOCK_BYTES - 1)) {
+        return EINVAL;
+    }
+    // The table's end, file_offset + n_rows * row_size, must fit a uint64_t, so no row's file offset can wrap.
+    if (src.n_rows < 0 ||
+        (src.n_rows > 0 && src.row_size > (UINT64_MAX - src.file_offset) / static_cast<uint64_t>(src.n_rows))) {
+        return EINVAL;
+    }
+    // The request, ticket and landing slot live on this frame, and no pointer to them leaves it but the waiters': the
+    // wait below is what makes that safe. The slot's epoch is set once, here, before the first submit.
+    gather_frame   own;
+    gather_frame * frame = &own;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // A runtime mutant may let the wait return before the reads are delivered (the two unwaited gathers below, or a
+    // ticket wait that returns at once), so under any mutant the frame is leaked instead: a test must see the early
+    // return, not a delivery into a dead frame. A gather that cannot leak it submits nothing.
+    if (!lazy_ring_mutant_is(lazy_ring_mutant::NONE)) {
+        frame = new (std::nothrow) gather_frame;
+        if (frame == nullptr) {
+            return ENOMEM;
+        }
+    }
+#endif
+    lazy_gather_request & req    = frame->req;
+    lazy_io_ticket &      ticket = frame->ticket;
+    lazy_landing_slot &   slot   = frame->slot;
+    req.epoch                    = epoch;
+    req.ticket                   = &ticket;
+    ticket.request               = &req;
+    slot.epoch                   = epoch;
+    slot.data                    = dst;
+    slot.bytes                   = n * src.row_size;
+
+    const size_t      span_bytes = lazy_block_ring_span(src.row_size);
+    const lazy_io_key key{ lazy_io_class::PREFETCH, epoch, deadline, lazy_io_kind::TABLE_ROWS };
+    int               stopped = 0;  // why submitting stopped early; the reads already counted are still waited for
+    for (size_t i = 0; i < n && stopped == 0; ++i) {
+        const int64_t row = rows[i];
+        if (row < 0 || row >= src.n_rows) {
+            stopped = EINVAL;
+            break;
+        }
+        ++st.rows;
+        uint8_t * const out = dst + i * src.row_size;
+        // A lookup's shard lock, or a submit's locks, may throw std::system_error, and a submit std::bad_alloc, with
+        // reads perhaps already counted on this frame: a throw stops the submitting and still waits. The wait ends,
+        // because a submit that throws has woken a worker for every read it queued and never queues a read without
+        // the waiter it was queued for, so every counted waiter is on a read some worker will pick with no further
+        // submit. Any other exception ends the process through noexcept.
+        try {
+            if (cache != nullptr && cache->lookup_copy(row, out)) {
+                ++st.hits;
+                continue;
+            }
+            const uint64_t byte  = src.file_offset + static_cast<uint64_t>(row) * src.row_size;
+            const uint64_t start = byte / LAZY_IO_BLOCK_BYTES * LAZY_IO_BLOCK_BYTES;
+            lazy_io_waiter w;
+            w.ticket         = &ticket;
+            w.epoch          = epoch;
+            w.landing        = &slot;
+            w.landing_offset = i * src.row_size;
+            w.src_offset     = byte - start;
+            w.bytes          = src.row_size;
+            w.cache          = cache;
+            w.row            = row;
+            // 0 is a refusal the engine did not count: no live ring, or a span the ring cannot hold, each logged; or
+            // a span past the end of the address space, refused without a log. The rows after it are not submitted.
+            if (lazy_io_submit(context, src.fd, lazy_io_span{ src.file_id, start, span_bytes }, key, w) == 0) {
+                stopped = EIO;
+            } else {
+                ++st.reads;
+            }
+        } catch (const std::bad_alloc &) {
+            stopped = ENOMEM;
+        } catch (const std::system_error &) {
+            stopped = EIO;
+        }
+    }
+    // Every path after the first submit reaches this wait. Its 0 proves every counted row was copied into dst, not
+    // merely delivered, because this frame alone owns the request and the landing slot: nothing else can cancel or
+    // drain the request or move the slot's epoch, so no delivery skips its copy, and each landing range,
+    // [i * row_size, (i + 1) * row_size) with i < n, fits the slot's n * row_size bytes, so none is refused as outside
+    // it. A refused submit counted nothing, and `stopped` reports it.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    if (lazy_ring_mutant_is(lazy_ring_mutant::GATHER_RETURNS_UNWAITED) ||
+        (stopped != 0 && lazy_ring_mutant_is(lazy_ring_mutant::GATHER_ERROR_RETURNS_UNWAITED))) {
+        return stopped;
+    }
+#endif
+    const int read_error = lazy_io_ticket_wait(ticket);
+    return stopped != 0 ? stopped : read_error;
+}
+
+}  // namespace ggml_sycl

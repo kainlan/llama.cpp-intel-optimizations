@@ -28,6 +28,19 @@ def function_has_guard(source, name, guard):
 def function_has_module_guard(source, name):
     return function_has_guard(source, name, "sycl_module_mutation_guard")
 
+def first_match(pattern, source):
+    """Offset of the first match, or -1: an ordered chain of these fails when any link is missing."""
+    m = re.search(pattern, source)
+    return m.start() if m else -1
+
+# shutdown_unified_cache()'s snapshot: a local copy of the cache map (line-anchored, so not the accessor's static),
+# filled from the map, and only then the caches' teardown
+cache_snapshot_decl = first_match(
+    r"(?m)^[ \t]*std::unordered_map\s*<\s*int\s*,\s*std::shared_ptr\s*<\s*unified_cache\s*>\s*>\s+caches\s*;", cache_cpp)
+cache_snapshot_fill = first_match(r"\bcaches\s*=\s*device_caches\s*;", cache_cpp)
+cache_snapshot_ok = (0 <= cache_snapshot_decl < cache_snapshot_fill
+                     and cache_snapshot_fill < cache_cpp.find("item.second->shutdown_resources()"))
+
 saveable_mutating_procs = {
     "ggml_backend_split_buffer_type": "ggml_backend_sycl_split_buffer_type",
     "ggml_backend_tp_buffer_type": "ggml_backend_sycl_tp_buffer_type",
@@ -47,7 +60,9 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_register_gguf_file_identity": "ggml_backend_sycl_register_gguf_file_identity",
     "ggml_backend_sycl_register_weight_usage": "ggml_backend_sycl_register_weight_usage",
     "ggml_backend_sycl_try_register_weight_usage": "ggml_backend_sycl_try_register_weight_usage",
-    "ggml_backend_sycl_stage_inventory_plan": "ggml_backend_sycl_stage_inventory_plan",
+    # The staging proc's renamed export (design 5efe §4.3); the old name answers with a stub that refuses
+    # a libllama predating the inventory's storage inputs, and mutates nothing.
+    "ggml_backend_sycl_stage_load_inventory_plan": "ggml_backend_sycl_stage_load_inventory_plan",
     "ggml_backend_sycl_model_load_begin": "ggml_backend_sycl_model_load_begin",
     "ggml_backend_sycl_model_load_enter_nested": "ggml_backend_sycl_model_load_enter_nested",
     "ggml_backend_sycl_model_load_end": "ggml_backend_sycl_model_load_end",
@@ -55,6 +70,9 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_set_runtime_context_for_model": "ggml_backend_sycl_set_runtime_context_for_model",
     "ggml_backend_sycl_model_unloaded_token": "ggml_backend_sycl_model_unloaded_token",
     "ggml_backend_sycl_model_quarantine_token": "ggml_backend_sycl_model_quarantine_token",
+    # A STORAGE lazy table's open materializes its row cache, and its close releases it.
+    "ggml_backend_sycl_lazy_storage_open": "ggml_backend_sycl_lazy_storage_open",
+    "ggml_backend_sycl_lazy_storage_close": "ggml_backend_sycl_lazy_storage_close",
     "ggml_backend_sycl_test_seed_cpu_retained": "ggml_backend_sycl_test_seed_cpu_retained",
     "ggml_backend_sycl_test_seed_moe_module_state": "ggml_backend_sycl_test_seed_moe_module_state",
     "ggml_backend_sycl_test_allocate_predictor_scores": "ggml_backend_sycl_test_allocate_predictor_scores",
@@ -539,7 +557,7 @@ def nodelete_moe_state_reset_ok(source, wrapper_source):
     it does NOT prove every reader of g_moe_expert_meta/g_expert_groups is
     gated on g_moe_hybrid_init_success[d] -- it is not; the read sites at
     ggml-sycl.cpp:3729, 3807, 4063, 5138, 5521, 5625, 6580, 6910, 6990, 7017
-    and 7409 (moe_snapshot_registries, is_expert_resident, and the direct
+    and 7409 (is_expert_resident, and the direct
     iterations/uses of g_moe_expert_meta/g_expert_groups) take only the
     registries' own mutexes and read unconditionally, and
     g_moe_hybrid_init_success[dev] only gates whether moe_hybrid_init_once()
@@ -565,7 +583,6 @@ def nodelete_moe_state_reset_ok(source, wrapper_source):
         and "g_expert_groups.swap(new_expert_groups);" in init_once_body
         and "intentionally survive" in source
         and "g_expert_popularity.clear()" in source
-        and "g_adaptive_prestage.reset_after_stop()" in source
         and "g_expert_predictors[d].reset()" in source
         and "ggml_sycl_reset_moe_module_state();\n    if (!ggml_sycl::shutdown_unified_cache())" in source
         and "NODELETE reload retained model-bound MoE state" in wrapper_source
@@ -618,6 +635,10 @@ OWNING_READER_SITES = {
         # coherent read that decides only the message.
         "if (cache_placement_coherence(cache).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) {": 1,
         "coherent_cache_placement_plan_owner(cache)->entries.size());": 1,
+        # The expert evict device cases check, after each accepted evict and admit, that the device's cache holds the
+        # published plan, since every copy to the device refuses without it: one coherent read that decides only the
+        # case's verdict.
+        "return cache_placement_coherence(fx.cache).coherence == placement_cache_coherence::MATCH;": 1,
     }),
     "ggml/src/ggml-sycl/mmvq.cpp": Counter({
         "const auto plan_owner = ggml_sycl::coherent_cache_placement_plan_owner(route_cache);": 1,
@@ -690,10 +711,17 @@ def _owning_reader_sites():
 # llama.cpp-kjef: the auto-ubatch fit's ring term (ggml_sycl_hold_ring_uncovered) reads the published plan once,
 # `const auto current`, to size the prefill ring the way the stream phase does; it reads the same snapshot the expert
 # loan transaction reads, so no new reader kind, and the statement count under that name moves 4 -> 5.
+# The legacy expert prestage left with the name-hash expert ranking, and six of these statements with it: its
+# per-expert plan check and plan read, its secondary-device loop's three plan reads and its runtime switch's check.
+# The MoE reorder temp buffer's reservation, which only that prestage read, took four more: its multi-card
+# condition's two global-plan checks and two global-plan reads. The single-expert SOA upload, reachable only from an
+# init-time preload nothing called, took three cache-plan statements: its plan check, its plan-and-name check and
+# its per-expert device check.
+# The per-tensor MoE expert preload that nothing called is gone, and its two cache plan reads (the non-empty test
+# before its loop and the expert placement lookup inside it) with it; the live preload keeps its own.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
         "(*ggml_sycl_cache_plan_owner(cache))": 1,
-        "(*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));": 1,
         "(*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;": 1,
         "(*ggml_sycl_cache_plan_owner(plan_cache)).multi_device;": 1,
         "(plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
@@ -708,8 +736,6 @@ INTERNAL_WRAPPER_SITES = {
         "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 4,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(route_cache);": 1,
         "const auto plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);": 1,
-        "const auto pp_owner = ggml_sycl_cache_plan_owner(cache);": 1,
-        "const auto sec_plan = ggml_sycl_cache_plan_owner(sec_cache);": 1,
         "const bool active_plan = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty();": 1,
         "const bool has_placement_plan = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();": 1,
         "const bool have_plan = !ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty();": 2,
@@ -720,23 +746,16 @@ INTERNAL_WRAPPER_SITES = {
         "const int planned_device = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);": 1,
         "ggml_sycl_cache_plan_owner(cache)->count_planned_experts(src0->name, n_experts, device);": 1,
         "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
-        "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
-        "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
-        "if (!actual_weights && cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 1,
+        "ggml_sycl_configure_host_zones_for_plan(cache, device, ggml_sycl_cache_plan_owner(cache));": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 16,
         "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {": 1,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {": 1,
-        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 3,
         "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
-        "if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {": 1,
         "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\\0') {": 1,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {": 3,
-        "if (sec_budgets[i].cache && ggml_sycl_cache_plan_owner(sec_budgets[i].cache)->entries.empty()) {": 1,
         "in.has_placement_plan = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
         "plan_cache_hybrid && !ggml_sycl_cache_plan_owner(plan_cache_hybrid)->entries.empty();": 1,
         "return !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);": 1,
@@ -754,14 +773,12 @@ INTERNAL_WRAPPER_SITES = {
         "stream_plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
     }),
     "ggml_sycl_global_plan_owner": Counter({
-        "!ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {": 1,
         "!ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "const auto plan_owner = ggml_sycl_global_plan_owner();": 2,
         # The hold-spill fit (ggml_sycl_hold_spill_fit) reads the published plan once for the explicit micro-batch it
         # placed, whose RUNTIME zone holds the planned compute term: the fit credits a buffer no larger at that rung.
         "const auto room_plan = ggml_sycl_global_plan_owner();": 1,
         "ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_global_plan_owner()), ctx.device);": 1,
-        "ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {": 1,
         "ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
         "ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
         "plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
@@ -789,8 +806,24 @@ INTERNAL_WRAPPER_SITES = {
         # 14 and `now` to 2: test_expert_loan_and_refill_stop_on_a_missing_entry reads the publication a loan refused
         # "not resident" and a refill that dropped a triplet "not lent" must leave in place, and then reads the current
         # plan to show the dropped triplet is still on the host.
-        "const auto now = ::ggml_sycl_global_plan_snapshot();": 2,
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 15,  # llama.cpp-7999: +1, lent_bytes_are
+        # 2 -> 5: the padded, file-mapped and block-completing admit cases read the plan an accepted admit published.
+        # 5 -> 8: the evict cases that refill after an evict, swap in one call and refuse an evict beside an admit
+        # read the plan the call published, to show which side each triplet ended on.
+        # 8 -> 10: the evict landing helper reads each evicted member's target and host backing in the current plan,
+        # and the shared-storage case reads the plan its call published to show the refused triplet still on the
+        # device.
+        "const auto now = ::ggml_sycl_global_plan_snapshot();": 10,
+        # 14 -> 15: the fixture's lent_bytes_are helper reads the current plan to show which bytes are lent.
+        # 15 -> 16: test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned reads the published plan in
+        # its members_read helper, to show each lent member's backing and the plan's mapped staging source before the
+        # loan, while lent and after the refill. A test-only reader of the same snapshot the loan transaction publishes.
+        # 16 -> 20: the padded, file-mapped and block-completing admit cases read the publication an admit starts from,
+        # and the busy admit case's refusal check reads the one a refused admit must leave in place.
+        # 20 -> 21: the case that admits from a host copy shorter than the tensor reads the publication its refusal
+        # must leave in place.
+        # 21 -> 25: the evict cases read the publication a call starts from: the one-evict and shared-storage cases
+        # show an accepted call replaced it, and the just-admitted and lent cases show a BUSY evict left it in place.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 25,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
@@ -799,11 +832,21 @@ INTERNAL_WRAPPER_SITES = {
         "const auto snapshot = ggml_sycl_global_plan_snapshot();": 2,
         "found = ::ggml_sycl_global_plan_snapshot();": 1,
         "ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());": 1,
-        # llama.cpp-sif1 took this from 4 to 6: the refill cases show a refill with nothing to do, and one cancelled
-        # by a loan, published nothing. It then took it to 7: a loan refused without host zones published nothing. It
-        # then took it to 9: a boundary with no decode graph since the refill, and a refill whose only triplet was
-        # dropped, published nothing.
-        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 9,
+        # One check per call that must publish nothing, that it left the publication in place: the loan refused
+        # without host zones, the loan refused inside a graph, the probe, the loan and the evict refused under a live
+        # host entry (one check after both calls), the loan refused for shared storage, the refill with nothing to do,
+        # the refill a loan cancelled, a boundary with no decode graph since the refill, a refill whose only triplet
+        # was dropped, the busy admit case's BUSY admits (one check in its helper), the admit from a host copy shorter
+        # than the tensor, and the two BUSY evicts right after an admit, the first for whichever hold it meets and
+        # the second, after the copy's retention drained, for the retiring host entries alone.
+        "if (::ggml_sycl_global_plan_snapshot().get() != published.get()) {": 13,
+        # An accepted evict publishes a plan with the triplet on the host, so the case that evicts one resident
+        # triplet shows the publication changed.
+        "if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {": 1,
+        # The evict a loan made BUSY published nothing, kept the triplet's device entries and left the ledger alone,
+        # in one condition.
+        ("if (::ggml_sycl_global_plan_snapshot().get() != published.get() || "
+         "test_evict_device_entries(fx, 0, 0) != 3 ||"): 1,
         # llama.cpp-pu8v: test_expert_loan_and_refill_stop_on_a_missing_entry checks, in one condition each, that the
         # refused loan and the refill that dropped a triplet published nothing and left the request and the ledger
         # as they must be.
@@ -820,12 +863,10 @@ INTERNAL_WRAPPER_SITES = {
     }),
     "ggml_sycl_has_global_plan": Counter({
         "((ggml_sycl_has_global_plan() || ggml_sycl_planner_authoritative_residency_active(sycl_ctx->device)) &&": 1,
-        "(ggml_sycl_has_global_plan() &&": 1,
         "const bool has_host_inputs = ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph);": 1,
         "const bool plan_known = ggml_sycl_has_global_plan();": 1,
         "gpu_prefix_end < 0 && !(ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) &&": 1,
         "if (!ggml_sycl_has_global_plan() || !plan_owner->has_dense_entry(tensor_name)) {": 1,
-        "if (ggml_sycl_has_global_plan() &&": 1,
         "if (ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph) &&": 1,
         "if (ggml_sycl_has_global_plan() || has_runtime_plan() || g_moe_multi_gpu_active.load(std::memory_order_acquire)) {": 1,
         "if (ggml_sycl_has_global_plan()) {": 2,
@@ -852,6 +893,11 @@ def _wrapper_sites():
         sites[name] = lines
     return sites
 
+
+# The preload's definition, not its forward declaration: without the brace the lazy match starts at the declaration
+# and ends at the next column-0 brace a few lines on, so a check of the preload would read none of its body.
+_preload_match = re.search(r"static void ggml_sycl_preload_model_weights\(\)\s*\{.*?\n\}", backend, re.S)
+preload_body = _preload_match.group(0) if _preload_match else ""
 
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
@@ -1084,18 +1130,18 @@ checks = {
     < backend.index("registry.defer_quarantine(owner)"),
     "three phase commit publication before LIVE": backend.index("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
     < backend.index("registry->finalize_end(ticket, true, publication"),
-    "DL early and late inventory planning parity": "ggml_backend_sycl_stage_inventory_plan" in public
+    "DL early and late inventory planning parity": "ggml_backend_sycl_stage_load_inventory_plan" in public
     and "hooks.stage_inventory(&inventory, &envelope, early)" in llama
     and "defined(GGML_BACKEND_DL)" in llama
-    and "llama_model_sycl_compute_early_plan(ml, *this, __func__)" in llama
-    and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_inventory_plan\")" in llama
-    and "strcmp(name, \"ggml_backend_sycl_stage_inventory_plan\")" in backend
-    and "llama_model_sycl_set_late_inventory(ml, *this, __func__)" in llama
+    and "llama_model_sycl_compute_early_plan(ml, *this, use_mlock, __func__)" in llama
+    and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_load_inventory_plan\")" in llama
+    and "strcmp(name, \"ggml_backend_sycl_stage_load_inventory_plan\")" in backend
+    and "llama_model_sycl_set_late_inventory(ml, *this, use_mlock, __func__)" in llama
     and "sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft" in llama
     and "if (sycl_model_backend && ml.use_mmap)" in llama
     and "disabling mmap for SYCL weight layout upload" in llama
     and (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text().count(
-        "ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope"
+        "ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope"
     ) >= 2,
     "DL allocation and metadata parity": all(
         f'LOAD_SYCL_PROC({field}, "{name}")' in (root / "src/llama-model-loader.cpp").read_text()
@@ -1189,13 +1235,17 @@ checks = {
     and cache_cpp.count("stamp_pending_owner(cache_entry, load_effect_guard)") >= 2,
     "preload retains candidate identity": "const auto   preload_plan_snapshot = ggml_sycl_identity_plan_snapshot()" in backend
     and "ggml_sycl_scoped_alloc_rollback" in backend
-    and "ggml_sycl_global_plan_snapshot()" not in re.search(
-        r"static void ggml_sycl_preload_model_weights\(\).*?\n\}", backend, re.S).group(0)
+    and preload_body != ""
+    and "ggml_sycl_global_plan_snapshot()" not in preload_body
     and "SYCL host expert registration failed during preload" in backend
     and "SYCL host weight registration failed during preload" in backend
     and "dense_alloc_guard" in backend
-    and "ggml_sycl::mem_handle host_owner = ggml_sycl_host_expert_alloc(device, expert_size);" in backend,
-    "cache reuse stamps exact bound transaction": "stage_expert_group" in cache_cpp
+    # A SYCL_Mapped expert is served in place and allocates nothing, so the preload declares the owning mem_handle
+    # first and the branch that copies assigns the allocation to that same local (design 5efe §4.3).
+    and re.search(r"\bggml_sycl::mem_handle\s+host_owner\s*;.*?(?<![\w.>])host_owner\s*=\s*"
+                  r"ggml_sycl_host_expert_alloc\s*\(\s*device\s*,\s*expert_size\s*\)\s*;", preload_body,
+                  re.S) is not None,
+    "cache reuse stamps exact bound transaction": "void * unified_cache::try_get_cached_with_event(" in cache_cpp
     and cache_cpp.count("load_effect_guard = acquire_bound_load_effect()") >= 12
     and "stamp_pending_owner(entry_it->second, load_effect_guard)" in cache_cpp
     and "stamp_pending_owner(it->second, load_effect_guard)" in cache_cpp
@@ -1206,11 +1256,16 @@ checks = {
     and "if (sycl_model_backend)" in llama
     and "if (ml.no_alloc)" in llama
     and "defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)" in llama,
+    # The host bufts' alloc_buffer delegates to one shared allocator (design 5efe section 4.4), so both bodies are
+    # read, and the device statement is matched across the alignment the formatter gives it.
     "exact-device host allocation": "ggml_backend_sycl_host_buffer_type_for_device" in public
-    and "req.device = exact_device" in backend
-    and "get_current_device_id()" not in re.search(
-        r"ggml_backend_sycl_host_buffer_type_alloc_buffer\(.*?\n\}", backend, re.S
-    ).group(0),
+    and re.search(r"\breq\.device\s*=\s*exact_device;", re.search(
+        r"static ggml_backend_buffer_t ggml_sycl_host_buft_alloc\(.*?\n\}", backend, re.S
+    ).group(0)) is not None
+    and all("get_current_device_id()" not in re.search(sig + r"\(.*?\n\}", backend, re.S).group(0) for sig in (
+        r"ggml_backend_sycl_host_buffer_type_alloc_buffer",
+        r"static ggml_backend_buffer_t ggml_sycl_host_buft_alloc",
+    )),
     "DL KV and compute parity": all(f'strcmp(name, "{name}")' in backend for name in (
         "ggml_backend_sycl_kv_buffer_type_from_dev",
         "ggml_backend_sycl_push_kv_layer_mask_from_dev",
@@ -1731,10 +1786,7 @@ checks = {
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "callback-drain unload joined" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
-    "cache shutdown owner snapshot avoids rw-lock callbacks":
-        "std::unordered_map<int, std::shared_ptr<unified_cache>> caches" in cache_cpp
-        and cache_cpp.index("caches = g_device_caches")
-            < cache_cpp.index("item.second->shutdown_resources()"),
+    "cache shutdown owner snapshot avoids rw-lock callbacks": cache_snapshot_ok,
     "bounded retained handle drain": "wait_for(lock, std::chrono::milliseconds(timeout_ms)" in
         (root / "ggml/src/ggml-sycl/mem-handle.cpp").read_text()
         and "SYCL retained-handle drain timed out" in backend,

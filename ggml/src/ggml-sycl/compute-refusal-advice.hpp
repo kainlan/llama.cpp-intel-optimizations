@@ -17,7 +17,7 @@ namespace ggml_sycl {
 struct compute_refusal_budget {
     int    pct               = 100;  // resolved GGML_SYCL_VRAM_BUDGET_PCT
     size_t base_mem          = 0;    // host-unified-adjusted device total; 0 when unknown
-    size_t budget_bytes      = 0;    // the arena budget now: min(base*pct/100, free at init) - external headroom
+    size_t budget_bytes      = 0;    // the arena budget now: min(base*pct/100, free_floored) - external headroom
     size_t external_headroom = 0;    // the headroom the authority subtracted
     size_t fixed_zone_bytes  = 0;    // the arena zones that are not weights (RUNTIME, SCRATCH, ONEDNN)
 };
@@ -89,18 +89,19 @@ inline uint32_t compute_refusal_largest_ub(const compute_refusal_inputs & in) {
 }
 
 // The arena budget at `pct`, by the budget authority's own arithmetic (compute_vram_budget_authority()):
-// min(base * pct / 100, free at init) - external headroom. The free memory the authority started from is not
-// published; budget_bytes + external_headroom is it when that cap bound, and is at least base * pct / 100 otherwise,
-// which is the only case in which the cap does not matter, so the reconstruction is exact either way.
+// min(base * pct / 100, free_floored) - external headroom, where free_floored is the authority's free reading rounded
+// down to its 64 MiB grid. That figure is not published here; budget_bytes + external_headroom is it when that
+// cap bound, and is at least base * pct / 100 otherwise, which is the only case in which the cap does not matter, so
+// the reconstruction is exact either way.
 inline size_t compute_refusal_budget_bytes_at(const compute_refusal_budget & b, int pct) {
     if (b.base_mem == 0) {
         return 0;
     }
     pct                       = std::max(1, std::min(100, pct));
     size_t       budget       = static_cast<size_t>(b.base_mem * (static_cast<double>(pct) / 100.0));
-    const size_t free_at_init = b.budget_bytes + b.external_headroom;
-    if (free_at_init > 0 && budget > free_at_init) {
-        budget = free_at_init;
+    const size_t free_floored = b.budget_bytes + b.external_headroom;
+    if (free_floored > 0 && budget > free_floored) {
+        budget = free_floored;
     }
     return budget > b.external_headroom ? budget - b.external_headroom : 0;
 }

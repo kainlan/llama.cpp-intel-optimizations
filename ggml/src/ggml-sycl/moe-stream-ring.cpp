@@ -9,6 +9,8 @@
 #include "moe-stream-ring.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <string>
 
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
 #    include "ggml-impl.h"
@@ -58,7 +60,40 @@ moe_stream_ring_geometry moe_stream_ring_size(uint32_t region_slots,
     return geo;
 }
 
+std::string moe_stream_ring_weight_zone_line(int                     device,
+                                             const zone_tag_census & census,
+                                             uint32_t                slots_held,
+                                             size_t                  slot_bytes,
+                                             size_t                  top) {
+    // The zone's figures go through the census's own formatter: the ring's file names no zone figure, so nothing in the
+    // reserve can come to decide on one.
+    char head[160];
+    std::snprintf(head, sizeof(head),
+                  "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=%d ring_slots_held=%u slot_bytes=%zu",
+                  device, slots_held, slot_bytes);
+    return zone_tag_census_line(head, census, top);
+}
+
 #if !defined(GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY)
+
+void moe_stream_ring_warn_weight_zone(int device, uint32_t slots_held, size_t slot_bytes) noexcept {
+    // The caller is mid-reserve with its loan step still to run: an exception (the line's strings allocate) must not
+    // leave here, so the handler prints a literal that allocates nothing.
+    try {
+        zone_tag_census census;
+        if (!unified_cache_zone_tag_census(device, vram_zone_id::WEIGHT, census)) {
+            GGML_LOG_WARN(
+                "[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=%d has no cache or no active arena\n",
+                device);
+            return;
+        }
+        const std::string line = moe_stream_ring_weight_zone_line(device, census, slots_held, slot_bytes,
+                                                                  MOE_STREAM_RING_WEIGHT_ZONE_TOP_TAGS);
+        GGML_LOG_WARN("%s\n", line.c_str());
+    } catch (...) {
+        GGML_LOG_WARN("[MOE-STREAM-RING] WEIGHT zone at the short reserve: device=%d census failed\n", device);
+    }
+}
 
 bool moe_stream_ring::reserve(int device, const moe_stream_ring_geometry & geo, size_t * bytes_short) {
     if (bytes_short != nullptr) {

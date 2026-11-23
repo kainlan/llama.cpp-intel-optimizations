@@ -33,8 +33,6 @@ ALIASES = [
     ("ggml-sycl.cpp", "void ggml_backend_sycl_shutdown(void)", r"queue"),
     ("ggml-sycl.cpp", "int ggml_backend_sycl_verify_speculative_with_tokens(", r"default_q"),
     ("ggml-sycl.cpp", "static void ggml_sycl_measure_h2d_pinned(", r"q"),
-    ("ggml-sycl.cpp", "static void moe_prestage_popular_experts()", r"source\s*\.\s*ready"),
-    ("ggml-sycl.cpp", "void * moe_expert_ensure_soa_cached(", r"source\s*\.\s*ready"),
     ("ggml-sycl.cpp", "static bool ggml_sycl_materialize_planned_expert_layout(", r"source\s*\.\s*ready"),
     ("common.cpp", "void ggml_sycl_tp_copy_weight_shard(", r"stream"),
     ("dense-scheduler.cpp", None, r"pending_prefetch_"),

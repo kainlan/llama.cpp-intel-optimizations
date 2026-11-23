@@ -17,8 +17,10 @@
 #include "async-failure.hpp"
 #include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
+#include "fallback-error.hpp"
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
+#include "graph-prologue-memo.hpp"
 #include "graph-safe-memcpy-width.hpp"
 #include "graph-segment-cache.hpp"
 #include "kv-offload.hpp"
@@ -49,6 +51,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -62,7 +65,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <exception>
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
@@ -114,13 +116,7 @@ struct ggml_sycl_fa_graph_snapshot {
     int32_t      max_blocks_per_seq     = 0;
 };
 
-class ggml_sycl_fallback_error final : public std::exception {
-public:
-    explicit ggml_sycl_fallback_error(const char * reason) noexcept : reason_(reason ? reason : "SYCL fallback failed") {}
-    const char * what() const noexcept override { return reason_; }
-private:
-    const char * reason_;
-};
+// ggml_sycl_fallback_error lives in fallback-error.hpp, SYCL-free, so the fail-closed helper can throw it.
 
 bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const char * reason);
 
@@ -389,6 +385,14 @@ bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);
 constexpr bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site) {
     return false;
 }
+#endif
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// GGML_SYCL_TEST_INJECT_DEVICE_LOST=<site>:<n> throws, from the nth call at `site` onward, the exception a lost
+// device throws. It keeps throwing because a lost device stays lost: graph recording rethrows the first one and
+// runs the graph again directly.
+void ggml_sycl_test_inject_device_lost(const char * site);
+#else
+inline void ggml_sycl_test_inject_device_lost(const char *) {}
 #endif
 // Called by a wrapper once it has decided not to decline: it counts under the seam and, once per site per process,
 // says so at WARN when the SYCL debug switch is on (GGML_BACKEND_DEBUG=sycl), since INFO is dropped by default.
@@ -897,6 +901,66 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 #    define GGML_SYCL_KTRACE(kernel_name, ...) ((void) 0)
 #endif
 
+// The exit status of a process the backend ended because a device was lost. It differs from 1, which a failed test,
+// the watchdog and every other fatal op error use, so a script can tell a lost device from a wrong result.
+constexpr int GGML_SYCL_EXIT_DEVICE_LOST = 69;
+
+// True when an exception's text names a lost device, as the Level Zero adapter prints it:
+// "level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)".
+bool ggml_sycl_what_is_device_lost(const char * what) noexcept;
+
+// GGML_SYCL_EXIT_DEVICE_LOST for a lost device's exception text, 1 for any other.
+int ggml_sycl_fatal_exit_code(const char * what) noexcept;
+
+// Ends the process at once after a failure it cannot recover from. Prints `message` on one [SYCL-FATAL] line and
+// flushes stdout and stderr. Then it releases every device command parked on a CPU expert job, and prints the
+// zone-reset audit when GGML_SYCL_ZONE_RESET_AUDIT is set. Then it waits GGML_SYCL_FATAL_EXIT_SETTLE_MS (200 ms by
+// default, 0 disables) so the GPU driver can stop its idle submission rings: a process that ends sooner can leave an
+// engine parked on memory the kernel has released. Last it leaves through std::_Exit, so no exit handler and no static
+// destructor runs: after a device loss the Level Zero library's destructor does not return, and std::exit would run
+// it.
+// The caller prints its own diagnostic first, with fprintf(stderr) or std::cerr and not GGML_LOG_*: the tools route
+// ggml logs into a queue that a worker thread prints, and std::_Exit drops whatever is still queued.
+// Not async-signal-safe (it uses stdio, the audit's mutex and the job registry's timed mutex): never call it from a
+// signal handler.
+[[noreturn]] void ggml_sycl_fatal_exit(int code, const char * message) noexcept;
+
+// Makes GGML_ABORT and GGML_ASSERT wait like the fatal exit before abort() ends the process. Installs an abort
+// callback once; it runs the callback that was installed before it, or prints the message and the backtrace when
+// there was none, and then waits. A callback the application installs later replaces it. Safe to call from every
+// registration.
+// The callback is never removed: ggml's loader pins the backend module and a static build has nothing to unload, so
+// its address stays valid after a logical unload. It must be installed before a CPU expert job ring installs its own
+// abort callback, or the two could end up as each other's previous; that holds because a ring is made only for a
+// cache's compute stream, which the backend reaches only through its registration.
+void ggml_sycl_abort_settle_install() noexcept;
+
+// Records a device loss when `what` names one. The first loss prints "[SYCL-FATAL] device lost:" and registers an
+// exit handler that ends the process through ggml_sycl_fatal_exit. A path that reports the failure to its caller
+// instead of ending the process still does so.
+//
+// What this does to a normal exit, once a loss is recorded:
+// - Every later normal exit ends through _Exit(69). The 69 replaces whatever main returned or exit() was given. This
+//   holds also when the loss was seen only by a start-up probe and the run then finished on another card or on the
+//   CPU.
+// - Exit handlers and static destructors registered before the loss are skipped, the application's and the
+//   backend's own: the CPU worker shutdown and the end-of-run dumps such as the counter dump, the alloc-trace dump
+//   and the mem-copy census.
+// - Log lines still queued in an application's logger are lost.
+// - All open C stdio streams (FILE *) are flushed first. A C++ file stream that is still open loses what its buffer
+//   holds.
+//
+// The order: on glibc the handler runs before every exit handler and static destructor registered before the loss,
+// and before the libraries' own unload destructors, the Level Zero library's among them, whose teardown can hang on
+// a lost card. Exit handlers and static objects registered after the loss run before it. A loss recorded after
+// exit() has finished running its handlers cannot register one. The registration is tied to this library's handle,
+// so the order rests on the backend library staying loaded until the process exits; ggml pins backend libraries
+// (ggml-backend.h, ggml_backend_unload_checked; dl_pin_library in ggml-backend-dl.cpp).
+void ggml_sycl_note_exception(const char * what) noexcept;
+
+// True once any thread has recorded a device loss.
+bool ggml_sycl_device_lost_latched() noexcept;
+
 #define CHECK_TRY_ERROR(expr)                                                                           \
     [&]() {                                                                                             \
         try {                                                                                           \
@@ -905,6 +969,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
         } catch (std::exception const & e) {                                                            \
             std::cerr << e.what() << "\nException caught at file:" << __FILE__ << ", line:" << __LINE__ \
                       << ", func:" << __func__ << std::endl;                                            \
+            ggml_sycl_note_exception(e.what());                                                         \
             return dpct::default_error;                                                                 \
         }                                                                                               \
     }()
@@ -963,11 +1028,6 @@ static __dpct_inline__ float sycl_e8m0_to_fp32_half(uint8_t e) {
     return result;
 }
 
-static void crash() {
-    int * ptr = NULL;
-    *ptr      = 0;
-}
-
 [[noreturn]] static void ggml_sycl_error(const char * stmt,
                                          const char * func,
                                          const char * file,
@@ -975,6 +1035,13 @@ static void crash() {
                                          const char * msg) {
     fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
     fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
+    if (ggml_sycl_device_lost_latched()) {
+        // After a recorded loss any failed check ends the process at once, whichever card or call failed: the abort
+        // path's backtrace (gdb attaches to this process) and the core dump after it keep the process, and the card's
+        // memory, alive for as long as they take. The "SYCL error:" line and the exception line above it still name
+        // the failing call, and the loss has its own "[SYCL-FATAL] device lost:" line earlier in the log.
+        ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");
+    }
     GGML_ABORT("SYCL error");
 }
 
@@ -1196,8 +1263,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
     return err;
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    crash();
-    std::exit(1);
+    ggml_sycl_fatal_exit(ggml_sycl_fatal_exit_code(exc.what()), "ggml_sycl_set_device");
 }
 
 // Selects dpct device `dpct_device` as it is (no ggml_sycl_map_device_id) and keeps g_sycl_current_device_id in step.
@@ -1834,6 +1900,12 @@ struct sycl_device_info {
     // 19 MB model). Budget computations must consult this before taking a
     // percentage of `total_vram`/`global_mem_size` for such a device.
     bool            host_unified_memory  = false;
+    // True only when the host_unified_memory query above returned. A device
+    // whose query throws is "not known", not "discrete": mmap_support (the
+    // caps restore of llama.cpp-5efe C1) requires it, so an iGPU whose query
+    // throws does not advertise mmap. The VRAM budget keeps reading
+    // host_unified_memory alone, with its existing treat-as-discrete default.
+    bool            host_unified_known   = false;
     bool            supports_soa_reorder = false;  // Device capability: can use SoA weight layout
     XMXCapabilities xmx_caps;                      // XMX matrix engine capabilities (queried at init)
     char            device_name[256] = { 0 };      // Device name for GPU family detection
@@ -1917,6 +1989,8 @@ size_t                        ggml_sycl_get_free_vram_at_init(int device);
 size_t                        ggml_sycl_get_host_max_alloc_size();
 const sycl_peer_link_info *   ggml_sycl_get_peer_link_info(int src_device, int dst_device);
 void                          ggml_sycl_dump_peer_link_info();
+// Whether the placement plan for the registered model spans every physical GPU. Same predicate the planner asks.
+bool                          ggml_sycl_multi_device_plan_for_loaded_model();
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 namespace ggml_sycl {
@@ -2009,7 +2083,8 @@ struct layout_policy {
             if (qtype == GGML_TYPE_MXFP4) {
                 return GGML_LAYOUT_COALESCED;
             }
-            // MMVQ _id kernels for Q4_0/Q8_0 are AoS-only.
+            // Without XMX, Q4_0 and Q8_0 experts are AoS. Q4_0's MMVQ _id kernel is AoS-only; Q8_0 has an
+            // SOA one too (the branch above relies on it), so its AoS here is a placement choice, not a kernel limit.
             if (qtype == GGML_TYPE_Q4_0 || qtype == GGML_TYPE_Q8_0) {
                 return GGML_LAYOUT_AOS;
             }
@@ -3248,7 +3323,10 @@ inline sycl::usm::alloc ggml_sycl_get_alloc_type(const void * ptr) {
             return sycl::usm::alloc::host;
         case ggml_sycl::alloc_type::SHARED:
             return sycl::usm::alloc::shared;
-        case ggml_sycl::alloc_type::MMAP:
+        case ggml_sycl::alloc_type::HOST_MALLOC:
+        case ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE:
+        case ggml_sycl::alloc_type::FILE_MAPPED:
+        case ggml_sycl::alloc_type::HOST_CPU:
             return sycl::usm::alloc::unknown;  // Not USM — needs staging for GPU access
         case ggml_sycl::alloc_type::UNKNOWN:
             return sycl::usm::alloc::unknown;
@@ -4563,7 +4641,8 @@ struct ggml_tensor_extra_gpu {
         }
         data_device[dev] = ptr;
         if (ptr) {
-            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device);
+            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device,
+                                                                     ggml_sycl::chunk_lease_site::TENSOR_EXTRA);
         } else {
             data_handle[dev] = ggml_sycl::mem_handle{};
         }
@@ -4683,9 +4762,11 @@ struct ggml_tensor_extra_gpu {
         }
 
         if (!installed_source_handle) {
-            data_handle[dev] = on_device ? ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true) :
-                                           ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false,
-                                                                              ggml_sycl::mem_handle::HOST_DEVICE);
+            data_handle[dev] =
+                on_device ?
+                    ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true,
+                                                          ggml_sycl::chunk_lease_site::TENSOR_EXTRA) :
+                    ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false, ggml_sycl::mem_handle::HOST_DEVICE);
         }
 
         layout.mode        = storage_layout;
@@ -5059,11 +5140,14 @@ inline void ggml_sycl_refresh_cached_input_ptr(void *       dst,
 // Defined in ggml-sycl.cpp to avoid inlining a 100-line function.
 void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
-// Bytes a graph prestage copies to `device` for `tensor`, or 0 when it makes no
-// copy: weights, control-vector storage, device USM, INPUT tensors (their own
-// stable staging) and anything in the KV-host buft count 0. `src_buft` is the
-// buffer type the tensor lives in. The prestage and the resolver counter below
-// both read this one predicate.
+// Bytes of `tensor` that ordinary device kernels read from host memory in place,
+// or 0: weights, control-vector storage, device USM, flagged INPUT tensors and
+// anything in the KV-host buft count 0. A COPY source counts, and so does a
+// host-resident op output, which the prestage stages as an INPUT when another
+// split produced it but which only staging-aware consumers read from there
+// (ggml_sycl_prestage_reports_bytes in prestage-class.hpp). `src_buft` is the
+// buffer type the tensor lives in. The resolver counter below and the GRAPH-STAGE
+// cohort read this predicate; the prestage reads the same class rule.
 size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
                                             ggml_backend_buffer_type_t src_buft,
                                             int                        device);
@@ -5453,17 +5537,31 @@ inline bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor,
            tensor->name[0] != '\0' && ggml_is_contiguous(tensor);
 }
 
+// A file mapping is never a pointer a device or a kernel ABI may be handed: a mapped page is not USM, and a
+// host-tier weight runs on the CPU (docs/design/sycl-mmap-host-tier.md §5.3, P3). Reaching it here is a routing
+// defect, not a fallback, so it aborts naming the tensor instead of returning the mapped page. `info` is the
+// registry's record of the pointer about to be returned, from either branch of the resolver below.
+inline void ggml_sycl_resolve_or_host_refuse_mapped(const ggml_tensor *                          tensor,
+                                                    const std::optional<ggml_sycl::alloc_info> & info) {
+    if (info && info->type == ggml_sycl::alloc_type::FILE_MAPPED) {
+        GGML_ABORT("[FILE-MAPPED] resolve_or_host on mapped weight %s", tensor->name);
+    }
+}
+
 inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {
-    void * resolved = ggml_sycl_resolve_tensor_ptr(tensor, device);
+    const auto & registry = ggml_sycl::alloc_registry::instance();
+    void *       resolved = ggml_sycl_resolve_tensor_ptr(tensor, device);
     if (resolved != nullptr) {
+        ggml_sycl_resolve_or_host_refuse_mapped(tensor, registry.lookup_copy(resolved));
         return resolved;
     }
     void * raw = const_cast<void *>(ggml_sycl_host_data(tensor));
     if (raw == nullptr) {
         return nullptr;
     }
-
-    const auto * info = ggml_sycl::alloc_registry::instance().lookup(raw);
+    // One lookup serves the mapped check and the type checks below.
+    const auto info = registry.lookup_copy(raw);
+    ggml_sycl_resolve_or_host_refuse_mapped(tensor, info);
     if (info && info->type == ggml_sycl::alloc_type::DEVICE) {
         return nullptr;
     }
@@ -6373,6 +6471,9 @@ inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
 // Kernel name of the marker that gates the release of a staging buffer a size change displaced.
 struct graph_input_staging_retire_marker {};
 
+// The decode prologue memo a backend context keeps (graph-prologue-memo.hpp).
+using graph_prologue_memo = ggml_sycl::graph_prologue_memo::memo<ggml_tensor, ggml_backend_buffer_t>;
+
 // One routed row of a MUL_MAT_ID: slot i1 of token i2.
 struct mmid_row_mapping {
     int32_t i1;
@@ -7053,6 +7154,8 @@ struct ggml_backend_sycl_context {
     // each keyed split. Sparing the keyed slots at the prompt-path calls would save the re-record only where no
     // phase-change clear_active retires them anyway; that needs a measurement before it is worth the extra state.
     bool invalidate_moe_segments() {
+        // Every retire of recorded work drops the decode prologue memo as well, before a failure below can return.
+        prologue_memo.clear();
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_graphs_disabled = true;
             return false;
@@ -7115,9 +7218,10 @@ struct ggml_backend_sycl_context {
     }
 
     // === Cached per-graph computations (reset when n_nodes changes) ===
-    int  cached_persistent_n_nodes = -1;     // n_nodes when persistent check was cached
-    bool cached_persistent_result  = false;  // cached should_use_persistent_tg result
-    bool cached_is_decode_phase    = false;  // cached phase detection result
+    int      cached_persistent_n_nodes = -1;     // n_nodes when persistent check was cached
+    uint64_t cached_persistent_sig     = 0;      // graph signature when persistent check was cached
+    bool     cached_persistent_result  = false;  // cached should_use_persistent_tg result
+    bool     cached_is_decode_phase    = false;  // cached phase detection result
 
     // MoE phase layouts are persistent unified-cache allocations. Once a graph
     // phase has verified/materialized the planner-selected expert layouts,
@@ -8030,6 +8134,11 @@ struct ggml_backend_sycl_context {
     size_t                readback_staging_size = 0;
     ggml_sycl::mem_handle readback_staging_handle;
 
+    // This backend context's owner serial (docs/design/sycl-mmap-host-tier.md §4.4 "Lifetimes"): the owner its member
+    // allocations carry (CONTEXT lifetime, checked after `delete` in ggml_backend_sycl_free), and the key of its host
+    // SCRATCH demand and its host holder plan. Never 0.
+    uint64_t host_zone_owner_id = ggml_sycl::host_zone_owner_next_id();
+
     // Persistent host-pinned staging buffer for MMVQ/DMMV/MMQ weight streaming.
     // Eliminates per-token sycl::malloc_host in the mmap-source scatter-gather path.
     // Shared across all three kernel paths (only one runs at a time per context).
@@ -8171,6 +8280,10 @@ struct ggml_backend_sycl_context {
     graph_prestage_decline_memo prestage_decline_memo;
     // Bumped once per ggml_backend_sycl_graph_compute call; the decline memo counts a token once by it.
     uint64_t                    graph_compute_seq = 0;
+    // The signature, slot key and prestage effect list of the keyed decode graph this context last computed, served
+    // again while llama hands it the same graph (GGML_SYCL_GRAPH_PROLOGUE_MEMO). A member, so it dies with the
+    // context; invalidate_moe_segments() clears it.
+    graph_prologue_memo         prologue_memo;
 
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;
@@ -8371,6 +8484,10 @@ bool gpu_has_xmx(sycl::device & dev);
 // discrete") if the query throws.
 bool ggml_sycl_device_is_host_unified(const sycl::device & dev);
 
+// The same query, reporting whether it returned: `known` is set true only when
+// get_info succeeded, and false when it threw (the return is then false too).
+bool ggml_sycl_device_query_host_unified(const sycl::device & dev, bool & known);
+
 // Portable (non-SYCL) queries of total/available system RAM in bytes.
 // Returns 0 if detection fails. Used to size VRAM budgets for host-unified
 // (integrated) GPUs, whose "global memory" is backed by this same RAM --
@@ -8394,9 +8511,10 @@ size_t ggml_sycl_get_available_system_memory_bytes();
 // an integrated GPU a 53 GB arena against the B70's 31.9 GB), so the cap
 // must not scale with host RAM. For discrete devices (the common case),
 // returns raw_total_mem unchanged: this is a no-op on the existing,
-// documented-correct `min(total*pct, free_at_init)` discrete-GPU budget
-// path, and GGML_SYCL_VRAM_BUDGET_PCT continues to apply (by both call
-// sites, unchanged) on top of whatever this function returns.
+// documented-correct `min(total*pct, free_at_init floored to 64 MiB)`
+// discrete-GPU budget path, and GGML_SYCL_VRAM_BUDGET_PCT continues to
+// apply (by both call sites, unchanged) on top of whatever this function
+// returns.
 size_t ggml_sycl_vram_budget_base_mem(bool host_unified, size_t raw_total_mem);
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {

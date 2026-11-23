@@ -33,8 +33,8 @@ Outside the wrappers:
     legitimate caller is added, add it there.
 
 Before the if, between the caller's `#if GGML_SYCL_DNNL` line and the if, nothing may leave (return, goto, throw,
-GGML_ABORT, GGML_ASSERT, abort, exit, _Exit, quick_exit, terminate or longjmp): such a statement would skip the wrapper
-and the fallback alike.
+GGML_ABORT, GGML_ASSERT, abort, exit, _Exit, quick_exit, ggml_sycl_fatal_exit, terminate or longjmp): such a statement
+would skip the wrapper and the fallback alike.
 
 Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its
 blocks may appear: no statement, goto, throw, abort or else can follow it. When that line is an `#else`, its arm (up to
@@ -96,7 +96,7 @@ WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemmove\b|\bm
 # What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback
 # runs.
 LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b|\b_Exit\b|\bquick_exit\b"
-                   r"|\bterminate\b|\blongjmp\b")
+                   r"|\bggml_sycl_fatal_exit\b|\bterminate\b|\blongjmp\b")
 # A decline spelled as a return, in any of the forms an optional- or bool-returning consumer can write it.
 AFTER_NOTE_LEAVE = re.compile(r"\breturn\s+(?:false\b|std::nullopt\b|std::optional\s*<[^;{}]*>\s*(?:\(\s*\)|\{\s*\}))"
                               r"|\breturn\s*\{\s*\}")
@@ -118,6 +118,9 @@ GEMM_FORWARDERS = (("row_gemm", "std::optional<sycl::event>"), ("woq_gemm_q4_0",
 GEMM_DEAD = ("woq_gemm_q4_0_packed", "gemm_batch_array", "row_gemm_batch")
 GEMM_DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*scratchpad_mem\s*,\s*"
                            r"(?:scratchpad_md|cached\w*\s*->\s*scratchpad_md)\s*\)\s*\)\s*\{\s*return\s+([\w:]+)\s*;\s*\}")
+# The batched f16 caller's rethrow of a named error; MAIN_PINS pins it and its mutant removes the rethrow from it.
+RETHROW_PIN = ("batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst); } "
+               "catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) {")
 # Statements in ggml-sycl.cpp and outprod.cpp that carry a declined gemm to its declared next path: text -> how many.
 MAIN_PINS = (
     ('throw ggml_sycl_fallback_error("dnnl_gemm declined in mul_mat\'s f16 dense arm', 1),
@@ -127,8 +130,7 @@ MAIN_PINS = (
     ("batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(", 2),
     ("[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(", 1),
     # M-1: caller 1 rethrows a named error ahead of the resource-exhaustion ladder (its abort would misname the failure)
-    ("batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst); } catch (const ggml_sycl_fallback_error &) { throw; } "
-     "catch (const std::exception & e) {", 1),
+    (RETHROW_PIN, 1),
     # the hoisted pre-query declines before any write, and only the first slice may take the fallback
     ("{}, nullptr, true)) { return false; }", 1),
     ("if (b_a == 0) { return false; } throw ggml_sycl_fallback_error(\"dnnl_decline_after_write:dnnl_gemm\");", 1),
@@ -629,6 +631,8 @@ def gemm_mutants(files, edit):
         result = "std::nullopt"
         out.append(("a return follows %s's first-arm note" % name,
                     edit(g, first, first + "            if (m < 0) {\n                return %s;\n            }\n" % result)))
+    RETHROW_NOT_RETHROWN = RETHROW_PIN.replace("catch (const ggml_sycl_fallback_error &) { throw; } ", "", 1)
+    assert RETHROW_NOT_RETHROWN != RETHROW_PIN, "mutant anchor missing: the rethrow clause in RETHROW_PIN"
     for label, pin, new in (
             ("the hoisted pre-query no longer returns false on a decline", "{}, nullptr, true)) { return false; }",
              "{}, nullptr, true)) { }"),
@@ -649,8 +653,9 @@ def gemm_mutants(files, edit):
              'if (gemm_declined) { return true; }'),
             ("mul_mat_id reports a decline as done", "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }",
              "DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return true; }"),
-            ("caller 1 rethrows the named error as std::exception", "catch (const ggml_sycl_fallback_error &) { throw; } catch (const std::exception & e) {",
-             "catch (const std::exception & e) {")):
+            # anchored on the whole pin: the bare catch pair also stands in other functions, and a mutant that
+            # edits the first of those leaves the batched caller's rethrow in place
+            ("caller 1 rethrows the named error as std::exception", RETHROW_PIN, RETHROW_NOT_RETHROWN)):
         out.append((label, edit_pin(m, pin, new)))
     q4_note = "        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0);\n"
     q4_late = "        // Every later `return false` is behind us: \"engaged\" means the primitive is about to be submitted.\n" + q4_note
@@ -763,6 +768,7 @@ def mutants(files):
         ("the softmax #else arm calls quick_exit", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    quick_exit(1);")),
         ("the softmax #else arm calls std::terminate", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    std::terminate();")),
         ("the softmax #else arm calls longjmp", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    longjmp(0, 1);")),
+        ("the softmax #else arm calls ggml_sycl_fatal_exit", edit(sm, "#else\n    (void) use_dnnl_softmax;", "#else\n    (void) use_dnnl_softmax;\n    ggml_sycl_fatal_exit(1, \"x\");")),
         ("softmax writes src through a C-style cast before the decision", edit(h, SM_ANCHOR, "        ((float *) src)[0] = 0.0f;\n" + SM_ANCHOR)),
         ("softmax copies with std::copy_n before the decision", edit(h, SM_ANCHOR, "        std::copy_n((const float *) src, 1, (float *) src);\n" + SM_ANCHOR)),
         ("softmax fills with std::fill_n before the decision", edit(h, SM_ANCHOR, "        std::fill_n((float *) src, 1, 0.0f);\n" + SM_ANCHOR)),

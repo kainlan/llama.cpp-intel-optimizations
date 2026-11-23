@@ -236,6 +236,516 @@ if (BUILD_TESTING)
     add_test(NAME sycl-fusion-alias COMMAND test-sycl-fusion-alias)
     set_tests_properties(sycl-fusion-alias PROPERTIES LABELS "sycl;fusion;host")
 
+    # The FILE_MAPPED tier's raw file-mapping primitives (llama.cpp-5efe C2). file-mapping.cpp includes no SYCL
+    # header, so this target links it alone: no device, no model, no ggml. The test needs POSIX (mmap, /proc/self/maps),
+    # so it is Linux-only; the stub the other platforms get is run by test-sycl-file-mapping-unsupported below.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-file-mapping-host
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-host.cpp
+            file-mapping.cpp)
+        target_include_directories(test-sycl-file-mapping-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(test-sycl-file-mapping-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        set_target_properties(test-sycl-file-mapping-host PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-file-mapping-host COMMAND test-sycl-file-mapping-host)
+        set_tests_properties(test-sycl-file-mapping-host PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
+
+    # The tier on a build without it (llama.cpp-5efe C2 review M2): file-mapping.cpp and the test are compiled with
+    # _WIN32 defined, so the refusing stub that Windows gets is built and run on the host. Both are portable C++.
+    add_executable(test-sycl-file-mapping-unsupported
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-unsupported.cpp
+        file-mapping.cpp)
+    target_include_directories(test-sycl-file-mapping-unsupported PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-file-mapping-unsupported PRIVATE _WIN32=1)
+    set_target_properties(test-sycl-file-mapping-unsupported PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-file-mapping-unsupported COMMAND test-sycl-file-mapping-unsupported)
+    set_tests_properties(test-sycl-file-mapping-unsupported PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+
+    # The HOST_CPU tier's raw wrapper (llama.cpp-th32 T1): anonymous, MADV_HUGEPAGE, mlocked in full. host-cpu-mapping.cpp
+    # includes no SYCL header, so this target links it alone.
+    # The test needs POSIX (mmap, /proc/self/smaps, RLIMIT_MEMLOCK), so it is Linux-only; the stub the other platforms get
+    # is run by test-sycl-host-cpu-unsupported below.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-host-cpu-mapping
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-host-cpu-mapping.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(test-sycl-host-cpu-mapping PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(test-sycl-host-cpu-mapping PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        set_target_properties(test-sycl-host-cpu-mapping PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-host-cpu-mapping COMMAND test-sycl-host-cpu-mapping)
+        set_tests_properties(test-sycl-host-cpu-mapping PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
+
+    # The lazy tables' IO pool registry (th32 §3.3, §11 T3): the counted lease, clone, park, DYING, the FULL reap, the
+    # coverage wrapper, the helper guard and shut-down. lazy-io-pool.cpp includes no SYCL header, so this target links
+    # it with the row cache its reaper inserts into (lazy-row-cache.cpp and host-cpu-mapping.cpp, both device-free) and
+    # ggml-base for the abort and the log: no device, no unified cache, no SYCL module. Its abort legs
+    # re-execute the binary through fork and /proc/self/exe, so it is Linux-only.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp, and the FAIL line the
+    # test prints when it does. Each builds its own executable, test-sycl-lazy-io-pool-host-mutant-<macro suffix>, and a
+    # ctest of that name which passes only when that line appears.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_lazy_io_pool_host_mutants
+            LAZY_IO_POOL_MUTANT_NO_ENTRY_REAP
+                "FAIL the wrapper reaps before its take and after its drop: the take snapshot [0-9]+ reaps run, want [0-9]+: the entry reap did not run before the take"
+            LAZY_IO_POOL_MUTANT_NO_CLOSING_REAP
+                "FAIL the wrapper reaps before its take and after its drop: after the scope: 0 live pools, 0 leases, 1 parked, want its pool reaped by its closing reap"
+            LAZY_IO_POOL_MUTANT_INSTALL_ON_EMPTY_SLOT
+                "FAIL a take installs only on a generation match: take A's pool shares generation [0-9]+ with the pool installed and parked during its build"
+            LAZY_IO_POOL_MUTANT_GENERATION_LIVE_IGNORES_PARKED
+                "FAIL the owner check's generation is live in the slot and parked, and gone after the reap: generation [0-9]+ of the parked pool reads not live")
+        set(_lazy_io_pool_host_variants test-sycl-lazy-io-pool-host "" "")
+        list(LENGTH _lazy_io_pool_host_mutants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            math(EXPR _j "${_i} + 1")
+            list(GET _lazy_io_pool_host_mutants ${_i} _macro)
+            list(GET _lazy_io_pool_host_mutants ${_j} _regex)
+            string(REGEX REPLACE "^LAZY_IO_POOL_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            list(APPEND _lazy_io_pool_host_variants test-sycl-lazy-io-pool-host-mutant-${_suffix} "${_macro}" "${_regex}")
+        endforeach()
+        list(LENGTH _lazy_io_pool_host_variants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 3)
+            math(EXPR _j "${_i} + 1")
+            math(EXPR _k "${_i} + 2")
+            list(GET _lazy_io_pool_host_variants ${_i} _name)
+            list(GET _lazy_io_pool_host_variants ${_j} _macro)
+            list(GET _lazy_io_pool_host_variants ${_k} _regex)
+            add_executable(${_name}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-pool-host.cpp
+                lazy-io-pool.cpp
+                lazy-row-cache.cpp
+                host-cpu-mapping.cpp)
+            target_include_directories(${_name} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+            target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+            target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+            set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+            add_test(NAME ${_name} COMMAND ${_name})
+            if (_macro STREQUAL "")
+                set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+            else()
+                target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+                set_tests_properties(${_name} PROPERTIES
+                    LABELS "sycl;host;mutant"
+                    TIMEOUT 120
+                    PASS_REGULAR_EXPRESSION "${_regex}")
+            endif()
+        endforeach()
+    endif()
+
+    # The IO engine's queue (th32 §5.2.1) and the reaper's delivery (§5.3), host-only: the queue is a data structure
+    # the pool calls under its queue lock, so the order of §5.2.1 is exercised on one thread with fixture requests, no
+    # worker, no ring and no device. Links lazy-io-pool.cpp with the row cache its reaper inserts into
+    # (lazy-row-cache.cpp, host-cpu-mapping.cpp) and ggml-base for the log.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-io-pool.cpp's queue or delivery,
+    # and the FAIL line the arm that kills it prints. Each builds test-sycl-lazy-io-queue-host-mutant-<macro suffix>,
+    # and a ctest of that name which passes only when that line appears.
+    set(_lq_key "FAIL class 0 dispatches by \\(epoch, deadline\\), rows first, equal keys in order: dispatched ")
+    set(_lq_key_want ", want 106 103 102 105 104 100 101")
+    set(_lq_rekey_want "0 1 2 3 4 5 6 7 8 9 99 30 31 32 33 34 20 21 22 23 24")
+    set(_lq_join "FAIL a join from another context adds an entry at the joiner's key: block 97 dispatched at pick ")
+    string(CONCAT _lq_re_deadline_only "${_lq_key}100 101 106 103 102 105 104${_lq_key_want}")
+    string(CONCAT _lq_re_slices_first "${_lq_key}103 106 104 102 105 100 101${_lq_key_want}")
+    string(CONCAT _lq_re_equal_key_lifo "${_lq_key}106 103 105 102 104 101 100${_lq_key_want}")
+    string(CONCAT _lq_re_plain_epoch
+        "FAIL the epoch order survives the counter's wrap: dispatched 202 200 201, want 201 202 200")
+    string(CONCAT _lq_re_no_round_robin
+        "FAIL the contexts take turns: context 2's reads dispatched at picks 100 101 102 103, want 1 3 5 7")
+    string(CONCAT _lq_re_class_blind
+        "FAIL class 1 waits for every context's class 0: dispatched 0 13 1 10 2 11 12, want 10 11 12 0 13 1 2")
+    string(CONCAT _lq_re_no_promotion
+        "FAIL a class-0 join promotes a lookahead read: dispatched 10 2 0 1, want 10 2 1 0")
+    string(CONCAT _lq_re_no_chunking
+        "FAIL a span is read in chunks of at most 512 KiB: the span was queued as 1 reads, want 4 of at most 524288 B")
+    string(CONCAT _lq_re_no_dedup
+        "FAIL a request for a pending block joins its read: after two requests for block 5 and one for block 6, "
+        "3 reads in flight, want 2")
+    string(CONCAT _lq_re_join_keeps_position
+        "FAIL a same-context join takes the more urgent key and keeps its number: dispatched "
+        "0 1 2 3 4 5 6 7 8 9 30 31 32 33 34 20 21 22 23 24 99, want ${_lq_rekey_want}")
+    string(CONCAT _lq_re_no_second_entry "${_lq_join}100 from context 1, want pick 5 from context 2")
+    string(CONCAT _lq_re_cross_context_rekey "${_lq_join}0 from context 1, want pick 5 from context 2")
+    string(CONCAT _lq_re_fifo_ignored
+        "FAIL the FIFO override serves reads in enqueue order: dispatched 0 200 1 201 2 202 3 203 4 5 6 7 8 9 50, "
+        "want 0 1 2 3 4 5 6 7 8 9 200 201 202 203 50")
+    string(CONCAT _lq_re_log_at_completion
+        "FAIL the dispatch log numbers a read when a worker picks it up: the dispatch log lists blocks 2 1 0, "
+        "want 0 1 2")
+    string(CONCAT _lq_re_deliver_ignores_epoch
+        "FAIL the reaper copies only into its own epoch's live slot: a waiter for epoch 4 wrote into the slot at "
+        "epoch 5")
+    string(CONCAT _lq_re_cached_waiter_unchecked
+        "FAIL a cached waiter lies in one chunk, or the submit aborts: "
+        "the submit of a straddling cached waiter returned instead of aborting")
+    string(CONCAT _lq_re_landing_oob_silent
+        "FAIL a landing outside its live slot fails the request with EINVAL and one WARN: "
+        "the out-of-bounds landing left read_error 0 and 0 WARN line\\(s\\), want [0-9]+ and 1")
+    string(CONCAT _lq_re_index_before_own
+        "FAIL a submit that throws leaves the queue's indexes whole: a new read, allocation [0-9]+ thrown: "
+        "a class queue holds an entry no read owns")
+    set(_lazy_io_queue_mutants
+        LAZY_IO_QUEUE_MUTANT_DEADLINE_ONLY           "${_lq_re_deadline_only}"
+        LAZY_IO_QUEUE_MUTANT_SLICES_FIRST            "${_lq_re_slices_first}"
+        LAZY_IO_QUEUE_MUTANT_EQUAL_KEY_LIFO          "${_lq_re_equal_key_lifo}"
+        LAZY_IO_QUEUE_MUTANT_PLAIN_EPOCH_COMPARE     "${_lq_re_plain_epoch}"
+        LAZY_IO_QUEUE_MUTANT_NO_ROUND_ROBIN          "${_lq_re_no_round_robin}"
+        LAZY_IO_QUEUE_MUTANT_CLASS_BLIND             "${_lq_re_class_blind}"
+        LAZY_IO_QUEUE_MUTANT_NO_PROMOTION            "${_lq_re_no_promotion}"
+        LAZY_IO_QUEUE_MUTANT_NO_CHUNKING             "${_lq_re_no_chunking}"
+        LAZY_IO_QUEUE_MUTANT_NO_DEDUP                "${_lq_re_no_dedup}"
+        LAZY_IO_QUEUE_MUTANT_JOIN_KEEPS_POSITION     "${_lq_re_join_keeps_position}"
+        LAZY_IO_QUEUE_MUTANT_NO_SECOND_ENTRY         "${_lq_re_no_second_entry}"
+        LAZY_IO_QUEUE_MUTANT_CROSS_CONTEXT_REKEY     "${_lq_re_cross_context_rekey}"
+        LAZY_IO_QUEUE_MUTANT_FIFO_IGNORED            "${_lq_re_fifo_ignored}"
+        LAZY_IO_QUEUE_MUTANT_LOG_AT_COMPLETION       "${_lq_re_log_at_completion}"
+        LAZY_IO_QUEUE_MUTANT_DELIVER_IGNORES_EPOCH   "${_lq_re_deliver_ignores_epoch}"
+        LAZY_IO_QUEUE_MUTANT_INDEX_BEFORE_OWN        "${_lq_re_index_before_own}"
+        LAZY_IO_QUEUE_MUTANT_PARTIAL_INSERT          "${_lq_re_index_before_own}"
+        LAZY_IO_QUEUE_MUTANT_CACHED_WAITER_UNCHECKED "${_lq_re_cached_waiter_unchecked}"
+        LAZY_IO_QUEUE_MUTANT_LANDING_OOB_SILENT      "${_lq_re_landing_oob_silent}")
+    set(_lazy_io_queue_variants test-sycl-lazy-io-queue-host "" "")
+    list(LENGTH _lazy_io_queue_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_io_queue_mutants ${_i} _macro)
+        list(GET _lazy_io_queue_mutants ${_j} _regex)
+        string(REGEX REPLACE "^LAZY_IO_QUEUE_MUTANT_" "" _suffix "${_macro}")
+        string(TOLOWER "${_suffix}" _suffix)
+        string(REPLACE "_" "-" _suffix "${_suffix}")
+        list(APPEND _lazy_io_queue_variants test-sycl-lazy-io-queue-host-mutant-${_suffix} "${_macro}" "${_regex}")
+    endforeach()
+    list(LENGTH _lazy_io_queue_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _lazy_io_queue_variants ${_i} _name)
+        list(GET _lazy_io_queue_variants ${_j} _macro)
+        list(GET _lazy_io_queue_variants ${_k} _regex)
+        add_executable(${_name}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-queue-host.cpp
+            lazy-io-pool.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+
+    # The block ring's ensure and the IO engine's workers (th32 §3.3, §5.2, §5.3, §10), host-only: ensure allocates
+    # through lazy_io_allocate_host, a link seam the fixture header lazy-io-host-fixture.hpp defines with a counting
+    # ledger in place of lazy-table.cpp's HOST_CPU allocation, and the workers read through the PRIVATE_TESTING read
+    # source, so no device, no unified cache and no SYCL module. The fixture header defines the pool's other link seam,
+    # ggml_sycl_strict_enabled, as a switch only the strict arms' children turn on. Links lazy-io-pool.cpp with the row
+    # cache its reaper inserts into (lazy-row-cache.cpp, host-cpu-mapping.cpp), the ubatch gather that submits to it
+    # (lazy-gather.cpp, device-free too) and ggml-base for the log and the abort. The workers' reads are pread, so it is
+    # Linux-only.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line the arm that kills it prints. Each registers test-sycl-lazy-io-engine-host-mutant-<name> on the
+    # one executable, which passes only when that line appears. A mutant whose arm scores a child is registered on the
+    # child's return, a line only a child that ran past its mutated site prints, never on a missing abort line, which a
+    # child that died early for any other reason prints too. A strict site's return line carries the count of the
+    # site's WARN lines, and its registration names a count of 1, so it proves the WARN fired before the return. The
+    # strict sites' mutant has one registration per site: pool-strict-abort-dropped (the throwing reap) and its aliases
+    # -refused, -drop and -parked, the same selector.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(_le_rules "FAIL ensure allocates the need once and refuses what the plan did not charge: ")
+        string(CONCAT _le_re_no_ensuring
+            "FAIL a concurrent ensure refuses at once while the reserver is held: the second ensure returned ok, "
+            "want lazy-table-ring-concurrent-ensure")
+        string(CONCAT _le_re_ensuring_kept_on_throw
+            "FAIL a throwing allocation leaves ensuring clear for the next ensure: after the throw the pool's "
+            "ensuring is still set, want it cleared by the guard")
+        string(CONCAT _le_re_install_after_shut_down
+            "FAIL ensure refuses after shut-down and frees the reserver's ring: the reserver that reached its install "
+            "after shut-down returned ok, want lazy-table-ring-shut-down")
+        string(CONCAT _le_re_no_span_check
+            "${_le_rules}the ensure one block per slot short returned ok with 1 allocation\\(s\\), "
+            "want lazy-table-ring-too-narrow and none")
+        string(CONCAT _le_re_no_alignment_check
+            "FAIL a need that is not whole blocks per slot refuses before ensure reserves: the unaligned need "
+            "returned ok with 1 allocation\\(s\\), want lazy-table-ring-mismatch and none")
+        string(CONCAT _le_re_shutdown_no_wait
+            "FAIL shutdown cancels queued reads and waits for picked ones: shutdown returned while the picked reads "
+            "were still held on their latch, want it to return only after they finish")
+        string(CONCAT _le_re_worker_reap_destroys_pool
+            "FAIL a worker's last drop leaves its pool's join to the next FULL reap: the worker's drop ran [0-9]+ "
+            "join\\(s\\) on a pool worker and 1 self-join\\(s\\), want 0 and 0")
+        set(_le_strict_returned "the strict child returned from its site after 1 line\\(s\\) '\\[HOST-PLAN-BUG\\] ")
+        string(CONCAT _le_re_pool_strict_abort_dropped
+            "FAIL a reap whose first step throws aborts under strict leases: ${_le_strict_returned}"
+            "ring reap failed: the test seam's throw at the reap's first step': 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_pool_strict_abort_dropped_refused
+            "FAIL a reap refused under a held lock aborts under strict leases: ${_le_strict_returned}"
+            "ring reap refused: strict-child-lock held': 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_pool_strict_abort_dropped_drop
+            "FAIL a lease dropped under a held lock aborts under strict leases: ${_le_strict_returned}"
+            "ring lease dropped with strict-child-lock held': 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_pool_strict_abort_dropped_parked
+            "FAIL a reap finding a parked pool with a lease aborts under strict leases: ${_le_strict_returned}"
+            "reap found a parked pool holding 1 lease\\(s\\), want 0': 'STRICT-CHILD returned'")
+        string(CONCAT _le_re_ensure_witness_dropped
+            "FAIL an ensure entered holding a witnessed lock aborts naming it: "
+            "the held child's ensure returned: 'ENSURE-CHILD returned ok'")
+        set(_le_ticket_wait "FAIL a ticket's wait returns when its reads are delivered: ")
+        set(_le_re_ticket_wait_returns_at_once "${_le_ticket_wait}the wait returned with 3 reads held")
+        set(_le_re_ticket_zero_no_notify "${_le_ticket_wait}after the release the wait did not return within 5 s")
+        string(CONCAT _le_re_gather_returns_unwaited
+            "FAIL a gather waits for the reads it submitted: the gather returned with 3 reads held")
+        string(CONCAT _le_re_gather_error_returns_unwaited
+            "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, the gather "
+            "returned with a submitted read still held")
+        string(CONCAT _le_re_submit_throw_unwoken
+            "FAIL a submit throwing at a later chunk wakes a worker for each read it queued: after a submit threw at "
+            "its second chunk, a read it queued was never picked by a worker")
+        string(CONCAT _le_re_submit_waiter_unreserved
+            "FAIL a gather whose submit throws still waits for the reads it queued: after a submit threw, a worker "
+            "served a read no waiter was counted on")
+        set(_lazy_io_engine_mutants
+            no-ensuring                       "${_le_re_no_ensuring}"
+            ensuring-kept-on-throw            "${_le_re_ensuring_kept_on_throw}"
+            install-after-shut-down           "${_le_re_install_after_shut_down}"
+            no-span-check                     "${_le_re_no_span_check}"
+            no-alignment-check                "${_le_re_no_alignment_check}"
+            shutdown-no-wait                  "${_le_re_shutdown_no_wait}"
+            worker-reap-destroys-pool         "${_le_re_worker_reap_destroys_pool}"
+            pool-strict-abort-dropped         "${_le_re_pool_strict_abort_dropped}"
+            pool-strict-abort-dropped-refused "${_le_re_pool_strict_abort_dropped_refused}"
+            pool-strict-abort-dropped-drop    "${_le_re_pool_strict_abort_dropped_drop}"
+            pool-strict-abort-dropped-parked  "${_le_re_pool_strict_abort_dropped_parked}"
+            ensure-witness-dropped            "${_le_re_ensure_witness_dropped}"
+            ticket-wait-returns-at-once       "${_le_re_ticket_wait_returns_at_once}"
+            ticket-zero-no-notify             "${_le_re_ticket_zero_no_notify}"
+            gather-returns-unwaited           "${_le_re_gather_returns_unwaited}"
+            gather-error-returns-unwaited     "${_le_re_gather_error_returns_unwaited}"
+            submit-throw-unwoken              "${_le_re_submit_throw_unwoken}"
+            submit-waiter-unreserved          "${_le_re_submit_waiter_unreserved}")
+        add_executable(test-sycl-lazy-io-engine-host
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lazy-io-engine-host.cpp
+            lazy-gather.cpp
+            lazy-io-pool.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(test-sycl-lazy-io-engine-host PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(test-sycl-lazy-io-engine-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(test-sycl-lazy-io-engine-host PRIVATE ggml-base Threads::Threads)
+        set_target_properties(test-sycl-lazy-io-engine-host PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-lazy-io-engine-host COMMAND test-sycl-lazy-io-engine-host)
+        set_tests_properties(test-sycl-lazy-io-engine-host PROPERTIES LABELS "sycl;host" TIMEOUT 120)
+        list(LENGTH _lazy_io_engine_mutants _n)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            math(EXPR _j "${_i} + 1")
+            list(GET _lazy_io_engine_mutants ${_i} _mutant)
+            list(GET _lazy_io_engine_mutants ${_j} _regex)
+            add_test(NAME test-sycl-lazy-io-engine-host-mutant-${_mutant}
+                COMMAND test-sycl-lazy-io-engine-host --mutant ${_mutant})
+            set_tests_properties(test-sycl-lazy-io-engine-host-mutant-${_mutant} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endforeach()
+    endif()
+
+    # The hot-row cache of a STORAGE lazy table (th32 §6.3, §6.4, §11 T4): CLOCK replacement, shard independence, the
+    # 13.3 B/slot index, the no-leases rule, the yield that frees a chunk with no wait while rows stay gatherable, the
+    # counters, and the yieldable rule the planner shares. lazy-row-cache.cpp includes no SYCL header and the test hands
+    # the cache fixture memory through its one seam, so this target links that translation unit and host-cpu-mapping.cpp
+    # (the one sizing function the rule counts with, also device-free) with ggml-base for the log: no device, no unified
+    # cache, no SYCL module.
+    #
+    # Each MUTANTS pair is a positive control: a macro that plants one defect in lazy-row-cache.cpp, and the FAIL line
+    # the test prints when it does. Each builds its own executable, test-sycl-lazy-row-cache-mutant-<macro suffix>, and
+    # a ctest of that name which passes only when that line appears.
+    set(_lrc_clock "FAIL \\(2\\) CLOCK evicts by the reference bit and the hand, and the counters read back")
+    set(_lrc_shard "FAIL \\(3\\) a lookup in one shard never waits on another shard's lock")
+    set(_lrc_yield "FAIL \\(5\\) a yield frees a chunk with no wait while rows remain gatherable")
+    string(CONCAT _lrc_re_no_reference_bit "${_lrc_clock}: inserting 14 evicted 10, want 11")
+    string(CONCAT _lrc_re_one_lock
+        "${_lrc_shard}: a lookup in shard [0-9]+ did not return within 3000 ms while shard [0-9]+ was held")
+    string(CONCAT _lrc_re_yield_waits
+        "${_lrc_yield}: the yield did not return within 3000 ms while a reader was inside a lookup")
+    string(CONCAT _lrc_re_release_under_lock "${_lrc_yield}: chunk 63 was released while a shard lock was held")
+    string(CONCAT _lrc_re_yield_floor "${_lrc_yield}: a yield of everything left 0 chunks, want the 16 floor chunks")
+    string(CONCAT _lrc_re_yieldable_by_subtraction
+        "FAIL \\(8\\) the cache and the planner count one yieldable figure: "
+        "the yieldable bytes at Qwen's geometry are 583008256, want 276824064")
+    set(_lazy_row_cache_mutants
+        LAZY_ROW_CACHE_MUTANT_NO_REFERENCE_BIT         "${_lrc_re_no_reference_bit}"
+        LAZY_ROW_CACHE_MUTANT_ONE_LOCK                 "${_lrc_re_one_lock}"
+        LAZY_ROW_CACHE_MUTANT_YIELD_WAITS_FOR_READERS  "${_lrc_re_yield_waits}"
+        LAZY_ROW_CACHE_MUTANT_RELEASE_UNDER_SHARD_LOCK "${_lrc_re_release_under_lock}"
+        LAZY_ROW_CACHE_MUTANT_YIELD_FLOOR              "${_lrc_re_yield_floor}"
+        LAZY_ROW_CACHE_MUTANT_YIELDABLE_BY_SUBTRACTION "${_lrc_re_yieldable_by_subtraction}")
+    set(_lazy_row_cache_variants test-sycl-lazy-row-cache "" "")
+    list(LENGTH _lazy_row_cache_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_row_cache_mutants ${_i} _macro)
+        list(GET _lazy_row_cache_mutants ${_j} _regex)
+        string(REGEX REPLACE "^LAZY_ROW_CACHE_MUTANT_" "" _suffix "${_macro}")
+        string(TOLOWER "${_suffix}" _suffix)
+        string(REPLACE "_" "-" _suffix "${_suffix}")
+        list(APPEND _lazy_row_cache_variants test-sycl-lazy-row-cache-mutant-${_suffix} "${_macro}" "${_regex}")
+    endforeach()
+    list(LENGTH _lazy_row_cache_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _lazy_row_cache_variants ${_i} _name)
+        list(GET _lazy_row_cache_variants ${_j} _macro)
+        list(GET _lazy_row_cache_variants ${_k} _regex)
+        add_executable(${_name}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-sycl-lazy-row-cache.cpp
+            lazy-row-cache.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(${_name} PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        target_link_libraries(${_name} PRIVATE ggml-base Threads::Threads)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 120)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+
+    # The tier on a build without it (llama.cpp-th32 T1a): host-cpu-mapping.cpp and the test are compiled with _WIN32
+    # defined, so the refusing stub Windows gets is built and run on the host. Both are portable C++.
+    add_executable(test-sycl-host-cpu-unsupported
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-host-cpu-unsupported.cpp
+        host-cpu-mapping.cpp)
+    target_include_directories(test-sycl-host-cpu-unsupported PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-host-cpu-unsupported PRIVATE _WIN32=1)
+    set_target_properties(test-sycl-host-cpu-unsupported PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-cpu-unsupported COMMAND test-sycl-host-cpu-unsupported)
+    set_tests_properties(test-sycl-host-cpu-unsupported PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+
+    # The segment plan: a pure function of byte ranges, so this target links file-mapping.cpp alone (llama.cpp-5efe C3).
+    # The planner sits outside file-mapping.cpp's POSIX guard and the test uses no POSIX header, so it builds everywhere.
+    add_executable(test-sycl-file-mapping-segments
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-segments.cpp
+        file-mapping.cpp)
+    target_include_directories(test-sycl-file-mapping-segments PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(test-sycl-file-mapping-segments PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-file-mapping-segments COMMAND test-sycl-file-mapping-segments)
+    set_tests_properties(test-sycl-file-mapping-segments PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+
+    # The monotone host budget and the resident working-set WARN (docs/design/sycl-mmap-host-tier.md §4.5, §7 C5).
+    # host-budget.hpp is a pure header that includes nothing from SYCL, the cache or ggml, so each target compiles one
+    # test file against it alone and links nothing: no device, no library, no model. Each variant is a triple: the
+    # test, the macro that plants one defect in host-budget.hpp ("" for the base test), and the FAIL line the test
+    # prints when it does. A mutant builds its own executable, <test>-mutant-<macro suffix>, whose ctest passes only
+    # when that line appears; it has no SKIP_RETURN_CODE, so a mutant the test does not kill fails.
+    set(_hb_table "FAIL \\(1\\) every row of the 4\\.5 table: ")
+    set(_hb_sweep "FAIL \\(2\\) the budget never decreases as MemAvailable rises: ")
+    set(_hb_override "FAIL \\(3\\) the override composes: ")
+    string(CONCAT _hb_re_cliff
+        "${_hb_sweep}total=32\\.0 GiB: available 8\\.00 GiB gives 4\\.00 GiB, available 8\\.06 GiB gives 0\\.06 GiB")
+    string(CONCAT _hb_re_override_replaces
+        "${_hb_override}an override above the formula gives 200\\.00 GiB, want the formula's 121\\.80 GiB")
+    string(CONCAT _hb_re_old_reserve
+        "${_hb_table}total=246\\.9 GiB available=150\\.8 GiB gives 142\\.80 GiB \\(status ok\\), want 121\\.80 GiB")
+    set(_hb_re_pinned_unbounded
+        "FAIL \\(6\\) a pinned size past the RAM is refused: 1 byte past a 246\\.9 GiB host's RAM is allowed")
+    string(CONCAT _hb_re_warn_above_threshold
+        "FAIL \\(1\\) the WARN fires only past the room: "
+        "mapped_ws [0-9]+ at or below resident_room [0-9]+ printed the WARN")
+    string(CONCAT _hb_re_p3_constant
+        "FAIL \\(3\\) resident_room uses the budget's headroom: at total=62\\.0 GiB available=50\\.0 GiB "
+        "expected_host=4\\.0 GiB mapped_ws=20\\.0 GiB the WARN fired \\(headroom=31138512896 ")
+    set(_host_budget_variants
+        test-sycl-host-budget           ""                                      ""
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_CLIFF                "${_hb_re_cliff}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_OVERRIDE_REPLACES    "${_hb_re_override_replaces}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_OLD_RESERVE          "${_hb_re_old_reserve}"
+        test-sycl-host-budget           HOST_BUDGET_MUTANT_PINNED_UNBOUNDED     "${_hb_re_pinned_unbounded}"
+        test-sycl-host-working-set-warn ""                                      ""
+        test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_WARN_ABOVE_THRESHOLD "${_hb_re_warn_above_threshold}"
+        test-sycl-host-working-set-warn HOST_BUDGET_MUTANT_P3_CONSTANT          "${_hb_re_p3_constant}")
+    list(LENGTH _host_budget_variants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 3)
+        math(EXPR _j "${_i} + 1")
+        math(EXPR _k "${_i} + 2")
+        list(GET _host_budget_variants ${_i} _stem)
+        list(GET _host_budget_variants ${_j} _macro)
+        list(GET _host_budget_variants ${_k} _regex)
+        set(_name ${_stem})
+        if (NOT _macro STREQUAL "")
+            string(REGEX REPLACE "^HOST_BUDGET_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            set(_name ${_stem}-mutant-${_suffix})
+        endif()
+        add_executable(${_name} ${CMAKE_CURRENT_SOURCE_DIR}/tests/${_stem}.cpp)
+        set_target_properties(${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME ${_name} COMMAND ${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+        else()
+            target_compile_definitions(${_name} PRIVATE ${_macro}=1)
+            set_tests_properties(${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+
+    # The residency gate: the page cache of the FILE, measured with cachestat(2), over a 64 MiB fixture under the build
+    # directory (not tmpfs). It evicts per arm and exits 77 where it cannot (llama.cpp-5efe C3). Linux-only: it uses
+    # cachestat, /sys/dev/block and the glibc headers for them.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-file-mapping-residency
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-residency.cpp
+            file-mapping.cpp)
+        target_include_directories(test-sycl-file-mapping-residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        set_target_properties(test-sycl-file-mapping-residency PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        # the fixture directory is the build directory, passed as argv[1]
+        add_test(NAME test-sycl-file-mapping-residency COMMAND test-sycl-file-mapping-residency ${CMAKE_BINARY_DIR})
+        set_tests_properties(test-sycl-file-mapping-residency PROPERTIES
+            LABELS "sycl;host"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 300)
+    endif()
+
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)
@@ -436,7 +946,8 @@ if (BUILD_TESTING)
     add_test(NAME sycl-device-uuid-api COMMAND test-sycl-device-uuid-api)
     set_tests_properties(sycl-device-uuid-api PROPERTIES RUN_SERIAL TRUE LABELS "sycl;api;host")
 
-    foreach(_case inner-failure missing-success wrong-txn depth-underflow depth-overflow cancel rollback-idempotence
+    foreach(_case inner-failure missing-success wrong-txn depth-underflow commit-validate-fails-only-by-poison
+                  depth-overflow cancel rollback-idempotence
                   concurrent-end abort-reuse-aba teardown-reuse-aba concurrent-teardown concurrent-model-teardown
                   runtime-update-teardown load-effect-drain load-effect-abort-drain
                   cache-effect-drain cache-effect-abort-drain
@@ -538,6 +1049,11 @@ if (BUILD_TESTING)
     # llama.cpp-pmzl: DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER have a SYCL arm in both the executor switch and
     # supports_op, supports_op asks the one predicate each executor asserts, and the op sources allocate nothing
     # and never block the host. Numbers: test-sycl-dsv4-hc-kernels (host) and test-backend-ops (device).
+    # TOP_K_MASK joins them on the same terms, plus: the capability query llama's fused-op resolver asks is
+    # supports_op's body with only the placement declines off; while recording, the op reads a graph input through
+    # the pre-stage's device copy (the lookup bin-broadcast shares, graph-input-staged.hpp) and throws before any
+    # submit on a source that is neither staged nor device memory, so the segment runs directly; and its kernel has a
+    # barrier between the -inf fill and the kept cells.
     # --self-test: the allocation and host-wait checks are absence-based and pass on a tree that never had them.
     add_test(NAME sycl-dsv4-ops-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dsv4-ops-source.py
@@ -558,6 +1074,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
             --self-test)
     set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
+    # An unselected ggml_build_forward_select branch carries no GGML_TENSOR_FLAG_COMPUTE: the executors the test names
+    # skip it through ggml_sycl_is_noop; the source readers, the MoE dispatch walkers, the persistent TG checks and
+    # plan, and the fusions that run a look-ahead node ask the rule directly. --self-test: the single-rule check is
+    # absence-based.
+    add_test(NAME sycl-graph-compute-flag-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-compute-flag-source.py
+            --self-test)
+    set_tests_properties(sycl-graph-compute-flag-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
     # llama.cpp-qhfp: GET_ROWS runs Q4_K on the device through one shared support predicate, so qwen35's q4_K
     # token_embd.weight no longer forces a CPU split whose host-memory output cannot be recorded. --self-test:
     # the private-type-list and missing-arm checks are absence-based.
@@ -1980,12 +2504,13 @@ set_tests_properties(sycl-bf16-mul-mat PROPERTIES
     TIMEOUT 300
 )
 
-# DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER kernels against an independent double-precision oracle
-# (llama.cpp-pmzl). Host-only: the kernels run on the opencl:cpu device, so no GPU, no model and no unified
-# cache is touched. The kernels are header-only (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp) and the test
-# compiles the SAME headers dsv4-hc.cpp / lightning-indexer.cpp launch; it links ggml-base only, for the
-# reference quantizers that build the indexer's K. -fsycl without an AOT target list: the device image is JIT
-# compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
+# DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER kernels against an independent double-precision oracle, and TOP_K_MASK
+# against a bit-exact one, so a kernel that diverges from its op fails before it reaches a model. Host-only: the kernels
+# run on the opencl:cpu device, so no GPU, no model and no unified cache is touched. The kernels are header-only
+# (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp, top-k-mask-kernel.hpp) and the test compiles the SAME headers
+# dsv4-hc.cpp / lightning-indexer.cpp / top-k-mask.cpp launch; it links ggml-base only, for the reference quantizers
+# that build the indexer's K and the f16 conversion of the top-k mask's cells. -fsycl without an AOT target list: the
+# device image is JIT compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
 add_executable(test-sycl-dsv4-hc-kernels
     tests/test-dsv4-hc-kernels.cpp
 )
@@ -2046,6 +2571,72 @@ set_tests_properties(sycl-kv-layer-sizing PROPERTIES
     # llama.cpp-3aos: "hostonly" (no hyphen) matches the sibling
     # sycl-kv-slice-sizing's own spelling.
     LABELS "sycl;kv;sizing;hostonly"
+    TIMEOUT 60
+)
+
+# llama.cpp-5efe C4 (part b): the indexer cache counts toward a demoted layer's host-KV demand.  The real
+# placement_plan::kv_demand_for_layer() and the real plan_runtime_kv_demotion(); no device, no queue.  Same
+# arrangement as test-sycl-kv-layer-sizing above (header-only plan, no libggml-sycl).
+add_executable(test-sycl-kv-demand-idx
+    tests/test-sycl-kv-demand-idx.cpp
+    kv-runtime-demotion.cpp
+)
+target_include_directories(test-sycl-kv-demand-idx PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-kv-demand-idx PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-kv-demand-idx PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-kv-demand-idx PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-kv-demand-idx PRIVATE ggml-base)
+add_test(NAME sycl-kv-demand-idx COMMAND test-sycl-kv-demand-idx)
+set_tests_properties(sycl-kv-demand-idx PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;host;kv;hostonly"
+    TIMEOUT 60
+)
+
+# llama.cpp-5efe C4 (part c): the planner's host-weight accounting is split by host backing.  The real placement_plan
+# (charge_host_weight, the four terms, update_expert_placement); header-only plan, so no libggml-sycl, like
+# test-sycl-kv-demand-idx above.
+add_executable(test-sycl-host-backing-accounting
+    tests/test-sycl-host-backing-accounting.cpp
+)
+target_include_directories(test-sycl-host-backing-accounting PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-host-backing-accounting PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-host-backing-accounting PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-host-backing-accounting PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-host-backing-accounting PRIVATE ggml-base)
+add_test(NAME sycl-host-backing-accounting COMMAND test-sycl-host-backing-accounting)
+set_tests_properties(sycl-host-backing-accounting PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;host;placement;hostonly"
+    TIMEOUT 60
+)
+
+# llama.cpp-5efe C4 (part b): a stream_dma refusal of a file-mapped source is terminal in get_rows' slice loop (the real
+# loop over a fake stream_dma) and the registry predicate stream_dma reads.  getrows-dma-retry.hpp and alloc-registry.hpp
+# are header-only and SYCL-free, so this target builds without -fsycl or ggml-base, like test-kv-runtime-demotion below.
+add_executable(test-sycl-getrows-refusal-terminal
+    tests/test-sycl-getrows-refusal-terminal.cpp
+)
+target_include_directories(test-sycl-getrows-refusal-terminal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-getrows-refusal-terminal COMMAND test-sycl-getrows-refusal-terminal)
+set_tests_properties(sycl-getrows-refusal-terminal PROPERTIES
+    LABELS "sycl;host;getrows;hostonly"
     TIMEOUT 60
 )
 
@@ -2869,7 +3460,9 @@ set_tests_properties(expert-prefetch-runtime PROPERTIES
 endif()
 
 # Evict accounting, realloc failure handling, unaligned hash.
-# LABELS drop the old "cache" -- see rule 2 above.
+# LABELS carry "cache": it allocates through a real device cache and peaks near
+# 8.5 GB RSS, so it is a member of the family rule 2 describes and runs by name
+# or in the serial cache|mem-handle pass, never in the throttled sweep.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-unified-cache-bugs
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-unified-cache-bugs.cpp
@@ -2890,8 +3483,9 @@ target_compile_definitions(test-unified-cache-bugs PRIVATE
 target_link_libraries(test-unified-cache-bugs PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME unified-cache-bugs COMMAND test-unified-cache-bugs)
 set_tests_properties(unified-cache-bugs PROPERTIES
-    LABELS "sycl;unified;bugfix;tdd"
+    LABELS "sycl;unified;cache;bugfix;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 180
 )
 
@@ -2921,6 +3515,7 @@ add_test(NAME sycl-kv-view-resolution COMMAND test-sycl-kv-view-resolution)
 set_tests_properties(sycl-kv-view-resolution PROPERTIES
     LABELS "sycl;kv;view;handle;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_TEST_KV_VIEW_RUNTIME=0"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -3405,6 +4000,41 @@ set_tests_properties(sycl-runtime-alloc-flag-slab-released-at-shutdown PROPERTIE
     LABELS "sycl;allocator;runtime;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 180
+    SKIP_RETURN_CODE 77
+)
+# The arena teardown's refusal classes: a teardown refused before it freed any chunk leaves the arena as it was, one
+# refused after it freed a chunk leaves it partly freed and closed. Its own process, because its arms arm process-wide
+# test hooks. It allocates arenas on the device, so it carries `cache` and runs with that family, not in the sweep, and
+# alone (RUN_SERIAL): one arm holds a settle thread at a barrier, and a parallel test's load would only slow it.
+set(SYCL_ARENA_TEARDOWN_TEST_ENV
+    "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+)
+add_test(NAME sycl-runtime-alloc-arena-teardown-refusal-classes
+    COMMAND test-sycl-runtime-alloc --case arena_teardown_refusal_classes
+)
+set_tests_properties(sycl-runtime-alloc-arena-teardown-refusal-classes PROPERTIES
+    LABELS "sycl;allocator;runtime;cache;tdd"
+    ENVIRONMENT "${SYCL_ARENA_TEARDOWN_TEST_ENV}"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+)
+# The release of the last model: with no model live a cache gives back its PP MoE ring, its oneDNN pair and the arena
+# nothing holds; a claimed ring slot, a reserved pair or a chunk lease keeps them and is named; a load's start reserves
+# the released arena again and runs the release a failed load deferred; and a device's published terms go back to a
+# default load_published_terms, their start values. Its own process, because its first arm reads a process where
+# nothing has been published. It allocates arenas on the device, one at a time: 64 MiB ones, and for the two arms whose
+# start reserves the arena again a 2 GiB early arena, which holds the 1296 MiB of the start's default zones with room.
+# So it carries `cache` and runs alone with that family, not in the sweep.
+add_test(NAME sycl-runtime-alloc-last-release-empties-the-arena
+    COMMAND test-sycl-runtime-alloc --case last_release_empties_the_arena
+)
+set_tests_properties(sycl-runtime-alloc-last-release-empties-the-arena PROPERTIES
+    LABELS "sycl;allocator;runtime;cache;tdd"
+    ENVIRONMENT "${SYCL_ARENA_TEARDOWN_TEST_ENV}"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
 )
 endif() # direct-source static SYCL fixture
@@ -4162,6 +4792,7 @@ add_test(NAME test-sycl-tensor-usage COMMAND test-sycl-tensor-usage)
 set_tests_properties(test-sycl-tensor-usage PROPERTIES
     LABELS "sycl;moe;tensor-placement;tdd"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -4351,6 +4982,13 @@ set_tests_properties(test-sycl-bf16-mul-mat-backend PROPERTIES
 # test-thread-safety, test-backend-ops). RUN_SERIAL TRUE is still set below,
 # matching every other gpu-serial-labelled GPU test in this repo.
 #
+# It also checks that the buffer releases the extras its init_tensor made for
+# its own K/V tensors: it reserves a small VRAM arena when the process has
+# none and counts mem_handle chunk leases at the tensor_extra site before the
+# buffer, after init and after the free. Because it allocates on the GPU it
+# carries `mem-handle`, so the form 2 sweep leaves it to the serial
+# `-L 'cache|mem-handle'` family.
+#
 # Shares the enclosing `if (NOT GGML_BACKEND_DL)` opened above for
 # test-sycl-compute-buffer-extra-reuse rather than opening a redundant nested
 # one -- both tests close together at the single endif below.
@@ -4376,7 +5014,7 @@ target_compile_definitions(test-sycl-kv-view-extra-reuse PRIVATE
 target_link_libraries(test-sycl-kv-view-extra-reuse PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-kv-view-extra-reuse COMMAND test-sycl-kv-view-extra-reuse)
 set_tests_properties(test-sycl-kv-view-extra-reuse PROPERTIES
-    LABELS "sycl;memory;kv;tensor-extras;gpu-serial"
+    LABELS "sycl;memory;kv;tensor-extras;gpu-serial;mem-handle"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
@@ -4631,6 +5269,7 @@ add_test(NAME test-sycl-weight-key-stability COMMAND test-sycl-weight-key-stabil
 set_tests_properties(test-sycl-weight-key-stability PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -4679,17 +5318,18 @@ target_compile_definitions(test-sycl-kv-planned-device-materialization PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
-    # The test body sits behind #if defined(GGML_USE_SYCL); without this the
-    # whole body compiled out and the binary exited 0 without running anything.
-    GGML_USE_SYCL=1
 )
+# GGML_USE_SYCL arrives with ggml-sycl-private-fixtures (ggml-private-test-registry publishes it).
 target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-planned-device-materialization)
 # Two cards, not one: this fixture's own main() defaults the selector to
 # "level_zero:0,1" and its cases materialize across both. Narrowing it to the
 # single validation card the other pins use would change what it tests.
+# "cache", not "hostonly": it builds a real unified cache on each card and allocates
+# through it, the GPU-allocating family rule 2 describes, so it runs by name or in the
+# serial cache|mem-handle pass.
 set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
-    LABELS "sycl;kv;hostonly;tdd;0igs-batch1"
+    LABELS "sycl;kv;cache;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # Every skip path (no SYCL build, fewer than two devices) exits 77 so it
     # reads as a skip, not a pass.
@@ -4782,6 +5422,7 @@ add_test(NAME test-sycl-weight-key-uniqueness COMMAND test-sycl-weight-key-uniqu
 set_tests_properties(test-sycl-weight-key-uniqueness PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -4810,6 +5451,7 @@ add_test(NAME test-unified-cache-integrity COMMAND test-unified-cache-integrity)
 set_tests_properties(test-unified-cache-integrity PROPERTIES
     LABELS "sycl;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -4848,6 +5490,7 @@ add_test(NAME test-sycl-fattn-onednn-materialization COMMAND test-sycl-fattn-one
 set_tests_properties(test-sycl-fattn-onednn-materialization PROPERTIES
     LABELS "sycl;fattn;onednn;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_FA_ONEDNN_MATERIALIZE=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5069,6 +5712,7 @@ add_test(NAME test-unified-cache-concurrent COMMAND test-unified-cache-concurren
 set_tests_properties(test-unified-cache-concurrent PROPERTIES
     LABELS "sycl;hostonly;concurrency;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5209,6 +5853,34 @@ set_tests_properties(sycl-moe-stream-phase PROPERTIES
     TIMEOUT 60
 )
 
+# The loader's SYCL_Host buffer as a host WEIGHT zone term, and the host experts it serves in place, over a hand-built
+# plan. Host-only (no queue, no device, no allocation), built exactly like test-moe-stream-plan above.
+add_executable(test-sycl-loader-in-place-terms
+    tests/test-sycl-loader-in-place-terms.cpp
+)
+target_include_directories(test-sycl-loader-in-place-terms PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-loader-in-place-terms PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-loader-in-place-terms PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-loader-in-place-terms PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-loader-in-place-terms PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-loader-in-place-terms PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-loader-in-place-terms COMMAND test-sycl-loader-in-place-terms)
+set_tests_properties(sycl-loader-in-place-terms PROPERTIES
+    LABELS "sycl;planner;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
 # llama.cpp-36j0 Task 11a: loan selection (the lendable tail of the resident expert set) over a hand-built plan. Host-only,
 # built exactly like test-moe-stream-plan above.
 add_executable(test-moe-expert-loan-select
@@ -5232,6 +5904,34 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME sycl-moe-expert-loan-select COMMAND test-moe-expert-loan-select)
 set_tests_properties(sycl-moe-expert-loan-select PROPERTIES
+    LABELS "sycl;moe;ring;hostonly"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+)
+
+# The plan transaction's named moves (an evict list and an admit list of expert triplets) checked against a hand-built
+# plan before anything moves. Host-only, built exactly like test-moe-expert-loan-select above.
+add_executable(test-moe-expert-move-validate
+    tests/test-moe-expert-move-validate.cpp
+)
+target_include_directories(test-moe-expert-move-validate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-expert-move-validate PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-expert-move-validate PRIVATE "-fsycl")
+target_compile_definitions(test-moe-expert-move-validate PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-moe-expert-move-validate PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-expert-move-validate PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-expert-move-validate COMMAND test-moe-expert-move-validate)
+set_tests_properties(sycl-moe-expert-move-validate PROPERTIES
     LABELS "sycl;moe;ring;hostonly"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 60
@@ -5291,6 +5991,7 @@ add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resol
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -5381,9 +6082,12 @@ target_compile_definitions(test-fattn-thread-local PRIVATE
 )
 target_link_libraries(test-fattn-thread-local PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-fattn-thread-local COMMAND test-fattn-thread-local)
+# "cache": it allocates device buffers on a real queue, the GPU-allocating family
+# rule 2 describes, so it runs by name or in the serial cache|mem-handle pass.
 set_tests_properties(test-fattn-thread-local PROPERTIES
-    LABELS "sycl;fattn;tdd;0igs-batch2"
+    LABELS "sycl;fattn;cache;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5438,6 +6142,7 @@ add_test(NAME test-layout-bytes COMMAND test-layout-bytes)
 set_tests_properties(test-layout-bytes PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5526,6 +6231,7 @@ add_test(NAME test-moe-mul-mat-id COMMAND test-moe-mul-mat-id)
 set_tests_properties(test-moe-mul-mat-id PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5554,6 +6260,7 @@ add_test(NAME test-moe-mul-mat-id-q4q8 COMMAND test-moe-mul-mat-id-q4q8)
 set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5564,7 +6271,7 @@ endif() # static SYCL backend fixture
 # planned weight slot in f16 groups across its two halves: at least three at the slot's own grouping, and exactly
 # what the cap gives in two more Q4_0 cases that the test runs as child processes of itself with
 # GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX at 1 and 3. Pinned to the B50; a run with no SYCL GPU exits 77. The timeout
-# covers 36 cases and the single-threaded IQ quantizers.
+# covers 38 cases, two of them skewed at 1024 and 2048 rows, and the single-threaded IQ quantizers.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-pp-batched-dequant
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-batched-dequant.cpp
@@ -5655,6 +6362,174 @@ set_tests_properties(sycl-moe-bf16-direct-kernel PROPERTIES
     TIMEOUT 300
 )
 
+# Decode runs Q8_0 experts in the SOA layout the planner materialized them in: three one-token MUL_MAT_ID cases on a
+# planned model loaded the way libllama loads one, each matching the CPU backend at NMSE <= 5e-4 and a largest
+# difference <= 1.0, each failing unless its load logged the preload's [MOE-LAYOUT] line with layout=soa for the
+# tensor, and each failing on a decode or prompt refusal. Each case also names the dispatcher that launched the SOA
+# kernel: the decode cases the batched one, and a four-token prompt case, run in a child process with the batched
+# oneDNN prompt executor off, ggml_sycl_mul_mat_id_vec_q. Pinned to the B50; a run with no SYCL GPU, or with
+# GGML_SYCL_WEIGHTS_EVICTABLE off, exits 77. It loads a planned model onto the card, so it carries the `model` label,
+# which the full sweep excludes.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-decode-q8-0-soa
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-decode-q8-0-soa.cpp
+)
+target_include_directories(test-moe-decode-q8-0-soa PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-decode-q8-0-soa PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-decode-q8-0-soa PRIVATE "-fsycl")
+target_link_libraries(test-moe-decode-q8-0-soa PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-decode-q8-0-soa PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-decode-q8-0-soa PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-decode-q8-0-soa COMMAND test-moe-decode-q8-0-soa)
+set_tests_properties(test-moe-decode-q8-0-soa PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+)
+endif() # static SYCL backend fixture
+
+# The positive control of test-moe-decode-q8-0-soa: the same source linked against the private backend objects, with
+# the Q8_0 SOA MUL_MAT_ID kernel's planted fault switched on (every block reads the next block's scale). It passes only
+# when the kernel announced the fault and then three cases failed on NMSE, in output order: prompt-vec-q (its child
+# process prints first) with the kernel launched from vec_q, decode-base, and decode-ids-table with the kernel on the
+# per-expert table. So the test is shown to see a scale read from the wrong block through each dispatcher and each
+# table form, and a later break of any of them fails the kill.
+# No SKIP_RETURN_CODE: a run that skips prints none of those lines and fails, never reading as a kill.
+# It loads the same planned models, so it carries the `model` label too.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-decode-q8-0-soa-mutant-wrong-scale
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-decode-q8-0-soa.cpp
+)
+target_include_directories(test-moe-decode-q8-0-soa-mutant-wrong-scale PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+# The fault is compiled only into the private backend objects; the ordinary DSO carries none of it.
+target_link_libraries(test-moe-decode-q8-0-soa-mutant-wrong-scale PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+string(CONCAT _q8_0_soa_mutant_regex
+    "\\[MMVQ-MUTANT\\] q8_0-soa-id wrong-scale-block active.*"
+    "CASE name=prompt-vec-q [^\n]* site=vec_q [^\n]*-> FAIL: nmse.*"
+    "CASE name=decode-base [^\n]*-> FAIL: nmse.*"
+    "CASE name=decode-ids-table [^\n]* table=ids [^\n]*-> FAIL: nmse")
+add_test(NAME test-moe-decode-q8-0-soa-mutant-wrong-scale COMMAND test-moe-decode-q8-0-soa-mutant-wrong-scale)
+set_tests_properties(test-moe-decode-q8-0-soa-mutant-wrong-scale PROPERTIES
+    LABELS "sycl;moe;device;B50;mutant;model"
+    RUN_SERIAL TRUE
+    ENVIRONMENT "GGML_SYCL_TEST_MUTANT_Q8_0_SOA_ID=wrong-scale-block;ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+    PASS_REGULAR_EXPRESSION "${_q8_0_soa_mutant_regex}"
+)
+endif() # private SYCL backend fixture
+
+# Mixed residency for Q1_0 and NVFP4 experts: on a planned model whose plan the fixture edits to put 7 of 16 experts on
+# the host, each MUL_MAT_ID op runs its card experts through the batched dispatch and its host experts through the
+# HOST_CPU recipe, at 1, 7 and 512 tokens, on the gate (ne11 1) and down (ne11 4) tensors. Each case must match the CPU
+# backend on the device rows and on the host rows apart, log one [MOE-ROUTE] partition line whose local= and host=
+# counts are the occurrences the plan puts on each side, and refuse nothing. A case whose op picked experts from one
+# side only makes the run exit 77. It links the ordinary DSO, so it runs the production route, and it reads and stages
+# placement plans through the C++ lifecycle entry points the DSO exports (unified-cache.hpp, hence GGML_SYCL_DNNL as
+# the DSO was built). Pinned to the B50; a run with no SYCL GPU, more than one visible card, or
+# GGML_SYCL_WEIGHTS_EVICTABLE off exits 77. It loads a planned model onto the card, so it carries the `model` label,
+# which the full sweep excludes.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-mixed-residency-q1-nvfp4
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-mixed-residency-q1-nvfp4.cpp
+)
+target_include_directories(test-moe-mixed-residency-q1-nvfp4 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_definitions(test-moe-mixed-residency-q1-nvfp4 PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_compile_options(test-moe-mixed-residency-q1-nvfp4 PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-mixed-residency-q1-nvfp4 PRIVATE "-fsycl")
+target_link_libraries(test-moe-mixed-residency-q1-nvfp4 PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-mixed-residency-q1-nvfp4 PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-mixed-residency-q1-nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-mixed-residency-q1-nvfp4 COMMAND test-moe-mixed-residency-q1-nvfp4)
+set_tests_properties(test-moe-mixed-residency-q1-nvfp4 PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # static SYCL backend fixture
+
+# The Q1_0/NVFP4 batched-dispatch refusal at run time: on the mixed-residency vehicle (NVFP4, one card expert and three
+# host experts at one token), a failpoint makes the batched dispatch refuse once, and the op must end
+# GGML_STATUS_FAILED with the WARN that names reason=test-failpoint; the same op run again in the same process must then
+# succeed and match the CPU backend on both sides. The failpoint exists only in the private backend objects, so it
+# links ggml-sycl-private-fixtures (not the ordinary DSO) and closes the MMID route those objects compile in. It loads a
+# planned model onto the card, so it carries the `model` label, which the full sweep excludes. Pinned to the B50; a run
+# with no SYCL GPU, more than one visible card, GGML_SYCL_WEIGHTS_EVICTABLE off, or a published plan that leaves the
+# op's experts on one side only exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-q1-nvfp4-dispatch-refusal
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-q1-nvfp4-dispatch-refusal.cpp
+)
+target_include_directories(test-moe-q1-nvfp4-dispatch-refusal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-moe-q1-nvfp4-dispatch-refusal PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-q1-nvfp4-dispatch-refusal COMMAND test-moe-q1-nvfp4-dispatch-refusal)
+set_tests_properties(test-moe-q1-nvfp4-dispatch-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # private SYCL backend fixture
+
+# The MoE prompt staging refusal at run time: on an unplanned Q4_0 MoE model at 128 tokens, which takes the per-expert
+# prompt route, one failpoint per staging site (the row maps, the output, the F32 activation) makes that allocation act
+# as not granted once, and the op must end GGML_STATUS_FAILED with the [MOE-PP-STAGING] WARN that names the tensor, the
+# buffer, the rows and bytes and the device; the same op run again in the same process must then succeed and match the
+# CPU backend. The failpoints exist only in the private backend objects, so it links ggml-sycl-private-fixtures (not
+# the ordinary DSO) and closes the MMID route those objects compile in. It loads a model onto the card, so it carries
+# the `model` label, which the full sweep excludes. Pinned to the B50; a run with no SYCL GPU or more than one visible
+# card exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-pp-staging-refusal ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-staging-refusal.cpp)
+target_include_directories(test-moe-pp-staging-refusal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-moe-pp-staging-refusal PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-moe-pp-staging-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-pp-staging-refusal COMMAND test-moe-pp-staging-refusal)
+set_tests_properties(test-moe-pp-staging-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+endif() # private SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mul-mat-host-streaming
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-mul-mat-host-streaming.cpp
@@ -5679,6 +6554,7 @@ add_test(NAME test-mul-mat-host-streaming COMMAND test-mul-mat-host-streaming)
 set_tests_properties(test-mul-mat-host-streaming PROPERTIES
     LABELS "sycl;dispatch;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -5923,6 +6799,7 @@ add_test(NAME test-sycl-moe-expert-parallelism COMMAND test-sycl-moe-expert-para
 set_tests_properties(test-sycl-moe-expert-parallelism PROPERTIES
     LABELS "sycl;moe;tdd;0igs-batch2"
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture
@@ -6055,6 +6932,67 @@ set_tests_properties(test-sycl-orchestrator PROPERTIES
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+endif() # static SYCL backend fixture
+
+# The backend's fatal exit: a child process must end without running an exit handler or a static destructor. The
+# helper, control and classify modes touch no device.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-fatal-exit
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-sycl-fatal-exit.cpp
+)
+target_include_directories(test-sycl-fatal-exit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-fatal-exit PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-fatal-exit PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-fatal-exit PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-fatal-exit PRIVATE ggml-sycl-private-fixtures)
+set_target_properties(test-sycl-fatal-exit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# TIMEOUT covers the capture mode's four children, each bounded at 35 s by the parent.
+foreach(_fatal_mode IN ITEMS helper control classify capture settle settle-off settle-cap abort-settle abort-settle-chain)
+    add_test(NAME test-sycl-fatal-exit-${_fatal_mode} COMMAND test-sycl-fatal-exit ${_fatal_mode})
+    set_tests_properties(test-sycl-fatal-exit-${_fatal_mode} PROPERTIES
+        LABELS "sycl;fatal-exit"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 150
+    )
+endforeach()
+# The device modes inject the loss a lost device throws, at MUL_MAT_ID, at any op, at the synchronize wait and at the
+# graph boundary. Each child sets its own GGML_SYCL_TEST_INJECT_DEVICE_LOST (see device_injection() in the test), so a
+# mode runs by hand with no environment beyond the device selector.
+# Before the fatal exit waited, a fast exit on a healthy card often left "Fault response" lines and copy or compute
+# engine resets in the kernel log, scoped to the dying process's own context. Once, when the modes ran one second
+# apart under ctest, the fourth process hung on its first copy and the kernel reset the whole GT about 35 s later.
+# The fatal exit now waits for the driver's submission rings before it ends the process, 200 ms by default
+# (GGML_SYCL_FATAL_EXIT_SETTLE_MS). In a device check on 2026-11-16 (Arc Pro B50, compute-runtime 26.44), 20 fast
+# exits with that wait (the four modes, five rounds, 12 s apart) left no fault, engine reset or CAT error line in the
+# kernel log, and none hung. Without the wait, on the same card and driver the same day, 16 of 22 fast exits left such
+# lines. Twenty clean runs cannot rule out a rare hang.
+# The label fatal-exit-device still keeps the four device modes out of the documented full sweep: a test that ctest
+# kills at its TIMEOUT ends without the wait, and may still leave copy-engine work on the card, which no run has
+# checked. For the same reason each mode's parent still waits 12 s after its child before it returns, the spacing the
+# device check used. Run them by their label, one at a time:
+# ctest -L '^fatal-exit-device$' -j 1. scripts/check-ctest-safety-net.sh knows the label and fails if the sweep
+# selects a test carrying it.
+set(_fatal_device_env "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+                      "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+foreach(_fatal_site IN ITEMS mmid op sync graph)
+    add_test(NAME test-sycl-fatal-exit-${_fatal_site} COMMAND test-sycl-fatal-exit ${_fatal_site})
+    set_tests_properties(test-sycl-fatal-exit-${_fatal_site} PROPERTIES
+        LABELS "sycl;fatal-exit;device;B50;fatal-exit-device"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        ENVIRONMENT "${_fatal_device_env}"
+        TIMEOUT 120
+    )
+endforeach()
 endif() # static SYCL backend fixture
 
 # ---------------------------------------------------------------------------
@@ -6317,6 +7255,7 @@ if (NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;set-rows;owner-routing;restored"
         RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
     )
 endif()
 
@@ -6554,8 +7493,11 @@ endif()
 # backend; the ordinary DSO carries no layout-override seam.
 target_link_libraries(test-xmx-host-streaming PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
+# "cache": with XMX on it builds backend buffers and computes on the device, the
+# GPU-allocating family rule 2 describes, so it runs by name or in the serial
+# cache|mem-handle pass.
 set_tests_properties(test-xmx-host-streaming PROPERTIES
-    LABELS "sycl;xmx;tdd;0igs-batch2"
+    LABELS "sycl;xmx;cache;tdd;0igs-batch2"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # 77 = XMX off at build time, no SYCL backend, or a device without XMX
     # INT8/Q4_0. With both options OFF (the default) this test SKIPS -- which is
@@ -6898,6 +7840,18 @@ set_tests_properties(graph-prestage-decline-memo PROPERTIES
     TIMEOUT 60
 )
 
+# Test: the per-context decode prologue memo (signature, slot key, prestage effect list) of a graph llama reuses.
+# Host-only, same arrangement: graph-prologue-memo.hpp and graph-segment-cache.hpp include no SYCL header.
+add_executable(test-graph-prologue-memo
+    tests/test-graph-prologue-memo.cpp
+)
+target_include_directories(test-graph-prologue-memo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph-prologue-memo COMMAND test-graph-prologue-memo)
+set_tests_properties(graph-prologue-memo PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
 # Test: SYCL GET_ROWS Q4_K element decode against ggml's reference, plus the support predicate
 # (llama.cpp-qhfp). Host-only: get-rows-kquant.hpp and get-rows-support.hpp include no SYCL header, so the
 # device kernel's decode function runs here unchanged. ggml-base supplies the reference quantiser.
@@ -7175,8 +8129,9 @@ set_tests_properties(sycl-moe-control-plan PROPERTIES
 
 # MoE prefill expert streaming ring sizing (llama.cpp-36j0): the ring's byte
 # budget and slot count. Host-only: moe-stream-ring.cpp is compiled with
-# GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY, which leaves only the pure function, so
-# this target takes no -fsycl and does not link ggml-sycl (the same TU is also
+# GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY, which leaves only the pure functions
+# (moe_stream_ring_size and moe_stream_ring_weight_zone_line), so this target
+# takes no -fsycl and does not link ggml-sycl (the same TU is also
 # globbed into libggml-sycl, where the ring class is compiled too).
 add_executable(test-moe-stream-ring-sizing
     tests/test-moe-stream-ring-sizing.cpp
@@ -7192,6 +8147,28 @@ add_test(NAME sycl-moe-stream-ring-sizing COMMAND test-moe-stream-ring-sizing)
 set_tests_properties(sycl-moe-stream-ring-sizing PROPERTIES
     LABELS "sycl;moe;ring;hostonly"
     TIMEOUT 60
+)
+# Positive control for the short reserve's WEIGHT zone census: the same test with the tag ranking inverted, smallest
+# first. It passes only when the test prints the ranking case's FAIL line, which the unmutated ranking never prints.
+add_executable(test-moe-stream-ring-sizing-mutant-smallest-first
+    tests/test-moe-stream-ring-sizing.cpp
+    moe-stream-ring.cpp
+)
+target_include_directories(test-moe-stream-ring-sizing-mutant-smallest-first PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(test-moe-stream-ring-sizing-mutant-smallest-first PRIVATE
+    GGML_SYCL_MOE_STREAM_RING_SIZING_ONLY=1
+    GGML_SYCL_ZONE_TAG_CENSUS_MUTANT_SMALLEST_FIRST=1
+)
+set_target_properties(test-moe-stream-ring-sizing-mutant-smallest-first PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-stream-ring-sizing-mutant-smallest-first
+    COMMAND test-moe-stream-ring-sizing-mutant-smallest-first)
+set_tests_properties(sycl-moe-stream-ring-sizing-mutant-smallest-first PROPERTIES
+    LABELS "sycl;moe;ring;hostonly;mutant"
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "FAIL: census ranks largest bytes first, then more allocations, then the tag:"
 )
 
 add_executable(test-moe-mmid-workspace-plan
@@ -7229,6 +8206,22 @@ add_test(NAME sycl-moe-scratch-admission COMMAND test-moe-scratch-admission)
 set_tests_properties(sycl-moe-scratch-admission PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never enumerates or
     # submits to a device. Labels also avoid the throttled sweep's cache denylist.
+    LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# The packed layout of the batched MoE prompt executor's scratch. moe-pp-pack.hpp is header-only and includes no SYCL
+# header, so this target takes no -fsycl and links no backend library.
+add_executable(test-moe-pp-pack
+    tests/test-moe-pp-pack.cpp
+)
+target_include_directories(test-moe-pp-pack PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-moe-pp-pack PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-pp-pack COMMAND test-moe-pp-pack)
+set_tests_properties(sycl-moe-pp-pack PROPERTIES
     LABELS "sycl;moe;host-only;tsan-capable"
     TIMEOUT 30
 )
@@ -7373,6 +8366,25 @@ set_target_properties(test-sycl-graph-recorder-scope PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-graph-recorder-scope COMMAND test-sycl-graph-recorder-scope)
 set_tests_properties(sycl-graph-recorder-scope PROPERTIES
+    # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
+    LABELS "sycl;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
+# What a graph prestage does with one source tensor: the class rule, and the view-root walk that decides whether a
+# host-resident tensor is an op output (a CPU-produced activation the prestage stages as an INPUT). The header reads
+# only ggml.h's types and fields, so this target takes no -fsycl and links nothing.
+add_executable(test-sycl-prestage-class
+    tests/test-sycl-prestage-class.cpp
+)
+target_include_directories(test-sycl-prestage-class PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+set_target_properties(test-sycl-prestage-class PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-prestage-class COMMAND test-sycl-prestage-class)
+set_tests_properties(sycl-prestage-class PROPERTIES
     # Deliberately no ONEAPI_DEVICE_SELECTOR: this fixture never touches a device.
     LABELS "sycl;host-only;tsan-capable"
     TIMEOUT 30
@@ -7713,6 +8725,84 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;allocator;owner;host;tsan-capable"
         TIMEOUT 30)
 
+    # The FILE_MAPPED tier through the real front door (llama.cpp-5efe C2). A file mapping needs no device, but the
+    # test constructs the unified cache and allocates through it, so its labels are the intrusive-owner test's plus
+    # cache and gpu-serial, and it is registered like every test that constructs the cache: serial, selector pinned.
+    # POSIX-only (it reads /proc/self/maps and counts fds), so Linux-only; its name is its binary's (C2 review m2).
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-file-mapped-tier
+            tests/test-file-mapped-tier.cpp)
+        target_link_libraries(test-sycl-file-mapped-tier PRIVATE
+            ggml-sycl-private-fixtures Threads::Threads)
+        set_target_properties(test-sycl-file-mapped-tier PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-file-mapped-tier COMMAND test-sycl-file-mapped-tier)
+        set_tests_properties(test-sycl-file-mapped-tier PROPERTIES
+            # cache and gpu-serial: it constructs the unified cache, so the full sweep's label filter leaves it out
+            # and it runs alone, on the discrete cards
+            LABELS "sycl;allocator;owner;host;cache;gpu-serial"
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77
+            TIMEOUT 30)
+
+        # The HOST_CPU tier through the same front door (llama.cpp-th32 T1b): a locked anonymous mapping, one registry
+        # record, one munmap. Needs no device and is registered like the file-mapped tier; SKIP_RETURN_CODE 77 is
+        # also its refusal to pass when RLIMIT_MEMLOCK is below the request.
+        add_executable(test-sycl-host-cpu-tier
+            tests/test-host-cpu-tier.cpp)
+        target_link_libraries(test-sycl-host-cpu-tier PRIVATE
+            ggml-sycl-private-fixtures Threads::Threads)
+        set_target_properties(test-sycl-host-cpu-tier PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-host-cpu-tier COMMAND test-sycl-host-cpu-tier)
+        set_tests_properties(test-sycl-host-cpu-tier PROPERTIES
+            # cache and gpu-serial: it constructs the unified cache, so the full sweep's label filter leaves it out
+            # and it runs alone, on the discrete cards
+            LABELS "sycl;allocator;owner;host;cache;gpu-serial"
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77
+            TIMEOUT 30)
+    endif()
+
+    # The host WEIGHT zone is exact bytes plus named terms. Arm 1 sizes a synthetic Q2_K-shaped inventory through the
+    # real planner under a mocked device table; arm 2, the census, constructs the unified cache and allocates through
+    # it, so the binary is registered like the tier tests above: cache and gpu-serial, serial, selector pinned, and a
+    # host without a device skips (77) after arm 1 has run.
+    add_executable(test-sycl-host-weight-zone-terms
+        tests/test-sycl-host-weight-zone-terms.cpp)
+    target_link_libraries(test-sycl-host-weight-zone-terms PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-host-weight-zone-terms PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-weight-zone-terms COMMAND test-sycl-host-weight-zone-terms)
+    set_tests_properties(test-sycl-host-weight-zone-terms PROPERTIES
+        LABELS "sycl;allocator;owner;host;cache;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60)
+
+    # Host-resident weights are one published fact (design 5efe section 4.4): the real planner over the Qwen-shaped
+    # inventory under the fact true, false and locked, single- and two-device, under a mocked device table. It touches
+    # no device, but it links the backend's private fixtures and runs the planner on a model-sized inventory, so the
+    # rule for that registers it with the cache tests: gpu-serial, serial, selector pinned, 77 as the skip code.
+    # Lead-run.
+    add_executable(test-sycl-host-backing-plan
+        tests/test-sycl-host-backing-plan.cpp)
+    target_link_libraries(test-sycl-host-backing-plan PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-host-backing-plan PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-backing-plan COMMAND test-sycl-host-backing-plan)
+    set_tests_properties(test-sycl-host-backing-plan PROPERTIES
+        LABELS "sycl;host;gpu-serial;cache;mem-handle"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600)
+
     # The runtime allocation registry's containment lookup follows its range index (llama.cpp-ii25): bounds, nested
     # chunk/suballocation precedence, every registry mutation, and a brute-force oracle. Rows are published through the
     # host-only test seams; nothing is allocated and no device is touched.
@@ -7826,6 +8916,625 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         RUN_SERIAL TRUE
         TIMEOUT 60)
 
+    # The process-global host ledger (th32 §11 T2), arms (a)-(i): the lock-free charge protocol, the yield and its
+    # unregister handshake, the credit and the saturating budget function, plus the plan's commit terms, the zone
+    # commit check and the re-record of the terms by the KV refresh and the runtime MMID re-plan, on hand-built plans.
+    # Host-only: the arms call the ledger functions, a fake yielder, the budget function, those two pure functions and
+    # the two re-plans (the MMID re-plan under a mocked device table), and none constructs a cache or a pool or touches
+    # a device, so it carries none of the OOM-family labels. RUN_SERIAL: the ledger is process-global.
+    add_executable(test-sycl-host-ledger
+        tests/test-sycl-host-ledger.cpp)
+    target_link_libraries(test-sycl-host-ledger PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-host-ledger PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-ledger COMMAND test-sycl-host-ledger)
+    set_tests_properties(test-sycl-host-ledger PROPERTIES
+        LABELS "sycl;host"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 60)
+
+    # The host ledger's lead-run arms (th32 §11 T2), (j)-(o), with the over-budget and plan-against-committed fixtures:
+    # the budget's store order across planner passes and load transactions, the charge and credit at every exit of
+    # unified_allocate_owner, the must_host_cpu request rules, the yield's load exclusion and the tier backstop. It
+    # initialises the SYCL backends, constructs caches, configures their host zones, and runs the planner and a staged
+    # load, so it carries the OOM-family labels, runs alone on the discrete cards, and exits 77 without a SYCL GPU.
+    add_executable(test-sycl-host-ledger-device
+        tests/test-sycl-host-ledger-device.cpp)
+    target_link_libraries(test-sycl-host-ledger-device PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-host-ledger-device PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-host-ledger-device COMMAND test-sycl-host-ledger-device)
+    set_tests_properties(test-sycl-host-ledger-device PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120)
+
+    # The SCRATCH return's three device REDs (docs/design/sycl-mmap-host-tier.md §7 C4): test-sycl-scratch-trial-return,
+    # test-sycl-configure-refusal and test-sycl-scratch-owner-end. Each is one executable linked against the private
+    # fixtures, never libllama (§M82 case (2)). Their planted faults are runtime seams (scratch-test-mutant.hpp), so one
+    # build scores every fault: the base ctest runs every case unmutated, and each `<test>-mutant-<names>` ctest runs
+    # `--mutant <names> --cases <cases>` and passes only when its expected failure text appears. They construct caches
+    # and pinned pools on a real queue, so they carry the OOM-family labels, run alone on the B50 with 64 MiB chunks
+    # (§M88 (2)), load no model, and exit 77 without a SYCL GPU. Lead-run. A mutant registration has no
+    # SKIP_RETURN_CODE: a VOID or skipped case exits 77 and prints no failure text, so the registration fails instead
+    # of passing as a skip. A mutant is scored killed only by its line.
+    #   MUTANTS is a flat list of triples: the mutant names (comma-separated), the cases (comma-separated) and the
+    #   expected text. ENV adds variables to the registration's environment. An expected text carries no `;`:
+    #   ${ARGN} splits it there and shifts every later triple, so a printed `;` is matched by `.`.
+    function(ggml_sycl_scratch_return_test stem)
+        cmake_parse_arguments(SRT "" "TIMEOUT" "ENV;MUTANTS" ${ARGN})
+        add_executable(${stem} tests/${stem}.cpp)
+        target_link_libraries(${stem} PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+        set_target_properties(${stem} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        set(_env "ONEAPI_DEVICE_SELECTOR=level_zero:1" "GGML_SYCL_PINNED_CHUNK_MB=64" ${SRT_ENV}
+                 "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+        add_test(NAME ${stem} COMMAND ${stem})
+        set_tests_properties(${stem} PROPERTIES
+            LABELS "sycl;cache;mem-handle;gpu-serial"
+            ENVIRONMENT "${_env}"
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77
+            TIMEOUT ${SRT_TIMEOUT})
+        list(LENGTH SRT_MUTANTS _n)
+        if (_n GREATER 0)
+            math(EXPR _last "${_n} - 1")
+            foreach (_i RANGE 0 ${_last} 3)
+                math(EXPR _j "${_i} + 1")
+                math(EXPR _k "${_i} + 2")
+                list(GET SRT_MUTANTS ${_i} _mutants)
+                list(GET SRT_MUTANTS ${_j} _cases)
+                list(GET SRT_MUTANTS ${_k} _regex)
+                string(REPLACE "," "-" _suffix "${_mutants}")
+                add_test(NAME ${stem}-mutant-${_suffix} COMMAND ${stem} --mutant ${_mutants} --cases ${_cases})
+                set_tests_properties(${stem}-mutant-${_suffix} PROPERTIES
+                    LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+                    ENVIRONMENT "${_env}"
+                    RUN_SERIAL TRUE
+                    TIMEOUT ${SRT_TIMEOUT}
+                    PASS_REGULAR_EXPRESSION "${_regex}")
+            endforeach()
+        endif()
+    endfunction()
+
+    ggml_sycl_scratch_return_test(test-sycl-scratch-trial-return TIMEOUT 900 MUTANTS
+        return-noop ladder,second-context
+            "after the ladder, expected [0-9.]+ MiB \\(winner's need\\)[\r\n]+  the capacity quotes the loser"
+        return-releases-live ladder
+            "RETURN printed a SCRATCH return refused line for live chunk [0-9]+"
+        return-no-withdraw window,ladder
+            "capacity [0-9.]+ MiB after RETURN, expected 64\\.0 MiB[\r\n]+  the capacity quotes the loser"
+        return-no-file window
+            "chunk_count [0-9]+ after the ladder, expected [0-9]+. no SCRATCH released line for chunk [0-9]+"
+        double-decrement ladder
+            "SCRATCH capacity [0-9.]+ MiB exceeds the pool's allocated\\(\\) [0-9.]+ MiB"
+        return-no-immediate empty-return
+            "chunk_count [0-9]+ right after RETURN, expected [0-9]+: empty returned chunk [0-9]+ not released"
+        footprint-before-free empty-return
+            "MiB at the free point, expected [0-9.]+ MiB: footprint decremented before the free"
+        release-no-erase empty-return,window
+            "marked set holds [0-9]+ entry\\(ies\\) after the release of chunk [0-9]+, expected 0"
+        begin-names-any-owner throw-kept
+            "the second context's begin printed a SCRATCH return refused line for chunk [0-9]+, another owner"
+        rtm-left-in-txn retry-return,retry-keep,trial-retry-return,trial-retry-keep
+            "transaction holds [0-9]+ chunk\\(s\\) after RETURN_TO_MARK, expected 0"
+        rtm-left-in-txn,withdraw-transition-blind retry-return
+            "SCRATCH capacity [0-9.]+ MiB exceeds the pool's allocated\\(\\) [0-9.]+ MiB"
+        keep-walks-set retry-keep,trial-retry-keep
+            "chunk [0-9]+ not withdrawn after KEEP: KEEP reaches only the transaction's chunks"
+        carrier-dtor-noop dropped-carrier
+            "after a dropped released_chunk, expected [0-9.]+ MiB: footprint leaked by a dropped carrier"
+        moved-from-releases dropped-carrier
+            "after release_chunk_backing, expected [0-9.]+ MiB: footprint subtracted twice"
+        no-prune strand
+            "after the retry completed, expected [0-9.]+ MiB: stranded footprint never reconciled"
+        prune-without-query strand
+            "at the first reconcile while the allocation is still registered"
+        subtract-at-refusal strand
+            "after a refused free, expected [0-9.]+ MiB: footprint left while the allocation is still registered"
+        dtor-no-report teardown
+            "no teardown line for the stranded entry"
+        registered-exact-ptr-only registered-exact
+            "registered_exact answered true for ptr [^ ]+ with id [0-9]+, the row holds id [0-9]+"
+        stranded-reserve-8 nine-strand
+            "stranded_ capacity [0-9]+ exhausted at [0-9]+ entries"
+        lease-checked-first status-order
+            "reason=lease for chunk [0-9]+, which holds a live allocation")
+
+    # The driver forks and execs three children with their own envp (strict, plain, outstanding-carrier); it touches
+    # no device itself. GGML_SYCL_HOST_RESERVE_MB bounds the pinned budget, so the plain child's shortfall control,
+    # which grows the pool to its budget before the refusal, commits 1 GiB and not the host's memory.
+    ggml_sycl_scratch_return_test(test-sycl-configure-refusal TIMEOUT 300 ENV "GGML_SYCL_HOST_RESERVE_MB=1024" MUTANTS
+        configure-rebuilds plain
+            "rebuilt over withdrawn chunk [0-9]+: capacity [0-9.]+ after, [0-9.]+ before, marked set holds [0-9]+"
+        configure-direct-release plain
+            "marked set holds [0-9]+ entry\\(ies\\) after the release of chunk [0-9]+, expected 0"
+        strict-abort-dropped strict
+            "strict child exited [0-9]+, expected SIGABRT"
+        abort-non-strict plain
+            "plain child died by signal [0-9]+, expected exit 0"
+        carrier-assert-removed carrier
+            "outstanding-carrier child exited [0-9]+, expected SIGABRT")
+
+    ggml_sycl_scratch_return_test(test-sycl-scratch-owner-end TIMEOUT 600 MUTANTS
+        owner-end-removed orphaned
+            "FAIL \\[orphaned\\] chunk [0-9]+ not orphaned by the owner's end"
+        orphan-free-ignored orphaned
+            "FAIL \\[orphaned\\] chunk_count [0-9]+ after the stand-in's free, expected [0-9]+"
+        owner-end-no-empty empty-at-free
+            "after the context is freed, expected [0-9]+: withdrawn chunk [0-9]+ idle until pool destruction"
+        release-no-erase orphaned
+            "FAIL \\[orphaned\\] marked set holds [0-9]+ entry\\(ies\\) after the release of chunk [0-9]+, expected 0"
+        owner-end-first-only two-empty
+            "owner-end freed one of two chunks"
+        lease-drop-no-index lease-a
+            "after the lease dropped, expected [0-9]+: withdrawn chunk [0-9]+ waits for a begin")
+
+    # The file-mapped tier's device REDs (docs/design/sycl-mmap-host-tier.md §5.3, §7 C4), registered through the
+    # same helper: one executable each against the private fixtures, the B50 alone, no model. The meminfo control
+    # runs first: it writes its outcome and the boot id beside the binaries, and each of the other five reads it in its
+    # driver and exits 77 with one VOID line when the control has not run in this boot or failed
+    # (tests/file-mapped-test-common.hpp). DEPENDS orders a sweep that selects them all; it does not make a run of one
+    # of them pull the control in.
+    # The lead runs this one first, by name. It writes ${CMAKE_BINARY_DIR}/bin/sycl-pinned-meminfo-control.outcome.
+    ggml_sycl_scratch_return_test(test-sycl-pinned-meminfo-control TIMEOUT 300)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-stream-refusal TIMEOUT 120 MUTANTS
+        refusal-after-copy-fn with-copy-fn
+            "FAIL \\[with-copy-fn\\] stream_dma over a FILE_MAPPED view with a copy_fn was not refused")
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-bounce TIMEOUT 120)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-expert-owner TIMEOUT 120)
+    ggml_sycl_scratch_return_test(test-sycl-file-mapped-resolve-abort TIMEOUT 120)
+    # register_host_expert and register_host_weight refuse a pointer no registry knows (§4.8, §7 C6). It reads no
+    # pinned-memory figure, so it does not wait for the meminfo control. The mutant takes the refusal out of all three
+    # sites that apply it: register_host_expert, register_host_weight and the direct stage's host fallback.
+    set(_unreg_expert "FAIL \\[expert\\] register_host_expert accepted a malloc'ed UNREGISTERED pointer")
+    set(_unreg_weight "FAIL \\[weight\\] register_host_weight accepted a malloc'ed UNREGISTERED pointer")
+    # With the refusal removed the direct stage's other-tier guard still refuses an UNREGISTERED source, so nothing is
+    # published in place; the mutant is killed by the refusal that is not counted.
+    string(CONCAT _unreg_direct "FAIL \\[direct\\] direct_stage_expert counted 0 unregistered-host "
+        "refusal\\(s\\) for the malloc'ed source")
+    ggml_sycl_scratch_return_test(test-sycl-unregistered-host-refusal TIMEOUT 120 MUTANTS
+        unregistered-host-allowed expert,weight,direct "${_unreg_expert}.*${_unreg_weight}.*${_unreg_direct}")
+    # A refusal inside the segmented MoE record (§4.4): five cases on the non-keyed record function. The immediate
+    # return must fail both of its cases.
+    set(_seg_no_line "no \"recoverable runtime fallback failed\" line after a FAILED return")
+    # Every arm's text starts at its case's FAIL prefix, so only that case's c.fail line can match it.
+    set(_seg_lease_line "FAIL \\[active-valid\\] lease vectors [0-9]+\\+[0-9]+ non-empty after a FAILED return")
+    set(_seg_destroyed "FAIL \\[moe-after\\] executables destroyed")
+    ggml_sycl_scratch_return_test(test-sycl-seg-refusal-cleanup TIMEOUT 900 MUTANTS
+        seg-immediate-return direct,recording
+            "FAIL \\[direct\\] ${_seg_no_line}.*FAIL \\[recording\\] ${_seg_no_line}"
+        seg-cleanup-step-removed active-valid
+            "${_seg_lease_line}. active_exec_graph live"
+        seg-local-unwind moe-after
+            "${_seg_destroyed} in the unwind: moe_segments 0 at catch entry, [0-9]+ recorded at the throw"
+        seg-destroy-before-waits moe-after
+            "${_seg_destroyed} before the waits: moe_segments [0-9]+ at catch entry, 0 at the cleanup step"
+        seg-record-guard-removed stale-vectors
+            "FAIL \\[stale-vectors\\] no \"record refused\" line while the context holds [0-9]+ segment\\(s\\)")
+    set_tests_properties(test-sycl-file-mapped-stream-refusal test-sycl-file-mapped-bounce
+        test-sycl-file-mapped-expert-owner test-sycl-file-mapped-resolve-abort test-sycl-seg-refusal-cleanup
+        PROPERTIES DEPENDS test-sycl-pinned-meminfo-control)
+
+    # The host-only plan dry run's lead-run arms (th32 §4.2, §11 T11): a caller built against another struct layout is
+    # refused, expected_host is the stage's host_planned_bytes (the dry run handed the stage's own MemAvailable sample),
+    # every term is printed by name from the plan, a dry run stores no budget, the --mem-available option is the
+    # sample's MemAvailable, a load whose plan needs a larger arena zone while an allocation holds the arena is refused,
+    # not aborted, a load refused in its early pass keeps the PP MoE ring a context left in the KV zone, a load releases
+    # a ring that alone holds the arena and its stage rebuilds the arena once for the zones it was refused, a load whose
+    # oneDNN Graph floor alone outgrows an arena one allocation holds keeps the zones and its uncommitted end leaves
+    # no zone plan of its own stored (and the reverse order takes the sufficient path), a load that ends refused with no
+    # model live leaves nothing sized for it and the next load's start reserves the first load's arena, a load's start
+    # runs the release a failed load's end deferred (while an allocation holds the arena it keeps it, with a WARN that
+    # names the holders; once nothing holds it, it empties it once and reserves the first arena again), and a late pass
+    # refused on its decide step configures no host zone. The planner initialises SYCL and arms (a), (c), (e), (f),
+    # (h), (i), (j), (k) and (g) stage loads through real backends that construct caches, (h), (j) and (k) rebuild
+    # device 0's arena, (i) grows its ONEDNN zone by about 1 GiB, and (g)'s second load configures a host zone set of a
+    # few hundred MiB on each card, so it carries the OOM-family labels, runs alone on the discrete cards, and exits 77
+    # without a SYCL GPU.
+    add_executable(test-sycl-plan-dry-run
+        tests/test-sycl-plan-dry-run.cpp)
+    target_link_libraries(test-sycl-plan-dry-run PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-plan-dry-run PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-plan-dry-run COMMAND test-sycl-plan-dry-run)
+    set_tests_properties(test-sycl-plan-dry-run PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
+    # The lazy tables' residency (th32 §4.3 step 4, §11 T3): the DeepSeek-shaped tables both STORAGE and one HOST at
+    # thresholds derived from the plan's own zone terms, the Qwen PLE flip, the tables kept out of every zone maximum,
+    # and the null-pin and cold-class refusals. One binary, two registrations: --devices 1 plans through
+    # compute_placement_plan and the one-budget delegation on the B70 alone, --devices 2 through
+    # compute_multi_device_plan on both cards and exits 77 below two GPUs. The planner initialises SYCL and reads each
+    # device's cache, so both carry the OOM-family labels and run alone. Lead-run.
+    #
+    # The two-card registrations here and in the lazy-plan-interface block set GGML_SYCL_MOE_MULTI_GPU=1: these arms
+    # only plan and stage across both cards, which for a fixture with experts is the opt-in path. The one-card
+    # registrations see one GPU, where the multi-device plan is off whatever the variable says, so they leave it unset.
+    string(CONCAT _lazy_two_card_env
+        "GGML_SYCL_MOE_MULTI_GPU=1;"
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    add_executable(test-sycl-lazy-residency-plan
+        tests/test-sycl-lazy-residency-plan.cpp)
+    target_link_libraries(test-sycl-lazy-residency-plan PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-residency-plan PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-residency-plan-1dev COMMAND test-sycl-lazy-residency-plan --devices 1)
+    set_tests_properties(test-sycl-lazy-residency-plan-1dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    add_test(NAME test-sycl-lazy-residency-plan-2dev COMMAND test-sycl-lazy-residency-plan --devices 2)
+    set_tests_properties(test-sycl-lazy-residency-plan-2dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_two_card_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
+    # The lazy tables' backend interface (th32 §11 T3): a table enters through the inventory, rides the early and the
+    # late stage into the published plan and leaves with the model, all read through the model token; a direct entry
+    # with a pin on the thread's plan slot plans a table STORAGE that only a pinned plan can hold; and a plan that
+    # refuses its table refuses the load at the stage, with one WARN. --devices 1
+    # runs on the B70 alone, where the planner caller takes its single-device path; --devices 2 runs on both cards,
+    # where it takes the multi-device path, and exits 77 below two GPUs. The stage builds every device's cache, so both
+    # carry the OOM-family labels and run alone. Lead-run.
+    add_executable(test-sycl-lazy-plan-interface
+        tests/test-sycl-lazy-plan-interface.cpp)
+    target_link_libraries(test-sycl-lazy-plan-interface PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-plan-interface PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    # Arm (h) writes its table's file here: a STORAGE table reads through O_DIRECT, which tmpfs (/tmp) refuses.
+    target_compile_definitions(test-sycl-lazy-plan-interface PRIVATE
+        LAZY_STORAGE_FIXTURE_DIR="${CMAKE_BINARY_DIR}")
+    add_test(NAME test-sycl-lazy-plan-interface-1dev COMMAND test-sycl-lazy-plan-interface --devices 1)
+    set_tests_properties(test-sycl-lazy-plan-interface-1dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    add_test(NAME test-sycl-lazy-plan-interface-2dev COMMAND test-sycl-lazy-plan-interface --devices 2)
+    set_tests_properties(test-sycl-lazy-plan-interface-2dev PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_two_card_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
+    # The coverage wrapper (th32 §3.3, §11 T3): lazy_coverage_scope runs its entry FULL reap before its take and its
+    # closing FULL reap after its drop, scored by the registry's take-time snapshots with the guard's reap held in the
+    # hook. The registry lives in the backend's objects, so the binary links the private fixtures; it initialises no
+    # device, but it is registered gpu-serial and serial with the selector pinned like the other lazy-table tests.
+    # Lead-run.
+    add_executable(test-sycl-lazy-coverage-wrapper
+        tests/test-sycl-lazy-coverage-wrapper.cpp)
+    target_link_libraries(test-sycl-lazy-coverage-wrapper PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-coverage-wrapper PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-coverage-wrapper COMMAND test-sycl-lazy-coverage-wrapper)
+    set_tests_properties(test-sycl-lazy-coverage-wrapper PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120)
+
+    # The block ring's plan, leases and stage adoption (th32 §3.3, §4.2, §10, §11 T5): one ensure allocates the plan's
+    # need and a covered plan charges 0; a table wider than the live ring prints the decline line, once per load, and
+    # plans HOST where it fits, else refuses as too narrow; the staged candidate's lease carries the pool across the
+    # early and the late pass and across another model's unload; the stage's lease holds it across a read's drop inside
+    # the planner; an inventory with no lazy table takes nothing; the stage, its failure and the dry run leave no pool;
+    # the owner check is silent for a live or parked pool's ring rows; and under strict leases a STORAGE materialization
+    # aborts on each ring refusal that is a plan bug: too narrow, a mismatch and a concurrent ensure, each in its own
+    # child. The stage builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77 on the
+    # single-device path, carries the OOM-family labels and runs alone. Lead-run.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line of the arm that kills it, which runs alone. Each registers test-sycl-lazy-ring-mutant-<name> on
+    # the one executable, which passes only when that line appears. The mutant registrations carry no SKIP_RETURN_CODE:
+    # ctest honours a skip code before the regex, so a mutant run that VOIDs with exit 77 would read as skipped with its
+    # kill line never checked. A mutant run has no legitimate skip, so without the code that run fails.
+    #
+    # The environment sets GGML_SYCL_MOE_MULTI_GPU=1 for this binary and the reap-points one, mutants included: these
+    # arms only plan and stage across both cards, which for a fixture with experts is the opt-in path.
+    string(CONCAT _lazy_ring_env
+        "GGML_SYCL_MOE_MULTI_GPU=1;"
+        "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    string(CONCAT _lr_re_no_span_check
+        "FAIL the ring plan: one ensure allocates the need, a covered plan charges 0, a wider one declines: "
+        "the ensure one block per slot short returned ok with 1 allocation\\(s\\), "
+        "want lazy-table-ring-too-narrow and none")
+    string(CONCAT _lr_re_ignore_live_ring
+        "FAIL a wider table that fits nowhere refuses as lazy-table-ring-too-narrow: "
+        "the wider table planned with refusal 'none', want lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_ignore_live_ring_p3
+        "FAIL a wider table whose HOST fit holds but P3 does not refuses and plans no HOST: "
+        "the wider table planned with refusal 'lazy-table-cache-below-floor' and 0 table\\(s\\), "
+        "want lazy-table-ring-too-narrow and none")
+    string(CONCAT _lr_re_no_candidate_lease
+        "FAIL a model planned as covered across an unload finds the ring through a read's lease: "
+        "model A's ensure returned lazy-table-ring-unpinned, want ok")
+    string(CONCAT _lr_re_lease_at_stage
+        "FAIL the stage's lease holds the pool across a read's drop inside the planner pass: "
+        "model B's ensure returned lazy-table-ring-mismatch, want ok")
+    string(CONCAT _lr_re_lease_presence_as_coverage
+        "FAIL the early and the late pass charge the ring once, on the same STORAGE set: "
+        "the late pass's ring= is 0, want [0-9]+")
+    string(CONCAT _lr_re_take_without_candidate
+        "FAIL an inventory with no lazy table creates no pool, alone and after a lazy model: "
+        "the dense stage moved the registry generation from [0-9]+ to [0-9]+")
+    string(CONCAT _lr_re_lease_before_guard
+        "FAIL an all-HOST inventory takes the provisional lease and leaves nothing after the call: "
+        "after the early stage: 0 live pools, 0 leases, 1 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_replace_keeps_displaced
+        "FAIL two devices, early then late then unload, give back the pool and the ring's bytes: "
+        "after the unload and the reap: 1 live pools, [0-9]+ leases, 0 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_rollback_keeps_clone
+        "FAIL a stage failed after the first device leaves no lease and no parked pool: "
+        "after the failed early stage: 1 live pools, [0-9]+ leases, 0 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_count_without_pin
+        "FAIL the public entries read no coverage, and a null pin refuses as lazy-table-ring-unpinned: "
+        "the public entries counted [0-9]+ coverage reads, want 0")
+    string(CONCAT _lr_re_no_entry_reap
+        "FAIL the dry run reaps before its take and after its drop and charges the ring as a stage: "
+        "the dry run's take snapshot [0-9]+ reaps run, want [0-9]+")
+    string(CONCAT _lr_re_no_closing_reap
+        "FAIL the dry run reaps before its take and after its drop and charges the ring as a stage: "
+        "after the dry run: 0 live pools, 0 leases, 1 parked, want 0, 0, 0")
+    string(CONCAT _lr_re_generation_live_ignores_parked
+        "FAIL the block ring's POOL rows are silent while their generation is live or parked: "
+        "the parked generation [0-9]+ reports 1 ring row\\(s\\), want 0")
+    string(CONCAT _lr_re_strict_abort_dropped
+        "FAIL under strict leases the STORAGE materialization aborts on a ring refusal after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-too-narrow")
+    string(CONCAT _lr_re_strict_abort_dropped_mismatch
+        "FAIL under strict leases the STORAGE materialization aborts on a ring mismatch after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-mismatch")
+    string(CONCAT _lr_re_strict_abort_dropped_concurrent
+        "FAIL under strict leases the STORAGE materialization aborts on a concurrent ensure after its WARN: "
+        "the strict child did not abort: .*STRICT-CHILD returned status=lazy-table-ring-concurrent-ensure")
+    string(CONCAT _lr_re_decline_every_plan
+        "FAIL a load prints each declined table once across its plans, and again after its abort: "
+        "the second plan of load [0-9]+ printed 2 lines '.*' in all, want 1")
+    set(_lazy_ring_mutants
+        no-span-check                   "${_lr_re_no_span_check}"
+        ignore-live-ring                "${_lr_re_ignore_live_ring}"
+        ignore-live-ring-p3             "${_lr_re_ignore_live_ring_p3}"
+        no-candidate-lease              "${_lr_re_no_candidate_lease}"
+        lease-at-stage                  "${_lr_re_lease_at_stage}"
+        lease-presence-as-coverage      "${_lr_re_lease_presence_as_coverage}"
+        take-without-candidate          "${_lr_re_take_without_candidate}"
+        lease-before-guard              "${_lr_re_lease_before_guard}"
+        replace-keeps-displaced         "${_lr_re_replace_keeps_displaced}"
+        rollback-keeps-clone            "${_lr_re_rollback_keeps_clone}"
+        count-without-pin               "${_lr_re_count_without_pin}"
+        no-entry-reap                   "${_lr_re_no_entry_reap}"
+        no-closing-reap                 "${_lr_re_no_closing_reap}"
+        generation-live-ignores-parked  "${_lr_re_generation_live_ignores_parked}"
+        strict-abort-dropped            "${_lr_re_strict_abort_dropped}"
+        strict-abort-dropped-mismatch   "${_lr_re_strict_abort_dropped_mismatch}"
+        strict-abort-dropped-concurrent "${_lr_re_strict_abort_dropped_concurrent}"
+        decline-every-plan              "${_lr_re_decline_every_plan}")
+    add_executable(test-sycl-lazy-ring
+        tests/test-sycl-lazy-ring.cpp)
+    target_link_libraries(test-sycl-lazy-ring PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-ring PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-ring COMMAND test-sycl-lazy-ring)
+    set_tests_properties(test-sycl-lazy-ring PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_ring_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    list(LENGTH _lazy_ring_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_ring_mutants ${_i} _mutant)
+        list(GET _lazy_ring_mutants ${_j} _regex)
+        add_test(NAME test-sycl-lazy-ring-mutant-${_mutant}
+            COMMAND test-sycl-lazy-ring --mutant ${_mutant})
+        set_tests_properties(test-sycl-lazy-ring-mutant-${_mutant} PROPERTIES
+            LABELS "sycl;host;cache;mem-handle;gpu-serial;mutant"
+            ENVIRONMENT "${_lazy_ring_env}"
+            RUN_SERIAL TRUE
+            TIMEOUT 300
+            PASS_REGULAR_EXPRESSION "${_regex}")
+    endforeach()
+    # The no-entry-reap kill line reads the dry run's take-time snapshot, which is its own only when it took a lease.
+    # A run that prints the arm's no-lease line fails whatever else it prints, so a mutant that skips the take cannot
+    # read as a kill of the entry reap.
+    set_tests_properties(test-sycl-lazy-ring-mutant-no-entry-reap PROPERTIES
+        FAIL_REGULAR_EXPRESSION "it took no lease")
+
+    # The five witnessed locks (th32 §3.3, §11 T5; canonical §12.5): a FULL reap called under each of the IO pool
+    # registry's leaf mutex, g_tensor_inventory_mutex, g_lifecycle_plan_mutex and the IO engine's queue lock refuses
+    # naming it, and the control reports a table's strand lock not wired; host_ledger_sample and a yield round abort
+    # through GGML_SYCL_WITNESS under each of the four and return with none held. Every case runs in a child of the
+    # binary; the queue lock's children initialise backend 0 and ensure a block ring so an IO engine exists, so the
+    # binary runs on the B50, carries the OOM-family labels and runs alone. Lead-run.
+    string(CONCAT _lazy_lock_witness_env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    add_executable(test-sycl-lazy-lock-witness
+        tests/test-sycl-lazy-lock-witness.cpp)
+    target_link_libraries(test-sycl-lazy-lock-witness PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-lock-witness PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-lock-witness COMMAND test-sycl-lazy-lock-witness)
+    set_tests_properties(test-sycl-lazy-lock-witness PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_lock_witness_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 600)
+
+    # The IO pool's reap points (th32 §3.3, §11 T5): the entry reap of a planner caller, the reap after a failed load's
+    # end, the teardown reap at a model swap, the teardown reap whose first step throws, the shutdown drain with a read
+    # in flight, with the last table and read freed and with a published record never erased, that last also under
+    # GGML_SYCL_STRICT_LEASES=1, where the drain aborts (§10), and both orders of a read's last drop against a stage's
+    # take. The stage builds both cards' caches on the multi-device path, so it runs on level_zero:0,1, exits 77 on the
+    # single-device path, carries the OOM-family labels and runs alone. The teardown throw and the four shutdown
+    # fixtures run in children started before the parent initialises SYCL; only the strict one sets the variable.
+    # Lead-run.
+    #
+    # Each MUTANTS pair is a positive control: a runtime mutant of the PRIVATE_TESTING selector, passed as --mutant,
+    # and the FAIL line of the arm that kills it, which runs alone (a child arm's mutant is planted in that child). No
+    # mutant registration carries SKIP_RETURN_CODE, for the reason the lazy-ring block gives. The strict drain's mutant
+    # is registered on its child's shutdown returning after 1 leaked-lease line, which only a child whose drain logged
+    # the leaked lease and whose shutdown then returned prints, never on the missing abort line, which a child that
+    # died between its load and the drain for any other reason prints too.
+    string(CONCAT _lrp_re_no_entry_reap
+        "FAIL a stage's entry reap frees a ring another thread parked before the stage takes its lease: "
+        "B's first take ran with 1 parked node\\(s\\) after its entry reap, want 0: "
+        "the entry reap left the ring parked")
+    string(CONCAT _lrp_re_snapshot_carries_lease
+        "FAIL a model swap gives A's ring back at A's teardown with no witnessed lock held: "
+        "with A loaded and its ring made: 1 live pools, 2 leases, 0 parked, want 1, 1, 0")
+    string(CONCAT _lrp_re_take_ignores_dying
+        "FAIL a read's last drop between the stage's entry reap and its take parks, and the take builds anew: "
+        "model B's early plan charged ring=0, want [0-9]+: the take joined the parked pool")
+    string(CONCAT _lrp_re_reap_inside_try
+        "FAIL a teardown reap whose first step throws logs it and leaves the unload finalized once: "
+        "the teardown printed 'TEARDOWN-CHILD unloaded rc=16 ")
+    string(CONCAT _lrp_re_skip_lease_drain
+        "FAIL shutdown drains a never-erased record's lease with one leaked-lease line: "
+        "after the records were cleared: 'LEAKED-CHILD cleared drops_after_shut_down=1', "
+        "want drops_after_shut_down=0")
+    string(CONCAT _lrp_re_drain_strict_abort_dropped
+        "FAIL under strict leases the drain aborts at a never-erased record's leaked lease: "
+        "the strict child's shutdown returned after 1 leaked-lease line\\(s\\): 'LEAKED-STRICT-CHILD returned threw=")
+    set(_lazy_reap_points_mutants
+        no-entry-reap              "${_lrp_re_no_entry_reap}"
+        snapshot-carries-lease     "${_lrp_re_snapshot_carries_lease}"
+        take-ignores-dying         "${_lrp_re_take_ignores_dying}"
+        reap-inside-try            "${_lrp_re_reap_inside_try}"
+        skip-lease-drain           "${_lrp_re_skip_lease_drain}"
+        drain-strict-abort-dropped "${_lrp_re_drain_strict_abort_dropped}")
+    add_executable(test-sycl-lazy-reap-points
+        tests/test-sycl-lazy-reap-points.cpp)
+    target_link_libraries(test-sycl-lazy-reap-points PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-reap-points PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-reap-points COMMAND test-sycl-lazy-reap-points)
+    set_tests_properties(test-sycl-lazy-reap-points PROPERTIES
+        LABELS "sycl;host;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_ring_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 900)
+    list(LENGTH _lazy_reap_points_mutants _n)
+    math(EXPR _last "${_n} - 1")
+    foreach (_i RANGE 0 ${_last} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _lazy_reap_points_mutants ${_i} _mutant)
+        list(GET _lazy_reap_points_mutants ${_j} _regex)
+        add_test(NAME test-sycl-lazy-reap-points-mutant-${_mutant}
+            COMMAND test-sycl-lazy-reap-points --mutant ${_mutant})
+        set_tests_properties(test-sycl-lazy-reap-points-mutant-${_mutant} PROPERTIES
+            LABELS "sycl;host;cache;mem-handle;gpu-serial;mutant"
+            ENVIRONMENT "${_lazy_ring_env}"
+            RUN_SERIAL TRUE
+            TIMEOUT 900
+            PASS_REGULAR_EXPRESSION "${_regex}")
+    endforeach()
+
+    # The lazy table object (th32 §3.2, §3.3, §10, §11 T4): the HOST body's eager O_DIRECT read into locked HOST_CPU
+    # memory, the STORAGE descriptor, the last reference's release, the activation check (one extra chunk refuses,
+    # naming both numbers, and aborts under strict leases), both descriptor buffer types, the descriptor guard at
+    # ggml_sycl_get_data_ptr_slow's entry (its own process: one line, exit 134), and is_device_vram_buffer's
+    # descriptor test over every buffer type the backend exposes. Backend-level: no libllama, a table built
+    # from a fixture-written file in the working directory. Its tables come from the unified cache's owner-first entry
+    # and its guard child initialises SYCL, so it carries the OOM-family labels, runs alone, on the B50. Lead-run.
+    #
+    # The -mutant-predicate-too-broad registration is the buffer-type table's positive control: with
+    # ggml_backend_sycl_buffer_is_lazy also claiming the SYCL device type, the table must FAIL naming that type's
+    # changed answer. It is a runtime seam in ggml-sycl.cpp (PRIVATE_TESTING) rather than a compile variant, which
+    # would build ggml-sycl.cpp and the backend's device link a second time.
+    #
+    # The -mutant-read-whole-window registration is arm (2)'s end-of-file positive control: the table that ends its
+    # file at an unaligned end (Qwen's geometry), built by a read that asks for the whole O_DIRECT window instead of
+    # stopping at the table's last byte, must refuse naming that geometry. Also a runtime seam: a PRIVATE_TESTING
+    # constructor in lazy-table.cpp.
+    #
+    # The -mutant-shortfall-unreported registration is arm (15)'s positive control (th32 §6.4, the row cache's step-4
+    # shortfall): with the shortfall refused through the plain [LAZY-TABLE] WARN instead of its [HOST-PLAN-BUG] line,
+    # the arm must FAIL counting no such line. A runtime seam too: the PRIVATE_TESTING STORAGE constructor's flag.
+    string(CONCAT _lazy_table_env
+        "ONEAPI_DEVICE_SELECTOR=level_zero:1;"
+        "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+    add_executable(test-sycl-lazy-table
+        tests/test-sycl-lazy-table.cpp)
+    target_link_libraries(test-sycl-lazy-table PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-lazy-table PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-lazy-table COMMAND test-sycl-lazy-table)
+    set_tests_properties(test-sycl-lazy-table PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+    string(CONCAT _lazy_table_mutant_regex
+        "FAIL \\(13\\) no other buffer type's is_device_vram_buffer answer changes: "
+        "SYCL0 \\(ggml_backend_sycl_buffer_type\\): is_device_vram_buffer answered 0, today's read 1, want 1")
+    add_test(NAME test-sycl-lazy-table-mutant-predicate-too-broad
+        COMMAND test-sycl-lazy-table --mutant predicate-too-broad)
+    set_tests_properties(test-sycl-lazy-table-mutant-predicate-too-broad PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_mutant_regex}")
+    string(CONCAT _lazy_table_eof_mutant_regex
+        "FAIL \\(2\\) a HOST table reads its rows eagerly into one locked HOST_CPU record: "
+        "the table that ends its file at an unaligned end \\(offset 192, 4195600 B, the window 2608 B past the end "
+        "of the file\\) refused: lazy-table-read-failed: read 4195792 of 4198400 B")
+    add_test(NAME test-sycl-lazy-table-mutant-read-whole-window
+        COMMAND test-sycl-lazy-table --mutant read-whole-window)
+    set_tests_properties(test-sycl-lazy-table-mutant-read-whole-window PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_eof_mutant_regex}")
+    string(CONCAT _lazy_table_shortfall_mutant_regex
+        "FAIL \\(15\\) a row-cache shortfall refuses with one \\[HOST-PLAN-BUG\\] line naming planned and charged: "
+        "the shortfall printed 0 \\[HOST-PLAN-BUG\\] lines, want 1")
+    add_test(NAME test-sycl-lazy-table-mutant-shortfall-unreported
+        COMMAND test-sycl-lazy-table --mutant shortfall-unreported)
+    set_tests_properties(test-sycl-lazy-table-mutant-shortfall-unreported PROPERTIES
+        LABELS "sycl;cache;mem-handle;gpu-serial;mutant"
+        ENVIRONMENT "${_lazy_table_env}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "${_lazy_table_shortfall_mutant_regex}")
+
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
     # requires them to be rejected.  It is not redundant with the source gate in
@@ -7909,6 +9618,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         test-mmq-q6k-gpu
         test-dmmv-q6k-coalesced
         test-dmmv-q4-0-coalesced)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND _ggml_sycl_private_fixture_consumers test-sycl-file-mapped-tier test-sycl-host-cpu-tier)
+    endif()
     set(_ggml_sycl_private_fixture_binaries)
     foreach(_consumer IN LISTS _ggml_sycl_private_fixture_consumers)
         list(APPEND _ggml_sycl_private_fixture_binaries $<TARGET_FILE:${_consumer}>)
@@ -8037,6 +9749,132 @@ else()
         DISABLED TRUE
         LABELS "sycl;expert-predict;41bs;hostonly;not-built")
 endif()
+
+# Host zone routing, host-allocation lifetimes, the host SCRATCH demand ledger and the host holder plan
+# (docs/design/sycl-mmap-host-tier.md §4.4). host-zone-plan.cpp includes no SYCL header and is also globbed into
+# libggml-sycl, where it is the production copy; these targets compile it host-only, with no -fsycl, and link
+# ggml-base (plus ggml-cpu for the real-scheduler test). None constructs a unified_cache or initializes SYCL, so all
+# four are `sycl;host`.
+#
+# Each MUTANTS pair is a positive control: a macro that plants one defect the design names (in host-zone-plan.cpp or in
+# the test) and the failure text the test prints when it does. Each builds its own executable and ctest, which passes
+# only when that text appears. Three plant their defect in the test's own re-enactment of an order, so they score the
+# fixture's model of the order, not production: HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND and
+# HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE (the fake registry's releases and checks) and
+# HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING (simulate_host_fa). The production order is pinned by
+# tests/test-sycl-host-zone-boundary-owner-source.py (its pins O1-O6 and D1-D3).
+function(ggml_sycl_host_zone_plan_test stem)
+    cmake_parse_arguments(HZP "" "" "LIBS;MUTANTS" ${ARGN})
+    set(_variants "${stem}" "")
+    list(LENGTH HZP_MUTANTS _n)
+    if (_n GREATER 0)
+        math(EXPR _last "${_n} - 1")
+        foreach (_i RANGE 0 ${_last} 2)
+            list(GET HZP_MUTANTS ${_i} _macro)
+            string(REGEX REPLACE "^.*_MUTANT_" "" _suffix "${_macro}")
+            string(TOLOWER "${_suffix}" _suffix)
+            string(REPLACE "_" "-" _suffix "${_suffix}")
+            list(APPEND _variants "${stem}-mutant-${_suffix}" "${_macro}")
+        endforeach()
+    endif()
+    list(LENGTH _variants _nv)
+    math(EXPR _lastv "${_nv} - 1")
+    foreach (_i RANGE 0 ${_lastv} 2)
+        math(EXPR _j "${_i} + 1")
+        list(GET _variants ${_i} _name)
+        list(GET _variants ${_j} _macro)
+        add_executable(test-sycl-${_name} tests/test-sycl-${stem}.cpp host-zone-plan.cpp)
+        target_include_directories(test-sycl-${_name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/..
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_link_libraries(test-sycl-${_name} PRIVATE ggml-base ${HZP_LIBS})
+        set_target_properties(test-sycl-${_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME sycl-${_name} COMMAND test-sycl-${_name})
+        if (_macro STREQUAL "")
+            set_tests_properties(sycl-${_name} PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+        else()
+            target_compile_definitions(test-sycl-${_name} PRIVATE ${_macro}=1)
+            math(EXPR _k "${_i} - 1")
+            list(GET HZP_MUTANTS ${_k} _regex)
+            set_tests_properties(sycl-${_name} PROPERTIES
+                LABELS "sycl;host;mutant"
+                TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "${_regex}")
+        endif()
+    endforeach()
+endfunction()
+
+ggml_sycl_host_zone_plan_test(host-zone-select MUTANTS
+    HOST_ZONE_PLAN_MUTANT_OWNER_BY_LIFETIME
+        "the owner check fired on another context's or model's live record"
+    HOST_ZONE_PLAN_MUTANT_DEVICE_CHECK_EVERY_FREE
+        "the DEVICE check fired at a non-last backend's free while a second backend is live"
+    HOST_ZONE_SELECT_MUTANT_BUFFER_CHECK_AT_BACKEND
+        "llama_context's destruction order printed 2 leaked-record WARN"
+    HOST_ZONE_SELECT_MUTANT_MODEL_CHECK_AT_BUFFER_FREE
+        "the MODEL boundary printed 2 leaked-record WARN")
+
+ggml_sycl_host_zone_plan_test(host-scratch-demand MUTANTS
+    HOST_ZONE_PLAN_MUTANT_LEDGER_ACCUMULATE
+        "demand 420.0 MiB after \\(100, 10\\) then \\(300, 10\\), expected 310.0 MiB"
+    HOST_SCRATCH_DEMAND_MUTANT_PER_BACKEND
+        "a two-backend context's demand is 2400.0 MiB with grow_zone called 2 times"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_ADDITIVE_GROW
+        "a replacing notify within capacity grew again: grow_zone called 2 times, expected 1"
+    HOST_ZONE_PLAN_MUTANT_NOTIFY_DEVICE0
+        "with the host buft on device 1, the notify grew device 1 0 time\\(s\\) and device 0 1"
+    HOST_ZONE_PLAN_MUTANT_NOTIFY_CTX_DEVICE
+        "with the host buft on device 0, a device-1 backend's notify grew device 0 0 time\\(s\\) and device 1 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_NO_ROLLBACK
+        "after a failed grow, the next notify for the same deficit grew 0 time\\(s\\), expected 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_NO_RESERVE
+        "two notifies for one deficit grew 2 time\\(s\\), expected 1"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_WITHDRAW_KEPT
+        "withdrawal, the same target grew 1 time\\(s\\) in all, expected 2: the reservation still counts"
+    HOST_ZONE_PLAN_MUTANT_LEDGER_MARK_IGNORED
+        "the commit's re-notify printed no measured=100.0 allocated=80.0 on its demand line")
+
+if (NOT GGML_BACKEND_DL)
+    # The real ggml-base scheduler over two CPU backend instances; ggml-cpu is a MODULE under GGML_BACKEND_DL.
+    ggml_sycl_host_zone_plan_test(plan-walk-sched LIBS ggml-cpu)
+endif()
+
+ggml_sycl_host_zone_plan_test(attn-host-staging-plan MUTANTS
+    HOST_ZONE_PLAN_MUTANT_WALK_TG_REPLACES_PP
+        "committed q=1048512 expected 9437120[^~]*committed D=10 expected D=5120"
+    HOST_STAGING_PLAN_MUTANT_NO_BEGIN
+        "backend B committed a plan its reserve never walked"
+    HOST_ZONE_PLAN_MUTANT_CAPACITY_HIGH_WATER
+        "an auto-n_ubatch trial settled on 512 ends at Q capacity 34602944, expected 9437120"
+    HOST_STAGING_PLAN_MUTANT_FA_AFTER_STAGING
+        "a refused host FLASH_ATTN_EXT reads fa=0 refusals=1, expected fa=1 refusals=1"
+    HOST_ZONE_PLAN_MUTANT_FAIL_CLOSED_ASSERTS
+        "the fail-closed helper killed the process: rc 134"
+    HOST_ZONE_PLAN_MUTANT_POOLS_OWN_SCAN
+        "the pools initialized at D=32, expected the plan's D=16"
+    HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_REMOVED
+        "no `exceeds its planned` line for graph needs D=32"
+    HOST_ZONE_PLAN_MUTANT_POOLS_CHECK_STORAGE_SCAN
+        "an all-device plan printed the over-plan WARN"
+    HOST_ZONE_PLAN_MUTANT_POOLS_GATE_IS_HOST
+        "pool demand 0.3 MiB for an all-device src0"
+    HOST_ZONE_PLAN_MUTANT_POOLS_INIT_ONCE
+        "pools hold D=16 below committed high-water D=32"
+    HOST_ZONE_PLAN_MUTANT_DISPATCH_GROW
+        "the over-plan request recorded an allocation"
+    HOST_ZONE_PLAN_MUTANT_PLAN_IGNORES_SWITCH
+        "with the host dispatch off the plan allocated [1-9][0-9]* slot"
+    HOST_ZONE_PLAN_MUTANT_PREDICATE_IS_HOST
+        "the walk counted 2 host-KV node\\(s\\), expected 1 \\(the view\\)"
+    HOST_ZONE_PLAN_MUTANT_HELPER_DEVICE
+        "device 1's slots are unplanned"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_GROWS
+        "an unplanned device admitted a dispatch: [1-3] of 3 admits returned a slot"
+    HOST_ZONE_PLAN_MUTANT_UNPLANNED_POOLS_SCAN
+        "with no commit the pools initialized=1 at D=32"
+    HOST_ZONE_PLAN_MUTANT_FREE_RELEASES_PLANNED
+        "after an unrelated backend's free, device 1 did not admit by its plan")
 
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)

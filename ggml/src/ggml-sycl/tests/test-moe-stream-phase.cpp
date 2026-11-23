@@ -281,6 +281,84 @@ void test_declined_layer(const moe_stream_layer_info & claimed, const ggml_sycl:
     CHECK(ggml_sycl::moe_stream_executor_claims(claimed, geo));
 }
 
+// Which executor runs a prompt op of a layer decided for the CPU (moe_pp_cpu_split_choose). The counts are the plan's
+// for one (layer, role) of 32 experts: found, host, on_device (any device), on_target (the op's device).
+ggml_sycl::moe_pp_cpu_split_facts split_facts(int64_t found, int64_t host, int64_t on_device, int64_t on_target) {
+    ggml_sycl::moe_pp_cpu_split_facts f;
+    f.cpu_decided      = true;
+    f.triplet_role     = true;
+    f.island_runs_type = true;
+    f.experts          = 32;
+    f.counts.found     = found;
+    f.counts.host      = host;
+    f.counts.on_device = on_device;
+    f.counts.on_target = on_target;
+    return f;
+}
+
+void test_pp_cpu_split() {
+    using ggml_sycl::moe_pp_cpu_split;
+    using ggml_sycl::moe_pp_cpu_split_choose;
+    using ggml_sycl::moe_pp_cpu_split_facts;
+    // Every expert on the host: the island runs the op, whether or not the executor would take a device part.
+    const moe_pp_cpu_split_facts all_host = split_facts(32, 32, 0, 0);
+    CHECK(moe_pp_cpu_split_choose(all_host) == moe_pp_cpu_split::ISLAND);
+    moe_pp_cpu_split_facts f = all_host;
+    f.executor_takes_part    = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::ISLAND);
+    // Each of the three gates alone keeps the op hybrid: no CPU decision, a role outside the triplet, a type the
+    // island has no kernel for.
+    f             = all_host;
+    f.cpu_decided = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f              = all_host;
+    f.triplet_role = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f                  = all_host;
+    f.island_runs_type = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // A mixed op is split only when the executor takes its device experts.
+    const moe_pp_cpu_split_facts mixed = split_facts(32, 12, 20, 20);
+    CHECK(moe_pp_cpu_split_choose(mixed) == moe_pp_cpu_split::NONE);
+    f                     = mixed;
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::EXECUTOR_AND_ISLAND);
+    f.cpu_decided = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // The role and type gates hold for the split too: the island must run the op's host experts either way.
+    f                     = mixed;
+    f.executor_takes_part = true;
+    f.triplet_role        = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f                     = mixed;
+    f.executor_takes_part = true;
+    f.island_runs_type    = false;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // An expert the plan has no entry for, on an all-host op and on a mixed one.
+    CHECK(moe_pp_cpu_split_choose(split_facts(31, 31, 0, 0)) == moe_pp_cpu_split::NONE);
+    f                     = split_facts(31, 11, 20, 20);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // An expert on a device other than the op's.
+    f                     = split_facts(32, 12, 20, 19);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    f                     = split_facts(32, 31, 1, 0);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // No host expert: the op is resident, and the executor's resident claim owns it.
+    f                     = split_facts(32, 0, 32, 32);
+    f.executor_takes_part = true;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // No expert count. The counts are ones the plan cannot produce (a host expert among none found): they pass every
+    // other gate, so the count gate alone answers.
+    f         = split_facts(0, 1, 0, 0);
+    f.experts = 0;
+    CHECK(moe_pp_cpu_split_choose(f) == moe_pp_cpu_split::NONE);
+    // The default facts choose nothing.
+    CHECK(moe_pp_cpu_split_choose(moe_pp_cpu_split_facts()) == moe_pp_cpu_split::NONE);
+}
+
 // The decision log prints a declined layer through the change line's fixed format, with the reason "declined", which is
 // the line the gate's Q_decline arm scores; the summary counts it as a cpu layer-ubatch and not as a forced one.
 void capture_line(void * ctx, const char * line) {
@@ -762,7 +840,7 @@ int main() {
             // One unclaimed role (layer 0's up and down) keeps the layer hybrid, and so does no claim at all.
             CHECK(!ggml_sycl::moe_stream_executor_claims(*p0, ring_geo));
             CHECK(!ggml_sycl::moe_stream_executor_claims(*u0, ring_geo));
-            // The geometry-free half, which the ring-unavailable rule asks first.
+            // The geometry-free half, which the ring-unavailable rule asks right after moe_stream_layer_mapped_only.
             CHECK(ggml_sycl::moe_stream_layer_claimed(*c0) && ggml_sycl::moe_stream_layer_claimed(*p2));
             CHECK(!ggml_sycl::moe_stream_layer_claimed(*c1) && !ggml_sycl::moe_stream_layer_claimed(*c4));
             CHECK(!ggml_sycl::moe_stream_layer_claimed(*p0) && !ggml_sycl::moe_stream_layer_claimed(*u0));
@@ -786,6 +864,9 @@ int main() {
         }
         test_declined_line();
     }
+
+    // ---- which executor runs a prompt op of a layer decided for the CPU (moe_pp_cpu_split_choose) ----
+    test_pp_cpu_split();
 
     // ---- why a layer answered RING_UNAVAILABLE: the first rule that holds, in a fixed order ----
     {
@@ -817,7 +898,83 @@ int main() {
         CHECK(rule(idx, c0, no_ring, true, false) == "ring exceeds an eleventh of resident plus lent expert bytes");
         CHECK(rule(idx, c0, ring_geo, false, false) == "queue not in order");
         CHECK(rule(idx, c0, ring_geo, true, true) == "reserve refused");
-        // None of the seven: named anyway, so no ring-unavailable line goes unexplained.
+        // A layer whose host experts the plan left in their mapping stages none of them, so the executor cannot claim
+        // it: the rule names the plan's choice, the cause, ahead of the claim and of every later rule. A layer
+        // unclaimed for another reason (layer 1's fused entry) and a claimed layer answer as before.
+        placement_plan mapped_plan = make_plan();
+        for (placement_entry & e : mapped_plan.entries) {
+            if (e.layer_id == 0 && e.expert_id >= 0 && !e.on_device) {
+                e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+            }
+        }
+        const moe_stream_plan_index mapped = index_of(mapped_plan, claims_all);
+        CHECK(rule(mapped, layer_info(mapped, 0), ring_geo, true, false) == "host experts left mapped by the plan");
+        CHECK(rule(mapped, layer_info(mapped, 0), no_ring, false, true) == "host experts left mapped by the plan");
+        CHECK(rule(mapped, layer_info(mapped, 1), ring_geo, true, false) == "executor does not claim");
+        CHECK(rule(mapped, layer_info(mapped, 2), ring_geo, true, false) ==
+              "region smaller than the largest streamable matrix");
+        // One mapped expert among pinned ones: the other two stage, and the plan is still the only cause.
+        placement_plan one_mapped = make_plan();
+        for (placement_entry & e : one_mapped.entries) {
+            if (e.layer_id == 0 && e.expert_id == 5) {
+                e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+            }
+        }
+        const moe_stream_plan_index one = index_of(one_mapped, claims_all);
+        CHECK(rule(one, layer_info(one, 0), ring_geo, true, false) == "host experts left mapped by the plan");
+        // Expert 5's three matrices are counted as mapped; experts 1 and 6 stage their six for the executor.
+        const moe_stream_layer_info * one0 = layer_info(one, 0);
+        CHECK(one0 != nullptr && one0->n_mapped_host == 3 && one0->n_streamable == 6);
+        // The plan is named only when its backing alone keeps the layer from the executor. With no claim at all, or
+        // with layer 0's up and down unclaimed (claims_l0_gate_l2), pinning the experts would not make the executor
+        // take the layer, so the claim is the cause; only the matrices the executor would stage are counted.
+        const moe_stream_plan_index   mapped_unclaimed = index_of(mapped_plan, nullptr);
+        const moe_stream_layer_info * mu0              = layer_info(mapped_unclaimed, 0);
+        CHECK(mu0 != nullptr && mu0->n_mapped_host == 0);
+        CHECK(rule(mapped_unclaimed, mu0, ring_geo, true, false) == "executor does not claim");
+        claims_probe                mapped_partial_probe;
+        const moe_stream_plan_index mapped_partial = ggml_sycl::moe_stream_plan_index_build(
+            mapped_plan, 0, &mapped_partial_probe, claims_l0_gate_l2, kWideWindow);
+        // Asked once per (layer, role) with a matrix one AOS slot holds, mapped ones included: layers 0-2, three roles.
+        CHECK(mapped_partial_probe.calls == 9);
+        const moe_stream_layer_info * mp0 = layer_info(mapped_partial, 0);
+        CHECK(mp0 != nullptr && mp0->n_mapped_host == 3);
+        CHECK(rule(mapped_partial, mp0, ring_geo, true, false) == "executor does not claim");
+        // A mapped matrix no AOS slot holds (a zeroed inventory shape) is never asked, so it is not counted: pinning
+        // its expert would not let the ring stage it, and the claim is the cause.
+        placement_plan mapped_unfit_plan = mapped_plan;
+        for (placement_entry & e : mapped_unfit_plan.entries) {
+            if (e.layer_id == 0 && e.expert_id == 5 && e.expert_role == expert_tensor_role::GATE) {
+                e.ne[0] = 0;
+            }
+        }
+        mapped_unfit_plan.build_index();
+        const moe_stream_plan_index   mapped_unfit = index_of(mapped_unfit_plan, claims_all);
+        const moe_stream_layer_info * mn0          = layer_info(mapped_unfit, 0);
+        CHECK(mn0 != nullptr && mn0->items.size() == 9 && mn0->n_mapped_host == 8 && mn0->n_streamable == 0);
+        CHECK(rule(mapped_unfit, mn0, ring_geo, true, false) == "executor does not claim");
+        // A mapped layer with a fused entry: pinning its experts would still leave the entry the ring cannot stage.
+        placement_plan mapped_fused_plan = make_plan();
+        for (placement_entry & e : mapped_fused_plan.entries) {
+            if (e.layer_id == 1 && e.expert_id >= 0 && !e.on_device) {
+                e.host_backing = ggml_sycl::placement_host_backing::FILE_MAPPED;
+            }
+        }
+        const moe_stream_plan_index   mapped_fused = index_of(mapped_fused_plan, claims_all);
+        const moe_stream_layer_info * mf1          = layer_info(mapped_fused, 1);
+        CHECK(mf1 != nullptr && mf1->n_mapped_host == 9 && mf1->n_untriplet == 1);
+        CHECK(rule(mapped_fused, mf1, ring_geo, true, false) == "executor does not claim");
+        // The helper the rule asks first, directly: true only where the backing alone refuses the layer.
+        const moe_stream_layer_info * m0 = layer_info(mapped, 0);
+        const moe_stream_layer_info * o0 = layer_info(one, 0);
+        const moe_stream_layer_info * m2 = layer_info(mapped, 2);
+        CHECK(m0 != nullptr && ggml_sycl::moe_stream_layer_mapped_only(*m0));
+        CHECK(o0 != nullptr && ggml_sycl::moe_stream_layer_mapped_only(*o0));
+        CHECK(m2 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*m2));
+        CHECK(mu0 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mu0));
+        CHECK(mp0 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mp0));
+        CHECK(mf1 != nullptr && !ggml_sycl::moe_stream_layer_mapped_only(*mf1));
+        // None of the eight: named anyway, so no ring-unavailable line goes unexplained.
         CHECK(rule(idx, c0, ring_geo, true, false) == "region smaller than the largest streamable matrix");
         CHECK(rule(partial, layer_info(partial, 2), ring_geo, true, false) ==
               "region smaller than the largest streamable matrix");
@@ -1051,19 +1208,15 @@ int main() {
               "layout=2 unsupported(local-layout-unsupported)=2 recipe(RECIPE_MISMATCH)=1 recipe(RECIPE_MISSING)=1");
         // Every cause has a name of its own.
         const moe_staged_route_refusal all[] = {
-            moe_staged_route_refusal::NONE,          moe_staged_route_refusal::CLAIMED,
-            moe_staged_route_refusal::UNSUPPORTED,   moe_staged_route_refusal::KERNEL,
-            moe_staged_route_refusal::DIRECT_KERNEL, moe_staged_route_refusal::VIEW,
-            moe_staged_route_refusal::LAYOUT,        moe_staged_route_refusal::ROUTE,
-            moe_staged_route_refusal::RECIPE,
+            moe_staged_route_refusal::NONE,   moe_staged_route_refusal::CLAIMED, moe_staged_route_refusal::UNSUPPORTED,
+            moe_staged_route_refusal::KERNEL, moe_staged_route_refusal::VIEW,    moe_staged_route_refusal::LAYOUT,
+            moe_staged_route_refusal::ROUTE,  moe_staged_route_refusal::RECIPE,
         };
         std::unordered_set<std::string> names;
         for (moe_staged_route_refusal r : all) {
             names.insert(ggml_sycl::moe_staged_route_refusal_name(r));
         }
         CHECK(names.size() == sizeof(all) / sizeof(all[0]) && names.count("unknown") == 0);
-        CHECK(std::strcmp(ggml_sycl::moe_staged_route_refusal_name(moe_staged_route_refusal::DIRECT_KERNEL),
-                          "direct-kernel") == 0);
     }
 
     // ---- the regions' last uses, by window: what stage_window() refills, window_done() gates and reset_regions()

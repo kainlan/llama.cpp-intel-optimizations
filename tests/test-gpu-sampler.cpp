@@ -2,6 +2,8 @@
 // Verifies that GPU sampling produces correct results compared to CPU
 // Standalone test - doesn't depend on full ggml infrastructure
 
+#include "test-skip.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -1139,6 +1141,6 @@ int main() {
 #else
 int main() {
     printf("GPU sampler tests require SYCL build (-DGGML_USE_SYCL)\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #endif

@@ -652,6 +652,17 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+
+                // a node lives in the buffer it was assigned: a parent in another buffer (another backend's, for
+                // instance a host input a device backend reads in place) would move the node's output there. Ids
+                // that share a buffer type share one allocator (ggml_gallocr_new_n), so they are one buffer here.
+                // p_hn->buffer_id is set: a view parent is never own (galloc does not allocate views), so the
+                // is_own check above skipped it
+                if (galloc->buf_tallocs[p_hn->buffer_id] != galloc->buf_tallocs[buffer_id]) {
+                    AT_PRINTF("not reusing parent %s for %s as it is in another buffer\n", parent->name, node->name);
+                    continue;
+                }
+
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;

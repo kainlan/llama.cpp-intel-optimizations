@@ -90,6 +90,26 @@ int main() {
         }
         expect(reallocs <= 20, "a creeping request reallocates a logarithmic number of times");
     }
+    {
+        // The vec_dot paths quantize activation rows of the weight's vec_dot_type into src1_q. An F16 weight takes
+        // F32 rows, 4 bytes per element, so four of them outgrow src1_q at a K far below what a quantized type
+        // reaches; cpu_mul_mat must see that and take its GEMM fallback instead of the buffer assert.
+        const size_t f32_row_bytes_per_k = sizeof(float);
+        const size_t k_edge              = CPU_DISPATCH_SRC1_Q_BYTES / (4 * f32_row_bytes_per_k);
+        expect(k_edge == 57472, "four F32 rows fill src1_q at K = 57472");
+        expect(cpu_dispatch_src1_q_fits(4, CPU_DISPATCH_MAX_K * f32_row_bytes_per_k), "four F32 rows at MAX_K fit");
+        expect(cpu_dispatch_src1_q_fits(4, k_edge * f32_row_bytes_per_k), "four F32 rows at the edge fit exactly");
+        expect(!cpu_dispatch_src1_q_fits(4, (k_edge + 1) * f32_row_bytes_per_k), "four F32 rows past the edge do not");
+        expect(cpu_dispatch_src1_q_fits(CPU_DISPATCH_MAX_M, CPU_DISPATCH_MAX_Q_ROW_SIZE),
+               "MAX_M rows of the largest quantized row fit");
+        expect(!cpu_dispatch_src1_q_fits(CPU_DISPATCH_MAX_M + 1, CPU_DISPATCH_MAX_Q_ROW_SIZE),
+               "one row more than MAX_M of the largest quantized row does not");
+        expect(!cpu_dispatch_src1_q_fits(1, 0), "a zero row size never fits");
+
+        cpu_dispatch_buffers b;
+        b.init();
+        expect(b.src1_q.size() == CPU_DISPATCH_SRC1_Q_BYTES, "the bound is the size init() gives src1_q");
+    }
 
     if (g_failures == 0) {
         std::printf("PASS\n");

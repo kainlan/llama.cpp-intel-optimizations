@@ -304,8 +304,13 @@ def check_backend(backend_src: str) -> None:
         )
     region = backend_src[decl[0] : decl[1]]  # comment-blanking preserves offsets; the marker is a comment
     calls = [m.start() for m in re.finditer(r"ggml_sycl_make_(secondary_)?expert_dispatch_entry\(", region)]
-    if len(calls) < 2:
-        raise ContractError(f"FAIL: found {len(calls)} entry constructions in the hybrid branch, expected at least 2 ({TAG})")
+    # A floor, not a count: the branch builds its entries at one site today, and the loop below must not pass
+    # vacuously when that site is renamed or moved out of the region.
+    if not calls:
+        raise ContractError(
+            f"FAIL: found no entry construction in the hybrid branch, so its allow_cpu_fallback check would pass "
+            f"vacuously -- renamed or moved? ({TAG})"
+        )
     for at in calls:
         depth = 0
         end = at
@@ -468,6 +473,13 @@ def mutants(backend: str, cache: str):
     yield "a hybrid-branch entry omits allow_cpu_fallback (default true)", mutate(
         backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
         "operand.actual_layout(), operand.lease());",
+    ), cache
+    yield "the hybrid branch's entry construction renamed (the check must not pass vacuously)", mutate(
+        backend,
+        "expert_dispatch_entry entry = ggml_sycl_make_expert_dispatch_entry(\n"
+        "                    iid1, id, operand.expert_id,",
+        "expert_dispatch_entry entry = ggml_sycl_build_expert_dispatch_entry(\n"
+        "                    iid1, id, operand.expert_id,",
     ), cache
     yield "claim helper accepts a LIVE row", backend, mutate(
         cache, "if (it->second.state != runtime_alloc_state::RELEASING) {", "if (false) {"

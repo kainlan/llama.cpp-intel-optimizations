@@ -144,6 +144,7 @@ struct moe_stream_layer_info {
     size_t  host_bytes       = 0;  // AOS bytes of every host expert entry of the layer, fused ones included
     int     n_host_experts   = 0;  // distinct expert ids with a host entry
     int     n_untriplet      = 0;  // host expert entries the ring cannot stage (fused GATE_UP, CHUNK_*)
+    int     n_mapped_host    = 0;  // items the executor would stage but for the plan leaving them in their mapping
     int     n_streamable     = 0;  // items the ring gives slots, one each: staging AOS_ONLY
     size_t  matrix_bytes_max = 0;  // the largest one streamable matrix's slot bytes: the unit the ring stages
     int64_t K                = 0;  // the largest ne[0] over the host expert entries
@@ -222,15 +223,15 @@ static inline uint32_t moe_stream_window_experts(const moe_stream_window_hints &
 // One scan of plan.entries. Host entries carry target_device -1 and serve any device;
 // `device` selects only the resident bytes that bound the ring's size. The items take type and shape from the entry,
 // which the planner copied from the tensor inventory (a zeroed shape stages NONE). The ring serves the batched prompt
-// executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md): a matrix one AOS slot holds, whose weight the
-// library executor claims once staged, stages AOS_ONLY for the executor, whose own tables are the authority there
-// (llama.cpp-3460), and every other item stages NONE. The claim is asked once per (layer, role). No prompt kernel
-// reads the ring, so the device's prompt kernels are not asked.
+// executor only (W2 of docs/plans/2026-10-24-prefill-window-ring.md): a matrix one AOS slot holds, which the plan does
+// not leave in its mapping on the host and whose weight the library executor claims once staged, stages AOS_ONLY for
+// the executor, whose own tables are the authority there (llama.cpp-3460), and every other item stages NONE. The claim
+// is asked once per (layer, role). No prompt kernel reads the ring, so the device's prompt kernels are not asked.
 // `hints` gives the executor's phase, which with the streamable items per role decides window_slots, the region the
 // ring is sized to. `as_host`, when given, names (layer, expert) triplets, keyed moe_stream_table_key(layer, expert,
 // UNKNOWN), whose gate/up/down entries resident on `device` are read as host entries: the plan as a loan of those
-// triplets would leave it (the transaction's update_expert_placement flips on_device and the target only), without
-// copying the plan (moe_stream_loan_size_post_loan).
+// triplets would leave it (the transaction flips on_device and the target, and publishes the backing of the pinned copy
+// it made), without copying the plan (moe_stream_loan_size_post_loan).
 static inline moe_stream_plan_index moe_stream_plan_index_build(
     const placement_plan &               plan,
     int                                  device,
@@ -285,16 +286,31 @@ static inline moe_stream_plan_index moe_stream_plan_index_build(
         // slot (llama.cpp-3460, resolving llama.cpp-v7np): no reorder and no second slot, and the route refuses the
         // entry by its consumer. Any other matrix stages NONE (W2), and a matrix no AOS slot can hold does not ask
         // for its weight.
+        // mapped_host is the plan-time mirror of moe_stream_owner_streamable, which admits only a pinned WEIGHT owner:
+        // the index decides what the ring is sized for, the owner check guards each copy, and neither replaces the
+        // other. The preload copies a host expert whose backing sizes the WEIGHT zone into pinned memory when it has
+        // room, so the two agree except where the preload found none; there the owner check refuses the copy. A
+        // host-planned expert whose backing holds no WEIGHT-zone block is read in place from its mapping, so it stages
+        // NONE and its layer runs on the CPU. The claim is still asked for it, a pure predicate cached per
+        // (layer, role): a mapped item the executor would claim is counted, so the ring-unavailable rule can tell a
+        // layer only the plan's backing keeps from the executor from one the executor refuses. A device triplet read
+        // through as_host stages as a pinned host item would: its backing is not read here, because the loan copies it
+        // into pinned memory and publishes its entry PINNED.
+        const bool mapped_host = !e.on_device && !placement_plan::host_backing_sizes_weight_zone(e.host_backing);
+        bool       claimed     = false;
         if (library_claims != nullptr && moe_stream_item_aos_fits(item, SIZE_MAX)) {
             const uint64_t ck = moe_stream_table_key(item.layer, 0, item.role);
             auto           c  = claims.find(ck);
             if (c == claims.end()) {
                 c = claims.emplace(ck, library_claims(graph_ctx, item.layer, item.role)).first;
             }
-            if (c->second) {
-                item.staging  = moe_stream_staging::AOS_ONLY;
-                item.consumer = moe_stream_consumer::EXECUTOR;
-            }
+            claimed = c->second;
+        }
+        if (claimed && mapped_host) {
+            ++li.n_mapped_host;
+        } else if (claimed) {
+            item.staging  = moe_stream_staging::AOS_ONLY;
+            item.consumer = moe_stream_consumer::EXECUTOR;
         }
         li.items.push_back(item);
         // The ring is sized over the matrices it stages. Another one is still listed, so the layer's claim can see it
@@ -383,7 +399,7 @@ static inline uint32_t moe_stream_ring_slots_kept(const moe_stream_ring_geometry
 // True iff the batched executor takes every host matrix of the layer from the ring (W2): the layer has items, each one
 // staged AOS_ONLY for the executor (the index build's record of the claim), and no host entry is one the ring cannot
 // stage (fused GATE_UP, CHUNK_*). The geometry-free half of moe_stream_executor_claims, which the ring-unavailable rule
-// asks first.
+// asks right after moe_stream_layer_mapped_only.
 static inline bool moe_stream_layer_claimed(const moe_stream_layer_info & li) {
     if (li.n_untriplet != 0 || li.items.empty()) {
         return false;
@@ -394,6 +410,15 @@ static inline bool moe_stream_layer_claimed(const moe_stream_layer_info & li) {
         }
     }
     return true;
+}
+
+// True iff only the plan's backing keeps the layer from the executor: every item the ring does not stage is one the
+// plan left in its mapping and the executor would claim, and no fused entry refuses the layer, so pinning those
+// experts would make moe_stream_layer_claimed true. A layer the executor refuses for another reason (a type or role it
+// does not claim, a fused entry) answers false even when it also has mapped items, since pinning would not cure it.
+static inline bool moe_stream_layer_mapped_only(const moe_stream_layer_info & li) {
+    return li.n_mapped_host != 0 && li.n_untriplet == 0 &&
+           li.items.size() == static_cast<size_t>(li.n_streamable) + static_cast<size_t>(li.n_mapped_host);
 }
 
 // True iff GGML_SYCL_MOE_EXEC_DECLINE_LAYER (`knob`, -1 unset) names `layer`: begin_layer then turns the layer's
@@ -410,19 +435,58 @@ static inline bool moe_stream_executor_claims(const moe_stream_layer_info & li, 
     return geo.n_slots != 0 && moe_stream_layer_claimed(li);
 }
 
+// Which executor runs one prompt op of a layer the cost model decided for the CPU. NONE leaves the op's route as it is.
+// ISLAND sends the op to the retained per-expert path, whose CPU island runs the host experts grouped per expert.
+// EXECUTOR_AND_ISLAND runs the op's device experts on the batched executor and its host experts on the island.
+enum class moe_pp_cpu_split : uint8_t { NONE, ISLAND, EXECUTOR_AND_ISLAND };
+
+// What moe_pp_cpu_split_choose reads about one prompt op. `counts` is the plan's for the op's (layer, role) over
+// `experts`, asked for the op's device.
+struct moe_pp_cpu_split_facts {
+    bool                    cpu_decided         = false;  // the layer's decision is CPU
+    bool                    triplet_role        = false;  // the weight is a GATE, UP or DOWN matrix
+    bool                    island_runs_type    = false;  // the CPU island has a kernel for the weight's type
+    bool                    executor_takes_part = false;  // the batched executor takes the op's device experts
+    int64_t                 experts             = 0;      // the weight's expert count
+    expert_residency_counts counts;
+};
+
+// The op leaves the hybrid route only when the island can run every host expert and nothing else is left over: each
+// expert is planned, on the host or on the op's own device, and at least one is on the host. With no device expert
+// the island runs the whole op. With some, the op is split only if the batched executor takes the device experts;
+// otherwise it stays hybrid, since the retained per-expert path cannot read every device layout.
+static inline moe_pp_cpu_split moe_pp_cpu_split_choose(const moe_pp_cpu_split_facts & f) {
+    if (!f.cpu_decided || !f.triplet_role || !f.island_runs_type) {
+        return moe_pp_cpu_split::NONE;
+    }
+    const expert_residency_counts & c = f.counts;
+    if (f.experts <= 0 || c.found != f.experts || c.host <= 0 || c.on_device != c.on_target) {
+        return moe_pp_cpu_split::NONE;
+    }
+    if (c.on_target == 0) {
+        return moe_pp_cpu_split::ISLAND;
+    }
+    return f.executor_takes_part ? moe_pp_cpu_split::EXECUTOR_AND_ISLAND : moe_pp_cpu_split::NONE;
+}
+
 // Why a layer answered RING_UNAVAILABLE, for the phase's once-per-prompt WARN (lead ruling c-kcyf): the first rule that
-// holds, in this order. A layer the executor does not claim comes first, since the ring serves the executor only (W2).
-// geo is what moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the cap,
-// an eleventh of the resident plus lent expert bytes (llama.cpp-7999; its overflow guards refuse sizes far above any
-// resident expert set too). A window of 0 slots is no planned executor slot (before the load publishes the inventory
-// globals), or a slot that holds no expert. The last name is unreachable while the cost model's stage unit is one
-// streamable matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots holds the
+// holds, in this order. A layer only the plan's backing keeps from the executor comes first
+// (moe_stream_layer_mapped_only): the executor would claim it once its mapped experts were pinned, so the plan's choice
+// is the cause to name. Any other layer the executor does not claim comes next, since the ring serves the executor only
+// (W2). geo is what moe_stream_ring_size gave for idx; its all-zero answer past the index's first three rules is the
+// cap, an eleventh of the resident plus lent expert bytes (llama.cpp-7999; its overflow guards refuse sizes far above
+// any resident expert set too). A window of 0 slots is no planned executor slot (before the load publishes the
+// inventory globals), or a slot that holds no expert. The last name is unreachable while the cost model's stage unit is
+// one streamable matrix (moe_stream_layer_info::matrix_bytes_max), since a region of window_slots >= 1 slots holds the
 // largest streamable matrix in each slot; it is there so that no ring-unavailable line goes unexplained.
 static inline const char * moe_stream_ring_unavailable_rule(const moe_stream_plan_index &    idx,
                                                             const moe_stream_layer_info &    li,
                                                             const moe_stream_ring_geometry & geo,
                                                             bool                             in_order,
                                                             bool                             reserve_failed) {
+    if (moe_stream_layer_mapped_only(li)) {
+        return "host experts left mapped by the plan";
+    }
     if (!moe_stream_layer_claimed(li)) {
         return "executor does not claim";
     }
@@ -696,14 +760,13 @@ struct moe_stream_op {
 // recipe, asked before the route, and the recipe validator's refusal, asked after it. NONE means served.
 enum class moe_staged_route_refusal : uint8_t {
     NONE,
-    CLAIMED,        // the entry's consumer is the batched prompt executor, which reads the slot itself
-    UNSUPPORTED,    // the capability query answers no kernel for the type in the entry's layout
-    KERNEL,         // it answers a kernel other than the plain MMVQ_COMPAT
-    DIRECT_KERNEL,  // Q1_0/NVFP4: only their direct kernel runs them on a device (moe_type_needs_direct_kernel)
-    VIEW,           // the slot resolves to no device pointer
-    LAYOUT,         // the slot's resolved layout is not the entry's
-    ROUTE,          // validate_moe_batch_route refuses the route
-    RECIPE,         // the recipe is missing, or validate_moe_execution_recipe refuses it
+    CLAIMED,      // the entry's consumer is the batched prompt executor, which reads the slot itself
+    UNSUPPORTED,  // the capability query answers no kernel for the type in the entry's layout
+    KERNEL,       // it answers a kernel other than the plain MMVQ_COMPAT
+    VIEW,         // the slot resolves to no device pointer
+    LAYOUT,       // the slot's resolved layout is not the entry's
+    ROUTE,        // validate_moe_batch_route refuses the route
+    RECIPE,       // the recipe is missing, or validate_moe_execution_recipe refuses it
 };
 
 inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refusal) {
@@ -716,8 +779,6 @@ inline const char * moe_staged_route_refusal_name(moe_staged_route_refusal refus
             return "unsupported";
         case moe_staged_route_refusal::KERNEL:
             return "kernel";
-        case moe_staged_route_refusal::DIRECT_KERNEL:
-            return "direct-kernel";
         case moe_staged_route_refusal::VIEW:
             return "view";
         case moe_staged_route_refusal::LAYOUT:
@@ -1064,6 +1125,11 @@ class moe_stream_phase {
     // which begin_layer gives only to a layer the executor claims (moe_stream_executor_claims, asked again here), and
     // the ring is reserved (ring_ready()). A refused reserve answers false, and the layer stays hybrid.
     bool     executor_claims(int layer);
+    // True iff the decision begin_layer made for `layer` in the current micro-batch is CPU, for any reason; a layer
+    // with no host entry answers false. Ask it only after begin_layer for this op's layer: begin_layer is where a new
+    // micro-batch is detected and the last one's decisions dropped, so before it the answer may be the last
+    // micro-batch's.
+    bool     cpu_decided(int layer) const;
     // Before the executor dequantizes one phase of (layer, role), on a layer executor_claims answered true for: every
     // host matrix of the window that the ring can take is in the stage table after this returns. One not there yet is
     // copied now, with the rest of its window, into a region of its own, on the copy queue behind the region's read
@@ -1193,6 +1259,11 @@ class moe_stream_phase {
     // off for every later prompt in this backend context, which holds this phase; the per-prompt reset does not clear
     // this flag.
     bool                                    window_marks_failed_ = false;
+    // A short reserve printed the WEIGHT zone's holders (moe_stream_ring_warn_weight_zone): once per backend context,
+    // that is once per device per llama context on a multi-device split. Each llama context initializes its own SYCL
+    // backend per device, whose context owns this phase until its destructor, so neither begin_ubatch nor end_prompt
+    // clears the flag, and a new or recreated llama context has new phases.
+    bool                                    weight_zone_warned_  = false;
     // The windows' timing under GGML_SYCL_MOE_EXEC_TRACE=2, keyed by micro-batch and window:
     // begin_layer enables it from the op's decision log, stage_window(), window_begin and window_launched() record,
     // and flush_window_timing() prints and clears it. Written by the submitting thread only, so it takes no lock.
@@ -1220,9 +1291,9 @@ class moe_stream_phase {
 
 namespace detail {
 
-// True iff a SOA-to-AOS inverse of ggml_sycl_reorder_weight_gpu (the load fill's reorder, ggml-sycl.cpp) exists for
-// `type`. None exists yet: that function only runs AOS to SOA, so v1 lends AOS-layout entries only. Add a case here
-// when an inverse kernel lands.
+// True iff a SOA-to-AOS inverse of the load fill's reorder (reorder_aos_to_soa_device, ggml-sycl.cpp) exists for
+// `type`. None exists yet: the fill only runs AOS to SOA, so v1 lends AOS-layout entries only. Add a case here when an
+// inverse kernel lands.
 static inline bool moe_loan_soa_inverse_exists(ggml_type type) {
     (void) type;
     return false;
@@ -1405,6 +1476,110 @@ static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,
         bytes += e ? e->dst_size : 0;
     }
     return bytes;
+}
+
+// ---- Named moves: the plan transaction's explicit lists. ------------------------------------------------------------
+// A boundary driver names whole triplets to move: an evict list (device to host) and an admit list (host to device).
+// What the published plan says of each is checked here, before anything is minted or moved. Pure over the plan; the
+// plan's build_index() must have run. The cache checks the storage itself under its own locks, and its refusal is the
+// authority on whether a copy can move: this check says only what the plan already rules out.
+
+// One named triplet: the (gate, up, down) entries of expert_id in layer_id.
+struct moe_expert_triplet_ref {
+    int layer_id  = -1;
+    int expert_id = -1;
+};
+
+// The plan's verdict on named moves. evict and admit hold one reason per list entry, in list order: null when the
+// triplet may move, else why it may not. A refusal refuses that triplet alone. net_by_layer is, for each layer with a
+// movable triplet, the admits less the evicts there, sorted by layer: how the transaction would change the number of
+// that block's experts resident on the device.
+struct moe_expert_move_check {
+    std::vector<const char *>        evict;
+    std::vector<const char *>        admit;
+    std::vector<std::pair<int, int>> net_by_layer;
+};
+
+namespace detail {
+
+// The layouts an admit can stage from a host copy: AOS, whose device size and padded tail the transaction and the
+// cache both take from staged_expert_bytes (weight-row-padding.hpp). A SOA device copy is the load's reorder of the AOS
+// bytes, which an admit does not run yet; add the layout here when it does.
+static inline bool moe_admit_layout_stageable(const placement_entry & e) {
+    return e.layout == GGML_LAYOUT_AOS;
+}
+
+// The verdict on one named triplet of the list that moves it to the device (admit) or to the host (evict). `named`
+// holds every triplet named so far, so a later naming of one is a duplicate whatever the first naming's verdict: the
+// transaction moves a triplet at most once.
+static inline const char * moe_expert_move_refusal(const placement_plan &         plan,
+                                                   int                            device,
+                                                   const moe_expert_triplet_ref & ref,
+                                                   bool                           to_device,
+                                                   std::unordered_set<uint64_t> & named) {
+    if (ref.layer_id < 0 || ref.expert_id < 0) {
+        return "incomplete triplet";
+    }
+    if (!named.insert(moe_loan_triplet_key(ref.layer_id, ref.expert_id)).second) {
+        return "duplicate triplet";
+    }
+    const moe_loan_triplet t = moe_loan_triplet_of(plan, ref.layer_id, ref.expert_id);
+    if (!t.complete()) {
+        return "incomplete triplet";
+    }
+    for (int r = 0; r < 3; ++r) {
+        const placement_entry & e = *t.e[r];
+        if (e.on_device && e.target_device != device) {
+            return "wrong device";
+        }
+        if (e.on_device == to_device) {
+            return to_device ? "not on host" : "not on device";
+        }
+        if (to_device ? !moe_admit_layout_stageable(e) : !moe_loan_layout_lendable(e)) {
+            return "layout";
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace detail
+
+// Check named moves against `plan` for `device`: the evicts first, then the admits, as the transaction runs them.
+// A triplet is refused for a member the plan does not have or an id no entry can carry ("incomplete triplet"), for a
+// second naming in either list ("duplicate triplet"), for a member on another device ("wrong device"), for a member
+// already where the list would move it ("not on host" for an admit, "not on device" for an evict, so a triplet split
+// across the two is refused by both), or for a member in a layout that direction cannot copy ("layout"). Whether a
+// device copy is a view into a bulk tensor's shared allocation is the cache's question, asked under its locks.
+static inline moe_expert_move_check moe_expert_move_validate(const placement_plan &                      plan,
+                                                             int                                         device,
+                                                             const std::vector<moe_expert_triplet_ref> & evict,
+                                                             const std::vector<moe_expert_triplet_ref> & admit) {
+    moe_expert_move_check            out;
+    std::unordered_set<uint64_t>     named;
+    std::vector<std::pair<int, int>> moves;  // (layer, +1 for an admit, -1 for an evict), movable triplets only
+    out.evict.reserve(evict.size());
+    out.admit.reserve(admit.size());
+    for (const moe_expert_triplet_ref & ref : evict) {
+        out.evict.push_back(detail::moe_expert_move_refusal(plan, device, ref, /*to_device=*/false, named));
+        if (!out.evict.back()) {
+            moves.emplace_back(ref.layer_id, -1);
+        }
+    }
+    for (const moe_expert_triplet_ref & ref : admit) {
+        out.admit.push_back(detail::moe_expert_move_refusal(plan, device, ref, /*to_device=*/true, named));
+        if (!out.admit.back()) {
+            moves.emplace_back(ref.layer_id, +1);
+        }
+    }
+    std::stable_sort(moves.begin(), moves.end(),
+                     [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.first < b.first; });
+    for (const std::pair<int, int> & m : moves) {
+        if (out.net_by_layer.empty() || out.net_by_layer.back().first != m.first) {
+            out.net_by_layer.emplace_back(m.first, 0);
+        }
+        out.net_by_layer.back().second += m.second;
+    }
+    return out;
 }
 
 // ---- Loan sizing: a short ring's loan, sized from the plan the loan leaves. ----------------------------------------

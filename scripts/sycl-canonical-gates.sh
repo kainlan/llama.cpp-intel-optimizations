@@ -220,10 +220,15 @@ SHA="$(cd "$ROOT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
 # caller-inherited value.
 export ONEAPI_DEVICE_SELECTOR="$SELECTOR"
 
+# Log only. Shmem stays in the line as the iGPU signature; HostBacking (Shmem + the meminfo remainder)
+# is the figure that sees a discrete card's host-USM memory.
+[ -r "$SCRIPT_DIR/sycl-host-backing.sh" ] || { echo "sycl-canonical-gates: $SCRIPT_DIR/sycl-host-backing.sh is missing" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/sycl-host-backing.sh"
 sample_mem() {
     local label="$1"
     if [ -r /proc/meminfo ]; then
-        echo "[$label] $(grep -E '^(Shmem|MemAvailable):' /proc/meminfo | tr '\n' ' ')" >&2
+        echo "[$label] $(sycl_gpu_host_backing_log_line)" >&2
     fi
 }
 

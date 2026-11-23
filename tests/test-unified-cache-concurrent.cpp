@@ -8,6 +8,7 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
+#include "test-skip.h"
 
 #include <atomic>
 #include <cstdio>
@@ -19,7 +20,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

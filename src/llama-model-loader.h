@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-hparams.h"
+#include "llama-lazy-range-record.h"
 #include "llama-mmap.h"
 
 #include "ggml-cpp.h"
@@ -28,6 +29,15 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+
+// Whether a TENSOR_READ_LAZY tensor of `nbytes` is read lazily, as a function of
+// the lazy mode and of whether mmap is supported (llama.cpp-th32 T6a, design
+// DLM (a)). It is the one eligibility rule: nothing is eligible without mmap,
+// OFF never is, AUTO only above 4 GiB, ON always. A mode outside the enum (the
+// field is public C API, and only the CLI validates it) is never eligible. The
+// lazy-range record's pre-fill is the only caller: lazy_read::add() and the other
+// consumers read the deferral the record holds and none restates the rule.
+bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_supported);
 
 struct llama_model_loader {
     // Holds information on a model weight
@@ -80,9 +90,29 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+
+    // Set once load_tensors() has staged this load's early SYCL plan, which holds the host-backing fact (design 5efe
+    // §4.3). false on a load with no SYCL transaction, or before the plan, which keeps today's use_mmap answers.
+    bool sycl_load_plan_staged = false;
+
+    // Each SYCL_Mapped buffer's file and base file offset: a tensor of file idx at file offset offs lives at
+    // base + (offs - offset). load_all_data gets a context's buffers as a list, so the file picks the buffer.
+    struct sycl_mapped_base {
+        uint32_t idx;
+        uint64_t offset;
+    };
+
+    std::unordered_map<ggml_backend_buffer_t, sycl_mapped_base> sycl_mapped_base_offsets;
+
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+
+    // The rows of every TENSOR_READ_LAZY tensor the architecture declares and the file
+    // carries, filled once by load_tensors() before the early plan (llama.cpp-5efe C1).
+    // Whether a table is lazy, who reads it and where it sits in its file are read from
+    // here; no consumer keeps a copy.
+    llama_lazy_range_record lazy_record;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -90,31 +120,32 @@ struct llama_model_loader {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
 
-        // decide whether this tensor is read lazily
-        // pass w to also record it, or nullptr to only ask
+        // the record whose LAZY_READ rows this reads (set by the loader)
+        const llama_lazy_range_record * record = nullptr;
+
+        // Whether this tensor is read lazily through the CPU mapping: exactly when its
+        // row in the record is LAZY_READ. It reads `deferral` and decides nothing (the
+        // mode, the size floor and mmap support were the pre-fill's); a STORAGE row is
+        // another consumer's and answers false. The answer does not depend on the load
+        // mode or on `w`: the memory-fit pass (no_alloc, no mmap) passes no weight and
+        // must size a lazy table as the real load will leave it, unread.
+        // Pass w to also make the tensor a member, or nullptr to only ask.
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
 
+        // membership: the tensors this load really maps lazily
         bool any() const {
-            return !ranges.empty();
+            return !tensors.empty();
         }
 
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
         }
 
-        const llama_mmap::ranges & for_file(uint32_t idx) const {
-            static const llama_mmap::ranges none;
-
-            const auto it = ranges.find(idx);
-            return it == ranges.end() ? none : it->second;
-        }
-
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 
     private:
-        std::map<uint32_t, llama_mmap::ranges> ranges;
-        std::set<std::string>                  tensors;
+        std::set<std::string> tensors;
     } lazy;
 
     llama_files files;
@@ -169,6 +200,11 @@ struct llama_model_loader {
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
+    // The STORAGE tables' tensors: metadata only, in no buffer, so neither a buffer allocation, the load's measure nor
+    // load_all_data ever sees them. Kept out of ctx_map for that reason, and moved to the model in load_tensors.
+    ggml_context_ptr storage_ctx;
+    ggml_tensor *    create_storage_tensor(const std::string & name, const ggml_tensor * cur);
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;
@@ -177,11 +213,12 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
     // llama.cpp-lufn: `-ot <pattern>=CPU` is resolved through make_cpu_buft_list(), whose
-    // FIRST entry is the first device's host buffer type -- SYCL_Host on this fork -- ahead
-    // of the CPU_REPACK extras and the plain CPU buft. select_weight_buft() returns the
-    // first entry whose device accepts the op, so a CPU override silently lands in pinned
-    // host memory that the GPU still executes from, and reaches the CPU backend only for the
-    // ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
+    // FIRST entries are the first device's host buffer types -- SYCL_Host on this fork, after
+    // SYCL_Mapped on a load that maps files -- ahead of the CPU_REPACK extras and the plain CPU
+    // buft. select_weight_buft() returns the first entry whose device accepts the op (SYCL_Mapped
+    // only for a weight the plan backs FILE_MAPPED), so a CPU override silently lands in host
+    // memory that the GPU still executes from, pinned or file-mapped, and reaches the CPU backend
+    // only for the ops the SYCL device declines. Nothing said so: two runs asking for 96 and 144 layers
     // both put the same 45 MB on CPU. Count the downgrades here so done_getting_tensors()
     // can refuse loudly. Note `ggml_backend_buft_is_host()` cannot be the discriminator --
     // SYCL_Host IS host memory; the question is which DEVICE owns the buffer type.
@@ -198,6 +235,13 @@ struct llama_model_loader {
     size_t                     host_planned_cpu_owned_bytes = 0;
     std::string                first_host_planned_cpu_owned_name;
     ggml_backend_buffer_type_t first_host_planned_cpu_owned_buft = nullptr;
+
+    // Weights the SYCL plan backs FILE_MAPPED that create_tensor still bound to another SYCL host buffer type: a
+    // pinned copy the plan never charged (design 5efe §4.3). Counted per load, reported once by done_getting_tensors().
+    size_t                     n_planned_mapped_unserved     = 0;
+    size_t                     planned_mapped_unserved_bytes = 0;
+    std::string                first_planned_mapped_unserved_name;
+    ggml_backend_buffer_type_t first_planned_mapped_unserved_buft = nullptr;
 
     llama_model_loader(
         struct gguf_context * metadata,
@@ -267,6 +311,21 @@ struct llama_model_loader {
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // Whether this SYCL load maps its model files: the fact on the bound load's staged plan, which the staging proc
+    // derived from the inventory's resolved use_mmap (design 5efe §4.3). false before the plan is staged.
+    bool sycl_load_maps_files() const;
+
+    // Whether a weight bound to `buft` is served from the model file's mapping: for a SYCL buffer type, once this load
+    // staged a plan, the plan's backing for that weight (planned_file_mapped, which create_tensor asks once); use_mmap
+    // otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
+    bool weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const;
+
+    // The value GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to, as the SYCL inventory carries it (enum
+    // ggml_sycl_host_weight_layout: off, cpu, the default, where a planner-host dense weight is repacked into a
+    // CPU-owned buffer, or plain, a CPU-owned buffer in the file layout). Carried in the inventory, so the planner
+    // charges the buffers this loader binds instead of reading the variable itself.
+    static uint8_t host_weight_layout_sycl();
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

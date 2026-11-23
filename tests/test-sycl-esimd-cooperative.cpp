@@ -16,11 +16,12 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "test-skip.h"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
     std::fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

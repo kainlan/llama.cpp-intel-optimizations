@@ -354,16 +354,39 @@ def cache_violations(cache_cpp: str) -> list[str]:
     return found
 
 
+# The load publishes the ring through the one helper the stage and the plan dry run both call (llama.cpp-4zup), and the
+# helper hands the unified cache the planned ring.
+PUBLISH_SIGNATURE = "static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_inputs("
+RELEASE_STALE_RING_SIGNATURE = "static void ggml_sycl_release_stale_kv_zone_ring(int device) {"
+RUN_EFFECTS_SIGNATURE = "static void ggml_sycl_run_inventory_effects(const ggml_sycl_inventory_effects & effects) {"
+EARLY_EFFECT_SIGNATURE = "static void ggml_sycl_run_early_inventory_effect(int device) {"
+EARLY_ENTRY_SIGNATURE = "void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t"
+
+
 def load_plan_violations(sycl_cpp: str) -> list[str]:
     code = strip_comments(sycl_cpp)
-    load = re.search(r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*ctx->device\s*,[^;]*;(.*?)"
+    publish = code_of(sycl_cpp, PUBLISH_SIGNATURE)
+    if publish is None or not re.search(r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device\s*,", publish):
+        return ["a model load does not publish the planned ring"]
+    load = re.search(r"ggml_sycl_inventory_publish_planner_inputs\(\s*ctx->device\s*,\s*inventory\s*\)\s*;(.*?)"
                      r"ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots\(\s*ctx->device\s*,\s*false"
                      r"\s*,\s*false\s*\)\s*;", code, re.S)
     if load is None:
         return ["a model load keeps a previous context's KV-zone placement"]
-    if not re.search(r"const\s+size_t\s+(\w+)\s*=\s*ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held\("
-                     r"\s*ctx->device\s*\)\s*;\s*if\s*\(\s*\1\s*>\s*0\s*\)\s*\{[^{}]*"
-                     r"->release_pp_moe_onednn_scratch_ring\(\)", load.group(1)):
+    # The ring release is a load effect: it runs after every refusal of the pass, from the late pass's effect runner
+    # and the early pass's effect helper, which the direct early entry calls (the stage's own effect loop is pinned by
+    # test-sycl-load-stage-effect-pass-source).
+    release = code_of(sycl_cpp, RELEASE_STALE_RING_SIGNATURE)
+    runner = code_of(sycl_cpp, RUN_EFFECTS_SIGNATURE)
+    early_effect = code_of(sycl_cpp, EARLY_EFFECT_SIGNATURE)
+    early = code_of(sycl_cpp, EARLY_ENTRY_SIGNATURE)
+    if release is None or runner is None or early_effect is None or early is None or \
+            not re.search(r"const\s+size_t\s+(\w+)\s*=\s*ggml_sycl::unified_cache_get_pp_moe_onednn_kv_zone_bytes_held"
+                          r"\(\s*device\s*\)\s*;\s*if\s*\(\s*\1\s*==\s*0\s*\)\s*\{\s*return\s*;\s*\}[^}]*"
+                          r"->release_pp_moe_onednn_scratch_ring\(\)", release) or \
+            not re.search(r"ggml_sycl_release_stale_kv_zone_ring\(\s*effects\.device\s*\)\s*;", runner) or \
+            not re.search(r"ggml_sycl_release_stale_kv_zone_ring\(\s*device\s*\)\s*;", early_effect) or \
+            not re.search(r"ggml_sycl_run_early_inventory_effect\(\s*device\s*\)\s*;", early):
         return ["a model load keeps a previous context's ring in the KV zone"]
     return []
 
@@ -497,6 +520,20 @@ MUTATIONS = [
     ("load keeps a KV-zone ring", "sycl",
      "if (ring_cache && ring_cache->release_pp_moe_onednn_scratch_ring()) {", "if (false) {",
      "a model load keeps a previous context's ring in the KV zone"),
+    ("late effects skip the ring release", "sycl",
+     "    ggml_sycl_release_stale_kv_zone_ring(effects.device);\n", "",
+     "a model load keeps a previous context's ring in the KV zone"),
+    ("early effect skips the ring release", "sycl",
+     "    std::lock_guard lock(g_tensor_inventory_mutex);\n    ggml_sycl_release_stale_kv_zone_ring(device);\n}",
+     "    std::lock_guard lock(g_tensor_inventory_mutex);\n}",
+     "a model load keeps a previous context's ring in the KV zone"),
+    ("early entry skips its effect", "sycl",
+     "        ggml_sycl_run_early_inventory_effect(device);\n    }\n}", "    }\n}",
+     "a model load keeps a previous context's ring in the KV zone"),
+    ("load publishes no ring", "sycl",
+     "        device, in.pp_moe_onednn_weight_slot_bytes,",
+     "        h187_other_device, in.pp_moe_onednn_weight_slot_bytes,",
+     "a model load does not publish the planned ring"),
     ("load keeps the placement", "sycl",
      "    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(ctx->device, false, false);\n", "",
      "a model load keeps a previous context's KV-zone placement"),

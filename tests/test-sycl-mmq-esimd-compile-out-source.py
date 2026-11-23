@@ -469,7 +469,7 @@ def test_mutant_enclosing_directory_globs_the_dead_includer():
 
 
 def test_a_glob_in_an_unrelated_directory_does_not_trip_the_dead_includer_check():
-    files = [("tools/ui/CMakeLists.txt", "file(GLOB_RECURSE UI_DIST_FILES dist/*)")]
+    files = [("ui/apps/chat/CMakeLists.txt", "file(GLOB_RECURSE UI_DIST_FILES dist/*)")]
     assert check_includers(repo_includers(), files) is None
 
 

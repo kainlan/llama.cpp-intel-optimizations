@@ -503,7 +503,7 @@ def check_scatter(backend: str) -> None:
 def check_unload(cache_cpp: str) -> None:
     code = blank_comments(cache_cpp)
     body, _ = body_of(code, SHUTDOWN_SIG, "U")
-    clear = re.search(r"g_device_caches\.clear\(\)\s*;", body)
+    clear = re.search(r"\bdevice_caches\.clear\(\)\s*;", body)
     owner = re.search(r"g_moe_join_queue_owner\.store\s*\(\s*nullptr\b", body)
     refused = re.search(r"g_moe_join_queue_refused\.store\s*\(\s*false\b", body)
     if not clear or not owner or not refused or owner.start() < clear.end() or refused.start() < clear.end():

@@ -318,8 +318,14 @@ static const char * ggml_sycl_set_rows_alloc_type_name(const void * ptr) {
             return "host_pinned";
         case ggml_sycl::alloc_type::SHARED:
             return "shared";
-        case ggml_sycl::alloc_type::MMAP:
-            return "mmap";
+        case ggml_sycl::alloc_type::HOST_MALLOC:
+            return "host_malloc";
+        case ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE:
+            return "host_owned_elsewhere";
+        case ggml_sycl::alloc_type::FILE_MAPPED:
+            return "file_mapped";
+        case ggml_sycl::alloc_type::HOST_CPU:
+            return "host_cpu";
         default:
             return "other";
     }

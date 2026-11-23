@@ -25,6 +25,7 @@
 // load boundary. The B or reactivated-A exact-owner checks then fail.
 
 #include "../../../../tests/sycl-selector-fallback.hpp"
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
@@ -36,7 +37,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -82,7 +83,7 @@ int main(int, char ** argv) {
     ggml_sycl_load_txn load_a{};
     ggml_sycl_model_token model_a{};
     check(ggml_backend_sycl_model_load_begin(&load_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle begin");
-    check(ggml_backend_sycl_stage_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
+    check(ggml_backend_sycl_stage_load_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
           "model A plan stage");
 
     // Check 1 (positive control): first-sight registration of a name unique
@@ -140,7 +141,7 @@ int main(int, char ** argv) {
     ggml_sycl_load_txn load_b{};
     ggml_sycl_model_token model_b{};
     check(ggml_backend_sycl_model_load_begin(&load_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle begin");
-    check(ggml_backend_sycl_stage_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
+    check(ggml_backend_sycl_stage_load_inventory_plan(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK,
           "model B plan stage");
 
     // Check 3 (negative control): the reused name, registered fresh with

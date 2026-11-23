@@ -10,8 +10,10 @@
 
 #include "moe-scratch-admission.hpp"
 
+#include "moe-pp-pack.hpp"
 #include "zone-sizing.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace ggml_sycl {
@@ -27,13 +29,44 @@ bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out) {
     return true;
 }
 
+bool pp_moe_onednn_packed_rows_at(uint32_t n_ubatch, uint32_t n_expert, uint32_t n_expert_used, size_t * rows) {
+    if (rows == nullptr) {
+        return false;
+    }
+    if (n_ubatch == 0) {
+        *rows = 0;
+        return true;
+    }
+    if (n_expert == 0 || n_expert_used == 0) {
+        return false;
+    }
+    static_assert(sizeof(size_t) >= 8, "the row bound multiplies two 32-bit counts");
+    // The executor rounds each group's slot up to this, so the bound must use the same number.
+    constexpr size_t row_align = moe_pp_gemm_row_align;
+    constexpr size_t kMax      = std::numeric_limits<size_t>::max();
+    const size_t     n         = n_ubatch;
+    const size_t     used      = std::min(n_expert_used, n_expert);
+    const size_t     routed    = n * used;                            // rows the micro-batch routes in all
+    const size_t     active    = std::min<size_t>(n_expert, routed);  // experts that can hold a row
+    const size_t     slack     = (row_align - 1) * active;
+    const size_t     by_rows   = routed > (kMax - slack) / 2 ? kMax : 2 * routed + slack;
+    const size_t     by_rect   = ((n + row_align - 1) & ~(row_align - 1)) * active;
+    *rows                      = std::min(by_rows, by_rect);
+    return true;
+}
+
 bool pp_moe_onednn_slots_at(uint32_t n_ubatch,
+                            uint32_t n_expert,
+                            uint32_t n_expert_used,
                             size_t   activation_bytes_per_row,
                             size_t   output_bytes_per_row,
                             size_t * activation_slot_bytes,
                             size_t * output_slot_bytes) {
     constexpr size_t kMax = std::numeric_limits<size_t>::max();
-    const size_t     rows = n_ubatch;
+    size_t           rows = 0;
+    if (!pp_moe_onednn_packed_rows_at(n_ubatch, n_expert, n_expert_used, &rows)) {
+        return false;
+    }
     if (rows != 0 && (activation_bytes_per_row > kMax / rows || output_bytes_per_row > kMax / rows)) {
         return false;
     }
@@ -148,7 +181,8 @@ static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_input
         in.compute_reserve_bytes_per_row > kMax / rows ? kMax : rows * in.compute_reserve_bytes_per_row;
     size_t act_slot = 0;
     size_t out_slot = 0;
-    if (!pp_moe_onednn_slots_at(n_ubatch, in.activation_bytes_per_row, in.output_bytes_per_row, &act_slot, &out_slot)) {
+    if (!pp_moe_onednn_slots_at(n_ubatch, in.n_expert, in.n_expert_used, in.activation_bytes_per_row,
+                                in.output_bytes_per_row, &act_slot, &out_slot)) {
         return false;
     }
     out->activation_slot_bytes = act_slot;
@@ -190,7 +224,7 @@ static bool pp_moe_onednn_admit_ring_at(const pp_moe_onednn_ring_admission_input
     if (kv_zone_bytes == 0) {
         return true;
     }
-    // The largest-block term is an estimate (see the header); a failed reserve is the backstop.
+    // The largest-block term can go stale before the reserve (see the header); a failed reserve is the backstop.
     return out->compute_reserve_bytes <= out->kv_zone_headroom_bytes &&
            kv_zone_bytes <= out->kv_zone_headroom_bytes - out->compute_reserve_bytes &&
            kv_zone_bytes <= in.kv_zone_largest_block_bytes && kv_zone_bytes <= in.vram_budget_room_bytes;
@@ -200,7 +234,8 @@ pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_a
     pp_moe_onednn_ring_admission result;
     result.kv_zone_headroom_bytes =
         in.kv_zone_available_bytes > in.kv_admitted_bytes ? in.kv_zone_available_bytes - in.kv_admitted_bytes : 0;
-    if (in.ring_depth == 0 || in.n_ubatch == 0 || (in.activation_bytes_per_row == 0 && in.output_bytes_per_row == 0)) {
+    if (in.ring_depth == 0 || in.n_ubatch == 0 || (in.activation_bytes_per_row == 0 && in.output_bytes_per_row == 0) ||
+        in.n_expert == 0 || in.n_expert_used == 0) {
         return result;
     }
     if (pp_moe_onednn_admit_ring_at(in, in.n_ubatch, &result)) {
@@ -236,7 +271,8 @@ static bool pp_moe_onednn_ring_bytes_at(const pp_moe_onednn_explicit_ubatch_inpu
     const size_t     depth    = in.ring_depth;
     size_t           act_slot = 0;
     size_t           out_slot = 0;
-    if (!pp_moe_onednn_slots_at(n_ubatch, in.activation_bytes_per_row, in.output_bytes_per_row, &act_slot, &out_slot)) {
+    if (!pp_moe_onednn_slots_at(n_ubatch, in.n_expert, in.n_expert_used, in.activation_bytes_per_row,
+                                in.output_bytes_per_row, &act_slot, &out_slot)) {
         return false;
     }
     if (in.weight_slot_bytes > kMax - act_slot || in.weight_slot_bytes + act_slot > kMax - out_slot) {
@@ -269,7 +305,8 @@ pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
     pp_moe_onednn_explicit_ubatch_room room;
     room.in = in;
     if (in.n_ubatch_default == 0 || in.n_ubatch <= in.n_ubatch_default || in.weight_slot_bytes == 0 ||
-        in.ring_depth == 0 || (in.activation_bytes_per_row == 0 && in.output_bytes_per_row == 0)) {
+        in.ring_depth == 0 || (in.activation_bytes_per_row == 0 && in.output_bytes_per_row == 0) || in.n_expert == 0 ||
+        in.n_expert_used == 0) {
         return room;
     }
     room.valid = true;
@@ -329,6 +366,8 @@ pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide(
     fit.weight_slot_bytes             = in.weight_slot_bytes;
     fit.activation_bytes_per_row      = in.activation_bytes_per_row;
     fit.output_bytes_per_row          = in.output_bytes_per_row;
+    fit.n_expert                      = in.n_expert;
+    fit.n_expert_used                 = in.n_expert_used;
     fit.ring_depth                    = in.ring_depth;
     fit.n_ubatch                      = in.n_ubatch;
     decision.largest_fitting_n_ubatch = pp_moe_onednn_admit_ring(fit).largest_fitting_n_ubatch;

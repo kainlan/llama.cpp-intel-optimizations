@@ -10,10 +10,12 @@
 #include "../model-lifecycle.hpp"
 #include "../unified-cache.hpp"
 #include "../zone-sizing.hpp"
+#include "pinned-host-block-test-common.hpp"
 #include "sycl-spin-kernel.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -21,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -159,6 +162,104 @@ static bool allocate_failure_rolls_back_budget(sycl::queue & q) {
     }
     const size_t after = unified_cache_arena_non_weight_used(device);
     TEST_ASSERT(before == after, "runtime bytes did not roll back after alloc failure");
+    TEST_PASS();
+    return true;
+}
+
+// A raw device request meets the device's physical bytes at unified_alloc's raw exit: the device total less the arena
+// reservation, the raw rows held outside it and what was in use outside this process's accounting at the first cache.
+// With an arena the plan placed the weights, so a raw request past those bytes is refused and evicts nothing. The case
+// seeds one evictable cache entry whose eviction would free what the request is short of, sets the device total 1 MiB
+// past what the process holds, and checks that a 4 MiB raw request is refused with that entry still cached, a 512 KiB
+// one is served, and a 2 MiB request the RUNTIME zone serves never meets the gate.
+static bool raw_gate_refuses_past_the_device_total(sycl::queue & q) {
+    TEST_BEGIN("raw_gate_refuses_past_the_device_total");
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    // Without an arena the gate may evict, so the no-eviction claim below means something only with one.
+    TEST_ASSERT(cache->arena_active(), "no arena is active, so the arena's no-eviction rule cannot be exercised");
+    constexpr size_t MiB = 1024 * 1024;
+
+    alloc_request raw{};
+    raw.queue                          = &q;
+    raw.size                           = 4096;
+    raw.intent.role                    = alloc_role::COMPUTE;
+    raw.intent.category                = runtime_category::COMPUTE;
+    raw.intent.constraints.must_device = true;
+
+    // The device index the allocator resolves q to, read back from a small raw allocation.
+    alloc_handle   probe{};
+    alloc_metadata probe_meta{};
+    TEST_ASSERT(unified_alloc(raw, &probe) && unified_lookup(probe.ptr, &probe_meta), "the probe allocation failed");
+    TEST_ASSERT(unified_free(probe), "the probe free failed");
+    const int device = probe_meta.device;
+    TEST_ASSERT(cache->zone_available(vram_zone_id::RUNTIME) >= 2 * MiB,
+                "the RUNTIME zone has under 2 MiB free, so the zone half cannot run");
+
+    // One evictable entry outside the arena: a raw row the gate counts, in-use count 0, not pinned. It is the only
+    // entry an eviction for the 4 MiB request could take, and taking it would free more than that request is short of.
+    ggml_sycl_cache_id seed_id = {};
+    seed_id.valid              = true;
+    seed_id.model_id           = 0x7261772d67617465ull;  // an id no other case in this file uses
+    seed_id.name_hash          = 1;
+    seed_id.nbytes             = 4 * MiB;
+    seed_id.type               = GGML_TYPE_F32;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        seed_id.ne[i] = 1;
+    }
+    std::vector<uint8_t> seed_src(4 * MiB, 0);
+    bool                 needs_fill = false;
+    void *               seed_ptr =
+        cache->ensure_cached_alloc(seed_id, seed_src.data(), seed_src.size(), seed_src.size(),
+                                   cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS, false, &needs_fill);
+    TEST_ASSERT(seed_ptr != nullptr && cache->is_cached(seed_id, GGML_LAYOUT_AOS),
+                "the evictable entry was not cached");
+
+    const zone_raw_gate_inputs now = unified_cache_raw_gate_inputs(device, q);
+    TEST_ASSERT(now.device_total != 0, "the device total is unknown, so the gate gates nothing");
+    unified_cache_test_set_raw_gate_device_total(device, now.arena_bytes + now.raw_held + now.outside_accounting + MiB);
+
+    // The cache keeps no eviction count: an eviction shows as the entry gone, the entry count and the cache's used
+    // bytes down, and the sticky has_evictions flag raised (read only when it was clear before).
+    const size_t entries_before   = cache->entry_count();
+    const size_t used_before      = cache->used();
+    const size_t weight_before    = cache->zone_used(vram_zone_id::WEIGHT);
+    const bool   evictions_before = cache->has_evictions();
+    raw.size                      = 4 * MiB;
+    alloc_handle big{};
+    const bool   big_ok        = unified_alloc(raw, &big);
+    const bool   seed_kept     = cache->is_cached(seed_id, GGML_LAYOUT_AOS);
+    const bool   nothing_moved = cache->entry_count() == entries_before && cache->used() == used_before &&
+                               cache->zone_used(vram_zone_id::WEIGHT) == weight_before &&
+                               (evictions_before || !cache->has_evictions());
+    if (big_ok) {
+        unified_free(big);
+    }
+
+    raw.size = 512 * 1024;
+    alloc_handle small{};
+    const bool   small_ok = unified_alloc(raw, &small) && small.ptr != nullptr && unified_free(small);
+
+    // A request the RUNTIME zone serves is not a raw request: the gate's 1 MiB edge does not apply to it.
+    alloc_request zoned                       = raw;
+    zoned.size                                = 2 * MiB;
+    zoned.intent.role                         = alloc_role::GRAPH_TMP;
+    zoned.intent.category                     = runtime_category::GRAPH;
+    zoned.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+    alloc_handle in_zone{};
+    const bool   zone_ok = unified_alloc(zoned, &in_zone) && in_zone.ptr != nullptr && unified_free(in_zone);
+
+    unified_cache_test_set_raw_gate_device_total(device, 0);
+    if (seed_kept) {
+        cache->remove(seed_id, cache_entry_type::DENSE_WEIGHT, -1, -1, GGML_LAYOUT_AOS);
+        cache->evict(0);  // runs the deferred free of the removed entry
+    }
+
+    TEST_ASSERT(!big_ok && big.ptr == nullptr, "a raw request past the device's bytes was served");
+    TEST_ASSERT(seed_kept, "the refusal evicted the cached entry an arena trip must leave alone");
+    TEST_ASSERT(nothing_moved, "the refusal evicted cache entries or moved the WEIGHT zone");
+    TEST_ASSERT(small_ok, "a raw request inside the device's bytes was refused");
+    TEST_ASSERT(zone_ok, "a RUNTIME-zone request met the raw gate");
     TEST_PASS();
     return true;
 }
@@ -618,10 +719,12 @@ static bool direct_stage_host_fallback_counts_attempt(sycl::queue & q) {
     unified_cache * cache = get_unified_cache(q);
     TEST_ASSERT(cache != nullptr, "cache unavailable");
 
+    // The fallback publishes a source in place only when a registry names it (design 5efe §4.8, §7 C6), so the
+    // source is a pinned unified-cache block, not a raw sycl::malloc_host pointer. The block outlives the entry
+    // dropped below.
     constexpr size_t src_size = 4096;
-    void *           src      = sycl::malloc_host(src_size, q);
-    TEST_ASSERT(src != nullptr, "failed to allocate tiny host source");
-    std::memset(src, 0x5a, src_size);
+    pinned_host_block_test::block src_block(q, src_size, 0x5a);
+    void * const                  src = src_block.data();
 
     static int key_tag;
     const ggml_sycl_cache_id key      = test_make_cache_id(&key_tag, 0xfeed);
@@ -631,9 +734,8 @@ static bool direct_stage_host_fallback_counts_attempt(sycl::queue & q) {
     const direct_stage_result result = cache->direct_stage_expert(key, src, src_size, dst_size, GGML_LAYOUT_SOA,
                                                                   nullptr, nullptr, &q);
     const offload_stats_snapshot stats = offload_stats_get();
-    const size_t dropped = cache->drop_expert_entries_for_tensor_layout(
+    const size_t                 dropped = cache->drop_expert_entries_for_tensor_layout(
         std::vector<ggml_sycl_cache_id>{ key }, GGML_LAYOUT_AOS, "test-direct-stage-host-fallback-counts-attempt");
-    sycl::free(src, q);
 
     TEST_ASSERT(result.ok && result.ptr == src, "direct-stage should fall back to the host-USM source");
     TEST_ASSERT(dropped == 1, "direct-stage fallback entry should be dropped before freeing source");
@@ -790,9 +892,9 @@ static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
 
     const size_t cap_before    = pool.zone_capacity(host_zone_id::WEIGHT);
     const size_t chunks_before = pool.chunk_count();
-    // Mirrors unified-cache.cpp's fragmentation path: the growth request must
-    // guarantee that a fresh chunk can hold the whole allocation.
-    const size_t need          = request + align;
+    // unified-cache.cpp's fragmentation path asks the pool's rule for the
+    // growth: a fresh chunk must hold the whole allocation.
+    const size_t need          = pinned_chunk_pool::zone_grow_request(request, align);
     TEST_ASSERT(pool.grow_zone(host_zone_id::WEIGHT, need), "grow_zone should succeed within a 128 MiB budget");
     const size_t used_before = pool.zone_used(host_zone_id::WEIGHT);
 
@@ -801,15 +903,14 @@ static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
 
     const size_t cap_after    = pool.zone_capacity(host_zone_id::WEIGHT);
     const size_t chunks_after = pool.chunk_count();
-    const size_t aligned_need = (need + align - 1) & ~(align - 1);
+    const size_t grown_usable = pinned_chunk_pool::chunk_footprint_for(chunk, need).usable;
     TEST_ASSERT(chunks_after == chunks_before + 1, "oversize growth should add exactly one chunk");
-    TEST_ASSERT(cap_after - cap_before == aligned_need,
+    TEST_ASSERT(cap_after - cap_before == grown_usable,
                 "zone_capacity should grow by the actual bytes of the oversize chunk");
-    // TLSF does not split off a tail smaller than its minimum block, so the
-    // 64-byte slack rides along with the allocation: the accounted bytes are
-    // at least the request and at most the new chunk.
+    // The allocation takes its TLSF block, the request rounded to the grain, which the new chunk holds: the accounted
+    // bytes are at least the request and at most the new chunk.
     const size_t used_delta = pool.zone_used(host_zone_id::WEIGHT) - used_before;
-    TEST_ASSERT(used_delta >= request && used_delta <= aligned_need,
+    TEST_ASSERT(used_delta >= request && used_delta <= grown_usable,
                 "the oversize allocation should be accounted within the new chunk's bytes");
 
     // Budget is checked against the actual bytes: a growth that does not fit
@@ -818,6 +919,48 @@ static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
                 "growth beyond the remaining budget should be refused");
     TEST_ASSERT(pool.chunk_count() == chunks_after, "a refused growth must not add a chunk");
     TEST_ASSERT(pool.zone_capacity(host_zone_id::WEIGHT) == cap_after, "a refused growth must not change capacity");
+
+    pool.zone_free(host_zone_id::WEIGHT, ptr);
+    TEST_PASS();
+    return true;
+}
+
+// The same growth for a request whose size is not a multiple of the TLSF grain: zone_alloc rounds it up to the grain,
+// so the chunk grown for it must hold the rounded block, not only the request plus the base alignment. A size 32 B past
+// three chunks is the shape a SYCL_Host buffer takes (ggml-alloc pads its tensors to 32 B).
+static bool host_zone_grow_serves_odd_residue_oversize_alloc(sycl::queue & q) {
+    TEST_BEGIN("host_zone_grow_serves_odd_residue_oversize_alloc");
+
+    const char * old_chunk_mb = std::getenv("GGML_SYCL_PINNED_CHUNK_MB");
+    const bool   had_chunk_mb = old_chunk_mb != nullptr;
+    std::string  saved_chunk_mb;
+    if (had_chunk_mb) {
+        saved_chunk_mb = old_chunk_mb;
+    }
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+
+    constexpr size_t mib    = 1024ull * 1024ull;
+    constexpr size_t chunk  = 16ull * mib;
+    constexpr size_t budget = 128ull * mib;
+    const size_t     align  = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+
+    pinned_chunk_pool pool(q, budget);
+    pool.configure_zones(4ull * mib, 1ull * mib, 2ull * mib, 1ull * mib);  // one 16 MiB chunk
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", had_chunk_mb ? saved_chunk_mb.c_str() : nullptr);
+    TEST_ASSERT(pool.zones_configured(), "host zones were not configured");
+
+    const size_t request = 3 * chunk + 32;
+    TEST_ASSERT(pool.zone_alloc(host_zone_id::WEIGHT, request, align) == nullptr,
+                "a request past three chunks must not fit the 4 MiB WEIGHT zone before growth");
+    const size_t cap_before = pool.zone_capacity(host_zone_id::WEIGHT);
+    const size_t need       = pinned_chunk_pool::zone_grow_request(request, align);
+    TEST_ASSERT(pool.grow_zone(host_zone_id::WEIGHT, need), "grow_zone should succeed within a 128 MiB budget");
+    TEST_ASSERT(pool.zone_capacity(host_zone_id::WEIGHT) - cap_before ==
+                    pinned_chunk_pool::chunk_footprint_for(chunk, need).usable,
+                "zone_capacity should grow by the usable bytes of the chunk grown for the request");
+
+    void * ptr = pool.zone_alloc(host_zone_id::WEIGHT, request, align);
+    TEST_ASSERT(ptr != nullptr, "the chunk grown for a request off the TLSF grain should serve it");
 
     pool.zone_free(host_zone_id::WEIGHT, ptr);
     TEST_PASS();
@@ -966,7 +1109,7 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     const auto begin_candidate = lifecycle_find_candidate_placement_plan(load.txn.id);
     TEST_ASSERT(begin_candidate && begin_candidate->load_txn_id == load.txn.id && begin_candidate->explicit_no_plan,
                 "public begin did not expose its exact initial candidate");
-    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
+    TEST_ASSERT(ggml_backend_sycl_stage_load_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
                 "public early inventory staging failed");
     const auto snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
     TEST_ASSERT(snapshot && snapshot->load_txn_id == load.txn.id && !snapshot->explicit_no_plan && snapshot->plan,
@@ -981,11 +1124,10 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     // 16-MiB chunk; allow one further chunk for aligned zone boundaries.
     const size_t host_scratch = std::max(plan.host_zone_scratch_bytes,
         cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() +
-        plan.max_tensor_bytes + 32 * mib);
+        plan.max_copied_tensor_bytes + 32 * mib);
     const size_t host_zones = plan.host_zone_weight_bytes + std::max(plan.host_zone_kv_bytes, 64 * mib) +
                              plan.host_zone_staging_bytes + host_scratch;
-    const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes +
-                                plan.pp_pipeline_scratch_bytes + plan.pp_moe_onednn_scratch_bytes;
+    const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
     TEST_ASSERT(host_zones <= 1536 * mib && host_runtime <= 128 * mib,
                 "planned host footprint exceeds fixture bound; do not call late inventory");
     constexpr size_t chunk = 16 * mib;
@@ -1002,10 +1144,10 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
                 "inventory would exceed the conservative ONEDNN tail bound");
     fprintf(stderr, "host_zones=%zu host_runtime=%zu committed_bound=%zu\n",
             host_zones, host_runtime, host_committed_bound);
-    // Now cross the real late-inventory boundary. Its tiered_headroom
-    // diagnostic (base_mem/4 when weights exceed shared capacity) is not a
-    // second budget subtraction: g_tiered_headroom_reserve has no readers.
-    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
+    // Now cross the real late-inventory boundary. The headroom its
+    // [VRAM-BUDGET] lines print (base_mem/4 when weights exceed shared
+    // capacity) is a figure in those lines, not a second budget subtraction.
+    TEST_ASSERT(ggml_backend_sycl_stage_load_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
                 "public late inventory staging failed");
     const auto late_snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
     TEST_ASSERT(late_snapshot && late_snapshot->load_txn_id == load.txn.id && !late_snapshot->explicit_no_plan &&
@@ -1249,7 +1391,7 @@ static bool explicit_global_cache_shutdown_is_clean() {
 // (1) A REFUSED shutdown_unified_cache() call is not retryable-safe here
 // -- the sibling case's own refused shutdown (by design -- see that
 // case's own comment) left ITS cache PARTIALLY torn down: its parked
-// buffer's control kept the cache registered in g_device_caches, but a
+// buffer's control kept the cache registered in the per-device cache map, but a
 // subsequent onednn_graph_scratch_alloc() on that same cache resolved
 // off-device and hit GGML_ABORT at
 // onednn_graph_scratch_alloc_direct_locked(). So this case cannot simply
@@ -1419,7 +1561,7 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
 // be refused on unfixed code (that is the whole point of this case), and a
 // refused call is not retryable-safe here -- it leaves the cache PARTIALLY
 // torn down: its own parked buffer's control keeps the cache registered in
-// g_device_caches, but a subsequent onednn_graph_scratch_alloc() on that
+// the per-device cache map, but a subsequent onednn_graph_scratch_alloc() on that
 // same cache resolves off-device and hits GGML_ABORT at
 // onednn_graph_scratch_alloc_direct_locked(). So nothing may run in this
 // process after this case, on unfixed code.
@@ -1537,6 +1679,49 @@ static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
     TEST_ASSERT(!unified_lookup(ptr, &looked), "final-token sync did not erase the runtime record");
     TEST_ASSERT(cache->zone_used(exact.zone) < used_before,
                 "final-token sync did not reclaim the TLSF block");
+    TEST_PASS();
+    return true;
+}
+
+// A cache whose arena is reserved by hand stores no ONEDNN zone plan (only ensure_planned_arena_zones() stores one), so
+// its zone is bounded by its capacity alone and a pair that fits the zone is served. The device's own cache, built by
+// the earlier cases, holds the plan its ensure stored, whose Graph floor can exceed this 8 MiB zone; judged by that
+// plan, as a plan stored per device judged it, the zone's pair bound came out 0 and every pair was refused. A note
+// says whether that plan was there to be misread, and so whether the run shows anything about where the plan lives.
+static bool hand_built_arena_is_judged_by_its_own_zone_plan(sycl::queue & q) {
+    TEST_BEGIN("hand_built_arena_is_judged_by_its_own_zone_plan");
+    constexpr size_t mib          = 1024ull * 1024ull;
+    const size_t     max_alloc    = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache *  device_cache = get_unified_cache(q);
+    TEST_ASSERT(device_cache != nullptr, "no cache for the test device");
+    const zone_onednn_plan device_plan = device_cache->onednn_zone_plan_load();
+
+    unified_cache cache(q, 64ull * mib, 0, 0, 0);
+    if (cache.arena_active()) {
+        // The constructor's own ensure built the zones (a small GGML_SYCL_COMPUTE_ARENA_MB), so they carry its plan and
+        // none can be reserved by hand over them.
+        fprintf(stderr, "(the constructor built the arena; no hand-built zone) ");
+        TEST_PASS();
+        return true;
+    }
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        fprintf(stderr, "(arena reservation failed; no hand-built zone) ");
+        TEST_PASS();
+        return true;
+    }
+    const size_t zone = cache.zone_capacity(vram_zone_id::ONEDNN);
+    TEST_ASSERT(zone_onednn_plan_same(cache.onednn_zone_plan_load(), zone_onednn_plan()),
+                "a hand-built arena holds a zone plan nothing stored for it");
+    if (zone_onednn_pp_pair_bound(zone, device_plan.bare_bytes, device_plan.graph_floor_bytes) < 2ull * mib) {
+        fprintf(stderr, "(the device cache's plan, Graph floor %.1f MB, would bound this %.1f MB zone below the pair) ",
+                device_plan.graph_floor_bytes / (1024.0 * 1024.0), zone / (1024.0 * 1024.0));
+    } else {
+        fprintf(stderr,
+                "(the device cache's plan leaves this zone room for the pair; this run shows nothing about where "
+                "the plan lives) ");
+    }
+    TEST_ASSERT(cache.reserve_onednn_scratch(1ull * mib, 1ull * mib), "a pair fitting the hand-built zone was refused");
+    TEST_ASSERT(cache.shutdown_resources(), "arena shutdown did not release every self-owned allocation");
     TEST_PASS();
     return true;
 }
@@ -1704,6 +1889,551 @@ static bool concurrent_settle_destroy_closing_wins(sycl::queue & q) {
     return true;
 }
 
+// An arm that cannot build its fixture on this device measures nothing: it says why and marks the run skipped, and the
+// case then exits 77, never 0.
+#define TEST_SKIP(skipped, why)                \
+    do {                                       \
+        fprintf(stderr, "SKIPPED: %s\n", why); \
+        (skipped) = true;                      \
+        return true;                           \
+    } while (0)
+
+// Every zone's live authority and the generation it was minted at. A handle minted in a zone resolves only through
+// that authority object at that generation, so an arena whose incarnations are all unchanged resolves every handle it
+// resolved before to the same pointer.
+struct arena_incarnations {
+    std::array<std::shared_ptr<arena_authority>, static_cast<size_t>(vram_zone_id::COUNT)> authority{};
+    std::array<uint64_t, static_cast<size_t>(vram_zone_id::COUNT)>                         generation{};
+};
+
+static arena_incarnations arena_incarnations_of(const unified_cache & cache) {
+    arena_incarnations seen;
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        seen.authority[z]  = cache.arena_authority_snapshot(static_cast<vram_zone_id>(z));
+        seen.generation[z] = cache.arena_generation(static_cast<vram_zone_id>(z));
+    }
+    return seen;
+}
+
+// True when every zone has the authority object and generation it had, and that authority admits again.
+static bool arena_incarnations_unchanged(const unified_cache & cache, const arena_incarnations & before) {
+    const arena_incarnations now = arena_incarnations_of(cache);
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        if (now.authority[z] != before.authority[z] || now.generation[z] != before.generation[z]) {
+            return false;
+        }
+        if (now.authority[z] && !now.authority[z]->accepts(now.generation[z])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The SCRATCH zone of the arena serves a new allocation, inside the arena, and takes it back.
+static bool arena_serves_a_new_allocation(unified_cache & cache) {
+    constexpr size_t mib = 1024ull * 1024ull;
+    if (!cache.reserve_persistent_scratch("arena-teardown-restored", 1ull * mib)) {
+        return false;
+    }
+    void * const fresh  = cache.get_persistent_scratch("arena-teardown-restored");
+    const bool   inside = fresh != nullptr && cache.vram_owns(fresh);
+    cache.release_persistent_scratch("arena-teardown-restored");
+    return inside;
+}
+
+// A teardown refused because allocations are live in the arena leaves the arena as it was. The fixture holds the
+// scratch pool's exact allocation through a copy of its owner and asks the arena to tear itself down; the refusal is
+// the positive control. Then the arena is as it was: the held handle resolves to the pointer it resolved to before,
+// every zone keeps its authority and generation, and the SCRATCH zone serves a new allocation inside the arena.
+// Mutant: the teardown closing the allocator groups and retiring the authorities before it finds the allocations, and
+// not putting them back (the held handle stops resolving, the SCRATCH zone refuses the allocation).
+static bool arena_teardown_live_allocations_restores(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_live_allocations_restores");
+    constexpr size_t mib       = 1024ull * 1024ull;
+    const size_t     max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache    cache(q, 64ull * mib, 0, 0, 0);
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
+    }
+    TEST_ASSERT(cache.reserve_scratch_pool(1ull * mib), "the fixture's scratch pool was not reserved");
+    mem_handle         held   = cache.test_scratch_pool_owner();
+    const resolved_ptr before = held.resolve();
+    TEST_ASSERT(before, "the held scratch pool owner did not resolve before the teardown");
+    const arena_incarnations incarnations = arena_incarnations_of(cache);
+    const int                chunks       = cache.chunk_count();
+
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown freed an arena a live allocation is in");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::LIVE_ALLOCATIONS,
+                "the teardown did not record the live allocation as its cause");
+    TEST_ASSERT(cache.arena_active() && cache.chunk_count() == chunks, "the refused teardown changed the chunks");
+    const resolved_ptr after = held.resolve();
+    TEST_ASSERT(after && after.ptr == before.ptr,
+                "the held handle does not resolve to the pointer it resolved to before the refused teardown");
+    TEST_ASSERT(arena_incarnations_unchanged(cache, incarnations),
+                "a zone's authority or generation is not the one it had before the refused teardown");
+    TEST_ASSERT(arena_serves_a_new_allocation(cache), "the arena refused a new allocation after the refused teardown");
+
+    held = {};
+    TEST_ASSERT(cache.shutdown_resources(), "the arena was not torn down once its last holder was released");
+    TEST_ASSERT(!cache.arena_active(), "the completed teardown left the arena active");
+    TEST_PASS();
+    return true;
+}
+
+// Declared after an arm's cache, so it runs before the cache's destructor. An arm that returns early, or whose
+// teardown never reached a failure hook it armed, leaves that hook armed: the hooks are disarmed first, so none fires
+// here, in a later arm or in the destructor. Then the arena is torn down, a second time if the first is refused, so
+// the destructor finds no arena (a shutdown it cannot complete aborts the process).
+struct arena_teardown_retry {
+    unified_cache & cache;
+
+    ~arena_teardown_retry() {
+        unified_cache_test_disarm_arena_teardown_failures();
+        if (!cache.shutdown_resources()) {
+            (void) cache.shutdown_resources();
+        }
+    }
+};
+
+// GGML_SYCL_COMPUTE_ARENA_MB, put back as it was when the arm returns.
+struct compute_arena_mb_restore {
+    bool        had;
+    std::string value;
+
+    compute_arena_mb_restore() {
+        const char * saved = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+        had                = saved != nullptr;
+        value              = saved != nullptr ? saved : "";
+    }
+
+    ~compute_arena_mb_restore() { set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", had ? value.c_str() : nullptr); }
+};
+
+// The teardown's waits for leases, on its retired authorities and on each chunk, shortened to 100 ms for an arm that
+// holds a chunk lease through a teardown, so the arm does not wait out the 5000 ms default; put back when it returns.
+struct arena_lease_wait_short {
+    arena_lease_wait_short() { unified_cache_test_set_arena_drain_timeout_ms(100); }
+
+    ~arena_lease_wait_short() { unified_cache_test_set_arena_drain_timeout_ms(5000); }
+};
+
+// A chunk lease an arm holds through the cache's chunk lease API (the primitive mem_handle::from_chunk_ptr takes,
+// called directly because that bridge finds the per-device cache, not the arm's own). Declared after the arm's
+// arena_teardown_retry, so the lease is released before the retry's teardown on every return.
+struct held_chunk_lease {
+    unified_cache & cache;
+    int             chunk = -1;
+
+    ~held_chunk_lease() { release(); }
+
+    void release() {
+        if (chunk >= 0) {
+            cache.arena_release_chunk_lease(chunk);
+            chunk = -1;
+        }
+    }
+};
+
+// One pointer inside each chunk of the cache's arena, by chunk index: the first byte of the logical range each chunk
+// starts, or nullptr for a chunk the scan finds no pointer in.
+static std::vector<const void *> arena_pointer_in_each_chunk(unified_cache & cache) {
+    constexpr size_t          mib = 1024ull * 1024ull;
+    std::vector<const void *> in_chunk(static_cast<size_t>(cache.chunk_count()), nullptr);
+    for (size_t offset = 0; offset < cache.arena_total_size(); offset += 1ull * mib) {
+        const void * p     = cache.offset_to_ptr(offset);
+        const int    chunk = cache.arena_find_chunk(p);
+        if (chunk >= 0 && in_chunk[static_cast<size_t>(chunk)] == nullptr) {
+            in_chunk[static_cast<size_t>(chunk)] = p;
+        }
+    }
+    return in_chunk;
+}
+
+// A rebuild whose teardown the device refuses at its first free leaves the arena as it was, and a later load tries the
+// rebuild again. The arena's 8 MiB zones are smaller than the 32 MiB SCRATCH zone the ensure asks for, and nothing
+// holds it, so the ensure tears it down to rebuild it; the device refuses to free the first chunk (the PRIVATE_TESTING
+// free failure, armed for a teardown that has freed nothing). The ensure's refusal naming that cause is the positive
+// control. Then the arena is as it was: the same chunks and size, every zone's authority and generation, and the
+// SCRATCH zone serves a new allocation inside it. A second ensure tries the teardown again, and that teardown
+// completes.
+// Engagement: the arena is reserved with zones smaller than the ensure's, so the ensure must rebuild it.
+// Mutants: the refused first free not restoring (the authorities stay retired, so the incarnation check finds them
+// changed and the SCRATCH zone refuses the new allocation; FIRST_FREE_FAILED is not read as closed, so the second
+// ensure would still try the teardown and complete it); the cause read as closed (the second ensure refuses without
+// trying).
+static bool arena_teardown_first_free_refusal_restores(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_first_free_refusal_restores");
+    constexpr size_t         mib       = 1024ull * 1024ull;
+    const size_t             max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    compute_arena_mb_restore env;
+    unified_cache            cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry     retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
+    }
+    set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", "32");
+    TEST_ASSERT(cache.zone_capacity(vram_zone_id::SCRATCH) < 32ull * mib,
+                "the arena's SCRATCH zone already holds the ensure's 32 MiB, so no rebuild is needed");
+    const int                chunks_before = cache.chunk_count();
+    const size_t             size_before   = cache.arena_total_size();
+    const arena_incarnations incarnations  = arena_incarnations_of(cache);
+
+    unified_cache_test_fail_next_arena_free(0);
+    zone_arena_refusal first;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&first), "the ensure succeeded over a teardown that refused");
+    TEST_ASSERT(first.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+                    first.teardown == zone_arena_teardown_refusal::FIRST_FREE_FAILED,
+                "the ensure did not refuse for the first free the device refused");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::FIRST_FREE_FAILED,
+                "the cache does not record why its teardown refused");
+    TEST_ASSERT(cache.arena_active() && cache.chunk_count() == chunks_before && cache.arena_total_size() == size_before,
+                "the refused teardown changed the arena's chunks or size, or an arena was reserved over it");
+    TEST_ASSERT(arena_incarnations_unchanged(cache, incarnations),
+                "a zone's authority or generation is not the one it had before the refused teardown");
+    TEST_ASSERT(arena_serves_a_new_allocation(cache), "the arena refused a new allocation after the refused teardown");
+
+    // The retry's reserve may still refuse for this device's budget; what it must not do is refuse for the teardown.
+    zone_arena_refusal second;
+    const bool         rebuilt = cache.ensure_planned_arena_zones(&second);
+    TEST_ASSERT(rebuilt || second.reason != zone_arena_refusal_reason::TEARDOWN_REFUSED,
+                "a second ensure refused for the teardown instead of trying it again");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE,
+                "the second ensure's teardown did not complete");
+    TEST_PASS();
+    return true;
+}
+
+// A teardown whose wait for the leases on its retired authorities times out leaves the arena as it was. Nothing in the
+// fixture holds a lease, so the PRIVATE_TESTING drain failure makes the wait read as timed out; the refusal naming
+// that cause is the positive control. Then the arena is as it was, and a second teardown completes.
+// Mutant: the drain timeout returning without restore() (the authorities stay retired and the groups CLOSING, so the
+// SCRATCH zone refuses the allocation).
+static bool arena_teardown_drain_timeout_restores(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_drain_timeout_restores");
+    constexpr size_t     mib       = 1024ull * 1024ull;
+    const size_t         max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache        cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
+    }
+    const int                chunks       = cache.chunk_count();
+    const arena_incarnations incarnations = arena_incarnations_of(cache);
+
+    unified_cache_test_fail_next_arena_drain();
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown freed the arena although its drain timed out");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::DRAIN_TIMEOUT,
+                "the teardown did not record the timed-out drain as its cause");
+    TEST_ASSERT(cache.arena_active() && cache.chunk_count() == chunks, "the refused teardown changed the chunks");
+    TEST_ASSERT(arena_incarnations_unchanged(cache, incarnations),
+                "a zone's authority or generation is not the one it had before the refused teardown");
+    TEST_ASSERT(arena_serves_a_new_allocation(cache), "the arena refused a new allocation after the refused teardown");
+
+    TEST_ASSERT(cache.arena_destroy(), "a second teardown did not complete");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE && !cache.arena_active(),
+                "the completed teardown left the arena active or the earlier cause recorded");
+    TEST_PASS();
+    return true;
+}
+
+// A refused teardown that interrupted a settle finishes that settle. The settle of the ONEDNN group is held at its
+// RESETTING barrier, with ONEDNN's authority retired (the positive control that it is in flight); then a teardown runs
+// and its drain is made to time out. The teardown's restore finds the settle's drains empty and finishes the settle
+// itself, before the settle goes on: ONEDNN has a new authority that admits at the zone's generation, and every other
+// zone keeps its authority and generation. The released settle sees the group OPEN and publishes nothing over it.
+// Mutant: the restore giving the group back RESETTING without finishing the settle (ONEDNN has no authority while the
+// settle is held).
+static bool arena_teardown_restore_finishes_an_interrupted_settle(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_restore_finishes_an_interrupted_settle");
+    constexpr size_t     mib       = 1024ull * 1024ull;
+    const size_t         max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache        cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
+    }
+    const std::shared_ptr<arena_authority> settled = cache.arena_authority_snapshot(vram_zone_id::ONEDNN);
+
+    // Declared after the retry, so it runs first: a held settle is let go and joined on every return.
+    struct settle_release {
+        std::thread settler;
+
+        ~settle_release() {
+            unified_cache_test_pause_zone_settle(false);
+            if (settler.joinable()) {
+                settler.join();
+            }
+        }
+    } held;
+
+    unified_cache_test_pause_zone_settle(true);
+    held.settler        = std::thread([&] { cache.test_zone_boundary_check(vram_zone_id::ONEDNN); });
+    // A deadline, not a measure: the settle thread reaches its barrier at once on an idle host, and this host's
+    // permanent load must not turn a slow start into a failure.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!unified_cache_test_zone_settle_reached() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    TEST_ASSERT(unified_cache_test_zone_settle_reached(), "the settle did not reach its RESETTING barrier");
+    TEST_ASSERT(settled && cache.arena_authority_snapshot(vram_zone_id::ONEDNN) == nullptr,
+                "the held settle did not retire ONEDNN's authority");
+    const arena_incarnations others = arena_incarnations_of(cache);
+
+    unified_cache_test_fail_next_arena_drain();
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown freed the arena although its drain timed out");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::DRAIN_TIMEOUT,
+                "the teardown did not record the timed-out drain as its cause");
+    const std::shared_ptr<arena_authority> finished = cache.arena_authority_snapshot(vram_zone_id::ONEDNN);
+    TEST_ASSERT(finished && finished != settled && finished->accepts(cache.arena_generation(vram_zone_id::ONEDNN)),
+                "the refused teardown did not finish the settle it interrupted");
+    const arena_incarnations now = arena_incarnations_of(cache);
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        if (z == static_cast<size_t>(vram_zone_id::ONEDNN)) {
+            continue;
+        }
+        TEST_ASSERT(now.authority[z] == others.authority[z] && now.generation[z] == others.generation[z] &&
+                        (!now.authority[z] || now.authority[z]->accepts(now.generation[z])),
+                    "a zone the settle did not touch is not as it was before the refused teardown");
+    }
+
+    unified_cache_test_pause_zone_settle(false);
+    held.settler.join();
+    TEST_ASSERT(cache.arena_authority_snapshot(vram_zone_id::ONEDNN) == finished,
+                "the released settle published over the authority the refused teardown published");
+    TEST_ASSERT(arena_serves_a_new_allocation(cache), "the arena refused a new allocation after the refused teardown");
+    TEST_PASS();
+    return true;
+}
+
+// A teardown that cannot free a chunk after it freed one leaves the arena partly freed and closed. The arena is
+// reserved in three chunks (a 48 MiB per-chunk cap under a 128 MiB budget), and the device refuses to free the second
+// chunk, after the first was freed (the PRIVATE_TESTING free failure, armed for a teardown that has freed one chunk).
+// The refusal naming FREE_FAILED is the positive control. The teardown frees the third chunk too, and keeps the second;
+// the arena refuses a new allocation, and an ensure refuses for the partly freed arena without trying the teardown
+// again. A later teardown frees the chunk that was kept and completes.
+// Engagement: the arena has at least three chunks, so a chunk is freed before the failed one and one after it.
+// Mutants: the free loop stopping at the failed chunk after one was freed (the third chunk is still found); the
+// partly freed arena restored (it serves the allocation); the cause read as restorable (the ensure tries the
+// teardown again, which completes).
+static bool arena_teardown_partly_freed_stays_closed(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_partly_freed_stays_closed");
+    constexpr size_t     mib       = 1024ull * 1024ull;
+    const size_t         max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    unified_cache        cache(q, 128ull * mib, 0, 0, 0);
+    arena_teardown_retry retry{ cache };
+    if (!cache.arena_reserve(q, 128ull * mib, max_alloc, 48ull * mib, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 128 MiB arena, so no teardown was measured");
+    }
+    if (cache.chunk_count() < 3) {
+        TEST_SKIP(skipped, "the fixture's arena has fewer than three chunks, so no teardown can fail between frees");
+    }
+    const std::vector<const void *> in_chunk = arena_pointer_in_each_chunk(cache);
+    for (const void * p : in_chunk) {
+        TEST_ASSERT(p != nullptr, "a chunk of the fixture's arena has no pointer the test could find");
+    }
+
+    unified_cache_test_fail_next_arena_free(1);
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown completed although the device refused to free a chunk");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::FREE_FAILED,
+                "the teardown did not record the refused free after a chunk was freed");
+    TEST_ASSERT(cache.arena_find_chunk(in_chunk[0]) < 0 && cache.arena_find_chunk(in_chunk[1]) == 1,
+                "the teardown did not free the first chunk, or freed the chunk the device refused");
+    for (size_t chunk = 2; chunk < in_chunk.size(); ++chunk) {
+        TEST_ASSERT(cache.arena_find_chunk(in_chunk[chunk]) < 0,
+                    "the teardown stopped at the refused chunk instead of freeing the chunks after it");
+    }
+    TEST_ASSERT(!arena_serves_a_new_allocation(cache), "the partly freed arena served a new allocation");
+    zone_arena_refusal refused;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&refused) &&
+                    refused.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+                    refused.teardown == zone_arena_teardown_refusal::FREE_FAILED,
+                "an ensure did not refuse for the partly freed arena");
+    TEST_ASSERT(cache.arena_find_chunk(in_chunk[1]) == 1, "the ensure tried the teardown of the partly freed arena");
+
+    TEST_ASSERT(cache.arena_destroy(), "a later teardown did not free the chunk the refused one kept");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE && !cache.arena_active(),
+                "the completed teardown left the arena active or the earlier cause recorded");
+    TEST_PASS();
+    return true;
+}
+
+// A teardown that finds a lease on the first chunk it tries, which outlives the wait, frees nothing and leaves the
+// arena as it was. The fixture holds a lease on the arena's only chunk; the lease is not an allocation, so the
+// teardown reaches the chunk and waits for it, 100 ms here (the arm shortens the wait). The refusal naming
+// LEASES_OUTSTANDING is the positive control, and no abort. Then the arena is as it was; once the lease is released,
+// a second teardown completes.
+// Mutants: the timed-out lease aborting the process, or the chunk freed under the lease (the teardown completes); the
+// refusal not restoring (the SCRATCH zone refuses the allocation).
+static bool arena_teardown_outstanding_lease_restores(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_outstanding_lease_restores");
+    constexpr size_t       mib       = 1024ull * 1024ull;
+    const size_t           max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    arena_lease_wait_short short_wait;
+    unified_cache          cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry   retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no teardown was measured");
+    }
+
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
+    TEST_ASSERT(lease.chunk == 0 && cache.chunk_count() == 1,
+                "the fixture's lease is not on the only chunk of the arena");
+    const arena_incarnations incarnations = arena_incarnations_of(cache);
+
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown completed although a lease held its only chunk");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::LEASES_OUTSTANDING,
+                "the teardown did not record the outstanding lease as its cause");
+    TEST_ASSERT(cache.arena_active() && cache.arena_find_chunk(cache.arena_base()) == 0,
+                "the refused teardown freed the chunk the lease holds");
+    TEST_ASSERT(arena_incarnations_unchanged(cache, incarnations),
+                "a zone's authority or generation is not the one it had before the refused teardown");
+    TEST_ASSERT(arena_serves_a_new_allocation(cache), "the arena refused a new allocation after the refused teardown");
+
+    lease.release();
+    TEST_ASSERT(cache.arena_destroy(), "a second teardown did not complete once the lease was released");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE && !cache.arena_active(),
+                "the completed teardown left the arena active or the earlier cause recorded");
+    TEST_PASS();
+    return true;
+}
+
+// A teardown that finds a lease on a later chunk, after it freed an earlier one, keeps the leased chunk and leaves the
+// arena partly freed and closed: the path where the teardown used to abort. The arena is reserved in three chunks (a
+// 48 MiB per-chunk cap under a 128 MiB budget), and the fixture holds a lease on the second. The teardown frees the
+// first chunk, waits out the lease on the second (100 ms, as the arm shortens the wait), keeps it, and frees the
+// third. The refusal naming LEASES_OUTSTANDING_AFTER_FREE is the positive control, and no abort. The arena refuses a
+// new allocation. Then the lease is released, and an ensure still refuses for the partly freed arena without trying
+// the teardown: the kept chunk is still there. A later teardown frees it and completes.
+// Engagement: the arena has at least three chunks, so a chunk is freed before the leased one and one after it.
+// Mutants: the leased chunk freed after its wait (the first teardown completes); the free loop stopping at the leased
+// chunk (the third chunk is still found); the cause read as restorable (the ensure tries the teardown, which now
+// completes, and does not refuse for the partly freed arena).
+static bool arena_teardown_late_lease_stays_closed(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("arena_teardown_late_lease_stays_closed");
+    constexpr size_t       mib       = 1024ull * 1024ull;
+    const size_t           max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    arena_lease_wait_short short_wait;
+    unified_cache          cache(q, 128ull * mib, 0, 0, 0);
+    arena_teardown_retry   retry{ cache };
+    if (!cache.arena_reserve(q, 128ull * mib, max_alloc, 48ull * mib, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 128 MiB arena, so no teardown was measured");
+    }
+    if (cache.chunk_count() < 3) {
+        TEST_SKIP(skipped, "the fixture's arena has fewer than three chunks, so no lease can sit between frees");
+    }
+    const std::vector<const void *> in_chunk = arena_pointer_in_each_chunk(cache);
+    for (const void * p : in_chunk) {
+        TEST_ASSERT(p != nullptr, "a chunk of the fixture's arena has no pointer the test could find");
+    }
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(in_chunk[1]);
+    TEST_ASSERT(lease.chunk == 1, "the fixture's lease is not on the arena's second chunk");
+
+    TEST_ASSERT(!cache.arena_destroy(), "the teardown completed although a lease held the arena's second chunk");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE,
+                "the teardown did not record the lease that outlived its wait after a chunk was freed");
+    TEST_ASSERT(cache.arena_find_chunk(in_chunk[0]) < 0 && cache.arena_find_chunk(in_chunk[1]) == 1,
+                "the teardown did not free the first chunk, or freed the chunk the lease holds");
+    for (size_t chunk = 2; chunk < in_chunk.size(); ++chunk) {
+        TEST_ASSERT(cache.arena_find_chunk(in_chunk[chunk]) < 0,
+                    "the teardown stopped at the leased chunk instead of freeing the chunks after it");
+    }
+    TEST_ASSERT(!arena_serves_a_new_allocation(cache), "the partly freed arena served a new allocation");
+
+    lease.release();
+    zone_arena_refusal refused;
+    TEST_ASSERT(!cache.ensure_planned_arena_zones(&refused) &&
+                    refused.reason == zone_arena_refusal_reason::TEARDOWN_REFUSED &&
+                    refused.teardown == zone_arena_teardown_refusal::LEASES_OUTSTANDING_AFTER_FREE,
+                "an ensure did not refuse for the partly freed arena");
+    TEST_ASSERT(cache.arena_find_chunk(in_chunk[1]) == 1, "the ensure tried the teardown of the partly freed arena");
+
+    TEST_ASSERT(cache.arena_destroy(), "a teardown after the lease ended did not free the chunk it held");
+    TEST_ASSERT(cache.arena_teardown_refusal() == zone_arena_teardown_refusal::NONE && !cache.arena_active(),
+                "the completed teardown left the arena active or the earlier cause recorded");
+    TEST_PASS();
+    return true;
+}
+
+// The arena teardown's refusal classes, each arm on a cache of its own. It runs alone in its process (`--case
+// arena_teardown_refusal_classes`): its arms arm process-wide test hooks, and a refused teardown must not reach another
+// case's cache. Exits 0 when every arm passed, 1 when one failed, and 77 when none failed but one measured nothing.
+static int arena_teardown_refusal_classes(sycl::queue & q) {
+    bool skipped = false;
+    bool ok      = true;
+    ok &= arena_teardown_live_allocations_restores(q, skipped);
+    ok &= arena_teardown_first_free_refusal_restores(q, skipped);
+    ok &= arena_teardown_drain_timeout_restores(q, skipped);
+    ok &= arena_teardown_restore_finishes_an_interrupted_settle(q, skipped);
+    ok &= arena_teardown_partly_freed_stays_closed(q, skipped);
+    ok &= arena_teardown_outstanding_lease_restores(q, skipped);
+    ok &= arena_teardown_late_lease_stays_closed(q, skipped);
+    if (!ok) {
+        return 1;
+    }
+    if (skipped) {
+        fprintf(stderr, "SKIP: an arena teardown arm measured nothing on this device (its SKIPPED line says why)\n");
+        return SYCL_TEST_SKIP;
+    }
+    return 0;
+}
+
+static std::mutex               g_staging_log_mutex;
+static std::vector<std::string> g_staging_log_lines;
+
+static void staging_log_capture(ggml_log_level level, const char * text, void * user) {
+    (void) level;
+    (void) user;
+    if (text == nullptr) {
+        return;
+    }
+    fputs(text, stderr);
+    std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+    g_staging_log_lines.emplace_back(text);
+}
+
+// How many of the lines logged while a cache asked for `staging_size` bytes of staging was built and destroyed name
+// its staging buffer.
+static size_t staging_lines_while_constructing(sycl::queue & q, size_t staging_size) {
+    {
+        std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+        g_staging_log_lines.clear();
+    }
+
+    struct log_restore {
+        ~log_restore() { ggml_log_set(nullptr, nullptr); }
+    } restore;
+
+    ggml_log_set(staging_log_capture, nullptr);
+    {
+        unified_cache cache(q, 64ull * 1024ull * 1024ull, staging_size, 0, 0);
+    }
+    std::lock_guard<std::mutex> lock(g_staging_log_mutex);
+    return static_cast<size_t>(
+        std::count_if(g_staging_log_lines.begin(), g_staging_log_lines.end(), [](const std::string & line) {
+            return line.find("unified_cache:staging") != std::string::npos ||
+                   line.find("staging owner") != std::string::npos;
+        }));
+}
+
+// A cache asked for no staging buffer, the size GGML_SYCL_HOST_STAGING_MB=0 asks for and the fixtures here pass,
+// allocates none, so it logs no failed allocation of one. A zero-byte host allocation fails, and the cache logged that
+// on every such construction. Engagement: a staging buffer of 1 PiB, past any host's RAM, is asked for first under the
+// same capture, and its failure line must be seen. The driver aborted the process on that 1 PiB request instead of
+// failing it, so this also pins that the raw host exit refuses a size past the RAM before the driver and the cache logs
+// the failure. Mutants: the constructor asking the device for a zero-byte buffer; the raw host exit passing a size past
+// the RAM to the driver (at 1 PiB the process aborted here).
+static bool cache_without_staging_allocates_none(sycl::queue & q) {
+    TEST_BEGIN("cache_without_staging_allocates_none");
+    TEST_ASSERT(staging_lines_while_constructing(q, 1ull << 50) >= 1,
+                "a staging buffer past the host's RAM failed without a line naming it, so this check cannot see one");
+    TEST_ASSERT(staging_lines_while_constructing(q, 0) == 0,
+                "a cache asked for no staging buffer asked for one anyway and logged that it failed");
+    TEST_PASS();
+    return true;
+}
+
 static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
     TEST_BEGIN("host_zone_reset_trims_released_offload_pool_slots");
     offload_buffer_pool_trim(-1);
@@ -1750,6 +2480,772 @@ static bool host_zone_reset_trims_released_offload_pool_slots(sycl::queue & q) {
 
     TEST_PASS();
     return true;
+}
+
+// The planned terms of one device this case writes, read when it starts and written back when it ends, on every exit,
+// through the getters and setters themselves rather than through the helper under test.
+struct planned_terms_found {
+    int                                device;
+    size_t                             ring_weight;
+    size_t                             ring_act;
+    size_t                             ring_out;
+    uint32_t                           ring_depth;
+    uint32_t                           ring_n_ubatch;
+    size_t                             act_row;
+    size_t                             out_row;
+    uint32_t                           n_expert;
+    uint32_t                           n_expert_used;
+    bool                               act_in_kv;
+    bool                               out_in_kv;
+    onednn_graph_scratch_planned_shape graph;
+    nonfa_attn_scratch_planned_shape   nonfa;
+    moe_control_requirement            control;
+    size_t                             scatter;
+    size_t                             moe_mmvq;
+
+    explicit planned_terms_found(int d) :
+        device(d),
+        ring_weight(unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(d)),
+        ring_act(unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(d)),
+        ring_out(unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(d)),
+        ring_depth(unified_cache_get_planned_pp_moe_onednn_ring_depth(d)),
+        ring_n_ubatch(unified_cache_get_planned_pp_moe_onednn_n_ubatch(d)),
+        act_row(unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(d)),
+        out_row(unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(d)),
+        n_expert(unified_cache_get_planned_pp_moe_onednn_n_expert(d)),
+        n_expert_used(unified_cache_get_planned_pp_moe_onednn_n_expert_used(d)),
+        act_in_kv(unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(d)),
+        out_in_kv(unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(d)),
+        graph(unified_cache_get_planned_onednn_graph_scratch_shape(d)),
+        nonfa(unified_cache_get_planned_nonfa_attn_scratch_shape(d)),
+        control(unified_cache_get_planned_moe_control_requirement(d)),
+        scatter(unified_cache_get_planned_moe_host_scatter_scratch_bytes(d)),
+        moe_mmvq(unified_cache_get_planned_moe_mmvq_scratch_bytes(d)) {}
+
+    ~planned_terms_found() {
+        unified_cache_set_planned_pp_moe_onednn_scratch(device, ring_weight, ring_act, ring_out, ring_depth);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, ring_n_ubatch);
+        unified_cache_set_planned_pp_moe_onednn_row_bytes(device, act_row, out_row, n_expert, n_expert_used);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, act_in_kv, out_in_kv);
+        unified_cache_set_planned_onednn_graph_scratch_shape(device, graph.n_head_ctx_max, graph.n_head_swa_max,
+                                                             graph.n_swa, graph.n_ubatch, graph.n_ctx);
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, nonfa.n_head, nonfa.n_ubatch, nonfa.n_ctx);
+        unified_cache_set_planned_moe_control_requirement(device, control);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, scatter);
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, moe_mmvq);
+    }
+};
+
+// A plan that is tried and discarded publishes nothing. The load stage's fallback and the plan dry run put back the
+// terms the planner published while it computed the plan through planner_published_terms; this case checks that
+// helper against the cache's own per-device state, and the RUNTIME requirement the zones are sized from with it.
+// A load publishes its ring at the planning shape (n_ubatch 512) and its planner terms, a 4096-byte host scatter term
+// among them: the requirement is R0. The snapshot is taken. The plan with the room raises the host scatter term by the
+// run's 92160 bytes and publishes its own oneDNN Graph and non-FA shapes, and the micro-batch's publish grows the ring
+// to n_ubatch 2048. The fallback publishes the ring at 512 again. Before the restore the requirement is R0 + 92160,
+// what the zone was asked for when the run aborted, which shows the case reaches the term. After the restore it is
+// exactly R0, and every planner term reads what the load published, the host scatter term its 4096 bytes and the MoE
+// batched MMVQ bound the vehicle's 40-layer figure at 512 rows (the plan with the room published it at 2048 rows). A
+// second leg moves the CONTROL requirement, the other planner term the RUNTIME requirement counts, and restores it the
+// same way.
+// Engagement: the ring's slots grow from 512 to 2048 rows, the requirement moves by exactly the term moved, and the
+// MMVQ bound reads the discarded plan's figure before the restore.
+// Mutants: a term left out of the snapshot or the restore (its leg reads the discarded plan's value); a restore that
+// writes a constant, zero included (the load's nonzero shapes, host scatter, MMVQ and CONTROL bytes do not read back).
+// No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
+static bool planner_terms_restore_returns_the_runtime_requirement() {
+    TEST_BEGIN("planner_terms_restore_returns_the_runtime_requirement");
+    constexpr int       device       = 0;
+    constexpr size_t    mib          = 1024ull * 1024ull;
+    constexpr size_t    scatter_term = 92160;
+    constexpr size_t    load_scatter = 4096;
+    // The vehicle's MoE batched MMVQ bound over 40 layers at 512 and at 2048 rows (test-zone-sizing Case 46).
+    constexpr size_t    load_mmvq    = 190709760;
+    constexpr size_t    wide_mmvq    = 762839040;
+    planned_terms_found found(device);
+
+    // The load: a ring of one 64 MiB weight slot whose activation and output slots follow the micro-batch, all of it in
+    // the RUNTIME zone, and the planner's terms at the planning shape.
+    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, 5760, 11520, 32, 4);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    size_t act_512  = 0;
+    size_t out_512  = 0;
+    size_t act_2048 = 0;
+    size_t out_2048 = 0;
+    TEST_ASSERT(unified_cache_pp_moe_onednn_slots_for_ubatch(device, 512, &act_512, &out_512) &&
+                    unified_cache_pp_moe_onednn_slots_for_ubatch(device, 2048, &act_2048, &out_2048),
+                "the ring's slots cannot be sized from the row bytes");
+    TEST_ASSERT(act_2048 > act_512 && out_2048 > out_512,
+                "the ring's slots do not grow from 512 to 2048 rows, so the micro-batch's publish moves nothing");
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_512, out_512, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 512, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, load_mmvq);
+    size_t r0 = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &r0),
+                "the load's requirement is unanswerable");
+
+    const planner_published_terms before = planner_published_terms::snapshot(device);
+
+    // The plan with the room, and the micro-batch's publish.
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, load_scatter + scatter_term);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, wide_mmvq);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 32, 0, 0, 2048, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_2048, out_2048, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+    size_t grown = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &grown) && grown > r0 + scatter_term,
+                "the micro-batch's ring did not raise the requirement");
+
+    // The fallback publishes the ring at the planning shape again; the discarded plan's term is still published.
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, 64 * mib, act_512, out_512, 1);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+    size_t unrestored = 0;
+    TEST_ASSERT(
+        unified_cache_get_planned_runtime_zone_requirement(device, &unrestored) && unrestored == r0 + scatter_term,
+        "before the restore the requirement is not R0 + 92160, so the case does not reach the term");
+    TEST_ASSERT(unified_cache_get_planned_moe_mmvq_scratch_bytes(device) == wide_mmvq,
+                "before the restore the MMVQ bound is not the discarded plan's, so the case does not reach the term");
+
+    before.restore(device);
+    size_t restored = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
+                "after the restore the requirement is not the load's R0");
+    TEST_ASSERT(unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == load_scatter,
+                "the restore did not put back the load's 4096-byte host scatter term");
+    TEST_ASSERT(unified_cache_get_planned_moe_mmvq_scratch_bytes(device) == load_mmvq,
+                "the restore left the discarded plan's MoE batched MMVQ bound published");
+    const onednn_graph_scratch_planned_shape graph = unified_cache_get_planned_onednn_graph_scratch_shape(device);
+    TEST_ASSERT(graph.n_head_ctx_max == 32 && graph.n_head_swa_max == 0 && graph.n_swa == 0 && graph.n_ubatch == 512 &&
+                    graph.n_ctx == 4096,
+                "the restore left the discarded plan's oneDNN Graph scratch shape published");
+    const nonfa_attn_scratch_planned_shape nonfa = unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    TEST_ASSERT(nonfa.n_head == 32 && nonfa.n_ubatch == 512 && nonfa.n_ctx == 4096,
+                "the restore left the discarded plan's non-FA attention scratch shape published");
+
+    // The CONTROL requirement: a discarded plan that moved it raises the requirement by what it moved, and the
+    // restore puts the load's back.
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
+    size_t control_moved = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &control_moved) && control_moved == r0 + mib,
+                "a CONTROL requirement 1 MiB larger does not raise the requirement by 1 MiB");
+    before.restore(device);
+    const moe_control_requirement control = unified_cache_get_planned_moe_control_requirement(device);
+    TEST_ASSERT(control.bytes == mib && control.valid, "the restore left the discarded plan's CONTROL requirement");
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(device, &restored) && restored == r0,
+                "after the CONTROL restore the requirement is not the load's R0");
+
+    TEST_PASS();
+    return true;
+}
+
+// The PP pipeline scratch and the oneDNN pair with its stored sum, which planned_terms_found does not keep, read when
+// the case starts and written back when it ends.
+struct pipeline_and_pair_found {
+    int                  device;
+    load_published_terms found;
+
+    explicit pipeline_and_pair_found(int d) : device(d), found(load_published_terms::snapshot(d)) {}
+
+    ~pipeline_and_pair_found() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, found.pp_pipeline);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, found.onednn_weights, found.onednn_activations);
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, found.onednn_stored);
+    }
+};
+
+// A failed load puts back what it published and nothing another publisher wrote since: a runtime context transaction
+// of a live model publishes some of the same terms while the load runs, and the oneDNN pair's reserve raises the stored
+// sum outside the lock. The case drives load_published_record as the backend does: one record per load from the terms
+// as the load's first stage found them, and a note per planner pass from the terms before and after it.
+// The live model: pipeline 1 MiB, ring micro-batch 512 with no KV-zone slot, no host scatter, CONTROL 1 MiB, non-FA
+// 32 heads x 512 x 4096, the pair 4 + 2 MiB with the sum its reserve raised to 8 MiB, the MoE batched MMVQ bound at its
+// 512-row figure.
+// Leg 1. Pass 1 of the load publishes all of those anew (the pair 16 + 8 MiB, so the sum 24 MiB; the MMVQ bound at
+// 2048 rows). Between the passes a live context re-plans its ring (micro-batch 1024, its activation slot in the KV
+// zone) and the reserve raises the sum to 30 MiB. Pass 2 publishes the ring and the pair again. After it a live context
+// publishes its non-FA shape and raises the MMVQ bound to 1 GiB. The restore puts the pipeline, the scatter, CONTROL
+// and the pair's halves back to the live model's; the ring to the context's re-plan and the sum to the reserve's
+// raise, both of which the load wrote over; and it keeps the non-FA shape and the MMVQ bound the context published
+// after the load.
+// Leg 2. A load whose one pass publishes the pair and the MMVQ bound, after which the reserve raises the sum to 40 MiB:
+// the restore keeps the raise and puts the halves and the live model's MMVQ bound back.
+// Engagement: before each restore every term reads what the load or the later publisher wrote.
+// Mutants: a restore of every term to what the load's first stage found (the non-FA shape reads 32 x 512, the ring 512,
+// the sum 8 MiB, the MMVQ bound its 512-row figure); a restore of every group the load changed (the non-FA shape reads
+// 32 x 512, the MMVQ bound its 512-row figure); a note that ignores another publisher (the ring reads 512, the sum of
+// leg 1 8 MiB); a sum stored plainly (leg 2 reads 8 MiB); the MMVQ group left out of the restore (leg 2 reads the
+// load's 2048-row figure).
+// No device work: the terms are per-device process state. The case leaves every term it writes as it found it.
+static bool load_record_keeps_a_later_publish() {
+    TEST_BEGIN("load_record_keeps_a_later_publish");
+    constexpr int           device    = 0;
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    // The vehicle's MoE batched MMVQ bound over 40 layers at 512 and at 2048 rows (test-zone-sizing Case 46).
+    constexpr size_t        live_mmvq = 190709760;
+    constexpr size_t        load_mmvq = 762839040;
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+
+    const auto live = [&]() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, mib);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 512);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 0);
+        unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, 4 * mib, 2 * mib);
+        unified_cache_set_planned_onednn_scratchpad_bytes(device, 8 * mib);
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, live_mmvq);
+    };
+    const auto load_pass = [&]() {
+        unified_cache_set_planned_pp_pipeline_scratch_bytes(device, 3 * mib);
+        unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+        unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 92160);
+        unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ 2 * mib, true });
+        unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 2048, 4096);
+        unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+        unified_cache_set_planned_moe_mmvq_scratch_bytes(device, load_mmvq);
+    };
+
+    // Leg 1.
+    live();
+    load_published_record record(load_published_terms::snapshot(device));
+    load_published_terms  before = load_published_terms::snapshot(device);
+    load_pass();
+    record.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 1024);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, true, false);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 30 * mib);
+    before = load_published_terms::snapshot(device);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 2048);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    record.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 64, 1024, 8192);
+    TEST_ASSERT(unified_cache_raise_planned_moe_mmvq_scratch_bytes(device, 1024 * mib) == 1024 * mib,
+                "a live context's raise of the MMVQ bound does not answer the raised figure");
+
+    TEST_ASSERT(unified_cache_get_planned_pp_pipeline_scratch_bytes(device) == 3 * mib &&
+                    unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) == 2048 &&
+                    unified_cache_get_planned_moe_host_scatter_scratch_bytes(device) == 92160 &&
+                    unified_cache_get_planned_onednn_scratchpad_bytes_stored(device) == 24 * mib,
+                "before the restore the load's pipeline, ring, scatter and sum do not read what it published");
+    record.restore(device);
+    const load_published_terms back = load_published_terms::snapshot(device);
+    TEST_ASSERT(back.pp_pipeline == mib, "the restore left the failed load's pipeline scratch");
+    TEST_ASSERT(back.planner.scatter == 0, "the restore left the failed load's host scatter term");
+    TEST_ASSERT(back.planner.control.bytes == mib && back.planner.control.valid,
+                "the restore left the failed load's CONTROL requirement");
+    TEST_ASSERT(back.onednn_weights == 4 * mib && back.onednn_activations == 2 * mib,
+                "the restore left the failed load's oneDNN pair");
+    TEST_ASSERT(back.ring_n_ubatch == 1024 && back.ring_activation_in_kv && !back.ring_output_in_kv,
+                "the ring is not the live context's re-plan the load wrote over");
+    TEST_ASSERT(back.onednn_stored == 30 * mib, "the sum is not the reserve's raise the load wrote over");
+    TEST_ASSERT(
+        back.planner.nonfa.n_head == 64 && back.planner.nonfa.n_ubatch == 1024 && back.planner.nonfa.n_ctx == 8192,
+        "the restore put back over the non-FA shape a live context published after the load");
+    TEST_ASSERT(back.planner.moe_mmvq == 1024 * mib,
+                "the restore put back over the MMVQ bound a live context raised after the load");
+
+    // Leg 2.
+    live();
+    load_published_record raised(load_published_terms::snapshot(device));
+    before = load_published_terms::snapshot(device);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 16 * mib, 8 * mib);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, load_mmvq);
+    raised.note(before, load_published_terms::snapshot(device));
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 40 * mib);
+    TEST_ASSERT(unified_cache_get_planned_moe_mmvq_scratch_bytes(device) == load_mmvq,
+                "before the restore the MMVQ bound does not read what the load published");
+    raised.restore(device);
+    const load_published_terms kept = load_published_terms::snapshot(device);
+    TEST_ASSERT(kept.onednn_stored == 40 * mib, "the restore put back over the reserve's raise of the sum");
+    TEST_ASSERT(kept.onednn_weights == 4 * mib && kept.onednn_activations == 2 * mib,
+                "the restore left the failed load's oneDNN pair under a raised sum");
+    TEST_ASSERT(kept.planner.moe_mmvq == live_mmvq, "the restore left the failed load's MMVQ bound");
+
+    TEST_PASS();
+    return true;
+}
+
+// The start values of every term a load publishes are a default load_published_terms, and its restore writes every
+// group: the release of the last model puts each device it emptied back through load_published_terms{}.restore. In a
+// process where no cache of any device has been made and nothing has been published, every device's snapshot equals
+// the default. One value is then published in every group but the zone plan, which only a cache's own ensure stores,
+// and the snapshot differs in exactly those groups; after load_published_terms{}.restore it equals the default again.
+// Mutants: a term whose start value is not its default (the first check names the device); a group that restore()
+// does not write (the last check reads its mask).
+// No device work: the terms are per-device process state, and the case leaves them at their start values.
+static bool fresh_published_terms_are_the_default(int device) {
+    TEST_BEGIN("fresh_published_terms_are_the_default");
+    constexpr size_t           mib = 1024ull * 1024ull;
+    const load_published_terms start{};
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        const uint32_t differs = load_published_terms::snapshot(d).differing(start);
+        TEST_ASSERT(differs == 0, ("device " + std::to_string(d) + " reads group mask " + std::to_string(differs) +
+                                   " away from a default load_published_terms before anything was published")
+                                      .c_str());
+    }
+
+    unified_cache_set_planned_pp_pipeline_scratch_bytes(device, 3 * mib);
+    unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, 71);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, true, true);
+    unified_cache_set_planned_pp_moe_onednn_row_bytes(device, 96, 192, 8, 2);
+    unified_cache_set_planned_onednn_scratchpad_pair(device, 4 * mib, 2 * mib);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device, 8 * mib);
+    unified_cache_set_planned_onednn_graph_scratch_shape(device, 8, 8, 0, 512, 4096);
+    unified_cache_set_planned_nonfa_attn_scratch_shape(device, 32, 512, 4096);
+    unified_cache_set_planned_moe_control_requirement(device, moe_control_requirement{ mib, true });
+    unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, 8192);
+    unified_cache_set_planned_moe_mmvq_scratch_bytes(device, 16 * mib);
+    const uint32_t published = load_published_terms::snapshot(device).differing(start);
+    start.restore(device);
+    const uint32_t restored = load_published_terms::snapshot(device).differing(start);
+
+    const uint32_t want = LOAD_PUBLISHED_GROUP_ALL & ~static_cast<uint32_t>(LOAD_PUBLISHED_GROUP_ZONE_PLAN);
+    TEST_ASSERT(published == want, ("one value in every group but the zone plan moved group mask " +
+                                    std::to_string(published) + ", not " + std::to_string(want))
+                                       .c_str());
+    TEST_ASSERT(restored == 0, ("after load_published_terms{}.restore the groups of mask " + std::to_string(restored) +
+                                " are not at their start values")
+                                   .c_str());
+    TEST_PASS();
+    return true;
+}
+
+// Whether the cache's PP MoE oneDNN ring has a reserved slot 0. The read's copy holds the slot's owners, so it goes
+// before this returns.
+static bool ring_reserved(unified_cache & cache) {
+    unified_cache::pp_moe_onednn_scratch_slot read;
+    return cache.get_pp_moe_onednn_scratch_slot(0, read);
+}
+
+// Every byte the cache's VRAM zones count as used.
+static size_t zone_bytes_used(unified_cache & cache) {
+    size_t used = 0;
+    for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
+        used += cache.zone_used(static_cast<vram_zone_id>(z));
+    }
+    return used;
+}
+
+// The capacity of each of the cache's VRAM zones, by zone.
+static std::vector<size_t> zone_capacities(unified_cache & cache) {
+    std::vector<size_t> capacity(static_cast<size_t>(vram_zone_id::COUNT), 0);
+    for (size_t z = 0; z < capacity.size(); ++z) {
+        capacity[z] = cache.zone_capacity(static_cast<vram_zone_id>(z));
+    }
+    return capacity;
+}
+
+// The fixture's scratch on a hand-built cache, what a model's first prompt leaves: a one-slot PP MoE oneDNN ring of
+// 1 MiB slots in the RUNTIME zone, planned on the cache's device first (the reserve admits only a planned ring), and a
+// 1 + 1 MiB oneDNN pair from the ONEDNN zone. The caller's planned_terms_found and pipeline_and_pair_found put the
+// device's terms back.
+static bool reserve_ring_and_pair(unified_cache & cache, int device) {
+    constexpr size_t mib = 1024ull * 1024ull;
+    unified_cache_set_planned_pp_moe_onednn_scratch(device, mib, mib, mib, 1);
+    unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(device, false, false);
+    return cache.reserve_pp_moe_onednn_scratch(mib, mib, mib, 1) && ring_reserved(cache) &&
+           cache.reserve_onednn_scratch(mib, mib) && cache.has_onednn_scratch();
+}
+
+// The budget of a hand-built cache in which a load's start reserves the arena again (reserve_released_arena). That
+// reserve builds the early arena the cache's constructor builds: the whole budget, with zones sized from the start
+// terms, a 512 MiB SCRATCH zone and a 512 MiB RUNTIME zone (the GGML_SYCL_COMPUTE_ARENA_MB and
+// GGML_SYCL_RUNTIME_ARENA_MB defaults) and a 256 MiB ONEDNN zone, beside a KV and weight zone of at least 16 MiB:
+// 1296 MiB. Published terms only raise those zones, so a 64 MiB cache's start reserve is refused on every card, and
+// an arm on one measures no start. The arms that score the start's reserve run it at the zones a real start builds,
+// on a cache that holds them: 2 GiB of VRAM, held from the cache's construction to the arm's end (well under a
+// second), except between a release and the reserve after it. A card that cannot reserve it skips the arm.
+static constexpr size_t last_release_early_arena_budget = 2048ull * 1024ull * 1024ull;
+
+static std::mutex                                          g_last_release_log_mutex;
+static std::vector<std::pair<ggml_log_level, std::string>> g_last_release_log_lines;
+
+static void last_release_log_capture(ggml_log_level level, const char * text, void * user) {
+    (void) user;
+    if (text == nullptr) {
+        return;
+    }
+    fputs(text, stderr);
+    std::lock_guard<std::mutex> lock(g_last_release_log_mutex);
+    g_last_release_log_lines.emplace_back(level, text);
+}
+
+// The lines logged, with their levels, while the guard lives.
+struct last_release_log {
+    last_release_log() {
+        {
+            std::lock_guard<std::mutex> lock(g_last_release_log_mutex);
+            g_last_release_log_lines.clear();
+        }
+        ggml_log_set(last_release_log_capture, nullptr);
+    }
+
+    ~last_release_log() { ggml_log_set(nullptr, nullptr); }
+
+    // How many captured lines at `level` contain `a`, and `b` too when it is given.
+    size_t count(ggml_log_level level, const char * a, const char * b = nullptr) const {
+        std::lock_guard<std::mutex> lock(g_last_release_log_mutex);
+        size_t                      n = 0;
+        for (const auto & [at, line] : g_last_release_log_lines) {
+            n +=
+                at == level && line.find(a) != std::string::npos && (b == nullptr || line.find(b) != std::string::npos);
+        }
+        return n;
+    }
+};
+
+// A claimed slot of a cache's ring, released on every return. The claim's copy holds the slot's owners; they go before
+// the slot is released, as a dispatch drops its copy before it releases its claim. Declared after the arm's
+// arena_teardown_retry, so the claim ends before the retry's teardown.
+struct claimed_ring_slot {
+    unified_cache &                           cache;
+    unified_cache::pp_moe_onednn_scratch_slot slot{};
+    bool                                      held = false;
+
+    ~claimed_ring_slot() { release(); }
+
+    void release() {
+        if (held) {
+            const uint64_t generation = slot.generation;
+            slot                      = {};
+            cache.release_pp_moe_onednn_scratch_slot(0, generation);
+            held = false;
+        }
+    }
+};
+
+// A reservation of a cache's oneDNN pair, as a matmul takes it, released on every return; declared after the arm's
+// arena_teardown_retry.
+struct reserved_onednn_pair {
+    unified_cache &      cache;
+    onednn_scratch_token token{};
+
+    ~reserved_onednn_pair() { release(); }
+
+    void release() {
+        cache.release_onednn_scratch_reservation(token);
+        token = {};
+    }
+};
+
+// The release of the last model gives back what a cache sized for a model when no model is live, and nothing while one
+// is. A hand-built cache holds the fixture's ring and pair in the early arena its constructor reserved
+// (last_release_early_arena_budget). With a bit in its live mask the release returns MODEL_LIVE and the ring, the pair
+// and the arena stay. With the mask 0 it returns EMPTIED: no ring slot reads back, the pair is gone, the arena is not
+// active and no zone counts a used byte. A second release of the emptied cache returns EMPTIED again. A load's start
+// then reserves the early arena again (reserve_released_arena): an active arena with nothing used in it.
+// Engagement: the constructor reserved the early arena; the ring and the pair were reserved and the zones count their
+// bytes.
+// Mutants: the liveness check dropped (the first release empties the cache); a step left out of the release (the ring,
+// the pair or the arena stays, or a zone counts bytes); a release that cannot run twice; a start that does not reserve
+// the released arena again.
+static bool last_release_empties_ring_pair_and_arena(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_empties_ring_pair_and_arena");
+    const int               device = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, last_release_early_arena_budget, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_active()) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 2 GiB early arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    TEST_ASSERT(zone_bytes_used(cache) > 0, "the zones count no byte of the fixture's ring and pair");
+
+    cache.set_live_model_mask(1u);
+    const unified_cache_last_release live =
+        cache.release_for_no_live_model("live-model", unified_cache_release_cause::MODEL_RELEASED);
+    cache.set_live_model_mask(0u);
+    TEST_ASSERT(live == unified_cache_last_release::MODEL_LIVE, "with a model live the release did not say so");
+    TEST_ASSERT(ring_reserved(cache) && cache.has_onednn_scratch() && cache.arena_active(),
+                "with a model live the release gave back the ring, the pair or the arena");
+
+    const unified_cache_last_release emptied =
+        cache.release_for_no_live_model("last-model", unified_cache_release_cause::MODEL_RELEASED);
+    TEST_ASSERT(emptied == unified_cache_last_release::EMPTIED,
+                "with no model live the release did not empty the cache");
+    TEST_ASSERT(!ring_reserved(cache), "the PP MoE oneDNN ring stayed after the last release");
+    TEST_ASSERT(!cache.has_onednn_scratch(), "the oneDNN pair stayed after the last release");
+    TEST_ASSERT(!cache.arena_active(), "the arena stayed after the last release");
+    TEST_ASSERT(zone_bytes_used(cache) == 0, "a zone counts used bytes after the last release");
+    TEST_ASSERT(cache.release_for_no_live_model("again", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "a second release of the emptied cache did not return EMPTIED");
+
+    zone_arena_refusal refusal;
+    TEST_ASSERT(cache.reserve_released_arena(&refusal),
+                "a load's start did not reserve again the early arena the cache's constructor reserved");
+    TEST_ASSERT(cache.arena_active() && zone_bytes_used(cache) == 0,
+                "the arena a load's start reserved again is not active, or a zone counts used bytes in it");
+    TEST_PASS();
+    return true;
+}
+
+// A claimed slot of the ring keeps the ring and the arena: the release refuses with RING_CLAIMED and one ERROR line
+// that says so, and gives back nothing, the pair included. Once the claim ends the release empties the cache.
+// Engagement: slot 0 of the fixture's ring was claimed.
+// Mutants: a claimed slot released (the ring is gone after the refused release); the release going on past the refusal
+// (the pair or the arena is gone); the refusal silent (no ERROR line).
+static bool last_release_keeps_a_claimed_ring(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_keeps_a_claimed_ring");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    claimed_ring_slot claim{ cache };
+    claim.held = cache.claim_pp_moe_onednn_scratch_slot(0, claim.slot);
+    TEST_ASSERT(claim.held, "slot 0 of the fixture's ring was not claimed");
+
+    unified_cache_last_release refused = unified_cache_last_release::FAILED;
+    size_t                     errors  = 0;
+    {
+        const last_release_log log;
+        refused = cache.release_for_no_live_model("claimed", unified_cache_release_cause::MODEL_RELEASED);
+        errors  = log.count(GGML_LOG_LEVEL_ERROR, "[VRAM-ARENA] last release on device ",
+                            "a slot of the PP MoE oneDNN ring is still claimed");
+    }
+    TEST_ASSERT(refused == unified_cache_last_release::RING_CLAIMED, "a claimed slot did not refuse the release");
+    TEST_ASSERT(errors == 1, "the refused release did not log one ERROR line naming the claimed slot");
+    TEST_ASSERT(ring_reserved(cache) && cache.has_onednn_scratch() && cache.arena_active(),
+                "a release refused by a claimed slot gave back the ring, the pair or the arena");
+
+    claim.release();
+    TEST_ASSERT(cache.release_for_no_live_model("unclaimed", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "once the claim ended the release did not empty the cache");
+    TEST_ASSERT(!ring_reserved(cache) && !cache.arena_active(), "the ring or the arena stayed after the claim ended");
+    TEST_PASS();
+    return true;
+}
+
+// A reservation of the oneDNN pair keeps the pair and the arena: the release gives back the ring, then refuses with
+// PAIR_HELD and one ERROR line that says so. Once the reservation ends the release empties the cache.
+// Engagement: the fixture's pair was reserved as a matmul reserves it.
+// Mutants: a reserved pair freed (the pair is gone after the refused release); the release going on past the refusal
+// (the arena is gone); the refusal silent (no ERROR line).
+static bool last_release_keeps_a_reserved_pair(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_keeps_a_reserved_pair");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    reserved_onednn_pair                  pair{ cache };
+    unified_cache::onednn_scratch_buffers buffers;
+    TEST_ASSERT(cache.acquire_onednn_scratch_reservation(mib, mib, buffers, &pair.token),
+                "the fixture's oneDNN pair was not reserved as a matmul reserves it");
+
+    unified_cache_last_release refused = unified_cache_last_release::FAILED;
+    size_t                     errors  = 0;
+    {
+        const last_release_log log;
+        refused = cache.release_for_no_live_model("pair-held", unified_cache_release_cause::MODEL_RELEASED);
+        errors  = log.count(GGML_LOG_LEVEL_ERROR, "[VRAM-ARENA] last release on device ",
+                            "the oneDNN scratchpad pair is still reserved");
+    }
+    TEST_ASSERT(refused == unified_cache_last_release::PAIR_HELD, "a reserved pair did not refuse the release");
+    TEST_ASSERT(errors == 1, "the refused release did not log one ERROR line naming the reserved pair");
+    TEST_ASSERT(!ring_reserved(cache), "the ring, released before the pair, stayed");
+    TEST_ASSERT(cache.has_onednn_scratch() && cache.arena_active(),
+                "a release refused by a reserved pair gave back the pair or the arena");
+
+    pair.release();
+    TEST_ASSERT(cache.release_for_no_live_model("pair-free", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "once the reservation ended the release did not empty the cache");
+    TEST_ASSERT(!cache.has_onednn_scratch() && !cache.arena_active(),
+                "the pair or the arena stayed after the reservation ended");
+    TEST_PASS();
+    return true;
+}
+
+// A lease on the arena's chunk keeps the arena, and the release names what holds it without reaping it. The ring and
+// the pair go, then the release returns ARENA_HELD: at a failed load's abort with one WARN line, as the failed model's
+// buffers go after it, and after a model's release with one ERROR line, as nothing should hold the arena then. Each
+// line names the lease. Once the lease ends the release empties the cache.
+// Engagement: the lease is on the arena's first chunk.
+// Mutants: the lease reaped or the arena torn down under it (the arena is not active after the release); the holder
+// not named (no line with chunk_leases=1); the levels swapped (an ERROR at the abort, a WARN after the release).
+static bool last_release_names_a_held_arena(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_names_a_held_arena");
+    constexpr size_t        mib       = 1024ull * 1024ull;
+    const size_t            max_alloc = q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const int               device    = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, 64ull * mib, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_reserve(q, 64ull * mib, max_alloc, max_alloc, 8ull * mib, 8ull * mib, 8ull * mib, 0)) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 64 MiB arena, so no release was measured");
+    }
+    TEST_ASSERT(reserve_ring_and_pair(cache, device), "the fixture's ring or its oneDNN pair was not reserved");
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
+    TEST_ASSERT(lease.chunk >= 0, "the fixture's lease on the arena's first chunk was not taken");
+
+    unified_cache_last_release aborted = unified_cache_last_release::FAILED;
+    unified_cache_last_release after   = unified_cache_last_release::FAILED;
+    size_t                     warned = 0, warned_as_error = 0, errored = 0, errored_as_warn = 0;
+    {
+        const last_release_log log;
+        const char * const     abort_text   = "the failed load's buffers still hold the arena";
+        const char * const     release_text = "no model is live but the arena is held";
+        aborted         = cache.release_for_no_live_model("aborted", unified_cache_release_cause::LOAD_ABORTED);
+        warned          = log.count(GGML_LOG_LEVEL_WARN, abort_text, "chunk_leases=1");
+        warned_as_error = log.count(GGML_LOG_LEVEL_ERROR, abort_text);
+        after           = cache.release_for_no_live_model("released", unified_cache_release_cause::MODEL_RELEASED);
+        errored         = log.count(GGML_LOG_LEVEL_ERROR, release_text, "chunk_leases=1");
+        errored_as_warn = log.count(GGML_LOG_LEVEL_WARN, release_text);
+    }
+    TEST_ASSERT(aborted == unified_cache_last_release::ARENA_HELD,
+                "at an abort a held arena did not refuse the release");
+    TEST_ASSERT(warned == 1 && warned_as_error == 0, "the abort's release did not log one WARN line naming the lease");
+    TEST_ASSERT(after == unified_cache_last_release::ARENA_HELD, "after a release a held arena did not refuse it");
+    TEST_ASSERT(errored == 1 && errored_as_warn == 0, "the model release did not log one ERROR line naming the lease");
+    TEST_ASSERT(!ring_reserved(cache) && !cache.has_onednn_scratch(), "the ring or the pair stayed in a held arena");
+    TEST_ASSERT(cache.arena_active() && cache.arena_find_chunk(cache.arena_base()) == lease.chunk,
+                "the release tore down or freed the chunk a lease holds");
+
+    lease.release();
+    TEST_ASSERT(cache.release_for_no_live_model("lease-ended", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "once the lease ended the release did not empty the cache");
+    TEST_ASSERT(!cache.arena_active(), "the arena stayed after the lease ended");
+    TEST_PASS();
+    return true;
+}
+
+// A failed load whose buffers hold the arena at its abort defers the release to the next load's start, which runs it
+// again and, once nothing holds the arena, starts from the zones a last model's release leaves. The hand-built cache's
+// constructor reserves the early arena (last_release_early_arena_budget). The reference: a model's release empties the
+// cache and a load's start reserve builds the early arena again, at the constructor's zones, which every later start
+// must match. Then a lease on that arena's first chunk holds it. A load's start that finds it held on a
+// cache with no mark keeps the arena and sets no mark: only the abort sets it. Through a failed load's abort the lease
+// gives ARENA_HELD, and the release is marked deferred. A load's start while the lease still holds the arena runs the
+// release again, as ggml_backend_sycl_model_load_begin does for a marked cache: ARENA_HELD with one WARN line that says
+// the load runs on the arena as it is and that a holder left once the failed model is freed is a leak, the holders
+// named on a WARN line too and nothing at ERROR; the mark stays, the reserve does nothing and the chunk is still
+// leased. Once the lease ends, a load's start empties the cache, clears the mark and reserves the early arena again at
+// the reference zones, with nothing used in them.
+// Engagement: the constructor reserved the early arena, the reference reserve built it again, and the lease is on its
+// first chunk.
+// Mutants: the mark not set at the abort, or set at a start; the mark cleared by a release that kept the arena; the
+// mark kept after the cache emptied; the start's held arena logged with the abort's text, at ERROR or without its
+// holders; a start that rebuilds other zones than a last release's (the zones differ from the reference) or than the
+// constructor's (the reference differs from them).
+static bool last_release_deferred_by_a_failed_load(sycl::queue & q, bool & skipped) {
+    TEST_BEGIN("last_release_deferred_by_a_failed_load");
+    const int               device = ggml_sycl_get_device_id_from_queue(q);
+    planned_terms_found     found(device);
+    pipeline_and_pair_found found_pair(device);
+    unified_cache           cache(q, last_release_early_arena_budget, 0, 0, 0);
+    arena_teardown_retry    retry{ cache };
+    if (!cache.arena_active()) {
+        TEST_SKIP(skipped, "the device did not reserve the fixture's 2 GiB early arena, so no start was compared");
+    }
+    const std::vector<size_t> built_zones = zone_capacities(cache);
+    TEST_ASSERT(cache.release_for_no_live_model("reference", unified_cache_release_cause::MODEL_RELEASED) ==
+                    unified_cache_last_release::EMPTIED,
+                "the reference's model release did not empty the cache");
+    zone_arena_refusal refusal;
+    TEST_ASSERT(cache.reserve_released_arena(&refusal),
+                "a load's start did not reserve again the early arena the cache's constructor reserved");
+    const std::vector<size_t> first_zones = zone_capacities(cache);
+    TEST_ASSERT(first_zones == built_zones, "a load's start built other zones than the cache's constructor built");
+    TEST_ASSERT(!cache.last_release_deferred(), "a model's release that emptied the cache left a deferred mark");
+
+    held_chunk_lease lease{ cache };
+    lease.chunk = cache.arena_acquire_chunk_lease(cache.arena_base());
+    TEST_ASSERT(lease.chunk >= 0, "the fixture's lease on the early arena's first chunk was not taken");
+    TEST_ASSERT(cache.release_for_no_live_model("unmarked-start", unified_cache_release_cause::LOAD_START) ==
+                    unified_cache_last_release::ARENA_HELD,
+                "a load's start released an arena a lease holds");
+    TEST_ASSERT(!cache.last_release_deferred(), "a load's start marked a release deferred: only the abort marks it");
+    TEST_ASSERT(cache.release_for_no_live_model("aborted", unified_cache_release_cause::LOAD_ABORTED) ==
+                    unified_cache_last_release::ARENA_HELD,
+                "at an abort a held arena did not refuse the release");
+    TEST_ASSERT(cache.last_release_deferred(), "a failed load's held arena did not mark its release deferred");
+
+    unified_cache_last_release held_start = unified_cache_last_release::FAILED;
+    bool                       held_kept  = false;
+    size_t                     warned = 0, holders_named = 0, abort_text = 0, errored = 0;
+    {
+        const last_release_log log;
+        held_start = cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_START);
+        held_kept  = cache.reserve_released_arena(&refusal);
+        warned = log.count(GGML_LOG_LEVEL_WARN, "(load-start): a load is starting on an arena a failed load left held",
+                           "a holder still present after that failed model was freed is a leak");
+        holders_named = log.count(GGML_LOG_LEVEL_WARN, "[VRAM-ARENA] live in the arena on device");
+        abort_text    = log.count(GGML_LOG_LEVEL_WARN, "the failed load's buffers still hold the arena");
+        errored       = log.count(GGML_LOG_LEVEL_ERROR, "[VRAM-ARENA]");
+    }
+    TEST_ASSERT(held_start == unified_cache_last_release::ARENA_HELD,
+                "a load's start released an arena the failed load's buffers still hold");
+    TEST_ASSERT(warned == 1 && abort_text == 0,
+                "the start's release did not log its one WARN line saying a holder left after the free is a leak");
+    TEST_ASSERT(holders_named == 1 && errored == 0,
+                "the start's release did not name the holders at WARN, or logged an ERROR line");
+    TEST_ASSERT(cache.last_release_deferred(), "a release that kept the arena cleared the deferred mark");
+    TEST_ASSERT(held_kept && cache.arena_active() && cache.arena_find_chunk(cache.arena_base()) == lease.chunk,
+                "a load's start on the held arena refused, tore it down or freed the leased chunk");
+
+    lease.release();
+    const unified_cache_last_release free_start =
+        cache.release_for_no_live_model("load-start", unified_cache_release_cause::LOAD_START);
+    TEST_ASSERT(free_start == unified_cache_last_release::EMPTIED,
+                "once the lease ended a load's start did not empty the cache");
+    TEST_ASSERT(!cache.last_release_deferred(), "the deferred mark stayed after the cache emptied");
+    TEST_ASSERT(cache.reserve_released_arena(&refusal), "a load's start did not reserve the early arena again");
+    TEST_ASSERT(zone_capacities(cache) == first_zones,
+                "a load's start after the deferred release built other zones than a last model's release leaves");
+    TEST_ASSERT(zone_bytes_used(cache) == 0, "a zone counts used bytes in the early arena the load's start reserved");
+    TEST_PASS();
+    return true;
+}
+
+// The release of the last model, each arm on a cache of its own, and the start values it puts a device's published
+// terms back to. Its own process (`--case last_release_empties_the_arena`): the terms arm must read a process where
+// nothing has been published, and the arms publish the device's ring and pair terms. Exits 0 when every arm passed, 1
+// when one failed, and 77 when none failed but one measured nothing.
+static int last_release_empties_the_arena(sycl::queue & q) {
+    bool skipped = false;
+    bool ok      = true;
+    ok &= fresh_published_terms_are_the_default(ggml_sycl_get_device_id_from_queue(q));
+    ok &= last_release_empties_ring_pair_and_arena(q, skipped);
+    ok &= last_release_keeps_a_claimed_ring(q, skipped);
+    ok &= last_release_keeps_a_reserved_pair(q, skipped);
+    ok &= last_release_names_a_held_arena(q, skipped);
+    ok &= last_release_deferred_by_a_failed_load(q, skipped);
+    if (!ok) {
+        return 1;
+    }
+    if (skipped) {
+        fprintf(stderr, "SKIP: a last-release arm measured nothing on this device (its SKIPPED line says why)\n");
+        return SYCL_TEST_SKIP;
+    }
+    return 0;
 }
 
 int main(int argc, char ** argv) {
@@ -1833,12 +3329,17 @@ int main(int argc, char ** argv) {
     }
 
     // This child intentionally omits explicit shutdown. Its ordinary return
-    // exercises the production fallback where g_device_caches destroys its
-    // cache after main. Initializing the zone-sizing diagnostics after the
-    // global cache registry reproduces the historical destructor-order crash.
+    // exercises the production exit path, where the per-device cache map
+    // destroys its cache after main. The map is made at its first use, so the
+    // cache comes first and the zone-sizing diagnostics after it, the order of
+    // the historical destructor-order crash. Today the diagnostics' state is
+    // leaked on purpose and nothing of it is destroyed at exit; the order
+    // matters only if that state is given a destructor again, which would then
+    // run before the cache's teardown reports into it.
     if (argc == 2 && std::strcmp(argv[1], "--static-destruction-child") == 0) {
+        auto * cache = get_unified_cache(q);
         zone_sizing_record_observation("static-destruction-child");
-        return get_unified_cache(q) ? 0 : 1;
+        return cache ? 0 : 1;
     }
 
     // llama.cpp-me60: run exactly ONE of the two shutdown-poisoning cases,
@@ -1879,6 +3380,26 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
             return case_ok ? 0 : 1;
         }
+        if (std::strcmp(argv[2], "host_zone_grow_serves_odd_residue_oversize_alloc") == 0) {
+            const bool case_ok = host_zone_grow_serves_odd_residue_oversize_alloc(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_ok ? 0 : 1;
+        }
+        // No oneDNN dependency either; it allocates its own small arenas on the device.
+        if (std::strcmp(argv[2], "arena_teardown_refusal_classes") == 0) {
+            const int case_rc = arena_teardown_refusal_classes(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_rc;
+        }
+        // No oneDNN dependency; its first arm needs a process where nothing has been published.
+        if (std::strcmp(argv[2], "last_release_empties_the_arena") == 0) {
+            const int case_rc = last_release_empties_the_arena(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_rc;
+        }
 #if GGML_SYCL_DNNL
         const char * case_name = argv[2];
         bool         case_ok;
@@ -1909,6 +3430,7 @@ int main(int argc, char ** argv) {
     ok &= reserve_allocate_success_registers_pointer(q);
     ok &= arena_registry_commit_failure_rolls_back(q);
     ok &= allocate_failure_rolls_back_budget(q);
+    ok &= raw_gate_refuses_past_the_device_total(q);
     ok &= free_unknown_pointer_fails();
     ok &= strict_unknown_free_fails();
     ok &= double_free_fails(q);
@@ -1935,14 +3457,23 @@ int main(int argc, char ** argv) {
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_config_ordering_matters(q);
     ok &= host_zone_grow_serves_oversize_contiguous_alloc(q);
+    ok &= host_zone_grow_serves_odd_residue_oversize_alloc(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= independent_exact_token_defers_owned_release(q);
+    ok &= hand_built_arena_is_judged_by_its_own_zone_plan(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
     ok &= arena_shutdown_drains_dma_and_bcs(q);
     ok &= exact_scratch_shutdown_record_survives_for_retry(q);
     ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
+    // The refused-teardown arms arm process-wide failure hooks, so they run in a process of their own.
+    fprintf(stderr, "(the arena teardown refusal arms run only via --case arena_teardown_refusal_classes)\n");
+    // The last-release arms read a process where nothing has been published, so they too run in a process of their own.
+    fprintf(stderr, "(the last-release arms run only via --case last_release_empties_the_arena)\n");
+    ok &= cache_without_staging_allocates_none(q);
     ok &= accepted_control_publication_is_atomic_with_close_snapshot();
+    ok &= planner_terms_restore_returns_the_runtime_requirement();
+    ok &= load_record_keeps_a_later_publish();
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
     // Retain a real pinned suballocation across the first shutdown attempt;
     // retry drains the process-global cache while q and SYCL are still alive.
