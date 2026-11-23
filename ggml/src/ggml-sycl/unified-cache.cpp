@@ -21054,9 +21054,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // chunk serves this allocation alone, so growing by
                 // `alloc_size - largest` produced a chunk too small for the
                 // request it was grown for (Gemma 4 E4B: 2856 MB against
-                // 2048 MB chunks). grow_zone() sizes the chunk as
-                // max(chunk_size_, align_up(need)); the alignment slack keeps
-                // the aligned request inside the arena.
+                // 2048 MB chunks). `need` is the block the fresh chunk's TLSF
+                // takes for the request (zone_grow_request), and grow_zone()
+                // sizes the chunk as max(chunk_size_, align_up(need)), so the
+                // new chunk alone can serve the retry below. A retry that
+                // still fails is a miss: there is no second growth.
                 const size_t need = pinned_chunk_pool::zone_grow_request(alloc_size, alignment);
                 if (!ucache->host_zone_grow(zone, need)) {
                     return nullptr;

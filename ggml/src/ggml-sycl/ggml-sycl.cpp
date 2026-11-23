@@ -55548,6 +55548,7 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
     req.queue     = exact_queue;
     req.device    = exact_device;
     req.size      = size;
+    req.alignment = ggml_sycl::host_buft_alloc_alignment;  // the alignment the plan's replay sizes the buffer at
     req.intent    = intent;
     req.site_file = intent.site_file;
     req.site_line = intent.site_line;

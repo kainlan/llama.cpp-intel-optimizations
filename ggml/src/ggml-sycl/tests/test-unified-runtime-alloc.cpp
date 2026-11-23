@@ -903,15 +903,14 @@ static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
 
     const size_t cap_after    = pool.zone_capacity(host_zone_id::WEIGHT);
     const size_t chunks_after = pool.chunk_count();
-    const size_t aligned_need = (need + align - 1) & ~(align - 1);
+    const size_t grown_usable = pinned_chunk_pool::chunk_footprint_for(chunk, need).usable;
     TEST_ASSERT(chunks_after == chunks_before + 1, "oversize growth should add exactly one chunk");
-    TEST_ASSERT(cap_after - cap_before == aligned_need,
+    TEST_ASSERT(cap_after - cap_before == grown_usable,
                 "zone_capacity should grow by the actual bytes of the oversize chunk");
-    // TLSF does not split off a tail smaller than its minimum block, so the
-    // 64-byte slack rides along with the allocation: the accounted bytes are
-    // at least the request and at most the new chunk.
+    // The allocation takes its TLSF block, the request rounded to the grain, which the new chunk holds: the accounted
+    // bytes are at least the request and at most the new chunk.
     const size_t used_delta = pool.zone_used(host_zone_id::WEIGHT) - used_before;
-    TEST_ASSERT(used_delta >= request && used_delta <= aligned_need,
+    TEST_ASSERT(used_delta >= request && used_delta <= grown_usable,
                 "the oversize allocation should be accounted within the new chunk's bytes");
 
     // Budget is checked against the actual bytes: a growth that does not fit

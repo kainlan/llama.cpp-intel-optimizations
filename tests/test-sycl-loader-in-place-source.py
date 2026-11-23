@@ -509,7 +509,9 @@ def clause_c3_pool_footprint(t: dict) -> list:
                         "pinned_chunk_pool::chunk_footprint_for")
     # The request a grown chunk is sized from is the block zone_alloc's TLSF takes, one definition every grower asks.
     rule = body_of(t[PPH], GROW_REQUEST_SIG)
-    if len(re.findall(GROW_REQUEST_SIG, t[PPH] + t[PPC])) != 1 or "tlsf_allocator::round_request(" not in rule:
+    answers = [a.strip() for a in re.findall(r"\breturn\b([^;]*);", rule)]
+    if len(re.findall(GROW_REQUEST_SIG, t[PPH] + t[PPC])) != 1 or "tlsf_allocator::round_request(" not in rule \
+            or any(a != "0" and not a.startswith("tlsf_allocator::round_request(") for a in answers):
         problems.append("pinned_chunk_pool::zone_grow_request is not one definition sized by tlsf_allocator::"
                         "round_request")
     if not re.search(ZONE_GROW_CALL, t[UCC]):
@@ -517,14 +519,17 @@ def clause_c3_pool_footprint(t: dict) -> list:
     runtime_grow = body_of(t[PPC], r"\bvoid\s*\*\s*pinned_chunk_pool::allocate_from_chunks\s*\(")
     if not re.search(r"\bzone_grow_request\s*\(\s*size\s*,\s*alignment\s*\)", runtime_grow):
         problems.append("allocate_from_chunks does not grow by zone_grow_request")
-    for rel in (UCC, PPC, HPP):
+    for rel in (UCC, PPC, PPH, HPP):
         if re.search(r"max\s*\(\s*alignment\s*,\s*(?:pinned_chunk_pool::)?DEFAULT_ALIGNMENT\s*\)", t[rel]):
             problems.append(f"{rel} restates the grow request's alignment slack")
-    # The alignment the SYCL_Host buffer type allocates at is one named value, which the replay sizes by.
+    # The alignment the SYCL_Host buffer type allocates at is one named value, which the replay sizes by; the
+    # allocation sets it once, so no later assignment can split the two.
     if not re.search(r"\binline\s+constexpr\s+size_t\s+host_buft_alloc_alignment\s*=", t[HPP]):
         problems.append("the SYCL_Host buffer type's allocation alignment is not named in unified-cache.hpp")
-    if not re.search(r"\breq\.alignment\s*=\s*ggml_sycl::host_buft_alloc_alignment\s*;", fn(t, GS, HOST_BUFT_ALLOC)):
-        problems.append("ggml_sycl_host_buft_alloc does not allocate at ggml_sycl::host_buft_alloc_alignment")
+    buft_alloc = fn(t, GS, HOST_BUFT_ALLOC)
+    if not re.search(r"\breq\.alignment\s*=\s*ggml_sycl::host_buft_alloc_alignment\s*;", buft_alloc) \
+            or len(re.findall(r"\breq\.alignment\s*=[^=]", buft_alloc)) != 1:
+        problems.append("ggml_sycl_host_buft_alloc does not allocate at ggml_sycl::host_buft_alloc_alignment alone")
     if re.search(r"\(\s*size_t\s*\)\s*256\b", t[PPC]):
         problems.append("pinned-pool.cpp spells the TLSF grain as a literal instead of tlsf_allocator::block_grain")
     if len(re.findall(r"\bchunk_footprint\s+chunk_footprint_for\s*\(", t[PPH] + t[PPC])) != 1:
@@ -797,6 +802,8 @@ MUTANTS = [
     ("runtime-grow-own-rule", "C3", mutate_re(PPC, r"\bzone_grow_request\s*\(\s*size\s*,\s*alignment\s*\)", "size")),
     ("host-buft-alignment-split", "C3", mutate_re(
         GS, r"\breq\.alignment\s*=\s*ggml_sycl::host_buft_alloc_alignment\s*;", "req.alignment = 128;")),
+    ("host-buft-alignment-reassigned", "C3", mutate_re(
+        GS, r"(\breq\.alignment\s*=\s*ggml_sycl::host_buft_alloc_alignment\s*;)", r"\1 req.alignment = 128;")),
     ("replay-restates-chunk-rule", "C3", mutate(
         HPP, "pinned_chunk_pool::chunk_footprint_for(chunk, bytes).backing",
         "std::max(chunk, (bytes + 63) / 64 * 64) + pinned_chunk_pool::DEFAULT_ALIGNMENT")),

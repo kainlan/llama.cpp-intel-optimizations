@@ -1186,7 +1186,10 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
         }
     }
 
-    const chunk_footprint footprint      = chunk_footprint_for(chunk_size_, size);
+    // No chunk holds it: grow one sized to the block its TLSF takes for the request, which the budget check and
+    // grow_into() both size from.
+    const size_t          request        = zone_grow_request(size, alignment);
+    const chunk_footprint footprint      = chunk_footprint_for(chunk_size_, request);
     const size_t          new_chunk_size = footprint.usable;
     if (footprint_locked() + footprint.backing > budget_) {
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)%s\n",
@@ -1196,11 +1199,11 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
     }
 
     if (pinned_trace_enabled()) {
-        GGML_LOG_INFO("[SYCL] pinned pool grow: min=%zu chunk=%zu total=%.1f GB budget=%.1f GB mode=%s\n", size,
+        GGML_LOG_INFO("[SYCL] pinned pool grow: min=%zu chunk=%zu total=%.1f GB budget=%.1f GB mode=%s\n", request,
                       new_chunk_size, total_allocated_ / (1024.0 * 1024.0 * 1024.0),
                       budget_ / (1024.0 * 1024.0 * 1024.0), runtime_pool ? "runtime" : "zone-base");
     }
-    if (!grow_into(chunks, size, runtime_pool, "allocate_from_chunks")) {
+    if (!grow_into(chunks, request, runtime_pool, "allocate_from_chunks")) {
         return nullptr;
     }
 

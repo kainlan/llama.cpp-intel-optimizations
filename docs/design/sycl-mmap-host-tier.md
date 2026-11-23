@@ -1272,7 +1272,12 @@ the split and the placement (`placement_loader_pool_footprint_for`) at the
 buffer type's maximum size and the pool's chunk. The WEIGHT zone holds the
 footprint's zone bytes (`loader_zone`) in place of `host_zone_loader_bytes`,
 and a buffer larger than a chunk, for which the pool grows a chunk of its own,
-is `loader_grown`, counted by `total()` outside the zones. A plan within its
+is `loader_grown`, counted by `total()` outside the zones. The replay sizes
+each buffer by the pool's own rule, `pinned_chunk_pool::zone_grow_request` at
+`host_buft_alloc_alignment`, the alignment `ggml_sycl_host_buft_alloc`
+allocates at: the block the chunk's TLSF takes for the buffer, which is also
+what `unified_alloc` grows a chunk by when no segment holds it, so
+`loader_grown` is the pool's growth byte for byte. A plan within its
 budget therefore configures a WEIGHT zone whose segments hold every loader
 buffer a chunk can hold, and the pool's only growth for the others is
 `loader_grown`. A plan charged this term (the loader holds the weights,
@@ -1750,8 +1755,10 @@ created") describes a path that does not run.
       grows the zone once per SYCL backend.
     - The growth is one `grow_zone(SCRATCH, deficit + n x
       DEFAULT_ALIGNMENT)` call, where `n` is the number of buffers the demand
-      splits into at the chunk cap, the same slack rule as the miss path
-      (`uc:15432`). `grow_zone` commits **one chunk of
+      splits into at the chunk cap. (The miss path grows by each buffer's
+      TLSF block, `pinned_chunk_pool::zone_grow_request`, which can pass the
+      buffer's bytes by more than this slack; a buffer the zone then cannot
+      hold takes the miss path.) `grow_zone` commits **one chunk of
       `max(2048 MB, align_up(request))`** (`pinned-pool.cpp:613-712`). So
       the zone grows by at least the deficit, **rounded up to one chunk**,
       and the criteria score it that way.

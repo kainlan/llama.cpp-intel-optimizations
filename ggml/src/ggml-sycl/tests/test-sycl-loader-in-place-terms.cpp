@@ -460,7 +460,7 @@ pool_run run_pool(const std::vector<size_t> & buffers, size_t weight_zone, size_
             continue;
         }
         const ggml_sycl::pinned_chunk_pool::chunk_footprint grown = ggml_sycl::pinned_chunk_pool::chunk_footprint_for(
-            chunk, ggml_sycl::pinned_chunk_pool::zone_grow_request(buffer, kHeader));
+            chunk, ggml_sycl::pinned_chunk_pool::zone_grow_request(buffer, ggml_sycl::host_buft_alloc_alignment));
         run.grown_chunks++;
         run.grown_bytes += grown.backing;
         run.short_zone += bytes <= chunk ? 1 : 0;

@@ -169,10 +169,24 @@ class pinned_chunk_pool {
         return { usable, usable + DEFAULT_ALIGNMENT };
     }
 
-    // The bytes a zone grows by for one contiguous request of `size` bytes at `alignment` that no chunk of the zone
-    // holds (unified_alloc's fragmentation path): the request plus room to align it.
+    // The bytes the pool grows one chunk by for one contiguous request of `size` bytes at `alignment` (0 is
+    // DEFAULT_ALIGNMENT) that no chunk holds: unified_alloc's fragmentation path and allocate_from_chunks grow by it,
+    // and the plan's replay of the loader's buffers (placement_loader_pool_footprint_for) sizes each buffer with it.
+    // It is the block the chunk's TLSF takes for the request: zone_alloc and allocate_from_chunks align the size to
+    // `alignment` and ask the TLSF at the larger of that alignment and the grain, which round_request rounds the size
+    // to. A grown chunk is fresh and its TLSF arena is the whole chunk, so the block sits at offset 0, where every
+    // granularity is met, and an arena of exactly the block holds it: nothing more is needed. The TLSF places blocks by
+    // offset and never pads for the chunk's base, so extra bytes would not align the pointer further either. An
+    // alignment above the grain is one round_request refuses (it asserts), here as on every zone_alloc, so no chunk is
+    // grown for a request no chunk can serve. 0 when round_request refuses the size (zero, or within a grain of
+    // SIZE_MAX); grow_zone grows nothing for 0.
     static size_t zone_grow_request(size_t size, size_t alignment) {
-        return size + std::max(alignment, DEFAULT_ALIGNMENT);
+        const size_t align = alignment != 0 ? alignment : DEFAULT_ALIGNMENT;
+        if (size > SIZE_MAX - align) {
+            return 0;
+        }
+        const size_t aligned = (size + align - 1) & ~(align - 1);
+        return tlsf_allocator::round_request(aligned, std::max(align, tlsf_allocator::block_grain));
     }
 
     // The release of one chunk's backing, as a move-only RAII carrier defined after this class: its destructor frees

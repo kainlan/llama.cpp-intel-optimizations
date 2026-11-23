@@ -2536,6 +2536,11 @@ struct placement_loader_pool_footprint {
     size_t grown   = 0;
 };
 
+// The alignment a SYCL_Host buffer's allocation asks the pinned pool for: ggml_sycl_host_buft_alloc sets it on its
+// request, and placement_loader_pool_footprint_for sizes each of the loader's buffers at it, so the replay and the
+// pool size a buffer by one rule at one alignment.
+inline constexpr size_t host_buft_alloc_alignment = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+
 inline placement_loader_pool_footprint placement_loader_pool_footprint_for(const std::vector<size_t> & tensor_bytes,
                                                                            size_t                      max_size,
                                                                            size_t                      chunk) {
@@ -2543,14 +2548,13 @@ inline placement_loader_pool_footprint placement_loader_pool_footprint_for(const
     if (chunk == 0) {
         return footprint;
     }
-    // The pool's TLSF grain, to which zone_alloc rounds each request.
-    constexpr size_t    grain = tlsf_allocator::block_grain;
     std::vector<size_t> filled;  // the bytes each chunk segment holds, in segment order
     const auto          place = [&](size_t buffer) {
         ++footprint.buffers;
-        const size_t bytes = (buffer + grain - 1) / grain * grain;
+        // The block zone_alloc's TLSF takes for the buffer, in a segment or in a chunk grown for it.
+        const size_t bytes = pinned_chunk_pool::zone_grow_request(buffer, host_buft_alloc_alignment);
         if (bytes > chunk) {
-            // no segment holds it: grow_zone grows one chunk sized to the request, by the pool's own rule
+            // no segment holds it: the pool grows one chunk for the block, by the pool's own rule
             footprint.grown += pinned_chunk_pool::chunk_footprint_for(chunk, bytes).backing;
             return;
         }
