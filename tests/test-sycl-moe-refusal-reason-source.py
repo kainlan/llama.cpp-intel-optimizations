@@ -270,17 +270,20 @@ def direct_decline_violations(sycl: str) -> list[str]:
         body = else_body(code, close_brace)
         if body is None:
             found.append(f"an exit falls through without a named line: the if block at line {line} has no else")
-        elif DIRECT_DECLINE not in sycl[body[0]:body[1]]:
+        elif DIRECT_DECLINE not in code[body[0]:body[1]]:
             found.append(f"an exit falls through without a named line: the else of the if block at line {line}")
 
+    # The step is a literal, so it is read from the source; a match counts only where the comment-blanked code still
+    # has the helper there, so a comment that quotes the call names no step.
     direct = sycl[gate_at:end_at]
     for step in DIRECT_STEPS:
-        if not re.search(re.escape(DIRECT_DECLINE) + r'\s*src0,\s*ne12,\s*"' + step + '"', direct):
+        named = re.finditer(re.escape(DIRECT_DECLINE) + r'\s*src0,\s*ne12,\s*"' + step + '"', direct)
+        if not any(code.startswith(DIRECT_DECLINE, gate_at + m.start()) for m in named):
             found.append(f"no decline line names the step {step}")
 
     # A refusal that throws after the mark leaves the block by the catch, not by an else: its own block prints the
     # line before the throw.
-    failures = [m.start() for m in re.finditer(re.escape(SUBMIT_FAILURE), direct)]
+    failures = [m.start() for m in re.finditer(re.escape(SUBMIT_FAILURE), code[gate_at:end_at])]
     if not any(not under_testing_macro(sycl, gate_at, gate_at + at) for at in failures):
         found.append("the direct block has no submit failure outside the test build")
     for at in failures:
@@ -288,7 +291,7 @@ def direct_decline_violations(sycl: str) -> list[str]:
         if under_testing_macro(sycl, gate_at, at):
             continue
         block = enclosing_open_brace(code, at)
-        if DIRECT_DECLINE not in sycl[block:at]:
+        if DIRECT_DECLINE not in code[block:at]:
             found.append(f"the submit failure at line {sycl.count(chr(10), 0, at) + 1} throws without a named line")
 
     # The precondition's line names every conjunct that failed, from the bools the condition reads.
@@ -389,17 +392,22 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
         "adapter-refusal-unnamed": re.sub(
             r'\n\s*ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
             r'moe_direct_submit_failure\{\};)', "", sycl, count=1, flags=re.DOTALL),
-        # The adapter's line is gone and a comment names the helper in its place: the throw still prints nothing.
+        # The adapter's line is gone and a comment names the helper in its place: the throw still prints nothing. A
+        # real "adapter" line elsewhere keeps the step named, so only the throw's own block can witness this.
         "adapter-refusal-commented": re.sub(
             r'ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
             r'moe_direct_submit_failure\{\};)',
             '// ggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", ...) is printed by the caller', sycl,
-            count=1, flags=re.DOTALL),
-        # An else whose only mention of the helper is a comment prints nothing.
+            count=1, flags=re.DOTALL).replace(
+            DIRECT_SUCCESS, DIRECT_SUCCESS + '\nggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", "");', 1),
+        # An else whose only mention of the helper is a comment prints nothing. A real "workspace_slices" line
+        # elsewhere keeps the step named, so only the else check can witness this.
         "else-commented": re.sub(
             r'ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "workspace_slices",.*?\);',
             '// ggml_sycl_moe_direct_log_decline(src0, ne12, "workspace_slices", ...) was printed by the slicer',
-            sycl, count=1, flags=re.DOTALL),
+            sycl, count=1, flags=re.DOTALL).replace(
+            DIRECT_SUCCESS,
+            DIRECT_SUCCESS + '\nggml_sycl_moe_direct_log_decline(src0, ne12, "workspace_slices", "");', 1),
         # The adapter's line names another step; only a comment names "adapter".
         "step-commented": sycl.replace(
             'ggml_sycl_moe_direct_log_decline(\n                                    src0, ne12, "adapter",',
