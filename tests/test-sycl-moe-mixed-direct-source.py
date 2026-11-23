@@ -306,23 +306,29 @@ def table_violations(src: dict[str, str]) -> list[str]:
         found.append("table-stale: the upload does not hold the stale-on-throw guard from before its payload can "
                      "change")
     # One upload builds a retained table: of an all-card batch (the hybrid decode, skip_host off, where a HOST operand
-    # refuses the batch as the local view does) and of a mixed node's card part (skip_host on).
-    retained_head = "static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_table_from_batch("
-    retained = definition(sycl, retained_head)
-    if retained is None:
-        return found + ["table-card: the retained table upload ggml_sycl_upload_moe_retained_ptr_table_from_batch is "
-                        "missing"]
-    retained_at = sycl.find(retained_head)
-    if not has(spaced(sycl[retained_at:sycl.find("{", retained_at)]), "bool skip_host = false)") or \
+    # refuses the batch as the local view does) and of a mixed node's card part (skip_host on). The batch's view and
+    # its null slots come from the shared upload from a batch, which takes skip_host too; the retain is the retained
+    # upload's own.
+    def head_of(head: str) -> tuple[str | None, str]:
+        at = sycl.find(head)
+        return definition(sycl, head), spaced(sycl[at:sycl.find("{", at)]) if at >= 0 else ""
+
+    retained, retained_params = head_of(
+        "static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_table_from_batch(")
+    shared, shared_params = head_of("static const void * const * ggml_sycl_upload_moe_ptr_table_from_batch(")
+    if retained is None or shared is None:
+        return found + ["table-card: the retained upload or the shared upload from a batch is missing"]
+    retained, shared = spaced(code_of(retained)), spaced(code_of(shared))
+    if not has(retained_params, "bool skip_host = false)") or not has(shared_params, "bool skip_host = false)") or \
+            not re.search(r"\bggml_sycl_upload_moe_ptr_table_from_batch\([^;]*, skip_host\);", retained) or \
             "ggml_sycl_upload_moe_card_ptr_table_from_batch" in code_of(sycl):
         found.append("table-card: the card table has an upload of its own, not the retained one with skip_host")
-    flat = spaced(code_of(retained))
-    if not has(flat, "ggml_sycl::make_moe_batch_view(batch, layout, skip_host)"):
+    if not has(shared, "ggml_sycl::make_moe_batch_view(batch, layout, skip_host)"):
         found.append("table-card: the table's view does not leave HOST operands out with skip_host")
-    if not re.search(r"ggml_sycl_upload_moe_transient_ptr_table\([^;]*host_experts", flat):
+    if not re.search(r"ggml_sycl_upload_moe_transient_ptr_table\([^;]*host_experts", shared):
         found.append("table-card: the card table does not null its HOST operands' slots")
-    leases = find(flat, "result.role_leases.push_back(")
-    if leases < 0 or not has(flat[:leases], SKIP_HOST):
+    leases = find(retained, "result.role_leases.push_back(")
+    if leases < 0 or not has(retained[:leases], SKIP_HOST):
         found.append("table-card: a HOST operand's lease enters the table owner's retain")
     return found
 
@@ -658,6 +664,8 @@ def test_mutations_are_witnessed() -> None:
         ("sycl", r"(ggml_sycl_upload_moe_retained_ptr_table_from_batch\(.*?)if \(operand\.residency\(\) == "
                  r"ggml_sycl::moe_batch_residency::HOST\) \{\s*continue;\s*\}(\s*result\.role_leases)", r"\1\2",
          "table-card"),
+        # The retained upload drops skip_host on its way to the shared upload, so a mixed batch's table is refused.
+        ("sycl", r"(&event_set),\s*skip_host\);", r"\1);", "table-card"),
         # The table's view refuses a HOST operand whatever skip_host says.
         ("sycl", r"make_moe_batch_view\(batch, layout, skip_host\)", "make_moe_batch_view(batch, layout, false)",
          "table-card"),
