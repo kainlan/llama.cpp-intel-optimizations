@@ -49438,7 +49438,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                 // Every KV slot the block's weight layers execute moves with them: a looped model's later slots too.
                 for (const int slot :
                      ggml_sycl::kv_slots_of_layers(runtime_kv_plan.layer_phys, block.start_layer, block.end_layer)) {
-                    if (slot < 0 || static_cast<uint32_t>(slot) >= n_layers ||
+                    if (static_cast<uint32_t>(slot) >= n_layers ||
                         !layer_in_this_kv_buffer(static_cast<uint32_t>(slot)) ||
                         runtime_kv_plan.kv_size_for_layer(static_cast<uint32_t>(slot)) == 0) {
                         continue;

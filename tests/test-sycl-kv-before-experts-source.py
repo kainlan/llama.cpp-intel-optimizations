@@ -184,8 +184,8 @@ def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
     cost test, llama.cpp-w013), takes no more than is left, and counts in the plan's device bytes."""
     b = body(norm(cache), ROOM_SIG)
     return (bool(b) and ordered(
-        b, "if (layer_id >= 0 && owner == device_id) { layers.push_back(layer_id); }",
-        "kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));",
+        b, "if (slot >= 0 && owner == device_id) { slots.push_back(slot); }",
+        "kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(slot));",
         "room.held = std::min(room.wanted, remaining);", "remaining -= room.held;",
         "plan.kv_context_reserve_bytes = room.held;", "plan.vram_bytes += room.held;"))
 
@@ -239,15 +239,16 @@ def claim_room_line_is_visible_and_names_its_source(cache: str) -> bool:
 def claim_extra_is_the_context_minus_the_charge(hpp: str) -> bool:
     """The context's extra KV comes from the same per-layer rule as the charge, at n_ctx_context."""
     n = norm(hpp)
-    return ("size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }" in n
+    return ("size_t kv_bytes_for_layer(uint32_t slot) const { return kv_bytes_for_layer_at(slot, n_ctx); }" in n
             and ordered(n, "size_t kv_context_extra_bytes_for_layer(uint32_t il) const {",
                         "const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);",
                         "const size_t charged = kv_bytes_for_layer(il);",
                         "return at_context > charged ? at_context - charged : 0;"))
 
 
-KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
-UNIFORM_FALLBACK = "return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);"
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const"
+UNIFORM_FALLBACK = ("return is_swa_layer(static_cast<int>(slot)) ? kv_bytes_per_swa_layer(ctx) : "
+                    "kv_bytes_per_layer(ctx);")
 
 
 def claim_uniform_fallback_has_one_formula(hpp: str) -> bool:

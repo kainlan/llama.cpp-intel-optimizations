@@ -210,7 +210,7 @@ def claim_backend_takes_the_map_once(sycl: str, cache: str, kv_cache: str) -> bo
 PLAN_MIRROR = "plan.layer_phys = kv_info.layer_phys;"
 SLOTS_SIG = "static void plan_layer_kv_slots(placement_plan & plan,"
 SLOTS_LOOP = "for (const int slot : kv_slots_of_layers(kv_info.layer_phys, layer_id, layer_id)) {"
-SLOTS_SET = "plan.kv_device[slot] = kv_on_target && slot_has_kv ? target : -1;"
+SLOTS_SET = "plan.kv_device[slot] = slot_has_kv ? kv_target : -1;"
 SLOTS_CALL = "plan_layer_kv_slots(plan, kv_info, layer_id, "
 LAYER_KV_SIG = "static void plan_single_device_layer_kv(placement_plan & plan,"
 SLOT_ORDER = "slot_layers.emplace_back(static_cast<int>(slot), kv_info.layer_phys[slot]);"

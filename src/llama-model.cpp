@@ -362,10 +362,10 @@ struct llama_model_sycl_kv_layer_arrays {
 // widths, so the planner budgets both buffers and the allocator sizes each one
 // from its own cache. A layer whose only KV is indexer keys is FULL with zero
 // K/V widths, so it is still charged.
-// The arrays are indexed by KV cache slot. A looped model (inkling2_loop,
-// nanbeige, metis16) runs one weight layer for several slots: `phys` names the
-// weight layer of each (llama_model::layer_phys), so the planner puts a slot's
-// KV where that layer's weights are. The backend computes no map of its own.
+// The arrays are indexed by KV cache slot. A looped model runs one weight layer
+// for several slots: `phys` names the weight layer of each
+// (llama_model::layer_phys), so the planner puts a slot's KV where that layer's
+// weights are. The backend computes no map of its own.
 static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_model & model,
                                                                                uint32_t            n_layer) {
     const llama_hparams &            hparams = model.hparams;

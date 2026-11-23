@@ -721,9 +721,9 @@ struct placement_kv_info {
     // key cache (a second buffer over the layer's cells, K only); empty or 0 where a layer has none.
     std::vector<uint32_t> layer_idx_k_width;
     // The weight layer (`blk.N`) that executes each KV cache slot, from ggml_sycl_tensor_inventory::kv_layer_phys. A
-    // looped model runs one weight layer for several slots (inkling2_loop, nanbeige, metis16). Empty means every slot is
-    // its own layer, which is every other architecture. Every array above is indexed by slot. The planner keys KV by
-    // slot: a slot's KV lives where the layer that executes it lives, and the layer is charged for each of its slots.
+    // looped model runs one weight layer for several slots. Empty means every slot is its own layer. Every array above
+    // is indexed by slot. The planner keys KV by slot: a slot's KV lives where the layer that executes it lives, and
+    // the layer is charged for each of its slots.
     std::vector<int32_t>  layer_phys;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
@@ -745,16 +745,16 @@ struct placement_kv_info {
 
     uint32_t n_full_attn_layers() const { return n_layer > n_swa_layers ? n_layer - n_swa_layers : 0; }
 
-    // Returns true if the given layer uses SWA. Falls back to false when
-    // the per-layer mask is not populated.
-    bool is_swa_layer(int layer_id) const {
-        if (layer_id < 0 || swa_layer_mask.empty()) {
+    // Returns true if KV cache slot `slot` uses SWA. Falls back to false when
+    // the per-slot mask is not populated.
+    bool is_swa_layer(int slot) const {
+        if (slot < 0 || swa_layer_mask.empty()) {
             return false;
         }
-        if (static_cast<size_t>(layer_id) >= swa_layer_mask.size()) {
+        if (static_cast<size_t>(slot) >= swa_layer_mask.size()) {
             return false;
         }
-        return swa_layer_mask[layer_id];
+        return swa_layer_mask[slot];
     }
 
     size_t kv_bytes_per_layer() const { return kv_bytes_per_layer(n_ctx); }
@@ -806,21 +806,22 @@ struct placement_kv_info {
     // aggregate split when layer_kind/layer_k_width/layer_v_width are not
     // populated (an inventory built before this ticket, or a homogeneous
     // model that never needed per-layer truth).
-    size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }
+    // The argument is a KV cache slot; a weight layer's total over its slots is kv_bytes_for_phys_layer().
+    size_t kv_bytes_for_layer(uint32_t slot) const { return kv_bytes_for_layer_at(slot, n_ctx); }
 
-    // Layer `il`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries it. The
-    // planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and the
-    // per-layer charge above come from the same rule.
-    size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+    // KV cache slot `slot`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries
+    // it. The planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and
+    // the per-slot charge above come from the same rule.
+    size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const {
         if (!valid() || ctx == 0) {
             return 0;
         }
-        if (has_per_layer_kv_truth(il)) {
-            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,
-                                           n_seq_max, kv_unified, swa_full) +
-                   kv_idx_bytes_for_layer_at(il, ctx);
+        if (has_per_layer_kv_truth(slot)) {
+            return kv_layer_bytes_for_kind(layer_kind[slot], layer_k_width[slot], layer_v_width[slot], ctx, n_swa,
+                                           n_ubatch, n_seq_max, kv_unified, swa_full) +
+                   kv_idx_bytes_for_layer_at(slot, ctx);
         }
-        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
+        return is_swa_layer(static_cast<int>(slot)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
     }
 
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
@@ -1248,8 +1249,8 @@ struct placement_plan {
     // layer's shared dense weights; MoE experts remain separately placeable.
     std::unordered_map<int, int> layer_device;
 
-    int get_kv_device(int layer_id) const {
-        auto it = kv_device.find(layer_id);
+    int get_kv_device(int slot) const {
+        auto it = kv_device.find(slot);
         return it == kv_device.end() ? -1 : it->second;
     }
 
@@ -1312,7 +1313,8 @@ struct placement_plan {
         return layer_id < layer_kind.size() && layer_id < layer_k_width.size() && layer_id < layer_v_width.size();
     }
 
-    size_t kv_size_for_layer(uint32_t layer_id) const {
+    // The argument is a KV cache slot; a weight layer's total over its slots is kv_size_for_phys_layer().
+    size_t kv_size_for_layer(uint32_t slot) const {
         // llama.cpp-3aos: prefer the per-layer truth (kind + width) copied
         // in from placement_kv_info at plan-build time -- see
         // kv_layer_bytes_for_kind() for why the uniform split below is
@@ -1322,35 +1324,34 @@ struct placement_plan {
         // by update_runtime_kv_sizes() and the transaction body that sets
         // the last three), so this stays correct across a runtime context
         // update without re-deriving anything from kv_info.
-        if (has_per_layer_kv_truth(layer_id)) {
-            return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],
-                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,
-                                           planner_kv_unified, planner_swa_full) +
-                   kv_idx_size_for_layer(layer_id);
+        if (has_per_layer_kv_truth(slot)) {
+            return kv_layer_bytes_for_kind(layer_kind[slot], layer_k_width[slot], layer_v_width[slot], planner_n_ctx,
+                                           planner_n_swa, planner_n_ubatch, planner_n_seq_max, planner_kv_unified,
+                                           planner_swa_full) +
+                   kv_idx_size_for_layer(slot);
         }
         // Fallback: legacy uniform-per-class split (no per-layer truth populated).
-        if (kv_per_swa_layer > 0 && layer_id < swa_layer_mask.size() && swa_layer_mask[layer_id]) {
+        if (kv_per_swa_layer > 0 && slot < swa_layer_mask.size() && swa_layer_mask[slot]) {
             return kv_per_swa_layer;
         }
         return kv_per_layer;
     }
 
-    // The layer's indexer keys (llama.cpp-8ecj): part of kv_size_for_layer(), the layer's KV every budget charges;
+    // The slot's indexer keys (llama.cpp-8ecj): part of kv_size_for_layer(), the slot's KV every budget charges;
     // kv_tier_manager::configure_from_plan() sizes the indexer buffer from it alone.
-    size_t kv_idx_size_for_layer(uint32_t layer_id) const {
-        const uint32_t width = layer_id < layer_idx_k_width.size() ? layer_idx_k_width[layer_id] : 0;
-        if (width == 0 || !has_per_layer_kv_truth(layer_id)) {
+    size_t kv_idx_size_for_layer(uint32_t slot) const {
+        const uint32_t width = slot < layer_idx_k_width.size() ? layer_idx_k_width[slot] : 0;
+        if (width == 0 || !has_per_layer_kv_truth(slot)) {
             return 0;
         }
-        return kv_layer_bytes_for_kind(layer_kind[layer_id], width, 0, planner_n_ctx, planner_n_swa, planner_n_ubatch,
+        return kv_layer_bytes_for_kind(layer_kind[slot], width, 0, planner_n_ctx, planner_n_swa, planner_n_ubatch,
                                        planner_n_seq_max, planner_kv_unified, planner_swa_full);
     }
 
-    // The layer's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
-    size_t kv_main_size_for_layer(uint32_t layer_id) const {
-        return kv_size_for_layer(layer_id) - kv_idx_size_for_layer(layer_id);
-    }
+    // The slot's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
+    size_t kv_main_size_for_layer(uint32_t slot) const { return kv_size_for_layer(slot) - kv_idx_size_for_layer(slot); }
 
+    // The number of KV cache slots (a looped model has more slots than weight layers).
     size_t kv_layer_count() const {
         size_t n = swa_layer_mask.size();
         for (const auto & [layer_id, _] : kv_device) {

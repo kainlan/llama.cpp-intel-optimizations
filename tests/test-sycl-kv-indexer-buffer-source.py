@@ -140,10 +140,10 @@ LAYOUT = (
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
 )
-KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
-KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t layer_id) const"
-AT_ADDS = "+ kv_idx_bytes_for_layer_at(il, ctx);"
-SIZE_ADDS = "+ kv_idx_size_for_layer(layer_id);"
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const"
+KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t slot) const"
+AT_ADDS = "+ kv_idx_bytes_for_layer_at(slot, ctx);"
+SIZE_ADDS = "+ kv_idx_size_for_layer(slot);"
 PLAN_COPY = "plan.layer_idx_k_width = kv_info.layer_idx_k_width;"
 HINT = ("const uint32_t widths = kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer] + "
         "kv_info.idx_k_width(layer);")
