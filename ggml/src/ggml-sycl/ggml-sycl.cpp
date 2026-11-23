@@ -10794,17 +10794,22 @@ static void ggml_sycl_release_last_model_effects(const char *                   
 }
 
 // The model a SYCL_Host allocation made now belongs to: the load effect's owner, the one the host-weight registration
-// takes, or 0 outside a bound load.
+// takes, or 0 outside a bound load. The guard covers bound_candidate() alone: it takes the registry's lock, which can
+// throw, and this runs inside the host buffer type's allocation, which is called from C, so a lock error leaves the
+// allocation unowned instead of unwinding through C. acquire_load_effect() is noexcept. The rethrow arm is the form
+// the catch contract requires of every catch-all; bound_candidate() throws no fallback error.
 static uint64_t ggml_sycl_loading_model_id() {
-    auto & registry = ggml_sycl::lifecycle::global_registry();
+    auto &                          registry = ggml_sycl::lifecycle::global_registry();
+    ggml_sycl::lifecycle::LoadTxnId txn{};
     try {
-        const ggml_sycl::lifecycle::load_effect_lease effect = registry.acquire_load_effect(registry.bound_candidate());
-        return effect ? effect.owner.model.value : 0;
+        txn = registry.bound_candidate();
     } catch (const ggml_sycl_fallback_error &) {
         throw;
     } catch (...) {
         return 0;
     }
+    const ggml_sycl::lifecycle::load_effect_lease effect = registry.acquire_load_effect(txn);
+    return effect ? effect.owner.model.value : 0;
 }
 
 // The SYCL_Host chunks each model's load minted, so the model's MODEL check runs on every teardown path. A committed
