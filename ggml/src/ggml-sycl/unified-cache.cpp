@@ -21057,7 +21057,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 // 2048 MB chunks). grow_zone() sizes the chunk as
                 // max(chunk_size_, align_up(need)); the alignment slack keeps
                 // the aligned request inside the arena.
-                const size_t need = alloc_size + std::max(alignment, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+                const size_t need = pinned_chunk_pool::zone_grow_request(alloc_size, alignment);
                 if (!ucache->host_zone_grow(zone, need)) {
                     return nullptr;
                 }

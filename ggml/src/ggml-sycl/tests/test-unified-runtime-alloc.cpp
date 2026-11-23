@@ -892,9 +892,9 @@ static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
 
     const size_t cap_before    = pool.zone_capacity(host_zone_id::WEIGHT);
     const size_t chunks_before = pool.chunk_count();
-    // Mirrors unified-cache.cpp's fragmentation path: the growth request must
-    // guarantee that a fresh chunk can hold the whole allocation.
-    const size_t need          = request + align;
+    // unified-cache.cpp's fragmentation path asks the pool's rule for the
+    // growth: a fresh chunk must hold the whole allocation.
+    const size_t need          = pinned_chunk_pool::zone_grow_request(request, align);
     TEST_ASSERT(pool.grow_zone(host_zone_id::WEIGHT, need), "grow_zone should succeed within a 128 MiB budget");
     const size_t used_before = pool.zone_used(host_zone_id::WEIGHT);
 

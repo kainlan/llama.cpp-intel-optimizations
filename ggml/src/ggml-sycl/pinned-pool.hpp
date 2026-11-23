@@ -169,6 +169,12 @@ class pinned_chunk_pool {
         return { usable, usable + DEFAULT_ALIGNMENT };
     }
 
+    // The bytes a zone grows by for one contiguous request of `size` bytes at `alignment` that no chunk of the zone
+    // holds (unified_alloc's fragmentation path): the request plus room to align it.
+    static size_t zone_grow_request(size_t size, size_t alignment) {
+        return size + std::max(alignment, DEFAULT_ALIGNMENT);
+    }
+
     // The release of one chunk's backing, as a move-only RAII carrier defined after this class: its destructor frees
     // the chunk owner and moves the footprint, so a carrier dropped on any path releases and accounts exactly as a
     // consumed one does.
