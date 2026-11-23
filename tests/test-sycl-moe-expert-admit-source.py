@@ -335,7 +335,7 @@ PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_reside
 
 REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {"
 NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
-                '(%s); copy wait %llu us, id remap %llu us, meta lookup %llu us\\n"')
+                '(%s); copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\\n"')
 NAMED_LINE = "GGML_LOG_WARN(" + NAMED_FORMAT
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
 # The entry's one production caller: the swap driver at the synchronize boundary.
@@ -421,9 +421,12 @@ BODY_SUM = "++lent; (to_device ? taken : freed) += record.device_bytes;"
 BODY_RESULT = "result.bytes_freed = freed; result.bytes_readmitted = taken;"
 BODY_COUNT = "if (!m.to_device) { ++n_evicted; }"
 NAMED_LINE_ARGS = ("device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason, "
-                   "(unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us);")
+                   "(unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us, "
+                   "(unsigned long long) ggml_sycl::expert_move_us_since(txn_start));")
 # M1: what the body sums into the line, and where each figure is measured.
 SUM_META = "meta_us += triplet.resolve_us;"
+# The line's total runs from the transaction's first statement, before the lock and the preparation.
+TXN_START = "const auto txn_start = std::chrono::steady_clock::now();"
 SUM_CACHE = "copy_us += record.copy_us; remap_us += record.remap_us;"
 CACHE_TIMES = ("out.copy_us = copy_took;", "out.remap_us = remap_took;")
 PREP_TIMED = "const bool resolved = resolver(*e, target); out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);"
@@ -671,9 +674,10 @@ def check(raw: dict[str, str]) -> None:
             or not ordered(txn, "stop = ggml_sycl_expert_prepare_triplet(", SUM_META, "std::unique_lock lock(")
             or not ordered(txn, "loaned = cache->refill_lent_triplet(triplet.members, record); break; }", SUM_CACHE,
                            "if (!loaned && (admit || evict)) {")
-            or not ordered(txn, SUM_CACHE, NAMED_LINE)):
-        fail("M1", "the named move's result line is not one WARN carrying the batch's copy, id remap and meta lookup "
-                   "times, each summed as its call returns")
+            or not ordered(txn, SUM_CACHE, NAMED_LINE)
+            or txn.count(TXN_START) != 1 or not txn.startswith("{ " + TXN_START)):
+        fail("M1", "the named move's result line is not one WARN carrying the batch's copy submission, id remap and "
+                   "meta lookup times, each summed as its call returns, and the transaction's total from its start")
     if (not all(loan.count(t) == 1 and copy.count(t) == 1 for t in CACHE_TIMES) or prep.count(PREP_TIMED) != 1
             or "resolver(*e, target)" in prep.replace(PREP_TIMED, "")):
         fail("M1", "a cache body does not record its copy and handover times, or the preparation does not time its "
@@ -727,6 +731,10 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("named-line-debug", "M1", [("sycl", TXN_SIG, 'GGML_LOG_WARN(\n            "[MOE-EXEC] named move',
                                             'GGML_LOG_DEBUG(\n            "[MOE-EXEC] named move')])
     expect_fail("meta-lookup-unsummed", "M1", [("sycl", TXN_SIG, "meta_us += triplet.resolve_us;", "")])
+    start_line = "    " + TXN_START + "\n"
+    lock_line = "    std::unique_lock lock(g_tensor_inventory_mutex);\n"
+    expect_fail("total-from-the-lock", "M1", [("sycl", TXN_SIG, start_line, ""),
+                                             ("sycl", TXN_SIG, lock_line, lock_line + start_line)])
     expect_fail("loan-copy-untimed", "M1", [("cache", LOAN_SIG, "out.copy_us  = copy_took;", "")])
     expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int ",
                                          "ggml_sycl_txn_result ggml_sycl_expert_move_run(int ")])

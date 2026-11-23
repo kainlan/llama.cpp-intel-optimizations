@@ -22087,6 +22087,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     ggml_sycl_expert_loan_result *               out,
     bool                                         warn_busy,
     std::vector<ggml_sycl_expert_move_outcome> * named_moves = nullptr) {
+    // For the named move's result line: its total runs from here, so the time outside its timed parts shows.
+    const auto txn_start = std::chrono::steady_clock::now();
+
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
     const bool                   named  = direction == ggml_sycl_expert_txn_direction::NAMED;
     ggml_sycl_expert_loan_result result{};
@@ -22212,7 +22215,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     const char * stop      = nullptr;
     bool         transient = false;
     // The batch's host time, in microseconds, for the named move's result line: the members' metadata lookups in the
-    // preparation, and the cache's copy steps and id handovers (expert_move_record).
+    // preparation, and the cache's copy submissions and id handovers (expert_move_record).
     uint64_t     meta_us   = 0;
     uint64_t     copy_us   = 0;
     uint64_t     remap_us  = 0;
@@ -22577,12 +22580,14 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             }
         }
         // A WARN, since every tool drops INFO: the line is where a run shows what its moves cost the boundary thread,
-        // the copy steps' and the id handovers' time in the cache and the metadata lookups', summed over the batch.
+        // the copy steps' submission and the id handovers' time in the cache and the metadata lookups', summed over
+        // the batch, and the transaction's whole time from its start to this line, which shows what they leave out.
         GGML_LOG_WARN(
             "[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s); "
-            "copy wait %llu us, id remap %llu us, meta lookup %llu us\n",
+            "copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\n",
             device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason,
-            (unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us);
+            (unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us,
+            (unsigned long long) ggml_sycl::expert_move_us_since(txn_start));
     } else {
         if (stop) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, stop);
