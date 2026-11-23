@@ -2,9 +2,10 @@
 //
 // Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
 // there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
-// off the primary card (to the host or another card), which the route cannot reach; SKIP[no-backend] means no
-// backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
-// the no-GPU skip.
+// off the primary card (to the host or another card), which the route cannot reach; SKIP[no-backend] means the scoped
+// lifecycle fixture could not create a backend for a candidate owner device. Each skip line carries its tag so a log
+// grep can tell them apart from the no-GPU skip. The mixed fixture has no skip: past the device probe, a failure to
+// create its backend is a FAIL that names the step.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "async-failure.hpp"
 #include "ggml-alloc.h"
@@ -1228,11 +1229,11 @@ struct mixed_fixture {
             require(primary >= 0 && primary < ggml_backend_sycl_get_device_count(),
                     "mixed fixture: the candidate plan has no primary device the registry exposes");
             // Staging used temporary backends; the fixture's own backend is created after it, as in a real load.
+            // The device probe passed, so a null backend here is a failure, not a skip.
             backend = ggml_backend_sycl_init(primary);
-            if (backend == nullptr) {
-                throw test_skip("no-backend",
-                                "no backend for the mixed fixture's primary device " + std::to_string(primary));
-            }
+            require(backend != nullptr,
+                    "mixed fixture: ggml_backend_sycl_init returned null for the plan's primary device after the "
+                    "device probe passed");
             backend_device = primary;
             load_weights();
             const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
