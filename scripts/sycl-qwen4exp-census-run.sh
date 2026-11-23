@@ -154,7 +154,7 @@ esac
 # wait for GPU host backing below 30 GiB
 # before touching the device; give up after SETTLE_TIMEOUT_S and escalate.
 # Compared in kB against 30 GiB. MemAvailable is not a condition: it sits near
-# 55 GB on purpose while another tenant holds a model (ruling 2026-11-12), and the planner refuses a
+# 50 GiB on purpose while another tenant holds a model (ruling 2026-11-12), and the planner refuses a
 # load that exceeds the host budget by name.
 settled() {
     local bk; bk=$(sycl_gpu_host_backing_kb) || return 1
