@@ -1,0 +1,88 @@
+Task 8i, lead runs on 1f2dc2606 (the task tree's build; the merge 7c2e47857 has the same code), 2026-11-23.
+Driver: libze_intel_gpu.so.1.18.40734. One load per run, under GPU.lock, selector pinned.
+GATE lines print sha= of the gate script's tree; the binaries are the task tree's build/.
+Throughput under the permanent host load: orientation, not a baseline.
+
+=== 1 registry test b50
+  card the test ran on: B50 (wanted B50)
+--- step rc=0
+212: === 19 checks, 0 failures ===
+=== 2 binbcast trace b70
+  out: 1, 2, 3, 4, 5, 6, ||
+0.49.479.190 I common_perf_print: prompt eval time =     967.76 ms /    14 tokens (   69.13 ms per token,    14.47 tokens per second)
+0.49.479.191 I common_perf_print:        eval time =     746.04 ms /     3 runs   (  248.68 ms per token,     4.02 tokens per second)
+--- step rc=0
+=== 3 inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=86b40679c
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+0.49.131.839 I common_perf_print: prompt eval time =     967.81 ms /    14 tokens (   69.13 ms per token,    14.47 tokens per second)
+0.49.131.840 I common_perf_print:        eval time =    1718.35 ms /    14 runs   (  122.74 ms per token,     8.15 tokens per second)
+--- step rc=0
+=== 4 inkling diag b70
+  out: 1, 2, 3, 4, 5, 6||
+0.49.963.208 I common_perf_print: prompt eval time =     938.16 ms /    14 tokens (   67.01 ms per token,    14.92 tokens per second)
+0.49.963.209 I common_perf_print:        eval time =     420.40 ms /     1 runs   (  420.40 ms per token,     2.38 tokens per second)
+--- step rc=0
+=== 5 planlines
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kept 179 plan lines of 3360
+  kept 198 plan lines of 4285
+--- step rc=0
+=== 6 inkling gate both
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=86b40679c
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+0.48.175.369 I common_perf_print: prompt eval time =     887.96 ms /    14 tokens (   63.43 ms per token,    15.77 tokens per second)
+0.48.175.370 I common_perf_print:        eval time =    1716.76 ms /    14 runs   (  122.63 ms per token,     8.15 tokens per second)
+--- step rc=0
+=== 7 inkling ABBA b70
+== arm a  2026-11-23T00:25:06-05:00  shmem=11GB  load=14.59
+  arm env: none  builders: ninja=1 icpx=2
+  arm end: load=10.56 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT a pp512 avg=43.16 t/s stddev=0.00 samples=[43.16]
+  RESULT a tg128 avg=4.23 t/s stddev=0.00 samples=[4.23]
+== arm i  2026-11-23T00:26:57-05:00  shmem=11GB  load=9.87
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=7.44 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT i pp512 avg=43.27 t/s stddev=0.00 samples=[43.27]
+  RESULT i tg128 avg=11.26 t/s stddev=0.00 samples=[11.26]
+== arm i2  2026-11-23T00:28:29-05:00  shmem=11GB  load=7.01
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=23.90 builders: ninja=1 icpx=5  (a builder at either end makes this arm's tg a lower bound)
+  RESULT i2 pp512 avg=30.55 t/s stddev=0.00 samples=[30.55]
+  RESULT i2 tg128 avg=6.99 t/s stddev=0.00 samples=[6.99]
+== arm a2  2026-11-23T00:30:26-05:00  shmem=11GB  load=21.37
+  arm env: none  builders: ninja=1 icpx=4
+  arm end: load=10.47 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT a2 pp512 avg=43.02 t/s stddev=0.00 samples=[43.02]
+  RESULT a2 tg128 avg=4.21 t/s stddev=0.00 samples=[4.21]
+--- step rc=0
+=== 8I GATES END 2026-11-23T00:32:19-05:00
+
+== Trace run (step 2), B70, GGML_SYCL_BINBCAST_TRACE=1, 4 tokens
+  [BINBCAST] stage lines naming .scale: 0   (before: t8i-binbcast-stage-census-baf7cf05a.txt)
+  planned-mode runtime materialization rejected: 0   (baseline: 64, the cap)
+  [SYCL-SEG-SLOT] recording failed at op=REPEAT: 0
+  stage lines that remain, by tensor:
+      128 [BINBCAST] stage tensor=ffn_moe_weighted-N (view) bytes=B device=0 src=PTR dst=PTR
+       16 [BINBCAST] stage tensor=ffn_moe_down-N bytes=B device=0 src=PTR dst=PTR
+  (outputs of the BF16 expert nodes that still run on the CPU in this tree; Task 8g moves them to the card)
+
+== Plan lines (step 4, GGML_SCHED_DEBUG run)
+  [PLACEMENT-MOE] expected=6144 planned=6144 unclassified=0 duplicates=0 missing=0
+  [PLACEMENT-MOE] roles: gate=0 up=0 down=3072 gate_up=3072 unknown=0
+  [PLACEMENT-MOE] target device0: 6144 expert tensors
+  [PLACEMENT] NORM/EMBED      device= 87 (883.8 MB)  host=  0 (0.0 MB)
+  baseline baf7cf05a: duplicates=40, roles down=3092 gate_up=3092, target device0: 6184 expert tensors, NORM/EMBED device= 47
+  i: graphs printed 40; largest graph: 9 splits, 4 CPU splits, 44 nodes in CPU splits
+        4 x CPU split of 2 MUL, 2 MUL_MAT_ID, 4 SCALE, 1 SIGMOID, 2 TANH
+      ops in CPU splits: MUL 8, MUL_MAT_ID 8, SCALE 16, SIGMOID 4, TANH 8
+  Mistral (B70) and GPT-OSS (B50) plan lines: no line differs from integ-plan-baf7cf05a beyond free-memory and timing figures.
+
+== What changed in the decoded token (bench arms a = integration tree, i = this task; llama-bench -v)
+  a: recorded split: 46 segment graphs + 133 direct boundaries + 88 direct segments (2531/11469 nodes in graphs, 403 retained handles); REPEAT recording failures 176
+  i: recorded split: 134 segment graphs + 133 direct boundaries + 0 direct segments (11336/11469 nodes in graphs, 1547 retained handles); REPEAT recording failures 0
+
+Reading: with the scale tensors on the card their REPEAT nodes record, so the segment graphs of the main decode
+split cover 11336 of 11469 nodes instead of 2531. tg128 reads 11.26 t/s in the arm with no builder alive at either
+end (a: 4.23, a2: 4.21); the arm a builder joined reads 6.99 and is a lower bound. pp512 is unchanged (43.3 against
+43.2 and 43.0). The gate's 14 decoded tokens read 122.7 ms per token against 254.7.

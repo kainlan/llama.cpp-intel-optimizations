@@ -912,6 +912,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-weight-alias-source.py)
     set_tests_properties(test-sycl-host-weight-alias-source PROPERTIES
         LABELS "sycl;registry;source;source-contract;hostonly;python" TIMEOUT 30)
+    # An expert family's per-expert scale (".scale", ".input_scale") is MOE_INTERMEDIATE to the name rule and to
+    # the weight-usage registry through one predicate, so the planner's dense entry and the S1 preload agree and a
+    # card layer's scale is staged to the card (Inkling 2 Task 8i). Run WITH --self-test so each pin is proven to
+    # catch its mutant.
+    add_test(NAME test-sycl-moe-expert-scale-usage-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-scale-usage-source.py --self-test)
+    set_tests_properties(test-sycl-moe-expert-scale-usage-source PROPERTIES
+        LABELS "sycl;moe;registry;source;source-contract;hostonly;python" TIMEOUT 30)
     # llama.cpp-qeld: this gate sat unregistered, so nothing noticed when the h9uv
     # weight_ext split (ed8ef61b3) moved the fields it pins. Text-only, no device.
     add_test(NAME test-sycl-moe-ptr-table-retention-source

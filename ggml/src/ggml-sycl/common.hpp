@@ -2202,15 +2202,26 @@ inline bool ggml_sycl_is_canonical_tied_embedding_name(const char * name) {
     return name != nullptr && std::strcmp(name, "token_embd.weight") == 0;
 }
 
+// An expert family's per-expert scale: "<family>.scale", ".scales" or ".input_scale", {n_expert} (or {1}) F32
+// metadata beside an NVFP4 or FP8 expert matrix, or a view of one ("... .scale (reshaped)" is the name the REPEAT in
+// build_lora_mm_id reads). It is a small dense tensor, not an expert matrix. The name rule (infer_tensor_usage) and
+// the weight-usage registry (ggml_backend_sycl_try_register_weight_usage) both ask this one predicate: the planner
+// reads the first and gives the scale a dense entry with its layer, the S1 preload reads the second and stages that
+// dense entry, so the two must agree. Meaningful only for a name already in an expert family.
+inline bool ggml_sycl_moe_expert_scale_name(const char * name) {
+    return name != nullptr && (strstr(name, "exps.scale") != nullptr || strstr(name, "exps.input_scale") != nullptr);
+}
+
 inline tensor_usage infer_tensor_usage(const char * name) {
     if (!name) {
         return tensor_usage::UNKNOWN;
     }
 
-    // MoE expert weights (highest priority - check first).  Bias tensors share
-    // the same ffn_*_exps prefix but are separate small tensors; treating them
-    // as per-expert weights duplicates the planner's semantic
-    // (layer, expert, role) entries.
+    // MoE expert weights (highest priority - check first).  Bias and scale
+    // tensors (ggml_sycl_moe_expert_scale_name) share the same ffn_*_exps
+    // prefix but are separate small tensors; treating them as per-expert
+    // weights duplicates the planner's semantic (layer, expert, role) entries
+    // and leaves them without the dense entry that stages them with their layer.
     // "ffn_gate_up_exps" is the FUSED gate+up expert tensor and contains
     // neither "ffn_gate_exps" nor "ffn_up_exps", so it needs its own literal.
     // Omitting it made the planner treat the whole fused tensor as ONE dense
@@ -2236,7 +2247,7 @@ inline tensor_usage infer_tensor_usage(const char * name) {
                                strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps") ||
                                strstr(name, "ffn_gate_chexps") || strstr(name, "ffn_up_chexps") ||
                                strstr(name, "ffn_down_chexps");
-    if (moe_exps_name && !strstr(name, ".bias")) {
+    if (moe_exps_name && !strstr(name, ".bias") && !ggml_sycl_moe_expert_scale_name(name)) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
     }
     if (moe_exps_name) {

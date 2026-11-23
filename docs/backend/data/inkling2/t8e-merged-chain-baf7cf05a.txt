@@ -1,0 +1,206 @@
+=== 1 dev tests b70
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  binaries newer than their sources: yes
+lock wait: 0s
+== sycl-q1-nvfp4-admitted-device on b70  2026-11-22T22:29:26-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 56  context-bind: 0  abort lines: 0
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: [SYCL-ASYNC-FAILURE] device 0: graph_compute: an asynchronous SYCL error was delivered after this context was created (device errors=2, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: Q1/NVFP4 scoped production-route lifecycle: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+== sycl-q1-nvfp4-adapter-device on b70  2026-11-22T22:29:36-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 0  context-bind: 0  abort lines: 0
+332: Q1/NVFP4 lifecycle-aware admitted device adapter: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:29:46-05:00
+lock released
+--- step rc=0
+=== 2 inkling gate b70
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+gate script: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt/scripts/sycl-canonical-gates.sh at baf7cf05a
+== inkling gate, level_zero:0  2026-11-22T22:29:48-05:00  shmem=11GB
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0 sha=baf7cf05a
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.52.015.828 I common_perf_print:        load time =   46735.31 ms
+0.52.015.828 I common_perf_print: prompt eval time =     922.91 ms /    14 tokens (   65.92 ms per token,    15.17 tokens per second)
+0.52.015.829 I common_perf_print:        eval time =    3502.62 ms /    14 runs   (  250.19 ms per token,     4.00 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:30:59-05:00
+lock released
+--- step rc=0
+=== 3 planlines
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+  libggml-sycl newer than ggml/src/ggml-sycl/ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml/src/ggml-sycl/unified-cache.cpp: yes
+lock wait: 0s
+== mistral B70 -v  2026-11-22T22:31:02-05:00 shmem=11GB
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kept 179 plan lines of 3360
+  shmem=11GB
+  kernel fault lines since start: 0
+== gptoss B50 -v, no -c  2026-11-22T22:31:43-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  answer lines: 1  device_lost: 0
+  kept 198 plan lines of 4285
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:32:22-05:00
+lock released
+--- step rc=0
+=== 4 dev tests b50
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  binaries newer than their sources: yes
+lock wait: 0s
+== sycl-q1-nvfp4-admitted-device on b50  2026-11-22T22:32:24-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 56  context-bind: 0  abort lines: 0
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+343: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: [SYCL-ASYNC-FAILURE] device 0: graph_compute: an asynchronous SYCL error was delivered after this context was created (device errors=2, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+343: Q1/NVFP4 scoped production-route lifecycle: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:32:34-05:00
+lock released
+--- step rc=0
+=== 5 inkling gate both
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+gate script: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt/scripts/sycl-canonical-gates.sh at baf7cf05a
+== inkling gate, level_zero:0,1  2026-11-22T22:32:37-05:00  shmem=11GB
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=baf7cf05a
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 1
+0.52.611.830 I common_perf_print:        load time =   47193.51 ms
+0.52.611.831 I common_perf_print: prompt eval time =     898.60 ms /    14 tokens (   64.19 ms per token,    15.58 tokens per second)
+0.52.611.831 I common_perf_print:        eval time =    3626.85 ms /    14 runs   (  259.06 ms per token,     3.86 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:33:48-05:00
+lock released
+--- step rc=0
+=== 6 inkling diag b70
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+== inkling DIAGNOSTIC (-v, -n 2, GGML_SCHED_DEBUG=2), level_zero:0  2026-11-22T22:33:51-05:00  shmem=11GB
+  rc=0  err lines: 335272  SPLIT headers: 360
+  out: 1, 2, 3, 4, 5, 6||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.50.148.016 I common_perf_print:        load time =   47360.64 ms
+0.50.148.017 I common_perf_print: prompt eval time =     904.60 ms /    14 tokens (   64.61 ms per token,    15.48 tokens per second)
+0.50.148.017 I common_perf_print:        eval time =     434.23 ms /     1 runs   (  434.23 ms per token,     2.30 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:34:54-05:00
+lock released
+--- step rc=0
+=== 7 inkling bench b70
+host: load average: 9.80, 8.50, 8.87  ninja=0 icpx=0
+driver: libze_intel_gpu.so.1.18.40734
+arm m: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 lib-newer-than-source=yes
+lock wait: 0s
+== arm m  2026-11-22T22:34:57-05:00  shmem=11GB  load=9.80
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0  err lines: 14773  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT m pp512 avg=38.15 t/s stddev=0.00 samples=[38.15]
+  RESULT m tg128 avg=3.91 t/s stddev=0.00 samples=[3.91]
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T22:36:52-05:00
+lock released
+--- step rc=0
+=== 8 tbo MUL_MAT_ID
+tree: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt head=baf7cf05a tracked-changes=0 lib-newer-than-source=yes
+host: load average: 13.79, 10.08, 9.38  ninja=0
+== level_zero:0 -o MUL_MAT_ID  2026-11-22T22:36:55-05:00  shmem=11GB
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=1  out lines: 1890  op lines: 1864  OK: 1227  FAIL: 150  not supported: 353
+Backend 1/2: SYCL0
+  1227/1375 tests passed
+  Backend SYCL0: FAIL
+Backend 2/2: CPU
+1/2 backends passed
+  MUL_MAT_ID(type_a=iq4_xs,type_b=f32,n_mats=16,n_used=4,b=1,m=72,n=13,k=2048,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=iq4_xs,type_b=f32,n_mats=4,n_used=2,b=0,m=202,n=24,k=512,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=q4_K,type_b=f32,n_mats=16,n_used=4,b=1,m=72,n=13,k=2048,m_v=80,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=1,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=15,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=16,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=17,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=31,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=32,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=33,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=47,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=48,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+== level_zero:1 -o MUL_MAT_ID  2026-11-22T22:37:47-05:00  shmem=11GB
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=1  out lines: 1891  op lines: 1865  OK: 1226  FAIL: 151  not supported: 353
+Backend 1/2: SYCL0
+  1226/1375 tests passed
+  Backend SYCL0: FAIL
+Backend 2/2: CPU
+1/2 backends passed
+  MUL_MAT_ID(type_a=iq4_xs,type_b=f32,n_mats=16,n_used=4,b=1,m=72,n=13,k=2048,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=iq4_xs,type_b=f32,n_mats=4,n_used=2,b=0,m=202,n=24,k=512,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=q4_K,type_b=f32,n_mats=16,n_used=4,b=1,m=72,n=13,k=2048,m_v=80,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=1,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=15,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=16,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=17,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=31,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=32,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=33,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=47,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  MUL_MAT_ID(type_a=f16,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=48,k=256,m_v=0,ids_offset=0,skip=0): not supported [SYCL0] 
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=1 2026-11-22T22:38:42-05:00
+lock released
+--- step rc=1
+=== CHAIN END 2026-11-22T22:38:42-05:00

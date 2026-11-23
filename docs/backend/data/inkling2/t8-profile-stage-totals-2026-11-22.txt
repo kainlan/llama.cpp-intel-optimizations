@@ -1,0 +1,21 @@
+# Host time by stage, GGML_SYCL_E2E_TG_PROFILE=1, B70, -n 24 (23 decoded tokens), one run per tree, 2026-11-22
+# t8b = tree 0f4060d0f (before Task 8e); merged = baf7cf05a (Tasks 8b, 8e, 8f, 8h)
+t8b: profile blocks=774 ops=143858 sum_wall=6915 ms sum_host=4963 ms
+    other            calls=  83335 host=   2136.6 ms  (26 us/call)
+    moe              calls=   2200 host=   1135.7 ms  (516 us/call)
+    elementwise      calls=  39583 host=    939.5 ms  (24 us/call)
+    non_moe_matmul   calls=  15866 host=    597.9 ms  (38 us/call)
+    attention        calls=   1800 host=    133.3 ms  (74 us/call)
+    kv               calls=   1074 host=     19.8 ms  (18 us/call)
+merged: profile blocks=129 ops=163802 sum_wall=2527 ms sum_host=5929 ms
+    other            calls=  95397 host=   2622.5 ms  (27 us/call)
+    moe              calls=   2200 host=   1188.4 ms  (540 us/call)
+    elementwise      calls=  42188 host=   1135.9 ms  (27 us/call)
+    non_moe_matmul   calls=  18059 host=    781.0 ms  (43 us/call)
+    attention        calls=   3600 host=    153.2 ms  (43 us/call)
+    kv               calls=   2358 host=     48.0 ms  (20 us/call)
+# eval time: t8b 5851.40 ms /    23 runs   (  254.41 ms per token,     3.93 tokens per second)
+# eval time: merged 6017.55 ms /    23 runs   (  261.63 ms per token,     3.82 tokens per second)
+# segment recording lines, merged tree:
+     88 [SYCL-SEG-SLOT] segment [A-B) recording failed at node N op=REPEAT name=node_N: bin-broadcast raw host staging is not graph-recordable; running it directly
+      1 [SYCL-SEG] Segmented recording failed, falling back to per-op dispatch
