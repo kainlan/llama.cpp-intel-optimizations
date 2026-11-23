@@ -88688,6 +88688,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     if (activation && src1_device_base && dst_device_base &&
                         slices.activation_f32.bytes == activation_bytes && slices.output_f32.bytes == output_bytes &&
                         completion->bundle.mark_possible_submit()) {
+                        // Set as the terminal task's submit returns: from then on that task owns the host leg's
+                        // release (its body resets the leg on the host-task thread), so the catch leaves the leg alone.
+                        bool terminal_submitted = false;
                         try {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK)) {
@@ -88831,6 +88834,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     completion->bundle = ggml_sycl::moe_admitted_workspace_bundle{};
                                 });
                             });
+                            terminal_submitted = true;
                             // Recorded on the submitting thread, right after the submit returns. A CPU expert job's
                             // join on the join-only queue waits only for the latest RECORDED host task of this
                             // stream; an unrecorded one could be posted behind a join that holds the runtime's one
@@ -88867,7 +88871,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 // this same stream, the cache's queue, which the arm requires), and the job stops
                                 // before its next task, so what is left is the task in hand. A join that was submitted
                                 // already ran in the drain, and no copy is left to read the buffers.
-                            } else if (completion->host_leg) {
+                            } else if (!terminal_submitted && completion->host_leg) {
                                 // Quiescence is unproven: a queued copy may still read or write the leg's buffers, and
                                 // the job may still wait for its marker, which may never be written. The graph has
                                 // failed and nothing reads the leg's rows, so its job is let go here: it stops waiting
