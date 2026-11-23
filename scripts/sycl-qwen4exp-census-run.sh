@@ -61,7 +61,7 @@ MISTRAL_MODEL="${MISTRAL_MODEL:-/models/mistral-7b-v0.1.Q4_0.gguf}"
 if [ -n "${WATCHDOG_SHMEM_GB+set}" ]; then
     echo "WATCHDOG_SHMEM_GB is no longer read: use WATCHDOG_HOST_BACKING_GIB (a whole number of GiB)" >&2; exit 3
 fi
-ABORT_GIB="${WATCHDOG_HOST_BACKING_GIB:-100}"
+ABORT_GIB="${WATCHDOG_HOST_BACKING_GIB-100}"
 case "$ABORT_GIB" in
     ''|*[!0-9]*) echo "WATCHDOG_HOST_BACKING_GIB must be a whole number of GiB (got '$ABORT_GIB')" >&2; exit 3;;
 esac
