@@ -152,7 +152,7 @@ expect_rc "controls rc" "$rc" 0
 expect "controls print ok" "$out" "controls: ok"
 # Each window-ring control must fail when its regex stops discriminating: mutate one regex in a copy of the gate.
 mutate_control() { # <name> <sed expression> [what the mutation breaks]
-    mkdir -p "$WORK/mut/scripts"
+    mkdir -p "$WORK/mut/scripts"; cp -a "$ROOT_DIR/scripts/sycl-host-backing.sh" "$WORK/mut/scripts/"
     sed -E "$2" "$GATE" > "$WORK/mut/scripts/gate.sh"
     cmp -s "$GATE" "$WORK/mut/scripts/gate.sh" && { fail "control mutation $1 changed nothing"; return; }
     out="$(bash "$WORK/mut/scripts/gate.sh" --check-controls 2>&1)"; rc=$?
@@ -1152,12 +1152,20 @@ expect "--src-dir names the tree the head check reads" "$out" "resets=PASS"
 out="$(rf "$WORK/srcrepo/build" --no-head-check --out-dir "$WORK/rf-nohead" 0000000)"; rc=$?
 expect_rc "--no-head-check is the explicit escape: the wrong head passes" "$rc" 0
 mkdir -p "$WORK/snap/scripts"
-cp -a "$ROOT_DIR/scripts/sycl-moe-exec-gate.sh" "$ROOT_DIR/scripts/sycl-moe-exec-prompts" \
+cp -a "$ROOT_DIR/scripts/sycl-moe-exec-gate.sh" "$ROOT_DIR/scripts/sycl-host-backing.sh" "$ROOT_DIR/scripts/sycl-moe-exec-prompts" \
     "$ROOT_DIR/scripts/qwen4exp-mtp-prompts" "$WORK/snap/scripts/"
 SNAP="$WORK/snap/scripts/sycl-moe-exec-gate.sh"
 out="$(GATE_UNDER="$SNAP" rf "$WORK/srcrepo/build" --out-dir "$WORK/rf-snap" "$SRC_SHA")"; rc=$?
 expect "the lead form: a snapshot copy of the script runs against another tree's build" "$out" "resets=PASS"
 expect_rc "the snapshot run rc" "$rc" 0
+# A snapshot copy without the host-backing library refuses by naming the file, not as "host not settled".
+mkdir -p "$WORK/snap-nolib/scripts"
+cp -a "$ROOT_DIR/scripts/sycl-moe-exec-gate.sh" "$ROOT_DIR/scripts/sycl-moe-exec-prompts" \
+    "$ROOT_DIR/scripts/qwen4exp-mtp-prompts" "$WORK/snap-nolib/scripts/"
+out="$(bash "$WORK/snap-nolib/scripts/sycl-moe-exec-gate.sh" --dry-run 2>&1)"; rc=$?
+expect "a snapshot without the library names the missing file" "$out" "sycl-host-backing.sh is missing"
+expect "the missing-library refusal ends with the final line" "$out" "verdicts_pass=0 GATE_DONE"
+expect_rc "the missing-library refusal rc" "$rc" 2
 out="$(bash "$SNAP" --dry-run 2>&1)"
 expect "snapshot prompts resolve next to the script (code-2k)" "$out" \
     "-f $WORK/snap/scripts/sycl-moe-exec-prompts/code-2k.txt"

@@ -126,7 +126,8 @@ mk_tree_at() { # $1=dir $2=throttle $3=act_freq
     echo "$3" > "$d/act_freq"
 }
 mk_tree() { mk_tree_at "$T/sys/class/drm/card9" "$1" "$2"; }
-mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/meminfo"; }
+# $1 = Shmem kB, $2 = meminfo remainder kB (default 0): MemTotal = MemFree + remainder.
+mk_meminfo() { printf 'MemTotal: %s kB\nMemFree: 256000000 kB\nMemAvailable: 190000000 kB\nShmem: %s kB\n' "$((256000000 + ${2:-0}))" "$1" > "$T/meminfo"; }
 mk_tree 0 0
 mk_meminfo 3000000
 

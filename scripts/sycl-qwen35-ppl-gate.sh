@@ -250,21 +250,30 @@ if [ "$(ldd "$PPL_BIN" 2>/dev/null | grep -cE 'libggml-sycl|libsycl')" -lt 2 ]; 
     skip "$PPL_BIN does not link the SYCL backend (source oneAPI setvars.sh first)"
 fi
 
-mem() { grep -E '^(MemAvailable|Shmem):' /proc/meminfo | tr '\n' ' '; }
+[ -r "$ROOT_DIR/scripts/sycl-host-backing.sh" ] || die "$ROOT_DIR/scripts/sycl-host-backing.sh is missing"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/sycl-host-backing.sh"
+mem() { sycl_gpu_host_backing_log_line; }
 
-# GPU.lock serialises access, not memory recovery: TTM shmem is released after the lock is, so wait for
-# the host to settle before each model load and fail closed if it never does.
+# GPU.lock serialises access, not memory recovery: GPU host backing (Shmem + the meminfo remainder) is released
+# after the lock is, so wait for the host to settle before each model load and fail closed if it never does.
+# An unreadable meminfo is not settled. MemAvailable is not a condition (ruling 2026-11-12): it sits near 55 GB on
+# purpose while another tenant holds a model, and the planner refuses an oversized load by name.
 settle() {
-    local s a
+    local st line="unreadable"
     for _ in $(seq 60); do
-        s="$(awk '/^Shmem:/{print $2}' /proc/meminfo)"
-        a="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
-        if [ "$s" -lt 31457280 ] && [ "$a" -gt 157286400 ]; then
-            return 0
+        # One read decides, and the refusal prints that read.
+        if st="$(sycl_gpu_host_state_kb)"; then
+            line="$(sycl_gpu_host_format_state "$st")"
+            if [ "$(sycl_gpu_host_state_backing_kb "$st")" -lt 31457280 ]; then
+                return 0
+            fi
+        else
+            line="unreadable"
         fi
         sleep 10
     done
-    die "host never settled (Shmem < 30 GB and MemAvailable > 150 GB): $(mem)"
+    die "host never settled (GPU host backing < 30 GiB): $line"
 }
 
 if [ "$TAKE_LOCK" = 1 ]; then

@@ -12,6 +12,8 @@ ggml-common.h
 !sycl-alloc-policy-fixtures/**
 !sycl-handle-policy-fixtures
 !sycl-handle-policy-fixtures/**
+!sycl-meminfo-fixtures
+!sycl-meminfo-fixtures/**
 !e1-rca
 !data
 !data/planner-canaries

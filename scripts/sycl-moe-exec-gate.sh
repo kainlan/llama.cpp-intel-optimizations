@@ -114,13 +114,13 @@
 #
 # Preflights refuse (rc 2): no <sha> or a head that differs from it; GGML_SYCL not ON; a binary missing, older than
 # the head commit, or not linked to the SYCL runtime; a model file missing; a failed grep control; builders
-# (ninja + icpx) that do not clear within 15 minutes; Shmem >= 30 GB or MemAvailable <= 150 GB; GPU.lock already held;
+# (ninja + icpx) that do not clear within 15 minutes; GPU host backing (Shmem + the meminfo remainder) >= 30 GiB; GPU.lock already held;
 # a GGML_SYCL_* or LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a
 # non-empty --out-dir unless --arm names the arms to redo or --clobber is given (a reused directory would score one
-# run's files as another's). Before each arm the host must settle (Shmem < 30 GB and MemAvailable > 150 GB, up to
+# run's files as another's). Before each arm the host must settle (GPU host backing < 30 GiB, up to
 # 10 minutes) and
 # the builders must reach 0 (the gate waits for them like settle, up to 15 minutes, 10 s polls); only an expired wait
-# stops the gate. Shmem, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
+# stops the gate. Shmem, host backing, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
 # every 5 s during it; every verdict line carries builders_pre= and builders_post= (the highest count seen during or
 # after the arm). A PASS with builders_post > 0 becomes NOT_SCORED(tainted=builders,was=PASS), exit class 3: a build
 # running next to the arm depresses throughput and flips CPU-path timing. A FAIL stays a FAIL and carries the flag.
@@ -139,7 +139,7 @@
 # is released; --help and --dry-run keep the plain form.
 #
 # The lead form: the script runs from a snapshot copy, against a build whose source tree is the merge tree:
-#   cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snap>/scripts/
+#   cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-host-backing.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snap>/scripts/
 #   bash <snap>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>
 # The prompts resolve next to the script (the snapshot); the head check, the binary-newer-than-head check and the
 # prompt source docs come from --src-dir, which defaults to the parent of --build-dir. --no-head-check stays as an
@@ -1251,8 +1251,19 @@ lock_release() {
 
 # ---------------------------------------------------------------- host state
 
-kb() { awk -v k="$1" '$1 == k ":" { print $2 }' /proc/meminfo; }
-mem_line() { echo "Shmem=$(kb Shmem) kB MemAvailable=$(kb MemAvailable) kB"; }
+# GPU host backing (Shmem + the meminfo remainder) is the settle and ceiling figure: a discrete card's host-USM memory
+# is in no meminfo field, so Shmem alone reads flat for it. The library is read from the script's own directory, so a
+# snapshot copy must carry it, and a copy without it refuses by name. An unreadable meminfo returns 1 and counts as
+# not settled. The gate does not also check that the load fits: the planner refuses a load that exceeds the host
+# budget by name, and a second check here would be a second source for that fact.
+if [ ! -r "$SCRIPT_DIR/sycl-host-backing.sh" ]; then
+    say "REFUSED: $SCRIPT_DIR/sycl-host-backing.sh is missing (a snapshot copy of this script must carry it)"
+    say "verdicts_pass=0 GATE_DONE"
+    exit 2
+fi
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/sycl-host-backing.sh"
+mem_line() { sycl_gpu_host_backing_log_line; } # one read for all three figures
 builders() {
     local n i c
     if [ -n "$BUILDERS_FILE" ]; then # test hook: a file holding the count
@@ -1265,10 +1276,12 @@ builders() {
     echo "$c"
 }
 host_settled() {
-    local s a
-    s="$(kb Shmem)"
-    a="$(kb MemAvailable)"
-    [ "${s:-999999999}" -lt 31457280 ] && [ "${a:-0}" -gt 157286400 ]
+    local st
+    # One read decides, and SETTLE_LINE is that read, so a refusal prints the figure it decided on.
+    SETTLE_LINE="Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB"
+    st="$(sycl_gpu_host_state_kb)" || return 1
+    SETTLE_LINE="$(sycl_gpu_host_format_state "$st")"
+    [ "$(sycl_gpu_host_state_backing_kb "$st")" -lt 31457280 ]
 }
 
 # refuse <why>: before the first arm it prints REFUSED and the final line. Once arms have run, a refusal must not drop
@@ -1307,7 +1320,7 @@ settle() { # waits up to 10 minutes; GPU.lock serialises access, not memory reco
         host_settled && return 0
         sleep 10
     done
-    refuse "host never settled (Shmem < 30 GB and MemAvailable > 150 GB): $(mem_line)"
+    refuse "host never settled (GPU host backing < 30 GiB): $SETTLE_LINE"
 }
 
 # sample_builders_during <pid> <file>: the highest builder count seen every 5 s while <pid> runs.
@@ -1467,8 +1480,7 @@ if [ "$DRY_RUN" = 1 ]; then
     say "dry-run: nothing is executed, no lock is taken, no device is touched"
     say "build-dir: $BUILD_DIR   src-dir: $SRC_DIR   lock: $LOCK_DIR (take=$TAKE_LOCK)"
     say "preflights: <sha> == head of src-dir, GGML_SYCL ON, binaries newer than head and linked to SYCL, models," \
-        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), Shmem < 30 GB," \
-        "MemAvailable > 150 GB," \
+        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), GPU host backing < 30 GiB," \
         "an empty or --arm/--clobber out-dir"
     for arm in "${ARMS[@]}"; do
         print_arm_plan "$arm"
@@ -1571,7 +1583,7 @@ for arm in "${ARMS[@]}"; do
     [ "$A_KIND" = journal ] || device_arms=1
 done
 [ "$device_arms" = 0 ] || wait_builders start
-[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $(mem_line)"
+[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $SETTLE_LINE"
 if [ "$TAKE_LOCK" = 1 ]; then
     lock_take || refuse "could not take $LOCK_DIR (held: $(cat "$LOCK_DIR/holder" 2>/dev/null || echo unknown))"
 fi
