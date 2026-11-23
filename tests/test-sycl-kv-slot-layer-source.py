@@ -214,7 +214,21 @@ SLOTS_SET = "plan.kv_device[slot] = slot_has_kv ? kv_target : -1;"
 SLOTS_CALL = "plan_layer_kv_slots(plan, kv_info, layer_id, "
 LAYER_KV_SIG = "static void plan_single_device_layer_kv(placement_plan & plan,"
 SLOT_ORDER = "slot_layers.emplace_back(static_cast<int>(slot), kv_info.layer_phys[slot]);"
+SLOT_WALK = "for (const auto & [slot, layer_id] : slot_layers) {"
+SLOT_COST = "kv_info.kv_bytes_for_layer(static_cast<uint32_t>(slot)) : 0;"
+SLOT_DECIDE = "plan.kv_device[slot] = kv_on_device ? device_id : -1;"
 PHYS_CHARGE = "kv_info.kv_bytes_for_phys_layer(layer_id)"
+SINGLE_PLAN_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
+NO_P2P_SIG = "static void populate_no_p2p_candidate_layer_blocks(placement_plan & plan,"
+MULTI_PLAN_SIG = ("placement_plan compute_multi_device_plan(const std::vector<device_budget> & device_budgets, "
+                  "const std::vector<placement_tensor_info> & tensor_inventory,")
+# (function, its fewest PHYS_CHARGE sites, its fewest SLOTS_CALL sites). A minimum, not a total: a new site does not
+# turn the claim red, a lost one does, and a site put back on the layer's own slot is LAYER_KEYED.
+PLANNER_SITES = (
+    (SINGLE_PLAN_SIG, 2, 1),  # the dense pass and the expert pass's KV charge; the dense pass places the slots
+    (NO_P2P_SIG, 2, 0),       # the block budget and the block's KV bytes
+    (MULTI_PLAN_SIG, 3, 2),   # the all-layers charge, the cohesive and dense passes; both passes place the slots
+)
 BLOCK_CHARGE = "block.kv_bytes += plan.kv_size_for_phys_layer(layer);"
 PHYS_SUM_SIG = "size_t kv_bytes_for_phys_layer(int layer_id) const"
 PHYS_SUM = ("for (const int slot : kv_slots_of_layers(layer_phys, layer_id, layer_id)) { "
@@ -232,15 +246,19 @@ LAYER_KEYED = (
 
 def claim_planner_keys_kv_by_slot(cache: str, cache_hpp: str, sycl: str) -> bool:
     """Both planners mirror the map; no KV decision or charge is keyed by a weight layer id; each layer's slots go where
-    the layer goes (three dense passes) and are charged with it (every charge site); the KV phase walks the slots in
-    slot order; a block counts and owns every slot its layers execute; the candidate diagnostic moves them all."""
+    the layer goes (three dense passes) and are charged with it (every charge site); the KV phase builds the slots in
+    slot order and decides each by walking them, charging the slot's own bytes; a block counts and owns every slot its
+    layers execute; the candidate diagnostic moves them all."""
     c = norm(cache)
     h = norm(cache_hpp)
     slots = body(c, SLOTS_SIG)
+    sites = [body(c, sig) for sig, _, _ in PLANNER_SITES]
     return (c.count(PLAN_MIRROR) == 2 and not any(k in c for k in LAYER_KEYED)
-            and bool(slots) and ordered(slots, SLOTS_LOOP, SLOTS_SET) and c.count(SLOTS_CALL) == 3
-            and SLOT_ORDER in body(c, LAYER_KV_SIG)
-            and c.count(PHYS_CHARGE) == 7 and BLOCK_CHARGE in c
+            and bool(slots) and ordered(slots, SLOTS_LOOP, SLOTS_SET)
+            and ordered(body(c, LAYER_KV_SIG), SLOT_ORDER, SLOT_WALK, SLOT_COST, SLOT_DECIDE)
+            and all(site.count(PHYS_CHARGE) >= phys and site.count(SLOTS_CALL) >= calls
+                    for site, (_, phys, calls) in zip(sites, PLANNER_SITES))
+            and BLOCK_CHARGE in c
             and PHYS_SUM in body(h, PHYS_SUM_SIG) and RANGE_LOOP in body(h, RANGE_SIG)
             and CANDIDATE_LOOP in norm(sycl))
 
@@ -388,8 +406,31 @@ def test_mutant_hook_answers_for_a_physical_layer_fails():
 
 def test_mutant_kv_phase_keyed_by_layer_fails():
     """Restores the defect in the KV phase: the slot written is the layer, so slots 24..47 get no device."""
-    mutant = _once(CACHE, "plan.kv_device[slot] = kv_on_device ? device_id : -1;",
-                   "plan.kv_device[layer_id] = kv_on_device ? device_id : -1;")
+    mutant = _once(CACHE, SLOT_DECIDE, "plan.kv_device[layer_id] = kv_on_device ? device_id : -1;")
+    assert not claim_planner_keys_kv_by_slot(mutant, CACHE_HPP, SYCL)
+
+
+def test_mutant_kv_phase_walks_layers_fails():
+    """The slot list is built, but the KV phase walks the layers: slots 24..47 are never decided and stay host."""
+    mutant = _once(CACHE, SLOT_WALK, "for (const auto & [layer_id, has_attn] : layer_has_attention) { "
+                   "const int slot = layer_id;")
+    assert SLOT_ORDER in body(mutant, LAYER_KV_SIG)
+    assert not claim_planner_keys_kv_by_slot(mutant, CACHE_HPP, SYCL)
+
+
+def test_mutant_multi_device_dense_pass_places_no_slots_fails():
+    """The multi-device dense pass charges a layer's slots but leaves them unplaced."""
+    call = "plan_layer_kv_slots(plan, kv_info, layer_id, kv_cost > 0 ? target : -1);"
+    n = norm(CACHE)
+    k = n.rfind(call)
+    assert k >= 0
+    mutant = n[:k] + n[k + len(call):]
+    assert not claim_planner_keys_kv_by_slot(mutant, CACHE_HPP, SYCL)
+
+
+def test_mutant_block_budget_charges_no_kv_fails():
+    """The block candidate's budget leaves out the KV of the slots its layers execute."""
+    mutant = _once(CACHE, "charge += kv_info.kv_bytes_for_phys_layer(layer_id);", "charge += 0;")
     assert not claim_planner_keys_kv_by_slot(mutant, CACHE_HPP, SYCL)
 
 
