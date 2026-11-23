@@ -11625,6 +11625,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     // throw.
     std::shared_ptr<mem_handle>      held[3];
     expert_retire_nodes              device_nodes[3];
+    id_map::node_type                spare_mapping[3];
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
     uint64_t                         remap_took = 0;
@@ -11644,6 +11645,16 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             }
             device_entry[i] = &it->second;
             held[i]         = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");
+            // A spare mapping node for each id handed over below, minted while a throw still changes nothing. While
+            // the locks are released before a rollback, something can erase the id (an id-wide retire of the copy
+            // registered under it finds no live entry to hand it to), and the restore re-inserts only nodes its own
+            // retire took out, which the hand-over leaves in place: the rollback puts the device entry back under its
+            // id through this node, building none.
+            const auto handed = id_to_key_.find(members[i].key);
+            if (handed != id_to_key_.end() && handed->second == device_key) {
+                id_map spare;
+                spare_mapping[i] = spare.extract(spare.emplace(members[i].key, device_key).first);
+            }
         }
         const auto remap_from = std::chrono::steady_clock::now();
         for (int i = 0; i < 3 && !refusal; ++i) {
@@ -11728,6 +11739,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
                     host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();
                 if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) {
                     mapped->second = device_key;
+                } else if (mapped == id_to_key_.end() && !spare_mapping[i].empty()) {
+                    id_to_key_.insert(std::move(spare_mapping[i]));
                 }
             }
             size_t r = 0;

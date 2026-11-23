@@ -1707,6 +1707,52 @@ def test_mutant_remap_walks_uncounted_fails():
     assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, REMAP_SIG, REMAP_WALK_COUNT, ""))
 
 
+# A rollback that finds the id mapping gone still puts the device entry back under its id. Something can erase the
+# mapping while the locks are released between step 3 and the rollback (an id-wide retire of the copy this loan
+# registered under the id finds no live entry to hand it to), and the restore re-inserts only a node its own retire
+# took out, which the hand-over left behind. So the loan mints a spare mapping node for each id it hands over, in the
+# check loop, where minting may still throw and nothing has changed, and the rollback inserts it when the id maps to
+# nothing: no node is built in the rollback.
+SPARE_DECL = "id_map::node_type spare_mapping[3];"
+SPARE_MINT = ("if (handed != id_to_key_.end() && handed->second == device_key) { id_map spare; "
+              "spare_mapping[i] = spare.extract(spare.emplace(members[i].key, device_key).first); }")
+SPARE_INSERT = ("else if (mapped == id_to_key_.end() && !spare_mapping[i].empty()) { "
+                "id_to_key_.insert(std::move(spare_mapping[i])); }")
+
+
+def claim_a_rollback_restores_a_lost_id(cache: str) -> bool:
+    loan = body(norm(cache), LOAN_SIG)
+    at = loan.find("if (failed) {")
+    rollback = loan[at:loan.find(REGISTRATION_REFUSED, at)] if at >= 0 else ""
+    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1 and loan.count(SPARE_INSERT) == 1
+            and ordered(loan, SPARE_DECL, HOLD, SPARE_MINT, LOAN_REPOINT)
+            and ordered(rollback, LOAN_HAND_BACK, SPARE_INSERT, HOST_WITHDRAW, RESTORE_CALL)
+            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS))
+
+
+def test_a_rollback_restores_a_lost_id():
+    assert claim_a_rollback_restores_a_lost_id(CACHE)
+
+
+def test_mutant_rollback_leaves_a_lost_id_lost_fails():
+    """The device entry goes back with no id mapping: every reader that resolves the expert through its id misses."""
+    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, LOAN_SIG, SPARE_INSERT, ""))
+
+
+def test_mutant_rollback_builds_the_mapping_fails():
+    """Emplaced in the rollback, the mapping allocates where nothing may throw."""
+    assert not claim_a_rollback_restores_a_lost_id(
+        _once_in(CACHE, LOAN_SIG, SPARE_INSERT,
+                 "else if (mapped == id_to_key_.end()) { id_to_key_.emplace(members[i].key, device_key); }"))
+
+
+def test_mutant_spare_minted_after_the_hand_over_fails():
+    """Minted once the ids are handed over, a throw would leave the entries changed."""
+    moved = _once_in(CACHE, LOAN_SIG, SPARE_MINT, "")
+    assert not claim_a_rollback_restores_a_lost_id(
+        _once_in(moved, LOAN_SIG, LOAN_REPOINT, LOAN_REPOINT + " " + SPARE_MINT))
+
+
 def test_loan_never_waits():
     assert claim_loan_never_waits(CACHE, SYCL)
 
