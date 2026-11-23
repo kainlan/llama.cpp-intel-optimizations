@@ -21,7 +21,9 @@ The claims, each failure message starting with its name:
 - host-*: the host leg refuses by name before admission (no input marker in play, a task the host recipe would refuse,
   no host workspace), never aborts, and lets a failure in its job reach the graph boundary through the join's host task.
   The host recipe's executor runs on its check's findings. A leg whose catch could not drain the queue joins the
-  bundle's quarantine through the terminal (host-quarantine).
+  bundle's quarantine through the terminal (host-quarantine). A leg lets its job go before its future goes, and a job
+  let go stops waiting for its input marker and runs nothing (host-let-go): the registry lets a quarantined slot go at
+  process exit before the cache abandons the marker word, and std::async's future waits its job.
 - terminal-*: the node's terminal is armed on the last host row copy, after the device output copy.
 - funnel-order: the per-op funnel flushes a pending CPU scatter on every op's path before MUL_MAT_ID is dispatched,
   which the direct block relies on to read src1 rows a deferred scatter may still owe.
@@ -40,6 +42,7 @@ FILES = {
     "plan_test": SYCL_DIR / "tests/test-moe-mmid-workspace-plan.cpp",
     "cpu": SYCL_DIR / "cpu-dispatch.cpp",
     "cpu_hpp": SYCL_DIR / "cpu-dispatch.hpp",
+    "signal": SYCL_DIR / "cpu-job-signal.hpp",
 }
 
 DIRECT_GATE = "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&"
@@ -469,9 +472,50 @@ def funnel_violations(src: dict[str, str]) -> list[str]:
     return []
 
 
+def struct_body(code: str, name: str) -> str | None:
+    """The body, braces included, of `struct name {`, in already blanked code."""
+    m = re.search(r"\bstruct\s+" + name + r"\s*\{", code)
+    return code[m.end() - 1:matching(code, m.end() - 1) + 1] if m else None
+
+
+def let_go_violations(src: dict[str, str]) -> list[str]:
+    # A leg parked in a quarantine is dropped only when its workspace slot is let go: once the terminal or a quiescence
+    # proof is ready, or by the registry's teardown, and at process exit that registry (a function-local static) goes
+    # before the caches, so before cpu_job_input_marker_end abandons the marker word its job may still wait on. The
+    # leg's future comes from std::async, whose last copy waits the job, so the leg lets its job go first.
+    found: list[str] = []
+    code = code_of(src["sycl"])
+    work = struct_body(code, "moe_direct_host_work")
+    leg = struct_body(code, "moe_direct_host_leg")
+    if work is None or not re.search(r"\bstd::atomic<bool>\s+let_go\s*\{\s*false\s*\}\s*;", work):
+        found.append("host-let-go: the host work has no let_go flag, cleared at construction")
+    if leg is None or not re.search(r"~moe_direct_host_leg\s*\(\s*\)\s*(?:noexcept\s*)?\{\s*if\s*\(\s*work\s*\)\s*\{\s*"
+                                    r"work\s*->\s*let_go\s*\.\s*store\s*\(\s*true\s*,\s*std::memory_order_release\s*\)"
+                                    r"\s*;\s*\}\s*\}", leg):
+        found.append("host-let-go: the leg does not let its job go as it goes, before its future waits the job")
+    launch = code_of(host_helpers(src["sycl"]).get("ggml_sycl_moe_direct_host_launch", ""))
+    wait = re.search(r"\bcpu_job_input_marker_wait\s*\(\s*inputs\s*,\s*&\s*held\s*->\s*let_go\s*\)\s*;", launch)
+    stop = re.search(r"\bif\s*\(\s*held\s*->\s*let_go\s*\.\s*load\s*\(\s*std::memory_order_acquire\s*\)\s*\)\s*\{\s*"
+                     r"throw\b", launch)
+    run = launch.find("ggml_sycl_cpu_moe_host_aos_execute(")
+    if not wait or not stop or run < 0 or not wait.start() < stop.start() < run:
+        found.append("host-let-go: the job does not wait its marker with the leg's let_go and throw, running nothing, "
+                     "once let go")
+    header = code_of(src["signal"])
+    m = re.search(r"inline\s+void\s+cpu_job_input_marker_wait\s*\(\s*const\s+cpu_job_input_marker\s*&\s*m\s*,\s*"
+                  r"const\s+std::atomic<bool>\s*\*\s*let_go\s*=\s*nullptr\s*\)\s*\{", header)
+    body = header[m.end() - 1:matching(header, m.end() - 1) + 1] if m else ""
+    loop = re.search(r"\bwhile\s*\(\s*!\s*cpu_job_input_marker_seen\s*\(\s*m\s*\)\s*\)\s*\{", body)
+    gone = re.search(r"\bif\s*\(\s*let_go\s*&&\s*let_go\s*->\s*load\s*\(\s*std::memory_order_acquire\s*\)\s*\)\s*\{\s*"
+                     r"return\s*;\s*\}", body)
+    if not loop or not gone or gone.start() < loop.end():
+        found.append("host-let-go: cpu_job_input_marker_wait does not return, inside its wait, once let_go is set")
+    return found
+
+
 def violations(src: dict[str, str]) -> list[str]:
     return (kernel_violations(src) + table_violations(src) + view_violations(src) + admission_violations(src) +
-            direct_violations(src) + cpu_violations(src) + funnel_violations(src))
+            direct_violations(src) + cpu_violations(src) + funnel_violations(src) + let_go_violations(src))
 
 
 def test_anchors_exist() -> None:
@@ -527,6 +571,17 @@ def test_mutations_are_witnessed() -> None:
         # The upload's refusal stops marking the table stale.
         ("sycl", r"(auto refuse = \[&\]\(\) -> const void \* const \* \{\s*if \(any_updated\) \{\s*)"
                  r"extra->weight\(\)\.mark_moe_device_table_stale\(device\);", r"\1(void) device;", "table-stale"),
+        # The leg goes without letting its job go: its future waits a job that may wait for its marker forever.
+        ("sycl", r"work->let_go\.store\(true, std::memory_order_release\);", "(void) work;", "host-let-go"),
+        # The job waits its marker without the leg's let_go.
+        ("sycl", r"cpu_job_input_marker_wait\(inputs, &held->let_go\);", "cpu_job_input_marker_wait(inputs);",
+         "host-let-go"),
+        # A job let go runs its tasks anyway.
+        ("sycl", r'throw std::runtime_error\("MUL_MAT_ID direct route host job let go before its inputs landed"\);',
+         "(void) 0;", "host-let-go"),
+        # The marker wait ignores let_go.
+        ("signal", r"if \(let_go && let_go->load\(std::memory_order_acquire\)\) \{\s*return;\s*\}", "",
+         "host-let-go"),
         # A failed drain frees the host leg with the unwinding completion instead of parking it.
         ("sycl", r"terminal->quarantine_host_leg\(std::move\(completion->host_leg\)\);", "completion->host_leg.reset();",
          "host-quarantine"),
