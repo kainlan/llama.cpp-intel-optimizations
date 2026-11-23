@@ -1179,9 +1179,9 @@ mapping_load arm3a_mapping_load_keeps_no_weight_on_sycl_host(const std::vector<p
 
     // The fact true under a layout other than cpu: every weight, a device-planned one included, is FILE_MAPPED.
     mapping_load plain;
-    plain.kv.load_maps_files        = true;
-    plain.kv.host_weight_layout     = GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN;
-    plain.plan                      = plan_q2k(inventory, plain.kv);
+    plain.kv.load_maps_files    = true;
+    plain.kv.host_weight_layout = GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN;
+    plain.plan                  = plan_q2k(inventory, plain.kv);
     check(plain.plan.host_backing_maps_files, "the builder copied the fact onto the plan");
     const loader_answers on = ask_loader(plain.plan, plain.kv, tensors);
     check(on.bound, "a load transaction binds with the mapping plan staged");
@@ -1195,9 +1195,9 @@ mapping_load arm3a_mapping_load_keeps_no_weight_on_sycl_host(const std::vector<p
     // type, and the loader keeps SYCL_Host for one only where no such type holds it, which the host zone select
     // decides, so its bytes are reported apart from the class rather than counted as zero.
     placement_kv_info cpu_kv{};
-    cpu_kv.load_maps_files        = true;
-    cpu_kv.host_weight_layout     = GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU;
-    const loader_answers cpu      = ask_loader(plan_q2k(inventory, cpu_kv), cpu_kv, tensors);
+    cpu_kv.load_maps_files    = true;
+    cpu_kv.host_weight_layout = GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU;
+    const loader_answers cpu  = ask_loader(plan_q2k(inventory, cpu_kv), cpu_kv, tensors);
     check(cpu.bound, "a load transaction binds with the default-layout mapping plan staged");
     print_answers("fact true, layout cpu", cpu);
     check_eq("fact true, layout cpu: no weight answers a backing that keeps SYCL_Host", cpu.sycl_host, 0);

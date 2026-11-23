@@ -191,10 +191,10 @@ struct fact {
 
 placement_kv_info kv_for(const fact & f) {
     placement_kv_info kv{};
-    kv.load_maps_files        = f.maps_files;
-    kv.load_locks_files       = f.locks_files;
+    kv.load_maps_files    = f.maps_files;
+    kv.load_locks_files   = f.locks_files;
     // Not cpu is plain here, the layout whose byte (2) a reader testing it as a bool would take for cpu (1).
-    kv.host_weight_layout     = f.layout_cpu ? GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU : GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN;
+    kv.host_weight_layout = f.layout_cpu ? GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU : GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN;
     return kv;
 }
 
