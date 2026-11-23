@@ -115,6 +115,7 @@ DRM_ROOT=/sys/class/drm
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/sycl-gpu-sysfs.sh"
+[ -r "$SCRIPT_DIR/sycl-host-backing.sh" ] || { echo "sycl-decode-mode-capture: REFUSED: $SCRIPT_DIR/sycl-host-backing.sh is missing" >&2; exit 3; }
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/sycl-host-backing.sh"
 
