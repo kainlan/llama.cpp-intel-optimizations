@@ -4043,6 +4043,10 @@ that name only the first predate the second.
   B50 holds nothing (Task 8d).
 - Inkling on the B50 alone: not run at this commit. At `6ee2a4058` it is refused by name (Task 8c).
 - NVFP4/Q1_0 admitted-device test: passes on the B70 and the B50, 56 `PASS:` lines each, 0 context-bind lines.
+  *Corrected 2026-11-22:* the run recorded here as the B50 was a second run on the B70. The lead's runner
+  passed the selector to `ctest`, and the registration's `ENVIRONMENT` property sets
+  `ONEAPI_DEVICE_SELECTOR=level_zero:0` over it. The first real B50 run is on the merged tree at `85d0720ed`:
+  rc 0, 56 `PASS:` lines (`docs/backend/data/inkling2/t8e-admitted-b50-85d0720ed.txt`).
   Adapter device test: passes on the B70.
 - Mistral gate, B70: `1 .. 10`. GPT-OSS gate, B50, no `-c`: one answer line, no device loss.
 - In every log: 0 `EXECUTION-TRIPWIRE`, 0 `route=direct` declines, 0 `failed to begin tracked execution graph`,
@@ -4363,6 +4367,10 @@ The planner places KV per cache slot on the device of the layer that executes it
 *Device results on the merged tree (`baf7cf05a`, the docs commit on `70292d66e`), each run once, zero kernel
 fault lines* (`docs/backend/data/inkling2/t8e-merged-chain-baf7cf05a.txt`):
 - `sycl-q1-nvfp4-admitted-device` on the B70 and on the B50: pass, 56 PASS lines each, 0 context-bind lines.
+  *Corrected 2026-11-22:* the run recorded here as the B50 was a second run on the B70. The lead's runner
+  passed the selector to `ctest`, and the registration's `ENVIRONMENT` property sets
+  `ONEAPI_DEVICE_SELECTOR=level_zero:0` over it. The first real B50 run is on the merged tree at `85d0720ed`:
+  rc 0, 56 `PASS:` lines (`docs/backend/data/inkling2/t8e-admitted-b50-85d0720ed.txt`).
   `sycl-q1-nvfp4-adapter-device` on the B70: pass.
 - Inkling gate, B70: `1, 2, ... 10`, 0 refusals. Inkling gate, both cards: the same.
 - Mistral B70 and GPT-OSS B50 gates pass; their plan lines differ from `integ-plan-d2ac34ce1` only in
@@ -5828,6 +5836,10 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
   core's worker abort. An abort is a broken part: each needs a way to fail the graph at its boundary.
 - On the B50 one decoded Inkling token can hold up to 288 pinned host workspaces live at once on the mixed
   path (Task 8c's count, a read). Not measured against `Shmem`.
+- A lead mistake, found 2026-11-22: three "B50" runs of `sycl-q1-nvfp4-admitted-device` ran on the B70,
+  because a ctest registration's `ENVIRONMENT` overrides the caller's selector. The runner now runs the binary
+  for any card but the registered one and fails the step unless the log names the card it was asked for. A
+  device run is evidence for a card only when its own log names that card.
 - A lead mistake to keep out of the next round: the contract sweep (`-j 4`) ran beside the device chain and
   overlapped the bench step. A bench step runs with nothing else of the lead's on the CPU.
 - From Task 8e's re-review: the commit message of `8050f81b3` words its change loosely (not amended, by
