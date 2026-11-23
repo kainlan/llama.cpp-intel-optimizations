@@ -2114,9 +2114,9 @@ static bool run_multi_device_kv_slot_block_test() {
 }
 
 // The backend takes the map from the inventory libllama fills: one entry per KV slot, each a weight layer id below the
-// slot count. An identity map is kept empty; a map with the wrong count or an entry out of range is refused, kept
-// empty, and says which. A layer the late inventory leaves out (its weights are on a CPU buffer type) keeps the map,
-// and its slots are host slots.
+// slot count. An identity map is kept empty; a map with the wrong count, a count with no map, or an entry out of range
+// is refused, kept empty, and says which. A layer the late inventory leaves out (its weights are on a CPU buffer
+// type) keeps the map, and its slots are host slots.
 static bool run_kv_slot_map_intake_test() {
     using namespace kv_slot_case;
     std::vector<ggml_sycl_tensor_info> tensors;
@@ -2175,6 +2175,13 @@ static bool run_kv_slot_map_intake_test() {
         short_map.kv_layer_count != n_slot || short_map.bad_slot != -1) {
         printf("FAIL: a map one entry short is refused and names both counts: refused=%d counts %u/%u bad slot %d\n",
                short_map.refused, short_map.count, short_map.kv_layer_count, short_map.bad_slot);
+        ok = false;
+    }
+    // A slot count with no map: the producer said it sent one and did not. Refused like a count mismatch, so the WARN
+    // says so, not read as no map and planned without a word.
+    const auto null_map = intake(nullptr, n_slot);
+    if (!null_map.refused || !null_map.layer_phys.empty()) {
+        printf("FAIL: a slot count with no map is refused, not read as no map: refused=%d\n", null_map.refused);
         ok = false;
     }
     const auto past  = intake(&out_of_range, n_slot);
