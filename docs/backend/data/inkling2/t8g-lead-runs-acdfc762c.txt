@@ -1,0 +1,153 @@
+Task 8g, lead runs on its last two heads (the task tree's build; the merge f298d2190 has the tree of acdfc762c), 2026-11-23.
+Driver: libze_intel_gpu.so.1.18.40734. One load per run, under GPU.lock, selector pinned. Zero kernel fault lines in every step.
+GATE lines print sha= of the gate script's tree; the binaries are the task tree's build/.
+Throughput under the permanent host load: orientation, not a baseline.
+
+##### A. Full set on cc2e1cbbb (before the round-2 minor fixes: publish guard helper, profiler metadata, two contracts)
+=== 0 kernel test (ctest, opencl:cpu)
+--- rc=0
+269:   inkling down k, row per slot           k=1152  rows=72   experts=8   slots=8 tokens=3 per_launch=3 vec4=1 max_rel_err=2.61e-08 ok
+269:   k=100 vec4, rows not a multiple of 4   k=100   rows=37   experts=16  slots=4 tokens=3 per_launch=3 vec4=1 max_rel_err=5.97e-08 ok
+269:   padded strides everywhere              k=64    rows=33   experts=5   slots=4 tokens=3 per_launch=3 vec4=1 max_rel_err=6.39e-08 ok
+269:   bad slots, scalar form                 k=99    rows=9    experts=5   slots=4 tokens=3 per_launch=3 vec4=0 max_rel_err=5.29e-08 ok
+269:   token chunks of 3, remainder 2         k=64    rows=10   experts=4   slots=2 tokens=11 per_launch=3 vec4=1 max_rel_err=4.79e-08 ok
+=== 1 bf16 route b70
+  card the test ran on: B70 (wanted B70)
+--- step rc=0
+268: PASS: BF16 expert device route, 8 cases, 2 controls
+=== 2 bf16 route b50
+  card the test ran on: B50 (wanted B50)
+--- step rc=0
+PASS: BF16 expert device route, 8 cases, 2 controls
+=== 3 kernel binary b70
+  card the test ran on: B70 (wanted B70)
+--- step rc=0
+device: Intel(R) Arc(TM) Pro B70 Graphics
+  inkling gate_up k, broadcast row       k=2304  rows=96   experts=8   slots=8 tokens=2 per_launch=2 vec4=1 max_rel_err=2.53e-08 ok
+  inkling down k, row per slot           k=1152  rows=72   experts=8   slots=8 tokens=3 per_launch=3 vec4=1 max_rel_err=2.79e-08 ok
+  inkling k, one row                     k=2304  rows=1    experts=8   slots=8 tokens=1 per_launch=1 vec4=1 max_rel_err=7.61e-09 ok
+  k=99 scalar form                       k=99    rows=50   experts=16  slots=4 tokens=5 per_launch=5 vec4=0 max_rel_err=4.2e-08 ok
+  k=100 vec4, rows not a multiple of 4   k=100   rows=37   experts=16  slots=4 tokens=3 per_launch=3 vec4=1 max_rel_err=3.35e-08 ok
+  k=3 below the lane count               k=3     rows=5    experts=2   slots=2 tokens=1 per_launch=1 vec4=0 max_rel_err=6.24e-08 ok
+  x base misaligned (no float4)          k=256   rows=20   experts=6   slots=3 tokens=2 per_launch=2 vec4=1 max_rel_err=2.04e-08 ok
+  weight row stride breaks vec4          k=128   rows=12   experts=4   slots=4 tokens=2 per_launch=2 vec4=0 max_rel_err=3.08e-08 ok
+  padded strides everywhere              k=64    rows=33   experts=5   slots=4 tokens=3 per_launch=3 vec4=1 max_rel_err=3.73e-08 ok
+  expert base off 8 bytes                k=256   rows=16   experts=4   slots=4 tokens=2 per_launch=2 vec4=1 max_rel_err=2.16e-08 ok
+  id -1 zero row, bad ids NaN rows       k=64    rows=10   experts=6   slots=6 tokens=2 per_launch=2 vec4=1 max_rel_err=3.19e-08 ok
+  bad slots, scalar form                 k=99    rows=9    experts=5   slots=4 tokens=3 per_launch=3 vec4=0 max_rel_err=2.8e-08 ok
+  token chunks of 3, remainder 2         k=64    rows=10   experts=4   slots=2 tokens=11 per_launch=3 vec4=1 max_rel_err=4.14e-08 ok
+PASS
+=== 4 inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=8e0949ffd
+--- step rc=0
+=== 5 inkling diag b70
+--- step rc=0
+=== 6 planlines
+--- step rc=0
+=== 7 inkling gate both
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=8e0949ffd
+--- step rc=0
+=== 8 binbcast trace b70
+--- step rc=0
+=== 9 tbo MUL_MAT_ID
+  rc=1  out lines: 1890  op lines: 1864  OK: 1258  FAIL: 150  not supported: 322
+  Backend SYCL0: FAIL
+  rc=1  out lines: 1891  op lines: 1865  OK: 1257  FAIL: 151  not supported: 322
+  Backend SYCL0: FAIL
+--- step rc=1
+=== 10 kprof decode b70
+--- step rc=0
+=== 8G FINAL END 2026-11-23T01:21:37-05:00  ninja=0 icpx=0
+
+split census (step 5, GGML_SCHED_DEBUG=2): graphs printed 40; largest graph: 1 split, 0 CPU splits, 0 nodes in CPU splits
+trace (step 8, 4 tokens, GGML_SYCL_BINBCAST_TRACE=1): [BINBCAST] entry 8606, launch 8606, no-stage 17212, stage 0, stage-copied 0
+  (Task 8i tree, same run: entry 8677, launch 8677, no-stage 17210, stage 144, stage-copied 144)
+test-backend-ops -o MUL_MAT_ID (step 9): B70 OK 1258 FAIL 150 not-supported 322; B50 OK 1257 FAIL 151 not-supported 322;
+  BF16 lines 31, all OK, on each card. Identical counts to the run on 8fe336e2b; the FAIL lines are the baseline's
+  (t8g-tbo-mmid-baseline-baf7cf05a-*.txt).
+gate decode (step 4, B70): eval time =    1312.00 ms /    14 runs   (   93.71 ms per token,    10.67 tokens per second)
+gate decode (step 7, both cards): eval time =    1515.26 ms /    14 runs   (  108.23 ms per token,     9.24 tokens per second)
+profiled decode (step 10): eval time =    3565.20 ms /    47 runs   (   75.86 ms per token,    13.18 tokens per second)
+
+A finding outside this task, step 6 (GPT-OSS gate, B50, no -c), this run only:
+[PLACE-4] device weight zone: 11536.2 MB (2691 tensors), host arena: 0.0 MB (0 tensors)
+[VRAM-ARENA] Rebuilding unused early arena for planned zones: scratch 512.0->512.0 MB, oneDNN 256.0->256.0 MB, runtime 1515.3->1919.4 MB
+[VRAM-ARENA] Destroyed 1 chunk(s), released 14292.0 MB
+[VRAM-ARENA] Reserving N-chunk arena: 2 chunks, 14292.0 MB total (per-chunk cap 15179.0 MB)
+[VRAM-ARENA] Reserved 2 chunks, 14292.0 MB total (weight=11476.6, KV=128.0, oneDNN=256.0, runtime=1919.4, scratch=512.0 MB)
+[PLACE-4] device weight zone: 11435.3 MB (2667 tensors), host arena: 100.9 MB (24 tensors)
+slot print_timing: id  0 | task 0 | prompt eval time =    1662.55 ms /    93 tokens (   17.88 ms per token,    55.94 tokens per second)
+slot print_timing: id  0 | task 0 |        eval time =    1611.76 ms /    17 tokens (  100.73 ms per token,     9.93 tokens per second)
+  The single 14292 MB reservation failed 15 ms after the previous arena was destroyed, with no log line; the two-chunk
+  arena takes a fixed 128 MB KV reserve from the weight zone and 8 expert triplets went to the host. The gate passed.
+  The same step on 8fe336e2b, 1f2dc2606 and acdfc762c (below) reserved a single chunk and decoded at ~27.5 t/s.
+
+##### B. Reduced set on acdfc762c (the code that changed), then the throughput pair
+=== 1 bf16 route b70
+--- step rc=0
+268: PASS: BF16 expert device route, 8 cases, 2 controls
+=== 2 bf16 route b50
+--- step rc=0
+PASS: BF16 expert device route, 8 cases, 2 controls
+=== 3 inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=8e0949ffd
+common_perf_print: prompt eval time =     806.94 ms /    14 tokens (   57.64 ms per token,    17.35 tokens per second)
+common_perf_print:        eval time =    1320.02 ms /    14 runs   (   94.29 ms per token,    10.61 tokens per second)
+--- step rc=0
+=== 4 planlines
+--- step rc=0
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, shared KV+weight=13012.0 MB)
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1515.3, oneDNN=256.0, shared KV+weight=12008.7 MB)
+[VRAM-ARENA] Reserved single chunk: 14292.0 MB (scratch=512.0, runtime=1919.4, oneDNN=256.0, shared KV+weight=11604.6 MB)
+slot print_timing: id  0 | task 0 | prompt eval time =    1126.20 ms /    93 tokens (   12.11 ms per token,    82.58 tokens per second)
+slot print_timing: id  0 | task 0 |        eval time =     578.28 ms /    17 tokens (   36.14 ms per token,    27.67 tokens per second)
+=== 5 kprof decode b70
+common_perf_print: prompt eval time =     850.30 ms /    14 tokens (   60.74 ms per token,    16.46 tokens per second)
+common_perf_print:        eval time =    3435.96 ms /    47 runs   (   73.11 ms per token,    13.68 tokens per second)
+--- step rc=0
+mulmat.moe.bf16_direct,mulmat,ncols=2304;nrows_per_expert=2304;total_batches=8;launches=1,0,compute,192,29079687,151456,147709,151770,152812,153542,0,0,0
+mulmat.moe.bf16_direct,mulmat,ncols=1152;nrows_per_expert=2304;total_batches=8;launches=1,0,compute,192,14598960,76036,74792,76041,76771,77291,0,0,0
+=== 8G FINAL2 GATES END 2026-11-23T01:40:36-05:00  ninja=0 icpx=0
+build quiet after 0s  load average: 8.64, 9.28, 10.51
+=== 8G ABBA END rc=0 2026-11-23T01:46:37-05:00  ninja=0 icpx=0
+=== 8G FINAL2 END 2026-11-23T01:46:37-05:00
+
+ABBA, B70, llama-bench -p 512 -n 128, one repetition per arm, base = Task 8i tree (wt-t8i, 1f2dc2606, the code of 7c2e47857):
+== arm i  2026-11-23T01:40:39-05:00  shmem=11GB  load=8.64
+  arm end: load=8.97 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT i pp512 avg=42.98 t/s stddev=0.00 samples=[42.98]
+  RESULT i tg128 avg=11.01 t/s stddev=0.00 samples=[11.01]
+== arm g  2026-11-23T01:42:12-05:00  shmem=11GB  load=9.30
+  arm end: load=9.43 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT g pp512 avg=47.42 t/s stddev=0.00 samples=[47.42]
+  RESULT g tg128 avg=15.28 t/s stddev=0.00 samples=[15.28]
+== arm g2  2026-11-23T01:43:38-05:00  shmem=11GB  load=9.06
+  arm end: load=10.14 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT g2 pp512 avg=47.58 t/s stddev=0.00 samples=[47.58]
+  RESULT g2 tg128 avg=15.28 t/s stddev=0.00 samples=[15.28]
+== arm i2  2026-11-23T01:45:05-05:00  shmem=11GB  load=9.81
+  arm end: load=10.49 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  RESULT i2 pp512 avg=41.40 t/s stddev=0.00 samples=[41.40]
+  RESULT i2 tg128 avg=10.72 t/s stddev=0.00 samples=[10.72]
+
+##### C. Decode profile, B70, 48 tokens of text, kernel profiler on (kprof CSV beside this file), per forward pass (49 passes)
+Task 8g, acdfc762c: 73.11 ms per decoded token; directly dispatched submissions 737 per pass; device-timed 18.97 ms per pass
+    mulmat.mmvq.id_aos_nvfp4                    88.0 per pass   16.001 ms per pass  mean    181.8 us
+    mulmat.moe.bf16_direct                       8.0 per pass    1.135 ms per pass  mean    141.8 us
+    fattn.decode.esimd_partitioned              47.0 per pass    0.550 ms per pass  mean     11.7 us
+    fattn.compute.xmx_v2                         1.0 per pass    0.509 ms per pass  mean    519.4 us
+    mulmat.onednn_gemm.unbatched                97.0 per pass    0.225 ms per pass  mean      2.3 us
+    sycl.memcpy.mem_ops                         89.8 per pass    0.145 ms per pass  mean      1.6 us
+    sycl.binbcast.mul                           50.3 per pass    0.090 ms per pass  mean      1.8 us
+    sycl.binbcast.add                           47.5 per pass    0.077 ms per pass  mean      1.6 us
+Task 8i, 1f2dc2606: 102.83 ms per decoded token; directly dispatched submissions 1122 per pass; device-timed 19.38 ms per pass
+    mulmat.mmvq.id_aos_nvfp4                    88.0 per pass   16.054 ms per pass  mean    182.4 us
+    sycl.binbcast.mul                           76.1 per pass    1.104 ms per pass  mean     14.5 us
+    fattn.decode.esimd_partitioned              47.0 per pass    0.557 ms per pass  mean     11.8 us
+    fattn.compute.xmx_v2                         1.0 per pass    0.518 ms per pass  mean    528.7 us
+    mulmat.onednn_gemm.unbatched               115.8 per pass    0.292 ms per pass  mean      2.5 us
+    sycl.memcpy.mem_ops                        137.0 per pass    0.220 ms per pass  mean      1.6 us
+    sycl.binbcast.add                          105.7 per pass    0.162 ms per pass  mean      1.5 us
+    sycl.binbcast.event                        235.8 per pass    0.121 ms per pass  mean      0.5 us
+The profiler times directly dispatched submissions only: the kernels inside replayed segment graphs have no row.
+About 54 ms of the 73 ms token is therefore not attributed by this table.
