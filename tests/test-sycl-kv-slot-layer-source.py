@@ -9,7 +9,8 @@ their own, fell to the host tier, and their attention ran on the CPU, while the 
 The fix this gate pins:
   - libllama names the weight layer of each slot (llama_model::layer_phys, the identity unless a looped model
     overrides it) and hands the map to the backend in the inventory, one entry per slot; the struct grew from 192 to
-    208 bytes, appended, so no existing offset moved, and both sides pin the layout;
+    208 bytes, appended, so no existing offset moved, and both sides pin the layout; every model whose source aliases
+    one slot's layer to another's (layers[a] = layers[b]) overrides it;
   - the backend takes the map once, at intake: only with one entry per slot and every entry a weight layer id below
     the slot count, otherwise it plans every slot as its own layer and says so at WARN; an identity map is kept empty,
     so a model whose slots are its layers plans and prints exactly as before. The backend computes no map of its own,
@@ -135,6 +136,41 @@ def claim_libllama_names_each_slots_layer(model_h: str, models_h: str, model: st
     return (BASE_LAYER_PHYS in norm(model_h) and LOOP_OVERRIDE in loop
             and ARRAYS_FILL in body(m, ARRAYS_SIG) and POPULATE_SET in body(m, POPULATE_SIG)
             and m.count(CALLER_PASSES) == 2)
+
+
+MODEL_SRCS = {p.name: p.read_text() for p in sorted((ROOT / "src" / "models").glob("*.cpp"))}
+LOOP_MODEL = "llama_model_inkling2_loop"
+ALIAS_RE = re.compile(r"\blayers\[[^\]\n]+\]\s*=\s*layers\[")
+MEMBER_DEF_RE = re.compile(r"^[A-Za-z][^\n;]*?\b(llama_model_[a-z0-9_]+)::", re.M)
+OVERRIDE_HEAD = "int layer_phys(int il) const override"
+
+
+def struct_body(models_h_norm: str, name: str) -> str:
+    head = f"struct {name} :"
+    at = models_h_norm.find(head)
+    return body(models_h_norm[at:], head) if at >= 0 else ""
+
+
+def aliasing_models(model_srcs: dict) -> set:
+    """The model classes with a member function that aliases one KV slot's layer to another's (layers[a] = layers[b]),
+    each alias owned by the definition it sits in; "" for an alias outside any member definition."""
+    found = set()
+    for src in model_srcs.values():
+        text = strip_comments(src)
+        heads = [(m.start(), m.group(1)) for m in MEMBER_DEF_RE.finditer(text)]
+        for alias in ALIAS_RE.finditer(text):
+            owners = [name for at, name in heads if at < alias.start()]
+            found.add(owners[-1] if owners else "")
+    return found
+
+
+def claim_every_aliasing_model_names_its_layers(models_h: str, model_srcs: dict) -> bool:
+    """A model whose slots alias another slot's layer at load names that layer: the planner places a slot's KV with
+    layer_phys(slot)'s weights, so a model without the override has its repeated slots' KV on the host tier. The scan
+    fails closed: it must find inkling2_loop, and every alias it finds must have an owner."""
+    mh = norm(models_h)
+    models = aliasing_models(model_srcs)
+    return LOOP_MODEL in models and "" not in models and all(OVERRIDE_HEAD in struct_body(mh, m) for m in models)
 
 
 # ---- (b) the layout -------------------------------------------------------------------------------------------------
@@ -290,6 +326,15 @@ def test_libllama_names_each_slots_layer():
     assert claim_libllama_names_each_slots_layer(MODEL_H, MODELS_H, MODEL)
 
 
+def test_alias_scan_finds_the_looped_models():
+    looped = {"llama_model_hrm_text", LOOP_MODEL, "llama_model_metis16", "llama_model_nanbeige"}
+    assert looped <= aliasing_models(MODEL_SRCS)
+
+
+def test_every_aliasing_model_names_its_layers():
+    assert claim_every_aliasing_model_names_its_layers(MODELS_H, MODEL_SRCS)
+
+
 def test_map_is_appended_and_pinned():
     assert claim_map_is_appended_and_pinned(SYCL_H, SYCL)
 
@@ -322,9 +367,40 @@ def test_mutant_producer_sends_the_slot_fails():
     assert not claim_libllama_names_each_slots_layer(MODEL_H, MODELS_H, mutant)
 
 
+def _drop_override(models_h: str, name: str) -> str:
+    """`models_h` with the layer_phys declaration removed from struct `name`."""
+    n = norm(models_h)
+    at = n.find(f"struct {name} :")
+    assert LOOP_OVERRIDE in struct_body(n, name), f"{name} declares no {LOOP_OVERRIDE!r}"
+    k = n.find(LOOP_OVERRIDE, at)
+    return n[:k] + n[k + len(LOOP_OVERRIDE):]
+
+
 def test_mutant_loop_model_names_no_layer_fails():
-    mutant = _once(MODELS_H, LOOP_OVERRIDE, "")
+    mutant = _drop_override(MODELS_H, LOOP_MODEL)
     assert not claim_libllama_names_each_slots_layer(MODEL_H, mutant, MODEL)
+    assert not claim_every_aliasing_model_names_its_layers(mutant, MODEL_SRCS)
+
+
+def test_mutant_hrm_text_names_no_layer_fails():
+    mutant = _drop_override(MODELS_H, "llama_model_hrm_text")
+    assert not claim_every_aliasing_model_names_its_layers(mutant, MODEL_SRCS)
+
+
+def test_mutant_new_aliasing_model_without_override_fails():
+    """An upstream sync adds a looped model and no override: its repeated slots' KV would be host."""
+    srcs = dict(MODEL_SRCS, **{"zz-loop.cpp": "void llama_model_zz_loop::load_arch_tensors(llama_model_loader &) {\n"
+                                              "    layers[1] = layers[0];\n}\n"})
+    models_h = MODELS_H + "\nstruct llama_model_zz_loop : public llama_model_base {\n};\n"
+    assert "llama_model_zz_loop" in aliasing_models(srcs)
+    assert not claim_every_aliasing_model_names_its_layers(models_h, srcs)
+
+
+def test_mutant_alias_scan_finds_nothing_fails():
+    """A scan that stops matching the alias form finds no looped model; that must not read as every model is fine."""
+    srcs = {name: src.replace("layers[il] = layers[layer_phys(il)];", "") for name, src in MODEL_SRCS.items()}
+    assert srcs != MODEL_SRCS
+    assert not claim_every_aliasing_model_names_its_layers(MODELS_H, srcs)
 
 
 def test_mutant_one_builder_drops_the_map_fails():
