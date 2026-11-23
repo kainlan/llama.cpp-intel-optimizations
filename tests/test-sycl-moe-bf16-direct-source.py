@@ -4,10 +4,12 @@
 A MUL_MAT_ID whose experts are BF16 runs on the device whose plan holds every expert at AOS, from the cached full-local
 expert table and the device ids, with src1 and dst read and written in place. These claims pin that shape:
 
-  (a) one predicate, ggml_sycl_moe_bf16_direct_route_available(op, device), defined once in ggml-sycl.cpp: a known
-      plan answers alone (every expert of the weight planned on this device at AOS, asked through
-      ggml_sycl_moe_tensor_plan_primary_layout), and with no plan a weight in a SYCL device buffer of this device
-      counts; it reads no environment and has no row-multiple rule;
+  (a) one predicate, ggml_sycl_moe_bf16_direct_route_available(op, device), defined once in ggml-sycl.cpp: a view
+      of a weight is declined before any placement question (the route publishes and reads a root tensor's experts
+      only); a known plan answers alone (every expert of the weight planned on this device at AOS, asked through
+      ggml_sycl_moe_tensor_plan_primary_layout); with no plan, a weight nothing has placed yet counts (test-backend-ops
+      asks supports_op before it allocates, then allocates on the backend it asked) and a placed weight counts only in
+      a SYCL device buffer of this device; it reads no environment and has no row-multiple rule;
   (b) supports_op asks that predicate as the MUL_MAT_ID gate's third term, and the route asks the same predicate;
   (c) the route sits in ggml_sycl_mul_mat_id after the src0->extra ensure block and before the MMID_SCHED device
       schedule, the yx28 decode-direct request and ggml_sycl_ensure_weight_on_device(); its block is one call to
@@ -50,6 +52,7 @@ PREDICATE_HEAD = f"static bool {PREDICATE}(const ggml_tensor * op, int device) {
 ROUTE_FN = "ggml_sycl_mul_mat_id_bf16_direct"
 ROUTE_FN_HEAD = f"static void {ROUTE_FN}(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {{"
 ROUTE_IF = f"if ({PREDICATE}(dst, ctx.device)) {{"
+UNPLACED_CLAIM = "if(src0->buffer==nullptr){returntrue;}"
 ROUTE_BODY = f"{ROUTE_FN}(ctx,dst);return;"
 GATE = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device) && "
         f"!{PREDICATE}(op, device)) {{")
@@ -157,6 +160,10 @@ def claim_a_predicate(s):
     for forbidden in ("getenv", "% 32", "%32", "WARP_SIZE", "ggml_sycl_moe_pp_batched", "GGML_TYPE_NVFP4"):
         if forbidden in body:
             fails.append(f"the predicate carries {forbidden!r}")
+    view_at = body.find("src0->view_src != nullptr")
+    plan_at = body.find("ggml_sycl_moe_plan_owner_for_device(device)")
+    if view_at < 0 or (plan_at >= 0 and view_at > plan_at):
+        fails.append("the predicate does not decline a view of the weight before it asks the plan")
     plan_arm = braced_body(body, "if (plan) {")
     if plan_arm is None:
         fails.append("the predicate has no `if (plan) {` arm")
@@ -171,6 +178,9 @@ def claim_a_predicate(s):
         for needed in ("ggml_backend_buffer_is_sycl(", "!ggml_backend_buffer_is_sycl_split("):
             if needed not in tail:
                 fails.append(f"the no-plan arm does not ask {needed}")
+        unplaced = tight(tail).find(UNPLACED_CLAIM)
+        if unplaced < 0 or unplaced > tight(tail).find("ggml_backend_buffer_is_sycl("):
+            fails.append("the no-plan arm does not claim a weight nothing has placed yet before it reads the buffer")
     return fails
 
 
@@ -347,6 +357,10 @@ MUTANTS = [
     ("a", "sycl", PREDICATE_HEAD, "return ggml_sycl_moe_tensor_plan_primary_layout(",
      "(void) ggml_sycl_moe_tensor_plan_primary_layout("),
     ("a", "sycl", PREDICATE_HEAD, "!ggml_backend_buffer_is_sycl_split(", "true || !ggml_backend_sycl_unused("),
+    ("a", "sycl", PREDICATE_HEAD, "src0->view_src != nullptr || ", ""),
+    ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }", ""),
+    ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }",
+     "if (src0->buffer == nullptr) { return false; }"),
     ("b", "sycl", None, f" && !{PREDICATE}(op, device)) {{", ") {"),
     ("b", "sycl", None, ROUTE_IF, "if (true) {"),
     ("c", "sycl", None, ROUTE_IF + " " + ROUTE_FN + "(ctx, dst); return; }", ""),
