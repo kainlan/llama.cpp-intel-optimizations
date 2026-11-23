@@ -55533,10 +55533,10 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
         exact_cache ? &exact_cache->get_queue() : &ggml_sycl_get_device(exact_device).default_queue();
     // A SYCL_Host chunk of a model load is the model's (§4.4 "Lifetimes"): S1-PRELOAD serves host experts from it in
     // place, so the cache's entries hold copies of its owner past the buffer's free_buffer, until the model's slot is
-    // reclaimed, and the model's MODEL check after that reclaim is its leak check. That includes the loader's
-    // temporaries, the pinned upload buffers a load frees before it ends: they lose a check at their own free, and a
-    // leaked one is a MODEL row of this model that outlives the reclaim, which that check reports. With no load effect
-    // to name the model (a fixture that sets the load flag alone), the chunk keeps its buffer's own owner.
+    // reclaimed, and the model's MODEL check after that reclaim is its leak check. A chunk the load frees before it
+    // ends is a MODEL row too (never an upload buffer: under the load guard the device reports async off): it loses a
+    // check at its own free, and a leaked one outlives the reclaim, which that check reports. With no load effect to
+    // name the model (a fixture that sets the load flag alone), the chunk keeps its buffer's own owner.
     const uint64_t model_id = intent.lifetime == ggml_sycl::alloc_lifetime::MODEL ? ggml_sycl_loading_model_id() : 0;
     const uint64_t owner_id = model_id != 0 ? 0 : ggml_sycl::host_zone_owner_next_id();
     intent.owner = model_id != 0 ? ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::MODEL, model_id } :

@@ -1821,9 +1821,10 @@ created") describes a path that does not run.
       reclaim is a leak. A load that rolls back runs the same check once both
       its rollback (`ggml_sycl_abort_owner_effects_noexcept`, after its slot
       release) and the free of its last `SYCL_Host` chunk (the model's
-      destructor) have happened, whichever is last. The loader's temporaries,
-      the pinned upload buffers a load frees before it ends, are `MODEL` rows
-      too: they lose a check at their own free, and a leaked one outlives the
+      destructor) have happened, whichever is last. A `SYCL_Host` chunk the
+      load frees before it ends is a `MODEL` row too (never an upload buffer:
+      under the load guard the device reports `async` off, so a load takes
+      none): it loses a check at its own free, and a leaked one outlives the
       reclaim, so the model's check reports it.
     - **`DEVICE`** (addendum 10 (b), §M62 (D)). It is allowed only for a
       holder whose contents are device-scoped and shared by every context
