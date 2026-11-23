@@ -30,7 +30,9 @@
 // Every load that main and the arms stage of the Qwen3.8-shaped inventory maps its file (mapped_qwen38_inventory), so
 // the stage's loader-pool refusal refuses none of them, whatever the host's budget, but arm (l)'s, which stages the
 // unmapped inventory and scores that refusal. A load it refuses releases every arena nothing holds, as (k)'s last end
-// does, so (l) runs after (k), and before (g).
+// does, so (l) runs after (k), and before (g). A mapped load pins its routed host experts for the window ring and
+// moves them back to the mapping when the pinned plan does not fit the host budget, so arms (a) and (c) read which leg
+// each plan took from the planner's own lines and score that leg; no verdict depends on the host's MemAvailable.
 //
 // Every arm names its engagement check, the observation that proves it reached the mechanism it scores, and the
 // mutant it kills. An arm whose engagement check fails is VOID, and a VOID arm fails the binary like a FAIL. Every arm
@@ -125,20 +127,141 @@ uint64_t residency_entries(const ggml_sycl_plan_dry_run_plan & p) {
     return n;
 }
 
-// The ring the planner charges the RUNTIME zone for an inventory: the loader's weight slot and the activation and
-// output slots pp_moe_onednn_slots_at gives at the load's micro-batch, at the ring's effective depth. The loader sizes
-// only the weight slot, so its scratch bytes are not the ring. 0 when the slots cannot be sized.
-size_t planned_ring_bytes(const ggml_sycl_tensor_inventory & inv) {
+// The PP MoE oneDNN ring an inventory publishes, as the planner prints it: while it sizes each record of a plan,
+// populate_host_zone_sizing reads the ring back from the per-device globals the publish wrote and prints it on a
+// "[SYCL-PLAN] PP MoE oneDNN scratch ring: " line before the record. The figures are the loader's weight slot and the
+// activation and output slots pp_moe_onednn_slots_at gives at the load's micro-batch, at the ring's effective depth,
+// in the planner's format. The ring is a VRAM allocation, so no host term carries it: the host RUNTIME term is the
+// oneDNN scratchpad and the DMA staging pool (placement_plan_host_zone_commit_terms). Empty when the slots cannot be
+// sized.
+std::string planned_ring_text(const ggml_sycl_tensor_inventory & inv) {
     size_t act = 0;
     size_t out = 0;
     if (!pp_moe_onednn_slots_at(placement_load_n_ubatch(inv.n_ubatch), static_cast<uint32_t>(std::max(0, inv.n_expert)),
                                 static_cast<uint32_t>(std::max(0, inv.n_expert_used)),
                                 inv.pp_moe_onednn_activation_bytes_per_row, inv.pp_moe_onednn_output_bytes_per_row,
                                 &act, &out)) {
-        return 0;
+        return {};
     }
-    return test_pp_moe_onednn_planned_scratch_bytes(inv.pp_moe_onednn_weight_slot_bytes, act, out,
-                                                    inv.pp_moe_onednn_ring_depth);
+    const size_t weight = inv.pp_moe_onednn_weight_slot_bytes;
+    const size_t total  = test_pp_moe_onednn_planned_scratch_bytes(weight, act, out, inv.pp_moe_onednn_ring_depth);
+    const double mb     = 1024.0 * 1024.0;
+    char         text[192];
+    std::snprintf(text, sizeof(text),
+                  "depth=%u total=%.1f MB weight_slot=%.1f MB activation_slot=%.1f MB output_slot=%.1f MB",
+                  test_pp_moe_onednn_effective_ring_depth(inv.pp_moe_onednn_ring_depth), total / mb, weight / mb,
+                  act / mb, out / mb);
+    return text;
+}
+
+// What a run of the planner did with a mapped load's routed host experts for the window ring, as its own lines say:
+// kept them pinned (the "pinned for the window ring" line, after the plan's record), moved them back to the mapping
+// once the pinned plan failed its fit or a lazy table refused it (the "stay mapped" WARN, between the plan's two
+// records), moved them back before the ledger because the plan holds no ring room (that WARN, before the plan's one
+// record), or never pinned them (neither line). The host budget decides between the first two.
+enum class pin_leg { UNPINNED, KEPT, WITHDRAWN, NO_ROOM };
+
+const char * pin_leg_name(pin_leg leg) {
+    switch (leg) {
+        case pin_leg::KEPT:
+            return "pin-kept";
+        case pin_leg::WITHDRAWN:
+            return "pin-withdrawn";
+        case pin_leg::NO_ROOM:
+            return "pin-no-ring-room";
+        case pin_leg::UNPINNED:
+            break;
+    }
+    return "unpinned";
+}
+
+// One device's plan as a run logged it. Its record is its last [HOST-LEDGER] plan line: a plan whose pin is withdrawn
+// after the fit is recorded twice, the pinned plan first. `records` counts those lines, `max_planned` is the largest
+// host_planned_bytes among them (the pinned plan's on that leg), `rings` holds for each record the ring line its sizing
+// printed before it (empty when it printed none), and `leg` is what the run's [PLACEMENT] lines say of the pin.
+struct logged_plan {
+    size_t                   device = SIZE_MAX;
+    std::string              record;
+    size_t                   records     = 0;
+    size_t                   max_planned = 0;
+    std::vector<std::string> rings;
+    pin_leg                  leg = pin_leg::UNPINNED;
+};
+
+// The text after `marker` on `line`, without its line end.
+std::string text_after(const std::string & line, const std::string & marker) {
+    std::string text = line.substr(line.find(marker) + marker.size());
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) {
+        text.pop_back();
+    }
+    return text;
+}
+
+// The plans `lines` record, one per device, in the order the devices were first recorded. A pin line names no device,
+// so it belongs to the plan the run is sizing when it is logged: the kept line and the fit's WARN follow that plan's
+// first record, and the no-room WARN comes before its only record.
+std::vector<logged_plan> logged_plans(const std::vector<std::string> & lines) {
+    const std::string        ring_marker = "[SYCL-PLAN] PP MoE oneDNN scratch ring: ";
+    std::vector<logged_plan> plans;
+    std::string              ring;
+    bool                     no_room = false;
+    size_t                   last    = SIZE_MAX;  // the plan the last record was for
+    for (const std::string & line : lines) {
+        if (line.find(ring_marker) != std::string::npos) {
+            ring = text_after(line, ring_marker);
+            continue;
+        }
+        if (line.find("[PLACEMENT] routed host experts stay mapped") != std::string::npos) {
+            if (line.find("the plan holds no window-ring room") != std::string::npos) {
+                no_room = true;
+            } else if (last != SIZE_MAX) {
+                plans[last].leg = pin_leg::WITHDRAWN;
+            }
+            continue;
+        }
+        if (line.find("[PLACEMENT] routed host experts pinned for the window ring") != std::string::npos) {
+            if (last != SIZE_MAX) {
+                plans[last].leg = pin_leg::KEPT;
+            }
+            continue;
+        }
+        if (line.find("[HOST-LEDGER] device=") == std::string::npos ||
+            line.find(" plan host_budget=") == std::string::npos) {
+            continue;
+        }
+        const size_t device = printed(line, "device");
+        last                = 0;
+        while (last < plans.size() && plans[last].device != device) {
+            ++last;
+        }
+        if (last == plans.size()) {
+            plans.emplace_back();
+            plans.back().device = device;
+        }
+        logged_plan & plan = plans[last];
+        plan.record        = line;
+        plan.records += 1;
+        plan.max_planned = std::max(plan.max_planned, printed(line, "host_planned_bytes"));
+        plan.rings.push_back(ring);
+        ring.clear();
+        if (no_room) {
+            plan.leg = pin_leg::NO_ROOM;
+            no_room  = false;
+        }
+    }
+    return plans;
+}
+
+// Whether every record of `plan` printed `ring` on its ring line.
+bool every_record_printed(const logged_plan & plan, const std::string & ring) {
+    return plan.records > 0 && plan.rings.size() == plan.records &&
+           std::all_of(plan.rings.begin(), plan.rings.end(), [&](const std::string & r) { return r == ring; });
+}
+
+// The leg and the ring line of `plan`'s record, as a PASS line names them.
+std::string leg_and_ring(const logged_plan & plan) {
+    return "leg=" + std::string(pin_leg_name(plan.leg)) + " records=" + num(plan.records) + " ring=[" +
+           (plan.rings.empty() ? std::string() : plan.rings.back()) + "]";
 }
 
 // Zeroes the per-device planner inputs a stage publishes from an inventory (the PP pipeline scratch and the PP MoE
@@ -322,24 +445,43 @@ unified_cache * device0_arena_cache() {
 }
 
 // (a) expected_host is the stage's host_planned_bytes. An early stage run in a load transaction plans the
-// Qwen3.8-shaped inventory on each device the scheduler exposes, and its planner records host_planned_bytes on one
-// [HOST-LEDGER] plan line per plan; the dry run over the same inventory, against the budgets the stage planned against
-// (the same process, so the same caches and arena zones), reports the same figure for each plan, in the same order.
+// Qwen3.8-shaped inventory on each device the scheduler exposes, and its planner records host_planned_bytes on a
+// [HOST-LEDGER] plan line. A plan's record is its last such line for its device: the load maps its file, so the planner
+// pins the routed host experts for the window ring, and when the pinned plan does not fit the budget it moves them
+// back to the mapping and records the plan again. The dry run over the same inventory, against the budgets the stage
+// planned against (the same process, so the same caches and arena zones), plans the devices the stage planned and
+// reports each record's figure, in the same order.
 // The dry run's VRAM budget is the arena's whole reservation while the arena is active, so the stage's load holds a
 // page in every arena through its end, which would otherwise release them, until the dry run has run.
 // The dry run is handed the stage's own MemAvailable sample through --mem-available (arm (d) proves the option is the
 // sample), read from the stage's one [HOST-LEDGER] stored-budget line, so both sides compute the budget from one
 // sample: two samples differ by the host's drift, and when the budget binds that drift moves the plan.
+// Legs: whether the pin is kept or withdrawn is the host budget's call (on a host whose budget is below the pinned
+// plan, every run takes the withdrawn leg), so the arm reads each plan's leg from each run's own lines (pin_leg) and
+// scores the leg taken. Both runs plan from one sample, so they take the same leg with the same number of records, and
+// the dry run's PINNED residency says what its lines say: only a kept pin leaves a PINNED entry on a mapped load.
 // Engagement: the stage run returned OK with at least one plan line and stored one budget, every arena was held through
-// its end, the dry run returned OK with as many plans, every dry-run plan put at least one weight on the host (the
-// shape's experts overflow any card here), and its RUNTIME term carries the inventory's PP MoE ring, which the dry run
-// published itself after the stage's publish was withdrawn. A budget that still differs from the stage's VOIDs the arm
-// only when an input each side reads live (the pinned share, the committed bytes, the RAM total) moved in between and
-// the budget binds; with none moved it FAILs, as one sample computed into two budgets.
-// Mutants: a term dropped from or added to expected_host (it differs from the record by that term); the dry run not
-// publishing the inventory's planner inputs (RUNTIME and expected_host lose the ring); a budget other than the stage's
-// (the host weights, and with them expected_host, move); the dry run computing a budget from the sample other than the
-// stage's (the budgets differ with nothing moved).
+// its end, the dry run returned OK, every dry-run plan put at least one weight on the host (the shape's experts
+// overflow any card here: PINNED on the kept leg, FILE_MAPPED on the others), and every record the dry run made printed
+// the inventory's PP MoE ring on its ring line (planned_ring_text). That line is the planner reading back, while it
+// sizes the record, the ring the dry run published after the stage's publish was withdrawn (zeroed), so it is printed
+// on every leg and no host figure moves it.
+// A budget, leg or record count that differs from the stage's VOIDs the arm only when an input each side reads live
+// (the pinned share, the committed bytes, the RAM total) moved in between and the budget binds a record of either run;
+// with none moved it FAILs, as one sample planned into two plans.
+// Mutants, each killed on every leg unless it says otherwise:
+//   a non-zero term dropped from or added to expected_host: it differs from the record by that term. Every commit term
+//     but the loader's two is non-zero on every leg (the withdrawn leg's record charges a 64 MiB WEIGHT zone and a
+//     15 MiB RUNTIME term). A mapped load charges no loader term, so a dropped loader_zone is arm (b)'s to kill, on
+//     the unmapped inventory; loader_grown is 0 in every plan these arms make, so no arm kills dropping it;
+//   the dry run not publishing the inventory's planner inputs: its sizing reads the zeroed ring and prints no ring line
+//     (a VOID, which fails the binary);
+//   a dry run planning against a budget other than the one it computed: its records' host_budget is not the stage's;
+//   the dry run computing its budget from a sample other than the stage's: the budgets differ with nothing moved;
+//   a dry run that does not pin the routed experts: its plans read unpinned against the stage's kept, withdrawn or
+//     no-room leg (on the unpinned leg the stage did not pin either, and the mutant changes nothing);
+//   the dry run reporting the plan its fit withdrew: expected_host is the pinned plan's figure, not the record's
+//     (withdrawn leg only; on the other legs a plan has one record, and the mutant changes nothing).
 arm_result arm_a_expected_host_is_the_stage_figure() {
     arm_result              r;
     mapped_qwen38_inventory inv;
@@ -351,13 +493,14 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
     }
     log_clear();
     const ggml_sycl_lifecycle_result stage_rc = ggml_backend_sycl_stage_load_inventory_plan(&inv.inv, nullptr, true);
-    const std::vector<std::string>   stage    = lines_with("[HOST-LEDGER] device=", " plan host_budget=");
+    const std::vector<logged_plan>   stage    = logged_plans(log_snapshot());
     const std::vector<std::string>   stored   = lines_with("[HOST-LEDGER] stored budget=");
     std::vector<mem_handle>          held;  // the arenas the stage planned against, until the dry run has run
     const bool                       arenas_held = hold_arenas(held);
     (void) ggml_backend_sycl_model_load_end(txn, false, nullptr);
     if (stage_rc != GGML_SYCL_LIFECYCLE_OK || stage.empty()) {
-        void_arm(r, "the early stage run returned " + num(stage_rc) + " with " + num(stage.size()) + " plan lines");
+        void_arm(r,
+                 "the early stage run returned " + num(stage_rc) + " with " + num(stage.size()) + " devices recorded");
         return r;
     }
     if (!arenas_held) {
@@ -378,16 +521,22 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
     opts.mem_available_set           = 1;
     opts.mem_available_bytes         = stage_available;
 
-    auto                             res = fresh_result();
+    auto res = fresh_result();
+    log_clear();
     const ggml_sycl_lifecycle_result rc  = ggml_backend_sycl_plan_dry_run(&inv.inv, &opts, res.get());
-    if (rc != GGML_SYCL_LIFECYCLE_OK || res->n_plans != stage.size()) {
-        void_arm(r, "the dry run returned " + num(rc) + " with " + num(res->n_plans) + " plans; the stage made " +
-                        num(stage.size()));
+    const std::vector<logged_plan>   dry = logged_plans(log_snapshot());
+    if (rc != GGML_SYCL_LIFECYCLE_OK) {
+        void_arm(r, "the dry run returned " + num(rc));
         return r;
     }
-    const size_t ring = planned_ring_bytes(inv.inv);
-    if (ring == 0) {
-        void_arm(r, "the inventory's ring cannot be sized, so a RUNTIME term above it proves nothing");
+    if (res->n_plans != stage.size() || dry.size() != res->n_plans) {
+        fail(r, "the dry run returned " + num(res->n_plans) + " plans and recorded " + num(dry.size()) +
+                    " devices; the stage recorded " + num(stage.size()));
+        return r;
+    }
+    const std::string ring = planned_ring_text(inv.inv);
+    if (ring.empty()) {
+        void_arm(r, "the inventory's ring cannot be sized, so no ring line can show the dry run published it");
     }
     // The budget's other inputs that each side reads live: the pinned share, the committed bytes and the RAM total.
     const bool moved = res->pinned_bytes != printed(stored[0], "pinned") ||
@@ -398,29 +547,53 @@ arm_result arm_a_expected_host_is_the_stage_figure() {
                     num(res->pinned_bytes) + ", committed " + num(res->committed_bytes) + ") the dry run's host " +
                     "budget is " + num(res->host_budget) + ", the stage stored " + num(stage_budget));
     }
+    std::string legs;
     for (uint32_t i = 0; i < res->n_plans; ++i) {
         const ggml_sycl_plan_dry_run_plan & p    = res->plans[i];
+        const logged_plan &                 s    = stage[i];
+        const logged_plan &                 d    = dry[i];
         const std::string                   name = "plan " + num(i) + " (device " + std::to_string(p.device) + ")";
         if (residency_entries(p) == 0) {
             void_arm(r, name + " put no weight on the host, so the WEIGHT terms were not exercised");
         }
-        if (p.runtime < ring) {
-            void_arm(r, name + ": RUNTIME " + num(p.runtime) + " does not carry the inventory's ring of " + num(ring));
+        if (!every_record_printed(d, ring)) {
+            void_arm(r, name + ": of the dry run's " + num(d.records) + " records, one printed the ring line [" +
+                            (d.rings.empty() ? std::string() : d.rings.back()) + "], not the inventory's [" + ring +
+                            "], so the dry run did not publish its ring");
         }
-        // A budget above the plan's whole host figure did not bind it, so a moved live input cannot move the plan; one
-        // at or below it may have, and then the comparison is not like for like.
-        const size_t plan_budget = printed(stage[i], "host_budget");
+        expect(r, p.device == static_cast<int32_t>(s.device) && d.device == s.device,
+               name + ": the stage's record is for device " + num(s.device) + ", the dry run's for device " +
+                   num(d.device));
+        // A budget above every record's host figure did not bind the plan, so a moved live input cannot move it; one
+        // at or below it may have, and then neither the leg nor the figure is like for like. On the withdrawn leg the
+        // record the budget bound is the pinned plan's, the larger.
+        const size_t plan_budget = printed(s.record, "host_budget");
         const size_t low_budget  = std::min<size_t>(plan_budget, p.host_budget);
-        if (moved && plan_budget != p.host_budget && p.expected_host >= low_budget) {
-            void_arm(r, name + ": the host budget binds (" + num(p.expected_host) + " host bytes) and the pinned " +
-                            "share, committed bytes or RAM total moved between the stage (budget " + num(plan_budget) +
-                            ") and the dry run (" + num(p.host_budget) + ")");
+        if (moved && plan_budget != p.host_budget && std::max(s.max_planned, d.max_planned) >= low_budget) {
+            void_arm(r, name + ": the host budget binds (" + num(std::max(s.max_planned, d.max_planned)) +
+                            " host bytes) and the pinned share, committed bytes or RAM total moved between the stage " +
+                            "(budget " + num(plan_budget) + ") and the dry run (" + num(p.host_budget) + ")");
+            continue;
         }
-        expect(r, p.device == static_cast<int32_t>(printed(stage[i], "device")),
-               name + ": the stage's plan line is for device " + num(printed(stage[i], "device")));
-        expect(r, p.expected_host == printed(stage[i], "host_planned_bytes"),
-               name + ": expected_host " + num(p.expected_host) + ", the stage's host_planned_bytes " +
-                   num(printed(stage[i], "host_planned_bytes")));
+        if (!moved) {
+            expect(r, p.host_budget == plan_budget,
+                   name + ": the dry run recorded host_budget " + num(p.host_budget) + ", the stage's record " +
+                       num(plan_budget));
+        }
+        expect(r, d.leg == s.leg && d.records == s.records,
+               name + ": the dry run took the " + pin_leg_name(d.leg) + " leg with " + num(d.records) +
+                   " records, the stage the " + pin_leg_name(s.leg) + " leg with " + num(s.records));
+        const uint64_t pinned = p.residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED];
+        expect(r, (d.leg == pin_leg::KEPT) == (pinned > 0),
+               name + ": the dry run's lines say " + pin_leg_name(d.leg) + ", and its residency holds " + num(pinned) +
+                   " PINNED entries");
+        expect(r, p.expected_host == printed(s.record, "host_planned_bytes"),
+               name + ": expected_host " + num(p.expected_host) + ", the stage's record's host_planned_bytes " +
+                   num(printed(s.record, "host_planned_bytes")));
+        legs += (legs.empty() ? "" : "; ") + name + " " + leg_and_ring(d);
+    }
+    if (r.result == outcome::PASS) {
+        r.why = legs;
     }
     return r;
 }
@@ -701,12 +874,17 @@ arm_result arm_b_every_term_printed_from_the_plan() {
 //   refusal: while a load is open the dry run is refused with LOAD_BUSY before it samples or plans, and stores nothing.
 // Engagement: a load was staged before the dry run (its stage returned OK with at least one plan line); the dry run
 // returned OK, not LOAD_BUSY, so that load had ended, and planned at least one device; its budget is not B0 (so a store
-// would have moved the value); it published the inventory's PP MoE ring while it planned (its RUNTIME term carries the
-// ring, which the sentinel does not hold), so it wrote at least one of the globals; the refusal was observed.
-// Mutants: a storing host_budget_pass_scope or a host_ledger_store_budget call in the dry run (the stored value leaves
-// B0 and the store count moves); the planner recording the stored budget instead of the one passed in (the plans record
-// B0); the restore dropped (a global reads what the dry run wrote, not its sentinel); the refusal dropped (the dry run
-// plans inside the transaction and returns OK).
+// would have moved the value); it published the inventory's PP MoE ring while it planned, so it wrote at least one of
+// the globals: every record it made printed the inventory's ring on its ring line (planned_ring_text), which the
+// planner reads back from the per-device globals while it sizes the record, and which shows the sentinel's ring when
+// nothing was published; the refusal was observed. The ring line is printed for every record whether the routed host
+// experts' pin is kept or withdrawn, which the host budget decides (the PASS line names the leg each plan took, read
+// from the dry run's own lines); no check here reads a host figure that moves with the leg.
+// Mutants, each killed on every leg, since none of them is on the pin's path: a storing host_budget_pass_scope or a
+// host_ledger_store_budget call in the dry run (the stored value leaves B0 and the store count moves); the planner
+// recording the stored budget instead of the one passed in (every record, the last among them, records B0); the
+// restore dropped (a global reads what the dry run wrote, not its sentinel: the ring line shows the publish wrote the
+// inventory's ring over it); the refusal dropped (the dry run plans inside the transaction and returns OK).
 arm_result arm_c_a_dry_run_stores_nothing() {
     arm_result              r;
     mapped_qwen38_inventory inv;
@@ -737,11 +915,13 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     }
 
     ggml_sycl_test_host_ledger_store_budget(B0);
-    const uint64_t                          s0    = stores();
-    ggml_sycl_plan_dry_run_opts             opts  = default_opts();
-    auto                                    res   = fresh_result();
+    const uint64_t              s0   = stores();
+    ggml_sycl_plan_dry_run_opts opts = default_opts();
+    auto                        res  = fresh_result();
+    log_clear();
     const ggml_sycl_lifecycle_result        rc    = ggml_backend_sycl_plan_dry_run(&inv.inv, &opts, res.get());
     const std::vector<device_planner_state> after = read_planner_state();
+    const std::vector<logged_plan>          dry   = logged_plans(log_snapshot());
     write_planner_state(original);
     if (rc != GGML_SYCL_LIFECYCLE_OK || res->n_plans == 0) {
         void_arm(r, "the dry run returned " + num(rc) + " with " + num(res->n_plans) + " plans");
@@ -749,17 +929,26 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     if (res->host_budget == B0) {
         void_arm(r, "the dry run's own budget is B0, so a store would not show");
     }
-    const size_t ring = planned_ring_bytes(inv.inv);
-    if (ring == 0) {
-        void_arm(r, "the inventory's ring cannot be sized, so a RUNTIME term above it proves nothing");
+    const std::string ring = planned_ring_text(inv.inv);
+    if (ring.empty()) {
+        void_arm(r, "the inventory's ring cannot be sized, so no ring line can show the dry run published it");
     }
-    for (uint32_t i = 0; i < res->n_plans; ++i) {
-        if (res->plans[i].runtime < ring) {
-            void_arm(r, "plan " + num(i) + " did not plan the inventory's ring, so the dry run wrote no global");
+    if (rc == GGML_SYCL_LIFECYCLE_OK && dry.size() != res->n_plans) {
+        void_arm(r, "the dry run returned " + num(res->n_plans) + " plans and its lines record " + num(dry.size()) +
+                        " devices, so its records cannot be read");
+    }
+    std::string legs;
+    for (uint32_t i = 0; i < res->n_plans && i < dry.size(); ++i) {
+        if (!every_record_printed(dry[i], ring)) {
+            void_arm(r, "plan " + num(i) + " did not plan the inventory's ring [" + ring + "] (a record printed [" +
+                            (dry[i].rings.empty() ? std::string() : dry[i].rings.back()) +
+                            "]), so the dry run wrote no global");
         }
         expect(r, res->plans[i].host_budget == res->host_budget,
                "plan " + num(i) + " recorded " + num(res->plans[i].host_budget) + ", not the dry run's budget " +
                    num(res->host_budget));
+        legs += (legs.empty() ? "" : "; ") + std::string("plan ") + num(i) + " (device " +
+                std::to_string(res->plans[i].device) + ") " + leg_and_ring(dry[i]);
     }
     expect(r, host_ledger_budget() == B0, "the stored budget moved from B0 to " + num(host_ledger_budget()));
     expect(r, stores() == s0, "the dry run stored " + num(stores() - s0) + " times");
@@ -787,6 +976,9 @@ arm_result arm_c_a_dry_run_stores_nothing() {
     }
     expect(r, open_res->n_plans == 0, "the refused dry run reported " + num(open_res->n_plans) + " plans");
     expect(r, b2 == b1 && s2 == s1, "the refused dry run stored a budget");
+    if (r.result == outcome::PASS) {
+        r.why = legs;
+    }
     return r;
 }
 
@@ -931,9 +1123,9 @@ arm_result arm_d_mem_available_option_is_the_sample() {
 
 // The device-wide terms a load publishes beside the planner state (device_planner_state), which a refused load puts
 // back too: the ring's KV-zone slots, its row bytes and expert counts, its micro-batch, and the oneDNN pair with its
-// stored sum. The dry run publishes none of them, so they are not in the sentinel the dry-run arms share: a KV-zone
-// slot there would move the RUNTIME term those arms check. Read through load_published_terms::snapshot, the pair's one
-// reader; written through the setters.
+// stored sum. The dry run publishes none of them, so they are not in the sentinel the dry-run arms share, which holds
+// what the dry run writes and must put back. Read through load_published_terms::snapshot, the pair's one reader;
+// written through the setters.
 struct device_load_extras {
     bool     act_in_kv          = false;
     bool     out_in_kv          = false;
