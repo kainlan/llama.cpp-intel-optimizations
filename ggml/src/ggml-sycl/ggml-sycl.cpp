@@ -21858,12 +21858,14 @@ static const char * ggml_sycl_expert_named_stop(const std::vector<ggml_sycl_expe
 }
 
 // One triplet prepared outside the locks: its members with the storage minted for them, the extra that remembers each
-// member's storage, what its move is, and for a named move its place in the caller's list.
+// member's storage, what its move is, for a named move its place in the caller's list, and the microseconds its
+// preparation spent in the resolver, which looks each member up in the expert metadata.
 struct ggml_sycl_expert_prepared_triplet {
     ggml_sycl::expert_move_member members[3];
-    ggml_tensor_extra_gpu *       extras[3] = { nullptr, nullptr, nullptr };
-    ggml_sycl_expert_move_kind    kind      = ggml_sycl_expert_move_kind::LOAN;
-    size_t                        named     = 0;
+    ggml_tensor_extra_gpu *       extras[3]  = { nullptr, nullptr, nullptr };
+    ggml_sycl_expert_move_kind    kind       = ggml_sycl_expert_move_kind::LOAN;
+    size_t                        named      = 0;
+    uint64_t                      resolve_us = 0;
 };
 
 // Prepare `out` (its kind already set) for the triplet `keys` names, with no lock held: map each member to the cache
@@ -21889,7 +21891,13 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
         const ggml_sycl::expert_placement_key & k = keys[r];
         const ggml_sycl::placement_entry *      e = plan.find_expert_entry(k.layer_id, k.expert_id, k.role);
         ggml_sycl_expert_loan_target            target;
-        if (!e || !resolver(*e, target) || !target.extra) {
+        if (!e) {
+            return texts.no_tensor;
+        }
+        const auto resolve_from = std::chrono::steady_clock::now();
+        const bool resolved     = resolver(*e, target);
+        out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);
+        if (!resolved || !target.extra) {
             return texts.no_tensor;
         }
         if (!cache.has_expert_source(target.key, to_device)) {
@@ -22050,7 +22058,8 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
 // caller re-posts BUSY ones (warn_busy false). A refill runs at every decode graph's boundary, so it WARNs only the
 // lent triplets it drops from the ledger, once each (a triplet is dropped once); its boundary runner WARNs refusals,
 // rate-limited. `named_moves` is a named move's list, one outcome per triplet, which the body fills in; null for the
-// other directions. A named move WARNs nothing: its caller reads every answer from the outcomes.
+// other directions. A named move WARNs no refusal: its caller reads every answer from the outcomes. Its one result
+// line is a WARN with the batch's timings.
 static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     ggml_sycl_expert_txn_direction               direction,
     int                                          device,
@@ -22185,6 +22194,11 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     prepared.reserve(n_selected);
     const char * stop      = nullptr;
     bool         transient = false;
+    // The batch's host time, in microseconds, for the named move's result line: the members' metadata lookups in the
+    // preparation, and the cache's copy steps and id handovers (expert_move_record).
+    uint64_t     meta_us   = 0;
+    uint64_t     copy_us   = 0;
+    uint64_t     remap_us  = 0;
 
     // A lent triplet no later boundary could prepare either (a member no tensor resolves, or no WEIGHT arena on the
     // device to mint its storage from) leaves the ledger under the lock below, if it is the back by then. Left there,
@@ -22197,6 +22211,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         triplet.kind  = named && !(*named_moves)[triplet.named].to_device ? ggml_sycl_expert_move_kind::EVICT : kind;
         stop = ggml_sycl_expert_prepare_triplet(*cache, device, *current->plan, &keys[3 * t], *resolver, triplet,
                                                 &transient);
+        meta_us += triplet.resolve_us;
         if (!stop) {
             prepared.push_back(std::move(triplet));
         } else if (named) {
@@ -22299,6 +22314,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                     loaned = cache->refill_lent_triplet(triplet.members, record);
                     break;
             }
+            copy_us += record.copy_us;
+            remap_us += record.remap_us;
             // A named triplet the cache refuses, admit or evict, is refused alone, REFUSED when a later boundary would
             // meet the refusal again and BUSY otherwise, and the next one moves; nothing of it moved.
             if (!loaned && (admit || evict)) {
@@ -22518,9 +22535,13 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                 ++n_evicted;
             }
         }
-        // Its caller reads each triplet's answer, so the line is DEBUG.
-        GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\n",
-                       device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);
+        // A WARN, since every tool drops INFO: the line is where a run shows what its moves cost the boundary thread,
+        // the copy steps' and the id handovers' time in the cache and the metadata lookups', summed over the batch.
+        GGML_LOG_WARN(
+            "[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s); "
+            "copy wait %llu us, id remap %llu us, meta lookup %llu us\n",
+            device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason,
+            (unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us);
     } else {
         if (stop) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, stop);

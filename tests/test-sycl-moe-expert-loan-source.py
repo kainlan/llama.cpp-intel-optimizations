@@ -1226,7 +1226,7 @@ def claim_final_refusals_name_the_cache_refusals(cache: str, sycl: str) -> bool:
 
 # --- a lent triplet the refill can never prepare leaves the ledger, WARNed (llama.cpp-sif1) -------------------------
 
-RESOLVE_FAILED = "if (!e || !resolver(*e, target) || !target.extra) { return texts.no_tensor; }"
+RESOLVE_FAILED = "if (!resolved || !target.extra) { return texts.no_tensor; }"
 # The refill's row of the kind table: the words its preparation and its log use.
 REFILL_TEXTS = ('case ggml_sycl_expert_move_kind::REFILL: return { "no tensor for a lent expert", "not lent", '
                 '"exception while refilling", "refill" };')

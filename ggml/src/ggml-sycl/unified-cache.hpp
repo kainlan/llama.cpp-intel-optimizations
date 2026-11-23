@@ -35,6 +35,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -4142,7 +4143,9 @@ struct expert_move_member {
 // the entry's leases are gone and behind the copy, which is the entry's last write, and in device_keys[i] the key the
 // device entry was retired under: the caller drops every view it holds on the entry by that key, since a retired
 // entry refuses the resolve a view would otherwise be matched by once the cache generation moves. A move to the
-// device leaves both at their defaults.
+// device leaves both at their defaults. An accepted move also reports the host time it spent, in microseconds, in its
+// copy step (the submissions; a synchronous staged branch would show here as a wait) and in its handover (each id
+// handed to the new copy and the old one retired, under the cache locks), for the move's summary line.
 struct expert_move_record {
     bool                 accepted     = false;
     const char *         reason       = "none";
@@ -4152,7 +4155,15 @@ struct expert_move_record {
     expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
                                               expert_retire_status::INVALID };
     unified_cache_key    device_keys[3]   = {};
+    uint64_t             copy_us          = 0;
+    uint64_t             remap_us         = 0;
 };
+
+// Whole microseconds since `since`, for the expert move's timings.
+inline uint64_t expert_move_us_since(std::chrono::steady_clock::time_point since) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count());
+}
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Deterministic publication/lifecycle controls exist only in private fixtures.

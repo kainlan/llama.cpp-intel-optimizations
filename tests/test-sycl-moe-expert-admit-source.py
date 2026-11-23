@@ -46,8 +46,8 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       strict ("not lent", "not a lent copy"), admit_host_triplet passes true, and an admit's host copy must be pinned
       storage it owns whole, its owner exactly the entry's base and size, and a host-zone slice ("host copy not
       pinned" otherwise), while a refill's owner need only hold the entry, as the loan that lent it requires;
-  A9  a named move WARNs nothing (its refusals skip the loan's WARN, its result line is DEBUG), and outside the
-      private test fixtures the entry has exactly one caller, the decode-boundary swap driver
+  A9  a named move WARNs no refusal (its refusals skip the loan's WARN; its caller reads each answer from the
+      outcomes), and outside the private test fixtures the entry has exactly one caller, the decode-boundary swap driver
       (ggml_sycl_run_expert_swap_at_boundary), which calls it once;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
       lets through;
@@ -75,7 +75,11 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       moves; it never ends the list;
   E5  each moved outcome records the device storage it took or gives back; the body sums the bytes once per
       direction, as each triplet moves, writes them once the plan is published and names both directions in its
-      DEBUG line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list.
+      result line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list;
+  M1  a named move's one result line is a WARN (every tool drops INFO) that carries, summed over the batch, the
+      microseconds the cache spent in each move's copy step and in its id handover and retire, and the transaction in
+      the members' metadata lookups: each cache body, the loan's and the copy to the device, records its two times in
+      the move record, the preparation times its resolver call, and the body sums all three as each call returns.
 
 Checks run on comment-stripped, whitespace-normalized text. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it and is reported if it survives, if another pin
@@ -330,8 +334,9 @@ PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_reside
                 '{ refusal = admit ? "host copy not pinned" : "not a lent copy"; break; }')
 
 REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {"
-NAMED_DEBUG = ('GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
-               '(%s)\\n"')
+NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
+                '(%s); copy wait %llu us, id remap %llu us, meta lookup %llu us\\n"')
+NAMED_LINE = "GGML_LOG_WARN(" + NAMED_FORMAT
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
 # The entry's one production caller: the swap driver at the synchronize boundary.
 DRIVER_SIG = "static void ggml_sycl_run_expert_swap_at_boundary("
@@ -415,7 +420,13 @@ STAMP_COMPARES = "s.expert_storage_generation == expert_storage_generation"
 BODY_SUM = "++lent; (to_device ? taken : freed) += record.device_bytes;"
 BODY_RESULT = "result.bytes_freed = freed; result.bytes_readmitted = taken;"
 BODY_COUNT = "if (!m.to_device) { ++n_evicted; }"
-NAMED_DEBUG_ARGS = "device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);"
+NAMED_LINE_ARGS = ("device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason, "
+                   "(unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us);")
+# M1: what the body sums into the line, and where each figure is measured.
+SUM_META = "meta_us += triplet.resolve_us;"
+SUM_CACHE = "copy_us += record.copy_us; remap_us += record.remap_us;"
+CACHE_TIMES = ("out.copy_us = copy_took;", "out.remap_us = remap_took;")
+PREP_TIMED = "const bool resolved = resolver(*e, target); out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);"
 ENTRY_BYTES = "r.bytes_evicted = answer.bytes_freed; r.bytes_admitted = answer.bytes_readmitted;"
 ENTRY_SPLIT = ("for (ggml_sycl_expert_move_outcome & m : moves) { if (m.moved) { "
                "++(m.to_device ? r.n_admitted : r.n_evicted); } (m.to_device ? r.admitted : r.evicted).push_back(m); }")
@@ -566,8 +577,8 @@ def check(raw: dict[str, str]) -> None:
                    "refill's owner bound is not the loan's")
 
     # A9 ---------------------------------------------------------------------------------------------------------------
-    if txn.count(REFUSE_GATE) != 1 or txn.count(NAMED_DEBUG) != 1:
-        fail("A9", "a named move's refusal or result is logged above DEBUG")
+    if txn.count(REFUSE_GATE) != 1:
+        fail("A9", "a named move's refusal is logged")
     private = _private_testing_lines(raw["sycl"])
     stripped = strip_comments(raw["sycl"])
     lines = stripped.split("\n")
@@ -647,13 +658,26 @@ def check(raw: dict[str, str]) -> None:
 
     # E5 ---------------------------------------------------------------------------------------------------------------
     if (txn.count(BODY_SUM) != 1 or txn.count(BODY_RESULT) != 1 or txn.count(BODY_COUNT) != 1
-            or txn.count(NAMED_DEBUG_ARGS) != 1 or "+= m.device_bytes" in txn
-            or not ordered(txn, BODY_SUM, BODY_RESULT, BODY_COUNT, NAMED_DEBUG, NAMED_DEBUG_ARGS)):
-        fail("E5", "the body does not sum each direction's bytes once, as each triplet moves, or its DEBUG line does "
+            or txn.count(NAMED_LINE_ARGS) != 1 or "+= m.device_bytes" in txn
+            or not ordered(txn, BODY_SUM, BODY_RESULT, BODY_COUNT, NAMED_FORMAT, NAMED_LINE_ARGS)):
+        fail("E5", "the body does not sum each direction's bytes once, as each triplet moves, or its result line does "
                    "not name both directions")
     if entry.count(ENTRY_BYTES) != 1 or entry.count(ENTRY_SPLIT) != 1 or "device_bytes" in entry:
         fail("E5", "the entry does not take the body's bytes, or does not count each outcome in its direction and "
                    "return it in its own list")
+
+    # M1 ---------------------------------------------------------------------------------------------------------------
+    if (txn.count(NAMED_LINE) != 1 or txn.count(SUM_META) != 1 or txn.count(SUM_CACHE) != 1
+            or not ordered(txn, "stop = ggml_sycl_expert_prepare_triplet(", SUM_META, "std::unique_lock lock(")
+            or not ordered(txn, "loaned = cache->refill_lent_triplet(triplet.members, record); break; }", SUM_CACHE,
+                           "if (!loaned && (admit || evict)) {")
+            or not ordered(txn, SUM_CACHE, NAMED_LINE)):
+        fail("M1", "the named move's result line is not one WARN carrying the batch's copy, id remap and meta lookup "
+                   "times, each summed as its call returns")
+    if (not all(loan.count(t) == 1 and copy.count(t) == 1 for t in CACHE_TIMES) or prep.count(PREP_TIMED) != 1
+            or "resolver(*e, target)" in prep.replace(PREP_TIMED, "")):
+        fail("M1", "a cache body does not record its copy and handover times, or the preparation does not time its "
+                   "resolver call")
 
 
 def mutate(raw: dict[str, str], edits: list[tuple[str, str, str, str]]) -> dict[str, str]:
@@ -700,6 +724,10 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
+    expect_fail("named-line-debug", "M1", [("sycl", TXN_SIG, 'GGML_LOG_WARN(\n            "[MOE-EXEC] named move',
+                                            'GGML_LOG_DEBUG(\n            "[MOE-EXEC] named move')])
+    expect_fail("meta-lookup-unsummed", "M1", [("sycl", TXN_SIG, "meta_us += triplet.resolve_us;", "")])
+    expect_fail("loan-copy-untimed", "M1", [("cache", LOAN_SIG, "out.copy_us  = copy_took;", "")])
     expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int ",
                                          "ggml_sycl_txn_result ggml_sycl_expert_move_run(int ")])
     expect_fail("fill-waited", "A1", [("cache", COPY_SIG, "bq,\n                                                    "

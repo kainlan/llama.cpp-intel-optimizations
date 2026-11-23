@@ -11592,6 +11592,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     // 2. The copies, on the DMA queue behind what wrote each entry. mem_copy_async retains each copy's two owners
     // until it completes, so the device storage outlives the read and the host storage the write, whatever happens
     // to either entry afterwards.
+    const auto copy_from = std::chrono::steady_clock::now();
     try {
         sycl::queue & dq = get_dma_queue();
         for (int i = 0; i < 3; ++i) {
@@ -11604,6 +11605,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         out.reason = "copy submit failed";
         return false;
     }
+    const uint64_t copy_took = expert_move_us_since(copy_from);
 
     // 3. All three or none, under the locks: each device entry is still the one checked. The transaction takes a lease
     // that holds the entry in place until its host copy is published. Its last write becomes its copy, which ran behind
@@ -11623,6 +11625,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     expert_retire_nodes              device_nodes[3];
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
+    uint64_t                         remap_took = 0;
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -11640,6 +11643,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             device_entry[i] = &it->second;
             held[i]         = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");
         }
+        const auto remap_from = std::chrono::steady_clock::now();
         for (int i = 0; i < 3 && !refusal; ++i) {
             const unified_cache_key device_key =
                 make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
@@ -11653,6 +11657,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
             out.device_keys[i]   = device_key;
         }
+        remap_took = expert_move_us_since(remap_from);
     }
     if (refusal) {
         out        = expert_move_record{};
@@ -11762,6 +11767,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     // pass reaps each entry.
     out.accepted = true;
     out.reason   = "OK";
+    out.copy_us  = copy_took;
+    out.remap_us = remap_took;
     for (int i = 0; i < 3; ++i) {
         out.device_bytes += device_size[i];
     }
@@ -11920,6 +11927,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
     // 2. The copies, on the BCS queue (the copy engine, off the compute engine the decode graph runs on) behind what
     // wrote each host copy: a loan's D2H copy, or the load's. Both endpoints are typed owners, so the copy is a direct
     // DMA, and mem_copy_async retains both until it completes.
+    const auto copy_from = std::chrono::steady_clock::now();
     try {
         sycl::queue & bq = get_bcs_queue();
         for (int i = 0; i < 3; ++i) {
@@ -11940,6 +11948,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         out.reason = "copy submit failed";
         return false;
     }
+    const uint64_t copy_took = expert_move_us_since(copy_from);
 
     // 3. Everything the publication allocates, built before the locks: each device entry and its mirror record, and
     // the nodes the host retires hand back. Under the locks, the device entries' insertion and their lease minting
@@ -11984,7 +11993,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
     scoped_planned_materialization   materialization(this, admit ? "expert admit" : "expert refill");
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
-    int                              inserted = 0;
+    int                              inserted   = 0;
+    uint64_t                         remap_took = 0;
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -12054,7 +12064,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         // key name the device entry by then, so the retire there takes neither; under the loan's other host ids it
         // takes both, into host_nodes.
         if (!refusal) {
-            size_t r = 0;
+            const auto remap_from = std::chrono::steady_clock::now();
+            size_t     r          = 0;
             for (int i = 0; i < 3; ++i) {
                 const ggml_sycl_cache_id & key = members[i].key;
                 std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);
@@ -12069,6 +12080,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                     }
                 }
             }
+            remap_took = expert_move_us_since(remap_from);
         }
     }
 
@@ -12094,6 +12106,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
 
     out.accepted = true;
     out.reason   = "OK";
+    out.copy_us  = copy_took;
+    out.remap_us = remap_took;
     for (int i = 0; i < 3; ++i) {
         out.device_bytes += device_size[i];
     }
