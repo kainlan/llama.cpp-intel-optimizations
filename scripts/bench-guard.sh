@@ -35,7 +35,8 @@
 #
 # Postflight SUSPECT triggers, each with its own reason token in the verdict
 # line and archived header: GPU host backing grew more than 5 GB across the run
-# (`backing-grew:<N>kB`, net Shmem plus the remainder); the run was killed by the timeout
+# (`backing-grew:<N>kB`, net Shmem plus the remainder; a first post sample over the threshold is
+# re-taken after BENCH_GUARD_POST_RECHECK_S seconds, default 5, and only the second sample counts); the run was killed by the timeout
 # (`timeout-killed:rc=<N>`, rc 124/137); `timeout` itself could not execute
 # the wrapped command -- bad `timeout` invocation, command not executable, or
 # command not found (`not-executed:rc=<N>`, rc 125/126/127); the wrapped
@@ -78,6 +79,8 @@ SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" S
 SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
+# Seconds to wait before the second post-run sample; the environment variable lets a test set it to 0.
+POST_RECHECK_S="${BENCH_GUARD_POST_RECHECK_S:-5}"
 LOG="" BUDGET=900 JOURNALCTL_CMD=""
 # shellcheck disable=SC2034  # --drm-root below sets DRM_ROOT, read by derive_card_for_selector (sourced further down, sycl-gpu-sysfs.sh) -- shellcheck can't see across a `source`
 while [ $# -gt 0 ]; do case "$1" in
@@ -241,6 +244,13 @@ else
 fi
 
 sample_shmem
+# A sample taken as the wrapped process exits can still see its host backing (the xe driver releases it a moment
+# later). When the first post sample is over the growth threshold, wait and sample once more; the second sample is
+# the one that decides and is the one the header records. No wait when the first sample is under.
+if [ $((SAMPLE_BACKING - pre_backing)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
+    sleep "$POST_RECHECK_S"
+    sample_shmem
+fi
 post_shmem_raw="$SAMPLE_RAW" post_tmpfs="$SAMPLE_TMPFS" post_shmem_eff="$SAMPLE_EFF" post_remainder="$SAMPLE_REM" post_backing="$SAMPLE_BACKING"
 post_thr="$(cat "$FREQ/throttle/status")"
 

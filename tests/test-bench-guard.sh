@@ -13,6 +13,8 @@ GUARD="$ROOT_DIR/scripts/bench-guard.sh"
 # finding Q17).
 T="$(mktemp -d)"; trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 fail=0
+# No real wait before the post-run re-check in any case below.
+export BENCH_GUARD_POST_RECHECK_S=0
 skipped=0
 # cases: total test-case count, printed in the final "OK" line (llama.cpp-3e0f
 # finding 10). Every case below bumps this exactly once -- expect_status does
@@ -182,6 +184,30 @@ mk_tree 0 0; mk_meminfo 3000000
 head -1 "$T/run3.log" | grep -q "SUSPECT.*backing-grew:40000000kB" || { echo "FAIL: remainder-only growth must stamp SUSPECT backing-grew (got: $(head -1 "$T/run3.log"))"; fail=1; }
 head -1 "$T/run3.log" | grep -qE 'pre_remainder=0kB pre_backing=3000000kB post_remainder=40000000kB post_backing=43000000kB' \
     || { echo "FAIL: header must stamp remainder and backing (got: $(head -1 "$T/run3.log"))"; fail=1; }
+
+cases=$((cases+1))
+# The post-run sample is re-taken when the first is over the growth threshold, because the host backing of the
+# exiting process is released a moment later. The fake df-cmd counts its calls (one per sample: preflight, pre,
+# post, post again) and switches the meminfo the remainder is read from. First post high, second low: VALID.
+# Both high: SUSPECT. The wait is set to 0 through the environment.
+mk_recheck_df() { # $1 = remainder kB on the 4th sample
+    printf '%s\n' '#!/usr/bin/env bash' \
+        "n=\$(cat '$T/df.n' 2>/dev/null || echo 0); n=\$((n+1)); echo \$n > '$T/df.n'" \
+        "if [ \$n -eq 3 ]; then printf 'MemTotal: 296000000 kB\\nMemFree: 256000000 kB\\nShmem: 3000000 kB\\n' > '$T/meminfo'; fi" \
+        "if [ \$n -eq 4 ]; then printf 'MemTotal: %s kB\\nMemFree: 256000000 kB\\nShmem: 3000000 kB\\n' \$((256000000 + $1)) > '$T/meminfo'; fi" \
+        "echo 'Filesystem 1K-blocks Used Available Use% Mounted on'" > "$T/recheck-df.sh"
+    chmod +x "$T/recheck-df.sh"; rm -f "$T/df.n"
+}
+mk_tree 0 0; mk_meminfo 3000000; mk_recheck_df 0
+BENCH_GUARD_POST_RECHECK_S=0 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "$T/recheck-df.sh" --max-wait 1 --journalctl-cmd true \
+    --log "$T/run4.log" -- true || fail=1
+head -1 "$T/run4.log" | grep -q "VALID" || { echo "FAIL: a post sample that drops on the re-check must stay VALID (got: $(head -1 "$T/run4.log"))"; fail=1; }
+head -1 "$T/run4.log" | grep -q "post_remainder=0kB post_backing=3000000kB" || { echo "FAIL: header must record the deciding (second) sample (got: $(head -1 "$T/run4.log"))"; fail=1; }
+cases=$((cases+1))
+mk_tree 0 0; mk_meminfo 3000000; mk_recheck_df 40000000
+BENCH_GUARD_POST_RECHECK_S=0 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "$T/recheck-df.sh" --max-wait 1 --journalctl-cmd true \
+    --log "$T/run5.log" -- true || fail=1
+head -1 "$T/run5.log" | grep -q "SUSPECT.*backing-grew:40000000kB" || { echo "FAIL: a post sample high on both reads must stamp SUSPECT (got: $(head -1 "$T/run5.log"))"; fail=1; }
 
 cases=$((cases+1))
 # A meminfo without MemTotal gives no remainder: refuse, never read it as 0.
@@ -824,7 +850,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 49 ] || { echo "FAIL: expected 49 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 51 ] || { echo "FAIL: expected 51 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
