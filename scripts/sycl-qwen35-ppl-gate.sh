@@ -257,7 +257,7 @@ mem() { sycl_gpu_host_backing_log_line; }
 
 # GPU.lock serialises access, not memory recovery: GPU host backing (Shmem + the meminfo remainder) is released
 # after the lock is, so wait for the host to settle before each model load and fail closed if it never does.
-# An unreadable meminfo is not settled. MemAvailable is not a condition (ruling 2026-11-12): it sits near 55 GB on
+# An unreadable meminfo is not settled. MemAvailable is not a condition (ruling 2026-11-12): it sits near 50 GiB on
 # purpose while another tenant holds a model, and the planner refuses an oversized load by name.
 settle() {
     local s
@@ -268,7 +268,7 @@ settle() {
         fi
         sleep 10
     done
-    die "host never settled (GPU host backing < 30 GB): $(mem)"
+    die "host never settled (GPU host backing < 30 GiB): $(mem)"
 }
 
 if [ "$TAKE_LOCK" = 1 ]; then
