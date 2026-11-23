@@ -1581,8 +1581,8 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
 INHERIT_DEF = ("void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept { "
                "dst.owner_mask |= src.owner_mask; dst.owner_tagged = dst.owner_tagged || src.owner_tagged; "
                "if (dst.pending_load_txn_id == 0) { dst.pending_load_txn_id = src.pending_load_txn_id; } }")
-ADMIT_INHERIT = ("} else { inherit_entry_ownership(device_entry[i], it->second); "
-                 "device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id; }")
+ADMIT_INHERIT = "inherit_entry_ownership(device_entry[i], it->second);"
+ADMIT_MIRROR = "device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;"
 REGISTER_BODY_SIG = ("bool unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, size_t size, "
                      "ggml_layout_mode layout, mem_handle * out_handle, std::shared_ptr<void> allocation_owner, "
                      "const mem_handle & typed_owner,")
@@ -1602,8 +1602,8 @@ def claim_a_moved_copy_belongs_to_its_sources_models(cache: str) -> bool:
     owned = body(c, REGISTER_OWNED_SIG)
     loan = body(c, LOAN_SIG)
     return (c.count(INHERIT_DEF) == 1 and c.count("inherit_entry_ownership(") == 3
-            and admit.count(ADMIT_INHERIT) == 1
-            and ordered(admit, REFILL_SESSION, CACHE_LOCKS, ADMIT_INHERIT, EMPLACE, SWAP_MIRROR)
+            and admit.count(ADMIT_INHERIT) == 1 and admit.count(ADMIT_MIRROR) == 1
+            and ordered(admit, REFILL_SESSION, CACHE_LOCKS, ADMIT_INHERIT, ADMIT_MIRROR, EMPLACE, SWAP_MIRROR)
             and reg.count(REGISTER_INHERIT) == 1 and reg.count(REGISTER_MIRROR_TXN) == 1
             and ordered(reg, REGISTER_STAMP, REGISTER_INHERIT, REGISTER_INSERT, REGISTER_MIRROR_TXN)
             and owned.count(FORWARD) == 2
@@ -3512,20 +3512,19 @@ def test_mutant_helper_drops_the_tag_fails():
 
 
 def test_mutant_admit_publishes_untagged_fails():
-    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, ADMIT_INHERIT, "}"))
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, ADMIT_INHERIT + " ", ""))
 
 
 def test_mutant_admit_tags_after_the_insert_fails():
-    """The inserted entry is a copy of device_entry[i]: tagging the local after the insert tags nothing."""
-    moved = _once(CACHE, ADMIT_INHERIT, "}")
-    assert not claim_a_moved_copy_belongs_to_its_sources_models(
-        _once(moved, EMPLACE, EMPLACE + " inherit_entry_ownership(device_entry[i], it->second);"))
+    """The inserted entry is a copy of device_entry[i]: tagging the local after the insert tags nothing. The call is
+    moved, not dropped, so only the ordering clause (inside the second lock, before the insert) catches it."""
+    moved = _once(CACHE, ADMIT_INHERIT + " ", "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(moved, EMPLACE, EMPLACE + " " + ADMIT_INHERIT))
 
 
 def test_mutant_admit_mirror_keeps_the_stamp_fails():
     """A mirror whose pending load differs from its entry's survives that load's abort, naming a retired entry."""
-    assert not claim_a_moved_copy_belongs_to_its_sources_models(
-        _once(CACHE, " device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;", ""))
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, " " + ADMIT_MIRROR, ""))
 
 
 def test_mutant_registration_ignores_the_source_fails():
@@ -3553,6 +3552,13 @@ def test_mutant_owned_registration_drops_the_source_fails():
 def test_mutant_loan_names_no_source_fails():
     assert not claim_a_moved_copy_belongs_to_its_sources_models(
         _once(CACHE, REGISTER, REGISTER.replace(", &out.device_keys[i])", ", nullptr)")))
+
+
+def test_mutant_loan_names_its_source_after_the_registration_fails():
+    """The registration reads the key it is handed as the source: a key set only after the call names no entry."""
+    moved = _once_in(CACHE, LOAN_SIG, " " + LOAN_DEVICE_KEY, "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once_in(moved, LOAN_SIG, REGISTER + ";", REGISTER + "; " + LOAN_DEVICE_KEY))
 
 
 # --- a missing source refuses before the insert -----------------------------------------------------------------------
