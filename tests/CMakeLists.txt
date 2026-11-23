@@ -1119,6 +1119,15 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
+    # Task 8g (Inkling 2 Mini): BF16 experts run on the device that holds every expert at AOS, through one predicate
+    # that supports_op and the route both ask, from the cached full-local table and the device ids, with no host ids,
+    # no host wait and no MMID workspace; a refusal fails the graph at its boundary, never re-routes or aborts.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-bf16-direct-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-bf16-direct-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.

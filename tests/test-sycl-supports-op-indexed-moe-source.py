@@ -261,11 +261,14 @@ def contract(text: str) -> bool:
         executor_helper_reads_the_latch(text)
         and function_body_open < early < early_close < router_flag < planner < planner_close < switch
         and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
+        # A MUL_MAT_ID is admitted by the MMID tables, the batched prompt executor's claim, or the BF16 direct
+        # route's one predicate (Task 8g); the route asks the same predicate, so the gate and the route agree.
         and executable_body(early_body) == (
             "constggml_typeindexed_a_type=op->src[0]->type;"
             "if(op->op==GGML_OP_MUL_MAT_ID){"
             "if(!ggml_is_contiguous(op->src[0])){returnfalse;}"
-            "if(!moe_mmvq_admission_supports_type(indexed_a_type)&&!ggml_sycl_moe_pp_batched_admits_op(op,device)){"
+            "if(!moe_mmvq_admission_supports_type(indexed_a_type)&&!ggml_sycl_moe_pp_batched_admits_op(op,device)"
+            "&&!ggml_sycl_moe_bf16_direct_route_available(op,device)){"
             "returnfalse;}}"
             "elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4"
             "&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}"
