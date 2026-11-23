@@ -34,7 +34,7 @@ loop, which is why it runs last):
   "Used" of tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), plus
   the meminfo remainder (`scripts/sycl-host-backing.sh`; a discrete card's
   host-pinned memory is in no meminfo field, so `Shmem` alone is flat for it),
-  above 10 GB (`SHMEM_CEIL_KB`; the TTM-shmem OOM signature this repo has hit
+  above 10 GiB (`SHMEM_CEIL_KB`; the TTM-shmem OOM signature this repo has hit
   repeatedly). An unreadable meminfo, or one without `MemTotal`, refuses. This became net
   of tmpfs on 2026-09-04, after the guard refused every baseline run because
   other sessions' ordinary `/tmp`/`/dev/shm` files — not GPU-BO backing — held
@@ -49,7 +49,7 @@ loop, which is why it runs last):
   (`pre_shmem_raw`/`pre_tmpfs`/`pre_shmem_eff`, mirrored for `post_*`) rather
   than only the net number, and adds the remainder and the sum
   (`pre_remainder`/`pre_backing`, mirrored for `post_*`), so a SUSPECT-for-growth
-  verdict (`backing-grew`, more than 5 GB across the run) can still be traced
+  verdict (`backing-grew`, more than 5 GiB across the run) can still be traced
   back to which component moved. A first post-run sample over that threshold is
   re-taken after `BENCH_GUARD_POST_RECHECK_S` seconds (default 5), because the
   exiting process's host backing is released a moment after exit; only the
@@ -517,7 +517,7 @@ check engages the ring.
   head comparison and the newer-than-head check, so it gives up the guarantee that the binaries were built
   from the sha, and it still validates the sha format and still refuses a missing binary. A table taken
   under it is not a baseline.
-  The script refuses unless the host has settled (GPU host backing under 30 GB; `MemAvailable` is not a condition) and the
+  The script refuses unless the host has settled (GPU host backing under 30 GiB; `MemAvailable` is not a condition) and the
   builders (ninja plus icpx) clear. A running build is waited out, before the lock at the start and before
   every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem`, GPU host backing and
   `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm.

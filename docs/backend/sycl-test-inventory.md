@@ -1001,7 +1001,7 @@ is the registration Task 16 declined.
   <run the binary>
   sleep 5; sycl_gpu_host_backing_gib   # after
   ```
-  Abort the session if GPU host backing (`Shmem` plus the `/proc/meminfo` remainder) climbs past ~100 GB. A reading taken in the same command as the
+  Abort the session if GPU host backing (`Shmem` plus the `/proc/meminfo` remainder) climbs past ~100 GiB. A reading taken in the same command as the
   exiting process is measuring the wrong instant and manufactures a false alarm.
 - **Pin the selector**, but ⚠️ **not all of these want `level_zero:1`** — see the per-row
   column. Two of them deliberately run on the **CPU** backend, and the two-GPU rows need both

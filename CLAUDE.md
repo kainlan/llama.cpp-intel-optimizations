@@ -47,13 +47,13 @@ History and measurements: `docs/backend/sycl-host-safety.md`.
   acceptance criterion, ask whether the binary loads a model onto a GPU. If it does, run it once.
 - Pin the selector to the discrete cards for any local run that does not need the iGPU. Unpinned is the default
   and the dangerous form: `ONEAPI_DEVICE_SELECTOR=level_zero:0,1 ctest --test-dir build -R '<name>' --output-on-failure`
-- Sample GPU host backing before each GPU run and about 5 s after it, and abort if it climbs past ~100 GB:
+- Sample GPU host backing before each GPU run and about 5 s after it, and abort if it climbs past ~100 GiB:
   `source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`. Read it, not `Shmem` alone (flat for a
   discrete card) and not `free`. A reading taken in the same command as an exiting process is a false alarm:
   `sleep 5; source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib`.
 - `GPU.lock` serialises access, not memory recovery. After you take it and before you touch the device, wait for
-  GPU host backing `< 30 GB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on that
-  figure only: `MemAvailable` sits near 55 GB on purpose while a 122 GiB model is held in host memory (ruling
+  GPU host backing `< 30 GiB`. If that takes more than ~10 minutes, release it and escalate. Guard a run on that
+  figure only: `MemAvailable` sits near 50 GiB on purpose while a 122 GiB model is held in host memory (ruling
   2026-11-12, amended 2026-11-23: the instrument is `Shmem` plus the remainder, still no `MemAvailable` floor).
 - Run every GPT-OSS test under `timeout`, so a hang cannot hold the card. `timeout 60` covers a short 20B run;
   a bench or a default-context run needs more (`scripts/sycl-canonical-gates.sh` uses 900).

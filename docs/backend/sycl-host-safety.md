@@ -285,7 +285,7 @@ label, so "only `main`" means "nobody classified this", not "this is safe".
   **Before writing "run it N times" into any script, gate, or acceptance criterion, ask whether
   the binary loads a model onto a GPU.** If yes: run it ONCE, sample
   `grep -E '^(MemAvailable|Shmem):' /proc/meminfo` before and ~5 s after, and abort if `Shmem`
-  climbs past ~100 GB. Prefer a narrower reproducer, or an instrumented single run, over
+  climbs past ~100 GB. Correction, 2026-11-23: read GPU host backing (section 10) instead. Prefer a narrower reproducer, or an instrumented single run, over
   repetition. Label filters do NOT protect you (`test-backend-ops` carries no labels), and a
   healthy-looking `free` reading does not either.
 
@@ -312,7 +312,7 @@ label, so "only `main`" means "nobody classified this", not "this is safe".
 
   Amendment, 2026-11-23: still no `MemAvailable` floor, but the instrument is GPU host backing, `Shmem` plus the
   `/proc/meminfo` remainder (section 10), because `Shmem` alone is flat for a discrete card's host-pinned memory.
-  The `30 GB` and `100 GB` figures keep their numbers and apply to that sum.
+  The `30` and `100` figures keep their numbers and apply to that sum, in GiB (see section 10).
 
   ⚠️ **THE CAUSE IS NOW KNOWN, AND THERE IS A ONE-LINE MITIGATION** (`llama.cpp-403s`,
   2026-08-01). It is not model size and not concurrency — it is the **iGPU**, which reports
@@ -407,6 +407,9 @@ wrong — the agent that hit this correctly halted a verification mid-sequence. 
 ./build/bin/test-llama-archs -a <arch>
 sleep 5; grep -E '^(Shmem|MemAvailable):' /proc/meminfo
 ```
+
+Correction, 2026-11-23: read GPU host backing (section 10), `sleep 5; source scripts/sycl-host-backing.sh;
+sycl_gpu_host_backing_gib`. `Shmem` alone is flat for a discrete card's host-pinned memory.
 
 `Shmem` is the figure that goes to ~227 GB in a real event; `free` conflates it with
 reclaimable cache. This is the mirror image of the stale-guardrail trap recorded under
@@ -635,19 +638,30 @@ iGPU's signature missing, not that nothing was held.
 
 **Why the sum does not see the other tenant.** The other session holds a 122 GiB model in `AnonPages`
 (126 to 130 GiB), which the formula subtracts. Measured with that tenant's model held (`AnonPages` 126.4 GiB):
-remainder 1.9 GiB, sum 12.9 GiB. `MemAvailable` sits near 55 GB then, by design, which is why no
+remainder 1.9 GiB, sum 12.9 GiB. `MemAvailable` sits near 50 GiB then, by design, which is why no
 `MemAvailable` floor is used (ruling 2026-11-12). Recorded snapshots and the test:
 `tests/sycl-meminfo-fixtures/` and `tests/test-sycl-host-backing.sh`.
+
+**Units.** One unit everywhere: GiB, the kernel's kB / 1048576, which the library prints. Scripts compare in kB.
+Settle is below 30 GiB, abort is past 100 GiB, bench-guard's ceiling is 10 GiB and its growth threshold 5 GiB.
 
 **Thresholds.** They keep their numbers and apply to the sum.
 
 - Idle sum on this host: 12.7 to 15 GiB (`Shmem` 11 to 12 GiB of ordinary tmpfs, remainder 2 to 3 GiB).
   Recorded idle snapshot with the tenant's model held: 12.7 GiB. Recorded Qwen3.8 default-mode load: 65.4 GiB.
-- Settle floor, "below 30 GB": about 15 GB above idle, so a leftover of that size from the previous run blocks
+- Settle floor, "below 30 GiB": about 15 GiB above idle, so a leftover of that size from the previous run blocks
   the next one.
-- Abort ceiling, "past ~100 GB": the largest planned load is the planner's host budget (`MemAvailable` minus
-  about 31 GB, about 76 GB pinned) plus idle, about 90 GB. The host is short at about 110 GiB: `MemTotal`
-  247 GiB minus the tenant's ~127 GiB minus kernel memory. 100 GB sits between 90 and 110.
+- Abort ceiling, "past ~100 GiB": the largest planned load is the planner's host budget (about 72 to 76 GiB
+  pinned) plus idle (13 to 15 GiB), about 88 to 91 GiB. The host is short at about 110 GiB: `MemTotal`
+  247 GiB minus the tenant's ~127 GiB minus kernel memory. 100 GiB sits between 88 to 91 and 110.
 
 `scripts/bench-guard.sh` keeps its own, lower ceiling (10 GiB) and still nets ordinary tmpfs out of `Shmem`
 before it adds the remainder.
+
+**What is not guarded.** A valid Qwen run on 2026-11-23 reached 20.9 GB of `MemAvailable`, so a floor at 20 GB sits
+inside normal operation and is not used. A runaway of ordinary process memory (malloc) by a run is in
+`AnonPages`, which the sum leaves out on purpose, so no script sees it, and the planner's named refusal bounds
+planned memory only. A guard for that class is tracked in the task tracker.
+
+**Test seam.** `SYCL_HOST_BACKING_MEMINFO` replaces `/proc/meminfo` as the library's default file so a test can
+feed a recorded snapshot. A log line says `source=<path>` when it is set. Never set it in a real run.
