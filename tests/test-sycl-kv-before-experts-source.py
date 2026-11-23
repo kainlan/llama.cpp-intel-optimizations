@@ -284,7 +284,7 @@ HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_re
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
-            "bool host_weight_layout_cpu; uint32_t n_ubatch_context; "
+            "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
             "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
             "uint32_t n_ubatch_measure; }")
 # The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
@@ -357,10 +357,10 @@ COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_para
 COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
 COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
 COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
-COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
+COMMON_FIT = "common_fit_params(params.model.get_paths(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
-COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
+COMMON_LOAD = "llama_model * model = common_model_load(params.model.get_paths(), mparams);"
 
 
 def claim_common_hands_the_requested_context(common: str) -> bool:
@@ -375,8 +375,9 @@ def claim_common_hands_the_requested_context(common: str) -> bool:
 
 
 BENCH_CTX = "uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }"
-BENCH_FIT = ("cparams.n_ctx = std::max(cparams.n_ctx, inst.n_ctx());",
-             "common_fit_params(inst.model.c_str(), &mparams, &cparams,", FIT_REFRESH,
+BENCH_FIT = ("uint32_t n_ctx_needed = std::max<uint32_t>(inst.n_ctx(), inst.fit_min_ctx);",
+             "cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);",
+             "common_fit_params({ inst.model }, &mparams, &cparams,", FIT_REFRESH,
              "lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);")
 
 

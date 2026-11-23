@@ -376,22 +376,29 @@ def test_the_preload_serves_in_place_only_what_the_plan_left_mapped():
     assert cond.index("host_backing_sizes_weight_zone") < cond.index("ggml_sycl_mapped_buffer_owner"), cond
     assert "getenv" not in body
 
-    # A failed pinned allocation over a mapping registers the mapping with its owner, and warns once per tensor.
-    fb_at = re.search(r"\}\s*else\s+if\s*\(\s*!\s*tensor_source_is_device\s*\)\s*\{", body)
-    assert fb_at, "the lambda has no fallback branch for a host source without pinned room"
-    fallback = balanced(body, fb_at.end() - 1)
-    owner = re.search(r"ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)", fallback)
-    assert owner, fallback
-    gate = re.search(
-        r"\bif\s*\(\s*ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)\s*\)\s*\{",
-        fallback,
+    # A failed pinned allocation over a mapping registers the mapping with its owner, and warns once per tensor. The
+    # owner call is the branch's own condition, so the warning and the in-place pointer are reached only with an owner.
+    fb_at = re.search(
+        r"\}\s*else\s+if\s*\(\s*!\s*tensor_source_is_device\s*&&\s*"
+        r"ggml_sycl_mapped_buffer_owner\s*\(\s*tensor\s*->\s*buffer\s*,\s*&\s*host_owner\s*\)\s*\)\s*\{",
+        body,
     )
-    assert gate, "the owner call does not gate the warning"
-    gated = balanced(fallback, gate.end() - 1)
+    assert fb_at, "the lambda has no mapping-owner branch for a host source without pinned room"
+    gated = balanced(body, fb_at.end() - 1)
     assert re.search(r"\bGGML_LOG_WARN\s*\(", gated), "the warning is not inside the mapping-owner branch"
     assert re.search(r"\blogged_pin_alloc_failed\s*=\s*true\s*;", gated), "the once-flag is not set inside that branch"
-    clear = re.search(r"\bhost_owner\s*=\s*\{\s*\}\s*;", fallback)
-    assert clear and clear.start() < owner.start(), "host_owner is not cleared before the owner call"
+    assert re.search(r"\bhost_ptr\s*=", gated), "the mapping-owner branch does not serve the source in place"
+
+    # Any other host source without room has no owner: it is counted for the load's refusal and never registered
+    # (registered unowned, the CPU and the window ring would read memory nothing holds).
+    rest = body[fb_at.end() + len(gated) + 1 :]
+    un_at = re.search(r"^\s*else\s+if\s*\(\s*!\s*tensor_source_is_device\s*\)\s*\{", rest)
+    assert un_at, "the mapping-owner branch is not followed by the no-owner branch for a host source"
+    unowned = balanced(rest, un_at.end() - 1)
+    assert re.search(r"\bhost_expert_unowned_count\s*\[\s*device\s*\]\s*\+\+", unowned), unowned
+    assert re.search(r"\bhost_expert_unowned_bytes\s*\[\s*device\s*\]\s*\+=\s*expert_size\s*;", unowned), unowned
+    assert re.search(r"\breturn\s+false\s*;", unowned), "the no-owner branch does not decline the registration"
+    assert not re.search(r"\bhost_ptr\s*=", unowned), "the no-owner branch serves the source in place unowned"
 
     # The caller hands the plan's backing over, not a constant.
     assert re.search(r"register_host_aos_expert\s*\(\s*e\s*,\s*expert_aos\s*,\s*placement\s*\.\s*host_backing\s*,", src)

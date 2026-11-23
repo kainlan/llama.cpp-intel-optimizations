@@ -201,7 +201,7 @@ struct fattn_params {
     // Per-op precision hint from ggml_flash_attn_ext_get_prec(dst). When
     // GGML_PREC_F32 the XMX-v2 dispatcher forces a float-accumulator
     // specialization (matches test-backend-ops's tight 5e-4 NMSE gate and the
-    // PREC_F32 pin at llama-graph.cpp:1726). GGML_PREC_DEFAULT lets the
+    // PREC_F32 pin at llama-graph.cpp:1726). GGML_PREC_UNDEFINED lets the
     // dispatcher pick up the build-time `afloat` typedef (half under
     // GGML_SYCL_F16, float otherwise). Mirrors CUDA's pattern at
     // ggml/src/ggml-cuda/fattn-wmma-f16.cu:541.

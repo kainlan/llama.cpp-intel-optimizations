@@ -81,6 +81,5 @@ void ggml_sycl_count_equal(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
             break;
         default:
             GGML_ASSERT(false);
-            break;
     }
 }

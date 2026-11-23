@@ -228,8 +228,10 @@ host_scratch_ensure_result host_scratch_ledger::ensure_locked_then_grow(std::uni
 #    else
         reserved_target_ = r.target;
 #    endif
-        // One grow_zone call for the deficit plus one alignment of slack per buffer the demands split into, the same
-        // slack rule as the miss path. The pool commits one chunk of max(2048 MB, align_up(request)).
+        // One grow_zone call for the deficit plus one alignment of slack per buffer the demands split into. The pool
+        // commits one chunk of max(2048 MB, align_up(request)). Each buffer then takes its TLSF block (its size rounded
+        // to the grain, pinned_chunk_pool::zone_grow_request), which can pass its bytes by more than that slack; a
+        // buffer the zone then cannot hold takes the miss path, which grows a chunk for its block.
         r.request = reserved_increment + n_buffers * ops.alignment;
     }
 #endif

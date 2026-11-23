@@ -17,7 +17,7 @@
 // been measured by anyone, in any run. `-x gemma2` gets past it without pretending the hang is
 // fixed.
 
-#include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "test-archs-table.h"
 
 #include <algorithm>
@@ -46,14 +46,14 @@ struct archs_exclude {
     // usable architecture, and leaves `archs` untouched when it does -- a rejected name that
     // still grew the set would be a second way to be wrong.
     //
-    // "Not usable" folds together two cases on purpose, because llm_arch_from_string() cannot
+    // "Not usable" folds together two cases on purpose, because llama_arch_from_string() cannot
     // tell them apart: a name that matches nothing, and the literal "(unknown)", which is a
     // real entry in LLM_ARCH_NAMES and maps to LLM_ARCH_UNKNOWN. The sweep skips
     // LLM_ARCH_UNKNOWN before it reaches the exclusion check, so accepting either would be a
     // silent no-op -- an exclude that excludes nothing, letting a run claim coverage of an
     // architecture it never reached.
     static bool parse(const char * name, std::vector<llm_arch> & archs) {
-        const llm_arch arch = llm_arch_from_string(name);
+        const llm_arch arch = llama_arch_from_string(name);
         if (arch == LLM_ARCH_UNKNOWN) {
             return false;
         }

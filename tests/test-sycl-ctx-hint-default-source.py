@@ -212,9 +212,9 @@ COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_para
 COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
 COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
 COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
-COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
+COMMON_FIT = "common_fit_params(params.model.get_paths(), &mparams, &cparams,"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
-COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
+COMMON_LOAD = "llama_model * model = common_model_load(params.model.get_paths(), mparams);"
 
 
 def claim_common_asks_for_the_default(common: str) -> bool:
@@ -235,7 +235,7 @@ def claim_common_asks_for_the_default(common: str) -> bool:
 SPEC_SIG = "common_speculative_init_result::common_speculative_init_result("
 SPEC_STEPS = ("auto mparams = common_model_params_to_llama(params);", "cparams.n_ctx = llama_n_ctx(ctx_tgt);",
               "mparams.n_ctx_hint = cparams.n_ctx;",
-              "llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);")
+              "llama_model * model_dft = common_model_load(params.speculative.draft.mparams.get_paths(), mparams);")
 
 
 def claim_draft_asks_for_its_context(spec: str) -> bool:
@@ -372,7 +372,7 @@ INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 # appended after it (th32 §4.1), with the measured micro-batch in their padding (test-sycl-load-measure-source).
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
-            "bool host_weight_layout_cpu; uint32_t n_ubatch_context; "
+            "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
             "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
             "uint32_t n_ubatch_measure; }")
 SIZE_PINS = (

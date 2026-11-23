@@ -35,9 +35,18 @@
 constexpr size_t CPU_DISPATCH_MAX_M          = 16;
 constexpr size_t CPU_DISPATCH_MAX_K          = 14336;
 constexpr size_t CPU_DISPATCH_MAX_Q_ROW_SIZE = (CPU_DISPATCH_MAX_K / 32 + 1) * 128;
+constexpr size_t CPU_DISPATCH_SRC1_Q_BYTES   = CPU_DISPATCH_MAX_M * CPU_DISPATCH_MAX_Q_ROW_SIZE;
+
+// True when `rows` activation rows of `row_bytes` each fit the src1_q buffer init() sizes. row_bytes is the row size
+// of the weight's vec_dot_type, not of the weight: an F16 weight takes F32 activation rows, 4 bytes per element, so
+// its rows outgrow the quantized-row bound at a smaller K than any quantized type's. A caller asks this before it
+// takes a vec_dot path, and takes its fallback when the rows do not fit.
+inline bool cpu_dispatch_src1_q_fits(size_t rows, size_t row_bytes) {
+    return row_bytes != 0 && rows <= CPU_DISPATCH_SRC1_Q_BYTES / row_bytes;
+}
 
 struct cpu_dispatch_buffers {
-    std::vector<uint8_t> src1_q;  // Quantization buffer: CPU_DISPATCH_MAX_M * CPU_DISPATCH_MAX_Q_ROW_SIZE
+    std::vector<uint8_t> src1_q;  // Quantization buffer: CPU_DISPATCH_SRC1_Q_BYTES
     std::vector<float>   accs;    // Accumulator buffer: reused as __m256* via reinterpret_cast
 
     // Note: accs is reinterpreted as __m256 array. Since we only use _mm256_setzero_ps()
@@ -52,7 +61,7 @@ struct cpu_dispatch_buffers {
 
     // Size the small, always-needed buffers. Cheap to repeat: resize to the same size is a no-op.
     void init() {
-        src1_q.resize(CPU_DISPATCH_MAX_M * CPU_DISPATCH_MAX_Q_ROW_SIZE);
+        src1_q.resize(CPU_DISPATCH_SRC1_Q_BYTES);
         // __m256 is 32 bytes = 8 floats; allocate for max chunk4 (256 + max_m) accumulators
         accs.resize((256 + CPU_DISPATCH_MAX_M) * 8);  // Conservative upper bound: 256 stack + max_m heap
     }

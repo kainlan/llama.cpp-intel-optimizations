@@ -2708,6 +2708,13 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
         return false;
     }
 
+    // Upstream's ggml_flash_attn_ext_rows puts a K/V row list in src[5]. No route here reads one: the dispatch takes
+    // src[5] as q_seq_ids, which nothing in this tree sets. Declining keeps llama_context's fused_kv_rows probe off on
+    // SYCL, so a row list never reaches a kernel that would read it as sequence ids.
+    if (dst->src[5] != nullptr) {
+        return false;
+    }
+
     // q4_0 / q8_0 K/V: admitted only through the DPAS route, which carries its own type, shape and device screen
     if (ggml_sycl_fattn_dpas_supported(dst)) {
         return true;
@@ -3809,10 +3816,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.n_head_log2   = n_head_log2;
     params.logit_softcap = logit_softcap;
 
-    // Per-op precision hint. test-backend-ops sets PREC_F32 on every case via
-    // ggml_flash_attn_ext_set_prec; llama-graph.cpp:1726 pins PREC_F32
-    // unconditionally for the SYCL/CUDA paths. The XMX-v2 dispatcher reads
-    // this to force a float-accumulator specialization on PREC_F32.
+    // Per-op accumulator precision, set with ggml_prec_set_acc. llama-graph's
+    // attention builder pins PREC_F32 on every flash-attention op. The XMX-v2
+    // dispatcher reads this to force a float-accumulator specialization on
+    // PREC_F32.
     params.prec = ggml_flash_attn_ext_get_prec(dst);
 
     // Q dimensions: [batch, n_heads, n_queries, head_dim]

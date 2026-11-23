@@ -49,7 +49,9 @@ llama_hparams llama_kv_idx_hparams(const llama_hparams & hparams) {
 
     // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
     std::fill(hp.n_head_kv_arr.begin(), hp.n_head_kv_arr.end(), 1);
-    hp.n_embd_head_k_full = hparams.indexer_head_size;
+    // a k-pool indexer caches its per-token rows and the pooled key side by side
+    // (glm5-next: key | gate | pooled, qwen4exp: key | pooled)
+    hp.n_embd_head_k_full = hparams.indexer_head_size * (hparams.indexer_kpool > 0 ? hparams.indexer_kpool_row : 1);
 
     // the cached indexer keys are raw, rotation happens after pooling at read time, so a
     // K-shift must not rotate them while the stream copies in the same update still apply
@@ -116,7 +118,7 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
     res.type_k   = params_mem.type_k;
     res.type_v   = params_mem.type_v;
     res.v_trans  = !cparams.flash_attn;
-    res.no_alloc = hparams.no_alloc;
+    res.no_alloc = params_mem.no_alloc || model.no_alloc();
     res.n_stream = cparams.kv_unified ? 1 : cparams.n_seq_max;
 
     const bool has_other = pol.mem_other != nullptr;
@@ -158,6 +160,7 @@ llama_kv_layer_owners llama_kv_layer_owners_default(const llama_model & model) {
         /*.swa_full  =*/false,
         /*.ctx_type  =*/LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.mem_other =*/nullptr,
+        /*.no_alloc  =*/false,
     };
     llama_cparams cparams = {};
     cparams.n_seq_max     = 1;

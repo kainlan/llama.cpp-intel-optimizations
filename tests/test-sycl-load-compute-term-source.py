@@ -849,8 +849,8 @@ def claim_pp_trace_reads_the_reserved_n_seqs(llama: str) -> bool:
     blk = t[at:at + 2000] if at >= 0 else ""
     return (t.count(PP_N_SEQS) == 1 and ordered(
         blk, PP_N_SEQS, "case LLM_ARCH_KIMI_LINEAR: case LLM_ARCH_MINIMAX_01:", "pp_n_seqs = 1;",
-        "gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);",
-        "default: gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);",
+        "gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());",
+        "default: gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());",
         "g.kind = LLAMA_MEASURE_KIND_PP_AGAIN;", "g.n_seqs = pp_n_seqs;")
         and "? 1 : n_seqs" not in blk)
 

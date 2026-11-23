@@ -19,8 +19,6 @@
 #include <unordered_map>
 #include <vector>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
-
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
@@ -97,8 +95,14 @@ struct llama_model_loader {
     // §4.3). false on a load with no SYCL transaction, or before the plan, which keeps today's use_mmap answers.
     bool sycl_load_plan_staged = false;
 
-    // Each SYCL_Mapped buffer's base file offset: a tensor at file offset offs lives at base + (offs - this).
-    std::unordered_map<ggml_backend_buffer_t, uint64_t> sycl_mapped_base_offsets;
+    // Each SYCL_Mapped buffer's file and base file offset: a tensor of file idx at file offset offs lives at
+    // base + (offs - offset). load_all_data gets a context's buffers as a list, so the file picks the buffer.
+    struct sycl_mapped_base {
+        uint32_t idx;
+        uint64_t offset;
+    };
+
+    std::unordered_map<ggml_backend_buffer_t, sycl_mapped_base> sycl_mapped_base_offsets;
 
     bool check_tensors;
     bool no_alloc;
@@ -317,14 +321,24 @@ struct llama_model_loader {
     // otherwise. create_tensor never consults use_mmap for a SYCL weight (design 5efe §4.3).
     bool weight_maps_files(ggml_backend_buffer_type_t buft, bool planned_file_mapped) const;
 
-    // Whether GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to cpu, the default, where a planner-host dense weight is repacked
-    // into a CPU-owned buffer rather than read in the file layout (=plain, =off). Carried in the inventory, so the
-    // planner charges the backing this loader binds instead of reading the variable itself.
-    static bool host_weight_layout_cpu();
+    // The value GGML_SYCL_HOST_WEIGHT_LAYOUT resolved to, as the SYCL inventory carries it (enum
+    // ggml_sycl_host_weight_layout: off, cpu, the default, where a planner-host dense weight is repacked into a
+    // CPU-owned buffer, or plain, a CPU-owned buffer in the file layout). Carried in the inventory, so the planner
+    // charges the buffers this loader binds instead of reading the variable itself.
+    static uint8_t host_weight_layout_sycl();
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
-    void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+    // byte range within a mapped file
+    struct mapping_range {
+        size_t first; // inclusive
+        size_t last;  // exclusive
+    };
+
+    // sorted, non-overlapping ranges of file 'idx' that back the tensors of 'ctx'
+    // ranges owned by other contexts are excluded, so that a buffer wrapping them won't pin
+    // data that this context never reads (lazy tensors, -cmoe tensors, ...)
+    std::vector<mapping_range> get_mapping_ranges(uint32_t idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;
@@ -336,7 +350,7 @@ struct llama_model_loader {
     // Returns false if cancelled by progress_callback
     bool load_all_data(
             struct ggml_context * ctx,
-            llama_buf_map & bufs,
+            std::vector<ggml_backend_buffer_t> & bufs,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);

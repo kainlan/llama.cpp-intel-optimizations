@@ -92,6 +92,8 @@ void ggml_sycl_roll(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
     auto src = dst.src(0);
     GGML_ASSERT(src && src.type() == GGML_TYPE_F32);
 
+    // the kernel indexes in 32-bit
+    GGML_ASSERT(dst.ne(0) * dst.ne(1) * dst.ne(2) * dst.ne(3) <= INT32_MAX);
     const int ne0 = (int) dst.ne(0);
     const int ne1 = (int) dst.ne(1);
     const int ne2 = (int) dst.ne(2);

@@ -39,7 +39,6 @@ struct llama_measure_graph {
     bool               nextn        = false;
     bool               nextn_masked = false;
     int32_t            nextn_offset = 0;
-    bool               warmup       = false;
 };
 
 struct llama_measure_set_params {
@@ -48,7 +47,6 @@ struct llama_measure_set_params {
     uint32_t n_outputs_max       = 0;
     bool     kv_unified          = true;
     uint32_t n_layer_nextn       = 0;      // hparams.n_layer_nextn
-    bool     warmup              = false;  // the context's warmup flag now: while on, every graph is a warmup graph
     // The reserve's closing pp graph is built with one sequence for the archs
     // whose pp compute grows with n_seq_tokens^2 (KIMI_LINEAR, MINIMAX_01).
     bool     pp_again_single_seq = false;
@@ -81,7 +79,6 @@ inline std::vector<llama_measure_graph> llama_measure_graph_set(const llama_meas
         for (uint32_t v = 0; v < llama_measure_nextn_variants(p.n_layer_nextn); ++v) {
             llama_measure_graph base;
             base.embeddings = emb != 0;
-            base.warmup     = p.warmup;
             if (v > 0) {
                 base.nextn        = true;
                 base.nextn_masked = ((v - 1) % 2) == 1;

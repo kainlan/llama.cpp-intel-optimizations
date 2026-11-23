@@ -110,6 +110,10 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     parsed_offset_views = []
     skipped_non_inplace = 0
     skipped_real_model = 0
+    parsed_bf16_views = []
+    skipped_bf16_non_inplace = 0
+    parsed_truncate_views = []
+    skipped_truncate_non_inplace = 0
     for row in discovered_rows:
         # original inplace rows: (..., ff, <v>, true, true)
         match = re.search(r"ff,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
@@ -133,9 +137,30 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
         if re.search(r",\s*(?:false|true)\s*,\s*\d+\s*,\s*true\s*$", row):
             skipped_real_model += 1
             continue
+        # Upstream BF16 ROPE (#32387): a mode x ff nest of its own with a forward strided view and a backward
+        # offset view, both out-of-place, and one inplace row per mode. SYCL refuses BF16 ROPE before this
+        # predicate (ggml_sycl_op_core_semantics_supported), so these stay out of the decision arithmetic.
+        if row.startswith("GGML_TYPE_BF16"):
+            match = re.search(r",\s*(?:false|true)\s*,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
+            if match is not None:
+                parsed_bf16_views.append(int(match.group(1)))
+                continue
+            if re.search(r",\s*ff\s*,\s*\d+\s*,\s*(?:true|false)\s*$", row):
+                skipped_bf16_non_inplace += 1
+                continue
+        # Upstream YaRN truncate rows (#30206): (..., ff, v, forward, inplace, n_offs 0, n_ctx_orig, freq_base,
+        # beta_fast, truncate), one out-of-place row per fw and one inplace row, in a type x mode x truncate nest.
+        match = re.search(r",\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*,\s*0\s*,(?:[^,]*,){3}\s*truncate\s*$", row)
+        if match is not None:
+            parsed_truncate_views.append(int(match.group(1)))
+            continue
+        if re.search(r",\s*fw\s*,\s*false\s*,\s*0\s*,(?:[^,]*,){3}\s*truncate\s*$", row):
+            skipped_truncate_non_inplace += 1
+            continue
         raise AssertionError(f"unparsed inplace ROPE inventory row: {row!r}")
-    assert (len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace + skipped_real_model ==
-            len(discovered_rows))
+    assert (len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace + skipped_real_model +
+            len(parsed_bf16_views) + skipped_bf16_non_inplace + len(parsed_truncate_views) +
+            skipped_truncate_non_inplace == len(discovered_rows))
 
     assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
     assert modes == [
@@ -153,6 +178,13 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     assert skipped_non_inplace == 4
     # qwen3.5 0.8B/4B and gemma4 E2B/E4B shapes: out-of-place, outside this inplace contract.
     assert skipped_real_model == 4
+    # BF16: two out-of-place rows per mode x ff, one inplace row (view 0) per mode.
+    assert parsed_bf16_views == [0]
+    assert skipped_bf16_non_inplace == 2
+    # YaRN truncate: one out-of-place row per fw and one inplace row on a view (v = 1), which the predicate
+    # refuses like the nest's view rows when that view is not contiguous.
+    assert parsed_truncate_views == [1]
+    assert skipped_truncate_non_inplace == 1
 
     multiplicity = len(types) * len(modes) * len(factors)
     decisions = [view == 0 for view in parsed_views for _ in range(multiplicity)]

@@ -78,7 +78,6 @@ e2e_tg_stage e2e_tg_stage_from_op(ggml_op op, const char * tensor_name) {
         case GGML_OP_SET_ROWS_PAGED:
             return e2e_tg_stage::KV;
         case GGML_OP_ADD:
-        case GGML_OP_ADD1:
         case GGML_OP_ADD_ID:
         case GGML_OP_GLU:
         case GGML_OP_NORM:

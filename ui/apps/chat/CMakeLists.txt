@@ -1,0 +1,260 @@
+set(TARGET llama-ui)
+
+set(LLAMA_UI_HF_BUCKET "ggml-org/llama-ui" CACHE STRING "Hugging Face bucket name for prebuilt UI assets")
+set(LLAMA_UI_GZIP      ON                  CACHE BOOL   "Apply gzip compress to assets to save bandwidth")
+
+# Backward compat: forward old var to new one
+if(DEFINED LLAMA_BUILD_WEBUI)
+    set(LLAMA_BUILD_UI ${LLAMA_BUILD_WEBUI})
+    message(DEPRECATION "LLAMA_BUILD_WEBUI is deprecated, use LLAMA_BUILD_UI instead")
+endif()
+if(DEFINED LLAMA_USE_PREBUILT_WEBUI)
+    set(LLAMA_USE_PREBUILT_UI ${LLAMA_USE_PREBUILT_WEBUI})
+    message(DEPRECATION "LLAMA_USE_PREBUILT_WEBUI is deprecated, use LLAMA_USE_PREBUILT_UI instead")
+endif()
+if(DEFINED LLAMA_WEBUI_HF_BUCKET)
+    set(LLAMA_UI_HF_BUCKET ${LLAMA_WEBUI_HF_BUCKET})
+    message(DEPRECATION "LLAMA_WEBUI_HF_BUCKET is deprecated, use LLAMA_UI_HF_BUCKET instead")
+endif()
+
+# Resolve HF asset version: env overrides, then the pin, then the build number
+include("${CMAKE_CURRENT_LIST_DIR}/ui-version.cmake")
+llama_ui_resolve_hf_version(HF_UI_VERSION)
+
+if(NOT "${HF_UI_VERSION}" STREQUAL "" AND NOT HF_UI_VERSION MATCHES "^[A-Za-z0-9._-]+$")
+    message(FATAL_ERROR "UI: invalid HF_UI_VERSION='${HF_UI_VERSION}' - must match ^[A-Za-z0-9._-]+$")
+endif()
+
+set(UI_CPP "${CMAKE_CURRENT_BINARY_DIR}/ui.cpp")
+set(UI_H   "${CMAKE_CURRENT_BINARY_DIR}/ui.h")
+
+# Inputs that make the provisioning script's answer change.
+#
+# The bulk of this comes from sources.cmake -- the same list the script itself
+# globs in npm_build_should_skip(), read from the same file so the two cannot
+# drift apart. Note that is a claim about DIVERGENCE, not about CORRECTNESS:
+# single-sourcing means this list inherits whatever sources.cmake gets wrong,
+# and it currently gets things wrong in both directions (a listed file that no
+# longer exists, real inputs that are unlisted). Tracked as llama.cpp-3658.
+set(UI_ASSET_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake")
+list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ui-version.cmake")
+
+# Priority 1 in scripts/ui-assets.cmake is pre-built assets dropped into
+# ui/apps/chat/dist -- the documented recovery path for disconnected builds,
+# and NOT covered by sources.cmake's globs (src/*, static/*). Without this the
+# stamp is never invalidated by them and manually supplied assets are silently
+# ignored for as long as the stamp stays fresh.
+#
+# The EXISTS guard needs a reconfigure trigger, because CMake's regeneration
+# keys on CMakeLists.txt rather than on the guarded path: a declaration left
+# behind by a deleted dist/ is a hard build failure, not merely a stale one.
+# Hence CMAKE_CONFIGURE_DEPENDS on the directory, at TWO levels -- POSIX moves a
+# directory's mtime only for entries changing in THAT directory, so
+# ui/apps/chat catches dist/ appearing and vanishing, and dist/ catches entries
+# within it.
+#
+# Deliberately a directory dependency, NOT file(GLOB ... CONFIGURE_DEPENDS):
+# CMake implements the latter with a glob re-verification step in the
+# regeneration check, which risks reintroducing the always-out-of-date edge this
+# file exists to remove. Trading a never-rebuild bug for an always-rebuild one
+# is the worst move available. A plain directory dependency adds no such edge.
+#
+# Repro commands and exact error text for every case: the axis inventory below.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}")
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
+    set_property(DIRECTORY APPEND PROPERTY
+        CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/dist")
+endif()
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dist/index.html")
+    # EVERY file under dist/ is an input, not just index.html: emit_files() in
+    # scripts/ui-assets.cmake GLOB_RECURSEs and embeds every regular file under
+    # the asset dir, so a changed hashed bundle at
+    # dist/_app/immutable/bundle.HASH.js is embedded verbatim.
+    # Depending on index.html alone let every other asset go stale silently --
+    # the same defect this block was added to close, one file across.
+    file(GLOB_RECURSE UI_DIST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
+
+    # dist/_gzip is OUTPUT, not input. ui-assets.cmake used to REMOVE_RECURSE
+    # and regenerate it INSIDE dist/ on every provisioning run; it now stages
+    # the gzip tree under the build dir and deletes a leftover dist/_gzip, and
+    # emit_files() skips ^_gzip/ when embedding. Declaring those files would
+    # leave the stamp's inputs newer than the stamp -- provisioning on every
+    # build, precisely the always-dirty defect this file exists to remove.
+    #
+    # ONE pattern, used at BOTH exclusion sites below, and it must stay one:
+    # they were two patterns in two syntaxes and drifted, because `MATCHES` is
+    # an unanchored substring test where the FILTER pattern was bounded.
+    # `(/|$)` is correct under both operators. Do not re-split it.
+    #
+    # tests/test-ui-gzip-exclude.cmake gates exactly this, including the
+    # re-splitting: it reads the pattern out of this file, drives both
+    # operators, and rejects the known-bad pattern as a negative control.
+    set(UI_DIST_GZIP_EXCLUDE "/dist/_gzip(/|$)")
+
+    list(FILTER UI_DIST_FILES EXCLUDE REGEX "${UI_DIST_GZIP_EXCLUDE}")
+    list(APPEND UI_ASSET_DEPENDS ${UI_DIST_FILES})
+
+    # The same POSIX mtime rule applies at every depth, so every directory under
+    # dist/ is watched, not just dist/ itself -- the glob above DECLARES deep
+    # files, and a declared file deleted without a reconfigure is the hard build
+    # failure, not a stale one.
+    #
+    # Finite and self-maintaining rather than an infinite regress: the set is
+    # enumerated at configure time, and a NEW subdirectory always changes its
+    # parent's mtime, and the parent is watched -- so it triggers the
+    # reconfigure that enumerates it.
+    file(GLOB_RECURSE UI_DIST_ENTRIES LIST_DIRECTORIES true
+         "${CMAKE_CURRENT_SOURCE_DIR}/dist/*")
+    foreach(entry ${UI_DIST_ENTRIES})
+        if (IS_DIRECTORY "${entry}" AND NOT entry MATCHES "${UI_DIST_GZIP_EXCLUDE}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${entry}")
+        endif()
+    endforeach()
+endif()
+
+# Axis inventory. Six rounds of this fix each closed the axis in front of it
+# and left the next one narrow, so it is written down rather than remembered.
+#
+# Round six was a row of THIS TABLE asserting a closure that had never been
+# tested ("depth ... at any depth"), which is worse than no inventory: it tells
+# the next reader not to check the one thing that is broken. So every CLOSED
+# row below names the test that was actually run. A row whose evidence is
+# "reasoned about it" is not CLOSED and does not belong in that half.
+#
+#   CLOSED  direction     create vs delete of dist/
+#           mechanism     CONFIGURE_DEPENDS on ui/apps/chat
+#           test          create dist/ -> "Re-running CMake"; rm -rf dist/ -> same
+#
+#   CLOSED  granularity   dist/ itself vs a file inside it
+#           mechanism     CONFIGURE_DEPENDS on dist/
+#           test          rm dist/index.html (dist/ left in place) -> "Re-running CMake"
+#
+#   CLOSED  content       every embedded asset, not only index.html
+#           mechanism     GLOB_RECURSE into UI_ASSET_DEPENDS
+#           test          touch dist/_app/immutable/bundle.CD8EIUIV.js -> stamp
+#                         rescheduled 0 -> 1, and ninja explain NAMES that file
+#
+#   CLOSED  depth         add/remove below the first level under dist/,
+#                         EXCEPT inside dist/_gzip, which is deliberately
+#                         excluded as generated output (see above)
+#           mechanism     per-directory CONFIGURE_DEPENDS over dist/**
+#           test          add a file two levels down -> "Re-running CMake",
+#                         declared after; remove it -> same, undeclared, no
+#                         "missing and no known rule" error
+#
+#   CLOSED  exclusion     the _gzip exclusion matches _gzip and not _gzipfoo,
+#                         identically at both sites
+#           mechanism     single UI_DIST_GZIP_EXCLUDE pattern, used twice
+#           test          tests/test-ui-gzip-exclude.cmake -- COMMITTED and
+#                         registered (ctest: test-ui-gzip-exclude), not a
+#                         command someone once ran. Reads the pattern out of
+#                         this file, drives both operators over 9 paths, and
+#                         re-runs them against the known-bad pattern as a
+#                         negative control. Mutation-checked: it fails if the
+#                         round-six pattern returns, if the two sites are
+#                         re-split into literals, or if the variable is renamed
+#
+#   CLOSED  dotfiles      hidden assets (.nojekyll and friends, ordinary in a
+#                         static-site dist/) are declared, not skipped
+#           mechanism     file(GLOB_RECURSE) does match leading-dot names --
+#                         checked because the opposite is widely assumed and
+#                         would be this bug's exact shape: an asset emit_files()
+#                         embeds but nothing declares
+#           test          cmake -P over a scratch dist/ containing .nojekyll
+#                         and sub/.hidden -> both listed
+#
+#   CLOSED  symlinks      a symlinked directory under dist/ is not a source of
+#                         embedded-but-undeclared assets
+#           mechanism     agreement, not coverage: file(GLOB_RECURSE) does not
+#                         descend into a symlinked directory, and the embedder
+#                         is the same primitive -- emit_files() in
+#                         scripts/ui-assets.cmake GLOB_RECURSEs without
+#                         FOLLOW_SYMLINKS (it replaced the C++ llama-ui-embed
+#                         helper in the upstream 694ec2354 merge). What is
+#                         embedded and what is declared match, which is the
+#                         property that matters; both descending or neither is
+#                         fine, one of each is not
+#           test          cmake -P scratch tree with a dir symlink (not
+#                         descended), run against the C++ helper before it
+#                         was replaced; emit_files() uses the same glob
+#
+#   OPEN    npm cold start   a first-ever `node_modules` install could create a
+#                            top-level entry under ui/apps/chat and fire one
+#                            extra reconfigure. Correct behaviour, bounded to
+#                            once, never observed here (this tree is always
+#                            warm).
+#   OPEN    sources.cmake    UI_SOURCE_GLOBS is stale in both directions -- it
+#                            names a file that no longer exists and omits real
+#                            inputs (the vite plugins). Inherited by everything
+#                            above that reads it. llama.cpp-3658.
+#   OPEN    race             a file changed while provisioning is mid-run is not
+#                            re-detected until the next build. Inherent to a
+#                            stamp; not worth closing.
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
+    list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/sources.cmake")
+    set(UI_ASSET_GLOBS "")
+    foreach(glob ${UI_SOURCE_GLOBS})
+        list(APPEND UI_ASSET_GLOBS "${CMAKE_CURRENT_SOURCE_DIR}/${glob}")
+    endforeach()
+    file(GLOB_RECURSE UI_ASSET_GLOBBED ${UI_ASSET_GLOBS})
+    list(APPEND UI_ASSET_DEPENDS ${UI_ASSET_GLOBBED})
+    foreach(file ${UI_SOURCE_FILES})
+        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${file}")
+            list(APPEND UI_ASSET_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${file}")
+        endif()
+    endforeach()
+endif()
+
+# Provision UI assets. This used to be an `add_custom_target(... ALL ...)`,
+# which CMake emits with an output file it never creates -- so Ninja found it
+# dirty on every build and the tree had no no-op build at all (llama.cpp-9ubg).
+# Driving it from a real OUTPUT stamp keeps the same behaviour where it matters
+# (a changed ui/apps/chat/ source still re-provisions, via UI_ASSET_DEPENDS)
+# while letting an untouched tree settle. ui.cpp/ui.h are declared outputs
+# rather than BYPRODUCTS; the script writes them with copy_if_different and
+# CMake marks the rule `restat`, so the library still only recompiles when
+# contents change.
+#
+# The glob above is evaluated at configure time, like the file(GLOB) in
+# ggml/src/ggml-sycl/CMakeLists.txt: editing an existing UI source is picked up
+# by the build, but ADDING one needs a reconfigure.
+set(UI_ASSETS_STAMP "${CMAKE_CURRENT_BINARY_DIR}/ui-assets.stamp")
+
+add_custom_command(
+    OUTPUT  "${UI_ASSETS_STAMP}" ${UI_CPP} ${UI_H}
+    COMMAND ${CMAKE_COMMAND}
+        "-DUI_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DUI_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        "-DLLAMA_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+        "-DLLAMA_BUILD_NUMBER=${LLAMA_BUILD_NUMBER}"
+        "-DHF_BUCKET=${LLAMA_UI_HF_BUCKET}"
+        "-DHF_VERSION=${HF_UI_VERSION}"
+        "-DHF_ENABLED=${LLAMA_USE_PREBUILT_UI}"
+        "-DBUILD_UI=${LLAMA_BUILD_UI}"
+        "-DLLAMA_UI_GZIP=${LLAMA_UI_GZIP}"
+        -P "${PROJECT_SOURCE_DIR}/scripts/ui-assets.cmake"
+    COMMAND ${CMAKE_COMMAND} -E touch "${UI_ASSETS_STAMP}"
+    DEPENDS ${UI_ASSET_DEPENDS}
+            "${CMAKE_CURRENT_SOURCE_DIR}/ui.h.in"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ui.cpp.in"
+    COMMENT "Provisioning UI assets"
+    VERBATIM
+)
+
+add_custom_target(llama-ui-assets ALL DEPENDS "${UI_ASSETS_STAMP}")
+
+set_source_files_properties(${UI_CPP} ${UI_H} PROPERTIES GENERATED TRUE)
+
+add_library(${TARGET} STATIC ${UI_CPP} ${UI_H})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+add_dependencies(${TARGET} llama-ui-assets)
+
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+target_include_directories(${TARGET} PUBLIC
+    ${CMAKE_CURRENT_BINARY_DIR}
+)

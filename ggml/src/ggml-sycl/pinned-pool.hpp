@@ -12,6 +12,7 @@
 #include "scratch-test-mutant.hpp"
 #include "tlsf-allocator.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -132,7 +133,8 @@ struct segmented_buffer {
 // Optional: set GGML_SYCL_PINNED_CHUNK_MB to override the default chunk size.
 // Optional: set GGML_SYCL_PINNED_ALLOC_TIMEOUT_MS to abort if a chunk allocation hangs.
 //
-// Uses per-zone-per-chunk TLSF sub-allocators for O(1) alloc/free with coalescing.
+// Uses per-zone-per-chunk TLSF sub-allocators: O(1) free with coalescing, and O(1)
+// allocation unless it walks the request's own size class (see tlsf_allocator::allocate).
 // Each zone has isolated TLSF allocators, enabling proper zone_reset() without
 // disturbing other zones' allocations.
 // A chunk is released at the pool's destruction, or earlier by
@@ -147,6 +149,45 @@ class pinned_chunk_pool {
     static constexpr size_t DEFAULT_ALIGNMENT = 64;                         // Cache line alignment
     // No chunk index: what zone_free() and release_chunk_lease() return when the call released no orphaned chunk.
     static constexpr size_t NO_CHUNK          = SIZE_MAX;
+
+    // Byte footprint of ONE new chunk able to hold `min_size` usable bytes in a pool of `chunk_size`-byte chunks.
+    // `usable` is what the chunk's TLSF arena manages (max(chunk_size, align_up(min_size))); `backing` is what
+    // grow_into() commits against budget_ (usable plus the DEFAULT_ALIGNMENT header it skips at the base). Every
+    // pre-growth budget check (grow_zone, allocate_from_chunks), grow_into()'s own check, and the plan's replay of the
+    // loader's buffers (placement_loader_pool_footprint_for) must use this one function: llama.cpp-nsl3 was a
+    // divergence between them (grow_zone budgeted N * chunk_size_ for chunks grow_into() sized differently), and a
+    // pre-check that admits a growth grow_into() then refuses surfaces as an allocation failure with a misleading
+    // budget line.
+    struct chunk_footprint {
+        size_t usable;
+        size_t backing;
+    };
+
+    static chunk_footprint chunk_footprint_for(size_t chunk_size, size_t min_size) {
+        const size_t aligned = (min_size + DEFAULT_ALIGNMENT - 1) & ~(DEFAULT_ALIGNMENT - 1);
+        const size_t usable  = std::max(chunk_size, aligned);
+        return { usable, usable + DEFAULT_ALIGNMENT };
+    }
+
+    // The bytes the pool grows one chunk by for one contiguous request of `size` bytes at `alignment` (0 is
+    // DEFAULT_ALIGNMENT) that no chunk holds: unified_alloc's fragmentation path and allocate_from_chunks grow by it,
+    // and the plan's replay of the loader's buffers (placement_loader_pool_footprint_for) sizes each buffer with it.
+    // It is the block the chunk's TLSF takes for the request: zone_alloc and allocate_from_chunks align the size to
+    // `alignment` and ask the TLSF at the larger of that alignment and the grain, which round_request rounds the size
+    // to. A grown chunk is fresh and its TLSF arena is the whole chunk, so the block sits at offset 0, where every
+    // granularity is met, and an arena of exactly the block holds it: nothing more is needed. The TLSF places blocks by
+    // offset and never pads for the chunk's base, so extra bytes would not align the pointer further either. An
+    // alignment above the grain is one round_request refuses (it asserts), here as on every zone_alloc, so no chunk is
+    // grown for a request no chunk can serve. 0 when round_request refuses the size (zero, or within a grain of
+    // SIZE_MAX); grow_zone grows nothing for 0.
+    static size_t zone_grow_request(size_t size, size_t alignment) {
+        const size_t align = alignment != 0 ? alignment : DEFAULT_ALIGNMENT;
+        if (size > SIZE_MAX - align) {
+            return 0;
+        }
+        const size_t aligned = (size + align - 1) & ~(align - 1);
+        return tlsf_allocator::round_request(aligned, std::max(align, tlsf_allocator::block_grain));
+    }
 
     // The release of one chunk's backing, as a move-only RAII carrier defined after this class: its destructor frees
     // the chunk owner and moves the footprint, so a carrier dropped on any path releases and accounts exactly as a
@@ -329,9 +370,9 @@ class pinned_chunk_pool {
 
     // The SCRATCH return's device REDs compute every expected figure from the pool's own chunk rule (§7 C4 "computed
     // as a sum of chunk_footprint_for terms"): the usable and backing bytes of one new chunk able to hold `min_size`.
-    size_t test_chunk_usable_for(size_t min_size) const { return chunk_footprint_for(min_size).usable; }
+    size_t test_chunk_usable_for(size_t min_size) const { return chunk_footprint_for(chunk_size_, min_size).usable; }
 
-    size_t test_chunk_backing_for(size_t min_size) const { return chunk_footprint_for(min_size).backing; }
+    size_t test_chunk_backing_for(size_t min_size) const { return chunk_footprint_for(chunk_size_, min_size).backing; }
 
     // The registry metadata of a live base chunk's backing, for the registry hold (§M88 (1)). False for a tombstone or
     // an index past the end.
@@ -381,23 +422,6 @@ class pinned_chunk_pool {
 
     // Allocate a new chunk (>= min_size). Returns false if over budget or allocation fails.
     bool grow(size_t min_size, const char * site);
-
-    // Byte footprint of ONE new chunk able to hold `min_size` usable bytes.
-    // `usable` is what the chunk's TLSF arena manages (max(chunk_size_,
-    // align_up(min_size))); `backing` is what grow_into() commits against
-    // budget_ (usable plus the DEFAULT_ALIGNMENT header it skips at the
-    // base). Every pre-growth budget check (grow_zone, allocate_from_chunks)
-    // and grow_into()'s own check must use this same arithmetic: llama.cpp-nsl3
-    // was a divergence between them (grow_zone budgeted N * chunk_size_ for
-    // chunks grow_into() sized differently), and a pre-check that admits a
-    // growth grow_into() then refuses surfaces as an allocation failure with
-    // a misleading budget line.
-    struct chunk_footprint {
-        size_t usable;
-        size_t backing;
-    };
-
-    chunk_footprint chunk_footprint_for(size_t min_size) const;
 
     void free_chunk_owner(chunk & c, const char * ctx);
 

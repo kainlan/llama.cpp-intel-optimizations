@@ -112,7 +112,7 @@ struct host_scratch_zone_ops {
     size_t plan_scratch_bytes                 = 0;
     // The host buffer chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB): a demand splits into buffers of at most this size.
     size_t chunk_cap                          = 0;
-    // pinned_chunk_pool::DEFAULT_ALIGNMENT: the slack one buffer can need, as on the miss path.
+    // pinned_chunk_pool::DEFAULT_ALIGNMENT: the slack the ensure adds to its grow for each buffer a demand splits into.
     size_t alignment                          = 0;
 };
 

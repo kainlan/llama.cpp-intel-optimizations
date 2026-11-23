@@ -655,7 +655,7 @@ INTERNAL_WRAPPER_SITES = {
         "const int planned_device = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);": 1,
         "ggml_sycl_cache_plan_owner(cache)->count_planned_experts(src0->name, n_experts, device);": 1,
         "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
-        "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
+        "ggml_sycl_configure_host_zones_for_plan(cache, device, ggml_sycl_cache_plan_owner(cache));": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 16,
         "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,

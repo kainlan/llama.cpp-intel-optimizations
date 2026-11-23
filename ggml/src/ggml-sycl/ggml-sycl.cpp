@@ -110,6 +110,7 @@
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/exit-settle.hpp"
 #include "ggml-sycl/fattn.hpp"
+#include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
@@ -139,6 +140,7 @@
 #include "ggml-sycl/orchestrator.hpp"
 #include "ggml-sycl/pool-legacy-release.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/prestage-class.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/residency-probe.hpp"
@@ -150,6 +152,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/tenant-claim-scope.hpp"
+#include "ggml-sycl/top-k-mask.hpp"
 #include "ggml-sycl/topk.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
@@ -4606,8 +4609,12 @@ static void moe_decode_route_census_maybe_print() {
 }
 
 namespace ggml_sycl {
+// `device` is the card whose pool `cache` is: a cache does not record its device index, and a multi-device plan's
+// device_id is -1, so only the caller can say which card's share of the plan this is.
 static void ggml_sycl_configure_host_zones_for_plan(
-    ggml_sycl::unified_cache * cache, const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
+    ggml_sycl::unified_cache *                               cache,
+    int                                                      device,
+    const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
     if (!cache || !plan_owner || plan_owner->entries.empty()) {
         return;
     }
@@ -4621,10 +4628,29 @@ static void ggml_sycl_configure_host_zones_for_plan(
     // The zone sizes come from the function the plan's host figure comes from (th32 §4.2), so what this step commits
     // is what the planner counted: the KV zone at its 64 MiB floor (KV is co-located with attention weights, so
     // plan.host_zone_kv_bytes already counts the host layers' KV), the SCRATCH zone at least the live oneDNN scratch
-    // plus the largest tensor plus headroom, and the RUNTIME pool's bytes.
-    const ggml_sycl::host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms(
-        plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
-        cache->pinned_pool_chunk_size());
+    // plus the largest tensor plus headroom, and the RUNTIME pool's bytes. Every card's zones are configured from the
+    // one plan, so they are this card's share of it: the loader's SYCL_Host buffer is in loader_device's pool only.
+    const ggml_sycl::host_zone_commit_terms terms = ggml_sycl::placement_plan_host_zone_commit_terms_on_device(
+        plan,
+        ggml_sycl::placement_plan_host_zone_commit_terms(
+            plan, cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size(),
+            cache->pinned_pool_chunk_size()),
+        device);
+    if (plan.loader_holds_weights && device != plan.loader_device) {
+        if (plan.loader_device >= 0) {
+            GGML_LOG_WARN(
+                "[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer is in device "
+                "%d's pool, which commits its %zu B of tensors as loader_zone=%zu loader_grown=%zu; this card's zones "
+                "leave it out\n",
+                device, plan.loader_device, plan.host_zone_loader_bytes, plan.host_zone_terms.loader_zone,
+                plan.host_zone_terms.loader_grown);
+        } else {
+            GGML_LOG_WARN(
+                "[HOST-PLAN] device=%d WEIGHT zone: loader_residency=0: the loader's SYCL_Host buffer is split across "
+                "the scheduler's devices by layer, so the plan charges it to no card's zones\n",
+                device);
+        }
+    }
     const size_t committed_before = cache->pinned_pool_committed();
 
     // Zone-config preflight: grow the pinned-pool to total capacity before configure_host_zones()
@@ -4669,8 +4695,9 @@ static void ggml_sycl_configure_host_zones_for_plan(
     // The pool grows by at most what the plan counts: its recorded terms, which a re-plan that moves a term re-records,
     // never this step's own recomputation, so a chunk committed here that the plan does not count is named (th32 §4.2,
     // §10's ledger check).
-    (void) ggml_sycl::host_zone_commit_check(plan.device_id, plan.host_zone_terms.total(), committed_before,
-                                             cache->pinned_pool_committed());
+    (void) ggml_sycl::host_zone_commit_check(
+        device, ggml_sycl::placement_plan_host_zone_commit_terms_on_device(plan, plan.host_zone_terms, device).total(),
+        committed_before, cache->pinned_pool_committed());
 
     if (cache->host_zones_configured()) {
         GGML_LOG_INFO("[HOST-ARENA] Zones configured: WEIGHT=%.1f MB KV=%.1f MB STAGING=%.1f MB SCRATCH=%.1f MB\n",
@@ -4687,15 +4714,15 @@ static void ggml_sycl_configure_host_zones_for_plan(
 
 // S1 preload retains its existing current-plan behavior. The guarded inventory
 // path instead passes the exact candidate captured while inventory was locked.
-static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache) {
+static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache, int device) {
     if (cache) {
-        ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));
+        ggml_sycl_configure_host_zones_for_plan(cache, device, ggml_sycl_cache_plan_owner(cache));
     }
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void configure_host_zones_for_plan_for_testing(unified_cache * cache, const placement_plan & plan) {
-    ggml_sycl_configure_host_zones_for_plan(cache, std::make_shared<const placement_plan>(plan));
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, int device, const placement_plan & plan) {
+    ggml_sycl_configure_host_zones_for_plan(cache, device, std::make_shared<const placement_plan>(plan));
 }
 #endif
 
@@ -10769,6 +10796,157 @@ static void ggml_sycl_release_last_model_effects(const char *                   
     }
 }
 
+// The model a SYCL_Host allocation made now belongs to: the load effect's owner, the one the host-weight registration
+// takes, or 0 outside a bound load. The guard covers bound_candidate() alone: it takes the registry's lock, which can
+// throw, and this runs inside the host buffer type's allocation, which is called from C, so a lock error leaves the
+// allocation unowned instead of unwinding through C. acquire_load_effect() is noexcept. The rethrow arm is the form
+// the catch contract requires of every catch-all; bound_candidate() throws no fallback error.
+static uint64_t ggml_sycl_loading_model_id() {
+    auto &                          registry = ggml_sycl::lifecycle::global_registry();
+    ggml_sycl::lifecycle::LoadTxnId txn{};
+    try {
+        txn = registry.bound_candidate();
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        return 0;
+    }
+    const ggml_sycl::lifecycle::load_effect_lease effect = registry.acquire_load_effect(txn);
+    return effect ? effect.owner.model.value : 0;
+}
+
+// The SYCL_Host chunks each model's load minted, so the model's MODEL check runs on every teardown path. A committed
+// model is checked by its slot release, after the reclaim. A rolled-back load's chunks are freed by the model's
+// destructor after its rollback, or by an unwind before it, so its check runs once both the rollback and the last
+// chunk's free have happened. `bytes` is what the model holds on each device now, minted minus freed, so the loader's
+// temporaries count only while they live. `weight_zone_baseline` is each device's WEIGHT zone capacity when this load
+// decided that card's host zones (ggml_sycl_model_host_weight_baseline_note), the point the preload measures the
+// zone's growth from; `weight_zone_baseline_taken` says the load took it.
+struct ggml_sycl_model_host_chunk_record {
+    size_t                                    live = 0;
+    std::array<size_t, GGML_SYCL_MAX_DEVICES> bytes{};
+    std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_zone_baseline{};
+    std::array<bool, GGML_SYCL_MAX_DEVICES>   weight_zone_baseline_taken{};
+    bool                                      rolled_back = false;
+};
+
+struct ggml_sycl_model_host_chunks_store {
+    std::mutex                                                      mutex;
+    std::unordered_map<uint64_t, ggml_sycl_model_host_chunk_record> records;
+};
+
+// Never destroyed: a model's buffers can be freed from a static destructor at exit.
+static ggml_sycl_model_host_chunks_store & ggml_sycl_model_host_chunks() {
+    static ggml_sycl_model_host_chunks_store * const store = new ggml_sycl_model_host_chunks_store;
+    return *store;
+}
+
+static void ggml_sycl_model_host_chunks_check(uint64_t model_id) {
+    ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL,
+                                                   { ggml_sycl::alloc_owner_kind::MODEL, model_id });
+}
+
+static void ggml_sycl_model_host_chunk_minted(uint64_t model_id, int device, size_t size) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    ggml_sycl_model_host_chunk_record & record = store.records[model_id];
+    record.live++;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        record.bytes[device] += size;
+    }
+}
+
+static void ggml_sycl_model_host_chunk_freed(uint64_t model_id, int device, size_t size) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    bool                                check = false;
+    {
+        std::lock_guard<std::mutex> lock(store.mutex);
+        auto                        it = store.records.find(model_id);
+        if (it == store.records.end()) {
+            return;  // the model's release already checked and forgot it
+        }
+        ggml_sycl_model_host_chunk_record & record = it->second;
+        record.live -= record.live > 0 ? 1 : 0;
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+            record.bytes[device] -= std::min(record.bytes[device], size);
+        }
+        check = record.rolled_back && record.live == 0;
+        if (check) {
+            store.records.erase(it);
+        }
+    }
+    if (check) {
+        ggml_sycl_model_host_chunks_check(model_id);
+    }
+}
+
+// A rolled-back load, after its slot release: the check runs now when no chunk of it is left, else at the last one's
+// free.
+static void ggml_sycl_model_host_chunks_rolled_back(uint64_t model_id) {
+    if (model_id == 0) {
+        return;
+    }
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    bool                                check = false;
+    {
+        std::lock_guard<std::mutex>         lock(store.mutex);
+        ggml_sycl_model_host_chunk_record & record = store.records[model_id];
+        record.rolled_back                         = true;
+        check                                      = record.live == 0;
+        if (check) {
+            store.records.erase(model_id);
+        }
+    }
+    if (check) {
+        ggml_sycl_model_host_chunks_check(model_id);
+    }
+}
+
+static void ggml_sycl_model_host_chunks_forget(uint64_t model_id) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    store.records.erase(model_id);
+}
+
+static size_t ggml_sycl_model_host_chunk_bytes(uint64_t model_id, int device) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    auto                                it = store.records.find(model_id);
+    if (it == store.records.end() || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return it->second.bytes[device];
+}
+
+// The late pass, once it has decided `device`'s host zones for `model_id`'s load: the WEIGHT zone's capacity then.
+// Zones outlive the model that configured them (a model's release frees its chunks, not the pool's zones), and the
+// configure step keeps zones it finds configured, so a later load starts from the zone an earlier one left, grown
+// chunks included. Measuring from here counts only the growth this load's loader caused.
+static void ggml_sycl_model_host_weight_baseline_note(uint64_t model_id, int device, size_t capacity) {
+    if (model_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    ggml_sycl_model_host_chunk_record & record = store.records[model_id];
+    record.weight_zone_baseline[device]        = capacity;
+    record.weight_zone_baseline_taken[device]  = true;
+}
+
+// The baseline ggml_sycl_model_host_weight_baseline_note took for `model_id` on `device`, in `*capacity`; false when
+// the load took none there.
+static bool ggml_sycl_model_host_weight_baseline(uint64_t model_id, int device, size_t * capacity) {
+    ggml_sycl_model_host_chunks_store & store = ggml_sycl_model_host_chunks();
+    std::lock_guard<std::mutex>         lock(store.mutex);
+    auto                                it = store.records.find(model_id);
+    if (it == store.records.end() || device < 0 || device >= GGML_SYCL_MAX_DEVICES ||
+        !it->second.weight_zone_baseline_taken[device]) {
+        return false;
+    }
+    *capacity = it->second.weight_zone_baseline[device];
+    return true;
+}
+
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
@@ -10800,18 +10978,20 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // teardown -- like MID_LOAD_REPLAN -- runs on the same thread that owns
     // this cache's contents, not from an arbitrary other thread.
     ggml_sycl_moe_ids_cache_new_graph();
-    // The MODEL boundary (§4.4 "Lifetimes"): the model's device weight buffers went in pimpl.reset() before this hook,
-    // and its host-registered weight extras and graph leases just above, so no MODEL row it owns may remain. Not at a
-    // weight buffer's free_buffer: one model's weights span several weight buffers that share its model id, and a
-    // host-registered expert's extra is in no device buffer at all.
-    if (owner.model.value != 0) {
-        ggml_sycl::unified_cache_host_zone_owner_check(ggml_sycl::alloc_lifetime::MODEL,
-                                                       { ggml_sycl::alloc_owner_kind::MODEL, owner.model.value });
-    }
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
     ggml_sycl_erase_weight_identities_for_owner(owner);
     const size_t   reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);
+    // The MODEL boundary (§4.4 "Lifetimes"): the model's weight buffers went in pimpl.reset() before this hook, its
+    // host-registered weight extras and graph leases above, and its cache entries in the reclaim just above, so no
+    // MODEL row it owns may remain. After the reclaim, not before: a host expert served in place from a SYCL_Host chunk
+    // of the model holds a copy of that chunk's owner in its cache entry until the reclaim drops it. Not at a weight
+    // buffer's free_buffer: one model's weights span several weight buffers that share its model id, and a
+    // host-registered expert's extra is in no device buffer at all.
+    if (owner.model.value != 0) {
+        ggml_sycl_model_host_chunks_check(owner.model.value);
+        ggml_sycl_model_host_chunks_forget(owner.model.value);
+    }
     g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
@@ -11494,6 +11674,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     } catch (...) {
         clean = false;
     }
+    // The rolled-back load keeps its MODEL check: it runs now if the load's SYCL_Host chunks are already freed, else
+    // when the model's destructor frees the last of them. Outside every try stage, like the restore below: it reports
+    // through its own lines, not through `clean`, and aborts only under strict.
+    ggml_sycl_model_host_chunks_rolled_back(owner.model.value);
     // The device-wide terms the aborted load published, where they still hold what it published, go back to what they
     // held before it, so the models on the device plan with their own again. The restore cannot throw and runs outside
     // any try stage.
@@ -15548,8 +15732,7 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
-static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout_cpu) == 187,
-              "host_weight_layout_cpu left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout) == 187, "host_weight_layout left the padding");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
@@ -15710,13 +15893,27 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     return in;
 }
 
-// An inventory no entry point reads: absent, or naming tensors or lazy tables with no array behind the count. The four
-// entry points (the early and the late direct entries, the stage and the dry run) refuse it before anything reads it,
-// so the intake below copies whatever the counts name.
+// An inventory no entry point reads: absent, naming tensors or lazy tables with no array behind the count, or carrying
+// a host_weight_layout byte that names no layout (enum ggml_sycl_host_weight_layout). The four entry points (the early
+// and the late direct entries, the stage and the dry run) refuse it before anything reads it, so the intake below
+// copies whatever the counts name and every reader of the layout byte reads a known layout.
 static bool ggml_sycl_inventory_malformed(const ggml_sycl_tensor_inventory * inventory) {
-    return inventory == nullptr || (inventory->count > 0 && inventory->tensors == nullptr) ||
-           (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr);
+    if (inventory == nullptr || (inventory->count > 0 && inventory->tensors == nullptr) ||
+        (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr)) {
+        return true;
+    }
+    if (!ggml_sycl::host_weight_layout_facts_of(inventory->host_weight_layout).known) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] the inventory's host_weight_layout byte %u names no layout (off 0, cpu 1, plain 2): the "
+            "plan cannot tell which buffer the loader puts a host dense weight in, so the inventory is refused\n",
+            static_cast<unsigned>(inventory->host_weight_layout));
+        return true;
+    }
+    return false;
 }
+
+// The SYCL_Host buffer type's chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB), defined with that buffer type.
+static size_t ggml_backend_sycl_host_buffer_type_chunk_cap();
 
 // The planner's KV and cost inputs from an inventory, written over `kv`, which keeps every field the inventory does not
 // carry (n_seq_max is a runtime-context input). The stage fills g_placement_kv_info; the plan dry run fills a copy.
@@ -15777,7 +15974,17 @@ static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info &     
     // it, and every entry's host backing, planned_host_backing and the from-file hook read it from the plan.
     kv.load_maps_files          = inventory->use_mmap_resolved && ggml_sycl::file_mapping_supported();
     kv.load_locks_files         = kv.load_maps_files && inventory->use_mlock_resolved;
-    kv.host_weight_layout_cpu   = inventory->host_weight_layout_cpu;
+    // Whether the loader binds the SYCL_Host buffer type for the weights on a load that maps no file, and keeps that
+    // buffer for the model's life; the plan derives from it whether the WEIGHT zone charges that buffer.
+    kv.load_weights_evictable   = ggml_backend_sycl_weights_evictable();
+    // Which pool holds that buffer: libllama binds the SYCL_Host buffer type of each layer's scheduler device, and a
+    // buffer's chunks come from that device's cache. With one device visible to the scheduler (one GPU selected, or
+    // several collapsed to device 0) that is device 0 for every layer; with more, the buffer is split across them.
+    kv.load_loader_device       = ggml_backend_sycl_get_device_count() == 1 ? 0 : -1;
+    // The largest buffer that buffer type lets ggml-alloc request, before a zone bounds it: the plan splits the
+    // loader's tensors into buffers with it, as ggml-alloc does, to charge them as the pinned pool will hold them.
+    kv.load_loader_buffer_cap   = ggml_backend_sycl_host_buffer_type_chunk_cap();
+    kv.host_weight_layout       = inventory->host_weight_layout;
     // Its RUNTIME room is composed from the published plan on the single-device path, before each plan
     // (compute_and_store_plan_for_inventory); until then, and on every other path, there is none.
     kv.explicit_ubatch          = {};
@@ -16902,6 +17109,9 @@ static int ggml_sycl_compute_placement_plan_early_impl(ggml_backend_t           
     // Under the lock and before the pass publishes, so a failed load puts back only what this pass wrote.
     ggml_sycl_load_published_pass published(g_sycl_plan_load_effect_txn);
     populate_inventory_globals(ctx, inventory);
+    // The early inventory names every weight of the file, the ones the loader will put in a CPU-owned buffer included,
+    // so the loader term applies the host weight layout's rule to it (placement_loader_holds_host_dense).
+    g_placement_kv_info.load_inventory_unbound = true;
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
     int    budget_pct = 0;
     compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem);
@@ -16984,6 +17194,9 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_t
     // ggml_backend_sycl_compute_placement_plan_early() call with the same
     // inventory snapshot.
     populate_inventory_globals(ctx, inventory);
+    // The late inventory keeps only the tensors on SYCL buffers, so every entry the loader term counts is in the
+    // loader's SYCL_Host buffer.
+    g_placement_kv_info.load_inventory_unbound = false;
 
     // Phase B: VRAM budget computation.
     size_t vram_budget = 0, base_mem = 0, free_mem = 0;
@@ -17291,6 +17504,27 @@ static bool ggml_sycl_stage_refuse_lazy_plan(const ggml_sycl::placement_plan * p
     return true;
 }
 
+// Refuses the load for a plan whose loader buffers the pinned pool cannot hold within the host budget
+// (placement_plan_loader_pool_refusal): logs one ERROR naming the reason and its figures and returns true, and the
+// stage then returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED. A late plan over its budget would fail in grow_zone partway
+// through; an early candidate can also be refused although its pool growth would fit (see the refusal's comment). Once
+// a late plan admits, no loader pool growth fails where the pool's own budget is at least the plan's. The stage asks it
+// before the lazy-plan refusal, whose room the loader's zone took. Returns false, logging nothing, for any other plan.
+static bool ggml_sycl_stage_refuse_loader_pool_plan(const ggml_sycl::placement_plan * plan, bool early) {
+    if (plan == nullptr) {
+        return false;
+    }
+    const std::string refusal = ggml_sycl::placement_plan_loader_pool_refusal(*plan);
+    if (refusal.empty()) {
+        return false;
+    }
+    GGML_LOG_ERROR(
+        "[HOST-PLAN] load refused: %s (early=%d): the pinned pool cannot hold the loader's SYCL_Host buffers "
+        "within the host budget\n",
+        refusal.c_str(), early ? 1 : 0);
+    return true;
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                        const ggml_sycl_placement_envelope * envelope,
                                                                        bool                                 early) {
@@ -17447,6 +17681,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 if (ggml_sycl_stage_refuse_cross_card_expert_plan(decision.snapshot->plan.get())) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
+                if (ggml_sycl_stage_refuse_loader_pool_plan(decision.snapshot->plan.get(), early)) {
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
                 if (ggml_sycl_stage_refuse_lazy_plan(decision.snapshot->plan.get(), early)) {
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
@@ -17473,6 +17710,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         const auto early_candidate =
             early ? ggml_sycl::lifecycle_find_candidate_placement_plan(effect.owner.load.value) : nullptr;
         if (early_candidate && ggml_sycl_stage_refuse_cross_card_expert_plan(early_candidate->plan.get())) {
+            return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+        }
+        if (early_candidate && ggml_sycl_stage_refuse_loader_pool_plan(early_candidate->plan.get(), early)) {
             return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
         }
         if (early_candidate && ggml_sycl_stage_refuse_lazy_plan(early_candidate->plan.get(), early)) {
@@ -17526,7 +17766,14 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
                 ggml_sycl_run_inventory_effects(decision.effects);
                 if (!decision.snapshot->explicit_no_plan) {
                     auto * cache = ggml_sycl::get_unified_cache_for_device(decision.device);
-                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.snapshot->plan);
+                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, decision.device, decision.snapshot->plan);
+                    // The zones this load starts from, configured now or kept from an earlier load: the preload
+                    // measures the WEIGHT zone's growth from here to the end of its host-weight placement.
+                    if (cache != nullptr && cache->host_zones_configured()) {
+                        ggml_sycl_model_host_weight_baseline_note(
+                            owner.model.value, decision.device,
+                            cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT));
+                    }
                 }
                 if (!effects_are_current()) {
                     // Detection, not atomic competing-provisioning or backing
@@ -17745,15 +17992,23 @@ static void ggml_sycl_plan_dry_run_record(uint32_t                              
     line("WEIGHT", "host_weights", out.weight_host_weights);
     GGML_LOG_INFO("[PLAN-DRY-RUN] plan=%u device=%d WEIGHT blocks=%" PRIu64 "\n", index, plan.device_id,
                   out.weight_blocks);
+    // The loader's SYCL_Host buffer and the host experts it serves in place, which hold no block. Printed and not
+    // exported: the result struct crosses the backend's dlopen boundary, so its layout stays.
+    line("WEIGHT", "loader_residency", weight.loader_residency);
+    line("WEIGHT", "loader_served", weight.loader_served);
     line("WEIGHT", "host_compute_reserve", out.weight_host_compute_reserve);
     line("WEIGHT", "layout_copies", out.weight_layout_copies);
     line("WEIGHT", "tlsf_bound", out.weight_tlsf_bound);
     line("WEIGHT", "swap_headroom", weight.swap_headroom);
     line("ZONE", "weight", out.zone_weight);
+    // The loader's buffers as the pool holds them: the WEIGHT zone bytes they take, and the chunks the pool grows for
+    // a buffer larger than a chunk. Printed and not exported, as above.
+    line("ZONE", "loader_zone", terms.loader_zone);
     line("ZONE", "kv", out.zone_kv);
     line("ZONE", "staging", out.zone_staging);
     line("ZONE", "scratch", out.zone_scratch);
     line("COMMIT", "runtime", out.runtime);
+    line("COMMIT", "loader_grown", terms.loader_grown);
     line("COMMIT", "rounding", out.rounding);
     line("HOST", "expected_host", out.expected_host);
     line("HOST", "host_budget", out.host_budget);
@@ -17809,6 +18064,8 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
     // keeps the value a load would plan with.
     ggml_sycl::placement_kv_info                        kv     = g_placement_kv_info;
     ggml_sycl_inventory_fill_kv_info(kv, inventory);
+    // The dry run plans the load's early inventory, every weight of the file, as the early pass does.
+    kv.load_inventory_unbound  = true;
     // P3's reading, the budget's source and its headroom refusal are the dry run's own sample's, the one its budget
     // came from, never the ledger's stored values. The source is the override only when the override is the budget
     // (design 5efe §4.5: it composes); an accepted override above the formula leaves the computed budget.
@@ -35695,6 +35952,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_probe_buffer_interface = {
 
     /* .clear           = */ NULL,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 static ggml_backend_buffer_t ggml_backend_sycl_probe_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -35727,9 +35987,11 @@ static bool ggml_backend_sycl_probe_buffer_type_is_host(ggml_backend_buffer_type
 static const ggml_backend_buffer_type_i ggml_backend_sycl_probe_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_sycl_probe_buffer_type_get_name,
     /* .alloc_buffer   = */ ggml_backend_sycl_probe_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n = */ NULL,
     /* .get_alignment  = */ ggml_backend_sycl_probe_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_sycl_probe_buffer_type_get_max_size,
     /* .get_alloc_size = */ NULL,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host        = */ ggml_backend_sycl_probe_buffer_type_is_host,
 
 };
@@ -37375,6 +37637,9 @@ static void ggml_check_sycl() try {
             { "GGML_SYCL_PRIORITIZE_DMMV",  &g_ggml_sycl_prioritize_dmmv,  0  },
             { "GGML_SYCL_KQV_FORCE_SIMPLE", &g_ggml_sycl_kqv_force_simple, 0  },
             { "GGML_SYCL_KQV_DISABLE_FP16", &g_ggml_sycl_kqv_disable_fp16, 0  },
+            // Upstream's device-built MUL_MAT_ID schedule (18c5a95e2). Upstream defaults it to 1, this fork to 0
+            // (owner decision 2026-11-21); the bits are masked after the loop, as upstream does.
+            { "GGML_SYCL_MMID_SCHED",       &g_ggml_sycl_mmid_sched,       0  },
 #ifdef GGML_SYCL_XMX_GEMM
             { "GGML_SYCL_USE_XMX_GEMM",     &g_ggml_sycl_use_xmx_gemm,     0  },
             // 64 is the ONLY statement of the XMX batch threshold's default;
@@ -37423,6 +37688,7 @@ static void ggml_check_sycl() try {
         for (const sycl_env_setting & setting : sycl_env_settings) {
             *setting.dest = get_sycl_env(setting.name, setting.default_value);
         }
+        g_ggml_sycl_mmid_sched &= GGML_SYCL_MMID_SCHED_DEVICE | GGML_SYCL_MMID_SCHED_UNBOUNDED;
         g_ggml_sycl_moe_exec_policy = static_cast<int>(ggml_sycl_moe_exec_config().policy);
         g_ggml_sycl_moe_exec_trace  = ggml_sycl_moe_exec_config().trace;
 
@@ -38627,8 +38893,14 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                                 extra->data_device_ptr(dev_id));
             }
         }
-    } else if (ggml_sycl_soa_reorder_supported_type(tensor->type) &&
+    } else if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+               ggml_sycl_soa_reorder_supported_type(tensor->type) &&
                (ggml_sycl_reorder_enabled() || ggml_sycl_unified_kernel_requires_aos(tensor->type))) {
+        // A compute-buffer copy of a host weight (the scheduler's upload of an op it gave this device) is
+        // refilled in the plain layout before every run, so it takes no reorder record: it falls through to
+        // the plain extra below and is read as the AOS bytes it holds (upstream 18c5a95e2, "stop
+        // erroneously reordering host-offloaded tensors").
+        //
         // Reuse an existing extra if present.  Do NOT overwrite it or we lose the
         // model_id for unified cache lookups.
         //
@@ -39403,7 +39675,7 @@ static bool ggml_sycl_dense_f16_arm_serves_pp(const ggml_tensor * src0,
         !ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)) {
         return false;
     }
-    if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {
+    if (!dst || dst->op_params[0] != GGML_PREC_UNDEFINED) {
         return false;
     }
     if (src0->buffer &&
@@ -45372,6 +45644,12 @@ static void ggml_sycl_moe_exec_copy_probe(int                           device,
 }
 
 static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_sycl::mem_handle * out);
+static bool ggml_sycl_loader_buffer_owner(ggml_backend_buffer_t   buffer,
+                                          const void *            data,
+                                          size_t                  bytes,
+                                          int                     device,
+                                          ggml_sycl::mem_handle * out,
+                                          const char **           why);
 
 static void ggml_sycl_preload_model_weights() {
     // Finisher authority keeps B's candidate immutable for the whole preload;
@@ -45457,6 +45735,17 @@ static void ggml_sycl_preload_model_weights() {
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_host_bytes{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_device_count{};
         std::array<size_t, GGML_SYCL_MAX_DEVICES> weight_host_count{};
+        // Host-planned experts left with no owner (no pinned room and no buffer to serve them from): the load refuses
+        // once the sweep has counted them.
+        std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_count{};
+        std::array<size_t, GGML_SYCL_MAX_DEVICES> host_expert_unowned_bytes{};
+        std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_unowned_first{};
+        // Host experts the plan serves from the loader's SYCL_Host chunk whose chunk the gate refused: the plan sized
+        // no block for a copy, so the load refuses once the sweep has counted them, naming the gate's first reason.
+        std::array<size_t, GGML_SYCL_MAX_DEVICES>      host_expert_loader_refused_count{};
+        std::array<size_t, GGML_SYCL_MAX_DEVICES>      host_expert_loader_refused_bytes{};
+        std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_loader_refused_first{};
+        std::array<std::string, GGML_SYCL_MAX_DEVICES> host_expert_loader_refused_reason{};
 
         // Collect all (tensor, device) pairs, grouped by device
         struct preload_item {
@@ -45753,7 +46042,7 @@ static void ggml_sycl_preload_model_weights() {
             // Part A: configure the host arena once the placement plan is known.
             // This partitions the pre-allocated pinned pool into persistent and
             // resettable host zones so inference uses bump/reset only.
-            ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
+            ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, device);
             ggml_sycl::scoped_planned_materialization planned_materialization(cache, "S1-PRELOAD/bulk");
 
             // Submit all H2D copies for this device without waiting
@@ -46046,17 +46335,41 @@ static void ggml_sycl_preload_model_weights() {
                             !tensor_source_is_device &&
                             !ggml_sycl::placement_plan::host_backing_sizes_weight_zone(planned_backing) &&
                             ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner);
+                        // A pinned host expert the plan serves from the loader's SYCL_Host chunk is registered in
+                        // place with that chunk's owner, which the model holds for its life: the plan charged the
+                        // chunk as loader_residency and gave the expert no block. There is no copy fallback: a copy
+                        // would take room no zone was sized for, so an expert the gate refuses is counted, never
+                        // registered, and the load refuses after the sweep.
+                        const bool loader_serves = !served_in_place && !tensor_source_is_device &&
+                                                   planned_backing == ggml_sycl::placement_host_backing::PINNED &&
+                                                   global_plan != nullptr && global_plan->loader_serves_host_experts;
+                        const char * loader_refusal = nullptr;
+                        const bool   loader_in_place =
+                            loader_serves && ggml_sycl_loader_buffer_owner(tensor->buffer, expert_aos, expert_size,
+                                                                           device, &host_owner, &loader_refusal);
+                        if (loader_serves && !loader_in_place) {
+                            if (host_expert_loader_refused_count[device]++ == 0) {
+                                host_expert_loader_refused_first[device] =
+                                    std::string(tensor->name ? tensor->name : "?") + "[" + std::to_string(e) + "]";
+                                host_expert_loader_refused_reason[device] =
+                                    loader_refusal ? loader_refusal : "the gate gave no reason";
+                            }
+                            host_expert_loader_refused_bytes[device] += expert_size;
+                            return false;
+                        }
                         void * host_ptr = nullptr;
-                        if (served_in_place) {
+                        if (served_in_place || loader_in_place) {
                             host_ptr = const_cast<uint8_t *>(expert_aos);
-                        } else {
-                            // The owner handle frees the storage on every early return.
+                        } else if (tensor_source_is_device || host_expert_unowned_count[device] == 0) {
+                            // The owner handle frees the storage on every early return. Once a host expert on this
+                            // device went without an owner the load refuses after the sweep, so no further room is
+                            // asked for one.
                             host_owner = ggml_sycl_host_expert_alloc(device, expert_size);
                             host_ptr   = host_owner.valid() ? host_owner.resolve().ptr : nullptr;
                         }
 
-                        if (served_in_place) {
-                            // registered below with the mapping's owner
+                        if (served_in_place || loader_in_place) {
+                            // registered below with the mapping's or the loader chunk's owner
                         } else if (host_ptr) {
                             if (tensor_source_is_device) {
                                 sycl::queue * source_queue =
@@ -46072,23 +46385,29 @@ static void ggml_sycl_preload_model_weights() {
                             }
                             ggml_sycl::host_mem_ledger_get().host_expert_copy_cumulative_bytes.fetch_add(
                                 expert_size, std::memory_order_relaxed);
-                        } else if (!tensor_source_is_device) {
-                            // No pinned room: the source is served in place. A SYCL_Mapped source keeps its mapping's
-                            // owner, as a planned in-place expert does; the window ring cannot stream this expert, so
-                            // the load says so once per tensor. Any other host source is registered unowned.
-                            host_owner = {};
-                            if (ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner)) {
-                                if (!logged_pin_alloc_failed) {
-                                    GGML_LOG_WARN(
-                                        "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: no pinned room for "
-                                        "%zu bytes the plan pinned; served from the mapping, and the "
-                                        "window ring will not stream it\n",
-                                        tensor->name ? tensor->name : "?", device, static_cast<long long>(e),
-                                        expert_size);
-                                    logged_pin_alloc_failed = true;
-                                }
+                        } else if (!tensor_source_is_device &&
+                                   ggml_sycl_mapped_buffer_owner(tensor->buffer, &host_owner)) {
+                            // No pinned room: a SYCL_Mapped source is served in place with its mapping's owner, as a
+                            // planned in-place expert is; the window ring cannot stream this expert, so the load says
+                            // so once per tensor.
+                            if (!logged_pin_alloc_failed) {
+                                GGML_LOG_WARN(
+                                    "[MOE-LAYOUT] tensor=%s device=%d expert=%lld: no pinned room for "
+                                    "%zu bytes the plan pinned; served from the mapping, and the "
+                                    "window ring will not stream it\n",
+                                    tensor->name ? tensor->name : "?", device, static_cast<long long>(e), expert_size);
+                                logged_pin_alloc_failed = true;
                             }
                             host_ptr = const_cast<uint8_t *>(expert_aos);
+                        } else if (!tensor_source_is_device) {
+                            // No owner for a host-planned expert: it is never registered unowned (the CPU would read
+                            // memory nothing holds, and the ring would skip it). The load refuses after the sweep.
+                            if (host_expert_unowned_count[device]++ == 0) {
+                                host_expert_unowned_first[device] =
+                                    std::string(tensor->name ? tensor->name : "?") + "[" + std::to_string(e) + "]";
+                            }
+                            host_expert_unowned_bytes[device] += expert_size;
+                            return false;
                         } else {
                             return false;
                         }
@@ -47422,6 +47741,116 @@ static void ggml_sycl_preload_model_weights() {
             // (late MoE experts, warmup conversions) will sub-allocate from
             // existing chunks or fall back to individual allocations.
             ggml_sycl::unified_cache_seal_layout_pool(device);
+        }
+
+        // The plan charged the loader's SYCL_Host buffer to loader_device's WEIGHT zone. Two checks, once the loader's
+        // temporaries are freed, so what the model still holds in SYCL_Host chunks in that device's pool is that
+        // buffer. The term: more than loader_residency means the plan counted the buffer short. The growth: the plan
+        // sized the zone to hold the loader's buffers as its replay places them (loader_zone, loader_grown), with the
+        // rest of its record beside them. From the baseline the late pass took to now, after the host weights are
+        // placed, the zone growing past loader_grown means the pool grew for bytes the plan did not place. A pass says
+        // so at INFO, and a check that cannot run (no baseline, no cache, no configured zones) at WARN, so a log tells
+        // a pass from a load that never reached the check.
+        if (global_plan != nullptr && global_plan->loader_holds_weights && global_plan->loader_device >= 0) {
+            const uint64_t model_id = ggml_sycl::lifecycle::global_registry().current_active_token().model.value;
+            const size_t   held     = ggml_sycl_model_host_chunk_bytes(model_id, global_plan->loader_device);
+            const size_t   planned  = ggml_sycl::placement_plan_host_weight_zone_terms(*global_plan).loader_residency;
+            if (held > planned) {
+                GGML_LOG_WARN(
+                    "[HOST-PLAN-BUG] device=%d the loader_residency term is short of the loader's SYCL_Host buffer: "
+                    "the buffer holds %zu B, the term %zu B, %zu B less\n",
+                    global_plan->loader_device, held, planned, held - planned);
+            }
+            ggml_sycl::unified_cache * const loader_cache =
+                ggml_sycl::get_existing_unified_cache_for_device(global_plan->loader_device);
+            size_t baseline = 0;
+            if (loader_cache != nullptr && loader_cache->host_zones_configured()) {
+                // One reading, so the figure the check judges is the figure the pass line prints: the capacity is
+                // read without the pool's lock, and a second read could see a later grow.
+                const size_t capacity = loader_cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
+                if (ggml_sycl_model_host_weight_baseline(model_id, global_plan->loader_device, &baseline)) {
+                    const std::string growth_bug = ggml_sycl::host_zone_weight_growth_check(
+                        global_plan->loader_device,
+                        ggml_sycl::placement_plan_host_zone_commit_terms_on_device(
+                            *global_plan, global_plan->host_zone_terms, global_plan->loader_device),
+                        baseline, capacity);
+                    if (!growth_bug.empty()) {
+                        GGML_LOG_WARN("%s\n", growth_bug.c_str());
+                    } else {
+                        GGML_LOG_INFO(
+                            "[HOST-PLAN] device=%d loader pool check passed: the WEIGHT zone grew %zu B from its "
+                            "baseline %zu B, within the plan's loader_grown %zu B\n",
+                            global_plan->loader_device, capacity > baseline ? capacity - baseline : 0, baseline,
+                            global_plan->host_zone_terms.loader_grown);
+                    }
+                } else {
+                    GGML_LOG_WARN(
+                        "[HOST-PLAN] device=%d the loader pool check has no WEIGHT zone baseline: this load did not "
+                        "decide the card's host zones before its loader allocated, so the zone's growth goes "
+                        "unchecked\n",
+                        global_plan->loader_device);
+                }
+            } else {
+                GGML_LOG_WARN(
+                    "[HOST-PLAN] device=%d loader pool check skipped: %s at the preload, so the WEIGHT zone's growth "
+                    "goes unchecked\n",
+                    global_plan->loader_device,
+                    loader_cache == nullptr ? "the device has no unified cache" :
+                                              "the device's host zones are not configured");
+            }
+        }
+
+        // No silent degrade: a host-planned expert with no owner is not registered, and the load refuses here, once the
+        // sweep has counted every one, as a dense weight that cannot be registered does.
+        size_t      unowned_count = 0;
+        size_t      unowned_bytes = 0;
+        std::string unowned_where;
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (host_expert_unowned_count[d] == 0) {
+                continue;
+            }
+            unowned_count += host_expert_unowned_count[d];
+            unowned_bytes += host_expert_unowned_bytes[d];
+            unowned_where += (unowned_where.empty() ? "" : ", ") + std::string("device ") + std::to_string(d) + ": " +
+                             std::to_string(host_expert_unowned_count[d]) + " from " + host_expert_unowned_first[d];
+        }
+        // No copy fallback: an expert the plan serves from the loader's chunk and the gate refused is not registered
+        // either. The plan charged it to the loader's buffer and sized no block for a copy, so the load refuses here
+        // too, naming the gate's reason. Both lines are logged before either refusal throws.
+        size_t      gate_refused_count = 0;
+        size_t      gate_refused_bytes = 0;
+        std::string gate_refused_where;
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (host_expert_loader_refused_count[d] == 0) {
+                continue;
+            }
+            gate_refused_count += host_expert_loader_refused_count[d];
+            gate_refused_bytes += host_expert_loader_refused_bytes[d];
+            gate_refused_where += (gate_refused_where.empty() ? "" : ", ") + std::string("device ") +
+                                  std::to_string(d) + ": " + std::to_string(host_expert_loader_refused_count[d]) +
+                                  " from " + host_expert_loader_refused_first[d] + ", first because " +
+                                  host_expert_loader_refused_reason[d];
+        }
+        if (gate_refused_count > 0) {
+            GGML_LOG_ERROR(
+                "[S1-PRELOAD] %zu host experts (%.1f MB) the plan serves from the loader's SYCL_Host buffer were "
+                "refused by its gate (%s); the plan sized no block for a copy, so the load refuses\n",
+                gate_refused_count, gate_refused_bytes / (1024.0 * 1024.0), gate_refused_where.c_str());
+        }
+        if (unowned_count > 0) {
+            // The count covers the first unowned expert on a device and every host expert the sweep met after it,
+            // for which it asked no room.
+            GGML_LOG_ERROR(
+                "[S1-PRELOAD] %zu host-planned experts (%.1f MB) have no owner: the first on a device found no pinned "
+                "room for a copy and no buffer to serve it from in place, and no room was asked for those after it "
+                "(%s); the load refuses rather than register them unowned\n",
+                unowned_count, unowned_bytes / (1024.0 * 1024.0), unowned_where.c_str());
+        }
+        if (gate_refused_count > 0) {
+            throw std::runtime_error("S1 preload in-place host experts were refused by the loader buffer gate");
+        }
+        if (unowned_count > 0) {
+            throw std::runtime_error("S1 preload planned host experts have no owner");
         }
 
         const auto t_end   = std::chrono::steady_clock::now();
@@ -49411,6 +49840,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_buffer_clear,
 
     /* .reset           = */ ggml_backend_sycl_buffer_reset,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_buffer_get_caps,
 
 };
@@ -50168,8 +50600,6 @@ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_ty
 // reached through one wrapper, ggml_sycl_arena_chunk_cap, which is the only function
 // on this path that names the arena backing kind.
 
-static size_t ggml_backend_sycl_host_buffer_type_chunk_cap();
-
 enum class ggml_sycl_chunk_cap_set {
     LEDGER_CURRENT,  // the capacities the ledger holds now: the unscoped device function reads these
     COMMITTED,       // the committed planned capacities: only the freeze reads these
@@ -50813,10 +51243,12 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface 
 
     /* .get_name         = */ ggml_backend_sycl_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
 
     /* .get_max_size     = */ ggml_backend_sycl_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
 };
 
@@ -51717,6 +52149,9 @@ static const ggml_backend_buffer_i tiered_kv_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ tiered_kv_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 // Buffer type: allocates tiered buffer with hot (device) + cold (host pinned) regions
@@ -52512,9 +52947,11 @@ static size_t tiered_kv_buft_get_max_size(ggml_backend_buffer_type_t buft) {
 static const ggml_backend_buffer_type_i tiered_kv_buft_interface = {
     /* .get_name         = */ tiered_kv_buft_get_name,
     /* .alloc_buffer     = */ tiered_kv_buft_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ tiered_kv_buft_get_alignment,
     /* .get_max_size     = */ tiered_kv_buft_get_max_size,
     /* .get_alloc_size   = */ NULL,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,
 };
 
@@ -52934,6 +53371,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_split_buffer_interface = {
     /* .clear           = */ ggml_backend_sycl_split_buffer_clear,
 
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_split_buffer_get_caps,
 };
 
@@ -53045,10 +53485,12 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
 
     /* .get_name         = */ ggml_backend_sycl_split_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_split_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_split_buffer_type_get_alignment,
     /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
 
     /* .get_alloc_size   = */ ggml_backend_sycl_split_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ ggml_backend_sycl_split_buffer_type_is_host,
     /* .get_caps         = */ ggml_backend_sycl_split_buffer_type_get_caps,
 };
@@ -53701,6 +54143,9 @@ static struct ggml_backend_buffer_i ggml_backend_sycl_tp_buffer_interface = {
     /* .cpy_tensor      = */ NULL,
     /* .clear           = */ ggml_backend_sycl_tp_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
     /* .get_caps        = */ ggml_backend_sycl_tp_buffer_get_caps,
 };
 
@@ -53805,9 +54250,11 @@ static uint32_t ggml_backend_sycl_tp_buffer_type_get_caps(ggml_backend_buffer_ty
 static const ggml_backend_buffer_type_i ggml_backend_sycl_tp_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_sycl_tp_buffer_type_name,
     /* .alloc_buffer   = */ ggml_backend_sycl_tp_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n = */ NULL,
     /* .get_alignment  = */ ggml_backend_sycl_tp_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_sycl_tp_buffer_type_get_max_size,
     /* .get_alloc_size = */ ggml_backend_sycl_tp_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host        = */ ggml_backend_sycl_tp_buffer_type_is_host,
     /* .get_caps       = */ ggml_backend_sycl_tp_buffer_type_get_caps,
 };
@@ -55302,8 +55749,8 @@ enum class ggml_sycl_host_buft_kind {
 // WEIGHT, lifetime MODEL, only inside a model load. A post-load SYCL_Host buffer (compute, output, inputs, a CPU
 // layer's LoRA or control vector) is a context's: role COMPUTE, lifetime CONTEXT, which select_zone sends to
 // SCRATCH. SYCL_KV_Host is host KV: role KV, cohort kv_host_buffer, lifetime CONTEXT, so the KV zone. The TP
-// HostCompute buffer is a context's compute buffer. The owner is the buffer's own serial, which its alloc_buffer
-// mints.
+// HostCompute buffer is a context's compute buffer. The owner is filled in by ggml_sycl_host_buft_alloc: the loading
+// model's for a SYCL_Host buffer of a model load, the buffer's own serial for every other.
 static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_kind kind) {
     ggml_sycl::alloc_intent intent{};
     intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
@@ -55311,8 +55758,7 @@ static ggml_sycl::alloc_intent ggml_sycl_host_buft_intent(ggml_sycl_host_buft_ki
     switch (kind) {
         case ggml_sycl_host_buft_kind::HOST:
             if (g_sycl_in_model_load.load(std::memory_order_acquire)) {
-                // Accepted deviation from §4.4's MODEL owner: this MODEL row carries its buffer's BUFFER owner and is
-                // checked at that buffer's free_buffer, the model's weight buffer whose free releases it.
+                // The owner is the loading model's, which ggml_sycl_host_buft_alloc fills in (§4.4 "Lifetimes").
                 intent.role     = ggml_sycl::alloc_role::WEIGHT;
                 intent.lifetime = ggml_sycl::alloc_lifetime::MODEL;
             } else {
@@ -55359,17 +55805,14 @@ static size_t ggml_sycl_host_buft_max_size(ggml_backend_buffer_type_t buft, int 
 
     auto * cache = device >= 0 ? ggml_sycl::get_unified_cache_for_device(device) : nullptr;
     if (cache && cache->host_zones_configured()) {
-        size_t largest = cache->host_zone_largest_free_block(zone);
         // Optimistic chunk capability, not a reservation or a guarantee of
         // currently available contiguous bytes. unified_alloc may try zone
         // growth, but budget, phase, or alignment constraints can still make
         // allocation fail. This host buffer path then returns nullptr; it
-        // does not escape the pool through raw sycl::malloc_host.
-        if (largest < chunk_cap) {
-            largest =
-                std::min(chunk_cap, std::max(largest, static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE)));
-        }
-        return std::min(largest, chunk_cap);
+        // does not escape the pool through raw sycl::malloc_host. The plan
+        // replays the loader's split at the same rule
+        // (placement_loader_pool_footprint_for).
+        return ggml_sycl::host_zone_buffer_max_size(chunk_cap, cache->host_zone_largest_free_block(zone));
     }
 
     // Use host_max_alloc_size based on the minimum maxMemAllocSize across active
@@ -55405,9 +55848,13 @@ struct sycl_host_buf_ctx {
     // the table that carried it.
     std::unique_ptr<ggml_sycl::tenant_claim> claim;
     // The buffer's owner serial and the lifetime its allocation was registered with (§4.4 "Lifetimes"): free_buffer
-    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns.
+    // checks that no record of this owner outlives it. 0 for a claimed slot, whose memory the tenant table owns, and
+    // for a chunk a model owns.
     uint64_t                                 owner_id = 0;
     ggml_sycl::alloc_lifetime                lifetime = ggml_sycl::alloc_lifetime::GRAPH;
+    // The model whose load minted this chunk, which owns its allocation; 0 for any other buffer. free_buffer reports
+    // the chunk gone to the model's record, and the model's MODEL check is its leak check.
+    uint64_t                                 model_id = 0;
 };
 
 // llama.cpp-30h4: order host-side access to this pinned USM against the GPU
@@ -55523,6 +55970,12 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
         ggml_sycl::unified_cache_host_zone_owner_check(ctx->lifetime,
                                                        { ggml_sycl::alloc_owner_kind::BUFFER, ctx->owner_id });
     }
+    // A model's chunk is checked with the model, not here: an expert served from it in place holds a copy of its owner
+    // until the model's slot is reclaimed. The model's record learns the chunk is gone, so a rolled-back load runs its
+    // MODEL check once its last chunk is.
+    if (ctx->model_id != 0) {
+        ggml_sycl_model_host_chunk_freed(ctx->model_id, ctx->device, ctx->size);
+    }
     delete ctx;
     buffer->context = nullptr;
 }
@@ -55635,7 +56088,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
                                                                 int                                      device,
                                                                 std::unique_ptr<ggml_sycl::tenant_claim> claim,
                                                                 uint64_t                                 owner_id,
-                                                                ggml_sycl::alloc_lifetime                lifetime) {
+                                                                ggml_sycl::alloc_lifetime                lifetime,
+                                                                uint64_t                                 model_id) {
     // Use the wrapper struct as buffer context so free_buffer knows which
     // deallocation path to take.  Override get_base to extract the raw pointer.
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
@@ -55654,6 +56108,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
     ctx->claim    = std::move(claim);
     ctx->owner_id = owner_id;
     ctx->lifetime = lifetime;
+    ctx->model_id = model_id;
 
     if (!ggml_backend_buffer_set_type(buffer, buft)) {
         ggml_backend_buffer_free(buffer);
@@ -55687,7 +56142,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
 
 // The host bufts' one allocation path, over the intent their builder made. The device is the buft's, never the
 // current device's. An allocation is owned by the buffer it backs, so its owner is the buffer's serial, minted here
-// before the allocation and checked at the buffer's free_buffer.
+// before the allocation and checked at the buffer's free_buffer; a SYCL_Host chunk of a model load is the model's.
 static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_t buft,
                                                        size_t                     size,
                                                        ggml_sycl::alloc_intent    intent) {
@@ -55708,13 +56163,21 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
             return nullptr;
         }
         return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr, size, std::move(claimed_handle), exact_device,
-                                                  std::move(claim), 0, intent.lifetime);
+                                                  std::move(claim), 0, intent.lifetime, 0);
     }
     auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
     sycl::queue * exact_queue =
         exact_cache ? &exact_cache->get_queue() : &ggml_sycl_get_device(exact_device).default_queue();
-    const uint64_t owner_id            = ggml_sycl::host_zone_owner_next_id();
-    intent.owner                       = { ggml_sycl::alloc_owner_kind::BUFFER, owner_id };
+    // A SYCL_Host chunk of a model load is the model's (§4.4 "Lifetimes"): S1-PRELOAD serves host experts from it in
+    // place, so the cache's entries hold copies of its owner past the buffer's free_buffer, until the model's slot is
+    // reclaimed, and the model's MODEL check after that reclaim is its leak check. A chunk the load frees before it
+    // ends is a MODEL row too (never an upload buffer: under the load guard the device reports async off): it loses a
+    // check at its own free, and a leaked one outlives the reclaim, which that check reports. With no load effect to
+    // name the model (a fixture that sets the load flag alone), the chunk keeps its buffer's own owner.
+    const uint64_t model_id = intent.lifetime == ggml_sycl::alloc_lifetime::MODEL ? ggml_sycl_loading_model_id() : 0;
+    const uint64_t owner_id = model_id != 0 ? 0 : ggml_sycl::host_zone_owner_next_id();
+    intent.owner = model_id != 0 ? ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::MODEL, model_id } :
+                                   ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::BUFFER, owner_id };
     // When host zones are configured, route through the zone system so allocations are tracked and budgeted; the
     // zone is select_zone()'s answer for this intent. When zones are not configured, use the pinned pool runtime.
     intent.constraints.use_pinned_pool = (exact_cache && exact_cache->host_zones_configured());
@@ -55722,6 +56185,7 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
     req.queue     = exact_queue;
     req.device    = exact_device;
     req.size      = size;
+    req.alignment = ggml_sycl::host_buft_alloc_alignment;  // the alignment the plan's replay sizes the buffer at
     req.intent    = intent;
     req.site_file = intent.site_file;
     req.site_line = intent.site_line;
@@ -55742,8 +56206,12 @@ static ggml_backend_buffer_t ggml_sycl_host_buft_alloc(ggml_backend_buffer_type_
     ggml_sycl::mem_handle buffer_handle =
         ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_buffer_owner), GGML_LAYOUT_AOS);
 
-    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr,
-                                              owner_id, intent.lifetime);
+    ggml_backend_buffer_t buffer = ggml_backend_sycl_host_buffer_wrap(
+        buft, ptr, size, std::move(buffer_handle), exact_device, nullptr, owner_id, intent.lifetime, model_id);
+    if (buffer != nullptr && model_id != 0) {
+        ggml_sycl_model_host_chunk_minted(model_id, exact_device, size);
+    }
+    return buffer;
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -55760,10 +56228,12 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
         /* .iface    = */ {
                            /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
                            /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n   = */ NULL,
 
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                            /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
                            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n = */ NULL,
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
@@ -55781,9 +56251,11 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing()
         /* .iface    = */ {
                            /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
                            /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n   = */ NULL,
                            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
                            /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
                            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n = */ NULL,
                            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
@@ -56065,6 +56537,52 @@ static bool ggml_sycl_mapped_buffer_owner(ggml_backend_buffer_t buffer, ggml_syc
     }
     if (out) {
         *out = ctx->owner;
+    }
+    return true;
+}
+
+// The owner of the loader's SYCL_Host chunk that holds `bytes` at `data`, so S1-PRELOAD serves a host expert from it in
+// place instead of copying it into a block of its own. Only a chunk the loader keeps for the model's life qualifies: a
+// SYCL_Host buffer (its free_buffer) allocated, not claimed, with lifetime MODEL, and minted by a model's load
+// (model_id != 0), so the model owns it and its leak check covers it. Its owner must be one the window ring copies from
+// directly on `device`, since the ring streams a host expert from its lease. On a refusal `why` names it.
+static bool ggml_sycl_loader_buffer_owner(ggml_backend_buffer_t   buffer,
+                                          const void *            data,
+                                          size_t                  bytes,
+                                          int                     device,
+                                          ggml_sycl::mem_handle * out,
+                                          const char **           why) {
+    const char * refusal = nullptr;
+    const auto * ctx     = buffer != nullptr && buffer->iface.free_buffer == ggml_backend_sycl_host_buffer_free_buffer ?
+                               static_cast<const sycl_host_buf_ctx *>(buffer->context) :
+                               nullptr;
+    ggml_sycl::alloc_metadata owner_md{};
+    if (ctx == nullptr) {
+        refusal = "the tensor is not in a SYCL_Host buffer";
+    } else if (ctx->claim) {
+        refusal = "its SYCL_Host buffer is a claimed tenant slot";
+    } else if (ctx->lifetime != ggml_sycl::alloc_lifetime::MODEL || !ctx->buffer_handle.valid()) {
+        refusal = "its SYCL_Host buffer is not the model's";
+    } else if (ctx->model_id == 0) {
+        refusal = "its SYCL_Host buffer was not minted by a model's load";
+    } else if (static_cast<const uint8_t *>(data) < static_cast<const uint8_t *>(ctx->ptr) ||
+               static_cast<size_t>(static_cast<const uint8_t *>(data) - static_cast<const uint8_t *>(ctx->ptr)) >
+                   ctx->size ||
+               bytes > ctx->size - static_cast<size_t>(static_cast<const uint8_t *>(data) -
+                                                       static_cast<const uint8_t *>(ctx->ptr))) {
+        refusal = "the expert's bytes are not inside its SYCL_Host buffer";
+    } else if (!ctx->buffer_handle.owner_metadata(&owner_md) ||
+               !ggml_sycl::moe_stream_owner_streamable(owner_md, device)) {
+        refusal = "its SYCL_Host buffer's owner is not a pinned WEIGHT allocation of this device's host zone";
+    }
+    if (refusal != nullptr) {
+        if (why) {
+            *why = refusal;
+        }
+        return false;
+    }
+    if (out) {
+        *out = ctx->buffer_handle;
     }
     return true;
 }
@@ -56446,6 +56964,9 @@ static const ggml_backend_buffer_i ggml_backend_sycl_lazy_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_sycl_lazy_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_sycl_lazy_buffer_clear,
     /* .reset           = */ nullptr,
+    /* .set_tensor_n    = */ nullptr,  // ggml falls back to the single-tensor entries above
+    /* .get_tensor_n    = */ nullptr,
+    /* .cpy_tensor_n    = */ nullptr,
     /* .get_caps        = */ nullptr,  // the type's: STABLE_BASE, and no host access since is_host is false
 };
 
@@ -56661,9 +57182,11 @@ static size_t ggml_backend_sycl_host_compute_buffer_type_get_max_size(ggml_backe
 static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_host_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_host_compute_buffer_alloc,  // Per-device buffer for TP
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_sycl_host_compute_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ NULL,  // Not a CPU host buffer - it's SYCL host memory
 };
 
@@ -56792,9 +57315,11 @@ static size_t ggml_backend_sycl_cpu_offload_compute_get_max_size(ggml_backend_bu
 static const ggml_backend_buffer_type_i ggml_backend_sycl_cpu_offload_compute_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_sycl_cpu_offload_compute_buffer_type_name,
     /* .alloc_buffer     = */ ggml_backend_sycl_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ NULL,
     /* .get_alignment    = */ ggml_backend_sycl_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_sycl_cpu_offload_compute_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_sycl_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ NULL,
     /* .is_host          = */ ggml_backend_sycl_cpu_offload_compute_is_host,
 };
 
@@ -58697,23 +59222,6 @@ __dpct_inline__ static void k_argsort_f32_i32(const float * x,
     }
 }
 
-static void diag_mask_inf_f32(const float *            x,
-                              float *                  dst,
-                              const int                ncols,
-                              const int                rows_per_channel,
-                              const int                n_past,
-                              const sycl::nd_item<3> & item_ct1) {
-    const int col = item_ct1.get_local_range(1) * item_ct1.get_group(1) + item_ct1.get_local_id(1);
-    const int row = item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
-    if (col >= ncols) {
-        return;
-    }
-    const int i = row * ncols + col;
-    //dst[i] = col > (n_past + row % rows_per_channel) ? -INFINITY : x[i];
-    //dst[i] = x[i] - (col > n_past + row % rows_per_channel) * INT_MAX; // equivalent within rounding error but slightly faster on GPU
-    dst[i]      = x[i] - (col > n_past + row % rows_per_channel) * FLT_MAX;
-}
-
 static void scale_f32(const float *            x,
                       float *                  dst,
                       const float              scale,
@@ -59107,22 +59615,6 @@ static void topk_f32_i32_sycl(const float * x,
                 }
             });
         });
-    });
-}
-
-static void diag_mask_inf_f32_sycl(const float * x,
-                                   float *       dst,
-                                   const int     ncols_x,
-                                   const int     nrows_x,
-                                   const int     rows_per_channel,
-                                   const int     n_past,
-
-                                   queue_ptr stream) {
-    const sycl::range<3> block_dims(1, SYCL_DIAG_MASK_INF_BLOCK_SIZE, 1);
-    const int            block_num_x = (ncols_x + SYCL_DIAG_MASK_INF_BLOCK_SIZE - 1) / SYCL_DIAG_MASK_INF_BLOCK_SIZE;
-    const sycl::range<3> block_nums(1, block_num_x, nrows_x);
-    stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-        diag_mask_inf_f32(x, dst, ncols_x, rows_per_channel, n_past, item_ct1);
     });
 }
 
@@ -59581,7 +60073,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
     // for why and what it does not (yet) cover.
     const layout_mode q8_0_dense_planned_layout = ggml_sycl_q8_0_dense_planned_layout(src0, ctx.device);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+        row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_UNDEFINED) {
         sycl::half * src0_pp_scratch = nullptr;
         sycl::half * src1_pp_scratch = nullptr;
 #if GGML_SYCL_DNNL
@@ -60356,24 +60848,6 @@ inline void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
             GGML_ABORT("[TOP_K] no SYCL path for ncols=%lld k=%lld; supports_op should have declined it",
                        (long long) ncols, (long long) k);
     }
-}
-
-inline void ggml_sycl_op_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    auto src0 = dst.src(0);
-    GGML_ASSERT(src0.type() == GGML_TYPE_F32);
-    GGML_ASSERT(dst.type() == GGML_TYPE_F32);
-    dpct::queue_ptr main_stream = ctx.stream();
-    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-
-    const float * src0_dd = src0.resolve_as<const float>();
-    float *       dst_dd  = dst.resolve_as<float>();
-    const int64_t ne00    = src0.ne(0);
-    const int64_t ne01    = src0.ne(1);
-
-    const int    nrows0 = ggml_nrows(src0.raw());
-    const auto * params = static_cast<const int32_t *>(dst.op_params());
-    const int    n_past = params ? params[0] : 0;
-    diag_mask_inf_f32_sycl(src0_dd, dst_dd, ne00, nrows0, ne01, n_past, main_stream);
 }
 
 inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -66151,7 +66625,7 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *            
 }
 
 static bool ggml_sycl_simple_consumer_op(enum ggml_op op) {
-    return op == GGML_OP_ADD || op == GGML_OP_ADD1 || op == GGML_OP_MUL || op == GGML_OP_CONT || op == GGML_OP_DUP ||
+    return op == GGML_OP_ADD || op == GGML_OP_MUL || op == GGML_OP_CONT || op == GGML_OP_DUP ||
            op == GGML_OP_CPY || op == GGML_OP_SOFT_MAX || op == GGML_OP_ROPE || op == GGML_OP_NORM ||
            op == GGML_OP_RMS_NORM || op == GGML_OP_ARGSORT || op == GGML_OP_TOP_K || op == GGML_OP_GET_ROWS ||
            op == GGML_OP_GLU;
@@ -67022,7 +67496,7 @@ static bool ggml_sycl_try_route_simple_consumer(ggml_backend_sycl_context & ctx,
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -67399,7 +67873,7 @@ static bool ggml_sycl_try_cross_device_f16_attention(ggml_backend_sycl_context &
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -67604,7 +68078,7 @@ static bool ggml_sycl_try_route_flash_attn_ext(ggml_backend_sycl_context & ctx, 
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -67830,7 +68304,7 @@ static bool ggml_sycl_try_route_mul_mat_weight_owner(ggml_backend_sycl_context &
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -68063,7 +68537,7 @@ static bool ggml_sycl_try_route_mul_mat_activation(ggml_backend_sycl_context & c
             ctx.device = old_device;
             if (old_dpct_device >= 0) {
                 try {
-                    dpct::select_device(static_cast<unsigned int>(old_dpct_device));
+                    ggml_sycl_select_dpct_device(old_dpct_device);
                 } catch (...) {
                 }
             }
@@ -81039,11 +81513,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     }
 }
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
 struct fused_moe_route_validation {
     bool                               ok     = false;
     const char *                       reason = "not-validated";
@@ -87474,6 +87943,41 @@ template <size_t N>
 #    define GGML_SYCL_MOE_PP_STAGING_FAILPOINT(failure) false
 #endif
 
+// The device-built MUL_MAT_ID schedule (upstream 18c5a95e2, fused-gemm.cpp), GGML_SYCL_MMID_SCHED, default 0. It takes
+// a prompt op whose experts are all planned on this device in the AOS layout, in upstream's f32/i32 layout. Its four
+// scratch tables must fit ceilings the planner names for them (mmid-sched-admission.hpp). The planner reserves no such
+// tables yet, so every eligible call is refused MISSING_PLAN, reported once, and the op takes its planned MoE route.
+// Admission refusing before anything is allocated or queued is the contract that later wiring keeps.
+static bool ggml_sycl_mul_mat_id_device_sched(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (!src0 || !src1 || !ids || src1->ne[2] == 1 || !ggml_is_contiguous(src0) || ids->type != GGML_TYPE_I32 ||
+        ids->nb[0] != sizeof(int32_t) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src1->nb[1] != sizeof(float) * src1->ne[0] || dst->nb[1] != sizeof(float) * dst->ne[0] ||
+        ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    // Layout follows residency: the schedule reads AOS expert slices from this device, so it is asked only when the plan
+    // put every expert here in that layout. Upstream's kernel reads the experts at base + e * nb02; the fork keeps each
+    // expert in its own cache entry, so a launch also needs the kernel to read a per-expert pointer table.
+    layout_mode planned_layout = GGML_LAYOUT_AOS;
+    if (!ggml_sycl_moe_tensor_plan_primary_layout(src0, ctx.device, &planned_layout) ||
+        planned_layout != GGML_LAYOUT_AOS) {
+        return false;
+    }
+    ggml_sycl::mmid_sched_scratch_shape required;
+    if (!ggml_sycl_grouped_dequant_gemm_device_scratch(src0->type, /*reordered=*/false, ggml_sycl_src1_prec(dst),
+                                                       src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0],
+                                                       ctx.stream(), &required)) {
+        return false;
+    }
+    const ggml_sycl::mmid_sched_scratch_admission admission =
+        ggml_sycl::mmid_sched_preflight_scratch(/*planned=*/nullptr, required);
+    ggml_sycl::mmid_sched_warn_refusal_once(admission);
+    return false;
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
@@ -87732,6 +88236,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    /* use_tensor_data_ptr = */ false);
         std::lock_guard<std::mutex> lock(s_mul_mat_id_extras_mutex);
         s_mul_mat_id_extras.push_back(std::move(new_extra));
+    }
+
+    // GGML_SYCL_MMID_SCHED (default 0): the device-built prompt schedule. A refusal falls through to the planned routes.
+    if ((g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_DEVICE) && ggml_sycl_mul_mat_id_device_sched(ctx, dst)) {
+        return;
     }
 
     // llama.cpp-yx28: batch-1 decode with every expert resident on this
@@ -97241,11 +97750,6 @@ static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_ten
     ggml_sycl_op_scale(ctx, dst);
 }
 
-static void ggml_sycl_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
-    ggml_sycl_op_diag_mask_inf(ctx, dst);
-}
-
 static void ggml_sycl_pool2d(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
     ggml_sycl_op_pool2d(ctx, dst);
@@ -97296,12 +97800,13 @@ static void ggml_sycl_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_ten
 }
 
 static void ggml_sycl_set_main_device(const int main_device) try {
-    if (dpct::get_current_device_id() == static_cast<unsigned int>(main_device)) {
+    // The thread's cached device id (upstream f3d7725a7): this runs at the start of every graph compute.
+    if (get_current_device_id() == main_device) {
         return;
     }
     check_allow_gpu_index(main_device);
 
-    dpct::select_device(main_device);
+    ggml_sycl_select_dpct_device(main_device);
     if (g_ggml_sycl_debug) {
         dpct::device_info prop;
 
@@ -100133,6 +100638,9 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_sycl_op_lightning_indexer(ctx, safe_dst);
             break;
+        case GGML_OP_TOP_K_MASK:
+            ggml_sycl_op_top_k_mask(ctx, safe_dst);
+            break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
             break;
@@ -100143,14 +100651,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
                 ggml_sycl_debug_dump_tensor_meta("ADD src1", dst->src[1]);
             }
             ggml_sycl_add(ctx, safe_dst);
-            break;
-        case GGML_OP_ADD1:
-            if (g_ggml_sycl_debug) {
-                ggml_sycl_debug_dump_tensor_meta("ADD1 dst", dst);
-                ggml_sycl_debug_dump_tensor_meta("ADD1 src0", dst->src[0]);
-                ggml_sycl_debug_dump_tensor_meta("ADD1 src1", dst->src[1]);
-            }
-            ggml_sycl_add1(ctx, safe_dst);
             break;
         case GGML_OP_ADD_ID:
             // Skip residual MoE ADD_ID bias nodes only when a fused/direct producer
@@ -100398,9 +100898,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_TRANSPOSE:
             GGML_SYCL_DEBUG("%s: Tensor NO-OP\n", __func__);
 
-            break;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_sycl_diag_mask_inf(ctx, safe_dst);
             break;
 
         case GGML_OP_SOFT_MAX:
@@ -101672,6 +102169,10 @@ static std::vector<std::pair<int, ggml_tensor *>> find_mulmat_consumers(const gg
 
     for (int j = start_idx; j < cgraph->n_nodes; j++) {
         ggml_tensor * node = cgraph->nodes[j];
+        // the fusion runs every consumer it returns, so an uncomputed MUL_MAT is not one
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
 
         if (node->op == GGML_OP_MUL_MAT) {
             // MUL_MAT src[1] is the activation input
@@ -102141,7 +102642,9 @@ static int ggml_sycl_match_moe_down_sum_chain(const ggml_cgraph * cgraph, int no
         if (add->op == GGML_OP_VIEW || add->op == GGML_OP_RESHAPE || add->op == GGML_OP_PERMUTE) {
             continue;
         }
-        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || add->ne[0] != weighted->ne[0]) {
+        // the fused sum stands in for every ADD of the chain, so an uncomputed one would run through it
+        if (!ggml_sycl_graph_node_is_computed(add) || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+            add->ne[0] != weighted->ne[0]) {
             return -1;
         }
         int  weighted_views = 0;
@@ -102236,8 +102739,10 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
     if (!cgraph || node_idx < 0 || node_idx >= cgraph->n_nodes) {
         return false;
     }
+    // the bias entry hands in a MUL it found by looking ahead, which may be a node the graph does not compute
     ggml_tensor * mul = cgraph->nodes[node_idx];
-    if (!mul || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || mul->ne[3] != 1) {
+    if (!mul || !ggml_sycl_graph_node_is_computed(mul) || mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 ||
+        mul->ne[3] != 1) {
         return false;
     }
 
@@ -102531,6 +103036,10 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
     if (!mul || !add || !sort || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD || sort->op != GGML_OP_ARGSORT) {
         return reject("pattern");
     }
+    // the fused kernel runs the look-ahead nodes too, so each must be one the graph computes
+    if (!ggml_sycl_graph_node_is_computed(add) || !ggml_sycl_graph_node_is_computed(sort)) {
+        return reject("uncomputed");
+    }
     if (add->src[0] != mul && add->src[1] != mul) {
         return reject("add-not-consuming-mul");
     }
@@ -102704,7 +103213,9 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     }
     ggml_tensor * mul = cgraph->nodes[node_idx];
     ggml_tensor * add = cgraph->nodes[node_idx + 1];
-    if (!mul || !add || mul->op != GGML_OP_MUL_MAT || add->op != GGML_OP_ADD) {
+    // the fused kernel runs the ADD too, so it must be a node the graph computes
+    if (!mul || !add || !ggml_sycl_graph_node_is_computed(add) || mul->op != GGML_OP_MUL_MAT ||
+        add->op != GGML_OP_ADD) {
         return false;
     }
     if (add->src[0] != mul && add->src[1] != mul) {
@@ -103368,9 +103879,12 @@ static void ggml_sycl_trace_persistent_ops(ggml_backend_sycl_context & ctx) {
 
 // Check if a graph node is a no-op that doesn't generate GPU/CPU work.
 // Used by graph_compute_impl, prefix detection, and suffix dispatch.
+// A node the graph does not compute (an unselected ggml_build_forward_select branch) is one: its inputs were never
+// written or uploaded, and its output may already belong to another tensor (ggml_sycl_graph_node_is_computed).
 static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {
     return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
-           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE;
+           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+           !ggml_sycl_graph_node_is_computed(node);
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -105435,7 +105949,11 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        // as in ggml_sycl_block_exec_publish_aliases: an uncomputed node has no output to alias
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -105495,7 +106013,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
     preblock_seen.reserve(8);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // as in the pre-block copy: an uncomputed node's sources are not its block's inputs
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -105552,7 +106071,8 @@ static block_exec_runtime_context_probe_result ggml_sycl_probe_block_exec_runtim
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // as in the plan's source scan: an input only an uncomputed node reads is not missing
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         const int block_idx = node_block[static_cast<size_t>(i)];
@@ -105780,7 +106300,11 @@ static bool ggml_sycl_block_exec_publish_aliases(ggml_backend_sycl_context &    
     exec_ctx.alias_publications.reserve(static_cast<size_t>(cgraph->n_nodes));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
+        // an uncomputed node has no output to alias: nothing writes it, and nothing computed reads it
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (ggml_sycl_block_exec_node_needs_local_output(node) || ggml_nbytes(node) == 0) {
             continue;
         }
         const int block_idx = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -105890,7 +106414,8 @@ static bool ggml_sycl_block_exec_prepare_context(ggml_backend_sycl_context &    
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * dst = cgraph->nodes[i];
-        if (!dst) {
+        // the block dispatch does not run an uncomputed node, so its sources plan no copy and no edge
+        if (!dst || !ggml_sycl_graph_node_is_computed(dst)) {
             continue;
         }
         const int dst_block = exec_ctx.node_block[static_cast<size_t>(i)];
@@ -106239,7 +106764,8 @@ static bool ggml_sycl_block_exec_stage_preblock_inputs(ggml_backend_sycl_context
     std::unordered_set<block_exec_planned_tensor_key, block_exec_planned_tensor_key_hash> seen;
     for (int i = exec_ctx.block_first[block_idx]; i <= exec_ctx.block_last[block_idx]; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // the block dispatch does not run an uncomputed node, so its sources need no copy on the block's device
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         for (int s = 0; s < GGML_MAX_SRC && node->src[s] != nullptr; ++s) {
@@ -106352,7 +106878,7 @@ struct ggml_sycl_block_exec_device_scope {
     ~ggml_sycl_block_exec_device_scope() {
         if (prev_dpct_device >= 0) {
             try {
-                dpct::select_device(static_cast<unsigned int>(prev_dpct_device));
+                ggml_sycl_select_dpct_device(prev_dpct_device);
             } catch (...) {
             }
         }
@@ -109003,6 +109529,8 @@ static void moe_prefetch_scan(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph 
 
 static thread_local bool g_moe_descriptor_prescanned_for_dispatch = false;
 
+// Every loop leaves a node the graph does not compute. g_moe_gate_up_pairs feeds the fused dispatch, the down-sum
+// take and the persistent descriptors, and an uncomputed MUL_MAT_ID of the same layer would take a slot of the pair.
 static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
                                           ggml_cgraph *               cgraph,
                                           bool                        reset_precomputed,
@@ -109020,7 +109548,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         const char * weight_name = node->src[0]->name ? node->src[0]->name : "";
@@ -109056,7 +109587,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         for (auto & kv : g_moe_gate_up_pairs) {
@@ -109081,7 +109615,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
             continue;
         }
         const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
@@ -109104,7 +109641,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL || !node->src[0] || !node->src[1]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL || !node->src[0] || !node->src[1]) {
             continue;
         }
         for (auto & kv : g_moe_gate_up_pairs) {
@@ -110697,7 +111237,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 // 3. Reuses the quantized result for all projections (Q, K, V or gate, up)
                 // This bypasses the ggml_can_fuse_subgraph limitation where shared intermediates fail.
                 // Note: Only triggers for batch size >= 8 to avoid overhead during token generation
-                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+                if (fusion_site_on(2) && i + 1 < cgraph->n_nodes &&
+                    ggml_sycl_graph_node_is_computed(cgraph->nodes[i + 1]) && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     // Check if MUL uses RMS_NORM output
                     if (mul_node->src[0] == node || mul_node->src[1] == node) {
@@ -110770,9 +111311,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (fusion_site_on(5) && node->op == GGML_OP_ADD) {
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
-                    // Check: next op is RMS_NORM and it uses this ADD's output as input
-                    if (next->op == GGML_OP_RMS_NORM && next->src[0] == node &&
-                        ggml_sycl_check_fusion_types(cgraph, i, 2) && ggml_is_contiguous(next) &&
+                    // Check: next op is RMS_NORM, the graph computes it, and it uses this ADD's output as input
+                    if (ggml_sycl_graph_node_is_computed(next) && next->op == GGML_OP_RMS_NORM &&
+                        next->src[0] == node && ggml_sycl_check_fusion_types(cgraph, i, 2) &&
+                        ggml_is_contiguous(next) &&
                         ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
                         ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_ADD_RMS_NORM, cgraph, i,
                                                            sycl_ctx->device)) {
@@ -110789,10 +111331,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (fusion_site_on(6) && node->op == GGML_OP_MUL) {
                 if (i + 1 < cgraph->n_nodes) {
                     ggml_tensor * next = cgraph->nodes[i + 1];
-                    // Check: next op is ADD and uses this MUL's output
-                    if (next->op == GGML_OP_ADD && (next->src[0] == node || next->src[1] == node) &&
-                        node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
-                        ggml_is_contiguous(next)) {
+                    // Check: next op is ADD, the graph computes it, and it uses this MUL's output
+                    if (ggml_sycl_graph_node_is_computed(next) && next->op == GGML_OP_ADD &&
+                        (next->src[0] == node || next->src[1] == node) && node->type == GGML_TYPE_F32 &&
+                        next->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && ggml_is_contiguous(next)) {
                         ggml_tensor * x     = node->src[0];
                         ggml_tensor * scale = node->src[1];
                         ggml_tensor * bias  = (next->src[0] == node) ? next->src[1] : next->src[0];
@@ -110901,7 +111443,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     fprintf(stderr, "[FFN TRACE] MUL_MAT node %d (%s): glu_info.glu=%p\n", i, node->name,
                             (void *) glu_info.glu);
                 }
-                if (glu_info.glu != nullptr) {
+                // The fused kernel runs the GLU and its paired MUL_MAT. A computed GLU's sources are computed too, so
+                // asking of the GLU covers both.
+                if (glu_info.glu != nullptr && ggml_sycl_graph_node_is_computed(glu_info.glu)) {
                     // Found GLU consumer, now find the paired MUL_MAT
                     ggml_tensor *       glu       = glu_info.glu;
                     const ggml_tensor * other_src = glu_info.is_gate ? glu->src[1] : glu->src[0];
@@ -112337,6 +112881,9 @@ static bool moe_graph_pair_can_fuse_segment(const moe_gate_up_pair & pair) {
     return pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI;
 }
 
+// Every loop leaves a node the graph does not compute, so dispatch_indices names only nodes that run. The descriptor
+// candidate count, the segment recorder, the block graphs, the graphlets and the decode analysis take their MoE
+// dispatch points from that list, and an uncomputed MUL_MAT_ID of the same layer cannot take a slot of a fused pair.
 static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgraph * cgraph) {
     moe_graph_dispatch_plan plan;
     if (!cgraph) {
@@ -112349,7 +112896,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         plan.total_moe_nodes++;
@@ -112387,7 +112937,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_ADD_ID || !node->src[0] || !node->src[1] || !node->src[2]) {
             continue;
         }
         for (auto & kv : pairs) {
@@ -112413,7 +112966,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) {
             continue;
         }
         const enum ggml_glu_op glu_op = ggml_get_glu_op(node);
@@ -112447,7 +113003,10 @@ static moe_graph_dispatch_plan moe_graph_collect_dispatch_indices(const ggml_cgr
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT_ID) {
             continue;
         }
         if (first_fused_indices.count(i) != 0) {
@@ -114487,8 +115046,6 @@ static void moe_graph_segmented_call_end() {
 // storage it touches. The single moe_segments slot keyed on (n_nodes, is_decode) let two same-sized splits from
 // different layers replay each other's graphs, and thrashed across the splits of one token.
 
-static bool graph_tensor_is_input(const ggml_tensor * tensor);
-
 // GGML_SYCL_GRAPH_RERECORD or GGML_SYCL_NO_SEG_GRAPH turns segmented replay off.
 static bool ggml_sycl_segmented_graph_env_allows() {
     static const bool allows =
@@ -114828,11 +115385,13 @@ static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
 
 // A slot's graph inputs, as positions in the split (leaf i as i, src j of node n as -(n*GGML_MAX_SRC+j)-1), never as
 // tensor pointers: a key fixes the split's structure, so the same positions name the same inputs on every replay.
+// Only a computed node's sources count, as in the pre-stage. The slot key is built on the graph signature, which mixes
+// each node's flags; the prologue memo (default on) serves the signature it recorded while the graph's uid holds.
 static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vector<int32_t> & refs) {
     refs.clear();
     std::vector<const ggml_tensor *> seen;  // this call only
     auto                             consider = [&](const ggml_tensor * t, int32_t ref) {
-        if (!t || !t->data || ggml_sycl_tensor_is_weight(t) || ggml_nbytes(t) == 0 || !graph_tensor_is_input(t)) {
+        if (!t || !t->data || ggml_sycl_tensor_is_weight(t) || ggml_nbytes(t) == 0 || !ggml_sycl_prestage_is_input(t)) {
             return;
         }
         if (std::find(seen.begin(), seen.end(), t) != seen.end()) {
@@ -114846,7 +115405,10 @@ static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vec
     }
     for (int n = 0; n < cgraph->n_nodes; ++n) {
         const ggml_tensor * node = cgraph->nodes[n];
-        for (int j = 0; node && j < GGML_MAX_SRC; ++j) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
             consider(node->src[j], -(n * GGML_MAX_SRC + j) - 1);
         }
     }
@@ -117092,7 +117654,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         }
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
-        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_DEFAULT, the unified kernel's
+        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_UNDEFINED, the unified kernel's
         // oneDNN f16 route has none, so each arm's own condition is applied below.
         if (!src0 || !src1 || !(src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) ||
             !ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1) {
@@ -117120,7 +117682,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         // The unified kernel's own oneDNN f16 route (Route A) draws them too for an op the scratch does not supply,
         // whatever its precision. The router is asked once per node and its answer shared by both arms.
         const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);
-        const bool                      prec_default = node->op_params[0] == GGML_PREC_DEFAULT;
+        const bool                      prec_default = node->op_params[0] == GGML_PREC_UNDEFINED;
         const bool legacy_draws = prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
         const bool unified_draws =
             ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied);
@@ -117445,32 +118007,6 @@ static void ggml_sycl_xmx_moe_pre_allocate_buffers(ggml_backend_sycl_context & c
 
 #endif
 
-// A view of an INPUT tensor is that input. ggml_view_tensor() does not copy flags, so the INPUT flag lives on
-// the root (llama's recurrent-state copy indices are `ggml_view_1d(s_copy, ...)`), and a flag-only test would
-// treat the view as an ordinary host tensor: not staged to a stable device buffer, and never refreshed on replay.
-static bool graph_tensor_is_input(const ggml_tensor * tensor) {
-    for (; tensor; tensor = tensor->view_src) {
-        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// What a graph prestage does with one source tensor. The first three classes
-// are decided without copying; COPY is the only class whose bytes the
-// predicate reports. INPUT and KV_HOST are not counted but still reach the
-// prestage's copy path: INPUT has its own stable staging, and a KV-host source
-// is staged as before.
-enum class ggml_sycl_prestage_class {
-    CONTROL,
-    WEIGHT,
-    DEVICE,
-    INPUT,
-    KV_HOST,
-    COPY,
-};
-
 // The buffer type `tensor`'s bytes live in. A view lives in its source's buffer.
 static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tensor * tensor) {
     if (!tensor) {
@@ -117481,25 +118017,55 @@ static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tens
     return buf ? buf->buft : nullptr;
 }
 
-// Requires tensor->data: a tensor with no storage yet has nothing to classify.
+// The nodes of one graph, collected on first use. Only a host op output that no earlier class claims asks
+// (ggml_sycl_prestage_facts_of), so a graph whose intermediates and inputs live on the device never builds it.
+struct ggml_sycl_graph_node_set {
+    // `cgraph` is non-null: the pre-stage and the refresh return on a null graph before they construct one.
+    explicit ggml_sycl_graph_node_set(const ggml_cgraph * cgraph) : cgraph(cgraph) {}
+
+    bool contains(const ggml_tensor * tensor) {
+        if (!built) {
+            built = true;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                nodes.insert(cgraph->nodes[i]);
+            }
+        }
+        return nodes.find(tensor) != nodes.end();
+    }
+
+  private:
+    const ggml_cgraph *                     cgraph = nullptr;
+    bool                                    built  = false;
+    std::unordered_set<const ggml_tensor *> nodes;
+};
+
+// Requires tensor->data: a tensor with no storage yet has nothing to classify. `graph_nodes` is the graph being
+// staged. Without one the producer of a host op output is unknown, and the fact says "this graph's own": that keeps
+// it COPY, the class it had before host op outputs could be inputs, and the bytes predicate counts it either way.
+static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of(const ggml_tensor *        tensor,
+                                                            ggml_backend_buffer_type_t src_buft,
+                                                            ggml_sycl_graph_node_set * graph_nodes) {
+    ggml_sycl_prestage_facts facts;
+    facts.is_control        = ggml_sycl_tensor_uses_cross_device_control_storage(tensor);
+    facts.is_weight         = ggml_sycl_tensor_is_weight(tensor);
+    facts.is_device         = ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device;
+    facts.is_input          = ggml_sycl_prestage_is_input(tensor);
+    facts.is_kv_host        = src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
+    facts.root_is_op_output = ggml_sycl_prestage_root_is_op_output(tensor);
+    // The rule reads the graph-node fact only for a host op output no earlier class claims; asking for any other
+    // tensor would build the node set for every device intermediate of every walk.
+    const bool reaches_rule = facts.root_is_op_output && !facts.is_control && !facts.is_weight && !facts.is_device &&
+                              !facts.is_input && !facts.is_kv_host;
+    facts.root_is_graph_node =
+        reaches_rule && (!graph_nodes || graph_nodes->contains(ggml_sycl_prestage_view_root(tensor)));
+    return facts;
+}
+
+// The rule is ggml_sycl_prestage_class_of (prestage-class.hpp).
 static ggml_sycl_prestage_class ggml_sycl_prestage_classify(const ggml_tensor *        tensor,
-                                                            ggml_backend_buffer_type_t src_buft) {
-    if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
-        return ggml_sycl_prestage_class::CONTROL;
-    }
-    if (ggml_sycl_tensor_is_weight(tensor)) {
-        return ggml_sycl_prestage_class::WEIGHT;
-    }
-    if (ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device) {
-        return ggml_sycl_prestage_class::DEVICE;
-    }
-    if (graph_tensor_is_input(tensor)) {
-        return ggml_sycl_prestage_class::INPUT;
-    }
-    if (src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
-        return ggml_sycl_prestage_class::KV_HOST;
-    }
-    return ggml_sycl_prestage_class::COPY;
+                                                            ggml_backend_buffer_type_t src_buft,
+                                                            ggml_sycl_graph_node_set * graph_nodes) {
+    return ggml_sycl_prestage_class_of(ggml_sycl_prestage_facts_of(tensor, src_buft, graph_nodes));
 }
 
 size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
@@ -117511,7 +118077,10 @@ size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
     if (!tensor || !tensor->data) {
         return 0;
     }
-    return ggml_sycl_prestage_classify(tensor, src_buft) == ggml_sycl_prestage_class::COPY ? ggml_nbytes(tensor) : 0;
+    // No graph in hand: ggml_sycl_prestage_reports_bytes gives the same answer for a host op output whichever graph
+    // produced it.
+    const bool reported = ggml_sycl_prestage_reports_bytes(ggml_sycl_prestage_facts_of(tensor, src_buft, nullptr));
+    return reported ? ggml_nbytes(tensor) : 0;
 }
 
 thread_local int g_ggml_sycl_device_dispatch_depth = 0;
@@ -117560,7 +118129,7 @@ uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phas
 }
 
 // The sources a prestage of `cgraph` copies to `device`, in the prestage's own
-// walk: leafs, then every node's sources. Sources are deduplicated by tensor
+// walk: leafs, then every computed node's sources. Sources are deduplicated by tensor
 // object, not by the prestage's (cache id, device, view offset) key, so two
 // tensors that share a key count twice; the value is a diagnostic cohort size.
 static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int device) {
@@ -117579,7 +118148,10 @@ static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int
     }
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        for (int j = 0; node && j < GGML_MAX_SRC; j++) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
             visit(node->src[j]);
         }
     }
@@ -117694,6 +118266,9 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
     // Filled only on a recording pass; an empty set allocates nothing.
     std::unordered_set<const ggml_tensor *> recorded;
 
+    // A host op output this graph produces is not another split's input (ggml_sycl_prestage_class_of).
+    ggml_sycl_graph_node_set graph_nodes(cgraph);
+
     // The stage action for a tensor that needs a device copy: the INPUT arm, or the unified cache with the staging
     // cache behind it. A recording pass lists each tensor the first time it gets here, before the action runs, so a
     // replay of the list runs the same actions in the same order with the same failure handling.
@@ -117799,7 +118374,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
         }
 
         const ggml_sycl_prestage_class source_class =
-            ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor));
+            ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor), &graph_nodes);
 
         // Handle weight tensors specially in tiered mode
         if (source_class == ggml_sycl_prestage_class::WEIGHT) {
@@ -117874,9 +118449,10 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context *             
     // The cgraph->leafs array may be empty even when nodes reference non-device tensors.
     // This is the ROOT CAUSE of the DEVICE_LOST error - leaf tensors like "leaf_5" are
     // referenced by nodes but not in cgraph->leafs, so they weren't being pre-staged.
+    // A node the graph does not compute never runs, so nothing reads its sources.
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
 
@@ -118132,6 +118708,9 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     std::unordered_set<graph_input_tensor_key, graph_input_tensor_key_hash> seen_inputs;
     ctx->cached_input_tensors.clear();
 
+    // As in the pre-stage: an op output this graph produces is not an input to refresh.
+    ggml_sycl_graph_node_set graph_nodes(cgraph);
+
     auto make_input_tensor_key = [&](const ggml_tensor * tensor, graph_input_tensor_key * out_key) -> bool {
         if (!tensor || ctx->device < 0 || !out_key) {
             return false;
@@ -118188,7 +118767,11 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         if (ggml_nbytes(tensor) == 0) {
             return;
         }
-        if (!graph_tensor_is_input(tensor)) {
+        // A host-resident op output the pre-stage stages as an INPUT is refreshed like one: a replay that does not run
+        // the pre-stage first would otherwise read the bytes of the token that recorded it.
+        if (!(ggml_sycl_prestage_is_input(tensor) ||
+              ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor), &graph_nodes) ==
+                  ggml_sycl_prestage_class::INPUT)) {
             if (dkw0_input_list_on && dkw0_skipped_seen.insert(tensor).second) {
                 fprintf(stderr,
                         "[DKW0-INPUT-LIST] SKIPPED name=%s tensor=%p op=%s type=%d ne=[%lld,%lld,%lld,%lld] "
@@ -118224,12 +118807,14 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     for (int i = 0; i < cgraph->n_leafs; ++i) {
         discover_input(cgraph->leafs[i]);
     }
+    // As in the pre-stage: only a computed node's sources, so this never lists an input the pre-stage skipped.
     for (int i = 0; i < cgraph->n_nodes; ++i) {
-        if (!cgraph->nodes[i]) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            discover_input(cgraph->nodes[i]->src[j]);
+            discover_input(node->src[j]);
         }
     }
 
@@ -119784,6 +120369,16 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         }
         return false;
     };
+    // An update recipe names graph nodes by their index in the graph its plan was built from. The caller drops the plan
+    // when the graph signature, which carries every node's flags, changes, so each index names a computed node of this
+    // graph. One that does not fails the replay into a full rebuild instead of running a node the graph does not compute.
+    auto recipe_node = [cgraph](const auto & entry) -> ggml_tensor * {
+        if (entry.graph_node_idx < 0 || entry.graph_node_idx >= cgraph->n_nodes) {
+            return nullptr;
+        }
+        ggml_tensor * node = cgraph->nodes[entry.graph_node_idx];
+        return node && ggml_sycl_graph_node_is_computed(node) ? node : nullptr;
+    };
 
     // Fast path: reuse cached plan and refresh mutable pointers only.
     if (kernel.has_cached_plan()) {
@@ -119815,7 +120410,11 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                     continue;
                 }
                 const int     oi   = entry.plan_op_idx;
-                ggml_tensor * node = cgraph->nodes[entry.graph_node_idx];
+                ggml_tensor * node = recipe_node(entry);
+                if (!node) {
+                    recipe_ok = false;
+                    break;
+                }
 
                 // GET_ROWS has no plan op (plan_op_idx == -1); others use direct mutable access
                 OperationDescriptor * op = (oi >= 0) ? kernel.get_op_descriptor_mut(oi) : nullptr;
@@ -120148,8 +120747,12 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
                 for (const auto & entry : recipe) {
                     if (entry.op_type == OperationType::GET_ROWS && entry.get_rows_idx == -2) {
                         // Sentinel: this is a CPY entry stored in the recipe
-                        ggml_tensor * cpy_node = cgraph->nodes[entry.graph_node_idx];
-                        if (cpy_node && cpy_node->src[0] && cpy_node->src[1]) {
+                        ggml_tensor * cpy_node = recipe_node(entry);
+                        if (!cpy_node) {
+                            recipe_ok = false;
+                            break;
+                        }
+                        if (cpy_node->src[0] && cpy_node->src[1]) {
                             int                              source_op_idx = entry.plan_op_idx;
                             ggml_sycl_deferred_copy_endpoint src_endpoint{};
                             ggml_sycl_deferred_copy_endpoint dst_endpoint{};
@@ -120234,7 +120837,8 @@ recipe_failed:
 
             for (int i = 0; i < cgraph->n_nodes && fast_path_ok; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (!node) {
+                // the full walk below adds no op for an uncomputed node; both walks leave the same nodes
+                if (!node || !ggml_sycl_graph_node_is_computed(node)) {
                     continue;
                 }
 
@@ -121267,7 +121871,12 @@ full_build:
             }
             break;
         }
-        if (g_ggml_sycl_debug && node) {
+        // An uncomputed node adds no op. The unselected input-embedding branch carries a DUP, which the switch below
+        // does not support, so walking it would decline the whole plan for a node that never runs.
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (g_ggml_sycl_debug) {
             graph_op_counts[node->op]++;
         }
         int layer = -1;
@@ -121495,9 +122104,10 @@ full_build:
                         const ggml_tensor * next = cgraph->nodes[i + 1];
                         // Pattern: MUL(rms_norm_output, norm_weight) where norm_weight
                         // is a 1D weight tensor (same shape as hidden dim).
-                        if (next && next->op == GGML_OP_MUL && next->src[0] == node && next->src[1] &&
-                            ggml_are_same_shape(next->src[0], next->src[1]) && next->src[1]->type == GGML_TYPE_F32 &&
-                            ggml_is_contiguous(next)) {
+                        // An uncomputed node can read a computed one; fusing it would run it.
+                        if (next && ggml_sycl_graph_node_is_computed(next) && next->op == GGML_OP_MUL &&
+                            next->src[0] == node && next->src[1] && ggml_are_same_shape(next->src[0], next->src[1]) &&
+                            next->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(next)) {
                             const void * wptr = resolve_input_ptr(next->src[1], layer);
                             if (wptr) {
                                 wptr = ensure_device_access_ptr(next->src[1], wptr, "RMS_NORM fused weight");
@@ -123280,7 +123890,11 @@ static bool extract_persistent_plan_split(ggml_sycl::UnifiedKernel &           p
     std::vector<const ggml_tensor *> matmul_weight_tensors;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0]) {
+        // the plan holds no op for an uncomputed node, so the list skips the same nodes to stay index-aligned
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0]) {
             matmul_weight_tensors.push_back(node->src[0]);
         }
     }
@@ -123655,6 +124269,9 @@ static bool is_decode_phase_graph(ggml_cgraph * cgraph) {
     bool found_mul_mat = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             found_mul_mat = true;
             // src[1] is the activation tensor, ne[1] is the M dimension (batch size)
@@ -123990,6 +124607,9 @@ static bool has_supported_architecture(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         if (node->op == GGML_OP_RMS_NORM) {
             has_rms_norm = true;
         }
@@ -124073,7 +124693,7 @@ static persistent_moe_graph_probe persistent_tg_probe_moe_graph(const ggml_cgrap
     std::unordered_map<int, persistent_moe_layer_probe> layers;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         if (persistent_tg_is_moe_router_argsort(node)) {
@@ -124181,7 +124801,8 @@ static persistent_tg_policy_summary persistent_tg_summarize_policy(ggml_cgraph *
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
+        // the plan skips an uncomputed node, so its op is no blocker
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
             continue;
         }
         switch (node->op) {
@@ -124307,7 +124928,10 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[0]->type == GGML_TYPE_F16) {
             static bool logged_f16_matmul_once = false;
             if (!logged_f16_matmul_once) {
                 GGML_LOG_INFO(
@@ -124321,6 +124945,10 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
+        // the plan skips an uncomputed node: the unselected input-embedding branch's DUP declines nothing
+        if (!node || !ggml_sycl_graph_node_is_computed(node)) {
+            continue;
+        }
         switch (node->op) {
             case GGML_OP_GET_ROWS:
             case GGML_OP_RMS_NORM:
@@ -124346,6 +124974,23 @@ static bool graph_has_only_persistent_ops(ggml_cgraph * cgraph) {
     }
 
     return true;
+}
+
+// Drop the decode plans the persistent TG path cached for one graph: the primary kernel's plan and its update
+// recipe, the split secondary kernel's plan, and the secondary ops the split plan reuses. Both the graphs that leave the
+// persistent path and a graph that changes its eligibility key call it, so no plan outlives the graph it was built
+// from. No plan update is in progress at either call, so dropping the cache is all it takes.
+static void persistent_tg_drop_cached_plans(ggml_backend_sycl_context & ctx) {
+    if (ctx.unified_kernel && ctx.unified_kernel->has_cached_plan()) {
+        ctx.unified_kernel->invalidate_plan_cache();
+    }
+    if (g_split_secondary_kernel && g_split_secondary_kernel->has_cached_plan()) {
+        g_split_secondary_kernel->invalidate_plan_cache();
+    }
+    if (g_split_plan_cached) {
+        g_split_plan_cached = false;
+        g_cached_secondary_ops.clear();
+    }
 }
 
 /**
@@ -124920,14 +125565,23 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // re-scanning the graph on every call.
     // Cache key includes both n_nodes AND phase (decode vs PP) because PP and TG
     // can have the same n_nodes when GPU prefix mode truncates the graph.
-    bool       persistent_eligible;
-    const int  persistent_cache_key = cgraph->n_nodes + (cached_is_decode ? 1000000 : 0);
-    const bool persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key;
+    // The answer, the plan built from it and the plan's update recipe hold for one graph, and n_nodes does not name
+    // one: the same nodes with a different input branch selected differ only in their COMPUTE flags. The key carries
+    // the graph signature too, which mixes each node's op, shape and flags, and a new key drops the cached plans before
+    // the graph is judged. The signature costs a walk of the graph, so only a process with persistent TG on pays it.
+    bool           persistent_eligible;
+    const int      persistent_cache_key = cgraph->n_nodes + (cached_is_decode ? 1000000 : 0);
+    const uint64_t persistent_cache_sig =
+        ggml_sycl::env_persistent_tg_enabled() ? ggml_sycl_graph_signature(cgraph) : 0;
+    const bool persistent_cache_hit = sycl_ctx->cached_persistent_n_nodes == persistent_cache_key &&
+                                      sycl_ctx->cached_persistent_sig == persistent_cache_sig;
     if (persistent_cache_hit) {
         persistent_eligible = sycl_ctx->cached_persistent_result;
     } else {
+        persistent_tg_drop_cached_plans(*sycl_ctx);
         persistent_eligible                 = should_use_persistent_tg(*sycl_ctx, cgraph);
         sycl_ctx->cached_persistent_n_nodes = persistent_cache_key;
+        sycl_ctx->cached_persistent_sig     = persistent_cache_sig;
         sycl_ctx->cached_persistent_result  = persistent_eligible;
     }
     if (persistent_tg_log_policy_enabled()) {
@@ -125342,16 +125996,7 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     }
 normal_dispatch:
     // Leaving persistent TG path (e.g. PP phase): drop cached decode plans.
-    if (sycl_ctx->unified_kernel && sycl_ctx->unified_kernel->has_cached_plan()) {
-        sycl_ctx->unified_kernel->invalidate_plan_cache();
-    }
-    if (g_split_secondary_kernel && g_split_secondary_kernel->has_cached_plan()) {
-        g_split_secondary_kernel->invalidate_plan_cache();
-    }
-    if (g_split_plan_cached) {
-        g_split_plan_cached = false;
-        g_cached_secondary_ops.clear();
-    }
+    persistent_tg_drop_cached_plans(*sycl_ctx);
 
 #ifdef GGML_SYCL_GRAPH
     // Optional layout copies were retired since this context last looked: drop
@@ -128042,6 +128687,25 @@ static bool ggml_sycl_norm_rows_supported(const ggml_tensor * t) {
     return t->nb[0] == ts && t->nb[1] % ts == 0 && t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
 }
 
+// Upstream ggml widened these ops past what the SYCL kernels compute; a node that uses the wider form runs
+// elsewhere. supports_op and the capability query ask it before the shared impl. It stays out of the impl's prologue
+// and per-op cases, and ahead of the MUL_MAT type helper, because those are pinned by source contracts
+// (tests/test-sycl-op-support-predicates.py, tests/test-sycl-supports-op-indexed-moe-source.py).
+//   ROPE    the kernels are instantiated for f32/f16 sources (ggml_rope accepts BF16 since upstream 7fce5439f).
+//           rope.cpp passes the node's truncate flag (upstream 1fa7f1c48) to the YaRN correction dims itself.
+//   MUL_MAT [TAG_GGML_PREC] every route converts src1 below f32 (q8_1 for MMVQ/MMQ, f16 for the oneDNN and
+//           dequant routes), so a node whose src1 precision forbids that is declined (upstream 494d0f47b).
+static bool ggml_sycl_op_core_semantics_supported(const ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_ROPE:
+            return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
+        case GGML_OP_MUL_MAT:
+            return ggml_prec_get_src(op, 1) != GGML_PREC_BF16 && ggml_prec_get_src(op, 1) != GGML_PREC_F32;
+        default:
+            return true;
+    }
+}
+
 static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
     // The one list lives in unified-types.hpp: the zone planner asks it too.
     return ggml_sycl::dense_mul_mat_type_supported(type);
@@ -128068,10 +128732,14 @@ static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
 // supports_op is "is there a kernel for this op, type and shape" AND "is the data placed where this device runs it".
 // The second half is the placement declines below (host-demoted KV, planner-on-host); `placement_declines` switches
 // exactly those off, which is what ggml_backend_sycl_supports_op_capability() does, so the capability answer is
-// this same body and cannot drift from supports_op.
+// this same body and cannot drift from supports_op. Both entries also ask ggml_sycl_op_core_semantics_supported()
+// first: the impl's prologue and cases are pinned by source contracts, and that check is a kernel question too.
 static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines);
 
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (!ggml_sycl_op_core_semantics_supported(op)) {
+        return false;
+    }
     return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/true);
 }
 
@@ -128586,8 +129254,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         case GGML_OP_DIV:
             // The other four bin_bcast consumers; see
             // ggml_sycl_binbcast_layout_supported and the REPEAT case above.
-            // ADD1 (k_add1), ADD_ID and COUNT_EQUAL have their own kernels and
-            // stay in the unconditional group below.
+            // ADD_ID and COUNT_EQUAL have their own kernels and stay in the
+            // unconditional group below.
             return ggml_sycl_binbcast_layout_supported(op->src[0], op->src[1], op);
         case GGML_OP_CONCAT:
             // Layout is genuinely handled: concat.cpp:119-153 has a fully
@@ -128606,7 +129274,6 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD1:
         case GGML_OP_ADD_ID:
         case GGML_OP_COUNT_EQUAL:
             return true;
@@ -128683,12 +129350,12 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                    ggml_sycl_norm_rows_supported(op);
 
         case GGML_OP_SCALE:
-            return true;
+            // ggml_sycl_op_scale asserts f32 on both sides and reads src0 flat; ggml_scale now accepts
+            // non-contiguous views, which that flat read would mis-address
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
 
         case GGML_OP_CONT:
             return op->src[0]->type != GGML_TYPE_BF16;
-        case GGML_OP_DIAG_MASK_INF:
-            return true;
         case GGML_OP_SOFT_MAX:
             return true;
         case GGML_OP_SOFT_MAX_BACK:
@@ -128783,6 +129450,8 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             return ggml_sycl_dsv4_hc_post_supported(op);
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_sycl_lightning_indexer_supported(op);
+        case GGML_OP_TOP_K_MASK:
+            return ggml_sycl_top_k_mask_supported(op);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN:
@@ -128807,9 +129476,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 return false;
             }
         case GGML_OP_FILL:
+            return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_CUMSUM:
         case GGML_OP_DIAG:
-            return true;
+            // the kernels are f32 only; the ops accept BF16 now
+            return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_ROLL:
@@ -128836,10 +129507,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
 // ggml_backend_sycl_reg_get_proc_address for callers that must tell a missing kernel from a placement decline
 // (llama_context::resolve_fused_ops): supports_op's "false" covers both, this is false only when there is no
 // kernel. Exact for the fused ops that caller probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER,
-// DSV4_HC_*); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks of their
-// own that this does not neutralise.
+// DSV4_HC_*, TOP_K_MASK); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks
+// of their own that this does not neutralise.
 bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (dev == nullptr || op == nullptr) {
+    if (dev == nullptr || op == nullptr || !ggml_sycl_op_core_semantics_supported(op)) {
         return false;
     }
 

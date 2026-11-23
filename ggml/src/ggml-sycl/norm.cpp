@@ -214,9 +214,22 @@ static void rms_norm_f32(const float *            x,
 
     float tmp = 0.0f;  // partial sum for thread in warp
 
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
+    // float4 path for 16-byte aligned rows (decode); odd lengths and unaligned views stay scalar.
+    // x and dst are per-work-group row pointers, so every work-item of a group takes the same path.
+    const bool contig = ncols % 4 == 0 && (uintptr_t) x % 16 == 0 && (uintptr_t) dst % 16 == 0;
+    const int  n4     = ncols / 4;
+
+    if (contig) {
+        const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+        for (int i = tid; i < n4; i += block_size) {
+            const sycl::float4 v = x4[i];
+            tmp += sycl::dot(v, v);
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
     }
 
     // sum up partial sums
@@ -241,8 +254,16 @@ static void rms_norm_f32(const float *            x,
     const float mean  = tmp / ncols;
     const float scale = sycl::rsqrt(mean + eps);
 
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * x[col];
+    if (contig) {
+        const sycl::float4 * x4 = reinterpret_cast<const sycl::float4 *>(x);
+        sycl::float4 *       d4 = reinterpret_cast<sycl::float4 *>(dst);
+        for (int i = tid; i < n4; i += block_size) {
+            d4[i] = scale * x4[i];
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[col] = scale * x[col];
+        }
     }
 }
 

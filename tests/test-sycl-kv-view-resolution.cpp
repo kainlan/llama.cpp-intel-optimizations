@@ -37,6 +37,10 @@ bool ggml_sycl_test_plan_real_simple_consumer_dispatch(const ggml_tensor *      
                                                        int                                   current_device,
                                                        ggml_sycl_test_consumer_device_plan * out);
 bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, const void * resolved_ptr, int device);
+void * ggml_sycl_test_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
+                                                      const ggml_tensor *         tensor,
+                                                      size_t                      span_bytes,
+                                                      int                         device);
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -849,6 +853,121 @@ static bool test_binbcast_stages_only_raw_host_storage() {
     return true;
 }
 
+// Sets this thread's recording flag for one scope, so an assertion that returns early cannot leave later cases
+// recording.
+struct recording_this_thread_scope {
+    const bool previous;
+
+    explicit recording_this_thread_scope(bool recording) : previous(g_ggml_sycl_graph_recording) {
+        g_ggml_sycl_graph_recording = recording;
+    }
+
+    ~recording_this_thread_scope() { g_ggml_sycl_graph_recording = previous; }
+};
+
+// Under spread placement a graph input such as an attention bias stays in host memory, and the graph pre-stage copies
+// it to a stable device buffer keyed by the tensor. While recording, binbcast must read that copy: its raw host
+// staging cannot be recorded, and running the segment directly instead drains the stream once per layer.
+static bool test_binbcast_reads_staged_graph_input_while_recording() {
+    printf("\n=== Test: binbcast reads a staged graph input while recording ===\n");
+
+    alignas(64) std::uint8_t raw_host[4096]       = {};
+    alignas(64) std::uint8_t staged_fake[256]     = {};  // never dereferenced: the lookup only resolves the handle
+    // The view's own entry: a lookup keyed on the view's root would answer staged_fake instead.
+    alignas(64) std::uint8_t staged_view_fake[64] = {};
+
+    ggml_tensor bias;
+    init_tensor(bias, "leaf_115");
+    bias.type  = GGML_TYPE_F32;
+    bias.nb[0] = ggml_type_size(bias.type);
+    bias.nb[1] = bias.nb[0] * bias.ne[0];
+    bias.nb[2] = bias.nb[1] * bias.ne[1];
+    bias.nb[3] = bias.nb[2] * bias.ne[2];
+    bias.data  = raw_host;
+    bias.flags = GGML_TENSOR_FLAG_INPUT;
+
+    const size_t bias_bytes = ggml_nbytes(&bias);
+
+    ggml_tensor unplanted;
+    init_tensor(unplanted, "leaf_116");
+    unplanted.data  = raw_host;
+    unplanted.flags = GGML_TENSOR_FLAG_INPUT;
+
+    ggml_tensor not_input;
+    init_tensor(not_input, "host_activation");
+    not_input.data = raw_host;
+
+    // A view carries no flags of its own (ggml_view_tensor does not copy them); its root is the input.
+    ggml_tensor view;
+    init_tensor(view, "leaf_115 (view)");
+    view.type     = GGML_TYPE_F32;
+    view.ne[0]    = 8;
+    view.nb[0]    = ggml_type_size(view.type);
+    view.nb[1]    = view.nb[0] * view.ne[0];
+    view.nb[2]    = view.nb[1] * view.ne[1];
+    view.nb[3]    = view.nb[2] * view.ne[2];
+    view.view_src = &bias;
+    view.data     = raw_host;
+
+    // Never deleted: its destructor tears down backend-wide state (queues, cache holds, execution bindings) that
+    // this synthetic context never set up. Only its staging map is used here.
+    auto * ctx = new ggml_backend_sycl_context(0);
+    // A reused, larger buffer: its capacity exceeds the bytes the pre-stage copied for this tensor.
+    ctx->graph_input_staging_adopt_for_test(
+        &bias,
+        ggml_sycl::mem_handle::from_direct(staged_fake, GGML_LAYOUT_AOS,
+                                           /*on_device=*/true, /*device=*/0, sizeof(staged_fake)),
+        sizeof(staged_fake));
+    ctx->graph_input_staging_adopt_for_test(
+        &not_input,
+        ggml_sycl::mem_handle::from_direct(staged_fake, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0, bias_bytes),
+        bias_bytes);
+    ctx->graph_input_staging_adopt_for_test(
+        &view,
+        ggml_sycl::mem_handle::from_direct(staged_view_fake, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0,
+                                           ggml_nbytes(&view)),
+        ggml_nbytes(&view));
+
+    TEST_ASSERT(ggml_sycl_test_binbcast_needs_raw_host_staging(&bias, raw_host, 0),
+                "precondition: the host input needs raw staging without a staged copy");
+
+    {
+        recording_this_thread_scope recording(true);
+        TEST_ASSERT(ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &bias, bias_bytes, 0) == staged_fake,
+                    "a named INPUT with a staged copy must resolve to the staged device pointer while recording");
+        TEST_ASSERT(
+            ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &unplanted, ggml_nbytes(&unplanted), 0) == nullptr,
+            "an INPUT with no staged copy must not resolve while recording (raw staging still throws)");
+        TEST_ASSERT(ggml_sycl_test_binbcast_needs_raw_host_staging(&unplanted, raw_host, 0),
+                    "an INPUT with no staged copy still needs raw host staging");
+        TEST_ASSERT(ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &bias, bias_bytes + 4, 0) == nullptr,
+                    "a kernel span past the bytes copied must not read the staged copy, whatever its capacity");
+        TEST_ASSERT(
+            ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &not_input, ggml_nbytes(&not_input), 0) == nullptr,
+            "a host tensor without the INPUT flag must not read a staging entry keyed by its pointer");
+
+        TEST_ASSERT(
+            ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &view, ggml_nbytes(&view), 0) == staged_view_fake,
+            "a view of an INPUT reads its own entry: the pre-stage stages it under its own pointer");
+
+        const char saved_first = bias.name[0];
+        bias.name[0]           = '\0';
+        void * unnamed_ptr     = ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &bias, bias_bytes, 0);
+        bias.name[0]           = saved_first;
+        TEST_ASSERT(unnamed_ptr == nullptr,
+                    "an unnamed INPUT never takes the pre-stage's INPUT arm, so an entry under its pointer is not "
+                    "this token's copy");
+    }
+
+    {
+        recording_this_thread_scope recording(false);
+        TEST_ASSERT(ggml_sycl_test_binbcast_graph_input_staged_ptr(*ctx, &bias, bias_bytes, 0) == nullptr,
+                    "outside recording binbcast must resolve as before, not read the staged copy");
+    }
+
+    return true;
+}
+
 int main() {
     const ggml_sycl_device_info              no_peer_mock_info     = make_mock_sycl_info(false);
     const ggml_sycl_device_info              direct_peer_mock_info = make_mock_sycl_info(true);
@@ -878,6 +997,7 @@ int main() {
     ok &= test_resolve_or_host_rejects_registered_wrong_device_data();
     ok &= test_untracked_device_usm_fails_common_resolver();
     ok &= test_binbcast_stages_only_raw_host_storage();
+    ok &= test_binbcast_reads_staged_graph_input_while_recording();
 
     printf("\nSYCL KV view resolution tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

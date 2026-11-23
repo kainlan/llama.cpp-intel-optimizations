@@ -1,4 +1,4 @@
-# Gate for the UI bundle version resolution in tools/ui/ui-version.cmake.
+# Gate for the UI bundle version resolution in ui/apps/chat/ui-version.cmake.
 #
 # The fork's own build number is never a published bundle version, so a build
 # that derives the version from it embeds the floating `latest` bundle, which
@@ -7,20 +7,20 @@
 # order: HF_WEBUI_VERSION, HF_UI_VERSION, the pin, then b<build number>, then
 # empty.
 #
-# Run:  cmake -DUI_VERSION_CMAKE=<path to tools/ui/ui-version.cmake> -P test-ui-version-pin.cmake
+# Run:  cmake -DUI_VERSION_CMAKE=<path to ui/apps/chat/ui-version.cmake> -P test-ui-version-pin.cmake
 
 cmake_minimum_required(VERSION 3.18)
 
 if (NOT DEFINED UI_VERSION_CMAKE)
     get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
-    set(UI_VERSION_CMAKE "${_here}/../tools/ui/ui-version.cmake")
+    set(UI_VERSION_CMAKE "${_here}/../ui/apps/chat/ui-version.cmake")
 endif()
 if (NOT EXISTS "${UI_VERSION_CMAKE}")
     message(FATAL_ERROR "test-ui-version-pin: no such file: ${UI_VERSION_CMAKE}")
 endif()
 if (NOT DEFINED UI_CMAKE)
     get_filename_component(_here "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
-    set(UI_CMAKE "${_here}/../tools/ui/CMakeLists.txt")
+    set(UI_CMAKE "${_here}/../ui/apps/chat/CMakeLists.txt")
 endif()
 if (NOT EXISTS "${UI_CMAKE}")
     message(FATAL_ERROR "test-ui-version-pin: no such file: ${UI_CMAKE}")
@@ -89,7 +89,7 @@ endif()
 message(STATUS "PASS f (default pin is not a cache entry)")
 math(EXPR _pass "${_pass}+1")
 
-# g. editing the pin must re-run provisioning: tools/ui/CMakeLists.txt has to
+# g. editing the pin must re-run provisioning: ui/apps/chat/CMakeLists.txt has to
 # include the file (or the resolver is not defined) and list it among the
 # provisioning step's dependencies.
 file(READ "${UI_CMAKE}" _ui_text)

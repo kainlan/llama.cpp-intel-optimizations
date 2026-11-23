@@ -149,11 +149,13 @@ static bool host_ptr_is_usm_accessible(const void * ptr) {
 //     before the host zones are configured: its metadata cannot be told from a
 //     standalone base's, so it keeps the registry answer.
 //   - SYCL device buffers' owners with roles KV and COMPUTE never qualify,
-//     even when the buffer fell back to host-pinned memory. The SYCL_Host
-//     buffer's owner (role STAGING outside model load, category HOST_COMPUTE)
-//     would, but the backend holds it only as the buffer's identity: its
-//     tensors' copies pass views without an owner, so they keep the registry
-//     answer.
+//     even when the buffer fell back to host-pinned memory. A SYCL_Host
+//     buffer's tensors' copies pass views without an owner, so they keep the
+//     registry answer. The exception is the loader's SYCL_Host chunk of a model
+//     load (role WEIGHT, tier HOST_PINNED, lifetime MODEL): a host expert
+//     S1-PRELOAD serves from it in place leases the chunk's owner, so the
+//     prefill expert ring's copies from that lease qualify as a pinned-pool
+//     weight's do, below.
 //   - A pinned-pool weight qualifies because host-planned experts are the
 //     prefill expert ring's copy source (llama.cpp-36j0): staged, every ring
 //     copy would hold the submitting thread on a host memcpy and a wait. A

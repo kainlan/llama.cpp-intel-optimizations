@@ -185,11 +185,21 @@ def stage_planners() -> set:
     return found
 
 
-def stage_sizing() -> set:
+# A card's share of terms the sizing already produced, not a sizing of its own: it leaves the loader's SYCL_Host
+# buffer out of every card but loader_device's and never adds a byte (test-sycl-loader-in-place-terms), so the plan's
+# recorded figure, which the dry run reports, is loader_device's commit and no card commits more.
+CARD_SHARE = "placement_plan_host_zone_commit_terms_on_device"
+
+
+def configure_sizing_calls() -> set:
     hpp = read(SYCL / "unified-cache.hpp")
-    found = called_from(
+    return called_from(
         body(sycl_cpp(), "ggml_sycl_configure_host_zones_for_plan"), declared_returning(hpp, "host_zone_commit_terms")
     )
+
+
+def stage_sizing() -> set:
+    found = configure_sizing_calls() - {CARD_SHARE}
     assert found, "ggml_sycl_configure_host_zones_for_plan calls no sizing unified-cache.hpp declares"
     return found
 
@@ -198,6 +208,16 @@ def test_the_derivation_finds_the_stage_planners():
     # Engagement for the derivation: the two planners and the commit-terms sizing this tree is known to call.
     assert stage_planners() == {"compute_placement_plan", "compute_multi_device_plan"}, stage_planners()
     assert stage_sizing() == {"placement_plan_host_zone_commit_terms"}, stage_sizing()
+
+
+def test_the_card_share_takes_the_sizings_terms():
+    # The share is excused from the dry run only while it reshapes the sizing's own result: the configuration passes
+    # the sizing's terms straight into it.
+    assert CARD_SHARE in configure_sizing_calls(), "the zone configuration no longer takes a card's share"
+    configure = body(sycl_cpp(), "ggml_sycl_configure_host_zones_for_plan")
+    assert re.search(
+        rf"\b{CARD_SHARE}\s*\(\s*plan\s*,\s*ggml_sycl::placement_plan_host_zone_commit_terms\s*\(", configure
+    ), f"the zone configuration's {CARD_SHARE} does not take the terms placement_plan_host_zone_commit_terms sizes"
 
 
 def test_the_derivation_sees_a_planner_call_and_ignores_a_comment():

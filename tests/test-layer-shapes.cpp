@@ -368,7 +368,7 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
         const uint32_t n_stream = ctx->get_cparams().kv_unified ? 1 : ctx->get_cparams().n_seq_max;
         CHECK(kv.n_stream == n_stream, "%s/%s: n_stream %u, want %u", arch_name, cfg.name, kv.n_stream, n_stream);
         CHECK(kv.v_trans == !ctx->get_cparams().flash_attn, "%s/%s: v_trans", arch_name, cfg.name);
-        CHECK(kv.no_alloc == model.hparams.no_alloc, "%s/%s: no_alloc", arch_name, cfg.name);
+        CHECK(kv.no_alloc == model.no_alloc(), "%s/%s: no_alloc", arch_name, cfg.name);
 
         int n_owned = 0;
         for (int il = 0; il < (int) kv.layers.size() && il < n_layer; ++il) {

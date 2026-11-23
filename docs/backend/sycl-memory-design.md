@@ -333,7 +333,8 @@ means its owner has the entry's base and the entry's size, so retiring the entry
 gives back exactly its bytes; an owner wider than its entry may hold another
 expert. A copy served in place from a file mapping, or one whose owner is wider
 than its entry, is refused "host copy not pinned", REFUSED, and stays on the
-host.
+host. A host expert served in place from the loader's `SYCL_Host` chunk under
+`-lm none` is the second kind: its owner is the whole chunk.
 
 An evict is the loan's move under the named move's rules. The preparation mints
 pinned host storage for the tensor's bytes per expert, and the loan's cache body
@@ -3391,11 +3392,15 @@ never a use after free.
 
 **Contiguity.** Each KV-zone slot is one allocation. So the whole KV-zone part
 must also fit the zone's largest free block, read after the old ring is
-released. That is an estimate, not a guarantee. The TLSF allocator's
-`largest_free_block()` returns the head of its highest size class rather than a
-scanned maximum. With two or more KV-zone slots (ring depth above 1, or both
-kinds in the zone), a later allocation can take the exact-class fallback and
-miss. The check covers the single-allocation case. For the rest, the reserve
+released. That is a necessary check, not a guarantee. The TLSF allocator's
+`largest_free_block()` is the exact size of the largest free block, and with two
+or more KV-zone slots (ring depth above 1, or both kinds in the zone) the slots
+still fit it together whenever their sum does: each is a multiple of the 256-byte
+grain, a slot placed in that block is carved from its front (`split_block`) and
+leaves the rest whole, and a slot placed elsewhere leaves the block untouched.
+What the check cannot see is a change between the read and the reserve: another
+KV-zone tenant can allocate in between, and the read is not taken under the
+zone's allocator lock (llama.cpp-zvnh). Then the reserve
 fails, and the refusal says the allocator could not place the slots rather than
 naming the size it just refused. An automatic `-ub` then keeps its last
 accepted size; an explicit one fails context creation.
@@ -4103,7 +4108,7 @@ and hanging at the first graph.
 libllama; each opens `ggml_backend_sycl_compute_alloc_scope` around the call. The KV cache's K-shift graph goes through
 `lctx->sched_alloc_graph` (the K-shift's compute buffer is a scheduler compute buffer like any other), and the
 multimodal projector's scheduler, which allocates on the same buffer type, opens the same exported scope through the
-registry (`clip_sycl_compute_scope`). `tests/test-sycl-hold-ledger-source.py` pins that no bare call remains anywhere in
+registry (`mtmd_sycl_compute_scope`). `tests/test-sycl-hold-ledger-source.py` pins that no bare call remains anywhere in
 `src/`, `tools/`, `common/` or `examples/`.
 
 *Only a fit verdict lowers `-ub`.* A reserve that threw is a loss of the rung, but it starts or continues the descent
@@ -4187,8 +4192,8 @@ what the compute buffers free is the contiguous tail of the zone, not holes betw
 sizes seen on the B70 are a 39.2 MB Q8 buffer and a 61.4 MB + 24.6 MB f16 pair in a 512 MB default RUNTIME zone. If a
 layout nonetheless fragmented the zone, the failure is the clean one that already exists: the walk's `ensure_buffer`
 cannot place the buffer and the graph is refused before submission, naming the zone's free bytes. `zone_largest_free`
-is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
-would be a second heuristic beside the aggregate one rather than a contiguity proof.
+is not consulted: `largest_free_block()` is the exact size of the largest free block, but it bounds one allocation, not
+the set of planned buffers, so it would be a second check beside the aggregate one rather than a contiguity proof.
 
 *Plan inputs are per owner (llama.cpp-45qo).* The per-token and weight maxima and the `n_ubatch` are each model's own
 terms in the planned load terms' owner table (`planned-load-terms.hpp`, canonical contract 12.4), keyed by the model's

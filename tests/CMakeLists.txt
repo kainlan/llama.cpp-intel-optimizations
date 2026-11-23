@@ -1,3 +1,5 @@
+find_package(Threads REQUIRED)
+
 llama_add_compile_flags()
 
 # Intel's SYCL link step records transient icpx/ocloc objects (written under
@@ -14,8 +16,19 @@ if (CMAKE_GENERATOR STREQUAL "Ninja" AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLL
     set(CMAKE_CXX_LINK_DEPENDS_USE_LINKER FALSE)
 endif()
 
+# Optional args:
+# - LINK: libraries to link against (defaults to llama-common, which also brings llama)
 function(llama_build source)
-    set(TEST_SOURCES ${source} ${ARGN})
+    set(options)
+    set(oneValueArgs)
+    set(multiValueArgs LINK)
+    cmake_parse_arguments(LLAMA_BUILD "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    set(TEST_SOURCES ${source} ${LLAMA_BUILD_UNPARSED_ARGUMENTS})
+
+    if (NOT LLAMA_BUILD_LINK)
+        set(LLAMA_BUILD_LINK llama-common)
+    endif()
 
     if (DEFINED LLAMA_TEST_NAME)
         set(TEST_TARGET ${LLAMA_TEST_NAME})
@@ -24,7 +37,8 @@ function(llama_build source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
-    target_link_libraries(${TEST_TARGET} PRIVATE llama llama-common) # TODO: [TAG_TESTS_LLAMA_LINK]
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+    target_link_libraries(${TEST_TARGET} PRIVATE ${LLAMA_BUILD_LINK})
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
@@ -40,6 +54,10 @@ function(llama_test target)
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
     endif()
+    # Upstream writes several labels as one space-joined string ("model behavior backend"). Split it, so
+    # each is a label of its own: kept whole, the anchored `-LE '...|^model$'` of the CLAUDE.md form-2
+    # sweep would not match it and the sweep would run a model loader.
+    string(REPLACE " " ";" LLAMA_TEST_LABEL "${LLAMA_TEST_LABEL}")
     if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
         set(LLAMA_TEST_WORKING_DIRECTORY .)
     endif()
@@ -70,6 +88,10 @@ function(llama_test_cmd target)
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
     endif()
+    # Upstream writes several labels as one space-joined string ("model behavior backend"). Split it, so
+    # each is a label of its own: kept whole, the anchored `-LE '...|^model$'` of the CLAUDE.md form-2
+    # sweep would not match it and the sweep would run a model loader.
+    string(REPLACE " " ";" LLAMA_TEST_LABEL "${LLAMA_TEST_LABEL}")
     if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
         set(LLAMA_TEST_WORKING_DIRECTORY .)
     endif()
@@ -173,18 +195,27 @@ endfunction()
 # - LABEL: label for the test (defaults to main)
 # - ARGS: arguments to pass to the test executable
 # - WORKING_DIRECTORY
+# - LINK: libraries to link against (defaults to llama-common, which also brings llama)
 function(llama_build_and_test source)
     include(CMakeParseArguments)
     set(options)
     set(oneValueArgs NAME LABEL WORKING_DIRECTORY)
-    set(multiValueArgs ARGS)
+    set(multiValueArgs ARGS LINK)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
+    if (NOT LLAMA_TEST_LINK)
+        set(LLAMA_TEST_LINK llama-common)
+    endif()
+
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
     endif()
+    # Upstream writes several labels as one space-joined string ("model behavior backend"). Split it, so
+    # each is a label of its own: kept whole, the anchored `-LE '...|^model$'` of the CLAUDE.md form-2
+    # sweep would not match it and the sweep would run a model loader.
+    string(REPLACE " " ";" LLAMA_TEST_LABEL "${LLAMA_TEST_LABEL}")
     if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
         set(LLAMA_TEST_WORKING_DIRECTORY .)
     endif()
@@ -195,10 +226,11 @@ function(llama_build_and_test source)
     endif()
 
     add_executable(${TEST_TARGET} ${TEST_SOURCES})
+    target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
     if (LLAMA_TESTS_INSTALL)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
-    target_link_libraries(${TEST_TARGET} PRIVATE llama-common)
+    target_link_libraries(${TEST_TARGET} PRIVATE ${LLAMA_TEST_LINK})
 
     add_test(
         NAME ${TEST_TARGET}
@@ -220,37 +252,47 @@ endfunction()
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-coder    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-coder.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-llm      ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-llm.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-falcon            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-falcon.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-gemma-4           ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-gpt-2             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-bpe         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-spm         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-mpt               ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-phi-3.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2             ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact            ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
-llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder         ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge        LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-command-r       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-command-r.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-coder  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-coder.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-deepseek-llm    LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-deepseek-llm.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-falcon          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-falcon.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-gemma-4         LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf --check-decode)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-gpt-2           LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-bpe       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-llama-spm       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-mpt             LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-phi-3           LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-phi-3.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen2           LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-qwen35          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen35.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-refact          LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
+llama_test(test-tokenizer-0 NAME test-tokenizer-0-starcoder       LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
 if (NOT WIN32)
     llama_test_cmd(
         ${CMAKE_CURRENT_SOURCE_DIR}/test-tokenizers-repo.sh
         NAME test-tokenizers-ggml-vocabs
+        LABEL behavior
         WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-        ARGS https://huggingface.co/ggml-org/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
+        ARGS https://huggingface.co/ggml-org-dev/vocabs ${PROJECT_SOURCE_DIR}/models/ggml-vocabs
     )
 endif()
 
 if (LLAMA_LLGUIDANCE)
-    llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
+    llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build(test-recurrent-state-rollback.cpp)
-llama_build(test-save-load-state.cpp)
+# llama_context state tests: KV and recurrent state save, load, copy, rollback
+set(LLAMA_CONTEXT_TEST_SRC
+    test-llama-context.cpp
+    llama-context/cases-kv.cpp
+    llama-context/cases-rs.cpp
+    llama-context/test-case.cpp
+    llama-context/test-log.cpp
+    llama-context/test-runner.cpp
+    llama-context/test-util.cpp
+)
+llama_build(${LLAMA_CONTEXT_TEST_SRC})
 
 # llama.cpp-7fmt: the context a load holds KV room for, resolved from llama_model_params::n_ctx_hint: 0 no room, a
 # named hint as given (padded), and LLAMA_N_CTX_HINT_DEFAULT the model's default context, n_ctx_train padded as
@@ -259,54 +301,59 @@ llama_build_and_test(test-n-ctx-hint-resolve.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
-    llama_build_and_test(test-unicode.cpp)
-    llama_build_and_test(test-sampling.cpp)
-    llama_build_and_test(test-reasoning-budget.cpp)
-    llama_build_and_test(test-grammar-parser.cpp)
-    llama_build_and_test(test-grammar-integration.cpp)
-    llama_build_and_test(test-llama-grammar.cpp)
-    llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-unicode.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-sampling.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-reasoning-budget.cpp  LABEL behavior)
+    llama_build_and_test(test-grammar-parser.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-grammar-integration.cpp  LABEL behavior)
+    llama_build_and_test(test-llama-grammar.cpp  LABEL behavior  LINK llama)
+    llama_build_and_test(test-batch-alloc.cpp  LABEL behavior  LINK llama)
     llama_build_and_test(test-lazy-mode-resolve.cpp)
     llama_build_and_test(test-cpu-dispatch-buffers.cpp)
     llama_build_and_test(test-host-mem-plan.cpp)
-    llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    llama_build_and_test(test-kv-cache.cpp LABEL behavior)
+    target_include_directories(test-kv-cache PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-chat.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
-    llama_build_and_test(test-json-schema-to-grammar.cpp)
+    llama_build_and_test(test-server-component.cpp  LABEL behavior)
+    target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-component PRIVATE server-context)
+    llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()
 
-    llama_build(test-gbnf-validator.cpp)
+    llama_build(test-gbnf-validator.cpp LINK llama)
 
     # build test-tokenizer-1-bpe target once and add many tests
     llama_build(test-tokenizer-1-bpe.cpp)
 
     # TODO: disabled due to slowness
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-aquila    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-aquila.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-falcon    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-falcon.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-gpt-2     ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-gpt-neox  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-neox.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-llama-bpe ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf --ignore-merges)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-mpt       ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-refact    ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
-    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-starcoder ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-aquila     LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-aquila.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-falcon     LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-falcon.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-gpt-2      LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-2.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-gpt-neox   LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-gpt-neox.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-llama-bpe  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf --ignore-merges)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-mpt        LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-mpt.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-refact     LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-refact.gguf)
+    #llama_test(test-tokenizer-1-bpe NAME test-tokenizer-1-starcoder  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-starcoder.gguf)
 
     # build test-tokenizer-1-spm target once and add many tests
     llama_build(test-tokenizer-1-spm.cpp)
 
-    llama_test(test-tokenizer-1-spm  NAME test-tokenizer-1-llama-spm ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
-    #llama_test(test-tokenizer-1-spm  NAME test-tokenizer-1-baichuan  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-baichuan.gguf)
+    llama_test(test-tokenizer-1-spm  NAME test-tokenizer-1-llama-spm  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
+    #llama_test(test-tokenizer-1-spm  NAME test-tokenizer-1-baichuan  LABEL behavior  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-baichuan.gguf)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-    llama_build(test-llama-archs.cpp)
-
     # Gates -x/--exclude of test-llama-archs (llama.cpp-fepd). Inside this block, not beside
-    # test-archs-table below, because it calls llm_arch_from_string()/llm_arch_all() -- the same
-    # internal symbols test-llama-archs uses, and the reason for the NOT WIN32 OR NOT
-    # BUILD_SHARED_LIBS guard in the first place. It still loads no model and touches no device.
+    # test-archs-table below, because test-archs-exclude.cpp calls llm_arch_all()/llm_arch_name(),
+    # internal symbols not exported with LLAMA_API -- the reason for the NOT WIN32 OR NOT
+    # BUILD_SHARED_LIBS guard in the first place. (test-llama-archs itself now builds outside
+    # the guard: it reaches the arch tables only through the exports in src/llama-ext.h.)
+    # It still loads no model and touches no device.
     #
     # On the name: NOT test-llama-archs-exclude. Four CI workflows carry `ctest -E
     # "test-llama-archs"` and -E is an UNANCHORED regex, so that name would be swallowed by the
@@ -328,68 +375,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         # The script exits 77 (skip) when the binary it drives was not built.
         set_tests_properties(test-archs-exclude-cli PROPERTIES SKIP_RETURN_CODE 77)
     endif()
-    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
-    file(MAKE_DIRECTORY "${MODEL_DIR}")
-
-    llama_test(
-        test-llama-archs
-        NAME test-generate-models
-        LABEL main
-        ARGS -o "${MODEL_DIR}"
-    )
-    set_tests_properties(test-generate-models PROPERTIES
-        FIXTURES_SETUP generate-models
-    )
-
-    llama_test(
-        test-recurrent-state-rollback
-        LABEL main
-        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-nemotron-h
-        LABEL main
-        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-dsv4
-        LABEL main
-        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-kimi-k3
-        LABEL main
-        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-
-    # Test state save/load functionality across all architectures, using the generated dummy models
-    llama_test(
-        test-save-load-state
-        LABEL main
-        ARGS --models "${MODEL_DIR}"
-    )
-    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
-
     # H5 of llama.cpp-zhcn (structural arm): init_reserve(s) spans s streams in every memory class.
     # Loads tiny models, so it carries `model`, the label the ctest sweep (form 2 in CLAUDE.md) excludes,
-    # and is run by hand pinned to the discrete cards. Inside this block for the same reason as
-    # test-llama-archs: it uses internal symbols.
+    # and is run by hand pinned to the discrete cards. Inside this block because it uses internal
+    # symbols (src/llama-context.h and the memory classes).
     llama_build_and_test(test-context-measure-h5.cpp LABEL model)
 
     # H3i (2) and (3) of llama.cpp-zhcn: a refused allocation during a memory update reaches the
@@ -405,9 +394,74 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # The measure-only llama_context (zhcn C7h): one MEASURE on a scheduler of its own, no allocation, no
     # log lines, the real context's compute peak. CPU only, tiny synthetic models. `model` as above.
     llama_build_and_test(test-measure-context.cpp LABEL model)
-
-    llama_build(test-fusion.cpp)
 endif()
+
+llama_build(test-llama-archs.cpp)
+
+# Every test from here to test-llama-context loads a model, generates one, or needs a fixture that does, so each
+# carries `model`: the label the CLAUDE.md form-2 sweep (-LE '...|^model$') excludes, and the one
+# scripts/check-ctest-safety-net.sh counts loaders by. Upstream labels them "main behavior backend"; the helpers
+# split that string into separate labels, so `model` here is a label of its own.
+if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
+    llama_build(test-fp8.cpp)
+    set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")
+    file(MAKE_DIRECTORY "${FP8_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-fp8-models LABEL "main behavior backend model"
+        ARGS -a llama -s 1 -o "${FP8_MODEL_DIR}")
+    set_tests_properties(test-generate-fp8-models PROPERTIES FIXTURES_SETUP fp8-models)
+    llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend model"
+        ARGS --models "${FP8_MODEL_DIR}")
+    llama_test(test-fp8 NAME test-fp8-kv LABEL "main behavior backend model"
+        ARGS --models "${FP8_MODEL_DIR}" --kv)
+    set_tests_properties(test-fp8-requantize test-fp8-kv PROPERTIES FIXTURES_REQUIRED fp8-models)
+endif()
+
+set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+file(MAKE_DIRECTORY "${MODEL_DIR}")
+
+llama_test(
+    test-llama-archs
+    NAME test-generate-models
+    LABEL "main behavior backend model"
+    ARGS -o "${MODEL_DIR}"
+)
+set_tests_properties(test-generate-models PROPERTIES
+    FIXTURES_SETUP generate-models
+)
+
+# Target model for test-speculative-rejection-sampling
+set(SPEC_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-speculative-models/target")
+file(MAKE_DIRECTORY "${SPEC_TARGET_DIR}")
+llama_test(
+    test-llama-archs
+    NAME test-generate-speculative-target
+    LABEL "main model"
+    ARGS -a llama -s 999 -o "${SPEC_TARGET_DIR}"
+)
+set_tests_properties(
+    test-generate-speculative-target
+    PROPERTIES FIXTURES_SETUP speculative-model
+)
+
+# To avoid recreating the model use the fixture exclude any option:
+# -FA "^speculative-model$"
+llama_build_and_test(test-speculative-rejection-sampling.cpp LABEL "main model" ARGS
+    -m "${SPEC_TARGET_DIR}/llama-dense.gguf")
+set_tests_properties(test-speculative-rejection-sampling PROPERTIES FIXTURES_REQUIRED speculative-model)
+
+# Test context state handling across all architectures, using the generated dummy models
+llama_test(
+    test-llama-context
+    LABEL "main behavior backend model"
+    ARGS --models "${MODEL_DIR}"
+)
+# abort on graph reallocations that the initial reserve should have covered
+set_tests_properties(test-llama-context PROPERTIES
+    FIXTURES_REQUIRED generate-models
+    ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
+)
+
+llama_build(test-fusion.cpp)
 
 # Gates the results table of test-llama-archs against the log output it shares a stream with
 # (llama.cpp-to9m). Registered unconditionally and outside the block above: it drives the
@@ -833,37 +887,50 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_link_libraries(test-sycl-moe-routing-device-oracle PRIVATE llama-common)
 endif()
 
-llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
-llama_build_and_test(test-jinja.cpp)
-llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
-llama_build_and_test(test-json-schema.cpp)
-llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-llama_build_and_test(test-chat-template.cpp)
+llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)
+llama_build_and_test(test-jinja.cpp  LABEL behavior)
+llama_test(test-jinja  NAME test-jinja-py  ARGS -py  LABEL "python behavior")
+llama_test_cmd(python3
+    NAME test-conversion-fp8
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_conversion_fp8.py -v
+)
+llama_test_cmd(python3
+    NAME test-kv-cache-scales
+    LABEL "python behavior"
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    ARGS -m unittest discover -s tests -p test_kv_cache_scales.py -v
+)
+llama_build_and_test(test-json-schema.cpp  LABEL behavior)
+llama_build_and_test(test-chat-auto-parser.cpp  LABEL behavior  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-chat-template.cpp  LABEL behavior)
 # debug tool for chat template differential analysis (not registered as a test, run it manually)
 llama_build(test-chat-analysis.cpp)
-llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-log.cpp  LABEL behavior)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp
     peg-parser/test-basic.cpp
     peg-parser/test-gbnf-generation.cpp
     peg-parser/test-json-parser.cpp
-    peg-parser/test-json-serialization.cpp
     peg-parser/test-python-dict-parser.cpp
     peg-parser/test-unicode.cpp
     peg-parser/tests.h
+    LABEL behavior
 )
 
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
-    set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
+    set(MODEL_NAME "stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
 else()
-    set(MODEL_NAME "tinyllamas/stories15M-be.Q4_0.gguf")
+    set(MODEL_NAME "stories15M-be.Q4_0.gguf")
     set(MODEL_HASH "SHA256=9aec857937849d976f30397e97eb1cabb53eb9dcb1ce4611ba8247fb5f44c65d")
 endif()
 set(MODEL_DEST "${CMAKE_BINARY_DIR}/${MODEL_NAME}")
 
 add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
+    -DREPO=ggml-org-dev/stories15M
     -DDEST=${MODEL_DEST}
     -DNAME=${MODEL_NAME}
     -DHASH=${MODEL_HASH}
@@ -927,6 +994,12 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-row-workers-source.py --self-test)
     set_tests_properties(test-sycl-cpu-row-workers-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # The CPU row kernels and cpu_mul_mat's vec_dot path ask cpu_dispatch_src1_q_fits, the one
+    # src1_q bound, before they quantize activations into it. WITH --self-test.
+    add_test(NAME test-sycl-cpu-dispatch-src1-q-bound-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-dispatch-src1-q-bound-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-dispatch-src1-q-bound-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 30)
     # Every CPU expert pool job stamp is taken inside a trace guard, the trace line
     # carries the six per-token sums, and =2 is the only per-job printer
     # (llama.cpp-j6jf). Run WITH --self-test so each pin is proven to catch its mutant.
@@ -1306,8 +1379,15 @@ if (GGML_SYCL)
     endif()
 endif()
 
-llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
+# the context state cases against a real model, the sweep above uses the generated dummy ones
+llama_test(test-llama-context  NAME test-llama-context-model  LABEL "model behavior backend"  ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-llama-context-model PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+# `model`: it loads the downloaded model, so the form-2 sweep must leave it out (it is also excluded by name there).
+llama_build_and_test(test-thread-safety.cpp  LABEL "main backend model"  ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 # NOTE (llama.cpp-u7vj): this test used to pin GGML_SYCL_DISABLE_GRAPH=1 here.
 # That pin was a workaround for a production defect, and the comment justifying
 # it blamed the wrong mechanism -- it read as though graph replay itself held
@@ -1371,13 +1451,13 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
-llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
 # llama.cpp-y8xv quality round 1, Q5: host-only test for the -ub range
 # parser hoisted into tools/llama-bench/llama-bench-parse.hpp -- pulls in
 # only that header, not llama-bench itself.
 llama_build_and_test(test-llama-bench-parse.cpp)
 target_include_directories(test-llama-bench-parse PRIVATE ${PROJECT_SOURCE_DIR}/tools/llama-bench)
-llama_build_and_test(test-model-resolution.cpp)
+llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
@@ -2078,7 +2158,7 @@ if (NOT WIN32)
     set_property(TEST test-skip-policy PROPERTY
         ENVIRONMENT "LLAMA_TEST_SKIP_BINARY=$<TARGET_FILE:test-autorelease>")
 
-    # Gate for the single _gzip exclusion predicate in tools/ui/CMakeLists.txt,
+    # Gate for the single _gzip exclusion predicate in ui/apps/chat/CMakeLists.txt,
     # which is consumed by both list(FILTER ... REGEX) and if(... MATCHES). It
     # was two hand-written patterns and they drifted, so a real directory merely
     # beginning "_gzip" was silently dropped from the watch while its files
@@ -2094,7 +2174,7 @@ if (NOT WIN32)
         ${CMAKE_COMMAND}
         NAME test-ui-gzip-exclude
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+        ARGS -DUI_CMAKE=${PROJECT_SOURCE_DIR}/ui/apps/chat/CMakeLists.txt
              -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-gzip-exclude.cmake
     )
     set_tests_properties(test-ui-gzip-exclude PROPERTIES
@@ -2102,7 +2182,7 @@ if (NOT WIN32)
         TIMEOUT 60
     )
 
-    # Gate for the UI bundle version order in tools/ui/ui-version.cmake: env
+    # Gate for the UI bundle version order in ui/apps/chat/ui-version.cmake: env
     # overrides, then the committed pin, then the build-number derivation. Without
     # the pin the build embeds the floating bundle, which can stop matching this
     # tree's server code at any time.
@@ -2110,8 +2190,8 @@ if (NOT WIN32)
         ${CMAKE_COMMAND}
         NAME test-ui-version-pin
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/ui-version.cmake
-             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/tools/ui/CMakeLists.txt
+        ARGS -DUI_VERSION_CMAKE=${PROJECT_SOURCE_DIR}/ui/apps/chat/ui-version.cmake
+             -DUI_CMAKE=${PROJECT_SOURCE_DIR}/ui/apps/chat/CMakeLists.txt
              -P ${CMAKE_CURRENT_SOURCE_DIR}/test-ui-version-pin.cmake
     )
     set_tests_properties(test-ui-version-pin PROPERTIES
@@ -2880,6 +2960,18 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kernel-profiler-source-binbcast.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
+    # A recorded bin-broadcast reads a staged graph input instead of raw-staging host memory. A main()-only script:
+    # llama_test_pytest would collect no tests and fail with pytest's exit 5.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-binbcast-graph-input-staging-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-binbcast-graph-input-staging-source.py
+    )
+    set_tests_properties(test-sycl-binbcast-graph-input-staging-source PROPERTIES
+        LABELS "sycl;python;source-assert"
         TIMEOUT 120
     )
     llama_test_pytest(
@@ -4014,33 +4106,46 @@ endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
-  llama_build_and_test(test-opt.cpp)
+  llama_build_and_test(test-opt.cpp  LABEL "main behavior backend"  LINK ggml)
+endif()
+if (GGML_METAL AND NOT GGML_BACKEND_DL)
+    # calls the Metal backend's graph optimizer and fusion table directly
+    llama_build_and_test(test-metal-graph-optimize.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
 
-# TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
-llama_build(test-backend-ops.cpp)
+llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
-llama_build_and_test(test-tiled-mulmat.cpp)
-llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
-llama_build_and_test(test-autorelease.cpp       LABEL "model")
-llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+llama_build_and_test(test-backend-tensor.cpp LINK ggml)
+llama_build_and_test(test-sleep.cpp LINK ggml)
+llama_build_and_test(test-backend-sched.cpp LINK ggml)
 
-# Test for state restore with fragmented KV cache
-# Requires a model, uses same args pattern as test-thread-safety
-llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (BUILD_SHARED_LIBS)
+    llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
+    target_compile_definitions(test-llama-mmap PRIVATE LLAMA_BUILD)
+else()
+    llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
+endif()
+
+llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
+llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
+llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
+llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
 
 if (APPLE)
     llama_build(test-rset-release.cpp)
+    llama_build_and_test(test-host-buffer-release.cpp LINK ggml)
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
-    llama_build_and_test(test-barrier.cpp)
-    llama_build_and_test(test-quantize-fns.cpp)
-    llama_build_and_test(test-quantize-perf.cpp)
-    llama_build_and_test(test-rope.cpp)
-    llama_build_and_test(test-col2im-1d.cpp)
+    llama_build_and_test(test-barrier.cpp  LABEL "main behavior"  LINK ggml)
+    llama_build_and_test(test-quantize-fns.cpp  LABEL "main behavior"  LINK ggml)
+    llama_build_and_test(test-quantize-perf.cpp  LABEL "main behavior backend"  LINK ggml)
+    llama_build_and_test(test-rope.cpp  LABEL "main behavior backend"  LINK ggml)
+    llama_build_and_test(test-col2im-1d.cpp  LABEL "main behavior backend"  LINK ggml)
+    llama_build_and_test(test-conv-1d.cpp  LABEL "main behavior backend"  LINK ggml)
+    llama_build_and_test(test-gelu-quick.cpp  LABEL "main behavior backend"  LINK ggml)
 
     # RESTORED (llama.cpp-0igs): 3c8f296fd:258 had this immediately above
     # test-rope, inside this same NOT GGML_BACKEND_DL guard -- it uses the
@@ -4072,13 +4177,9 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
 endif()
 
 # libmtmd
-set(LLAMA_TEST_NAME test-mtmd-c-api)
-llama_build_and_test(test-mtmd-c-api.c)
-target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
-unset(LLAMA_TEST_NAME)
+llama_build_and_test(test-mtmd-c-api.c  LABEL behavior  LINK mtmd)
 
-llama_build_and_test(test-mtmd-impl.cpp)
-target_link_libraries(test-mtmd-impl PRIVATE mtmd)
+llama_build_and_test(test-mtmd-impl.cpp  LABEL behavior  LINK mtmd llama-common)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -4091,10 +4192,10 @@ if (TARGET cpp-httplib)
 
         add_executable(test-gguf-model-data test-gguf-model-data.cpp)
         target_link_libraries(test-gguf-model-data PRIVATE gguf-model-data llama-common)
-        llama_test(test-gguf-model-data LABEL "model")
+        llama_test(test-gguf-model-data  LABEL "model behavior")
 
         # test-quant-type-selection requires gguf-model-data for remote model metadata
-        llama_build_and_test(test-quant-type-selection.cpp LABEL "model")
+        llama_build_and_test(test-quant-type-selection.cpp  LABEL "model behavior"  LINK llama)
         target_link_libraries(test-quant-type-selection PRIVATE gguf-model-data)
         target_compile_definitions(test-quant-type-selection PRIVATE
             SNAPSHOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/snapshots")
@@ -4108,10 +4209,10 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
-    llama_build_and_test(test-gguf.cpp)
+    llama_build_and_test(test-gguf.cpp  LABEL behavior  LINK ggml)
 
     # Needs non-public ggml{,-backend}-impl.h
-    llama_build_and_test(test-alloc.cpp)
+    llama_build_and_test(test-alloc.cpp  LABEL "behavior backend"  LINK ggml)
 
     # The scheduler's chunk query and its clean failure on a refused buffer.
     # Both need ggml-backend-impl.h for the dummy backend's interface structs
@@ -4335,6 +4436,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mapped-loader-source.py --self-test)
     set_tests_properties(test-sycl-mapped-loader-source PROPERTIES
         LABELS "sycl;host;source-contract;python" TIMEOUT 120)
+    # On a load that does not map files the loader's SYCL_Host buffer is a charged host term, owned by the model, and
+    # S1-PRELOAD serves host experts from it in place; a host expert with no owner refuses the load. A plain script:
+    # --self-test requires each witness mutant to be caught.
+    add_test(NAME test-sycl-loader-in-place-source
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-loader-in-place-source.py --self-test)
+    set_tests_properties(test-sycl-loader-in-place-source PROPERTIES
+        LABELS "sycl;host;source-contract;python;hostonly" TIMEOUT 120)
     # docs/design/sycl-mmap-host-tier.md §7 C4: every test the C4 section names is registered exactly once, read from
     # the design's own list; with --load-log, the mapped load's DMA staging pool reads 0.0 MB. A plain script whose
     # planted controls (one registration removed, one doubled, the section gone) run on every invocation.
@@ -5237,7 +5345,8 @@ endif()
 
 # zhcn C7f: setter classification (design gate 16, section 2.3). Every
 # llama_context::set_* definition is classified as reserving, measured or none,
-# and the row's contract is pinned on its body; set_warmup reserves on change.
+# and the row's contract is pinned on its body; the layer_inp_dev, nextn_dev and
+# ctx_state_src setters reserve only on a change (set_warmup carried that pin until upstream removed warmup).
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-setter-classification-source

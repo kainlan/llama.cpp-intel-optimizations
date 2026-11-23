@@ -734,8 +734,6 @@ DOC_ROW_MAP = {
 DOC_DRIFT = {
     ("`gs:48244`", "holder"): "the job slot is the TP worker's own w.results[layer], not a g_tp_* global; the TP sync "
                               "still consumes and clears it",
-    ("`gs:42652`, `in_model_load`", "owner"): "the MODEL row carries its weight buffer's BUFFER owner, checked at that "
-                                              "buffer's free_buffer: the deviation ggml_sycl_host_buft_intent records",
     ("`gs:57652`", "row"): "the MoE ids cache makes no host request in this tree",
     ("`cpu-expert-pool.cpp:77`", "row"): "the CpuExpertPool ring is gone: cpu-expert-pool.cpp makes no host request, "
                                          "and the pool holds only its workers",
@@ -911,9 +909,11 @@ def _tree_doc_view(row: dict, cls: str, variant: int):
     n = len(row["role"].split("|"))
     if cls == "CALLERS":
         return {"role": "caller's", "zone": row["zone"], "lifetime": "caller's", "owner": "caller's"}
-    owner = "none until llama.cpp-30r1" if cls == "UNOWNED" else "BUFFER" if cls == "BUILDER" else \
-        _variants(row["owner"], n)[variant]
     lifetime = _variants(row["lifetime"], n)[variant]
+    # The builder's alloc_buffer mints the owner: the loading model's for a model load's chunk, else the buffer's.
+    builder_owner = "MODEL" if lifetime == "MODEL" else "BUFFER"
+    owner = "none until llama.cpp-30r1" if cls == "UNOWNED" else builder_owner if cls == "BUILDER" else \
+        _variants(row["owner"], n)[variant]
     return {"role": row["role"].split("|")[variant], "zone": _variants(row["zone"], n)[variant],
             "lifetime": "GRAPH" if lifetime == "-" else lifetime, "owner": owner}
 
@@ -1009,7 +1009,8 @@ def clause_select_zone(texts: dict) -> list:
 
 
 def clause_owners(texts: dict) -> list:
-    """§7 C4: every non-GRAPH row names an owner; the builder's rows get the buffer's, minted by its alloc_buffer."""
+    """§7 C4: every non-GRAPH row names an owner; the builder's rows get the buffer's, minted by its alloc_buffer,
+    except a model load's SYCL_Host chunk (lifetime MODEL), which gets the loading model's (§4.4 "Lifetimes")."""
     fails = []
     want = table_rows()
     for key, row in sorted(_rows_by_key(texts).items()):
@@ -1026,8 +1027,14 @@ def clause_owners(texts: dict) -> list:
             if owner == "-":
                 fails.append(f"owner: {key} at line {row['line']} is lifetime {life} and names no owner")
     alloc = _body(texts, GS, "ggml_sycl_host_buft_alloc")
-    if not re.search(r"\bintent\s*\.\s*owner\s*=\s*\{\s*(?:ggml_sycl::)?alloc_owner_kind::BUFFER\b", alloc):
-        fails.append("owner: ggml_sycl_host_buft_alloc does not mint the builder rows' BUFFER owner")
+    ref = r"(?:ggml_sycl::)?alloc_owner_ref\s*\{\s*(?:ggml_sycl::)?alloc_owner_kind::"
+    if not re.search(r"\bintent\s*\.\s*owner\s*=\s*model_id\s*!=\s*0\s*\?\s*" + ref + r"MODEL\s*,\s*model_id\s*\}\s*:\s*"
+                     + ref + r"BUFFER\s*,\s*owner_id\s*\}\s*;", alloc):
+        fails.append("owner: ggml_sycl_host_buft_alloc does not mint the builder rows' BUFFER owner, or the loading "
+                     "model's for a model load's chunk")
+    if not re.search(r"\bmodel_id\s*=\s*intent\s*\.\s*lifetime\s*==\s*(?:ggml_sycl::)?alloc_lifetime::MODEL\s*\?\s*"
+                     r"ggml_sycl_loading_model_id\s*\(\s*\)\s*:\s*0\s*;", alloc):
+        fails.append("owner: ggml_sycl_host_buft_alloc names a model owner for a row that is not lifetime MODEL")
     for kind in ("HOST", "KV_HOST"):
         n = len(re.findall(r"ggml_sycl_host_buft_alloc\s*\([^;]*ggml_sycl_host_buft_intent\s*\(\s*"
                            r"ggml_sycl_host_buft_kind::" + kind + r"\s*\)", _src(texts, GS).bare))
@@ -1693,9 +1700,16 @@ def clause_context_wiring(texts: dict) -> list:
             fails.append(f"context wiring: llama_context does not resolve ggml_backend_sycl_{name}")
     if fails:
         return fails
+    # llama_context::sched_new is where a scheduler is built: it neither reserves nor begins, so its callers are the
+    # creation sites a begin must follow, as a direct ggml_backend_sched_new would be.
+    factory = "llama_context::sched_new"
     for f in s.functions:
         body = s.bare[f["open"]:f["close"]]
-        for m in re.finditer(r"\bggml_backend_sched_new\s*\(", body):
+        if f["name"] == factory:
+            if re.search(r"\bgraph_reserve\s*\(", body):
+                fails.append(f"context wiring: {factory} reserves before any caller can begin")
+            continue
+        for m in re.finditer(r"\b(?:ggml_backend_)?sched_new\s*\(", body):
             nxt_reserve = re.search(r"\bgraph_reserve\s*\(", body[m.end():])
             nxt_begin = re.search(r"\b" + re.escape(ptr["begin_host_holders"]) + r"\s*\(", body[m.end():])
             if not nxt_begin or (nxt_reserve and nxt_reserve.start() < nxt_begin.start()):
@@ -1906,7 +1920,7 @@ def clause_trial_ops(texts: dict) -> list:
     path = _sched_path(texts)
     im = path["reserve"] if path else None
     lo2 = path["reserve_lo"] if path else 0
-    retry = re.search(r"\bpipeline_parallel\s*=\s*false\s*;[^;]*?\bggml_backend_sched_new\s*\(",
+    retry = re.search(r"\bpipeline_parallel\s*=\s*false\s*;[^;]*?\b(?:ggml_backend_)?sched_new\s*\(",
                       code[lo2:im["close"]]) if im else None
     failed = [p for p, _ in _reserves(s, lo2, lo2 + retry.start())] if retry else []
     if not failed:
@@ -2213,7 +2227,7 @@ _CAND_COMMIT = ("        for (auto & sb : sycl_backends) {\n"
                 "            }\n"
                 "        }\n")
 _RENOTIFY = ("        if (!measure_only && sycl_dev0 && sycl_host_hooks.notify_host_buffer_sizes && "
-             "!model.hparams.no_alloc) {\n"
+             "!model.no_alloc()) {\n"
              "            sycl_host_compute_bytes =\n"
              "                llama_context_sycl_host_compute_allocated(model, sched.get(), backend_ptrs, "
              "backend_buft);\n"
@@ -2261,10 +2275,12 @@ _BEGIN = ("    if (sycl_host_hooks.begin_host_holders) {\n"
           "        sycl_host_hooks.begin_host_holders(state.sched.get());\n"
           "    }\n")
 _BEGIN_0_NOTE = "    // scheduler's compute buffers, and the walks of this reserve fill the pending plans afresh.\n"
-_SCHED_NEW_0 = ("    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), "
-                "backend_ptrs.size(), max_nodes,\n"
-                "                                             state.cparams.pipeline_parallel, "
-                "state.cparams.op_offload));\n")
+_SCHED_REALLOC_CB = "    ggml_backend_sched_set_realloc_callback(state.sched.get(), sched_graph_realloc, this);\n"
+_SCHED_NEW_0 = ("    sched_new(state, {\n"
+                "        /*.max_nodes  =*/ max_nodes,\n"
+                "        /*.parallel   =*/ state.cparams.pipeline_parallel,\n"
+                "        /*.op_offload =*/ state.cparams.op_offload,\n"
+                "    });\n")
 _MEASURE_CALL = "    sycl_host_measure();\n\n"
 _MEASURE_NOTIFY = ("        if (!measure_only) {  // a measure-only context resolves no hooks and prints nothing a "
                    "vehicle arm scores\n"
@@ -2363,9 +2379,13 @@ MUTANTS = [
     ("owner-dropped", "owners", [(GS, _TENANT_OWNER, "")],
      "('ggml-sycl.cpp', 'ggml_sycl_reserve_host_tenants', 1) at line"),
     ("owner-builder-not-buffer", "owners",
-     [(GS, "    intent.owner                       = { ggml_sycl::alloc_owner_kind::BUFFER, owner_id };\n",
-       "    intent.owner                       = { ggml_sycl::alloc_owner_kind::DEVICE, owner_id };\n")],
+     [(GS, "ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::BUFFER, owner_id };\n",
+       "ggml_sycl::alloc_owner_ref{ ggml_sycl::alloc_owner_kind::DEVICE, owner_id };\n")],
      "ggml_sycl_host_buft_alloc does not mint the builder rows' BUFFER owner"),
+    ("owner-builder-model-for-every-row", "owners",
+     [(GS, "model_id = intent.lifetime == ggml_sycl::alloc_lifetime::MODEL ? ggml_sycl_loading_model_id() : 0;\n",
+       "model_id = ggml_sycl_loading_model_id();\n")],
+     "names a model owner for a row that is not lifetime MODEL"),
     ("unowned-row-added", "unowned-ratchet",
      [(GS, _TENANT_LIFETIME + _TENANT_OWNER, _TENANT_LIFETIME.replace("CONTEXT", "UNOWNED") + _TENANT_OWNER)],
      "carries UNOWNED and is not one of the site table's 12 lines"),
@@ -2539,6 +2559,9 @@ MUTANTS = [
      [(PLAN, _UNPLANNED_POOLS, "        d.dims = host_pool_scan(graph, host_pool_has_storage, nullptr);\n"
                                "        return d;\n")],
      "the pools' init is sized from 'd.dims = host_pool_scan("),
+    ("wiring-factory-reserves", "context-wiring",
+     [(LC, _SCHED_REALLOC_CB, _SCHED_REALLOC_CB + "    graph_reserve(state, 1, 1, 1, nullptr);\n")],
+     "llama_context::sched_new reserves before any caller can begin"),
     ("wiring-retry-unbegun", "context-wiring", [(LC, _RETRY_BEGIN, "")],
      "creates a scheduler and reserves before the begin entry"),
     ("wiring-begin-before-creation", "context-wiring",

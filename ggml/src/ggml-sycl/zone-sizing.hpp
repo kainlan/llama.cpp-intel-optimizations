@@ -629,7 +629,7 @@ bool zone_unified_pp_draws_dequant(bool primary_unified,
                                    bool scratch_supplies);
 
 // Whether the graph-entry walk counts a node toward the planned f16 dequant buffers. Two arms can draw them and they
-// do not share a precision condition: the legacy f16 arm only runs for GGML_PREC_DEFAULT, the unified kernel's
+// do not share a precision condition: the legacy f16 arm only runs for GGML_PREC_UNDEFINED, the unified kernel's
 // oneDNN f16 route has no precision check at all. A walk that filtered every node on precision first would leave
 // an F32-precision node the unified route draws for unsized (growth, or a plan-breach abort where the old pool copy
 // degraded silently). Pure.

@@ -24,11 +24,8 @@ bool ggml_op_can_inplace(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FILL:
         case GGML_OP_SCALE:
-        case GGML_OP_DIAG_MASK_ZERO:
-        case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
-        case GGML_OP_ADD1:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -655,6 +652,17 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+
+                // a node lives in the buffer it was assigned: a parent in another buffer (another backend's, for
+                // instance a host input a device backend reads in place) would move the node's output there. Ids
+                // that share a buffer type share one allocator (ggml_gallocr_new_n), so they are one buffer here.
+                // p_hn->buffer_id is set: a view parent is never own (galloc does not allocate views), so the
+                // is_own check above skipped it
+                if (galloc->buf_tallocs[p_hn->buffer_id] != galloc->buf_tallocs[buffer_id]) {
+                    AT_PRINTF("not reusing parent %s for %s as it is in another buffer\n", parent->name, node->name);
+                    continue;
+                }
+
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
@@ -819,6 +827,26 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
                 }
             }
             AT_PRINTF("\n");
+        }
+
+        // a node that is not computed and that nothing consumes (the dead end of an unselected
+        // ggml_build_forward_select branch) never needs its memory: nothing frees a node without consumers,
+        // so it would stay allocated to the end of the graph and pin the buffer layout, which grows the
+        // peak by far more than its own size when a larger tensor later has to be placed past it
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+            if (hn->n_children == 0 && hn->n_views == 0) {
+                if (ggml_impl_is_view(node)) {
+                    struct ggml_tensor * view_src    = node->view_src;
+                    struct hash_node *   view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+                    view_src_hn->n_views -= 1;
+                    if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
+                        ggml_gallocr_free_node(galloc, view_src);
+                    }
+                } else if (hn->allocated) {
+                    ggml_gallocr_free_node(galloc, node);
+                }
+            }
         }
     }
 }
@@ -1151,131 +1179,55 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
 
 // utils
 
-static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {
-    for (size_t i = 0; i < *n_buffers; i++) {
-        ggml_backend_buffer_free((*buffers)[i]);
+static struct ggml_tensor ** ggml_backend_alloc_ctx_tensors_from_buft_collect(
+        struct ggml_context * ctx, int * n_tensors) {
+    int n = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        n++;
     }
-    free(*buffers);
+    *n_tensors = n;
+    if (n == 0) {
+        return NULL;
+    }
+
+    struct ggml_tensor ** tensors = (struct ggml_tensor **) malloc(n * sizeof(struct ggml_tensor *));
+    if (tensors == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, n * sizeof(struct ggml_tensor *));
+        return NULL;
+    }
+    int i = 0;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        tensors[i++] = t;
+    }
+    return tensors;
 }
 
-static bool alloc_tensor_range(struct ggml_context * ctx,
-        struct ggml_tensor * first, struct ggml_tensor * last,
-        ggml_backend_buffer_type_t buft, size_t size,
-        ggml_backend_buffer_t ** buffers, size_t * n_buffers) {
-
-    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
-    if (buffer == NULL) {
-        GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
-        free_buffers(buffers, n_buffers);
-        return false;
-    }
-
-    *buffers = realloc(*buffers, sizeof(ggml_backend_buffer_t) * (*n_buffers + 1));
-    (*buffers)[(*n_buffers)++] = buffer;
-
-    struct ggml_tallocr tallocr = ggml_tallocr_new(buffer);
-
-    for (struct ggml_tensor * t = first; t != last; t = ggml_get_next_tensor(ctx, t)) {
-        enum ggml_status status = GGML_STATUS_SUCCESS;
-        if (t->data == NULL) {
-            if (t->view_src == NULL) {
-                status = ggml_tallocr_alloc(&tallocr, t);
-            } else if (t->buffer == NULL) {
-                status = ggml_backend_view_init(t);
-            }
-        } else {
-            if (t->view_src != NULL && t->buffer == NULL) {
-                // view of a pre-allocated tensor
-                status = ggml_backend_view_init(t);
-            }
-        }
-        if (status != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("%s: failed to initialize tensor %s\n", __func__, t->name);
-            free_buffers(buffers, n_buffers);
-            return false;
-        }
-    }
-
-    return true;
-}
-
-static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
-        struct ggml_context * ctx, ggml_backend_buffer_type_t buft, size_t * nbytes_total, bool no_alloc) {
+ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_get_no_alloc(ctx) == true);
 
-    size_t alignment = ggml_backend_buft_get_alignment(buft);
-    size_t max_size = ggml_backend_buft_get_max_size(buft);
-
-    ggml_backend_buffer_t * buffers = NULL;
-    size_t n_buffers = 0;
-    *nbytes_total = 0;
-
-    size_t cur_buf_size = 0;
-    struct ggml_tensor * first = ggml_get_first_tensor(ctx);
-    for (struct ggml_tensor * t = first; t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-        size_t this_size = 0;
-        if (t->data == NULL && t->view_src == NULL) {
-            this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
-        }
-
-        if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
-            // allocate tensors in the current buffer
-            if (!no_alloc && !alloc_tensor_range(ctx, first, t, buft, cur_buf_size, &buffers, &n_buffers)) {
-                return NULL;
-            }
-            first = t;
-            *nbytes_total += cur_buf_size;
-            cur_buf_size = this_size;
-        } else {
-            cur_buf_size += this_size;
-        }
-    }
-
-    // allocate remaining tensors
-    if (cur_buf_size > 0) {
-        *nbytes_total += cur_buf_size;
-        if (!no_alloc && !alloc_tensor_range(ctx, first, NULL, buft, cur_buf_size, &buffers, &n_buffers)) {
-            return NULL;
-        }
-    }
-
-    if (no_alloc) {
+    int n_tensors = 0;
+    struct ggml_tensor ** tensors = ggml_backend_alloc_ctx_tensors_from_buft_collect(ctx, &n_tensors);
+    if (tensors == NULL) {
         return NULL;
     }
 
-    if (n_buffers == 0) {
-#ifndef NDEBUG
-        GGML_LOG_DEBUG("%s: all tensors in the context are already allocated\n", __func__);
-#endif
-        GGML_ASSERT(!buffers);
-        return NULL;
-    }
-
-    ggml_backend_buffer_t buffer;
-    if (n_buffers == 1) {
-        buffer = buffers[0];
-    } else {
-        buffer = ggml_backend_multi_buffer_alloc_buffer(buffers, n_buffers);
-    }
-    if (buffers) {
-        free(buffers); // can be NULL if context is empty or no_alloc
-    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer_n(buft, tensors, n_tensors);
+    free(tensors);
     return buffer;
 }
 
 size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
-    size_t nbytes_total = 0;
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft_impl(ctx, buft, &nbytes_total, /*no_alloc=*/ true);
-    GGML_ASSERT(!buf);
-    return nbytes_total;
-}
+    GGML_ASSERT(ggml_get_no_alloc(ctx) == true);
 
-ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
-    size_t nbytes_total = 0;
-    if (ggml_backend_buft_is_meta(buft)) {
-        return ggml_backend_meta_alloc_ctx_tensors_from_buft(ctx, buft);
+    int n_tensors = 0;
+    struct ggml_tensor ** tensors = ggml_backend_alloc_ctx_tensors_from_buft_collect(ctx, &n_tensors);
+    if (tensors == NULL) {
+        return 0;
     }
-    return ggml_backend_alloc_ctx_tensors_from_buft_impl(ctx, buft, &nbytes_total, /*no_alloc =*/ false);
+
+    size_t nbytes_total = ggml_backend_buft_get_alloc_size_n(buft, tensors, n_tensors);
+    free(tensors);
+    return nbytes_total;
 }
 
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {

@@ -166,7 +166,8 @@ if [ "${1:-}" = "--list-devices" ]; then
 fi
 case "${STUB_MISTRAL_MODE:-pass}" in
     pass)
-        printf "1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
+        # the real shape: the SPM dummy prefix is echoed as a leading space
+        printf " 1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n"
         exit 0
         ;;
     abort)

@@ -75,17 +75,17 @@ def resolve_ok(code: str) -> bool:
     ]
     if not all(z(n) in b for n in needed):
         return False
-    # the headers of the three groups, as upstream printed them
+    # the headers of the two groups, as upstream prints them (upstream removed the Gated Delta Net and Lightning
+    # Indexer groups in the 19bc41dbb merge; the top-k mask group came in with it)
     for header in (
-        '"resolving fused Gated Delta Net support:"',
-        '"resolving fused Lightning Indexer support:"',
         '"resolving fused DeepSeek V4 HC support:"',
+        '"resolving fused top-k mask support:"',
     ):
         if b.count(z(header)) != 1:
             return False
     # every probe has its own entry id
     for entry in (
-        "FA", "GDN_AR", "GDN_CH", "LID", "HC_PRE", "HC_COMB", "HC_POST",
+        "FA", "KV_ROWS", "HC_PRE", "HC_COMB", "HC_POST", "TKM",
     ):
         if len(re.findall(rf"FUSED_RESOLUTION_ENTRY_{entry}\b", b)) != 1:
             return False
@@ -106,8 +106,9 @@ def test_resolve_mutants():
         ("a log statement restored", "enabled = entry.enabled;", 'LLAMA_LOG_INFO("%s enabled\\n", probe.name); enabled = entry.enabled;'),
         ("the upstream func restored", "const uint32_t n_tokens_probe = probe.n_tokens_per_seq * n_seqs;", "const char * func = __func__; const uint32_t n_tokens_probe = probe.n_tokens_per_seq * n_seqs;"),
         ("the record never written", "resolution.entry[id] = entry;", ""),
-        ("a header never recorded", 'start_group(FUSED_RESOLUTION_ENTRY_LID_HEADER, "resolving fused Lightning Indexer support:");', ""),
-        ("two probes share an entry", "resolve(llm_fused_op_gdn_ch_probe, state.cparams.fused_gdn_ch, FUSED_RESOLUTION_ENTRY_GDN_CH);", "resolve(llm_fused_op_gdn_ch_probe, state.cparams.fused_gdn_ch, FUSED_RESOLUTION_ENTRY_GDN_AR);"),
+        ("a header never recorded", 'start_group(FUSED_RESOLUTION_ENTRY_TKM_HEADER, "resolving fused top-k mask support:");', ""),
+        ("two probes share an entry", "resolve(llm_fused_op_dsv4_hc_comb_probe, state.cparams.fused_dsv4_hc_comb, FUSED_RESOLUTION_ENTRY_HC_COMB);", "resolve(llm_fused_op_dsv4_hc_comb_probe, state.cparams.fused_dsv4_hc_comb, FUSED_RESOLUTION_ENTRY_HC_PRE);"),
+        ("the K/V rows probe shares the FA entry", "resolve(llm_fused_op_flash_attn_kv_rows_probe, state.cparams.fused_kv_rows, FUSED_RESOLUTION_ENTRY_KV_ROWS);", "resolve(llm_fused_op_flash_attn_kv_rows_probe, state.cparams.fused_kv_rows, FUSED_RESOLUTION_ENTRY_FA);"),
     ]
     for name, old, new in mutants:
         assert not resolve_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"

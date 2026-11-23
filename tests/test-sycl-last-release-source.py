@@ -84,13 +84,24 @@ UH = code(UH_RAW)
 
 
 def block_at(text: str, start: int) -> str:
-    """The brace block that opens at the first '{' at or after `start`, skipping string and char literals."""
+    """The brace block that opens at the first '{' at or after `start`, skipping comments and string and char literals.
+
+    Raw source reaches it too (a check that reads a comment), where an apostrophe in a comment is not a char literal.
+    """
     o = text.find("{", start) if start >= 0 else -1
     if o == -1:
         return ""
     depth, i = 0, o
     while i < len(text):
         c = text[i]
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = len(text) if j == -1 else j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = len(text) if j == -1 else j + 2
+            continue
         if c in "\"'":
             j = i + 1
             while j < len(text) and text[j] != c:
@@ -589,6 +600,11 @@ def test_last_resort_comment_says_why():
     assert check_last_resort_comment(GS_RAW) == []
 
 
+def test_block_at_reads_raw_source_past_a_comment_apostrophe():
+    src = "void f() { // the loader's buffer\n    g(); /* it's { */ }\nint x = '}';"
+    assert block_at(src, 0) == "{ // the loader's buffer\n    g(); /* it's { */ }"
+
+
 # ---- mutation witnesses: each applies the regression its check guards ----
 
 
@@ -880,6 +896,15 @@ def test_witness_last_resort_comment_without_why():
     k = GS_RAW.find(LAST_RESORT_SIG)
     assert k != -1
     assert check_last_resort_comment(GS_RAW[:k] + GS_RAW[k:].replace("another device", "the device", 1))
+
+
+def test_witness_last_resort_release_gone_while_another_function_releases():
+    # later functions release the ring too, so only the function's own body can tell this release is gone
+    k = GS_RAW.find(LAST_RESORT_SIG)
+    assert k != -1
+    gone = GS_RAW[:k] + GS_RAW[k:].replace("cache->release_pp_moe_onednn_scratch_ring()", "cache->keep_ring()", 1)
+    assert "cache->release_pp_moe_onednn_scratch_ring()" in gone[k:]
+    assert check_last_resort_comment(gone) == ["the decide pass's last-resort ring release is gone"]
 
 
 if __name__ == "__main__":
