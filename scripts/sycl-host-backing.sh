@@ -58,3 +58,14 @@ sycl_gpu_host_backing_gib() {
     kb="$(sycl_gpu_host_backing_kb "${1:-/proc/meminfo}")" || return 1
     awk -v kb="$kb" 'BEGIN{printf "%.1f\n", kb / 1048576}'
 }
+
+# sycl_gpu_host_backing_log_line [meminfo-file]: one log line, "Shmem: N kB HostBacking: N kB
+# MemAvailable: N kB". Shmem stays in it as the iGPU signature. It always returns 0: a figure
+# that cannot be read prints "unreadable", so a log line never decides anything.
+sycl_gpu_host_backing_log_line() {
+    local f="${1:-/proc/meminfo}" shm av bk
+    shm="$(awk '/^Shmem:/{print $2}' "$f" 2>/dev/null)" || shm=
+    av="$(awk '/^MemAvailable:/{print $2}' "$f" 2>/dev/null)" || av=
+    bk="$(sycl_gpu_host_backing_kb "$f" 2>/dev/null)" || bk=
+    echo "Shmem: ${shm:-unreadable} kB HostBacking: ${bk:-unreadable} kB MemAvailable: ${av:-unreadable} kB"
+}

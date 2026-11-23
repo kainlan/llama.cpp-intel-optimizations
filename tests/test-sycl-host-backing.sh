@@ -69,6 +69,10 @@ out="$(sycl_gpu_host_backing_gib "$T/no-such-file" 2>/dev/null)" && rc=0 || rc=$
 check_true "gib on unreadable returns non-zero" [ "$rc" -ne 0 ]
 check_eq "gib on unreadable prints nothing" "" "$out"
 
+# The log line carries all three figures, and "unreadable" instead of a failure.
+check_eq "log line" "Shmem: 11970836 kB HostBacking: 68554068 kB MemAvailable: 52242988 kB" "$(sycl_gpu_host_backing_log_line "$LOADED")"
+check_eq "log line, unreadable" "Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB" "$(sycl_gpu_host_backing_log_line "$T/no-such-file")"
+
 # Default file is /proc/meminfo: a number on any Linux host.
 if [ -r /proc/meminfo ]; then
     case "$(sycl_gpu_host_backing_kb)" in
