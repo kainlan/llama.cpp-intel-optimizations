@@ -355,6 +355,9 @@ void check_layout_byte_reads_one_way() {
     // A byte no layout names is a malformed inventory, which every entry point refuses. A plan built from one anyway
     // reads it on the side that charges more: the loader's term holds the dense weight, and a mapping load charges it
     // as a CPU-owned buffer rather than a mapping no zone holds.
+    // The enum has no fixed underlying type, so its values are 0-3 and casting 255 to it is undefined. A constant
+    // evaluation that reaches such a cast does not compile, so this pins that the byte is refused before the cast.
+    static_assert(!ggml_sycl::host_weight_layout_facts_of(255).known, "an unknown byte must not reach the enum cast");
     for (const unsigned byte : { 3u, 255u }) {
         const host_weight_layout_facts unknown = ggml_sycl::host_weight_layout_facts_of(static_cast<uint8_t>(byte));
         CHECK(!unknown.known);
