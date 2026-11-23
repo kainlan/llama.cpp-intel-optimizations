@@ -1102,11 +1102,19 @@ def check(header_raw, source):
                 clear_bind[:call].rstrip()[-1:] not in (";", "{", "}"):
             fails.append("L4 context end: the clear of an ended context's bindings does not drop its registry entries by the "
                          "ended id after it has reset the bindings, once, outside the lock (statement-initial)")
+        # A reset can trip the execution tripwire. Its reports are kept in a fixed array under the lock and logged
+        # after the drop, so no log call runs under the binding mutex; those lines are the only additions allowed.
         pin(fails, clear_bind,
-            r"\{\s*bool devices\[GGML_SYCL_MAX_DEVICES\] = \{\};\s*\{\s*std::lock_guard<std::mutex> lock\(g_execution_backend_binding_mutex\);"
+            r"\{\s*bool devices\[GGML_SYCL_MAX_DEVICES\] = \{\};\s*"
+            r"ggml_sycl_execution_tripwire_report\s+tripped\[GGML_SYCL_MAX_DEVICES\];\s*"
+            r"size_t\s+n_tripped\s*=\s*0;\s*size_t\s+n_tripped_lost\s*=\s*0;\s*"
+            r"\{\s*std::lock_guard<std::mutex> lock\(g_execution_backend_binding_mutex\);"
             r"[\s\S]*?if \(it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES\) \{\s*"
-            r"devices\[it->first->device\] = true;\s*\}\s*ggml_sycl_execution_reset_backend_binding_state\(it->first\);"
-            r"[\s\S]*?\}\s*\}\s*ggml_sycl_execution_drop_context_registry_entries\(context_id, devices\);\s*\}$",
+            r"devices\[it->first->device\] = true;\s*\}\s*const ggml_sycl_execution_tripwire_report report =\s*"
+            r"ggml_sycl_execution_reset_backend_binding_state\(it->first\);"
+            r"[\s\S]*?\}\s*\}\s*ggml_sycl_execution_drop_context_registry_entries\(context_id, devices\);\s*"
+            r"for \(size_t i = 0; i < n_tripped; \+\+i\) \{\s*ggml_sycl_execution_tripwire_log\(tripped\[i\]\);\s*\}\s*"
+            r"if \(n_tripped_lost > 0\) \{[^{}]*\}\s*\}$",
             "L4 context end: the clear of an ended context's bindings does not collect the bound devices under the "
             "lock, reset, and drop the entries by the ended id after the lock (devices collected before the reset)")
         pin(fails, clear_bind, r"for \(auto it = g_execution_backend_bindings\.begin\(\); it != g_execution_backend_bindings\.end\(\);\) \{\s*"
@@ -1379,15 +1387,21 @@ def mutations(header_raw, source):
          "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n",
          "    if (context_id != 0) ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n"),
         ("the ended context's entries are dropped under the binding mutex", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
-         "    }\n    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n}",
-         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n    }\n}"),
+         "    }\n    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n",
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n    }\n"),
         ("the ended context's entries are dropped by another id", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
          "drop_context_registry_entries(context_id, devices);", "drop_context_registry_entries(0, devices);"),
         ("the ended context's devices are not collected", "does not collect the bound devices under the lock", CLEAR_BIND_SIG,
          "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n", ""),
         ("the ended context's devices are collected after the reset", "does not collect the bound devices under the lock", CLEAR_BIND_SIG,
-         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n                ggml_sycl_execution_reset_backend_binding_state(it->first);\n",
-         "                ggml_sycl_execution_reset_backend_binding_state(it->first);\n                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n"),
+         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n"
+         "                    devices[it->first->device] = true;\n                }\n"
+         "                const ggml_sycl_execution_tripwire_report report =\n"
+         "                    ggml_sycl_execution_reset_backend_binding_state(it->first);\n",
+         "                const ggml_sycl_execution_tripwire_report report =\n"
+         "                    ggml_sycl_execution_reset_backend_binding_state(it->first);\n"
+         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n"
+         "                    devices[it->first->device] = true;\n                }\n"),
         ("the ended context's drop pins backends again", "pins backends again", CLEAR_BIND_SIG,
          "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n",
          "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n    ggml_sycl_execution_for_each_bound_backend(context_id, [](ggml_backend_sycl_context *, const ggml_sycl_execution_backend_binding &) {});\n"),

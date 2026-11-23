@@ -12375,40 +12375,77 @@ static ggml_sycl_execution_state_snapshot ggml_sycl_take_execution_state_snapsho
 // to that invocation. Submitting, releasing, quarantining or clearing the graph before the scope closes breaks both,
 // so the lifecycle verbs report it: one ERROR line per invocation, naming the caller that did it (the verb's own
 // caller, passed down through the defaulted site/line arguments). Nothing else changes, so a run that trips it fails
-// or passes exactly as it would without the line. Caller holds ctx->execution_state_mutex.
-static void ggml_sycl_execution_tripwire_locked(ggml_backend_sycl_context * ctx,
-                                                const char *                action,
-                                                const char *                site,
-                                                int                         line) noexcept {
+// or passes exactly as it would without the line. The decision and the fields it prints are taken under
+// ctx->execution_state_mutex; the line is logged after every lock is released, because a log call runs the sink a
+// user installed (H8 rule above). action is nullptr when there is nothing to report.
+struct ggml_sycl_execution_tripwire_report {
+    const char * action        = nullptr;
+    const char * site          = nullptr;
+    int          line          = 0;
+    int          device        = -1;
+    uint64_t     context_id    = 0;
+    uint64_t     graph_epoch   = 0;
+    uint64_t     invocation_id = 0;
+    int          depth         = 0;
+};
+
+// Caller holds ctx->execution_state_mutex. Decides and copies; logs nothing.
+static ggml_sycl_execution_tripwire_report ggml_sycl_execution_tripwire_check_locked(ggml_backend_sycl_context * ctx,
+                                                                                     const char *                action,
+                                                                                     const char *                site,
+                                                                                     int line) noexcept {
     if (ctx->execution_dispatch_depth == 0 || ctx->execution_invocation_id == 0 ||
         ctx->execution_tripwire_invocation == ctx->execution_invocation_id) {
-        return;
+        return {};
     }
     ctx->execution_tripwire_invocation = ctx->execution_invocation_id;
+    return { action,
+             site,
+             line,
+             ctx->device,
+             ctx->execution_context_id,
+             ctx->execution_graph_epoch,
+             ctx->execution_invocation_id,
+             ctx->execution_dispatch_depth };
+}
+
+// Caller holds no lock.
+static void ggml_sycl_execution_tripwire_log(const ggml_sycl_execution_tripwire_report & report) noexcept {
+    if (!report.action) {
+        return;
+    }
     GGML_LOG_ERROR(
         "[EXECUTION-TRIPWIRE] %s the tracked graph of device %d while a dispatch scope holds it open: site=%s:%d "
         "context=%llu graph=%llu invocation=%llu depth=%d\n",
-        action, ctx->device, site ? site : "?", line, (unsigned long long) ctx->execution_context_id,
-        (unsigned long long) ctx->execution_graph_epoch, (unsigned long long) ctx->execution_invocation_id,
-        ctx->execution_dispatch_depth);
+        report.action, report.device, report.site ? report.site : "?", report.line,
+        (unsigned long long) report.context_id, (unsigned long long) report.graph_epoch,
+        (unsigned long long) report.invocation_id, report.depth);
 }
 
 static void ggml_sycl_execution_tripwire(ggml_backend_sycl_context * ctx,
                                          const char *                action,
                                          const char *                site,
                                          int                         line) noexcept {
-    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
-    ggml_sycl_execution_tripwire_locked(ctx, action, site, line);
+    ggml_sycl_execution_tripwire_report report;
+    {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+        report = ggml_sycl_execution_tripwire_check_locked(ctx, action, site, line);
+    }
+    ggml_sycl_execution_tripwire_log(report);
 }
 
-static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_context * ctx,
-                                                            const char *                site = __builtin_FUNCTION(),
-                                                            int                         line = __builtin_LINE()) {
+// Returns the tripwire's report instead of logging it: one caller resets under g_execution_backend_binding_mutex,
+// and the line must wait until that lock is released too.
+[[nodiscard]] static ggml_sycl_execution_tripwire_report ggml_sycl_execution_reset_backend_binding_state(
+    ggml_backend_sycl_context * ctx,
+    const char *                site = __builtin_FUNCTION(),
+    int                         line = __builtin_LINE()) {
     if (!ctx) {
-        return;
+        return {};
     }
-    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
-    ggml_sycl_execution_tripwire_locked(ctx, "unbinding", site, line);
+    std::lock_guard<std::mutex>         state_lock(ctx->execution_state_mutex);
+    ggml_sycl_execution_tripwire_report report =
+        ggml_sycl_execution_tripwire_check_locked(ctx, "unbinding", site, line);
     ctx->execution_context_id = 0;
     ctx->execution_participant_id = -1;
     ctx->execution_session_id = 0;
@@ -12421,6 +12458,7 @@ static void ggml_sycl_execution_reset_backend_binding_state(ggml_backend_sycl_co
     ctx->execution_root_load_txn_id = 0;
     ctx->execution_root_slot = GGML_SYCL_MODEL_SLOT_NONE;
     ctx->execution_root_slot_generation = 0;
+    return report;
 }
 
 // covered_devices and the registry's bound_device_refs record the same fact
@@ -12473,6 +12511,11 @@ static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) 
     // for the section it needs the end to land within a few instructions of the store on the same context, a
     // publish racing the end of its own context, which is unsupported.
     bool devices[GGML_SYCL_MAX_DEVICES] = {};
+    // A reset can trip the wire; its line is logged after the lock (H8). One report per device holds every backend
+    // a context binds; any beyond that are counted and reported together.
+    ggml_sycl_execution_tripwire_report tripped[GGML_SYCL_MAX_DEVICES];
+    size_t                              n_tripped      = 0;
+    size_t                              n_tripped_lost = 0;
     {
         std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
         for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
@@ -12480,7 +12523,13 @@ static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) 
                 if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {
                     devices[it->first->device] = true;
                 }
-                ggml_sycl_execution_reset_backend_binding_state(it->first);
+                const ggml_sycl_execution_tripwire_report report =
+                    ggml_sycl_execution_reset_backend_binding_state(it->first);
+                if (report.action && n_tripped < GGML_SYCL_MAX_DEVICES) {
+                    tripped[n_tripped++] = report;
+                } else if (report.action) {
+                    ++n_tripped_lost;
+                }
                 it = g_execution_backend_bindings.erase(it);
             } else {
                 ++it;
@@ -12488,6 +12537,15 @@ static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) 
         }
     }
     ggml_sycl_execution_drop_context_registry_entries(context_id, devices);
+    for (size_t i = 0; i < n_tripped; ++i) {
+        ggml_sycl_execution_tripwire_log(tripped[i]);
+    }
+    if (n_tripped_lost > 0) {
+        GGML_LOG_ERROR(
+            "[EXECUTION-TRIPWIRE] %zu more backends of context %llu were unbound while a dispatch scope "
+            "held their tracked graph open\n",
+            n_tripped_lost, (unsigned long long) context_id);
+    }
 }
 
 template<typename F>
@@ -12562,7 +12620,7 @@ static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) 
             (void) ggml_sycl::execution::global_registry().unbind_backend({ binding->context_id }, device);
         }
     }
-    ggml_sycl_execution_reset_backend_binding_state(ctx);
+    ggml_sycl_execution_tripwire_log(ggml_sycl_execution_reset_backend_binding_state(ctx));
 }
 
 static std::vector<int> ggml_sycl_execution_expected_participants_locked(uint64_t context_id,
@@ -16680,11 +16738,16 @@ static void ggml_sycl_execution_clear_graph_tracking(ggml_backend_sycl_context *
     if (!ctx) {
         return;
     }
-    std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
-    ggml_sycl_execution_tripwire_locked(ctx, "clearing", site, line);
-    ctx->execution_graph_epoch = 0;
-    ctx->execution_invocation_id = 0;
-    ctx->execution_graph_sealed = false;
+    ggml_sycl_execution_tripwire_report report;
+    {
+        std::lock_guard<std::mutex> state_lock(ctx->execution_state_mutex);
+        report = ggml_sycl_execution_tripwire_check_locked(ctx, "clearing", site, line);
+
+        ctx->execution_graph_epoch   = 0;
+        ctx->execution_invocation_id = 0;
+        ctx->execution_graph_sealed  = false;
+    }
+    ggml_sycl_execution_tripwire_log(report);
 }
 
 static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * ctx,

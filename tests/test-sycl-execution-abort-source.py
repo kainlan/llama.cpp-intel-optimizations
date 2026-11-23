@@ -464,23 +464,68 @@ if own_drain_found:
 #
 # Each lifecycle verb that ends the invocation (submit, release, quarantine) or zeroes the backend's copy of it (the
 # clear, the binding reset) asks the tripwire first, with its caller's site; the scope counts itself out before its
-# own seal or quarantine.
+# own seal or quarantine. The tripwire decides under the state lock and the line is logged after every lock of the
+# function is released: a log call runs the sink a user installed (the H8 rule). The binding reset hands its report
+# back, because one caller resets under g_execution_backend_binding_mutex.
+LOCK_DECL = re.compile(r"\bstd::(?:lock_guard|unique_lock|scoped_lock)\s*<[^>]*>\s*\w+\s*\(")
+TRIPWIRE_LOG_CALL = re.compile(r"\b(?:ggml_sycl_execution_tripwire_log|GGML_LOG_\w+)\s*\(")
+
+
+def enclosing_open(text, at):
+    """Offset of the `{` that opens the innermost block containing `at`."""
+    depth = 0
+    for i in range(at - 1, -1, -1):
+        if text[i] == "}":
+            depth += 1
+        elif text[i] == "{":
+            if depth == 0:
+                return i
+            depth -= 1
+    return -1
+
+
+def tripwire_log_lock_violations(source):
+    found = []
+    blank = blank_comments_and_literals(source)
+    bodies = function_bodies(blank)
+    for name, body in sorted(bodies.items()):
+        if "ggml_sycl_execution_tripwire_log(" not in body:
+            continue
+        held = []
+        for lock in LOCK_DECL.finditer(body):
+            block = enclosing_open(body, lock.start())
+            held.append((lock.start(), matching_close(body, block)))
+        for call in TRIPWIRE_LOG_CALL.finditer(body):
+            if any(start < call.start() < end for start, end in held):
+                found.append(name + " logs the tripwire under a lock")
+                break
+    for call in re.finditer(r"\bggml_sycl_execution_reset_backend_binding_state\s*\(", blank):
+        before = blank[:call.start()].rstrip()
+        if not (before.endswith("ggml_sycl_execution_tripwire_log(") or before.endswith("=")
+                or re.search(r"static ggml_sycl_execution_tripwire_report$", before)):
+            found.append("a binding reset drops the tripwire's report")
+    return found
+
+
 def tripwire_violations(source):
     found = []
 
     def body(name):
         return function_body(source, r"static \w+ " + name + r"\s*\(")
 
-    tripwire = body("ggml_sycl_execution_tripwire_locked")
-    if not (re.search(r"execution_dispatch_depth == 0 \|\|", tripwire) and "site=%s:%d" in tripwire
-            and "execution_tripwire_invocation = ctx->execution_invocation_id;" in tripwire):
+    check = body("ggml_sycl_execution_tripwire_check_locked")
+    if not (re.search(r"execution_dispatch_depth == 0 \|\|", check)
+            and "execution_tripwire_invocation = ctx->execution_invocation_id;" in check and "GGML_LOG" not in check
+            and "site=%s:%d" in body("ggml_sycl_execution_tripwire_log")):
         found.append("tripwire reports once per invocation, only while a scope is open, with the site")
     for name, action, before in (
-        ("ggml_sycl_execution_clear_graph_tracking", '"clearing"', "ctx->execution_graph_epoch = 0;"),
-        ("ggml_sycl_execution_reset_backend_binding_state", '"unbinding"', "ctx->execution_context_id = 0;"),
+        ("ggml_sycl_execution_clear_graph_tracking", '"clearing"', "ctx->execution_graph_epoch "),
+        ("ggml_sycl_execution_reset_backend_binding_state", '"unbinding"', "ctx->execution_context_id "),
     ):
-        if not ordered(body(name), "ggml_sycl_execution_tripwire_locked(ctx, " + action + ", site, line);", before):
+        asked = "ggml_sycl_execution_tripwire_check_locked(ctx, " + action + ", site, line);"
+        if not ordered(body(name), asked, before):
             found.append(name + " asks the tripwire before it zeroes")
+    found.extend(tripwire_log_lock_violations(source))
     for name, action, before in (
         ("ggml_sycl_execution_submit_graph", '"submitting"', "registry.submit_invocation("),
         ("ggml_sycl_execution_release_graph", '"releasing"', "registry.release_invocation("),
@@ -557,7 +602,22 @@ def scope_end_violations(source):
 tripwire_found = tripwire_violations(backend)
 tripwire_mutants = {
     "clear-unwired": backend.replace(
-        '    ggml_sycl_execution_tripwire_locked(ctx, "clearing", site, line);\n', "", 1),
+        '        report = ggml_sycl_execution_tripwire_check_locked(ctx, "clearing", site, line);\n', "", 1),
+    # The line logged with the state lock still held.
+    "tripwire-logs-under-state-lock": backend.replace(
+        "        report = ggml_sycl_execution_tripwire_check_locked(ctx, action, site, line);\n"
+        "    }\n    ggml_sycl_execution_tripwire_log(report);\n",
+        "        report = ggml_sycl_execution_tripwire_check_locked(ctx, action, site, line);\n"
+        "        ggml_sycl_execution_tripwire_log(report);\n    }\n", 1),
+    # A binding reset's line logged inside the binding lock's loop.
+    "binding-reset-logs-under-binding-lock": backend.replace(
+        "                if (report.action && n_tripped < GGML_SYCL_MAX_DEVICES) {\n",
+        "                ggml_sycl_execution_tripwire_log(report);\n"
+        "                if (report.action && n_tripped < GGML_SYCL_MAX_DEVICES) {\n", 1),
+    # A binding reset whose report nobody logs.
+    "binding-reset-report-dropped": backend.replace(
+        "    ggml_sycl_execution_tripwire_log(ggml_sycl_execution_reset_backend_binding_state(ctx));\n",
+        "    (void) ggml_sycl_execution_reset_backend_binding_state(ctx);\n", 1),
     "release-unwired": backend.replace('    ggml_sycl_execution_tripwire(ctx, "releasing", site, line);\n', "", 1),
     "release-site-dropped": backend.replace(
         "                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);\n            });\n"
