@@ -280,6 +280,11 @@ def layout_bool_reads(t: dict) -> list:
                 continue  # the source of a copy
             if re.search(r"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*$", before):
                 continue
+            # The refusal of a byte that names no layout prints it, as no named value can: the last argument of an
+            # ERROR line, cast for its %u.
+            if (re.search(r"\bGGML_LOG_ERROR\s*\([^;]*static_cast\s*<\s*unsigned\s*>\s*\(\s*inventory\s*$",
+                          code[max(0, m.start() - 400):m.start()]) and re.match(r"\s*\)\s*\)\s*;", after)):
+                continue
             line = code.count("\n", 0, m.start()) + 1
             problems.append(f"{rel}:{line}: reads host_weight_layout as a bool or a number, not against a named value")
     return problems

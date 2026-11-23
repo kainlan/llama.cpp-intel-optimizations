@@ -36447,7 +36447,7 @@ static placement_host_backing placement_host_backing_when_host(const placement_p
     if (!plan.host_backing_maps_files) {
         return placement_host_backing::PINNED;
     }
-    if (routed_expert || get_rows_only || kv_info.host_weight_layout != GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU) {
+    if (routed_expert || get_rows_only || !host_weight_layout_facts_of(kv_info.host_weight_layout).dense_cpu_owned) {
         return placement_host_backing::FILE_MAPPED;
     }
     return placement_host_backing::CPU_OWNED;

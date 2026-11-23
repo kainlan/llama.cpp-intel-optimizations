@@ -2446,9 +2446,11 @@ static constexpr host_weight_layout_facts host_weight_layout_facts_of(uint8_t ho
             return { true, false, true };
         case GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN:
             return { true, false, false };
-        default:
-            return { true, false, false };
     }
+    // No default case, so a new layout is a -Wswitch warning here. A byte no case names is read on the side that
+    // charges more (the loader's SYCL_Host buffer holds the weight, and ggml-cpu owns a buffer for it too), for the
+    // entry points' refusal to name.
+    return { false, true, true };
 }
 
 // Whether the loader's SYCL_Host buffer holds the host-planned dense weights of the inventory a plan was made from,
@@ -2463,7 +2465,7 @@ static constexpr host_weight_layout_facts host_weight_layout_facts_of(uint8_t ho
 // exactly the loader's SYCL_Host contents and its plan counts every entry. The off layout leaves the weight in
 // SYCL_Host. A user -ot override the plan does not see is outside this rule.
 static constexpr bool placement_loader_holds_host_dense(uint8_t host_weight_layout, bool inventory_unbound) noexcept {
-    return !inventory_unbound || host_weight_layout == GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF;
+    return !inventory_unbound || host_weight_layout_facts_of(host_weight_layout).loader_holds_dense;
 }
 
 // Whether the loader's SYCL_Host buffer holds `entry`'s tensor, for a plan whose loader holds the weights: every entry

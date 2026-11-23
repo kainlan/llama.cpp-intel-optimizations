@@ -15885,12 +15885,23 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     return in;
 }
 
-// An inventory no entry point reads: absent, or naming tensors or lazy tables with no array behind the count. The four
-// entry points (the early and the late direct entries, the stage and the dry run) refuse it before anything reads it,
-// so the intake below copies whatever the counts name.
+// An inventory no entry point reads: absent, naming tensors or lazy tables with no array behind the count, or carrying
+// a host_weight_layout byte that names no layout (enum ggml_sycl_host_weight_layout). The four entry points (the early
+// and the late direct entries, the stage and the dry run) refuse it before anything reads it, so the intake below
+// copies whatever the counts name and every reader of the layout byte reads a known layout.
 static bool ggml_sycl_inventory_malformed(const ggml_sycl_tensor_inventory * inventory) {
-    return inventory == nullptr || (inventory->count > 0 && inventory->tensors == nullptr) ||
-           (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr);
+    if (inventory == nullptr || (inventory->count > 0 && inventory->tensors == nullptr) ||
+        (inventory->lazy_table_count > 0 && inventory->lazy_tables == nullptr)) {
+        return true;
+    }
+    if (!ggml_sycl::host_weight_layout_facts_of(inventory->host_weight_layout).known) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] the inventory's host_weight_layout byte %u names no layout (off 0, cpu 1, plain 2): the "
+            "plan cannot tell which buffer the loader puts a host dense weight in, so the inventory is refused\n",
+            static_cast<unsigned>(inventory->host_weight_layout));
+        return true;
+    }
+    return false;
 }
 
 // The SYCL_Host buffer type's chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB), defined with that buffer type.
