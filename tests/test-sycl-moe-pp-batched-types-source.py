@@ -93,6 +93,13 @@ dequant. These claims pin that shape:
       itself. So no type is seeded at the executor's rate while the claim refuses it (IQ1_S, IQ1_M
       and IQ4_XS have the f16 row and no MMVQ-ID kernel), and (h) holds for the staged claim too: it never takes a
       type with no MMVQ-ID kernel, so such a type is never admitted on a hybrid layer.
+  (t) the ring is planned only for a model with an expert a ring consumer runs. moe_pp_onednn_ring_serves_type in
+      moe-mmvq-tables.hpp is exactly the WOQ and f16 tables over every layout, and asks no runtime knob. The publish
+      helper, after it takes the inventory's ring and before it sizes and publishes it, plans no ring (weight slot and
+      depth 0) when ggml_sycl_inventory_ring_has_consumer finds no gate, up or down expert (moe_classify_tensor, the
+      names the loader sizes the ring from) of a type that predicate serves. The consumer asks no knob predicate, so the
+      ring a load plans never follows a runtime knob. An Inkling 2 Mini load (NVFP4 experts on the MMID direct route,
+      BF16 experts on the BF16 direct route) plans none, so its RUNTIME zone carries no ring nobody would use.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -212,6 +219,18 @@ STAGED_CLAIM_HEAD = "planned = plan != nullptr && ggml_sycl_moe_pp_batched_claim
 SEED_GATE = "if (!moe_pp_batched_takes_staged_type(t)) { return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED; }"
 SEED_MXFP4 = "if (t == GGML_TYPE_MXFP4) { return 3990.0; }"
 TABLE_TERMS = ("moe_mmvq_admission_supports_type(", "moe_pp_batched_f16_supports_layout(")
+# The types a ring consumer runs, and the publish helper's gate that plans no ring for a model with none of them.
+RING_TYPE = "moe_pp_onednn_ring_serves_type"
+RING_TYPE_BODY = ("{ for (int layout = GGML_LAYOUT_AOS; layout <= GGML_LAYOUT_MXFP4_DPAS; ++layout) { "
+                  "const enum ggml_layout_mode mode = static_cast<enum ggml_layout_mode>(layout); "
+                  "if (moe_pp_batched_woq_supports_layout(type, mode) || moe_pp_batched_f16_supports_layout(type, "
+                  "mode)) { return true; } } return false; }")
+RING_CONSUMER = "ggml_sycl_inventory_ring_has_consumer"
+RING_CONSUMER_TERMS = ("moe_classify_tensor(t.name) == MOE_TENSOR_UNKNOWN", "moe_pp_onednn_ring_serves_type(t.type)")
+RING_KNOB_TERMS = ("ggml_sycl_moe_pp_batched_takes_layout(", "ggml_sycl_moe_pp_batched_takes_type(",
+                   "ggml_sycl_moe_pp_onednn_batched_claims_tensor(", "_enabled()")
+RING_GATE = "if (in.pp_moe_onednn_ring_depth != 0 && !ggml_sycl_inventory_ring_has_consumer(inventory)) {"
+RING_RESETS = ("in.pp_moe_onednn_weight_slot_bytes = 0;", "in.pp_moe_onednn_ring_depth = 0;")
 UNTESTED_ON_DEVICE = {
     "GGML_TYPE_IQ1_S": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
     "GGML_TYPE_IQ2_XXS": "needs an imatrix to quantize (ggml_quantize_requires_imatrix)",
@@ -1169,6 +1188,39 @@ def claim_s_staged_type(s):
     return fails
 
 
+def claim_t_ring_consumer(s):
+    fails = []
+    helper = one_definition(s["tables"], RING_TYPE)
+    if helper is None:
+        return [f"{RING_TYPE} is not defined exactly once in moe-mmvq-tables.hpp"]
+    if helper != RING_TYPE_BODY:
+        fails.append(f"{RING_TYPE} is not exactly the WOQ and f16 tables over every layout, with no knob")
+    consumer = one_definition(s["sycl"], RING_CONSUMER)
+    if consumer is None:
+        return fails + [f"{RING_CONSUMER} is not defined exactly once in ggml-sycl.cpp"]
+    for term in RING_CONSUMER_TERMS:
+        if term not in consumer:
+            fails.append(f"{RING_CONSUMER} does not ask `{term}`")
+    for term in RING_KNOB_TERMS:
+        if term in consumer:
+            fails.append(f"{RING_CONSUMER} asks `{term}`: the ring a load plans would follow a runtime knob")
+    publish = one_definition(s["sycl"], PUBLISH_FN) or ""
+    gate = publish.find(RING_GATE)
+    if gate < 0:
+        return fails + ["the publish helper plans the loader's ring whatever types the model's experts have"]
+    open_pos = gate + len(RING_GATE) - 1
+    block = publish[open_pos : match_close(publish, open_pos)]
+    for reset in RING_RESETS:
+        if reset not in block:
+            fails.append(f"the gate for a ring no consumer runs does not plan no ring (`{reset}` is missing)")
+    head = publish.find(PLAN_SITE_HEAD)
+    sizer = publish.find("ggml_sycl::pp_moe_onednn_slots_at(")
+    setter = publish.find("unified_cache_set_planned_pp_moe_onednn_scratch(")
+    if not (0 <= head < gate < sizer < setter):
+        fails.append("the gate does not sit after the inventory's ring is taken and before it is sized and published")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -1189,6 +1241,7 @@ CLAIMS = {
     "q": claim_q_group_knob,
     "r": claim_r_failure_drain,
     "s": claim_s_staged_type,
+    "t": claim_t_ring_consumer,
 }
 
 
@@ -1415,6 +1468,17 @@ MUTANTS = [
      "if (!moe_pp_batched_f16_supports_layout(t, GGML_LAYOUT_AOS)) {"),
     ("s", "cost", SEED_MXFP4, SEED_MXFP4 + " if (t == GGML_TYPE_IQ4_XS) { return 5000.0; }"),
     ("s", "cost", SEED_GATE, ""),
+    # The predicate drops the f16 table or asks the knobs; the consumer asks the knob-reading claim; the gate is gone;
+    # the gate keeps the depth; the gate moves after the slots are sized.
+    ("t", "tables", " || moe_pp_batched_f16_supports_layout(type, mode)) { return true; }", ") { return true; }"),
+    ("t", "tables", "if (moe_pp_batched_woq_supports_layout(type, mode) ||",
+     "if (moe_pp_batched_supports_layout(type, mode, false, false) ||"),
+    ("t", "sycl", "moe_pp_onednn_ring_serves_type(t.type)", "ggml_sycl_moe_pp_batched_takes_type(t.type)"),
+    ("t", "sycl", RING_GATE, "if (false) {"),
+    ("t", "sycl", "in.pp_moe_onednn_weight_slot_bytes = 0; in.pp_moe_onednn_ring_depth = 0; } const uint32_t n_ubatch",
+     "in.pp_moe_onednn_weight_slot_bytes = 0; } const uint32_t n_ubatch"),
+    ("t", "sycl", PLAN_SITE_HEAD,
+     PLAN_SITE_HEAD + " (void) ggml_sycl::pp_moe_onednn_slots_at(0, 0, 0, 0, 0, nullptr, nullptr);"),
 ]
 
 
@@ -1436,6 +1500,9 @@ def test_claims_are_not_vacuous(sources):
     assert one_definition(sources["tables"], STAGED_TYPE) is not None
     assert one_definition(sources["sycl"], CLAIMS_STAGED_TYPE) is not None
     assert one_definition(sources["cost"], "moe_exec_dev_gflops_seed") is not None
+    assert one_definition(sources["tables"], RING_TYPE) is not None
+    assert one_definition(sources["sycl"], RING_CONSUMER) is not None
+    assert RING_GATE in (one_definition(sources["sycl"], PUBLISH_FN) or "")
 
 
 if __name__ == "__main__":

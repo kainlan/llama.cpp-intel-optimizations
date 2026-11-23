@@ -16176,6 +16176,24 @@ static std::vector<ggml_sycl::placement_tensor_info> ggml_sycl_inventory_planner
     return detail;
 }
 
+// Whether the inventory has a gate, up or down expert, from the names the loader sizes the PP MoE oneDNN ring from,
+// of a type a ring consumer runs (moe_pp_onednn_ring_serves_type). The loader sizes the ring for every MoE model, but
+// only the batched prompt executor and the MXFP4 SOA per-expert staging claim its slots: Q1_0 and NVFP4 experts run on
+// the MMID direct route and BF16 experts on the BF16 direct route. The question asks no runtime knob, so the ring a
+// load plans does not depend on a knob that turns an executor off for one run.
+static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_inventory * inventory) {
+    for (size_t i = 0; i < inventory->count; ++i) {
+        const ggml_sycl_tensor_info & t = inventory->tensors[i];
+        if (moe_classify_tensor(t.name) == MOE_TENSOR_UNKNOWN || t.ne[0] <= 0 || t.ne[1] <= 0) {
+            continue;
+        }
+        if (moe_pp_onednn_ring_serves_type(t.type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The per-device planner inputs an inventory carries, as ggml_sycl_inventory_publish_planner_inputs() published them.
 struct ggml_sycl_inventory_planner_inputs {
     size_t   pp_pipeline_scratch_bytes           = 0;
@@ -16195,6 +16213,19 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     in.pp_pipeline_scratch_bytes       = pp_pipeline_env_enabled() ? inventory->pp_pipeline_scratch_bytes : 0;
     in.pp_moe_onednn_weight_slot_bytes = inventory->pp_moe_onednn_weight_slot_bytes;
     in.pp_moe_onednn_ring_depth        = inventory->pp_moe_onednn_ring_depth;
+
+    // A model whose experts no ring consumer runs plans no ring. Without this gate the load would reserve the ring
+    // and every context would demand its RUNTIME room again, for a ring nothing claims; on a model with an MMID
+    // device workspace, which also takes RUNTIME room, that demand refuses a later context's micro-batch.
+    if (in.pp_moe_onednn_ring_depth != 0 && !ggml_sycl_inventory_ring_has_consumer(inventory)) {
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device %d: no gate, up or down expert of this model has a "
+            "type a ring consumer runs, so the plan neither reserves nor demands the %.1f MB weight slot the loader "
+            "sized\n",
+            device, in.pp_moe_onednn_weight_slot_bytes / (1024.0 * 1024.0));
+        in.pp_moe_onednn_weight_slot_bytes = 0;
+        in.pp_moe_onednn_ring_depth        = 0;
+    }
 
     // The two row-scaled slots are sized here, by the function the ring's admission and re-plan size them with, at
     // the micro-batch the rest of the load plans at, so the ring planned at load and a ring re-planned for the same

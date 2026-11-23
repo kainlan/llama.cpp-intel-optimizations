@@ -374,6 +374,23 @@ inline bool moe_pp_batched_takes_staged_type(enum ggml_type type) {
     return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS);
 }
 
+// Whether an expert of `type` has a consumer of the PP MoE oneDNN scratch ring, in any layout: the batched prompt
+// executor (the WOQ and f16 tables above) or the MXFP4 SOA per-expert staging (the f16 table's MXFP4 row). The load
+// plans the ring only for a model with such an expert (ggml_sycl_inventory_ring_has_consumer). Q1_0 and NVFP4 run on
+// their MMID direct route and BF16 on the BF16 direct route, and none of those draws on the ring, so a model whose
+// experts are only those types would otherwise hold a ring of several hundred MB in its RUNTIME zone that nothing
+// uses. The answer asks no runtime knob: the ring a load plans does not change with a knob that turns an executor off
+// for a run, and every type the ring stages for a host expert (moe_pp_batched_takes_staged_type) is served.
+inline bool moe_pp_onednn_ring_serves_type(enum ggml_type type) {
+    for (int layout = GGML_LAYOUT_AOS; layout <= GGML_LAYOUT_MXFP4_DPAS; ++layout) {
+        const enum ggml_layout_mode mode = static_cast<enum ggml_layout_mode>(layout);
+        if (moe_pp_batched_woq_supports_layout(type, mode) || moe_pp_batched_f16_supports_layout(type, mode)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Whether the cache holds one entry per expert of a `type` weight at `layout`, which the batched executor needs:
 // the retained prompt admission resolves each active expert's own entry before the executor runs. The claim
 // predicate asks this after the table, so the claim never takes a layout the cache does not hold per expert.

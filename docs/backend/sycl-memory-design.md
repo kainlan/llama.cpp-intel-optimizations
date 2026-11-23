@@ -3174,6 +3174,22 @@ batched prompt MoE dispatch on a device whose publish could not size the ring. O
 GPT-OSS 20B (32 experts, 4 used) `-ub 512` packs into 6,112 rows instead of the
 rectangle's 16,384: slots of 33.6 MB and 67.1 MB instead of 90 MB and 180 MB.
 
+**Which models plan a ring.** The loader sizes a ring for every MoE model, from
+its gate, up and down experts. Only two consumers claim its slots: the batched
+prompt executor (its WOQ and f16 tables) and the MXFP4 SOA per-expert staging.
+The load-time publish therefore plans no ring, weight slot and depth 0, when no
+gate, up or down expert has a type one of them runs
+(`moe_pp_onednn_ring_serves_type` in `moe-mmvq-tables.hpp`, asked by
+`ggml_sycl_inventory_ring_has_consumer`). It asks no runtime knob, so the ring a
+load plans does not change with a knob that turns an executor off for one run.
+Inkling 2 Mini is such a model: its NVFP4 experts run on the MMID direct route
+and its BF16 experts on the BF16 direct route. Its loader-sized ring was 350.7 MB
+at `-ub 512` (a 172.1 MB weight slot), which the load reserved and each context
+demanded again. That demand sat in the RUNTIME zone beside the MMID device
+workspace, which the zone's requirement does not count, so a second context at
+`-ub 128` was refused for a ring nothing would claim. A model with no ring logs
+"[SYCL-PLAN] no PP MoE oneDNN scratch ring on device N" and no ring line.
+
 **Why the RUNTIME zone is not grown at load (`llama.cpp-u1bb`).** Growing it at
 model load looks natural and is wrong. The arena is one chunk with fixed zones,
 `[shared KV+WEIGHT][ONEDNN][RUNTIME][SCRATCH]`, each with its own TLSF sized
