@@ -627,9 +627,11 @@ the normal exit plus 15 early ones. Thirteen of those 15 compute and therefore
 acquire; they are the defect. The remaining two are the persistent-TG returns,
 which never call `compute_impl_unlocked()` and so never acquire.)
 
-The invocation is acquired inside `ggml_backend_sycl_graph_compute_impl()` at
-its entry (`ggml_sycl_execution_begin_graph`), i.e. on *every* call that reaches
-`compute_impl_unlocked()`. The matching
+The invocation is begun by a dispatch scope (`ggml_sycl_execution_dispatch_scope`,
+§12.3). `ggml_backend_sycl_graph_compute_impl()` opens one at its entry, so
+*every* call that reaches `compute_impl_unlocked()` begins one. The keyed and
+whole-split segment record and replay and the block graphlets dispatch nodes
+without `compute_impl` and open their own scopes. The matching
 `ggml_sycl_execution_submit_graph()` / `ggml_sycl_execution_release_graph()`
 pair exists only on the function's **normal** exit. Thirteen bypass paths inside
 `ggml_backend_sycl_graph_compute_unchecked()` call `compute_impl_unlocked()`
@@ -1435,6 +1437,44 @@ mutable KV/RUNTIME/SCRATCH ownership. Diagnostics record physical device UUID,
 logical index, the one bound `ContextId`/`GraphEpoch`, and `InvocationId` for
 every aggregate device so same/multi-device behavior is asserted, not inferred
 from the selector.
+
+**Who begins an invocation: the dispatch scope.**
+`ggml_sycl_execution_dispatch_scope` (`ggml-sycl.cpp`) is the only path to
+`ggml_sycl_execution_begin_graph`. Its constructor runs
+`ggml_sycl_execution_begin_dispatch_graph`, which begins this backend's tracked
+graph or joins the one it already holds OPEN/SEALED. On a refusal it throws if
+the context is armed for tracked execution, and an unarmed context runs
+untracked.
+
+Who opens a scope:
+- `ggml_backend_sycl_graph_compute_impl`;
+- each path that dispatches nodes without it: `moe_graph_record_segment_slot`,
+  `moe_graph_replay_segment_slot`, `moe_graph_record_segments`,
+  `moe_graph_replay_segments` and `moe_graph_try_block_graphlets`.
+
+Scopes nest when such a path falls back to `compute_impl`.
+`ctx->execution_dispatch_depth` counts the open scopes under
+`ctx->execution_state_mutex`. Only the scope that brings the count to zero ends
+the graph: it seals on a normal exit and quarantines
+(`registry.abort_invocation`) when an exception leaves it. An inner scope ends
+nothing. Submit and release stay where they were, at graph_compute's exit and
+in `ggml_backend_sycl_synchronize`.
+
+The tripwire: a graph that is submitted, released, quarantined, cleared or
+unbound while a scope still holds it open logs one `[EXECUTION-TRIPWIRE]` line
+at ERROR per invocation. The line carries the action, the caller's site, the
+device, the context, the graph epoch, the invocation and the depth. The decision
+is taken under `execution_state_mutex`; an unbind takes it under
+`g_execution_backend_binding_mutex` as well. The line is logged after every lock
+is released.
+
+The rule for a new dispatch path: a function that graph_compute reaches and that
+dispatches a node opens a scope. A dispatch is a call to `compute_forward`, to
+the direct-node helper, or to an op entry point. The function declares the scope
+in its outermost block, before its first dispatch, with only named statements
+before it. `tests/test-sycl-execution-abort-source.py` holds that census: its
+`PRE_SCOPE_CALLS` lists the named statements and its `DISPATCH_EXEMPT` lists the
+exemptions, each with a reason.
 
 ### 12.4 Owner-targeted reset, graph invalidation, and teardown
 

@@ -16793,10 +16793,12 @@ static void ggml_sycl_execution_drain_own_terminal(ggml_backend_sycl_context * c
 // defect (MISMATCH/STALE/OVERFLOW) instead of seeing an undifferentiated
 // "failed to begin tracked SYCL execution graph". Left untouched (OK) when
 // `ctx` is null or the context isn't armed for tracked execution at all --
-// see the caller in ggml_backend_sycl_graph_compute_impl(), which only treats
-// a `false` return as a refusal once it has independently confirmed the
-// context *was* armed (execution_context_id/execution_root_model_id set), so
-// those two early-outs never reach the caller's throw.
+// see the only caller, ggml_sycl_execution_begin_dispatch_graph(), which every
+// ggml_sycl_execution_dispatch_scope runs (compute_impl's and each bypass
+// path's) and which only treats a `false` return as a refusal once it has
+// independently confirmed the context *was* armed
+// (execution_context_id/execution_root_model_id set), so those two early-outs
+// never reach the caller's throw.
 static bool ggml_sycl_execution_begin_graph(ggml_backend_sycl_context *   ctx,
                                             ggml_sycl::execution::error * out_err = nullptr) noexcept {
     if (!ctx) {
@@ -121040,9 +121042,11 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     };
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] Lambda created\n");
 
-    // llama.cpp-u7vj: every path reaching compute_impl_unlocked() opens a tracked
-    // invocation inside ggml_backend_sycl_graph_compute_impl(), but the matching
-    // submit lives only on this function's normal exit. Thirteen bypass paths run
+    // llama.cpp-u7vj: every path that dispatches nodes opens a tracked invocation
+    // through ggml_sycl_execution_dispatch_scope -- compute_impl's at its entry,
+    // and the segment record/replay and block graphlets that dispatch without
+    // compute_impl their own -- but the matching submit lives only on this
+    // function's normal exit. Thirteen bypass paths run
     // the compute and then return early, so the graph ended SEALED -- never
     // COMPLETE -- and release_invocation() correctly refuses a non-terminal graph.
     // Nothing then cleared device_owners_, so the owning context kept working via
