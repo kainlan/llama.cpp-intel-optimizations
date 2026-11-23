@@ -799,6 +799,31 @@ static bool test_recipe_matrix_workspace_and_immutability() {
     return true;
 }
 
+// One output of the host executor, from ggml-base alone: the weight row dequantized, against the activation row rounded
+// through Q8_0 as the executor rounds it, summed in double. It reads none of ggml-cpu's lookup tables, so it holds in a
+// process that never initialized the CPU backend, which is how this test runs.
+static float host_executor_reference(ggml_type       type,
+                                     const uint8_t * weight_row,
+                                     const float *   activation_row,
+                                     int64_t         K) {
+    const auto *         weight_traits = ggml_get_type_traits(type);
+    const auto *         q8_traits     = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    std::vector<float>   weight(static_cast<size_t>(K)), activation(static_cast<size_t>(K));
+    std::vector<uint8_t> q8(ggml_row_size(GGML_TYPE_Q8_0, K));
+    weight_traits->to_float(weight_row, weight.data(), K);
+    q8_traits->from_float_ref(activation_row, q8.data(), K);
+    q8_traits->to_float(q8.data(), activation.data(), K);
+    double sum = 0.0;
+    for (size_t k = 0; k < weight.size(); ++k) {
+        sum += static_cast<double>(weight[k]) * activation[k];
+    }
+    return static_cast<float>(sum);
+}
+
+static bool host_executor_output_matches(float got, float expected) {
+    return std::isfinite(got) && std::fabs(got - expected) <= 1e-2f * (1.0f + std::fabs(expected));
+}
+
 static bool test_numerical_q1_nvfp4_host_executor() {
     using namespace ggml_sycl;
     int identity = 200;
@@ -807,11 +832,33 @@ static bool test_numerical_q1_nvfp4_host_executor() {
         const int64_t N = 2;
         const auto * traits = ggml_sycl_get_type_traits_cpu(type);
         CHECK(traits && traits->vec_dot);
+        const auto * base_traits = ggml_get_type_traits(type);
+        CHECK(base_traits && base_traits->from_float_ref && base_traits->to_float);
+        const size_t row_size = ggml_row_size(type, K);
         for (moe_route_phase phase : { moe_route_phase::DECODE, moe_route_phase::PROMPT }) {
             const size_t rows = phase == moe_route_phase::DECODE ? 1 : 3;
-            std::vector<uint8_t> weights(ggml_row_size(type, K) * N, 0);
+            // Weight row n is the activations' pattern scaled by n + 1, so the first output is a sum of squares, far
+            // from zero: an executor that reads a zero block scale returns exactly 0 there and fails.
+            std::vector<uint8_t> weights(row_size * N, 0);
+            std::vector<float>   weight_values(static_cast<size_t>(K));
+            for (int64_t n = 0; n < N; ++n) {
+                for (int64_t k = 0; k < K; ++k) {
+                    weight_values[static_cast<size_t>(k)] = float(n + 1) * float(int(k % 13) - 6) / 7.0f;
+                }
+                base_traits->from_float_ref(weight_values.data(), weights.data() + static_cast<size_t>(n) * row_size,
+                                            K);
+            }
             std::vector<float> activations(rows * K);
             for (size_t i = 0; i < activations.size(); ++i) activations[i] = float(int(i % 13) - 6) / 7.0f;
+            std::vector<float> expected(rows * N);
+            for (size_t m = 0; m < rows; ++m) {
+                for (int64_t n = 0; n < N; ++n) {
+                    expected[m * N + n] =
+                        host_executor_reference(type, weights.data() + n * row_size, activations.data() + m * K, K);
+                }
+            }
+            // Positive control: the reference itself is not near zero where the zero-scale defect would hide.
+            CHECK(std::fabs(expected[0]) > 1.0f);
             std::vector<float> output(rows * N, 99.0f);
             auto route = route_for(weights.data(), -1, moe_batch_residency::HOST, GGML_LAYOUT_AOS,
                                    GGML_LAYOUT_AOS, identity++);
@@ -838,7 +885,13 @@ static bool test_numerical_q1_nvfp4_host_executor() {
             task.workspace_lease = weight_handle(aligned, 0, GGML_LAYOUT_AOS, identity++, false);
             moe_batch_reject_reason reject;
             CHECK(ggml_sycl_cpu_moe_host_aos_execute(task, &reject));
-            for (float value : output) CHECK(std::isfinite(value) && value == 0.0f);
+            for (size_t i = 0; i < output.size(); ++i) {
+                if (!host_executor_output_matches(output[i], expected[i])) {
+                    std::fprintf(stderr, "FAIL: %s host executor output %zu: got %f, expected %f\n",
+                                 ggml_type_name(type), i, output[i], expected[i]);
+                    return false;
+                }
+            }
             task.workspace_bytes = bytes - 1;
             CHECK(!ggml_sycl_cpu_moe_host_aos_execute(task, &reject) &&
                   reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
@@ -869,8 +922,9 @@ static bool test_numerical_q1_nvfp4_host_executor() {
                 task.workspace_bytes = bytes;
                 task.workspace_lease = weight_handle(aligned, 0, GGML_LAYOUT_AOS, identity++, false);
                 CHECK(ggml_sycl_cpu_moe_host_aos_execute(task, &reject));
-                for (float value : one_output) {
-                    CHECK(std::isfinite(value) && value == 0.0f);
+                for (int64_t n = 0; n < N; ++n) {
+                    const float one_expected = host_executor_reference(type, weights.data() + n * row_size, one_row, K);
+                    CHECK(host_executor_output_matches(one_output[static_cast<size_t>(n)], one_expected));
                 }
                 CHECK(munmap(mapping, static_cast<size_t>(page_size) * 2) == 0);
             }
