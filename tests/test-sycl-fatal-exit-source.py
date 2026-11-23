@@ -154,11 +154,41 @@ def test_the_sync_diagnostic_is_printed_without_the_log_queue():
         f"ggml-sycl.cpp: the [SYCL-SYNC-DIAG] line must be printed with std::fprintf(stderr, ...), found {calls}")
     diag = body.find("\"[SYCL-SYNC-DIAG]")
     flush = body.find("std::fflush(stderr);", diag)
-    # The drain no longer aborts through SYCL_CHECK: it latches the failure and reports it, and the report and the
-    # boundary cleanup after it are the first calls that can reach a failed SYCL check and end the process.
+    # The drain does not abort through SYCL_CHECK: it latches the failure, ends the process at once after a device
+    # loss, and otherwise reports it. The loss's fast exit and the report are the first calls after the line that can
+    # end the process.
     report = body.find("ggml_sycl_async_failure_report(sycl_ctx, \"synchronize\");", diag)
     assert 0 <= flush < report, (
         "ggml-sycl.cpp: the [SYCL-SYNC-DIAG] line must be flushed before the failure report can end the process")
+
+
+SYNC_LOSS_EXIT = re.compile(
+    r"if \(ggml_sycl_device_lost_latched\(\)\) \{\s*"
+    r"ggml_sycl_fatal_exit\(GGML_SYCL_EXIT_DEVICE_LOST, \"SYCL_CHECK failed after a device loss\"\);\s*\}")
+
+
+def test_a_failed_drain_after_a_device_loss_ends_the_process_at_once():
+    """A synchronize whose drain failed ends the process at once when a device loss is recorded, after its diagnostic
+    line and before the report and the boundary cleanup: driver teardown can hang on a lost card, and a hang holds the
+    card. Any other failure keeps the latch-and-return: the report, the cleanup, then return. The exit names the path
+    test-sycl-fatal-exit's sync mode requires ("SYCL_CHECK failed after a device loss", status 69)."""
+    main = code_of(SYCL / "ggml-sycl.cpp")
+    start = main.find("static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {")
+    assert start >= 0, "ggml-sycl.cpp: ggml_backend_sycl_synchronize is missing"
+    body = braced_block(main, start)
+    branch_at = body.find("if (ggml_sycl_async_failure_since(sycl_ctx->async_failure_cursor)) {")
+    assert branch_at >= 0, "ggml-sycl.cpp: synchronize's failure branch is missing"
+    branch = braced_block(body, branch_at)
+    flush = branch.find("std::fflush(stderr);", branch.find("\"[SYCL-SYNC-DIAG]"))
+    gate = SYNC_LOSS_EXIT.search(branch)
+    assert gate, "ggml-sycl.cpp: a failed drain after a device loss does not end the process at once"
+    report = branch.find("ggml_sycl_async_failure_report(sycl_ctx, \"synchronize\");")
+    cleanup = branch.find("ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, \"synchronize\",")
+    ret = branch.rfind("return;")
+    assert 0 <= flush < gate.start() < report < cleanup < ret, (
+        "ggml-sycl.cpp: the loss's fast exit must follow the flushed diagnostic line and precede the report, the "
+        "cleanup and the return that the failure branch keeps for any other failure")
+    assert len(SYNC_LOSS_EXIT.findall(body)) == 1, "ggml-sycl.cpp: synchronize must end the process in one place"
 
 
 def test_graph_boundary_cleanup_records_a_device_loss():

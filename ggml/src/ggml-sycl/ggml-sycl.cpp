@@ -102964,8 +102964,8 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         if (!drain_error.empty()) {
             // An asynchronous error goes to the queue's handler, not to this catch: a throw here is the wait itself
             // failing (a lost device, for one). Either way the queue's work cannot be trusted, so latch it like a
-            // delivered error instead of aborting. A lost device is also recorded for the process, which then leaves
-            // through _Exit at its next failed SYCL check or at its exit, so no teardown waits on the lost card.
+            // delivered error instead of aborting. A lost device is also recorded for the process, and the failure
+            // branch below then ends the process at once.
             ggml_sycl_note_exception(drain_error.c_str());
             ggml_sycl_async_failure_record(sycl_ctx->device, drain_error.c_str());
         }
@@ -103000,6 +103000,13 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
                              cache_used / (1024.0 * 1024.0), cache_budget / (1024.0 * 1024.0),
                              free_mem / (1024.0 * 1024.0), total_mem / (1024.0 * 1024.0));
                 std::fflush(stderr);
+            }
+            if (ggml_sycl_device_lost_latched()) {
+                // After a device loss a failed drain ends the process here, before the report and the cleanup: the
+                // cleanup drains and releases on the lost card, driver teardown can hang there, and a hung process
+                // holds the card and its memory until it is killed (docs/backend/SYCL.md, exit status 69). Any other
+                // failure is latched and reported, and the context computes nothing more.
+                ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");
             }
             ggml_sycl_async_failure_report(sycl_ctx, "synchronize");
             if (!sycl_ctx->async_failure_cleaned) {

@@ -1156,7 +1156,10 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 
 When the backend records a lost device, it prints `[SYCL-FATAL] device lost: ...`. From then on the process ends
 with status 69 at its next failed SYCL check, or when it exits. A site that cannot continue after a loss ends the
-process at once, with its own `[SYCL-FATAL] <function>:` line and the same status.
+process at once, with its own `[SYCL-FATAL] <function>:` line and the same status. A `ggml_backend_synchronize`
+whose drain fails after the loss is such a check: it prints its `[SYCL-SYNC-DIAG]` line and then
+`[SYCL-FATAL] SYCL_CHECK failed after a device loss`, before the context's cleanup would drain the lost card. A
+drain that fails for any other reason is latched and reported as above, and the process runs on.
 
 No teardown runs on the way out. Only when the process leaves through a normal exit do exit handlers registered after
 the loss still run first. On a lost card the driver's teardown can hang, and the process would then hold its memory
