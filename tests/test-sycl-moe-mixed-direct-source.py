@@ -15,15 +15,16 @@ The claims, each failure message starting with its name:
   admitted adapter uses, so the other mul_mat_vec_q_id callers' kernel images do not change.
 - table-*: a slot of the expert pointer table is null or a pointer the table's owner holds a lease for. A table is
   zeroed when it is created or its views are rebuilt, and a HOST operand's slot is nulled with its handle dropped. A
-  refusal after the host payload may have changed marks the device table stale (table-stale).
+  refusal, or a throw, after the host payload may have changed marks the device table stale (table-stale).
 - view-*, admission-*: the batch views and the workspace admission take the card occurrences only, each with its own
   occurrence index; the refusing local view stays for every other caller.
 - host-*: the host leg refuses by name before admission (no input marker in play, a task the host recipe would refuse,
   no host workspace), never aborts, and lets a failure in its job reach the graph boundary through the join's host task.
   The host recipe's executor runs on its check's findings. A leg whose catch could not drain the queue joins the
-  bundle's quarantine through the terminal (host-quarantine). A leg lets its job go before its future goes, and a job
-  let go stops waiting for its input marker and runs nothing (host-let-go): the registry lets a quarantined slot go at
-  process exit before the cache abandons the marker word, and std::async's future waits its job.
+  bundle's quarantine through the terminal (host-quarantine). A leg lets its job go before its future goes and as it is
+  parked, and a job let go stops waiting for its input marker and runs no further task (host-let-go): the registry
+  lets a quarantined slot go at process exit before the cache abandons the marker word, std::async's future waits its
+  job, and a parked leg's marker may never be written.
 - terminal-*: the node's terminal is armed on the last host row copy, after the device output copy.
 - funnel-order: the per-op funnel flushes a pending CPU scatter on every op's path before MUL_MAT_ID is dispatched,
   which the direct block relies on to read src1 rows a deferred scatter may still owe.
@@ -278,6 +279,27 @@ def table_violations(src: dict[str, str]) -> list[str]:
         elif change is None or change.start() < lam.start() or re.search(r"return\s+nullptr\s*;", code[lam_end:]):
             found.append("table-stale: a refusal after the payload can change returns without marking the table "
                          "stale")
+    # A throw once the payload may have changed (the payload's upload can throw) leaves it ahead of the device table
+    # just as a refusal does, so a guard held from before the first change marks the table stale as any throw leaves
+    # the upload. A destructor, not a catch: it swallows nothing, and it marks every throw, the fallback error included
+    # that the rethrow-first rule makes a catch pass up untouched.
+    guard = struct_body(code, "moe_ptr_table_stale_on_throw")
+    marks = guard is not None and re.search(
+        r"~moe_ptr_table_stale_on_throw\s*\(\s*\)\s*(?:noexcept\s*)?\{\s*if\s*\(\s*payload_changed\s*&&\s*"
+        r"std::uncaught_exceptions\s*\(\s*\)\s*>\s*exceptions\s*\)\s*\{\s*weight\s*\.\s*"
+        r"mark_moe_device_table_stale\s*\(\s*device\s*\)\s*;\s*\}\s*\}", guard) and re.search(
+        r"\bconst\s+int\s+exceptions\s*=\s*std::uncaught_exceptions\s*\(\s*\)\s*;", guard)
+    held = re.search(r"\bconst\s+moe_ptr_table_stale_on_throw\s+\w+\s*\{\s*extra\s*->\s*weight\s*\(\s*\)\s*,\s*"
+                     r"device\s*,\s*any_updated\s*\}\s*;", code)
+    declared = re.search(r"\bbool\s+any_updated\s*=\s*false\s*;", code)
+    copy_at = code.find("ggml_sycl_copy_payload_to_handle_async(")
+    if not marks:
+        found.append("table-stale: no guard marks the table stale as a throw leaves the upload once the payload "
+                     "changed")
+    elif not held or not declared or change is None or copy_at < 0 or \
+            not declared.end() <= held.start() < change.start() < copy_at:
+        found.append("table-stale: the upload does not hold the stale-on-throw guard from before its payload can "
+                     "change")
     card = definition(sycl, "static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_card_ptr_table_from_batch(")
     if card is None:
         return found + ["table-card: the card table upload ggml_sycl_upload_moe_card_ptr_table_from_batch is missing"]
@@ -423,10 +445,15 @@ def direct_violations(src: dict[str, str]) -> list[str]:
                      "leg")
     # A failed drain proves no quiescence: the host leg joins the bundle's quarantine through the terminal, so its
     # buffers are not freed under a queued copy and the submitting thread does not wait its job.
+    # The branch parks the leg and does nothing else to it, but let its job go (host-let-go).
     drain = find(body, "exact_queue->wait_and_throw();")
-    park = find(body, "} else if (completion->host_leg) { terminal->quarantine_host_leg(std::move(completion->host_leg));")
+    branch_head = spaced("} else if (completion->host_leg) {")
+    park = find(body, branch_head)
+    branch = body[park + len(branch_head) - 1:matching(body, park + len(branch_head) - 1) + 1] if park >= 0 else ""
+    parked = branch.replace(spaced("completion->host_leg->let_go_job();") + " ", "", 1)
     if drain < 0 or park < drain or find(body, "if (quiescent) {", drain) > park or \
-            find(body, "if (quiescent) {", drain) < 0:
+            find(body, "if (quiescent) {", drain) < 0 or \
+            parked != "{" + spaced("terminal->quarantine_host_leg(std::move(completion->host_leg));") + "}":
         found.append("host-quarantine: a host leg whose drain failed does not join the bundle's quarantine through "
                      "the terminal")
     if not has(direct, "g_q1_nvfp4_test_host_submit.fetch_add(") or \
@@ -489,18 +516,34 @@ def let_go_violations(src: dict[str, str]) -> list[str]:
     leg = struct_body(code, "moe_direct_host_leg")
     if work is None or not re.search(r"\bstd::atomic<bool>\s+let_go\s*\{\s*false\s*\}\s*;", work):
         found.append("host-let-go: the host work has no let_go flag, cleared at construction")
-    if leg is None or not re.search(r"~moe_direct_host_leg\s*\(\s*\)\s*(?:noexcept\s*)?\{\s*if\s*\(\s*work\s*\)\s*\{\s*"
-                                    r"work\s*->\s*let_go\s*\.\s*store\s*\(\s*true\s*,\s*std::memory_order_release\s*\)"
-                                    r"\s*;\s*\}\s*\}", leg):
+    lets_go = leg is not None and re.search(
+        r"\bvoid\s+let_go_job\s*\(\s*\)\s*(?:const\s*)?(?:noexcept\s*)?\{\s*if\s*\(\s*work\s*\)\s*\{\s*work\s*->\s*"
+        r"let_go\s*\.\s*store\s*\(\s*true\s*,\s*std::memory_order_release\s*\)\s*;\s*\}\s*\}", leg)
+    if not lets_go or not re.search(r"~moe_direct_host_leg\s*\(\s*\)\s*(?:noexcept\s*)?\{\s*let_go_job\s*\(\s*\)\s*;"
+                                    r"\s*\}", leg):
         found.append("host-let-go: the leg does not let its job go as it goes, before its future waits the job")
     launch = code_of(host_helpers(src["sycl"]).get("ggml_sycl_moe_direct_host_launch", ""))
-    wait = re.search(r"\bcpu_job_input_marker_wait\s*\(\s*inputs\s*,\s*&\s*held\s*->\s*let_go\s*\)\s*;", launch)
-    stop = re.search(r"\bif\s*\(\s*held\s*->\s*let_go\s*\.\s*load\s*\(\s*std::memory_order_acquire\s*\)\s*\)\s*\{\s*"
-                     r"throw\b", launch)
+    throw_if_let_go = (r"if\s*\(\s*held\s*->\s*let_go\s*\.\s*load\s*\(\s*std::memory_order_acquire\s*\)\s*\)\s*\{\s*"
+                       r"throw\b")
+    # The throw comes right after the marker wait: the input wait after it waits the marker again, without let_go.
+    stop = re.search(r"\bcpu_job_input_marker_wait\s*\(\s*inputs\s*,\s*&\s*held\s*->\s*let_go\s*\)\s*;\s*" +
+                     throw_if_let_go, launch)
     run = launch.find("ggml_sycl_cpu_moe_host_aos_execute(")
-    if not wait or not stop or run < 0 or not wait.start() < stop.start() < run:
+    if not stop or run < 0 or not stop.end() < run:
         found.append("host-let-go: the job does not wait its marker with the leg's let_go and throw, running nothing, "
                      "once let go")
+    # A job let go while it runs stops at its next task: a dropped leg then waits for at most the task in hand, not for
+    # every task left, under whatever lock or on whatever thread drops it.
+    each = re.search(r"\bfor\s*\(\s*size_t\s+t\s*=\s*0\s*;\s*t\s*<\s*held\s*->\s*tasks\s*\.\s*size\s*\(\s*\)\s*;\s*"
+                     r"\+\+\s*t\s*\)\s*\{\s*" + throw_if_let_go, launch)
+    if not stop or not each or not stop.end() < each.start() or not each.end() < run:
+        found.append("host-let-go: a job let go between its tasks runs the tasks left")
+    # A parked leg's rows are never read (the graph has failed), and its marker may never be written: its job is let go
+    # as it is parked, so it neither spins a core until exit nor runs tasks whose rows nothing reads.
+    if not re.search(r"\}\s*else\s+if\s*\(\s*completion\s*->\s*host_leg\s*\)\s*\{\s*completion\s*->\s*host_leg\s*->\s*"
+                     r"let_go_job\s*\(\s*\)\s*;\s*terminal\s*->\s*quarantine_host_leg\s*\(", code):
+        found.append("host-let-go: a leg parked in the terminal keeps its job waiting for a marker that may never "
+                     "come")
     header = code_of(src["signal"])
     m = re.search(r"inline\s+void\s+cpu_job_input_marker_wait\s*\(\s*const\s+cpu_job_input_marker\s*&\s*m\s*,\s*"
                   r"const\s+std::atomic<bool>\s*\*\s*let_go\s*=\s*nullptr\s*\)\s*\{", header)
@@ -571,8 +614,25 @@ def test_mutations_are_witnessed() -> None:
         # The upload's refusal stops marking the table stale.
         ("sycl", r"(auto refuse = \[&\]\(\) -> const void \* const \* \{\s*if \(any_updated\) \{\s*)"
                  r"extra->weight\(\)\.mark_moe_device_table_stale\(device\);", r"\1(void) device;", "table-stale"),
-        # The leg goes without letting its job go: its future waits a job that may wait for its marker forever.
+        # The stale-on-throw guard stops marking the table stale.
+        ("sycl", r"(~moe_ptr_table_stale_on_throw\(\) \{\s*if \(payload_changed && std::uncaught_exceptions\(\) > "
+                 r"exceptions\) \{\s*)weight\.mark_moe_device_table_stale\(device\);", r"\1(void) weight;",
+         "table-stale"),
+        # The guard marks the table stale on every exit, a successful return included.
+        ("sycl", r"if \(payload_changed && std::uncaught_exceptions\(\) > exceptions\)", "if (payload_changed)",
+         "table-stale"),
+        # The upload holds no guard: a throw from the payload's copy leaves the payload ahead of a table still valid.
+        ("sycl", r"const moe_ptr_table_stale_on_throw stale_on_throw\{[^;]*\};", "", "table-stale"),
+        # The leg's let-go helper stores nothing: its future waits a job that may wait for its marker forever.
         ("sycl", r"work->let_go\.store\(true, std::memory_order_release\);", "(void) work;", "host-let-go"),
+        # The leg goes without letting its job go.
+        ("sycl", r"~moe_direct_host_leg\(\) \{\s*let_go_job\(\);\s*\}", "~moe_direct_host_leg() {}", "host-let-go"),
+        # A job let go between its tasks runs the tasks left.
+        ("sycl", r"(for \(size_t t = 0; t < held->tasks\.size\(\); \+\+t\) \{)\s*if \(held->let_go\.load\("
+                 r"std::memory_order_acquire\)\) \{\s*throw std::runtime_error\([^;]*\);\s*\}", r"\1",
+         "host-let-go"),
+        # A parked leg's job keeps waiting for a marker that may never be written.
+        ("sycl", r"completion->host_leg->let_go_job\(\);(\s*terminal->quarantine_host_leg)", r"\1", "host-let-go"),
         # The job waits its marker without the leg's let_go.
         ("sycl", r"cpu_job_input_marker_wait\(inputs, &held->let_go\);", "cpu_job_input_marker_wait(inputs);",
          "host-let-go"),
