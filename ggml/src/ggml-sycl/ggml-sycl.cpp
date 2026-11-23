@@ -55494,6 +55494,41 @@ static void scale_f32(const float *            x,
     dst[i] = scale * x[i] + bias;
 }
 
+// The source and dst each walked with their own byte strides, as unary_op_generic_kernel (element_wise.cpp)
+// walks a strided unary operand: one work-item per element of the logical shape, decomposed into (i0..i3).
+// Each work-item reads its element before it writes it, so in place (dst a view of src0 with src0's
+// strides) is safe.
+static void scale_f32_strided(const float *            x,
+                              float *                  dst,
+                              const float              scale,
+                              const float              bias,
+                              const int64_t            k,
+                              const int64_t            ne0,
+                              const int64_t            ne1,
+                              const int64_t            ne2,
+                              const size_t             nb00,
+                              const size_t             nb01,
+                              const size_t             nb02,
+                              const size_t             nb03,
+                              const size_t             nb0,
+                              const size_t             nb1,
+                              const size_t             nb2,
+                              const size_t             nb3,
+                              const sycl::nd_item<3> & item_ct1) {
+    const int64_t i = (int64_t) item_ct1.get_local_range(2) * item_ct1.get_group(2) + item_ct1.get_local_id(2);
+    if (i >= k) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / (ne0 * ne1)) % ne2;
+    const int64_t i3 = i / (ne0 * ne1 * ne2);
+
+    const float * src = (const float *) ((const char *) x + i0 * nb00 + i1 * nb01 + i2 * nb02 + i3 * nb03);
+    float *       out = (float *) ((char *) dst + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+    *out              = scale * *src + bias;
+}
+
 template <typename Ti, typename To>
 static void pool2d_nchw_kernel(const int ih,
                                const int iw,
@@ -55634,6 +55669,36 @@ static void scale_f32_sycl(const float * x,
                           sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE)),
 
         [=](sycl::nd_item<3> item_ct1) { scale_f32(x, dst, scale, bias, k, item_ct1); });
+}
+
+static void scale_f32_strided_sycl(const float *   x,
+                                   float *         dst,
+                                   const float     scale,
+                                   const float     bias,
+                                   const int64_t * ne,
+                                   const size_t *  nb_src,
+                                   const size_t *  nb_dst,
+                                   queue_ptr       stream) {
+    const int64_t k          = ne[0] * ne[1] * ne[2] * ne[3];
+    const int64_t num_blocks = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
+    const int64_t ne0        = ne[0];
+    const int64_t ne1        = ne[1];
+    const int64_t ne2        = ne[2];
+    const size_t  nb00       = nb_src[0];
+    const size_t  nb01       = nb_src[1];
+    const size_t  nb02       = nb_src[2];
+    const size_t  nb03       = nb_src[3];
+    const size_t  nb0        = nb_dst[0];
+    const size_t  nb1        = nb_dst[1];
+    const size_t  nb2        = nb_dst[2];
+    const size_t  nb3        = nb_dst[3];
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE),
+                          sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) {
+            scale_f32_strided(x, dst, scale, bias, k, ne0, ne1, ne2, nb00, nb01, nb02, nb03, nb0, nb1, nb2, nb3,
+                              item_ct1);
+        });
 }
 
 static void sum_rows_f32_sycl(const float * x, float * dst, const int ncols, const int nrows, queue_ptr stream) {
@@ -57157,7 +57222,15 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
     const auto * params = static_cast<const float *>(dst.op_params());
     memcpy(&scale, params + 0, sizeof(float));
     memcpy(&bias, params + 1, sizeof(float));
-    scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0.raw()), main_stream);
+    GGML_ASSERT(ggml_are_same_shape(src0.raw(), dst.raw()));
+    if (src0.is_contiguous() && dst.is_contiguous()) {
+        // both flat: index by element, no per-element index decomposition
+        scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(src0.raw()), main_stream);
+    } else {
+        // a view (e.g. one half of a fused gate_up row) and/or a dst that is a view of it (in place):
+        // read and write each in the layout it is in, no contiguous copy first
+        scale_f32_strided_sycl(src0_dd, dst_dd, scale, bias, src0.ne_arr(), src0.nb_arr(), dst.nb_arr(), main_stream);
+    }
     /*
 
     DPCT1010:87: SYCL uses exceptions to report errors and does not use the
@@ -124565,9 +124638,11 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                    ggml_sycl_norm_rows_supported(op);
 
         case GGML_OP_SCALE:
-            // ggml_sycl_op_scale asserts f32 on both sides and reads src0 flat; ggml_scale now accepts
-            // non-contiguous views, which that flat read would mis-address
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+            // F32 only (ggml_sycl_op_scale asserts f32 on both sides; F16 and BF16 are declined). Any layout:
+            // a flat src0 and dst take scale_f32, anything else (a strided or offset view of src0, and in place
+            // a dst that is a view of src0 with its strides) takes scale_f32_strided, which walks src0 and dst
+            // each with its own byte strides.
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
 
         case GGML_OP_CONT:
             return op->src[0]->type != GGML_TYPE_BF16;
