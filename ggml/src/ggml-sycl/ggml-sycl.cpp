@@ -83470,10 +83470,17 @@ static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int devic
            ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, op->src[0], device, false);
 }
 
-// Whether `buffer` is one device's own SYCL buffer, not a split buffer: the only kind the BF16 route can publish expert
-// slices from (the publisher reads its context as a ggml_backend_sycl_buffer_context).
-static bool ggml_sycl_moe_bf16_direct_unsplit_sycl_buffer(ggml_backend_buffer_t buffer) {
-    return buffer != nullptr && ggml_backend_buffer_is_sycl(buffer) && !ggml_backend_buffer_is_sycl_split(buffer);
+// Whether `buffer` is `device`'s own buffer: one device's SYCL buffer, not a split buffer (the publisher reads its context
+// as a ggml_backend_sycl_buffer_context), of `device`, in VRAM. The BF16 route without a plan admits a placed weight
+// only there, and publishes expert slices only from there: it records them under `device`, so another card's buffer
+// must never pass.
+static bool ggml_sycl_moe_bf16_direct_own_vram_buffer(ggml_backend_buffer_t buffer, int device) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_sycl(buffer) || ggml_backend_buffer_is_sycl_split(buffer)) {
+        return false;
+    }
+    const auto * buf_ctx = static_cast<const ggml_backend_sycl_buffer_context *>(buffer->context);
+    return buf_ctx != nullptr && buf_ctx->device == device &&
+           buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
 }
 
 // Whether `device` computes a BF16 MUL_MAT_ID with the BF16 expert kernel (moe-bf16-direct.hpp, Inkling 2 Mini plan
@@ -83510,12 +83517,7 @@ static bool ggml_sycl_moe_bf16_direct_route_available(const ggml_tensor * op, in
     if (src0->buffer == nullptr) {
         return true;
     }
-    if (!ggml_sycl_moe_bf16_direct_unsplit_sycl_buffer(src0->buffer)) {
-        return false;
-    }
-    const auto * buf_ctx = static_cast<const ggml_backend_sycl_buffer_context *>(src0->buffer->context);
-    return buf_ctx != nullptr && buf_ctx->device == device &&
-           buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
+    return ggml_sycl_moe_bf16_direct_own_vram_buffer(src0->buffer, device);
 }
 
 // Every BF16 MUL_MAT_ID that reaches ggml_sycl_mul_mat_id runs here, on this device: the experts from the full-local
@@ -83558,7 +83560,7 @@ static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, gg
     if (table == nullptr) {
         int  published_kind   = -1;
         bool published_stable = false;
-        if (ggml_sycl_moe_bf16_direct_unsplit_sycl_buffer(src0->buffer) &&
+        if (ggml_sycl_moe_bf16_direct_own_vram_buffer(src0->buffer, ctx.device) &&
             ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS, &published_kind,
                                                          &published_stable)) {
             table = ensure_table();
@@ -83593,9 +83595,11 @@ static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, gg
     shape.ids_nb1   = ids->nb[1];
     shape.dst_nb1   = dst->nb[1];
     shape.dst_nb2   = dst->nb[2];
+
     // The kernel runs any token count in chunks that fit a launch, but not a single token whose slots and rows alone
     // exceed one; the pointers are checked above, so this is the submitter's only refusal left.
-    if (ggml_sycl::moe_bf16_direct_tokens_per_launch(shape) <= 0) {
+    const int64_t tokens_per_launch = ggml_sycl::moe_bf16_direct_tokens_per_launch(shape);
+    if (tokens_per_launch <= 0) {
         refuse("one token's slots and rows exceed one kernel launch");
     }
 
@@ -83608,11 +83612,13 @@ static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, gg
 
     // GGML_SYCL_KERNEL_PROFILE row, labelled the way mmvq_submit_aos_id_impl labels the MMVQ id kernels. The wrapper
     // times the event it is handed, the last token chunk's, so a dispatch split into chunks reports its last chunk
-    // only; at Inkling's shapes that starts above about 7000 tokens in one ubatch.
+    // only, and the row says so with launches > 1; at Inkling's shapes (2304 rows, 8 slots) that starts above 7281
+    // tokens in one ubatch.
     std::string profile_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         profile_metadata = "ncols=" + std::to_string(shape.k) + ";nrows_per_expert=" + std::to_string(shape.rows) +
-                           ";total_batches=" + std::to_string(shape.n_tokens * shape.n_slots);
+                           ";total_batches=" + std::to_string(shape.n_tokens * shape.n_slots) +
+                           ";launches=" + std::to_string((shape.n_tokens + tokens_per_launch - 1) / tokens_per_launch);
     }
     ggml_sycl_profile_label profile_label{};
     profile_label.name       = "mulmat.moe.bf16_direct";
