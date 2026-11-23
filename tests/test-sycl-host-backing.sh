@@ -84,6 +84,11 @@ check_eq "parts on unreadable prints nothing" "" "$out"
 check_eq "state, loaded" "11970836 56583232 52242988" "$(sycl_gpu_host_state_kb "$LOADED")"
 check_eq "state, idle" "11597780 1765960 $(awk '/^MemAvailable:/{print $2}' "$IDLE")" "$(sycl_gpu_host_state_kb "$IDLE")"
 
+# A caller that decides on one read and prints the figure it decided on keeps the state string.
+st="$(sycl_gpu_host_state_kb "$LOADED")"
+check_eq "state backing" 68554068 "$(sycl_gpu_host_state_backing_kb "$st")"
+check_eq "state format" "Shmem: 11970836 kB HostBacking: 68554068 kB MemAvailable: 52242988 kB" "$(sycl_gpu_host_format_state "$st")"
+
 # Default file is /proc/meminfo: a number on any Linux host.
 if [ -r /proc/meminfo ]; then
     case "$(sycl_gpu_host_backing_kb)" in

@@ -81,11 +81,26 @@ sycl_gpu_host_backing_gib() {
 # always returns 0: a figure that cannot be read prints "unreadable", so a log line never decides
 # anything.
 sycl_gpu_host_backing_log_line() {
-    local st shm rem av
+    local st
     if st="$(sycl_gpu_host_state_kb "$@" 2>/dev/null)"; then
-        read -r shm rem av <<< "$st"
-        echo "Shmem: $shm kB HostBacking: $((shm + rem)) kB MemAvailable: $av kB"
+        sycl_gpu_host_format_state "$st"
     else
         echo "Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB"
     fi
+}
+
+# sycl_gpu_host_state_backing_kb "<state>": Shmem + remainder in kB, from a string that
+# sycl_gpu_host_state_kb printed. A caller that decides on a read and then prints the figure it
+# decided on keeps the state string and passes it to both this and the format function.
+sycl_gpu_host_state_backing_kb() {
+    local shm rem av
+    read -r shm rem av <<< "$1"
+    echo $((shm + rem))
+}
+
+# sycl_gpu_host_format_state "<state>": the log line for a state string.
+sycl_gpu_host_format_state() {
+    local shm rem av
+    read -r shm rem av <<< "$1"
+    echo "Shmem: $shm kB HostBacking: $((shm + rem)) kB MemAvailable: $av kB"
 }
