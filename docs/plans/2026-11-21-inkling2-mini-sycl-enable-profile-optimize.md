@@ -4595,6 +4595,38 @@ admission.** The weight is loaded BF16, AOS, on the card; the kernel reads it th
   probe. A table miss publishes only for a weight in this device's own buffer. Added by the lead: a profiler
   label for the kernel (`mulmat.moe.bf16_direct`), because the device-time profile has no row for it.
 
+**DONE 2026-11-23, merged as `f298d2190`.** Task commits after the first reviews: `beb6867ab` and `0c24f4780`
+(RED), `2b6253cb9` (token chunks, the kernel test's skip), `31d06fabd` (the route keyed on the type, refusal by
+name), `54e6dc1d2` (inventory), `cc2e1cbbb` (the watchdog contract), then the second quality round's four minor
+findings: `10643997b` (RED), `41f9e93eb`, `acdfc762c`. Spec review PASS; quality review FAIL, then PASS with four
+minor findings, then PASS on their fixes. Evidence: `docs/backend/data/inkling2/t8g-lead-runs-acdfc762c.txt`.
+
+*Rulings made in the last rounds.*
+- The private-route watchdog contract lists its production-route device tests by name
+  (`sycl-q1-nvfp4-admitted-device`, `sycl-moe-bf16-direct-device`), checks each registration, wants exactly one
+  property-setting call per name, and counts the variable against the list. A third user is added on purpose.
+- A table miss publishes only from this device's own VRAM buffer: one helper holds the test for the predicate's
+  no-plan arm and for the publish guard.
+- The profiler row carries `launches=`: in a dispatch cut into several launches it times the last one only.
+- Accepted deviation: the device test also exits 77 when `GGML_SYCL_WEIGHTS_EVICTABLE` is explicitly 0.
+
+*Device results, one run each, zero kernel fault lines (task tree's build; the merge has the tree of
+`acdfc762c`).*
+- Kernel test: passes on `opencl:cpu` and on the B70, `per_launch=3` in every case.
+- Route test: 8 cases and 2 controls pass on the B70 and on the B50 (each log names its card), `unused_nonzero=0`
+  in every case, on `cc2e1cbbb` and again on `acdfc762c`.
+- `test-backend-ops -o MUL_MAT_ID`: the same 31 BF16 cases OK on each card, every other count as on `8fe336e2b`.
+- Inkling gate: passes on the B70 and on both cards. Mistral (B70) and GPT-OSS (B50) gates pass.
+- Split census: 1 split, 0 on the CPU (9 and 4 before). Trace: no `[BINBCAST] stage` line (288 before).
+
+*Throughput, B70, interleaved ABBA against the Task 8i tree, no builder alive at either end of any arm:* tg128
+15.28 and 15.28 t/s against 11.01 and 10.72; pp512 47.42 and 47.58 against 42.98 and 41.40. Orientation figures
+under the permanent host load, not a baseline.
+
+*Owed after this task:* both contract sweeps on a full build of the merged tree (Task 8c's tree runs them after
+it merges this head); a device case for an activation view at a 4-byte offset (it needs an `xvec=` field on the
+route's log line, or it can only show "numbers right").
+
 **Checkpoint before any code (report to the lead, then wait):**
 1. How the CPU backend reads these experts today, given that the scheduler print shows them as `[SYCL0]` with
    no copy in the split's inputs: is there a host mirror, and does it stay allocated once the node runs on the
@@ -5843,6 +5875,27 @@ tensors on the card, replay took 11336 of the split's 11469 nodes, and decode we
 half of S4) is re-measured on the merged tree before any decode task is written. The prompt rows (S4's
 prompt half, S8) are untouched: pp512 did not move.
 
+**After Task 8g (2026-11-23), measured on the merged code (`acdfc762c`, B70).** Three profiled loads of 48
+decoded tokens: `docs/backend/data/inkling2/t8g-lead-runs-acdfc762c.txt`, section C, and the CSVs
+`t8i-kprof-tg-b70-1f2dc2606.csv`, `t8g-kprof-tg-b70-acdfc762c.csv`, `t8g-kprof-nograph-b70-acdfc762c.csv`.
+
+| # | Verdict now | Measured |
+|---|-------------|----------|
+| S1 | **closed for decode** | A decoded token is 65 ms in the bench (15.3 t/s) and 73 ms under the profiler, from 255 ms. With replay off the same token is 267 ms and 6948 device submissions; with replay 737 of them are dispatched directly. Replay removes about 200 ms of per-submission host time. |
+| S2 | **met** | 1 scheduler split, none on the CPU. |
+| S7 | **closed, no task** | 131 marker events per token with replay (2020 without), 0.07 ms. Not a hotspot once replay engages. The `reuse` mode stays opt-in; its ABBA is no longer owed for speed. |
+| S9 | **the largest known item** | The NVFP4 expert kernel: 88 calls, 182 us each, 16.0 ms of device time per token in all three loads. That is a quarter of the 65 ms token. |
+| S5 | **the first decode task** | Device-timed kernel work is 26 ms per token with every kernel dispatched and timed. About 40 ms of the 65 ms token has no row. The dense BF16 `MUL_MAT` (495 entries per token) still has no device-time label: `mulmat.dispatch.entry` counts 977 entries per token at zero device time. Until it has one, the 40 ms cannot be split between that kernel and replay's own cost. |
+| S4 (decode half) | folded into S9 | The same kernel; the prompt half stands as written. |
+
+BF16 experts on the card cost 1.1 ms per token (8 calls, 142 us each). pp512 moved with this task as well (47.5
+against 42.2): the prompt's BF16 experts left the CPU too. The prompt rows S4 and S8 are not re-measured; their
+shares of a 691-token prompt are from `fe79b7062`.
+
+Order for decode, replacing the decode part of the proposal below: the S5 label first (a measurement: one load
+tells whether the 40 ms is kernel time or replay overhead), then S9 or the dense kernel, whichever the label
+names as larger.
+
 Proposed order (the user reviews it before any of it starts): Tasks 8g and 8i first, because they are running
 and they decide whether graph replay engages at all (S1); then S7 (the smallest change); S8 (a contained change
 for a quarter of the prompt); S4 as a grouped prompt kernel (half of the prompt, the largest piece of work); the
@@ -5912,6 +5965,18 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
   did. It should skip with 77.
 - The canonical gate script prints `sha=` of its own tree, not of the tree whose `build/` it ran. A gate
   run from a task tree is labelled with the integration tree's commit.
+- The single-chunk VRAM arena reservation can fail right after the early arena is destroyed (seen once, GPT-OSS
+  on the B50, 15 ms after the destroy, evidence in `t8g-lead-runs-acdfc762c.txt`). Nothing is logged. The
+  two-chunk fallback takes a fixed 128 MB KV reserve from the weight zone when the plan held 6 MB, so 8 expert
+  triplets went to the host and decode read 9.9 t/s for 27.5. The gate passed. Wanted: a WARN on the failed
+  reservation, a bounded retry (the driver's free figure is stale-low after a destroy), and a KV zone in the
+  fallback sized from the plan.
+- The BF16 route's device test has no case for an activation view at a 4-byte offset (the float4 guard). It
+  needs the route's log line to print the activation form.
+- The watchdog contract cannot see a test named through a variable or a wrapper function in a property call.
+- `test-sycl-moe-resolved-batch` was labelled `host` and reserves a ~29.9 GB VRAM arena on the B70; it also
+  crashed at exit (a cache destructor asked a destroyed device manager for its index). Task 8c fixes both.
+- The kernel profiler reports `failed_timestamps` (11187 in the replay-off load): its totals are lower bounds.
 - A lead mistake to keep out of the next round: a throughput pair was read while implementer builds started
   inside it, and two slow arms were chased as a regression for five loads. Builders are sampled at both
   ends of an arm now, and an implementer's build waits for the bench's `done` file.

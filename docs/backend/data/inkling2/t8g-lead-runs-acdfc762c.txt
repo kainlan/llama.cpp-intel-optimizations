@@ -151,3 +151,20 @@ Task 8i, 1f2dc2606: 102.83 ms per decoded token; directly dispatched submissions
     sycl.binbcast.event                        235.8 per pass    0.121 ms per pass  mean      0.5 us
 The profiler times directly dispatched submissions only: the kernels inside replayed segment graphs have no row.
 About 54 ms of the 73 ms token is therefore not attributed by this table.
+
+##### D. The same load with GGML_SYCL_DISABLE_GRAPH=1 (every kernel dispatched and timed), acdfc762c, B70, builders quiet
+eval time =   12553.97 ms /    47 runs   (  267.11 ms per token,     3.74 tokens per second)
+submissions 6948 per pass; device-timed 25.92 ms per pass; failed_timestamps 11187 (totals are lower bounds)
+    mulmat.mmvq.id_aos_nvfp4                    88.0 per pass   16.022 ms per pass  mean    182.1 us
+    mulmat.onednn_gemm.unbatched               412.4 per pass    1.359 ms per pass  mean      3.3 us
+    sycl.binbcast.add                          776.0 per pass    1.182 ms per pass  mean      1.5 us
+    mulmat.moe.bf16_direct                       8.0 per pass    1.136 ms per pass  mean    142.0 us
+    sycl.binbcast.mul                          699.9 per pass    1.056 ms per pass  mean      1.5 us
+    sycl.binbcast.event                       2019.9 per pass    1.029 ms per pass  mean      0.5 us
+    fattn.decode.esimd_partitioned              47.0 per pass    0.552 ms per pass  mean     11.7 us
+    fattn.compute.xmx_v2                         1.0 per pass    0.516 ms per pass  mean    527.2 us
+    norm.rms_norm_mul                          152.0 per pass    0.437 ms per pass  mean      2.9 us
+    sycl.binbcast.repeat                       208.0 per pass    0.423 ms per pass  mean      2.0 us
+    norm.rms_norm                              360.0 per pass    0.416 ms per pass  mean      1.2 us
+    sycl.set_rows.generic                       96.0 per pass    0.338 ms per pass  mean      3.5 us
+    mulmat.dispatch.entry                      977.0 per pass    0.000 ms per pass  (entries with no device-time row: the dense BF16 MUL_MAT among them)
