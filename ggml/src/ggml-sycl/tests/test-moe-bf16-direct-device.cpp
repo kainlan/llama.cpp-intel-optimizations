@@ -22,8 +22,10 @@
 // active plan does not contain (it sits in a SYCL device buffer, which counts only when no plan is known), and a
 // strided view of a planned expert tensor (every other expert).
 //
-// The NaN rows of a null slot and an out-of-range id, and the zero row of id -1, are checked at the submitter level by
-// its own test; the production route never builds such a table.
+// Two cases send id -1 (an unused slot) through the production route: the Inkling gate_up decode case and the k 99
+// prompt case. dst starts as NaN on both backends, the CPU writes a zero row for -1, and every such row must come back
+// exactly zero. The NaN rows of a null table entry and an out-of-range id are checked at the submitter level by its
+// own test (test-sycl-moe-bf16-direct-kernel); the production route never builds such a table.
 //
 // Every case prints one CASE line and every control one CONTROL line. The process exits 1 if any failed, 77 when
 // there is no SYCL GPU or the weights are not evictable (the fixture models the default load only). Pin one card.
@@ -40,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -329,8 +332,13 @@ struct case_data {
 
 // BF16-representable activations (the CPU rounds src1 to BF16) and distinct experts per token: with as many slots as
 // experts each token takes a rotated permutation, reversed on odd tokens; otherwise slots stride the experts from a
-// moving base.
-case_data make_case(const model_spec & model, const expert_spec & spec, int n_tokens, std::mt19937 & rng) {
+// moving base. With `unused_slots`, every third token (token 0 first) gives one slot id -1, the slot moving on each
+// time, so a decode case has one unused slot and a 33-token prompt case eleven, spread over the slots.
+case_data make_case(const model_spec &  model,
+                    const expert_spec & spec,
+                    int                 n_tokens,
+                    bool                unused_slots,
+                    std::mt19937 &      rng) {
     case_data                             c{ n_tokens, spec.ne11, model.n_used, {}, {} };
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     c.input.resize(size_t(spec.k_in) * spec.ne11 * n_tokens);
@@ -349,6 +357,9 @@ case_data make_case(const model_spec & model, const expert_spec & spec, int n_to
                 expert = (base + i * (model.n_expert / model.n_used)) % model.n_expert;
             }
             c.ids[size_t(t) * model.n_used + i] = expert;
+        }
+        if (unused_slots && t % 3 == 0) {
+            c.ids[size_t(t) * model.n_used + (t / 3) % model.n_used] = -1;
         }
     }
     return c;
@@ -417,6 +428,10 @@ ggml_status run_backend(ggml_backend_t               backend,
     }
     ggml_backend_tensor_set(input, c.input.data(), 0, c.input.size() * sizeof(float));
     ggml_backend_tensor_set(ids, c.ids.data(), 0, c.ids.size() * sizeof(int32_t));
+    // dst starts as NaN, so a row the op leaves unwritten (an unused slot's zero row, say) cannot pass by luck.
+    const std::vector<float> poison(size_t(spec.k_out) * c.n_used * c.n_tokens,
+                                    std::numeric_limits<float>::quiet_NaN());
+    ggml_backend_tensor_set(dst, poison.data(), 0, poison.size() * sizeof(float));
 
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, dst);
@@ -457,15 +472,17 @@ bool supports(ggml_backend_t backend, ggml_tensor * weights, const case_data & c
 
 // Runs one case and prints its CASE line. Returns true when it passed. Every count is of the lines that appeared
 // while this case ran. The kernel takes its vec4 form when k is a multiple of 4 (every row and expert then starts on
-// an 8-byte boundary), its scalar form otherwise.
+// an 8-byte boundary), its scalar form otherwise. With `unused_slots` the case has id -1 slots, and each of their
+// output rows must be exactly zero.
 bool run_case(lifecycle_fixture & life,
               ggml_backend_t      cpu,
               const model_spec &  model,
               size_t              tensor,
               int                 n_tokens,
+              bool                unused_slots,
               std::mt19937 &      rng) {
     const expert_spec & spec = model.tensors[tensor];
-    const case_data     c    = make_case(model, spec, n_tokens, rng);
+    const case_data     c    = make_case(model, spec, n_tokens, unused_slots, rng);
     const int           vec4 = spec.k_in % 4 == 0 ? 1 : 0;
 
     const bool admitted = supports(life.backend, life.weights[tensor], c);
@@ -490,6 +507,20 @@ bool run_case(lifecycle_fixture & life,
                             g_log.count_since(from, { "[MOE-DECODE-REFUSAL]" }) +
                             g_log.count_since(from, { "[MOE-PROMPT-REFUSAL]" });
 
+    // The rows of id -1 slots: one per such slot, in dst's [k_out, n_used, n_tokens] order, the same order as ids.
+    size_t unused = 0, unused_nonzero = 0;
+    for (size_t r = 0; r < c.ids.size(); ++r) {
+        if (c.ids[r] != -1) {
+            continue;
+        }
+        ++unused;
+        const size_t row = r * size_t(spec.k_out);
+        if (got.size() < row + size_t(spec.k_out) ||
+            !std::all_of(got.begin() + row, got.begin() + row + spec.k_out, [](float v) { return v == 0.0f; })) {
+            ++unused_nonzero;
+        }
+    }
+
     std::string why;
     if (!admitted) {
         why += " supports-op";
@@ -497,6 +528,11 @@ bool run_case(lifecycle_fixture & life,
         why += " compute-status";
     } else if (!(std::isfinite(err) && err <= k_nmse_tol)) {
         why += " nmse";
+    }
+    if (unused_slots && unused == 0) {
+        why += " no-unused-slot";
+    } else if (admitted && status == GGML_STATUS_SUCCESS && unused_nonzero != 0) {
+        why += " unused-row-not-zero";
     }
     if (admitted && route == 0) {
         why += " route-did-not-run";
@@ -507,10 +543,11 @@ bool run_case(lifecycle_fixture & life,
         why += " refusal";
     }
     std::fprintf(stderr,
-                 "CASE model=%s tensor=%s k=%d m=%d experts=%d used=%d ne11=%d tokens=%d supports_op=%d status=%d "
-                 "max_row_nmse=%.3e route_lines=%zu want_vec4=%d form_lines=%zu refusals=%zu -> %s%s\n",
-                 model.label, spec.name, spec.k_in, spec.k_out, model.n_expert, model.n_used, c.ne11, n_tokens,
-                 admitted ? 1 : 0, static_cast<int>(status), err, route, vec4, route_form, refusals,
+                 "CASE model=%s tensor=%s k=%d m=%d experts=%d used=%d ne11=%d tokens=%d unused_slots=%zu "
+                 "supports_op=%d status=%d max_row_nmse=%.3e unused_nonzero=%zu route_lines=%zu want_vec4=%d "
+                 "form_lines=%zu refusals=%zu -> %s%s\n",
+                 model.label, spec.name, spec.k_in, spec.k_out, model.n_expert, model.n_used, c.ne11, n_tokens, unused,
+                 admitted ? 1 : 0, static_cast<int>(status), err, unused_nonzero, route, vec4, route_form, refusals,
                  why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
@@ -526,7 +563,7 @@ bool report_control(const char * name, bool admitted) {
 int run_controls(lifecycle_fixture & life, const model_spec & model, std::mt19937 & rng) {
     int                 failed = 0;
     const expert_spec & spec   = model.tensors[0];
-    const case_data     c      = make_case(model, spec, k_decode, rng);
+    const case_data     c      = make_case(model, spec, k_decode, /* unused_slots = */ false, rng);
 
     ggml_init_params                                    params = { 4 * ggml_tensor_overhead(), nullptr, true };
     std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), &ggml_free);
@@ -554,6 +591,7 @@ int main() {
     // Read once by the backend, so it is set before anything touches it.
     setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);
     ggml_log_set(log_callback, nullptr);
+    // The device probe is the one place a SYCL exception means "no usable GPU here"; after it, any exception fails.
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) {
@@ -563,6 +601,11 @@ int main() {
             std::fprintf(stderr, "SKIP: no usable SYCL GPU\n");
             return LLAMA_TEST_EXIT_SKIP;
         }
+    } catch (const sycl::exception & e) {
+        std::fprintf(stderr, "SKIP: no usable SYCL GPU: %s\n", e.what());
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    try {
         if (!ggml_backend_sycl_weights_evictable()) {
             std::fprintf(stderr,
                          "SKIP: GGML_SYCL_WEIGHTS_EVICTABLE is off, so libllama would load these experts into the "
@@ -588,7 +631,10 @@ int main() {
             lifecycle_fixture life(*model, rng);
             for (size_t t = 0; t < model->tensors.size(); ++t) {
                 for (int n_tokens : { k_decode, k_prompt }) {
-                    failed += run_case(life, cpu.get(), *model, t, n_tokens, rng) ? 0 : 1;
+                    // id -1 in one decode case (Inkling gate_up, the vec4 form) and one prompt case (k 99, scalar).
+                    const bool unused_slots = (model == &inkling && t == 0 && n_tokens == k_decode) ||
+                                              (model == &off32 && t == 1 && n_tokens == k_prompt);
+                    failed += run_case(life, cpu.get(), *model, t, n_tokens, unused_slots, rng) ? 0 : 1;
                     ++cases;
                 }
             }
@@ -603,9 +649,6 @@ int main() {
         }
         std::fprintf(stderr, "PASS: BF16 expert device route, %d cases, %d controls\n", cases, controls);
         return 0;
-    } catch (const sycl::exception & e) {
-        std::fprintf(stderr, "SKIP: no usable SYCL GPU: %s\n", e.what());
-        return LLAMA_TEST_EXIT_SKIP;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
