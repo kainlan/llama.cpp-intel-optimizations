@@ -428,11 +428,15 @@ triplet fits, nothing is published. The caller retries at a later boundary.
 Planned headroom in the zone is the planner's job, not the transaction's.
 
 Every copy a move publishes belongs to the models that owned the entry it
-replaces. Only a model load's end tags an entry with its owners
-(`owner_mask`, `owner_tagged`), and a model teardown never reclaims an untagged
-entry, so a copy published after the load would otherwise outlive its model in
-the WEIGHT zone or the pinned host zone. One helper, `inherit_entry_ownership`,
-copies the owners and any pending load: an admit's or a refill's device entry
+replaces. A model load's end tags what the load staged with its owners
+(`owner_mask`, `owner_tagged`), and a moved copy is tagged by inheriting its
+source's owners and tag. A model teardown never reclaims an untagged entry, so a
+copy published after the load would otherwise outlive its model in the WEIGHT
+zone or the pinned host zone. One helper, `inherit_entry_ownership`, copies the
+owners and the tag, and copies the source's pending load only when the copy's
+own stamp left none: a copy made outside any load takes the pending load, so
+that load's end tags it, while a mover inside a load keeps that load's stamp,
+since that load published the copy. An admit's or a refill's device entry
 takes them from the host copy it withdraws, under the locks that re-check that
 copy; a loan's or an evict's host copy takes them from the device entry the
 loan retired, which the loan holds in place until its registrations return

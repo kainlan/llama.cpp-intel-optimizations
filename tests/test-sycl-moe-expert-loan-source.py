@@ -1573,9 +1573,9 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
 
 # --- a moved copy belongs to its source's models --------------------------------------------------------------------
 
-# Only a model load's end tags an entry with its owners, and a model teardown never reclaims an untagged entry, so a copy
-# a move publishes after the load would outlive its model. Each copy takes the owners of the entry it replaces, through
-# one helper: the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces
+# A model load's end tags what it staged, and a model teardown never reclaims an untagged entry, so a copy a move
+# publishes after the load would outlive its model unless it is tagged by inheritance. Each copy takes the owners and
+# tag of the entry it replaces, and that entry's pending load when the copy's own stamp left none, through one helper:the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces
 # and before it is inserted, its mirror keeping the entry's pending load; and the host copy a loan or an evict
 # registers, from the device entry the loan retired and holds in place, before the registration inserts it.
 INHERIT_DEF = ("void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept { "
