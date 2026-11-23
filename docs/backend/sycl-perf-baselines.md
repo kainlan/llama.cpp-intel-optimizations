@@ -501,7 +501,7 @@ check engages the ring.
 - **Script.** `scripts/sycl-moe-exec-gate.sh <merge sha>`, run by the lead only, detached, one run at a
   time, under `GPU.lock`. The lead form runs a snapshot copy of the script against a build whose source
   tree is the merge tree:
-  `cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snapshot>/scripts/`,
+  `cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-host-backing.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snapshot>/scripts/`,
   then `bash <snapshot>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>`.
   The prompts resolve next to the script (the snapshot); the head check and the binary-newer-than-head
   check read the build's own source tree, `--src-dir`, which defaults to the parent of `--build-dir`. The
