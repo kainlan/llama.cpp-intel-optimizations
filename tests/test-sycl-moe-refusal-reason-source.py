@@ -19,7 +19,8 @@ The same holds for the Q1_0/NVFP4 direct route in ggml_sycl_mul_mat_id. Those
 types run nowhere else, so a call the direct block declines falls through to the
 retained route core, whose refusal (reason=capability_unsupported) names that
 core's own refusal, not the step of the direct route that declined. Each exit
-that falls through the block therefore prints a line naming its step
+that falls through the block therefore prints a line naming its step, and so
+does the adapter's refusal after the mark, before its throw
 (direct_decline_violations below).
 """
 from pathlib import Path
@@ -78,10 +79,18 @@ DIRECT_END = "// MoE hybrid GPU+CPU dispatch gate"
 DIRECT_SUCCESS = "ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);"
 DIRECT_PRECONDITION = "if (all_primary &&"
 # Each step that can decline a call once it has a batch, in the order the route reaches them; "layout" is the gate's
-# own remaining conjunct.
+# own remaining conjunct, and "adapter" is the kernel adapter's refusal after the mark.
 DIRECT_STEPS = ("layout", "precondition", "retained_table", "binding", "table_owner_retain", "private_table_owner",
                 "queue_capability", "invocation_snapshot", "submission_authority", "authority_issuer",
-                "workspace_admission", "workspace_slices")
+                "workspace_admission", "workspace_slices", "adapter")
+# The precondition's conjuncts are named bools, computed once: the condition and the decline's failed= list read the
+# same bools, and each note's label is the bool's name.
+CONJUNCT_DECL = re.compile(r"\bconst\s+bool\s+(\w+)\s*=")
+NOTE_CALL = re.compile(r'\bnote\(\s*(\w+)\s*,\s*"(\w+)"\s*\)\s*;')
+# A failed submit after the mark throws to the catch that drains the queue. The route's own refusals print their step
+# first; the failures the test build injects are not refusals.
+SUBMIT_FAILURE = "throw moe_direct_submit_failure{};"
+TESTING_MACRO = "GGML_SYCL_Q1_NVFP4_ROUTE_TESTING"
 
 
 def blank_comments_and_literals(text: str) -> str:
@@ -171,6 +180,61 @@ def top_level_terms(condition: str) -> list[str]:
     return out
 
 
+def under_testing_macro(sycl: str, start: int, at: int) -> bool:
+    """Whether `at` sits in the test-build branch of an #ifdef of TESTING_MACRO opened after `start`."""
+    stack: list[bool] = []
+    for m in re.finditer(r"^[ \t]*#[ \t]*(ifdef|ifndef|if|elif|else|endif)\b(.*)$", sycl[start:at], re.M):
+        kind = m.group(1)
+        if kind in ("ifdef", "ifndef", "if"):
+            stack.append(kind == "ifdef" and m.group(2).strip() == TESTING_MACRO)
+        elif kind in ("elif", "else") and stack:
+            stack[-1] = False
+        elif kind == "endif" and stack:
+            stack.pop()
+    return any(stack)
+
+
+def enclosing_open_brace(code: str, at: int) -> int:
+    """Index of the brace that opens the block holding `at`."""
+    depth = 0
+    for i in range(at - 1, -1, -1):
+        if code[i] == "}":
+            depth += 1
+        elif code[i] == "{":
+            if depth == 0:
+                return i
+            depth -= 1
+    return -1
+
+
+def precondition_violations(sycl: str, code: str, condition_open: int, condition_close: int,
+                            preamble: tuple[int, int], body: tuple[int, int] | None) -> list[str]:
+    """The precondition tests named bools only, each declared once in `preamble`, and its decline notes each of them,
+    in order, under its own name, and nothing else."""
+    found: list[str] = []
+    terms = top_level_terms(sycl[condition_open:condition_close + 1])
+    declared = CONJUNCT_DECL.findall(code[preamble[0]:preamble[1]])
+    for term in terms:
+        if not re.fullmatch(r"\w+", term):
+            found.append(f"the precondition's conjunct {term} is not a named bool")
+        elif declared.count(term) != 1:
+            found.append(f"the precondition's conjunct {term} is not declared once as a const bool before it")
+    if len(set(terms)) != len(terms):
+        found.append("the precondition tests a conjunct twice")
+    if body is None:
+        return found + ["the precondition has no decline"]
+    notes = NOTE_CALL.findall(sycl[body[0]:body[1]])
+    if len(re.findall(r"\bnote\s*\(", code[body[0]:body[1]])) != len(notes):
+        found.append("the precondition's decline notes something other than a named bool")
+    for expression, label in notes:
+        if expression != label:
+            found.append(f"the precondition's decline names the bool {expression} as {label}")
+    noted = [expression for expression, _ in notes]
+    if noted != terms:
+        found.append(f"the precondition's decline notes {noted}, but the precondition tests {terms}")
+    return found
+
+
 def direct_decline_violations(sycl: str) -> list[str]:
     """Every exit that falls through the Q1_0/NVFP4 direct block prints one line naming the step that declined."""
     found: list[str] = []
@@ -214,20 +278,28 @@ def direct_decline_violations(sycl: str) -> list[str]:
         if not re.search(re.escape(DIRECT_DECLINE) + r'\s*src0,\s*ne12,\s*"' + step + '"', direct):
             found.append(f"no decline line names the step {step}")
 
-    # The precondition's line names every conjunct that failed: a conjunct the else does not spell is one it cannot
-    # name.
+    # A refusal that throws after the mark leaves the block by the catch, not by an else: its own block prints the
+    # line before the throw.
+    failures = [m.start() for m in re.finditer(re.escape(SUBMIT_FAILURE), direct)]
+    if not any(not under_testing_macro(sycl, gate_at, gate_at + at) for at in failures):
+        found.append("the direct block has no submit failure outside the test build")
+    for at in failures:
+        at += gate_at
+        if under_testing_macro(sycl, gate_at, at):
+            continue
+        block = enclosing_open_brace(code, at)
+        if DIRECT_DECLINE not in sycl[block:at]:
+            found.append(f"the submit failure at line {sycl.count(chr(10), 0, at) + 1} throws without a named line")
+
+    # The precondition's line names every conjunct that failed, from the bools the condition reads.
     precondition_at = code.find(DIRECT_PRECONDITION, gate_at, end_at)
     if precondition_at < 0:
         return found + ["the direct block's precondition is missing"]
     condition_open = code.index("(", precondition_at)
     condition_close = matching(code, condition_open)
     body = else_body(code, matching(code, code.index("{", condition_close)))
-    if body is not None:
-        named = spaced(sycl[body[0]:body[1]])
-        for term in top_level_terms(sycl[condition_open:condition_close + 1]):
-            if term not in named:
-                found.append(f"the precondition's decline line does not name the conjunct {term}")
-    return found
+    return found + precondition_violations(sycl, code, condition_open, condition_close, (gate_at, precondition_at),
+                                           body)
 
 
 def test_anchors_exist() -> None:
@@ -297,9 +369,25 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
             '(void) (\n                            src0, ne12, "workspace_slices",', 1),
         # One step of the issuer chain reported under another's name.
         "step-renamed": sycl.replace('"binding", "occurrence=%zu', '"retained_table", "occurrence=%zu', 1),
-        # A precondition conjunct the decline line does not name.
-        "conjunct-unnamed": sycl.replace("if (all_primary && exec.context_id",
-                                         "if (all_primary && ne10 > 0 && exec.context_id", 1),
+        # A named conjunct the decline line does not note.
+        "conjunct-unnamed": sycl.replace(
+            "        if (all_primary && context_id",
+            "        const bool src0_rows = ne01 > 0;\n        if (all_primary && src0_rows && context_id", 1),
+        # A conjunct spelled inline, whose text the decline's own line already carries.
+        "conjunct-text-already-in-else": sycl.replace(
+            "if (all_primary && context_id", "if (all_primary && direct_batch.operands.size() && context_id", 1),
+        # A conjunct dropped from the condition that the decline still notes.
+        "conjunct-removed-still-noted": sycl.replace("ids_device && ids_stride && src1_type",
+                                                     "ids_device && src1_type", 1),
+        # A note that names its bool as another conjunct.
+        "note-mislabelled": sycl.replace('note(ids_device, "ids_device");', 'note(ids_device, "ids_stride");', 1),
+        # A note that tests its own expression instead of the bool the condition reads.
+        "note-of-an-expression": sycl.replace('note(ids_device, "ids_device");',
+                                              'note(ids_device_ptr != nullptr, "ids_device");', 1),
+        # The adapter's refusal after the mark throws with no line.
+        "adapter-refusal-unnamed": re.sub(
+            r'\n\s*ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
+            r'moe_direct_submit_failure\{\};)', "", sycl, count=1, flags=re.DOTALL),
         # The gate's layout conjunct falls through unnamed.
         "layout-unnamed": re.sub(r'\} else if \(\(src0->type == GGML_TYPE_Q1_0.*?"layout".*?\);\n    \}', "}",
                                  sycl, count=1, flags=re.DOTALL),
