@@ -16775,10 +16775,10 @@ static void ggml_sycl_execution_try_retire_terminal(ggml_backend_sycl_context * 
     const auto rc = registry.retire_graph({ state.context_id }, snapshot.session, snapshot.reset_epoch,
                                           snapshot.graph_epoch, owner);
     if (rc == ggml_sycl::execution::error::OK || rc == ggml_sycl::execution::error::STALE) {
-        ggml_sycl_execution_for_each_bound_backend(state.context_id,
-            [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
-                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);
-            });
+        ggml_sycl_execution_for_each_bound_backend(state.context_id, [&](ggml_backend_sycl_context * backend_ctx,
+                                                                         const ggml_sycl_execution_backend_binding &) {
+            ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);
+        });
     }
 }
 
@@ -16994,10 +16994,10 @@ static bool ggml_sycl_execution_release_graph(ggml_backend_sycl_context * ctx,
     ggml_sycl::execution::snapshot snapshot{};
     if (registry.extract({ state.context_id }, &snapshot) == ggml_sycl::execution::error::OK &&
         snapshot.invocation.value == 0) {
-        ggml_sycl_execution_for_each_bound_backend(state.context_id,
-            [&](ggml_backend_sycl_context * backend_ctx, const ggml_sycl_execution_backend_binding &) {
-                ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);
-            });
+        ggml_sycl_execution_for_each_bound_backend(state.context_id, [&](ggml_backend_sycl_context * backend_ctx,
+                                                                         const ggml_sycl_execution_backend_binding &) {
+            ggml_sycl_execution_clear_graph_tracking(backend_ctx, site, line);
+        });
         ggml_sycl_execution_try_retire_terminal(ctx, site, line);
     }
     return true;
@@ -87661,7 +87661,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // The direct recipe and exact queue capability were proven together
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
-            auto          queue_cap   = direct_batch.operands.front().recipe_queue_capability();
+            auto          queue_cap          = direct_batch.operands.front().recipe_queue_capability();
             // The operand whose capability is missing or differs, for the decline line.
             size_t        queue_cap_declined = 0;
             for (size_t i = 0; i < direct_batch.operands.size(); ++i) {
@@ -87709,8 +87709,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl_moe_mark_direct_authority_pre_admission(src0);
                 ggml_sycl::moe_mmid_authoritative_admission_request request;
                 request.authority = std::move(authority);
-                request.shape = { static_cast<size_t>(ids->ne[0]), static_cast<size_t>(ne11), ne10, ne01,
-                                  static_cast<int32_t>(src0->type) };
+                request.shape     = { static_cast<size_t>(ids->ne[0]), static_cast<size_t>(ne11), ne10, ne01,
+                                      static_cast<int32_t>(src0->type) };
                 auto admitted = ggml_sycl::unified_cache_admit_moe_mmid_workspace(std::move(request));
                 if (admitted.status == ggml_sycl::moe_mmid_lease_status::ACQUIRED && admitted.bundle.valid()) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
@@ -87763,8 +87763,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // dense src1 is one piece, and the loop never runs.
                             sycl::event dependency = ggml_sycl::mem_copy_ptr_async(
                                 activation, src1_device_base, activation_piece_bytes, *exact_queue,
-                                retained_table.has_ready_event ? std::vector<sycl::event>{ retained_table.ready_event }
-                                                               : std::vector<sycl::event>{});
+                                retained_table.has_ready_event ?
+                                    std::vector<sycl::event>{ retained_table.ready_event } :
+                                    std::vector<sycl::event>{});
                             for (int64_t piece = 1; piece < activation_pieces; ++piece) {
                                 const int64_t first_row = piece * activation_piece_rows;
                                 dependency              = ggml_sycl::mem_copy_ptr_async(

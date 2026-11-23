@@ -1589,9 +1589,11 @@ moe_mmid_admitted_result moe_mmid_workspace_registry::admit(
             for (size_t prior = 0; prior < r; ++prior) if (pool_map[prior] == p) return out;
             const auto & available = pool->geometry; auto & needed = geometry[r];
             if (!moe_mmid_plan_workspace({ static_cast<size_t>(request.shape.K), static_cast<size_t>(request.shape.N),
-                                            request.shape.ne11, request.shape.top_k, capacity },
-                                          wanted.owner_device != authority->submit_device, &needed) ||
-                !moe_mmid_workspace_geometry_holds(available, needed)) return out;
+                                           request.shape.ne11, request.shape.top_k, capacity },
+                                         wanted.owner_device != authority->submit_device, &needed) ||
+                !moe_mmid_workspace_geometry_holds(available, needed)) {
+                return out;
+            }
             pool_map[r] = p;
         }
         if (pool_map[r] == SIZE_MAX) return out; order[r] = r;
