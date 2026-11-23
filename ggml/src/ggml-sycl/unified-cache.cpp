@@ -17487,6 +17487,7 @@ bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
     return true;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache::test_reset_evictions_latch() noexcept {
     has_evictions_.store(false, std::memory_order_release);
 }
@@ -17506,6 +17507,7 @@ bool unified_cache::test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * o
     }
     return true;
 }
+#endif
 
 uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);

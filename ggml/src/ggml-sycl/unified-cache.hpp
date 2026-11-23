@@ -5681,12 +5681,15 @@ class unified_cache {
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
     bool     test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_layout_mode layout, sycl::event event);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test-only: the last clears the eviction latch, which production code must never do outside a reclaim.
     // The walks of entries_ the id remap has made over the cache's life (id_remap_walks_).
     uint64_t test_id_remap_walks() const noexcept;
     // The key `id` maps to, in *out; false when the id maps to nothing.
     bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
     // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
     void     test_reset_evictions_latch() noexcept;
+#endif
     size_t   retired_pending_count_for_test() const noexcept {
         return retired_pending_count_.load(std::memory_order_acquire);
     }

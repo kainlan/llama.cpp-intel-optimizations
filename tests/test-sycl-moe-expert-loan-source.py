@@ -3801,6 +3801,64 @@ def test_mutant_guard_sets_nothing_fails():
 def test_mutant_guard_never_armed_fails():
     assert not claim_an_unpublished_move_sets_the_latch(_once_in(SYCL, TXN_SIG, GUARD_ARM, ""), CACHE_HPP)
 
+
+# The hooks the move cases read the latch and the id map through exist only in the testing build: a production caller
+# of test_reset_evictions_latch could clear the latch outside a reclaim and turn graph replay back on over a retire no
+# epoch covers.
+TEST_ONLY_HOOKS = ("test_id_remap_walks()", "test_id_mapping(ggml_sycl_cache_id id", "test_reset_evictions_latch()")
+PRIVATE_TESTING_IF = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+
+
+def _in_private_testing(text: str, needle: str) -> bool:
+    """Whether every occurrence of `needle` sits in the true branch of a GGML_SYCL_PRIVATE_TESTING conditional."""
+    lines = strip_comments(text).split("\n")
+    stack: list[bool] = []
+    seen = False
+    for line in lines:
+        directive = line.strip()
+        if directive.startswith("#if"):
+            stack.append(directive == PRIVATE_TESTING_IF)
+        elif directive.startswith("#el"):
+            stack[-1] = False
+        elif directive.startswith("#endif"):
+            stack.pop()
+        elif needle in line:
+            seen = True
+            if not any(stack):
+                return False
+    return seen
+
+
+def _raw_once(text: str, old: str, new: str) -> str:
+    """`text` with the one occurrence of `old` replaced on the raw text, for a mutant whose anchor is a line break."""
+    assert text.count(old) == 1, f"mutant anchor must match exactly once: {old!r} x{text.count(old)}"
+    return text.replace(old, new, 1)
+
+
+def claim_the_move_test_hooks_are_test_only(hpp: str, cache: str) -> bool:
+    return all(_in_private_testing(hpp, hook) and _in_private_testing(cache, "unified_cache::" + hook)
+               for hook in TEST_ONLY_HOOKS)
+
+
+def test_the_move_test_hooks_are_test_only():
+    assert claim_the_move_test_hooks_are_test_only(CACHE_HPP, CACHE)
+
+
+def test_mutant_latch_reset_in_production_fails():
+    """The declaration moved out of the guard: production code could clear the latch."""
+    hpp = _raw_once(CACHE_HPP, "    void     test_reset_evictions_latch() noexcept;\n", "")
+    hpp = _raw_once(hpp, PRIVATE_TESTING_IF + "\n    // Test-only",
+                "    void     test_reset_evictions_latch() noexcept;\n" + PRIVATE_TESTING_IF + "\n    // Test-only")
+    assert not claim_the_move_test_hooks_are_test_only(hpp, CACHE)
+
+
+def test_mutant_definitions_in_production_fail():
+    cache = _raw_once(CACHE, PRIVATE_TESTING_IF + "\nvoid unified_cache::test_reset_evictions_latch()",
+                  "void unified_cache::test_reset_evictions_latch()")
+    cache = _raw_once(cache, "    return true;\n}\n#endif\n\nuint64_t unified_cache::test_entry_pending_load_txn(",
+                  "    return true;\n}\n\nuint64_t unified_cache::test_entry_pending_load_txn(")
+    assert not claim_the_move_test_hooks_are_test_only(CACHE_HPP, cache)
+
 if __name__ == "__main__":
     import sys
 
