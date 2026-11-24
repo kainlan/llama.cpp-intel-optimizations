@@ -67982,10 +67982,18 @@ static const void * const * moe_fusion_build_full_local_ptr_table(ggml_backend_s
     return table;
 }
 
+// The cached full-local table, or a build of one unless the probe already failed at this storage generation.
+// every_expert_resolved, when given, is the build's answer (see moe_fusion_build_full_local_ptr_table) and false on
+// every other null. A probe that failed at this generation answers false as well; a caller that asks right after a
+// publish never meets one, since storing an expert record moves the generation.
 static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_sycl_context & ctx,
                                                                    const ggml_tensor *         weight,
                                                                    int                         layer_hash,
-                                                                   layout_mode                 layout) {
+                                                                   layout_mode                 layout,
+                                                                   bool * every_expert_resolved = nullptr) {
+    if (every_expert_resolved) {
+        *every_expert_resolved = false;
+    }
     const void * const * cached = moe_fusion_full_local_ptr_table(weight, ctx.device, layout);
     if (cached) {
         return cached;
@@ -68005,7 +68013,7 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_
         !extra->weight().moe_full_local_probe_ok[ctx.device]) {
         return nullptr;
     }
-    return moe_fusion_build_full_local_ptr_table(ctx, weight, layer_hash, layout);
+    return moe_fusion_build_full_local_ptr_table(ctx, weight, layer_hash, layout, every_expert_resolved);
 }
 
 // One eligibility decision of ggml_sycl_moe_decode_direct_table(). On
@@ -83716,9 +83724,10 @@ static void * ggml_sycl_moe_direct_device_operand(const ggml_tensor * tensor, in
 
 // The full-local AOS expert table of `src0` on ctx.device, the one the planner's preload provides, for the direct
 // routes (BF16, and NVFP4 resident decode). A weight in this card's own buffer has no expert records until something
-// publishes them: publish its AOS slices from the buffer and build once more. A publish that still leaves the table
-// unbuilt is not repeated at the same expert storage generation, so a node whose plan and storage disagree pays only
-// the memoized probe. Null when not every expert resolves at AOS on this card.
+// publishes them: publish its AOS slices from the buffer and build once more. A publish that fails, or after which an
+// expert still does not resolve, is a fact of this expert storage generation and is not repeated at it, so a node
+// whose plan and storage disagree pays only the memoized probe. A table upload that fails after every expert resolved
+// is not stamped: it may be transient, and the next node publishes and builds again. Null when there is no table.
 static const void * const * ggml_sycl_moe_direct_ensure_aos_table(ggml_backend_sycl_context & ctx,
                                                                   const ggml_tensor *         src0) {
     const int            layer = moe_cache_layer_id(src0->name);
@@ -83731,13 +83740,14 @@ static const void * const * ggml_sycl_moe_direct_ensure_aos_table(ggml_backend_s
     if (failed == weight.moe_expert_storage_generation) {
         return nullptr;
     }
-    int  published_kind   = -1;
-    bool published_stable = false;
+    int  published_kind        = -1;
+    bool published_stable      = false;
+    bool every_expert_resolved = false;
     if (ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS, &published_kind,
                                                      &published_stable)) {
-        table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS);
+        table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS, &every_expert_resolved);
     }
-    if (table == nullptr) {
+    if (table == nullptr && !every_expert_resolved) {
         failed = weight.moe_expert_storage_generation;
     }
     return table;
@@ -84064,8 +84074,10 @@ static bool ggml_sycl_moe_resident_decode_route_available(const ggml_tensor *   
 // them. The one vector is both the publication and the failure escrow: retain_handles_until_event_or_keep leaves it as
 // it was when it throws. So on any exit that did not publish (a submit or a profiler record that throws after a
 // submit, a refusal after the quantize was enqueued, a publication that throws) the destructor drains the stream
-// before the handles go, and no slice or lease is released under a kernel that may still read it. A taken node
-// publishes and clears `submitted` first, so it never drains.
+// before the handles go, and no slice or lease is released under a kernel that may still read it. A drain that itself
+// throws has not shown the work done, so the handles are kept, not released: parked as the store parks a record whose
+// wait failed, until the next graph release or a complete reap of their owner. A taken node publishes and clears
+// `submitted` first, so it never drains.
 struct ggml_sycl_moe_resident_decode_retention {
     std::vector<ggml_sycl::mem_handle> handles;
     sycl::queue *                      submitted = nullptr;
@@ -84080,8 +84092,14 @@ struct ggml_sycl_moe_resident_decode_retention {
                 submitted->wait_and_throw();
             } catch (...) {
                 // The backend's async handler records a device failure and throws nothing, so what lands here is the
-                // runtime's own synchronous error (a lost device). A destructor cannot rethrow without terminating.
-                GGML_LOG_WARN("[MoE] NVFP4 resident decode route: the drain before a failed node's handles go threw\n");
+                // runtime's own synchronous error (a lost device), and the work may still be running. Nothing here
+                // throws: a destructor cannot rethrow without terminating, and keeping the handles is noexcept.
+                const size_t count = handles.size();
+                const bool   kept  = ggml_sycl::keep_handles_after_failed_wait(handles);
+                GGML_LOG_ERROR(
+                    "[MoE] NVFP4 resident decode route: the drain after a failed submit threw; its %zu "
+                    "handles are %s\n",
+                    count, kept ? "kept, not released" : "released: no memory was left to keep them");
             }
         }
     }

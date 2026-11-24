@@ -248,11 +248,24 @@ template <typename T> void retained_vector_make_room(std::vector<T> & vec, size_
     }
 }
 
+// Moves every handle into the store's unwaitable list with its owner id, under the store's lock. The two store vectors
+// are kept parallel, so both grow before either insert, after which neither insert allocates. On a throw `handles` and
+// both vectors are as they were: a second growth that throws has changed only the first vector's capacity.
+void retained_park_unwaitable(std::vector<mem_handle> & handles) {
+    const std::vector<uint64_t> ids   = owner_control_ids(handles);
+    auto &                      state = *g_retained_handles_state;
+    retained_store_lock         lock(state);
+    retained_vector_make_room(state.graph_unwaitable, handles.size());
+    retained_vector_make_room(state.graph_unwaitable_ids, ids.size());
+    state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(handles.begin()),
+                                  std::make_move_iterator(handles.end()));
+    state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), ids.begin(), ids.end());
+    handles.clear();
+}
+
 // Takes every handle out of `handles` on success. On a throw `handles` and every store vector are as they were.
 // The sink is one vector: a range insert at its end has no effects when its allocation throws, and it moves the
-// handles only after that allocation, so it needs no reserve of its own. The two store vectors are kept parallel, so
-// both grow before either insert, after which neither insert allocates; a second growth that throws has changed only
-// the first vector's capacity, not its elements.
+// handles only after that allocation, so it needs no reserve of its own. Without a sink the handles are parked.
 void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {
     if (handles.empty()) {
         return;
@@ -265,16 +278,7 @@ void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {
         handles.clear();
         return;
     }
-
-    const std::vector<uint64_t> ids   = owner_control_ids(handles);
-    auto &                      state = *g_retained_handles_state;
-    retained_store_lock         lock(state);
-    retained_vector_make_room(state.graph_unwaitable, handles.size());
-    retained_vector_make_room(state.graph_unwaitable_ids, ids.size());
-    state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(handles.begin()),
-                                  std::make_move_iterator(handles.end()));
-    state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), ids.begin(), ids.end());
-    handles.clear();
+    retained_park_unwaitable(handles);
 }
 
 void retained_handle_drain_loop() {
@@ -2276,8 +2280,9 @@ terminal_retention_ticket terminal_retention_ticket::prepare(std::initializer_li
     ticket.graph_sink_  = g_graph_retained_handle_sink;
     ticket.graph_epoch_ = g_graph_recording_sink.epoch_id;
     if (ticket.graph_sink_) {
-        // The later move-insert is allocation-free for this recording attempt.
-        ticket.graph_sink_->reserve(ticket.graph_sink_->size() + ticket.publication_.size());
+        // The later move-insert is allocation-free for this recording attempt: the sink's capacity is now at least its
+        // size plus the publication, grown geometrically, so a ticket per node does not reallocate the sink each time.
+        retained_vector_make_room(*ticket.graph_sink_, ticket.publication_.size());
     }
     if (!ticket.publication_.empty()) ticket.publisher_ = begin_retained_handle_publish();
     ticket.state_ = state::PREPARED;
@@ -2810,6 +2815,25 @@ void retain_handles_until_event_transactional(std::vector<mem_handle> handles, s
 
 void retain_handles_until_event_or_keep(std::vector<mem_handle> & handles, sycl::event event) {
     publish_handles_until_event(handles, std::move(event));
+}
+
+bool keep_handles_after_failed_wait(std::vector<mem_handle> & handles) noexcept {
+    if (handles.empty()) {
+        return true;
+    }
+    try {
+        retained_park_unwaitable(handles);
+        return true;
+    } catch (const std::bad_alloc &) {
+        // Parking leaves `handles` as it was when it cannot allocate, so they can still be leaked below.
+    }
+    // No room to park them: leak them, so nothing the unfinished work may read is freed under it. A failed nothrow
+    // allocation constructs nothing, so `handles` is still whole when this returns false.
+    if (new (std::nothrow) std::vector<mem_handle>(std::move(handles)) != nullptr) {
+        GGML_LOG_ERROR("[MEM-HANDLE] no memory to park handles after a failed wait; they are leaked, never released\n");
+        return true;
+    }
+    return false;
 }
 
 void record_terminal_retention(sycl::event event,

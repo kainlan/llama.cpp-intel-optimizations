@@ -506,7 +506,7 @@ def claim_d_route_body(s):
                          "resolve")
         if (helper.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1 or
                 helper.count(HELPER_TABLE_CALL) != 1 or helper.count(HELPER_RETRY) != 1 or
-                helper.count("failed = ") != 1):
+                helper.count("failed = weight.moe_expert_storage_generation;") != 1):
             fails.append("the table helper publishes other than once, probes other than before and after it, or "
                          "stamps other than once")
     probe = braced_body(sycl, PROBE_HEAD) if defined_once(sycl, PROBE_HEAD) else None
@@ -677,7 +677,7 @@ def claim_j_retention(s):
                      "naming a drain that throws instead of rethrowing it")
     # A drain that threw has not shown the work done, so the handles are kept, never let go in the catch.
     caught = dtor[len(RETENTION_DTOR):]
-    if (not caught.startswith(KEEP_CALL) or "GGML_LOG_ERROR(" not in caught or "GGML_LOG_WARN(" in caught or
+    if (not 0 <= caught.find(KEEP_CALL) < caught.find("GGML_LOG_ERROR(") or "GGML_LOG_WARN(" in caught or
             "handles.clear()" in dtor or "handles={}" in dtor or "handles.swap(" in dtor):
         fails.append("the retention's destructor lets its handles go after a drain that threw instead of keeping "
                      f"them through {KEEP} and naming it at ERROR")
@@ -742,7 +742,8 @@ def claim_l_growth(s):
     if helper is None or tight(helper) != MAKE_ROOM_BODY:
         fails.append(f"{MAKE_ROOM} does not reserve only when the capacity is short, and then to the larger of the "
                      "need and twice the capacity")
-    for head in (GRAPH_HEAD, PUBLISH_HEAD, PARK_HEAD, KEEP_HEAD, PREPARE_HEAD):
+    # prepare reserves its own fresh owners vector once; its view of the sink is covered by the scan below.
+    for head in (GRAPH_HEAD, PUBLISH_HEAD, PARK_HEAD, KEEP_HEAD):
         if "reserve(" in (braced_body(mem_cpp, head) or "reserve("):
             fails.append(f"{head.split('(')[0]} reserves a retained-handle vector itself")
     park = tight(braced_body(mem_cpp, PARK_HEAD) or "")

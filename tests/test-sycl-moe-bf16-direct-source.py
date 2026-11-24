@@ -334,7 +334,7 @@ def claim_d_route_body(s):
         if min(marks) < 0 or marks != sorted(marks) or \
                 helper.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1 or \
                 helper.count(HELPER_TABLE_CALL) != 1 or helper.count(HELPER_RETRY) != 1 or \
-                helper.count("failed = ") != 1:
+                helper.count("failed = weight.moe_expert_storage_generation;") != 1:
             fails.append("the table helper does not publish once, only on a miss in this device's own buffer at a "
                          "generation not stamped, probe again after it, and stamp only a failed publish or an expert "
                          "that did not resolve")
