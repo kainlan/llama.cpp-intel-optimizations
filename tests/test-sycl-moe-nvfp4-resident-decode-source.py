@@ -43,11 +43,18 @@ ready event. These claims pin that shape:
       retain_handles_until_event_or_keep, and disarms only after that returns. So a submit or a profiler record that
       throws, a refusal after the quantize, and a publication that throws all drain before the handles go, and a
       taken node never drains. The publication leaves the vector as it was when it throws: the record enters the
-      store with an empty vector and takes the handles by a swap, and the graph-lifetime path reserves before it
-      moves anything;
+      store with an empty vector and takes the handles by a swap; the graph-lifetime path moves the handles into
+      its one sink by a single range insert, which has no effects when its allocation throws because a mem_handle
+      moves without throwing (a static_assert holds that), and grows both parallel store vectors before it inserts
+      into either;
   (k) the cheap per-node costs stay out: the entries read the card's half support from the capabilities taken at
       init, the plan owner is fetched once, the quantize's profiler label is built only while the profiler is on,
-      the route asks ctx.stream() once, and the kernel's event is constructed only once the route has taken the node.
+      the route asks ctx.stream() once, and the kernel's event is constructed only once the route has taken the node;
+  (l) the retained-handle vectors grow geometrically. A reserve to exactly size() + n on every call reallocates and
+      moves the whole vector each time, which is quadratic over the nodes of a graph: neither keep-on-throw body
+      reserves, the parallel store vectors grow through one helper that reserves only when the capacity is short and
+      then to the larger of the need and twice the capacity, and nowhere in mem-handle.cpp is the sink or a store
+      vector reserved to its own size() plus n.
 """
 
 import re
@@ -154,12 +161,19 @@ PUBLISH_PUSH = ("state.queue.push_back({{},std::move(event),std::move(ids),std::
                 "state.queue.back().handles.swap(handles);}")
 PUBLISH_GRAPH = "retain_handles_for_current_graph(handles); return;"
 GRAPH_HEAD = "void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {"
-GRAPH_SINK = ("g_graph_retained_handle_sink->reserve(g_graph_retained_handle_sink->size()+handles.size());"
-              "g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),"
-              "std::make_move_iterator(handles.begin()),std::make_move_iterator(handles.end()));handles.clear();return;")
+GRAPH_SINK = ("if(g_graph_retained_handle_sink){g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),"
+              "std::make_move_iterator(handles.begin()),std::make_move_iterator(handles.end()));handles.clear();return;}")
+MAKE_ROOM = "retained_vector_make_room"
+MAKE_ROOM_HEAD = f"template <typename T> void {MAKE_ROOM}(std::vector<T> & vec, size_t extra) {{"
+MAKE_ROOM_BODY = ("constsize_tneeded=vec.size()+extra;if(needed>vec.capacity()){"
+                  "vec.reserve(std::max(needed,2*vec.capacity()));}")
+NOTHROW_MOVE = "static_assert(std::is_nothrow_move_constructible<mem_handle>::value,"
+# The sink and the two parallel store vectors; a reserve of one of them to its own size() plus n is the quadratic one.
+RETAINED_VECTORS = ("g_graph_retained_handle_sink", "graph_unwaitable", "graph_unwaitable_ids")
+SELF_SIZE_RESERVE = re.compile(r"([A-Za-z_][\w.>-]*?)(?:\.|->)reserve\(\s*\1(?:\.|->)size\(\)\s*\+")
 GRAPH_UNWAITABLE = ("retained_store_locklock(state);"
-                    "state.graph_unwaitable.reserve(state.graph_unwaitable.size()+handles.size());"
-                    "state.graph_unwaitable_ids.reserve(state.graph_unwaitable_ids.size()+ids.size());"
+                    f"{MAKE_ROOM}(state.graph_unwaitable,handles.size());"
+                    f"{MAKE_ROOM}(state.graph_unwaitable_ids,ids.size());"
                     "state.graph_unwaitable.insert(state.graph_unwaitable.end(),std::make_move_iterator(handles.begin()),"
                     "std::make_move_iterator(handles.end()));"
                     "state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(),ids.begin(),ids.end());"
@@ -652,10 +666,35 @@ def claim_j_retention(s):
         fails.append("the graph-lifetime retention does not take the caller's vector by reference")
     else:
         tg = tight(graph)
-        if GRAPH_SINK not in tg or GRAPH_UNWAITABLE not in tg:
-            fails.append("the graph-lifetime retention moves a handle before every allocation it needs is made")
+        if GRAPH_SINK not in tg:
+            fails.append("the graph-lifetime retention does not move the handles into its sink by one range insert")
+        if GRAPH_UNWAITABLE not in tg:
+            fails.append("the graph-lifetime retention inserts into one store vector before both have grown")
         if not 0 <= graph.find("owner_control_ids(handles)") < graph.find("retained_store_lock"):
             fails.append("the graph-lifetime retention reads the owner ids under the store lock")
+    if mem_cpp.count(NOTHROW_MOVE) != 1:
+        fails.append("nothing holds that a mem_handle moves without throwing, which a range insert with no effects on "
+                     "a throw relies on")
+    return fails
+
+
+def claim_l_growth(s):
+    mem_cpp = s["mem_cpp"]
+    fails = []
+    helper = braced_body(mem_cpp, MAKE_ROOM_HEAD) if defined_once(mem_cpp, MAKE_ROOM_HEAD) else None
+    if helper is None or tight(helper) != MAKE_ROOM_BODY:
+        fails.append(f"{MAKE_ROOM} does not reserve only when the capacity is short, and then to the larger of the "
+                     "need and twice the capacity")
+    for head in (GRAPH_HEAD, PUBLISH_HEAD):
+        if "reserve(" in (braced_body(mem_cpp, head) or "reserve("):
+            fails.append(f"{head.split('(')[0]} reserves a retained-handle vector itself")
+    graph = tight(braced_body(mem_cpp, GRAPH_HEAD) or "")
+    for vector, extra in (("state.graph_unwaitable", "handles"), ("state.graph_unwaitable_ids", "ids")):
+        if graph.count(f"{MAKE_ROOM}({vector},{extra}.size());") != 1:
+            fails.append(f"{vector} does not grow through {MAKE_ROOM}")
+    for match in SELF_SIZE_RESERVE.finditer(mem_cpp):
+        if re.split(r"\.|->", match.group(1))[-1] in RETAINED_VECTORS:
+            fails.append(f"a retained-handle vector is reserved to its own size() plus n: {match.group(0)}")
     return fails
 
 
@@ -700,6 +739,7 @@ CLAIMS = {
     "i": claim_i_bad_ids,
     "j": claim_j_retention,
     "k": claim_k_hot_path,
+    "l": claim_l_growth,
 }
 
 
@@ -823,11 +863,30 @@ MUTANTS = [
      "state.queue.push_back({ std::move(handles), std::move(event)"),
     ("j", "mem_cpp", PUBLISH_HEAD, "state.queue.back().handles.swap(handles);", ""),
     ("j", "mem_cpp", None, PUBLISH_HEAD, PUBLISH_HEAD.replace(" & handles", " handles")),
+    # The sink takes the handles one at a time: a throw part way leaves some moved and the rest in the caller's vector.
     ("j", "mem_cpp", GRAPH_HEAD,
-     "g_graph_retained_handle_sink->reserve(g_graph_retained_handle_sink->size() + handles.size());", ""),
-    ("j", "mem_cpp", GRAPH_HEAD, "state.graph_unwaitable.reserve(state.graph_unwaitable.size() + handles.size());",
-     ""),
+     "g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(), "
+     "std::make_move_iterator(handles.begin()), std::make_move_iterator(handles.end()));",
+     "for (auto & handle : handles) { g_graph_retained_handle_sink->push_back(std::move(handle)); }"),
+    # The ids vector grows only after the handles went in: a throw there leaves the two store vectors apart.
+    ("j", "mem_cpp", GRAPH_HEAD,
+     (f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size());", "state.graph_unwaitable_ids.insert("),
+     ("", f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size()); state.graph_unwaitable_ids.insert(")),
+    ("j", "mem_cpp", None, NOTHROW_MOVE, "static_assert(true,"),
     ("j", "mem_hpp", None, OR_KEEP_DECL, OR_KEEP_DECL.replace(" & handles", " handles")),
+    # The exact reserves come back: on the sink, on either store vector, inside the helper, or anywhere else.
+    ("l", "mem_cpp", GRAPH_HEAD, "if (g_graph_retained_handle_sink) {",
+     "if (g_graph_retained_handle_sink) { "
+     "g_graph_retained_handle_sink->reserve(g_graph_retained_handle_sink->size() + handles.size());"),
+    ("l", "mem_cpp", GRAPH_HEAD, f"{MAKE_ROOM}(state.graph_unwaitable, handles.size());",
+     "state.graph_unwaitable.reserve(state.graph_unwaitable.size() + handles.size());"),
+    ("l", "mem_cpp", GRAPH_HEAD, f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size());",
+     "state.graph_unwaitable_ids.reserve(state.graph_unwaitable_ids.size() + ids.size());"),
+    ("l", "mem_cpp", MAKE_ROOM_HEAD, "vec.reserve(std::max(needed, 2 * vec.capacity()));", "vec.reserve(needed);"),
+    ("l", "mem_cpp", MAKE_ROOM_HEAD, "if (needed > vec.capacity()) {", "if (true) {"),
+    ("l", "mem_cpp", "void retained_handle_drain_loop() {", "state.graph_unwaitable.insert(",
+     "state.graph_unwaitable.reserve(state.graph_unwaitable.size() + record.handles.size()); "
+     "state.graph_unwaitable.insert("),
     ("k", "mmvq_cpp", RESIDENT_FN, FP16_ASK, "!q.get_device().has(sycl::aspect::fp16)"),
     ("k", "mmvq_cpp", ADMITTED_FN, FP16_ASK, "!q.get_device().has(sycl::aspect::fp16)"),
     ("k", "mmvq_cpp", FP16_HELPER_HEAD, FP16_READ, "sycl::device().has(sycl::aspect::fp16)"),
