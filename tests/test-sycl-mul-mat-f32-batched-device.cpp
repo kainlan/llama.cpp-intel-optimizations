@@ -39,6 +39,12 @@
 //
 // Per taken case the test also prints the scratchpad the route's primitive asks for: the oneDNN primitive cache is
 // cleared before the route run, so afterwards it holds that one primitive and get_max_scratchpad_size() is its size.
+// A count other than 1 fails the case: the figure means something only if this is the backend's cache.
+//
+// The mix also runs with size-1 dimensions: the block list starts empty, so the first mixes have one state (m = 1 in
+// the scores, k = 1 in the output), and several queries are single (ffn_res_query and output_res_query, and the
+// sliding-window layers' attn_res_query), so n = 1; a first-layer single query has both. Each such shape runs at a
+// small and a large T.
 //
 // Usage (the registration supplies the env; a bare run needs it too):
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 GGML_SYCL_DISABLE_GRAPH=1 ./build/bin/test-sycl-mul-mat-f32-batched-device
@@ -191,13 +197,15 @@ run_result run_case(ggml_backend_t backend, const mm_case & c, int inject) {
 }
 
 struct errors {
-    double ref_route = 0.0, ref_loop = 0.0, route_vs_loop = 0.0, abs_route = 0.0;
+    // `first` is the case's first run: the route in a taken case, the loop in a declined one; `loop` is the injected
+    // decline's run of a taken case.
+    double first_vs_ref = 0.0, ref_loop = 0.0, route_vs_loop = 0.0, abs_first = 0.0;
     bool   finite = true;
 };
 
 // One pass over dst in double: the reference and its scale S for each element, compared with each run's output.
-// `loop` may be empty (a declined case has one run).
-errors compare(const mm_case & c, const std::vector<float> & route, const std::vector<float> & loop) {
+// `first` is the case's first run; `loop` may be empty (a declined case has one run).
+errors compare(const mm_case & c, const std::vector<float> & first, const std::vector<float> & loop) {
     errors        e;
     const int64_t K = c.a[0], M = c.a[1], N = c.b[1];
     const int64_t r2 = c.b[2] / c.a[2], r3 = c.b[3] / c.a[3];
@@ -216,10 +224,10 @@ errors compare(const mm_case & c, const std::vector<float> & route, const std::v
                     }
                     scale          = scale > 0.0 ? scale : 1.0;
                     const size_t i = (size_t) (m + M * (n + N * p));
-                    const double r = route[i];
+                    const double r = first[i];
                     e.finite       = e.finite && std::isfinite(r);
-                    e.ref_route    = std::fmax(e.ref_route, std::fabs(r - ref) / scale);
-                    e.abs_route    = std::fmax(e.abs_route, std::fabs(r - ref));
+                    e.first_vs_ref = std::fmax(e.first_vs_ref, std::fabs(r - ref) / scale);
+                    e.abs_first    = std::fmax(e.abs_first, std::fabs(r - ref));
                     if (!loop.empty()) {
                         const double l  = loop[i];
                         e.finite        = e.finite && std::isfinite(l);
@@ -259,6 +267,15 @@ std::vector<mm_case> make_cases() {
         cases.push_back(make_case("Inkling mix scores" + t, { 2304, 5, T, 1 }, { 2304, 3, T, 1 }, false, true));
         cases.push_back(make_case("Inkling mix output" + t, { 5, 2304, T, 1 }, { 5, 3, T, 1 }, false, true));
         cases.push_back(make_case("Inkling bias table" + t, { 16, 1025, 1, 1 }, { 16, 24, T, 1 }, false, true));
+    }
+    for (const int64_t T : { 2, 512 }) {
+        const std::string t = " T=" + std::to_string(T);
+        cases.push_back(make_case("mix scores, one query" + t, { 2304, 5, T, 1 }, { 2304, 1, T, 1 }, false, true));
+        cases.push_back(make_case("mix scores, one state" + t, { 2304, 1, T, 1 }, { 2304, 3, T, 1 }, false, true));
+        cases.push_back(make_case("mix scores, one of each" + t, { 2304, 1, T, 1 }, { 2304, 1, T, 1 }, false, true));
+        cases.push_back(make_case("mix output, one state" + t, { 1, 2304, T, 1 }, { 1, 3, T, 1 }, false, true));
+        cases.push_back(make_case("mix output, one query" + t, { 5, 2304, T, 1 }, { 5, 1, T, 1 }, false, true));
+        cases.push_back(make_case("mix output, one of each" + t, { 1, 2304, T, 1 }, { 1, 1, T, 1 }, false, true));
     }
     cases.push_back(make_case("declined: partial broadcast", { 64, 24, 2, 1 }, { 64, 10, 6, 1 }, false, false));
     cases.push_back(make_case("declined: non-contiguous src1", { 64, 24, 6, 1 }, { 64, 10, 6, 1 }, true, false));
@@ -323,7 +340,7 @@ int main(int, char ** argv) {
             printf(
                 "  max err/S: route vs ref %.3e (F32 bound %.3e), loop vs ref %.3e, route vs loop %.3e (max abs route "
                 "err %.3e)\n",
-                e.ref_route, tol_route_f32(c.a[0]), e.ref_loop, e.route_vs_loop, e.abs_route);
+                e.first_vs_ref, tol_route_f32(c.a[0]), e.ref_loop, e.route_vs_loop, e.abs_first);
             if (first.calls != 1 || first.engaged != 1 || first.declined != 0) {
                 fprintf(stderr, "FAIL: %s: the route did not make exactly one GEMM submission\n", c.name.c_str());
                 case_ok = false;
@@ -337,10 +354,11 @@ int main(int, char ** argv) {
                 case_ok = false;
             }
             if (first.cache_entries != 1) {
-                printf(
-                    "  note: the primitive cache holds %zu entries after the route run; the scratchpad figure is "
-                    "their maximum\n",
-                    first.cache_entries);
+                fprintf(stderr,
+                        "FAIL: %s: the primitive cache holds %zu entries after the route run, not the route's one: the "
+                        "cache this test clears and reads is not the one the backend used\n",
+                        c.name.c_str(), first.cache_entries);
+                case_ok = false;
             }
             if (!(e.ref_loop <= TOL_REF)) {
                 fprintf(stderr, "FAIL: %s: the loop differs from the double reference (%.3e)\n", c.name.c_str(),
@@ -354,7 +372,7 @@ int main(int, char ** argv) {
         } else {
             printf("  loop: calls=%llu declined=%llu engaged=%llu\n", (unsigned long long) first.calls,
                    (unsigned long long) first.declined, (unsigned long long) first.engaged);
-            printf("  max err/S: loop vs ref %.3e (max abs err %.3e)\n", e.ref_route, e.abs_route);
+            printf("  max err/S: loop vs ref %.3e (max abs err %.3e)\n", e.first_vs_ref, e.abs_first);
             if (first.calls != (uint64_t) P || first.engaged != (uint64_t) P || first.declined != 0) {
                 fprintf(stderr, "FAIL: %s: a declined node did not run one GEMM per plane (want %lld)\n",
                         c.name.c_str(), (long long) P);
@@ -367,9 +385,9 @@ int main(int, char ** argv) {
         }
         // A taken case's first run is the route, held to F32; a declined case's is the loop, held to the build's math.
         const double tol_first = c.taken ? tol_route_f32(c.a[0]) : TOL_REF;
-        if (!(e.ref_route <= tol_first)) {
+        if (!(e.first_vs_ref <= tol_first)) {
             fprintf(stderr, "FAIL: %s: the %s differs from the double reference (%.3e > %.3e)\n", c.name.c_str(),
-                    c.taken ? "route" : "loop", e.ref_route, tol_first);
+                    c.taken ? "route" : "loop", e.first_vs_ref, tol_first);
             case_ok = false;
         }
         printf("  %s\n", case_ok ? "ok" : "FAILED");

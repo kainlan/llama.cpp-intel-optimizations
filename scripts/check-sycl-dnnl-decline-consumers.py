@@ -152,7 +152,7 @@ MAIN_PINS = (
     # the batched F32 route: its one gemm's decline is false, and the dispatch goes on to the orchestrator's loop
     ("const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(", 1),
     ("return batched_gemm.has_value();", 1),
-    ("ggml_sycl_mul_mat_f32_batched(ctx, src0, src1, dst, f32_batched_route)) { } else {", 1),
+    ("src0_resolved, src1_resolved, dst_resolved, f32_batched_route)) { return; } else {", 1),
     # one push of the group event, after the decline check (review r3 Nit-2)
     ("gemm_events.push_back(*group_event)", 1),
     ("DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();", 1),

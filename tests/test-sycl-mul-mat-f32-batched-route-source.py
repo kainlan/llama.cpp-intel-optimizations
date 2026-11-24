@@ -11,20 +11,27 @@ whitespace-canonical text:
   once, all inside the condition of one `else if` of the chain that tests the f16 route, which declares the tensor
   route and then reads `route != NONE && environment admits && op(..., route, ...)` in that order (so the queue
   state is read only for a node the tensors admit, and nothing of the route runs for a node an f16 branch takes);
-  its `else` is the orchestrator's, reached with select() when the route declines;
+  its `else` is the orchestrator's, reached with select() when the route declines; the environment is built from
+  the function's own route environment and the conjunction of exactly the three operands' on-device results; the op
+  receives the three resolved operands whose on_device made that gate; a taken node only returns (the block after the
+  chain is TP debug and TP post-processing, neither of which applies to a node the route takes);
 - a decline falls through and does not throw: the route op returns the has_value() of the one gemm() result it
   holds, and its body has no throw and no abort, so a declined scratchpad (nullopt) is false and the dispatch goes
-  on to the orchestrator; a pointer that resolves to null is a decline before gemm();
+  on to the orchestrator; a pointer that is null is a decline before gemm();
+- the route op uses the dispatch's resolution and nothing else: its three pointers are the .ptr of the resolved
+  operands it receives, A from src0's, B from src1's and C from dst's; it calls no resolver of its own; and before
+  gemm() it chains each operand's ready event onto the queue gemm() runs on, as the per-plane loop chains src0's;
 - the environment the predicate reads is filled from the backend's own facts: the recording flag from
   ggml_sycl_graph_recording_active() and the queue's state, tensor parallelism from g_sycl_tp_config, split and
   weight from the route environment the f16 chain reads;
-- the route body makes one submission and keeps nothing: exactly one DnnlGemmWrapper::gemm call, no loop, no
-  allocation of any kind, no wait, no static and no store through a member or a pointer;
+- the route body makes one submission and keeps nothing: exactly one DnnlGemmWrapper::gemm call and no other
+  submission or USM call (memset, memcpy, fill, copy, submit, parallel_for, single_task, std::mem*), no loop, no
+  allocation of any kind, no wait, no static, and no store through a member, a dereference or an index;
 - gemm() chooses its profiler label by batch count: both of its labels name one variable that is the batched row
   when a batch count is above 1 and the unbatched row otherwise;
-- the route computes in F32: gemm() takes its float math as a dnnl_gemm_fpmath parameter whose default,
-  DNNL_GEMM_FPMATH_BUILD, is the build's choice (fpmath f16 under GGML_SYCL_F16, otherwise nothing set); only
-  DNNL_GEMM_FPMATH_STRICT sets fpmath strict; the primitive cache key carries the mode in a field its equality and its
+- the route computes in F32: gemm() takes its float math as a ggml_sycl_dnnl_fpmath parameter whose default,
+  GGML_SYCL_DNNL_FPMATH_BUILD, is the build's choice (fpmath f16 under GGML_SYCL_F16, otherwise nothing set); only
+  GGML_SYCL_DNNL_FPMATH_STRICT sets fpmath strict; the primitive cache key carries the mode in a field its equality and its
   hash both read, so a strict and an f16 primitive of one shape are two entries; the route op passes STRICT, and no
   other caller does.
 
@@ -56,7 +63,9 @@ _MUL_MAT = (
 )
 _ROUTE_OP = (
     "[[nodiscard]] static bool ggml_sycl_mul_mat_f32_batched(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, "
-    "const ggml_tensor * src1, ggml_tensor * dst, ggml_sycl_mul_mat_f32_batched_route route)"
+    "const ggml_tensor * src1, ggml_tensor * dst, const ggml_sycl::resolved_ptr & src0_r, "
+    "const ggml_sycl::resolved_ptr & src1_r, const ggml_sycl::resolved_ptr & dst_r, "
+    "ggml_sycl_mul_mat_f32_batched_route route)"
 )
 _ENV_OF = (
     "static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(ggml_backend_sycl_context & ctx, "
@@ -144,6 +153,39 @@ def _chain_reaches(b: str, chain_if: int, head: int) -> bool:
         pos = block_close + 1 + len("else ")
 
 
+def gate_resolutions(b: str) -> dict:
+    """{tensor: (resolved name, on-device name)} for the dispatch's gate: each `const bool X = R && R.on_device;` whose
+    R is the dispatch's `ggml_sycl_resolve(tensor, ctx.device)` of src0, src1 or dst."""
+    out = {}
+    for o in re.finditer(r"\bconst bool (\w+)=(\w+)&&\2\.on_device;", b):
+        r = re.search(r"\bconst auto " + o.group(2) + r"=ggml_sycl_resolve\((src0|src1|dst),ctx\.device\);", b)
+        if r:
+            out.setdefault(r.group(1), []).append((o.group(2), o.group(1)))
+    return {t: v[0] for t, v in out.items() if len(v) == 1}
+
+
+def gate_input_errors(b: str, env_term: str, op: str) -> list:
+    """The environment's inputs and the op's resolved operands are the dispatch's own."""
+    errs = []
+    gate = gate_resolutions(b)
+    if sorted(gate) != ["dst", "src0", "src1"]:
+        return ["the dispatch does not resolve src0, src1 and dst once each with an on-device result"]
+    route_env = re.search(r"\bconst ggml_sycl_mul_mat_route_env (\w+)=ggml_sycl_mul_mat_route_env_of\(src0,src1\);", b)
+    at = env_term.find(_ENV_OF_CALL)
+    args = call_args(env_term, at + len(_ENV_OF_CALL) - 1) if at != -1 else []
+    if len(args) != 3 or args[0] != "ctx" or not route_env or args[1] != route_env.group(1):
+        errs.append("the environment is not built from ctx and the function's own route environment: %r" % args)
+    if len(args) == 3 and sorted(split_top(args[2], "&&")) != sorted(o for _, o in gate.values()):
+        errs.append("the environment's on_device is not the conjunction of the three operands' on-device results: %r"
+                    % args[2])
+    # the op's resolved operands are the ones whose on_device made the gate, in src0, src1, dst order
+    op_args = call_args(op, len("ggml_sycl_mul_mat_f32_batched"))
+    want = [gate[t][0] for t in ("src0", "src1", "dst")]
+    if [a for a in op_args if a in want] != want:
+        errs.append("the op does not receive the gate's resolved src0, src1 and dst, in that order: %r" % op_args)
+    return errs
+
+
 def dispatch_errors(code: str) -> list:
     errs = []
     b = function_body(code, _MUL_MAT)
@@ -193,13 +235,15 @@ def dispatch_errors(code: str) -> list:
     if len(terms) != 3 or route_test != [0] or env_test != [1]:
         errs.append("the condition is not `route != NONE && environment admits && op(route)`, in that order: %r"
                     % init_test[1])
-    # the branch body is empty: a taken route did the op; its `else` is the orchestrator's
+    errs += gate_input_errors(b, terms[1], op)
+    # a taken route did the op and only returns: the block after the chain is TP debug and TP post-processing, which a
+    # node the route takes (no weight, no tensor parallelism) never needs; its `else` is the orchestrator's
     body_open = cond_close + 1
     if b[body_open] != "{":
         return errs + ["the else-if has no block"]
     body_close = balanced_end(b, body_open, "{", "}")
-    if b[body_open + 1 : body_close].strip():
-        errs.append("the taken branch does more than end the chain: %r" % b[body_open + 1 : body_close][:120])
+    if b[body_open + 1 : body_close] != "return;":
+        errs.append("the taken branch does more or less than return: %r" % b[body_open + 1 : body_close][:120])
     if not b.startswith("}else{", body_close):
         errs.append("the branch after the route is not a plain else")
     else:
@@ -232,9 +276,12 @@ def test_dispatch_mutants():
     chain_if = b.index("if(f16_route==")
     env_of = env_term[len(_ENV_ADMITS) : -1]
 
-    # the order of the route test's operands is spelling: it passes
+    # the order of the route test's operands and of the three on-device results is spelling: they pass
     flipped = code.replace(b, mutate(b, route_test + "&&", _NONE + "!=" + route_var + "&&"), 1)
     assert dispatch_errors(flipped) == [], dispatch_errors(flipped)
+    reordered = code.replace(b, mutate(b, env_term, env_term.replace(
+        "src0_on_device_r&&src1_on_device_r&&dst_on_device_r", "dst_on_device_r&&src0_on_device_r&&src1_on_device_r")), 1)
+    assert dispatch_errors(reordered) == [], dispatch_errors(reordered)
 
     for name, new_b in [
         ("the route branch is gone", b.replace(branch, "}", 1)),
@@ -261,6 +308,17 @@ def test_dispatch_mutants():
         ("the environment is not asked", mutate(b, test, route_test + "&&" + op)),
         ("the dispatch reads the queue state",
          b[:chain_if] + "(void)ctx.stream()->ext_oneapi_get_state();" + b[chain_if:]),
+        ("a taken route falls through to the post-chain block", mutate(b, branch, branch.replace("{return;}", "{}"))),
+        ("the environment is told every operand is on the device",
+         mutate(b, env_term, env_term.replace("src0_on_device_r&&src1_on_device_r&&dst_on_device_r", "true"))),
+        ("the environment reads one operand's on-device result",
+         mutate(b, env_term, env_term.replace("src0_on_device_r&&src1_on_device_r&&dst_on_device_r", "src1_on_device_r"))),
+        ("the environment gets a default route environment",
+         mutate(b, env_term, env_term.replace(",route_env,", ",ggml_sycl_mul_mat_route_env{},"))),
+        ("the op gets a fresh resolution of src1",
+         mutate(b, op, op.replace(",src1_resolved,", ",ggml_sycl_resolve(src1,ctx.device),"))),
+        ("the op gets src0's and src1's resolutions swapped",
+         mutate(b, op, op.replace("src0_resolved,src1_resolved", "src1_resolved,src0_resolved"))),
         ("a declined route does not reach the orchestrator's select",
          b.replace("ctx.matmul_orchestrator.select(src0,src1,dst,forced_layout)",
                    "ctx.matmul_orchestrator.pick(src0,src1,dst,forced_layout)", 1)),
@@ -273,18 +331,30 @@ def test_dispatch_mutants():
 _ALLOC = re.compile(r"\bunified_alloc\w*\(|\bunified_allocate\w*\(|\bggml_sycl_pool_alloc\b|\bmalloc\w*\(|\.alloc\(|"
                     r"\bsycl::malloc\w*|\bmem_handle\b|\balloc_owner\b|\bfree\(")
 _WAIT = re.compile(r"\bwait(?:_and_throw)?\(|\bext_oneapi_submit_barrier\(|\bsynchronize\(")
-_STORE = re.compile(r"(?:->|\.)\w+(?:\[[^\]]*\])*=(?!=)")
+# a store through a member (`p->x =`, `s.x =`), a dereference (`*p =`) or an index (`p[i] =`); declarations such as
+# `float * c = ...` are not stores, since a statement's first character is never `*` in them
+_STORE = re.compile(r"(?:->|\.)\w+(?:\[[^\]]*\])*=(?!=)|[;{}]\*[^;=]*=(?!=)|[;{}][\w.>-]+\[[^\]]*\]=(?!=)")
+# a submission or USM call other than the one gemm()
+_SUBMIT = re.compile(r"(?:->|\.)(?:memset|memcpy|fill|copy|submit|parallel_for|single_task|prefetch|mem_advise)\(|"
+                     r"\bstd::mem\w+\(|(?<![\w:])(?:memset|memcpy|memmove)\(")
+_RESOLVERS = re.compile(r"\bggml_sycl_resolve\w*\(|\bggml_sycl_get_data_ptr\w*\(|\bggml_sycl_get_weight\w*ptr\w*\(")
+_RESOLVED_PARAM = re.compile(r"const ggml_sycl::resolved_ptr&(\w+)")
 
 
 _NULL_TERM = re.compile(r"!(\w+)|(\w+)==nullptr|nullptr==(\w+)")
 
 
+def _pointers(b: str) -> list:
+    """The pointer variables the route op takes from a resolved operand's .ptr, as (name, operand) matches."""
+    return [m for m in re.finditer(r"\b(\w+)=(?:static_cast<[^>]*>\()?(\w+)\.ptr\)?;", b)]
+
+
 def null_check_errors(b: str, gemm_at: int) -> list:
-    """A null resolved pointer is a decline: after the three resolutions and before gemm(), one `if` whose condition
+    """A null pointer is a decline: after the three pointers are taken and before gemm(), one `if` whose condition
     tests each of them for null returns false (the orchestrator resolves and reports on its own path)."""
-    resolved = [m for m in re.finditer(r"\b(\w+)=[^;]*\bggml_sycl_resolve_tensor_ptr\(", b)]
+    resolved = _pointers(b)
     if len(resolved) != 3:
-        return ["the route op does not resolve exactly three pointers (%d)" % len(resolved)]
+        return ["the route op does not take exactly three pointers from resolved operands (%d)" % len(resolved)]
     names = {m.group(1) for m in resolved}
     after = b.index(";", resolved[-1].end())
     for m in re.finditer(r"\bif\(", b):
@@ -301,6 +371,31 @@ def null_check_errors(b: str, gemm_at: int) -> list:
             return ["a null pointer is not a plain decline: %r" % block]
         return []
     return ["no check declines when one of %s resolves to null" % sorted(names)]
+
+
+def resolution_errors(full: str, b: str, gemm_at: int) -> list:
+    """The pointers are the dispatch's: A, B and C are the .ptr of the src0, src1 and dst operands the op receives, no
+    resolver runs here, and each operand's ready event is chained onto gemm()'s queue before gemm()."""
+    errs = []
+    params = _RESOLVED_PARAM.findall(full[: full.index("{")])
+    if len(params) != 3:
+        return ["the route op does not receive three resolved operands: %r" % params]
+    if _RESOLVERS.search(b):
+        errs.append("the route op resolves a tensor itself: %r" % _RESOLVERS.search(b).group(0))
+    args = call_args(b, gemm_at + len("DnnlGemmWrapper::gemm"))
+    taken = {m.group(1): m.group(2) for m in _pointers(b)}
+    if len(args) < 17 or [taken.get(args[i]) for i in (4, 9, 14)] != params:
+        errs.append("gemm()'s A, B and C are not the .ptr of the src0, src1 and dst operands: %r"
+                    % ([args[i] for i in (4, 9, 14)] if len(args) > 14 else args, taken))
+        return errs
+    chained = []
+    for m in re.finditer(r"\bggml_sycl_chain_ready_event_if_needed\(", b):
+        c = call_args(b, m.end() - 1)
+        if m.start() < gemm_at and len(c) >= 2 and c[0] == "*" + args[16]:
+            chained.append(c[1])
+    if sorted(chained) != sorted(params):
+        errs.append("before gemm() the ready events chained onto its queue are %r, not each operand's once" % chained)
+    return errs
 
 
 def route_op_errors(code: str) -> list:
@@ -323,9 +418,12 @@ def route_op_errors(code: str) -> list:
     if re.search(r"\bstatic\b", b):
         errs.append("the route op keeps a static")
     if _STORE.search(b):
-        errs.append("the route op stores through a member or pointer: %r" % _STORE.search(b).group(0))
+        errs.append("the route op stores through a member, a dereference or an index: %r" % _STORE.search(b).group(0))
+    if _SUBMIT.search(b):
+        errs.append("the route op submits or calls USM besides gemm(): %r" % _SUBMIT.search(b).group(0))
     if gemms:
         errs += null_check_errors(b, gemms[0])
+        errs += resolution_errors(full, b, gemms[0])
         # has_value() is the semantic, not a spelling: true only when gemm() produced an event, nullopt (a declined
         # scratchpad) being false
         m = re.search(r"(?:const)?std::optional<sycl::event>(\w+)=DnnlGemmWrapper::gemm\(", b)
@@ -369,7 +467,40 @@ def test_route_op_mutants():
         ("a stored pointer", mutate(full, ret, "dst->extra=nullptr;" + ret)),
         ("a stored pointer in the context", mutate(full, ret, "ctx.last_ptr=nullptr;" + ret)),
         ("a static", mutate(full, ret, "static const void*last=nullptr;" + ret)),
+        ("a store through a dereference", mutate(full, ret, "*c=0.0f;" + ret)),
+        ("a store through an index", mutate(full, ret, "c[0]=0.0f;" + ret)),
+        ("a memset", mutate(full, ret, "stream->memset(c,0,4);" + ret)),
+        ("a memcpy", mutate(full, ret, "stream->memcpy(c,a,4);" + ret)),
+        ("a submit", mutate(full, ret, "stream->submit([&](sycl::handler&h){});" + ret)),
+        ("a parallel_for", mutate(full, ret, "stream->parallel_for(sycl::range<1>(1),[=](sycl::id<1>){});" + ret)),
+        ("a std::memset", mutate(full, ret, "std::memset(nullptr,0,0);" + ret)),
     ]:
+        assert route_op_errors(code.replace(full, new, 1)), f"mutant {name!r} slipped through"
+
+
+def test_resolution_mutants():
+    code = code_of(SYCL_CPP)
+    full = function_body(code, _ROUTE_OP)
+    b = full[full.index("{") :]
+    ptrs = {m.group(2): m.group(0) for m in _pointers(b)}
+    chains = re.findall(r"ggml_sycl_chain_ready_event_if_needed\([^;]*\);", b)
+    held = re.search(r"(?:const)?std::optional<sycl::event>\w+=DnnlGemmWrapper::gemm\(", full)
+    gemm_stmt = full[held.start() : full.index(";", held.start()) + 1]
+    src1_chain = [c for c in chains if ",src1_r" in c][0]
+    for name, new in [
+        ("B from a second resolver",
+         mutate(full, ptrs["src1_r"], ptrs["src1_r"].replace("src1_r.ptr", "ggml_sycl_resolve_tensor_ptr(src1,ctx.device)"))),
+        ("B from get_data_ptr", mutate(full, ptrs["src1_r"], ptrs["src1_r"].replace("src1_r.ptr", "ggml_sycl_get_data_ptr(src1,ctx.device)"))),
+        ("A from src1's operand", mutate(full, ptrs["src0_r"], ptrs["src0_r"].replace("src0_r.ptr", "src1_r.ptr"))),
+        ("src1's ready event not chained", mutate(full, src1_chain, "")),
+        ("src1's ready event chained twice instead of dst's",
+         mutate(full, [c for c in chains if ",dst_r" in c][0], src1_chain)),
+        ("a ready event chained onto another queue",
+         mutate(full, src1_chain, src1_chain.replace("(*stream,", "(*ctx.stream(ctx.device,1),"))),
+        ("the ready events chained after gemm()",
+         full.replace("".join(chains), "", 1).replace(gemm_stmt, gemm_stmt + "".join(chains), 1)),
+    ]:
+        assert new != full, f"mutant {name!r} changed nothing"
         assert route_op_errors(code.replace(full, new, 1)), f"mutant {name!r} slipped through"
 
 
@@ -497,9 +628,9 @@ def test_label_mutants():
 
 
 # ---- the route computes in F32; every other caller keeps the build's float math ----
-_STRICT = "DNNL_GEMM_FPMATH_STRICT"
-_BUILD = "DNNL_GEMM_FPMATH_BUILD"
-_FPMATH_PARAM = re.compile(r"dnnl_gemm_fpmath (\w+)=(\w+)")
+_STRICT = "GGML_SYCL_DNNL_FPMATH_STRICT"
+_BUILD = "GGML_SYCL_DNNL_FPMATH_BUILD"
+_FPMATH_PARAM = re.compile(r"ggml_sycl_dnnl_fpmath (\w+)=(\w+)")
 
 
 def _between(code: str, start: str, end: str) -> str:
@@ -514,7 +645,7 @@ def fpmath_errors(gemm_code: str, sycl_code: str, others: dict) -> list:
     params = call_args(gb, gb.index("gemm(") + len("gemm"))
     found = [(i, _FPMATH_PARAM.fullmatch(p)) for i, p in enumerate(params) if _FPMATH_PARAM.fullmatch(p)]
     if len(found) != 1:
-        return ["gemm() does not take one dnnl_gemm_fpmath parameter with a default (%d)" % len(found)]
+        return ["gemm() does not take one ggml_sycl_dnnl_fpmath parameter with a default (%d)" % len(found)]
     index, m = found[0]
     param = m.group(1)
     if m.group(2) != _BUILD:
@@ -546,9 +677,9 @@ def fpmath_errors(gemm_code: str, sycl_code: str, others: dict) -> list:
 
     # the cache key carries the mode: a strict and an f16 primitive of one shape are two entries
     key = _between(gemm_code, "struct DnnlPrimitiveKey{", "struct DnnlPrimitiveKeyHash{")
-    fields = re.findall(r"\bdnnl_gemm_fpmath (\w+);", key)
+    fields = re.findall(r"\bggml_sycl_dnnl_fpmath (\w+);", key)
     if len(fields) != 1:
-        errs.append("the primitive key has no one dnnl_gemm_fpmath field: %r" % fields)
+        errs.append("the primitive key has no one ggml_sycl_dnnl_fpmath field: %r" % fields)
     else:
         field = fields[0]
         eq = key[key.index("operator==(") :]
@@ -595,12 +726,12 @@ def test_fpmath_mutants():
     g = code_of(GEMM_HPP)
     s = code_of(SYCL_CPP)
     gb = gemm_body(g)
-    m = re.search(r"dnnl_gemm_fpmath (\w+)=" + _BUILD, gb)
+    m = re.search(r"ggml_sycl_dnnl_fpmath (\w+)=" + _BUILD, gb)
     param = m.group(1)
     strict_set = re.search(r"(\w+)\.set_fpmath_mode\(dnnl::fpmath_mode::strict\);", gb).group(0)
     f16_set = re.search(r"(\w+)\.set_fpmath_mode\(dnnl::fpmath_mode::f16\);", gb).group(0)
     key = _between(g, "struct DnnlPrimitiveKey{", "struct DnnlPrimitiveKeyHash{")
-    field = re.search(r"\bdnnl_gemm_fpmath (\w+);", key).group(1)
+    field = re.search(r"\bggml_sycl_dnnl_fpmath (\w+);", key).group(1)
     hashed = _between(g, "struct DnnlPrimitiveKeyHash{", "struct DnnlCachedPrimitive{")
     hash_line = re.search(r"h\^=std::hash<\w+>\{\}\((?:static_cast<\w+>\()?k\." + field + r"\)?\)<<\d+;", hashed).group(0)
     route = function_body(s, _ROUTE_OP)
@@ -614,7 +745,7 @@ def test_fpmath_mutants():
 
     gemm_mutants = [
         ("the default is strict", in_gemm(param + "=" + _BUILD, param + "=" + _STRICT)),
-        ("the parameter is gone", g.replace(gb, gb.replace(",dnnl_gemm_fpmath " + param + "=" + _BUILD, ""), 1)),
+        ("the parameter is gone", g.replace(gb, gb.replace(",ggml_sycl_dnnl_fpmath " + param + "=" + _BUILD, ""), 1)),
         ("the STRICT branch sets f16", in_gemm(strict_set, strict_set.replace("::strict", "::f16"))),
         ("f16 also overrides strict", in_gemm(strict_set, strict_set + f16_set)),
         ("f16 without GGML_SYCL_F16", g.replace(gb, gb.replace("#ifdef GGML_SYCL_F16 ", "", 1).replace("#endif}", "}", 1), 1)),
@@ -622,7 +753,7 @@ def test_fpmath_mutants():
         ("the key ignores the parameter", in_gemm("key." + field + "=" + param + ";", "key." + field + "=" + _BUILD + ";")),
         ("equality forgets the mode", g.replace("&&" + field + "==other." + field, "", 1)),
         ("the hash forgets the mode", g.replace(hash_line, "", 1)),
-        ("the key has no mode field", g.replace(key, key.replace("dnnl_gemm_fpmath " + field + ";", ""), 1)),
+        ("the key has no mode field", g.replace(key, key.replace("ggml_sycl_dnnl_fpmath " + field + ";", ""), 1)),
         ("row_gemm passes strict", g[:row_call_end] + "," + _STRICT + g[row_call_end:]),
     ]
     for name, new_g in gemm_mutants:
