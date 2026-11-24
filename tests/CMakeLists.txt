@@ -5428,6 +5428,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the batched F32 MUL_MAT route: consulted before the orchestrator, a decline falls through, one gemm
+# and nothing kept, the environment from the backend's facts, gemm()'s label by batch count. Host test of the
+# predicate: test-sycl-mul-mat-f32-batched-route; device test: test-sycl-mul-mat-f32-batched-device.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mul-mat-f32-batched-route-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mul-mat-f32-batched-route-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-7gno: source gate for the auto n_ubatch trial's hoisted block (the decisions the planned ladder's rung set
 # depends on are made before the memory module exists; the [SYCL-PLAN] lines stay in the ladder, byte for byte).
 if (Python3_Interpreter_FOUND)

@@ -700,6 +700,7 @@ enum ggml_sycl_ready_query_site {
     GGML_SYCL_READY_QUERY_SITE_MOE_SORT,
     GGML_SYCL_READY_QUERY_SITE_MOE_XMX,
     GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH,
+    GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED,
     GGML_SYCL_READY_QUERY_SITE_COUNT,
 };
 
@@ -736,6 +737,8 @@ inline const char * ggml_sycl_ready_query_site_name(ggml_sycl_ready_query_site s
             return "moe_xmx";
         case GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH:
             return "cpu_dispatch";
+        case GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED:
+            return "mul_mat_f32_batched";
         case GGML_SYCL_READY_QUERY_SITE_OTHER:
         case GGML_SYCL_READY_QUERY_SITE_COUNT:
             break;

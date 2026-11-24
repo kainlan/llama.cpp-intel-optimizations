@@ -65882,6 +65882,116 @@ static bool ggml_sycl_mul_mat_src1_has_reader(const ggml_tensor * src0,
     throw;
 }
 
+// The facts the batched F32 route reads that are not a function of the tensors (nonfa-stage.hpp), built only for a node
+// the tensors admit. `on_device` is the dispatch's own resolution of src0, src1 and dst. A command graph records when
+// the backend says so or the queue is in its recording state: a primitive the cache has not seen would be created
+// inside the recording.
+static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
+    ggml_backend_sycl_context &         ctx,
+    const ggml_sycl_mul_mat_route_env & route_env,
+    bool                                on_device) {
+    ggml_sycl_mul_mat_f32_batched_env env;
+    env.split           = route_env.split;
+    env.has_weight      = route_env.has_weight;
+    env.tensor_parallel = g_sycl_tp_config.enabled;
+    env.recording       = ggml_sycl_graph_recording_active() ||
+                    ctx.stream()->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
+    env.on_device = on_device;
+    return env;
+}
+
+// A batched F32 MUL_MAT as one oneDNN matmul, for a node ggml_sycl_mul_mat_f32_batched_route_of took: dense F32
+// activations in this device's memory. The per-plane loop of ggml_sycl_op_mul_mat would submit one GEMM per plane.
+//
+// The mapping is the loop's: gemm(a = src0, b = src1) with m = ne01, k = ne00, A rows and B columns k apart, and C
+// column n at n * ldc with ldc = ne0, so dst[n][m] = sum over k of src0[m][k] * src1[n][k].
+//
+// The operands are the dispatch's own resolution: src0_r, src1_r and dst_r are the results whose on_device admitted
+// the node, so the GEMM reads and writes exactly the memory the gate checked. Resolving a second time could differ:
+// for a non-weight tensor ggml_sycl_resolve() can return the unified cache's device copy, while a raw-pointer resolver
+// returns tensor->data, host memory for a host-pinned buffer. A copy the cache is still filling carries a ready
+// event, which is chained onto the queue before the GEMM, as the per-plane loop chains src0's; that orders the
+// queue, and no host thread waits.
+//
+// The pointers are transient views for this one submission and nothing here outlives the call. The operands are
+// non-weight tensors in this device's memory: compute-buffer activations, KV views or graph inputs. What keeps them
+// valid until the GEMM has run is the execution queue: it is in order, so every later command on this backend that
+// writes or reads that memory runs after the GEMM, and the scheduler synchronizes the backend
+// (ggml_backend_sycl_synchronize waits on stream(device, 0), which is ctx.stream()) before it reallocates the graph's
+// buffers; their owners outlive the queue's pending work.
+//
+// Returns false when one of the three pointers is null or gemm() declined its scratchpad: nothing was submitted and dst
+// was not written, so the dispatch goes on to the orchestrator, whose per-plane loop computes the same op on the same
+// placement. A throw from gemm() propagates as it does on every other path.
+[[nodiscard]] static bool ggml_sycl_mul_mat_f32_batched(ggml_backend_sycl_context &         ctx,
+                                                        const ggml_tensor *                 src0,
+                                                        const ggml_tensor *                 src1,
+                                                        ggml_tensor *                       dst,
+                                                        const ggml_sycl::resolved_ptr &     src0_r,
+                                                        const ggml_sycl::resolved_ptr &     src1_r,
+                                                        const ggml_sycl::resolved_ptr &     dst_r,
+                                                        ggml_sycl_mul_mat_f32_batched_route route) {
+#if GGML_SYCL_DNNL
+    GGML_TENSOR_BINARY_OP_LOCALS
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const queue_ptr stream = ctx.stream();
+
+    const float * a = static_cast<const float *>(src0_r.ptr);
+    const float * b = static_cast<const float *>(src1_r.ptr);
+    float *       c = static_cast<float *>(dst_r.ptr);
+    if (!a || !b || !c) {
+        // A decline: the orchestrator resolves the same tensors on its own path and reports there.
+        return false;
+    }
+    size_t stream_identity = 0;
+    ggml_sycl_chain_ready_event_if_needed(*stream, src0_r,
+                                          ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                          GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED);
+    ggml_sycl_chain_ready_event_if_needed(*stream, src1_r,
+                                          ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                          GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED);
+    ggml_sycl_chain_ready_event_if_needed(*stream, dst_r,
+                                          ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                          GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED);
+
+    const int  m = static_cast<int>(ne01);
+    const int  k = static_cast<int>(ne00);
+    int        n;
+    dnnl_dim_t batches;
+    if (route == GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_COLUMNS) {
+        // src0 is one plane for every plane of src1, which is batched in dim 2 only. src1 is dense, so its plane p
+        // column j, at (p * ne11 + j) * k, is column p * ne11 + j of one [k, ne11 * ne12] matrix; dst plane p column j,
+        // at (p * ne1 + j) * ne0 with ne1 == ne11, is column p * ne11 + j of one [m, ne11 * ne12] matrix with ldc = ne0.
+        // The batch is the columns of one plain GEMM.
+        n       = static_cast<int>(ne11 * ne12);
+        batches = 1;
+    } else {
+        // The same batch on both: plane p of src0, src1 and dst at p * k * m, p * k * n and p * ldc * n, the last being
+        // the plane stride gemm() fixes for C.
+        n       = static_cast<int>(ne11);
+        batches = ne12 * ne13;
+    }
+    // Strict float math: the op is F32 x F32 and what it replaces computes in F32 wherever oneDNN does not use the
+    // build's f16 licence, so the route does not take that licence (its output feeds softmax in Inkling's mix).
+    const auto                       f32          = DnnlGemmWrapper::to_dt<float>();
+    const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(
+        ctx, m, n, k, a, f32, 1, k, static_cast<dnnl_dim_t>(k) * m, b, f32, 1, k, static_cast<dnnl_dim_t>(k) * n, c,
+        f32, stream, batches, batches, static_cast<int>(ne0),
+        /* deps = */ {}, ggml_type_name(src0->type), /* query_only = */ false, GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT);
+    return batched_gemm.has_value();
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src0_r);
+    GGML_UNUSED(src1_r);
+    GGML_UNUSED(dst_r);
+    GGML_UNUSED(route);
+    return false;
+#endif
+}
+
 static void k_mul_mat_batched_f16_f32_fallback(const sycl::half *       src0,
                                                const sycl::half *       src1,
                                                float *                  dst,
@@ -80728,6 +80838,24 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 GGML_ABORT("[SYCL] KQV debug override requested scalar GPU fallback, but fallback failed.");
             }
         }
+    } else if (const ggml_sycl_mul_mat_f32_batched_route f32_batched_route =
+                   ggml_sycl_mul_mat_f32_batched_route_of(src0, src1, dst);
+               f32_batched_route != GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE &&
+               ggml_sycl_mul_mat_f32_batched_env_admits(ggml_sycl_mul_mat_f32_batched_env_of(
+                   ctx, route_env, src0_on_device_r && src1_on_device_r && dst_on_device_r)) &&
+               ggml_sycl_mul_mat_f32_batched(ctx, src0, src1, dst, src0_resolved, src1_resolved, dst_resolved,
+                                             f32_batched_route)) {
+        // A batched F32 activation matmul, asked after the f16 branches (which take an F16 src0 only) and before the
+        // orchestrator, whose per-plane loop is the fall-through for every node the route declines. The tensors are
+        // asked first: the environment, a queue-state query among its facts, is built only for a node they admit, so
+        // decode's batch-1 nodes pay for one tensor check. One oneDNN matmul computed every plane; a declined
+        // scratchpad wrote nothing and reads false, so the orchestrator's dispatch below computes the op instead.
+        //
+        // A taken node returns here, as every orchestrator path does. The block after this chain is the TP debug
+        // probes, which match FFN weight names and print only under GGML_SYCL_TP_DEBUG, and the TP column- and
+        // row-parallel post-processing, which acts only on a TP-sharded src0. The route declines a weight and tensor
+        // parallelism, so none of it applies, and its 32-layer name scan would cost a taken node about 64 snprintf.
+        return;
     } else {
         ggml_sycl::test_record_orchestrator_call();
         auto decision = ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout);

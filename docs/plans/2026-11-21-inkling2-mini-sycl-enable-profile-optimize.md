@@ -6299,22 +6299,24 @@ read-only trace of the path on `05569a4f4` (explorer, 2026-11-24).
    and calls `gemm` once with batch counts; the label). Both fail first.
    `sycl:` the predicate, the route, the label.
 2. `tests:` a device test, labels including `device`, run by the lead only: for each of the three Inkling shapes
-   at T = 1, 2, 179 and 512, and for a 2-D src0 with a batch in dim 3, the SYCL result against a CPU oracle
+   at T = 1, 2, 179 and 512, and for a 2-D src0 with a batch in dim 3 (*amended at the checkpoint: T = 1 is not
+   this route's, and that last shape never reaches the backend; see the record below*), the SYCL result against
+   a CPU oracle
    computed in double, within a stated relative tolerance; a decline case (a permuted operand) that must give
    the same values through the loop; and an assertion, through a counter or the profiler's own count, that the
    taken cases made one GEMM submission and the declined case made one per plane. It must name its card in its
    log and skip with 77 when no device is there.
 
 **Acceptance Criteria:**
-- [ ] The host test and the source contract fail before the GREEN commit for the reason they name and pass after.
-- [ ] Full build; the two source-contract sweeps with only the known eight red; inventory check 0.
-- [ ] Lead runs, each once: the device test on both cards; `test-backend-ops -o MUL_MAT` on each card with no case
+- [x] The host test and the source contract fail before the GREEN commit for the reason they name and pass after.
+- [x] Full build; the two source-contract sweeps with only the known eight red; inventory check 0.
+- [x] Lead runs, each once: the device test on both cards; `test-backend-ops -o MUL_MAT` on each card with no case
       changing status against `t19-tbo-MUL_MAT-cb9b34792`; the Inkling gate on the B70, the B50 alone and both
       cards; the Mistral gate on the B70 and the GPT-OSS gate on the B50.
-- [ ] Lead runs, each once, on the B70: the 691-token prompt under the kernel profiler (the GEMM rows' submission
+- [x] Lead runs, each once, on the B70: the 691-token prompt under the kernel profiler (the GEMM rows' submission
       count against 199,440, and a cold primitive cache is part of this run on purpose) and under the stage
       profiler (the non-MoE matmul stage against 3783 ms); one ABBA of `llama-bench` against the merged tree.
-- [ ] A fixed-seed 64-token completion is compared with the merged tree's. Equal text is expected. A difference is
+- [x] A fixed-seed 64-token completion is compared with the merged tree's. Equal text is expected. A difference is
       not a failure by itself (one batched GEMM may sum in another order) but is reported with the first
       differing token and the device test's measured error.
 
@@ -6328,6 +6330,54 @@ read-only trace of the path on `05569a4f4` (explorer, 2026-11-24).
 
 **Commits:** `sycl: a batched F32 MUL_MAT is one oneDNN matmul`, preceded by its `tests:` commit; then the device
 test's `tests:` commit. Path-scoped.
+
+**Done (lead, 2026-11-24; branch `task/inkling2-t20` at `3a7d15d36`; evidence
+`docs/backend/data/inkling2/t20-lead-runs.txt`; the lead's rulings, R1-R8, D1-D6, M1-M4 and Q1-Q10, are in
+`t20-lead-rulings.md` beside it and win over the task text above where they differ).**
+- *What was built.* An F32 x F32 `MUL_MAT` on activations whose batch is above 1 is one `DnnlGemmWrapper::gemm`
+  call where it was one per plane. Two cases: both operands carry the batch (one batched matmul), or src0 is 2-D
+  and src1's batch is folded into the columns of one plain GEMM. The tensor predicate
+  `ggml_sycl_mul_mat_f32_batched_route_of` and the environment predicate `..._env_admits` are in `nonfa-stage.hpp`;
+  the route is an else-if link of the F16 chain in `ggml_sycl_mul_mat`, asked only for a node no F16 branch took.
+  It declines to the per-plane loop for a weight, a split node, tensor parallel, an active recording, an operand
+  not on this device, a non-contiguous operand, or a null resolved pointer. It allocates nothing, copies nothing
+  and adds no host wait: it uses the dispatch's resolved operands and orders its GEMM after their ready events.
+- *The float mode (ruling R8), found by the device test's printed figures.* `gemm()` set `fpmath_mode::f16` on every
+  primitive in this build. oneDNN uses that licence per shape and per card: for the mix-scores shape the loop was
+  F32-exact on the B70 (2e-7) and the first route was not (7e-4). `gemm()` now takes the mode as a parameter
+  (`ggml_sycl_dnnl_fpmath`, default = what it did), the primitive key carries it, and the route passes
+  `GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT`. After that the route's worst error is 2.7e-6 on both cards, the same
+  figures on the B70 and the B50, inside the F32 bound `(K + 1) * 2^-24` the test holds it to. The loop's mode and
+  every other caller of `gemm()` are unchanged.
+- *Measured, B70, driver 26.44, no builder alive, each once.* GEMM submissions for a 691-token prompt: 199,440
+  before, 1,008 after (480 batched, 20.5 ms of device time; 528 unbatched, 11.9 ms). The non-MoE matmul stage's host
+  time: 3783 ms before, 212 ms after. Interleaved `llama-bench`, pp512 / tg128 in t/s, in run order: merged tree
+  76.70 / 25.16, task 111.78 / 25.30, task 111.42 / 25.36, merged tree 77.58 / 25.19. Prompt +45%, decode unchanged
+  (T = 1 nodes are not this route's). The bench was run on `55fa1fb12`; the later heads were not benched again:
+  the 691-token prompt under the kernel profiler read 100.5 t/s at `55fa1fb12` and 100.4 t/s at the final head.
+- *Unchanged elsewhere.* `test-backend-ops -o MUL_MAT` changes no case on either card against
+  `t19-tbo-MUL_MAT-cb9b34792` (run at `55fa1fb12` and `3657fe3f3`). The Inkling gate on the B70, the B50 alone and
+  both cards, the Mistral gate on the B70 and the GPT-OSS gate on the B50 pass at both of those heads; the Inkling
+  B70 gate passes at `c2d5a5040` and `6345c83d6`. The fixed-seed 64-token text is byte-equal to the merged tree's at
+  all four heads. The device test passes on both cards at the final code head: 27 taken cases, one primitive and
+  a zero scratchpad each, no shape refused up to T = 2048.
+- *Checkpoint corrections to the task text.* A node whose dim-3 sizes differ is refused by `supports_op`, so "a 2-D
+  src0 with a batch in dim 3" never reaches the backend: the device cases are equal batch in dim 2, equal batch in
+  dims 2 and 3, and a 2-D src0 broadcast over dim 2. T = 1 is not a route case (the batch must be above 1); the
+  size-1 shapes the model builds (m, n or k of 1) are covered at T = 2 and 512. Inkling prompt graphs are not
+  recorded. `ggml-sycl.cpp` is far longer than the text said.
+- *Reviews.* Spec review of `3657fe3f3`: pass, four minors (M1-M4). Quality review of `c2d5a5040`: pass, ten minors
+  and three notes (Q1-Q10); the two that changed what runs were Q1 (the first route resolved its operands a second
+  time, and a second resolver could return a host pointer for an operand whose device copy the gate had approved)
+  and Q3. Re-review of `6345c83d6`: pass, two minors (a store spelling the contract missed, one sentence in the
+  env-var page), fixed in a Python-only and a doc-only commit. The next re-review found the store check still
+  missed increments and three index spellings; it now refuses every `++` and `--` in the route body and says in
+  its docstring that it is a pattern over text, not a parser. The last re-review passed with no finding.
+- *Lead mistakes, kept as a record.* The checkpoint ruling repeated "the compute buffer's owner waits in its
+  destructor" as what orders a later reader after the GEMM. That destructor waits on another queue; the order
+  comes from the in-order execution queue and the scheduler's synchronize, and the route's comment says so (Q2).
+  The name `..._FPMATH_STRICT` the lead asked for in Q9 is refused by the tenant-plan contract, which reserves
+  `GGML_SYCL_*STRICT*`; the implementer renamed it.
 
 ---
 
@@ -6576,6 +6626,24 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   the unclean baseline recorded above. Not diagnosed; they are decode shapes.
 - The host guard `test-sycl-nvfp4-decode-host` carries `sycl;quant;hostonly`: neither fixed contract sweep selects
   it. It runs by name and in the full sweep.
+
+*Left by Task 20 (2026-11-24):*
+- **The oneDNN primitive cache grows by one entry per distinct prompt-ubatch token count and shape.** The batched
+  key contains T. A server that sees many prompt lengths keeps one primitive for each, for the life of the process.
+  Runtime dimensions (`DNNL_RUNTIME_DIM_VAL`) or a bound on the cache would end it; neither is adopted (ruling R1).
+- A `gemm()` throw at a token count nobody tested replaces a run the per-plane loop would have completed. A negative
+  memo for a refused primitive, with a fall back to the loop, is owed (ruling R5). No shape was refused up to
+  T = 2048 on either card.
+- `on_device` in the resolver's last branch is not tied to a device id: on a two-card run it says "on a device",
+  not "on this one". The route declines a split node by its own flag, so this is not reachable through the route
+  today; it is the resolver's defect.
+- A recorded batched F32 node replays through the loop with the build's f16 licence, while an eager one is computed
+  in F32. No Inkling prompt graph is recorded today.
+- No device test reaches the ready-event path of the route: the device test's operands are complete when the node
+  runs. The cover is the source contract and `tests/test-sycl-chain-same-queue-source.py`.
+- `scripts/check-sycl-dnnl-decline-consumers.py` is not a usable gate: one of its mutants survives ("caller 1
+  rethrows the named error as std::exception"), so it is red before and after any change.
+- The NVFP4 prompt kernel is now the largest part of an Inkling prompt: about 3.2 s of a 6.9 s 691-token prompt.
 
 ---
 
