@@ -81,7 +81,7 @@ DIRECT_REFUSAL = "ggml_sycl_moe_direct_log_refusal("
 DIRECT_DECLINE_TAG = "[MOE-DIRECT-DECLINE]"
 DIRECT_DECLINE_FORMAT = "[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct step=%s %s\\n"
 DIRECT_REFUSAL_FORMAT = "[%s] tensor=%s route=direct step=%s %s\\n"
-DIRECT_GATE ="if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&"
+DIRECT_GATE = "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&"
 DIRECT_END = "// MoE hybrid GPU+CPU dispatch gate"
 # The success path ends at the return right after the terminal host task is recorded.
 DIRECT_SUCCESS = "ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);"
