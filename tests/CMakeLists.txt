@@ -1137,8 +1137,8 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
     # An NVFP4 decode node whose experts the plan puts all on its card at AOS runs from the full-local expert table and
-    # the device ids with no host wait, workspace or host task (Inkling 2 Mini plan, Task 18): its predicate, the plan
-    # memo's key, the ready event, the declines and the shared MMVQ geometry.
+    # the device ids with no host wait, workspace or host task: its predicate, the plan memo's key, the ready event,
+    # the declines, the shared MMVQ geometry and the retention that keeps every handle alive under submitted work.
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-nvfp4-resident-decode-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-nvfp4-resident-decode-source.py
