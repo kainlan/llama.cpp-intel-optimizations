@@ -96,6 +96,40 @@ cost about 0.7 s per micro-batch on the B50 (an estimate from single calls, not 
 - Consequence: the grouped executor of this task keeps one ids read per layer application but leases 128 experts
   where the direct route builds 4,096 operands. Whether that removes the exposed time is step 1's measurement.
 
+## Step 1 (a-c) measured (lead's runs, each once, `task/inkling2-t21` at `87524b0d8` against base `b44cb4b5f`)
+
+Step 1 is the `MOE_TENSOR_GATE_UP` role, NVFP4 on the grouped executor's F16 arm, ring sizing that counts the
+fused tensor, and the re-entry of the direct route on a decline.
+
+| check | base | step 1 |
+|---|---|---|
+| B70 long prompt, pp t/s (order: base, new, new, base) | 92.31, 90.00 | 160.51, 159.45 |
+| B70 long prompt, tg t/s | 25.92, 25.45 | 25.93, 25.45 |
+| B70 peak host backing | 21 GiB | 21 GiB |
+| B70 691-token prompt under the kernel profiler | 98.9 t/s | 171.1 t/s |
+| B70 perplexity, 6 chunks of 2048 tokens of this repository's docs | 7.5741 +/- 0.2468 | 7.5792 +/- 0.2470 |
+| B50 alone long prompt, pp / tg t/s | 17.32 / 7.00 | 16.46 / 6.56 |
+| B50 alone, experts served from the host mapping | 10215.0 MB | 10774.6 MB |
+
+- Device test `test-moe-pp-batched-dequant` on the B50: 43 cases pass; the NVFP4 cases (plain, small and large
+  scales, fused gate_up) at nmse 1.41e-05 to 1.43e-05 against the CPU backend; no re-entry.
+- The step 1 text is byte-equal run to run and differs from base (the activations are F16 where the old kernel
+  quantised them to Q8_1); the perplexity pair says quality is unchanged.
+- Profile at 691 tokens: `moe.pp.gemm.execute` 320.9 ms over 1,794 launches, gather and scatter 108 ms over
+  17,086 launches each, `mulmat.mmvq.id_aos_nvfp4` down from 3,192 ms to 5 ms. The label `moe.pp.dequant.nvfp4`
+  times a marker, not the converter (the converter drops its event), so the dequant's device time is in no
+  label and the "exposed host time" of that profile is overstated. Next in size: dense BF16 698 ms, BF16
+  experts 580 ms, attention 430 ms.
+- **The B50 alone is slower with the ring**: the 558.6 MiB ring displaced about 560 MB of experts to the host
+  and one more layer to the CPU, for prompt and decode. Hence the final form of R5 below.
+- **R5, final form.** For a ring whose weights have the resident use only (NVFP4 today), the ring is kept on a
+  device only if the plan made with it leaves no expert of those weights on the host; otherwise the ring is
+  published as 0, the zones are ensured again (an arena nothing holds may be rebuilt) and the plan is made once
+  more. Weights with a staged or SOA per-expert use (Qwen, GPT-OSS) keep today's ring exactly. Acceptance: the
+  B50 alone gives base's plan line, base's text and base's speed; the B70 keeps its ring and its 160 t/s.
+- Spec review of a-c (fresh reviewer, read-only): pass, eight minor findings, all sent to the implementer. Only
+  Inkling, of the models on this machine whose headers were read, stores a fused `ffn_gate_up_exps`.
+
 ## What is not known yet
 
 - How much of the exposed host time is the ids wait and how much the operand build.
