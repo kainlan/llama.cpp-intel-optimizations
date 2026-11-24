@@ -28,6 +28,9 @@ struct ggml_sycl_q1_nvfp4_test_counters {
     // The direct route's host leg: the mixed batches whose host occurrences it submitted, and how many occurrences.
     uint64_t host_submit;
     uint64_t host_occurrences;
+    // The resident decode route's kernel submissions: an NVFP4 decode node whose experts the plan puts all on its card
+    // at AOS, run from the full expert table and the device ids, with no workspace, host ids or host task.
+    uint64_t resident_submit;
 };
 
 enum ggml_sycl_q1_nvfp4_test_failure {
@@ -79,3 +82,10 @@ GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_q1_nvfp4_test_read_expert_table(ggml_back
                                                                        const ggml_tensor * weight,
                                                                        size_t              count,
                                                                        const void **       out);
+// Writes `value` into slot `slot` of `weight`'s expert pointer table on `backend`'s device, after the backend's queue
+// has finished, and leaves the table's host records and its memoized full-local probe as they are: a later dispatch
+// reads the slot as written. False when the weight has no device table there or it is shorter than `slot + 1`.
+GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_q1_nvfp4_test_write_expert_slot(ggml_backend_t      backend,
+                                                                       const ggml_tensor * weight,
+                                                                       size_t              slot,
+                                                                       const void *        value);
