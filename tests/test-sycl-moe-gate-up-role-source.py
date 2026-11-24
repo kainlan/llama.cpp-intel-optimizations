@@ -44,7 +44,8 @@ the Q1_0/NVFP4 direct MMID route runs ahead of. This gate holds both:
       MXFP4 prompt profile's whole span and phase marks) and the MoE profile's per-layer and per-role op counts. The
       timers still add the second pass's time, which is the node's too;
   S8  the device test runs NVFP4 on the plain fixture and on a fused gate_up fixture and two special-scale fixtures,
-      writes no 0xFF scale, and fails a case that printed the re-entry line;
+      runs Q8_0 on a fused gate_up fixture too (the resident claim takes the role for every executor type, and Q8_0
+      plans SOA where NVFP4 plans AOS), writes no 0xFF scale, and fails a case that printed the re-entry line;
   S9  no other prompt dispatch takes a node the direct route stepped aside for: the planned-local batched MMVQ try,
       which runs ahead of the executor under two GPUs or GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED=1 and is neither
       the executor nor the direct route, is called once, behind `!pp_direct_deferred`;
@@ -182,6 +183,10 @@ QUEUE_CALL = re.compile(
     r"ggml_sycl_safe_memcpy|finish_or_release|record_done)\s*\(|\bdnnl::"
 )
 TEST_FUSED_NAME = '"blk.0.ffn_gate_up_exps.weight"'
+TEST_FUSED_OTHER = "constexpr ggml_type k_fused_other_types[] = { GGML_TYPE_Q8_0 };"
+TEST_FUSED_OTHER_RUN = ("for (ggml_type type : k_fused_other_types) { lifecycle_fixture life(type, rng, k_n_ubatch, "
+                        "fixture_variant::FUSED_GATE_UP); if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng), "
+                        "false, 0)) { ++failed; } }")
 TEST_VARIANTS = ("constexpr fixture_variant k_nvfp4_variants[] = { fixture_variant::SMALL_SCALES, "
                  "fixture_variant::LARGE_SCALES, fixture_variant::FUSED_GATE_UP };")
 TEST_SCALES = re.compile(r"constexpr uint8_t (k_small_scales|k_large_scales)\[\] = \{([^}]*)\};")
@@ -430,6 +435,8 @@ def check_seam(s: Sources) -> None:
     if test.count(TEST_FUSED_NAME) != 1 or "GGML_TYPE_NVFP4, };" not in test:
         raise ContractError("FAIL [pin S8]: the device test lacks the plain NVFP4 case or the fused gate_up tensor")
     need_once(test, TEST_VARIANTS, "S8", "the NVFP4 fixtures")
+    need_once(test, TEST_FUSED_OTHER, "S8", "the fused gate_up case of another type")
+    need_once(test, TEST_FUSED_OTHER_RUN, "S8", "the run of the other type's fused gate_up case")
     scales = TEST_SCALES.findall(test)
     if len(scales) != 2 or any(re.search(r"0x[fF][fF]\b", body) for _, body in scales):
         raise ContractError("FAIL [pin S8]: the special scales are not two cycles free of 0xFF")
@@ -632,6 +639,12 @@ def self_test(raws: dict[str, str]) -> int:
                 [("fixture_variant::LARGE_SCALES,\n                                                    "
                   "fixture_variant::FUSED_GATE_UP };",
                   "fixture_variant::LARGE_SCALES };")])
+    expect_fail("test-fused-nvfp4-only", "S8", D,
+                [("constexpr ggml_type k_fused_other_types[] = { GGML_TYPE_Q8_0 };",
+                  "constexpr ggml_type k_fused_other_types[] = { GGML_TYPE_NVFP4 };")])
+    expect_fail("test-fused-other-plain", "S8", D,
+                [("lifecycle_fixture life(type, rng, k_n_ubatch, fixture_variant::FUSED_GATE_UP);",
+                  "lifecycle_fixture life(type, rng, k_n_ubatch, fixture_variant::PLAIN);")])
     expect_fail("test-ignores-reentry", "S8", D,
                 [("unplanned != 0 || reentered != 0) {", "unplanned != 0) {")])
     # S9: the planned-local batched try.
