@@ -647,9 +647,16 @@ span separately under one label double-counts in the aggregate rows.
 
 Coverage as of llama.cpp-qmen: every decode MUL_MAT kernel family; the dense and
 MXFP4-batched oneDNN GEMM executors (`mulmat.onednn_gemm.execute`,
-`mxfp4.pp.gemm.execute`); the un-batched oneDNN GEMM primitive
-(`DnnlGemmWrapper::gemm`, label `mulmat.onednn_gemm.unbatched` — the
-Q8_0/Q4_0 dequant-then-GEMM route most prefill Q8_0 M≥512 GEMMs take); the full
+`mxfp4.pp.gemm.execute`); the oneDNN GEMM primitive `DnnlGemmWrapper::gemm`,
+under one of two labels chosen per call by its batch count:
+`mulmat.onednn_gemm.batched` when `max(batches_a, batches_b) > 1`, and
+`mulmat.onednn_gemm.unbatched` otherwise (the Q8_0/Q4_0 dequant-then-GEMM route
+most prefill Q8_0 M≥512 GEMMs take, the per-plane loop's GEMMs, and the batched
+F32 route's 2-D-src0 case, which folds the batch into one GEMM's columns). Before
+the batched row existed every call reported as `unbatched`: the F16 KQ/KQV
+batched route's calls and the batched F32 MUL_MAT route's calls now report under
+`batched`, so compare an older profiler CSV's `unbatched` row with the sum of
+both rows; the full
 RMS_NORM family (`norm.rms_norm`, `norm.rms_norm_mul`, `norm.rms_norm_mul_add`,
 `norm.add_rms_norm`) plus `norm.norm` / `norm.group_norm`. `l2_norm` is
 deliberately unwrapped.
