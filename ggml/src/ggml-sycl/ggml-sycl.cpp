@@ -92812,6 +92812,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         moe_mmid_direct_defers_to_executor(
             ne12 != 1, pp_onednn_batched_route,
             ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device));
+    // How a pass of a deferred node asks for its second pass on the direct route, the one writer of the request. The
+    // pass that asks returns at once, having written nothing to dst, and the node runs again once it has unwound
+    // (ggml_sycl_mul_mat_id_with_direct_reentry). The WARN fires once per (device, cause).
+    const auto request_direct_reentry = [&](moe_pp_batched_refusal cause, const char * why) {
+        if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, cause)) {
+            GGML_LOG_WARN("[PP-MOE] direct MMID route re-entered device=%d cause=%s tensor=%s type=%s: %s\n",
+                          ctx.device, moe_pp_batched_refusal_name(cause), src0->name, ggml_type_name(src0->type), why);
+        }
+        g_mmid_direct_reentry.requested = dst;
+    };
     if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&
         ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && direct_admission &&
         !pp_direct_deferred) {
@@ -96614,6 +96624,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // until graph_compute's catch has drained the queue. The transient down SOA has no owner on this
                 // frame, so it is released here; with nothing submitted that reads it, the release needs no marker.
                 release_prompt_down_soa_once(false);
+                // The direct MMID route needs no row map, so a node it stepped aside for goes back to it.
+                if (pp_direct_deferred) {
+                    request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING,
+                                           "the prompt row-map staging did not fit before the batched executor ran");
+                    return;
+                }
                 ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_row_mappings", row_maps_total,
                                                 row_maps_total * sizeof(mmid_row_mapping),
                                                 "MUL_MAT_ID prompt row-map staging did not fit");
@@ -98292,17 +98308,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
         // The direct MMID route stepped aside for this node and the executor declined it before its first submission
         // (after it, the decline throws). The per-expert path below has no executor for the direct route's types, so
-        // this pass ends here, having written nothing to dst, and the node runs again on the direct route once this
-        // pass has unwound (ggml_sycl_mul_mat_id_with_direct_reentry). A decline that named no cause reads "none".
+        // the node goes back to that route. A decline that named no cause reads "none".
         if (pp_direct_deferred) {
-            if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, pp_batched_refusal)) {
-                GGML_LOG_WARN(
-                    "[PP-MOE] direct MMID route re-entered device=%d cause=%s tensor=%s type=%s: the batched executor "
-                    "declined the node before its first submission\n",
-                    ctx.device, moe_pp_batched_refusal_name(pp_batched_refusal), src0->name,
-                    ggml_type_name(src0->type));
-            }
-            g_mmid_direct_reentry.requested = dst;
+            request_direct_reentry(pp_batched_refusal,
+                                   "the batched executor declined the node before its first submission");
             return;
         }
 
@@ -99596,11 +99605,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #undef GGML_SYCL_MOE_PP_STAGING_FAILPOINT
 
 // Runs a MUL_MAT_ID node, and runs it once more when its first pass asks: the direct MMID route stepped aside for the
-// node (moe_mmid_direct_defers_to_executor) and the batched executor then declined it before its first submission.
-// By then the first pass has unwound, so the executor's ring slot claim and its experts' leases are released, while
-// the host ids snapshot stays in the graph-local ids cache and the prompt admission in its cache: the second pass
-// reads both again with no device wait. It runs with the executor's claim on the node's weight suppressed, so the
-// node takes the route it took before the executor claimed it. One retry, never a loop: the second pass cannot ask.
+// node (moe_mmid_direct_defers_to_executor), and then the prompt row-map staging did not fit or the batched executor
+// declined the node before its first submission. The first pass is not free of device work: it may have submitted the
+// row-map copy, and its ready guard submits a queue sync event as dst's ready event on the way out. Neither writes
+// dst, and the second pass publishes its own. By then the first pass has unwound, so the executor's ring slot claim
+// and its experts' leases are released, while the host ids snapshot stays in the graph-local ids cache and the prompt
+// admission in its cache: the second pass reads both again with no device wait. It runs with the executor's claim on
+// the node's weight suppressed, so the node takes the route it took before the executor claimed it. One retry, never
+// a loop: the second pass cannot ask.
 static void ggml_sycl_mul_mat_id_with_direct_reentry(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     g_mmid_direct_reentry.requested = nullptr;
     ggml_sycl_mul_mat_id(ctx, dst);

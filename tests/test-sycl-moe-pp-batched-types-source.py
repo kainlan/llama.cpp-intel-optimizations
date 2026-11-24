@@ -1295,7 +1295,7 @@ MUTANTS = [
      "return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS"),
     ("e", "sycl", "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)", "true"),
     ("e", "tables", "case moe_pp_batched_refusal::GEMM:", ""),
-    ("e", "tables", "GEMM, COUNT", "GEMM"),
+    ("e", "tables", "ROW_MAP_STAGING, COUNT", "ROW_MAP_STAGING"),
     ("e", "sycl", "static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,",
      "static_assert(true,"),
     ("e", "sycl", "refusal >= moe_pp_batched_refusal::COUNT", "false"),

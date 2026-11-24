@@ -558,6 +558,7 @@ enum class moe_pp_batched_refusal : uint8_t {
     SCRATCH_SLOT,       // a ring slot could not be acquired
     SCRATCH_SLOT_SIZE,  // an acquired slot is smaller than planned
     GEMM,               // the batched GEMM failed after the experts were staged
+    ROW_MAP_STAGING,    // not the executor's: the op's prompt row-map staging, allocated before it runs, did not fit
     COUNT,              // not a cause: the number of causes
 };
 
@@ -609,6 +610,8 @@ inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) 
             return "scratch-slot-size";
         case moe_pp_batched_refusal::GEMM:
             return "gemm";
+        case moe_pp_batched_refusal::ROW_MAP_STAGING:
+            return "row-map-staging";
         case moe_pp_batched_refusal::COUNT:
             break;
     }
