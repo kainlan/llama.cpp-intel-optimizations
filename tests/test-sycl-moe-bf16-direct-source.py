@@ -17,8 +17,12 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       schedule, the yx28 decode-direct request and ggml_sycl_ensure_weight_on_device(); its block is keyed on the BF16
       expert type, not on the predicate, and is one call to ggml_sycl_mul_mat_id_bf16_direct() and a return, so no
       BF16 op reaches the routes after it, none of which has a BF16 kernel;
-  (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table (publishing the weight's AOS slices on a miss
-      only from this device's own buffer, through the same helper the predicate asks), the device-resident ids, submits
+  (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table through one table helper (which publishes the
+      weight's AOS slices on a miss only from this device's own buffer, through the same buffer test the predicate
+      asks, and not again at a storage generation where the publish failed or an expert still did not resolve after
+      it; a table upload that failed is retried at the next node, as this route did before the helper existed),
+      src1 and dst only where they resolve to
+      this device's own memory (the ruling forbids a GPU read of host memory), the device-resident ids, submits
       through moe_bf16_direct_submit() inside the kernel profiler's existing wrapper under the label
       mulmat.moe.bf16_direct (its metadata naming the launch count, from the one tokens-per-launch answer the route
       asks for), and retains a snapshot of the table's dispatch bundle (its active leases and the table's
@@ -65,7 +69,7 @@ ROUTE_IF = "if (src0->type == GGML_TYPE_BF16) {"
 ROUTE_ASK = f"if (!{PREDICATE}(dst, ctx.device)) {{"
 UNPLACED_CLAIM = "if(src0->buffer==nullptr){returntrue;}"
 # One helper holds the whole "this device's own buffer" test: one device's unsplit SYCL buffer, of `device`, in VRAM.
-OWN_BUFFER = "ggml_sycl_moe_bf16_direct_own_vram_buffer"
+OWN_BUFFER = "ggml_sycl_moe_direct_own_vram_buffer"
 OWN_BUFFER_HEAD = f"static bool {OWN_BUFFER}(ggml_backend_buffer_t buffer, int device) {{"
 OWN_BUFFER_BODY = (
     "if(buffer==nullptr||!ggml_backend_buffer_is_sycl(buffer)||ggml_backend_buffer_is_sycl_split(buffer)){returnfalse;}"
@@ -75,7 +79,27 @@ NO_PLAN_TAIL = f"{UNPLACED_CLAIM}return{OWN_BUFFER}(src0->buffer,device);"
 # Spellings of the buffer test that belong to the helper alone.
 BUFFER_TEST_PARTS = ("ggml_backend_buffer_is_sycl_split(", "ggml_backend_buffer_is_sycl(", "buf_ctx",
                      "alloc_tier::DEVICE_VRAM")
-PUBLISH_GUARD = f"if ({OWN_BUFFER}(src0->buffer, ctx.device) && ggml_sycl_publish_mmid_canonical_aos_experts("
+# The one table helper this route and the NVFP4 resident decode route ask: probe, then on a miss in this device's own
+# buffer publish once and probe again, unless the publish failed or an expert did not resolve at this storage
+# generation. A table upload that failed is not stamped, so this route retries it as it did before the helper.
+ENSURE_HELPER = "ggml_sycl_moe_direct_ensure_aos_table"
+ENSURE_HELPER_HEAD = (f"static const void * const * {ENSURE_HELPER}(ggml_backend_sycl_context & ctx, "
+                      "const ggml_tensor * src0) {")
+HELPER_EARLY = (f"if (table != nullptr || src0->extra == nullptr || !{OWN_BUFFER}(src0->buffer, ctx.device)) "
+                "{ return table; }")
+HELPER_PUBLISH = "if (ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS,"
+HELPER_TABLE_CALL = "table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS);"
+HELPER_RETRY = ("table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS, "
+                "&every_expert_resolved);")
+HELPER_STAMP_SKIP = "if (failed == weight.moe_expert_storage_generation) { return nullptr; }"
+HELPER_STAMP_STORE = ("if (table == nullptr && !every_expert_resolved) { "
+                      "failed = weight.moe_expert_storage_generation; }")
+# src1 and dst: only an on-device pointer, resolved without materializing.
+OPERAND_HELPER = "ggml_sycl_moe_direct_device_operand"
+OPERAND_HELPER_HEAD = f"static void * {OPERAND_HELPER}(const ggml_tensor * tensor, int device) {{"
+OPERAND_HELPER_BODY = ("constggml_sycl::resolved_ptrresolved=ggml_sycl_resolve_no_materialize(tensor,device);"
+                       "returnresolved.on_device?resolved.ptr:nullptr;")
+OPERAND_CALLS = (f"{OPERAND_HELPER}(src1, ctx.device)", f"{OPERAND_HELPER}(dst, ctx.device)")
 PROFILE_SUBMIT = "ggml_sycl_profile_submit("
 PROFILE_NAME = '"mulmat.moe.bf16_direct"'
 PROFILE_KEYS = ('"ncols="', '";nrows_per_expert="', '";total_batches="', '";launches="')
@@ -93,7 +117,7 @@ EXTRA_ENSURED = "s_mul_mat_id_extras.push_back(std::move(new_extra));"
 MMID_SCHED = "(g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_DEVICE)"
 DECODE_DIRECT = "ggml_sycl::moe_decode_direct_request direct_request;"
 ENSURE_WEIGHT = "ggml_sycl_ensure_weight_on_device(src0, ctx.device);"
-TABLE_CALL = "moe_fusion_ensure_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS)"
+TABLE_CALL = f"{ENSURE_HELPER}(ctx, src0)"
 IDS_CALL = "ggml_sycl_moe_ids_device_resident_ptr(ctx, ids"
 SUBMIT_CALL = "ggml_sycl::moe_bf16_direct_submit("
 SNAPSHOT_CALL = "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle("
@@ -116,7 +140,9 @@ NEEDS_DIRECT_BODY = "returntype==GGML_TYPE_Q1_0||type==GGML_TYPE_NVFP4;"
 # A host wait is spelled .wait(, ->wait( or sycl::event::wait(: the three spellings are listed apart.
 ROUTE_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "ids_host", "ggml_sycl_copy_ids_to_host",
                    "mmid_workspace", "q8_1", "GGML_ABORT", "ggml_sycl_ensure_weight_on_device", "malloc_", "sycl::free(",
-                   "getenv", "cpu", "ggml_sycl_retain_moe_ptr_table_leases_until_event")
+                   "getenv", "cpu", "ggml_sycl_retain_moe_ptr_table_leases_until_event",
+                   "ggml_sycl_resolve_tensor_ptr", "moe_fusion_ensure_full_local_ptr_table",
+                   "ggml_sycl_publish_mmid_canonical_aos_experts")
 SYCL_INCLUDE = re.compile(r'#include "(?:ggml-sycl/)?moe-bf16-direct\.hpp"')
 KERNEL_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "malloc_", "sycl::free(", "unified_alloc",
                     "q8_1", "GGML_ABORT", "getenv")
@@ -206,11 +232,14 @@ def claim_a_predicate(s):
         fails.append(f"{OWN_BUFFER} is not defined once as `an unsplit SYCL buffer of `device`, in DEVICE_VRAM`")
     elif sycl.find(OWN_BUFFER_HEAD) > sycl.find(PREDICATE_HEAD):
         fails.append(f"{OWN_BUFFER} is defined after the predicate that asks it")
-    asks = len(re.findall(rf"\b{OWN_BUFFER}\(", sycl))
-    if asks != 3:
-        fails.append(f"{OWN_BUFFER} appears {asks} times; want its definition, the predicate and the publish guard")
+    # Counted in this route's own bodies, so another route's use of the helper cannot move the count.
     route = route_fn_body(sycl) or ""
-    for where, text in (("predicate", body), ("route", route)):
+    helper = braced_body(sycl, ENSURE_HELPER_HEAD) or ""
+    for where, text, want in (("predicate", body, 1), ("table helper", helper, 1), ("route", route, 0)):
+        asks = len(re.findall(rf"\b{OWN_BUFFER}\(", text))
+        if asks != want:
+            fails.append(f"the {where} asks {OWN_BUFFER} {asks} times; want {want}")
+    for where, text in (("predicate", body), ("table helper", helper), ("route", route)):
         spelled = [part for part in BUFFER_TEST_PARTS if part in text]
         if spelled:
             fails.append(f"the {where} spells the buffer test out ({', '.join(spelled)}) instead of asking {OWN_BUFFER}")
@@ -292,12 +321,27 @@ def claim_d_route_body(s):
         return [f"{ROUTE_FN} is not defined exactly once"]
     fails = []
     for needed in (TABLE_CALL, IDS_CALL, SNAPSHOT_CALL, SUBMIT_CALL, RETAIN_CALL, REFUSAL_WARN, REFUSAL_THROW,
-                   ROUTE_LOG, "ggml_sycl::ggml_sycl_moe_route_log_enabled()", PUBLISH_GUARD, PROFILE_SUBMIT,
-                   PROFILE_NAME, *PROFILE_KEYS):
+                   ROUTE_LOG, "ggml_sycl::ggml_sycl_moe_route_log_enabled()", PROFILE_SUBMIT, PROFILE_NAME,
+                   *PROFILE_KEYS, *OPERAND_CALLS):
         if needed not in body:
             fails.append(f"{ROUTE_FN} does not contain {needed}")
-    if body.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1:
-        fails.append("the route publishes other than once, behind the own-VRAM-buffer test")
+    sycl = s["sycl"]
+    helper = braced_body(sycl, ENSURE_HELPER_HEAD) if sycl.count(ENSURE_HELPER_HEAD) == 1 else None
+    if helper is None:
+        fails.append(f"{ENSURE_HELPER} is not defined exactly once")
+    else:
+        marks = [helper.find(HELPER_EARLY), helper.find(HELPER_STAMP_SKIP), helper.find(HELPER_PUBLISH),
+                 helper.find(HELPER_RETRY), helper.find(HELPER_STAMP_STORE)]
+        if min(marks) < 0 or marks != sorted(marks) or \
+                helper.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1 or \
+                helper.count(HELPER_TABLE_CALL) != 1 or helper.count(HELPER_RETRY) != 1 or \
+                helper.count("failed = weight.moe_expert_storage_generation;") != 1:
+            fails.append("the table helper does not publish once, only on a miss in this device's own buffer at a "
+                         "generation not stamped, probe again after it, and stamp only a failed publish or an expert "
+                         "that did not resolve")
+    operand = braced_body(sycl, OPERAND_HELPER_HEAD) if sycl.count(OPERAND_HELPER_HEAD) == 1 else None
+    if operand is None or tight(operand) != OPERAND_HELPER_BODY:
+        fails.append(f"{OPERAND_HELPER} does not answer only an on-device pointer, resolved without materializing")
     # The launch count in the profiler row comes from the one tokens-per-launch answer the refusal already asked for.
     if body.count(TOKENS_PER_LAUNCH_CALL) != 1:
         fails.append(f"the route does not ask {TOKENS_PER_LAUNCH_CALL} exactly once")
@@ -450,8 +494,9 @@ MUTANTS = [
     ("a", "sycl", OWN_BUFFER_HEAD, " && buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM", ""),
     ("a", "sycl", PREDICATE_HEAD, f"{OWN_BUFFER}(src0->buffer, device)",
      "ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer)"),
-    ("a", "sycl", ROUTE_FN_HEAD, f"{OWN_BUFFER}(src0->buffer, ctx.device)",
-     "ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer)"),
+    ("a", "sycl", ENSURE_HELPER_HEAD, f"!{OWN_BUFFER}(src0->buffer, ctx.device)",
+     "!(ggml_backend_buffer_is_sycl(src0->buffer) && !ggml_backend_buffer_is_sycl_split(src0->buffer))"),
+    ("a", "sycl", ROUTE_FN_HEAD, TABLE_CALL, f"({OWN_BUFFER}(src0->buffer, ctx.device), {TABLE_CALL})"),
     ("a", "sycl", PREDICATE_HEAD, "src0->view_src != nullptr || ", ""),
     ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }", ""),
     ("a", "sycl", PREDICATE_HEAD, "if (src0->buffer == nullptr) { return true; }",
@@ -465,7 +510,17 @@ MUTANTS = [
     ("b", "sycl", None, ROUTE_IF, f"if (src0->type == GGML_TYPE_BF16 && {PREDICATE}(dst, ctx.device)) {{"),
     ("b", "sycl", ROUTE_FN_HEAD, ROUTE_ASK, "if (false) {"),
     ("b", "sycl", ROUTE_ASK, "refuse(", "(void) ("),
-    ("d", "sycl", ROUTE_FN_HEAD, PUBLISH_GUARD, "if (ggml_sycl_publish_mmid_canonical_aos_experts("),
+    ("d", "sycl", ENSURE_HELPER_HEAD, f" || !{OWN_BUFFER}(src0->buffer, ctx.device)", ""),
+    ("d", "sycl", ENSURE_HELPER_HEAD, HELPER_STAMP_SKIP, ""),
+    ("d", "sycl", ENSURE_HELPER_HEAD, "GGML_LAYOUT_AOS);", "GGML_LAYOUT_SOA);"),
+    # A table upload that failed stamped like an expert that did not resolve: this route would stop retrying it.
+    ("d", "sycl", ENSURE_HELPER_HEAD, "if (table == nullptr && !every_expert_resolved) {", "if (table == nullptr) {"),
+    ("d", "sycl", ROUTE_FN_HEAD, TABLE_CALL,
+     "moe_fusion_ensure_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS)"),
+    # src1 or dst read through a pointer that may be host memory.
+    ("d", "sycl", ROUTE_FN_HEAD, OPERAND_CALLS[0], "ggml_sycl_resolve_tensor_ptr(src1)"),
+    ("d", "sycl", ROUTE_FN_HEAD, OPERAND_CALLS[1], "ggml_sycl_resolve_tensor_ptr(dst)"),
+    ("d", "sycl", OPERAND_HELPER_HEAD, "return resolved.on_device ? resolved.ptr : nullptr;", "return resolved.ptr;"),
     ("d", "sycl", ROUTE_FN_HEAD, PROFILE_NAME, '"mulmat.moe.bf16"'),
     ("d", "sycl", ROUTE_FN_HEAD, PROFILE_SUBMIT, "ggml_sycl_profile_record_returned_event("),
     ("d", "sycl", ROUTE_FN_HEAD, '";launches="', '";chunks="'),
@@ -476,7 +531,6 @@ MUTANTS = [
     ("g", "cpp", None, "shape.src1_nb1 % 16 == 0 && shape.src1_nb2 % 16 == 0", "true"),
     ("g", "cpp", None, "(reinterpret_cast<uintptr_t>(w_row) & 7) == 0", "true"),
     ("g", "hpp", None, "std::numeric_limits<int>::max()", "std::numeric_limits<size_t>::max()"),
-    ("d", "sycl", ROUTE_FN_HEAD, TABLE_CALL, TABLE_CALL.replace("GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA")),
     ("d", "sycl", ROUTE_FN_HEAD, RETAIN_CALL, "(void) ("),
     ("d", "sycl", ROUTE_FN_HEAD, SNAPSHOT_CALL, "(void) ("),
     ("d", "sycl", ROUTE_FN_HEAD, RETAIN_CALL, "ggml_sycl_retain_moe_ptr_table_leases_until_event(extra, ctx.device, "),

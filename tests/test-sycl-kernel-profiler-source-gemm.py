@@ -29,7 +29,12 @@ def test_unbatched_gemm_execute_sites_are_wrapped_and_wait_free() -> None:
     # "std::optional<sycl::event> gemm(" is distinct from "std::optional<sycl::event> row_gemm("
     # and contains no variable whitespace, so the literal anchors the slice.
     body = slice_between(gemm, "static std::optional<sycl::event> gemm(", "static std::optional<sycl::event> row_gemm(")
-    assert body.count('"mulmat.onednn_gemm.unbatched"') == 2
+    # One name per call, chosen by batch count: a call with a batch above 1 is the batched row, so the per-plane loop's
+    # GEMMs and one batched GEMM over the same planes are told apart. Both execute sites take that one name; which
+    # count chooses it is test-sycl-mul-mat-f32-batched-route-source's.
+    assert body.count('"mulmat.onednn_gemm.unbatched"') == 1
+    assert body.count('"mulmat.onednn_gemm.batched"') == 1
+    assert len(re.findall(r"gemm_label\.name\s*=\s*gemm_label_name;", body)) == 2
     assert body.count("ggml_sycl_profile_submit(*q,") == 2
     assert body.count("dnnl::sycl_interop::execute(") == 2
     assert "variant=fallback_create" in body
@@ -85,8 +90,9 @@ def test_gemm_accepts_deps_and_optional_op_context_with_safe_defaults() -> None:
     # Whitespace-tolerant: clang-format is free to realign the parameter
     # column, so anchor on the token content, not the spacing.
     assert re.search(r"const std::vector<sycl::event>\s*&\s*deps\s*=\s*\{\},", sig)
-    # gemm's last parameter is query_only (S3-4), so op_context is no longer the one before the brace
-    assert re.search(r"const char\s*\*\s*op_context\s*=\s*nullptr,\s*bool\s+query_only\s*=\s*false\)\s*\{", sig)
+    # query_only (S3-4) follows op_context and the float-math mode follows query_only, so op_context is not the
+    # parameter before the brace
+    assert re.search(r"const char\s*\*\s*op_context\s*=\s*nullptr,\s*bool\s+query_only\s*=\s*false[,)]", sig)
 
 
 def test_row_gemm_forwards_op_context_to_gemm() -> None:

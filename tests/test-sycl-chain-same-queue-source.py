@@ -51,9 +51,11 @@ THE CONTRACT.  With comments blanked:
      event only through ggml_sycl_ready_event_from_queue, and otherwise queries it under
      its caller's site and chains a barrier when it is unfinished.
   E. The shared helper is called only by the per-op chain, binbcast's two sources, the
-     two mmvq weight checks, the split mul_mat weight check and the f16 dequant arm's SOA
-     plane (a MUL_MAT weight read, so it shares MUL_MAT_WEIGHT); each of the six passes
-     the identity of the very queue it chains on, and each call names its own site.
+     two mmvq weight checks, the split mul_mat weight check, the f16 dequant arm's SOA
+     plane (a MUL_MAT weight read, so it shares MUL_MAT_WEIGHT) and the batched F32
+     mul_mat route's three operands (one site, MUL_MAT_F32_BATCHED); each call other
+     than the per-op chain's passes the identity of the very queue it chains on, and
+     each call names its own site.
   D. Every other ggml_sycl_should_add_dependency call names its own site.
   Q. (common.hpp ggml_sycl_should_add_dependency) only under
      ggml_sycl_cpu_expert_trace_enabled() it counts each query in the calling thread's
@@ -364,7 +366,8 @@ HELPER_CALLS = (
     ("ggml-sycl.cpp", SITE + "MUL_MAT_WEIGHT"),
     # ggml_sycl_dequant_f16_from_loaded_layout, the plane a CHUNK_LEASE handle owns: a MUL_MAT weight read.
     ("ggml-sycl.cpp", SITE + "MUL_MAT_WEIGHT"),
-)
+    # ggml_sycl_mul_mat_f32_batched: src0, src1 and dst, each resolved by the dispatch, before its one gemm().
+) + (("ggml-sycl.cpp", SITE + "MUL_MAT_F32_BATCHED"),) * 3
 
 
 def check_helper_calls(s: dict) -> None:
@@ -388,7 +391,7 @@ def check_helper_calls(s: dict) -> None:
                               "chains on")
             seen.append((name, site))
     if sorted(seen) != sorted(HELPER_CALLS):
-        fail("E", f"the shared helper's calls are {sorted(seen)}, not the seven this gate knows")
+        fail("E", f"the shared helper's calls are {sorted(seen)}, not the {len(HELPER_CALLS)} this gate knows")
 
 
 # Every other status query: (file, event, site).
@@ -768,6 +771,15 @@ def self_test(s: dict) -> int:
         ("E", "backend", "f16 dequant arm tagged as another site",
          within("static void ggml_sycl_dequant_f16_from_loaded_layout(", SITE + r"MUL_MAT_WEIGHT\)", SITE + "OTHER)")),
         ("E", "binbcast", "binbcast src1 tagged as another site", retag("BINBCAST_SRC1", "OTHER")),
+        ("E", "backend", "batched F32 route drops an identity", drop_identity("MUL_MAT_F32_BATCHED")),
+        ("E", "backend", "batched F32 route identity of another device's stream",
+         within("static bool ggml_sycl_mul_mat_f32_batched(",
+                r"ggml_sycl_chain_same_queue_identity\(\*stream,(\s*&\w+\),\s*)" + SITE + r"MUL_MAT_F32_BATCHED\)",
+                r"ggml_sycl_chain_same_queue_identity(*ctx.stream(ctx.device, 1),\1" + SITE + "MUL_MAT_F32_BATCHED)")),
+        ("E", "backend", "batched F32 route dst tagged as another site",
+         within("static bool ggml_sycl_mul_mat_f32_batched(",
+                r"(dst_r,\s*ggml_sycl_chain_same_queue_identity\([^()]*\),\s*)" + SITE + r"MUL_MAT_F32_BATCHED\)",
+                r"\1" + SITE + "MUL_MAT_WEIGHT)")),
         ("E", "add_id", "an added helper call with no site",
          sub(r"(  collect_ready_deps\(src0\);\n)", r"\1  ggml_sycl_chain_ready_event_if_needed(q, ggml_sycl_resolve(src0.raw(), ctx.device));\n")),
         ("D", "moe_xmx", "an untagged status query", sub(r",(\s*)" + SITE + r"MOE_XMX\)", ")")),

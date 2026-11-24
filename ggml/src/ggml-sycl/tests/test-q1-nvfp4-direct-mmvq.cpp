@@ -233,16 +233,26 @@ void source_contract_tests() {
     assert(policy.find("mmvq_submit_q1_nvfp4_aos(*target_queue") != std::string::npos);
     assert(cpp.find("mmvq_submit_q1_nvfp4_aos_id(*stream") != std::string::npos);
 
+    // The sizes, the ids view rule and the int bound on both launches live in one geometry helper; the admitted
+    // entry asks it, takes only a geometry that fits, and adds its own buffer and ids-snapshot checks.
+    const size_t geometry_api = cpp.find("mmvq_q1_nvfp4_id_fit mmvq_q1_nvfp4_id_geometry_of(");
     const size_t admitted_api = cpp.find("bool mmvq_submit_q1_nvfp4_aos_id_admitted(");
-    const size_t admitted_end = cpp.find("sycl::event mmvq_submit_quantize_q8_1_soa", admitted_api);
-    assert(admitted_api != std::string::npos && admitted_end != std::string::npos);
+    const size_t admitted_end = cpp.find("bool mmvq_submit_q1_nvfp4_aos_id_resident(", admitted_api);
+    assert(geometry_api != std::string::npos && admitted_api != std::string::npos && geometry_api < admitted_api &&
+           admitted_end != std::string::npos);
+    const std::string geometry_body = cpp.substr(geometry_api, admitted_api - geometry_api);
     const std::string admitted_body = cpp.substr(admitted_api, admitted_end - admitted_api);
     for (const char * required :
-         { "weight_type == GGML_TYPE_Q1_0", "weight_type == GGML_TYPE_NVFP4",
-           "buffers.activation_q8_bytes != required_q8", "buffers.output_f32_bytes != required_output",
-           "ne11 != 1 && ne11 != top_k", "ids_host[i] < 0 || ids_host[i] >= n_experts", "checked_mul", "checked_add",
-           "mmvq_submit_quantize_q8_1_aos_after", "mmvq_submit_q1_nvfp4_aos_id(",
-           "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))" }) {
+         { "weight_type == GGML_TYPE_Q1_0", "weight_type == GGML_TYPE_NVFP4", "ne11 != 1 && ne11 != top_k",
+           "checked_mul", "checked_add", "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))",
+           "kernel_items > static_cast<size_t>(INT_MAX) || quantize_items > static_cast<size_t>(INT_MAX)",
+           "return mmvq_q1_nvfp4_id_fit::LAUNCH_PAST_INT;", "return mmvq_q1_nvfp4_id_fit::FITS;" }) {
+        assert(geometry_body.find(required) != std::string::npos);
+    }
+    for (const char * required :
+         { "!= mmvq_q1_nvfp4_id_fit::FITS", "buffers.activation_q8_bytes != geometry.q8_bytes",
+           "buffers.output_f32_bytes != geometry.output_bytes", "ids_host[i] < 0 || ids_host[i] >= n_experts",
+           "mmvq_submit_quantize_q8_1_aos_after", "mmvq_submit_q1_nvfp4_aos_id(" }) {
         assert(admitted_body.find(required) != std::string::npos);
     }
     // The kernel reads the ids tensor in place: nothing writes an op's input, so no snapshot is uploaded over it.

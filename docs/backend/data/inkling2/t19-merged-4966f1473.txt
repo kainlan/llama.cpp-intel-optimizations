@@ -1,0 +1,66 @@
+Merged tree after Task 19 (feat/inkling2 at 4966f1473): the lead's runs, 2026-11-24. B70 (level_zero:0), driver 26.44.
+Build: llama-bench, llama-cli, llama-completion; BUILD_RC=0, last step [107/107]. Each run below was made once.
+
+== 1. Gate and one bench load
+GATE inkling PASS rc=0 selector=level_zero:0 sha=4966f1473
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  arm end: load=4.71 builders: ninja=0 icpx=0
+  RESULT m pp512 avg=77.70 t/s stddev=0.00 samples=[77.70]
+  RESULT m tg128 avg=25.26 t/s stddev=0.00 samples=[25.26]
+
+== 2. Decode, 48 tokens, GGML_SYCL_E2E_TG_PROFILE=1: host time of the submitting thread per stage (t18 = 8825673f7)
+t19: profile blocks=98 ops=42072 sum_wall=1184 ms sum_host=1405 ms
+    moe              calls=   4704 host=    408.8 ms  (87 us/call)
+    other            calls=  18038 host=    355.8 ms  (20 us/call)
+    non_moe_matmul   calls=   3908 host=    241.7 ms  (62 us/call)
+    attention        calls=   7056 host=    241.5 ms  (34 us/call)
+    elementwise      calls=   7982 host=    150.4 ms  (19 us/call)
+    kv               calls=    384 host=      6.6 ms  (17 us/call)
+t18: profile blocks=98 ops=42072 sum_wall=1334 ms sum_host=1525 ms
+    moe              calls=   4704 host=    505.5 ms  (107 us/call)
+    other            calls=  18038 host=    360.3 ms  (20 us/call)
+    non_moe_matmul   calls=   3908 host=    286.0 ms  (73 us/call)
+    attention        calls=   7056 host=    212.6 ms  (30 us/call)
+    elementwise      calls=   7982 host=    153.6 ms  (19 us/call)
+    kv               calls=    384 host=      6.6 ms  (17 us/call)
+0.52.997.879 I common_perf_print: prompt eval time =     687.37 ms /    14 tokens (   49.10 ms per token,    20.37 tokens per second)
+0.52.997.879 I common_perf_print:        eval time =    2044.26 ms /    47 runs   (   43.49 ms per token,    22.99 tokens per second)
+
+== 3. Prompt, 691 tokens, kernel profiler: device time per directly dispatched kernel, whole prompt
+directly dispatched submissions 221257 per pass; device-timed 5406.20 ms per pass; failed_timestamps 11187
+    mulmat.mmvq.id_aos_nvfp4                   264.0 per pass  3135.269 ms per pass  mean  11876.0 us
+    mulmat.bf16_native                        1922.0 per pass   697.937 ms per pass  mean    363.1 us
+    mulmat.moe.bf16_direct                      24.0 per pass   580.362 ms per pass  mean  24181.8 us
+    mulmat.onednn_gemm.unbatched             199440.0 per pass   441.929 ms per pass  mean      2.2 us
+    fattn.compute.xmx_v2                        96.0 per pass   430.086 ms per pass  mean   4480.1 us
+    sycl.binbcast.mul                         2472.0 per pass    50.123 ms per pass  mean     20.3 us
+    sycl.binbcast.add                         2328.0 per pass    23.527 ms per pass  mean     10.1 us
+    sycl.binbcast.sub                          432.0 per pass    14.091 ms per pass  mean     32.6 us
+    norm.rms_norm                             1080.0 per pass     6.971 ms per pass  mean      6.5 us
+    sycl.binbcast.repeat                       624.0 per pass     4.791 ms per pass  mean      7.7 us
+    sycl.memcpy.mem_ops                        593.0 per pass     4.750 ms per pass  mean      8.0 us
+    sycl.set_rows.generic                      288.0 per pass     4.136 ms per pass  mean     14.4 us
+    sycl.binbcast.event                       6432.0 per pass     3.314 ms per pass  mean      0.5 us
+    norm.add_rms_norm                          192.0 per pass     2.259 ms per pass  mean     11.8 us
+    norm.rms_norm_mul                          270.0 per pass     2.013 ms per pass  mean      7.5 us
+    sycl.softmax.forward                       360.0 per pass     1.381 ms per pass  mean      3.8 us
+1.00.137.190 I common_perf_print: prompt eval time =   10228.01 ms /   691 tokens (   14.80 ms per token,    67.56 tokens per second)
+
+== 4. Prompt, 691 tokens, GGML_SYCL_E2E_TG_PROFILE=1: host time per stage, whole prompt
+pp: profile blocks=5 ops=21225 sum_wall=7554 ms sum_host=8608 ms
+    moe              calls=    264 host=   4028.5 ms  (15259 us/call)
+    non_moe_matmul   calls=   2683 host=   3783.4 ms  (1410 us/call)
+    other            calls=  12317 host=    495.3 ms  (40 us/call)
+    elementwise      calls=   5301 host=    161.5 ms  (30 us/call)
+    attention        calls=    396 host=    133.4 ms  (337 us/call)
+    kv               calls=    264 host=      6.4 ms  (24 us/call)
+0.59.788.752 I common_perf_print: prompt eval time =    9599.58 ms /   691 tokens (   13.89 ms per token,    71.98 tokens per second)
+
+== 5. Reading
+- The stage host times of a profile sum to more than its wall (decode 1405 against 1184 ms): stages nest. They rank, they do not add.
+- Prompt, 9.6 s for 691 tokens. The MoE stage's 4.0 s is its kernels: 3.1 s of NVFP4 expert mat-vec and 0.6 s of BF16
+  expert mat-vec (the admitted route waits for its kernel). The non-MoE matmul stage's 3.8 s is not: its kernels are
+  0.7 s (bf16_native) and 0.4 s (oneDNN GEMM), and the rest is 199,440 GEMM submissions, 19 us of host time each (row S8).
+- NVFP4 in the prompt: 3135 ms over 691 x 8 x 88 (token, expert, node) pairs is 6.4 us per pair. It was 22 us before Task 19.
+- Decode: the 98 profile blocks are 49 graphs (one prompt graph, 48 tokens) in two blocks each, so a token has 96
+  MUL_MAT_ID calls at 87 us of host time (107 before Task 19): 8.3 ms of a 39.6 ms bench token.

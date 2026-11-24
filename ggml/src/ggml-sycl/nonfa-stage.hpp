@@ -15,6 +15,10 @@
 // which staging path is compiled -- arrive in `ggml_sycl_mul_mat_route_env`,
 // which ggml-sycl.cpp fills in one function for the dispatch and for the measure
 // view alike, through ggml_sycl_mul_mat_route_env_from below.
+//
+// The batched F32 route below sits in the same chain, after the f16 branches and
+// before the orchestrator, and is classified the same way: a pure function of the
+// tensors and a small environment.
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -118,6 +122,60 @@ inline bool ggml_sycl_mul_mat_routes_batched_f16(const ggml_tensor *            
                                                  const ggml_sycl_mul_mat_route_env & env) {
     const ggml_sycl_mul_mat_f16_route route = ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, env);
     return route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED || route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED;
+}
+
+// The batched F32 x F32 MUL_MAT as one oneDNN matmul. The per-plane loop of ggml_sycl_op_mul_mat submits one GEMM
+// per plane, and each submission costs host time of its own (descriptors, the primitive lookup, the argument map),
+// so a batch of T small planes costs T of them; this route submits one for the whole batch.
+//
+// The facts that are not a function of the tensors, filled by ggml-sycl.cpp at the dispatch for a node the tensors
+// admit. A default-constructed environment declines: nobody said the operands are in this device's memory.
+struct ggml_sycl_mul_mat_f32_batched_env {
+    bool split           = false;  // src0 is in a row-split buffer
+    bool has_weight      = false;  // src0 or src1 is a weight
+    bool tensor_parallel = false;  // tensor parallelism is on: its sharded paths are the orchestrator's
+    bool recording       = false;  // a command graph records: a new primitive would be created (JIT) inside it
+    bool on_device       = false;  // src0, src1 and dst all resolve to this device's memory
+};
+
+enum ggml_sycl_mul_mat_f32_batched_route {
+    GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE,     // declined: the orchestrator's dispatch, one GEMM per plane
+    GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_COLUMNS,  // a 2-D src0 against a src1 batched in dim 2: one plain GEMM
+    GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_BATCHED,  // the same batch on both: one GEMM with batch dims
+};
+
+// Whether the environment admits the route. The dispatch asks it only for a node the tensors admit, since building
+// the environment queries the queue's state.
+inline bool ggml_sycl_mul_mat_f32_batched_env_admits(const ggml_sycl_mul_mat_f32_batched_env & env) {
+    return !env.split && !env.has_weight && !env.tensor_parallel && !env.recording && env.on_device;
+}
+
+// The route `dst = mul_mat(src0, src1)` takes, from the tensors alone. It reads the operands at strides computed from
+// ne, so every operand must be contiguous; a contiguous tensor that ggml_is_permuted reports as permuted (a size-1 dim
+// with a large stride) is dense all the same and is taken. gemm() takes its dimensions as int, so a product above
+// INT32_MAX declines. A taken node runs the route only if ggml_sycl_mul_mat_f32_batched_env_admits agrees.
+inline ggml_sycl_mul_mat_f32_batched_route ggml_sycl_mul_mat_f32_batched_route_of(const ggml_tensor * src0,
+                                                                                  const ggml_tensor * src1,
+                                                                                  const ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE;
+    }
+    if (src1->ne[2] * src1->ne[3] <= 1) {
+        return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE;
+    }
+    if (src0->ne[0] > INT32_MAX || src0->ne[1] > INT32_MAX || src1->ne[1] * src1->ne[2] > INT32_MAX) {
+        return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE;
+    }
+    if (src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3]) {
+        return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_BATCHED;
+    }
+    if (src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1) {
+        return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_COLUMNS;
+    }
+    return GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE;
 }
 
 // The f16 element count ggml_sycl_mul_mat_batched_sycl's staging alloc() receives

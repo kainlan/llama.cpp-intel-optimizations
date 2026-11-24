@@ -3081,6 +3081,26 @@ set_tests_properties(sycl-context-nonfa-stage PROPERTIES
     TIMEOUT 30
 )
 
+# Which F32 x F32 MUL_MAT nodes run as one oneDNN matmul instead of one GEMM per plane: the predicate in
+# nonfa-stage.hpp, every accept and decline condition and the three Inkling shapes. Host-only like the test above;
+# it names no tenant cohort, so it carries the classification labels only.
+add_executable(test-sycl-mul-mat-f32-batched-route
+    tests/test-sycl-mul-mat-f32-batched-route.cpp
+)
+target_include_directories(test-sycl-mul-mat-f32-batched-route PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-sycl-mul-mat-f32-batched-route PRIVATE ggml-base)
+set_target_properties(test-sycl-mul-mat-f32-batched-route PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-sycl-mul-mat-f32-batched-route COMMAND test-sycl-mul-mat-f32-batched-route)
+set_tests_properties(test-sycl-mul-mat-f32-batched-route PROPERTIES
+    LABELS "sycl;hostonly"
+    TIMEOUT 30
+)
+
 # The published section of a context and the load's compute-term ledger (llama.cpp-moua
 # L4 step 3): runtime-context-section.hpp reads a runtime-context descriptor once into an
 # owning section, classifies a candidate's coverage and holds the late check's rule. It names
@@ -4083,6 +4103,34 @@ foreach (_q2_0_variant f16 f32)
     )
 endforeach()
 
+# Test: the NVFP4 dot product's decode on the host. Compares the table and the arithmetic E2M1
+# decode bit for bit and runs vec_dot_nvfp4_q8_1 against a format oracle. Header-only like the
+# Q2_0 test above, but it opens no queue: it calls the inline functions from main(). Built once,
+# since neither decode computes in dfloat. The selector is pinned so a queue added later still
+# cannot reach a GPU.
+add_executable(test-sycl-nvfp4-decode-host
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-nvfp4-decode-host.cpp
+)
+target_include_directories(test-sycl-nvfp4-decode-host PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-nvfp4-decode-host PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-nvfp4-decode-host PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-nvfp4-decode-host PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+add_test(NAME test-sycl-nvfp4-decode-host COMMAND test-sycl-nvfp4-decode-host)
+set_tests_properties(test-sycl-nvfp4-decode-host PROPERTIES
+    LABELS "sycl;quant;hostonly"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: unified-cache layout and multi-device placement choices, plus the
 # fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
 #
@@ -4932,6 +4980,39 @@ set_tests_properties(test-sycl-dnnl-decline-fallthrough PROPERTIES
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
     TIMEOUT 180
+)
+
+# The batched F32 MUL_MAT route: a batched F32 x F32 MUL_MAT on dense activations is one oneDNN matmul. Each case
+# computes one MUL_MAT graph on the SYCL backend and counts the "dnnl_gemm" site through the PRIVATE_TESTING seam (one
+# submission for a taken case, one per plane after an injected decline and for a declined node), and compares the
+# output with the loop's and with a double-precision reference. It includes gemm.hpp to clear and read the oneDNN
+# primitive cache, so it prints the scratchpad the route's primitive asks for. GGML_SYCL_DISABLE_GRAPH=1: the route
+# declines while a command graph records. Touches the GPU with single-op graphs (at most ~205 MB) and loads no model;
+# labelled mem-handle so a sweep leaves it to the lead. Built the same way as the test above.
+add_executable(test-sycl-mul-mat-f32-batched-device
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mul-mat-f32-batched-device.cpp
+)
+target_include_directories(test-sycl-mul-mat-f32-batched-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mul-mat-f32-batched-device PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-mul-mat-f32-batched-device PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-mul-mat-f32-batched-device PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-mul-mat-f32-batched-device PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-mul-mat-f32-batched-device COMMAND test-sycl-mul-mat-f32-batched-device)
+set_tests_properties(test-sycl-mul-mat-f32-batched-device PROPERTIES
+    LABELS "sycl;device;mem-handle;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_DISABLE_GRAPH=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
 )
 endif()
 # llama.cpp-9qjy: a BF16 dense weight uploaded to the SYCL backend is admitted by

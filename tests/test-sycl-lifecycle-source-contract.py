@@ -719,6 +719,9 @@ def _owning_reader_sites():
 # its per-expert device check.
 # The per-tensor MoE expert preload that nothing called is gone, and its two cache plan reads (the non-empty test
 # before its loop and the expert placement lookup inside it) with it; the live preload keeps its own.
+# The NVFP4 resident decode route asks ggml_sycl_moe_plan_owner_for_device on every decode node, so that function
+# fetches the cache's owner once and answers with that copy: its empty test and its return leave their two statements
+# for one `const auto plan` (4 -> 3 and 1 -> 0, 1 -> 2); the same snapshot is read, so no new reader kind.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
         "(*ggml_sycl_cache_plan_owner(cache))": 1,
@@ -729,7 +732,8 @@ INTERNAL_WRAPPER_SITES = {
         "cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
         "const auto phase_plan_owner = ggml_sycl_cache_plan_owner(cache);": 1,
         "const auto placement = (*ggml_sycl_cache_plan_owner(cache))": 5,
-        "const auto plan = ggml_sycl_cache_plan_owner(cache);": 1,
+        # ggml_sycl_moe_plan_owner_for_device fetches the cache's owner once and answers with it: a decode node asks.
+        "const auto plan = ggml_sycl_cache_plan_owner(cache);": 2,
         "const auto plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);": 1,
         "const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 12,
@@ -753,7 +757,7 @@ INTERNAL_WRAPPER_SITES = {
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
         "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
-        "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
+        "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 3,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\\0') {": 1,
         "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {": 3,
         "in.has_placement_plan = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
@@ -764,8 +768,6 @@ INTERNAL_WRAPPER_SITES = {
         "return ggml_sycl_has_global_plan() || (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
         # llama.cpp-5tdy: the all-experts-resident query reads the plan once through its owning shared_ptr.
         "return ggml_sycl_cache_plan_owner(cache)->all_experts_on_device(src0->name, n_experts, device);": 1,
-        # ggml_sycl_moe_plan_owner_for_device: the one place the cache-then-global plan resolution is written.
-        "return ggml_sycl_cache_plan_owner(cache);": 1,
         "return ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_cache_plan_owner(plan_cache)),": 1,
         "return ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_cache_plan_owner(plan_cache)));": 1,
         "return ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);": 1,

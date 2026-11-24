@@ -104,7 +104,8 @@ std::string stage_deltas(const ggml_sycl_q1_nvfp4_test_counters & before,
     return "candidate=+" + delta(before.candidate, now.candidate) + " admitted=+" + delta(before.admit, now.admit) +
            " submitted=+" + delta(before.submit, now.submit) + " executed=+" + delta(before.terminal, now.terminal) +
            " recycled=+" + delta(before.recycle, now.recycle) + " quarantined=+" +
-           delta(before.quarantine, now.quarantine);
+           delta(before.quarantine, now.quarantine) + " resident=+" +
+           delta(before.resident_submit, now.resident_submit);
 }
 
 [[noreturn]] void fail_stages(const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
@@ -914,6 +915,13 @@ void report_pass(const std::string & name, ggml_type type, int ne11, input_rows 
               << " tokens=" << tokens << " ids=" << ids_layout_name(ids_at) << std::endl;
 }
 
+// Whether a node of these fixtures takes the resident decode route: an NVFP4 decode with dense input rows, its experts
+// all planned on the card at AOS (the lifecycle fixtures' plan), runs from the full expert table without the
+// workspace. Q1_0 stays on the admitted route, and so does a strided input, which the route's quantizer does not read.
+bool resident_route_expected(ggml_type type, input_rows rows, int tokens) {
+    return type == GGML_TYPE_NVFP4 && rows == input_rows::DENSE && tokens == 1;
+}
+
 // `graph` tags the graph in every label, so graph A and graph B of one churn regression stay distinguishable.
 void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph,
                            input_rows rows = input_rows::DENSE, int tokens = 1,
@@ -950,6 +958,22 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
         if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    if (resident_route_expected(type, rows, tokens)) {
+        // Both passes take the resident route and nothing of the admitted one: no candidate, no workspace slot.
+        require_stages(after.resident_submit == before.resident_submit + 2,
+                       "the resident decode route did not take both passes" + label(no_pass), before);
+        require_stages(after.candidate == before.candidate && after.admit == before.admit &&
+                           after.submit == before.submit && after.terminal == before.terminal &&
+                           after.recycle == before.recycle && after.workspace_generation == before.workspace_generation,
+                       "a resident decode pass reached the admitted route or its workspace" + label(no_pass), before);
+        report_pass("successful_reuse_case (graph=" + std::string(graph) + ", resident)", type, ne11, rows,
+                    life.authorization, tokens, ids_at);
+        return;
+    }
+    // A node the resident decode route declines (an NVFP4 decode with strided input rows among them, checked against
+    // the oracle above) runs on the admitted route alone: the resident route submitted nothing for it.
+    require_stages(after.resident_submit == before.resident_submit,
+                   "a node the resident decode route declines reached its submit" + label(no_pass), before);
     const auto observed_slots = [&]() {
         return label(no_pass) + ": observed first=(slot=" + std::to_string(first.workspace_slot) +
                ", generation=" + std::to_string(first.workspace_generation) +
@@ -999,6 +1023,103 @@ void prompt_above_capacity_case(lifecycle_fixture & life, ggml_type type) {
                    before);
     require_ids_unchanged(c, at, before);
     report_pass(scope.marker->name, type, 1, input_rows::DENSE, life.authorization, tokens);
+}
+
+// Whether `got` matches `oracle` at `i` within the cases' tolerance.
+bool matches_oracle(const std::vector<float> & got, const std::vector<float> & oracle, size_t i) {
+    return std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= 0.08f * (1.0f + std::fabs(oracle[i]));
+}
+
+// Ids a resident decode node can be handed that select no expert: one past the table, which the checked kernel writes
+// as a quiet NaN row without reading through any slot, and -1, which it writes as a zero row. The graph succeeds, and
+// the slot between them, a real expert, matches the oracle: a bad id costs its own row, not the node.
+void resident_bad_ids_case(lifecycle_fixture & life, int ne11) {
+    std::vector<float>         oracle;
+    size_t                     count = 0;
+    auto                       c     = make_graph(life.backend, GGML_TYPE_NVFP4, ne11, oracle, count);
+    // Slot 1 keeps the graph's own expert, so the oracle make_graph computed still holds for its row.
+    const std::vector<int32_t> bad   = { route_experts, route_selected_experts[1], -1 };
+    ggml_backend_tensor_set(c.ids_storage, bad.data(), 0, bad.size() * sizeof(int32_t));
+    c.ids_written = bad;
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const std::string at = " (ne11=" + std::to_string(ne11) + ")";
+    const case_scope  scope("resident_bad_ids_case" + at, before);
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "a resident decode node with bad ids failed its graph" + at, before);
+    ggml_backend_synchronize(life.backend);
+    std::vector<float> got(count);
+    ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
+    for (size_t i = 0; i < count; ++i) {
+        const size_t slot = i / gate_output_n;
+        const bool   ok = slot == 0 ? std::isnan(got[i]) : slot == 2 ? got[i] == 0.0f : matches_oracle(got, oracle, i);
+        if (!ok) {
+            fail_stages("slot " + std::to_string(slot) + " (id " + std::to_string(bad[slot]) + ") at " +
+                            std::to_string(i) + " is " + std::to_string(got[i]) + "; want " +
+                            (slot == 0 ? std::string("a quiet NaN") :
+                             slot == 2 ? std::string("zero") :
+                                         "the oracle's " + std::to_string(oracle[i])) +
+                            at,
+                        before);
+        }
+    }
+    require_ids_unchanged(c, at, before);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.resident_submit == before.resident_submit + 1 && after.candidate == before.candidate &&
+                       after.admit == before.admit,
+                   "the resident decode route did not take the node with bad ids" + at, before);
+    report_pass(scope.marker->name, GGML_TYPE_NVFP4, ne11, input_rows::DENSE, life.authorization);
+}
+
+// A table slot that holds no expert: the resident route's checked kernel writes every row that selects it as a quiet
+// NaN without reading through it, and the other rows stay right. The slot is nulled behind the route's memoized table
+// probe, the state a table upload that dropped an expert would leave, and written back afterwards; the next pass then
+// matches the oracle again, so the NaN rows came from the slot and not from the case.
+void resident_null_slot_case(lifecycle_fixture & life) {
+    std::vector<float>  oracle;
+    size_t              count  = 0;
+    auto                c      = make_graph(life.backend, GGML_TYPE_NVFP4, 1, oracle, count);
+    const ggml_tensor * weight = c.out->src[0];
+    const int32_t       nulled = route_selected_experts[1];  // slot 1's expert; slots 0 and 2 select another
+    ggml_sycl_q1_nvfp4_test_counters before{}, after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const case_scope scope("resident_null_slot_case", before);
+
+    const auto run = [&](const std::string & pass, bool slot_null) {
+        const std::string at = " (pass=" + pass + ")";
+        require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                       "a resident decode node failed its graph" + at, before);
+        ggml_backend_synchronize(life.backend);
+        std::vector<float> got(count);
+        ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
+        for (size_t i = 0; i < count; ++i) {
+            const size_t slot = i / gate_output_n;
+            const bool   nan  = slot_null && route_selected_experts[slot] == nulled;
+            if (nan ? !std::isnan(got[i]) : !matches_oracle(got, oracle, i)) {
+                fail_stages("slot " + std::to_string(slot) + " at " + std::to_string(i) + " is " +
+                                std::to_string(got[i]) + "; want " +
+                                (nan ? std::string("a quiet NaN") : "the oracle's " + std::to_string(oracle[i])) + at,
+                            before);
+            }
+        }
+        require_ids_unchanged(c, at, before);
+    };
+    run("first", false);
+    const void * slots[route_experts] = {};
+    require_stages(ggml_sycl_q1_nvfp4_test_read_expert_table(life.backend, weight, route_experts, slots) &&
+                       slots[nulled] != nullptr,
+                   "the first pass left no expert pointer in the slot the case nulls", before);
+    require_stages(ggml_sycl_q1_nvfp4_test_write_expert_slot(life.backend, weight, nulled, nullptr),
+                   "the case could not null the table slot", before);
+    run("nulled", true);
+    require_stages(ggml_sycl_q1_nvfp4_test_write_expert_slot(life.backend, weight, nulled, slots[nulled]),
+                   "the case could not write the table slot back", before);
+    run("restored", false);
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    require_stages(after.resident_submit == before.resident_submit + 3 && after.candidate == before.candidate &&
+                       after.admit == before.admit,
+                   "the resident decode route did not take all three passes", before);
+    report_pass(scope.marker->name, GGML_TYPE_NVFP4, 1, input_rows::DENSE, life.authorization);
 }
 
 void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) {
@@ -1552,6 +1673,9 @@ void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tok
                        after.submit == before.submit + 1 && after.terminal == before.terminal + 1 &&
                        after.recycle == before.recycle + 1,
                    "the direct route did not take the mixed batch once" + at, before);
+    // A mixed decode's plan does not put every expert on the card, so the resident decode route declines it whole.
+    require_stages(after.resident_submit == before.resident_submit,
+                   "the resident decode route submitted a mixed batch" + at, before);
     require_stages(after.host_submit == before.host_submit + 1 &&
                        after.host_occurrences == before.host_occurrences + host_occurrences,
                    "the host leg did not submit the batch's " + std::to_string(host_occurrences) +
@@ -1704,6 +1828,16 @@ int main() {
                 successful_reuse_case(life, type, route_top_k, "production");
                 successful_reuse_case(life, type, route_top_k, "production-strided", input_rows::STRIDED);
             }
+        }
+        require_clean_teardown();
+        // The resident decode route through production entry, no private authorization: an id that selects no expert
+        // and a table slot that holds none each cost their own rows, and the graph succeeds.
+        {
+            lifecycle_fixture life(backend_order::BEFORE_LOAD_END, route_authorization::PRODUCTION);
+            for (const int ne11 : { 1, route_top_k }) {
+                resident_bad_ids_case(life, ne11);
+            }
+            resident_null_slot_case(life);
         }
         require_clean_teardown();
         // Prompt rows, no private authorization: the route submits a prompt once, every token's rows in one kernel.

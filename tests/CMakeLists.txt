@@ -1262,6 +1262,15 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;moe;source;source-contract;hostonly;python"
         TIMEOUT 60)
+    # An NVFP4 decode node whose experts the plan puts all on its card at AOS runs from the full-local expert table and
+    # the device ids with no host wait, workspace or host task: its predicate, the plan memo's key, the ready event,
+    # the declines, the shared MMVQ geometry and the retention that keeps every handle alive under submitted work.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-nvfp4-resident-decode-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-nvfp4-resident-decode-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;moe;source;source-contract;hostonly;python"
+        TIMEOUT 60)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.
@@ -1348,6 +1357,12 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-q2-0-wiring-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-q2-0-wiring-source.py
+        LABEL "sycl;quant;source;hostonly;python"
+        TIMEOUT 30)
+    # Which decode the NVFP4 dot product uses; the bits are test-sycl-nvfp4-decode-host's.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-nvfp4-decode-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-nvfp4-decode-source.py
         LABEL "sycl;quant;source;hostonly;python"
         TIMEOUT 30)
     # The opt-in ESIMD Q4_0 mmq kernels crash ocloc 26.35 / IGC 2.41 and are compiled out unless the CMake option
@@ -5409,6 +5424,17 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-nonfa-stage-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-nonfa-stage-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# Source gate for the batched F32 MUL_MAT route: consulted before the orchestrator, a decline falls through, one gemm
+# and nothing kept, the environment from the backend's facts, gemm()'s label by batch count. Host test of the
+# predicate: test-sycl-mul-mat-f32-batched-route; device test: test-sycl-mul-mat-f32-batched-device.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mul-mat-f32-batched-route-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mul-mat-f32-batched-route-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

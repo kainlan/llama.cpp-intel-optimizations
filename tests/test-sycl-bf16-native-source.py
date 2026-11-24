@@ -172,6 +172,21 @@ def test_executor_allocates_nothing_and_waits_on_nothing():
         "an unknown (0) extent must be rejected, not accepted"
 
 
+def test_executor_launch_is_a_kernel_profiler_row():
+    # A decoded Inkling 2 Mini token runs about 628 of these launches; without a row the kernel profiler
+    # (GGML_SYCL_KERNEL_PROFILE) cannot say what they cost. The launch goes through the profiler's submit wrapper,
+    # which times the event the kernel returns, under a name of its own and with the shape in the metadata.
+    executor = body_after(_code(), "static void ggml_sycl_mul_mat_bf16_weight(")
+    wrapped = executor.find("ggml_sycl_profile_submit(")
+    launch = executor.find("ggml_sycl_bf16::mul_mat_bf16_f32(")
+    assert 0 <= wrapped < launch, "the kernel must be launched inside ggml_sycl_profile_submit"
+    assert '"mulmat.bf16_native"' in executor, "the profiler row is named mulmat.bf16_native"
+    for key in ('"ncols="', '";nrows="', '";n_vecs="'):
+        assert key in executor, f"the row's metadata must carry {key}"
+    assert "ggml_sycl_kernel_profile_enabled()" in executor, \
+        "the metadata string is built only when the profiler is on (628 launches per token)"
+
+
 def test_kernel_takes_no_event_and_no_atomics():
     kernel = strip_comments(KERNEL.read_text())
     for forbidden in ("depends_on", "sycl::event * ready", "atomic_ref", "atomic_fetch", "malloc_device", "malloc_host"):

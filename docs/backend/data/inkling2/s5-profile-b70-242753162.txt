@@ -1,0 +1,61 @@
+Stage 3, first measurement: dense BF16 MUL_MAT profiler row and host-side stage profile. B70 (level_zero:0), Inkling 2 Mini Q8,
+48 tokens of text, tree 242753162 (master b3e761180 plus the mulmat.bf16_native label), driver 26.44, 2026-11-23, no builder alive.
+One load per run, under GPU.lock. Zero kernel fault lines. Per forward pass (49 passes).
+
+##### A. Kernel profiler, graph replay on (kprof CSV beside this file): 73.99 ms per decoded token
+directly dispatched submissions 778 per pass; device-timed 21.21 ms per pass; failed_timestamps 17908
+    mulmat.mmvq.id_aos_nvfp4                    88.0 per pass    16.265 ms per pass  mean    184.8 us
+    mulmat.bf16_native                          39.2 per pass     1.953 ms per pass  mean     49.8 us
+    mulmat.moe.bf16_direct                       8.0 per pass     1.135 ms per pass  mean    141.9 us
+    fattn.decode.esimd_partitioned              47.0 per pass     0.549 ms per pass  mean     11.7 us
+    fattn.compute.xmx_v2                         1.0 per pass     0.522 ms per pass  mean    533.3 us
+    mulmat.onednn_gemm.unbatched                97.0 per pass     0.228 ms per pass  mean      2.4 us
+    sycl.memcpy.mem_ops                         90.0 per pass     0.146 ms per pass  mean      1.6 us
+    sycl.binbcast.mul                           50.3 per pass     0.090 ms per pass  mean      1.8 us
+    sycl.binbcast.add                           47.5 per pass     0.075 ms per pass  mean      1.6 us
+
+##### B. Kernel profiler, GGML_SYCL_DISABLE_GRAPH=1 (every kernel dispatched and timed): 268.99 ms per decoded token
+directly dispatched submissions 7590 per pass; device-timed 36.52 ms per pass; failed_timestamps 11187
+    mulmat.mmvq.id_aos_nvfp4                    88.0 per pass    16.218 ms per pass  mean    184.3 us
+    mulmat.bf16_native                         641.0 per pass    10.419 ms per pass  mean     16.3 us
+    mulmat.onednn_gemm.unbatched               412.4 per pass     1.369 ms per pass  mean      3.3 us
+    sycl.binbcast.add                          776.0 per pass     1.167 ms per pass  mean      1.5 us
+    mulmat.moe.bf16_direct                       8.0 per pass     1.137 ms per pass  mean    142.1 us
+    sycl.binbcast.mul                          699.9 per pass     1.056 ms per pass  mean      1.5 us
+    sycl.binbcast.event                       2019.9 per pass     1.029 ms per pass  mean      0.5 us
+    fattn.decode.esimd_partitioned              47.0 per pass     0.549 ms per pass  mean     11.7 us
+    fattn.compute.xmx_v2                         1.0 per pass     0.520 ms per pass  mean    531.0 us
+    norm.rms_norm_mul                          152.0 per pass     0.439 ms per pass  mean      2.9 us
+    sycl.binbcast.repeat                       208.0 per pass     0.419 ms per pass  mean      2.0 us
+    norm.rms_norm                              360.0 per pass     0.414 ms per pass  mean      1.2 us
+mulmat.bf16_native: 641.0 launches per pass, 10.419 ms per pass device time, mean 16.3 us, failed_timestamps 0
+    ncols=2304;nrows=3072;n_vecs=1             94.0/pass   2.939 ms/pass  mean    31.3 us  p50    31.2  min   29.2  rec=0
+    ncols=3072;nrows=2304;n_vecs=1             47.0/pass   1.847 ms/pass  mean    39.3 us  p50    39.2  min   38.0  rec=0
+    ncols=2304;nrows=201024;n_vecs=1            1.0/pass   1.557 ms/pass  mean  1557.0 us  p50  1556.6  min 1554.5  rec=0
+    ncols=2304;nrows=1024;n_vecs=1             94.0/pass   1.040 ms/pass  mean    11.1 us  p50    11.0  min   10.1  rec=0
+    ncols=64;nrows=2304;n_vecs=1              188.1/pass   0.518 ms/pass  mean     2.8 us  p50     2.7  min    2.5  rec=0
+    ncols=4608;nrows=64;n_vecs=14               2.0/pass   0.455 ms/pass  mean   232.5 us  p50   232.2  min  230.1  rec=0
+    ncols=4608;nrows=64;n_vecs=1               94.0/pass   0.418 ms/pass  mean     4.4 us  p50     4.5  min    4.0  rec=0
+    ncols=2304;nrows=384;n_vecs=1              47.0/pass   0.354 ms/pass  mean     7.5 us  p50     7.5  min    7.1  rec=0
+    ncols=2304;nrows=3072;n_vecs=14             2.0/pass   0.343 ms/pass  mean   175.2 us  p50   170.7  min  169.4  rec=0
+    ncols=2304;nrows=1024;n_vecs=14             2.0/pass   0.232 ms/pass  mean   118.5 us  p50   115.9  min  114.7  rec=0
+    ncols=3072;nrows=2304;n_vecs=14             1.0/pass   0.223 ms/pass  mean   227.2 us  p50   222.4  min  221.6  rec=0
+    ncols=2304;nrows=24;n_vecs=1               47.0/pass   0.149 ms/pass  mean     3.2 us  p50     3.1  min    3.0  rec=0
+    ncols=2304;nrows=384;n_vecs=14              1.0/pass   0.118 ms/pass  mean   120.5 us  p50   117.8  min  114.6  rec=0
+    ncols=2304;nrows=24;n_vecs=14               1.0/pass   0.107 ms/pass  mean   109.3 us  p50   106.7  min  105.6  rec=0
+    ncols=2304;nrows=32;n_vecs=1               15.7/pass   0.052 ms/pass  mean     3.3 us  p50     3.3  min    2.8  rec=0
+    ncols=2304;nrows=32;n_vecs=14               0.3/pass   0.042 ms/pass  mean   128.7 us  p50   129.5  min  121.1  rec=0
+    ncols=64;nrows=2304;n_vecs=14               3.9/pass   0.025 ms/pass  mean     6.4 us  p50     6.4  min    6.1  rec=0
+Bandwidth read from the rows above: 2304x3072 BF16 (14.2 MB) in 31.3 us is about 450 GB/s; the output head 2304x201024
+(926 MB) in 1557 us is about 595 GB/s. The dense BF16 kernel is at the card's memory bandwidth.
+
+##### C. Host-side stage profile (GGML_SYCL_E2E_TG_PROFILE=1), replay on: 71.59 ms per decoded token
+host time over 49 passes: profile blocks=98 ops=42072 sum_wall=1298 ms sum_host=3589 ms
+    moe              calls=   4704 host=   2563.8 ms  (545 us/call)
+    other            calls=  18038 host=    359.6 ms  (20 us/call)
+    non_moe_matmul   calls=   3908 host=    246.4 ms  (63 us/call)
+    attention        calls=   7056 host=    242.7 ms  (34 us/call)
+    elementwise      calls=   7982 host=    170.2 ms  (21 us/call)
+    kv               calls=    384 host=      6.6 ms  (17 us/call)
+moe: 4704 calls is 96 per pass; 2563.8 ms is 52.3 ms per pass, 545 us per MUL_MAT_ID node on the submitting thread.
+The MoE kernels need 17.4 ms of device time per pass (A). Host stage times sum to the wall: the thread is busy or blocked.

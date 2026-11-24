@@ -243,6 +243,7 @@ enum class ids_layout { PACKED, VIEW };
 
 void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
     constexpr int experts = 4, top_k = 3, tokens = 2, rows = 5;
+    const int     device = ggml_sycl_get_device_id_from_queue(q);  // the entry reads this card's init-time capabilities
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
     const size_t block_bytes = type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
     const size_t blocks_per_row = static_cast<size_t>(K / (type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4));
@@ -288,9 +289,9 @@ void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
     });
     mmvq_q1_nvfp4_admitted_buffers buffers{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
     sycl::event terminal;
-    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
-                                                  snapshot, experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
-                                                  ids_nb1, buffers, &delayed, &terminal),
+    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, device, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
+                                                 snapshot, experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
+                                                 ids_nb1, buffers, &delayed, &terminal),
             ids_at == ids_layout::VIEW ? "valid admitted submit with an ids view rejected" :
                                          "valid admitted submit rejected");
     terminal.wait_and_throw();
@@ -318,9 +319,10 @@ void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
         std::memset(q8.ptr, 0x6b, q8_bytes);
         std::fill(output.ptr, output.ptr + output_values, 77.0f);
         mmvq_q1_nvfp4_admitted_buffers bad{ q8_ptr, q8_size, output.ptr, output_size };
-        require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, bad_type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
-                                                       bad_ids, experts, bad_k, rows, top_k, tokens, ne11, nb0, nb1,
-                                                       bad), name);
+        require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, device, bad_type, GGML_LAYOUT_AOS, table.ptr, activation.ptr,
+                                                      ids_view, bad_ids, experts, bad_k, rows, top_k, tokens, ne11, nb0,
+                                                      nb1, bad),
+                name);
         for (size_t i = 0; i < q8_bytes; ++i) require(q8.ptr[i] == 0x6b, "refusal changed Q8 bytes");
         for (size_t i = 0; i < output_values; ++i) require(output.ptr[i] == 77.0f, "refusal changed output");
     };
@@ -347,9 +349,9 @@ void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
     require(std::equal(ids_written.begin(), ids_written.end(), ids.ptr), "a refusal wrote into the device ids");
 
     mmvq_q1_nvfp4_admitted_buffers overflow{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
-    require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
-                                                   snapshot, experts, K, rows, INT_MAX, INT_MAX, ne11,
-                                                   sizeof(int32_t), ids_nb1, overflow),
+    require(!mmvq_submit_q1_nvfp4_aos_id_admitted(q, device, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids_view,
+                                                  snapshot, experts, K, rows, INT_MAX, INT_MAX, ne11, sizeof(int32_t),
+                                                  ids_nb1, overflow),
             "overflow shape submitted");
 }
 
@@ -360,6 +362,7 @@ void run_case(sycl::queue & q, ggml_type type, int ne11, ids_layout ids_at) {
 // output starts at a sentinel, so a kernel that left a row alone fails as surely as one that computed it.
 void run_skip_case(sycl::queue & q, ggml_type type, int ne11) {
     constexpr int     experts = 4, top_k = 3, tokens = 2, rows = 5, host_expert = 0;
+    const int         device          = ggml_sycl_get_device_id_from_queue(q);
     const int         K               = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
     const size_t      block_bytes     = type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
     const size_t      blocks_per_row  = static_cast<size_t>(K / (type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4));
@@ -391,8 +394,8 @@ void run_skip_case(sycl::queue & q, ggml_type type, int ne11) {
 
     mmvq_q1_nvfp4_admitted_buffers buffers{ q8.ptr, q8_bytes, output.ptr, output_values * sizeof(float) };
     sycl::event                    terminal;
-    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr, snapshot,
-                                                 experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
+    require(mmvq_submit_q1_nvfp4_aos_id_admitted(q, device, type, GGML_LAYOUT_AOS, table.ptr, activation.ptr, ids.ptr,
+                                                 snapshot, experts, K, rows, top_k, tokens, ne11, sizeof(int32_t),
                                                  top_k * sizeof(int32_t), buffers, nullptr, &terminal),
             "a batch with a null slot was refused before submit");
     // A kernel that read through the null slot faults the device; the fault arrives here, and it is this case's

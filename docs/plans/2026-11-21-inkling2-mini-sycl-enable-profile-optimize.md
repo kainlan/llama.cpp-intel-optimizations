@@ -5944,6 +5944,19 @@ and they decide whether graph replay engages at all (S1); then S7 (the smallest 
 for a quarter of the prompt); S4 as a grouped prompt kernel (half of the prompt, the largest piece of work); the
 S5 profiler label; S9 and the rest of S1 only after a new profile, because replay changes what a token costs.
 
+**First Stage 3 measurement (lead, 2026-11-23, B70, tree `242753162` = master `b3e761180` plus the
+`mulmat.bf16_native` profiler row).** The user asked to continue with the optimization. Evidence:
+`docs/backend/data/inkling2/s5-profile-b70-242753162.txt` and the two kprof CSVs beside it.
+
+| # | Verdict | Measured |
+|---|---------|----------|
+| S5 | **closed, not a candidate** | 641 dense BF16 launches per token, 10.4 ms of device time, mean 16 us. A 2304x3072 weight (14.2 MB) takes 31.3 us, about 450 GB/s; the output head (926 MB) takes 1557 us, about 595 GB/s. The kernel is at the card's memory bandwidth. The lead's guess that launch count was the cost was wrong. |
+| S9 | open, second | The NVFP4 expert kernel is 16.2 ms per token (88 launches of 184 us), the largest single device item. |
+| S10 | **new, first** | Device time is about 36.5 ms of a 65 ms token. The submitting thread spends 52.3 ms per token inside the 96 `MUL_MAT_ID` nodes (545 us each) for 17.4 ms of kernel time. Task 18. |
+
+Order for decode now: Task 18 (the host wait), then a new profile, then S9. A token bounded by device time would
+be about 36 to 40 ms; that is an estimate until Task 18 is measured.
+
 **Acceptance Criteria:**
 - [ ] Every row is either closed with its measured number or expanded into tasks that meet the Task Detail Standard.
 - [ ] Every Stage 3 task's acceptance is an interleaved paired A/B (ABBA order) plus the three Inkling gates, the
@@ -5951,6 +5964,551 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
 - [ ] No task changes placement policy to make a kernel's layout fit; no task adds a second source for a fact the
       loaded operand already carries.
 - [ ] The user has approved the rewritten Stage 3.
+
+### Task 18: An all-resident NVFP4 `MUL_MAT_ID` decode node submits without a host wait (written 2026-11-23)
+
+**Track:** S3-decode. **Depends on:** Task 8c (merged), the `mulmat.bf16_native` profiler row (`task/inkling2-s5`).
+**Found by:** the first Stage 3 measurement (`docs/backend/data/inkling2/s5-profile-b70-242753162.txt`). On the
+B70 a decoded token is 65 ms in a bench and about 72 ms profiled. Its kernels need about 36.5 ms of device time.
+The submitting thread spends 52.3 ms per token inside the 96 `MUL_MAT_ID` nodes, 545 us each, and their kernels
+need 17.4 ms. GPT-OSS on the same card (72 `MUL_MAT_ID` per token, MXFP4) decodes a token in about 19 ms.
+
+**Description (traced by an explorer in `242753162`, read not run; line numbers move, find each site by name):**
+- A decode node with NVFP4 experts is refused by the cached-table direct route (the block in
+  `ggml_sycl_mul_mat_id` that ends in `mmvq_moe_batched_dispatch`) because `dedicated_decode_route`
+  (`moe-decode-hostpath.hpp`) is set for MXFP4, Q1_0 and NVFP4. The event-chained route refuses it for the same
+  reason. It then runs the admitted route of Task 8b and 8c.
+- On that route the only blocking wait is `ggml_sycl_copy_ids_to_host` for the layer's ids (a synchronous copy:
+  `mem_copy` then `wait_and_throw`), once per layer through `g_moe_layer_ids_cache`, which is cleared at every
+  graph boundary. On an in-order queue that wait drains everything submitted before it.
+- The host uses the ids for the resolved batch (`ggml_sycl_build_moe_resolved_batch`), the card-or-host split,
+  the host leg's preparation and the table upload. Per node it also takes a workspace slot (two slots, freed only
+  in the terminal host task), mints an execution snapshot and submits one host task.
+- When every expert of the tensor is PRIMARY on the context's device none of that needs the ids on the host: a
+  full per-tensor pointer table and a range check on the device answer all of it.
+- `[MOE-DECODE-CANONICAL]` prints `published=0` on every decode node of the measured run: the per-node canonical
+  publish does not republish and the table is not re-uploaded per node (checked in the run's log and its
+  memcpy rows).
+- The BF16 route (`ggml_sycl_mul_mat_id_bf16_direct`) already has no host wait: it uses the cached full-local
+  table, the ids on the device, and retains the table's dispatch bundle until the kernel's event.
+- `mmvq_moe_batched_dispatch` already reaches `mmvq_submit_q1_nvfp4_aos_id` (`mmvq.cpp`), the kernel the admitted
+  route runs. The decode-direct table is `ggml_sycl_moe_decode_direct_table`, stamped by replan epoch, storage
+  generation and selected rows (`moe_decode_direct_stamp`).
+
+**Ruling (lead, 2026-11-23):** placement decides the route. A decode node whose tensor has every expert PRIMARY
+on the context's device, in AOS, submits its kernel with the ids read on the device from a full per-tensor
+pointer table, with no host copy of the ids, no resolved batch, no workspace slot and no host task. A tensor with
+any host or secondary expert keeps the admitted route of Task 8c unchanged.
+- One predicate decides it, asked by the route and by nothing else's copy of the rule. It is answered from the
+  plan and the table, not from the ids.
+- The kernel is the loaded layout's kernel that exists (`mmvq_submit_q1_nvfp4_aos_id` or the admitted one):
+  nothing is converted or re-staged. If the route needs the checked-slot form (a null slot or an id out of range
+  writes NaN rows, an id below zero writes zero), it uses that form; an unchecked read of a slot is not allowed.
+- Lifetime: the node retains the table's dispatch bundle (the table's allocation and its expert leases) and the
+  ids' storage until the kernel's event, the way `ggml_sycl_mul_mat_id_bf16_direct` does
+  (`ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle`, `retain_handles_until_event`). No persistent lease is
+  relied on without that retain.
+- No new host wait, no new abort, no new allocation outside the unified cache.
+- Q1_0 follows NVFP4 only if it is the same code path with no extra work; otherwise it stays as it is and the
+  hand-back says so. The prompt path is not this task.
+- Graph replay: the node still runs eagerly between replayed segments. Recording it into a segment is a later
+  task; say in the hand-back what stops it.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. What the activation needs on the cached-table route for NVFP4 (the Q8_1 quantized activation and where its
+   buffer comes from), and whether `mmvq_moe_batched_dispatch` already provides it without a workspace slot.
+2. Whether the decode-direct table holds every expert of an all-resident tensor or only the selected rows, what
+   its stamp invalidates on, and what the node must retain.
+3. The predicate: its exact inputs, and why it cannot say yes for a tensor with a host expert (the B50).
+4. What the 545 us per node is made of after the ids wait is gone: name every remaining per-node host cost on the
+   new route (plan walks, vector builds, barriers, logs) and which of them this task removes.
+5. The device test you will extend and the RED you will write first.
+
+**Acceptance Criteria:**
+- [x] On the B70 a decode node with NVFP4 experts reaches the kernel with no `ggml_sycl_copy_ids_to_host`, no
+      `ggml_sycl_build_moe_resolved_batch`, no workspace admission and no host task: pinned by a source contract
+      with mutants, and shown by a route log line that names the route.
+- [x] A tensor with a host expert takes the admitted route as before: the admitted device test and the mixed
+      fixture pass unchanged on both cards.
+- [x] A device test drives the new route through the production entry with a bad id and a null slot.
+- [x] Lead runs: the Inkling gate on the B70, the B50 alone and both cards; the Mistral and GPT-OSS gates;
+      `test-backend-ops -o MUL_MAT_ID` on each card; one ABBA on the B70 against the tree before the task; one
+      host-stage profile that shows the `moe` stage's host time per node.
+- [x] Full build, the two source-contract sweeps with only the known eight red, the inventory regenerated.
+
+**Done (lead, 2026-11-24; branch `task/inkling2-t18` at `3de6793db`; evidence
+`docs/backend/data/inkling2/t18-lead-runs-48390d4bb.txt`, `t18-lead-runs-8825673f7.txt` and
+`t18-lead-runs-4d8598234.txt`; the lead's rulings after the checkpoint and after the first review are in
+`t18-lead-rulings.md` beside them).**
+- *What was built.* `ggml_sycl_mul_mat_id_nvfp4_resident_decode`: a decode node whose NVFP4 experts the plan puts
+  all on this card at AOS runs from the full-local expert table and the ids where they are. The input is quantized
+  into a Q8_1 slice of the SCRATCH zone, the checked MMVQ-ID kernel writes dst, and the kernel's event becomes
+  dst's ready event. No host read of the ids, no resolved batch, no workspace, no host task, no host wait. Every
+  other shape declines to the admitted route with a reason logged once (`GGML_SYCL_MOE_ROUTE_LOG=1`). Q1_0 stays
+  on the admitted route. A bad id costs its own row (NaN for an id past the table or a null slot, zero for an id
+  below zero), not the node.
+- *Measured, B70, driver 26.44, no builder alive, pp512 / tg128 in t/s.* Interleaved, in run order: before
+  47.56 / 14.62, after 47.19 / 21.17, after 47.24 / 21.14, before 47.53 / 14.70 (`8825673f7`). The first round's
+  pair read 47.29 / 14.87, 47.41 / 21.02, 47.26 / 21.09, 47.18 / 14.77 (`48390d4bb`), and one load of `4d8598234`
+  read 47.57 / 21.04. Decode +44%, prompt unchanged. The `moe` stage costs 107 us of host time per `MUL_MAT_ID`
+  node; it was 545 us.
+- *Unchanged elsewhere.* Mistral on the B70 and GPT-OSS on the B50 do not move in an interleaved pair each (the
+  retained-handle publication changed for every route). The Inkling gate passes on the B70, the B50 alone and both
+  cards. `test-backend-ops -o MUL_MAT_ID` changes no case on either card. The plan lines of Mistral and GPT-OSS
+  differ only in the driver's free-memory reading and in measured times.
+- *Reviews.* Spec review passed. The first quality review failed on a lifetime window: on four failure paths (a
+  submit, a profiler record or a publication that throws, a refusal after the quantize) the handles could be
+  released under submitted work. The route now holds them in one object that drains the stream before it lets
+  them go on any exit that did not publish, and a drain that itself fails parks them in the store's failed-wait
+  list. Publication takes the vector by reference and leaves it whole when it throws
+  (`retain_handles_until_event_or_keep`). Two later rounds were minors.
+- *Three mistakes in the rounds, kept as a record.* The first fix reserved the retained-handle vectors to an exact
+  size on every call, which is quadratic over the nodes of a graph; the lead found it by reading the diff before
+  the device runs, and the round-1 pair could not have shown it. A "publish already failed" stamp also recorded a
+  transient upload failure and would have made it permanent for the BF16 route. A reviewer's claim that a snapshot
+  without de-duplication takes a reference per expert more was passed on by the lead as a ruling without a read.
+  It is wrong: a handle's identity includes its slice offset, so every expert lease is kept either way, and the
+  one handle taken twice is the table's own.
+- *Not exercised on a device.* The failure paths (a throwing submit, a failed drain) run only when the runtime
+  throws. Their evidence is the source contract's pins and mutants and the reviews.
+- *Merged (`8af32c220`, evidence `docs/backend/data/inkling2/t18-merged-8af32c220.txt`).* The final head's sweeps
+  fail the known eight and no other. The merged build passes the Inkling gate and reads 47.45 / 21.22.
+- *The next decode target is the NVFP4 expert kernel (row S9), with a measured bound.* At the decode shape the
+  kernel takes 179.4 us for the 2304 x 2304 experts and 113.8 us for the 1152 x 2304 ones, 12.9 ms per token for
+  the 88 calls. The figure of 16.2 ms this plan carried divided a total that included the prompt's calls. The BF16
+  expert kernel on the same card reads 3.6 times the bytes for the same weights in less time (151.3 and 76.0 us,
+  about 560 GB/s on both shapes), so the NVFP4 kernel is bound by its arithmetic, not by memory: at that read rate
+  its 88 calls would cost 2.8 ms.
+
+### Task 19: The NVFP4 dot product decodes its codes and its scale without the emulated permute (written 2026-11-24)
+
+**Track:** S3-decode (row S9). **Depends on:** Task 18 (merged, `8af32c220`).
+**Found by:** a read-only trace of the kernel on `d538f7c74` (explorer, 2026-11-24) against the merged tree's
+profile (`docs/backend/data/inkling2/t18-merged-8af32c220.txt`).
+
+**Description (read, not run; line numbers move, find each site by name):**
+- A decode call launches `mul_mat_vec_q_id` (`mmvq.cpp`) with one 32-lane sub-group per (expert, row) pair. Each
+  lane calls `vec_dot_nvfp4_q8_1` (`vecdotq.hpp`), which decodes four ints of E2M1 codes with
+  `get_int_from_table_16(..., kvalues_mxfp4)` and two UE4M3 scales with `ggml_sycl_ue4m3_to_fp32` (`common.hpp`).
+- `get_int_from_table_16` is six `dpct::byte_level_permute` calls, each emulated with 64-bit shifts. The comment
+  above `mxfp4_codes_to_int8` in `vecdotq.hpp` records that this made the MXFP4 mat-vec compute-bound on Intel
+  GPUs; `vec_dot_mxfp4_q8_1` was moved to the arithmetic decode `get_int_from_mxfp4`. NVFP4 uses the same code
+  table and was not moved.
+- `ggml_sycl_ue4m3_to_fp32` has three compares and a `sycl::ldexp` per scale; NVFP4 has a scale per 16 elements,
+  twice MXFP4's rate. MXFP4's scale is built from bits (`sycl_e8m0_to_fp32_half`).
+- Both rewrites below return the same bits as the code they replace. Checked on the host in Python on 2026-11-24:
+  the arithmetic decode against the table for all 65536 combinations of four codes, the scale for all 256 bytes.
+  A host check is not the device: the task commits both checks as tests and the lead's device runs decide.
+- The same functor serves the prompt's NVFP4 expert calls and the dense NVFP4 mat-vec. `ggml_sycl_ue4m3_to_fp32`
+  is also called from `convert.cpp`, `cpy.hpp` and `dequantize.hpp`.
+- Not in this task: the launch geometry (36 and 18 blocks against 16 per sub-group pass, 75% and 56% lane use,
+  and a 4-way unroll that needs 64 blocks), `dpct::dp4a`, an f32-activation path. Each is a later task that this
+  task's measurement orders.
+
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/vecdotq.hpp` (`vec_dot_nvfp4_q8_1`), `ggml/src/ggml-sycl/common.hpp`
+  (`ggml_sycl_ue4m3_to_fp32`).
+- Test: one new host-only test of the two equivalences, and its registration.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Every call site of `get_int_from_table_16` with `kvalues_mxfp4` that an NVFP4 tensor can reach (the functor,
+   and any NVFP4 arm in `mmvq.cpp`), and which of them this task changes.
+2. How a host-only test in this tree compiles a header that uses `sycl::int2` and `__dpct_inline__` and runs with
+   no device: name the existing test you copy the pattern from, its registration and its labels.
+3. The RED you will write first for each of the two commits.
+
+**Implementation, two commits in this order, each RED then GREEN:**
+
+1. *The codes.* In `vec_dot_nvfp4_q8_1` replace both `get_int_from_table_16(get_int_b4(bq4->qs, iqsN),
+   kvalues_mxfp4)` with `get_int_from_mxfp4(get_int_b4(bq4->qs, iqsN))`. The test compares
+   `get_int_from_mxfp4(x)` with `get_int_from_table_16(x, kvalues_mxfp4)` for every `x` whose four bytes each
+   take all 256 values with the other three at 0x00, 0xff and one mixed pattern, and for the 65536 combinations
+   of four low-nibble codes with a fixed high nibble.
+2. *The scale.* `ggml_sycl_ue4m3_to_fp32` becomes:
+
+```cpp
+static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
+    // exp > 0: (1 + man/8) * 2^(exp - 8), written as its bits. exp == 0: man * 2^-10. 0x7f and 0xff read as 0.
+    const uint32_t exp     = (x >> 3) & 0xfu;
+    const uint32_t man     = x & 0x7u;
+    const uint32_t bits    = ((exp + 119u) << 23) | (man << 20);
+    float          normal;
+    memcpy(&normal, &bits, sizeof(float));
+    const float small  = (float) man * 0x1p-10f;
+    const float value  = exp == 0 ? small : normal;
+    return (x & 0x7fu) == 0x7fu ? 0.0f : value;
+}
+```
+
+   The test keeps the replaced body as a local reference function and compares the bits of both for all 256
+   bytes. Keep the reference in the test, not in the header.
+
+**Acceptance Criteria:**
+- [x] *Amended (lead, 2026-11-24): an equivalence test cannot fail first, because both rewrites return the same
+      bits by design.* The source contract `test-sycl-nvfp4-decode-source` fails before each GREEN commit for the
+      reason it names and passes after, and the first contract sweep selects it. The host test
+      `test-sycl-nvfp4-decode-host` is a guard that passes before and after, run by name in the hand-back.
+- [x] Full build; the two source-contract sweeps with only the known eight red; inventory check 0.
+- [x] Lead runs, each once, after each of the two commits: the kernel profiler row
+      `mulmat.mmvq.id_aos_nvfp4` at both decode shapes against 179.4 us and 113.8 us; one ABBA on the B70 against
+      the merged tree.
+- [x] Lead runs, once, on the final head: `sycl-q1-nvfp4-admitted-device` on both cards and
+      `sycl-q1-nvfp4-adapter-device`; `test-backend-ops -o MUL_MAT_ID` and `-o MUL_MAT` on each card with no case
+      changing status; the Inkling gate on the B70, the B50 alone and both cards; one fixed-seed 64-token
+      completion whose text equals the merged tree's.
+- [x] *Changed on purpose (lead, 2026-11-24).* The rule was: a commit whose profiler row moves by less than 3% at
+      both shapes is not merged. The scale commit moved it by 2.3% and 1.8% and is merged. The rule now reads: such
+      a commit is not merged if it adds code or complexity to the kernel; one that adds none is kept and recorded
+      as neutral. Reason in the record below.
+
+**Gotchas:**
+- `vecdotq.hpp` and `common.hpp` are included by the device kernels: a full build, not a named target, before the
+  hand-back. Take no build while a lead bench runs (the lead says when).
+- The codes' sign: code 8 is minus zero and must decode to 0; the arithmetic decode already does.
+- Do not change `get_int_from_table_16`, `kvalues_mxfp4`, the MXFP4 functors or `mul_mat_vec_q_id`.
+- Never `clang-format-19 -i`; check with `git-clang-format-19 --diff <base>` on the touched files.
+
+**Commits:** `sycl: the NVFP4 dot product decodes its codes arithmetically` and
+`sycl: the UE4M3 scale is built from its bits`, each preceded by its `tests:` RED commit, path-scoped.
+
+**Done (lead, 2026-11-24; branch `task/inkling2-t19` at `fdcba0872`; evidence
+`docs/backend/data/inkling2/t19-lead-runs-cb9b34792.txt`; the lead's rulings are in `t19-lead-rulings.md` beside
+it).**
+- *What was built.* `vec_dot_nvfp4_q8_1` decodes its two code ints with `get_int_from_mxfp4`, the arithmetic decode
+  the MXFP4 functor already used, where it had `get_int_from_table_16` (six emulated byte permutes per int).
+  `ggml_sycl_ue4m3_to_fp32` writes the float's exponent and mantissa fields where it had three compares, a branch
+  and `sycl::ldexp`. Both return the same bits as before for every input.
+- *Measured, B70, driver 26.44, no builder alive.* The kernel row `mulmat.mmvq.id_aos_nvfp4` per launch at the two
+  decode shapes: 179.4 and 113.8 us before, 75.2 and 51.2 us after the codes, 73.5 and 50.3 us after the scale. The
+  prompt shape (112 pairs) went from 2484 and 1554 us to 884 and 588 us. The BF16 expert row is equal to 0.2 us in
+  all three profiles. Interleaved bench on the final device-run head, pp512 / tg128 in t/s, in run order: before
+  47.36 / 21.20, after 76.71 / 25.38, after 77.65 / 25.45, before 47.22 / 21.20. The pair after the codes alone
+  read 47.68 / 21.21, 76.75 / 25.26, 76.34 / 25.20, 47.11 / 21.21. Prompt +63%, decode +20%.
+- *Unchanged elsewhere, final head `cb9b34792` (the later commits change tests only).* The admitted device test
+  passes on both cards and the adapter device test on the B70. `test-backend-ops -o MUL_MAT_ID`, `-o MUL_MAT`,
+  `-o CPY` and `-o GET_ROWS` change no case on either card against the before-change census. The Inkling gate
+  passes on the B70, the B50 alone and both cards. A fixed-seed 64-token completion on the B70 is byte-equal to the
+  merged tree's.
+- *The 3% rule, changed on purpose.* The scale commit is under the bar and stays. The rule was written to keep
+  complexity that does not pay out of the kernel. This body adds none: it removes a branch and a library call and
+  has the form of the E8M0 helper beside it. Taking it out would be a revert, a rebuild and a second device set for
+  no gain. It is recorded as neutral; the gain of this task is the code decode.
+- *Reviews.* The first spec review passed the production code and failed the guard test: its high-nibble sweep
+  multiplied by `0x11111111` where `0x01010101` was meant, so only the high-nibble-zero case ran all 65536
+  combinations (16 at worst) while the comment and the commit message claimed all sixteen. The generator now
+  checks each input it makes. The quality review passed with minors: the source contract had pinned spellings and
+  now pins the form only (no table decode, no `ldexp`, no branch, the value read from its bits), with values left
+  to the host test; the host test's header says why its sweeps stand for every input and why the fast float
+  model cannot change a result. The reviewer compared the two code decodes on all 2^32 inputs in a host model:
+  no mismatch. A re-review found two more in the contract (a `sizeof(float)` spelling still pinned; a direct
+  `kvalues_mxfp4` read in the functor not refused), fixed in a Python-only commit, and the last re-review passed.
+  Its one note, that a `memcpy` with source and destination swapped would pass the contract, is not taken: that
+  is a value error and the host test's 256-byte comparison catches it.
+- *A lead mistake, kept as a record.* The task text asked for an equivalence test as the failing test of each
+  commit. The implementer's checkpoint caught that it cannot fail. A later round then had the contract pin the
+  helper's select by its spelling, at a reviewer's request passed on by the lead, and the next review had it taken
+  out again: a source contract pins the form a change must keep, a value belongs to a test that computes it.
+- *What `test-backend-ops` does not cover here.* On this backend it runs no NVFP4 case for `MUL_MAT` or
+  `GET_ROWS` (all "not supported") and three for `CPY`. The cover for the changed functor is the `MUL_MAT_ID`
+  census, the two device tests and the text comparison.
+- *Merged (`4966f1473`, evidence `docs/backend/data/inkling2/t19-merged-4966f1473.txt`).* The merged build passes
+  the Inkling gate on the B70 and one bench load reads 77.70 / 25.26.
+- *Where a prompt token goes now (691 tokens, 9.6 s, 72 t/s under the stage profiler).* Two items carry it.
+  The non-MoE matmul stage holds the submitting thread for 3.8 s while its kernels run for 1.1 s: the rest is
+  199,440 oneDNN GEMM submissions at 19 us of host time each (row S8, one GEMM per batch element of a 3-D F32
+  `MUL_MAT`). The NVFP4 expert kernel is 3.1 s of device time, 6.4 us per (token, expert) pair where it was 22 us
+  before this task; the BF16 expert kernel is 0.6 s. Attention is 0.4 s.
+- *Where a decoded token goes now (39.6 ms in the bench).* Directly dispatched kernels are 11.9 ms of device time,
+  6.8 ms of it the NVFP4 expert kernel. The 96 `MUL_MAT_ID` nodes cost 87 us of host time each, 8.3 ms. The stage
+  host times nest (they sum to more than the profiler's wall), so they rank and do not add.
+- *Order from here.* Prompt first, by share: row S8 (39% of the prompt, a contained change by the earlier read),
+  then the NVFP4 prompt kernel (33%; whether grouping tokens per expert pays is not known, because the decode
+  shape shows this kernel bound by arithmetic and not by memory). Decode: the per-node host cost, then the
+  kernel's lane geometry.
+
+### Task 20: A batched F32 `MUL_MAT` is one oneDNN matmul, not one per batch element (written 2026-11-24)
+
+**Track:** S3-prompt (row S8). **Depends on:** Task 19 (merged, `4966f1473`).
+**Found by:** the merged tree's prompt profile (`docs/backend/data/inkling2/t19-merged-4966f1473.txt`) and a
+read-only trace of the path on `05569a4f4` (explorer, 2026-11-24).
+
+**Description (read, not run; line numbers move, find each site by name):**
+- Inkling builds three kinds of F32 x F32 `MUL_MAT` whose batch dimension is the token count T, all on
+  activations, none on a weight:
+  - `graph::mix` (`src/models/inkling2.cpp`), two per call: `scores = mul_mat(states, queries)` with
+    `states` [n_embd, nb+1, T] and `queries` [n_embd, nq, T], and `mul_mat(cont(transpose(states)), scores)`
+    with [nb+1, n_embd, T] and [nb+1, nq, T]. Both operands carry the batch.
+  - the relative-position bias table: `mul_mat(pad(attn_rel_bias), Rcur)` with a 2-D src0 [n_rel, n_extent+1]
+    and `Rcur` [n_rel, n_head, T]. src0 is broadcast over the batch.
+- An F32 src0 reaches the generic loop in `ggml_sycl_op_mul_mat` (`ggml-sycl.cpp`):
+  `for (i0 = 0; i0 < ne13 * ne12; ++i0)`, one call of `ggml_sycl_op_mul_mat_sycl` per plane, whose F32 arm calls
+  `DnnlGemmWrapper::row_gemm` (`gemm.hpp`), which is `gemm(...)` with both batch counts 1.
+- Each `gemm()` call takes the queue's exec mutex, builds a primitive key and three memory descriptors, looks the
+  primitive up under a global mutex, constructs three `dnnl::memory` objects, fetches the scratchpad, builds an
+  argument map and a profiler record, and executes. Measured: 19 us of host time per call, 199,440 calls for a
+  691-token prompt, 3.8 s of a 9.6 s prompt, for 0.44 s of device time.
+- `DnnlGemmWrapper::gemm` already takes `batches_a` and `batches_b` and builds 3-D descriptors
+  ({batches, m, k}, {batches, k, n}, {max, m, n}); a batch of 1 on either side broadcasts. The F16 batched route
+  (`ggml_sycl_mul_mat_batched_sycl`, predicate `ggml_sycl_mul_mat_f16_route_of` in `nonfa-stage.hpp`) calls it
+  that way. It refuses F32 src0 only by its type check. No F32 batched route exists.
+- The mapping the loop uses, to keep: `gemm(a = src0, b = src1)`, m = ne01, n = ne11, k = ne10, A strides
+  {1, k, k*m}, B strides {1, k, n*k}, `ldc = ne0`; dst[n][m] = sum over k of src0[m][k] * src1[n][k]. C's batch
+  stride is fixed at `ldc * n`, so dst must be dense across planes.
+- `gemm()` labels every call `mulmat.onednn_gemm.unbatched`, batched or not.
+- Decode has T = 1: these nodes have batch 1 there and are not this task's.
+
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (the route and its dispatch in `ggml_sycl_mul_mat`),
+  `ggml/src/ggml-sycl/nonfa-stage.hpp` or a new small header beside it (the predicate), `ggml/src/ggml-sycl/gemm.hpp`
+  (the profiler label only).
+- Create: a host test of the predicate, a device test of the route, a source contract; their registrations.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Confirm or correct each line of the description against the code, with file:line.
+2. How the F16 batched route resolves its operand pointers and their owners, what it does with the event `gemm()`
+   returns, and what orders a later reader of dst after the GEMM. State what the F32 route must do to be at least
+   as safe: which `mem_handle`s exist for src0, src1 and dst on this path, and whether anything must be retained
+   until the event. Is the queue in-order, and where is that established?
+3. The primitive cache: is it bounded, and what does a miss cost? The batched key contains T. A server sees many
+   prompt lengths. Read the installed oneDNN headers and documentation (not memory) for whether a GPU matmul
+   primitive can be created with a runtime batch dimension (`DNNL_RUNTIME_DIM_VAL`) and whether this build's
+   engine supports it. Report what you find; do not adopt runtime dimensions without the lead's ruling.
+4. Graph recording: is a prompt graph recorded or replayed at all, and does the scratchpad pre-sizing before a
+   recording read the primitive cache in a way a new batched key changes?
+5. Whether `Rcur` (the output of `clip`) and the two `mix` operands are contiguous at dispatch, by reading the
+   graph code, and which checks the predicate needs so that a non-dense operand declines.
+6. Which `test-backend-ops` `MUL_MAT` cases (F32 x F32, batch > 1) the predicate would take, by reading the case
+   list, and which it declines.
+
+**Design (the lead's, open to correction at the checkpoint):**
+- A predicate `ggml_sycl_mul_mat_f32_batched_route_of(env)` in the form of the F16 one: a pure function over a
+  small struct, testable on the host. It takes a node only when all hold: src0, src1 and dst are F32; the batch
+  `ne12 * ne13` is above 1; `ne02 * ne03` equals it or equals 1; no operand is a weight; no operand is
+  transposed or permuted; all three are contiguous; the node is not split across devices and its operands are in
+  this device's memory. Everything else declines to the loop that exists. A decline is not a refusal: no throw,
+  no failed graph, no log above debug.
+- The route submits one `DnnlGemmWrapper::gemm` with the batch counts and the mapping above. If `gemm()` declines,
+  the node falls through to the existing loop (the F16 route's decline behaviour is the model; state it).
+- No allocation, no copy, no conversion, no host wait, no host read of an operand. Operands stay where they are.
+- `gemm()` labels a call with a batch above 1 `mulmat.onednn_gemm.batched`. The F16 batched route's calls move to
+  that row with it; adapt the source test that pins the label.
+
+**Implementation, each RED then GREEN:**
+1. `tests:` the host test of the predicate (every accept and decline condition, one case each, and the three
+   Inkling shapes by their dimensions) and the source contract (the route is consulted before the orchestrator
+   and calls `gemm` once with batch counts; the label). Both fail first.
+   `sycl:` the predicate, the route, the label.
+2. `tests:` a device test, labels including `device`, run by the lead only: for each of the three Inkling shapes
+   at T = 1, 2, 179 and 512, and for a 2-D src0 with a batch in dim 3 (*amended at the checkpoint: T = 1 is not
+   this route's, and that last shape never reaches the backend; see the record below*), the SYCL result against
+   a CPU oracle
+   computed in double, within a stated relative tolerance; a decline case (a permuted operand) that must give
+   the same values through the loop; and an assertion, through a counter or the profiler's own count, that the
+   taken cases made one GEMM submission and the declined case made one per plane. It must name its card in its
+   log and skip with 77 when no device is there.
+
+**Acceptance Criteria:**
+- [x] The host test and the source contract fail before the GREEN commit for the reason they name and pass after.
+- [x] Full build; the two source-contract sweeps with only the known eight red; inventory check 0.
+- [x] Lead runs, each once: the device test on both cards; `test-backend-ops -o MUL_MAT` on each card with no case
+      changing status against `t19-tbo-MUL_MAT-cb9b34792`; the Inkling gate on the B70, the B50 alone and both
+      cards; the Mistral gate on the B70 and the GPT-OSS gate on the B50.
+- [x] Lead runs, each once, on the B70: the 691-token prompt under the kernel profiler (the GEMM rows' submission
+      count against 199,440, and a cold primitive cache is part of this run on purpose) and under the stage
+      profiler (the non-MoE matmul stage against 3783 ms); one ABBA of `llama-bench` against the merged tree.
+- [x] A fixed-seed 64-token completion is compared with the merged tree's. Equal text is expected. A difference is
+      not a failure by itself (one batched GEMM may sum in another order) but is reported with the first
+      differing token and the device test's measured error.
+
+**Gotchas:**
+- GPU and model-loading runs are the lead's. The implementer builds, runs host tests and the contract sweeps.
+- `ggml-sycl.cpp` is about 90k lines and the codescout index misses matches in it: locate with
+  `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<pattern>'`.
+- Take no build while a lead bench runs (the lead says when).
+- Never `clang-format-19 -i`; check with `git-clang-format-19 --diff <base>` on the touched files.
+- A new model-loading or device test must carry a label the safety net knows (`.claude/rules/ctest-registration.md`).
+
+**Commits:** `sycl: a batched F32 MUL_MAT is one oneDNN matmul`, preceded by its `tests:` commit; then the device
+test's `tests:` commit. Path-scoped.
+
+**Done (lead, 2026-11-24; branch `task/inkling2-t20` at `3a7d15d36`; evidence
+`docs/backend/data/inkling2/t20-lead-runs.txt`; the lead's rulings, R1-R8, D1-D6, M1-M4 and Q1-Q10, are in
+`t20-lead-rulings.md` beside it and win over the task text above where they differ).**
+- *What was built.* An F32 x F32 `MUL_MAT` on activations whose batch is above 1 is one `DnnlGemmWrapper::gemm`
+  call where it was one per plane. Two cases: both operands carry the batch (one batched matmul), or src0 is 2-D
+  and src1's batch is folded into the columns of one plain GEMM. The tensor predicate
+  `ggml_sycl_mul_mat_f32_batched_route_of` and the environment predicate `..._env_admits` are in `nonfa-stage.hpp`;
+  the route is an else-if link of the F16 chain in `ggml_sycl_mul_mat`, asked only for a node no F16 branch took.
+  It declines to the per-plane loop for a weight, a split node, tensor parallel, an active recording, an operand
+  not on this device, a non-contiguous operand, or a null resolved pointer. It allocates nothing, copies nothing
+  and adds no host wait: it uses the dispatch's resolved operands and orders its GEMM after their ready events.
+- *The float mode (ruling R8), found by the device test's printed figures.* `gemm()` set `fpmath_mode::f16` on every
+  primitive in this build. oneDNN uses that licence per shape and per card: for the mix-scores shape the loop was
+  F32-exact on the B70 (2e-7) and the first route was not (7e-4). `gemm()` now takes the mode as a parameter
+  (`ggml_sycl_dnnl_fpmath`, default = what it did), the primitive key carries it, and the route passes
+  `GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT`. After that the route's worst error is 2.7e-6 on both cards, the same
+  figures on the B70 and the B50, inside the F32 bound `(K + 1) * 2^-24` the test holds it to. The loop's mode and
+  every other caller of `gemm()` are unchanged.
+- *Measured, B70, driver 26.44, no builder alive, each once.* GEMM submissions for a 691-token prompt: 199,440
+  before, 1,008 after (480 batched, 20.5 ms of device time; 528 unbatched, 11.9 ms). The non-MoE matmul stage's host
+  time: 3783 ms before, 212 ms after. Interleaved `llama-bench`, pp512 / tg128 in t/s, in run order: merged tree
+  76.70 / 25.16, task 111.78 / 25.30, task 111.42 / 25.36, merged tree 77.58 / 25.19. Prompt +45%, decode unchanged
+  (T = 1 nodes are not this route's). The bench was run on `55fa1fb12`; the later heads were not benched again:
+  the 691-token prompt under the kernel profiler read 100.5 t/s at `55fa1fb12` and 100.4 t/s at the final head.
+- *Unchanged elsewhere.* `test-backend-ops -o MUL_MAT` changes no case on either card against
+  `t19-tbo-MUL_MAT-cb9b34792` (run at `55fa1fb12` and `3657fe3f3`). The Inkling gate on the B70, the B50 alone and
+  both cards, the Mistral gate on the B70 and the GPT-OSS gate on the B50 pass at both of those heads; the Inkling
+  B70 gate passes at `c2d5a5040` and `6345c83d6`. The fixed-seed 64-token text is byte-equal to the merged tree's at
+  all four heads. The device test passes on both cards at the final code head: 27 taken cases, one primitive and
+  a zero scratchpad each, no shape refused up to T = 2048.
+- *Checkpoint corrections to the task text.* A node whose dim-3 sizes differ is refused by `supports_op`, so "a 2-D
+  src0 with a batch in dim 3" never reaches the backend: the device cases are equal batch in dim 2, equal batch in
+  dims 2 and 3, and a 2-D src0 broadcast over dim 2. T = 1 is not a route case (the batch must be above 1); the
+  size-1 shapes the model builds (m, n or k of 1) are covered at T = 2 and 512. Inkling prompt graphs are not
+  recorded. `ggml-sycl.cpp` is far longer than the text said.
+- *Reviews.* Spec review of `3657fe3f3`: pass, four minors (M1-M4). Quality review of `c2d5a5040`: pass, ten minors
+  and three notes (Q1-Q10); the two that changed what runs were Q1 (the first route resolved its operands a second
+  time, and a second resolver could return a host pointer for an operand whose device copy the gate had approved)
+  and Q3. Re-review of `6345c83d6`: pass, two minors (a store spelling the contract missed, one sentence in the
+  env-var page), fixed in a Python-only and a doc-only commit. The next re-review found the store check still
+  missed increments and three index spellings; it now refuses every `++` and `--` in the route body and says in
+  its docstring that it is a pattern over text, not a parser. The last re-review passed with no finding.
+- *Lead mistakes, kept as a record.* The checkpoint ruling repeated "the compute buffer's owner waits in its
+  destructor" as what orders a later reader after the GEMM. That destructor waits on another queue; the order
+  comes from the in-order execution queue and the scheduler's synchronize, and the route's comment says so (Q2).
+  The name `..._FPMATH_STRICT` the lead asked for in Q9 is refused by the tenant-plan contract, which reserves
+  `GGML_SYCL_*STRICT*`; the implementer renamed it.
+
+### Integration with master, and what a long prompt showed (lead, 2026-11-24)
+
+**What.** `master` had moved to `6687ccc7e` (the `integ/th32` merge: storage tiers, host-pinned experts,
+host-backing guards; about 1,800 commits) while this line stayed on `a6f03b1ee`. Branch `integ/inkling2-on-master`
+merges master into the line: `331457e43` (with Tasks 18 and 19), `186ebed61` (one census contract row) and
+`641c7e065` (with Task 20). Evidence: `docs/backend/data/inkling2/integ-641c7e065-lead-runs.txt`.
+- *Conflicts.* `ggml-sycl.cpp`: both sides' test counters and seam functions kept; the direct-route adapter call
+  keeps this line's `ctx.device` argument with master's `ggml_sycl_moe_direct_log_refusal`. `gemm.hpp`: master renamed
+  the primitive attribute and made oneDNN deterministic; Task 20's float-mode branch is kept on master's object (one
+  of its lines had merged without a conflict and would not have compiled). Test seam header, the lifecycle
+  contract's counts, the env-var page and the generated inventory: both sides kept, the inventory regenerated.
+- *Review of both merges (opus, read-only): pass, no finding.* A host-pinned or host-tiered operand resolves as not on
+  the device, so it cannot reach the batched F32 route; the NVFP4 resident decode route declines any expert the
+  planner put on the host. One coverage note is in the owed list.
+- *Build and contracts at `641c7e065`.* Full build `[786/786]`. The two fixed sweeps: five red, all red on master itself
+  (`test-llama-context-cpu-only-compile`, `test-sycl-runtime-registry-index-source`,
+  `sycl-private-cpu-traits-source`, `test-llama-lazy-declaration-source`, `test-llama-lazy-range-record-source`).
+  Six of this line's old eight are green on the new base, `test-sycl-dnnl-decline-consumers` among them.
+- *Device checks, each once.* The Task 20 device test and the NVFP4 admitted test pass on both cards; the Inkling
+  gate passes on the B70, the B50 alone and both cards; the Mistral B70 and GPT-OSS B50 gates pass; the fixed-seed
+  64-token text is byte-equal to the pre-merge tree's; `test-backend-ops -o MUL_MAT` changes no case on either card.
+- *`llama-bench -p 512 -n 128`, interleaved, each run once, pp / tg in t/s.* Inkling B70, before the merge against
+  integrated: 112.2 / 25.2 and 112.3 / 25.3 against 113.3 / 27.6 and 112.3 / 27.6. Mistral B70, master against
+  integrated: 3356 / 107.9 and 3350 / 108.2 against 3349 / 108.1 and 3355 / 107.9. GPT-OSS B50: 874.7 / 35.5 and
+  872.5 / 35.7 against 873.0 / 35.7 and 872.7 / 35.8.
+
+**The long real-text arm (user direction, 2026-11-24: "we should test things with longer prompts so we actually
+exercise real usage").** A 4,737-token document (5,037 in Mistral's tokenizer) and 255 generated tokens, seed 42, temperature 0, through the
+completion tool (Inkling, Mistral) or the chat tool (GPT-OSS). From now on every verification round of this plan
+carries this arm. Runner: the lead's `run-long.sh`; it becomes a script in `scripts/` when Task 21 lands.
+
+| model, setup | before | integrated |
+|---|---|---|
+| Inkling, B70, `-c 8192` | 92.0 pp, 23.95 tg, peak host backing 49 GiB | 92.3 pp, 26.1 tg, 21 GiB |
+| Inkling, both cards | 92.3 pp, 23.96 tg, 49 GiB | 92.3 pp, 26.2 tg, 21 GiB |
+| Inkling, B50 alone | 16.3 pp, 6.3 tg, 57 GiB | 18.9 pp, 7.1 tg, 21 GiB |
+| GPT-OSS, B70, default context | 1043 and 1105 pp, 48.6 and 50.7 tg | 1098 and 1100 pp, 50.1 and 50.5 tg |
+| GPT-OSS, B50, default context | 119 and 128 pp, 20.7 and 20.0 tg | 133 and 120 pp, 21.3 and 21.0 tg |
+| Mistral, B70, `-ub 512` | 2451 pp, 88.7 tg (first run of the pair, cold: 1519) | 2452 and 2366 pp, 88.5 tg |
+| Mistral, B50, `-ub 512` | 1064 pp, 39.4 tg (first run, cold: 879) | 1063 and 1063 pp, 39.4 tg |
+
+("before" is the Inkling line before the merge for Inkling and a clean master build for the others; pp and tg in
+t/s; each run once.) The integrated tree is not slower than its before-arm anywhere. What the arm found that the
+short gates and the bench had not:
+1. **Mistral cannot process a long prompt with default flags, on master and on the integrated tree, on both
+   cards.** The context is created with an auto micro-batch of 2048 (`[SYCL-PLAN] auto n_ubatch=2048 for n_ctx=32768
+   n_batch=2048 (tried 2048; cached)`) while the load plan measured its compute slot at 512, and the first prompt
+   graph is refused: `[DEQUANT-F16] graph refused before submission ... needs 112.0 MB ... planned 0.0 MB for both
+   buffers at the runtime n_ubatch=2048`. A named refusal, not a crash, and not from this line. Owed below.
+2. **GPT-OSS on the B50 at its default context does 119-133 t/s on a long prompt** against 874 from the bench, and
+   21 t/s of decode against 35.7. The same on both trees. Owed below.
+3. **Inkling's real prompt speed is 92 t/s, not the bench's 112**, and on the B50 alone it is 19 / 7 t/s.
+4. **Before the merge, Inkling's long-prompt text was not reproducible run to run** on the B70 (two runs of the same
+   tree diverge after the fifth bullet). The integrated tree's two runs are byte-equal: master made oneDNN
+   deterministic. So the long arm's text check is run-to-run equality on the new tree and a read of the output,
+   not equality with the before tree.
+5. **Inkling with no `-c` is refused by name** (training context 1,048,576: the compute buffer would need 150 GiB).
+   The Inkling gate and every run of this plan pass a context; that is a request, not a shrink.
+
+**Prompt-speed direction (lead's decision, 2026-11-24, after the user's "100 pp is really low ... it should be
+able to run like thousands").** The arithmetic agrees with the user. One Inkling token is 48 MoE layer applications
+of 8 experts (3.06e9 weight-activation products, from the profiler's launch counts) plus about 1.3e9 in dense
+layers: 4.3e9 products, about 60% of a Mistral token. Mistral runs at about 3,350 t/s on the B70. GPT-OSS, the
+MoE this backend is fastest on, does 2.4e9 expert products per token at about 1,100 t/s on a long prompt. At
+GPT-OSS's end-to-end rate Inkling would do about 600-800 t/s; at Mistral's, several thousand.
+- *Why it does 92.* The NVFP4 expert kernel is 3.2 s of a 6.9 s 691-token prompt, at 0.69e12 products per second:
+  one work-group per (token, expert) pair, each re-reading and re-decoding its expert's rows; at 512 tokens an
+  expert is used by 32 tokens on average. The BF16 expert kernel has the same structure (0.30e12). Dense BF16
+  weights run at 1.5e12. About 1.8 s is host time over 22,825 submissions.
+- *What GPT-OSS does (read by an explorer on `641c7e065`, not run).* Its default prompt path is not the tiled DPAS
+  kernel (that measured 461 t/s) but the grouped oneDNN executor `try_pp_onednn_f16_batched` (owner ruling
+  `llama.cpp-iikr`, 2026-08-25): a host counting sort of the ids, one launch that repacks the active experts from
+  their loaded layout into weight-only-quantised planes in the planned scratch ring, a gather of each expert's
+  rows as F16, one oneDNN GEMM per expert, a scatter. About twenty other quant types take the same executor
+  through an F16 dequant into the same planned slot. NVFP4 and Q1_0 are excluded from it
+  (`moe_type_needs_direct_kernel`, `moe_pp_batched_f16_supports_layout`).
+- **Decision: NVFP4 experts take the grouped oneDNN prompt executor.** This reverses this plan's earlier reading
+  (row S4: "a grouped NVFP4 kernel is a new kernel on the loaded AOS layout", because the executor "converts the
+  weights to F16"). Reason: the loaded layout of the weight does not change and no second layout is kept; the
+  executor's planes are per-dispatch scratch in a zone the planner sizes, which `docs/backend/sycl-memory-design.md`
+  and `.claude/rules/sycl-backend.md` already class as layout work on device-resident data, and which is this
+  fork's default prompt design for every other expert type since the 2026-08-25 ruling. A hand-written grouped
+  kernel on AoS stays the fallback if the probe below fails: the explorer's read puts its ceiling at a quarter
+  of the oneDNN class. Decode keeps the resident route of Tasks 18 and 19.
+- *The risk that decides the design:* Inkling has 128 experts, all active at 512 tokens, against GPT-OSS's 32. A
+  gather, a GEMM and a scatter per expert is about 400 submissions per node and 96 nodes per ubatch: at the
+  measured 23 us per submission that alone is 0.9 s per 512 tokens. The stage kernels and the GEMM must be batched
+  over experts (the executor's 3-D arm is opt-in because it gives wrong numbers at HEAD).
+
+### Task 21: NVFP4 experts take the grouped oneDNN prompt executor (written 2026-11-24)
+
+**Track:** S3-prompt (row S4). **Depends on:** the integration above. **Base:** `integ/inkling2-on-master`.
+
+**Checkpoint before any GREEN code (report to the lead, then wait). Read on the task's own base; cite file:line:**
+1. Every site that excludes NVFP4 from the grouped executor and why each was written (`git log -S` on the
+   predicate names): `moe_type_needs_direct_kernel`, `choose_moe_batch_executor`,
+   `moe_pp_batched_f16_supports_layout`, `moe_pp_batched_woq_supports_layout`, `moe_pp_onednn_ring_serves_type`,
+   the claim predicate in `ggml_sycl_mul_mat_id`, the route capability. Which of them guard host experts (the
+   immutable host recipe, which must not change) and which guard a device-resident prompt node.
+2. The executor end to end for a type it serves through the F16 dequant (not MXFP4): the converter
+   (`convert.cpp` has an NVFP4 one: is it complete, is it exercised, what does it cost per element), the slot and
+   who plans its size, how experts are grouped when they do not all fit, what orders the GEMM after the repack,
+   what is waited on. State every allocation and its owner.
+3. The ring and the slot for Inkling on each setup: 128 experts of 2304 x 2304 and 1152 x 2304 in F16 are 1.36 GB
+   and 0.68 GB per node. What the planner reserves today for this model (it plans no ring for NVFP4), what it
+   must reserve, and what that displaces on the B70 (32 GB) and the B50 (16 GB, experts partly host-pinned).
+   Never by shrinking the context.
+4. oneDNN weight-only quantisation: read the installed oneDNN's headers and documentation (not memory) for
+   whether a GPU matmul takes `f4_e2m1` weights with a scale group of 16 along K and which scale data types it
+   accepts. NVFP4's scale is UE4M3, one per 16 elements, plus a per-expert F32 scale tensor. Say whether a probe
+   is needed and write it as a device test the lead runs.
+5. Host cost: submissions per node for 128 active experts in the per-expert arm; what is wrong in the 3-D arm
+   (`gemm.hpp`, the comment at its opt-in) and what `gemm_batch_strided` needs from the slot's layout; a design
+   that makes the count independent of the number of experts.
+6. Numerics: the executor multiplies F16 activations by decoded weights, the kernel in use multiplies Q8_1
+   activations. Which is closer to the CPU reference, and what the device test must bound.
+7. The mixed card-and-host node and the two-card split: what the executor does with an expert that is not on this
+   card, and what the Inkling B50-alone setup (most experts host-pinned) takes.
+
+**The lead rules on the design after the checkpoint.** Expected shape, to be confirmed or corrected: step 1 the
+F16 dequant arm for device-resident NVFP4 prompt nodes with a planned slot (measured on the long prompt); step 2
+batching over experts; step 3 the weight-only-quantised arm if oneDNN takes group 16; BF16 experts and dense BF16
+weights follow in Task 22 on the same executor.
+
+**Acceptance (each lead run once, B70 first):** the long real-text arm on Inkling: pp at least 2x the 92 t/s of
+this record or the task stops and reports why; text byte-equal run to run and read for sense; decode not slower;
+peak host backing not higher. The Inkling, Mistral B70 and GPT-OSS B50 gates; `test-backend-ops -o MUL_MAT_ID`
+with no case changing; the two contract sweeps with no new red; the interleaved bench against the integrated
+tree; the same long arm on the B50 alone and on both cards. No `-ngl`, no context shrink, no new host wait, no
+allocation outside the unified cache.
 
 ---
 
@@ -6160,6 +6718,81 @@ host-to-device copy with a wait. These are the first candidates for the profile 
 *Decisions that are the user's (asked, not answered):* the eight contracts that are red on `master`; the
 interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkling2`; replacing the system
 `mkdir`.
+
+*Left by Task 18 (2026-11-24):*
+- **The BF16 direct route has the publication window Task 18 closed for NVFP4**: a by-value retain after the
+  submit, and a profiler record that can throw between them. A lifetime defect of the same kind; the fix is the
+  same retention object.
+- The remaining host cost of a resident NVFP4 node is 107 us. Known parts: a snapshot of about 130 handle copies per
+  node (a shared immutable lease set per table generation removes it), one unified-cache allocation for the Q8_1
+  slice, a wake of the drain worker per publication, and costs outside the route that every `MUL_MAT_ID` node
+  pays (two clock reads, census counters, two `strstr` calls on the tensor name ahead of a probe flag, the
+  pending-scatter check).
+- The route throws under graph recording and turns MoE graphs off for the context. Recording the node needs a
+  Q8_1 slice that outlives one node.
+- The prompt path is unchanged: every prompt node declines with `reason=prompt`.
+- The admitted route resolves src1 and dst without checking that they are on this card, and its adapter's
+  refusal line does not name which check failed (a launch past an int reads as `step=adapter`).
+- A table upload that keeps failing republishes every expert slice on every node and moves the weight's storage
+  generation each time, which also invalidates the other card's table memo. A retry bound is not designed.
+- `mmvq_profile_label` looks the device up from the queue on every node with the profiler off. The drain worker's
+  own insert into the failed-wait list does not use `retained_vector_make_room`.
+- The route's plan memo and its once-per-reason decline bits are written without a lock. Correct while one thread
+  computes a context's graphs, which is the only supported use.
+- Lead tooling: the profile runner counts the two-card startup warning as a device loss (a false 1 on every
+  two-card profile run); the gate runner already excludes it.
+
+*Left by Task 19 (2026-11-24):*
+- **The MXFP4 kernels in `mmvq.cpp` still decode with `get_int_from_table_16(..., kvalues_mxfp4)`**, the emulated
+  permute Task 19 took out of the NVFP4 functor: the sites near lines 4382, 5570-5644 and 6922, and
+  `moe_get_int_from_table_16` in `fused-moe-esimd.hpp` (414, 763). Only the MXFP4 functor in `vecdotq.hpp` uses the
+  arithmetic decode. GPT-OSS is MXFP4. Which of these sites a GPT-OSS token or prompt runs is not measured; a
+  profile decides whether the same swap pays there.
+- The NVFP4 expert kernel costs about 5.4 ms per decoded Inkling token against about 2.8 ms at the card's measured
+  bandwidth. Next on it, by the explorer's read: lane-filling geometry (56% and 75% of the lanes work at these
+  column counts), then the dot product's `dpct::dp4a` emulation.
+- `test-backend-ops -o MUL_MAT` fails one case on both cards before any Task 19 change:
+  `MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,...)`. Not diagnosed.
+- `test-backend-ops -o MUL_MAT_ID` fails 12 NVFP4 cases on the B70 before and after (`m=512,n=1,k=256`), part of
+  the unclean baseline recorded above. Not diagnosed; they are decode shapes.
+- The host guard `test-sycl-nvfp4-decode-host` carries `sycl;quant;hostonly`: neither fixed contract sweep selects
+  it. It runs by name and in the full sweep.
+
+*Left by Task 20 (2026-11-24):*
+- **The oneDNN primitive cache grows by one entry per distinct prompt-ubatch token count and shape.** The batched
+  key contains T. A server that sees many prompt lengths keeps one primitive for each, for the life of the process.
+  Runtime dimensions (`DNNL_RUNTIME_DIM_VAL`) or a bound on the cache would end it; neither is adopted (ruling R1).
+- A `gemm()` throw at a token count nobody tested replaces a run the per-plane loop would have completed. A negative
+  memo for a refused primitive, with a fall back to the loop, is owed (ruling R5). No shape was refused up to
+  T = 2048 on either card.
+- `on_device` in the resolver's last branch is not tied to a device id: on a two-card run it says "on a device",
+  not "on this one". The route declines a split node by its own flag, so this is not reachable through the route
+  today; it is the resolver's defect.
+- A recorded batched F32 node replays through the loop with the build's f16 licence, while an eager one is computed
+  in F32. No Inkling prompt graph is recorded today.
+- No device test reaches the ready-event path of the route: the device test's operands are complete when the node
+  runs. The cover is the source contract and `tests/test-sycl-chain-same-queue-source.py`.
+- `scripts/check-sycl-dnnl-decline-consumers.py` is not a usable gate: one of its mutants survives ("caller 1
+  rethrows the named error as std::exception"), so it is red before and after any change.
+- The NVFP4 prompt kernel is now the largest part of an Inkling prompt: about 3.2 s of a 6.9 s 691-token prompt.
+
+*Left by the integration with master and the long-prompt arm (2026-11-24):*
+- **Mistral 7B refuses any prompt longer than one micro-batch with default flags, on master.** The auto micro-batch
+  is 2048 (cached: "ladder exhausted") and the load plan is told 512, so the dense F16 dequant buffers are planned
+  at 0 MB for the runtime size and the first graph is refused (`llama.cpp-479i` names the refusal). With `-ub 512`
+  the same prompt runs at 2,451 t/s on the B70 and 1,063 on the B50. The auto size and the plan must come from
+  one number. Not from this line; master's defect, found by the long arm.
+- **GPT-OSS on the B50 at its default context: 119-133 t/s on a 4.7k-token prompt and 21 t/s of decode**, against
+  874 and 35.7 from `llama-bench`. Not diagnosed here (the default context is 131072; what the KV room displaced
+  was not read). The bench figure overstates real use on that card by 7x.
+- Master's `test-backend-ops -o MUL_MAT_ID` fails one Q8_0 case on both cards
+  (`type_a=q8_0, n_mats=16, n_used=16, m=32, n=65536, k=256`), on the clean master build as well.
+- Master's grown-WEIGHT arm of `test-q1-nvfp4-admitted-device` ("deferred-bind-grown-weight") runs its NVFP4 case
+  through this line's resident route, so only its Q1_0 case shows the admitted route on that fixture.
+- A cold first run is 20-40% slower on a Mistral long prompt (1519 against 2451 t/s): the first arm of a pair
+  must not be read alone.
+- `llama-bench`'s random tokens gave Inkling 112 t/s where real text gives 92: the bench stays a regression
+  instrument, the long arm is the speed that is reported.
 
 ---
 
