@@ -82,11 +82,12 @@ inline std::atomic<int64_t> & args_map_calls_accum() {
 
 // The float math a gemm() primitive may use. BUILD is the build's choice: fpmath f16 under GGML_SYCL_F16, which lets
 // oneDNN round f32 inputs to f16 where it chooses to, and otherwise no fpmath call, so oneDNN's process default
-// applies. STRICT sets fpmath strict on the primitive: no down-conversion, whatever the build or the process default.
-// dnnl::fpmath_mode cannot stand in for this, since it has no value for "no fpmath call".
+// applies. NO_DOWNCONVERT sets fpmath strict on the primitive: no down-conversion, whatever the build or the process
+// default. dnnl::fpmath_mode cannot stand in for this, since it has no value for "no fpmath call". The value does not
+// say STRICT because every GGML_SYCL_*STRICT* name belongs to the strict-leases abort switch.
 enum ggml_sycl_dnnl_fpmath {
     GGML_SYCL_DNNL_FPMATH_BUILD,
-    GGML_SYCL_DNNL_FPMATH_STRICT,
+    GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT,
 };
 
 struct DnnlPrimitiveKey {
@@ -408,7 +409,7 @@ class DnnlGemmWrapper {
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
-        if (fpmath == GGML_SYCL_DNNL_FPMATH_STRICT) {
+        if (fpmath == GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT) {
             primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::strict);
         } else {
 #    ifdef GGML_SYCL_F16
