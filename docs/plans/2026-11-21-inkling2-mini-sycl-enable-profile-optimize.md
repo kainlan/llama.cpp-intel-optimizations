@@ -6075,6 +6075,93 @@ any host or secondary expert keeps the admitted route of Task 8c unchanged.
   about 560 GB/s on both shapes), so the NVFP4 kernel is bound by its arithmetic, not by memory: at that read rate
   its 88 calls would cost 2.8 ms.
 
+### Task 19: The NVFP4 dot product decodes its codes and its scale without the emulated permute (written 2026-11-24)
+
+**Track:** S3-decode (row S9). **Depends on:** Task 18 (merged, `8af32c220`).
+**Found by:** a read-only trace of the kernel on `d538f7c74` (explorer, 2026-11-24) against the merged tree's
+profile (`docs/backend/data/inkling2/t18-merged-8af32c220.txt`).
+
+**Description (read, not run; line numbers move, find each site by name):**
+- A decode call launches `mul_mat_vec_q_id` (`mmvq.cpp`) with one 32-lane sub-group per (expert, row) pair. Each
+  lane calls `vec_dot_nvfp4_q8_1` (`vecdotq.hpp`), which decodes four ints of E2M1 codes with
+  `get_int_from_table_16(..., kvalues_mxfp4)` and two UE4M3 scales with `ggml_sycl_ue4m3_to_fp32` (`common.hpp`).
+- `get_int_from_table_16` is six `dpct::byte_level_permute` calls, each emulated with 64-bit shifts. The comment
+  above `mxfp4_codes_to_int8` in `vecdotq.hpp` records that this made the MXFP4 mat-vec compute-bound on Intel
+  GPUs; `vec_dot_mxfp4_q8_1` was moved to the arithmetic decode `get_int_from_mxfp4`. NVFP4 uses the same code
+  table and was not moved.
+- `ggml_sycl_ue4m3_to_fp32` has three compares and a `sycl::ldexp` per scale; NVFP4 has a scale per 16 elements,
+  twice MXFP4's rate. MXFP4's scale is built from bits (`sycl_e8m0_to_fp32_half`).
+- Both rewrites below return the same bits as the code they replace. Checked on the host in Python on 2026-11-24:
+  the arithmetic decode against the table for all 65536 combinations of four codes, the scale for all 256 bytes.
+  A host check is not the device: the task commits both checks as tests and the lead's device runs decide.
+- The same functor serves the prompt's NVFP4 expert calls and the dense NVFP4 mat-vec. `ggml_sycl_ue4m3_to_fp32`
+  is also called from `convert.cpp`, `cpy.hpp` and `dequantize.hpp`.
+- Not in this task: the launch geometry (36 and 18 blocks against 16 per sub-group pass, 75% and 56% lane use,
+  and a 4-way unroll that needs 64 blocks), `dpct::dp4a`, an f32-activation path. Each is a later task that this
+  task's measurement orders.
+
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/vecdotq.hpp` (`vec_dot_nvfp4_q8_1`), `ggml/src/ggml-sycl/common.hpp`
+  (`ggml_sycl_ue4m3_to_fp32`).
+- Test: one new host-only test of the two equivalences, and its registration.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Every call site of `get_int_from_table_16` with `kvalues_mxfp4` that an NVFP4 tensor can reach (the functor,
+   and any NVFP4 arm in `mmvq.cpp`), and which of them this task changes.
+2. How a host-only test in this tree compiles a header that uses `sycl::int2` and `__dpct_inline__` and runs with
+   no device: name the existing test you copy the pattern from, its registration and its labels.
+3. The RED you will write first for each of the two commits.
+
+**Implementation, two commits in this order, each RED then GREEN:**
+
+1. *The codes.* In `vec_dot_nvfp4_q8_1` replace both `get_int_from_table_16(get_int_b4(bq4->qs, iqsN),
+   kvalues_mxfp4)` with `get_int_from_mxfp4(get_int_b4(bq4->qs, iqsN))`. The test compares
+   `get_int_from_mxfp4(x)` with `get_int_from_table_16(x, kvalues_mxfp4)` for every `x` whose four bytes each
+   take all 256 values with the other three at 0x00, 0xff and one mixed pattern, and for the 65536 combinations
+   of four low-nibble codes with a fixed high nibble.
+2. *The scale.* `ggml_sycl_ue4m3_to_fp32` becomes:
+
+```cpp
+static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
+    // exp > 0: (1 + man/8) * 2^(exp - 8), written as its bits. exp == 0: man * 2^-10. 0x7f and 0xff read as 0.
+    const uint32_t exp     = (x >> 3) & 0xfu;
+    const uint32_t man     = x & 0x7u;
+    const uint32_t bits    = ((exp + 119u) << 23) | (man << 20);
+    float          normal;
+    memcpy(&normal, &bits, sizeof(float));
+    const float small  = (float) man * 0x1p-10f;
+    const float value  = exp == 0 ? small : normal;
+    return (x & 0x7fu) == 0x7fu ? 0.0f : value;
+}
+```
+
+   The test keeps the replaced body as a local reference function and compares the bits of both for all 256
+   bytes. Keep the reference in the test, not in the header.
+
+**Acceptance Criteria:**
+- [ ] The host test fails before each GREEN commit for the reason it names and passes after; it carries a label
+      the fixed contract sweeps select or is run by name in the hand-back.
+- [ ] Full build; the two source-contract sweeps with only the known eight red; inventory check 0.
+- [ ] Lead runs, each once, after each of the two commits: the kernel profiler row
+      `mulmat.mmvq.id_aos_nvfp4` at both decode shapes against 179.4 us and 113.8 us; one ABBA on the B70 against
+      the merged tree.
+- [ ] Lead runs, once, on the final head: `sycl-q1-nvfp4-admitted-device` on both cards and
+      `sycl-q1-nvfp4-adapter-device`; `test-backend-ops -o MUL_MAT_ID` and `-o MUL_MAT` on each card with no case
+      changing status; the Inkling gate on the B70, the B50 alone and both cards; one fixed-seed 64-token
+      completion whose text equals the merged tree's.
+- [ ] A commit whose profiler row moves by less than 3% at both shapes is not merged: the plan records the number
+      and the commit is dropped from the branch before the merge.
+
+**Gotchas:**
+- `vecdotq.hpp` and `common.hpp` are included by the device kernels: a full build, not a named target, before the
+  hand-back. Take no build while a lead bench runs (the lead says when).
+- The codes' sign: code 8 is minus zero and must decode to 0; the arithmetic decode already does.
+- Do not change `get_int_from_table_16`, `kvalues_mxfp4`, the MXFP4 functors or `mul_mat_vec_q_id`.
+- Never `clang-format-19 -i`; check with `git-clang-format-19 --diff <base>` on the touched files.
+
+**Commits:** `sycl: the NVFP4 dot product decodes its codes arithmetically` and
+`sycl: the UE4M3 scale is built from its bits`, each preceded by its `tests:` RED commit, path-scoped.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
