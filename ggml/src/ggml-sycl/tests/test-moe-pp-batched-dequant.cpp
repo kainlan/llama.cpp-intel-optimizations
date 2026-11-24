@@ -40,6 +40,9 @@
 //     never written: the CPU decode reads it as 240, the SYCL decode as 0, and no quantizer writes the sign bit;
 //   * a fused gate_up tensor (blk.0.ffn_gate_up_exps) beside a down tensor, as Inkling 2 Mini's NVFP4 layers hold
 //     them: the executor claims the fused weight as a plain matrix per expert.
+// The executor's resident claim takes the fused role for every type it runs, so Q8_0 runs the fused fixture too, at
+// 64 tokens with the activation broadcast. At this shape Q8_0 is materialized SOA where NVFP4 is AOS, so the fused
+// role meets both of the executor's readers.
 // NVFP4 and Q1_0 also have the direct MMID route, which runs ahead of the executor and steps aside for a prompt the
 // executor claims while the ring is planned (moe_mmid_direct_defers_to_executor). The success line is what shows it
 // stepped aside: had it run the node, no success line would print.
@@ -92,7 +95,7 @@ constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.
 // The fused model's two tensors: the fused gate_up weight the case runs, and the down weight.
 constexpr const char * k_fused_tensor_names[2] = { "blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight" };
 
-// What a fixture loads. Every variant but PLAIN is an NVFP4 model.
+// What a fixture loads. SMALL_SCALES and LARGE_SCALES are NVFP4 models; PLAIN and FUSED_GATE_UP take any type.
 enum class fixture_variant {
     PLAIN,          // gate, up and down, one quantization shared by all three; the gate runs
     SMALL_SCALES,   // PLAIN with every UE4M3 scale byte rewritten from k_small_scales
@@ -127,10 +130,16 @@ constexpr ggml_type k_types[] = {
 constexpr fixture_variant k_nvfp4_variants[]    = { fixture_variant::SMALL_SCALES, fixture_variant::LARGE_SCALES,
                                                     fixture_variant::FUSED_GATE_UP };
 constexpr int             k_nvfp4_variant_cases = int(sizeof(k_nvfp4_variants) / sizeof(k_nvfp4_variants[0]));
+
+// The other types that run the fused gate_up fixture, one case each.
+constexpr ggml_type k_fused_other_types[] = { GGML_TYPE_Q8_0 };
+constexpr int       k_fused_other_cases   = int(sizeof(k_fused_other_types) / sizeof(k_fused_other_types[0]));
+
 // 64 tokens with the activation broadcast to every used expert (gate/up, ne11 1), and 300 tokens with one
 // activation row per used expert (down, ne11 k_used).
 constexpr int k_cases_per_type = 2;
-constexpr int k_cases = k_cases_per_type * int(sizeof(k_types) / sizeof(k_types[0])) + k_nvfp4_variant_cases;
+constexpr int k_cases =
+    k_cases_per_type * int(sizeof(k_types) / sizeof(k_types[0])) + k_nvfp4_variant_cases + k_fused_other_cases;
 
 // The backend prints its [MOE-PP-ONEDNN-F16-BATCHED] success line at most this many times per process (the
 // batched_log counter in ggml-sycl.cpp). Each case runs one MUL_MAT_ID op and so prints one line, and a case past the
@@ -784,6 +793,13 @@ int main(int argc, char ** argv) {
         for (fixture_variant variant : k_nvfp4_variants) {
             lifecycle_fixture life(GGML_TYPE_NVFP4, rng, k_n_ubatch, variant);
             if (!run_case(life, cpu.get(), make_case(GGML_TYPE_NVFP4, 64, 1, rng), false, 0)) {
+                ++failed;
+            }
+        }
+        // After each type's plain fixture, for the same reason.
+        for (ggml_type type : k_fused_other_types) {
+            lifecycle_fixture life(type, rng, k_n_ubatch, fixture_variant::FUSED_GATE_UP);
+            if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng), false, 0)) {
                 ++failed;
             }
         }
