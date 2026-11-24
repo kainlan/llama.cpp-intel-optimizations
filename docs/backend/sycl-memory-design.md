@@ -3175,20 +3175,36 @@ GPT-OSS 20B (32 experts, 4 used) `-ub 512` packs into 6,112 rows instead of the
 rectangle's 16,384: slots of 33.6 MB and 67.1 MB instead of 90 MB and 180 MB.
 
 **Which models plan a ring.** The loader sizes a ring for every MoE model, from
-its gate, up and down experts. Only two consumers claim its slots: the batched
-prompt executor (its WOQ and f16 tables) and the MXFP4 SOA per-expert staging.
-The load-time publish therefore plans no ring, weight slot and depth 0, when no
-gate, up or down expert has a type one of them runs
+its gate, up, down and fused gate_up experts (`llama_sycl_is_moe_expert_weight_name`
+in `src/llama-sycl-expert-names.h`). Only two consumers claim its slots: the
+batched prompt executor (its WOQ and f16 tables) and the MXFP4 SOA per-expert
+staging. The load-time publish therefore plans no ring, weight slot and depth 0,
+when no gate, up, down or gate_up expert has a type one of them runs
 (`moe_pp_onednn_ring_serves_type` in `moe-mmvq-tables.hpp`, asked by
 `ggml_sycl_inventory_ring_has_consumer`). It asks no runtime knob, so the ring a
 load plans does not change with a knob that turns an executor off for one run.
-Inkling 2 Mini is such a model: its NVFP4 experts run on the MMID direct route
-and its BF16 experts on the BF16 direct route. Its loader-sized ring was 350.7 MB
-at `-ub 512` (a 172.1 MB weight slot), which the load reserved and each context
-demanded again. That demand sat in the RUNTIME zone beside the MMID device
-workspace, which the zone's requirement does not count, so a second context at
-`-ub 128` was refused for a ring nothing would claim. A model with no ring logs
-"[SYCL-PLAN] no PP MoE oneDNN scratch ring on device N" and no ring line.
+A model with no ring logs "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device N"
+and no ring line.
+
+Inkling 2 Mini plans one since its NVFP4 experts joined the executor's f16 table
+(Task 21 of `docs/plans/2026-11-21-inkling2-mini-sycl-enable-profile-optimize.md`):
+the MMID direct route steps aside for a prompt the executor claims while the ring
+is planned (`moe_mmid_direct_defers_to_executor`), and its BF16 experts stay on
+the BF16 direct route. Its widest expert is the fused gate_up weight (K 2304,
+N 2304, 128 experts, 8 used), so at `-ub 512` the ring is 558.6 MB: a 344.3 MB
+weight slot (128 experts in the MXFP4 WOQ shape the loader sizes for), and
+activation and output slots of 71.4 MB and 142.9 MB (16,256 packed rows of 4,608
+and 9,216 bytes). Before the loader knew the fused name it sized the ring from
+the down weight alone, 350.7 MB with a 172.1 MB weight slot, and then no consumer
+claimed it: that demand sat in the RUNTIME zone beside the MMID device workspace,
+which the zone's requirement does not count, and a second context at `-ub 128`
+was refused for a ring nothing would claim. The weight slot still sits beside
+that workspace, which the zone's requirement still does not count; what a second
+context fits now has not been measured. A device whose plan puts some expert of
+every ring-served weight off the card has no node the executor claims there (the
+claim needs every expert of the weight on the card), so its ring is reserved for
+nothing until Task 21's step 1d, which is to publish that device's ring as 0 and
+plan once more.
 
 **Why the RUNTIME zone is not grown at load (`llama.cpp-u1bb`).** Growing it at
 model load looks natural and is wrong. The arena is one chunk with fixed zones,

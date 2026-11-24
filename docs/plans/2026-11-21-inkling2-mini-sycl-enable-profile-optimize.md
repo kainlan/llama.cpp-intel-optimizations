@@ -624,6 +624,10 @@ substrings, so the prompt-scratch sizing loop at `:476-485` never sees its dimen
 (`ggml/src/ggml-sycl/ggml-sycl.cpp:7131`). This task makes the loader agree and puts the name test where a unit test
 can reach it.
 
+**LANDED WITH TASK 21 (2026-11-24).** Task 21 gives fused NVFP4 prompt nodes the executor that uses the ring, the
+second branch of the decision rule below, so this change lands with it: ported by hand from `98c3d4bc2` onto
+`task/inkling2-t21`, with the four Minor findings settled (see Task 21's step 1 record).
+
 **HELD 2026-11-21 (lead ruling after quality review). Implemented on `task/inkling2-t5` (`98c3d4bc2`), reviewed, NOT
 merged.** The code does what this task says. The task's premise is not established, and two statements in it are
 wrong:
@@ -6510,6 +6514,56 @@ with no case changing; the two contract sweeps with no new red; the interleaved 
 tree; the same long arm on the B50 alone and on both cards. No `-ngl`, no context shrink, no new host wait, no
 allocation outside the unified cache.
 
+**Lead rulings after the checkpoint (2026-11-24).** Step 1 acceptance: the long arm on the B70 at least 1.25x the
+92 t/s; the NVFP4 expert device time per 512-token micro-batch from the kernel profiler; text byte-equal run to run;
+decode not slower; peak host backing not higher; the B50 alone and both cards not slower. Per-dispatch conversion
+into planned, cache-owned scratch is allowed for prompts; the F16 arm is scaffolding and the weight-only-quantised arm
+is the target; AoS stays the only layout; decode is untouched. `MOE_TENSOR_GATE_UP` is its own role: every
+role-indexed array grows with it, every switch names it with no default arm, and the pair-GLU does not apply to it.
+NVFP4 is not staged: `moe_pp_batched_takes_staged_type` excludes it through `moe_type_has_immutable_host_recipe`,
+and the B50 host route, the CPU-island refusal and the host recipe pools do not change. No new host wait, no
+allocation outside the unified cache, and the leases and the ring claim are held until the done event. The ring
+order (R5): option A, as its own step 1d after steps a, b and c (below). The route seam: the direct route steps aside
+for a prompt node only when the claim holds and the device has a planned ring weight slot; a decline the executor
+reports before its first submission re-enters the direct route; a failure after it throws with a named reason.
+
+**Step 1, a to c (implementer's record, 2026-11-24, `task/inkling2-t21`).**
+- (a) `MOE_TENSOR_GATE_UP` is role 3 and `MOE_TENSOR_UNKNOWN` moved to 4; the profile's role arrays are sized
+  `UNKNOWN + 1`. The classifier tests the fused name first. Both switches on the role name it with no default; the
+  group registry breaks for it (a fused block is registered, never complete). The executor's resident claim admits
+  it, its staged claim does not (the ring's windows stage the separate gate, up and down host matrices only). The
+  routed-expert count counts it as a block's counting tensor. The paired gate/up paths do not take it: the bundle and
+  single-XMX helpers name GATE and UP alone, and the pair scan, which records a fused weight as `gate_weight` by its
+  `ffn_gate` prefix, matches a GLU only to a layer with an up output, which a fused layer never has. How Inkling's
+  graph consumes the fused output: `src/models/inkling2.cpp:397-410` builds the MoE through `build_moe_ffn` with
+  the fused weight and no separate gate or up weight. There one `MUL_MAT_ID` of the fused weight (with the NVFP4
+  BF16-accumulation request and the per-expert scale multiply of `build_lora_mm_id`) is split into a gate view and
+  an up view (`src/llama-graph.cpp:2544-2558`), and `LLM_FFN_SITU` activates them as a chain of scale, tanh,
+  sigmoid and mul ops (`:2615`), not a `GLU` op, so no pair-GLU pattern exists for the scan to find.
+- (b) NVFP4 is in the executor's f16 table at AOS (the `convert.cpp` NVFP4 dequant to f16) and in the ring's served
+  types, and not in the staged-type predicate (`moe_type_has_immutable_host_recipe` moved to
+  `moe-mmvq-tables.hpp`, which both predicates read).
+- (c) The loader names the fused tensor: Task 5's `src/llama-sycl-expert-names.h`, ported by hand from `98c3d4bc2`
+  with its four review findings settled (the header's `.bias` comment corrected, the sizing loop calls the name test
+  with no wrapper, a negative check for `ffn_norm_exps`, and grovemoe's `_chexps` left out on purpose, with a
+  negative check: the executor's claim does not take them).
+- The seam. `moe_mmid_direct_defers_to_executor` (prompt, claim, planned ring weight slot) makes the direct route
+  step aside. A decline before the executor's first submission returns false; the call site then warns once per
+  (device, cause), "[PP-MOE] direct MMID route re-entered", and asks for a second pass, which
+  `ggml_sycl_mul_mat_id_with_direct_reentry` runs once the first pass has unwound, with the claim answering false for
+  the node's weight, so the node takes the route it took before. The first pass releases the ring slot claim and the
+  expert leases on unwind; the ids snapshot and the prompt admission stay cached and the second pass reads them with
+  no device wait. A decline after the first submission, or a GEMM-stage failure, throws with a named reason. The
+  routed-expert count skips the second pass. Pinned by `test-sycl-moe-gate-up-role-source`.
+- Device test for the lead: `test-moe-pp-batched-dequant` runs NVFP4 on the plain fixture, on a fused gate_up
+  fixture, and on two fixtures whose UE4M3 scale bytes are all rewritten (zero, subnormals, 0x7f and sign-set forms;
+  the largest finite values), against the CPU at NMSE <= 5e-4, and fails a case that printed the re-entry line.
+
+**Step 1d (R5, option A), not yet written.** After the plan, on each device: if no weight of a ring-served type has
+every expert planned there (`ggml_sycl_moe_tensor_plan_primary_layout`, the claim's own predicate), publish that
+device's ring as 0 and plan once more, one retry; a WARN names the device, the ring bytes released and the count of
+ring-served weights seen; the stage and the dry run share the decision.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
@@ -6560,6 +6614,12 @@ allocation outside the unified cache.
   device run is evidence for a card only when its own log names that card.
 - The NVFP4 expert launch (`mul_mat_vec_q_id`, `mmvq.cpp`) has the range risk Task 8g's kernel had: its
   global range grows with the micro-batch and nothing checks it against an int. A read, not a failure seen.
+- The two UE4M3 scale decodes disagree on one byte: the CPU's (`ggml_ue4m3_to_fp32`, `ggml-impl.h`) reads 0xFF
+  as 240, because it zeroes only 0x00 and 0x7F and ignores the sign through `(x >> 3) & 0xF`; the SYCL one
+  (`ggml_sycl_ue4m3_to_fp32`, `common.hpp`) reads it as 0, because it zeroes `(x & 0x7f) == 0x7f`. Every other
+  sign-set byte decodes alike. No quantizer writes the sign bit, so no model holds 0xFF; Task 21's device test never
+  writes it. Neither decode was changed. The fix is to refuse a sign-set or NaN scale at load, the CPU decode's own
+  TODO.
 - `ggml_sycl_mul_mat_id`'s catch calls `std::exit(1)` on a SYCL exception it does not recognise. An exit is
   an abort by another name: the graph should fail at its boundary.
 - `test-sycl-bf16-mul-mat` throws uncaught when no `opencl:cpu` device exists, as Task 8g's kernel test
