@@ -29,7 +29,12 @@ def test_unbatched_gemm_execute_sites_are_wrapped_and_wait_free() -> None:
     # "std::optional<sycl::event> gemm(" is distinct from "std::optional<sycl::event> row_gemm("
     # and contains no variable whitespace, so the literal anchors the slice.
     body = slice_between(gemm, "static std::optional<sycl::event> gemm(", "static std::optional<sycl::event> row_gemm(")
-    assert body.count('"mulmat.onednn_gemm.unbatched"') == 2
+    # One name per call, chosen by batch count: a call with a batch above 1 is the batched row, so the per-plane loop's
+    # GEMMs and one batched GEMM over the same planes are told apart. Both execute sites take that one name; which
+    # count chooses it is test-sycl-mul-mat-f32-batched-route-source's.
+    assert body.count('"mulmat.onednn_gemm.unbatched"') == 1
+    assert body.count('"mulmat.onednn_gemm.batched"') == 1
+    assert len(re.findall(r"gemm_label\.name\s*=\s*gemm_label_name;", body)) == 2
     assert body.count("ggml_sycl_profile_submit(*q,") == 2
     assert body.count("dnnl::sycl_interop::execute(") == 2
     assert "variant=fallback_create" in body

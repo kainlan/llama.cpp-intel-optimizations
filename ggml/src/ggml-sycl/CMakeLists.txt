@@ -2487,6 +2487,26 @@ set_tests_properties(sycl-context-nonfa-stage PROPERTIES
     TIMEOUT 30
 )
 
+# Which F32 x F32 MUL_MAT nodes run as one oneDNN matmul instead of one GEMM per plane: the predicate in
+# nonfa-stage.hpp, every accept and decline condition and the three Inkling shapes. Host-only like the test above;
+# it names no tenant cohort, so it carries the classification labels only.
+add_executable(test-sycl-mul-mat-f32-batched-route
+    tests/test-sycl-mul-mat-f32-batched-route.cpp
+)
+target_include_directories(test-sycl-mul-mat-f32-batched-route PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-sycl-mul-mat-f32-batched-route PRIVATE ggml-base)
+set_target_properties(test-sycl-mul-mat-f32-batched-route PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-sycl-mul-mat-f32-batched-route COMMAND test-sycl-mul-mat-f32-batched-route)
+set_tests_properties(test-sycl-mul-mat-f32-batched-route PROPERTIES
+    LABELS "sycl;hostonly"
+    TIMEOUT 30
+)
+
 # The published section of a context and the load's compute-term ledger (llama.cpp-moua
 # L4 step 3): runtime-context-section.hpp reads a runtime-context descriptor once into an
 # owning section, classifies a candidate's coverage and holds the late check's rule. It names
