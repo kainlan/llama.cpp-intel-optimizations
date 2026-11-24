@@ -8,6 +8,14 @@
 // same ints for every input the functor can pass, so this test compares them:
 //   - every value of each byte, with the other three bytes at 0x00, at 0xff and at one mixed pattern;
 //   - every combination of four low-nibble codes, under each of the 16 high nibbles.
+// These sweeps stand for all 2^32 inputs because in both decodes each output byte depends on one
+// input nibble only. In the table decode that holds by construction: each byte_level_permute
+// selector nibble picks one table byte, and the code's bit 3 picks the low or the high table half.
+// In the arithmetic decode it holds because of bounds, not construction: the input is masked to one
+// code per byte, each byte-wise sum stays below 256 (at most 12 + 0x7f), and the two's-complement
+// +1 is skipped for magnitude 0 (so ~mag + 1 is at most 0xff); no carry crosses a byte. The
+// sweeps put every code in every position beside neighbouring bytes at 0x00, 0xff and a mixed
+// pattern and beside every neighbouring code, which would show one lane leaking into another.
 // It also runs the functor itself for each iqs the MMVQ kernels pass it (0 and 4: QI_NVFP4 = 8,
 // VDR_NVFP4_Q8_1_MMVQ = 4) and compares the result with a double-precision oracle written from the
 // format (64 weights, four 16-weight sub-blocks, a UE4M3 scale each, codes from the E2M1 table).
@@ -28,7 +36,11 @@
 // (0x01) to 1.75 * 2^7 = 224 (0x7e): man/8 and each power-of-two scaling are exact in binary32
 // (ldexp is exact by definition, 0 ulp in the OpenCL spec), the bit form puts the same exponent and
 // mantissa fields down directly, and the smallest nonzero value, 2^-10, is far above binary32's
-// normal range floor, so a device that flushes denormals sees none.
+// normal range floor, so a device that flushes denormals sees none. The kernels and this test build
+// under icpx's default -fp-model=fast (only ggml-base is set to precise, in ggml/src/CMakeLists.txt).
+// That cannot change either scale body: fast lets the compiler contract and reassociate, and when
+// every operation and every intermediate is exact in binary32 and none is a denormal, any regrouping
+// gives the same bits.
 
 #include "dequantize.hpp"
 #include "ggml-common.h"
