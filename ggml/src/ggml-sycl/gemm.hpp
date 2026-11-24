@@ -84,9 +84,9 @@ inline std::atomic<int64_t> & args_map_calls_accum() {
 // oneDNN round f32 inputs to f16 where it chooses to, and otherwise no fpmath call, so oneDNN's process default
 // applies. STRICT sets fpmath strict on the primitive: no down-conversion, whatever the build or the process default.
 // dnnl::fpmath_mode cannot stand in for this, since it has no value for "no fpmath call".
-enum dnnl_gemm_fpmath {
-    DNNL_GEMM_FPMATH_BUILD,
-    DNNL_GEMM_FPMATH_STRICT,
+enum ggml_sycl_dnnl_fpmath {
+    GGML_SYCL_DNNL_FPMATH_BUILD,
+    GGML_SYCL_DNNL_FPMATH_STRICT,
 };
 
 struct DnnlPrimitiveKey {
@@ -112,7 +112,7 @@ struct DnnlPrimitiveKey {
     int                     woq_zp_mask;
     // gemm()'s float math: one shape under strict and under f16 is two primitives. Every other family keeps the
     // zero-initialised BUILD, its math being fixed by its variant.
-    dnnl_gemm_fpmath        fpmath;
+    ggml_sycl_dnnl_fpmath   fpmath;
 
     bool operator==(const DnnlPrimitiveKey & other) const {
         return m == other.m && n == other.n && k == other.k && batches_a == other.batches_a &&
@@ -332,8 +332,8 @@ class DnnlGemmWrapper {
     // the caller takes its declared next path (llama.cpp-23mk S3-4). A value is the primitive's completion event.
     // query_only asks the scratchpad question and stops: it submits nothing, does not count as an engaged call, and
     // returns an empty event when not declined. A caller that will run the same descriptor over many batches asks once
-    // with it before its first write. fpmath is the primitive's float math (see dnnl_gemm_fpmath); the default keeps
-    // the build's.
+    // with it before its first write. fpmath is the primitive's float math (see ggml_sycl_dnnl_fpmath); the default
+    // keeps the build's.
     [[nodiscard]] static std::optional<sycl::event> gemm(ggml_backend_sycl_context &      ctx,
                                                          int                              m,
                                                          int                              n,
@@ -357,7 +357,7 @@ class DnnlGemmWrapper {
                                                          const std::vector<sycl::event> & deps       = {},
                                                          const char *                     op_context = nullptr,
                                                          bool                             query_only = false,
-                                                         dnnl_gemm_fpmath fpmath = DNNL_GEMM_FPMATH_BUILD) {
+                                                         ggml_sycl_dnnl_fpmath fpmath = GGML_SYCL_DNNL_FPMATH_BUILD) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
 
         auto stream = ctx.stream_dnnl(q);
@@ -408,7 +408,7 @@ class DnnlGemmWrapper {
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
-        if (fpmath == DNNL_GEMM_FPMATH_STRICT) {
+        if (fpmath == GGML_SYCL_DNNL_FPMATH_STRICT) {
             primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::strict);
         } else {
 #    ifdef GGML_SYCL_F16

@@ -62467,7 +62467,7 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
     const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(
         ctx, m, n, k, a, f32, 1, k, static_cast<dnnl_dim_t>(k) * m, b, f32, 1, k, static_cast<dnnl_dim_t>(k) * n, c,
         f32, stream, batches, batches, static_cast<int>(ne0),
-        /* deps = */ {}, ggml_type_name(src0->type), /* query_only = */ false, DNNL_GEMM_FPMATH_STRICT);
+        /* deps = */ {}, ggml_type_name(src0->type), /* query_only = */ false, GGML_SYCL_DNNL_FPMATH_STRICT);
     return batched_gemm.has_value();
 #else
     GGML_UNUSED(ctx);
