@@ -3440,12 +3440,16 @@ static bool ggml_sycl_secondary_local_agg_enabled() {
 // MoE expert tensor type classification.
 // In MoE FFN: hidden -> gate*up -> SiLU -> down -> output
 // gate+up are read first (enables SiLU overlap), down is read second.
+// A fused gate_up weight (ffn_gate_up_exps) is one matrix whose output holds the gate half and the up half side by
+// side; the graph splits and activates that output itself (build_moe_ffn), so the role has no gate or up partner and
+// none of the paired gate/up paths (the pair-GLU, the gate/up XMX bundle, the gate/up group registry) takes it.
 // ---------------------------------------------------------------------------
 enum moe_tensor_type : int {
-    MOE_TENSOR_GATE    = 0,  // ffn_gate_exps — read first
-    MOE_TENSOR_UP      = 1,  // ffn_up_exps   — read first (with gate)
-    MOE_TENSOR_DOWN    = 2,  // ffn_down_exps — read second (after SiLU)
-    MOE_TENSOR_UNKNOWN = 3,
+    MOE_TENSOR_GATE    = 0,  // ffn_gate_exps    — read first
+    MOE_TENSOR_UP      = 1,  // ffn_up_exps      — read first (with gate)
+    MOE_TENSOR_DOWN    = 2,  // ffn_down_exps    — read second (after SiLU)
+    MOE_TENSOR_GATE_UP = 3,  // ffn_gate_up_exps — read first, gate and up in one matrix
+    MOE_TENSOR_UNKNOWN = 4,
 };
 
 static constexpr int MOE_PROFILE_ROLE_COUNT = static_cast<int>(MOE_TENSOR_UNKNOWN) + 1;
@@ -3454,6 +3458,9 @@ static constexpr int MOE_PROFILE_ROLE_COUNT = static_cast<int>(MOE_TENSOR_UNKNOW
 static moe_tensor_type moe_classify_tensor(const char * name) {
     if (!name) {
         return MOE_TENSOR_UNKNOWN;
+    }
+    if (strstr(name, "ffn_gate_up_exps")) {
+        return MOE_TENSOR_GATE_UP;
     }
     if (strstr(name, "ffn_gate_exps")) {
         return MOE_TENSOR_GATE;
@@ -3475,6 +3482,8 @@ static const char * moe_tensor_type_name(moe_tensor_type type) {
             return "up";
         case MOE_TENSOR_DOWN:
             return "down";
+        case MOE_TENSOR_GATE_UP:
+            return "gate_up";
         case MOE_TENSOR_UNKNOWN:
             return "unknown";
     }
@@ -6691,7 +6700,11 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     grp.down_key = meta.canonical_key;
                     grp.has_down = true;
                     break;
-                default:
+                case MOE_TENSOR_GATE_UP:
+                    // The registry keys a block's separate gate, up and down; a fused gate_up weight has no gate or
+                    // up partner to group with, so its block counts as registered and never as complete.
+                    break;
+                case MOE_TENSOR_UNKNOWN:
                     break;
             }
             n_groups_registered++;
@@ -16205,11 +16218,12 @@ static std::vector<ggml_sycl::placement_tensor_info> ggml_sycl_inventory_planner
     return detail;
 }
 
-// Whether the inventory has a gate, up or down expert, from the names the loader sizes the PP MoE oneDNN ring from,
-// of a type a ring consumer runs (moe_pp_onednn_ring_serves_type). The loader sizes the ring for every MoE model, but
-// only the batched prompt executor and the MXFP4 SOA per-expert staging claim its slots: Q1_0 and NVFP4 experts run on
-// the MMID direct route and BF16 experts on the BF16 direct route. The question asks no runtime knob, so the ring a
-// load plans does not depend on a knob that turns an executor off for one run.
+// Whether the inventory has a gate, up, down or fused gate_up expert, from the names the loader sizes the PP MoE
+// oneDNN ring from (llama_sycl_is_moe_expert_weight_name), of a type a ring consumer runs
+// (moe_pp_onednn_ring_serves_type). The loader sizes the ring for every MoE model, but only the batched prompt
+// executor and the MXFP4 SOA per-expert staging claim its slots: Q1_0 experts run on the MMID direct route and BF16
+// experts on the BF16 direct route. The question asks no runtime knob, so the ring a load plans does not depend on a
+// knob that turns an executor off for one run.
 static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_inventory * inventory) {
     for (size_t i = 0; i < inventory->count; ++i) {
         const ggml_sycl_tensor_info & t = inventory->tensors[i];
@@ -16248,9 +16262,9 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     // device workspace, which also takes RUNTIME room, that demand refuses a later context's micro-batch.
     if (in.pp_moe_onednn_ring_depth != 0 && !ggml_sycl_inventory_ring_has_consumer(inventory)) {
         GGML_LOG_INFO(
-            "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device %d: no gate, up or down expert of this model has a "
-            "type a ring consumer runs, so the plan neither reserves nor demands the %.1f MB weight slot the loader "
-            "sized\n",
+            "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device %d: no gate, up, down or gate_up expert of this model "
+            "has a type a ring consumer runs, so the plan neither reserves nor demands the %.1f MB weight slot the "
+            "loader sized\n",
             device, in.pp_moe_onednn_weight_slot_bytes / (1024.0 * 1024.0));
         in.pp_moe_onednn_weight_slot_bytes = 0;
         in.pp_moe_onednn_ring_depth        = 0;
@@ -87982,8 +87996,12 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!weight || !ggml_sycl_moe_pp_batched_takes_type(weight->type)) {
         return false;
     }
+    // A fused gate_up weight (MOE_TENSOR_GATE_UP) is one plain matrix per expert to this executor, so the resident
+    // claim takes it. The staged claim does not: the ring's windows stage a layer's separate gate, up and down host
+    // matrices only (moe_expert_role_is_triplet), so a staged gate_up weight would decline at its first host expert.
     const moe_tensor_type role = moe_classify_tensor(weight->name ? weight->name : "");
-    if (role != MOE_TENSOR_GATE && role != MOE_TENSOR_UP && role != MOE_TENSOR_DOWN) {
+    const bool triplet_role    = role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP || role == MOE_TENSOR_DOWN;
+    if (!triplet_role && !(role == MOE_TENSOR_GATE_UP && !host_staged)) {
         return false;
     }
     layout_mode planned_layout = GGML_LAYOUT_AOS;
@@ -88025,7 +88043,35 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     return ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout);
 }
 
+// A MUL_MAT_ID node's second pass on the direct MMID route (ggml_sycl_mul_mat_id_with_direct_reentry), per thread:
+// the first pass names the node it asks a second pass for, and the second pass runs with the batched executor's claim
+// on that node's weight suppressed, so the node takes the route it took before the executor claimed it.
+struct ggml_sycl_mmid_direct_reentry {
+    const ggml_tensor * requested         = nullptr;  // the executor declined this node before its first submission
+    const ggml_tensor * suppressed_weight = nullptr;  // the weight the executor does not claim during the second pass
+};
+
+static thread_local ggml_sycl_mmid_direct_reentry g_mmid_direct_reentry;
+
+// True the first time a node goes back to the direct MMID route for `refusal` on `device`: the re-entry WARN fires once
+// per (device, cause). One bit per cause, so the shift below is defined only while COUNT fits the mask.
+static bool ggml_sycl_moe_pp_direct_reentry_first(int device, moe_pp_batched_refusal refusal) {
+    static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,
+                  "the direct route's re-entry latch holds one bit per moe_pp_batched_refusal cause");
+    static std::atomic<uint32_t> seen[GGML_SYCL_MAX_DEVICES] = {};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || refusal >= moe_pp_batched_refusal::COUNT) {
+        return false;
+    }
+    const uint32_t bit = 1u << static_cast<uint32_t>(refusal);
+    return (seen[device].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+}
+
+// The claim ggml_sycl_mul_mat_id asks, from the device's own cache plan. During a node's second pass on the direct
+// route it answers false for that node's weight, at every site of the pass that asks it.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
+    if (weight != nullptr && weight == g_mmid_direct_reentry.suppressed_weight) {
+        return false;
+    }
     return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false);
 }
 
@@ -88197,12 +88243,14 @@ struct moe_hybrid_decode_record {
 };
 
 // The one tensor of a block whose op counts the routed experts: its gate tensor, or its fused gate/up tensor when the
-// pack stores the two as one (moe_classify_tensor knows only the separate names, and other code keys off it, so the
-// fused spelling is named here). Gate, up and down of a block route the same ids, so counting on one of them counts a
+// pack stores the two as one. Gate, up and down of a block route the same ids, so counting on one of them counts a
 // (token, expert) pair once per block.
 static bool ggml_sycl_moe_route_counts_tensor(const char * name) {
-    return name != nullptr &&
-           (moe_classify_tensor(name) == MOE_TENSOR_GATE || std::strstr(name, "ffn_gate_up_exps") != nullptr);
+    if (name == nullptr) {
+        return false;
+    }
+    const moe_tensor_type role = moe_classify_tensor(name);
+    return role == MOE_TENSOR_GATE || role == MOE_TENSOR_GATE_UP;
 }
 
 // Counts the experts a prompt op routed, from its host ids snapshot (the ids tensor's n_used ids per token),
@@ -88210,6 +88258,11 @@ static bool ggml_sycl_moe_route_counts_tensor(const char * name) {
 // its ids on this thread already, so this adds increments and no wait.
 static void ggml_sycl_moe_route_counts_add_prompt(int device, const ggml_tensor * src0, const int32_t * ids, size_t n) {
     if (!src0 || !ggml_sycl_moe_route_counts_tensor(src0->name)) {
+        return;
+    }
+    // A node's second pass on the direct MMID route (ggml_sycl_mul_mat_id_with_direct_reentry) reads the snapshot its
+    // first pass already counted.
+    if (src0 == g_mmid_direct_reentry.suppressed_weight) {
         return;
     }
     const std::shared_ptr<ggml_sycl::moe_route_counts> table = ggml_sycl::moe_route_counts_current(device);
@@ -92726,8 +92779,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const ggml_sycl::moe_resolved_batch_result & direct_admission =
         ne12 == 1 ? retained_decode_batch_result : retained_prompt_batch_result;
     const layout_mode direct_layout = ne12 == 1 ? route_layout : retained_prompt_layout;
+    // The route steps aside for a prompt the batched executor claims on this device while the ring the executor runs in
+    // is planned there (moe_mmid_direct_defers_to_executor). If the executor then declines before its first submission,
+    // the node comes back here on a second pass with the claim suppressed (ggml_sycl_mul_mat_id_with_direct_reentry).
+    const bool pp_direct_deferred =
+        ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) &&
+        moe_mmid_direct_defers_to_executor(
+            ne12 != 1, pp_onednn_batched_route,
+            ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device));
     if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&
-        ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && direct_admission) {
+        ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && direct_admission &&
+        !pp_direct_deferred) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
         g_q1_nvfp4_test_candidate.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -96626,6 +96688,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const size_t src1_contiguous_f32_row_bytes = nb11;
         const size_t src1_contiguous_f16_row_bytes = static_cast<size_t>(ne10) * sizeof(sycl::half);
 
+        // A node the direct MMID route stepped aside for (pp_direct_deferred) has that route to go back to only until
+        // the executor submits its first device work: until then a decline returns false, and the call site below asks
+        // for the node's second pass on the route, naming the cause the executor recorded; after it, a decline throws
+        // like a tiled-claimed op's.
+        bool                   pp_batched_submitted = false;
+        moe_pp_batched_refusal pp_batched_refusal   = moe_pp_batched_refusal::NONE;
+
         auto try_pp_onednn_f16_batched = [&]() -> bool {
             // The island runs every expert of this op (moe_pp_cpu_split::ISLAND): the executor has no device expert to
             // take, and the decision gave the layer to the CPU.
@@ -96691,6 +96760,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const auto decline_batched = [&](moe_pp_batched_refusal refusal, const char * detail, int64_t expert_id,
                                              bool route_logged) -> bool {
                 const char * reason = detail ? detail : moe_pp_batched_refusal_name(refusal);
+                pp_batched_refusal  = refusal;
                 if (route_logged && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> reject_log{ 0 };
                     if (reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -96729,6 +96799,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                       "); refusing rather than falling through to the SOA-only staging fallback "
                                       "(llama.cpp-71hx)";
                     throw ggml_sycl_fallback_error(tiled_claim_msg.c_str());
+                }
+                if (pp_direct_deferred && pp_batched_submitted) {
+                    // Same thread_local reason as the tiled message above.
+                    static thread_local std::string deferred_submitted_msg;
+                    deferred_submitted_msg = std::string("[MOE-PP-ONEDNN-BATCHED] op '") +
+                                             (src0 && src0->name ? src0->name : "?") +
+                                             "' that the direct MMID route deferred to this executor declined (" +
+                                             reason + ") after its first submission";
+                    throw ggml_sycl_fallback_error(deferred_submitted_msg.c_str());
                 }
                 return false;
             };
@@ -97241,6 +97320,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return batched_out + pack.slot_base_row[slot] * static_cast<size_t>(ne0);
             };
             batched_scratch_claim.mark_used();
+            // Every decline from here on follows device work this dispatch submitted (see pp_batched_submitted).
+            pp_batched_submitted = true;
 
             // The device experts' ready events. A deferred expert's copy is ordered by its window's own barrier, in
             // the phase loop (llama.cpp-8epx): it is not submitted yet.
@@ -97628,6 +97709,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     tiled_claim_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] XMX_TILED-claimed op '") +
                                            (src0 && src0->name ? src0->name : "?") + "' GEMM dispatch failed: " + what;
                     throw ggml_sycl_fallback_error(tiled_claim_gemm_msg.c_str());
+                }
+                // The GEMM stage runs after the first submission, so a node the direct MMID route deferred to this
+                // executor fails here too (pp_batched_submitted).
+                if (pp_direct_deferred) {
+                    static thread_local std::string deferred_gemm_msg;
+                    deferred_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] op '") +
+                                        (src0 && src0->name ? src0->name : "?") +
+                                        "' that the direct MMID route deferred to this executor: GEMM dispatch failed "
+                                        "after its first submission: " +
+                                        what;
+                    throw ggml_sycl_fallback_error(deferred_gemm_msg.c_str());
                 }
                 return false;
             };
@@ -98168,6 +98260,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif
         };
         if (try_pp_onednn_f16_batched()) {
+            return;
+        }
+        // The direct MMID route stepped aside for this node and the executor declined it before its first submission
+        // (after it, the decline throws). The per-expert path below has no executor for the direct route's types, so
+        // this pass ends here, having written nothing to dst, and the node runs again on the direct route once this
+        // pass has unwound (ggml_sycl_mul_mat_id_with_direct_reentry). A decline that named no cause reads "none".
+        if (pp_direct_deferred) {
+            if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, pp_batched_refusal)) {
+                GGML_LOG_WARN(
+                    "[PP-MOE] direct MMID route re-entered device=%d cause=%s tensor=%s type=%s: the batched executor "
+                    "declined the node before its first submission\n",
+                    ctx.device, moe_pp_batched_refusal_name(pp_batched_refusal), src0->name,
+                    ggml_type_name(src0->type));
+            }
+            g_mmid_direct_reentry.requested = dst;
             return;
         }
 
@@ -99459,6 +99566,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 }
 
 #undef GGML_SYCL_MOE_PP_STAGING_FAILPOINT
+
+// Runs a MUL_MAT_ID node, and runs it once more when its first pass asks: the direct MMID route stepped aside for the
+// node (moe_mmid_direct_defers_to_executor) and the batched executor then declined it before its first submission.
+// By then the first pass has unwound, so the executor's ring slot claim and its experts' leases are released, while
+// the host ids snapshot stays in the graph-local ids cache and the prompt admission in its cache: the second pass
+// reads both again with no device wait. It runs with the executor's claim on the node's weight suppressed, so the
+// node takes the route it took before the executor claimed it. One retry, never a loop: the second pass cannot ask.
+static void ggml_sycl_mul_mat_id_with_direct_reentry(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    g_mmid_direct_reentry.requested = nullptr;
+    ggml_sycl_mul_mat_id(ctx, dst);
+    if (g_mmid_direct_reentry.requested != dst) {
+        return;
+    }
+    g_mmid_direct_reentry.requested         = nullptr;
+    g_mmid_direct_reentry.suppressed_weight = dst->src[0];
+    struct suppression_end {
+        ~suppression_end() { g_mmid_direct_reentry.suppressed_weight = nullptr; }
+    } end;
+    ggml_sycl_mul_mat_id(ctx, dst);
+}
 
 static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
@@ -102575,7 +102702,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
                         dst->name ? dst->name : "", ctx.device);
                 return false;
             }
-            ggml_sycl_mul_mat_id(ctx, dst);
+            ggml_sycl_mul_mat_id_with_direct_reentry(ctx, dst);
             ggml_sycl_moe_down_shadow_compare(ctx, dst);
             ggml_sycl_moe_stream_layer_done(ctx, dst);
             break;
