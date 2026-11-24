@@ -84112,12 +84112,12 @@ static bool ggml_sycl_mul_mat_id_nvfp4_resident_decode(ggml_backend_sycl_context
     req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::SCRATCH;
     req.intent.constraints.forbid_vram_zone_spill = true;
     req.intent.constraints.cascade_step           = true;
-    ggml_sycl::allocation_result q8_alloc         = ggml_sycl::unified_allocate_owner(req);
-    if (!q8_alloc) {
+    ggml_sycl::allocation_result allocation       = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         return decline(moe_resident_decode_decline::SCRATCH);
     }
     ggml_sycl::mem_handle q8_handle =
-        ggml_sycl::mem_handle::from_owned_alloc(std::move(q8_alloc.owner), GGML_LAYOUT_AOS);
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
     const auto q8 = q8_handle.resolve(ctx.device);
     if (!q8 || q8.ptr == nullptr || !q8.on_device) {
         return decline(moe_resident_decode_decline::SCRATCH);

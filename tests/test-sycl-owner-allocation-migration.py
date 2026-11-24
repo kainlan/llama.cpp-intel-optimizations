@@ -188,6 +188,10 @@ NAMED_OWNER_FIRST_SITES = (
      "unified_alloc; the expert registers with this typed owner so its leases report HOST_PINNED/WEIGHT through "
      "owner_metadata() and the prefill ring copies from it directly; refuses on failure, handed over via "
      "from_owned_alloc"),
+    ("ggml_sycl_mul_mat_id_nvfp4_resident_decode",
+     "Inkling 2 Mini Task 18: the NVFP4 resident decode route's per-node Q8_1 input slice (must_device, SCRATCH zone, "
+     "spill forbidden), held in the dispatch's retained handles until the kernel's event; a refusal declines the node "
+     "to the admitted route, handed over via from_owned_alloc"),
 )
 
 
