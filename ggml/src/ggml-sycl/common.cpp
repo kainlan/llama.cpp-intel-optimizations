@@ -3363,3 +3363,19 @@ sycl::queue ggml_sycl_make_queue(const sycl::context &       ctx,
 sycl::queue ggml_sycl_make_queue(const sycl::device & dev, int slot, const sycl::property_list & props) {
     return sycl::queue(dev, ggml_sycl_async_handler(slot), props);
 }
+
+void ggml_sycl_queue_profiling_warn_unavailable(const char * diagnostic) {
+    static std::mutex                      warned_mutex;
+    static std::unordered_set<std::string> warned;
+    const std::string                      name = diagnostic != nullptr ? diagnostic : "a profiling diagnostic";
+    {
+        std::lock_guard<std::mutex> lock(warned_mutex);
+        if (!warned.insert(name).second) {
+            return;
+        }
+    }
+    GGML_LOG_WARN(
+        "[SYCL] %s reads event profiling, which the backend's queues do not carry because GGML_SYCL_QUEUE_PROFILING=0; "
+        "it reports no figure. Set GGML_SYCL_QUEUE_PROFILING=1 to read it.\n",
+        name.c_str());
+}

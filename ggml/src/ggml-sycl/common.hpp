@@ -8798,10 +8798,16 @@ void ggml_sycl_watchdog_non_graph_begin();
 void ggml_sycl_watchdog_non_graph_end();
 
 // Standard property list for all directly-created GPU in-order queues.
-// Includes enable_profiling to activate counter-based events on L0 (~15% TG speedup).
+// Includes enable_profiling unless GGML_SYCL_QUEUE_PROFILING=0 (ggml_sycl_queue_profiling_enabled()). The property was
+// added "to activate counter-based events on L0 (~15% TG speedup)", measured on an older adapter and not re-measured
+// since. What is known today: on the Level Zero v2 adapter it costs one device timestamp query per submitted command,
+// which only the diagnostics that read event profiling info use, and the default stays on while that is measured.
 // Use this for every `new sycl::queue(...)` call that targets a GPU device.
 inline sycl::property_list default_queue_properties() {
-    return sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} };
+    if (ggml_sycl_queue_profiling_enabled()) {
+        return sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} };
+    }
+    return sycl::property_list{ sycl::property::queue::in_order{} };
 }
 
 // Combined pin/unpin skip guard: returns true when per-op pin/unpin should be

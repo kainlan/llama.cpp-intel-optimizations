@@ -202,6 +202,7 @@ most need to know:
 | `GGML_SYCL_DISABLE_GRAPH=1` | OFF | Disable SYCL graph replay (~3% TG, mainly helps PP) |
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
+| `GGML_SYCL_QUEUE_PROFILING=0` | ON | Diagnostic knob: build every queue without `enable_profiling`, which drops one device timestamp query per submitted command. Diagnostics that read event profiling info need it ON; with `0` they print one WARN and no figure |
 
 Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK=1`,
 `GGML_SYCL_SAFE_MODE=1` (drain queue per op to localize faults), and

@@ -4944,6 +4944,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# GGML_SYCL_QUEUE_PROFILING (llama.cpp-atiz): the knob that takes enable_profiling off every queue the backend builds.
+# Host-only source gate: the predicate reads the environment and not a macro, the three property sites go through it,
+# and every get_profiling_info reader asks it first. Same registration shape as the sibling above; each pin carries a
+# mutant inside the test.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-queue-profiling-knob-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-queue-profiling-knob-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pktr: test-sycl-layout-choice.cpp is already registered, in
 # ggml/src/ggml-sycl/CMakeLists.txt, as ctest `sycl-layout-choice` (note the
 # ctest name differs from the executable target name). Do not register it

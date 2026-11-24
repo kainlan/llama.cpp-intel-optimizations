@@ -2,12 +2,14 @@
 """Source gate for llama.cpp-yke2. Full mechanism: see
 ggml/src/ggml-sycl/dpct/helper.hpp's create_queue_impl() comment (the
 canonical explanation of why sycl::property::queue::enable_profiling() must
-be unconditional, not `#ifdef DPCT_PROFILING_ENABLED`) and
+not depend on `#ifdef DPCT_PROFILING_ENABLED`; since llama.cpp-atiz it is on by
+default and only the environment, GGML_SYCL_QUEUE_PROFILING=0, turns it off,
+through ggml_sycl_queue_profiling_enabled()) and
 tests/test-sycl-profiling-queue-property.cpp's header comment (why that
 GPU test has two phases). This gate checks two fixes at the SOURCE TEXT
 level only, without touching a SYCL device: (1) both create_queue_impl()
-overloads in dpct/helper.hpp add the property unconditionally, with the
-macro itself no longer defined for the ggml-sycl target; (2)
+overloads in dpct/helper.hpp add the property by default, through the
+environment predicate and never a macro, with the macro itself no longer defined for the ggml-sycl target; (2)
 unified-cache.cpp's create_cache_for_device() calls
 ensure_single_device_context_queue() unconditionally, not gated on
 `total_gpus > 1`.
@@ -815,7 +817,7 @@ def test_create_queue_impl_defined_exactly_twice():
     )
 
 
-def test_create_queue_impl_enables_profiling_unconditionally():
+def test_create_queue_impl_enables_profiling_by_default_without_a_macro():
     # Checked against the MASKED body, never the original (quality review
     # c-4rrx audit): either check on raw text is foolable by an
     # explanatory comment -- ENABLE_PROFILING_CALL spelled out nearby would
@@ -825,9 +827,13 @@ def test_create_queue_impl_enables_profiling_unconditionally():
     for body in _create_queue_impl_bodies():
         masked_body = _mask_comments_and_strings(body)
         assert ENABLE_PROFILING_CALL in masked_body, (
-            f"create_queue_impl must unconditionally add {ENABLE_PROFILING_CALL} to its property_list "
+            f"create_queue_impl must add {ENABLE_PROFILING_CALL} to its property_list by default "
             "(llama.cpp-yke2) -- a macro-gated `#ifdef DPCT_PROFILING_ENABLED` cannot be interposition-safe "
             "in a header-only inline"
+        )
+        assert "ggml_sycl_queue_profiling_enabled()" in masked_body, (
+            "the default is decided by the environment predicate (llama.cpp-atiz), the same answer in every "
+            "translation unit's copy of this inline"
         )
         assert DPCT_PROFILING_MACRO not in masked_body, (
             f"create_queue_impl must not read {DPCT_PROFILING_MACRO} at all -- the property must be "
