@@ -6071,6 +6071,36 @@ set_tests_properties(sycl-placement-residency-summary PROPERTIES
     TIMEOUT 120
 )
 
+# Whether a load keeps a device's PP MoE oneDNN ring, from the plan made with it (moe-ring-consumer.hpp): a ring whose
+# weights reach only the batched executor's resident claim is dropped when the plan leaves one of their experts on the
+# host. Host-only: synthetic plans, no queue, no device, no model. Built like the residency-summary test above, which
+# links ggml-sycl for placement_plan, inside the same NOT GGML_BACKEND_DL guard.
+add_executable(test-sycl-moe-ring-consumer
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-ring-consumer.cpp
+)
+target_include_directories(test-sycl-moe-ring-consumer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-ring-consumer PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-ring-consumer PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-moe-ring-consumer PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-moe-ring-consumer PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-ring-consumer PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-ring-consumer COMMAND test-sycl-moe-ring-consumer)
+set_tests_properties(sycl-moe-ring-consumer PROPERTIES
+    LABELS "sycl;moe;plan;host;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"

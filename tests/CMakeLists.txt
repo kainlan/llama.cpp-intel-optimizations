@@ -1206,6 +1206,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-gate-up-role-source.py --self-test)
     set_tests_properties(test-sycl-moe-gate-up-role-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # A load drops a PP MoE oneDNN scratch ring that serves resident layers only and displaced experts: the one
+    # decision the stage and the plan dry run call, the stage's order (no ring, the planner terms put back, the RUNTIME
+    # surplus given back, one more plan), the drop held for the load, and the cache's give-back. Run WITH --self-test so
+    # each mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-ring-drop-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-ring-drop-source.py --self-test)
+    set_tests_properties(test-sycl-moe-ring-drop-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The swap policy header is plain host code: standard includes only, and no mutable state outside the struct the
     # caller owns. Run WITH --self-test so each pin is shown to catch its mutant.
     add_test(NAME test-sycl-moe-swap-policy-source

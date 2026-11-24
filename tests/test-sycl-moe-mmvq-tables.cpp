@@ -1038,6 +1038,42 @@ int main() {
         }
     }
 
+    // 19. The ring uses a type reaches (moe_pp_ring_uses_of_type): each bit is the table its consumer reads, so a type
+    // gains or loses a use only with that table. NVFP4 reaches the resident claim alone, so a load keeps its ring only
+    // while the plan made with it leaves no NVFP4 expert on the host (moe_pp_ring_check_resident_only); a staged type
+    // (Qwen's IQ4_NL) and MXFP4, which the per-expert path stages at SOA, keep their ring as before. Q1_0 and F32 reach
+    // none.
+    {
+        const auto check_uses = [&](ggml_type type, uint32_t want, const char * why) {
+            const uint32_t got = moe_pp_ring_uses_of_type(type);
+            std::printf("ring use check: %s uses=0x%x want=0x%x (%s)\n", ggml_type_name(type), got, want, why);
+            if (got != want) {
+                ++failures;
+            }
+        };
+        check_uses(GGML_TYPE_NVFP4, MOE_PP_RING_USE_RESIDENT, "Inkling: the executor's f16 arm, never staged");
+        check_uses(GGML_TYPE_IQ4_NL, MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_STAGED,
+                   "Qwen: host-pinned experts stage through the ring");
+        check_uses(GGML_TYPE_MXFP4, MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_SOA_EXPERT,
+                   "GPT-OSS: the WOQ arm and the per-expert SOA staging");
+        check_uses(GGML_TYPE_Q1_0, MOE_PP_RING_USE_NONE, "the MMID direct route draws on no ring");
+        check_uses(GGML_TYPE_F32, MOE_PP_RING_USE_NONE, "a float expert keeps its own route");
+        // Every bit against its own table, over every type: the function adds no type of its own, and a type with any
+        // use is one the ring is planned for (moe_pp_onednn_ring_serves_type).
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            const uint32_t  uses = moe_pp_ring_uses_of_type(type);
+            const bool      res  = (uses & MOE_PP_RING_USE_RESIDENT) != 0;
+            const bool      stg  = (uses & MOE_PP_RING_USE_STAGED) != 0;
+            const bool      soa  = (uses & MOE_PP_RING_USE_SOA_EXPERT) != 0;
+            if (res != moe_pp_onednn_ring_serves_type(type) || stg != moe_pp_batched_takes_staged_type(type) ||
+                soa != (type == GGML_TYPE_MXFP4) || (uses != MOE_PP_RING_USE_NONE && !res)) {
+                std::printf("FAIL: type=%d ring uses 0x%x disagree with the consumers' tables\n", t, uses);
+                ++failures;
+            }
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

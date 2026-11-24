@@ -4330,6 +4330,48 @@ int main() {
               "a plan with no clamp had a clamp line");
     }
 
+    // ---- Case 51: the RUNTIME zone a load gives back after it drops its PP MoE ring ---------------------------------
+    // A load that dropped a ring which displaced experts asks the ensure for the RUNTIME zone's surplus back
+    // (zone_arena_ensure_options::give_back). Only an arena that holds every zone the plan needs and has a larger RUNTIME
+    // zone has a surplus; a zone that must grow is the ensure's ordinary rebuild, and an equal one has nothing to give.
+    // The rebuild gives back the RUNTIME zone alone: SCRATCH and ONEDNN stay as built, as a sufficient arena keeps them,
+    // even where the plan now asks for less of them.
+    {
+        constexpr size_t MiB = 1024ull * 1024ull;
+        using ggml_sycl::zone_arena_give_back_sizes;
+        using ggml_sycl::zone_arena_runtime_surplus;
+        using ggml_sycl::zone_arena_sizes;
+
+        // The B50 shape: the ring raised the RUNTIME zone to 1258 MB over a 700 MB plan without it.
+        const zone_arena_sizes have = { 512 * MiB, 256 * MiB, 1258 * MiB };
+        const zone_arena_sizes need = { 512 * MiB, 256 * MiB, 700 * MiB };
+        CHECK(zone_arena_runtime_surplus(have, need), "a RUNTIME zone above the plan's had no surplus");
+        zone_arena_sizes sizes = zone_arena_give_back_sizes(have, need);
+        CHECK(sizes.scratch == 512 * MiB && sizes.onednn == 256 * MiB && sizes.runtime == 700 * MiB,
+              "the give-back did not rebuild RUNTIME at the plan's figure with the other zones as built");
+
+        // SCRATCH and ONEDNN larger than the plan asks: kept as built, only RUNTIME comes back.
+        const zone_arena_sizes larger = { 600 * MiB, 300 * MiB, 1258 * MiB };
+        CHECK(zone_arena_runtime_surplus(larger, need), "larger SCRATCH and ONEDNN zones hid the RUNTIME surplus");
+        sizes = zone_arena_give_back_sizes(larger, need);
+        CHECK(sizes.scratch == 600 * MiB && sizes.onednn == 300 * MiB && sizes.runtime == 700 * MiB,
+              "the give-back shrank a SCRATCH or ONEDNN zone");
+
+        // No surplus: equal, or a zone the plan needs larger (the ensure's own rebuild grows it).
+        CHECK(!zone_arena_runtime_surplus(need, need), "an arena at the plan had a surplus");
+        const zone_arena_sizes runtime_short = { 512 * MiB, 256 * MiB, 600 * MiB };
+        CHECK(!zone_arena_runtime_surplus(runtime_short, need), "a RUNTIME zone short of the plan had a surplus");
+        const zone_arena_sizes scratch_short = { 256 * MiB, 256 * MiB, 1258 * MiB };
+        CHECK(!zone_arena_runtime_surplus(scratch_short, need), "an arena whose SCRATCH zone must grow had a surplus");
+        const zone_arena_sizes onednn_short = { 512 * MiB, 128 * MiB, 1258 * MiB };
+        CHECK(!zone_arena_runtime_surplus(onednn_short, need), "an arena whose ONEDNN zone must grow had a surplus");
+        // One grain above the plan is a surplus: the plan's figure is already rounded as the reserve rounds it.
+        const zone_arena_sizes one_grain = { 512 * MiB, 256 * MiB, 700 * MiB + ggml_sycl::k_zone_arena_alignment };
+        CHECK(zone_arena_runtime_surplus(one_grain, need), "a RUNTIME zone one grain above the plan had no surplus");
+        // No arena: nothing to give back.
+        CHECK(!zone_arena_runtime_surplus(zone_arena_sizes{}, need), "an absent arena had a surplus");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
