@@ -23831,6 +23831,94 @@ ggml_sycl::moe_fused::PromptFusionResult mmvq_submit_retained_prompt_fusion(
                                                       inject_publication_failure);
 }
 
+bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
+                                  int                         ncols,
+                                  int                         nrows_per_expert,
+                                  int                         top_k,
+                                  int                         n_tokens,
+                                  int                         ne11,
+                                  int64_t                     ids_nb0,
+                                  int64_t                     ids_nb1,
+                                  mmvq_q1_nvfp4_id_geometry * out) {
+    const int weight_qk = weight_type == GGML_TYPE_Q1_0 ? QK1_0 : weight_type == GGML_TYPE_NVFP4 ? QK_NVFP4 : 0;
+    if (out == nullptr || weight_qk == 0 || ncols <= 0 || nrows_per_expert <= 0 || top_k <= 0 || n_tokens <= 0 ||
+        (ne11 != 1 && ne11 != top_k) || ncols % weight_qk != 0 || ncols % QK8_1 != 0 ||
+        ids_nb0 < static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sizeof(int32_t)) ||
+        ids_nb0 % alignof(int32_t) != 0 || ids_nb1 % alignof(int32_t) != 0) {
+        return false;
+    }
+
+    const size_t sk                    = static_cast<size_t>(top_k);
+    const size_t st                    = static_cast<size_t>(n_tokens);
+    const size_t sr                    = static_cast<size_t>(ne11);
+    const size_t sn                    = static_cast<size_t>(nrows_per_expert);
+    const size_t blocks_per_row        = static_cast<size_t>(ncols / QK8_1);
+    const size_t weight_blocks_per_row = static_cast<size_t>(ncols / weight_qk);
+    const size_t weight_block_bytes    = weight_type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
+    const auto   checked_mul           = [](size_t a, size_t b, size_t * product) {
+        if (a != 0 && b > SIZE_MAX / a) {
+            return false;
+        }
+        *product = a * b;
+        return true;
+    };
+    const auto checked_add = [](size_t a, size_t b, size_t * sum) {
+        if (b > SIZE_MAX - a) {
+            return false;
+        }
+        *sum = a + b;
+        return true;
+    };
+
+    size_t occurrences = 0, activation_rows = 0, quant_blocks = 0, q8_row_bytes = 0, q8_bytes = 0;
+    size_t output_values = 0, output_bytes = 0, ids_slot_span = 0, ids_token_span = 0, ids_max_offset = 0;
+    size_t q8_nb12 = 0, dst_nb1 = 0, dst_nb2 = 0, block_num_z = 0, kernel_groups = 0, kernel_items = 0;
+    size_t quantize_items = 0, weight_blocks = 0, weight_bytes = 0;
+    if (!checked_mul(sk, st, &occurrences) || !checked_mul(sr, st, &activation_rows) ||
+        !checked_mul(activation_rows, blocks_per_row, &quant_blocks) ||
+        !checked_mul(blocks_per_row, sizeof(block_q8_1), &q8_row_bytes) ||
+        !checked_mul(activation_rows, q8_row_bytes, &q8_bytes) || !checked_mul(occurrences, sn, &output_values) ||
+        !checked_mul(output_values, sizeof(float), &output_bytes) ||
+        !checked_mul(sk - 1, static_cast<size_t>(ids_nb0), &ids_slot_span) ||
+        !checked_mul(st - 1, static_cast<size_t>(ids_nb1), &ids_token_span) ||
+        !checked_add(ids_slot_span, ids_token_span, &ids_max_offset) ||
+        !checked_add(ids_max_offset, sizeof(int32_t), &ids_max_offset) || !checked_mul(sr, q8_row_bytes, &q8_nb12) ||
+        !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2) ||
+        !checked_mul(sn, weight_blocks_per_row, &weight_blocks) ||
+        !checked_mul(weight_blocks, weight_block_bytes, &weight_bytes)) {
+        return false;
+    }
+    block_num_z = sn / GGML_SYCL_MOE_MMV_Y + (sn % GGML_SYCL_MOE_MMV_Y != 0);
+    if (!checked_mul(occurrences, block_num_z, &kernel_groups) ||
+        !checked_mul(kernel_groups, static_cast<size_t>(GGML_SYCL_MOE_MMV_Y) * WARP_SIZE, &kernel_items) ||
+        !checked_mul(quant_blocks, static_cast<size_t>(WARP_SIZE), &quantize_items) || occurrences > INT_MAX ||
+        activation_rows > INT_MAX || ids_max_offset > static_cast<size_t>(PTRDIFF_MAX) || q8_row_bytes > INT64_MAX ||
+        q8_nb12 > INT64_MAX || dst_nb1 > INT64_MAX || dst_nb2 > INT64_MAX || weight_blocks > INT_MAX ||
+        weight_bytes > INT_MAX || kernel_items == 0 || quantize_items == 0) {
+        return false;
+    }
+    // Slots are adjacent inside a token, and tokens do not overlap; a view's token stride may leave the other columns
+    // of its source between them (build_moe_ffn hands MUL_MAT_ID the top-k view of the argsort). The alignment test
+    // above keeps the stride a whole number of ids. ids_max_offset above is the farthest id's byte end under these
+    // strides, and the only bound checked on it is PTRDIFF_MAX: the extent of the storage the view lies in is not
+    // passed here, so that the farthest id lies inside it rests on the caller handing over a real tensor's view.
+    if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))) {
+        return false;
+    }
+
+    out->occurrences    = occurrences;
+    out->quant_blocks   = quant_blocks;
+    out->q8_row_bytes   = q8_row_bytes;
+    out->q8_bytes       = q8_bytes;
+    out->q8_nb12        = q8_nb12;
+    out->output_bytes   = output_bytes;
+    out->dst_nb1        = dst_nb1;
+    out->dst_nb2        = dst_nb2;
+    out->kernel_items   = kernel_items;
+    out->quantize_items = quantize_items;
+    return true;
+}
+
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,
@@ -23849,84 +23937,25 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
                                           const mmvq_q1_nvfp4_admitted_buffers & buffers,
                                           const sycl::event *                    dependency,
                                           sycl::event *                          event_out) {
-    const int  weight_qk = weight_type == GGML_TYPE_Q1_0 ? QK1_0 : weight_type == GGML_TYPE_NVFP4 ? QK_NVFP4 : 0;
-    const auto aligned   = [](const void * ptr, size_t alignment) {
+    const auto aligned = [](const void * ptr, size_t alignment) {
         return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
     };
-    if (weight_qk == 0 || weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !activation_f32 || !ids_device ||
-        !ids_host || !buffers.activation_q8 || !buffers.output_f32 || n_experts <= 0 || ncols <= 0 ||
-        nrows_per_expert <= 0 || top_k <= 0 || n_tokens <= 0 || (ne11 != 1 && ne11 != top_k) ||
-        ncols % weight_qk != 0 || ncols % QK8_1 != 0 || ids_nb0 < static_cast<int64_t>(sizeof(int32_t)) ||
-        ids_nb1 < static_cast<int64_t>(sizeof(int32_t)) || ids_nb0 % alignof(int32_t) != 0 ||
-        ids_nb1 % alignof(int32_t) != 0 || !aligned(expert_ptrs_device, alignof(void *)) ||
-        !aligned(activation_f32, alignof(float)) || !aligned(ids_device, alignof(int32_t)) ||
-        !aligned(buffers.activation_q8, alignof(block_q8_1)) || !aligned(buffers.output_f32, alignof(float)) ||
-        !q.get_device().has(sycl::aspect::fp16)) {
+    if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !activation_f32 || !ids_device || !ids_host ||
+        !buffers.activation_q8 || !buffers.output_f32 || n_experts <= 0 ||
+        !aligned(expert_ptrs_device, alignof(void *)) || !aligned(activation_f32, alignof(float)) ||
+        !aligned(ids_device, alignof(int32_t)) || !aligned(buffers.activation_q8, alignof(block_q8_1)) ||
+        !aligned(buffers.output_f32, alignof(float)) || !q.get_device().has(sycl::aspect::fp16)) {
         return false;
     }
-
-    const size_t sk             = static_cast<size_t>(top_k);
-    const size_t st             = static_cast<size_t>(n_tokens);
-    const size_t sr             = static_cast<size_t>(ne11);
-    const size_t sn             = static_cast<size_t>(nrows_per_expert);
-    const size_t blocks_per_row        = static_cast<size_t>(ncols / QK8_1);
-    const size_t weight_blocks_per_row = static_cast<size_t>(ncols / weight_qk);
-    const size_t weight_block_bytes =
-        weight_type == GGML_TYPE_Q1_0 ? sizeof(block_q1_0) : sizeof(block_nvfp4);
-    const auto   checked_mul    = [](size_t a, size_t b, size_t * out) {
-        if (a != 0 && b > SIZE_MAX / a) {
-            return false;
-        }
-        *out = a * b;
-        return true;
-    };
-    const auto checked_add = [](size_t a, size_t b, size_t * out) {
-        if (b > SIZE_MAX - a) {
-            return false;
-        }
-        *out = a + b;
-        return true;
-    };
-
-    size_t occurrences = 0, activation_rows = 0, quant_blocks = 0, q8_row_bytes = 0, required_q8 = 0;
-    size_t output_values = 0, required_output = 0, ids_slot_span = 0, ids_token_span = 0, ids_max_offset = 0;
-    size_t q8_nb12 = 0, dst_nb1 = 0, dst_nb2 = 0, block_num_z = 0, kernel_groups = 0, kernel_items = 0;
-    size_t weight_blocks = 0, weight_bytes = 0;
-    if (!checked_mul(sk, st, &occurrences) || !checked_mul(sr, st, &activation_rows) ||
-        !checked_mul(activation_rows, blocks_per_row, &quant_blocks) ||
-        !checked_mul(blocks_per_row, sizeof(block_q8_1), &q8_row_bytes) ||
-        !checked_mul(activation_rows, q8_row_bytes, &required_q8) || !checked_mul(occurrences, sn, &output_values) ||
-        !checked_mul(output_values, sizeof(float), &required_output) ||
-        !checked_mul(sk - 1, static_cast<size_t>(ids_nb0), &ids_slot_span) ||
-        !checked_mul(st - 1, static_cast<size_t>(ids_nb1), &ids_token_span) ||
-        !checked_add(ids_slot_span, ids_token_span, &ids_max_offset) ||
-        !checked_add(ids_max_offset, sizeof(int32_t), &ids_max_offset) || !checked_mul(sr, q8_row_bytes, &q8_nb12) ||
-        !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2) ||
-        !checked_mul(sn, weight_blocks_per_row, &weight_blocks) ||
-        !checked_mul(weight_blocks, weight_block_bytes, &weight_bytes)) {
-        return false;
-    }
-    block_num_z = sn / GGML_SYCL_MOE_MMV_Y + (sn % GGML_SYCL_MOE_MMV_Y != 0);
-    if (!checked_mul(occurrences, block_num_z, &kernel_groups) ||
-        !checked_mul(kernel_groups, static_cast<size_t>(GGML_SYCL_MOE_MMV_Y) * WARP_SIZE, &kernel_items) ||
-        !checked_mul(quant_blocks, static_cast<size_t>(WARP_SIZE), &kernel_groups) || occurrences > INT_MAX ||
-        activation_rows > INT_MAX || ids_max_offset > static_cast<size_t>(PTRDIFF_MAX) || q8_row_bytes > INT64_MAX ||
-        q8_nb12 > INT64_MAX || dst_nb1 > INT64_MAX || dst_nb2 > INT64_MAX || weight_blocks > INT_MAX ||
-        weight_bytes > INT_MAX || kernel_items == 0 || kernel_groups == 0 ||
-        buffers.activation_q8_bytes != required_q8 || buffers.output_f32_bytes != required_output) {
-        return false;
-    }
-    // Slots are adjacent inside a token, and tokens do not overlap; a view's token stride may leave the other columns
-    // of its source between them (build_moe_ffn hands MUL_MAT_ID the top-k view of the argsort). The alignment test
-    // above keeps the stride a whole number of ids. ids_max_offset above is the farthest id's byte end under these
-    // strides, and the only bound checked on it is PTRDIFF_MAX: the extent of the storage the view lies in is not
-    // passed here, so that the farthest id lies inside it rests on the caller handing over a real tensor's view.
-    if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))) {
+    mmvq_q1_nvfp4_id_geometry geometry;
+    if (!mmvq_q1_nvfp4_id_geometry_of(weight_type, ncols, nrows_per_expert, top_k, n_tokens, ne11, ids_nb0, ids_nb1,
+                                      &geometry) ||
+        buffers.activation_q8_bytes != geometry.q8_bytes || buffers.output_f32_bytes != geometry.output_bytes) {
         return false;
     }
     // The snapshot is the caller's read of the storage the kernel reads in place. It is checked here, before anything
     // is submitted, and not read again after this function returns.
-    for (size_t i = 0; i < occurrences; ++i) {
+    for (size_t i = 0; i < geometry.occurrences; ++i) {
         if (ids_host[i] < 0 || ids_host[i] >= n_experts) {
             return false;
         }
@@ -23934,13 +23963,69 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
 
     // The kernel reads the ids where they are. Quantization waits on the caller's dependency, which covers the
     // activation copy, and the kernel follows quantization.
-    sycl::event quant_event =
-        mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, quant_blocks, dependency);
-    return mmvq_submit_q1_nvfp4_aos_id(
-        q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8, ids_device, buffers.output_f32, ncols,
-        nrows_per_expert, static_cast<int>(occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1,
-        static_cast<int64_t>(q8_row_bytes), static_cast<int64_t>(q8_nb12), static_cast<int64_t>(dst_nb1),
-        static_cast<int64_t>(dst_nb2), n_experts, quant_event, event_out);
+    sycl::event quant_event = mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols,
+                                                                  geometry.quant_blocks, dependency);
+    return mmvq_submit_q1_nvfp4_aos_id(q, weight_type, weight_layout, expert_ptrs_device, buffers.activation_q8,
+                                       ids_device, buffers.output_f32, ncols, nrows_per_expert,
+                                       static_cast<int>(geometry.occurrences), top_k, n_tokens, ne11, ids_nb0, ids_nb1,
+                                       static_cast<int64_t>(geometry.q8_row_bytes),
+                                       static_cast<int64_t>(geometry.q8_nb12), static_cast<int64_t>(geometry.dst_nb1),
+                                       static_cast<int64_t>(geometry.dst_nb2), n_experts, quant_event, event_out);
+}
+
+bool mmvq_submit_q1_nvfp4_aos_id_resident(sycl::queue &        q,
+                                          ggml_type            weight_type,
+                                          ggml_layout_mode     weight_layout,
+                                          const void * const * expert_ptrs_device,
+                                          int                  n_experts,
+                                          const float *        activation_f32,
+                                          const int32_t *      ids_device,
+                                          int                  ncols,
+                                          int                  nrows_per_expert,
+                                          int                  top_k,
+                                          int                  n_tokens,
+                                          int                  ne11,
+                                          int64_t              ids_nb0,
+                                          int64_t              ids_nb1,
+                                          void *               activation_q8,
+                                          size_t               activation_q8_bytes,
+                                          float *              dst,
+                                          size_t               dst_bytes,
+                                          sycl::event *        event_out) {
+    const auto aligned = [](const void * ptr, size_t alignment) {
+        return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+    };
+    if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !activation_f32 || !ids_device || !activation_q8 ||
+        !dst || !event_out || n_experts <= 0 || !aligned(expert_ptrs_device, alignof(void *)) ||
+        !aligned(activation_f32, alignof(float)) || !aligned(ids_device, alignof(int32_t)) ||
+        !aligned(activation_q8, alignof(block_q8_1)) || !aligned(dst, alignof(float)) ||
+        !q.get_device().has(sycl::aspect::fp16)) {
+        return false;
+    }
+    mmvq_q1_nvfp4_id_geometry geometry;
+    if (!mmvq_q1_nvfp4_id_geometry_of(weight_type, ncols, nrows_per_expert, top_k, n_tokens, ne11, ids_nb0, ids_nb1,
+                                      &geometry) ||
+        activation_q8_bytes != geometry.q8_bytes || dst_bytes != geometry.output_bytes) {
+        return false;
+    }
+
+    // Quantization is its own row in GGML_SYCL_KERNEL_PROFILE; the kernel keeps its mulmat.mmvq.id_aos_<type> row.
+    // The in-order queue orders it after the work that produced activation_f32.
+    std::string quantize_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        quantize_metadata = "ncols=" + std::to_string(ncols) + ";quant_blocks=" + std::to_string(geometry.quant_blocks);
+    }
+    const ggml_sycl_profile_label quantize_label = mmvq_profile_label(
+        q, "mulmat.mmvq.id_quantize_q8_1_aos", quantize_metadata.c_str(), "mulmat", geometry.q8_bytes);
+    const sycl::event quant_event = ggml_sycl_profile_submit(q, quantize_label, [&](sycl::queue & profiled_queue) {
+        return mmvq_submit_quantize_q8_1_aos_after(profiled_queue, activation_f32, activation_q8, ncols,
+                                                   geometry.quant_blocks, nullptr);
+    });
+    return mmvq_submit_q1_nvfp4_aos_id(q, weight_type, weight_layout, expert_ptrs_device, activation_q8, ids_device,
+                                       dst, ncols, nrows_per_expert, static_cast<int>(geometry.occurrences), top_k,
+                                       n_tokens, ne11, ids_nb0, ids_nb1, static_cast<int64_t>(geometry.q8_row_bytes),
+                                       static_cast<int64_t>(geometry.q8_nb12), static_cast<int64_t>(geometry.dst_nb1),
+                                       static_cast<int64_t>(geometry.dst_nb2), n_experts, quant_event, event_out);
 }
 
 sycl::event mmvq_submit_quantize_q8_1_soa(sycl::queue &                    q,

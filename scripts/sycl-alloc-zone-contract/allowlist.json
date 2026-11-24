@@ -441,6 +441,14 @@
       "function": "moe_mmid_materialize_refusal_reported",
       "id": "E-MMID-REFUSAL-FOLLOWS-CATCH",
       "reason": "moe_mmid_materialize_refusal_reported is noexcept and its try wraps only the caller's follows callable, which the backend answers with a read-only exact-queue lookup in the MMID registry for each workspace owner: no allocation, no op execution, so no ggml_sycl_fallback_error. The handler answers 'reported', so the context bind's tripwire still fires. A rethrow would std::terminate through the noexcept boundary, and the registry translation unit is host-linkable without the backend's common header that defines the fallback error. Permanent."
+    },
+    {
+      "id": "H-MOE-RESIDENT-DECODE-Q8",
+      "code": "H-CASCADE",
+      "key": "ggml-sycl.cpp::ggml_sycl_mul_mat_id_nvfp4_resident_decode::declaration:req:0a08dde2::write:cascade_step#0",
+      "count": 1,
+      "outcome": "CASCADE",
+      "reason": "The NVFP4 resident decode route's Q8_1 input slice in the SCRATCH zone, spill forbidden. A refusal has a declared next path in the caller: the route declines the node by name (reason=scratch) and the admitted MUL_MAT_ID route runs it from its own workspace, so the miss is a counted cascade miss, not a plan fault."
     }
   ]
 }

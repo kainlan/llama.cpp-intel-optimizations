@@ -3866,6 +3866,19 @@ static inline bool ggml_sycl_valid_device_index(int dev) {
 // Defined in ggml-sycl.cpp with the route that builds it (llama.cpp-7pvo).
 struct moe_hybrid_decode_record;
 
+// The NVFP4 resident decode route's memoized plan answer for one weight on one device: whether the plan puts every
+// expert of the weight on the device at AOS. Walking the plan's experts is the costly part of the route's per-node
+// question, and the answer changes only with the plan object, a mid-load replan (which keeps the object and bumps the
+// epoch) or the weight's expert storage; those three are the key. The node's shapes, strides and ids are not in the
+// key and are asked of every node.
+struct ggml_sycl_moe_resident_decode_plan_memo {
+    std::weak_ptr<const ggml_sycl::placement_plan> plan;
+    uint64_t                                       replan_epoch       = 0;
+    uint64_t                                       storage_generation = 0;
+    bool                                           valid              = false;
+    bool                                           all_aos            = false;
+};
+
 struct ggml_tensor_extra_gpu_weight_ext {
     dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
 
@@ -4334,6 +4347,10 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    // The NVFP4 resident decode route's plan answer per device, and per device a bit for each reason the route has
+    // declined this weight under GGML_SYCL_MOE_ROUTE_LOG, so the route log names each reason once.
+    ggml_sycl_moe_resident_decode_plan_memo         moe_resident_decode_plan[GGML_SYCL_MAX_DEVICES];
+    uint32_t                                        moe_resident_decode_declines_logged[GGML_SYCL_MAX_DEVICES] = {};
     // Batch-1 decode direct-dispatch eligibility and layout, per device; see
     // moe-decode-hostpath.hpp (llama.cpp-yx28).
     ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];

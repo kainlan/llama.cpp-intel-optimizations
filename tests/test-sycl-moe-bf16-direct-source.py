@@ -64,7 +64,7 @@ ROUTE_IF = "if (src0->type == GGML_TYPE_BF16) {"
 ROUTE_ASK = f"if (!{PREDICATE}(dst, ctx.device)) {{"
 UNPLACED_CLAIM = "if(src0->buffer==nullptr){returntrue;}"
 # One helper holds the whole "this device's own buffer" test: one device's unsplit SYCL buffer, of `device`, in VRAM.
-OWN_BUFFER = "ggml_sycl_moe_bf16_direct_own_vram_buffer"
+OWN_BUFFER = "ggml_sycl_moe_direct_own_vram_buffer"
 OWN_BUFFER_HEAD = f"static bool {OWN_BUFFER}(ggml_backend_buffer_t buffer, int device) {{"
 OWN_BUFFER_BODY = (
     "if(buffer==nullptr||!ggml_backend_buffer_is_sycl(buffer)||ggml_backend_buffer_is_sycl_split(buffer)){returnfalse;}"
@@ -206,8 +206,9 @@ def claim_a_predicate(s):
     elif sycl.find(OWN_BUFFER_HEAD) > sycl.find(PREDICATE_HEAD):
         fails.append(f"{OWN_BUFFER} is defined after the predicate that asks it")
     asks = len(re.findall(rf"\b{OWN_BUFFER}\(", sycl))
-    if asks != 3:
-        fails.append(f"{OWN_BUFFER} appears {asks} times; want its definition, the predicate and the publish guard")
+    if asks != 4:
+        fails.append(f"{OWN_BUFFER} appears {asks} times; want its definition, the predicate, the BF16 publish guard "
+                     "and the NVFP4 resident decode route's publish guard")
     route = route_fn_body(sycl) or ""
     for where, text in (("predicate", body), ("route", route)):
         spelled = [part for part in BUFFER_TEST_PARTS if part in text]

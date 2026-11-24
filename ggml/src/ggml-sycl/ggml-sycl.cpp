@@ -83681,10 +83681,10 @@ static bool ggml_sycl_moe_pp_batched_admits_op(const ggml_tensor * op, int devic
 }
 
 // Whether `buffer` is `device`'s own buffer: one device's SYCL buffer, not a split buffer (the publisher reads its context
-// as a ggml_backend_sycl_buffer_context), of `device`, in VRAM. The BF16 route without a plan admits a placed weight
-// only there, and publishes expert slices only from there: it records them under `device`, so another card's buffer
-// must never pass.
-static bool ggml_sycl_moe_bf16_direct_own_vram_buffer(ggml_backend_buffer_t buffer, int device) {
+// as a ggml_backend_sycl_buffer_context), of `device`, in VRAM. The direct routes (BF16, and NVFP4 resident decode)
+// publish expert slices only from there, and the BF16 route without a plan admits a placed weight only there: the
+// publisher records the slices under `device`, so another card's buffer must never pass.
+static bool ggml_sycl_moe_direct_own_vram_buffer(ggml_backend_buffer_t buffer, int device) {
     if (buffer == nullptr || !ggml_backend_buffer_is_sycl(buffer) || ggml_backend_buffer_is_sycl_split(buffer)) {
         return false;
     }
@@ -83727,7 +83727,7 @@ static bool ggml_sycl_moe_bf16_direct_route_available(const ggml_tensor * op, in
     if (src0->buffer == nullptr) {
         return true;
     }
-    return ggml_sycl_moe_bf16_direct_own_vram_buffer(src0->buffer, device);
+    return ggml_sycl_moe_direct_own_vram_buffer(src0->buffer, device);
 }
 
 // Every BF16 MUL_MAT_ID that reaches ggml_sycl_mul_mat_id runs here, on this device: the experts from the full-local
@@ -83770,7 +83770,7 @@ static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, gg
     if (table == nullptr) {
         int  published_kind   = -1;
         bool published_stable = false;
-        if (ggml_sycl_moe_bf16_direct_own_vram_buffer(src0->buffer, ctx.device) &&
+        if (ggml_sycl_moe_direct_own_vram_buffer(src0->buffer, ctx.device) &&
             ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS, &published_kind,
                                                          &published_stable)) {
             table = ensure_table();
@@ -83857,6 +83857,304 @@ static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, gg
                           ggml_sycl::moe_bf16_direct_vec4(shape) ? 1 : 0);
         }
     }
+}
+
+// Why the NVFP4 resident decode route left a decode node to the admitted route. The route log names each reason once
+// per weight and device with one bit per reason on the weight, so COUNT must fit 32 bits.
+enum class moe_resident_decode_decline : uint8_t {
+    OPERANDS,          // not NVFP4 experts x F32 input -> F32 output with I32 ids
+    PROMPT,            // more than one token
+    WEIGHT_VIEW,       // a view of the weight, a non-contiguous weight, or a weight with no extra
+    INPUT_ROWS,        // the input's floats or rows are not adjacent
+    OUTPUT_ROWS,       // the output's floats or rows are not adjacent
+    GEOMETRY,          // a shape or ids view the checked kernel's geometry does not take
+    PLAN,              // no plan, or a plan that does not put every expert on this card at AOS
+    IDS_NOT_RESIDENT,  // the ids have no storage on this card
+    NO_POINTER,        // the input or the output has no pointer on this card
+    TABLE_INCOMPLETE,  // the plan says every expert is here at AOS, but not every one resolves here yet
+    SCRATCH,           // the SCRATCH zone could not hold the quantized input
+    COUNT,
+};
+
+static const char * moe_resident_decode_decline_name(moe_resident_decode_decline decline) {
+    switch (decline) {
+        case moe_resident_decode_decline::OPERANDS:
+            return "operands";
+        case moe_resident_decode_decline::PROMPT:
+            return "prompt";
+        case moe_resident_decode_decline::WEIGHT_VIEW:
+            return "weight_view";
+        case moe_resident_decode_decline::INPUT_ROWS:
+            return "input_rows";
+        case moe_resident_decode_decline::OUTPUT_ROWS:
+            return "output_rows";
+        case moe_resident_decode_decline::GEOMETRY:
+            return "geometry";
+        case moe_resident_decode_decline::PLAN:
+            return "plan";
+        case moe_resident_decode_decline::IDS_NOT_RESIDENT:
+            return "ids_not_resident";
+        case moe_resident_decode_decline::NO_POINTER:
+            return "no_pointer";
+        case moe_resident_decode_decline::TABLE_INCOMPLETE:
+            return "table_incomplete";
+        case moe_resident_decode_decline::SCRATCH:
+            return "scratch";
+        case moe_resident_decode_decline::COUNT:
+            break;
+    }
+    return "unknown";
+}
+
+// Names a decline in the route log, once per weight, device and reason, so a run under GGML_SYCL_MOE_ROUTE_LOG=1 shows
+// whether, and why, a decode node of this weight left the resident route. A decline is not a fault: the admitted
+// route runs the node as it did before the resident route existed.
+static void ggml_sycl_moe_resident_decode_log_decline(const ggml_tensor *         src0,
+                                                      int                         device,
+                                                      moe_resident_decode_decline decline) {
+    static_assert(static_cast<uint32_t>(moe_resident_decode_decline::COUNT) <= 32,
+                  "the decline log holds one bit per moe_resident_decode_decline reason");
+    if (!ggml_sycl::ggml_sycl_moe_route_log_enabled() || src0 == nullptr || src0->extra == nullptr || device < 0 ||
+        device >= GGML_SYCL_MAX_DEVICES || decline >= moe_resident_decode_decline::COUNT) {
+        return;
+    }
+    auto &         weight = static_cast<ggml_tensor_extra_gpu *>(src0->extra)->weight();
+    uint32_t &     logged = weight.moe_resident_decode_declines_logged[device];
+    const uint32_t bit    = 1u << static_cast<uint32_t>(decline);
+    if ((logged & bit) != 0) {
+        return;
+    }
+    logged |= bit;
+    GGML_LOG_INFO("[MOE-ROUTE] resident decode declined tensor=%s device=%d reason=%s\n", src0->name, device,
+                  moe_resident_decode_decline_name(decline));
+}
+
+// Whether the placement plan for `device` puts every expert of `src0` on `device` at AOS, memoized on the weight. The
+// plan walk reads every expert's entry, too much to repeat for each decode node; its answer changes only with the plan
+// object, the replan epoch (a mid-load replan keeps the object and bumps the epoch) and the weight's expert storage
+// generation, so those three are the key. Without a plan the answer is no: nothing has placed the experts, so there is
+// no full-local table to read.
+static bool ggml_sycl_moe_resident_decode_plan_all_aos(const ggml_tensor * src0, int device) {
+    if (src0->extra == nullptr || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    const std::shared_ptr<const ggml_sycl::placement_plan> plan = ggml_sycl_moe_plan_owner_for_device(device);
+    if (!plan) {
+        return false;
+    }
+    auto &         weight     = static_cast<ggml_tensor_extra_gpu *>(src0->extra)->weight();
+    auto &         memo       = weight.moe_resident_decode_plan[device];
+    const uint64_t epoch      = ggml_sycl::moe_route_table_current_replan_epoch();
+    const uint64_t generation = weight.moe_expert_storage_generation;
+    const bool     same_plan  = !memo.plan.owner_before(plan) && !plan.owner_before(memo.plan);
+    if (memo.valid && memo.replan_epoch == epoch && memo.storage_generation == generation && same_plan) {
+        return memo.all_aos;
+    }
+    layout_mode layout = GGML_LAYOUT_AOS;
+    memo.all_aos = ggml_sycl_moe_tensor_plan_primary_layout(*plan, src0, device, &layout) && layout == GGML_LAYOUT_AOS;
+    memo.plan    = plan;
+    memo.replan_epoch       = epoch;
+    memo.storage_generation = generation;
+    memo.valid              = true;
+    return memo.all_aos;
+}
+
+// Whether `op`, on `device`, is a decode node the NVFP4 resident route runs: NVFP4 experts x F32 input -> F32 output
+// with I32 ids, one token, the weight a whole contiguous root tensor (its expert records live on its own extra), the
+// input's and output's floats and rows adjacent, a shape and ids view the checked kernel's geometry takes (filled into
+// *geometry), and, asked last, a plan that puts every expert on `device` at AOS. The plan's answer is memoized on the
+// weight under a key that says nothing about the node, so everything about the node is asked first, of every node.
+// Every no names its reason in *decline, and the caller leaves the node to the admitted route.
+//
+// NVFP4 only. Q1_0 decode stays on the admitted route: its admitted lifecycle cases (admission, workspace reuse, the
+// refusal and failure paths) run on Q1_0 weights and are the vehicle for the failure-path tests, which a Q1_0 decode
+// node taken here would leave without one.
+static bool ggml_sycl_moe_resident_decode_route_available(const ggml_tensor *           op,
+                                                          int                           device,
+                                                          mmvq_q1_nvfp4_id_geometry *   geometry,
+                                                          moe_resident_decode_decline * decline) {
+    const auto no = [decline](moe_resident_decode_decline reason) {
+        *decline = reason;
+        return false;
+    };
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * ids  = op->src[2];
+    if (op->op != GGML_OP_MUL_MAT_ID || src0 == nullptr || src1 == nullptr || ids == nullptr ||
+        src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        ids->type != GGML_TYPE_I32) {
+        return no(moe_resident_decode_decline::OPERANDS);
+    }
+    if (ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        op->ne[2] != 1 || op->ne[3] != 1) {
+        return no(moe_resident_decode_decline::PROMPT);
+    }
+    // The expert records live on the weight's own extra, and the AOS publisher publishes only a root tensor.
+    if (src0->view_src != nullptr || !ggml_is_contiguous(src0) || src0->extra == nullptr) {
+        return no(moe_resident_decode_decline::WEIGHT_VIEW);
+    }
+    // Quantization reads the input as ne11 adjacent rows of adjacent floats; one row has no row stride to check.
+    if (src1->nb[0] != sizeof(float) || (src1->ne[1] > 1 && src1->nb[1] != src1->ne[0] * sizeof(float))) {
+        return no(moe_resident_decode_decline::INPUT_ROWS);
+    }
+    // The kernel writes [top_k][N] floats with the geometry's strides.
+    if (op->nb[0] != sizeof(float) || op->nb[1] != op->ne[0] * sizeof(float)) {
+        return no(moe_resident_decode_decline::OUTPUT_ROWS);
+    }
+    const auto fits_int = [](int64_t value) {
+        return value > 0 && value <= INT_MAX;
+    };
+    if (src1->ne[0] != src0->ne[0] || op->ne[0] != src0->ne[1] || op->ne[1] != ids->ne[0] || !fits_int(src0->ne[0]) ||
+        !fits_int(src0->ne[1]) || !fits_int(src0->ne[2]) || !fits_int(ids->ne[0]) || !fits_int(src1->ne[1]) ||
+        !mmvq_q1_nvfp4_id_geometry_of(src0->type, static_cast<int>(src0->ne[0]), static_cast<int>(src0->ne[1]),
+                                      static_cast<int>(ids->ne[0]), 1, static_cast<int>(src1->ne[1]),
+                                      static_cast<int64_t>(ids->nb[0]), static_cast<int64_t>(ids->nb[1]), geometry)) {
+        return no(moe_resident_decode_decline::GEOMETRY);
+    }
+    if (!ggml_sycl_moe_resident_decode_plan_all_aos(src0, device)) {
+        return no(moe_resident_decode_decline::PLAN);
+    }
+    return true;
+}
+
+// The NVFP4 resident decode route: a decode node whose experts the plan puts all on this card at AOS runs from the
+// full-local expert table and the ids where they are. The input is quantized into a Q8_1 slice of the SCRATCH zone and
+// the checked MMVQ-ID kernel writes dst, with no host read of the ids, no workspace, no host task and no host wait;
+// the caller publishes the kernel's event as dst's ready event. True when the node was submitted, with *kernel_event
+// the kernel's event. False is a decline: the reason is named once in the route log and the admitted route runs the
+// node unchanged. A launch past an int, and a kernel entry that refuses a shape the predicate took, are refusals: one
+// named WARN line and ggml_sycl_fallback_error.
+//
+// Bad ids cost their own rows, not the node. The ids are not range-checked on the host, because that would need the
+// host read this route exists to remove; the checked kernel answers each row instead. An id below zero writes a
+// zero row. An id at or past the table's length, or one whose table slot holds no expert (a null slot), writes a
+// quiet NaN row without reading through the slot. Every other row is computed, and the graph succeeds.
+static bool ggml_sycl_mul_mat_id_nvfp4_resident_decode(ggml_backend_sycl_context & ctx,
+                                                       ggml_tensor *               dst,
+                                                       sycl::event *               kernel_event) {
+    const ggml_tensor * src0    = dst->src[0];
+    const ggml_tensor * src1    = dst->src[1];
+    const ggml_tensor * ids     = dst->src[2];
+    const auto          decline = [&](moe_resident_decode_decline reason) {
+        ggml_sycl_moe_resident_decode_log_decline(src0, ctx.device, reason);
+        return false;
+    };
+    const auto refuse = [&](const char * reason) {
+        GGML_LOG_WARN("[MoE] NVFP4 resident decode route refused: tensor=%s device=%d reason=%s\n", src0->name,
+                      ctx.device, reason);
+        throw ggml_sycl_fallback_error("NVFP4 MoE resident decode route refused");
+    };
+
+    mmvq_q1_nvfp4_id_geometry   geometry;
+    moe_resident_decode_decline reason = moe_resident_decode_decline::COUNT;
+    if (!ggml_sycl_moe_resident_decode_route_available(dst, ctx.device, &geometry, &reason)) {
+        return decline(reason);
+    }
+
+    // A capture would record this node's scratch slice and the table as they are now. Do what the BF16 route does:
+    // let the outer handler drop the graph to direct execution, before any table, ids or scratch work.
+    if (g_ggml_sycl_graph_recording) {
+        ctx.moe_graphs_disabled_once = true;
+        GGML_LOG_WARN("[MoE] NVFP4 resident decode route under graph recording: tensor=%s; direct execution\n",
+                      src0->name);
+        throw sycl::exception(sycl::make_error_code(sycl::errc::runtime),
+                              "NVFP4 MoE resident decode route incompatible with graph recording");
+    }
+
+    // A decode node's launch is far below an int; the check states the kernels' bound instead of assuming it.
+    if (geometry.kernel_items > static_cast<size_t>(INT_MAX) ||
+        geometry.quantize_items > static_cast<size_t>(INT_MAX)) {
+        refuse("the launch exceeds an int");
+    }
+
+    ggml_sycl::mem_handle ids_handle;
+    const int32_t *       ids_dev = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids, &ids_handle);
+    if (ids_dev == nullptr) {
+        return decline(moe_resident_decode_decline::IDS_NOT_RESIDENT);
+    }
+    const float * src1_dev = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
+    float *       dst_dev  = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
+    if (src1_dev == nullptr || dst_dev == nullptr) {
+        return decline(moe_resident_decode_decline::NO_POINTER);
+    }
+
+    // The table the planner's preload provides. A weight in this card's own buffer has no expert records until
+    // something publishes them: publish its AOS slices from the buffer and build once more. A table that still does
+    // not resolve is a placement the plan states and the storage does not show yet; the admitted route, which builds
+    // its own batch table, runs the node.
+    const auto ensure_table = [&]() {
+        return moe_fusion_ensure_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS);
+    };
+    const void * const * table = ensure_table();
+    if (table == nullptr) {
+        int  published_kind   = -1;
+        bool published_stable = false;
+        if (ggml_sycl_moe_direct_own_vram_buffer(src0->buffer, ctx.device) &&
+            ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS, &published_kind,
+                                                         &published_stable)) {
+            table = ensure_table();
+        }
+    }
+    if (table == nullptr) {
+        return decline(moe_resident_decode_decline::TABLE_INCOMPLETE);
+    }
+
+    // The quantized input: this node's own SCRATCH slice. A zone that cannot hold it is a planned miss, not a plan
+    // fault: the node declines and the admitted route runs it from its workspace.
+    ggml_sycl::alloc_request req{};
+    req.queue                                     = ctx.stream();
+    req.device                                    = ctx.device;
+    req.size                                      = geometry.q8_bytes;
+    req.intent.role                               = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                           = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.cohort_id                          = "moe_resident_decode_q8";
+    req.intent.constraints.must_device            = true;
+    req.intent.constraints.prefer_vram_zone       = ggml_sycl::vram_zone_id::SCRATCH;
+    req.intent.constraints.forbid_vram_zone_spill = true;
+    req.intent.constraints.cascade_step           = true;
+    ggml_sycl::allocation_result q8_alloc         = ggml_sycl::unified_allocate_owner(req);
+    if (!q8_alloc) {
+        return decline(moe_resident_decode_decline::SCRATCH);
+    }
+    ggml_sycl::mem_handle q8_handle =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(q8_alloc.owner), GGML_LAYOUT_AOS);
+    const auto q8 = q8_handle.resolve(ctx.device);
+    if (!q8 || q8.ptr == nullptr || !q8.on_device) {
+        return decline(moe_resident_decode_decline::SCRATCH);
+    }
+
+    // The table's dispatch bundle (its active expert leases and the table's own allocation), the ids' storage and the
+    // scratch stay alive until the kernel is done, and nothing else holds them for this node. The bundle is a
+    // snapshot, as every production pointer-table dispatcher takes: the active leases stay on the table for the next
+    // dispatch from it.
+    std::vector<ggml_sycl::mem_handle> retained = ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(
+        static_cast<const ggml_tensor_extra_gpu *>(src0->extra), ctx.device);
+    retained.push_back(ids_handle);
+    retained.push_back(std::move(q8_handle));
+
+    // The entry makes every check before it submits anything, so a refusal leaves nothing in flight on the slices.
+    if (!mmvq_submit_q1_nvfp4_aos_id_resident(
+            *ctx.stream(), src0->type, GGML_LAYOUT_AOS, table, static_cast<int>(src0->ne[2]), src1_dev, ids_dev,
+            static_cast<int>(src0->ne[0]), static_cast<int>(src0->ne[1]), static_cast<int>(ids->ne[0]), 1,
+            static_cast<int>(src1->ne[1]), static_cast<int64_t>(ids->nb[0]), static_cast<int64_t>(ids->nb[1]), q8.ptr,
+            geometry.q8_bytes, dst_dev, ggml_nbytes(dst), kernel_event)) {
+        refuse("the kernel entry refused a shape the predicate took");
+    }
+    ggml_sycl::retain_handles_until_event(std::move(retained), *kernel_event);
+    ctx.moe_graphs_disabled_once = true;
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+    g_q1_nvfp4_test_resident_submit.fetch_add(1, std::memory_order_relaxed);
+#endif
+
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> resident_decode_log{ 0 };
+        if (resident_decode_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+            GGML_LOG_INFO("[MOE-ROUTE] resident decode tensor=%s device=%d experts=%lld slots=%lld ne11=%lld\n",
+                          src0->name, ctx.device, (long long) src0->ne[2], (long long) ids->ne[0],
+                          (long long) src1->ne[1]);
+        }
+    }
+    return true;
 }
 
 #if GGML_SYCL_DNNL
@@ -85308,6 +85606,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     if (src0->type == GGML_TYPE_BF16) {
         ggml_sycl_mul_mat_id_bf16_direct(ctx, dst);
         return;
+    }
+
+    // An NVFP4 decode node whose experts the plan puts all on this card at AOS runs on the resident decode route: the
+    // full-local table, the ids where they are and one checked kernel, with no host read of the ids, no workspace and
+    // no host task. The kernel's event is dst's ready event, so the guard's queue-sync event is not submitted. A node
+    // the route declines takes the routes below unchanged.
+    if (src0->type == GGML_TYPE_NVFP4) {
+        sycl::event resident_event;
+        if (ggml_sycl_mul_mat_id_nvfp4_resident_decode(ctx, dst, &resident_event)) {
+            ggml_sycl_set_tensor_ready_event(dst, ctx.device, resident_event, ctx.stream());
+            ready_guard.published = true;
+            return;
+        }
     }
 
     // GGML_SYCL_MMID_SCHED (default 0): the device-built prompt schedule. A refusal falls through to the planned routes.
