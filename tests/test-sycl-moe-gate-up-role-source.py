@@ -38,7 +38,10 @@ the Q1_0/NVFP4 direct MMID route runs ahead of. This gate holds both:
       declines go through the decline tail) and the build without oneDNN;
   S7  the prompt count skips a node's second pass, whose snapshot its first pass counted;
   S8  the device test runs NVFP4 on the plain fixture and on a fused gate_up fixture and two special-scale fixtures,
-      writes no 0xFF scale, and fails a case that printed the re-entry line.
+      writes no 0xFF scale, and fails a case that printed the re-entry line;
+  S9  no other prompt dispatch takes a node the direct route stepped aside for: the planned-local batched MMVQ try,
+      which runs ahead of the executor under two GPUs or GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED=1 and is neither
+      the executor nor the direct route, is called once, behind `!pp_direct_deferred`.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
@@ -145,6 +148,9 @@ TEST_VARIANTS = ("constexpr fixture_variant k_nvfp4_variants[] = { fixture_varia
 TEST_SCALES = re.compile(r"constexpr uint8_t (k_small_scales|k_large_scales)\[\] = \{([^}]*)\};")
 TEST_REENTRY = 'const size_t reentered = g_log.count_since(from, { "direct MMID route re-entered" });'
 TEST_REFUSAL = "if (refused != 0 || prompt_rf != 0 || unplanned != 0 || reentered != 0) {"
+PLANNED_LOCAL_TRY = "try_pp_planned_local_batched()"
+PLANNED_LOCAL_CALL = ("if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && !pp_direct_deferred && "
+                      "try_pp_planned_local_batched()) { return; }")
 
 
 class ContractError(AssertionError):
@@ -369,6 +375,11 @@ def check_seam(s: Sources) -> None:
         raise ContractError("FAIL [pin S8]: the special scales are not two cycles free of 0xFF")
     need_once(test, TEST_REENTRY, "S8", "the device test's re-entry count")
     need_once(test, TEST_REFUSAL, "S8", "the device test's refusal verdict")
+    # S9
+    if be.count(PLANNED_LOCAL_TRY) != 1:
+        raise ContractError(f"FAIL [pin S9]: the planned-local batched try is called {be.count(PLANNED_LOCAL_TRY)} "
+                            "times, not once")
+    need_once(be, PLANNED_LOCAL_CALL, "S9", "the planned-local batched try behind the deferral")
 
 
 def check(s: Sources) -> None:
@@ -530,6 +541,13 @@ def self_test(raws: dict[str, str]) -> int:
                   "fixture_variant::LARGE_SCALES };")])
     expect_fail("test-ignores-reentry", "S8", D,
                 [("unplanned != 0 || reentered != 0) {", "unplanned != 0) {")])
+    # S9: the planned-local batched try.
+    expect_fail("planned-local-takes-deferred", "S9", B,
+                [("pp_planned_local_batched_enabled && !pp_direct_deferred &&", "pp_planned_local_batched_enabled &&")])
+    expect_fail("planned-local-second-call", "S9", B,
+                [("        if (try_pp_onednn_f16_batched()) {\n",
+                  "        if (pp_planned_local_batched_enabled && try_pp_planned_local_batched()) {\n"
+                  "            return;\n        }\n        if (try_pp_onednn_f16_batched()) {\n")])
 
     # The NOT APPLIED report must fire on an anchor the sources do not hold, or a stale mutant would pass unseen.
     try:
