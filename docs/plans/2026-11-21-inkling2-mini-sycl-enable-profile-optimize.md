@@ -6379,6 +6379,137 @@ test's `tests:` commit. Path-scoped.
   The name `..._FPMATH_STRICT` the lead asked for in Q9 is refused by the tenant-plan contract, which reserves
   `GGML_SYCL_*STRICT*`; the implementer renamed it.
 
+### Integration with master, and what a long prompt showed (lead, 2026-11-24)
+
+**What.** `master` had moved to `6687ccc7e` (the `integ/th32` merge: storage tiers, host-pinned experts,
+host-backing guards; about 1,800 commits) while this line stayed on `a6f03b1ee`. Branch `integ/inkling2-on-master`
+merges master into the line: `331457e43` (with Tasks 18 and 19), `186ebed61` (one census contract row) and
+`641c7e065` (with Task 20). Evidence: `docs/backend/data/inkling2/integ-641c7e065-lead-runs.txt`.
+- *Conflicts.* `ggml-sycl.cpp`: both sides' test counters and seam functions kept; the direct-route adapter call
+  keeps this line's `ctx.device` argument with master's `ggml_sycl_moe_direct_log_refusal`. `gemm.hpp`: master renamed
+  the primitive attribute and made oneDNN deterministic; Task 20's float-mode branch is kept on master's object (one
+  of its lines had merged without a conflict and would not have compiled). Test seam header, the lifecycle
+  contract's counts, the env-var page and the generated inventory: both sides kept, the inventory regenerated.
+- *Review of both merges (opus, read-only): pass, no finding.* A host-pinned or host-tiered operand resolves as not on
+  the device, so it cannot reach the batched F32 route; the NVFP4 resident decode route declines any expert the
+  planner put on the host. One coverage note is in the owed list.
+- *Build and contracts at `641c7e065`.* Full build `[786/786]`. The two fixed sweeps: five red, all red on master itself
+  (`test-llama-context-cpu-only-compile`, `test-sycl-runtime-registry-index-source`,
+  `sycl-private-cpu-traits-source`, `test-llama-lazy-declaration-source`, `test-llama-lazy-range-record-source`).
+  Six of this line's old eight are green on the new base, `test-sycl-dnnl-decline-consumers` among them.
+- *Device checks, each once.* The Task 20 device test and the NVFP4 admitted test pass on both cards; the Inkling
+  gate passes on the B70, the B50 alone and both cards; the Mistral B70 and GPT-OSS B50 gates pass; the fixed-seed
+  64-token text is byte-equal to the pre-merge tree's; `test-backend-ops -o MUL_MAT` changes no case on either card.
+- *`llama-bench -p 512 -n 128`, interleaved, each run once, pp / tg in t/s.* Inkling B70, before the merge against
+  integrated: 112.2 / 25.2 and 112.3 / 25.3 against 113.3 / 27.6 and 112.3 / 27.6. Mistral B70, master against
+  integrated: 3356 / 107.9 and 3350 / 108.2 against 3349 / 108.1 and 3355 / 107.9. GPT-OSS B50: 874.7 / 35.5 and
+  872.5 / 35.7 against 873.0 / 35.7 and 872.7 / 35.8.
+
+**The long real-text arm (user direction, 2026-11-24: "we should test things with longer prompts so we actually
+exercise real usage").** A 4,737-token document (5,037 in Mistral's tokenizer) and 255 generated tokens, seed 42, temperature 0, through the
+completion tool (Inkling, Mistral) or the chat tool (GPT-OSS). From now on every verification round of this plan
+carries this arm. Runner: the lead's `run-long.sh`; it becomes a script in `scripts/` when Task 21 lands.
+
+| model, setup | before | integrated |
+|---|---|---|
+| Inkling, B70, `-c 8192` | 92.0 pp, 23.95 tg, peak host backing 49 GiB | 92.3 pp, 26.1 tg, 21 GiB |
+| Inkling, both cards | 92.3 pp, 23.96 tg, 49 GiB | 92.3 pp, 26.2 tg, 21 GiB |
+| Inkling, B50 alone | 16.3 pp, 6.3 tg, 57 GiB | 18.9 pp, 7.1 tg, 21 GiB |
+| GPT-OSS, B70, default context | 1043 and 1105 pp, 48.6 and 50.7 tg | 1098 and 1100 pp, 50.1 and 50.5 tg |
+| GPT-OSS, B50, default context | 119 and 128 pp, 20.7 and 20.0 tg | 133 and 120 pp, 21.3 and 21.0 tg |
+| Mistral, B70, `-ub 512` | 2451 pp, 88.7 tg (first run of the pair, cold: 1519) | 2452 and 2366 pp, 88.5 tg |
+| Mistral, B50, `-ub 512` | 1064 pp, 39.4 tg (first run, cold: 879) | 1063 and 1063 pp, 39.4 tg |
+
+("before" is the Inkling line before the merge for Inkling and a clean master build for the others; pp and tg in
+t/s; each run once.) The integrated tree is not slower than its before-arm anywhere. What the arm found that the
+short gates and the bench had not:
+1. **Mistral cannot process a long prompt with default flags, on master and on the integrated tree, on both
+   cards.** The context is created with an auto micro-batch of 2048 (`[SYCL-PLAN] auto n_ubatch=2048 for n_ctx=32768
+   n_batch=2048 (tried 2048; cached)`) while the load plan measured its compute slot at 512, and the first prompt
+   graph is refused: `[DEQUANT-F16] graph refused before submission ... needs 112.0 MB ... planned 0.0 MB for both
+   buffers at the runtime n_ubatch=2048`. A named refusal, not a crash, and not from this line. Owed below.
+2. **GPT-OSS on the B50 at its default context does 119-133 t/s on a long prompt** against 874 from the bench, and
+   21 t/s of decode against 35.7. The same on both trees. Owed below.
+3. **Inkling's real prompt speed is 92 t/s, not the bench's 112**, and on the B50 alone it is 19 / 7 t/s.
+4. **Before the merge, Inkling's long-prompt text was not reproducible run to run** on the B70 (two runs of the same
+   tree diverge after the fifth bullet). The integrated tree's two runs are byte-equal: master made oneDNN
+   deterministic. So the long arm's text check is run-to-run equality on the new tree and a read of the output,
+   not equality with the before tree.
+5. **Inkling with no `-c` is refused by name** (training context 1,048,576: the compute buffer would need 150 GiB).
+   The Inkling gate and every run of this plan pass a context; that is a request, not a shrink.
+
+**Prompt-speed direction (lead's decision, 2026-11-24, after the user's "100 pp is really low ... it should be
+able to run like thousands").** The arithmetic agrees with the user. One Inkling token is 48 MoE layer applications
+of 8 experts (3.06e9 weight-activation products, from the profiler's launch counts) plus about 1.3e9 in dense
+layers: 4.3e9 products, about 60% of a Mistral token. Mistral runs at about 3,350 t/s on the B70. GPT-OSS, the
+MoE this backend is fastest on, does 2.4e9 expert products per token at about 1,100 t/s on a long prompt. At
+GPT-OSS's end-to-end rate Inkling would do about 600-800 t/s; at Mistral's, several thousand.
+- *Why it does 92.* The NVFP4 expert kernel is 3.2 s of a 6.9 s 691-token prompt, at 0.69e12 products per second:
+  one work-group per (token, expert) pair, each re-reading and re-decoding its expert's rows; at 512 tokens an
+  expert is used by 32 tokens on average. The BF16 expert kernel has the same structure (0.30e12). Dense BF16
+  weights run at 1.5e12. About 1.8 s is host time over 22,825 submissions.
+- *What GPT-OSS does (read by an explorer on `641c7e065`, not run).* Its default prompt path is not the tiled DPAS
+  kernel (that measured 461 t/s) but the grouped oneDNN executor `try_pp_onednn_f16_batched` (owner ruling
+  `llama.cpp-iikr`, 2026-08-25): a host counting sort of the ids, one launch that repacks the active experts from
+  their loaded layout into weight-only-quantised planes in the planned scratch ring, a gather of each expert's
+  rows as F16, one oneDNN GEMM per expert, a scatter. About twenty other quant types take the same executor
+  through an F16 dequant into the same planned slot. NVFP4 and Q1_0 are excluded from it
+  (`moe_type_needs_direct_kernel`, `moe_pp_batched_f16_supports_layout`).
+- **Decision: NVFP4 experts take the grouped oneDNN prompt executor.** This reverses this plan's earlier reading
+  (row S4: "a grouped NVFP4 kernel is a new kernel on the loaded AOS layout", because the executor "converts the
+  weights to F16"). Reason: the loaded layout of the weight does not change and no second layout is kept; the
+  executor's planes are per-dispatch scratch in a zone the planner sizes, which `docs/backend/sycl-memory-design.md`
+  and `.claude/rules/sycl-backend.md` already class as layout work on device-resident data, and which is this
+  fork's default prompt design for every other expert type since the 2026-08-25 ruling. A hand-written grouped
+  kernel on AoS stays the fallback if the probe below fails: the explorer's read puts its ceiling at a quarter
+  of the oneDNN class. Decode keeps the resident route of Tasks 18 and 19.
+- *The risk that decides the design:* Inkling has 128 experts, all active at 512 tokens, against GPT-OSS's 32. A
+  gather, a GEMM and a scatter per expert is about 400 submissions per node and 96 nodes per ubatch: at the
+  measured 23 us per submission that alone is 0.9 s per 512 tokens. The stage kernels and the GEMM must be batched
+  over experts (the executor's 3-D arm is opt-in because it gives wrong numbers at HEAD).
+
+### Task 21: NVFP4 experts take the grouped oneDNN prompt executor (written 2026-11-24)
+
+**Track:** S3-prompt (row S4). **Depends on:** the integration above. **Base:** `integ/inkling2-on-master`.
+
+**Checkpoint before any GREEN code (report to the lead, then wait). Read on the task's own base; cite file:line:**
+1. Every site that excludes NVFP4 from the grouped executor and why each was written (`git log -S` on the
+   predicate names): `moe_type_needs_direct_kernel`, `choose_moe_batch_executor`,
+   `moe_pp_batched_f16_supports_layout`, `moe_pp_batched_woq_supports_layout`, `moe_pp_onednn_ring_serves_type`,
+   the claim predicate in `ggml_sycl_mul_mat_id`, the route capability. Which of them guard host experts (the
+   immutable host recipe, which must not change) and which guard a device-resident prompt node.
+2. The executor end to end for a type it serves through the F16 dequant (not MXFP4): the converter
+   (`convert.cpp` has an NVFP4 one: is it complete, is it exercised, what does it cost per element), the slot and
+   who plans its size, how experts are grouped when they do not all fit, what orders the GEMM after the repack,
+   what is waited on. State every allocation and its owner.
+3. The ring and the slot for Inkling on each setup: 128 experts of 2304 x 2304 and 1152 x 2304 in F16 are 1.36 GB
+   and 0.68 GB per node. What the planner reserves today for this model (it plans no ring for NVFP4), what it
+   must reserve, and what that displaces on the B70 (32 GB) and the B50 (16 GB, experts partly host-pinned).
+   Never by shrinking the context.
+4. oneDNN weight-only quantisation: read the installed oneDNN's headers and documentation (not memory) for
+   whether a GPU matmul takes `f4_e2m1` weights with a scale group of 16 along K and which scale data types it
+   accepts. NVFP4's scale is UE4M3, one per 16 elements, plus a per-expert F32 scale tensor. Say whether a probe
+   is needed and write it as a device test the lead runs.
+5. Host cost: submissions per node for 128 active experts in the per-expert arm; what is wrong in the 3-D arm
+   (`gemm.hpp`, the comment at its opt-in) and what `gemm_batch_strided` needs from the slot's layout; a design
+   that makes the count independent of the number of experts.
+6. Numerics: the executor multiplies F16 activations by decoded weights, the kernel in use multiplies Q8_1
+   activations. Which is closer to the CPU reference, and what the device test must bound.
+7. The mixed card-and-host node and the two-card split: what the executor does with an expert that is not on this
+   card, and what the Inkling B50-alone setup (most experts host-pinned) takes.
+
+**The lead rules on the design after the checkpoint.** Expected shape, to be confirmed or corrected: step 1 the
+F16 dequant arm for device-resident NVFP4 prompt nodes with a planned slot (measured on the long prompt); step 2
+batching over experts; step 3 the weight-only-quantised arm if oneDNN takes group 16; BF16 experts and dense BF16
+weights follow in Task 22 on the same executor.
+
+**Acceptance (each lead run once, B70 first):** the long real-text arm on Inkling: pp at least 2x the 92 t/s of
+this record or the task stops and reports why; text byte-equal run to run and read for sense; decode not slower;
+peak host backing not higher. The Inkling, Mistral B70 and GPT-OSS B50 gates; `test-backend-ops -o MUL_MAT_ID`
+with no case changing; the two contract sweeps with no new red; the interleaved bench against the integrated
+tree; the same long arm on the B50 alone and on both cards. No `-ngl`, no context shrink, no new host wait, no
+allocation outside the unified cache.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
@@ -6644,6 +6775,24 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
 - `scripts/check-sycl-dnnl-decline-consumers.py` is not a usable gate: one of its mutants survives ("caller 1
   rethrows the named error as std::exception"), so it is red before and after any change.
 - The NVFP4 prompt kernel is now the largest part of an Inkling prompt: about 3.2 s of a 6.9 s 691-token prompt.
+
+*Left by the integration with master and the long-prompt arm (2026-11-24):*
+- **Mistral 7B refuses any prompt longer than one micro-batch with default flags, on master.** The auto micro-batch
+  is 2048 (cached: "ladder exhausted") and the load plan is told 512, so the dense F16 dequant buffers are planned
+  at 0 MB for the runtime size and the first graph is refused (`llama.cpp-479i` names the refusal). With `-ub 512`
+  the same prompt runs at 2,451 t/s on the B70 and 1,063 on the B50. The auto size and the plan must come from
+  one number. Not from this line; master's defect, found by the long arm.
+- **GPT-OSS on the B50 at its default context: 119-133 t/s on a 4.7k-token prompt and 21 t/s of decode**, against
+  874 and 35.7 from `llama-bench`. Not diagnosed here (the default context is 131072; what the KV room displaced
+  was not read). The bench figure overstates real use on that card by 7x.
+- Master's `test-backend-ops -o MUL_MAT_ID` fails one Q8_0 case on both cards
+  (`type_a=q8_0, n_mats=16, n_used=16, m=32, n=65536, k=256`), on the clean master build as well.
+- Master's grown-WEIGHT arm of `test-q1-nvfp4-admitted-device` ("deferred-bind-grown-weight") runs its NVFP4 case
+  through this line's resident route, so only its Q1_0 case shows the admitted route on that fixture.
+- A cold first run is 20-40% slower on a Mistral long prompt (1519 against 2451 t/s): the first arm of a pair
+  must not be read alone.
+- `llama-bench`'s random tokens gave Inkling 112 t/s where real text gives 92: the bench stays a regression
+  instrument, the long arm is the speed that is reported.
 
 ---
 
