@@ -61,7 +61,8 @@ Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.c
     (!consumer(...))` guard and of the `return consumer(...)` / `flag = consumer(...)` consumers (counted heads,
     out_prod's included), the single push of the MoE group event, the woq q4_0/q8_0 callers and the dequant arms that
     follow them, the hoisted pre-query's `return false` and the first slice's `b_a == 0` distinction, the MXFP4 PP and
-    unified PP fall-through, the MoE group break and stage failure, and the mul_mat_id `return false`.
+    unified PP fall-through, the MoE group break and stage failure, the mul_mat_id `return false`, and the batched F32
+    route's held gemm() result, returned as its has_value(), with the dispatch going on to the orchestrator on false.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching
 fails the gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on
@@ -148,6 +149,10 @@ MAIN_PINS = (
     # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each
     ("return DnnlGemmWrapper::gemm(", 1),
     ("used_onednn_fp16 = DnnlGemmWrapper::row_gemm(", 1),
+    # the batched F32 route: its one gemm's decline is false, and the dispatch goes on to the orchestrator's loop
+    ("const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(", 1),
+    ("return batched_gemm.has_value();", 1),
+    ("src0_resolved, src1_resolved, dst_resolved, f32_batched_route)) { return; } else {", 1),
     # one push of the group event, after the decline check (review r3 Nit-2)
     ("gemm_events.push_back(*group_event)", 1),
     ("DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();", 1),
@@ -672,6 +677,10 @@ def gemm_mutants(files, edit):
     out.append(("M1d: the unified PP flag takes the negated result",
                 edit_pin(m, "used_onednn_fp16 = DnnlGemmWrapper::row_gemm(",
                          "used_onednn_fp16 = !DnnlGemmWrapper::row_gemm(")))
+    out.append(("M1e: the batched F32 route reads a decline as done",
+                edit_pin(m, "return batched_gemm.has_value();", "return true;")))
+    out.append(("M1f: the batched F32 route returns the negated result",
+                edit_pin(m, "return batched_gemm.has_value();", "return !batched_gemm.has_value();")))
     # review r3 Nit-1: a return after a note spelled other than `return false` / `return std::nullopt`
     for name, site in (("gemm", "DNNL_GEMM"), ("gemm_batch_strided", "DNNL_GEMM_BATCH"),
                        ("woq_gemm_batch_mxfp4", "DNNL_WOQ_MXFP4_BATCH")):
