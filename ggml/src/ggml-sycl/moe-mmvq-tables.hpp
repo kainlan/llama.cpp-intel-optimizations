@@ -266,6 +266,24 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
     return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
 }
 
+namespace ggml_sycl {
+
+// Q1_0 and NVFP4 host experts run an immutable recipe: a HOST_CPU recipe whose host workspace is planned for the
+// micro-batch (plan_moe_host_workspace) and checked exactly by validate_moe_execution_recipe, never the pinned buffer
+// pool the other host experts share. The prompt CPU island does not run them for that reason
+// (ggml_sycl_moe_pp_cpu_island_runs_type), and the ring does not stage them (moe_pp_batched_takes_staged_type). On a
+// device they need nothing of their own: the capability query answers the MMVQ_COMPAT id kernel for them, but more
+// narrowly than for other MMVQ id types (only an expert local to the submitting card, in AOS, with a block-aligned K),
+// and validate_moe_execution_recipe checks the direct kernel's recipe by its kernel, not by this type test. They are
+// also the types the MMID direct route in ggml_sycl_mul_mat_id runs on the primary card, so the planner's MMID
+// workspace pools (plan_moe_mmid_workspaces) are planned for them. Defined here, the lightest header that asks it, so
+// the host table test and the SYCL headers read one definition.
+inline bool moe_type_has_immutable_host_recipe(ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
+}
+
+}  // namespace ggml_sycl
+
 // The batched mul_mat_id prompt executor (try_pp_onednn_f16_batched in ggml-sycl.cpp): which
 // (type, layout) pairs it runs, as two arms (llama.cpp-348c).
 //
@@ -292,9 +310,11 @@ inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne
 // records the same limit (llama.cpp-dkw0). This executor's per-expert call passes only the element count. No plan
 // reaches the case either: the planner materializes an expert COALESCED only for MXFP4 without XMX
 // (layout_policy::get_optimal), and MXFP4's f16 arm admits SOA alone.
-// Q1_0 and NVFP4 have converters but are left out: they run on a device through their MMVQ id kernel (the dispatch
-// table above), and listing them here also needs test-moe-pp-batched-dequant to run them against the CPU, as it runs
-// every listed type. The float types need no dequant and keep their own routes.
+// NVFP4 is in on AOS, its only layout: a prompt whose every expert is on the device runs this arm, and the MMID direct
+// route keeps decode and every node the executor does not claim (the route steps aside only when
+// moe_mmid_direct_defers_to_executor says so). Q1_0 has a converter but is left out: it runs on a device through its
+// MMVQ id kernel (the dispatch table above), and listing it here also needs test-moe-pp-batched-dequant to run it
+// against the CPU, as it runs every listed type. The float types need no dequant and keep their own routes.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 // test-moe-pp-batched-dequant runs every listed type on a device except IQ1_S, IQ2_XXS and IQ2_XS, which need an
@@ -332,6 +352,7 @@ inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_la
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_NVFP4:
             return layout == GGML_LAYOUT_AOS;
         default:
             return false;
@@ -369,18 +390,23 @@ inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
 //     decision, no ring, the decline knob) runs the hybrid path, and supports_op, which decides before that, admits no
 //     other type on a hybrid layer (ggml_sycl_moe_pp_batched_admits_op).
 // IQ1_S, IQ1_M and IQ4_XS have the f16 row but no MMVQ-ID kernel, so they are left out until one exists
-// (llama.cpp-w4qk). MXFP4 has no f16 row at AOS: the ring stages nothing of it, so its layer stays hybrid.
+// (llama.cpp-w4qk). MXFP4 has no f16 row at AOS: the ring stages nothing of it, so its layer stays hybrid. NVFP4 has
+// both, and is still left out with Q1_0 by a third term: their host experts run an immutable host recipe with its own
+// planned workspace (moe_type_has_immutable_host_recipe), so a layer with an NVFP4 host expert keeps the route it has
+// (the B50's host route, the CPU island's refusal), and only a prompt whose every NVFP4 expert is on the device runs
+// this executor.
 inline bool moe_pp_batched_takes_staged_type(enum ggml_type type) {
-    return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS);
+    return !ggml_sycl::moe_type_has_immutable_host_recipe(type) && moe_mmvq_admission_supports_type(type) &&
+           moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS);
 }
 
 // Whether an expert of `type` has a consumer of the PP MoE oneDNN scratch ring, in any layout: the batched prompt
 // executor (the WOQ and f16 tables above) or the MXFP4 SOA per-expert staging (the f16 table's MXFP4 row). The load
-// plans the ring only for a model with such an expert (ggml_sycl_inventory_ring_has_consumer). Q1_0 and NVFP4 run on
-// their MMID direct route and BF16 on the BF16 direct route, and none of those draws on the ring, so a model whose
-// experts are only those types would otherwise hold a ring of several hundred MB in its RUNTIME zone that nothing
-// uses. The answer asks no runtime knob: the ring a load plans does not change with a knob that turns an executor off
-// for a run, and every type the ring stages for a host expert (moe_pp_batched_takes_staged_type) is served.
+// plans the ring only for a model with such an expert (ggml_sycl_inventory_ring_has_consumer). Q1_0 runs on its MMID
+// direct route and BF16 on the BF16 direct route, and neither draws on the ring, so a model whose experts are only
+// those types would otherwise hold a ring of several hundred MB in its RUNTIME zone that nothing uses. The answer
+// asks no runtime knob: the ring a load plans does not change with a knob that turns an executor off for a run, and
+// every type the ring stages for a host expert (moe_pp_batched_takes_staged_type) is served.
 inline bool moe_pp_onednn_ring_serves_type(enum ggml_type type) {
     for (int layout = GGML_LAYOUT_AOS; layout <= GGML_LAYOUT_MXFP4_DPAS; ++layout) {
         const enum ggml_layout_mode mode = static_cast<enum ggml_layout_mode>(layout);
@@ -389,6 +415,17 @@ inline bool moe_pp_onednn_ring_serves_type(enum ggml_type type) {
         }
     }
     return false;
+}
+
+// Whether the Q1_0/NVFP4 direct MMID route steps aside for a MUL_MAT_ID node so the batched prompt executor runs it:
+// a prompt (more than one token per expert row), a weight the executor claims on the device (every expert planned there,
+// in a layout its tables take: ggml_sycl_moe_pp_onednn_batched_claims_tensor), and a PP MoE oneDNN ring weight slot
+// planned on the device. Without the slot every dispatch of the executor declines (SCRATCH_UNPLANNED), so the route
+// keeps the node. Decode never steps aside: the executor runs prompts only. A node the executor declines before its
+// first submission runs again with the claim suppressed, and the route takes it then
+// (ggml_sycl_mul_mat_id_with_direct_reentry in ggml-sycl.cpp).
+inline bool moe_mmid_direct_defers_to_executor(bool prompt, bool executor_claims, size_t ring_weight_slot_bytes) {
+    return prompt && executor_claims && ring_weight_slot_bytes > 0;
 }
 
 // Whether the cache holds one entry per expert of a `type` weight at `layout`, which the batched executor needs:
