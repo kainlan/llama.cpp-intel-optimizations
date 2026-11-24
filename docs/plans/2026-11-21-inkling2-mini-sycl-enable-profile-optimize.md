@@ -6548,21 +6548,48 @@ reports before its first submission re-enters the direct route; a failure after 
   with no wrapper, a negative check for `ffn_norm_exps`, and grovemoe's `_chexps` left out on purpose, with a
   negative check: the executor's claim does not take them).
 - The seam. `moe_mmid_direct_defers_to_executor` (prompt, claim, planned ring weight slot) makes the direct route
-  step aside. A decline before the executor's first submission returns false; the call site then warns once per
-  (device, cause), "[PP-MOE] direct MMID route re-entered", and asks for a second pass, which
-  `ggml_sycl_mul_mat_id_with_direct_reentry` runs once the first pass has unwound, with the claim answering false for
-  the node's weight, so the node takes the route it took before. The first pass releases the ring slot claim and the
-  expert leases on unwind; the ids snapshot and the prompt admission stay cached and the second pass reads them with
-  no device wait. A decline after the first submission, or a GEMM-stage failure, throws with a named reason. The
-  routed-expert count skips the second pass. Pinned by `test-sycl-moe-gate-up-role-source`.
+  step aside. A decline before the executor's first submission returns false, and so does a prompt row-map staging
+  that does not fit (the direct route needs no row map); either way the pass asks for a second pass through one
+  helper, `request_direct_reentry`, which warns once per (device, cause), "[PP-MOE] direct MMID route re-entered"
+  (the row-map cause reads `row-map-staging`), and `ggml_sycl_mul_mat_id_with_direct_reentry` runs the second pass
+  once the first has unwound, with the claim answering false for the node's weight, so the node takes the route it
+  took before. No other prompt dispatch takes a deferred node: the planned-local batched MMVQ try, which runs ahead
+  of the executor under two GPUs or `GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED=1`, skips it. The first pass is not
+  free of device work: it may have submitted the row-map copy, and its ready guard submits a queue sync event as
+  dst's ready event on the way out; neither writes dst, and the second pass publishes its own. It releases the ring
+  slot claim and the expert leases on unwind; the ids snapshot and the prompt admission stay cached and the second
+  pass reads them with no device wait. A decline after the first submission, or a GEMM-stage failure, throws with a
+  named reason. A re-entered node is counted once: the routed-expert count skips the second pass, and so do the MMID
+  entry's other per-call counts (the decode-route census, the whole-call host timer, the MXFP4 prompt profile's
+  whole span and phase marks, and the MoE profile's per-layer and per-role op counts), while every timer adds both
+  passes' time. Pinned by `test-sycl-moe-gate-up-role-source`.
 - Device test for the lead: `test-moe-pp-batched-dequant` runs NVFP4 on the plain fixture, on a fused gate_up
   fixture, and on two fixtures whose UE4M3 scale bytes are all rewritten (zero, subnormals, 0x7f and sign-set forms;
-  the largest finite values), against the CPU at NMSE <= 5e-4, and fails a case that printed the re-entry line.
+  the largest finite values), and Q8_0 on a fused gate_up fixture, against the CPU at NMSE <= 5e-4, and fails a case
+  that printed the re-entry line. No device test arms the row-map re-entry: the staging failpoint lives in the
+  private fixture objects, which this test does not link.
+- Which models store the fused tensor (the lead's header dump, 2026-11-24): only Inkling 2 Mini stores
+  `ffn_gate_up_exps`. Qwen 1.5 MoE, the Qwen3.8 Flash Next MTP and GSQ-RCO files, Qwen3.6-35B NVFP4, DeepSeek V4 and
+  V4.1 and GPT-OSS store separate gate, up and down tensors; the first two shards of the plain Qwen3.8 Q8_0 split
+  held no expert tensor and the later shards were not read. The role stays general (the resident claim takes it for
+  every executor type), hence the Q8_0 fused case.
+- RED evidence, said exactly: `tests/test-sycl-moe-mmvq-tables.cpp` cases 17 and 18 and
+  `tests/test-load-measure-guards.cpp:1241-1256` were red on the base by failing to compile (the names they call did
+  not exist yet), not by a failed assertion.
+- The spec review of a to c (2026-11-24) passed with eight minor findings; the seven that asked for a change are in
+  the bullets above, and the UE4M3 special-scale fixtures and the 0xFF owed note, outside the brief, were accepted.
 
-**Step 1d (R5, option A), not yet written.** After the plan, on each device: if no weight of a ring-served type has
-every expert planned there (`ggml_sycl_moe_tensor_plan_primary_layout`, the claim's own predicate), publish that
-device's ring as 0 and plan once more, one retry; a WARN names the device, the ring bytes released and the count of
-ring-served weights seen; the stage and the dry run share the decision.
+**Step 1d (R5 final, 2026-11-24), not yet written.** Measured first: on the B50 alone, the a-c build served 10774.6 MB
+of experts from the host mapping where the base served 10215.0 MB, the CPU layers started at 14 instead of 15, and
+the long arm lost pp 17.32 -> 16.46 and tg 7.00 -> 6.56 t/s, though the ring served nodes there. A ring whose
+weights have the RESIDENT use only (NVFP4 today) is kept on a device only if the plan made with it leaves no expert
+of those weights on the host; otherwise the ring is published as 0, the zones are ensured again (an arena no live
+model holds is rebuilt to the smaller requirement), and the plan is made once more, and that plan is final even if
+it then holds every expert (those nodes take the direct route, as on master). Weights with a STAGED or SOA_EXPERT
+use keep today's behaviour exactly, so Qwen and GPT-OSS plans do not change. Where a live model holds the arena,
+the zone is kept and the WARN says so. The WARN names the device, the ring MB released and the host-planned expert
+count that caused it; the stage and the dry run call one decision function. The reason: a resident-only ring that
+displaces an expert trades prompt room for a decode loss on every token, and on the B50 it lost on the prompt too.
 
 ---
 
@@ -6638,6 +6665,13 @@ ring-served weights seen; the stage and the dry run share the decision.
 - `test-sycl-moe-resolved-batch` was labelled `host` and reserves a ~29.9 GB VRAM arena on the B70; it also
   crashed at exit (a cache destructor asked a destroyed device manager for its index). Task 8c fixes both.
 - The kernel profiler reports `failed_timestamps` (11187 in the replay-off load): its totals are lower bounds.
+- The kernel profiler's `moe.pp.dequant.<type>` label times an empty marker, not the dequant kernel (Task 21's
+  profile: 17,086 samples of 0.1 us for NVFP4). The f16 converters return no event, so the label asks the queue for
+  `ext_oneapi_get_last_event()`, and the installed runtime (oneAPI 2026.2) answers that with a new marker it enqueues
+  (`urEnqueueEventsWait`), whose start follows the kernel's end on an in-order queue. The kernel's time is in no
+  label, and each sample adds one enqueue to a profiled run only. Fix: a two-event record in the profiler, a marker
+  before the converter and one after, timed end to end (`after.command_end - before.command_end`), which covers every
+  converter without changing their signatures and can label the MXFP4 SOA dequant too, which has no label today.
 - Task 8c, host leg cost: one `std::async` thread and one host SCRATCH leg per mixed node, about 96 spinning
   threads per decoded token on the B50. They are bounded to 2 or 3 in flight only by the ids host wait
   (`ggml_sycl_copy_ids_to_host`) and the per-layer ids cache: removing that wait needs a bound first.
