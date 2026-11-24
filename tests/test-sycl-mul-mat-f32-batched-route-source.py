@@ -18,7 +18,12 @@ whitespace-canonical text:
 - the route body makes one submission and keeps nothing: exactly one DnnlGemmWrapper::gemm call, no loop, no
   allocation of any kind, no wait, no static and no store through a member or a pointer;
 - gemm() chooses its profiler label by batch count: both of its labels name one variable that is the batched row
-  when a batch count is above 1 and the unbatched row otherwise.
+  when a batch count is above 1 and the unbatched row otherwise;
+- the route computes in F32: gemm() takes its float math as a dnnl_gemm_fpmath parameter whose default,
+  DNNL_GEMM_FPMATH_BUILD, is the build's choice (fpmath f16 under GGML_SYCL_F16, otherwise nothing set); only
+  DNNL_GEMM_FPMATH_STRICT sets fpmath strict; the primitive cache key carries the mode in a field its equality and its
+  hash both read, so a strict and an f16 primitive of one shape are two entries; the route op passes STRICT, and no
+  other caller does.
 
 Every clause has mutants that must fail it. Host-only; collected by pytest.
 """
@@ -336,6 +341,153 @@ def test_label_mutants():
          + code[code.rindex("gemm_label.name=" + var + ";") + len("gemm_label.name=" + var + ";") :]),
     ]:
         assert label_errors(new), f"mutant {name!r} slipped through"
+
+
+# ---- the route computes in F32; every other caller keeps the build's float math ----
+_STRICT = "DNNL_GEMM_FPMATH_STRICT"
+_BUILD = "DNNL_GEMM_FPMATH_BUILD"
+_FPMATH_PARAM = re.compile(r"dnnl_gemm_fpmath (\w+)=(\w+)")
+
+
+def _between(code: str, start: str, end: str) -> str:
+    i = code.index(start)
+    return code[i : code.index(end, i)]
+
+
+def fpmath_errors(gemm_code: str, sycl_code: str, others: dict) -> list:
+    """`others` maps each other ggml-sycl source that names the strict mode to its z-spelled code."""
+    errs = []
+    gb = gemm_body(gemm_code)
+    params = call_args(gb, gb.index("gemm(") + len("gemm"))
+    found = [(i, _FPMATH_PARAM.fullmatch(p)) for i, p in enumerate(params) if _FPMATH_PARAM.fullmatch(p)]
+    if len(found) != 1:
+        return ["gemm() does not take one dnnl_gemm_fpmath parameter with a default (%d)" % len(found)]
+    index, m = found[0]
+    param = m.group(1)
+    if m.group(2) != _BUILD:
+        errs.append("gemm()'s float-math default is not the build's: %r" % m.group(2))
+
+    # the primitive's attribute: strict for STRICT, and for anything else exactly the build's choice
+    sets = re.findall(r"(\w+)\.set_fpmath_mode\(dnnl::fpmath_mode::(\w+)\);", gb)
+    if sorted(mode for _, mode in sets) != ["f16", "strict"] or len({attr for attr, _ in sets}) != 1:
+        errs.append("gemm() does not set exactly one strict and one f16 float math on one attribute: %r" % sets)
+    else:
+        attr = sets[0][0]
+        if not re.search(r"\bget_or_create\([^;]*," + attr + r"\);", gb):
+            errs.append("the attribute holding the float math is not the one the cache creates the primitive with")
+        cond = re.search(r"\bif\((?:" + param + "==" + _STRICT + "|" + _STRICT + "==" + param + r")\)\{", gb)
+        if not cond:
+            errs.append("the strict float math is not chosen by the parameter being " + _STRICT)
+        else:
+            then_close = balanced_end(gb, cond.end() - 1, "{", "}")
+            then = gb[cond.end() : then_close]
+            if then != attr + ".set_fpmath_mode(dnnl::fpmath_mode::strict);":
+                errs.append("the STRICT branch does more or less than set strict: %r" % then)
+            if not gb.startswith("else{", then_close + 1):
+                errs.append("the build's float math is not the STRICT branch's else")
+            else:
+                other = gb[then_close + 1 + len("else") : balanced_end(gb, then_close + 1 + len("else"), "{", "}") + 1]
+                if not re.fullmatch(r"\{#(?:ifdef GGML_SYCL_F16|if defined\(GGML_SYCL_F16\)) " + attr
+                                    + r"\.set_fpmath_mode\(dnnl::fpmath_mode::f16\);#endif\}", other):
+                    errs.append("the else is not exactly f16 under GGML_SYCL_F16: %r" % other)
+
+    # the cache key carries the mode: a strict and an f16 primitive of one shape are two entries
+    key = _between(gemm_code, "struct DnnlPrimitiveKey{", "struct DnnlPrimitiveKeyHash{")
+    fields = re.findall(r"\bdnnl_gemm_fpmath (\w+);", key)
+    if len(fields) != 1:
+        errs.append("the primitive key has no one dnnl_gemm_fpmath field: %r" % fields)
+    else:
+        field = fields[0]
+        eq = key[key.index("operator==(") :]
+        if not re.search(r"(?:&&|return )" + field + "==other\\." + field + r"\b", eq):
+            errs.append("the key's equality does not compare its float math")
+        hashed = _between(gemm_code, "struct DnnlPrimitiveKeyHash{", "struct DnnlCachedPrimitive{")
+        if not re.search(r"\bh\^=std::hash<\w+>\{\}\((?:static_cast<\w+>\()?k\." + field + r"\)?\)", hashed):
+            errs.append("the key's hash does not read its float math")
+        if re.findall(r"\bkey\." + field + r"=([^;]*);", gb) != [param]:
+            errs.append("gemm() does not put its float-math parameter in its key")
+
+    # the route op passes STRICT at that parameter's place, and nothing else names STRICT
+    route = function_body(sycl_code, _ROUTE_OP)
+    at = route.find("DnnlGemmWrapper::gemm(")
+    args = call_args(route, at + len("DnnlGemmWrapper::gemm")) if at != -1 else []
+    if len(args) <= index or args[index] != _STRICT:
+        errs.append("the route op does not pass %s as gemm()'s float math: %r" % (_STRICT, args[index:]))
+    if sycl_code.count(_STRICT) != route.count(_STRICT) or route.count(_STRICT) != 1:
+        errs.append("ggml-sycl.cpp names %s outside the one route call" % _STRICT)
+    if gemm_code.count(_STRICT) != 2:  # the enumerator and gemm()'s one test of it
+        errs.append("gemm.hpp names %s %d times, not as the enumerator and its one test"
+                    % (_STRICT, gemm_code.count(_STRICT)))
+    for path, text in others.items():
+        if _STRICT in text:
+            errs.append("%s passes %s" % (path, _STRICT))
+    return errs
+
+
+def _others() -> dict:
+    out = {}
+    for p in sorted(SYCL.rglob("*")):
+        if p.suffix in (".cpp", ".hpp", ".h") and p.name not in ("gemm.hpp", "ggml-sycl.cpp"):
+            raw = p.read_text(errors="replace")
+            if _STRICT in raw:
+                out[str(p.relative_to(ROOT))] = code_of(raw)
+    return out
+
+
+def test_the_route_computes_in_f32_and_every_other_caller_keeps_the_builds_math():
+    assert fpmath_errors(code_of(GEMM_HPP), code_of(SYCL_CPP), _others()) == []
+
+
+def test_fpmath_mutants():
+    g = code_of(GEMM_HPP)
+    s = code_of(SYCL_CPP)
+    gb = gemm_body(g)
+    m = re.search(r"dnnl_gemm_fpmath (\w+)=" + _BUILD, gb)
+    param = m.group(1)
+    strict_set = re.search(r"(\w+)\.set_fpmath_mode\(dnnl::fpmath_mode::strict\);", gb).group(0)
+    f16_set = re.search(r"(\w+)\.set_fpmath_mode\(dnnl::fpmath_mode::f16\);", gb).group(0)
+    key = _between(g, "struct DnnlPrimitiveKey{", "struct DnnlPrimitiveKeyHash{")
+    field = re.search(r"\bdnnl_gemm_fpmath (\w+);", key).group(1)
+    hashed = _between(g, "struct DnnlPrimitiveKeyHash{", "struct DnnlCachedPrimitive{")
+    hash_line = re.search(r"h\^=std::hash<\w+>\{\}\((?:static_cast<\w+>\()?k\." + field + r"\)?\)<<\d+;", hashed).group(0)
+    route = function_body(s, _ROUTE_OP)
+    f16_route = "return DnnlGemmWrapper::gemm(ctx,a1,b1,a0,src0,"
+    f16_args_end = balanced_end(s, s.index(f16_route) + len("return DnnlGemmWrapper::gemm"), "(", ")")
+    row = g.index("static std::optional<sycl::event>row_gemm(")
+    row_call_end = balanced_end(g, g.index("return gemm(", row) + len("return gemm"), "(", ")")
+
+    def in_gemm(old: str, new: str) -> str:
+        return g.replace(gb, mutate(gb, old, new), 1)
+
+    gemm_mutants = [
+        ("the default is strict", in_gemm(param + "=" + _BUILD, param + "=" + _STRICT)),
+        ("the parameter is gone", g.replace(gb, gb.replace(",dnnl_gemm_fpmath " + param + "=" + _BUILD, ""), 1)),
+        ("the STRICT branch sets f16", in_gemm(strict_set, strict_set.replace("::strict", "::f16"))),
+        ("f16 also overrides strict", in_gemm(strict_set, strict_set + f16_set)),
+        ("f16 without GGML_SYCL_F16", g.replace(gb, gb.replace("#ifdef GGML_SYCL_F16 ", "", 1).replace("#endif}", "}", 1), 1)),
+        ("strict for the build default", g.replace(gb, gb.replace(param + "==" + _STRICT, param + "!=" + _STRICT, 1), 1)),
+        ("the key ignores the parameter", in_gemm("key." + field + "=" + param + ";", "key." + field + "=" + _BUILD + ";")),
+        ("equality forgets the mode", g.replace("&&" + field + "==other." + field, "", 1)),
+        ("the hash forgets the mode", g.replace(hash_line, "", 1)),
+        ("the key has no mode field", g.replace(key, key.replace("dnnl_gemm_fpmath " + field + ";", ""), 1)),
+        ("row_gemm passes strict", g[:row_call_end] + "," + _STRICT + g[row_call_end:]),
+    ]
+    for name, new_g in gemm_mutants:
+        assert new_g != g, f"mutant {name!r} changed nothing"
+        assert fpmath_errors(new_g, s, {}), f"mutant {name!r} slipped through"
+
+    route_call = route[route.index("DnnlGemmWrapper::gemm(") :]
+    route_call = route_call[: balanced_end(route_call, len("DnnlGemmWrapper::gemm"), "(", ")") + 1]
+    sycl_mutants = [
+        ("the route passes the build's math", s.replace(route, mutate(route, route_call, route_call.replace(_STRICT, _BUILD)), 1)),
+        ("the route omits the math", s.replace(route, mutate(route, route_call, route_call.replace("," + _STRICT, "")), 1)),
+        ("the F16 batched route passes strict", s[:f16_args_end] + ",false," + _STRICT + s[f16_args_end:]),
+    ]
+    for name, new_s in sycl_mutants:
+        assert new_s != s, f"mutant {name!r} changed nothing"
+        assert fpmath_errors(g, new_s, {}), f"mutant {name!r} slipped through"
+    assert fpmath_errors(g, s, {"ggml/src/ggml-sycl/outprod.cpp": "gemm(" + _STRICT + ")"}), \
+        "mutant 'outprod passes strict' slipped through"
 
 
 if __name__ == "__main__":

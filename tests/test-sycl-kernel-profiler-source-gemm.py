@@ -90,8 +90,9 @@ def test_gemm_accepts_deps_and_optional_op_context_with_safe_defaults() -> None:
     # Whitespace-tolerant: clang-format is free to realign the parameter
     # column, so anchor on the token content, not the spacing.
     assert re.search(r"const std::vector<sycl::event>\s*&\s*deps\s*=\s*\{\},", sig)
-    # gemm's last parameter is query_only (S3-4), so op_context is no longer the one before the brace
-    assert re.search(r"const char\s*\*\s*op_context\s*=\s*nullptr,\s*bool\s+query_only\s*=\s*false\)\s*\{", sig)
+    # query_only (S3-4) follows op_context and the float-math mode follows query_only, so op_context is not the
+    # parameter before the brace
+    assert re.search(r"const char\s*\*\s*op_context\s*=\s*nullptr,\s*bool\s+query_only\s*=\s*false[,)]", sig)
 
 
 def test_row_gemm_forwards_op_context_to_gemm() -> None:

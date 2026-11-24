@@ -15,15 +15,21 @@
 // A taken case's 2-D src0 against a src1 batched in dim 2 is one plain GEMM over every column, batch 1 on both sides:
 // its profiler row is the unbatched one, so the count above, not the label, is its witness.
 //
-// Tolerances. gemm() sets fpmath_mode::f16 on every primitive in a GGML_SYCL_F16 build (gemm.hpp), whatever the data
-// types, and oneDNN documents that mode as "implicit f32->f16 conversions allowed" (dnnl_common_types.h). Each input may
-// then be rounded to f16 (unit roundoff 2^-11), so a product a*b is off by about 2^-10 of |a*b| and a dot product by
-// about 1e-3 of sum |a_k * b_k|, plus the f32 accumulation (k * 2^-24, 1.4e-4 at k = 2304). Every comparison is
-// therefore scaled by S = sum over k of |src0[m][k] * src1[n][k]| for its element, computed in double with the
-// reference: err = |got - ref| / S.
-//   against the double-precision CPU reference: err <= 4e-3, four times the f16 bound above;
-//   the route against the loop's output: err <= 8e-3, since each may convert (or not) and sum in its own order.
-// The measured maxima of both are printed per case.
+// Tolerances. Every comparison is scaled by S = sum over k of |src0[m][k] * src1[n][k]| for its element, computed in
+// double with the reference: err = |got - ref| / S. The inputs are floats and the reference sums their exact products
+// in double, so the reference's own error is negligible.
+//   The route against the reference: err <= (K + 1) * 2^-24. The route asks gemm() for strict float math, so its
+//   primitive computes in F32, and an F32 dot product of length K, in any summation order, is within gamma_K ~ K * u
+//   (u = 2^-24) of S; the extra u is the result's rounding. A failure means the route did not compute in F32. At the
+//   largest K (2304) the bound is 1.4e-4, still five times under the error f16 math was measured to give there.
+//   The loop against the reference: err <= 4e-3. The per-plane loop still runs under the build's float math, which
+//   in a GGML_SYCL_F16 build is fpmath_mode::f16 ("implicit f32->f16 conversions allowed", dnnl_common_types.h):
+//   oneDNN may round each input to f16 (unit roundoff 2^-11), so a product is off by about 2^-10 of |a*b| and a dot
+//   product by about 1e-3 of S; the bound is four times that. Whether oneDNN uses the licence depends on the shape
+//   and the card (one Inkling shape was measured in F32 on the B70 and in f16 on the B50), so the loop's figure may
+//   be F32 or f16.
+//   The route against the loop's output: err <= 8e-3, loose for the same reason.
+// The measured maxima of all three are printed per case.
 //
 // The Inkling cases are its three node kinds at the model's dimensions (n_embd 2304, 3 mix queries, at most 4 earlier
 // blocks, n_relative 16, n_head 24, the sliding window's bias table 1024 + 1 rows) at T = 2, 179, 512 and 2048. At
@@ -61,8 +67,13 @@
 namespace {
 
 constexpr const char * SITE         = "dnnl_gemm";
-constexpr double       TOL_REF      = 4e-3;
+constexpr double       TOL_REF      = 4e-3;  // the loop: the build's float math, f16 in a GGML_SYCL_F16 build
 constexpr double       TOL_ROUTE_VS = 8e-3;
+
+// The route against the reference: strict F32 math over a dot product of length k.
+double tol_route_f32(int64_t k) {
+    return (double) (k + 1) * std::ldexp(1.0, -24);
+}
 
 struct mm_case {
     std::string name;
@@ -271,8 +282,10 @@ int main(int, char ** argv) {
     ggml_backend_sycl_get_device_description(0, description, sizeof(description));
     const char * selector = getenv("ONEAPI_DEVICE_SELECTOR");
     printf("device 0: %s (ONEAPI_DEVICE_SELECTOR=%s)\n", description, selector ? selector : "(unset)");
-    printf("tolerances, scaled by sum|a*b|: against the double reference %.0e, route against loop %.0e\n", TOL_REF,
-           TOL_ROUTE_VS);
+    printf(
+        "tolerances, scaled by sum|a*b|: route against the double reference (K + 1) * 2^-24 (F32), loop against it "
+        "%.0e, route against loop %.0e\n",
+        TOL_REF, TOL_ROUTE_VS);
     fflush(stdout);
 
     bool ok = true;
@@ -307,8 +320,10 @@ int main(int, char ** argv) {
                 (unsigned long long) first.engaged, first.cache_entries, first.scratchpad_bytes);
             printf("  injected decline: calls=%llu declined=%llu engaged=%llu\n", (unsigned long long) fallen.calls,
                    (unsigned long long) fallen.declined, (unsigned long long) fallen.engaged);
-            printf("  max err/S: route vs ref %.3e, loop vs ref %.3e, route vs loop %.3e (max abs route err %.3e)\n",
-                   e.ref_route, e.ref_loop, e.route_vs_loop, e.abs_route);
+            printf(
+                "  max err/S: route vs ref %.3e (F32 bound %.3e), loop vs ref %.3e, route vs loop %.3e (max abs route "
+                "err %.3e)\n",
+                e.ref_route, tol_route_f32(c.a[0]), e.ref_loop, e.route_vs_loop, e.abs_route);
             if (first.calls != 1 || first.engaged != 1 || first.declined != 0) {
                 fprintf(stderr, "FAIL: %s: the route did not make exactly one GEMM submission\n", c.name.c_str());
                 case_ok = false;
@@ -350,9 +365,11 @@ int main(int, char ** argv) {
             fprintf(stderr, "FAIL: %s: a non-finite output\n", c.name.c_str());
             case_ok = false;
         }
-        if (!(e.ref_route <= TOL_REF)) {
-            fprintf(stderr, "FAIL: %s: the %s differs from the double reference (%.3e)\n", c.name.c_str(),
-                    c.taken ? "route" : "loop", e.ref_route);
+        // A taken case's first run is the route, held to F32; a declined case's is the loop, held to the build's math.
+        const double tol_first = c.taken ? tol_route_f32(c.a[0]) : TOL_REF;
+        if (!(e.ref_route <= tol_first)) {
+            fprintf(stderr, "FAIL: %s: the %s differs from the double reference (%.3e > %.3e)\n", c.name.c_str(),
+                    c.taken ? "route" : "loop", e.ref_route, tol_first);
             case_ok = false;
         }
         printf("  %s\n", case_ok ? "ok" : "FAILED");
