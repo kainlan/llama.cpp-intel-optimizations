@@ -8648,14 +8648,16 @@ static __dpct_inline__ float ggml_sycl_e8m0_to_fp32(uint8_t x) {
 }
 
 static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
-    if (x == 0 || x == 0x7f || x == 0xff) {
-        return 0.0f;
-    }
-
-    const int   exp = (x >> 3) & 0xf;
-    const int   man = x & 0x7;
-    const float raw = exp == 0 ? sycl::ldexp((float) man, -9) : sycl::ldexp(1.0f + (float) man / 8.0f, exp - 7);
-    return raw * 0.5f;
+    // Half the format's value, because kvalues_mxfp4 holds the E2M1 values doubled.
+    // exp > 0: (1 + man/8) * 2^(exp - 8), written as its bits. exp == 0: man * 2^-10. 0x7f and 0xff read as 0.
+    const uint32_t exp  = (x >> 3) & 0xfu;
+    const uint32_t man  = x & 0x7u;
+    const uint32_t bits = ((exp + 119u) << 23) | (man << 20);
+    float          normal;
+    memcpy(&normal, &bits, sizeof(float));
+    const float small = (float) man * 0x1p-10f;
+    const float value = exp == 0 ? small : normal;
+    return (x & 0x7fu) == 0x7fu ? 0.0f : value;
 }
 
 static inline bool ggml_sycl_type_is_fp8_e4m3(ggml_type type) {

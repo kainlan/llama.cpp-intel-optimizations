@@ -3450,6 +3450,34 @@ foreach (_q2_0_variant f16 f32)
     )
 endforeach()
 
+# Test: the NVFP4 dot product's decode on the host. Compares the table and the arithmetic E2M1
+# decode bit for bit and runs vec_dot_nvfp4_q8_1 against a format oracle. Header-only like the
+# Q2_0 test above, but it opens no queue: it calls the inline functions from main(). Built once,
+# since neither decode computes in dfloat. The selector is pinned so a queue added later still
+# cannot reach a GPU.
+add_executable(test-sycl-nvfp4-decode-host
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-nvfp4-decode-host.cpp
+)
+target_include_directories(test-sycl-nvfp4-decode-host PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-nvfp4-decode-host PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-nvfp4-decode-host PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-nvfp4-decode-host PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+add_test(NAME test-sycl-nvfp4-decode-host COMMAND test-sycl-nvfp4-decode-host)
+set_tests_properties(test-sycl-nvfp4-decode-host PROPERTIES
+    LABELS "sycl;quant;hostonly"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: unified-cache layout and multi-device placement choices, plus the
 # fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
 #
