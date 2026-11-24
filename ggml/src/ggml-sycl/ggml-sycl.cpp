@@ -77294,6 +77294,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // asked first: the environment, a queue-state query among its facts, is built only for a node they admit, so
         // decode's batch-1 nodes pay for one tensor check. One oneDNN matmul computed every plane; a declined
         // scratchpad wrote nothing and reads false, so the orchestrator's dispatch below computes the op instead.
+        //
+        // A taken node returns here, as every orchestrator path does. The block after this chain is the TP debug
+        // probes, which match FFN weight names and print only under GGML_SYCL_TP_DEBUG, and the TP column- and
+        // row-parallel post-processing, which acts only on a TP-sharded src0. The route declines a weight and tensor
+        // parallelism, so none of it applies, and its 32-layer name scan would cost a taken node about 64 snprintf.
+        return;
     } else {
         ggml_sycl::test_record_orchestrator_call();
         auto decision = ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout);
