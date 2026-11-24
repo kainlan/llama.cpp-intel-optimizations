@@ -46,8 +46,9 @@ ready event. These claims pin that shape:
       throws, a refusal after the quantize, and a publication that throws all drain before the handles go, and a
       taken node never drains. A drain that itself throws proves nothing about the work, so the handles are kept,
       not released: keep_handles_after_failed_wait (noexcept) parks them in the store's unwaitable list as the drain
-      worker parks a record whose wait failed, or leaks them when there is no memory to park them, and the destructor
-      names it at ERROR. The publication leaves the vector as it was when it throws: the record enters the store with
+      worker parks a record whose wait failed, catching every throw of that parking (each leaves the handles whole),
+      or leaks them when they cannot be parked, and the destructor names it at ERROR as the exit of a node that did
+      not publish its handles, not as one cause of that exit. The publication leaves the vector as it was when it throws: the record enters the store with
       an empty vector and takes the handles by a swap; the graph-lifetime path moves the handles into its one sink by
       a single range insert, which has no effects when its allocation throws because a mem_handle moves without
       throwing (a static_assert holds that), and otherwise parks them, growing both parallel store vectors before it
@@ -163,8 +164,13 @@ KEEP = "keep_handles_after_failed_wait"
 KEEP_CALL = f"constboolkept=ggml_sycl::{KEEP}(handles);"
 KEEP_DECL = f"bool {KEEP}(std::vector<mem_handle> & handles) noexcept;"
 KEEP_HEAD = f"bool {KEEP}(std::vector<mem_handle> & handles) noexcept {{"
-KEEP_PARK = "try{retained_park_unwaitable(handles);returntrue;}catch(conststd::bad_alloc&){}"
+# Every throw in the parking (an allocation, the store's lock, a length error) leaves the handles whole, so the keep
+# catches them all: a narrower handler lets the rest reach noexcept and terminate.
+KEEP_PARK = "try{retained_park_unwaitable(handles);returntrue;}catch(...){}"
 KEEP_LEAK = "if(new(std::nothrow)std::vector<mem_handle>(std::move(handles))!=nullptr){"
+# The drain runs on every exit that did not publish (a submit that threw, a refusal after the quantize, a publication
+# that threw), so its log names that exit, not one of its causes.
+RETENTION_LOG = "a node exited without publishing its handles and the drain "
 PARK_HEAD = "void retained_park_unwaitable(std::vector<mem_handle> & handles) {"
 RETENTION_NO_COPY = (f"{RETENTION}(const {RETENTION} &) = delete;",
                      f"{RETENTION} & operator=(const {RETENTION} &) = delete;")
@@ -681,12 +687,16 @@ def claim_j_retention(s):
             "handles.clear()" in dtor or "handles={}" in dtor or "handles.swap(" in dtor):
         fails.append("the retention's destructor lets its handles go after a drain that threw instead of keeping "
                      f"them through {KEEP} and naming it at ERROR")
+    if tight(RETENTION_LOG) not in caught or "failedsubmit" in caught:
+        fails.append("the retention's destructor names one cause of the drain instead of the exit it runs on: a node "
+                     "that exited without publishing its handles")
     if mem_hpp.count(KEEP_DECL) != 1:
         fails.append(f"mem-handle.hpp does not declare {KEEP} on the caller's vector, noexcept")
     keep = tight(braced_body(mem_cpp, KEEP_HEAD) or "") if defined_once(mem_cpp, KEEP_HEAD) else ""
-    if KEEP_PARK not in keep or KEEP_LEAK not in keep or keep.find(KEEP_PARK) > keep.find(KEEP_LEAK):
-        fails.append(f"{KEEP} does not park the handles as a failed wait's are parked, and leak them, never release "
-                     "them, when there is no memory to park them")
+    if (KEEP_PARK not in keep or KEEP_LEAK not in keep or keep.find(KEEP_PARK) > keep.find(KEEP_LEAK) or
+            keep.count("catch(") != 1 or "throw" in keep):
+        fails.append(f"{KEEP} does not park the handles as a failed wait's are parked, catching every throw of the "
+                     "parking without rethrowing it, and leak them, never release them, when they cannot be parked")
     for needed in RETENTION_NO_COPY:
         if needed not in struct:
             fails.append(f"the retention can be copied: it lacks {needed}")
@@ -941,6 +951,10 @@ MUTANTS = [
     ("j", "sycl", RETENTION_HEAD, f"ggml_sycl::{KEEP}(handles);", "(handles.clear(), true);"),
     ("j", "sycl", RETENTION_HEAD, f"ggml_sycl::{KEEP}(handles);", "true;"),
     ("j", "sycl", RETENTION_HEAD, "GGML_LOG_ERROR(", "GGML_LOG_WARN("),
+    ("j", "sycl", RETENTION_HEAD, RETENTION_LOG, "the drain after a failed submit "),
+    # A keep that lets a throw of the parking other than an allocation's reach noexcept, or rethrows one.
+    ("j", "mem_cpp", KEEP_HEAD, "catch (...) {", "catch (const std::bad_alloc &) {"),
+    ("j", "mem_cpp", KEEP_HEAD, "catch (...) {", "catch (...) { throw;"),
     ("j", "mem_hpp", None, KEEP_DECL, KEEP_DECL.replace(" noexcept;", ";")),
     ("j", "mem_cpp", KEEP_HEAD, "retained_park_unwaitable(handles);", "handles.clear();"),
     ("j", "mem_cpp", KEEP_HEAD, "new (std::nothrow) std::vector<mem_handle>(std::move(handles)) != nullptr",
