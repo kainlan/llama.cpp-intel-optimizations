@@ -18,6 +18,8 @@
 //                         (woq_gemm_batch_mxfp4 in ggml-sycl/gemm.hpp under GGML_SYCL_MOE_PP_WOQ_3D: {1,32,1}, three
 //                         dims), whose comment records wrong numbers. Diagnostic: it shows whether the group dims are
 //                         the cause.
+//   nvfp4-2d-f16-scales   the 2-D and 3-D NVFP4 forms with each sanitised scale widened to f16, the fallback when
+//   nvfp4-3d-f16-scales   f8_e4m3 scales are refused: 0.125 instead of 0.0625 bytes of scale per element.
 //
 // Exit status: 0 once every arm has run, whatever each found; 77 without a SYCL GPU; 1 only when the probe itself
 // breaks outside an arm. Device buffers come from sycl::malloc_device, as in test-onednn-woq-mxfp4.cpp: the probe
@@ -286,6 +288,19 @@ woq_problem make_mxfp4_problem(int B, int M, int K, int N, uint32_t seed) {
     return p;
 }
 
+// The same problem with every sanitised E4M3 scale byte replaced by its value as f16 (two bytes, little-endian). A
+// sanitised byte has no sign and no NaN pattern, and every E4M3 value is exact in f16, so the reference stands.
+woq_problem with_f16_scales(const woq_problem & p) {
+    woq_problem out = p;
+    out.scales.resize(p.scales.size() * 2);
+    for (size_t i = 0; i < p.scales.size(); ++i) {
+        const uint16_t h      = f16_bits(2.0f * ue4m3_half_sycl(p.scales[i]));
+        out.scales[2 * i]     = (uint8_t) (h & 0xff);
+        out.scales[2 * i + 1] = (uint8_t) (h >> 8);
+    }
+    return out;
+}
+
 // How the scales are declared to oneDNN.
 struct woq_form {
     dt                 scale_dt;
@@ -549,6 +564,15 @@ int main() {
         const woq_problem pmx = make_mxfp4_problem(4, 32, 1152, 2304, 0x4d5846u);
         run_numerics_arm("mxfp4-3d-control", *q, eng, stream, pmx, mxfp4_3d);
         run_numerics_arm("mxfp4-3d-prod-groups", *q, eng, stream, pmx, mxfp4_3d_prod);
+
+        const woq_form nvfp4_2d_f16 = {
+            dt::f16, k_nvfp4_sub, (1 << 0) | (1 << 1), { k_nvfp4_sub, 1 }
+        };
+        const woq_form nvfp4_3d_f16 = {
+            dt::f16, k_nvfp4_sub, (1 << 0) | (1 << 1) | (1 << 2), { k_nvfp4_sub, 1 }
+        };
+        run_numerics_arm("nvfp4-2d-f16-scales", *q, eng, stream, with_f16_scales(p2d), nvfp4_2d_f16);
+        run_numerics_arm("nvfp4-3d-f16-scales", *q, eng, stream, with_f16_scales(p3d), nvfp4_3d_f16);
     } catch (const std::exception & e) {
         std::printf("PROBE harness FAIL %s\n", e.what());
         std::fflush(stdout);
