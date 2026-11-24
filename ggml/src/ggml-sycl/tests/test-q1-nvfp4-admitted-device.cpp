@@ -848,6 +848,10 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, c
                     life.authorization, tokens, ids_at);
         return;
     }
+    // A node the resident decode route declines (an NVFP4 decode with strided input rows among them, checked against
+    // the oracle above) runs on the admitted route alone: the resident route submitted nothing for it.
+    require_stages(after.resident_submit == before.resident_submit,
+                   "a node the resident decode route declines reached its submit" + label(no_pass), before);
     const auto observed_slots = [&]() {
         return label(no_pass) + ": observed first=(slot=" + std::to_string(first.workspace_slot) +
                ", generation=" + std::to_string(first.workspace_generation) +
@@ -1546,6 +1550,9 @@ void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tok
                        after.submit == before.submit + 1 && after.terminal == before.terminal + 1 &&
                        after.recycle == before.recycle + 1,
                    "the direct route did not take the mixed batch once" + at, before);
+    // A mixed decode's plan does not put every expert on the card, so the resident decode route declines it whole.
+    require_stages(after.resident_submit == before.resident_submit,
+                   "the resident decode route submitted a mixed batch" + at, before);
     require_stages(after.host_submit == before.host_submit + 1 &&
                        after.host_occurrences == before.host_occurrences + host_occurrences,
                    "the host leg did not submit the batch's " + std::to_string(host_occurrences) +
