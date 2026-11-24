@@ -630,8 +630,8 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 #endif
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-// How many loan fixtures failed to settle in their teardown since the last call (a retained-owner drain that timed
-// out), and resets the count. A case that passes while this is not zero has not passed.
+// Returns how many loan fixture teardowns did not settle (a retained-owner drain that timed out) since the last call,
+// and resets the count. A case that passes while this is not zero has not passed.
 int test_expert_loan_take_teardown_failures();
 
 // The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an

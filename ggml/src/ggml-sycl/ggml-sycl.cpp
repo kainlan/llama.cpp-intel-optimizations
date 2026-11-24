@@ -23610,8 +23610,10 @@ struct test_loan_fixture {
         queue->wait_and_throw();
         cache->get_dma_queue().wait_and_throw();
         cache->get_bcs_queue().wait_and_throw();
-        if (!drain_retained_handles(true, 5000)) {
-            fprintf(stderr, "ERROR: test_loan_fixture teardown: the retained owners did not drain in 5000 ms\n");
+        constexpr int drain_ms = 5000;
+        if (!drain_retained_handles(true, drain_ms)) {
+            fprintf(stderr, "ERROR: test_loan_fixture teardown: the retained owners did not drain in %d ms\n",
+                    drain_ms);
             g_test_loan_teardown_failures.fetch_add(1, std::memory_order_relaxed);
         }
         cache->process_deferred_frees_public();
