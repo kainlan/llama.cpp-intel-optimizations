@@ -85,6 +85,8 @@ def call_args(code: str, open_at: int) -> list:
     args, depth, start = [], 0, open_at + 1
     for j in range(open_at + 1, end):
         ch = code[j]
+        if ch == ">" and code[j - 1] == "-":
+            continue  # `->` is member access, not a closing template bracket
         if ch in "([{<":
             depth += 1
         elif ch in ")]}>":
