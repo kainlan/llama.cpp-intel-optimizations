@@ -2348,10 +2348,11 @@ bool ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
                                         bool                        allow_alloc);
 // Whether a dispatch bundle snapshot leaves out a handle whose allocation it already holds. A full-local table holds one
 // lease per expert, so a route that dispatches from it alone takes its leases as they are (NONE) and skips comparing
-// every handle with every other, O(n^2) per node. What NONE costs is references, never lifetime: for a weight whose
-// expert slices were published from its own VRAM buffer, every lease is a slice of that one buffer owner, so NONE takes
-// n references to it plus the table's own where BY_IDENTITY takes one or two; each extra reference keeps alive only
-// what the first already does, and costs one count change at the snapshot and one at its release.
+// every handle with every other, O(n^2) per node. NONE changes no lifetime and keeps the handles BY_IDENTITY would:
+// each lease is a different expert's slice, and a slice's identity includes its offset and size, so no two leases
+// compare equal even when every slice is of one buffer. The one handle NONE takes twice is the table's own, which
+// ggml_sycl_set_moe_ptr_table_leases adds to the leases and the snapshot appends again after them: one extra
+// reference, to what the first already keeps alive.
 enum class moe_dispatch_bundle_dedup : uint8_t {
     BY_IDENTITY,  // compare each handle's stable identity with every handle taken before it
     NONE,         // take every handle that has an identity
