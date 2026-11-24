@@ -62438,11 +62438,16 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
         // A decline: the orchestrator resolves the same tensors on its own path and reports there.
         return false;
     }
-    size_t         stream_identity = 0;
-    const size_t * same_queue      = ggml_sycl_chain_same_queue_identity(*stream, &stream_identity);
-    ggml_sycl_chain_ready_event_if_needed(*stream, src0_r, same_queue);
-    ggml_sycl_chain_ready_event_if_needed(*stream, src1_r, same_queue);
-    ggml_sycl_chain_ready_event_if_needed(*stream, dst_r, same_queue);
+    size_t stream_identity = 0;
+    ggml_sycl_chain_ready_event_if_needed(*stream, src0_r,
+                                          ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                          GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED);
+    ggml_sycl_chain_ready_event_if_needed(*stream, src1_r,
+                                          ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                          GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED);
+    ggml_sycl_chain_ready_event_if_needed(*stream, dst_r,
+                                          ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                          GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED);
 
     const int  m = static_cast<int>(ne01);
     const int  k = static_cast<int>(ne00);
