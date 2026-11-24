@@ -234,15 +234,31 @@ std::vector<uint64_t> owner_control_ids(const std::vector<mem_handle> & handles)
     return ids;
 }
 
-// Takes every handle out of `handles` on success. On a throw `handles` is as it was: every allocation is made before
-// the first handle moves, and a mem_handle moves without throwing.
+// A range insert of mem_handles leaves the source handles whole when it throws only because no move can throw.
+static_assert(
+    std::is_nothrow_move_constructible<mem_handle>::value,
+    "the graph-lifetime retention keeps the caller's handles on a throw only if a mem_handle cannot throw on a move");
+
+// Makes room for `extra` more elements and keeps the growth geometric. A reserve to exactly size() + extra on every
+// retaining node would reallocate and move the whole vector each time, which is quadratic over the nodes of a graph.
+template <typename T> void retained_vector_make_room(std::vector<T> & vec, size_t extra) {
+    const size_t needed = vec.size() + extra;
+    if (needed > vec.capacity()) {
+        vec.reserve(std::max(needed, 2 * vec.capacity()));
+    }
+}
+
+// Takes every handle out of `handles` on success. On a throw `handles` and every store vector are as they were.
+// The sink is one vector: a range insert at its end has no effects when its allocation throws, and it moves the
+// handles only after that allocation, so it needs no reserve of its own. The two store vectors are kept parallel, so
+// both grow before either insert, after which neither insert allocates; a second growth that throws has changed only
+// the first vector's capacity, not its elements.
 void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {
     if (handles.empty()) {
         return;
     }
 
     if (g_graph_retained_handle_sink) {
-        g_graph_retained_handle_sink->reserve(g_graph_retained_handle_sink->size() + handles.size());
         g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),
                                              std::make_move_iterator(handles.begin()),
                                              std::make_move_iterator(handles.end()));
@@ -253,8 +269,8 @@ void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {
     const std::vector<uint64_t> ids   = owner_control_ids(handles);
     auto &                      state = *g_retained_handles_state;
     retained_store_lock         lock(state);
-    state.graph_unwaitable.reserve(state.graph_unwaitable.size() + handles.size());
-    state.graph_unwaitable_ids.reserve(state.graph_unwaitable_ids.size() + ids.size());
+    retained_vector_make_room(state.graph_unwaitable, handles.size());
+    retained_vector_make_room(state.graph_unwaitable_ids, ids.size());
     state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(handles.begin()),
                                   std::make_move_iterator(handles.end()));
     state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), ids.begin(), ids.end());

@@ -161,13 +161,15 @@ PUBLISH_PUSH = ("state.queue.push_back({{},std::move(event),std::move(ids),std::
                 "state.queue.back().handles.swap(handles);}")
 PUBLISH_GRAPH = "retain_handles_for_current_graph(handles); return;"
 GRAPH_HEAD = "void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {"
-GRAPH_SINK = ("if(g_graph_retained_handle_sink){g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),"
-              "std::make_move_iterator(handles.begin()),std::make_move_iterator(handles.end()));handles.clear();return;}")
+GRAPH_SINK = ("if(g_graph_retained_handle_sink){"
+              "g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),"
+              "std::make_move_iterator(handles.begin()),std::make_move_iterator(handles.end()));"
+              "handles.clear();return;}")
 MAKE_ROOM = "retained_vector_make_room"
 MAKE_ROOM_HEAD = f"template <typename T> void {MAKE_ROOM}(std::vector<T> & vec, size_t extra) {{"
 MAKE_ROOM_BODY = ("constsize_tneeded=vec.size()+extra;if(needed>vec.capacity()){"
                   "vec.reserve(std::max(needed,2*vec.capacity()));}")
-NOTHROW_MOVE = "static_assert(std::is_nothrow_move_constructible<mem_handle>::value,"
+NOTHROW_MOVE = "std::is_nothrow_move_constructible<mem_handle>::value"
 # The sink and the two parallel store vectors; a reserve of one of them to its own size() plus n is the quadratic one.
 RETAINED_VECTORS = ("g_graph_retained_handle_sink", "graph_unwaitable", "graph_unwaitable_ids")
 SELF_SIZE_RESERVE = re.compile(r"([A-Za-z_][\w.>-]*?)(?:\.|->)reserve\(\s*\1(?:\.|->)size\(\)\s*\+")
@@ -672,7 +674,7 @@ def claim_j_retention(s):
             fails.append("the graph-lifetime retention inserts into one store vector before both have grown")
         if not 0 <= graph.find("owner_control_ids(handles)") < graph.find("retained_store_lock"):
             fails.append("the graph-lifetime retention reads the owner ids under the store lock")
-    if mem_cpp.count(NOTHROW_MOVE) != 1:
+    if tight(mem_cpp).count(f"static_assert({NOTHROW_MOVE},") != 1:
         fails.append("nothing holds that a mem_handle moves without throwing, which a range insert with no effects on "
                      "a throw relies on")
     return fails
@@ -872,7 +874,7 @@ MUTANTS = [
     ("j", "mem_cpp", GRAPH_HEAD,
      (f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size());", "state.graph_unwaitable_ids.insert("),
      ("", f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size()); state.graph_unwaitable_ids.insert(")),
-    ("j", "mem_cpp", None, NOTHROW_MOVE, "static_assert(true,"),
+    ("j", "mem_cpp", None, NOTHROW_MOVE, "true"),
     ("j", "mem_hpp", None, OR_KEEP_DECL, OR_KEEP_DECL.replace(" & handles", " handles")),
     # The exact reserves come back: on the sink, on either store vector, inside the helper, or anywhere else.
     ("l", "mem_cpp", GRAPH_HEAD, "if (g_graph_retained_handle_sink) {",
