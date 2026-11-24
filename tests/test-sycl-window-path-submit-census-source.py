@@ -476,6 +476,7 @@ ALLOW: dict[str, tuple[int, str]] = {
         (1, shortcut("copies an f32 MUL_MAT result into its f16 destination")),
     "shortcut:ggml-sycl.cpp:ggml_sycl_op_pool2d": (1, shortcut("POOL_2D")),
     "shortcut:ggml-sycl.cpp:ggml_sycl_q1_nvfp4_test_read_expert_table": (1, TEST_ENTRY),
+    "shortcut:ggml-sycl.cpp:ggml_sycl_q1_nvfp4_test_write_expert_slot": (1, TEST_ENTRY),
     "shortcut:ggml-sycl.cpp:ggml_sycl_readback_via_shared_kernel":
         (1, shortcut("a device readback through shared memory")),
     "shortcut:ggml-sycl.cpp:ggml_sycl_tp_launch_async_ffn": (1, shortcut(TP + "the async FFN's GLU")),
