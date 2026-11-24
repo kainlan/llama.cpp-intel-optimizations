@@ -19,7 +19,9 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       BF16 op reaches the routes after it, none of which has a BF16 kernel;
   (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table through one table helper (which publishes the
       weight's AOS slices on a miss only from this device's own buffer, through the same buffer test the predicate
-      asks, and not again at a storage generation where that already failed), src1 and dst only where they resolve to
+      asks, and not again at a storage generation where the publish failed or an expert still did not resolve after
+      it; a table upload that failed is retried at the next node, as this route did before the helper existed),
+      src1 and dst only where they resolve to
       this device's own memory (the ruling forbids a GPU read of host memory), the device-resident ids, submits
       through moe_bf16_direct_submit() inside the kernel profiler's existing wrapper under the label
       mulmat.moe.bf16_direct (its metadata naming the launch count, from the one tokens-per-launch answer the route
@@ -77,7 +79,8 @@ NO_PLAN_TAIL = f"{UNPLACED_CLAIM}return{OWN_BUFFER}(src0->buffer,device);"
 BUFFER_TEST_PARTS = ("ggml_backend_buffer_is_sycl_split(", "ggml_backend_buffer_is_sycl(", "buf_ctx",
                      "alloc_tier::DEVICE_VRAM")
 # The one table helper this route and the NVFP4 resident decode route ask: probe, then on a miss in this device's own
-# buffer publish once and probe again, unless that already failed at this storage generation.
+# buffer publish once and probe again, unless the publish failed or an expert did not resolve at this storage
+# generation. A table upload that failed is not stamped, so this route retries it as it did before the helper.
 ENSURE_HELPER = "ggml_sycl_moe_direct_ensure_aos_table"
 ENSURE_HELPER_HEAD = (f"static const void * const * {ENSURE_HELPER}(ggml_backend_sycl_context & ctx, "
                       "const ggml_tensor * src0) {")
@@ -85,7 +88,11 @@ HELPER_EARLY = (f"if (table != nullptr || src0->extra == nullptr || !{OWN_BUFFER
                 "{ return table; }")
 HELPER_PUBLISH = "if (ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS,"
 HELPER_TABLE_CALL = "table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS);"
+HELPER_RETRY = ("table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS, "
+                "&every_expert_resolved);")
 HELPER_STAMP_SKIP = "if (failed == weight.moe_expert_storage_generation) { return nullptr; }"
+HELPER_STAMP_STORE = ("if (table == nullptr && !every_expert_resolved) { "
+                      "failed = weight.moe_expert_storage_generation; }")
 # src1 and dst: only an on-device pointer, resolved without materializing.
 OPERAND_HELPER = "ggml_sycl_moe_direct_device_operand"
 OPERAND_HELPER_HEAD = f"static void * {OPERAND_HELPER}(const ggml_tensor * tensor, int device) {{"
@@ -323,12 +330,14 @@ def claim_d_route_body(s):
         fails.append(f"{ENSURE_HELPER} is not defined exactly once")
     else:
         marks = [helper.find(HELPER_EARLY), helper.find(HELPER_STAMP_SKIP), helper.find(HELPER_PUBLISH),
-                 helper.rfind(HELPER_TABLE_CALL)]
+                 helper.find(HELPER_RETRY), helper.find(HELPER_STAMP_STORE)]
         if min(marks) < 0 or marks != sorted(marks) or \
                 helper.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1 or \
-                helper.count(HELPER_TABLE_CALL) != 2:
+                helper.count(HELPER_TABLE_CALL) != 1 or helper.count(HELPER_RETRY) != 1 or \
+                helper.count("failed = ") != 1:
             fails.append("the table helper does not publish once, only on a miss in this device's own buffer at a "
-                         "generation where that has not failed, and probe again after it")
+                         "generation not stamped, probe again after it, and stamp only a failed publish or an expert "
+                         "that did not resolve")
     operand = braced_body(sycl, OPERAND_HELPER_HEAD) if sycl.count(OPERAND_HELPER_HEAD) == 1 else None
     if operand is None or tight(operand) != OPERAND_HELPER_BODY:
         fails.append(f"{OPERAND_HELPER} does not answer only an on-device pointer, resolved without materializing")
@@ -503,6 +512,8 @@ MUTANTS = [
     ("d", "sycl", ENSURE_HELPER_HEAD, f" || !{OWN_BUFFER}(src0->buffer, ctx.device)", ""),
     ("d", "sycl", ENSURE_HELPER_HEAD, HELPER_STAMP_SKIP, ""),
     ("d", "sycl", ENSURE_HELPER_HEAD, "GGML_LAYOUT_AOS);", "GGML_LAYOUT_SOA);"),
+    # A table upload that failed stamped like an expert that did not resolve: this route would stop retrying it.
+    ("d", "sycl", ENSURE_HELPER_HEAD, "if (table == nullptr && !every_expert_resolved) {", "if (table == nullptr) {"),
     ("d", "sycl", ROUTE_FN_HEAD, TABLE_CALL,
      "moe_fusion_ensure_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), GGML_LAYOUT_AOS)"),
     # src1 or dst read through a pointer that may be host memory.

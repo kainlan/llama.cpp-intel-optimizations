@@ -18,7 +18,9 @@ ready event. These claims pin that shape:
       request and the weight ensure, keyed on the NVFP4 expert type; when it takes the node the caller only marks the
       guard published, so the guard's queue-sync event is not submitted; a decline falls through unchanged;
   (d) the route takes the AOS full-local table through the helper the BF16 route asks (which publishes AOS slices on
-      a miss only from this card's own buffer, and not again at a storage generation where that already failed),
+      a miss only from this card's own buffer, and not again at a storage generation where the publish failed or an
+      expert still did not resolve after it; a table upload that failed is retried, and the table probe passes the
+      build's answer out so the helper can tell the two apart),
       the input and the output only where they resolve to this card's own memory, the ids' own device storage and a
       Q8_1 slice from the SCRATCH zone that may not spill, and keeps a snapshot of the table's dispatch bundle taken
       without the identity dedup, the ids' storage and the scratch until the kernel's event; it never reads ids on
@@ -42,19 +44,26 @@ ready event. These claims pin that shape:
       the quantize, then the kernel, each possibly through the profiler), publishes the same vector with
       retain_handles_until_event_or_keep, and disarms only after that returns. So a submit or a profiler record that
       throws, a refusal after the quantize, and a publication that throws all drain before the handles go, and a
-      taken node never drains. The publication leaves the vector as it was when it throws: the record enters the
-      store with an empty vector and takes the handles by a swap; the graph-lifetime path moves the handles into
-      its one sink by a single range insert, which has no effects when its allocation throws because a mem_handle
-      moves without throwing (a static_assert holds that), and grows both parallel store vectors before it inserts
-      into either;
+      taken node never drains. A drain that itself throws proves nothing about the work, so the handles are kept,
+      not released: keep_handles_after_failed_wait (noexcept) parks them in the store's unwaitable list as the drain
+      worker parks a record whose wait failed, or leaks them when there is no memory to park them, and the destructor
+      names it at ERROR. The publication leaves the vector as it was when it throws: the record enters the store with
+      an empty vector and takes the handles by a swap; the graph-lifetime path moves the handles into its one sink by
+      a single range insert, which has no effects when its allocation throws because a mem_handle moves without
+      throwing (a static_assert holds that), and otherwise parks them, growing both parallel store vectors before it
+      inserts into either;
   (k) the cheap per-node costs stay out: the entries read the card's half support from the capabilities taken at
       init, the plan owner is fetched once, the quantize's profiler label is built only while the profiler is on,
       the route asks ctx.stream() once, and the kernel's event is constructed only once the route has taken the node;
   (l) the retained-handle vectors grow geometrically. A reserve to exactly size() + n on every call reallocates and
-      moves the whole vector each time, which is quadratic over the nodes of a graph: neither keep-on-throw body
-      reserves, the parallel store vectors grow through one helper that reserves only when the capacity is short and
-      then to the larger of the need and twice the capacity, and nowhere in mem-handle.cpp is the sink or a store
-      vector reserved to its own size() plus n.
+      moves the whole vector each time, which is quadratic over the nodes of a graph: no keep-on-throw body, the
+      store's parking or a ticket's prepare reserves itself, the parallel store vectors grow through one helper that
+      reserves only when the capacity is short and then to the larger of the need and twice the capacity, and
+      nowhere in mem-handle.cpp is the sink (or a ticket's view of it) or a store vector reserved to its own size()
+      plus n;
+  (m) a terminal retention ticket's prepare makes room in the recording's sink, through that helper, for every handle
+      its commit will move there, so the commit does not allocate: after the helper the capacity is at least the size
+      plus the publication.
 """
 
 import re
@@ -109,11 +118,21 @@ ENSURE_HELPER_HEAD = (f"static const void * const * {ENSURE_HELPER}(ggml_backend
                       "const ggml_tensor * src0) {")
 TABLE_CALL = f"{ENSURE_HELPER}(ctx, src0)"
 HELPER_TABLE_CALL = "table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS);"
+HELPER_RETRY = ("table = moe_fusion_ensure_full_local_ptr_table(ctx, src0, layer, GGML_LAYOUT_AOS, "
+                "&every_expert_resolved);")
 HELPER_EARLY = (f"if (table != nullptr || src0->extra == nullptr || !{OWN_BUFFER}(src0->buffer, ctx.device)) "
                 "{ return table; }")
 STAMP_READ = "uint64_t & failed = weight.moe_direct_publish_failed_generation[ctx.device];"
 STAMP_SKIP = "if (failed == weight.moe_expert_storage_generation) { return nullptr; }"
-STAMP_STORE = "if (table == nullptr) { failed = weight.moe_expert_storage_generation; }"
+# Stamped when the publish failed or an expert still did not resolve; a table upload that failed is retried.
+STAMP_STORE = ("if (table == nullptr && !every_expert_resolved) { "
+               "failed = weight.moe_expert_storage_generation; }")
+# The table probe passes the build's answer out: false at its start and on its own early outs, the build's otherwise.
+PROBE_HEAD = ("static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_sycl_context & ctx, "
+              "const ggml_tensor * weight, int layer_hash, layout_mode layout, "
+              "bool * every_expert_resolved = nullptr) {")
+PROBE_CLEAR = "if (every_expert_resolved) { *every_expert_resolved = false; }"
+PROBE_FORWARD = "return moe_fusion_build_full_local_ptr_table(ctx, weight, layer_hash, layout, every_expert_resolved);"
 STAMP_FIELD = "uint64_t moe_direct_publish_failed_generation[GGML_SYCL_MAX_DEVICES] = {};"
 HELPER_PUBLISH = "if (ggml_sycl_publish_mmid_canonical_aos_experts(src0, ctx.device, GGML_LAYOUT_AOS,"
 OPERAND_HELPER = "ggml_sycl_moe_direct_device_operand"
@@ -138,7 +157,15 @@ RETAIN_CALL = "ggml_sycl::retain_handles_until_event_or_keep(retention.handles, 
 RETENTION = "ggml_sycl_moe_resident_decode_retention"
 RETENTION_HEAD = f"struct {RETENTION} {{"
 RETENTION_DTOR = ("~ggml_sycl_moe_resident_decode_retention(){if(submitted!=nullptr){try{submitted->wait_and_throw();}"
-                  "catch(...){GGML_LOG_WARN(")
+                  "catch(...){")
+# A drain that threw proves nothing about the work: the handles are kept, as the store keeps a failed wait's.
+KEEP = "keep_handles_after_failed_wait"
+KEEP_CALL = f"constboolkept=ggml_sycl::{KEEP}(handles);"
+KEEP_DECL = f"bool {KEEP}(std::vector<mem_handle> & handles) noexcept;"
+KEEP_HEAD = f"bool {KEEP}(std::vector<mem_handle> & handles) noexcept {{"
+KEEP_PARK = "try{retained_park_unwaitable(handles);returntrue;}catch(conststd::bad_alloc&){}"
+KEEP_LEAK = "if(new(std::nothrow)std::vector<mem_handle>(std::move(handles))!=nullptr){"
+PARK_HEAD = "void retained_park_unwaitable(std::vector<mem_handle> & handles) {"
 RETENTION_NO_COPY = (f"{RETENTION}(const {RETENTION} &) = delete;",
                      f"{RETENTION} & operator=(const {RETENTION} &) = delete;")
 ARM = "retention.submitted = stream;"
@@ -164,15 +191,22 @@ GRAPH_HEAD = "void retain_handles_for_current_graph(std::vector<mem_handle> & ha
 GRAPH_SINK = ("if(g_graph_retained_handle_sink){"
               "g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),"
               "std::make_move_iterator(handles.begin()),std::make_move_iterator(handles.end()));"
-              "handles.clear();return;}")
+              "handles.clear();return;}retained_park_unwaitable(handles);")
 MAKE_ROOM = "retained_vector_make_room"
 MAKE_ROOM_HEAD = f"template <typename T> void {MAKE_ROOM}(std::vector<T> & vec, size_t extra) {{"
 MAKE_ROOM_BODY = ("constsize_tneeded=vec.size()+extra;if(needed>vec.capacity()){"
                   "vec.reserve(std::max(needed,2*vec.capacity()));}")
 NOTHROW_MOVE = "std::is_nothrow_move_constructible<mem_handle>::value"
-# The sink and the two parallel store vectors; a reserve of one of them to its own size() plus n is the quadratic one.
-RETAINED_VECTORS = ("g_graph_retained_handle_sink", "graph_unwaitable", "graph_unwaitable_ids")
+# The sink (the recording's own, and a ticket's view of it) and the two parallel store vectors; a reserve of one of them
+# to its own size() plus n is the quadratic one.
+RETAINED_VECTORS = ("g_graph_retained_handle_sink", "graph_sink_", "graph_unwaitable", "graph_unwaitable_ids")
 SELF_SIZE_RESERVE = re.compile(r"([A-Za-z_][\w.>-]*?)(?:\.|->)reserve\(\s*\1(?:\.|->)size\(\)\s*\+")
+# A terminal retention ticket makes room at prepare for every handle its commit will move into the recording's sink,
+# so the commit does not allocate: after the helper, the capacity is at least the size plus the publication.
+PREPARE_HEAD = ("terminal_retention_ticket terminal_retention_ticket::prepare(std::initializer_list<resolved_ptr> "
+                "resolved, std::vector<mem_handle> owners) {")
+PREPARE_ROOM = f"if(ticket.graph_sink_){{{MAKE_ROOM}(*ticket.graph_sink_,ticket.publication_.size());}}"
+MAKE_ROOM_COVERS = "if(needed>vec.capacity()){vec.reserve(std::max(needed,"
 GRAPH_UNWAITABLE = ("retained_store_locklock(state);"
                     f"{MAKE_ROOM}(state.graph_unwaitable,handles.size());"
                     f"{MAKE_ROOM}(state.graph_unwaitable_ids,ids.size());"
@@ -457,19 +491,27 @@ def claim_d_route_body(s):
         fails.append("the ids' storage and the scratch do not join the snapshot before the submit")
 
     # The table: one helper, shared with the BF16 route, publishes on a miss only from this card's own buffer and not
-    # again at a storage generation where the publish and its retry already failed.
+    # again at a storage generation where the publish failed or an expert still did not resolve after it. A table
+    # upload that failed is not stamped: it may be transient, and the next node publishes and builds again.
     helper = braced_body(sycl, ENSURE_HELPER_HEAD) if defined_once(sycl, ENSURE_HELPER_HEAD) else None
     if helper is None:
         fails.append(f"{ENSURE_HELPER} is not defined exactly once")
     else:
         marks = [helper.find(HELPER_EARLY), helper.find(STAMP_READ), helper.find(STAMP_SKIP),
-                 helper.find(HELPER_PUBLISH), helper.rfind(HELPER_TABLE_CALL), helper.find(STAMP_STORE)]
+                 helper.find(HELPER_PUBLISH), helper.find(HELPER_RETRY), helper.find(STAMP_STORE)]
         if min(marks) < 0 or marks != sorted(marks):
             fails.append("the table helper does not, in order: return the probe's table unless it missed on this "
-                         "card's own buffer, skip a generation whose publish already failed, publish once, probe again "
-                         "and stamp the generation when the table still does not resolve")
-        if helper.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1 or helper.count(HELPER_TABLE_CALL) != 2:
-            fails.append("the table helper publishes other than once or probes other than before and after it")
+                         "card's own buffer, skip a generation already stamped, publish once, probe again with the "
+                         "build's answer, and stamp the generation only when the publish failed or an expert did not "
+                         "resolve")
+        if (helper.count("ggml_sycl_publish_mmid_canonical_aos_experts(") != 1 or
+                helper.count(HELPER_TABLE_CALL) != 1 or helper.count(HELPER_RETRY) != 1 or
+                helper.count("failed = ") != 1):
+            fails.append("the table helper publishes other than once, probes other than before and after it, or "
+                         "stamps other than once")
+    probe = braced_body(sycl, PROBE_HEAD) if defined_once(sycl, PROBE_HEAD) else None
+    if probe is None or not probe.lstrip().startswith(PROBE_CLEAR) or probe.count(PROBE_FORWARD) != 1:
+        fails.append("the table probe does not answer false until the build answers, and pass the build's answer on")
     asks = len(re.findall(rf"\b{ENSURE_HELPER}\(", sycl))
     if asks != 3:
         fails.append(f"{ENSURE_HELPER} appears {asks} times; want its definition, the BF16 route's ask and this one")
@@ -633,6 +675,18 @@ def claim_j_retention(s):
     if RETENTION_DTOR not in tight(struct) or struct.count("wait_and_throw") != 1 or "throw;" in dtor:
         fails.append("the retention's destructor does not drain the armed stream, and only then, before the handles go, "
                      "naming a drain that throws instead of rethrowing it")
+    # A drain that threw has not shown the work done, so the handles are kept, never let go in the catch.
+    caught = dtor[len(RETENTION_DTOR):]
+    if (not caught.startswith(KEEP_CALL) or "GGML_LOG_ERROR(" not in caught or "GGML_LOG_WARN(" in caught or
+            "handles.clear()" in dtor or "handles={}" in dtor or "handles.swap(" in dtor):
+        fails.append("the retention's destructor lets its handles go after a drain that threw instead of keeping "
+                     f"them through {KEEP} and naming it at ERROR")
+    if mem_hpp.count(KEEP_DECL) != 1:
+        fails.append(f"mem-handle.hpp does not declare {KEEP} on the caller's vector, noexcept")
+    keep = tight(braced_body(mem_cpp, KEEP_HEAD) or "") if defined_once(mem_cpp, KEEP_HEAD) else ""
+    if KEEP_PARK not in keep or KEEP_LEAK not in keep or keep.find(KEEP_PARK) > keep.find(KEEP_LEAK):
+        fails.append(f"{KEEP} does not park the handles as a failed wait's are parked, and leak them, never release "
+                     "them, when there is no memory to park them")
     for needed in RETENTION_NO_COPY:
         if needed not in struct:
             fails.append(f"the retention can be copied: it lacks {needed}")
@@ -646,9 +700,9 @@ def claim_j_retention(s):
     if body.count("retention.submitted") != 2 or body.count("retention.handles") != 4:
         fails.append("the retention is armed, disarmed, filled or published other than in the protocol")
     note = comment_block(s["sycl_raw"], RETENTION_HEAD)
-    if not all(word in note for word in ("profiler", "refusal", "publication", "drains")):
-        fails.append("no comment at the retention names the exits it drains for: a submit or profiler throw, a "
-                     "refusal after the quantize, a publication throw")
+    if not all(word in note for word in ("profiler", "refusal", "publication", "drains", "kept")):
+        fails.append("no comment at the retention names the exits it drains for (a submit or profiler throw, a "
+                     "refusal after the quantize, a publication throw) and that a drain that throws keeps the handles")
 
     # The publication leaves the caller's vector as it was when it throws.
     if mem_hpp.count(OR_KEEP_DECL) != 1:
@@ -667,13 +721,14 @@ def claim_j_retention(s):
     if graph is None:
         fails.append("the graph-lifetime retention does not take the caller's vector by reference")
     else:
-        tg = tight(graph)
-        if GRAPH_SINK not in tg:
-            fails.append("the graph-lifetime retention does not move the handles into its sink by one range insert")
-        if GRAPH_UNWAITABLE not in tg:
-            fails.append("the graph-lifetime retention inserts into one store vector before both have grown")
-        if not 0 <= graph.find("owner_control_ids(handles)") < graph.find("retained_store_lock"):
-            fails.append("the graph-lifetime retention reads the owner ids under the store lock")
+        if GRAPH_SINK not in tight(graph):
+            fails.append("the graph-lifetime retention does not move the handles into its sink by one range insert, "
+                         "and park them in the store otherwise")
+    park = braced_body(mem_cpp, PARK_HEAD) if defined_once(mem_cpp, PARK_HEAD) else None
+    if park is None or GRAPH_UNWAITABLE not in tight(park):
+        fails.append("the store's parking inserts into one store vector before both have grown")
+    elif not 0 <= park.find("owner_control_ids(handles)") < park.find("retained_store_lock"):
+        fails.append("the store's parking reads the owner ids under the store lock")
     if tight(mem_cpp).count(f"static_assert({NOTHROW_MOVE},") != 1:
         fails.append("nothing holds that a mem_handle moves without throwing, which a range insert with no effects on "
                      "a throw relies on")
@@ -687,16 +742,29 @@ def claim_l_growth(s):
     if helper is None or tight(helper) != MAKE_ROOM_BODY:
         fails.append(f"{MAKE_ROOM} does not reserve only when the capacity is short, and then to the larger of the "
                      "need and twice the capacity")
-    for head in (GRAPH_HEAD, PUBLISH_HEAD):
+    for head in (GRAPH_HEAD, PUBLISH_HEAD, PARK_HEAD, KEEP_HEAD, PREPARE_HEAD):
         if "reserve(" in (braced_body(mem_cpp, head) or "reserve("):
             fails.append(f"{head.split('(')[0]} reserves a retained-handle vector itself")
-    graph = tight(braced_body(mem_cpp, GRAPH_HEAD) or "")
+    park = tight(braced_body(mem_cpp, PARK_HEAD) or "")
     for vector, extra in (("state.graph_unwaitable", "handles"), ("state.graph_unwaitable_ids", "ids")):
-        if graph.count(f"{MAKE_ROOM}({vector},{extra}.size());") != 1:
+        if park.count(f"{MAKE_ROOM}({vector},{extra}.size());") != 1:
             fails.append(f"{vector} does not grow through {MAKE_ROOM}")
     for match in SELF_SIZE_RESERVE.finditer(mem_cpp):
         if re.split(r"\.|->", match.group(1))[-1] in RETAINED_VECTORS:
             fails.append(f"a retained-handle vector is reserved to its own size() plus n: {match.group(0)}")
+    return fails
+
+
+def claim_m_ticket_room(s):
+    mem_cpp = s["mem_cpp"]
+    fails = []
+    prepare = braced_body(mem_cpp, PREPARE_HEAD) if defined_once(mem_cpp, PREPARE_HEAD) else None
+    if prepare is None or tight(prepare).count(PREPARE_ROOM) != 1:
+        fails.append("terminal_retention_ticket::prepare does not make room in the recording's sink for every handle "
+                     f"its commit will move there, through {MAKE_ROOM}")
+    helper = tight(braced_body(mem_cpp, MAKE_ROOM_HEAD) or "")
+    if MAKE_ROOM_COVERS not in helper:
+        fails.append(f"{MAKE_ROOM} can leave the capacity below the size plus the need, so the commit could allocate")
     return fails
 
 
@@ -742,6 +810,7 @@ CLAIMS = {
     "j": claim_j_retention,
     "k": claim_k_hot_path,
     "l": claim_l_growth,
+    "m": claim_m_ticket_room,
 }
 
 
@@ -796,6 +865,12 @@ MUTANTS = [
     ("d", "sycl", ENSURE_HELPER_HEAD, f"!{OWN_BUFFER}(src0->buffer, ctx.device)", "false"),
     ("d", "sycl", ENSURE_HELPER_HEAD, STAMP_SKIP, ""),
     ("d", "sycl", ENSURE_HELPER_HEAD, STAMP_STORE, ""),
+    # A table upload that failed stamped like an expert that did not resolve: a transient failure would stick.
+    ("d", "sycl", ENSURE_HELPER_HEAD, "if (table == nullptr && !every_expert_resolved) {",
+     "if (table == nullptr) {"),
+    ("d", "sycl", ENSURE_HELPER_HEAD, HELPER_RETRY, HELPER_TABLE_CALL),
+    ("d", "sycl", PROBE_HEAD, PROBE_FORWARD, PROBE_FORWARD.replace(", every_expert_resolved);", ");")),
+    ("d", "sycl", PROBE_HEAD, PROBE_CLEAR, ""),
     ("d", "sycl", ENSURE_HELPER_HEAD, HELPER_PUBLISH, "if (true || ggml_sycl_publish_mmid_canonical_aos_experts(src0, "
      "ctx.device, GGML_LAYOUT_AOS,"),
     ("d", "sycl", ENSURE_HELPER_HEAD, "GGML_LAYOUT_AOS);", "GGML_LAYOUT_SOA);"),
@@ -860,7 +935,15 @@ MUTANTS = [
     ("j", "sycl", RETENTION_HEAD, "submitted->wait_and_throw();", ""),
     ("j", "sycl", RETENTION_HEAD, "if (submitted != nullptr) {", "if (true) {"),
     ("j", "sycl", RETENTION_HEAD, RETENTION_NO_COPY[0], ""),
-    ("j", "sycl", RETENTION_HEAD, "catch (...) { GGML_LOG_WARN(", "catch (...) { throw; GGML_LOG_WARN("),
+    ("j", "sycl", RETENTION_HEAD, "catch (...) {", "catch (...) { throw;"),
+    # A drain that threw, and the handles go anyway: released in the catch, or left to the vector's destructor.
+    ("j", "sycl", RETENTION_HEAD, f"ggml_sycl::{KEEP}(handles);", "(handles.clear(), true);"),
+    ("j", "sycl", RETENTION_HEAD, f"ggml_sycl::{KEEP}(handles);", "true;"),
+    ("j", "sycl", RETENTION_HEAD, "GGML_LOG_ERROR(", "GGML_LOG_WARN("),
+    ("j", "mem_hpp", None, KEEP_DECL, KEEP_DECL.replace(" noexcept;", ";")),
+    ("j", "mem_cpp", KEEP_HEAD, "retained_park_unwaitable(handles);", "handles.clear();"),
+    ("j", "mem_cpp", KEEP_HEAD, "new (std::nothrow) std::vector<mem_handle>(std::move(handles)) != nullptr",
+     "(handles.clear(), true)"),
     ("j", "mem_cpp", PUBLISH_HEAD, "state.queue.push_back({ {}, std::move(event)",
      "state.queue.push_back({ std::move(handles), std::move(event)"),
     ("j", "mem_cpp", PUBLISH_HEAD, "state.queue.back().handles.swap(handles);", ""),
@@ -871,24 +954,34 @@ MUTANTS = [
      "std::make_move_iterator(handles.begin()), std::make_move_iterator(handles.end()));",
      "for (auto & handle : handles) { g_graph_retained_handle_sink->push_back(std::move(handle)); }"),
     # The ids vector grows only after the handles went in: a throw there leaves the two store vectors apart.
-    ("j", "mem_cpp", GRAPH_HEAD,
+    ("j", "mem_cpp", PARK_HEAD,
      (f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size());", "state.graph_unwaitable_ids.insert("),
      ("", f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size()); state.graph_unwaitable_ids.insert(")),
+    # The graph-lifetime retention without a sink parks nothing.
+    ("j", "mem_cpp", GRAPH_HEAD, "retained_park_unwaitable(handles);", ""),
     ("j", "mem_cpp", None, NOTHROW_MOVE, "true"),
     ("j", "mem_hpp", None, OR_KEEP_DECL, OR_KEEP_DECL.replace(" & handles", " handles")),
     # The exact reserves come back: on the sink, on either store vector, inside the helper, or anywhere else.
     ("l", "mem_cpp", GRAPH_HEAD, "if (g_graph_retained_handle_sink) {",
      "if (g_graph_retained_handle_sink) { "
      "g_graph_retained_handle_sink->reserve(g_graph_retained_handle_sink->size() + handles.size());"),
-    ("l", "mem_cpp", GRAPH_HEAD, f"{MAKE_ROOM}(state.graph_unwaitable, handles.size());",
+    ("l", "mem_cpp", PARK_HEAD, f"{MAKE_ROOM}(state.graph_unwaitable, handles.size());",
      "state.graph_unwaitable.reserve(state.graph_unwaitable.size() + handles.size());"),
-    ("l", "mem_cpp", GRAPH_HEAD, f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size());",
+    ("l", "mem_cpp", PARK_HEAD, f"{MAKE_ROOM}(state.graph_unwaitable_ids, ids.size());",
      "state.graph_unwaitable_ids.reserve(state.graph_unwaitable_ids.size() + ids.size());"),
     ("l", "mem_cpp", MAKE_ROOM_HEAD, "vec.reserve(std::max(needed, 2 * vec.capacity()));", "vec.reserve(needed);"),
     ("l", "mem_cpp", MAKE_ROOM_HEAD, "if (needed > vec.capacity()) {", "if (true) {"),
     ("l", "mem_cpp", "void retained_handle_drain_loop() {", "state.graph_unwaitable.insert(",
      "state.graph_unwaitable.reserve(state.graph_unwaitable.size() + record.handles.size()); "
      "state.graph_unwaitable.insert("),
+    ("l", "mem_cpp", PREPARE_HEAD, f"{MAKE_ROOM}(*ticket.graph_sink_, ticket.publication_.size());",
+     "ticket.graph_sink_->reserve(ticket.graph_sink_->size() + ticket.publication_.size());"),
+    # The ticket's prepare leaves the sink without room for its commit's move-insert, or the helper can.
+    ("m", "mem_cpp", PREPARE_HEAD, f"{MAKE_ROOM}(*ticket.graph_sink_, ticket.publication_.size());", ""),
+    ("m", "mem_cpp", PREPARE_HEAD, f"{MAKE_ROOM}(*ticket.graph_sink_, ticket.publication_.size());",
+     f"{MAKE_ROOM}(*ticket.graph_sink_, 1);"),
+    ("m", "mem_cpp", MAKE_ROOM_HEAD, "vec.reserve(std::max(needed, 2 * vec.capacity()));",
+     "vec.reserve(2 * vec.capacity());"),
     ("k", "mmvq_cpp", RESIDENT_FN, FP16_ASK, "!q.get_device().has(sycl::aspect::fp16)"),
     ("k", "mmvq_cpp", ADMITTED_FN, FP16_ASK, "!q.get_device().has(sycl::aspect::fp16)"),
     ("k", "mmvq_cpp", FP16_HELPER_HEAD, FP16_READ, "sycl::device().has(sycl::aspect::fp16)"),
