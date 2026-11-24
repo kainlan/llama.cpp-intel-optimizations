@@ -62377,9 +62377,10 @@ static bool ggml_sycl_mul_mat_src1_has_reader(const ggml_tensor * src0,
     throw;
 }
 
-// The facts the batched F32 route reads that are not a function of the tensors (nonfa-stage.hpp). `on_device` is the
-// dispatch's own resolution of src0, src1 and dst. A command graph records when the backend says so or the queue is in
-// its recording state: a primitive the cache has not seen would be created inside the recording.
+// The facts the batched F32 route reads that are not a function of the tensors (nonfa-stage.hpp), built only for a node
+// the tensors admit. `on_device` is the dispatch's own resolution of src0, src1 and dst. A command graph records when
+// the backend says so or the queue is in its recording state: a primitive the cache has not seen would be created
+// inside the recording.
 static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
     ggml_backend_sycl_context &         ctx,
     const ggml_sycl_mul_mat_route_env & route_env,
@@ -62405,9 +62406,9 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
 // the queue is in order, so the GEMM runs before any later reader of dst and before the buffer's release, whose
 // destructor waits on the stream.
 //
-// Returns false when gemm() declined its scratchpad: nothing was submitted and dst was not written, so the dispatch goes
-// on to the orchestrator, whose per-plane loop computes the same op on the same placement. A throw from gemm()
-// propagates as it does on every other path.
+// Returns false when an operand does not resolve to a device pointer or gemm() declined its scratchpad: nothing was
+// submitted and dst was not written, so the dispatch goes on to the orchestrator, whose per-plane loop computes the
+// same op on the same placement. A throw from gemm() propagates as it does on every other path.
 [[nodiscard]] static bool ggml_sycl_mul_mat_f32_batched(ggml_backend_sycl_context &         ctx,
                                                         const ggml_tensor *                 src0,
                                                         const ggml_tensor *                 src1,
@@ -62421,6 +62422,10 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
     const float * a = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src0, ctx.device));
     const float * b = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
     float *       c = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
+    if (!a || !b || !c) {
+        // A decline: the orchestrator resolves the same tensors on its own path and reports there.
+        return false;
+    }
 
     const int  m = static_cast<int>(ne01);
     const int  k = static_cast<int>(ne00);
@@ -77148,11 +77153,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         GGML_ABORT("[SYCL] Non-weight F16 matmul requires device-resident tensors or GPU cross-device recovery.");
     }
     const ggml_sycl_mul_mat_f16_route f16_route = ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, route_env);
-    // A batched F32 activation matmul is one oneDNN matmul, asked after the f16 branches (which take an F16 src0 only)
-    // and before the orchestrator, whose per-plane loop is the fall-through for every node the route declines.
-    const ggml_sycl_mul_mat_f32_batched_route f32_batched_route = ggml_sycl_mul_mat_f32_batched_route_of(
-        src0, src1, dst,
-        ggml_sycl_mul_mat_f32_batched_env_of(ctx, route_env, src0_on_device_r && src1_on_device_r && dst_on_device_r));
     if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021 || f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021) {
@@ -77262,10 +77262,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 GGML_ABORT("[SYCL] KQV debug override requested scalar GPU fallback, but fallback failed.");
             }
         }
-    } else if (f32_batched_route != GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE &&
+    } else if (const ggml_sycl_mul_mat_f32_batched_route f32_batched_route =
+                   ggml_sycl_mul_mat_f32_batched_route_of(src0, src1, dst);
+               f32_batched_route != GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE &&
+               ggml_sycl_mul_mat_f32_batched_env_admits(ggml_sycl_mul_mat_f32_batched_env_of(
+                   ctx, route_env, src0_on_device_r && src1_on_device_r && dst_on_device_r)) &&
                ggml_sycl_mul_mat_f32_batched(ctx, src0, src1, dst, f32_batched_route)) {
-        // One oneDNN matmul computed every plane. A declined scratchpad wrote nothing and reads false, so the
-        // orchestrator's dispatch below computes the op instead.
+        // A batched F32 activation matmul, asked after the f16 branches (which take an F16 src0 only) and before the
+        // orchestrator, whose per-plane loop is the fall-through for every node the route declines. The tensors are
+        // asked first: the environment, a queue-state query among its facts, is built only for a node they admit, so
+        // decode's batch-1 nodes pay for one tensor check. One oneDNN matmul computed every plane; a declined
+        // scratchpad wrote nothing and reads false, so the orchestrator's dispatch below computes the op instead.
     } else {
         ggml_sycl::test_record_orchestrator_call();
         auto decision = ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout);
