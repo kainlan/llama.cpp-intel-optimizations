@@ -293,6 +293,10 @@ checks = {
 DISPATCH_ANCHORS = ("ggml_sycl_compute_forward", "ggml_sycl_compute_forward_impl", "moe_graph_dispatch_direct_node")
 DISPATCH_OP_SWITCH = re.compile(r"\bswitch\s*\(\s*dst->op\s*\)\s*\{")
 DISPATCH_OP_CALL = re.compile(r"\b(ggml_sycl_\w+)\s*\(\s*ctx\b")
+# An op switch entry point that forwards to another: the MUL_MAT_ID case calls ggml_sycl_mul_mat_id through the direct
+# MMID route's re-entry wrapper, which runs it once more when the route stepped aside for an executor that declined.
+# The forwarded entry point counts as a dispatch only while the wrapper's body hands it the context.
+DISPATCH_FORWARDS = {"ggml_sycl_mul_mat_id_with_direct_reentry": "ggml_sycl_mul_mat_id"}
 CALL = re.compile(r"\b(\w+)\s*\(")
 DISPATCH_SCOPE_OPEN = re.compile(r"\bggml_sycl_execution_dispatch_scope\s+\w+\s*\(\s*\w+\s*\)\s*;")
 DISPATCH_ROOT = "ggml_backend_sycl_graph_compute_unchecked"
@@ -344,7 +348,10 @@ def dispatch_names(bodies):
     if not switch:
         return None
     cases = impl[switch.end() - 1:matching_close(impl, switch.end() - 1) + 1]
-    return set(DISPATCH_ANCHORS) | {call.group(1) for call in DISPATCH_OP_CALL.finditer(cases)}
+    names = set(DISPATCH_ANCHORS) | {call.group(1) for call in DISPATCH_OP_CALL.finditer(cases)}
+    return names | {inner for outer, inner in DISPATCH_FORWARDS.items()
+                    if outer in names and inner in {call.group(1)
+                                                    for call in DISPATCH_OP_CALL.finditer(bodies.get(outer, ""))}}
 
 
 def dispatch_scope_violations(source):
@@ -544,6 +551,9 @@ dispatch_mutants.update({
     # An exempt function that no longer calls an op entry point keeps an exemption it does not need.
     "exemption-outlives-its-op-call": backend.replace(
         "    ggml_sycl_op_set_rows(ctx, ggml_sycl::sycl_tensor(&dst, ctx.device));\n", "", 1),
+    # The re-entry wrapper's two passes call another function: ggml_sycl_mul_mat_id is no longer a dispatch it forwards.
+    "forward-not-handed-the-context": backend.replace(
+        "\n    ggml_sycl_mul_mat_id(ctx, dst);\n", "\n    ggml_sycl_mul_mat_id_pass(ctx, dst);\n"),
 })
 
 checks.update({
