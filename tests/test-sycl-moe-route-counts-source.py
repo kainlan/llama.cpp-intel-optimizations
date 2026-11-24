@@ -435,9 +435,9 @@ def check_counting_tensor(s: Sources, count_block: str, build: str) -> None:
     if be.code.count("ggml_sycl_moe_route_counts_tensor(") != 3:
         raise ContractError("FAIL [pin P14]: the counting-tensor predicate is not defined once and called twice")
     pred = be.block_text(PREDICATE_FN, "P14")
-    if "MOE_TENSOR_GATE" not in pred or '"ffn_gate_up_exps"' not in pred:
-        raise ContractError("FAIL [pin P14]: the predicate does not name both the gate tensor and ffn_gate_up_exps")
-    if re.search(r"MOE_TENSOR_(?:UP|DOWN|UNKNOWN)|ffn_up_exps|ffn_down_exps|ffn_gate_exps", pred):
+    if "role == MOE_TENSOR_GATE ||" not in pred or "role == MOE_TENSOR_GATE_UP;" not in pred:
+        raise ContractError("FAIL [pin P14]: the predicate does not name both the gate role and the fused gate_up role")
+    if re.search(r"MOE_TENSOR_(?:UP|DOWN|UNKNOWN)\b|ffn_\w+_exps", pred):
         raise ContractError("FAIL [pin P14]: the predicate admits a tensor that is neither gate nor fused gate/up")
     helper = be.block_text(PROMPT_HELPER, "P14")
     if "moe_classify_tensor(" in build or "moe_classify_tensor(" in helper:
@@ -662,11 +662,12 @@ def self_test(raws: dict[str, str]) -> int:
                 [("an upper bound for the counted blocks", "a rate for the counted blocks")])
 
     # The fused gate/up tensor, the loop's bound and sense, the negative block, and the report that grows.
-    fused = ' || std::strstr(name, "ffn_gate_up_exps") != nullptr'
-    expect_fail("predicate-lacks-fused-spelling", "P14", B, [(fused, "")])
-    expect_fail("predicate-fused-misspelt", "P14", B,
-                [("ffn_gate_up_exps\") != nullptr", "ffn_gate_up_expert\") != nullptr")])
-    expect_fail("predicate-admits-down", "P14", B, [(fused, fused + " || moe_classify_tensor(name) == MOE_TENSOR_DOWN")])
+    fused = " || role == MOE_TENSOR_GATE_UP;"
+    expect_fail("predicate-lacks-fused-role", "P14", B, [(fused, ";")])
+    expect_fail("predicate-fused-by-name", "P14", B,
+                [(fused, ' || std::strstr(name, "ffn_gate_up_exps") != nullptr;')])
+    expect_fail("predicate-admits-down", "P14", B,
+                [(fused, " || role == MOE_TENSOR_GATE_UP || role == MOE_TENSOR_DOWN;")])
     expect_fail("predicate-called-a-third-time", "P14", B,
                 [(INSTALL_CALL, '(void) ggml_sycl_moe_route_counts_tensor("x");\n    ' + INSTALL_CALL)])
     expect_fail("build-site-classifies-itself", "P2", B,

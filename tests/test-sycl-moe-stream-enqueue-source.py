@@ -865,7 +865,9 @@ def test_staging_source_mutants():
 
 
 BATCH_HPP_REL = "ggml/src/ggml-sycl/moe-resolved-batch.hpp"
+TABLES_HPP_REL = "ggml/src/ggml-sycl/moe-mmvq-tables.hpp"
 BATCH_HPP = read(BATCH_HPP_REL)
+TABLES_HPP = read(TABLES_HPP_REL)
 BUILD_SIG = "moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor * src0,"
 STAGED_CAP_SIG = ("static ggml_sycl::moe_staged_route_refusal ggml_sycl_moe_staged_capability_refusal(const "
                   "moe_route_capability & cap)")
@@ -884,6 +886,8 @@ CHOOSE_SIG = "inline moe_batch_executor_choice choose_moe_batch_executor("
 IMMUTABLE_HOST_USE = ("if (recipe.kind == moe_batch_executor::HOST_CPU && "
                       "moe_type_has_immutable_host_recipe(recipe.request.type)) {")
 IMMUTABLE_ISLAND_USE = "if (ggml_sycl::moe_type_has_immutable_host_recipe(type)) { return false; }"
+# The ring stages no expert of either type (moe_pp_batched_takes_staged_type, beside the predicate).
+IMMUTABLE_STAGED_USE = "return !ggml_sycl::moe_type_has_immutable_host_recipe(type) && "
 # The validator checks the direct kernel's recipe by the kernel the recipe names.
 DIRECT_KERNEL_KEY = "if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {"
 # The executor choice's old early return: it refused every Q1_0/NVFP4 device recipe, whatever the capability said.
@@ -892,16 +896,18 @@ CHOOSE_EARLY_RETURN = ("if (operand.recipe().kind != moe_batch_executor::HOST_CP
                        "out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED; return out; }")
 
 
-def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
+def claim_staging_mirrors_serving(sycl: str, batch_hpp: str, tables_hpp: str = TABLES_HPP) -> bool:
     """The staged-route resolver asks one helper, which admits a supported MMVQ_COMPAT kernel and nothing else and asks
     no type: the kernel is the one a resident expert of the slot's (type, layout) runs, so the capability's kernel is
     the whole answer. The resolver is the helper's only caller: the ring stages from the library claim alone (W2) and
     asks no kernel predicate. The executor choice asks no type either, so it takes every kernel the capability query
     answers, Q1_0 and NVFP4 included; the recipe validator keys the direct kernel's exact workspace check by that
-    kernel. One predicate names Q1_0 and NVFP4, for their immutable host recipe, and only the validator's host check
-    and the prompt CPU island ask it; the old direct-kernel predicate and refusal are gone."""
+    kernel. One predicate names Q1_0 and NVFP4, for their immutable host recipe, defined in moe-mmvq-tables.hpp, and
+    only the validator's host check, the prompt CPU island and the ring's staged-type question ask it; the old
+    direct-kernel predicate and refusal are gone."""
     n = norm(sycl)
     b = norm(batch_hpp)
+    t = norm(tables_hpp)
     cap = body(n, STAGED_CAP_SIG)
     validate = body(b, VALIDATE_SIG)
     choose = body(b, CHOOSE_SIG)
@@ -910,8 +916,9 @@ def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
             and not re.search(r"\btype\b|GGML_TYPE_", cap)
             and ROUTE_CAP_ASK in body(n, BUILD_SIG)
             and n.count("ggml_sycl_moe_staged_capability_refusal(") == 2
-            and b.count(IMMUTABLE_SIG + " " + IMMUTABLE_BODY) == 1
-            and b.count(IMMUTABLE_CALL) == 2 and validate.count(IMMUTABLE_HOST_USE) == 1
+            and t.count(IMMUTABLE_SIG + " " + IMMUTABLE_BODY) == 1
+            and t.count(IMMUTABLE_CALL) == 2 and t.count(IMMUTABLE_STAGED_USE) == 1
+            and b.count(IMMUTABLE_CALL) == 1 and validate.count(IMMUTABLE_HOST_USE) == 1
             and n.count(IMMUTABLE_CALL) == 1 and n.count(IMMUTABLE_ISLAND_USE) == 1
             and validate.count(DIRECT_KERNEL_KEY) == 1
             and bool(choose) and not re.search(r"request\.type|moe_type_|CAPABILITY_UNSUPPORTED", choose)
@@ -923,11 +930,12 @@ def claim_staging_mirrors_serving(sycl: str, batch_hpp: str) -> bool:
 
 def test_staging_mirrors_serving():
     assert claim_staging_mirrors_serving(SYCL, BATCH_HPP), first_missing(
-        "ggml/src/ggml-sycl/ggml-sycl.cpp and moe-resolved-batch.hpp: whole files (the capability refusal body and the "
-        "island's use are searched in the first; the predicate, the validator and the executor choice in the second)",
-        norm(SYCL) + " " + norm(BATCH_HPP),
+        "ggml/src/ggml-sycl/ggml-sycl.cpp, moe-resolved-batch.hpp and moe-mmvq-tables.hpp: whole files (the "
+        "capability refusal body and the island's use are searched in the first; the validator and the executor "
+        "choice in the second; the predicate and the staged-type use in the third)",
+        norm(SYCL) + " " + norm(BATCH_HPP) + " " + norm(TABLES_HPP),
         STAGED_CAP_SIG + " {", *STAGED_CAP_STEPS, ROUTE_CAP_ASK, IMMUTABLE_ISLAND_USE, IMMUTABLE_SIG,
-        IMMUTABLE_HOST_USE, DIRECT_KERNEL_KEY)
+        IMMUTABLE_STAGED_USE, IMMUTABLE_HOST_USE, DIRECT_KERNEL_KEY)
 
 
 def test_staging_mirrors_serving_mutants():
@@ -963,10 +971,13 @@ def test_staging_mirrors_serving_mutants():
     assert not c(mutate(SYCL, IMMUTABLE_ISLAND_USE,
                         "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4) { return false; }"), BATCH_HPP)
     # The predicate losing one of its types.
-    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
+    assert not c(SYCL, BATCH_HPP, mutate(TABLES_HPP, IMMUTABLE_BODY, "{ return type == GGML_TYPE_Q1_0; }"))
+    # The ring's staged-type question dropping the predicate, so an NVFP4 host expert would be staged.
+    assert not c(SYCL, BATCH_HPP, mutate(TABLES_HPP, IMMUTABLE_STAGED_USE, "return "))
     # The old predicate's name coming back.
-    assert not c(SYCL, mutate(BATCH_HPP, IMMUTABLE_SIG, IMMUTABLE_SIG + " { return false; } inline bool "
-                              "moe_type_needs_direct_kernel(ggml_type type)"))
+    assert not c(SYCL, BATCH_HPP,
+                 mutate(TABLES_HPP, IMMUTABLE_SIG,
+                        IMMUTABLE_SIG + " { return false; } inline bool moe_type_needs_direct_kernel(ggml_type type)"))
 
 
 LIBRARY_CLAIMS_SIG = ("static bool ggml_sycl_moe_stream_library_claims(void * graph_ctx, int layer, "
@@ -980,7 +991,10 @@ CLAIMS_PLAN_LAYOUT = ("planned = plan != nullptr ? "
                       "ggml_sycl_moe_tensor_plan_primary_layout(*plan, weight, device, &planned_layout) : "
                       "ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout);")
 CLAIMS_STAGED_LAYOUT = "ggml_sycl_moe_tensor_plan_staged_layout(*plan, weight, device, &planned_layout);"
+# The entry point answers false for the weight of a node on its second pass on the direct MMID route
+# (ggml_sycl_mul_mat_id_with_direct_reentry); it reads no plan for that.
 CLAIMS_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) { "
+                "if (weight != nullptr && weight == g_mmid_direct_reentry.suppressed_weight) { return false; } "
                 "return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false); }")
 STAGED_CLAIM_ENTRY = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_staged_tensor("
                       "const ggml_sycl::placement_plan & plan, const ggml_tensor * weight, int device) { "
@@ -1111,8 +1125,9 @@ def claim_library_claims_read_the_index_plan(sycl: str) -> bool:
     build that asks it holds, through the staged claim (llama.cpp-3460), and asks only when the call holds a plan. The
     staged claim is the batched executor's own claim with its host_staged mode, which takes the planned layout from
     the plan it is given through the staged walk; neither plan-taking walk reads a plan of its own. Only the claim's
-    two-argument entry point, the batched executor's own route, reads the device's plan: it passes no plan, and the
-    resident walk's two-argument form reads the cache plan and delegates."""
+    two-argument entry point, the batched executor's own route, reads the device's plan: it passes no plan (and answers
+    false, reading none, for a node's second pass on the direct MMID route), and the resident walk's two-argument form
+    reads the cache plan and delegates."""
     n = norm(sycl)
     at = n.find(LIBRARY_CLAIMS_SIG + " {")
     lc = body(n[at:], LIBRARY_CLAIMS_SIG) if at >= 0 else ""
@@ -2409,7 +2424,7 @@ DTOR_SIG = "ggml_backend_sycl_context::~ggml_backend_sycl_context()"
 END_PROMPT = ("sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed); "
               "if (cached_is_decode && sycl_ctx->moe_stream) { sycl_ctx->moe_stream->end_prompt(); "
               "ggml_sycl_moe_stream_release_payload(*sycl_ctx); }")
-DISPATCH = ("ggml_sycl_mul_mat_id(ctx, dst); ggml_sycl_moe_down_shadow_compare(ctx, dst); "
+DISPATCH = ("ggml_sycl_mul_mat_id_with_direct_reentry(ctx, dst); ggml_sycl_moe_down_shadow_compare(ctx, dst); "
             "ggml_sycl_moe_stream_layer_done(ctx, dst); break;")
 LAYER_DONE_SIG = "static void ggml_sycl_moe_stream_layer_done(ggml_backend_sycl_context & ctx, const ggml_tensor * dst)"
 

@@ -1198,6 +1198,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
     set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The fused gate_up expert role (its enum slot, classifier order, switches, claim, paired-path exclusions, ring
+    # consumer and loader name test) and the seam where the direct MMID route steps aside for the batched prompt
+    # executor and takes a node back only while the executor has submitted nothing. Run WITH --self-test so each
+    # mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-gate-up-role-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-gate-up-role-source.py --self-test)
+    set_tests_properties(test-sycl-moe-gate-up-role-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The swap policy header is plain host code: standard includes only, and no mutable state outside the struct the
     # caller owns. Run WITH --self-test so each pin is shown to catch its mutant.
     add_test(NAME test-sycl-moe-swap-policy-source

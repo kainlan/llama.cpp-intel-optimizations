@@ -472,9 +472,12 @@ int main() {
     //    when a kernel decodes one expert of that materialized layout to f16: every quantized type
     //    ggml_get_to_fp16_sycl_for_layout decodes, on AOS; the four with a per-expert SOA dequant (Q4_0, Q8_0, Q4_K,
     //    Q6_K) on SOA too, since the planner materializes experts SOA (the B50 does Q8_0 and Q6_K); MXFP4 on SOA
-    //    only. Q1_0 and NVFP4 are left out, because only their direct kernel may run them on a device. The list is
-    //    the whole set: any other type the f16 arm admits on AOS fails below.
+    //    only. NVFP4 is in on AOS, its only layout: a prompt whose every expert is on the device runs the f16 arm,
+    //    and the direct MMID route keeps decode and every node the executor does not claim. Q1_0 is left out: only
+    //    its direct kernel runs it on a device. The list is the whole set: any other type the f16 arm admits on AOS
+    //    fails below.
     const ggml_type pp_f16_aos_types[] = {
+        GGML_TYPE_NVFP4,
         GGML_TYPE_Q4_0,
         GGML_TYPE_Q8_0,
         GGML_TYPE_Q4_K,
@@ -520,8 +523,7 @@ int main() {
             ++failures;
         }
     }
-    const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_F32,
-                                         GGML_TYPE_BF16 };
+    const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 };
     for (const ggml_type type : pp_never_types) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_pp_batched_supports_layout(type, layout, true, true)) {
@@ -937,10 +939,10 @@ int main() {
 
     // 16. The PP MoE oneDNN ring is planned only for a model with an expert a ring consumer runs: the batched prompt
     // executor (the WOQ and f16 tables, in any layout) or the MXFP4 SOA per-expert staging (the f16 table's MXFP4
-    // row). An Inkling 2 Mini load runs its NVFP4 experts on the MMID direct route and its BF16 experts on the BF16
-    // direct route, neither of which draws on the ring, so it plans none. The answer does not follow the runtime
-    // knobs: it is the union of the two tables with both of them on, so a knob that turns the executor off keeps the
-    // ring a load plans, and every type the ring stages for a host expert is served.
+    // row). An Inkling 2 Mini load runs its NVFP4 prompt experts on the executor's f16 arm, so it plans the ring; its
+    // BF16 experts run on the BF16 direct route, which does not draw on the ring. The answer does not follow the
+    // runtime knobs: it is the union of the two tables with both of them on, so a knob that turns the executor off
+    // keeps the ring a load plans, and every type the ring stages for a host expert is served.
     {
         const struct {
             ggml_type    type;
@@ -952,7 +954,7 @@ int main() {
             { GGML_TYPE_Q8_0,   true,  "an f16 row at AOS and SOA"                                 },
             { GGML_TYPE_Q4_0,   true,  "an f16 row at AOS and SOA"                                 },
             { GGML_TYPE_IQ4_XS, true,  "an f16 row at AOS, though no MMVQ-ID kernel"               },
-            { GGML_TYPE_NVFP4,  false, "Inkling's NVFP4 experts run on the MMID direct route"      },
+            { GGML_TYPE_NVFP4,  true,  "Inkling's NVFP4 prompt experts run on the f16 arm"         },
             { GGML_TYPE_Q1_0,   false, "Q1_0 experts run on the MMID direct route"                 },
             { GGML_TYPE_BF16,   false, "Inkling's BF16 experts run on the BF16 direct route"       },
             { GGML_TYPE_F16,    false, "a float expert needs no dequant and keeps its own route"   },
@@ -984,6 +986,53 @@ int main() {
             }
             if (moe_pp_batched_takes_staged_type(type) && !moe_pp_onednn_ring_serves_type(type)) {
                 std::printf("FAIL: type=%d is staged through the ring for a host expert, but plans no ring\n", t);
+                ++failures;
+            }
+        }
+    }
+
+    // 17. The direct MMID route steps aside for a node only when the batched executor can take it: a prompt, a weight
+    // the executor claims on the device, and a ring weight slot planned there. Each term alone keeps the route.
+    {
+        const struct {
+            bool         prompt;
+            bool         claims;
+            size_t       slot;
+            bool         want;
+            const char * why;
+        } defer_cases[] = {
+            { true,  true,  361u << 20, true,  "a claimed prompt with a planned ring"          },
+            { true,  true,  0,          false, "no ring planned: every dispatch would decline" },
+            { true,  false, 361u << 20, false, "the executor does not claim the weight"        },
+            { false, true,  361u << 20, false, "decode: the executor runs prompts only"        },
+            { false, false, 0,          false, "nothing holds"                                 },
+        };
+
+        for (const auto & c : defer_cases) {
+            if (moe_mmid_direct_defers_to_executor(c.prompt, c.claims, c.slot) != c.want) {
+                std::printf("FAIL: the direct route %s for: %s\n", c.want ? "keeps the node" : "steps aside", c.why);
+                ++failures;
+            }
+        }
+    }
+
+    // 18. A type whose host experts run an immutable host recipe (Q1_0 and NVFP4) is never staged through the ring,
+    // although NVFP4 has an f16 row at AOS: its host experts keep their own planned workspace, the B50's host route
+    // and the CPU island's refusal stay as they are, and only a prompt whose every expert is on the device runs the
+    // batched executor.
+    {
+        const ggml_type immutable_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 };
+        for (const ggml_type type : immutable_types) {
+            if (moe_pp_batched_takes_staged_type(type)) {
+                std::printf("FAIL: %s is staged through the ring, but its host experts run an immutable recipe\n",
+                            ggml_type_name(type));
+                ++failures;
+            }
+        }
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            if (moe_pp_batched_takes_staged_type(type) && ggml_sycl::moe_type_has_immutable_host_recipe(type)) {
+                std::printf("FAIL: type=%d is staged although its host experts run an immutable recipe\n", t);
                 ++failures;
             }
         }
