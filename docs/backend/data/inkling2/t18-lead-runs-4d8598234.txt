@@ -1,0 +1,67 @@
+Task 18 (NVFP4 resident decode route), after the re-review's minors: the lead's runs on 4d8598234
+===================================================================================================
+Date: 2026-11-24. Tree: task/inkling2-t18 at 4d8598234 (full build). Driver: compute-runtime 26.44. Each run was
+made once. 8825673f7..4d8598234 changes what a failed drain does with its handles, when a failed table publish
+is remembered, and how the retention ticket makes room in the graph sink; the runs below are the cases those
+changes touch.
+
+Reading
+-------
+- sycl-q1-nvfp4-admitted-device passes on the B70 and on the B50 (68 PASS lines each); sycl-moe-bf16-direct-device
+  passes on the B70.
+- The Inkling count gate passes on the B70 and on both cards: 0 refusals, 0 abort lines, no device loss, no kernel
+  fault line.
+- One bench load on the B70, no builder alive at either end: pp512 47.57 t/s, tg128 21.04 t/s. The prompt figure
+  equals the before-arms of the pair on 8825673f7 (47.56, 47.53), so the 0.7% that pair showed between its arms
+  is not attributed to the change.
+- The failed-drain path runs only when a drain throws. No run here reaches it; its evidence is the source
+  contract's pins and mutants and the reviews.
+- The task's final head, 3934d3ea9, differs from 4d8598234 in a comment, in the text of two ERROR lines and in
+  the handler of the failed-drain keep (catch-all for a narrower catch). None of the three is on a path a run
+  here takes. The merged tree's own gate covers that build.
+
+Scored console lines
+--------------------
+=== admitted b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  tests selected: 1  PASS lines: 68  context-bind: 0  abort lines: 0
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  kernel fault lines since start: 0
+--- step rc=0
+=== admitted b50
+  rc=0
+  card the test ran on: B50 (wanted B50)
+  tests selected: 0  PASS lines: 68  context-bind: 0  abort lines: 0
+  kernel fault lines since start: 0
+--- step rc=0
+=== bf16 direct b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  tests selected: 1  PASS lines: 1  context-bind: 0  abort lines: 0
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  kernel fault lines since start: 0
+--- step rc=0
+=== inkling gate b70
+  refusals: 0  abort lines: 0  device_lost: 0
+0.50.681.186 I common_perf_print: prompt eval time =     811.05 ms /    14 tokens (   57.93 ms per token,    17.26 tokens per second)
+0.50.681.186 I common_perf_print:        eval time =    1001.50 ms /    14 runs   (   71.54 ms per token,    13.98 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== inkling gate both
+  refusals: 0  abort lines: 0  device_lost: 0
+0.50.282.648 I common_perf_print: prompt eval time =     805.27 ms /    14 tokens (   57.52 ms per token,    17.39 tokens per second)
+0.50.282.649 I common_perf_print:        eval time =     990.84 ms /    14 runs   (   70.77 ms per token,    14.13 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== bench b70, one load
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.97 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 13038  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT c pp512 avg=47.57 t/s stddev=0.00 samples=[47.57]
+  RESULT c tg128 avg=21.04 t/s stddev=0.00 samples=[21.04]
+  kernel fault lines since start: 0
+--- step rc=0
+=== T18 R3 CHAIN END 2026-11-24T02:45:10-05:00  ninja=0 icpx=0

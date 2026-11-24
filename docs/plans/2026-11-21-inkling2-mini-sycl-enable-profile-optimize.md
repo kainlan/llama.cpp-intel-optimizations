@@ -6020,16 +6020,54 @@ any host or secondary expert keeps the admitted route of Task 8c unchanged.
 5. The device test you will extend and the RED you will write first.
 
 **Acceptance Criteria:**
-- [ ] On the B70 a decode node with NVFP4 experts reaches the kernel with no `ggml_sycl_copy_ids_to_host`, no
+- [x] On the B70 a decode node with NVFP4 experts reaches the kernel with no `ggml_sycl_copy_ids_to_host`, no
       `ggml_sycl_build_moe_resolved_batch`, no workspace admission and no host task: pinned by a source contract
       with mutants, and shown by a route log line that names the route.
-- [ ] A tensor with a host expert takes the admitted route as before: the admitted device test and the mixed
+- [x] A tensor with a host expert takes the admitted route as before: the admitted device test and the mixed
       fixture pass unchanged on both cards.
-- [ ] A device test drives the new route through the production entry with a bad id and a null slot.
-- [ ] Lead runs: the Inkling gate on the B70, the B50 alone and both cards; the Mistral and GPT-OSS gates;
+- [x] A device test drives the new route through the production entry with a bad id and a null slot.
+- [x] Lead runs: the Inkling gate on the B70, the B50 alone and both cards; the Mistral and GPT-OSS gates;
       `test-backend-ops -o MUL_MAT_ID` on each card; one ABBA on the B70 against the tree before the task; one
       host-stage profile that shows the `moe` stage's host time per node.
-- [ ] Full build, the two source-contract sweeps with only the known eight red, the inventory regenerated.
+- [x] Full build, the two source-contract sweeps with only the known eight red, the inventory regenerated.
+
+**Done (lead, 2026-11-24; branch `task/inkling2-t18` at `3de6793db`; evidence
+`docs/backend/data/inkling2/t18-lead-runs-48390d4bb.txt`, `t18-lead-runs-8825673f7.txt` and
+`t18-lead-runs-4d8598234.txt`; the lead's rulings after the checkpoint and after the first review are in
+`t18-lead-rulings.md` beside them).**
+- *What was built.* `ggml_sycl_mul_mat_id_nvfp4_resident_decode`: a decode node whose NVFP4 experts the plan puts
+  all on this card at AOS runs from the full-local expert table and the ids where they are. The input is quantized
+  into a Q8_1 slice of the SCRATCH zone, the checked MMVQ-ID kernel writes dst, and the kernel's event becomes
+  dst's ready event. No host read of the ids, no resolved batch, no workspace, no host task, no host wait. Every
+  other shape declines to the admitted route with a reason logged once (`GGML_SYCL_MOE_ROUTE_LOG=1`). Q1_0 stays
+  on the admitted route. A bad id costs its own row (NaN for an id past the table or a null slot, zero for an id
+  below zero), not the node.
+- *Measured, B70, driver 26.44, no builder alive, pp512 / tg128 in t/s.* Interleaved, in run order: before
+  47.56 / 14.62, after 47.19 / 21.17, after 47.24 / 21.14, before 47.53 / 14.70 (`8825673f7`). The first round's
+  pair read 47.29 / 14.87, 47.41 / 21.02, 47.26 / 21.09, 47.18 / 14.77 (`48390d4bb`), and one load of `4d8598234`
+  read 47.57 / 21.04. Decode +44%, prompt unchanged. The `moe` stage costs 107 us of host time per `MUL_MAT_ID`
+  node; it was 545 us.
+- *Unchanged elsewhere.* Mistral on the B70 and GPT-OSS on the B50 do not move in an interleaved pair each (the
+  retained-handle publication changed for every route). The Inkling gate passes on the B70, the B50 alone and both
+  cards. `test-backend-ops -o MUL_MAT_ID` changes no case on either card. The plan lines of Mistral and GPT-OSS
+  differ only in the driver's free-memory reading and in measured times.
+- *Reviews.* Spec review passed. The first quality review failed on a lifetime window: on four failure paths (a
+  submit, a profiler record or a publication that throws, a refusal after the quantize) the handles could be
+  released under submitted work. The route now holds them in one object that drains the stream before it lets
+  them go on any exit that did not publish, and a drain that itself fails parks them in the store's failed-wait
+  list. Publication takes the vector by reference and leaves it whole when it throws
+  (`retain_handles_until_event_or_keep`). Two later rounds were minors.
+- *Three mistakes in the rounds, kept as a record.* The first fix reserved the retained-handle vectors to an exact
+  size on every call, which is quadratic over the nodes of a graph; the lead found it by reading the diff before
+  the device runs, and the round-1 pair could not have shown it. A "publish already failed" stamp also recorded a
+  transient upload failure and would have made it permanent for the BF16 route. A reviewer's claim that a snapshot
+  without de-duplication takes a reference per expert more was passed on by the lead as a ruling without a read.
+  It is wrong: a handle's identity includes its slice offset, so every expert lease is kept either way, and the
+  one handle taken twice is the table's own.
+- *Not exercised on a device.* The failure paths (a throwing submit, a failed drain) run only when the runtime
+  throws. Their evidence is the source contract's pins and mutants and the reviews.
+- *The next decode target.* A bench token is now about 47 ms against about 36.5 ms of device-timed kernel work, so
+  decode on the B70 is mostly kernel-bound. The largest kernel row is the NVFP4 expert mat-vec (row S9).
 
 ---
 
@@ -6237,6 +6275,29 @@ host-to-device copy with a wait. These are the first candidates for the profile 
 *Decisions that are the user's (asked, not answered):* the eight contracts that are red on `master`; the
 interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkling2`; replacing the system
 `mkdir`.
+
+*Left by Task 18 (2026-11-24):*
+- **The BF16 direct route has the publication window Task 18 closed for NVFP4**: a by-value retain after the
+  submit, and a profiler record that can throw between them. A lifetime defect of the same kind; the fix is the
+  same retention object.
+- The remaining host cost of a resident NVFP4 node is 107 us. Known parts: a snapshot of about 130 handle copies per
+  node (a shared immutable lease set per table generation removes it), one unified-cache allocation for the Q8_1
+  slice, a wake of the drain worker per publication, and costs outside the route that every `MUL_MAT_ID` node
+  pays (two clock reads, census counters, two `strstr` calls on the tensor name ahead of a probe flag, the
+  pending-scatter check).
+- The route throws under graph recording and turns MoE graphs off for the context. Recording the node needs a
+  Q8_1 slice that outlives one node.
+- The prompt path is unchanged: every prompt node declines with `reason=prompt`.
+- The admitted route resolves src1 and dst without checking that they are on this card, and its adapter's
+  refusal line does not name which check failed (a launch past an int reads as `step=adapter`).
+- A table upload that keeps failing republishes every expert slice on every node and moves the weight's storage
+  generation each time, which also invalidates the other card's table memo. A retry bound is not designed.
+- `mmvq_profile_label` looks the device up from the queue on every node with the profiler off. The drain worker's
+  own insert into the failed-wait list does not use `retained_vector_make_room`.
+- The route's plan memo and its once-per-reason decline bits are written without a lock. Correct while one thread
+  computes a context's graphs, which is the only supported use.
+- Lead tooling: the profile runner counts the two-card startup warning as a device loss (a false 1 on every
+  two-card profile run); the gate runner already excludes it.
 
 ---
 
