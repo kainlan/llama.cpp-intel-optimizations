@@ -6221,6 +6221,109 @@ it).**
   shape shows this kernel bound by arithmetic and not by memory). Decode: the per-node host cost, then the
   kernel's lane geometry.
 
+### Task 20: A batched F32 `MUL_MAT` is one oneDNN matmul, not one per batch element (written 2026-11-24)
+
+**Track:** S3-prompt (row S8). **Depends on:** Task 19 (merged, `4966f1473`).
+**Found by:** the merged tree's prompt profile (`docs/backend/data/inkling2/t19-merged-4966f1473.txt`) and a
+read-only trace of the path on `05569a4f4` (explorer, 2026-11-24).
+
+**Description (read, not run; line numbers move, find each site by name):**
+- Inkling builds three kinds of F32 x F32 `MUL_MAT` whose batch dimension is the token count T, all on
+  activations, none on a weight:
+  - `graph::mix` (`src/models/inkling2.cpp`), two per call: `scores = mul_mat(states, queries)` with
+    `states` [n_embd, nb+1, T] and `queries` [n_embd, nq, T], and `mul_mat(cont(transpose(states)), scores)`
+    with [nb+1, n_embd, T] and [nb+1, nq, T]. Both operands carry the batch.
+  - the relative-position bias table: `mul_mat(pad(attn_rel_bias), Rcur)` with a 2-D src0 [n_rel, n_extent+1]
+    and `Rcur` [n_rel, n_head, T]. src0 is broadcast over the batch.
+- An F32 src0 reaches the generic loop in `ggml_sycl_op_mul_mat` (`ggml-sycl.cpp`):
+  `for (i0 = 0; i0 < ne13 * ne12; ++i0)`, one call of `ggml_sycl_op_mul_mat_sycl` per plane, whose F32 arm calls
+  `DnnlGemmWrapper::row_gemm` (`gemm.hpp`), which is `gemm(...)` with both batch counts 1.
+- Each `gemm()` call takes the queue's exec mutex, builds a primitive key and three memory descriptors, looks the
+  primitive up under a global mutex, constructs three `dnnl::memory` objects, fetches the scratchpad, builds an
+  argument map and a profiler record, and executes. Measured: 19 us of host time per call, 199,440 calls for a
+  691-token prompt, 3.8 s of a 9.6 s prompt, for 0.44 s of device time.
+- `DnnlGemmWrapper::gemm` already takes `batches_a` and `batches_b` and builds 3-D descriptors
+  ({batches, m, k}, {batches, k, n}, {max, m, n}); a batch of 1 on either side broadcasts. The F16 batched route
+  (`ggml_sycl_mul_mat_batched_sycl`, predicate `ggml_sycl_mul_mat_f16_route_of` in `nonfa-stage.hpp`) calls it
+  that way. It refuses F32 src0 only by its type check. No F32 batched route exists.
+- The mapping the loop uses, to keep: `gemm(a = src0, b = src1)`, m = ne01, n = ne11, k = ne10, A strides
+  {1, k, k*m}, B strides {1, k, n*k}, `ldc = ne0`; dst[n][m] = sum over k of src0[m][k] * src1[n][k]. C's batch
+  stride is fixed at `ldc * n`, so dst must be dense across planes.
+- `gemm()` labels every call `mulmat.onednn_gemm.unbatched`, batched or not.
+- Decode has T = 1: these nodes have batch 1 there and are not this task's.
+
+**File scope:**
+- Modify: `ggml/src/ggml-sycl/ggml-sycl.cpp` (the route and its dispatch in `ggml_sycl_mul_mat`),
+  `ggml/src/ggml-sycl/nonfa-stage.hpp` or a new small header beside it (the predicate), `ggml/src/ggml-sycl/gemm.hpp`
+  (the profiler label only).
+- Create: a host test of the predicate, a device test of the route, a source contract; their registrations.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. Confirm or correct each line of the description against the code, with file:line.
+2. How the F16 batched route resolves its operand pointers and their owners, what it does with the event `gemm()`
+   returns, and what orders a later reader of dst after the GEMM. State what the F32 route must do to be at least
+   as safe: which `mem_handle`s exist for src0, src1 and dst on this path, and whether anything must be retained
+   until the event. Is the queue in-order, and where is that established?
+3. The primitive cache: is it bounded, and what does a miss cost? The batched key contains T. A server sees many
+   prompt lengths. Read the installed oneDNN headers and documentation (not memory) for whether a GPU matmul
+   primitive can be created with a runtime batch dimension (`DNNL_RUNTIME_DIM_VAL`) and whether this build's
+   engine supports it. Report what you find; do not adopt runtime dimensions without the lead's ruling.
+4. Graph recording: is a prompt graph recorded or replayed at all, and does the scratchpad pre-sizing before a
+   recording read the primitive cache in a way a new batched key changes?
+5. Whether `Rcur` (the output of `clip`) and the two `mix` operands are contiguous at dispatch, by reading the
+   graph code, and which checks the predicate needs so that a non-dense operand declines.
+6. Which `test-backend-ops` `MUL_MAT` cases (F32 x F32, batch > 1) the predicate would take, by reading the case
+   list, and which it declines.
+
+**Design (the lead's, open to correction at the checkpoint):**
+- A predicate `ggml_sycl_mul_mat_f32_batched_route_of(env)` in the form of the F16 one: a pure function over a
+  small struct, testable on the host. It takes a node only when all hold: src0, src1 and dst are F32; the batch
+  `ne12 * ne13` is above 1; `ne02 * ne03` equals it or equals 1; no operand is a weight; no operand is
+  transposed or permuted; all three are contiguous; the node is not split across devices and its operands are in
+  this device's memory. Everything else declines to the loop that exists. A decline is not a refusal: no throw,
+  no failed graph, no log above debug.
+- The route submits one `DnnlGemmWrapper::gemm` with the batch counts and the mapping above. If `gemm()` declines,
+  the node falls through to the existing loop (the F16 route's decline behaviour is the model; state it).
+- No allocation, no copy, no conversion, no host wait, no host read of an operand. Operands stay where they are.
+- `gemm()` labels a call with a batch above 1 `mulmat.onednn_gemm.batched`. The F16 batched route's calls move to
+  that row with it; adapt the source test that pins the label.
+
+**Implementation, each RED then GREEN:**
+1. `tests:` the host test of the predicate (every accept and decline condition, one case each, and the three
+   Inkling shapes by their dimensions) and the source contract (the route is consulted before the orchestrator
+   and calls `gemm` once with batch counts; the label). Both fail first.
+   `sycl:` the predicate, the route, the label.
+2. `tests:` a device test, labels including `device`, run by the lead only: for each of the three Inkling shapes
+   at T = 1, 2, 179 and 512, and for a 2-D src0 with a batch in dim 3, the SYCL result against a CPU oracle
+   computed in double, within a stated relative tolerance; a decline case (a permuted operand) that must give
+   the same values through the loop; and an assertion, through a counter or the profiler's own count, that the
+   taken cases made one GEMM submission and the declined case made one per plane. It must name its card in its
+   log and skip with 77 when no device is there.
+
+**Acceptance Criteria:**
+- [ ] The host test and the source contract fail before the GREEN commit for the reason they name and pass after.
+- [ ] Full build; the two source-contract sweeps with only the known eight red; inventory check 0.
+- [ ] Lead runs, each once: the device test on both cards; `test-backend-ops -o MUL_MAT` on each card with no case
+      changing status against `t19-tbo-MUL_MAT-cb9b34792`; the Inkling gate on the B70, the B50 alone and both
+      cards; the Mistral gate on the B70 and the GPT-OSS gate on the B50.
+- [ ] Lead runs, each once, on the B70: the 691-token prompt under the kernel profiler (the GEMM rows' submission
+      count against 199,440, and a cold primitive cache is part of this run on purpose) and under the stage
+      profiler (the non-MoE matmul stage against 3783 ms); one ABBA of `llama-bench` against the merged tree.
+- [ ] A fixed-seed 64-token completion is compared with the merged tree's. Equal text is expected. A difference is
+      not a failure by itself (one batched GEMM may sum in another order) but is reported with the first
+      differing token and the device test's measured error.
+
+**Gotchas:**
+- GPU and model-loading runs are the lead's. The implementer builds, runs host tests and the contract sweeps.
+- `ggml-sycl.cpp` is about 90k lines and the codescout index misses matches in it: locate with
+  `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<pattern>'`.
+- Take no build while a lead bench runs (the lead says when).
+- Never `clang-format-19 -i`; check with `git-clang-format-19 --diff <base>` on the touched files.
+- A new model-loading or device test must carry a label the safety net knows (`.claude/rules/ctest-registration.md`).
+
+**Commits:** `sycl: a batched F32 MUL_MAT is one oneDNN matmul`, preceded by its `tests:` commit; then the device
+test's `tests:` commit. Path-scoped.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
