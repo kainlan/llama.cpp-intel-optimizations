@@ -23,11 +23,12 @@
 //
 // The functions are plain inline code, so main() calls them directly: no queue is opened and no
 // device is touched. A host comparison speaks for the device because no step in either decode
-// rounds. The codes are integer arithmetic (shifts, masks, byte-wise adds). Every scale is a 3-bit
-// integer or 1 + man/8 times a power of two between 2^-10 and 2^8: man/8 and each power-of-two
-// scaling are exact in binary32 (ldexp is exact by definition, 0 ulp in the OpenCL spec), the bit
-// form puts the same exponent and mantissa fields down directly, and the smallest nonzero value,
-// 2^-10, is far above binary32's normal range floor, so a device that flushes denormals sees none.
+// rounds. The codes are integer arithmetic (shifts, masks, byte-wise adds). Every halved scale is
+// man * 2^-10 (exp == 0) or (1 + man/8) * 2^(exp - 8) with exp 1..15, so its values run from 2^-10
+// (0x01) to 1.75 * 2^7 = 224 (0x7e): man/8 and each power-of-two scaling are exact in binary32
+// (ldexp is exact by definition, 0 ulp in the OpenCL spec), the bit form puts the same exponent and
+// mantissa fields down directly, and the smallest nonzero value, 2^-10, is far above binary32's
+// normal range floor, so a device that flushes denormals sees none.
 
 #include "dequantize.hpp"
 #include "ggml-common.h"
@@ -97,7 +98,8 @@ static void check_scale_all() {
     }
 }
 
-static int checks_codes = 0;
+static int checks_codes    = 0;
+static int generator_fails = 0;
 
 static void check_codes(uint32_t q4) {
     const sycl::int2 table = get_int_from_table_16((int) q4, kvalues_mxfp4);
@@ -120,13 +122,27 @@ static void check_codes_all() {
     }
     for (uint32_t high = 0; high < 16; high++) {
         for (uint32_t low = 0; low < 65536; low++) {
-            uint32_t q4 = 0x11111111u * (high << 4);
+            // Each byte: the fixed high nibble over its own low-nibble code.
+            uint32_t q4 = 0x01010101u * (high << 4);
             for (int byte = 0; byte < 4; byte++) {
                 q4 |= ((low >> (4 * byte)) & 0xfu) << (8 * byte);
+            }
+            // The sweep is only as wide as its generator: check the input before using it.
+            bool generated = true;
+            for (int byte = 0; byte < 4; byte++) {
+                const uint32_t b = (q4 >> (8 * byte)) & 0xffu;
+                generated        = generated && (b >> 4) == high && (b & 0xfu) == ((low >> (4 * byte)) & 0xfu);
+            }
+            if (!generated) {
+                if (generator_fails++ == 0) {
+                    std::fprintf(stderr, "FAIL: generator: high %u codes 0x%04x gave 0x%08x\n", high, low, q4);
+                }
+                continue;
             }
             check_codes(q4);
         }
     }
+    CHECK(generator_fails == 0, "generator: %d inputs do not carry the nibbles the sweep claims", generator_fails);
 }
 
 // One NVFP4 block (4-byte aligned, as the kernels read qs as ints) and the two q8_1 blocks it pairs with.

@@ -93,6 +93,8 @@ def check_scale(common: str) -> list:
         failures.append("ggml_sycl_ue4m3_to_fp32 does not read the normal value from its bits")
     if "(float)man*0x1p-10f" not in body:
         failures.append("ggml_sycl_ue4m3_to_fp32 does not give exp == 0 as man * 2^-10")
+    if "exp==0?small:normal" not in body:
+        failures.append("ggml_sycl_ue4m3_to_fp32 does not select man * 2^-10 for exp == 0 and the bit form otherwise")
     if "(x&0x7fu)==0x7fu?0.0f:" not in body:
         failures.append("ggml_sycl_ue4m3_to_fp32 does not read 0x7f and 0xff as 0")
     return failures
@@ -154,6 +156,8 @@ def test_scale_gate_fails_on_each_mutation() -> None:
         "normal not read from its bits": lambda: mutate(
             "memcpy(&normal, &bits, sizeof(float));", "normal = (float) bits;"),
         "NaN encodings not zeroed": lambda: mutate("(x & 0x7fu) == 0x7fu ? 0.0f : value", "value"),
+        "select arms swapped": lambda: mutate("exp == 0 ? small : normal", "exp == 0 ? normal : small"),
+        "select dropped": lambda: mutate("exp == 0 ? small : normal", "normal"),
     }
     for label, run in mutants.items():
         assert run(), f"gate still passes under mutation: {label}"
