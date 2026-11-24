@@ -145,7 +145,10 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-    set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host;python")
+    # The gate reads every function body of the backend and takes about 9 minutes on this tree (535 s measured). Its
+    # own TIMEOUT stands above a sweep's shorter --timeout, which would stop it before it reports.
+    set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host;python"
+                                                                TIMEOUT 1200)
     # llama.cpp-moua L4: every "Proc name:" in ggml-sycl.h has an unconditional registration arm and a definition,
     # the load-compute ledger has one writer and one clearer, and the txn-end clear guard, the destructor erase
     # and the success-tail drop keep their order. Pure Python over source text, with its own mutation matrix.
