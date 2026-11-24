@@ -692,9 +692,11 @@ def claim_j_retention(s):
                      "that exited without publishing its handles")
     if mem_hpp.count(KEEP_DECL) != 1:
         fails.append(f"mem-handle.hpp does not declare {KEEP} on the caller's vector, noexcept")
-    keep = tight(braced_body(mem_cpp, KEEP_HEAD) or "") if defined_once(mem_cpp, KEEP_HEAD) else ""
+    keep_body = (braced_body(mem_cpp, KEEP_HEAD) or "") if defined_once(mem_cpp, KEEP_HEAD) else ""
+    keep = tight(keep_body)
+    # A whole-word throw: the leak's std::nothrow is not one.
     if (KEEP_PARK not in keep or KEEP_LEAK not in keep or keep.find(KEEP_PARK) > keep.find(KEEP_LEAK) or
-            keep.count("catch(") != 1 or "throw" in keep):
+            keep.count("catch(") != 1 or re.search(r"\bthrow\b", keep_body)):
         fails.append(f"{KEEP} does not park the handles as a failed wait's are parked, catching every throw of the "
                      "parking without rethrowing it, and leak them, never release them, when they cannot be parked")
     for needed in RETENTION_NO_COPY:

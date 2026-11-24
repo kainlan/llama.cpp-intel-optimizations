@@ -2824,13 +2824,16 @@ bool keep_handles_after_failed_wait(std::vector<mem_handle> & handles) noexcept 
     try {
         retained_park_unwaitable(handles);
         return true;
-    } catch (const std::bad_alloc &) {
-        // Parking leaves `handles` as it was when it cannot allocate, so they can still be leaked below.
+    } catch (...) {
+        // Every throw of the parking leaves `handles` as it was: the owner ids, the store's lock and both reserves come
+        // before the first move, and the inserts after them do not allocate. So whatever it threw (no memory, the
+        // lock's system_error, a reserve's length_error) the handles can still be leaked below, and nothing reaches
+        // this function's noexcept.
     }
-    // No room to park them: leak them, so nothing the unfinished work may read is freed under it. A failed nothrow
+    // They could not be parked: leak them, so nothing the unfinished work may read is freed under it. A failed nothrow
     // allocation constructs nothing, so `handles` is still whole when this returns false.
     if (new (std::nothrow) std::vector<mem_handle>(std::move(handles)) != nullptr) {
-        GGML_LOG_ERROR("[MEM-HANDLE] no memory to park handles after a failed wait; they are leaked, never released\n");
+        GGML_LOG_ERROR("[MEM-HANDLE] could not park handles after a failed wait; they are leaked, never released\n");
         return true;
     }
     return false;

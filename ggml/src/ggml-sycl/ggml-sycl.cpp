@@ -84097,8 +84097,8 @@ struct ggml_sycl_moe_resident_decode_retention {
                 const size_t count = handles.size();
                 const bool   kept  = ggml_sycl::keep_handles_after_failed_wait(handles);
                 GGML_LOG_ERROR(
-                    "[MoE] NVFP4 resident decode route: the drain after a failed submit threw; its %zu "
-                    "handles are %s\n",
+                    "[MoE] NVFP4 resident decode route: a node exited without publishing its handles and the drain "
+                    "threw; its %zu handles are %s\n",
                     count, kept ? "kept, not released" : "released: no memory was left to keep them");
             }
         }
