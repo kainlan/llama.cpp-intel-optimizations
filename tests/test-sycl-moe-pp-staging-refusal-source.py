@@ -11,7 +11,9 @@ What this gate pins:
   - the helper: [[noreturn]], one WARN naming tensor, buffer, rows, bytes and device, then the throw, and no abort; it
     takes `reason` as a reference to a character array, because the exception keeps that pointer and a `const char *`
     from a temporary would dangle;
-  - the row-map staging (moe_pp_row_mappings) refuses when its allocation is null;
+  - the row-map staging (moe_pp_row_mappings) refuses when its allocation is null, except for a node the direct MMID
+    route stepped aside for (pp_direct_deferred): that route needs no row map, so the node goes back to it through
+    the route's re-entry request, under its own cause, and the op ends there without a throw;
   - the per-expert path's output staging (moe_pp_dst_contiguous) refuses when its allocation is null, where it used to
     run on with a null base that every later kernel wrote through;
   - the F32 activation staging (moe_pp_src1_f32) refuses at each of its three sites (the setup, the per-expert check
@@ -62,7 +64,9 @@ REFUSE = "ggml_sycl_moe_pp_refuse_staging("
 
 ROW_MAP_SITE = ("if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING)) { "
                 "dev_row_mappings.alloc(*stream, ctx.device, row_maps_total, \"moe_pp_row_mappings\"); } "
-                "if (!dev_row_mappings.get()) { release_prompt_down_soa_once(false); "
+                "if (!dev_row_mappings.get()) { release_prompt_down_soa_once(false); if (pp_direct_deferred) { "
+                "request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING, \"the prompt row-map staging did not "
+                "fit before the batched executor ran\"); return; } "
                 "ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, \"moe_pp_row_mappings\", row_maps_total,")
 
 DST_SITE = ("if (!GGML_SYCL_MOE_PP_STAGING_FAILPOINT(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING)) { "
@@ -217,8 +221,11 @@ def test_sites():
 def test_sites_mutants():
     c = claim_sites
     # The row-map site aborts again, or reads past a null buffer.
-    assert not c(mutate(SYCL, "release_prompt_down_soa_once(false); ggml_sycl_moe_pp_refuse_staging(src0",
-                        "release_prompt_down_soa_once(false); GGML_ABORT(\"x\"); ggml_sycl_moe_pp_refuse_staging_x(src0"))
+    assert not c(mutate(SYCL, "return; } ggml_sycl_moe_pp_refuse_staging(src0",
+                        "return; } GGML_ABORT(\"x\"); ggml_sycl_moe_pp_refuse_staging_x(src0"))
+    # A deferred node is refused there too, though the direct route it goes back to needs no row map.
+    reentry = "request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING"
+    assert not c(mutate(SYCL, "if (pp_direct_deferred) { " + reentry, "if (false) { " + reentry))
     # The output staging is used with no check, as it was.
     assert not c(mutate(SYCL, "if (!dst_contiguous_ptr) { ggml_sycl_moe_pp_refuse_staging(",
                         "if (false) { ggml_sycl_moe_pp_refuse_staging("))

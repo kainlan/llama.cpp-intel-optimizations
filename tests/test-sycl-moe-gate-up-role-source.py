@@ -32,7 +32,9 @@ the Q1_0/NVFP4 direct MMID route runs ahead of. This gate holds both:
   S5  a decline before the executor's first submission reaches the re-entry and not a throw: the executor marks its
       first submission once, after its scratch claim is marked used and after its last scratch decline, before its
       first queue call, with no queue call before it; the deferred throw in the decline tail needs that mark; the call
-      site asks for the second pass right after the executor returns false; the decline tail records the cause;
+      site asks for the second pass right after the executor returns false, naming the cause the decline tail
+      recorded; a pass asks only through one helper, defined once after the seam, which warns once per (device, cause)
+      and names the node, and is the only writer of the request;
   S6  after the first submission a deferred node's decline throws: the GEMM stage's tail throws for it, and the only
       bare `return false;` statements after the mark are the GEMM tail's, the deferred-expert propagation (whose
       declines go through the decline tail) and the build without oneDNN;
@@ -45,7 +47,10 @@ the Q1_0/NVFP4 direct MMID route runs ahead of. This gate holds both:
       writes no 0xFF scale, and fails a case that printed the re-entry line;
   S9  no other prompt dispatch takes a node the direct route stepped aside for: the planned-local batched MMVQ try,
       which runs ahead of the executor under two GPUs or GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED=1 and is neither
-      the executor nor the direct route, is called once, behind `!pp_direct_deferred`.
+      the executor nor the direct route, is called once, behind `!pp_direct_deferred`;
+  S10 a deferred node whose prompt row-map staging does not fit goes back to the direct route, which needs no row map,
+      under a cause of its own (ROW_MAP_STAGING, "row-map-staging"), before the staging refusal; any other node is
+      refused there as before.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
@@ -135,10 +140,19 @@ FIRST_SUBMISSION = "stream->ext_oneapi_submit_barrier(ready_events);"
 GEMM_FN = "auto gemm_stage_failed = [&](const char * what) -> bool {"
 GEMM_DEFERRED = "if (pp_direct_deferred) {"
 CALL_SITE = "if (try_pp_onednn_f16_batched()) { return; }"
-REENTRY_OPEN = "if (pp_direct_deferred) {"
-REENTRY_TAIL = "g_mmid_direct_reentry.requested = dst; return; }"
-REENTRY_LATCH = "ggml_sycl_moe_pp_direct_reentry_first(ctx.device, pp_batched_refusal)"
-REENTRY_TEXT = "direct MMID route re-entered"
+REQUEST_FN = "const auto request_direct_reentry = [&](moe_pp_batched_refusal cause, const char * why) {"
+REQUEST_BODY = ('{ if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, cause)) { GGML_LOG_WARN("[PP-MOE] direct MMID '
+                'route re-entered device=%d cause=%s tensor=%s type=%s: %s\\n", ctx.device, '
+                'moe_pp_batched_refusal_name(cause), src0->name, ggml_type_name(src0->type), why); } '
+                'g_mmid_direct_reentry.requested = dst; }')
+REQUEST_CALL = "request_direct_reentry("
+REQUEST_WRITE = "g_mmid_direct_reentry.requested = dst;"
+REENTRY_BLOCK = ('if (pp_direct_deferred) { request_direct_reentry(pp_batched_refusal, "the batched executor declined '
+                 'the node before its first submission"); return; }')
+ROW_MAP_REENTRY = ('if (!dev_row_mappings.get()) { release_prompt_down_soa_once(false); if (pp_direct_deferred) { '
+                   'request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING, "the prompt row-map staging did '
+                   'not fit before the batched executor ran"); return; } ggml_sycl_moe_pp_refuse_staging(')
+ROW_MAP_NAME = 'case moe_pp_batched_refusal::ROW_MAP_STAGING: return "row-map-staging";'
 POST_SUBMIT_RETURNS = 3
 COUNT_FN = "static void ggml_sycl_moe_route_counts_add_prompt("
 COUNT_SKIP = "if (src0 == g_mmid_direct_reentry.suppressed_weight) { return; }"
@@ -369,12 +383,17 @@ def check_seam(s: Sources) -> None:
                             "false otherwise")
     call_at = need_once(be, CALL_SITE, "S5", "the executor's call site")
     after = be[call_at + len(squash(CALL_SITE)) :].lstrip()
-    if not after.startswith(squash(REENTRY_OPEN)):
-        raise ContractError("FAIL [pin S5]: the re-entry does not follow the executor's call site")
-    reentry = brace_text(after, len(squash(REENTRY_OPEN)) - 1, "S5")
-    if (not reentry.endswith(squash(REENTRY_TAIL)) or squash(REENTRY_LATCH) not in reentry
-            or "GGML_LOG_WARN(" not in reentry or REENTRY_TEXT not in reentry or "throw" in reentry):
-        raise ContractError("FAIL [pin S5]: the re-entry does not warn once per cause and ask for the second pass")
+    if not after.startswith(squash(REENTRY_BLOCK)):
+        raise ContractError("FAIL [pin S5]: the executor's call site is not followed by the request for the second "
+                            "pass, naming the recorded cause")
+    request_at = need_once(be, REQUEST_FN, "S5", "the re-entry request")
+    if block(be, REQUEST_FN, "S5", "the re-entry request") != squash(REQUEST_BODY):
+        raise ContractError("FAIL [pin S5]: the re-entry request does not warn once per (device, cause), naming the "
+                            "node, and ask for the second pass")
+    if not def_at < request_at < call_at:
+        raise ContractError("FAIL [pin S5]: the re-entry request is not defined after the seam and before its uses")
+    if be.count(squash(REQUEST_WRITE)) != 1:
+        raise ContractError("FAIL [pin S5]: the second pass is asked for outside the one request")
     # S6
     gemm = block(lam, GEMM_FN, "S6", "the GEMM stage's tail")
     deferred = block(gemm, GEMM_DEFERRED, "S6", "the GEMM stage's deferred throw")
@@ -421,6 +440,14 @@ def check_seam(s: Sources) -> None:
         raise ContractError(f"FAIL [pin S9]: the planned-local batched try is called {be.count(PLANNED_LOCAL_TRY)} "
                             "times, not once")
     need_once(be, PLANNED_LOCAL_CALL, "S9", "the planned-local batched try behind the deferral")
+    # S10
+    row_map_at = need_once(be, ROW_MAP_REENTRY, "S10", "the deferred node's row-map staging failure")
+    if not def_at < row_map_at < call_at:
+        raise ContractError("FAIL [pin S10]: the row-map re-entry is not between the seam and the executor's call site")
+    need_once(s.sq["tables"], ROW_MAP_NAME, "S10", "the row-map cause's name")
+    if be.count(REQUEST_CALL) != 2:
+        raise ContractError(f"FAIL [pin S10]: the request has {be.count(REQUEST_CALL)} callers, not the executor's "
+                            "call site and the row-map staging")
 
 
 def check(s: Sources) -> None:
@@ -558,8 +585,15 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("decline-forgets-cause", "S5", B,
                 [("                pp_batched_refusal  = refusal;\n", "")])
     expect_fail("reentry-throws", "S5", B,
-                [("            g_mmid_direct_reentry.requested = dst;\n            return;\n        }",
-                  '            throw ggml_sycl_fallback_error("declined");\n        }')])
+                [("first submission\");\n            return;\n        }",
+                  'first submission\");\n            throw ggml_sycl_fallback_error(\"declined\");\n        }')])
+    expect_fail("request-warns-every-time", "S5", B,
+                [("        if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, cause)) {",
+                  "        if (true) {")])
+    expect_fail("second-request-writer", "S5", B,
+                [("                    request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING,",
+                  "                    g_mmid_direct_reentry.requested = dst;\n"
+                  "                    request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING,")])
     expect_fail("gemm-tail-returns-for-deferred", "S6", B,
                 [("                if (pp_direct_deferred) {\n                    static thread_local std::string "
                   "deferred_gemm_msg;",
@@ -603,6 +637,13 @@ def self_test(raws: dict[str, str]) -> int:
     # S9: the planned-local batched try.
     expect_fail("planned-local-takes-deferred", "S9", B,
                 [("pp_planned_local_batched_enabled && !pp_direct_deferred &&", "pp_planned_local_batched_enabled &&")])
+    # S10: the row-map staging.
+    expect_fail("row-map-refuses-deferred", "S10", B,
+                [("                request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING,",
+                  "                (void) (")])
+    expect_fail("row-map-cause-unnamed", "S10", T,
+                [('        case moe_pp_batched_refusal::ROW_MAP_STAGING:\n'
+                  '            return "row-map-staging";\n', "")])
     expect_fail("planned-local-second-call", "S9", B,
                 [("        if (try_pp_onednn_f16_batched()) {\n",
                   "        if (pp_planned_local_batched_enabled && try_pp_planned_local_batched()) {\n"
