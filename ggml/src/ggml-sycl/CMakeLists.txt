@@ -4347,6 +4347,39 @@ set_tests_properties(test-sycl-dnnl-decline-fallthrough PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 180
 )
+
+# The batched F32 MUL_MAT route: a batched F32 x F32 MUL_MAT on dense activations is one oneDNN matmul. Each case
+# computes one MUL_MAT graph on the SYCL backend and counts the "dnnl_gemm" site through the PRIVATE_TESTING seam (one
+# submission for a taken case, one per plane after an injected decline and for a declined node), and compares the
+# output with the loop's and with a double-precision reference. It includes gemm.hpp to clear and read the oneDNN
+# primitive cache, so it prints the scratchpad the route's primitive asks for. GGML_SYCL_DISABLE_GRAPH=1: the route
+# declines while a command graph records. Touches the GPU with single-op graphs (at most ~205 MB) and loads no model;
+# labelled mem-handle so a sweep leaves it to the lead. Built the same way as the test above.
+add_executable(test-sycl-mul-mat-f32-batched-device
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mul-mat-f32-batched-device.cpp
+)
+target_include_directories(test-sycl-mul-mat-f32-batched-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mul-mat-f32-batched-device PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-mul-mat-f32-batched-device PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-mul-mat-f32-batched-device PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-mul-mat-f32-batched-device PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-mul-mat-f32-batched-device COMMAND test-sycl-mul-mat-f32-batched-device)
+set_tests_properties(test-sycl-mul-mat-f32-batched-device PROPERTIES
+    LABELS "sycl;device;mem-handle;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_DISABLE_GRAPH=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
 endif()
 # llama.cpp-9qjy: a BF16 dense weight uploaded to the SYCL backend is admitted by
 # supports_op and computed natively from the BF16 bytes through the real dispatch
