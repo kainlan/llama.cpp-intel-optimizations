@@ -630,14 +630,15 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 #endif
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// How many loan fixtures failed to settle in their teardown since the last call (a retained-owner drain that timed
+// out), and resets the count. A case that passes while this is not zero has not passed.
+int test_expert_loan_take_teardown_failures();
+
 // The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
 // empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
 // arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
 // Without host zones the loan refuses by name and lends nothing (llama.cpp-sif1). Host zones cannot be unconfigured
 // and every other case configures them, so run it first.
-// How many loan fixtures failed to settle in their teardown since the last call (a retained-owner drain that timed
-// out, or a queue wait that threw), and resets the count. A case that passes while this is not zero has not passed.
-int         test_expert_loan_take_teardown_failures();
 std::string test_expert_loan_refuses_without_host_zones();
 std::string test_expert_loan_lends_two_triplets();
 std::string test_expert_loan_probe_changes_nothing();

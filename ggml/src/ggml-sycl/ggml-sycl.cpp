@@ -23426,9 +23426,9 @@ constexpr size_t test_loan_expert_bytes() {
     return 1024 * 1024;
 }
 
-// Fixtures whose teardown could not settle: a drain that timed out, or a queue wait that threw. A destructor cannot
-// return a string, so the runner reads this after each case (test_expert_loan_take_teardown_failures) and fails the
-// run, rather than letting a case pass with copies still in flight on the entries the next case reuses.
+// Fixtures whose teardown could not settle: a retained-owner drain that timed out. A destructor cannot return a
+// string, so the runner reads this after each case (test_expert_loan_take_teardown_failures) and fails the run,
+// rather than letting a case pass with copies still in flight on the entries the next case reuses.
 std::atomic<int> g_test_loan_teardown_failures{ 0 };
 
 std::string test_loan_fail(const char * fmt, ...) {
@@ -23607,14 +23607,9 @@ struct test_loan_fixture {
         }
         // Every queue a case's copies ran on: the cache's own, and the DMA and BCS queues its loans, refills and
         // staged copies use. The cache's three queues share one context.
-        try {
-            queue->wait_and_throw();
-            cache->get_dma_queue().wait_and_throw();
-            cache->get_bcs_queue().wait_and_throw();
-        } catch (const std::exception & e) {
-            fprintf(stderr, "ERROR: test_loan_fixture teardown: a queue wait threw: %s\n", e.what());
-            g_test_loan_teardown_failures.fetch_add(1, std::memory_order_relaxed);
-        }
+        queue->wait();
+        cache->get_dma_queue().wait();
+        cache->get_bcs_queue().wait();
         if (!drain_retained_handles(true, 5000)) {
             fprintf(stderr, "ERROR: test_loan_fixture teardown: the retained owners did not drain in 5000 ms\n");
             g_test_loan_teardown_failures.fetch_add(1, std::memory_order_relaxed);
