@@ -6579,7 +6579,7 @@ reports before its first submission re-enters the direct route; a failure after 
 - The spec review of a to c (2026-11-24) passed with eight minor findings; the seven that asked for a change are in
   the bullets above, and the UE4M3 special-scale fixtures and the 0xFF owed note, outside the brief, were accepted.
 
-**Step 1d (R5 final, 2026-11-24), not yet written.** Measured first: on the B50 alone, the a-c build served 10774.6 MB
+**Step 1d (R5 final, 2026-11-24).** Measured first: on the B50 alone, the a-c build served 10774.6 MB
 of experts from the host mapping where the base served 10215.0 MB, the CPU layers started at 14 instead of 15, and
 the long arm lost pp 17.32 -> 16.46 and tg 7.00 -> 6.56 t/s, though the ring served nodes there. A ring whose
 weights have the RESIDENT use only (NVFP4 today) is kept on a device only if the plan made with it leaves no expert
@@ -6590,6 +6590,40 @@ use keep today's behaviour exactly, so Qwen and GPT-OSS plans do not change. Whe
 the zone is kept and the WARN says so. The WARN names the device, the ring MB released and the host-planned expert
 count that caused it; the stage and the dry run call one decision function. The reason: a resident-only ring that
 displaces an expert trades prompt room for a decode loss on every token, and on the B50 it lost on the prompt too.
+
+What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead's to verify):
+- The decision is data: `moe_pp_ring_uses_of_type` (`moe-mmvq-tables.hpp`) names each type's ring uses from the
+  executors' own tables, and `moe_pp_ring_check_resident_only` (`moe-ring-consumer.hpp`, new) answers on a plan:
+  resident-only only when every ring weight's use is RESIDENT alone, and then the host experts the plan's semantic
+  index places, on any device. `tests/test-sycl-moe-ring-consumer.cpp` (new, host-only) runs the ruling's cases on
+  synthetic plans: Inkling all on device keeps, one expert on the host drops, 14 of 24 layers resident drops, Qwen
+  host-tiered and all-host keep, GPT-OSS hybrid and resident keep, a staged weight beside NVFP4 keeps, Q1_0 asks
+  nothing. The backend asks it through one function, `ggml_sycl_plan_ring_resident_check`, which the stage's
+  `ggml_sycl_stage_drop_displacing_ring` and the dry run's `ggml_sycl_plan_dry_run_drop_displacing_ring` call.
+- A plain re-ensure gives nothing back: an arena that holds every zone is kept as built however much larger it is.
+  So the ensure takes an opt-in, `zone_arena_ensure_options::give_back`: an arena with a RUNTIME surplus
+  (`zone_arena_runtime_surplus`) is rebuilt with SCRATCH and ONEDNN as built and RUNTIME at the plan's
+  (`zone_arena_give_back_sizes`, test-zone-sizing Case 51) when nothing points into it, and kept, marked held,
+  otherwise. Only the drop asks for it. Both ends keep the DIRECT cap's snapshot as a kept arena does
+  (`test-sycl-onednn-zone-keep-source`'s cap claim now counts five keeps). The drop's re-plan is the one other
+  plan without the micro-batch room (`test-sycl-explicit-ubatch-placement-source` counts it).
+- Before that ensure the drop puts the device back as a model with no ring consumer plans it: the dense scratch at the
+  planning shape (an explicit micro-batch's placement may have moved it), the ring 0, and the planner terms as they
+  were before the plans made with the ring, so the zones are asked for what master's ensure asked.
+- The drop holds for the load: a load plans each device at its early and late pass, and each intake publishes the
+  ring again. The stage records the load transaction that dropped a device's ring, and the late pass publishes none
+  before its entry ensure, so the given-back zone is not asked for again. A direct planner entry (no transaction)
+  decides afresh at each pass.
+- Deviation from the checkpoint's sketch: no per-type "serves" functions and no plan-method refactor. The checkpoint
+  sketched both for a decision the plan would make; the ruling puts the decision after the plan, on what the plan
+  placed, so the uses table and one rule over the plan's index carry it.
+- `tests/test-sycl-moe-ring-drop-source.py` (new, 30 mutants) pins the uses, the rule, the weight list's filter, the
+  one decision, the stage's order, the one give-back writer, both call sites, the drop's record and the late pass's
+  republish, the dry run's two sites, the cache's give-back and the zone rules.
+- Not verified here: nothing ran on a card. No device test reaches the give-back rebuild, the WARN, the late pass's
+  republish or the multi-device drop (opt-in `GGML_SYCL_MOE_MULTI_GPU`). The lead's acceptance: the B50 alone gives
+  the base plan line (10215.0 MB from the mapping), text byte-equal to base, pp/tg not lower; the B70 keeps its ring
+  (558.6 MB at `-ub 512`) and its 160 t/s.
 
 ---
 

@@ -3200,11 +3200,47 @@ claimed it: that demand sat in the RUNTIME zone beside the MMID device workspace
 which the zone's requirement does not count, and a second context at `-ub 128`
 was refused for a ring nothing would claim. The weight slot still sits beside
 that workspace, which the zone's requirement still does not count; what a second
-context fits now has not been measured. A device whose plan puts some expert of
-every ring-served weight off the card has no node the executor claims there (the
-claim needs every expert of the weight on the card), so its ring is reserved for
-nothing until Task 21's step 1d, which is to publish that device's ring as 0 and
-plan once more.
+context fits now has not been measured.
+
+**A resident-only ring that displaces experts is dropped (Task 21, step 1d).**
+NVFP4 experts reach the executor's resident claim and nothing else
+(`moe_pp_ring_uses_of_type` in `moe-mmvq-tables.hpp`: RESIDENT, against STAGED
+for the types the window ring stages and SOA_EXPERT for MXFP4's per-expert
+staging). Such a ring serves a layer only when every expert of the weight is on
+the card, and it stages no host expert. Its room comes out of the weights, so on
+a card too small for the whole model it moves experts to the host and buys
+nothing for them: on the B50 Inkling 2 Mini started its CPU layers at 14 instead
+of 15, served 10774.6 MB of experts from the mapping instead of 10215.0 MB, and
+ran pp 16.46 t/s and tg 6.56 t/s against 17.32 and 7.00 without the ring. So the
+load keeps such a ring on a device only if the plan made with it leaves no expert
+of those weights on the host (`moe_pp_ring_check_resident_only` in
+`moe-ring-consumer.hpp`, asked through `ggml_sycl_plan_ring_resident_check`).
+Otherwise `ggml_sycl_stage_drop_displacing_ring` puts the dense scratch back at
+the planning shape, publishes the ring as 0, puts back the planner terms the
+plans made with the ring published, and asks for the zones again with the
+RUNTIME surplus given back (below), and the device is planned once more. That
+plan is final even if it then holds every expert: its NVFP4 nodes take the MMID
+direct route, as before Task 21. The WARN "[SYCL-PLAN] device N drops its PP MoE
+oneDNN scratch ring" names the ring's MB, the host experts that caused it, and
+whether the RUNTIME zone was rebuilt smaller or kept because something points
+into the arena. The drop holds for the rest of the load: its late pass publishes
+no ring before its entry ensure (`ggml_sycl_stage_ring_dropped_by_this_load`).
+A ring with any weight of a staged or SOA use is kept as before, so Qwen and
+GPT-OSS plans do not change, and the B70, which holds all of Inkling's experts,
+keeps its 558.6 MB ring. The plan dry run calls the same decision and reports
+the plan made without the ring (it sizes no zone, so it gives none back).
+
+**The RUNTIME give-back.** A sufficient arena is kept as built however much
+larger its zones are, so a later, smaller plan beside a live one never shrinks
+them. The drop is the one exception: it asks the ensure with
+`zone_arena_ensure_options::give_back`, and an arena whose zones all hold the
+plan and whose RUNTIME zone is larger (`zone_arena_runtime_surplus`) is rebuilt
+with SCRATCH and ONEDNN as built and RUNTIME at the plan's
+(`zone_arena_give_back_sizes`), when nothing points into it
+(`zone_arena_rebuild_allowed`). An arena a live model or a freed context's
+allocations hold is kept as built, its surplus with it. Both ends keep the
+DIRECT Graph-scratch cap's snapshot and the ONEDNN zone plan as a kept arena
+does.
 
 **Why the RUNTIME zone is not grown at load (`llama.cpp-u1bb`).** Growing it at
 model load looks natural and is wrong. The arena is one chunk with fixed zones,
