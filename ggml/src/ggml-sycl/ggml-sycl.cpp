@@ -62401,31 +62401,48 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
 // The mapping is the loop's: gemm(a = src0, b = src1) with m = ne01, k = ne00, A rows and B columns k apart, and C
 // column n at n * ldc with ldc = ne0, so dst[n][m] = sum over k of src0[m][k] * src1[n][k].
 //
-// The pointers are transient views for this one submission, resolved as the batched f16 route resolves its own. Their
-// owners are the compute buffer's (activations: the predicate declines a weight), and nothing here outlives the call:
-// the queue is in order, so the GEMM runs before any later reader of dst and before the buffer's release, whose
-// destructor waits on the stream.
+// The operands are the dispatch's own resolution: src0_r, src1_r and dst_r are the results whose on_device admitted
+// the node, so the GEMM reads and writes exactly the memory the gate checked. Resolving a second time could differ:
+// for a non-weight tensor ggml_sycl_resolve() can return the unified cache's device copy, while a raw-pointer resolver
+// returns tensor->data, host memory for a host-pinned buffer. A copy the cache is still filling carries a ready
+// event, which is chained onto the queue before the GEMM, as the per-plane loop chains src0's; that orders the
+// queue, and no host thread waits.
 //
-// Returns false when an operand does not resolve to a device pointer or gemm() declined its scratchpad: nothing was
-// submitted and dst was not written, so the dispatch goes on to the orchestrator, whose per-plane loop computes the
-// same op on the same placement. A throw from gemm() propagates as it does on every other path.
+// The pointers are transient views for this one submission and nothing here outlives the call. The operands are
+// non-weight tensors in this device's memory: compute-buffer activations, KV views or graph inputs. What keeps them
+// valid until the GEMM has run is the execution queue: it is in order, so every later command on this backend that
+// writes or reads that memory runs after the GEMM, and the scheduler synchronizes the backend
+// (ggml_backend_sycl_synchronize waits on stream(device, 0), which is ctx.stream()) before it reallocates the graph's
+// buffers; their owners outlive the queue's pending work.
+//
+// Returns false when one of the three pointers is null or gemm() declined its scratchpad: nothing was submitted and dst
+// was not written, so the dispatch goes on to the orchestrator, whose per-plane loop computes the same op on the same
+// placement. A throw from gemm() propagates as it does on every other path.
 [[nodiscard]] static bool ggml_sycl_mul_mat_f32_batched(ggml_backend_sycl_context &         ctx,
                                                         const ggml_tensor *                 src0,
                                                         const ggml_tensor *                 src1,
                                                         ggml_tensor *                       dst,
+                                                        const ggml_sycl::resolved_ptr &     src0_r,
+                                                        const ggml_sycl::resolved_ptr &     src1_r,
+                                                        const ggml_sycl::resolved_ptr &     dst_r,
                                                         ggml_sycl_mul_mat_f32_batched_route route) {
 #if GGML_SYCL_DNNL
     GGML_TENSOR_BINARY_OP_LOCALS
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
     const queue_ptr stream = ctx.stream();
 
-    const float * a = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src0, ctx.device));
-    const float * b = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
-    float *       c = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
+    const float * a = static_cast<const float *>(src0_r.ptr);
+    const float * b = static_cast<const float *>(src1_r.ptr);
+    float *       c = static_cast<float *>(dst_r.ptr);
     if (!a || !b || !c) {
         // A decline: the orchestrator resolves the same tensors on its own path and reports there.
         return false;
     }
+    size_t         stream_identity = 0;
+    const size_t * same_queue      = ggml_sycl_chain_same_queue_identity(*stream, &stream_identity);
+    ggml_sycl_chain_ready_event_if_needed(*stream, src0_r, same_queue);
+    ggml_sycl_chain_ready_event_if_needed(*stream, src1_r, same_queue);
+    ggml_sycl_chain_ready_event_if_needed(*stream, dst_r, same_queue);
 
     const int  m = static_cast<int>(ne01);
     const int  k = static_cast<int>(ne00);
@@ -62457,6 +62474,9 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
     GGML_UNUSED(src0);
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);
+    GGML_UNUSED(src0_r);
+    GGML_UNUSED(src1_r);
+    GGML_UNUSED(dst_r);
     GGML_UNUSED(route);
     return false;
 #endif
@@ -77267,7 +77287,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                f32_batched_route != GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE &&
                ggml_sycl_mul_mat_f32_batched_env_admits(ggml_sycl_mul_mat_f32_batched_env_of(
                    ctx, route_env, src0_on_device_r && src1_on_device_r && dst_on_device_r)) &&
-               ggml_sycl_mul_mat_f32_batched(ctx, src0, src1, dst, f32_batched_route)) {
+               ggml_sycl_mul_mat_f32_batched(ctx, src0, src1, dst, src0_resolved, src1_resolved, dst_resolved,
+                                             f32_batched_route)) {
         // A batched F32 activation matmul, asked after the f16 branches (which take an F16 src0 only) and before the
         // orchestrator, whose per-plane loop is the fall-through for every node the route declines. The tensors are
         // asked first: the environment, a queue-state query among its facts, is built only for a node they admit, so
