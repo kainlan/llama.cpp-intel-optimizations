@@ -36,7 +36,11 @@ the Q1_0/NVFP4 direct MMID route runs ahead of. This gate holds both:
   S6  after the first submission a deferred node's decline throws: the GEMM stage's tail throws for it, and the only
       bare `return false;` statements after the mark are the GEMM tail's, the deferred-expert propagation (whose
       declines go through the decline tail) and the build without oneDNN;
-  S7  the prompt count skips a node's second pass, whose snapshot its first pass counted;
+  S7  the prompt count skips a node's second pass, whose snapshot its first pass counted, and so does every other
+      per-call count the MMID entry keeps, read from one flag defined at the entry before the first of them: the
+      decode-route census's call count, the call counts of the two host-time probes (the whole-call timer and the
+      MXFP4 prompt profile's whole span and phase marks) and the MoE profile's per-layer and per-role op counts. The
+      timers still add the second pass's time, which is the node's too;
   S8  the device test runs NVFP4 on the plain fixture and on a fused gate_up fixture and two special-scale fixtures,
       writes no 0xFF scale, and fails a case that printed the re-entry line;
   S9  no other prompt dispatch takes a node the direct route stepped aside for: the planned-local batched MMVQ try,
@@ -138,6 +142,27 @@ REENTRY_TEXT = "direct MMID route re-entered"
 POST_SUBMIT_RETURNS = 3
 COUNT_FN = "static void ggml_sycl_moe_route_counts_add_prompt("
 COUNT_SKIP = "if (src0 == g_mmid_direct_reentry.suppressed_weight) { return; }"
+MMID_FN = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {"
+SECOND_PASS_DEF = ("const bool mmid_second_pass = dst->src[0] != nullptr && "
+                   "dst->src[0] == g_mmid_direct_reentry.suppressed_weight;")
+# Each per-call count of the MMID entry behind the flag, as the entry's body holds it after the flag's definition: the
+# census, the whole-call timer (the flag handed over, then read before its count), the MXFP4 prompt profile's whole
+# span (likewise) and phase marks, and the MoE profile's guard (the flag handed to the op end).
+ENTRY_GATES = (
+    "if (!mmid_second_pass) { g_moe_decode_route_census.mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);",
+    "b1_mmid_host_timer_instance.counts_call = !mmid_second_pass;",
+    "if (!counts_call) { return; } const uint64_t c = calls.fetch_add(1, std::memory_order_relaxed) + 1;",
+    "mxfp4_pp_host_whole_span.counts_call = !mmid_second_pass;",
+    "if (counts_call) { ++p.host_whole_calls; }",
+    "if (!mmid_second_pass) { ++(p.*calls_field); }",
+    "} moe_profile_guard_{ g_moe_profile_enabled, !mmid_second_pass };",
+    "g_moe_profile.moe_op_end(counts_call);",
+)
+# The statements that bump those counts, each once in the backend: the one behind its gate.
+ENTRY_BUMPS = ("mul_mat_id_calls.fetch_add(", "++p.host_whole_calls;", "++(p.*calls_field);",
+               "g_moe_profile.moe_op_end(")
+OP_END_FN = "void moe_op_end(bool counts_call) {"
+OP_END_COUNTS = ("if (counts_call) { cur_layer.n_calls++; }", "if (counts_call) { role_t.n_calls++; }")
 QUEUE_CALL = re.compile(
     r"\b(?:submit|ext_oneapi_submit_barrier|parallel_for|single_task|memcpy|memset|fill|copy|wait|wait_and_throw|"
     r"ggml_sycl_safe_memcpy|finish_or_release|record_done)\s*\(|\bdnnl::"
@@ -149,8 +174,8 @@ TEST_SCALES = re.compile(r"constexpr uint8_t (k_small_scales|k_large_scales)\[\]
 TEST_REENTRY = 'const size_t reentered = g_log.count_since(from, { "direct MMID route re-entered" });'
 TEST_REFUSAL = "if (refused != 0 || prompt_rf != 0 || unplanned != 0 || reentered != 0) {"
 PLANNED_LOCAL_TRY = "try_pp_planned_local_batched()"
-PLANNED_LOCAL_CALL = ("if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && !pp_direct_deferred && "
-                      "try_pp_planned_local_batched()) { return; }")
+PLANNED_LOCAL_CALL = ("if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && "
+                      "!pp_direct_deferred && try_pp_planned_local_batched()) { return; }")
 
 
 class ContractError(AssertionError):
@@ -347,8 +372,8 @@ def check_seam(s: Sources) -> None:
     if not after.startswith(squash(REENTRY_OPEN)):
         raise ContractError("FAIL [pin S5]: the re-entry does not follow the executor's call site")
     reentry = brace_text(after, len(squash(REENTRY_OPEN)) - 1, "S5")
-    if (not reentry.endswith(squash(REENTRY_TAIL)) or squash(REENTRY_LATCH) not in reentry or
-            "GGML_LOG_WARN(" not in reentry or REENTRY_TEXT not in reentry or "throw" in reentry):
+    if (not reentry.endswith(squash(REENTRY_TAIL)) or squash(REENTRY_LATCH) not in reentry
+            or "GGML_LOG_WARN(" not in reentry or REENTRY_TEXT not in reentry or "throw" in reentry):
         raise ContractError("FAIL [pin S5]: the re-entry does not warn once per cause and ask for the second pass")
     # S6
     gemm = block(lam, GEMM_FN, "S6", "the GEMM stage's tail")
@@ -365,6 +390,22 @@ def check_seam(s: Sources) -> None:
     count = block(be, COUNT_FN, "S7", "the prompt count")
     if squash(COUNT_SKIP) not in count or count.find(squash(COUNT_SKIP)) > count.find("->add_prompt("):
         raise ContractError("FAIL [pin S7]: the prompt count counts a node's second pass")
+    mmid = block(be, MMID_FN, "S7", "the MMID entry")
+    flag_def_at = need_once(mmid, SECOND_PASS_DEF, "S7", "the second-pass flag")
+    if be.count("mmid_second_pass =") != 1:
+        raise ContractError("FAIL [pin S7]: the second-pass flag is assigned more than once")
+    for gate in ENTRY_GATES:
+        if need_once(mmid, gate, "S7", "a per-call count behind the second-pass flag") < flag_def_at:
+            raise ContractError(f"FAIL [pin S7]: `{gate}` reads the second-pass flag before its definition")
+    for bump in ENTRY_BUMPS:
+        if be.count(squash(bump)) != 1:
+            raise ContractError(f"FAIL [pin S7]: `{bump}` appears {be.count(squash(bump))} times, not once: a count "
+                                "outside its second-pass gate")
+    op_end = block(be, OP_END_FN, "S7", "the MoE profile's op end")
+    for gate in OP_END_COUNTS:
+        need_once(op_end, gate, "S7", "an op count behind the op end's flag")
+    if op_end.count("n_calls++") != len(OP_END_COUNTS):
+        raise ContractError("FAIL [pin S7]: the MoE profile's op end counts an op outside its flag")
     # S8
     test = s.sq["device_test"]
     if test.count(TEST_FUSED_NAME) != 1 or "GGML_TYPE_NVFP4, };" not in test:
@@ -534,6 +575,24 @@ def self_test(raws: dict[str, str]) -> int:
     # S7, S8: the prompt count and the device test.
     expect_fail("count-twice", "S7", B,
                 [("    if (src0 == g_mmid_direct_reentry.suppressed_weight) {\n        return;\n    }\n", "")])
+    expect_fail("flag-never-set", "S7", B,
+                [("    const bool mmid_second_pass = dst->src[0] != nullptr && dst->src[0] == "
+                  "g_mmid_direct_reentry.suppressed_weight;",
+                  "    const bool mmid_second_pass = false;")])
+    expect_fail("census-counts-second-pass", "S7", B,
+                [("    if (!mmid_second_pass) {\n        g_moe_decode_route_census.mul_mat_id_calls.fetch_add",
+                  "    if (true) {\n        g_moe_decode_route_census.mul_mat_id_calls.fetch_add")])
+    expect_fail("timer-counts-second-pass", "S7", B,
+                [("    b1_mmid_host_timer_instance.counts_call = !mmid_second_pass;\n", "")])
+    expect_fail("whole-span-counts-second-pass", "S7", B,
+                [("            if (counts_call) {\n                ++p.host_whole_calls;\n            }\n",
+                  "            ++p.host_whole_calls;\n")])
+    expect_fail("phase-mark-counts-second-pass", "S7", B,
+                [("        if (!mmid_second_pass) {\n            ++(p.*calls_field);\n        }\n",
+                  "        ++(p.*calls_field);\n")])
+    expect_fail("op-end-counts-second-pass", "S7", B,
+                [("        if (counts_call) {\n            role_t.n_calls++;\n        }\n",
+                  "        role_t.n_calls++;\n")])
     expect_fail("test-writes-ff", "S8", D, [("{ 0x7e, 0xfe, 0x78, 0x7f }", "{ 0x7e, 0xff, 0x78, 0x7f }")])
     expect_fail("test-drops-fused", "S8", D,
                 [("fixture_variant::LARGE_SCALES,\n                                                    "
