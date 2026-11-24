@@ -167,9 +167,9 @@ REG_ADD_SIG = (r"static\s+void\s+cpu_job_signal_registry_add\s*\(\s*const\s+std:
                r"\s*ring\s*\)\s*\{")
 
 SNAP_STMT = "std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding();"
-GRAPH_RETURN = "retain_handles_for_current_graph(std::move(handles)); return; }"
+GRAPH_RETURN = "retain_handles_for_current_graph(handles); return; }"
 STORE_LOCK = "retained_store_lock lock(state);"
-PUSH_PREFIX = "state.queue.push_back({ std::move(handles), std::move(event), std::move(ids), std::move(gates)"
+PUSH_PREFIX = "state.queue.push_back({ {}, std::move(event), std::move(ids), std::move(gates)"
 KEPT_PUSH = "state.queue.push_back(std::move(record));"
 SNAP_DECL = "std::vector<std::shared_future<void>> cpu_job_signal_gates_outstanding();"
 LIVE_DECL = "std::vector<std::shared_ptr<cpu_job_signal_ring>> live;"
@@ -356,7 +356,7 @@ def self_test(s: dict) -> int:
              "std::vector<std::shared_future<void>> gates;\n    if (!ids.empty()) {\n"
              "        gates = cpu_job_signal_gates_outstanding();\n    }")),
         ("G1", "mem_cpp", "the snapshot is taken under the store lock",
-         lambda t: re.sub(r"(retained_store_lock lock\(state\);\n)(\s*)(state\.queue\.push_back\(\{ std::move\(handles\))",
+         lambda t: re.sub(r"(retained_store_lock lock\(state\);\n)(\s*)(state\.queue\.push_back\(\{ \{\}, std::move\(event\))",
                           r"\1\2std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding();\n\2\3",
                           re.sub(snap_line, "", t, count=1), count=1)),
         ("G1", "mem_cpp", "the record is pushed without the snapshot's gates",

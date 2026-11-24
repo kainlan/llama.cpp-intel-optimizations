@@ -37,12 +37,13 @@ What this unit (S2a-S2d, S3-0 and its review fold) enforces
       whose body is exactly `throw;`. The scope is every scanned file, which includes every file that holds a handler.
       #define bodies are scanned lexically with the same pattern, keyed (file, macro). The unguarded handlers are shrink-only
       debt (G-CATCH, keyed file::function::catch_clause:<kind>#ordinal); exemptions are allowlist entries by file and function.
-  (h) cascade_step and unconverted_ticket, keyed by the construction node, never by function. Nothing writes either today,
-      so every write is a finding that only an allowlist entry for that node exempts: cascade_step = true (H-CASCADE), a copy
-      of the enclosing function's own cascade_step parameter (H-CASCADE-PARAM, exempt by the allowlisted callee), a call that
-      passes true (H-PASS-TRUE) or forwards its own parameter (H-PASS-FORWARD) to a function with such a parameter, and an
-      unconverted_ticket string literal (H-UNCONV, the entry names the ticket). Any other expression (H-CASCADE-EXPR,
-      H-PASS-EXPR, H-UNCONV-EXPR) cannot be exempted. No H-* finding can be debt, and an entry's outcome may not be TERMINAL.
+  (h) cascade_step and unconverted_ticket, keyed by the construction node, never by function. The allowlisted writers are
+      the only ones: every write is a finding that only an allowlist entry for that node exempts, whether cascade_step =
+      true (H-CASCADE), a copy of the enclosing function's own cascade_step parameter (H-CASCADE-PARAM, exempt by the
+      allowlisted callee), a call that passes true (H-PASS-TRUE) or forwards its own parameter (H-PASS-FORWARD) to a
+      function with such a parameter, or an unconverted_ticket string literal (H-UNCONV, the entry names the ticket).
+      Any other expression (H-CASCADE-EXPR, H-PASS-EXPR, H-UNCONV-EXPR) cannot be exempted. No H-* finding can be debt,
+      and an entry's outcome may not be TERMINAL.
       An allowlisted node that stops writing its field fails as an entry matching nothing (a DECLARED row losing its flag).
       Positional initialisation of a request type and a call through a lambda or function pointer are not followed.
   (q) libc allocation primitives (S3-0): mmap, mmap64, mremap, posix_memalign, memalign, aligned_alloc, valloc, pvalloc, malloc, calloc,

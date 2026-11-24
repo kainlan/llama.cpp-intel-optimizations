@@ -2346,8 +2346,23 @@ bool ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
                                         const ggml_tensor *         src0,
                                         int64_t                     total_batches,
                                         bool                        allow_alloc);
+// Whether a dispatch bundle snapshot leaves out a handle whose allocation it already holds. A full-local table holds one
+// lease per expert, so a route that dispatches from it alone takes its leases as they are (NONE) and skips comparing
+// every handle with every other, O(n^2) per node. NONE changes no lifetime and keeps the handles BY_IDENTITY would:
+// each lease is a different expert's slice, and a slice's identity includes its offset and size, so no two leases
+// compare equal even when every slice is of one buffer. The one handle NONE takes twice is the table's own, which
+// ggml_sycl_set_moe_ptr_table_leases adds to the leases and the snapshot appends again after them: one extra
+// reference, to what the first already keeps alive.
+enum class moe_dispatch_bundle_dedup : uint8_t {
+    BY_IDENTITY,  // compare each handle's stable identity with every handle taken before it
+    NONE,         // take every handle that has an identity
+};
 std::vector<ggml_sycl::mem_handle> ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(
-    const ggml_tensor_extra_gpu * extra, int device, bool include_compact = false, bool include_missing = false);
+    const ggml_tensor_extra_gpu * extra,
+    int                           device,
+    bool                          include_compact = false,
+    bool                          include_missing = false,
+    moe_dispatch_bundle_dedup     dedup           = moe_dispatch_bundle_dedup::BY_IDENTITY);
 void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * extra, int device, sycl::event event);
 const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx,
                                                  const ggml_tensor *         ids,
@@ -3866,6 +3881,19 @@ static inline bool ggml_sycl_valid_device_index(int dev) {
 // Defined in ggml-sycl.cpp with the route that builds it (llama.cpp-7pvo).
 struct moe_hybrid_decode_record;
 
+// The NVFP4 resident decode route's memoized plan answer for one weight on one device: whether the plan puts every
+// expert of the weight on the device at AOS. Walking the plan's experts is the costly part of the route's per-node
+// question, and the answer changes only with the plan object, a mid-load replan (which keeps the object and bumps the
+// epoch) or the weight's expert storage; those three are the key. The node's shapes, strides and ids are not in the
+// key and are asked of every node.
+struct ggml_sycl_moe_resident_decode_plan_memo {
+    std::weak_ptr<const ggml_sycl::placement_plan> plan;
+    uint64_t                                       replan_epoch       = 0;
+    uint64_t                                       storage_generation = 0;
+    bool                                           valid              = false;
+    bool                                           all_aos            = false;
+};
+
 struct ggml_tensor_extra_gpu_weight_ext {
     dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
 
@@ -4334,6 +4362,14 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    // The NVFP4 resident decode route's plan answer per device, and per device a bit for each reason the route has
+    // declined this weight under GGML_SYCL_MOE_ROUTE_LOG, so the route log names each reason once.
+    ggml_sycl_moe_resident_decode_plan_memo         moe_resident_decode_plan[GGML_SYCL_MAX_DEVICES];
+    uint32_t                                        moe_resident_decode_declines_logged[GGML_SYCL_MAX_DEVICES]  = {};
+    // Per device, the expert storage generation at which the direct routes' publish of this weight's AOS slices from
+    // its own buffer, with the table build after it, last left the full-local table unbuilt (0: never; the generation
+    // starts at 1). A node at that generation does not publish again (ggml_sycl_moe_direct_ensure_aos_table).
+    uint64_t                                        moe_direct_publish_failed_generation[GGML_SYCL_MAX_DEVICES] = {};
     // Batch-1 decode direct-dispatch eligibility and layout, per device; see
     // moe-decode-hostpath.hpp (llama.cpp-yx28).
     ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];

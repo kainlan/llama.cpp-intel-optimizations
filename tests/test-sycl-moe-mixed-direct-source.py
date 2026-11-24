@@ -226,7 +226,7 @@ def kernel_violations(src: dict[str, str]) -> list[str]:
     if not has(flat, "ids_host[i] < 0 || ids_host[i] >= n_experts"):
         found.append("kernel-callers: the adapter no longer refuses a snapshot id outside [0, n_experts) before "
                      "submit")
-    elif not has(flat, "static_cast<int64_t>(dst_nb2), n_experts, quant_event, event_out)"):
+    elif not has(flat, "static_cast<int64_t>(geometry.dst_nb2), n_experts, quant_event, event_out)"):
         found.append("kernel-callers: the adapter does not pass n_experts as the table's slot count")
     return found
 

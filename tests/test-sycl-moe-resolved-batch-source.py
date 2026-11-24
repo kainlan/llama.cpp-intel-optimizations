@@ -911,6 +911,8 @@ def direct_prompt_parts(source: str, workspace: str, mmvq_cpp: str, mmvq_hpp: st
         # graph-shaped request, which cannot mint DIRECT authority, and also weighs a secondary owner's bounce slices.
         "admit": optional_definition(workspace, "moe_mmid_authoritative_admission_request && request) noexcept"),
         "adapter": optional_definition(mmvq_cpp, "bool mmvq_submit_q1_nvfp4_aos_id_admitted("),
+        # The sizes and the ids view rule the adapter and the resident decode entry share.
+        "geometry": optional_definition(mmvq_cpp, "mmvq_q1_nvfp4_id_fit mmvq_q1_nvfp4_id_geometry_of("),
         "declared": declared[:declared.index(";")],
         "mmvq_cpp": normalized_code(mmvq_cpp),
     }
@@ -1007,11 +1009,13 @@ def direct_prompt_violations(parts: dict[str, str]) -> list[str]:
     host_reads = adapter.replace("const int32_t * ids_host,", " ", 1).replace("!ids_host", " ", 1)
     if not adapter or "ids_host" in host_reads.replace("ids_host[i]", " "):
         failures.append("snapshot-sync: something other than the checks before submit reads the host snapshot")
-    if not has_tokens(adapter, "ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || "
-                               "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))"):
+    # The ids view rule is the shared geometry helper's, and the adapter asks the helper.
+    if not has_tokens(parts["geometry"], "ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || "
+                                         "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))") or \
+            not has_tokens(adapter, "mmvq_q1_nvfp4_id_geometry_of("):
         failures.append("ids-view: the adapter does not take a view's token stride")
     if not has_tokens(adapter, "mmvq_submit_quantize_q8_1_aos_after(q, activation_f32, buffers.activation_q8, ncols, "
-                               "quant_blocks, dependency)"):
+                               "geometry.quant_blocks, dependency)"):
         failures.append("quantize-dependency: quantization does not wait on the caller's dependency")
     return failures
 
@@ -1065,10 +1069,10 @@ def test_direct_prompt_mutants_each_fail_their_claim() -> None:
         ("snapshot-uploaded", "adapter", "sycl::event quant_event =",
          "(void) ggml_sycl::mem_copy_ptr_async(nullptr, ids_host, 0, q); sycl::event quant_event =",
          "snapshot-sync"),
-        ("packed-ids-only", "adapter", "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))",
+        ("packed-ids-only", "geometry", "ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))",
          "ids_nb1 != static_cast<int64_t>(sk * sizeof(int32_t))", "ids-view"),
-        ("quantize-unordered", "adapter", "ncols, quant_blocks, dependency)", "ncols, quant_blocks, nullptr)",
-         "quantize-dependency"),
+        ("quantize-unordered", "adapter", "ncols, geometry.quant_blocks, dependency)",
+         "ncols, geometry.quant_blocks, nullptr)", "quantize-dependency"),
     ]
     for name, part, old, new, claim in mutants:
         mutated = dict(parts)
