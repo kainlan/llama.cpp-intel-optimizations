@@ -6206,6 +6206,20 @@ it).**
 - *What `test-backend-ops` does not cover here.* On this backend it runs no NVFP4 case for `MUL_MAT` or
   `GET_ROWS` (all "not supported") and three for `CPY`. The cover for the changed functor is the `MUL_MAT_ID`
   census, the two device tests and the text comparison.
+- *Merged (`4966f1473`, evidence `docs/backend/data/inkling2/t19-merged-4966f1473.txt`).* The merged build passes
+  the Inkling gate on the B70 and one bench load reads 77.70 / 25.26.
+- *Where a prompt token goes now (691 tokens, 9.6 s, 72 t/s under the stage profiler).* Two items carry it.
+  The non-MoE matmul stage holds the submitting thread for 3.8 s while its kernels run for 1.1 s: the rest is
+  199,440 oneDNN GEMM submissions at 19 us of host time each (row S8, one GEMM per batch element of a 3-D F32
+  `MUL_MAT`). The NVFP4 expert kernel is 3.1 s of device time, 6.4 us per (token, expert) pair where it was 22 us
+  before this task; the BF16 expert kernel is 0.6 s. Attention is 0.4 s.
+- *Where a decoded token goes now (39.6 ms in the bench).* Directly dispatched kernels are 11.9 ms of device time,
+  6.8 ms of it the NVFP4 expert kernel. The 96 `MUL_MAT_ID` nodes cost 87 us of host time each, 8.3 ms. The stage
+  host times nest (they sum to more than the profiler's wall), so they rank and do not add.
+- *Order from here.* Prompt first, by share: row S8 (39% of the prompt, a contained change by the earlier read),
+  then the NVFP4 prompt kernel (33%; whether grouping tokens per expert pays is not known, because the decode
+  shape shows this kernel bound by arithmetic and not by memory). Decode: the per-node host cost, then the
+  kernel's lane geometry.
 
 ---
 
