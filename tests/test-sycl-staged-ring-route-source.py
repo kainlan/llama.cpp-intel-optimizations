@@ -1537,9 +1537,13 @@ PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt
                      "per-expert path refused a staged ring slot\"); }")
 PER_EXPERT_ANCHOR = "if (try_pp_onednn_f16_batched()) { return; }"
 # A node the direct MMID route stepped aside for leaves after the executor's try (it runs again on that route), so the
-# per-expert path, and its refusal, start after that exit.
-PER_EXPERT_REENTRY_OPEN = "if (pp_direct_deferred) {"
-PER_EXPERT_REENTRY_TAIL = "g_mmid_direct_reentry.requested = dst; return; }"
+# per-expert path, and its refusal, start after that exit. The exit is pinned whole, so nothing else can run between the
+# try and the refusal.
+PER_EXPERT_REENTRY = (
+    "if (pp_direct_deferred) { if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, pp_batched_refusal)) { "
+    "GGML_LOG_WARN(\"[PP-MOE] direct MMID route re-entered device=%d cause=%s tensor=%s type=%s: the batched executor "
+    "declined the node before its first submission\\n\", ctx.device, moe_pp_batched_refusal_name(pp_batched_refusal), "
+    "src0->name, ggml_type_name(src0->type)); } g_mmid_direct_reentry.requested = dst; return; }")
 PER_EXPERT_STEPS = (
     "pp_moe_onednn_scratch_claim pp_moe_onednn_scratch_claim_state;",
     "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
@@ -1569,9 +1573,8 @@ def claim_staged_batch_refused_by_name(sycl: str) -> bool:
     mmid = body(n, MMID_SIG)
     xmx = body(n, XMX_SIG)
     return (n.count(PER_EXPERT_REFUSE) == 1
-            and mmid.count(PER_EXPERT_ANCHOR + " " + PER_EXPERT_REENTRY_OPEN) == 1
-            and mmid.count(PER_EXPERT_REENTRY_TAIL + " " + PER_EXPERT_REFUSE) == 1
-            and ordered(mmid, PER_EXPERT_ANCHOR, PER_EXPERT_REENTRY_TAIL, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
+            and mmid.count(PER_EXPERT_ANCHOR + " " + PER_EXPERT_REENTRY + " " + PER_EXPERT_REFUSE) == 1
+            and ordered(mmid, PER_EXPERT_ANCHOR, PER_EXPERT_REENTRY, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
             and n.count(XMX_REFUSE) == 1 and ordered(xmx, XMX_REJECT, XMX_REFUSE, *XMX_STEPS))
 
 
@@ -1580,8 +1583,7 @@ def test_staged_batch_refused_by_name():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the xmx refusal is searched in the "
         "body of try_xmx_sorted_moe)",
         body(norm(SYCL), MMID_SIG),
-        PER_EXPERT_ANCHOR + " " + PER_EXPERT_REENTRY_OPEN, PER_EXPERT_REENTRY_TAIL + " " + PER_EXPERT_REFUSE,
-        *PER_EXPERT_STEPS,
+        PER_EXPERT_ANCHOR + " " + PER_EXPERT_REENTRY + " " + PER_EXPERT_REFUSE, *PER_EXPERT_STEPS,
         signature=MMID_SIG)
 
 
@@ -1589,6 +1591,13 @@ def test_staged_batch_refused_by_name_mutants():
     c = claim_staged_batch_refused_by_name
     # The per-expert path reads a staged slot at the tensor's layout.
     assert not c(mutate(SYCL, PER_EXPERT_REFUSE, ""))
+    # A statement between the direct route's exit and the refusal runs before the refusal.
+    assert not c(mutate(SYCL, PER_EXPERT_REENTRY + " " + PER_EXPERT_REFUSE,
+                        PER_EXPERT_REENTRY + " stream->wait(); " + PER_EXPERT_REFUSE))
+    # A statement inside the exit runs before the deferred node leaves.
+    tail = "return; }"
+    assert PER_EXPERT_REENTRY.endswith(tail)
+    assert not c(mutate(SYCL, PER_EXPERT_REENTRY, PER_EXPERT_REENTRY[:-len(tail)] + "stream->wait(); " + tail))
     # Refused only after the routes were taken.
     m = mutate(SYCL, PER_EXPERT_REFUSE + " ", "")
     m = m.replace(PER_EXPERT_STEPS[-1], PER_EXPERT_STEPS[-1] + " " + PER_EXPERT_REFUSE, 1)
