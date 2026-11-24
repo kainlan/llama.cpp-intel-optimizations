@@ -371,6 +371,11 @@ class DnnlGemmWrapper {
         key.ldc       = ldc;
         key.variant   = 0;  // gemm variant
 
+        // A call with a batch above 1 is a profiler row of its own, so one batched GEMM is told apart from the
+        // per-plane GEMMs a loop submits for the same planes.
+        const char * gemm_label_name =
+            std::max(batches_a, batches_b) > 1 ? "mulmat.onednn_gemm.batched" : "mulmat.onednn_gemm.unbatched";
+
         // Build memory descriptors
         dnnl::memory::dims a_dims    = { batches_a, m, k };
         dnnl::memory::dims a_strides = { stra2, stra1, stra0 };
@@ -423,7 +428,7 @@ class DnnlGemmWrapper {
                 matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
             ggml_sycl_profile_label gemm_label{};
-            gemm_label.name       = "mulmat.onednn_gemm.unbatched";
+            gemm_label.name       = gemm_label_name;
             gemm_label.category   = "mulmat";
             gemm_label.queue_kind = "compute";
             gemm_label.device     = ctx.device;
@@ -467,7 +472,7 @@ class DnnlGemmWrapper {
         }
 
         ggml_sycl_profile_label gemm_label{};
-        gemm_label.name       = "mulmat.onednn_gemm.unbatched";
+        gemm_label.name       = gemm_label_name;
         gemm_label.category   = "mulmat";
         gemm_label.queue_kind = "compute";
         gemm_label.device     = ctx.device;
