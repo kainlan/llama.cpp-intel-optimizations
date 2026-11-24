@@ -23831,21 +23831,28 @@ ggml_sycl::moe_fused::PromptFusionResult mmvq_submit_retained_prompt_fusion(
                                                       inject_publication_failure);
 }
 
-bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
-                                  int                         ncols,
-                                  int                         nrows_per_expert,
-                                  int                         top_k,
-                                  int                         n_tokens,
-                                  int                         ne11,
-                                  int64_t                     ids_nb0,
-                                  int64_t                     ids_nb1,
-                                  mmvq_q1_nvfp4_id_geometry * out) {
+// Whether `device` takes sycl::half, which the checked Q1_0/NVFP4 id kernels use. The backend asked the runtime once per
+// device at init (query_xmx_capabilities); a node does not ask again.
+static bool mmvq_q1_nvfp4_id_device_has_fp16(int device) {
+    return device >= 0 && device < ggml_sycl_info().device_count &&
+           ggml_sycl_info().devices[device].xmx_caps.supports_fp16_type;
+}
+
+mmvq_q1_nvfp4_id_fit mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
+                                                  int                         ncols,
+                                                  int                         nrows_per_expert,
+                                                  int                         top_k,
+                                                  int                         n_tokens,
+                                                  int                         ne11,
+                                                  int64_t                     ids_nb0,
+                                                  int64_t                     ids_nb1,
+                                                  mmvq_q1_nvfp4_id_geometry * out) {
     const int weight_qk = weight_type == GGML_TYPE_Q1_0 ? QK1_0 : weight_type == GGML_TYPE_NVFP4 ? QK_NVFP4 : 0;
     if (out == nullptr || weight_qk == 0 || ncols <= 0 || nrows_per_expert <= 0 || top_k <= 0 || n_tokens <= 0 ||
         (ne11 != 1 && ne11 != top_k) || ncols % weight_qk != 0 || ncols % QK8_1 != 0 ||
         ids_nb0 < static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sizeof(int32_t)) ||
         ids_nb0 % alignof(int32_t) != 0 || ids_nb1 % alignof(int32_t) != 0) {
-        return false;
+        return mmvq_q1_nvfp4_id_fit::NO_KERNEL;
     }
 
     const size_t sk                    = static_cast<size_t>(top_k);
@@ -23886,7 +23893,7 @@ bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
         !checked_mul(sn, sizeof(float), &dst_nb1) || !checked_mul(sk, dst_nb1, &dst_nb2) ||
         !checked_mul(sn, weight_blocks_per_row, &weight_blocks) ||
         !checked_mul(weight_blocks, weight_block_bytes, &weight_bytes)) {
-        return false;
+        return mmvq_q1_nvfp4_id_fit::NO_KERNEL;
     }
     block_num_z = sn / GGML_SYCL_MOE_MMV_Y + (sn % GGML_SYCL_MOE_MMV_Y != 0);
     if (!checked_mul(occurrences, block_num_z, &kernel_groups) ||
@@ -23895,7 +23902,7 @@ bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
         activation_rows > INT_MAX || ids_max_offset > static_cast<size_t>(PTRDIFF_MAX) || q8_row_bytes > INT64_MAX ||
         q8_nb12 > INT64_MAX || dst_nb1 > INT64_MAX || dst_nb2 > INT64_MAX || weight_blocks > INT_MAX ||
         weight_bytes > INT_MAX || kernel_items == 0 || quantize_items == 0) {
-        return false;
+        return mmvq_q1_nvfp4_id_fit::NO_KERNEL;
     }
     // Slots are adjacent inside a token, and tokens do not overlap; a view's token stride may leave the other columns
     // of its source between them (build_moe_ffn hands MUL_MAT_ID the top-k view of the argsort). The alignment test
@@ -23903,7 +23910,7 @@ bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
     // strides, and the only bound checked on it is PTRDIFF_MAX: the extent of the storage the view lies in is not
     // passed here, so that the farthest id lies inside it rests on the caller handing over a real tensor's view.
     if (ids_nb0 != static_cast<int64_t>(sizeof(int32_t)) || ids_nb1 < static_cast<int64_t>(sk * sizeof(int32_t))) {
-        return false;
+        return mmvq_q1_nvfp4_id_fit::NO_KERNEL;
     }
 
     out->occurrences    = occurrences;
@@ -23916,10 +23923,16 @@ bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
     out->dst_nb2        = dst_nb2;
     out->kernel_items   = kernel_items;
     out->quantize_items = quantize_items;
-    return true;
+    // DPC++ refuses a range past INT_MAX work-items at submit, with an exception the backend's handler turns into an
+    // exit, so the bound is part of the fit: an entry asked for such a launch returns false before it submits anything.
+    if (kernel_items > static_cast<size_t>(INT_MAX) || quantize_items > static_cast<size_t>(INT_MAX)) {
+        return mmvq_q1_nvfp4_id_fit::LAUNCH_PAST_INT;
+    }
+    return mmvq_q1_nvfp4_id_fit::FITS;
 }
 
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
+                                          int                                    device,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
@@ -23944,12 +23957,12 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
         !buffers.activation_q8 || !buffers.output_f32 || n_experts <= 0 ||
         !aligned(expert_ptrs_device, alignof(void *)) || !aligned(activation_f32, alignof(float)) ||
         !aligned(ids_device, alignof(int32_t)) || !aligned(buffers.activation_q8, alignof(block_q8_1)) ||
-        !aligned(buffers.output_f32, alignof(float)) || !q.get_device().has(sycl::aspect::fp16)) {
+        !aligned(buffers.output_f32, alignof(float)) || !mmvq_q1_nvfp4_id_device_has_fp16(device)) {
         return false;
     }
     mmvq_q1_nvfp4_id_geometry geometry;
-    if (!mmvq_q1_nvfp4_id_geometry_of(weight_type, ncols, nrows_per_expert, top_k, n_tokens, ne11, ids_nb0, ids_nb1,
-                                      &geometry) ||
+    if (mmvq_q1_nvfp4_id_geometry_of(weight_type, ncols, nrows_per_expert, top_k, n_tokens, ne11, ids_nb0, ids_nb1,
+                                     &geometry) != mmvq_q1_nvfp4_id_fit::FITS ||
         buffers.activation_q8_bytes != geometry.q8_bytes || buffers.output_f32_bytes != geometry.output_bytes) {
         return false;
     }
@@ -23974,6 +23987,7 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
 }
 
 bool mmvq_submit_q1_nvfp4_aos_id_resident(sycl::queue &        q,
+                                          int                  device,
                                           ggml_type            weight_type,
                                           ggml_layout_mode     weight_layout,
                                           const void * const * expert_ptrs_device,
@@ -23999,28 +24013,35 @@ bool mmvq_submit_q1_nvfp4_aos_id_resident(sycl::queue &        q,
         !dst || !event_out || n_experts <= 0 || !aligned(expert_ptrs_device, alignof(void *)) ||
         !aligned(activation_f32, alignof(float)) || !aligned(ids_device, alignof(int32_t)) ||
         !aligned(activation_q8, alignof(block_q8_1)) || !aligned(dst, alignof(float)) ||
-        !q.get_device().has(sycl::aspect::fp16)) {
+        !mmvq_q1_nvfp4_id_device_has_fp16(device)) {
         return false;
     }
     mmvq_q1_nvfp4_id_geometry geometry;
-    if (!mmvq_q1_nvfp4_id_geometry_of(weight_type, ncols, nrows_per_expert, top_k, n_tokens, ne11, ids_nb0, ids_nb1,
-                                      &geometry) ||
+    if (mmvq_q1_nvfp4_id_geometry_of(weight_type, ncols, nrows_per_expert, top_k, n_tokens, ne11, ids_nb0, ids_nb1,
+                                     &geometry) != mmvq_q1_nvfp4_id_fit::FITS ||
         activation_q8_bytes != geometry.q8_bytes || dst_bytes != geometry.output_bytes) {
         return false;
     }
 
-    // Quantization is its own row in GGML_SYCL_KERNEL_PROFILE; the kernel keeps its mulmat.mmvq.id_aos_<type> row.
-    // The in-order queue orders it after the work that produced activation_f32.
-    std::string quantize_metadata;
-    if (ggml_sycl_kernel_profile_enabled()) {
-        quantize_metadata = "ncols=" + std::to_string(ncols) + ";quant_blocks=" + std::to_string(geometry.quant_blocks);
-    }
-    const ggml_sycl_profile_label quantize_label = mmvq_profile_label(
-        q, "mulmat.mmvq.id_quantize_q8_1_aos", quantize_metadata.c_str(), "mulmat", geometry.q8_bytes);
-    const sycl::event quant_event = ggml_sycl_profile_submit(q, quantize_label, [&](sycl::queue & profiled_queue) {
-        return mmvq_submit_quantize_q8_1_aos_after(profiled_queue, activation_f32, activation_q8, ncols,
-                                                   geometry.quant_blocks, nullptr);
-    });
+    // Quantization is its own row in GGML_SYCL_KERNEL_PROFILE; the kernel keeps its mulmat.mmvq.id_aos_<type> row. The
+    // label is built only while the profiler is on, with the caller's device index, as the dense BF16 launch builds its
+    // own. The in-order queue orders quantization after the work that produced activation_f32.
+    const auto quantize = [&](sycl::queue & queue) {
+        return mmvq_submit_quantize_q8_1_aos_after(queue, activation_f32, activation_q8, ncols, geometry.quant_blocks,
+                                                   nullptr);
+    };
+    const sycl::event quant_event = !ggml_sycl_kernel_profile_enabled() ? quantize(q) : [&]() {
+        const std::string quantize_metadata =
+            "ncols=" + std::to_string(ncols) + ";quant_blocks=" + std::to_string(geometry.quant_blocks);
+        ggml_sycl_profile_label quantize_label{};
+        quantize_label.name       = "mulmat.mmvq.id_quantize_q8_1_aos";
+        quantize_label.category   = "mulmat";
+        quantize_label.queue_kind = "compute";
+        quantize_label.metadata   = quantize_metadata.c_str();
+        quantize_label.device     = device;
+        quantize_label.bytes      = geometry.q8_bytes;
+        return ggml_sycl_profile_submit(q, quantize_label, quantize);
+    }();
     return mmvq_submit_q1_nvfp4_aos_id(q, weight_type, weight_layout, expert_ptrs_device, activation_q8, ids_device,
                                        dst, ncols, nrows_per_expert, static_cast<int>(geometry.occurrences), top_k,
                                        n_tokens, ne11, ids_nb0, ids_nb1, static_cast<int64_t>(geometry.q8_row_bytes),

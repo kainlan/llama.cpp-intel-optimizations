@@ -912,7 +912,7 @@ def direct_prompt_parts(source: str, workspace: str, mmvq_cpp: str, mmvq_hpp: st
         "admit": optional_definition(workspace, "moe_mmid_authoritative_admission_request && request) noexcept"),
         "adapter": optional_definition(mmvq_cpp, "bool mmvq_submit_q1_nvfp4_aos_id_admitted("),
         # The sizes and the ids view rule the adapter and the resident decode entry share.
-        "geometry": optional_definition(mmvq_cpp, "bool mmvq_q1_nvfp4_id_geometry_of("),
+        "geometry": optional_definition(mmvq_cpp, "mmvq_q1_nvfp4_id_fit mmvq_q1_nvfp4_id_geometry_of("),
         "declared": declared[:declared.index(";")],
         "mmvq_cpp": normalized_code(mmvq_cpp),
     }

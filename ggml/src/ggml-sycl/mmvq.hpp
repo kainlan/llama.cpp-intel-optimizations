@@ -676,7 +676,10 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
 // destination scatter is implied. The table holds n_experts slots, and a slot
 // may be null (an expert not on this card): that occurrence's rows are written
 // as quiet NaN without reading through the slot, for the caller to overwrite.
+// `device` is q's device index: the entry reads that card's half support from the capabilities the backend asked
+// for at init.
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
+                                          int                                    device,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
@@ -711,18 +714,26 @@ struct mmvq_q1_nvfp4_id_geometry {
     size_t quantize_items = 0;  // the quantize kernel's global range
 };
 
-// Fills *out for a Q1_0 or NVFP4 weight of ncols x nrows_per_expert per expert, top_k slots per token, n_tokens tokens
-// and ne11 input rows per token (1, or one per slot), with ids strides ids_nb0 and ids_nb1 in bytes. False for a type,
-// shape or ids view the kernel does not take, or a size that overflows; *out is then unspecified.
-bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
-                                  int                         ncols,
-                                  int                         nrows_per_expert,
-                                  int                         top_k,
-                                  int                         n_tokens,
-                                  int                         ne11,
-                                  int64_t                     ids_nb0,
-                                  int64_t                     ids_nb1,
-                                  mmvq_q1_nvfp4_id_geometry * out);
+// What mmvq_q1_nvfp4_id_geometry_of finds for a node. LAUNCH_PAST_INT is a node the kernels take whose kernel or
+// quantize range passes INT_MAX work-items: DPC++ throws at the submit of such a range, so no entry submits it.
+enum class mmvq_q1_nvfp4_id_fit : uint8_t {
+    FITS,             // the kernels take the node and both launches fit an int
+    NO_KERNEL,        // a type, shape or ids view the kernel does not take, or a size that overflows
+    LAUNCH_PAST_INT,  // the kernels take the node, and a launch range passes INT_MAX
+};
+
+// Sizes a Q1_0 or NVFP4 weight of ncols x nrows_per_expert per expert, top_k slots per token, n_tokens tokens and ne11
+// input rows per token (1, or one per slot), with ids strides ids_nb0 and ids_nb1 in bytes. *out is filled for FITS and
+// for LAUNCH_PAST_INT, and unspecified for NO_KERNEL. Both entries refuse anything but FITS.
+mmvq_q1_nvfp4_id_fit mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
+                                                  int                         ncols,
+                                                  int                         nrows_per_expert,
+                                                  int                         top_k,
+                                                  int                         n_tokens,
+                                                  int                         ne11,
+                                                  int64_t                     ids_nb0,
+                                                  int64_t                     ids_nb1,
+                                                  mmvq_q1_nvfp4_id_geometry * out);
 
 // The resident decode form: every expert is on this card, so the kernel reads the ids where they are with no host
 // snapshot and the table's slot checks stand for the range check. activation_f32 is contiguous [token][ne11][K];
@@ -730,7 +741,9 @@ bool mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
 // output of exactly its output_bytes. Quantization is its own submission and profiler row, ordered on q after
 // whatever q already holds; the kernel follows it, and *event_out is the kernel's event. Nothing is allocated, waited
 // on or read on the host. An id below zero writes a zero row, and an id past n_experts or a null slot a quiet NaN row.
+// `device` is q's device index, as for the admitted entry.
 bool mmvq_submit_q1_nvfp4_aos_id_resident(sycl::queue &        q,
+                                          int                  device,
                                           ggml_type            weight_type,
                                           ggml_layout_mode     weight_layout,
                                           const void * const * expert_ptrs_device,

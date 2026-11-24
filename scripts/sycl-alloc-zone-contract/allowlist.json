@@ -285,6 +285,14 @@
       "reason": "ggml_sycl_host_tenants_erase is noexcept and runs from ~ggml_backend_sycl_context, from the clear of an ended execution context's bindings and from the publish's install guard: its try body takes the slot table the caller's id keyed out of the registry and drops it, which releases carves through their owners' destructors, and nothing in it raises a planned refusal; a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. The handler says the failed drop at ERROR (the carves then stay pinned until the process ends). Permanent; llama.cpp-moua L4 step 3c."
     },
     {
+      "id": "E-MOE-RESIDENT-DECODE-RETENTION-DRAIN",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_moe_resident_decode_retention::~ggml_sycl_moe_resident_decode_retention",
+      "count": 1,
+      "reason": "The NVFP4 resident decode route's retention drains its stream from its destructor on any exit that did not publish the handles a submitted kernel reads, so no slice or lease is released under that kernel; that exit is often the unwinding of the route's own ggml_sycl_fallback_error refusal. The try body is one queue::wait_and_throw: the backend's async handler records a device failure and throws nothing (async-failure.hpp), so the handler can only meet the runtime's own synchronous error, never a planned refusal, and a rethrow out of a destructor would std::terminate. The handler says the failed drain at WARN rather than staying silent. Permanent."
+    },
+    {
       "id": "E-L4-TENANT-CLAIM-DROP",
       "code": "G-CATCH",
       "file": "tenant-claim-scope.hpp",

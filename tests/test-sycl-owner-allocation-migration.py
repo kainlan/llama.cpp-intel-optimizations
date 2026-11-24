@@ -189,16 +189,17 @@ NAMED_OWNER_FIRST_SITES = (
      "owner_metadata() and the prefill ring copies from it directly; refuses on failure, handed over via "
      "from_owned_alloc"),
     ("ggml_sycl_mul_mat_id_nvfp4_resident_decode",
-     "Inkling 2 Mini Task 18: the NVFP4 resident decode route's per-node Q8_1 input slice (must_device, SCRATCH zone, "
-     "spill forbidden), held in the dispatch's retained handles until the kernel's event; a refusal declines the node "
-     "to the admitted route, handed over via from_owned_alloc"),
+     "the NVFP4 resident decode route's per-node Q8_1 input slice (must_device, SCRATCH zone, spill forbidden), held "
+     "in the node's retention until the kernel's event, which drains the stream first on any exit that did not "
+     "publish it; a refused allocation declines the node to the admitted route, handed over via from_owned_alloc"),
 )
 
 
 def function_body_span(code: str, name: str):
     """(start of the definition, end of its closing brace) of the one function `name` defined in `code`."""
-    # A definition is not a call: `if (!name(...)) {` also ends in `) {`, so a head preceded by `!` or `(` is a call.
-    heads = list(re.finditer(r"(?<![!(])\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
+    # A definition is not a call: `if (!name(...)) {` and `if (a && name(...)) {` also end in `) {`, so a head preceded
+    # by `!` or `(`, or by `&&` or `||` and a space, is a call.
+    heads = list(re.finditer(r"(?<![!(])(?<![&|] )\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
     assert len(heads) == 1, "%s: expected one definition, found %d" % (name, len(heads))
     start = heads[0].start()
     depth, index = 0, heads[0].end() - 1

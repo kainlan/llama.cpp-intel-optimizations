@@ -947,6 +947,13 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket);
 
+// Publication that leaves the caller the failure escrow without a second copy of each handle. On success every handle
+// has left `handles` for the store, which releases them after `event`. On a throw `handles` is exactly as it was, so a
+// caller whose submitted work still reads through them can drain that work before it lets them go. The vector is
+// swapped into the store's record, so no handle is copied or released on the submitting thread, where a prepared
+// terminal_retention_ticket copies each handle at prepare and releases the copies at commit.
+void retain_handles_until_event_or_keep(std::vector<mem_handle> & handles, sycl::event event);
+
 // The drain worker's waits since the last take (llama.cpp-qwn5), for the hybrid MoE decode trace's per-token waits
 // line: the records it waited, the gates those records carried, its time asleep on the gates and its time in the
 // record events' waits after them.

@@ -234,24 +234,31 @@ std::vector<uint64_t> owner_control_ids(const std::vector<mem_handle> & handles)
     return ids;
 }
 
-void retain_handles_for_current_graph(std::vector<mem_handle> handles) {
+// Takes every handle out of `handles` on success. On a throw `handles` is as it was: every allocation is made before
+// the first handle moves, and a mem_handle moves without throwing.
+void retain_handles_for_current_graph(std::vector<mem_handle> & handles) {
     if (handles.empty()) {
         return;
     }
 
     if (g_graph_retained_handle_sink) {
+        g_graph_retained_handle_sink->reserve(g_graph_retained_handle_sink->size() + handles.size());
         g_graph_retained_handle_sink->insert(g_graph_retained_handle_sink->end(),
                                              std::make_move_iterator(handles.begin()),
                                              std::make_move_iterator(handles.end()));
+        handles.clear();
         return;
     }
 
     const std::vector<uint64_t> ids   = owner_control_ids(handles);
     auto &                      state = *g_retained_handles_state;
     retained_store_lock         lock(state);
+    state.graph_unwaitable.reserve(state.graph_unwaitable.size() + handles.size());
+    state.graph_unwaitable_ids.reserve(state.graph_unwaitable_ids.size() + ids.size());
     state.graph_unwaitable.insert(state.graph_unwaitable.end(), std::make_move_iterator(handles.begin()),
                                   std::make_move_iterator(handles.end()));
     state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(), ids.begin(), ids.end());
+    handles.clear();
 }
 
 void retained_handle_drain_loop() {
@@ -2720,7 +2727,10 @@ bool retained_store_mutex_held() {
 }
 #endif
 
-static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
+// Takes every handle out of `handles` on success. On a throw `handles` is as it was: the record enters the store with
+// an empty vector and takes the handles by a swap that cannot throw, so a caller that still owns submitted work can
+// drain it before the handles go.
+static void publish_handles_until_event(std::vector<mem_handle> & handles, sycl::event event) {
     if (handles.empty()) {
         return;
     }
@@ -2732,7 +2742,7 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
 #endif
 
     if (graph_lifetime_retention_active()) {
-        retain_handles_for_current_graph(std::move(handles));
+        retain_handles_for_current_graph(handles);
         return;
     }
 
@@ -2747,7 +2757,8 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
     {
         auto &              state = *g_retained_handles_state;
         retained_store_lock lock(state);
-        state.queue.push_back({ std::move(handles), std::move(event), std::move(ids), std::move(gates) });
+        state.queue.push_back({ {}, std::move(event), std::move(ids), std::move(gates) });
+        state.queue.back().handles.swap(handles);
     }
     g_retained_handles_state->cv.notify_one();
 }
@@ -2766,19 +2777,23 @@ retained_handle_drain_census retained_handle_drain_census_take() noexcept {
 }
 
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {
-    publish_handles_until_event(std::move(handles), std::move(event));
+    publish_handles_until_event(handles, std::move(event));
 }
 
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event,
                                 retained_handle_publish_ticket ticket) {
-    publish_handles_until_event(std::move(handles), std::move(event));
+    publish_handles_until_event(handles, std::move(event));
     GGML_UNUSED(ticket);
 }
 
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket) {
-    publish_handles_until_event(std::move(handles), std::move(event));
+    publish_handles_until_event(handles, std::move(event));
     ticket.reset();
+}
+
+void retain_handles_until_event_or_keep(std::vector<mem_handle> & handles, sycl::event event) {
+    publish_handles_until_event(handles, std::move(event));
 }
 
 void record_terminal_retention(sycl::event event,

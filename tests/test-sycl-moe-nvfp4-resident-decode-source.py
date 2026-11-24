@@ -131,7 +131,7 @@ RETAIN_CALL = "ggml_sycl::retain_handles_until_event_or_keep(retention.handles, 
 RETENTION = "ggml_sycl_moe_resident_decode_retention"
 RETENTION_HEAD = f"struct {RETENTION} {{"
 RETENTION_DTOR = ("~ggml_sycl_moe_resident_decode_retention(){if(submitted!=nullptr){try{submitted->wait_and_throw();}"
-                  "catch(...){}}}")
+                  "catch(...){GGML_LOG_WARN(")
 RETENTION_NO_COPY = (f"{RETENTION}(const {RETENTION} &) = delete;",
                      f"{RETENTION} & operator=(const {RETENTION} &) = delete;")
 ARM = "retention.submitted = stream;"
@@ -613,8 +613,10 @@ def claim_j_retention(s):
         return [f"{ROUTE_FN} or {RETENTION} is not defined exactly once"]
     fails = []
     struct = braced_body(sycl, RETENTION_HEAD) or ""
-    if RETENTION_DTOR not in tight(struct) or struct.count("wait_and_throw") != 1:
-        fails.append("the retention's destructor does not drain the armed stream, and only then, before the handles go")
+    dtor = tight(struct)[tight(struct).find(RETENTION_DTOR):]
+    if RETENTION_DTOR not in tight(struct) or struct.count("wait_and_throw") != 1 or "throw;" in dtor:
+        fails.append("the retention's destructor does not drain the armed stream, and only then, before the handles go, "
+                     "naming a drain that throws instead of rethrowing it")
     for needed in RETENTION_NO_COPY:
         if needed not in struct:
             fails.append(f"the retention can be copied: it lacks {needed}")
@@ -816,6 +818,7 @@ MUTANTS = [
     ("j", "sycl", RETENTION_HEAD, "submitted->wait_and_throw();", ""),
     ("j", "sycl", RETENTION_HEAD, "if (submitted != nullptr) {", "if (true) {"),
     ("j", "sycl", RETENTION_HEAD, RETENTION_NO_COPY[0], ""),
+    ("j", "sycl", RETENTION_HEAD, "catch (...) { GGML_LOG_WARN(", "catch (...) { throw; GGML_LOG_WARN("),
     ("j", "mem_cpp", PUBLISH_HEAD, "state.queue.push_back({ {}, std::move(event)",
      "state.queue.push_back({ std::move(handles), std::move(event)"),
     ("j", "mem_cpp", PUBLISH_HEAD, "state.queue.back().handles.swap(handles);", ""),
