@@ -417,6 +417,38 @@ inline bool moe_pp_onednn_ring_serves_type(enum ggml_type type) {
     return false;
 }
 
+// The ways a PP MoE oneDNN ring slot serves an expert weight, each named by the consumer that claims the slot. Which a
+// ring's weights reach decides whether a load keeps the ring when the plan made with it leaves experts on the host
+// (moe_pp_ring_check_resident_only, moe-ring-consumer.hpp).
+enum moe_pp_ring_use : uint32_t {
+    MOE_PP_RING_USE_NONE       = 0,
+    // The batched prompt executor's resident claim: every expert of the weight planned on the device, in one layout.
+    MOE_PP_RING_USE_RESIDENT   = 1u << 0,
+    // The executor's staged claim: the weight's host experts are staged into ring slots.
+    MOE_PP_RING_USE_STAGED     = 1u << 1,
+    // The per-expert prompt path's MXFP4 f16 staging: it claims a slot for an expert planned on the device at SOA,
+    // whatever the rest of the weight is planned as.
+    MOE_PP_RING_USE_SOA_EXPERT = 1u << 2,
+};
+
+// The ring uses an expert weight of `type` can reach, from the tables the consumers read: the executor's arms
+// (moe_pp_onednn_ring_serves_type), the types the ring stages for a host expert (moe_pp_batched_takes_staged_type) and
+// the f16 arm's MXFP4 row at SOA, which the per-expert path's staging dequantizes. A type with any use is one the ring
+// is planned for. Like moe_pp_onednn_ring_serves_type, the answer asks no runtime knob.
+inline uint32_t moe_pp_ring_uses_of_type(enum ggml_type type) {
+    uint32_t uses = MOE_PP_RING_USE_NONE;
+    if (moe_pp_onednn_ring_serves_type(type)) {
+        uses |= MOE_PP_RING_USE_RESIDENT;
+    }
+    if (moe_pp_batched_takes_staged_type(type)) {
+        uses |= MOE_PP_RING_USE_STAGED;
+    }
+    if (type == GGML_TYPE_MXFP4 && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA)) {
+        uses |= MOE_PP_RING_USE_SOA_EXPERT;
+    }
+    return uses;
+}
+
 // Whether the Q1_0/NVFP4 direct MMID route steps aside for a MUL_MAT_ID node so the batched prompt executor runs it:
 // a prompt (more than one token per expert row), a weight the executor claims on the device (every expert planned there,
 // in a layout its tables take: ggml_sycl_moe_pp_onednn_batched_claims_tensor), and a PP MoE oneDNN ring weight slot

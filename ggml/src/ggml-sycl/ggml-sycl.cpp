@@ -135,6 +135,7 @@
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-pp-pack.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/moe-ring-consumer.hpp"
 #include "ggml-sycl/mul-mat-bf16.hpp"
 #include "ggml-sycl/nonfa-stage.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -16237,6 +16238,52 @@ static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_invento
     return false;
 }
 
+// The expert weights of a planner view that a ring consumer runs, with the ring uses of each one's type, as the ring
+// decision reads them (moe_pp_ring_check_resident_only). The filter is the one the ring's sizing reads
+// (ggml_sycl_inventory_ring_has_consumer): a gate, up, down or gate_up expert with a shape. The names point into
+// `detail`, which outlives the list at every caller.
+static std::vector<ggml_sycl::moe_pp_ring_weight> ggml_sycl_inventory_ring_weights(
+    const std::vector<ggml_sycl::placement_tensor_info> & detail) {
+    std::vector<ggml_sycl::moe_pp_ring_weight> weights;
+    for (const ggml_sycl::placement_tensor_info & info : detail) {
+        if (moe_classify_tensor(info.name.c_str()) == MOE_TENSOR_UNKNOWN || !info.has_shape()) {
+            continue;
+        }
+        const uint32_t uses = moe_pp_ring_uses_of_type(info.type);
+        if (uses == MOE_PP_RING_USE_NONE) {
+            continue;
+        }
+        ggml_sycl::moe_pp_ring_weight weight;
+        weight.name      = info.name.c_str();
+        weight.n_experts = info.ne[2] > 0 ? info.ne[2] : 1;
+        weight.uses      = uses;
+        weights.push_back(weight);
+    }
+    return weights;
+}
+
+// What the plan made with `device`'s published PP MoE oneDNN scratch ring says about that ring: the one decision the
+// load stage (ggml_sycl_stage_drop_displacing_ring) and the plan dry run (ggml_sycl_plan_dry_run_drop_displacing_ring)
+// both act on. A device with no ring published has nothing to decide.
+static ggml_sycl::moe_pp_ring_resident_check ggml_sycl_plan_ring_resident_check(
+    int                                                   device,
+    const std::vector<ggml_sycl::placement_tensor_info> & detail,
+    const ggml_sycl::placement_plan &                     plan) {
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device) == 0) {
+        return {};
+    }
+    const std::vector<ggml_sycl::moe_pp_ring_weight> weights = ggml_sycl_inventory_ring_weights(detail);
+    return ggml_sycl::moe_pp_ring_check_resident_only(plan, weights.data(), weights.size());
+}
+
+// Publishes no PP MoE oneDNN scratch ring on `device`, as a model with no ring consumer publishes
+// (ggml_sycl_inventory_publish_planner_inputs): every slot and the depth are zero, so the zone ensure reserves no ring
+// room, the explicit micro-batch has no ring room to hold, the context's re-plan has no ring to size, and the batched
+// prompt executor's resident claim has no slot to take (its nodes take the MMID direct route).
+static void ggml_sycl_publish_no_pp_moe_onednn_ring(int device) {
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, 0, 0, 0, 0);
+}
+
 // The per-device planner inputs an inventory carries, as ggml_sycl_inventory_publish_planner_inputs() published them.
 struct ggml_sycl_inventory_planner_inputs {
     size_t   pp_pipeline_scratch_bytes           = 0;
@@ -17076,6 +17123,103 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
     return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);
 }
 
+// The load transaction that dropped each device's PP MoE oneDNN scratch ring (ggml_sycl_stage_drop_displacing_ring), 0
+// for none. A load plans a device at its early pass and again at its late one, and the inventory intake of each pass
+// publishes the ring the loader sized. Where the early pass dropped it, the late pass publishes none again before its
+// zones are asked for, so the zone the early pass gave back is not asked for again and the late plan is made without
+// the ring, as the early pass's last plan was. Written and read under g_tensor_inventory_mutex.
+static uint64_t g_sycl_ring_dropped_load_txn[GGML_SYCL_MAX_DEVICES] = {};
+
+// Whether an earlier pass of this thread's staged load dropped `device`'s ring. Never for a direct planner entry.
+static bool ggml_sycl_stage_ring_dropped_by_this_load(int device) {
+    const uint64_t txn = g_sycl_plan_load_effect_txn;
+    return txn != 0 && device >= 0 && device < GGML_SYCL_MAX_DEVICES && g_sycl_ring_dropped_load_txn[device] == txn;
+}
+
+// Publishes no ring on `device` for the stage, and clears the inventory's copy of the ring the intake published with
+// it, so the two say the same.
+static void ggml_sycl_stage_publish_no_ring(int device) {
+    ggml_sycl_publish_no_pp_moe_onednn_ring(device);
+    g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
+    g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
+    g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
+    g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
+}
+
+// What the load stage did with a device's PP MoE oneDNN scratch ring after a plan made with it.
+enum class ggml_sycl_stage_ring_drop {
+    KEPT,     // the plan stands
+    DROPPED,  // no ring is published and the zones were asked for again: the caller plans once more, and that is final
+    REFUSED,  // the zones could not be asked for again: the refusal is logged, and the caller refuses the load
+};
+
+// Drops `device`'s PP MoE oneDNN scratch ring when the plan made with it says the ring costs more than it serves
+// (moe_pp_ring_check_resident_only, through ggml_sycl_plan_ring_resident_check): every weight the ring would serve
+// reaches the batched executor's resident claim alone (NVFP4 today), and the plan left an expert of those weights on
+// the host. Such a ring serves a layer only when all of its experts are on the device and stages no host expert, so
+// the room it took from the weights trades prompt room for a decode loss on every token, and measured on the B50 with
+// Inkling 2 Mini it lost on the prompt too: the ring moved CPU layers from 15 down to 14 and the experts served from
+// the mapping from 10215.0 MB up to 10774.6 MB, and took pp from 17.32 to 16.46 t/s and tg from 7.00 to 6.56 t/s. A
+// ring with a weight that reaches the staged claim or the MXFP4 SOA per-expert staging serves host experts too, so the
+// decision keeps it and a Qwen or GPT-OSS plan is the one it was.
+//
+// A drop leaves the device as a model with no ring consumer plans it: the ring and the dense scratch at the load's
+// planning shape (an explicit micro-batch's placement may have moved both to its own micro-batch), no ring, and the
+// planner terms as `published_before` holds them, from before the plans made with the ring. The zones are then asked
+// for again with the RUNTIME zone's surplus given back: an arena nothing points into is rebuilt with that zone at what
+// the plan now needs (zone_arena_ensure_options::give_back), so the plan once more gets the ring's room back for its
+// weights; an arena a live model or a freed context holds keeps its zone, and the WARN says so. The drop holds for
+// the rest of this load (ggml_sycl_stage_ring_dropped_by_this_load). Caller holds g_tensor_inventory_mutex.
+static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
+    int                                        device,
+    const ggml_sycl::placement_plan &          plan,
+    const ggml_sycl::planner_published_terms & published_before) {
+    const ggml_sycl::moe_pp_ring_resident_check check =
+        ggml_sycl_plan_ring_resident_check(device, g_tensor_inventory_detail, plan);
+    if (!check.displaces_experts()) {
+        return ggml_sycl_stage_ring_drop::KEPT;
+    }
+    const size_t   ring_bytes        = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
+    const uint32_t planning_n_ubatch = ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) != planning_n_ubatch) {
+        (void) ggml_sycl_publish_load_ubatch_scratch(device, planning_n_ubatch);
+    }
+    ggml_sycl_stage_publish_no_ring(device);
+    published_before.restore(device);
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        g_sycl_ring_dropped_load_txn[device] = g_sycl_plan_load_effect_txn;
+    }
+
+    ggml_sycl::zone_arena_give_back      give_back;
+    ggml_sycl::zone_arena_ensure_options options = ggml_sycl_load_arena_options();
+    options.give_back                            = &give_back;
+    ggml_sycl::zone_arena_refusal refusal;
+    if (ggml_sycl::get_unified_cache_for_device(device) &&
+        !ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options)) {
+        GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+        return ggml_sycl_stage_ring_drop::REFUSED;
+    }
+    constexpr double mb = 1024.0 * 1024.0;
+    char             zone[256];
+    if (give_back.rebuilt) {
+        snprintf(zone, sizeof(zone), "its RUNTIME zone was rebuilt at %.1f MB, %.1f MB less, for the weights",
+                 give_back.need_runtime / mb, (give_back.have_runtime - give_back.need_runtime) / mb);
+    } else if (give_back.held) {
+        snprintf(zone, sizeof(zone),
+                 "its RUNTIME zone keeps its %.1f MB (the plan needs %.1f MB): a live model or a freed context's "
+                 "allocations point into the arena",
+                 give_back.have_runtime / mb, give_back.need_runtime / mb);
+    } else {
+        snprintf(zone, sizeof(zone), "its RUNTIME zone had no room to give back");
+    }
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] device %d drops its PP MoE oneDNN scratch ring (%.1f MB): the plan made with it left %" PRId64
+        " experts of its %zu resident-only expert weights on the host, and a ring that serves only resident layers "
+        "trades prompt room for a decode loss on every token; %s, and the device is planned once more without it\n",
+        device, ring_bytes / mb, check.host_experts, check.n_weights, zone);
+    return ggml_sycl_stage_ring_drop::DROPPED;
+}
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex. False when the
@@ -17108,6 +17252,15 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // because a discarded plan goes back to the shape the ensure sized the zones for.
         (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(ctx->device, g_placement_kv_info,
                                                                                    envelope_arg);
+    }
+    // A ring an earlier pass of this load dropped stays dropped (ggml_sycl_stage_drop_displacing_ring): the intake
+    // published it again from the inventory, and the zones are asked for below without it.
+    if (ggml_sycl_stage_ring_dropped_by_this_load(ctx->device) &&
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx->device) != 0) {
+        ggml_sycl_stage_publish_no_ring(ctx->device);
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] device %d plans with no PP MoE oneDNN scratch ring: an earlier pass of this load dropped it\n",
+            ctx->device);
     }
     ggml_sycl::zone_arena_refusal refusal;
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
@@ -17161,12 +17314,30 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 "host fallback may be used for overflow\n");
         }
 
-        const std::vector<ggml_sycl::device_budget> budgets =
-            ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
         const ggml_sycl::multi_gpu_mode gpu_mode = ggml_sycl_plan_multi_gpu_mode(is_moe);
-        plan_candidate                           = ggml_sycl::compute_multi_device_plan(
-            budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
-            envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
+
+        // The budgets are read at each plan: a dropped ring's give-back can rebuild this device's arena in between.
+        auto plan_multi_device = [&]() {
+            const std::vector<ggml_sycl::device_budget> budgets =
+                ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
+            return ggml_sycl::compute_multi_device_plan(
+                budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
+                envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
+        };
+        // The planner terms as they stand before the plan, for a ring drop to put back (the single-device branch takes
+        // its own snapshot, published_before, for the plans with the micro-batch room as well).
+        const ggml_sycl::planner_published_terms terms_before_plan =
+            ggml_sycl::planner_published_terms::snapshot(ctx->device);
+        plan_candidate = plan_multi_device();
+        switch (ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, terms_before_plan)) {
+            case ggml_sycl_stage_ring_drop::KEPT:
+                break;
+            case ggml_sycl_stage_ring_drop::DROPPED:
+                plan_candidate = plan_multi_device();
+                break;
+            case ggml_sycl_stage_ring_drop::REFUSED:
+                return false;
+        }
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
             size_t moe_entries = 0;
             size_t xmx_entries = 0;
@@ -17285,6 +17456,16 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                     "which the arena could not reserve on device %d; the ring is re-planned when the context opens\n",
                     explicit_n_ubatch, room_short / (1024.0 * 1024.0), ctx->device);
             }
+        }
+        // With no ring there is no micro-batch room to hold, so the last plan is made without it.
+        switch (ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, published_before)) {
+            case ggml_sycl_stage_ring_drop::KEPT:
+                break;
+            case ggml_sycl_stage_ring_drop::DROPPED:
+                plan_candidate = plan_single_device(/*with_room=*/false);
+                break;
+            case ggml_sycl_stage_ring_drop::REFUSED:
+                return false;
         }
         have_plan = true;
         GGML_LOG_INFO(
@@ -17596,7 +17777,8 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 // streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
 // nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
 // The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
-// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds. A refused load's abort tears that
+// resort, and it, the micro-batch's grow leg or the give-back after a dropped ring (ggml_sycl_stage_drop_displacing_ring)
+// may rebuild an arena nothing holds. A refused load's abort tears that
 // arena down again when no model is live (ggml_sycl_release_last_model_effects), and the next load's start reserves
 // the early arena; an arena the load's own buffers still hold at the abort stays, and that start runs the release
 // again before its reserve. While a model is live on another device, the rebuilt arena (or, after a failed reserve,
@@ -18072,7 +18254,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         // The decide pass: every device plans and every refusal is decided before this pass's host zones, layer
         // streaming or stale-ring release, and the rollback guard's abort puts back what the pass published. The
         // planner's zone decision still changes a device here: the entry ensure's last resort releases a ring that
-        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones. With no model live
+        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones, or with a smaller
+        // RUNTIME zone once a ring that displaced experts is dropped. With no model live
         // the abort's release of the last model tears that arena down again, or the next load's start does when the
         // load's own buffers still hold it; while a model is live a refused load keeps it (or no arena, after a failed
         // reserve). The secondary MoE queues and caches a plan creates stay too.
@@ -18466,6 +18649,29 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 }  // namespace ggml_sycl
 #endif
 
+// The plan dry run's side of the ring decision the load stage makes (ggml_sycl_stage_drop_displacing_ring), through the
+// same decision function: when the plan made with `device`'s PP MoE oneDNN scratch ring left an expert of its
+// resident-only weights on the host, no ring is published on the device and the caller plans it once more, so the plan
+// the dry run reports records no ring where a load would drop it. The dry run sizes no zone, so none is given back,
+// and its saved state puts the ring back. True when it dropped the ring.
+static bool ggml_sycl_plan_dry_run_drop_displacing_ring(int                                                   device,
+                                                        const std::vector<ggml_sycl::placement_tensor_info> & detail,
+                                                        const ggml_sycl::placement_plan &                     plan) {
+    const ggml_sycl::moe_pp_ring_resident_check check = ggml_sycl_plan_ring_resident_check(device, detail, plan);
+    if (!check.displaces_experts()) {
+        return false;
+    }
+    const size_t ring_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
+    ggml_sycl_publish_no_pp_moe_onednn_ring(device);
+    GGML_LOG_INFO(
+        "[PLAN-DRY-RUN] device=%d drops its PP MoE oneDNN scratch ring (%.1f MB), as a load would: the plan made with "
+        "it left %" PRId64
+        " experts of its %zu resident-only expert weights on the host; the device is planned once more without it, "
+        "with no zone given back (the dry run sizes none)\n",
+        device, ring_bytes / (1024.0 * 1024.0), check.host_experts, check.n_weights);
+    return true;
+}
+
 // Plans `inventory` as the load's stage plans it: once per device the scheduler exposes, publishing that device's
 // planner inputs first, through the stage's helpers, against `budget`, the one computed from `sample`. A multi-device
 // plan packs each physical device to its budget authority's answer; a single-device plan to the arena's reservation
@@ -18558,9 +18764,16 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
                 }
             }
             const bool is_moe = n_experts > 0;
-            plans.push_back(ggml_sycl::compute_multi_device_plan(budgets, detail, static_cast<int>(inventory->n_layer),
-                                                                 ggml_sycl_plan_multi_gpu_mode(is_moe), kv,
-                                                                 opts.envelope, n_experts, host_budget, coverage_pin));
+
+            auto plan_multi = [&]() {
+                return ggml_sycl::compute_multi_device_plan(budgets, detail, static_cast<int>(inventory->n_layer),
+                                                            ggml_sycl_plan_multi_gpu_mode(is_moe), kv, opts.envelope,
+                                                            n_experts, host_budget, coverage_pin);
+            };
+            plans.push_back(plan_multi());
+            if (ggml_sycl_plan_dry_run_drop_displacing_ring(i, detail, plans.back())) {
+                plans.back() = plan_multi();
+            }
         } else {
             const size_t forced = override_for(i);
             const size_t plan_budget =
@@ -18570,8 +18783,14 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
             // As the stage publishes it before a single-device plan, from the inputs the plan is built from. The dry
             // run sizes no zone, and its saved state puts the shape back.
             (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(i, kv, opts.envelope);
-            plans.push_back(ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
-                                                              host_budget, coverage_pin));
+            auto plan_single = [&]() {
+                return ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
+                                                         host_budget, coverage_pin);
+            };
+            plans.push_back(plan_single());
+            if (ggml_sycl_plan_dry_run_drop_displacing_ring(i, detail, plans.back())) {
+                plans.back() = plan_single();
+            }
         }
     }
     std::string no_arena;

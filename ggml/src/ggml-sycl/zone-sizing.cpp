@@ -880,6 +880,14 @@ bool zone_arena_shortfall_is_reservation_only(const zone_arena_sizes & have,
            have.onednn >= onednn_pair_bytes;
 }
 
+bool zone_arena_runtime_surplus(const zone_arena_sizes & have, const zone_arena_sizes & need) {
+    return have.scratch >= need.scratch && have.onednn >= need.onednn && have.runtime > need.runtime;
+}
+
+zone_arena_sizes zone_arena_give_back_sizes(const zone_arena_sizes & have, const zone_arena_sizes & need) {
+    return { std::max(have.scratch, need.scratch), std::max(have.onednn, need.onednn), need.runtime };
+}
+
 size_t zone_onednn_kept_pair_bytes(const zone_onednn_plan & kept, size_t held_pair_bytes) {
     return std::max(kept.bare_bytes, held_pair_bytes);
 }

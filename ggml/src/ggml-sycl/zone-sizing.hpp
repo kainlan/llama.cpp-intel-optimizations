@@ -913,6 +913,24 @@ struct zone_arena_refusal {
     bool                        keep_deferred = false;
 };
 
+// Whether an arena whose zones are `have` gives RUNTIME room back to a plan that needs `need`
+// (zone_arena_ensure_options::give_back): it holds every zone the plan needs, and its RUNTIME zone is larger than the
+// plan's. A zone the plan needs larger is the ensure's ordinary rebuild, not a give-back. Pure.
+bool zone_arena_runtime_surplus(const zone_arena_sizes & have, const zone_arena_sizes & need);
+
+// The zones a give-back rebuilds the arena with: SCRATCH and ONEDNN as the arena has them (never below the plan's), and
+// RUNTIME at the plan's. Only the RUNTIME zone is given back; the others are kept as built, as an arena that holds
+// every zone keeps them. Pure.
+zone_arena_sizes zone_arena_give_back_sizes(const zone_arena_sizes & have, const zone_arena_sizes & need);
+
+// What an ensure asked to give back a RUNTIME surplus did (zone_arena_ensure_options::give_back).
+struct zone_arena_give_back {
+    size_t have_runtime = 0;      // the RUNTIME zone the arena had when the call decided, 0 with no arena
+    size_t need_runtime = 0;      // the RUNTIME zone the plan needs, rounded as the reserve rounds it
+    bool   rebuilt      = false;  // the arena was rebuilt with its RUNTIME zone at need_runtime
+    bool   held         = false;  // there was a surplus, and something pointed into the arena: kept as built
+};
+
 // How a caller asks for the arena's planned zones (unified_cache::ensure_planned_arena_zones).
 struct zone_arena_ensure_options {
     // The caller releases the PP MoE ring and asks again when the ring alone holds an arena that must grow (the load
@@ -925,6 +943,13 @@ struct zone_arena_ensure_options {
     // The load transaction the call is part of, 0 outside a staged load. A keep of a short ONEDNN zone warns once per
     // load transaction and device (zone_kept_onednn_warn_due), and at every keep for 0.
     uint64_t load_txn           = 0;
+    // Set by a caller that published a smaller RUNTIME term than the arena was built for and wants the zone's surplus
+    // back: the load stage, after it drops a PP MoE ring that displaced experts (ggml_sycl_stage_drop_displacing_ring in
+    // ggml-sycl.cpp). An arena with a surplus (zone_arena_runtime_surplus) is rebuilt with the zones
+    // zone_arena_give_back_sizes names when nothing points into it (zone_arena_rebuild_allowed), so the WEIGHT zone
+    // takes the surplus; otherwise it is kept as built. What the call did is written here. Unset, an arena that holds
+    // every zone is kept as built however much larger it is: a later, smaller plan beside a live one must not shrink it.
+    zone_arena_give_back * give_back          = nullptr;
 };
 
 // Whether a rebuild of the arena that something live blocks can be answered by keeping the zones as they are: SCRATCH
