@@ -31,9 +31,10 @@ whitespace-canonical text:
   when a batch count is above 1 and the unbatched row otherwise;
 - the route computes in F32: gemm() takes its float math as a ggml_sycl_dnnl_fpmath parameter whose default,
   GGML_SYCL_DNNL_FPMATH_BUILD, is the build's choice (fpmath f16 under GGML_SYCL_F16, otherwise nothing set); only
-  GGML_SYCL_DNNL_FPMATH_STRICT sets fpmath strict; the primitive cache key carries the mode in a field its equality and its
-  hash both read, so a strict and an f16 primitive of one shape are two entries; the route op passes STRICT, and no
-  other caller does.
+  GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT sets fpmath strict; the primitive cache key carries the mode in a field its
+  equality and its hash both read, so a strict and an f16 primitive of one shape are two entries; the route op passes
+  NO_DOWNCONVERT, and no other caller does. The value does not say STRICT: every GGML_SYCL_*STRICT* name is the one
+  strict-leases abort switch or one of its named exceptions (test-sycl-context-tenant-plan-source.py, gate 22).
 
 Every clause has mutants that must fail it. Host-only; collected by pytest.
 """
@@ -628,7 +629,7 @@ def test_label_mutants():
 
 
 # ---- the route computes in F32; every other caller keeps the build's float math ----
-_STRICT = "GGML_SYCL_DNNL_FPMATH_STRICT"
+_STRICT = "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT"
 _BUILD = "GGML_SYCL_DNNL_FPMATH_BUILD"
 _FPMATH_PARAM = re.compile(r"ggml_sycl_dnnl_fpmath (\w+)=(\w+)")
 
