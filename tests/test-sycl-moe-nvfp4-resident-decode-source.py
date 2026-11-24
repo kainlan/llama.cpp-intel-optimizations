@@ -48,11 +48,11 @@ ready event. These claims pin that shape:
       not released: keep_handles_after_failed_wait (noexcept) parks them in the store's unwaitable list as the drain
       worker parks a record whose wait failed, catching every throw of that parking (each leaves the handles whole),
       or leaks them when they cannot be parked, and the destructor names it at ERROR as the exit of a node that did
-      not publish its handles, not as one cause of that exit. The publication leaves the vector as it was when it throws: the record enters the store with
-      an empty vector and takes the handles by a swap; the graph-lifetime path moves the handles into its one sink by
-      a single range insert, which has no effects when its allocation throws because a mem_handle moves without
-      throwing (a static_assert holds that), and otherwise parks them, growing both parallel store vectors before it
-      inserts into either;
+      not publish its handles, not as one cause of that exit. The publication leaves the vector as it was when it
+      throws: the record enters the store with an empty vector and takes the handles by a swap; the graph-lifetime path
+      moves the handles into its one sink by a single range insert, which has no effects when its allocation throws
+      because a mem_handle moves without throwing (a static_assert holds that), and otherwise parks them, growing both
+      parallel store vectors before it inserts into either;
   (k) the cheap per-node costs stay out: the entries read the card's half support from the capabilities taken at
       init, the plan owner is fetched once, the quantize's profiler label is built only while the profiler is on,
       the route asks ctx.stream() once, and the kernel's event is constructed only once the route has taken the node;
@@ -216,7 +216,8 @@ MAKE_ROOM_COVERS = "if(needed>vec.capacity()){vec.reserve(std::max(needed,"
 GRAPH_UNWAITABLE = ("retained_store_locklock(state);"
                     f"{MAKE_ROOM}(state.graph_unwaitable,handles.size());"
                     f"{MAKE_ROOM}(state.graph_unwaitable_ids,ids.size());"
-                    "state.graph_unwaitable.insert(state.graph_unwaitable.end(),std::make_move_iterator(handles.begin()),"
+                    "state.graph_unwaitable.insert(state.graph_unwaitable.end(),"
+                    "std::make_move_iterator(handles.begin()),"
                     "std::make_move_iterator(handles.end()));"
                     "state.graph_unwaitable_ids.insert(state.graph_unwaitable_ids.end(),ids.begin(),ids.end());"
                     "handles.clear();")
@@ -396,7 +397,8 @@ def claim_a_predicate(s):
                       "ggml_sycl_resolve", "unified_allocate"):
         if forbidden in body:
             fails.append(f"the predicate carries {forbidden!r}")
-    # The plan's memoized answer is the last question, asked once: every shape and stride is asked of the node before it.
+    # The plan's memoized answer is the last question, asked once: every shape and stride is asked of the node
+    # before it.
     if body.count(f"{MEMO}(") != 1:
         fails.append(f"the predicate asks {MEMO} other than once")
     memo_at = body.find(MEMO_ASK)
@@ -633,7 +635,8 @@ def claim_h_mmvq(s):
             fails.append(f"the geometry helper does not hold {needed}")
     # The int bound on both launches is the helper's last question, asked once the sizes are filled in.
     if not tight(geometry).endswith(tight(LAUNCH_BOUND)):
-        fails.append("the geometry helper does not end by answering LAUNCH_PAST_INT for a launch past an int, else FITS")
+        fails.append("the geometry helper does not end by answering LAUNCH_PAST_INT for a launch past an int, "
+                     "else FITS")
     for name, entry in (("admitted", admitted), ("resident", resident)):
         if GEOMETRY_ASK + FIT_ONLY not in entry:
             fails.append(f"the {name} entry does not ask the geometry helper and take only FITS")
@@ -679,8 +682,8 @@ def claim_j_retention(s):
     struct = braced_body(sycl, RETENTION_HEAD) or ""
     dtor = tight(struct)[tight(struct).find(RETENTION_DTOR):]
     if RETENTION_DTOR not in tight(struct) or struct.count("wait_and_throw") != 1 or "throw;" in dtor:
-        fails.append("the retention's destructor does not drain the armed stream, and only then, before the handles go, "
-                     "naming a drain that throws instead of rethrowing it")
+        fails.append("the retention's destructor does not drain the armed stream, and only then, before the handles "
+                     "go, naming a drain that throws instead of rethrowing it")
     # A drain that threw has not shown the work done, so the handles are kept, never let go in the catch.
     caught = dtor[len(RETENTION_DTOR):]
     if (not 0 <= caught.find(KEEP_CALL) < caught.find("GGML_LOG_ERROR(") or "GGML_LOG_WARN(" in caught or
@@ -906,7 +909,8 @@ MUTANTS = [
     ("f", "sycl", ROUTE_FN_HEAD, LAUNCH_LIMIT + " refuse(", LAUNCH_LIMIT + " (void) ("),
     ("f", "sycl", ROUTE_FN_HEAD, REFUSAL_THROW, "GGML_ABORT("),
     # The launch limit asked only after the scratch is taken: a refusal would then follow allocation work.
-    ("f", "sycl", ROUTE_FN_HEAD, (LAUNCH_LIMIT + ' refuse("the launch exceeds an int"); }', "ggml_sycl::alloc_request req{};"),
+    ("f", "sycl", ROUTE_FN_HEAD,
+     (LAUNCH_LIMIT + ' refuse("the launch exceeds an int"); }', "ggml_sycl::alloc_request req{};"),
      ("", "ggml_sycl::alloc_request req{}; " + LAUNCH_LIMIT + ' refuse("the launch exceeds an int"); }')),
     ("g", "sycl", DECLINE_FN_HEAD, DECLINE_ONCE, ""),
     ("g", "sycl", DECLINE_FN_HEAD, "!ggml_sycl::ggml_sycl_moe_route_log_enabled() || ", ""),
