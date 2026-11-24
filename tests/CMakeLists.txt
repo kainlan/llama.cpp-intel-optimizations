@@ -678,6 +678,36 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# NVFP4 weight-only-quantisation probe: does this device's oneDNN run f16 x f4_e2m1 with f8_e4m3 scales grouped {16,1}
+# (NVFP4's stored bits, its UE4M3 scales sanitised), in 2-D and in the 3-D batched form, and does the 3-D MXFP4 form
+# work with groups {32,1} where the backend's opt-in 3-D arm passes {1,32,1}? Each arm prints
+# "PROBE <name> <PASS|FAIL|UNSUPPORTED> <detail>"; the binary exits 0 once every arm has run, whatever it found, so
+# the verdict is in those lines and not in the exit status. Exit 77 without a SYCL GPU. Same build shape as
+# test-onednn-woq-mxfp4 above (oneDNN and SYCL only, no backend). Labelled device, not tdd, and pinned to the B50.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-onednn-woq-nvfp4.cpp)
+    set_tests_properties(test-sycl-onednn-woq-nvfp4 PROPERTIES
+        LABELS "sycl;device;onednn;B50"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-onednn-woq-nvfp4 PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-onednn-woq-nvfp4 PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-onednn-woq-nvfp4 PRIVATE "-fsycl")
+        target_link_options(test-sycl-onednn-woq-nvfp4 PRIVATE "-fsycl")
+    endif()
+    find_package(DNNL QUIET)
+    if (TARGET DNNL::dnnl)
+        target_link_libraries(test-sycl-onednn-woq-nvfp4 PRIVATE DNNL::dnnl)
+        # ggml-sycl/dnnl-deterministic.hpp: the attribute production builds with.
+        target_include_directories(test-sycl-onednn-woq-nvfp4 PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    else()
+        message(WARNING "test-sycl-onednn-woq-nvfp4: DNNL::dnnl not found in this directory scope; the target will fail to link")
+    endif()
+endif()
+
 # SOA MXFP4 -> WOQ repack kernel device test (perf-recovery epic, track C,
 # llama.cpp-8rug): the production repack_mxfp4_soa_to_woq (ggml-sycl/convert.
 # cpp/.hpp) must reproduce a CPU reference of the nibble de-interleave +
