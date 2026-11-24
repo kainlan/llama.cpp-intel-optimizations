@@ -137,7 +137,7 @@ decides the executor" and "The executor cost model and the prefill ring" in
 
 - **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
 - **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST errors or corrupted results. Handles must resolve location on dereference so the cache can move data between tiers transparently.
-- **A graph node without `GGML_TENSOR_FLAG_COMPUTE` is not executed:** a node walker that dispatches, fuses, records or plans work skips it through `ggml_sycl_is_noop`, or tests `ggml_sycl_node_is_computed` when it must keep views, and `tests/test-sycl-compute-flag-source.py` holds the census.
+- **A graph node without `GGML_TENSOR_FLAG_COMPUTE` is not executed:** a node walker that dispatches, fuses, records or plans work skips it through `ggml_sycl_is_noop`, or tests `ggml_sycl_graph_node_is_computed` (`prestage-class.hpp`, the one statement of the rule) when it must keep views, and `tests/test-sycl-compute-flag-source.py` holds the census.
 - **PLACEMENT DECIDES THE EXECUTOR (owner ruling 2026-08-16; full statement in
   `docs/backend/sycl-memory-design.md` § "Placement decides the executor").** The
   planning pass puts data where it fits and where it runs best (dense weights fill

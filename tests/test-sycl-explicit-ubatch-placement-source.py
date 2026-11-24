@@ -30,15 +30,25 @@ What this gate pins:
 - a load that placed its explicit micro-batch keeps the ring at that size for every context whose own micro-batch is no
   larger: the transaction re-plans the ring for placement_explicit_ubatch_ring_n_ubatch()'s answer, so the re-plan's
   idempotent return keeps the placed ring instead of releasing it for a smaller one the next context must re-admit;
-- the hold-spill fit credits a compute buffer no larger than the planned compute term at the micro-batch the published
-  single-device plan PLACED on the device, read once before the demand, whole or nothing; every other rung, and every
-  load that placed none, is judged as before;
+- the hold-spill fit credits the planned compute term at the micro-batch the published single-device plan PLACED on
+  the device, or, for a plan that named none, at the micro-batch the load measured the term at (the planning
+  micro-batch only for an inventory that sent none), read before the demand on both sides of the term's bytes (a rung
+  that changed between the two reads credits nothing), and at every rung below it: a rung's own record no larger than
+  the term, whole or nothing, and a rung without a record of its own only at or below the micro-batch the term was
+  measured at (told to the fit only when there is a room); the hold epoch's rung that held a request out is charged,
+  and every rung above the room's rung is judged as before. The measured micro-batch is the load's own record, taken
+  at the inventory stage and turned off when two live loads disagree (with one WARN, on the compare-exchange store
+  that turns it off) and replaced by the next load once no load holds a compute term, never the plan's
+  planner_n_ubatch, which every runtime context transaction rewrites: the measure's params read the resolved shape,
+  the inventory carries the same resolver's micro-batch, and the backend records that (the planning micro-batch only
+  for a libllama that sent none, which is the auto ladder's bottom rung as the shape's fallback is);
 - a load whose plan was packed against a RUNTIME zone an earlier load in the process grew says so in ONE WARN after
   its late plan, only when the live zone is larger than the zone the arena reserves for that plan, so the first load
   of a process never prints it;
 - the RUNTIME zone is one reservation: the arena's reserve, the zone the cache plans, the explicit micro-batch's room,
   the check for a grown zone and its WARN all ask zone_runtime_reserved_bytes() (the larger of the floor and the
-  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others;
+  requirement, rounded up to the arena's 256-byte grain, checked), so none of them can round apart from the others,
+  and the SCRATCH zone's room counts the RUNTIME zone in its tail through the same helper, as the reserve rounds it;
   the cache asserts that grain is the zone allocator's block grain, so the two spellings cannot drift.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
@@ -48,6 +58,8 @@ Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
 
 import re
+
+import pytest
 
 from sycl_gate import body, norm, ordered, read
 
@@ -60,6 +72,8 @@ ZONE_HPP = read("ggml/src/ggml-sycl/zone-sizing.hpp")
 LLAMA_H = read("include/llama.h")
 SYCL_H = read("ggml/include/ggml-sycl.h")
 MODEL_CPP = read("src/llama-model.cpp")
+AUTO_UBATCH_H = read("src/llama-auto-ubatch.h")
+MEASURE_H = read("src/llama-load-measure.h")
 COMMON_CPP = read("common/common.cpp")
 BENCH_CPP = read("tools/llama-bench/llama-bench.cpp")
 
@@ -75,7 +89,7 @@ def struct_text(text: str, head: str) -> str:
 
 
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
-STORE_SIG = "static void compute_and_store_plan_for_inventory("
+STORE_SIG = "static bool compute_and_store_plan_for_inventory("
 PLANNER_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
 DECIDE_SIG = "pp_moe_onednn_explicit_ubatch_decision pp_moe_onednn_explicit_ubatch_decide("
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory("
@@ -132,6 +146,8 @@ FIT_INPUTS = (
     "fit.weight_slot_bytes = in.weight_slot_bytes;",
     "fit.activation_bytes_per_row = in.activation_bytes_per_row;",
     "fit.output_bytes_per_row = in.output_bytes_per_row;",
+    "fit.n_expert = in.n_expert;",
+    "fit.n_expert_used = in.n_expert_used;",
     "fit.ring_depth = in.ring_depth;",
     "fit.n_ubatch = in.n_ubatch;",
 )
@@ -140,28 +156,116 @@ FIT_INPUTS = (
 # device: the room comes from the placement's own helper (PLACE only), each field is assigned once, before the demand.
 FIT_SIG = "static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer)"
 FIT_PLAN = "const auto room_plan = ggml_sycl_global_plan_owner();"
-FIT_GATE = "if (!room_plan->multi_device && room_plan->device_id == q.device) {"
-FIT_ROOM = ("room_bytes = ggml_sycl::placement_explicit_ubatch_compute_room(room_plan->explicit_ubatch, "
-            "ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device), &room_n_ubatch);")
-FIT_FIELDS = "in.compute_room_n_ubatch = room_n_ubatch; in.compute_room_bytes = room_bytes;"
-FIT_DEMAND = "a.demand = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);"
+# The realized check charges a rung that recorded a request held outside the arena; the read resets nothing.
+FIT_HELD_OUT = ("bool held_out = false; if (q.rung_live) { ggml_sycl::planned_hold_spill_totals totals; "
+                "ggml_sycl::unified_cache_get_recent_planned_hold_spills(q.device, q.owner, &totals); "
+                "held_out = totals.raw_count != 0; }")
+# The micro-batch the load measured the term at: it places a plan's room and bounds the no-record credit. The record
+# can be replaced by the next load once no load holds a term, so the fit reads the rung, then the term's bytes, then
+# the rung again, and a rung that changed between the two reads credits nothing: 0 term bytes into the room, rung 0.
+FIT_MEASURED = ("const uint32_t measured_first = "
+                "ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device);")
+FIT_TERM_BYTES = "const size_t term_bytes = ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device);"
+FIT_RUNG_AGAIN = ("const bool rung_unchanged = "
+                  "ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device) == measured_first;")
+FIT_WITHHOLD = "const uint32_t measured_n_ubatch = rung_unchanged ? measured_first : 0;"
+FIT_ROOM = ("const size_t room_bytes = ggml_sycl::placement_plan_compute_room(*room_plan, q.device, "
+            "rung_unchanged ? term_bytes : 0, measured_n_ubatch, &room_n_ubatch);")
+# The plan's room: the single-device plan's own device, a placed explicit micro-batch's answer first, else the
+# micro-batch the load measured the term at, which the caller passes for a plan that named none. Never the plan's
+# planner_n_ubatch: every runtime context transaction rewrites it with the context's micro-batch.
+PLAN_ROOM_SIG = "size_t placement_plan_compute_room(const placement_plan & plan,"
+PLAN_ROOM_GATE = "if (!plan.multi_device && plan.device_id == device) {"
+PLAN_ROOM_EXPLICIT = "room = placement_explicit_ubatch_compute_room(plan.explicit_ubatch, compute_term, &n);"
+PLAN_ROOM_MEASURED = ("if (n == 0 && plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE && "
+                      "measured_n_ubatch != 0) { n = measured_n_ubatch; room = compute_term; }")
+# The load's planning micro-batch is recorded at each inventory intake, in the inventory stage (STAGE_SIG), under the
+# inventory mutex, through the store rule that turns the record off when a load disagrees with one still holding a
+# compute term on the device, and lets the load's value replace the record when none holds one (`term_live`, read
+# once from the merged term); a load's early plan and late intake carry the same inventory, and the rule keeps an
+# equal value, so the repeat changes nothing. The getter reads the record.
+PLANNING_SET = ("ggml_sycl::unified_cache_set_planned_compute_term_n_ubatch(ctx->device, "
+                "ggml_sycl_inventory_measure_n_ubatch(inventory));")
+PLANNING_SETTER_SIG = "void unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch)"
+PLANNING_SETTER_RULE = "uint32_t next = zone_compute_term_n_ubatch_store(stored, n_ubatch, term_live);"
+# Whether a load still holds a term is read from the device's merged compute term, once, before the rule: a constant
+# would let the last load win while two are live (false), or keep a record turned off after every load is gone (true).
+PLANNING_TERM_LIVE = ("const bool term_live = g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire) "
+                      "!= 0;")
+# The setter updates through a compare-exchange loop on the device's slot, so exactly one store sees the transition
+# to the mark, and WARNs only when that store is the one zone_compute_term_n_ubatch_turns_off() names.
+PLANNING_CAS_LOOP = ("while (next != stored && !g_planned_compute_term_n_ubatch[device_id].compare_exchange_weak("
+                     "stored, next, std::memory_order_acq_rel)) { next = zone_compute_term_n_ubatch_store(stored, "
+                     "n_ubatch, term_live); }")
+PLANNING_WARN_GUARD = "if (zone_compute_term_n_ubatch_turns_off(stored, next)) { GGML_LOG_WARN("
+PLANNING_WARN_TEXT = '"[LOAD-PLAN] device %d: this load plans its compute term at n_ubatch=%u where an earlier load'
+PLANNING_GETTER_SIG = "uint32_t unified_cache_get_planned_compute_term_n_ubatch(int device_id)"
+PLANNING_GETTER_RULE = ("return zone_compute_term_n_ubatch_read("
+                        "g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire));")
+# The micro-batch the term was measured at: the measure's params read the resolved shape, whose fallback is the auto
+# ladder's bottom rung; the inventory carries the same resolver's micro-batch and the backend records it, falling back
+# to the inventory's planning shape, the same rung, for a libllama that sent none.
+INVENTORY_N_UBATCH_RE = re.compile(r"\binventory\.n_ubatch\s*=\s*(\d+)\s*;")
+LADDER_RE = re.compile(r"llama_auto_ubatch_ladder\[\]\s*=\s*\{\s*(\d+)\s*,")
+MEASURE_SIG = "inline llama_context_params llama_load_measure_context_params(const llama_load_measure_shape & shape)"
+MEASURE_N_UBATCH = "params.n_ubatch = shape.n_ubatch;"
+SHAPE_SIG = "inline llama_load_measure_shape llama_load_measure_shape_resolve(uint32_t n_ctx_hint,"
+SHAPE_FALLBACK = "const uint32_t n_ubatch = n_ubatch_hint != 0 ? n_ubatch_hint : llama_auto_ubatch_ladder[0];"
+INVENTORY_MEASURE = ("inventory.n_ubatch_measure = llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, "
+                     "hparams.n_ctx_train).n_ubatch;")
+MEASURE_READER = ("static uint32_t ggml_sycl_inventory_measure_n_ubatch(const ggml_sycl_tensor_inventory * inventory) "
+                  "{ return inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch; }")
+# The measured rung is told only with a room; the hold epoch's rung, whose spills the counters are, is the held-out
+# rung the fit charges alone (the asked rung only when the owner has no epoch).
+FIT_FIELDS = ("in.compute_room_n_ubatch = room_n_ubatch; in.compute_room_bytes = room_bytes; "
+              "in.compute_room_measured_n_ubatch = room_bytes != 0 ? measured_n_ubatch : 0; "
+              "in.held_out_n_ubatch = held_out ? (have_epoch ? epoch_n_ubatch : q.n_ubatch) : 0;")
+FIT_DEMAND = "a.terms = ggml_sycl::zone_hold_fit_terms_at(in, q.n_ubatch);"
+FIT_DEMAND_FROM_TERMS = "a.demand = a.terms.demand;"
 FIT_FITS = "const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);"
 ROOM_HELPER_SIG = "size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & xub,"
 ROOM_HELPER_RULE = ("const bool placed = xub.action == pp_moe_onednn_explicit_ubatch_action::PLACE && xub.n_ubatch != 0; "
                     "if (n_ubatch != nullptr) { *n_ubatch = placed ? xub.n_ubatch : 0; } "
                     "return placed ? compute_term : 0;")
-CREDIT_SIG = "bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, size_t request)"
-CREDIT_RULE = "return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch && request <= in.compute_room_bytes;"
-DEMAND_SIG = "size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
-DEMAND_CREDIT = ("size_t request = zone_hold_fit_request(in, n_ubatch); "
-                 "if (zone_hold_fit_rung_has_compute_room(in, n_ubatch, request)) { request = 0; }")
-DEMAND_BOUND = "zone_hold_spill_raw_demand(zone_hold_spill_bound(plan, request, n_ubatch, n_ubatch), in.kv_room);"
+# The room serves its rung and every rung below it, never the held-out rung or a rung above: a rung's own record whole
+# or nothing, a rung without one only at or below the rung the term was measured at.
+CREDIT_SIG = ("bool zone_hold_fit_rung_has_compute_room(const zone_hold_fit_inputs & in, uint32_t n_ubatch, "
+              "size_t request, bool own_record)")
+CREDIT_RULE = ("if (n_ubatch == 0 || in.compute_room_n_ubatch == 0 || n_ubatch > in.compute_room_n_ubatch || "
+               "n_ubatch == in.held_out_n_ubatch) { return false; } "
+               "if (own_record) { return request <= in.compute_room_bytes; } "
+               "return in.compute_room_measured_n_ubatch != 0 && n_ubatch <= in.compute_room_measured_n_ubatch;")
+# The two hold-spill refusals print the room's rung and the rung the term was measured at, which differ under a placed
+# micro-batch (the B50 gate's room read 404.0 MB at 1024 with the term measured at 512); the fit's answer carries both.
+ANSWER_SIG = "struct ggml_sycl_hold_fit_answer {"
+ANSWER_MEASURED = "uint32_t compute_room_measured_n_ubatch = 0;"
+FIT_ANSWER_MEASURED = "a.compute_room_measured_n_ubatch = in.compute_room_measured_n_ubatch;"
+REFUSAL_HEADROOM_SIG = ("static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query & q, "
+                        "bool probe_mode)")
+REFUSAL_REALIZED_SIG = "static bool ggml_sycl_check_hold_spill_realized(int device,"
+ROOM_FORMAT = "compute_room=%.1f MB@%u (measured@%u)\\n"
+ROOM_FORMAT_OLD = "compute_room=%.1f MB@%u\\n"
+ROOM_ARGS = "a.compute_room_bytes / mb, a.compute_room_n_ubatch, a.compute_room_measured_n_ubatch);"
+
+# The demand's one arithmetic lives in zone_hold_fit_terms_at, so the terms a refusal prints are the demand's;
+# zone_hold_fit_demand (and so zone_hold_fit) only reads it.
+DEMAND_SIG = "zone_hold_fit_terms zone_hold_fit_terms_at(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
+DEMAND_CREDIT = ("t.request = zone_hold_fit_request(in, n_ubatch); "
+                 "t.request_credited = zone_hold_fit_rung_has_compute_room(in, n_ubatch, t.request, "
+                 "zone_hold_fit_rung_has_record(in, n_ubatch));")
+DEMAND_BOUND = ("zone_hold_spill_raw_demand(zone_hold_spill_bound(t.plan, t.request_credited ? 0 : t.request, "
+                "n_ubatch, n_ubatch), in.kv_room);")
+DEMAND_READER_SIG = "size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch)"
+DEMAND_READER = "{ return zone_hold_fit_terms_at(in, n_ubatch).demand; }"
 
 # A RUNTIME zone an earlier load grew: one WARN after the late plan, gated by the predicate on the zone the plan sizes.
 SET_INV_SIG = ("static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl("
-               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory)")
-LATE_PLAN = ("compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct); "
-             "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);")
+               "ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory, bool * plan_refused, "
+               "ggml_sycl_inventory_effects & effects)")
+# The late plan, which returns before the WARN when the arena's zones cannot hold it.
+LATE_REFUSE = ("if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) { "
+               "if (plan_refused != nullptr) { *plan_refused = true; } return {}; }")
+LATE_PLAN = LATE_REFUSE + " ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device);"
 KEPT_SIG = "static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device)"
 KEPT_READS = ("if (cache == nullptr || !cache->arena_active() || "
               "!ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement)) { return; }")
@@ -187,9 +291,12 @@ RESERVED_RULE = ("const size_t planned = requirement > floor_bytes ? requirement
                  "*out = (planned + k_zone_arena_alignment - 1) & ~(k_zone_arena_alignment - 1); return true;")
 ARENA_RESERVE_SIG = "bool unified_cache::arena_reserve(sycl::queue & queue,"
 ARENA_RESERVE_CALL = "if (!zone_runtime_reserved_bytes(0, runtime_bytes, &runtime_bytes)) {"
-ENSURE_SIG = "bool unified_cache::ensure_planned_arena_zones()"
+ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal * refusal, "
+              "const zone_arena_ensure_options & options)")
 ENSURE_CALL = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch) || "
                "!zone_runtime_reserved_bytes(runtime_floor, planned_runtime_scratch, &runtime_zone)) {")
+# The RUNTIME zone as arena_reserve rounds it (no floor), in the tail the SCRATCH zone's room is computed beside.
+ENSURE_ROOM_CALL = "if (zone_runtime_reserved_bytes(0, runtime_zone, &scratch_other_tail) &&"
 ROOM_ZONE_SIG = "static bool pp_moe_onednn_runtime_zone_bytes(const pp_moe_onednn_explicit_ubatch_inputs & in,"
 ROOM_ZONE_CALL = ("return zone_runtime_reserved_bytes(in.runtime_floor_bytes, "
                   "in.runtime_fixed_bytes + dense_bytes + ring_bytes, out);")
@@ -227,7 +334,8 @@ LAMBDA_ROOM = ("if (with_room) { ggml_sycl_fill_explicit_ubatch_room(ctx->device
 FIRST_PLAN = "plan_candidate = plan_single_device(true);"
 GROW_BRANCH = "if (plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {"
 GROW_PUBLISH = ("bool placed = ggml_sycl_publish_load_ubatch_scratch(ctx->device, explicit_n_ubatch) && "
-                "ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);")
+                "ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device, nullptr, "
+                "ggml_sycl_load_arena_options());")
 GROW_REPLAN = ("if (placed) { plan_candidate = plan_single_device(true); placed = "
                "plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::PLACE; }")
 GROW_FALLBACK = ("if (!placed) { "
@@ -253,11 +361,19 @@ PARAM_FIELD = "uint32_t n_ctx_hint; uint32_t n_ubatch_hint; };"
 MODEL_DEFAULT_RE = re.compile(r"/\*\.n_ctx_hint\s*=\*/\s*0,\s*/\*\.n_ubatch_hint\s*=\*/\s*0,\s*\};")
 INVENTORY_SET = "inventory.n_ubatch_context = n_ubatch_hint;"
 CALLER_PASSES = "hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
-BACKEND_COPY = "g_placement_kv_info.n_ubatch_context = inventory->n_ubatch_context;"
+# The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
+# (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
+STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
+             "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+BACKEND_COPY = "kv.n_ubatch_context = inventory->n_ubatch_context;"
 OFFSET_PIN = "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,"
 # The header's own pins, compiled by both sides of the dlopen boundary (libllama fills the struct, libggml-sycl reads it).
-# The slot-to-layer map appended after the micro-batch grew the struct to 208 bytes; the micro-batch did not move.
-HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, '
+# The lazy tables and the measured micro-batch appended after the micro-batch, then the slot-to-layer map after them,
+# grew the struct to 224 bytes; the micro-batch did not move.
+HEADER_SIZE_PIN = ('static_assert(sizeof(ggml_sycl_tensor_inventory) == 224, '
                    '"ggml_sycl_tensor_inventory layout changed");')
 HEADER_OFFSET_PIN = ('static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, '
                      '"n_ubatch_context moved");')
@@ -314,18 +430,102 @@ def claim_placed_ring_is_kept_for_smaller_contexts(sycl_cpp: str, cache_cpp: str
 
 
 def claim_fit_credits_the_placed_compute_room(sycl_cpp: str, zone_cpp: str, cache_cpp: str) -> bool:
-    """The hold-spill fit credits the planned compute term at the explicit micro-batch the published single-device
-    plan PLACED on the device, read once before the demand is asked: at that rung a request no larger than the term
-    adds nothing to the bound (whole or nothing), the plan stays in it, and every other rung and load is judged as
-    before."""
+    """The hold-spill fit credits the planned compute term at the micro-batch the published single-device plan sized
+    the device's RUNTIME zone for, read before the demand is asked: the explicit micro-batch it PLACED, else the
+    micro-batch the load measured the term at for a plan that named none. At that rung and every rung below it a
+    request credited by the room adds nothing to the bound (a rung's own record whole or nothing, a rung without one
+    only at or below the rung the term was measured at, told only with a room), the plan stays in it, the hold epoch's
+    rung that held a request out is charged, and every rung above the room's rung is judged as before."""
     fit = body(norm(sycl_cpp), FIT_SIG)
     zone = norm(zone_cpp)
+    cache = norm(cache_cpp)
     demand = body(zone, DEMAND_SIG)
-    return (bool(fit) and ordered(fit, FIT_PLAN, FIT_GATE, FIT_ROOM, FIT_FIELDS, FIT_DEMAND, FIT_FITS)
+    plan_room = body(cache, PLAN_ROOM_SIG)
+    return (bool(fit)
+            and ordered(fit, FIT_PLAN, FIT_HELD_OUT, FIT_MEASURED, FIT_ROOM, FIT_FIELDS, FIT_DEMAND,
+                        FIT_DEMAND_FROM_TERMS, FIT_FITS)
             and fit.count("in.compute_room_n_ubatch =") == 1 and fit.count("in.compute_room_bytes =") == 1
-            and ROOM_HELPER_RULE in body(norm(cache_cpp), ROOM_HELPER_SIG)
+            and fit.count("in.compute_room_measured_n_ubatch =") == 1 and fit.count("in.held_out_n_ubatch =") == 1
+            and fit.count("unified_cache_get_planned_compute_term_n_ubatch(") == 2
+            and ROOM_HELPER_RULE in body(cache, ROOM_HELPER_SIG)
+            and bool(plan_room) and ordered(plan_room, PLAN_ROOM_GATE, PLAN_ROOM_EXPLICIT, PLAN_ROOM_MEASURED)
+            and "planner_n_ubatch" not in plan_room and "planner_n_ubatch" not in fit
             and CREDIT_RULE in body(zone, CREDIT_SIG)
-            and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND))
+            and bool(demand) and ordered(demand, DEMAND_CREDIT, DEMAND_BOUND)
+            and body(zone, DEMAND_READER_SIG) == DEMAND_READER)
+
+
+def claim_fit_reads_the_rung_around_the_bytes(sycl_cpp: str) -> bool:
+    """The fit reads the measured rung, then the term's bytes, then the rung again, in that order, before the room is
+    asked. A rung that changed between the two reads withholds both: 0 term bytes into the room and rung 0. Each getter
+    is read where the order says and nowhere else in the fit, and the first rung and the bytes reach the room only
+    through the guard, so a mismatch can remove a credit and never grant one."""
+    fit = body(norm(sycl_cpp), FIT_SIG)
+    return (bool(fit)
+            and ordered(fit, FIT_MEASURED, FIT_TERM_BYTES, FIT_RUNG_AGAIN, FIT_WITHHOLD, FIT_ROOM)
+            and fit.count("unified_cache_get_planned_compute_term_n_ubatch(") == 2
+            and fit.count("unified_cache_get_planned_compute_term_bytes(") == 1
+            and len(re.findall(r"\bterm_bytes\b", fit)) == 2 and len(re.findall(r"\bmeasured_first\b", fit)) == 3
+            and len(re.findall(r"\brung_unchanged\b", fit)) == 3)
+
+
+def claim_refusals_print_the_measured_rung(sycl_cpp: str) -> bool:
+    """Both hold-spill refusals print the room as its bytes, its rung and the rung the term was measured at, from the
+    fit's answer, which copies the measured rung from the fit's inputs once; the old format, which named the room's
+    rung alone, is printed nowhere."""
+    sycl = norm(sycl_cpp)
+    answer = struct_text(sycl, ANSWER_SIG)
+    fit = body(sycl, FIT_SIG)
+    sites = (body(sycl, REFUSAL_HEADROOM_SIG), body(sycl, REFUSAL_REALIZED_SIG))
+    return (ANSWER_MEASURED in answer and bool(fit) and fit.count(FIT_ANSWER_MEASURED) == 1
+            and all(bool(site) and site.count(ROOM_FORMAT) == 1 and site.count(ROOM_ARGS) == 1 for site in sites)
+            and ROOM_FORMAT_OLD not in sycl)
+
+
+def claim_fit_reads_the_load_planning_micro_batch(sycl_cpp: str, cache_cpp: str) -> bool:
+    """The planning micro-batch the fit credits at is the load's, recorded at the inventory intake through the store
+    rule and read through its getter. The runtime context transaction, which rewrites the plan's planner_n_ubatch with
+    the context's micro-batch, records nothing, and the record has no other writer."""
+    sycl = norm(sycl_cpp)
+    cache = norm(cache_cpp)
+    populate = body(sycl, STAGE_SIG)
+    txn = body(sycl, TXN_SIG)
+    return (bool(populate) and PLANNING_SET in populate
+            and sycl.count("unified_cache_set_planned_compute_term_n_ubatch(") == 1
+            and bool(txn) and "unified_cache_set_planned_compute_term_n_ubatch(" not in txn
+            and PLANNING_SETTER_RULE in body(cache, PLANNING_SETTER_SIG)
+            and PLANNING_GETTER_RULE in body(cache, PLANNING_GETTER_SIG)
+            and cache.count("g_planned_compute_term_n_ubatch[device_id]") == 3)
+
+
+def claim_planning_record_warns_once(cache_cpp: str) -> bool:
+    """The setter reads whether a load holds a term from the device's merged compute term before the store rule,
+    moves the record through a compare-exchange loop, never a plain store, and WARNs only behind
+    zone_compute_term_n_ubatch_turns_off(), so the one store that turns the record off is the one that WARNs; the WARN
+    is written nowhere else."""
+    cache = norm(cache_cpp)
+    setter = body(cache, PLANNING_SETTER_SIG)
+    return (bool(setter) and ordered(setter, PLANNING_TERM_LIVE, PLANNING_SETTER_RULE, PLANNING_CAS_LOOP,
+                                     PLANNING_WARN_GUARD, PLANNING_WARN_TEXT)
+            and ".store(" not in setter
+            and cache.count(PLANNING_WARN_TEXT) == 1)
+
+
+def claim_planning_micro_batch_is_the_measure_shape(model_cpp: str, ladder_h: str, measure_h: str,
+                                                    sycl_cpp: str = "") -> bool:
+    """The recorded micro-batch is the one the compute term was measured at: the measure's params read the shape,
+    the shape falls back to the auto ladder's bottom rung, the inventory carries the same resolver's answer, and the
+    backend records it (the planning micro-batch only for a libllama that sent none). The inventory's own planning
+    micro-batch is still the ladder's bottom rung, the fallback both sides use."""
+    inv = INVENTORY_N_UBATCH_RE.findall(model_cpp)
+    ladder = LADDER_RE.findall(ladder_h)
+    measure = body(norm(measure_h), MEASURE_SIG)
+    shape = body(norm(measure_h), SHAPE_SIG)
+    return (len(inv) == 1 and len(ladder) == 1 and inv[0] == ladder[0]
+            and bool(measure) and MEASURE_N_UBATCH in measure
+            and bool(shape) and norm(SHAPE_FALLBACK) in shape
+            and norm(INVENTORY_MEASURE) in norm(model_cpp)
+            and (not sycl_cpp or norm(MEASURE_READER) in norm(sycl_cpp)))
 
 
 def claim_grown_zone_is_announced(sycl_cpp: str, zone_cpp: str, zone_hpp: str = ZONE_HPP) -> bool:
@@ -348,9 +548,10 @@ def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cp
                                           sycl_cpp: str) -> bool:
     """The RUNTIME zone is reserved, planned, planned against and compared through one checked helper: the arena's
     reserve, the zone ensure_planned_arena_zones() plans, the explicit micro-batch's room, the grown-zone rule and its
-    WARN each call zone_runtime_reserved_bytes(), and none of them rounds the zone itself. The helper takes the larger
-    of the floor and the requirement and rounds it up to the arena's named grain with the addition checked, and the
-    cache asserts the grain is the zone allocator's block grain."""
+    WARN each call zone_runtime_reserved_bytes(), and none of them rounds the zone itself. The ensure asks it a second
+    time, for the RUNTIME zone as the reserve rounds it, which the SCRATCH zone's room counts in the tail. The helper
+    takes the larger of the floor and the requirement and rounds it up to the arena's named grain with the addition
+    checked, and the cache asserts the grain is the zone allocator's block grain."""
     hpp = norm(zone_hpp)
     cache = norm(cache_cpp)
     reserve = body(cache, ARENA_RESERVE_SIG)
@@ -358,10 +559,11 @@ def claim_runtime_zone_is_one_reservation(zone_hpp: str, zone_cpp: str, cache_cp
     room = body(norm(admission_cpp), ROOM_ZONE_SIG)
     rule = body(norm(zone_cpp), KEPT_RULE_SIG)
     kept = body(norm(sycl_cpp), KEPT_SIG)
-    sites = (reserve, ensure, room, rule, kept)
+    sites = (reserve, room, rule, kept)
     return (ARENA_ALIGNMENT in hpp and cache.count(ARENA_GRAIN_ASSERT) == 1
             and RESERVED_RULE in body(hpp, RESERVED_SIG)
             and all(site.count("zone_runtime_reserved_bytes(") == 1 for site in sites)
+            and ensure.count("zone_runtime_reserved_bytes(") == 2 and ENSURE_ROOM_CALL in ensure
             and ARENA_RESERVE_CALL in reserve and "runtime_bytes = (runtime_bytes +" not in reserve
             and ENSURE_CALL in ensure and "runtime_zone = planned_runtime_scratch;" not in ensure
             and ROOM_ZONE_CALL in room and "align" not in room
@@ -428,7 +630,7 @@ def claim_transport_names_no_micro_batch_for_auto(llama_h: str, model_cpp: str, 
     bench_hint = body(bench, BENCH_HINT_SIG)
     return (PARAM_FIELD in norm(llama_h) and len(MODEL_DEFAULT_RE.findall(model_cpp)) == 1
             and INVENTORY_SET in body(model, POPULATE_SIG) and model.count(CALLER_PASSES) == 2
-            and BACKEND_COPY in sycl and OFFSET_PIN in sycl
+            and BACKEND_COPY in body(sycl, INTAKE_SIG) and INTAKE_CALL in body(sycl, STAGE_SIG) and OFFSET_PIN in sycl
             and HEADER_SIZE_PIN in norm(sycl_h) and HEADER_OFFSET_PIN in norm(sycl_h)
             and COMMON_NONE in norm(common_cpp)
             and bool(bench_hint) and bench_hint.lstrip("{ ").startswith(BENCH_NONE)
@@ -459,6 +661,44 @@ def test_placed_ring_is_kept_for_smaller_contexts():
 
 def test_fit_credits_the_placed_compute_room():
     assert claim_fit_credits_the_placed_compute_room(SYCL_CPP, ZONE_CPP, CACHE_CPP)
+
+
+def test_fit_reads_the_rung_around_the_bytes():
+    assert claim_fit_reads_the_rung_around_the_bytes(SYCL_CPP)
+
+
+def test_refusals_print_the_measured_rung():
+    assert claim_refusals_print_the_measured_rung(SYCL_CPP)
+
+
+def test_mutant_refusal_prints_the_room_rung_alone_fails():
+    """The old format: a log reader cannot tell the placed rung from the one the term was measured at."""
+    n = norm(SYCL_CPP)
+    assert n.count(ROOM_FORMAT) == 2
+    assert not claim_refusals_print_the_measured_rung(n.replace(ROOM_FORMAT, ROOM_FORMAT_OLD, 1))
+
+
+def test_mutant_refusal_prints_the_room_rung_twice_fails():
+    n = norm(SYCL_CPP)
+    assert n.count(ROOM_ARGS) == 2
+    assert not claim_refusals_print_the_measured_rung(
+        n.replace(ROOM_ARGS, ROOM_ARGS.replace("a.compute_room_measured_n_ubatch", "a.compute_room_n_ubatch"), 1))
+
+
+def test_mutant_answer_never_carries_the_measured_rung_fails():
+    assert not claim_refusals_print_the_measured_rung(_once(SYCL_CPP, FIT_ANSWER_MEASURED, ""))
+
+
+def test_fit_reads_the_load_planning_micro_batch():
+    assert claim_fit_reads_the_load_planning_micro_batch(SYCL_CPP, CACHE_CPP)
+
+
+def test_planning_record_warns_once():
+    assert claim_planning_record_warns_once(CACHE_CPP)
+
+
+def test_planning_micro_batch_is_the_measure_shape():
+    assert claim_planning_micro_batch_is_the_measure_shape(MODEL_CPP, AUTO_UBATCH_H, MEASURE_H, SYCL_CPP)
 
 
 def test_grown_zone_is_announced():
@@ -661,14 +901,211 @@ def test_mutant_fit_room_without_the_helper_fails():
     """The term read straight from the getter credits a rung no PLACE decision sized the zone for."""
     assert not claim_fit_credits_the_placed_compute_room(
         _once(SYCL_CPP, FIT_ROOM,
-              "room_bytes = ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device); "
+              "const size_t room_bytes = ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device); "
               "room_n_ubatch = room_plan->explicit_ubatch.n_ubatch;"), ZONE_CPP, CACHE_CPP)
 
 
 def test_mutant_fit_credits_another_device_fails():
     assert not claim_fit_credits_the_placed_compute_room(
-        _once(SYCL_CPP, FIT_GATE, FIT_GATE.replace(" && room_plan->device_id == q.device", "", 1)), ZONE_CPP,
+        SYCL_CPP, ZONE_CPP,
+        _once(CACHE_CPP, PLAN_ROOM_GATE, PLAN_ROOM_GATE.replace(" && plan.device_id == device", "", 1)))
+
+
+def test_mutant_fit_planning_micro_batch_from_the_published_plan_fails():
+    """The published plan's planner_n_ubatch is the context's rung, so the credit would follow every rung."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, FIT_MEASURED,
+              FIT_MEASURED.replace("ggml_sycl::unified_cache_get_planned_compute_term_n_ubatch(q.device)",
+                                   "room_plan->planner_n_ubatch", 1)), ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_fit_never_reads_the_rung_again_fails():
+    """One read of each cannot tell a rung that the next load replaced after the bytes were read."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_RUNG_AGAIN, "const bool rung_unchanged = true;"))
+
+
+def test_mutant_fit_passes_the_bytes_through_a_mismatch_fails():
+    """The mismatch ignored: the term's bytes reach the room whatever the second read said."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_ROOM, FIT_ROOM.replace("rung_unchanged ? term_bytes : 0", "term_bytes", 1)))
+
+
+def test_mutant_fit_keeps_the_rung_through_a_mismatch_fails():
+    """The mismatch ignored for the rung: a no-record rung would be credited against a replaced record."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_WITHHOLD, "const uint32_t measured_n_ubatch = measured_first;"))
+
+
+def test_mutant_fit_reads_the_rung_again_before_the_bytes_fails():
+    """Both rung reads before the bytes prove nothing about the bytes."""
+    n = _once(SYCL_CPP, FIT_RUNG_AGAIN, "")
+    assert n.count(FIT_TERM_BYTES) == 1
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        n.replace(FIT_TERM_BYTES, FIT_RUNG_AGAIN + " " + FIT_TERM_BYTES, 1))
+
+
+def test_mutant_fit_reads_the_bytes_a_second_time_fails():
+    """A second bytes read after the guard could belong to a later load than the rung."""
+    assert not claim_fit_reads_the_rung_around_the_bytes(
+        _once(SYCL_CPP, FIT_ROOM,
+              FIT_ROOM.replace("rung_unchanged ? term_bytes : 0",
+                               "rung_unchanged ? ggml_sycl::unified_cache_get_planned_compute_term_bytes(q.device) : 0",
+                               1)))
+
+
+def test_mutant_plan_room_reads_the_plan_field_fails():
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, ZONE_CPP,
+        _once(CACHE_CPP, PLAN_ROOM_MEASURED,
+              PLAN_ROOM_MEASURED.replace("measured_n_ubatch", "plan.planner_n_ubatch")))
+
+
+def test_mutant_plan_room_credits_a_named_micro_batch_it_did_not_place_fails():
+    """A grow-zone or refused micro-batch sized no room at the planning shape either."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, ZONE_CPP,
+        _once(CACHE_CPP, PLAN_ROOM_MEASURED,
+              PLAN_ROOM_MEASURED.replace(
+                  "plan.explicit_ubatch.action == pp_moe_onednn_explicit_ubatch_action::NONE && ", "", 1)))
+
+
+def test_mutant_credit_given_to_the_held_out_rung_fails():
+    """The rung whose own buffer the hold kept out was not served by the zone, so it cannot be credited."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, CREDIT_RULE.replace(" || n_ubatch == in.held_out_n_ubatch", "", 1)),
         CACHE_CPP)
+
+
+def test_mutant_fit_never_names_the_held_out_rung_fails():
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, "in.held_out_n_ubatch = held_out ? (have_epoch ? epoch_n_ubatch : q.n_ubatch) : 0;",
+              "in.held_out_n_ubatch = 0;"), ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_fit_charges_the_asked_rung_for_the_epoch_spills_fails():
+    """A settle check asks a smaller rung after a losing one: the losing rung's spills would charge the asked one."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, "(have_epoch ? epoch_n_ubatch : q.n_ubatch)", "q.n_ubatch"), ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_credit_without_the_measured_rung_bound_fails():
+    """A rung between the measured rung and a larger placed micro-batch would be credited a term measured smaller."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP,
+        _once(ZONE_CPP, CREDIT_RULE,
+              CREDIT_RULE.replace(" && n_ubatch <= in.compute_room_measured_n_ubatch", "", 1)), CACHE_CPP)
+
+
+def test_mutant_fit_tells_a_measured_rung_without_a_room_fails():
+    """A measured rung beside a 0-byte room would credit rungs without a record against nothing."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, "room_bytes != 0 ? measured_n_ubatch : 0;", "measured_n_ubatch;"), ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_fit_holds_out_every_rung_fails():
+    """A held-out record that switches the room off names a width below one the zone was planned to serve."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, "in.compute_room_bytes = room_bytes;", "in.compute_room_bytes = held_out ? 0 : room_bytes;"),
+        ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_fit_never_reads_the_held_out_record_fails():
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, FIT_HELD_OUT, FIT_HELD_OUT.replace("held_out = totals.raw_count != 0;", "held_out = false;")),
+        ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_fit_consumes_the_held_out_record_fails():
+    """A take resets the counters the realized refusal then reports."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, FIT_HELD_OUT,
+              FIT_HELD_OUT.replace("unified_cache_get_recent_planned_hold_spills(",
+                                   "unified_cache_take_planned_hold_spills(")), ZONE_CPP, CACHE_CPP)
+
+
+def test_mutant_planning_micro_batch_recorded_by_the_transaction_fails():
+    """The transaction would record the context's rung, the value the published plan already carries."""
+    txn = body(norm(SYCL_CPP), TXN_SIG)
+    assert txn
+    n = _once(SYCL_CPP, PLANNING_SET, "")
+    n = n.replace(txn, txn[:-1] + " " + PLANNING_SET.replace("ggml_sycl_inventory_measure_n_ubatch(inventory)",
+                                                             "next_kv_info.n_ubatch") + " }", 1)
+    assert not claim_fit_reads_the_load_planning_micro_batch(n, CACHE_CPP)
+
+
+def test_mutant_planning_micro_batch_never_recorded_fails():
+    assert not claim_fit_reads_the_load_planning_micro_batch(_once(SYCL_CPP, PLANNING_SET, ""), CACHE_CPP)
+
+
+def test_mutant_planning_record_skips_the_store_rule_fails():
+    """A plain store would let the last load win where two loads disagree, a credit at the wrong shape."""
+    assert not claim_fit_reads_the_load_planning_micro_batch(
+        SYCL_CPP, _once(CACHE_CPP, PLANNING_SETTER_RULE, "uint32_t next = n_ubatch;"))
+
+
+def test_mutant_planning_warn_on_any_mark_fails():
+    """A WARN on any store that leaves the mark would repeat on every later disagreeing load."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, "if (zone_compute_term_n_ubatch_turns_off(stored, next)) {",
+              "if (next == k_zone_compute_term_n_ubatch_disagreed) {"))
+
+
+@pytest.mark.parametrize("constant", ["false", "true"])
+def test_mutant_planning_record_term_live_constant_fails(constant):
+    """A liveness that is not read from the merged term: false lets the last load win while two loads are live, a
+    credit at the wrong shape; true keeps a record turned off after every load that held a term is gone."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, PLANNING_TERM_LIVE, f"const bool term_live = {constant};"))
+
+
+def test_mutant_planning_record_plain_store_fails():
+    """A plain store lets two racing loads both see the transition, and both WARN."""
+    assert not claim_planning_record_warns_once(
+        _once(CACHE_CPP, PLANNING_CAS_LOOP,
+              "g_planned_compute_term_n_ubatch[device_id].store(next, std::memory_order_release);"))
+
+
+def test_mutant_planning_getter_reads_the_disagreement_mark_fails():
+    assert not claim_fit_reads_the_load_planning_micro_batch(
+        SYCL_CPP,
+        _once(CACHE_CPP, PLANNING_GETTER_RULE,
+              "return g_planned_compute_term_n_ubatch[device_id].load(std::memory_order_acquire);"))
+
+
+@pytest.mark.parametrize("where", ["inventory", "ladder", "measure"])
+def test_mutant_planning_micro_batch_moves_apart_from_the_measure_fails(where):
+    """Moving any one of the three makes the recorded micro-batch a shape the term was not measured at."""
+    model, ladder, measure = MODEL_CPP, AUTO_UBATCH_H, MEASURE_H
+    if where == "inventory":
+        m = INVENTORY_N_UBATCH_RE.search(model)
+        assert m
+        model = model[:m.start(1)] + str(int(m.group(1)) * 2) + model[m.end(1):]
+    elif where == "ladder":
+        m = LADDER_RE.search(ladder)
+        assert m
+        ladder = ladder[:m.start(1)] + str(int(m.group(1)) // 2) + ladder[m.end(1):]
+    else:
+        measure = re.sub(r"n_ubatch_hint(\s*):(\s*)llama_auto_ubatch_ladder\[0\];",
+                         r"n_ubatch_hint\1:\2llama_auto_ubatch_ladder[1];", measure, count=1)
+        assert measure != MEASURE_H
+    assert not claim_planning_micro_batch_is_the_measure_shape(model, ladder, measure)
+
+
+@pytest.mark.parametrize("where", ["params", "inventory", "reader"])
+def test_mutant_recorded_micro_batch_not_the_measured_one_fails(where):
+    """The measure back at a fixed rung, the inventory sending the planning rung, or the backend reading the planning
+    rung over the field: each records a micro-batch the term was not measured at."""
+    model, measure, sycl = MODEL_CPP, MEASURE_H, SYCL_CPP
+    if where == "params":
+        measure = _once(MEASURE_H, MEASURE_N_UBATCH, "params.n_ubatch = llama_auto_ubatch_ladder[0];")
+    elif where == "inventory":
+        model = _once(MODEL_CPP, INVENTORY_MEASURE, "inventory.n_ubatch_measure = inventory.n_ubatch;")
+    else:
+        sycl = _once(SYCL_CPP, MEASURE_READER, MEASURE_READER.replace(
+            "inventory->n_ubatch_measure != 0 ? inventory->n_ubatch_measure : inventory->n_ubatch",
+            "inventory->n_ubatch"))
+    assert not claim_planning_micro_batch_is_the_measure_shape(model, AUTO_UBATCH_H, measure, sycl)
 
 
 def test_mutant_fit_credit_after_the_demand_fails():
@@ -680,16 +1117,29 @@ def test_mutant_fit_credit_after_the_demand_fails():
 
 
 def test_mutant_credit_takes_part_of_a_larger_request_fails():
-    """Whole or nothing: a request above the room is held back whole and spills whole."""
+    """Whole or nothing: a rung's own request above the room is held back whole and spills whole."""
     assert not claim_fit_credits_the_placed_compute_room(
-        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, "return n_ubatch != 0 && n_ubatch == in.compute_room_n_ubatch;"),
+        SYCL_CPP,
+        _once(ZONE_CPP, CREDIT_RULE,
+              CREDIT_RULE.replace("if (own_record) { return request <= in.compute_room_bytes; }",
+                                  "if (own_record) { return true; }", 1)),
         CACHE_CPP)
 
 
-def test_mutant_credit_ignores_the_rung_fails():
-    """Every rung would be credited the room planned for one, the auto trial's included."""
+def test_mutant_credit_ignores_the_own_record_fails():
+    """Every request would be judged as a scaled estimate, so a rung's own record above the room would be credited."""
     assert not claim_fit_credits_the_placed_compute_room(
-        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, "return n_ubatch != 0 && request <= in.compute_room_bytes;"), CACHE_CPP)
+        SYCL_CPP,
+        _once(ZONE_CPP, DEMAND_CREDIT,
+              DEMAND_CREDIT.replace("zone_hold_fit_rung_has_record(in, n_ubatch)", "false", 1)), CACHE_CPP)
+
+
+def test_mutant_credit_ignores_the_rung_fails():
+    """Every rung above the room's would borrow a room sized for smaller buffers, the auto trial's larger rungs
+    included."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, _once(ZONE_CPP, CREDIT_RULE, CREDIT_RULE.replace(" || n_ubatch > in.compute_room_n_ubatch", "", 1)),
+        CACHE_CPP)
 
 
 def test_mutant_grown_zone_rule_drops_the_comparison_fails():
@@ -733,6 +1183,12 @@ def test_mutant_ensure_plans_the_unrounded_requirement_fails():
     inlined = ("if (!unified_cache_get_planned_runtime_zone_requirement(dev_id, &planned_runtime_scratch)) {")
     assert not claim_runtime_zone_is_one_reservation(
         ZONE_HPP, ZONE_CPP, _once(CACHE_CPP, ENSURE_CALL, inlined), ADMISSION_CPP, SYCL_CPP)
+
+
+def test_mutant_scratch_room_rounds_the_runtime_zone_itself_fails():
+    inlined = "if ((scratch_other_tail = (runtime_zone + 255) & ~size_t(255), true) &&"
+    assert not claim_runtime_zone_is_one_reservation(
+        ZONE_HPP, ZONE_CPP, _once(CACHE_CPP, ENSURE_ROOM_CALL, inlined), ADMISSION_CPP, SYCL_CPP)
 
 
 def test_mutant_room_rounds_the_zone_itself_fails():
@@ -791,17 +1247,19 @@ def test_mutant_grown_zone_warn_at_info_fails():
 def test_mutant_grown_zone_warn_before_the_plan_fails():
     """Asked before the late plan, the requirement is the previous stage's, not this plan's."""
     assert not claim_grown_zone_is_announced(
-        _once(SYCL_CPP, LATE_PLAN, "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); "
-                                   "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);"), ZONE_CPP)
+        _once(SYCL_CPP, LATE_PLAN, "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); " + LATE_REFUSE),
+        ZONE_CPP)
 
 
 def test_mutant_grown_zone_warn_from_the_early_plan_too_fails():
     """Asked from the early plan as well, one load prints it twice."""
     early = ("compute_vram_budget_for_plan(ctx, vram_budget, budget_pct, base_mem, free_mem); "
-             "compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct); }")
+             "if (!compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct)) { "
+             "if (plan_refused != nullptr) { *plan_refused = true; } return -1; } return ctx->device; }")
     n = norm(SYCL_CPP)
     assert n.count(early) == 1
-    n = n.replace(early, early[:-1] + "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); }", 1)
+    n = n.replace(early, early[:-len("return ctx->device; }")] +
+                  "ggml_sycl_warn_runtime_zone_kept_from_earlier_load(ctx->device); return ctx->device; }", 1)
     assert not claim_grown_zone_is_announced(n, ZONE_CPP)
 
 
@@ -809,8 +1267,21 @@ def test_mutant_credit_drops_the_plan_fails():
     assert not claim_fit_credits_the_placed_compute_room(
         SYCL_CPP,
         _once(ZONE_CPP, DEMAND_BOUND,
-              "zone_hold_spill_raw_demand(zone_hold_spill_bound(0, request, n_ubatch, n_ubatch), in.kv_room);"),
+              DEMAND_BOUND.replace("zone_hold_spill_bound(t.plan, ", "zone_hold_spill_bound(0, ", 1)),
         CACHE_CPP)
+
+
+def test_mutant_demand_with_its_own_arithmetic_fails():
+    """A demand that computes its own sum can drift from the terms the refusal prints beside it."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        SYCL_CPP, _once(ZONE_CPP, DEMAND_READER, "{ return zone_hold_fit_terms_at(in, n_ubatch).plan; }"), CACHE_CPP)
+
+
+def test_mutant_printed_demand_not_the_terms_fails():
+    """A printed demand read apart from the terms can disagree with the terms printed beside it."""
+    assert not claim_fit_credits_the_placed_compute_room(
+        _once(SYCL_CPP, FIT_DEMAND_FROM_TERMS, "a.demand = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);"),
+        ZONE_CPP, CACHE_CPP)
 
 
 def test_mutant_room_dips_into_the_kv_room_fails():
@@ -983,6 +1454,12 @@ def test_mutant_header_layout_unpinned_fails():
 def test_mutant_backend_ignores_the_field_fails():
     assert not claim_transport_names_no_micro_batch_for_auto(
         LLAMA_H, MODEL_CPP, _once(SYCL_CPP, BACKEND_COPY, ""), COMMON_CPP, BENCH_CPP)
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_transport_names_no_micro_batch_for_auto(
+        LLAMA_H, MODEL_CPP, _once(SYCL_CPP, INTAKE_CALL, ""), COMMON_CPP, BENCH_CPP)
 
 
 def test_mutant_default_hint_dropped_fails():

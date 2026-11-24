@@ -2,6 +2,7 @@
 #include "ggml-sycl/cpu-traits-support.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/unified-cache.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -754,6 +755,17 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             choice = choose_moe_batch_executor(admitted.batch.operands[0], 0, false, ws.total_bytes - 1);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
 
+            // On the card these types run through the MMVQ id kernel the capability query answers for any MMVQ id
+            // type: an MMVQ_COMPAT recipe carries no workspace, and the choice takes it as it takes Q4_0's.
+            auto compat =
+                route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 93);
+            compat.recipe.request = request;
+            auto compat_batch     = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return compat; });
+            CHECK(compat_batch);
+            choice = choose_moe_batch_executor(compat_batch.batch.operands[0], 0, true, 0);
+            CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE);
+
+            // The direct kernel's recipe is checked by its kernel: it binds its bounded workspace exactly.
             auto device =
                 route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 91);
             device.recipe.request = request;
@@ -763,12 +775,33 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(device_batch);
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
                                                device.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
-            moe_admitted_workspace_bundle ordinary_bundle;
+            CHECK(choice && choice.executor == moe_batch_executor::PRIMARY_DEVICE);
             choice = choose_moe_batch_executor(device_batch.batch.operands[0], 0, true,
-                                               device.recipe.workspace.total_bytes, &ordinary_bundle);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+                                               device.recipe.workspace.total_bytes - 1);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
 
+            // A direct recipe whose workspace is not the one its plan gives is refused, although it was admitted.
+            auto resized = device;
+            resized.recipe.workspace.output_f32_bytes += resized.recipe.workspace.alignment;
+            resized.recipe.workspace.total_bytes += resized.recipe.workspace.alignment;
+            auto resized_batch = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return resized; });
+            CHECK(resized_batch);
+            choice = choose_moe_batch_executor(resized_batch.batch.operands[0], 0, true,
+                                               resized.recipe.workspace.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
+
+            // The direct kernel stays bound to its types without a type test of the choice: its plan refuses Q4_0.
+            auto q4_direct =
+                route_for(&value, 0, moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 94);
+            q4_direct.recipe.kernel    = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
+            q4_direct.recipe.workspace = device.recipe.workspace;
+            auto q4_direct_batch       = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return q4_direct; });
+            CHECK(q4_direct_batch);
+            choice = choose_moe_batch_executor(q4_direct_batch.batch.operands[0], 0, true,
+                                               q4_direct.recipe.workspace.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
+
+            // Validator coverage only: no route produces a second-card direct-kernel recipe.
             auto secondary =
                 route_for(&value, 1, moe_batch_residency::SECONDARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS, 92);
             secondary.recipe.request = request;
@@ -782,7 +815,10 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             CHECK(secondary_batch);
             choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, true,
                                                secondary.recipe.workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+            CHECK(choice && choice.executor == moe_batch_executor::SECONDARY_DEVICE);
+            choice = choose_moe_batch_executor(secondary_batch.batch.operands[0], 0, false,
+                                               secondary.recipe.workspace.total_bytes);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::WRONG_QUEUE);
 
             auto soa                                 = device_batch.batch.operands[0];
             auto soa_canonical                       = std::make_shared<moe_resolved_operand_canonical>(soa.c());
@@ -790,7 +826,7 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             soa_canonical->admitted_recipe_signature = moe_execution_recipe_signature(soa_canonical->recipe);
             soa.canonical                            = soa_canonical;
             choice = choose_moe_batch_executor(soa, 0, true, soa.recipe().workspace.total_bytes);
-            CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
+            CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
         }
     }
     moe_workspace_recipe overflow;
@@ -822,6 +858,105 @@ static float host_executor_reference(ggml_type       type,
 
 static bool host_executor_output_matches(float got, float expected) {
     return std::isfinite(got) && std::fabs(got - expected) <= 1e-2f * (1.0f + std::fabs(expected));
+}
+
+static bool test_recipe_workspace_follows_the_planned_micro_batch() {
+    using namespace ggml_sycl;
+    const auto * traits = ggml_sycl_get_type_traits_cpu(GGML_TYPE_NVFP4);
+    CHECK(traits && traits->vec_dot);
+    const size_t q8_row_bytes = ggml_row_size(traits->vec_dot_type, 64);
+
+    // The planner: one NVFP4 routed expert tensor. The workspace is one micro-batch of tokens, the micro-batch the
+    // plan is built for, never top-k times a fixed 512.
+    std::vector<placement_tensor_info> inventory;
+    placement_tensor_info              item;
+    item.name  = "blk.0.ffn_up_exps.weight";
+    item.type  = GGML_TYPE_NVFP4;
+    item.ne[0] = 64;
+    item.ne[1] = 64;
+    item.ne[2] = 1;
+    item.ne[3] = 1;
+    item.size  = ggml_row_size(GGML_TYPE_NVFP4, item.ne[0]) * static_cast<size_t>(item.ne[1]);
+    inventory.push_back(item);
+    const std::vector<device_budget> devices = {
+        { 0, 1, 1 }
+    };
+    size_t previous = 0;
+    for (uint32_t n_ubatch : { 512u, 2048u }) {
+        placement_kv_info kv{};
+        kv.n_ctx                  = 4096;
+        kv.n_ubatch               = n_ubatch;
+        kv.n_expert_used          = 8;
+        const placement_plan plan = compute_multi_device_plan(devices, inventory, 1, multi_gpu_mode::HYBRID, kv,
+                                                              nullptr, 1, host_ledger_budget());
+        moe_route_request    request{ moe_route_phase::PROMPT, 64, 64, n_ubatch, GGML_TYPE_NVFP4, 0 };
+        moe_workspace_recipe expected;
+        CHECK(plan_moe_host_workspace(request, q8_row_bytes, sizeof(size_t) * 4, &expected));
+        CHECK(plan.moe_host_recipe_workspace_bytes == expected.total_bytes);
+        CHECK(plan.moe_host_recipe_workspace_bytes > previous);
+        previous = plan.moe_host_recipe_workspace_bytes;
+    }
+
+    // The rule: one row per token, the largest shape wins in either order, nothing for no tokens or no shapes, and
+    // an overflow is refused without writing the answer.
+    const std::vector<moe_host_recipe_shape> wide_last = {
+        { 64, 64,  q8_row_bytes },
+        { 64, 128, q8_row_bytes }
+    };
+    const std::vector<moe_host_recipe_shape> wide_first = {
+        { 64, 128, q8_row_bytes },
+        { 64, 64,  q8_row_bytes }
+    };
+    size_t bytes = 1;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_last, 0, &bytes) && bytes == 0);
+    bytes = 1;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at({}, 512, &bytes) && bytes == 0);
+    for (uint32_t n_tokens : { 1u, 512u, 513u, 2048u, 4096u }) {
+        moe_route_request    wide_request{ moe_route_phase::PROMPT, 64, 128, n_tokens, GGML_TYPE_NVFP4, 0 };
+        moe_workspace_recipe wide;
+        CHECK(plan_moe_host_workspace(wide_request, q8_row_bytes, sizeof(size_t) * 4, &wide));
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_last, n_tokens, &bytes));
+        CHECK(bytes == wide.total_bytes);
+        size_t bytes_wide_first = 0;
+        CHECK(placement_moe_host_recipe_workspace_bytes_at(wide_first, n_tokens, &bytes_wide_first));
+        CHECK(bytes_wide_first == wide.total_bytes);
+    }
+
+    // One figure built by hand, not by plan_moe_host_workspace(): a 64x64 shape at 512 tokens. NVFP4's vec-dot type
+    // is Q8_0, 34 bytes per 32 values, so one 64-wide activation row is 68 bytes. The regions, each starting on a
+    // 64-byte boundary: f32 activations 512 x 64 x 4 = 131072, Q8_0 activations 512 x 68 = 34816 (ends at 165888 =
+    // 2592 x 64), f32 output 512 x 64 x 4 = 131072 (ends at 296960 = 4640 x 64), descriptors 512 x 4 x 8 = 16384.
+    // No padding is needed, so the total is 313344.
+    const std::vector<moe_host_recipe_shape> square = {
+        { 64, 64, q8_row_bytes }
+    };
+    CHECK(q8_row_bytes == 68);
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(square, 512, &bytes) && bytes == 313344);
+    size_t bytes_1024 = 0;
+    CHECK(placement_moe_host_recipe_workspace_bytes_at(square, 1024, &bytes_1024) && bytes_1024 > bytes);
+
+    const std::vector<moe_host_recipe_shape> huge = {
+        { INT64_MAX / 2, 64, q8_row_bytes }
+    };
+    bytes = 7;
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(huge, 4096, &bytes) && bytes == 7);
+
+    // A bad input is refused at every token count, 0 included, and leaves the answer unwritten.
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(square, 512, nullptr));
+    CHECK(!placement_moe_host_recipe_workspace_bytes_at(square, 0, nullptr));
+    const std::vector<moe_host_recipe_shape> bad_shapes[] = {
+        { { 0, 64, q8_row_bytes } },
+        { { 64, -1, q8_row_bytes } },
+        { { 64, 64, 0 } },
+        { { 64, 64, q8_row_bytes }, { -64, 64, q8_row_bytes } },
+    };
+    for (const std::vector<moe_host_recipe_shape> & bad : bad_shapes) {
+        for (uint32_t n_tokens : { 0u, 1u, 512u }) {
+            bytes = 7;
+            CHECK(!placement_moe_host_recipe_workspace_bytes_at(bad, n_tokens, &bytes) && bytes == 7);
+        }
+    }
+    return true;
 }
 
 static bool test_numerical_q1_nvfp4_host_executor() {
@@ -1070,7 +1205,8 @@ int main() {
         !test_prompt_local_view_uses_exact_retained_handles() ||
         !test_planned_prompt_hybrid_identity_readiness_and_layout_miss() ||
         !test_retained_role_alignment_and_terminal_transaction() || !test_recipe_matrix_workspace_and_immutability() ||
-        !test_numerical_q1_nvfp4_host_executor() || !test_decode_admission_is_route_mode_independent()) {
+        !test_recipe_workspace_follows_the_planned_micro_batch() || !test_numerical_q1_nvfp4_host_executor() ||
+        !test_decode_admission_is_route_mode_independent()) {
         return 1;
     }
     if (!test_staged_ring_route_contract() || !test_admission_entry_reuse_is_graph_keyed_for_staged_bundles()) {

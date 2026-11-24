@@ -15,13 +15,16 @@ source_reason=0`.  Two defects made that pair uninformative:
 Both are fixed at the source of the number rather than in the reader, so every
 future refusal arrives with reasons instead of archaeology.
 
-The same holds for the Q1_0/NVFP4 direct route in ggml_sycl_mul_mat_id. Those
-types run nowhere else, so a call the direct block declines falls through to the
-retained route core, whose refusal (reason=capability_unsupported) names that
-core's own refusal, not the step of the direct route that declined. Each exit
-that falls through the block therefore prints a line naming its step, and so
-does the adapter's refusal after the mark, before its throw
-(direct_decline_violations below).
+The same holds for the Q1_0/NVFP4 direct route in ggml_sycl_mul_mat_id. A call
+the direct block declines before its mark falls through to the retained route
+core, which runs it, or names its own refusal; neither line says which step of
+the direct route declined. Each exit that falls through the block therefore
+prints a line naming its step. That line is a decline, not a refusal: it carries
+the [MOE-DIRECT-DECLINE] tag and no refusal label, so a count of refusals does
+not count an op that ran. The two refusals after the mark (the host job's input
+marker and the kernel adapter) end the op with a throw; each prints its step
+under the phase's refusal label before the throw (direct_decline_violations
+below).
 """
 from pathlib import Path
 import re
@@ -73,19 +76,26 @@ def violations(batch: str, sycl: str) -> list[str]:
 
 
 DIRECT_DECLINE = "ggml_sycl_moe_direct_log_decline("
+DIRECT_REFUSAL = "ggml_sycl_moe_direct_log_refusal("
+# The decline's tag and format: a phase field, not a refusal label.
+DIRECT_DECLINE_TAG = "[MOE-DIRECT-DECLINE]"
+DIRECT_DECLINE_FORMAT = "[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct step=%s %s\\n"
+DIRECT_REFUSAL_FORMAT = "[%s] tensor=%s route=direct step=%s %s\\n"
 DIRECT_GATE = "if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&"
 DIRECT_END = "// MoE hybrid GPU+CPU dispatch gate"
 # The success path ends at the return right after the terminal host task is recorded.
 DIRECT_SUCCESS = "ggml_sycl::unified_cache_note_host_task(*exact_queue, terminal_task);"
 DIRECT_PRECONDITION = "if (card_or_host &&"
 # Each step that can decline a call once it has a batch, in the order the route reaches them; "layout" is the gate's
-# own remaining conjunct, the host_* steps are a mixed batch's host leg refused before admission, and
-# "host_marker_arm" (the cache refusing the host job's input marker) and "adapter" (the kernel adapter's refusal) come
-# after the mark.
-DIRECT_STEPS = ("layout", "precondition", "host_input_marker", "host_task", "host_workspace", "retained_table",
-                "binding", "table_owner_retain", "private_table_owner", "queue_capability", "invocation_snapshot",
-                "submission_authority", "authority_issuer", "workspace_admission", "workspace_slices",
-                "host_marker_arm", "adapter")
+# own remaining conjunct and the host_* steps are a mixed batch's host leg declined before admission. Each falls
+# through to the retained route core.
+DIRECT_DECLINE_STEPS = ("layout", "precondition", "host_input_marker", "host_task", "host_workspace",
+                        "retained_table", "binding", "table_owner_retain", "private_table_owner", "queue_capability",
+                        "invocation_snapshot", "submission_authority", "authority_issuer", "workspace_admission",
+                        "workspace_slices")
+# The steps after the mark, which refuse with a throw that fails the op: "host_marker_arm" (the cache refusing the host
+# job's input marker) and "adapter" (the kernel adapter's refusal).
+DIRECT_REFUSAL_STEPS = ("host_marker_arm", "adapter")
 # The precondition's conjuncts are named bools, computed once: the condition and the decline's failed= list read the
 # same bools, and each note's label is the bool's name.
 CONJUNCT_DECL = re.compile(r"\bconst\s+bool\s+(\w+)\s*=")
@@ -238,19 +248,38 @@ def precondition_violations(sycl: str, code: str, condition_open: int, condition
     return found
 
 
-def direct_decline_violations(sycl: str) -> list[str]:
-    """Every exit that falls through the Q1_0/NVFP4 direct block prints one line naming the step that declined."""
-    found: list[str] = []
-    helper_at = sycl.find("static void " + DIRECT_DECLINE)
+def helper_body(sycl: str, call: str) -> str | None:
+    """The body of the static helper whose call is `call`: the definition, not a declaration."""
+    helper_at = sycl.find("static void " + call)
     if helper_at < 0:
-        return ["the direct-route decline helper is missing"]
-    # The definition, not the declaration that carries the format attribute.
+        return None
     definition_at = sycl.find(") {", helper_at)
-    helper = sycl[definition_at:sycl.find("\n}\n", definition_at)]
-    if "route=direct step=%s" not in helper:
-        found.append("the decline line does not name its step")
-    if not ("MOE-DECODE-REFUSAL" in helper and "MOE-PROMPT-REFUSAL" in helper and "tensor=%s" in helper):
-        found.append("the decline line does not carry the phase label and the tensor")
+    return sycl[definition_at:sycl.find("\n}\n", definition_at)]
+
+
+def direct_decline_violations(sycl: str) -> list[str]:
+    """Every exit that falls through the Q1_0/NVFP4 direct block prints one decline line naming the step that declined,
+    and every refusal after the mark prints one refusal line naming its step before it throws."""
+    found: list[str] = []
+    decline = helper_body(sycl, DIRECT_DECLINE)
+    refusal = helper_body(sycl, DIRECT_REFUSAL)
+    if decline is None:
+        return ["the direct-route decline helper is missing"]
+    if refusal is None:
+        return ["the direct-route refusal helper is missing"]
+    # A decline falls through to an executor that runs the op: its line is not a refusal and carries no refusal label.
+    if DIRECT_DECLINE_FORMAT not in decline:
+        found.append("the decline line does not print the decline tag, the phase, the tensor and its step")
+    if not ('"decode"' in decline and '"prompt"' in decline):
+        found.append("the decline line does not name its phase")
+    if "REFUSAL" in decline:
+        found.append("the decline line carries a refusal label, but the op it names runs on the retained route core")
+    if DIRECT_REFUSAL_FORMAT not in refusal:
+        found.append("the refusal line does not print its label, the tensor and its step")
+    if not ("MOE-DECODE-REFUSAL" in refusal and "MOE-PROMPT-REFUSAL" in refusal):
+        found.append("the refusal line does not carry the phase's refusal label")
+    if DIRECT_DECLINE_TAG in refusal:
+        found.append("the refusal line carries the decline tag")
 
     gate_at = sycl.find(DIRECT_GATE)
     end_at = sycl.find(DIRECT_END, gate_at)
@@ -275,17 +304,25 @@ def direct_decline_violations(sycl: str) -> list[str]:
             found.append(f"an exit falls through without a named line: the if block at line {line} has no else")
         elif DIRECT_DECLINE not in code[body[0]:body[1]]:
             found.append(f"an exit falls through without a named line: the else of the if block at line {line}")
+        elif DIRECT_REFUSAL in code[body[0]:body[1]]:
+            found.append(f"an exit that falls through prints a refusal line: the else of the if block at line {line}")
 
     # The step is a literal, so it is read from the source; a match counts only where the comment-blanked code still
-    # has the helper there, so a comment that quotes the call names no step.
+    # has the helper there, so a comment that quotes the call names no step. Each helper names only its own steps.
     direct = sycl[gate_at:end_at]
-    for step in DIRECT_STEPS:
-        named = re.finditer(re.escape(DIRECT_DECLINE) + r'\s*src0,\s*ne12,\s*"' + step + '"', direct)
-        if not any(code.startswith(DIRECT_DECLINE, gate_at + m.start()) for m in named):
-            found.append(f"no decline line names the step {step}")
+    for helper, steps, other, kind in ((DIRECT_DECLINE, DIRECT_DECLINE_STEPS, DIRECT_REFUSAL_STEPS, "decline"),
+                                       (DIRECT_REFUSAL, DIRECT_REFUSAL_STEPS, DIRECT_DECLINE_STEPS, "refusal")):
+        calls = [m for m in re.finditer(re.escape(helper) + r'\s*src0,\s*ne12,\s*"(\w+)"', direct)
+                 if code.startswith(helper, gate_at + m.start())]
+        for step in steps:
+            if not any(m.group(1) == step for m in calls):
+                found.append(f"no {kind} line names the step {step}")
+        for m in calls:
+            if m.group(1) in other:
+                found.append(f"a {kind} line names the step {m.group(1)}, which is not a {kind}")
 
     # A refusal that throws after the mark leaves the block by the catch, not by an else: its own block prints the
-    # line before the throw.
+    # refusal line before the throw, and no decline line, since nothing runs the op after it.
     failures = [m.start() for m in re.finditer(re.escape(SUBMIT_FAILURE), code[gate_at:end_at])]
     if not any(not under_testing_macro(sycl, gate_at, gate_at + at) for at in failures):
         found.append("the direct block has no submit failure outside the test build")
@@ -294,8 +331,11 @@ def direct_decline_violations(sycl: str) -> list[str]:
         if under_testing_macro(sycl, gate_at, at):
             continue
         block = enclosing_open_brace(code, at)
-        if DIRECT_DECLINE not in code[block:at]:
-            found.append(f"the submit failure at line {sycl.count(chr(10), 0, at) + 1} throws without a named line")
+        line = sycl.count(chr(10), 0, at) + 1
+        if DIRECT_REFUSAL not in code[block:at]:
+            found.append(f"the submit failure at line {line} throws without a named refusal line")
+        if DIRECT_DECLINE in code[block:at]:
+            found.append(f"the submit failure at line {line} prints a decline line, but the op fails")
 
     # The precondition's line names every conjunct that failed, from the bools the condition reads.
     precondition_at = code.find(DIRECT_PRECONDITION, gate_at, end_at)
@@ -393,16 +433,38 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
                                               'note(ids_device_ptr != nullptr, "ids_device");', 1),
         # The adapter's refusal after the mark throws with no line.
         "adapter-refusal-unnamed": re.sub(
-            r'\n\s*ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
+            r'\n\s*ggml_sycl_moe_direct_log_refusal\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
             r'moe_direct_submit_failure\{\};)', "", sycl, count=1, flags=re.DOTALL),
         # The adapter's line is gone and a comment names the helper in its place: the throw still prints nothing. A
         # real "adapter" line elsewhere keeps the step named, so only the throw's own block can witness this.
         "adapter-refusal-commented": re.sub(
-            r'ggml_sycl_moe_direct_log_decline\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
+            r'ggml_sycl_moe_direct_log_refusal\(\s*src0, ne12, "adapter",.*?\);(?=\n\s*throw '
             r'moe_direct_submit_failure\{\};)',
-            '// ggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", ...) is printed by the caller', sycl,
+            '// ggml_sycl_moe_direct_log_refusal(src0, ne12, "adapter", ...) is printed by the caller', sycl,
             count=1, flags=re.DOTALL).replace(
-            DIRECT_SUCCESS, DIRECT_SUCCESS + '\nggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", "");', 1),
+            DIRECT_SUCCESS, DIRECT_SUCCESS + '\nggml_sycl_moe_direct_log_refusal(src0, ne12, "adapter", "");', 1),
+        # The adapter's refusal prints a decline line: the op fails, but a refusal count would not see it.
+        "adapter-refusal-as-decline": re.sub(
+            r'ggml_sycl_moe_direct_log_refusal\((\s*src0, ne12, "adapter",)', r"ggml_sycl_moe_direct_log_decline(\1",
+            sycl, count=1),
+        # The host marker's refusal prints a decline line.
+        "host-marker-refusal-as-decline": re.sub(
+            r'ggml_sycl_moe_direct_log_refusal\((\s*src0, ne12, "host_marker_arm",)',
+            r"ggml_sycl_moe_direct_log_decline(\1", sycl, count=1),
+        # An exit that falls through prints a refusal line, though the retained route core runs the op.
+        "admission-decline-as-refusal": sycl.replace(
+            'ggml_sycl_moe_direct_log_decline(src0, ne12, "workspace_admission",',
+            'ggml_sycl_moe_direct_log_refusal(src0, ne12, "workspace_admission",', 1),
+        # The decline helper prints the phase's refusal label again.
+        "decline-tagged-refusal": sycl.replace(
+            '"[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct step=%s %s\\n"',
+            '"[%s] tensor=%s route=direct step=%s %s\\n"', 1).replace(
+            'ne12 == 1 ? "decode" : "prompt"', 'ne12 == 1 ? "MOE-DECODE-REFUSAL" : "MOE-PROMPT-REFUSAL"', 1),
+        # The refusal helper prints the decline tag.
+        "refusal-tagged-decline": sycl.replace(
+            '"[%s] tensor=%s route=direct step=%s %s\\n", ne12 == 1 ? "MOE-DECODE-REFUSAL" : "MOE-PROMPT-REFUSAL"',
+            '"[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct step=%s %s\\n", ne12 == 1 ? "decode" : "prompt"',
+            1),
         # An else whose only mention of the helper is a comment prints nothing. A real "workspace_slices" line
         # elsewhere keeps the step named, so only the else check can witness this.
         "else-commented": re.sub(
@@ -413,15 +475,21 @@ def test_direct_route_decline_mutations_are_witnessed() -> None:
             DIRECT_SUCCESS + '\nggml_sycl_moe_direct_log_decline(src0, ne12, "workspace_slices", "");', 1),
         # The adapter's line names another step; only a comment names "adapter".
         "step-commented": sycl.replace(
-            'ggml_sycl_moe_direct_log_decline(\n                                    src0, ne12, "adapter",',
-            '// ggml_sycl_moe_direct_log_decline(src0, ne12, "adapter", ...)\n'
-            '                                ggml_sycl_moe_direct_log_decline(\n'
+            'ggml_sycl_moe_direct_log_refusal(\n                                    src0, ne12, "adapter",',
+            '// ggml_sycl_moe_direct_log_refusal(src0, ne12, "adapter", ...)\n'
+            '                                ggml_sycl_moe_direct_log_refusal(\n'
             '                                    src0, ne12, "binding",', 1),
         # The gate's layout conjunct falls through unnamed.
         "layout-unnamed": re.sub(r'\} else if \(\(src0->type == GGML_TYPE_Q1_0.*?"layout".*?\);\n    \}', "}",
                                  sycl, count=1, flags=re.DOTALL),
-        # The line no longer says which step declined.
-        "format-without-step": sycl.replace("route=direct step=%s %s\\n", "route=direct %s %s\\n", 1),
+        # The decline line no longer says which step declined.
+        "decline-format-without-step": sycl.replace(
+            "[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct step=%s %s\\n",
+            "[MOE-DIRECT-DECLINE] phase=%s tensor=%s route=direct %s %s\\n", 1),
+        # The refusal line no longer says which step refused.
+        "refusal-format-without-step": sycl.replace(
+            '"[%s] tensor=%s route=direct step=%s %s\\n", ne12 == 1',
+            '"[%s] tensor=%s route=direct %s %s\\n", ne12 == 1', 1),
     }
     for name, mutated in mutations.items():
         assert mutated != sycl, f"mutation {name} did not change the source"

@@ -79,9 +79,11 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_fro
 GGML_BACKEND_API bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il);
 
 // Whether the active placement plan leaves any part of the graph for the CPU to
-// execute: a host-planned dense layer, host-planned KV, a dense weight host-planned
-// by supports_op's own residency rule (including weights outside any layer, such
-// as token_embd or output), or an expert tensor with no expert on a device. False
+// execute: a host-planned dense layer, host-planned KV, a dense weight whose type
+// has no device MUL_MAT kernel (supports_op refuses that MUL_MAT wherever the
+// weight sits), a dense weight host-planned by supports_op's own residency rule
+// (including weights outside any layer, such as token_embd or output), or an
+// expert tensor with no expert on a device. False
 // when no plan is active. llama-context reads it to decide whether the CPU
 // backend's compute buffer needs the dedicated activation buffer type above; it
 // must be read AFTER the last placement re-plan, and the plan is process-global
@@ -103,6 +105,46 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(v
 // Exact current-registry host buffer type for a specific SYCL device. Returns
 // NULL for foreign/stale devices; never falls back to a default device.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev);
+
+// The mapped host buffer type for a SYCL device (design 5efe §4.3), named "SYCL_Mapped". A weight in it lives in the
+// model file's mapping: is_host is true so the CPU backend executes ops on it, it is read-only (set_tensor and
+// memset_tensor abort naming the tensor, clear naming the buffer's size), and its buffers come only from
+// ggml_backend_sycl_mapped_buffer_from_file.
+// NULL for a device that is not a current SYCL device.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_mapped_buffer_type_for_device(ggml_backend_dev_t dev);
+
+// A weight tensor's byte range in a model file, as the loader read it from the GGUF.
+struct ggml_sycl_mapped_tensor_range {
+    const char * name;
+    uint64_t     file_offset;
+    uint64_t     size;
+};
+
+// A range of a model file, [file_offset, file_offset + length).
+struct ggml_sycl_file_range {
+    uint64_t file_offset;
+    uint64_t length;
+};
+
+// Maps one model file's slice for a SYCL_Mapped context through the unified cache's file-mapping tier
+// (design 5efe §4.3, §5.1). The reservation spans the tensors' ranges; the mapped segments are their page-aligned
+// union with every lazy range left out (lazy_ranges is the loader's excluded_for_file(file_idx)), and a tensor that
+// overlaps a lazy range is refused. Host-executed tensors are advised WILLNEED, the lazy edges RANDOM, and under
+// -lm mmap+mlock the host-executed segments are locked; a lock failure refuses the load, naming errno, the bytes and
+// RLIMIT_MEMLOCK. fd is the loader's descriptor, which the tier duplicates. The buffer's base is the address of file
+// offset *out_base_file_offset (the reservation's first page), so a tensor at file offset offs lives at
+// base + (offs - *out_base_file_offset). NULL when the build has no tier, the bound load's staged plan does not map
+// files, or the mapping is refused (the reason is logged).
+GGML_BACKEND_API ggml_backend_buffer_t
+ggml_backend_sycl_mapped_buffer_from_file(ggml_backend_dev_t                           dev,
+                                          uint32_t                                     file_idx,
+                                          int                                          fd,
+                                          uint64_t                                     file_size,
+                                          const struct ggml_sycl_mapped_tensor_range * tensor_ranges,
+                                          size_t                                       n_tensor_ranges,
+                                          const struct ggml_sycl_file_range *          lazy_ranges,
+                                          size_t                                       n_lazy_ranges,
+                                          uint64_t *                                   out_base_file_offset);
 
 // Dedicated pinned-host buffer type for runtime-demoted KV layers (distinct
 // identity/name "SYCL_KV_Host" from the generic host buft above, so the
@@ -248,6 +290,28 @@ struct ggml_sycl_tensor_info {
     int64_t        ne[GGML_MAX_DIMS];
 };
 
+// A lazy table (th32 §4.1): a row table read per ubatch, either from a locked host body or from the file, which the
+// planner places by its own rule and never as a tensor. It is carried apart from ggml_sycl_tensor_info, so no zone
+// maximum the tensors size ever counts it. row_size is one row's bytes in the file's type; rows_per_token the rows one
+// token reads; consumer_layer the layer that reads it (-1 = unknown); file_index, file_offset and size the table's byte
+// range in the model's files.
+struct ggml_sycl_lazy_table_info {
+    const char *   name;
+    enum ggml_type type;
+    uint32_t       rows_per_token;
+    int64_t        ne[GGML_MAX_DIMS];
+    size_t         row_size;
+    int32_t        consumer_layer;
+    uint32_t       file_index;
+    size_t         file_offset;
+    size_t         size;
+    // Set by libllama for a table it never wants held whole on the host: the planner never places it HOST (it is
+    // STORAGE, or the plan refuses) and caps its row cache (unified-cache.cpp, placement_plan_decide_lazy_residency).
+    // The array of these is indexed by sizeof on the libggml-sycl side, so libllama and libggml-sycl must be rebuilt
+    // together.
+    bool           storage_only;
+};
+
 // llama.cpp-3aos: per-layer attention/KV kind, carried by
 // ggml_sycl_tensor_inventory::kv_layer_kind[] below. SHARED covers layers
 // with no K/V tensors of their own (Gemma 4/3n's reuse pattern,
@@ -261,6 +325,14 @@ enum ggml_sycl_kv_layer_kind {
     GGML_SYCL_KV_LAYER_SHARED = 2,  // no K/V of its own -- reuses an earlier layer's, or the KV cache holds none
 };
 
+// The host weight layout libllama resolved GGML_SYCL_HOST_WEIGHT_LAYOUT to, as ggml_sycl_tensor_inventory carries it
+// in one byte. OFF is 0, a zeroed inventory's value, and CPU keeps the 1 the byte held when it was a bool for cpu.
+enum ggml_sycl_host_weight_layout {
+    GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF   = 0,  // the loader binds its usual buffer types for a planner-host weight
+    GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU   = 1,  // a CPU-owned buffer, repacked where ggml-cpu repacks (the default)
+    GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN = 2,  // a CPU-owned buffer in the file layout
+};
+
 struct ggml_sycl_tensor_inventory {
     struct ggml_sycl_tensor_info * tensors;
     size_t                         count;
@@ -269,18 +341,22 @@ struct ggml_sycl_tensor_inventory {
     // Computed from the largest quantized weight tensor as 2 x (n_elements * sizeof(fp16)).
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
-    // Slots hold one dequantized expert weight, one f16 activation tile, and one f32 output tile.
+    // The weight slot is sized for every expert in the GEMM's weight form: the WOQ repack (4-bit values and e8m0
+    // scales) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on the executor's f16 arm
+    // stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows and the output slot
+    // f32 output rows.
     // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
+    // Unused: the loader writes 0 to both, and they stay because the layout static_asserts after this struct pin its
+    // size and offsets. The backend sizes the activation and output slots (pp_moe_onednn_slots_at) from the per-row
+    // bytes and the expert counts below, for the micro-batch a context runs.
     size_t                         pp_moe_onednn_activation_slot_bytes;
     size_t                         pp_moe_onednn_output_slot_bytes;
+    // Unread by the backend, which sizes the whole ring itself. The loader writes ring_depth * weight slot.
     size_t                         pp_moe_onednn_scratch_bytes;
-    // llama.cpp-ibj0: per-row bytes behind the two slot sizes above (activation
-    // slot = align256(n_ubatch * pp_moe_onednn_activation_bytes_per_row), output
-    // slot analogous) -- carried into the backend so the runtime-context
-    // transaction can re-plan the ring for the REAL runtime n_ubatch instead of
-    // the load-time default this struct's n_ubatch field below is fixed to (512).
-    // 0 for a dense model (no MoE PP ring).
+    // Bytes of one activation scratch row (the widest expert's input width in half floats) and of one output scratch
+    // row (its output width in floats). The backend multiplies them by the rows the packed scratch can need at the
+    // context's micro-batch, which depend on n_expert and n_expert_used below. 0 for a dense model (no MoE PP ring).
     size_t                         pp_moe_onednn_activation_bytes_per_row;
     size_t                         pp_moe_onednn_output_bytes_per_row;
     uint32_t                       pp_moe_onednn_ring_depth;
@@ -351,10 +427,11 @@ struct ggml_sycl_tensor_inventory {
     const uint8_t *                kv_layer_kind;         // Per-layer enum ggml_sycl_kv_layer_kind [kv_layer_count]
     uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds on the device ahead of the
-    // routed experts; n_ctx above stays the load's own planning shape. llama.cpp-ak0p: libllama fills it with the
-    // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for
-    // a single sequence; a caller that names no n_ctx asks for the model's default context, n_ctx_train
-    // (n_ctx_context_is_default, llama.cpp-7fmt). 0 = no request reached the load: no room is held. libllama and
+    // routed experts and which the oneDNN Graph scratch floor is sized for; n_ctx above stays the load's own planning
+    // shape. llama.cpp-ak0p: libllama fills it with the context the caller is about to create
+    // (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for a single sequence; a caller that names
+    // no n_ctx asks for the model's default context, n_ctx_train (n_ctx_context_is_default, llama.cpp-7fmt). 0 = no
+    // request reached the load: no room is held, and the floor takes the planning shape's n_ctx. libllama and
     // libggml-sycl must be rebuilt together for the planner to see it (see n_ctx_context_is_default for the layout).
     uint32_t                       n_ctx_context;
     // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
@@ -377,35 +454,90 @@ struct ggml_sycl_tensor_inventory {
     // before this field passes a 184-byte object, and libggml-sycl would read this byte past its end. libllama and
     // libggml-sycl must be rebuilt together.
     bool                           n_ctx_context_is_default;
+    // What only libllama knows about this load's storage (design 5efe §4.3), as libllama resolved it: these are inputs,
+    // not the load's host-backing fact. use_mmap_resolved: libllama's use_mmap after -lm and the device caps (an iGPU
+    // in the device set forces it off). use_mlock_resolved: -lm mlock or mmap+mlock. The staging proc derives the fact
+    // from them once, load_maps_files = use_mmap_resolved && the file-mapping tier exists in this build, and the plan
+    // holds it.
+    // host_weight_layout: the value libllama resolved GGML_SYCL_HOST_WEIGHT_LAYOUT to (enum
+    // ggml_sycl_host_weight_layout), from its three-valued resolver, host_weight_layout() in llama-model-loader.cpp,
+    // which is that variable's only reader, so the planner takes libllama's answer instead of reading the environment a
+    // second time. The planner reads all three values. cpu, the default, is the one layout whose planner-host dense
+    // weights ggml-cpu repacks into a buffer of its own, the state the planner backs CPU_OWNED on a load that maps
+    // files (§4.4). cpu and plain both put a planner-host dense weight of a load that maps no files in a CPU-owned
+    // buffer, not the loader's SYCL_Host buffer, which the loader term counts; off leaves it in SYCL_Host. A zeroed
+    // inventory carries off, and a reader compares the byte with a named value, never tests it as a bool.
+    // The three sit in the padding after n_ctx_context_is_default (offsets 185-187), so they add no bytes to it. A
+    // libllama built before them leaves those bytes unspecified, which is safe only because the staging proc that reads
+    // them is exported under a new name (ggml_backend_sycl_stage_load_inventory_plan): such a libllama resolves the old
+    // name, whose stub refuses the load, and never reaches a reader of these bytes. libllama and libggml-sycl must be
+    // rebuilt together.
+    bool                           use_mmap_resolved;
+    bool                           use_mlock_resolved;
+    uint8_t                        host_weight_layout;
     // The micro-batch the caller named for the context it is about to create (llama_model_params::n_ubatch_hint);
     // 0 = none named, which includes a micro-batch the backend picks itself. When it is above n_ubatch, the planner
     // plans the PP MoE oneDNN scratch ring in the RUNTIME zone for it and moves routed experts from the device to the
-    // host tier for the room, as it re-places KV that does not fit. It sits in the padding after the bool above, so it
-    // added no bytes to the struct. A libllama built before this field leaves the padding as the caller's object holds
-    // it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must still be rebuilt together for
-    // the planner to see it.
+    // host tier for the room, as it re-places KV that does not fit. The oneDNN Graph scratch floor is sized for it and
+    // n_ctx_context; when it is 0, for the planning micro-batch (the placement envelope's n_ubatch when the envelope
+    // names one, else n_ubatch). It sits in the padding after the bools, so it adds
+    // no bytes (the size is pinned below and in ggml-sycl.cpp). A libllama built before this field leaves the padding
+    // as the caller's object holds it: zero for every `= {}` inventory libllama builds. libllama and libggml-sycl must
+    // still be rebuilt together for the planner to see it.
     uint32_t                       n_ubatch_context;
+    // th32 §4.1: the lazy tables [lazy_table_count], an inventory class of their own: the planner decides each one's
+    // residency (§4.3 step 4) and none enters `tensors`, so max_tensor and every zone maximum leave them out. NULL with
+    // a count of 0 is a model with none, which every `= {}` inventory libllama builds reads as. A nonzero count with
+    // NULL is refused as a null `tensors` is: the stage and the dry run return GGML_SYCL_LIFECYCLE_NULL_OUTPUT, and the
+    // two direct entries plan nothing. Appended: the struct grew from 192 to 208 bytes, which the static_asserts below
+    // and ggml-sycl.cpp pin. The struct carries no size field, so a libllama built before these fields passes a
+    // 192-byte object: libggml-sycl then reads these 16 bytes past the end of the caller's object, and with a nonzero
+    // count dereferences whatever lies there as an array of tables. libllama and libggml-sycl must be rebuilt together.
+    const struct ggml_sycl_lazy_table_info * lazy_tables;
+    uint32_t                                 lazy_table_count;
+    // The micro-batch the load measured its compute term at (libllama's llama_load_measure_shape_resolve over the
+    // caller's hints), which the backend credits the term at. It sits in the padding after lazy_table_count, so it
+    // added no bytes. libllama and libggml-sycl are rebuilt together. When the field is 0 the backend reads n_ubatch
+    // instead.
+    uint32_t                                 n_ubatch_measure;
     // The weight layer (`blk.N`) that executes each KV cache slot [kv_layer_phys_count]. A looped model runs one weight
     // layer for several slots, and the planner puts each slot's KV where the layer that executes it has its weights.
     // The backend accepts the map only when kv_layer_phys_count == kv_layer_count and every entry is valid, that is in
     // range [0, kv_layer_count); otherwise, a nonzero count with a NULL map included, it plans every slot as its own
     // layer and says so at WARN. A count of 0 and an identity map both mean every slot is its own layer. Appended: the
-    // struct grew from 192 to 208 bytes, pinned below and in ggml-sycl.cpp. The struct carries no size field, so a
-    // libllama built before these fields passes a 192-byte object, and libggml-sycl reads the 16 bytes past its end as
+    // struct grew from 208 to 224 bytes, pinned below and in ggml-sycl.cpp. The struct carries no size field, so a
+    // libllama built before these fields passes a 208-byte object, and libggml-sycl reads the 16 bytes past its end as
     // a pointer and a count: this layout does not protect a stale producer. libllama and libggml-sycl must be rebuilt
     // together.
-    const int32_t *                kv_layer_phys;
-    uint32_t                       kv_layer_phys_count;
+    const int32_t *                          kv_layer_phys;
+    uint32_t                                 kv_layer_phys_count;
 };
 
 #if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
-// Both sides of the dlopen boundary compile the inventory's layout from here: libllama, which fills it, and
-// libggml-sycl, which reads it (ggml-sycl.cpp pins the same figures). A field that moves fails both builds instead of
-// being read from the wrong place.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
+// Both sides of the dlopen boundary compile the inventory's layout and each lazy table's from here: libllama, which
+// fills them, and libggml-sycl, which reads them (ggml-sycl.cpp pins the same figures). A field that moves fails both
+// builds instead of being read from the wrong place.
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 224, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
-static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 192, "kv_layer_phys moved");
-static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 200, "kv_layer_phys_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 208, "kv_layer_phys moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 216, "kv_layer_phys_count moved");
+static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
+static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, rows_per_token) == 12, "lazy table rows_per_token moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, ne) == 16, "lazy table ne moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, row_size) == 48, "lazy table row_size moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, consumer_layer) == 56, "lazy table consumer_layer moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, file_index) == 60, "lazy table file_index moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, file_offset) == 64, "lazy table file_offset moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, size) == 72, "lazy table size moved");
+static_assert(offsetof(ggml_sycl_lazy_table_info, storage_only) == 80, "lazy table storage_only moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mmap_resolved) == 185, "use_mmap_resolved left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, use_mlock_resolved) == 186, "use_mlock_resolved left the padding");
+static_assert(offsetof(ggml_sycl_tensor_inventory, host_weight_layout) == 187, "host_weight_layout left the padding");
 #endif
 
 // SYCL-side projection of the four placement-envelope fields the llama
@@ -441,8 +573,12 @@ typedef struct ggml_sycl_host_create_record {
 // Must be called after model metadata parsing, before tensor allocation.
 // This enables automatic VRAM/host placement based on tensor priority.
 // Direct calls retain legacy planning/late side effects; they do not guarantee
-// eager host-zone provisioning. The loader uses stage_inventory_plan(..., false)
+// eager host-zone provisioning. The loader uses stage_load_inventory_plan(..., false)
 // to attempt that provisioning before buffer allocation, under lifecycle guards.
+// A plan the VRAM arena's zones cannot hold is logged as an ERROR and nothing is
+// planned; this entry and the early one below return no result, only the stage does.
+// The stage's other plan refusals (a lazy-table refusal, a cross-card expert plan with no peer path between the
+// cards) are not asked on this entry, and the model loader does not use it: only tests call it directly.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
 
@@ -451,6 +587,10 @@ GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t     
 // Skips late-only side effects (layer-streaming setup, host-pinned pre-allocate)
 // that depend on state populated by create_tensor; those still run when
 // ggml_backend_sycl_set_tensor_inventory is called later.  Idempotent.
+// The stage's other plan refusals (a lazy-table refusal, a cross-card expert plan with no peer path between the
+// cards) are not asked on this entry. The model loader reaches it only through
+// ggml_backend_sycl_stage_load_inventory_plan(..., true), which asks them once every device has planned; only tests
+// call it directly.
 GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
     ggml_backend_t                            backend,
     const struct ggml_sycl_tensor_inventory * inventory);
@@ -470,6 +610,20 @@ GGML_BACKEND_API void ggml_backend_sycl_compute_placement_plan_early(
 // expert entries are not name-indexed and are not returned by this query;
 // they continue to use the per-expert dispatch path.
 GGML_BACKEND_API int ggml_backend_sycl_planned_target_device(const char * tensor_name);
+
+// The host backing a weight is planned with (design 5efe §4.4); the values mirror the planner's.
+enum ggml_sycl_host_backing {
+    GGML_SYCL_HOST_BACKING_PINNED      = 0,  // a copy in the cache's pinned host pool
+    GGML_SYCL_HOST_BACKING_FILE_MAPPED = 1,  // served from the model file's mapping
+    GGML_SYCL_HOST_BACKING_HOST_CPU    = 2,  // a copy in a cache-owned pageable host allocation
+    GGML_SYCL_HOST_BACKING_CPU_OWNED   = 3,  // a copy ggml-cpu makes in a buffer of its own (repacked)
+};
+
+// The backing the loader binds a weight's buffer type from (design 5efe §4.3), read from the bound load's staged plan,
+// which holds the load's fact: the plan's dense entry for a name-indexed weight, otherwise the transaction default
+// (FILE_MAPPED when the load maps files, PINNED when it does not). tensor_name NULL asks for that default alone, which
+// is how the loader reads the fact. PINNED when no plan is staged for the bound load.
+GGML_BACKEND_API enum ggml_sycl_host_backing ggml_backend_sycl_planned_host_backing(const char * tensor_name);
 
 // Set the placement envelope (snapshot of llama_model_params capacity inputs)
 // for this backend.  Must be called at model load alongside set_tensor_inventory.
@@ -790,15 +944,59 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_tensor_cache(ggml_backend_t backend)
 // the unified cache zone planner.  Call once per context, after graph_reserve() completes
 // and backend_buf_exp_size[] has been populated, but BEFORE the first graph_compute call.
 // VRAM arena zones are a fixed pre-allocated block — they cannot grow after creation.
-// This function pre-sizes the compute arena and host SCRATCH zone using the true
-// scheduler-derived sizes, replacing the heuristic defaults set at model load time.
-// - Updates the VRAM compute arena reservation with the actual scheduler requirement.
-// - Grows the host pinned SCRATCH zone for host-side compute buffers (oneDNN reorder, etc.).
+// This function pre-sizes the compute arena using the true scheduler-derived sizes,
+// replacing the heuristic defaults set at model load time: it updates the VRAM compute
+// arena reservation with the actual scheduler requirement. It does not grow the host
+// pinned SCRATCH zone; ggml_backend_sycl_notify_host_buffer_sizes does that.
 // sizes[i] is the compute buffer size for backend i; n_sizes is the length of sizes[].
 // NULL sizes or n_sizes == 0 is a no-op.
 GGML_BACKEND_API void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend,
                                                                     const size_t * sizes,
                                                                     int            n_sizes);
+
+// Records one llama_context's host buffer demand and grows the host pinned SCRATCH zone to
+// cover it. Returns false if the zone could not grow to cover it, or if backend is not a SYCL
+// backend (which is refused with a WARN before anything else is read). The demand replaces the
+// context's previous one; the zone is the device of the host buffer type of backend's device.
+// Scalars only, so no struct crosses the dlopen boundary; look it up by name through the
+// registry's proc address.
+// Proc name: "ggml_backend_sycl_notify_host_buffer_sizes".
+GGML_BACKEND_API bool ggml_backend_sycl_notify_host_buffer_sizes(ggml_backend_t backend,
+                                                                 size_t         host_compute_bytes,
+                                                                 size_t         host_output_bytes);
+
+// The host holder plan: the attention host staging slots and the CPU-expert pools, sized from
+// the reserve graphs. begin clears the pending plan of every SYCL backend in sched; plan walks
+// one graph while sched's split is live (after ggml_backend_sched_reserve_size, before the next
+// reserve) and merges its figures into the pending plans as a maximum; commit makes backend's
+// pending plan its committed one, which re-sizes the slots and the pools of its device. It also
+// marks backend's SCRATCH demand: the next notify through backend carries the allocated size,
+// and its demand line prints the measured and allocated figures. The SYCL side keeps neither
+// sched nor graph past the call. Look each up by name through the registry's proc address.
+// Proc name: "ggml_backend_sycl_begin_host_holders".
+GGML_BACKEND_API void ggml_backend_sycl_begin_host_holders(ggml_backend_sched_t sched);
+// Proc name: "ggml_backend_sycl_plan_host_holders".
+GGML_BACKEND_API bool ggml_backend_sycl_plan_host_holders(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+// Proc name: "ggml_backend_sycl_commit_host_holders".
+GGML_BACKEND_API bool ggml_backend_sycl_commit_host_holders(ggml_backend_t backend);
+
+// The host SCRATCH transaction of one llama_context (§4.4, §M75), made on the backend the notify is made through.
+// While a transaction is open, every chunk the host SCRATCH zone grows for it is recorded in it. OPEN opens the
+// auto-n_ubatch trial's transaction; MARK opens the reserve's own one when none is open and records its chunk count;
+// RETURN_TO_MARK returns the chunks grown since the mark and keeps the transaction open; KEEP closes it, its chunks
+// becoming ordinary capacity; RETURN closes it, drops the context's demand and returns its chunks, each released at
+// once when empty and otherwise at the context's next begin or its end. `n_ubatch` is recorded by the OPEN, or by the
+// MARK that opens the transaction, and the kept|returned witness prints that recorded value; the value passed with
+// KEEP, RETURN or RETURN_TO_MARK is ignored. Returns false for a non-SYCL backend or an unknown op. `op` is a plain
+// int, and every argument a scalar, so no enum or struct crosses the dlopen boundary; look it up by name through the
+// registry's proc address.
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_OPEN           0
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_KEEP           1
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN         2
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_MARK           3
+#define GGML_SYCL_HOST_SCRATCH_TRIAL_RETURN_TO_MARK 4
+// Proc name: "ggml_backend_sycl_host_scratch_trial".
+GGML_BACKEND_API bool ggml_backend_sycl_host_scratch_trial(ggml_backend_t backend, int op, uint32_t n_ubatch);
 
 // Get cache hit/miss statistics (stub — returns zeros).
 // hits/misses may be NULL if caller doesn't need that stat.
@@ -820,21 +1018,14 @@ GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device, char 
 GGML_BACKEND_API int  ggml_backend_sycl_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * total);
 
-// Check if MoE multi-GPU mode is requested via GGML_SYCL_MOE_MULTI_GPU=1.
-// Disabled by default while multi-device Level Zero execution is unstable.
-// When true, the SYCL backend handles multi-device MoE dispatch internally,
-// and secondary GPUs should NOT be exposed to the backend scheduler.
+// Whether the cross-card expert path is requested: two or more GPUs and GGML_SYCL_MOE_MULTI_GPU set non-zero.
+// Off by default: the cards have no peer path. When true, the backend dispatches expert work to secondary
+// GPUs itself, and those GPUs are not exposed to the backend scheduler.
 GGML_BACKEND_API bool ggml_backend_sycl_moe_multi_gpu_requested(void);
+// Whether the placement plan spans every physical GPU for a model with or without experts. A model without
+// experts gets the two-card plan whenever two GPUs are visible; one with experts only on the request above.
+GGML_BACKEND_API bool ggml_backend_sycl_multi_device_plan_requested(bool has_experts);
 GGML_BACKEND_API void ggml_backend_sycl_set_debug(int level);
-
-// llama.cpp-xojq (nphx Task 4b): the GPU MoE routing ceiling
-// (MOE_GPU_UBATCH_MAX, ggml-sycl/moe-control-plan.hpp) exposed for
-// llama_context's auto micro-batch ladder. Above this micro-batch the
-// routing-id/compaction table stops being a control-sized allocation and
-// moe_build_context_control_layout() refuses the GPU route
-// (exceeds_gpu_ubatch), so the trial must not try a larger candidate on a
-// MoE model (hparams.n_expert > 0) until llama.cpp-ohkx lifts the ceiling.
-GGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);
 
 // Device-to-host memcpy using the SYCL backend queue for the tensor's buffer.
 // This avoids mixing queues/contexts in tests.
@@ -1371,7 +1562,10 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_BUSY,
     GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND,
     // A deterministic refusal of a runtime plan update (budget or accounting),
-    // as opposed to the transient BUSY above. Callers must NOT retry it: the
+    // or of a model load's plan (a lazy table it refused, a cross-card expert
+    // plan with no peer path between the cards, or VRAM arena zones that
+    // cannot be sized for it while something holds the arena), as
+    // opposed to the transient BUSY above. Callers must NOT retry it: the
     // inputs cannot change between attempts, so a retry loop only multiplies
     // the error output. Appended last on purpose -- these values reach users as
     // `result=%d` and are quoted in tickets and logs (BUSY is 17), so inserting
@@ -1379,14 +1573,28 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
     // Synthesised by a CALLER that resolved no proc address for an entry point
     // the backend predates (see ggml_backend_sycl_set_runtime_context_desc).
-    // The backend never returns it. Appended last for the same reason.
+    // The backend returns it from one place only: the stub its proc table
+    // answers for the staging proc's old name, which refuses a libllama that
+    // predates this backend's inventory. Appended last for the same reason.
     GGML_SYCL_LIFECYCLE_UNSUPPORTED,
 };
 
 // Registry-resolved static/DL parity entry point. Applies the exact inventory
 // and placement envelope to every current SYCL device and stages the same
-// immutable load candidate used by direct static calls.
-GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(
+// immutable load candidate used by direct static calls. It derives the load's
+// host-backing fact from the inventory's resolved inputs (design 5efe §4.3)
+// and the staged plan holds it.
+//
+// A plan the backend refuses returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED after
+// an ERROR or WARN line that says why, and the stage puts back the per-device
+// planned terms the load published; the load's transaction then ends failed.
+//
+// Exported under this name since the inventory began carrying those inputs.
+// The registry answers the old name, ggml_backend_sycl_stage_inventory_plan,
+// with a stub that logs why and returns GGML_SYCL_LIFECYCLE_UNSUPPORTED, so a
+// libllama built before the inputs is refused by name instead of handing over
+// an inventory whose bytes 185-187 it never set.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(
     const struct ggml_sycl_tensor_inventory *   inventory,
     const struct ggml_sycl_placement_envelope * envelope,
     bool                                        early);
@@ -1903,6 +2111,109 @@ GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_r
     bool                                   flash_attn_enabled,
     const ggml_sycl_runtime_context_desc * desc,
     struct ggml_sycl_residency_probe *     out);
+
+// ---- the host-only plan dry run (th32 §4.2 "One source for the number") ----
+//
+// ggml_backend_sycl_plan_dry_run plans `inventory` through the planner the load's stage calls, sizes each plan's host
+// zones through the function the stage's configure step calls, and reports every host term from that plan, so its
+// expected_host is the stage's host_planned_bytes by construction. It stores nothing: no host budget, no plan, no
+// zone, no cache. It samples the host itself and plans against the budget computed from that sample.
+//
+// It is for a process with no model loaded and no load open: an open load or a live model is refused with LOAD_BUSY,
+// before anything is sampled. A cache that already exists is read (its arena zones, its live oneDNN scratch), never
+// created; with none, a device plans against its budget authority's fresh answer. The planners subtract the arena's
+// zone reservations only on a device whose cache has an active arena, so on a device without one the plan's device
+// share is an upper bound and its host terms a lower bound, and one [PLAN-DRY-RUN] line names each such device: every
+// physical device a multi-device plan packs, and the scheduler-visible device of a single-device plan. An explicit
+// micro-batch above the load's planning shape (inventory->n_ubatch_context) is not modelled: KV and the MoE prompt path
+// are planned at the planning shape, without that micro-batch's RUNTIME room. The plans size the oneDNN Graph scratch
+// floor for the context the model opens with (n_ctx_context, n_ubatch_context), but no figure the dry run reports
+// includes it: a device share subtracts the ONEDNN zone an active arena already holds, or none.
+
+#define GGML_SYCL_PLAN_DRY_RUN_VERSION     1
+#define GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES 16
+
+// The host backings a plan entry can carry, in placement_host_backing's order.
+enum ggml_sycl_plan_dry_run_backing {
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_PINNED      = 0,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_FILE_MAPPED = 1,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_HOST_CPU    = 2,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_CPU_OWNED   = 3,
+    GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT       = 4,
+};
+
+// The caller's inputs. struct_size and version gate the read; opts may be NULL, which is all zero.
+typedef struct ggml_sycl_plan_dry_run_opts {
+    uint32_t struct_size;
+    uint32_t version;            // GGML_SYCL_PLAN_DRY_RUN_VERSION
+    uint32_t mem_available_set;  // 1: mem_available_bytes is the sample's MemAvailable instead of the live reading
+    uint32_t n_device_budgets;   // device_budget_bytes[0..n) are read, at most GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES
+    uint64_t mem_available_bytes;
+    // The envelope the load would set (llama_model_sycl_make_placement_envelope); NULL plans without one.
+    const struct ggml_sycl_placement_envelope * envelope;
+    // A device's VRAM budget for the plan in bytes, in place of its budget authority's; 0 keeps the authority's.
+    uint64_t                                    device_budget_bytes[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];
+} ggml_sycl_plan_dry_run_opts;
+
+// One plan's host terms, each the plan's own field: the WEIGHT zone's terms (placement_plan_host_weight_zone_terms),
+// the commit terms (placement_plan_host_zone_commit_terms), expected_host (host_planned_bytes), the residency of the
+// plan's host entries by backing, and weight_host_bytes, the plan's charge for its PINNED and HOST_CPU entries, which
+// the residency of those two backings must equal (the dry run warns where it does not). The WEIGHT term swap_headroom
+// is not exported: the dry run prints it on its own line, and zone_weight and expected_host already count it.
+typedef struct ggml_sycl_plan_dry_run_plan {
+    int32_t  device;        // the plan's device_id, the device the planner's own lines name
+    uint32_t multi_device;  // 1: one plan over every physical device
+    uint64_t host_budget;   // the budget the plan recorded
+    uint64_t weight_host_weights;
+    uint64_t weight_blocks;
+    uint64_t weight_host_compute_reserve;
+    uint64_t weight_layout_copies;
+    uint64_t weight_tlsf_bound;
+    uint64_t zone_weight;
+    uint64_t zone_kv;
+    uint64_t zone_staging;
+    uint64_t zone_scratch;
+    uint64_t runtime;
+    uint64_t rounding;
+    uint64_t expected_host;
+    uint64_t residency_count[GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT];
+    uint64_t residency_bytes[GGML_SYCL_PLAN_DRY_RUN_BACKING_COUNT];
+    uint64_t weight_host_bytes;
+} ggml_sycl_plan_dry_run_plan;
+
+// The answer. The caller fills struct_size (sizeof(*this)) and version; the backend writes the rest on OK. The sample
+// fields are the inputs the budget was computed from, with mem_available_bytes the option's when it was given.
+typedef struct ggml_sycl_plan_dry_run_result {
+    uint32_t                    struct_size;
+    uint32_t                    version;  // GGML_SYCL_PLAN_DRY_RUN_VERSION
+    uint64_t                    mem_total_bytes;
+    uint64_t                    mem_available_bytes;
+    uint64_t                    pinned_bytes;
+    uint64_t                    committed_bytes;
+    uint32_t                    budget_pct;
+    uint32_t                    mem_available_from_opts;  // 1: mem_available_bytes is the option's
+    uint32_t                    host_reserve_override;    // 1: an accepted GGML_SYCL_HOST_RESERVE_MB caps the budget
+    uint32_t                    n_plans;
+    uint64_t                    host_budget;  // host_ledger_compute_budget of the sample and committed_bytes
+    uint64_t                    device_budget_bytes[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];  // each device's VRAM budget
+    ggml_sycl_plan_dry_run_plan plans[GGML_SYCL_PLAN_DRY_RUN_MAX_DEVICES];
+} ggml_sycl_plan_dry_run_result;
+
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_opts) == 160 || sizeof(void *) != 8, "dry run opts layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_plan) == 184, "dry run plan layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_plan_dry_run_result) == 3136, "dry run result layout changed");
+
+// OK with the result written; NULL_OUTPUT for a null inventory or result, an inventory whose tensor or lazy-table count
+// has no array behind it, or a struct header this backend does not read (a caller built against another layout, whose
+// struct_size differs; a [PLAN-DRY-RUN] refused WARN names both sizes and versions); LOAD_BUSY while a load is open or
+// a model is live; BUSY while the module is being mutated; NOT_FOUND with no SYCL device; EFFECT_FAILED when planning
+// threw. On every status but OK the result is left as the caller wrote it.
+// Proc name: "ggml_backend_sycl_plan_dry_run".
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_plan_dry_run(
+    const struct ggml_sycl_tensor_inventory *  inventory,
+    const struct ggml_sycl_plan_dry_run_opts * opts,
+    struct ggml_sycl_plan_dry_run_result *     result);
+
 // Capability-only form of ggml_backend_dev_supports_op for a SYCL device: supports_op with its two PLACEMENT
 // declines -- host-demoted KV (the KV-host buffer type) and planner-on-host (ggml_sycl_op_is_planned_on_host) --
 // switched off, so it is false only when there is no kernel for `op` (its type and shape). supports_op's "false"
@@ -2001,6 +2312,94 @@ GGML_BACKEND_API void ggml_backend_sycl_release_host_weight_extras(void);
 GGML_BACKEND_API void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched);
 GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 
+// The live bytes the unified cache's runtime-allocation registry holds under `role` (an ggml_sycl::alloc_role value) on
+// `device` (llama.cpp-th32 T1b), written to *out. Exported unconditionally, outside any GGML_SYCL_PRIVATE_TESTING block
+// and reachable through ggml_backend_reg_get_proc_address, so a test that links libllama and not ggml-sycl reads it
+// under GGML_BACKEND_DL=ON. Returns false, with *out zero, when the device has no cache, the role is out of range or
+// the arguments are invalid: a VOID reading, never a zero that could be mistaken for "nothing allocated".
+GGML_BACKEND_API bool ggml_backend_sycl_role_bytes_for_testing(int device, int role, uint64_t * out);
+
+// The lazy tables a placement plan carries (th32 §4.3 step 4, §11 T3): out[0] is the table count and out[1] the sum of
+// their host_resident_bytes. A nonzero model.model_id reads the plan published for (model_id, load_txn_id); model_id 0
+// reads the candidate staged for load_txn_id, so a fixture reads a load's plan before and after the load's end through
+// one entry. Returns false, with both outputs zero, when no such plan exists or `out` is null: a VOID reading, never a
+// count of 0 that could be mistaken for "no table". Exported unconditionally and reachable through the proc table, like
+// ggml_backend_sycl_role_bytes_for_testing above.
+// Proc name: "ggml_sycl_plan_lazy_tables_for_testing".
+GGML_BACKEND_API bool ggml_sycl_plan_lazy_tables_for_testing(struct ggml_sycl_model_token model, uint64_t out[2]);
+
+// The IO pool's live block ring (th32 §3.3, §10): its usable bytes, which equal the plan's block_ring_need that created
+// it and never its ring= charge, written to *out. Returns false, writing nothing, when no live pool has a ring or `out`
+// is null: a VOID reading. Exported unconditionally and reachable through the proc table, like the accessors above.
+// Proc name: "ggml_sycl_lazy_block_ring_bytes_for_testing".
+GGML_BACKEND_API bool ggml_sycl_lazy_block_ring_bytes_for_testing(uint64_t * out);
+
+// The planners' coverage reads since the process started (th32 §10's lazy_ring_coverage_reads): one per step-4
+// eligibility read, block_ring_need read and block_ring_charge read made through a coverage pin, so a plan made with no
+// provisional lease adds none. Written to *out; returns false only for a null `out`. Exported unconditionally and
+// reachable through the proc table, like the accessors above.
+// Proc name: "ggml_sycl_lazy_ring_coverage_reads_for_testing".
+GGML_BACKEND_API bool ggml_sycl_lazy_ring_coverage_reads_for_testing(uint64_t * out);
+
+// A STORAGE lazy table opened for a published model (the storage tier's consumer side): the table's O_DIRECT
+// descriptor, its row cache and the gather's state. Opaque.
+struct ggml_sycl_lazy_storage;
+
+// Opens the table `info` names for `model`, whose published plan must carry it STORAGE with the same row size, table
+// bytes, file offset and type, reading `file_path`. NULL, after a WARN naming the table and the reason, when the
+// module refuses mutations, an argument is null or model.model_id is 0, no published plan exists, the plan has no such
+// table or holds it HOST, the geometry disagrees, the materialization refuses, or, for a later open of a live table,
+// the stat of `file_path` fails or names another file. The table is built from the plan's figures; `info` only has to
+// agree with them. The open is a mutation, made under the module mutation guard. It throws nothing in practice: a
+// failure is a NULL.
+// Opens of one model and table are counted and return the same handle: a later open makes no second table and charges
+// no host bytes, and it is refused, with a WARN naming the live table's file and `file_path`, when `file_path` is not
+// the live table's file. Each successful open needs exactly one close; the last close releases the table, and every
+// close must come before the model's unload. Gathers through any holder serialise, and the counters are the table's,
+// not the caller's.
+// Proc name: "ggml_backend_sycl_lazy_storage_open".
+GGML_BACKEND_API struct ggml_sycl_lazy_storage * ggml_backend_sycl_lazy_storage_open(
+    struct ggml_sycl_model_token             model,
+    const struct ggml_sycl_lazy_table_info * info,
+    const char *                             file_path);
+
+// Copies row rows[i] of the table to dst + i * row_size for i in [0, n), from the row cache on a hit and from the file
+// on a miss, and returns once every row it submitted has landed. Calls on one table are serialised. Returns:
+//   0          every row landed;
+//   EINVAL     a null storage, a null rows or dst with n > 0, a dst shorter than n rows, or a table whose row spans
+//              more than one IO chunk, all refused before anything is read; or a row outside the table, which stops the
+//              gather there, every row before it that was submitted still waited for;
+//   EIO        the IO engine refused a read (no live ring, or a span the ring cannot hold or the address space cannot
+//              reach), or a lookup, a submit or the serialising lock threw std::system_error;
+//   ENOMEM     a lookup or a submit threw std::bad_alloc;
+//   ECANCELED  the backend shut down and cancelled a queued read: not a disk error;
+//   other      the first failed read's errno.
+// A code that stopped the submitting (EINVAL, EIO, ENOMEM) wins over a read's errno. It never throws, and it blocks
+// with no timeout until the IO engine's workers have delivered, so it must not be called from one of them.
+// Proc name: "ggml_backend_sycl_lazy_storage_gather".
+GGML_BACKEND_API int ggml_backend_sycl_lazy_storage_gather(struct ggml_sycl_lazy_storage * storage,
+                                                           const int32_t *                 rows,
+                                                           size_t                          n,
+                                                           void *                          dst,
+                                                           size_t                          dst_bytes);
+
+// out[0] hits, out[1] misses, out[2] evictions (the row cache's own counters), out[3] waiters submitted for misses
+// (not disk reads: rows of one block, and joined reads, share one). All zero for a null storage. It may run while a
+// gather does; the four are then a relaxed snapshot each, not consistent with one another.
+// Proc name: "ggml_backend_sycl_lazy_storage_counters".
+GGML_BACKEND_API void ggml_backend_sycl_lazy_storage_counters(const struct ggml_sycl_lazy_storage * storage,
+                                                              uint64_t                              out[4]);
+
+// Drops one open of the table; a null storage is a no-op. The close that drops the last open releases the table: no
+// other call on the handle, the counters included, may overlap that close, and the handle is dead after it. Every
+// other holder's calls go on through the same handle. Never refused, with one exception that a std::mutex does not
+// raise in practice: if taking the registry lock throws, the open is kept, the table stays live, and a WARN says so.
+// The module mutation guard is taken only while the module admits mutations: an admitted close holds off the unload's
+// drain, and a close arriving after admission closed runs unguarded, which closing before the unload makes
+// unreachable.
+// Proc name: "ggml_backend_sycl_lazy_storage_close".
+GGML_BACKEND_API void ggml_backend_sycl_lazy_storage_close(struct ggml_sycl_lazy_storage * storage);
+
 // The load-time measure's plan override.  While installed, every plan accessor on the
 // calling thread answers from the plan named by `stage` for the load `load_txn`,
 // and nothing is published.  Written only by these two functions; llama reaches them
@@ -2037,6 +2436,12 @@ GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install_kv(
     enum ggml_sycl_measure_stage              stage,
     const struct ggml_sycl_measure_kv_shape * kv_shape);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
+
+// Proc name: "ggml_backend_sycl_measure_plan_staged".  Whether the load `load_txn` has a plan staged for the measure
+// at `stage`, by the lookup the install makes, installing nothing.  A load the early pass could not plan stages no
+// probe plan: a model built in memory (its weights are known only after create_tensor), a no_alloc load, and a load
+// with the VRAM arena off.  The loader asks this first, so such a load is not refused for a measure it cannot run.
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_staged(uint64_t load_txn, enum ggml_sycl_measure_stage stage);
 
 // === Per-context chunk-cap copy and plan scopes ===
 //
@@ -2220,6 +2625,60 @@ GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void);
 // submit its primitive. Returns false for an unknown site.
 GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts(const char * site, uint64_t * calls, uint64_t * declined,
                                                             uint64_t * engaged);
+
+// The host ledger's charge-protocol seams (th32 §11 T2): one hook table, one hook per point. A point fires its hook
+// with an argument and reads the return value as its decision: an injection point fails when the hook returns nonzero;
+// FORCE_TIER_HOST_CPU returns 1 to force the final tier to HOST_CPU (mode A, no charge held) or 2 to force a
+// non-HOST_CPU tier (mode B, a charge held), both just before the tier-iff-charge check, its argument 1 when a charge
+// is held; NESTED_HOST_CPU fires inside every unified_alloc after that check and before registry publication, with no
+// allocator lock held, so a hook may allocate from it and counts its own recursion depth; OWNER_THROW's argument is 0
+// before unified_alloc and 1 after it. CHARGE_BEFORE_CAS and YIELD_AFTER_INFLIGHT are hold points: a hook there blocks
+// to hold the thread, and its return value is ignored.
+enum ggml_sycl_test_host_ledger_point {
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_CHARGE_BEFORE_CAS = 0,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_YIELD_AFTER_INFLIGHT,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MMAP_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_HOST_CPU_MLOCK_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_COORDINATOR_NULL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_CONTROL_NULL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_COHORT_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_PUBLISH_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_REGISTRY_FAIL,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_IDENTITY_MISMATCH,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_OWNER_THROW,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_FREE_REFUSED,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_FORCE_TIER_HOST_CPU,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_NESTED_HOST_CPU,
+    GGML_SYCL_TEST_HOST_LEDGER_POINT_COUNT,
+};
+
+typedef int32_t (*ggml_sycl_test_host_ledger_hook_fn)(int32_t point, int32_t arg);
+// Sets (fn) or clears (NULL) the point's hook. Returns false, and changes nothing, for an unknown point.
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_hook(int32_t point, ggml_sycl_test_host_ledger_hook_fn fn);
+// Seeds the stored budget without counting a store, so a store count read after seeding is still 0. The seeded budget
+// is not the headroom refusal: the refusal's flag is cleared, and the stored sample's figures are kept.
+GGML_BACKEND_API void ggml_sycl_test_host_ledger_store_budget(uint64_t budget);
+// The committed bytes; the budget stores made by the pass scope's store (the setter's are not counted); and the sum of
+// charged_bytes over the live HOST_CPU registry rows. Each returns false, writing nothing, for a null pointer.
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_committed(uint64_t * committed);
+GGML_BACKEND_API bool ggml_sycl_test_host_ledger_stores(uint64_t * stores);
+GGML_BACKEND_API bool ggml_sycl_test_host_cpu_live_bytes(uint64_t * live_bytes);
+
+// The lazy tables' planning seams (th32 §3.3, §11 T3), for a fixture that calls a planner entry directly.
+// plan_effect_begin makes `load_txn_id` this thread's staged-load transaction, as the stage does around its planner
+// calls, so the entry stages its plan as that load's candidate; it returns the id it replaced, which plan_effect_end
+// restores. It sets the transaction only, not the owner token the stage sets beside it, so a plan made under it skips
+// the dense scratch planning, which is keyed by that owner. coverage_pin_make takes a coverage pin through the IO
+// pool's registry, and a nonzero ring_bytes also ensures a ring of that many bytes through block_ring_ensure
+// (lazy-io-pool.hpp); coverage_pin_release drops it and runs the closing reap.
+// lazy_slot_begin publishes a pin on this thread's plan slot, the one the planner caller reads, and returns the scope
+// lazy_slot_end closes. Each pair nests: close them in reverse order, on the thread that opened them.
+GGML_BACKEND_API uint64_t ggml_sycl_test_plan_effect_begin(uint64_t load_txn_id);
+GGML_BACKEND_API void     ggml_sycl_test_plan_effect_end(uint64_t previous_txn_id);
+GGML_BACKEND_API void *   ggml_sycl_test_coverage_pin_make(uint64_t ring_bytes);
+GGML_BACKEND_API void     ggml_sycl_test_coverage_pin_release(void * pin);
+GGML_BACKEND_API void *   ggml_sycl_test_lazy_slot_begin(void * pin);
+GGML_BACKEND_API void     ggml_sycl_test_lazy_slot_end(void * scope);
 #endif
 
 #ifdef __cplusplus

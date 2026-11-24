@@ -1,6 +1,7 @@
 #include "ggml-sycl.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -250,6 +251,24 @@ static ggml_backend_reg_t deferred_hook_fixture() {
 static void phase(const char * name) {
     std::fprintf(stderr, "[sycl-runtime-wrapper] %s\n", name);
     std::fflush(stderr);
+}
+
+// Whether the backend logged the stale-libllama refusal at ERROR since the last reset. The callback forwards every line
+// to the callback it replaced, so the log stays as it would be without the probe. The flag is atomic because the
+// callback runs on whichever thread logs, and a thread the backend owns may log while the probe is installed.
+static std::atomic<bool> g_stale_stage_logged{ false };
+static ggml_log_callback g_stale_stage_prev_log    = nullptr;
+static void *            g_stale_stage_prev_log_ud = nullptr;
+
+static void stale_stage_log(enum ggml_log_level level, const char * text, void * user_data) {
+    if (level == GGML_LOG_LEVEL_ERROR && text &&
+        std::strstr(text, "libllama predates this backend's inventory; rebuild libllama and libggml-sycl together")) {
+        g_stale_stage_logged.store(true);
+    }
+    if (g_stale_stage_prev_log) {
+        g_stale_stage_prev_log(level, text, g_stale_stage_prev_log_ud);
+    }
+    GGML_UNUSED(user_data);
 }
 
 static bool fixture_expect(bool condition, const char * detail) {
@@ -1063,7 +1082,7 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_execution_context_finish_drain)
     LOAD_SYCL(ggml_backend_sycl_execution_session_begin_reset)
     LOAD_SYCL(ggml_backend_sycl_execution_session_finish_reset)
-    LOAD_SYCL(ggml_backend_sycl_stage_inventory_plan)
+    LOAD_SYCL(ggml_backend_sycl_stage_load_inventory_plan)
     using stage_inventory_failpoint_fn = void (*)();
     auto ggml_backend_sycl_test_fail_next_stage_inventory_plan_early_after_first_device_fn =
         reinterpret_cast<stage_inventory_failpoint_fn>(ggml_backend_reg_get_proc_address(
@@ -1403,7 +1422,7 @@ int main() {
     poisoned_envelope.n_seq_max       = 1;
     poisoned_envelope.flash_attn_type = -1;
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&poisoned_abort) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&poisoned_inventory, &poisoned_envelope, false) !=
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&poisoned_inventory, &poisoned_envelope, false) !=
             GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "poisoned abort setup failed\n");
         return 1;
@@ -1445,7 +1464,7 @@ int main() {
         return 1;
     }
     fail_stage_early_after_first_device();
-    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) == GGML_SYCL_LIFECYCLE_OK ||
+    if (CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, true) == GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
         std::fprintf(stderr, "early stage_inventory_plan did not fail closed\n");
         return 1;
@@ -1459,7 +1478,8 @@ int main() {
         return 1;
     }
     fail_stage_late_after_first_device();
-    if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) == GGML_SYCL_LIFECYCLE_OK ||
+    if (CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) ==
+            GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
         std::fprintf(stderr, "late stage_inventory_plan did not fail closed\n");
         return 1;
@@ -1467,6 +1487,44 @@ int main() {
     if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
         std::fprintf(stderr, "late stage failure left txn unrecoverable\n");
         return 1;
+    }
+
+    // A libllama built before the inventory carried its storage inputs resolves the staging proc by its old name. The
+    // registry answers that name with a stub that refuses by name before it reads anything (design 5efe §4.3), so the
+    // call passes no inventory and no envelope: a stub that read either would fault here instead of refusing. The stub
+    // is file-static, so the registry is the only way to reach it in either build.
+    phase("the staging proc's old name refuses a stale libllama");
+    {
+#if defined(GGML_SYCL_RUNTIME_MODULE)
+        ggml_backend_reg_t stale_reg = reg;
+#else
+        ggml_backend_reg_t stale_reg = ggml_backend_sycl_reg();
+#endif
+        void * stale_proc = ggml_backend_reg_get_proc_address(stale_reg, "ggml_backend_sycl_stage_inventory_plan");
+        void * renamed_proc =
+            ggml_backend_reg_get_proc_address(stale_reg, "ggml_backend_sycl_stage_load_inventory_plan");
+        if (!stale_proc || stale_proc == renamed_proc) {
+            std::fprintf(stderr, "the old staging proc name does not resolve to its own refusal stub\n");
+            return 1;
+        }
+        auto stale_stage = reinterpret_cast<decltype(&ggml_backend_sycl_stage_load_inventory_plan)>(stale_proc);
+        // ggml_log_set writes ggml's logger globals without synchronization, so the probe is swapped in and out only
+        // where this test runs no thread of its own: every std::async above has been joined by this phase, and the
+        // stub logs its refusal on this thread before it returns.
+        ggml_log_get(&g_stale_stage_prev_log, &g_stale_stage_prev_log_ud);
+        g_stale_stage_logged.store(false);
+        ggml_log_set(stale_stage_log, nullptr);
+        const ggml_sycl_lifecycle_result stale_rc = stale_stage(nullptr, nullptr, true);
+        ggml_log_set(g_stale_stage_prev_log, g_stale_stage_prev_log_ud);
+        if (stale_rc != GGML_SYCL_LIFECYCLE_UNSUPPORTED || CALL_SYCL(ggml_backend_sycl_has_active_placement_plan)()) {
+            std::fprintf(stderr, "the old staging proc name returned %d, not UNSUPPORTED, or staged a plan\n",
+                         (int) stale_rc);
+            return 1;
+        }
+        if (!g_stale_stage_logged.load()) {
+            std::fprintf(stderr, "the old staging proc name refused without logging why at ERROR\n");
+            return 1;
+        }
     }
 
     // llama.cpp-moua L4 step 3: the load's compute-term ledger.  An early c(P) is recorded for the open load,
@@ -1509,8 +1567,10 @@ int main() {
                          "L4 ledger: a transaction that is not the open load compared against another load's term\n");
             return 1;
         }
-        if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
-            CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        if (CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, true) !=
+                GGML_SYCL_LIFECYCLE_OK ||
+            CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) !=
+                GGML_SYCL_LIFECYCLE_OK ||
             CALL_SYCL(ggml_backend_sycl_model_load_end)(l4_commit, true, &l4_token) != GGML_SYCL_LIFECYCLE_OK ||
             l4_token.model_id == 0) {
             std::fprintf(stderr, "L4 ledger: the commit failed\n");
@@ -1567,8 +1627,9 @@ int main() {
     ggml_sycl_load_txn    committed{};
     ggml_sycl_model_token token{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&committed) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) !=
+            GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_load_end)(committed, true, &token) != GGML_SYCL_LIFECYCLE_OK ||
         token.model_id == 0) {
         std::fprintf(stderr, "runtime no-allocation commit failed\n");
@@ -1611,7 +1672,8 @@ int main() {
     ggml_sycl_load_txn quarantine_txn{};
     ggml_sycl_model_token quarantine_token{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&quarantine_txn) != GGML_SYCL_LIFECYCLE_OK ||
-        CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+        CALL_SYCL(ggml_backend_sycl_stage_load_inventory_plan)(&inventory, &envelope, false) !=
+            GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_load_end)(quarantine_txn, true, &quarantine_token) !=
             GGML_SYCL_LIFECYCLE_OK ||
         CALL_SYCL(ggml_backend_sycl_model_quarantine_token)(quarantine_token) != GGML_SYCL_LIFECYCLE_OK ||
@@ -1700,8 +1762,8 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_end"));
     auto unload_again = reinterpret_cast<decltype(&ggml_backend_sycl_model_unloaded_token)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_unloaded_token"));
-    auto stage_again = reinterpret_cast<decltype(&ggml_backend_sycl_stage_inventory_plan)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
+    auto stage_again = reinterpret_cast<decltype(&ggml_backend_sycl_stage_load_inventory_plan)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_load_inventory_plan"));
     auto authority_again = reinterpret_cast<decltype(&ggml_backend_sycl_has_active_placement_plan)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_has_active_placement_plan"));
     ggml_sycl_load_txn reload_txn{};

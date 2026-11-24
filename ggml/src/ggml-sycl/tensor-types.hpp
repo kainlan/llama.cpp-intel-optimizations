@@ -37,7 +37,7 @@ enum class tensor_class {
 enum class memory_tier {
     VRAM,         // Device VRAM (fastest)
     PINNED_HOST,  // Pinned host memory (GPU-accessible via PCIe)
-    MMAP          // File-backed mmap (slowest, fallback)
+    UNRESOLVED    // Not resolved to a tier: the initial value, and the "not found" result of a lookup
 };
 
 // Information about a single tensor

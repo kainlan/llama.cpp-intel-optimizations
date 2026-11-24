@@ -10,6 +10,8 @@
 // per-iteration time and the ratio is the load-bearing output (a
 // green-but-slow strided arm FAILS option A).
 #include "test-skip.h"
+// The attribute production builds with, so the answer is about the primitive the backend would run.
+#include "ggml-sycl/dnnl-deterministic.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -83,6 +85,7 @@ static int run_original_case(sycl::queue & q, dnnl::engine & eng, dnnl::stream &
     dnnl::memory::desc   b_md({ K, N }, dt::f4_e2m1, { N, 1 });
     dnnl::memory::desc   c_md({ M, N }, dt::f32, { N, 1 });
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) + (1 << 1), { G, 1 }, dt::e8m0);
     attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /*apply_to_int=*/true);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
@@ -211,6 +214,7 @@ static ab_arm_result run_ab_arm(sycl::queue & q, dnnl::engine & eng, dnnl::strea
     dnnl::memory::desc s_md({ groups, N }, dt::e8m0,
                             strided ? dnnl::memory::dims{ 1, groups } : dnnl::memory::dims{ N, 1 });
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) + (1 << 1), { G, 1 }, dt::e8m0);
     attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /*apply_to_int=*/true);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
@@ -317,6 +321,7 @@ static ab_arm_result run_roleswap_arm(sycl::queue & q, dnnl::engine & eng, dnnl:
     dnnl::memory::desc   c_md({ N, M }, dt::f32, { M, 1 });
     dnnl::memory::desc   sc_md({ N, groups }, dt::e8m0, { groups, 1 });  // the stored e8m0 plane, as-is
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scales(DNNL_ARG_SRC, (1 << 0) + (1 << 1), { 1, G }, dt::e8m0);
     attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /*apply_to_int=*/true);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);

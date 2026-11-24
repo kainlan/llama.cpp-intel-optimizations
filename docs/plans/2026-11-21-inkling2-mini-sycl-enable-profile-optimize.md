@@ -4034,6 +4034,11 @@ throws; the legacy MMID admission asks `moe_mmid_workspace_geometry_holds`.
 *Wording corrected against the ruling above:* decline lines print at ERROR, not WARN. From this task on a
 refusal count means both labels, `MOE-DECODE-REFUSAL` and `MOE-PROMPT-REFUSAL`; the criteria of Tasks 7 and 8
 that name only the first predate the second.
+*Changed 2026-11-23 (ruling: a direct-route decline that falls through to an executor that runs the op is not a
+refusal):* a decline before the mark prints `[MOE-DIRECT-DECLINE] phase=<decode|prompt> tensor=... route=direct
+step=...` at WARN, and the retained route core runs the op. Only the two refusals after the mark, `host_marker_arm`
+and `adapter`, keep the phase's refusal label, at ERROR. A refusal count no longer counts a decline; a count of
+`route=direct` lines counts both, as the criteria above that name it do.
 
 *Device results at `0f4060d0f`, one run each, zero kernel fault lines, `Shmem` 11 GB
 (`docs/backend/data/inkling2/t8b-lead-runs-0f4060d0f.txt`; the runs at `6ee2a4058` are in
@@ -6406,8 +6411,10 @@ test's `tests:` commit. Path-scoped.
   exit, an expert moving from card to host between nodes. A marker failure on the no-throw path can leave the
   job waiting (the MXFP4 marker jobs have the same exposure). The join holds a SYCL host-task thread for the
   job's whole run.
-- Task 8c, second card: a `residency=secondary` operand is still refused by name
-  (`[MOE-DECODE-REFUSAL] ... failed=card_or_host`); no witness run exists. Task 8d's.
+- Task 8c, second card: the direct route does not take a `residency=secondary` operand and says so by name. Since
+  the storage-tier merge of 2026-11-23 that line is a decline (`[MOE-DIRECT-DECLINE] ... failed=card_or_host`), and
+  the op goes on to the retained core. No run exists of either the decline or what the retained core then does with
+  such an operand. Task 8d's.
 - The lead's gate scoring counted the two-GPU startup warning as a lost device (`device_lost: 1`). The
   scratch runner ignores that line now; `scripts/sycl-canonical-gates.sh` should own the check.
 - A lead mistake to keep out of the next round: a throughput pair was read while implementer builds started

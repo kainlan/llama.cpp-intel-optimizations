@@ -93,6 +93,8 @@ void ggml_sycl_moe_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cg
 // gpu_ids: host array of expert slot indices (parallel to gpu_expert_ids)
 // n_gpu_entries: number of GPU-dispatched entries
 // Returns true if handled, false to fall back to per-expert loop.
+// reject_reason, reject_bytes: on a false return, the cause (a string literal) and, for a scratch allocation that
+// failed, the bytes it requested (0 for any other cause). Both are cleared on entry.
 bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                const ggml_tensor *              src0,
                                const ggml_tensor *              src1,
@@ -112,7 +114,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                                int64_t                          ids_host_count       = 0,
                                sycl::event *                    completion_event     = nullptr,
                                bool *                           completion_event_set = nullptr,
-                               const std::vector<sycl::event> * deps                 = nullptr);
+                               const std::vector<sycl::event> * deps                 = nullptr,
+                               const char **                    reject_reason        = nullptr,
+                               size_t *                         reject_bytes         = nullptr);
 
 bool mmvq_moe_batched_dispatch_pair_mxfp4_soa(ggml_backend_sycl_context & ctx,
                                               const ggml_tensor *         src0_a,
@@ -809,6 +813,28 @@ void mmvq_submit_mxfp4_coalesced(sycl::queue & q,
                                  int           nrows,
                                  int           total_nrows,
                                  int           row_low);
+
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+// Runs the Q8_0 matvec launcher of one layout (SOA when !coalesced) as the dispatcher does, with `compute_units` in
+// place of the card's count: 0 keeps the row form, the card's count lets the shape pick the column-split form
+// (mmvq_column_split_chunks in mmvq-launch-geometry.hpp). vx is the whole tensor in that layout, vy SOA Q8_1 of ncols
+// (mmvq_q8_1_soa_size), dst has nrows floats for rows [row_low, row_low + nrows), fused_add (may be null) has
+// fused_add_ne0 contiguous floats indexed by fused_add_row_base + row. Coalesced takes no slice: nrows ==
+// total_nrows, row_low == 0. Submits to q without waiting; returns the chunks launched, 1 for the row form.
+int mmvq_test_q8_0_launch(sycl::queue & q,
+                          bool          coalesced,
+                          const void *  vx,
+                          const void *  vy,
+                          float *       dst,
+                          int           ncols,
+                          int           nrows,
+                          int           total_nrows,
+                          int           row_low,
+                          int           compute_units,
+                          const float * fused_add,
+                          int64_t       fused_add_ne0,
+                          int64_t       fused_add_row_base);
+#    endif
 
 // Float-to-Q8_1 SOA quantization kernel submission for micro-graph
 // Input:  x[ncols] float activations

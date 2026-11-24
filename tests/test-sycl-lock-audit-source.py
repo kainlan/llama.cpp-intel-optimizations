@@ -29,14 +29,36 @@ destructor_body = slice_between(sycl, "ggml_backend_sycl_context::~ggml_backend_
 shutdown_body = slice_between(sycl, "void ggml_backend_sycl_shutdown(void)", "// backend reg")
 cleanup_helper = slice_between(sycl, "static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,\n                                                               const char *                stage,\n                                                               const char *                what) noexcept {", "static ggml_status ggml_backend_sycl_graph_compute")
 
+# synchronize latches a failure and returns, with one exception: a failed drain after a device loss ends the process at
+# once, because the cleanup that would follow drains and releases on the lost card, where driver teardown can hang
+# (docs/backend/SYCL.md, exit status 69). That fast exit must be the device-lost gate's only statement and the only exit
+# in synchronize; any other exit ends the process on a failure the caller should get back.
+SYNC_LOSS_GATE = "if (ggml_sycl_device_lost_latched()) {"
+SYNC_LOSS_EXIT = 'ggml_sycl_fatal_exit(GGML_SYCL_EXIT_DEVICE_LOST, "SYCL_CHECK failed after a device loss");'
+
+
+def sync_exits_only_after_device_loss(body: str) -> bool:
+    if body.count(SYNC_LOSS_GATE) != 1 or body.count(SYNC_LOSS_EXIT) != 1 or body.count("ggml_sycl_fatal_exit(") != 1:
+        return False
+    gate = body.index(SYNC_LOSS_GATE) + len(SYNC_LOSS_GATE)
+    exit_at = body.index(SYNC_LOSS_EXIT)
+    close = body.find("}", gate)
+    if not gate < exit_at < close:
+        return False
+    before = body[gate:exit_at].splitlines()
+    after = body[exit_at + len(SYNC_LOSS_EXIT):close]
+    return all(line.strip() == "" or line.strip().startswith("//") for line in before) and after.strip() == ""
+
+
 checks = {
     "graph_compute catches std and unknown": "catch (const std::exception & exc)" in graph_compute and "catch (...)" in graph_compute,
-    "graph_compute returns failed not escape": graph_compute.count("return GGML_STATUS_FAILED;") >= 3 and "std::exit(1)" not in graph_compute,
+    "graph_compute returns failed not escape": graph_compute.count("return GGML_STATUS_FAILED;") >= 3 and "std::exit(1)" not in graph_compute and "ggml_sycl_fatal_exit(" not in graph_compute,
     "graph_compute cleanup quarantines and releases exact invocation": "ggml_sycl_execution_quarantine_graph(cleanup_ctx)" in sycl and "ggml_sycl_execution_release_graph(cleanup_ctx)" in sycl,
     "synchronize catches std and unknown": "catch (const std::exception & exc)" in sync_body and "catch (...)" in sync_body,
     "synchronize no c++ escape": "std::exit(1)" not in sync_body and "ggml_backend_sycl_graph_boundary_exception_cleanup(sycl_ctx, \"synchronize\"" in sync_body,
-    "event boundary logs not exits": "GGML_LOG_ERROR" in event_boundary and "std::exit(1)" not in event_boundary,
-    "device event synchronize logs not exits": "GGML_LOG_ERROR" in device_event_sync and "std::exit(1)" not in device_event_sync,
+    "synchronize ends the process only after a device loss": sync_exits_only_after_device_loss(sync_body),
+    "event boundary logs not exits": "GGML_LOG_ERROR" in event_boundary and "std::exit(1)" not in event_boundary and "ggml_sycl_fatal_exit(" not in event_boundary,
+    "device event synchronize logs not exits": "GGML_LOG_ERROR" in device_event_sync and "std::exit(1)" not in device_event_sync and "ggml_sycl_fatal_exit(" not in device_event_sync,
     "for_each snapshots binding before callbacks": "ggml_sycl_execution_pin_bound_backends_locked(context_id)" in for_each and "ggml_sycl_execution_release_backend_pin(pin);" in for_each,
     "extract snapshots bound backends before swaps": "std::vector<ggml_sycl_execution_bound_backend_pin> bound_backends;" in extract_body and "binding_lock(g_execution_backend_binding_mutex)" in extract_body and "ggml_sycl_execution_pin_bound_backends_locked(ticket->context_id.value)" in extract_body,
     "extract swaps control owners outside binding lock": "for (size_t index = 0; index < bound_backends.size(); ++index)" in extract_body and "control_host_allocs.swap" in extract_body,

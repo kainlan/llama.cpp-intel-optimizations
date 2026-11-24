@@ -71,6 +71,7 @@ SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 COMMON = read("ggml/src/ggml-sycl/common.hpp")
 CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
 HDR = read("ggml/src/ggml-sycl/moe-host-scatter.hpp")
+ZONE = read("ggml/src/ggml-sycl/zone-sizing.cpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -112,6 +113,8 @@ TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction
 CLAIM_SIG = "static void ggml_sycl_moe_host_scatter_claim_plan(ggml_backend_sycl_context & ctx)"
 ENSURE_SIG = "inline void * ggml_sycl_runtime_scratch_ensure("
 REQ_SIG = "bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out)"
+# The pure sum the requirement hands its terms to (zone-sizing.cpp).
+ZONE_REQ_SIG = "bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out)"
 FIT_SIG = "bool unified_cache_dense_scratch_runtime_fit(int device_id,"
 PUBLISH_SIG = "static void publish_moe_host_scatter_term(const placement_plan & plan,"
 STRUCT_SIG = "template <typename RetireMarkerKernel> struct planned_runtime_scratch_t"
@@ -168,15 +171,19 @@ def claim_term_counts_only_host_experts(cache: str, hdr: str = HDR) -> bool:
             and "if (!t.has_host_experts || (t.device >= 0 && t.device != device)) { continue; }" in for_device)
 
 
-def claim_zone_requirement_folds_in_the_term(cache: str) -> bool:
-    """The RUNTIME zone requirement adds the term (checked) before the dense plans, and the zone sizing reads it."""
+def claim_zone_requirement_folds_in_the_term(cache: str, zone: str = ZONE) -> bool:
+    """The RUNTIME zone requirement reads the term and hands it to the pure sum, which adds it (checked) before the
+    dense plans, and the zone sizing reads the requirement."""
     t = norm(cache)
     req = body(t, REQ_SIG)
+    pure = body(norm(zone), ZONE_REQ_SIG)
     read_at = req.find("const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);")
-    check_at = req.find("if (moe_host_scatter > SIZE_MAX - base) { return false; }", read_at)
-    add_at = req.find("base += moe_host_scatter;", check_at)
-    out_at = req.find("*out = base + mmq_src1 + dequant_f16", add_at)
-    return (min(read_at, check_at, add_at, out_at) >= 0
+    field_at = req.find("terms.moe_host_scatter = moe_host_scatter;", read_at)
+    out_at = req.find("return zone_runtime_requirement(terms, out);", field_at)
+    added_at = pure.find("const size_t added[] = { terms.moe_host_scatter, terms.mmq_src1, terms.dequant_f16")
+    check_at = pure.find("if (term > SIZE_MAX - total) { return false; }", added_at)
+    add_at = pure.find("total += term;", check_at)
+    return (min(read_at, field_at, out_at, added_at, check_at, add_at) >= 0
             and re.search(r"unified_cache_get_planned_runtime_zone_requirement\(dev_id, &planned_runtime_scratch\).*?"
                           r"zone_runtime_reserved_bytes\(runtime_floor, planned_runtime_scratch, "
                           r"&runtime_zone\)", t) is not None)
@@ -611,12 +618,18 @@ def test_mutant_workspace_not_thread_local_fails():
 
 
 def test_mutant_zone_requirement_without_the_term_fails():
-    assert not claim_zone_requirement_folds_in_the_term(_once(CACHE, "base += moe_host_scatter;", ";"))
+    assert not claim_zone_requirement_folds_in_the_term(
+        CACHE, _once(ZONE, "{ terms.moe_host_scatter, terms.mmq_src1", "{ terms.mmq_src1"))
+
+
+def test_mutant_zone_requirement_never_hands_over_the_term_fails():
+    assert not claim_zone_requirement_folds_in_the_term(
+        _once(CACHE, "terms.moe_host_scatter = moe_host_scatter;", ""), ZONE)
 
 
 def test_mutant_zone_requirement_unchecked_add_fails():
     assert not claim_zone_requirement_folds_in_the_term(
-        _once(CACHE, "if (moe_host_scatter > SIZE_MAX - base) { return false; }", ""))
+        CACHE, _once(ZONE, "if (term > SIZE_MAX - total) { return false; }", ""))
 
 
 def test_mutant_fit_without_the_term_fails():

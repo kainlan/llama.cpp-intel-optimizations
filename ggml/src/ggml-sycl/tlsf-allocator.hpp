@@ -4,8 +4,10 @@
 //
 // TLSF (Two-Level Segregated Fit) sub-allocator for VRAM arena zones.
 //
-// Provides O(1) guaranteed alloc/free with zero writes to the managed
-// memory region. All metadata is stored in host memory (block_meta vector
+// Provides O(1) free, and O(1) allocation whenever a size class above the
+// request's own holds a block (otherwise allocation walks the request's own
+// class list, see allocate()), with zero writes to the managed memory
+// region. All metadata is stored in host memory (block_meta vector
 // + bitmaps). The allocator returns OFFSETS into the managed region;
 // callers convert offsets to device pointers via arena_base + offset.
 //
@@ -17,6 +19,8 @@
 
 #ifndef GGML_SYCL_TLSF_ALLOCATOR_HPP
 #define GGML_SYCL_TLSF_ALLOCATOR_HPP
+
+#include "exit-settle.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -33,6 +37,7 @@
 #define TLSF_ASSERT(cond) do { \
     if (!(cond)) { \
         fprintf(stderr, "TLSF_ASSERT failed: %s at %s:%d\n", #cond, __FILE__, __LINE__); \
+        ggml_sycl::exit_settle(); \
         abort(); \
     } \
 } while(0)
@@ -64,13 +69,30 @@ class tlsf_allocator {
         return (size + granularity - 1) & ~(granularity - 1);
     }
 
+    // The piece of a `remaining`-byte request that a free block of `largest`
+    // bytes (a largest_free_block() answer) takes when the request is split
+    // across regions: all of it if it fits, otherwise as much as fits.  Rounded
+    // up by the same granularity as round_request(), so no sub-grain remainder
+    // is left for a later piece; when that rounding passes the block's end (a
+    // region's last block ends off the grain when the region's size does), the
+    // block's on-grain part instead, which allocate() places.  0 when `largest`
+    // holds no whole granule or `remaining` is 0.
+    static size_t segment_piece(size_t remaining, size_t largest, size_t alignment) {
+        const size_t granularity = alignment > block_grain ? alignment : block_grain;
+        const size_t want        = remaining < largest ? remaining : largest;
+        const size_t piece       = (want + granularity - 1) & ~(granularity - 1);
+        return piece <= largest ? piece : largest & ~(granularity - 1);
+    }
+
     // Initialize with the SIZE of the managed region [0, size).
     // No pointer to the managed region is needed — all bookkeeping is
     // in host memory.  min_alloc_size: minimum block granularity
     // (256 bytes for GPU alignment).
     tlsf_allocator(size_t size);
 
-    // O(1) allocation. Returns OFFSET into the managed region.
+    // O(1) allocation when a class above the request's own holds a block;
+    // otherwise a walk of the request's own class. Returns OFFSET into the
+    // managed region.
     // Returns SIZE_MAX on failure.
     // Caller computes device_ptr = arena_base + offset.
     // alignment must be a power of 2 and <= MIN_BLOCK_SIZE (256); every
@@ -99,9 +121,9 @@ class tlsf_allocator {
     // around allocate() and free() -- in the unified cache that is
     // unified_cache::arena_allocator_group_mutex(zone) (llama.cpp-044k).
     //
-    // gap_below() and frontier_walk() are EXACT: they read the physical block
-    // list.  largest_free_block() is not (it reports the head of the highest
-    // size class), so a fit decision should use these, not that.
+    // gap_below() and frontier_walk() read the physical block list, so they
+    // say WHERE a block fits.  largest_free_block() is exact too, but only
+    // says how large the largest free block is, not where it lies.
     // ------------------------------------------------------------------
     static constexpr size_t no_anchor = SIZE_MAX;
 
@@ -159,7 +181,7 @@ class tlsf_allocator {
     // Query methods
     size_t used() const;                // Bytes currently allocated
     size_t available() const;           // Bytes available for allocation
-    size_t largest_free_block() const;  // Size of largest contiguous free block
+    size_t largest_free_block() const;  // Size of largest contiguous free block (walks the top class)
 
     // ------------------------------------------------------------------
     // Whole-TLSF block census (llama.cpp-moua L4 1b).
@@ -434,6 +456,9 @@ class tlsf_allocator {
             fl = (int) (sizeof(size_t) * 8 - 1 - __builtin_clzll(size)) - FL_OFFSET;
             sl = (int) ((size >> (fl + FL_OFFSET - SL_BITS)) - SL_COUNT);
             if (fl >= FL_COUNT) {
+                // This last class has no upper bound: from 2^35 * 31/16 bytes (about 62 GiB) up, a request that
+                // maps here can be larger than a block in it.  allocate() therefore checks the fast path's block
+                // and sends such a request to the walk of this class, which takes only a block that fits.
                 fl = FL_COUNT - 1;
                 sl = SL_COUNT - 1;
             }
@@ -662,7 +687,8 @@ inline int tlsf_allocator::alloc_block_id() {
 }
 
 // ------------------------------------------------------------------
-// allocate: O(1) via bitmap search, returns offset (SIZE_MAX on failure)
+// allocate: O(1) via bitmap search, else a walk of the request's own class;
+// returns offset (SIZE_MAX on failure)
 // ------------------------------------------------------------------
 inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t tag) {
     // Every block offset must stay a multiple of MIN_BLOCK_SIZE.  The pool's
@@ -684,17 +710,35 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t ta
     mapping_search(adjusted, fl, sl);
 
     int block_id = find_suitable(fl, sl);
+    if (block_id >= 0 && blocks_[block_id].size < size) {
+        block_id = -1;  // only the unbounded last class can hold a block below a request that maps to it
+    }
     if (block_id < 0) {
-        // mapping_search rounds the size UP to guarantee all blocks in the
-        // returned SL class are >= size. When the block sits exactly at an SL
-        // boundary this rounding pushes into the next (empty) SL class. Fall
-        // back to the exact (non-rounding) mapping. find_suitable searches from
-        // (fl, sl) upward so blocks in higher SL classes are included.
-        // Guard: the first block returned may be in a lower SL sub-class whose
-        // size is in [lower_bound, size), so verify before committing.
+        // mapping_search rounds the size UP to the next class, every block of
+        // which is >= size, so a miss there means no class above the request's
+        // own holds a block (in the unbounded last class, the request's own,
+        // the block found was too small).  The request's own class holds sizes in
+        // [lower_bound, upper), and a block in it may still fit, behind a
+        // smaller head (two sizes rounding into one class, like an expert
+        // triplet's 921600- and 921856-byte members), so its head alone is not
+        // enough.  Take the SMALLEST block >= size, not the first: when the
+        // freed holes are exactly the sizes about to be re-requested, a first
+        // fit puts a smaller request into a larger request's hole, leaves a
+        // sliver, and refuses the larger request later.
+        // The walk runs only when no larger class has a block, and it stops
+        // early on an exact-size match; the rounded search above stays O(1).
         mapping(adjusted, fl, sl);
-        block_id = find_suitable(fl, sl);
-        if (block_id < 0 || blocks_[block_id].size < size) {
+        block_id = -1;
+        for (int id = free_lists_[fl][sl]; id >= 0; id = blocks_[id].next_free) {
+            const size_t id_size = blocks_[id].size;
+            if (id_size >= size && (block_id < 0 || id_size < blocks_[block_id].size)) {
+                block_id = id;
+                if (id_size == size) {
+                    break;
+                }
+            }
+        }
+        if (block_id < 0) {
             return SIZE_MAX;
         }
     }
@@ -795,16 +839,22 @@ inline size_t tlsf_allocator::available() const {
 }
 
 inline size_t tlsf_allocator::largest_free_block() const {
-    // Find highest set bit in fl_bitmap to get largest FL class
+    // Every block of the highest non-empty class is larger than every block of
+    // a lower class, so that class alone holds the largest free block.  Its
+    // head need not be the largest: a class holds a range of sizes, and a
+    // larger block can sit behind a smaller head, so the head alone would
+    // understate it and a gate reading it would refuse requests allocate()
+    // places.  Cost: one walk of the top class's list, no other class.
     if (fl_bitmap_ == 0) {
         return 0;
     }
-    int fl       = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(fl_bitmap_));
-    // Find highest set bit in sl_bitmap for that FL class
-    int sl       = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(sl_bitmap_[fl]));
-    // The head of that list is the largest (approximately)
-    int block_id = free_lists_[fl][sl];
-    return block_id >= 0 ? blocks_[block_id].size : 0;
+    const int fl      = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(fl_bitmap_));
+    const int sl      = (int) (sizeof(uint32_t) * 8 - 1 - __builtin_clz(sl_bitmap_[fl]));
+    size_t    largest = 0;
+    for (int id = free_lists_[fl][sl]; id >= 0; id = blocks_[id].next_free) {
+        largest = std::max(largest, blocks_[id].size);
+    }
+    return largest;
 }
 
 // ------------------------------------------------------------------

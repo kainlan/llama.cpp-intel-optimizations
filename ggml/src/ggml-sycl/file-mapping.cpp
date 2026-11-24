@@ -1,0 +1,375 @@
+#include "file-mapping.hpp"
+
+#if !defined(_WIN32)
+#    include <sys/mman.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
+
+#    include <cerrno>
+#endif
+
+#include <algorithm>
+#include <atomic>
+
+namespace ggml_sycl {
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static std::atomic<uint64_t> g_munmap_count{ 0 };
+
+uint64_t unified_cache_file_mapping_munmap_count_for_test() {
+    return g_munmap_count.load(std::memory_order_acquire);
+}
+#endif
+
+const char * file_map_status_name(file_map_status status) {
+    switch (status) {
+        case file_map_status::OK:
+            return "ok";
+        case file_map_status::INVALID_ARGUMENT:
+            return "invalid-argument";
+        case file_map_status::DUP_FAILED:
+            return "dup-failed";
+        case file_map_status::FSTAT_FAILED:
+            return "fstat-failed";
+        case file_map_status::SIZE_MISMATCH:
+            return "size-mismatch";
+        case file_map_status::RESERVE_FAILED:
+            return "reserve-failed";
+        case file_map_status::SEGMENT_MAP_FAILED:
+            return "segment-map-failed";
+        case file_map_status::LOCK_FAILED:
+            return "lock-failed";
+        case file_map_status::ADVISE_FAILED:
+            return "advise-failed";
+        case file_map_status::UNSUPPORTED:
+            return "unsupported-platform";
+    }
+    return "?";
+}
+
+static uint64_t page_floor(uint64_t v, uint64_t page) {
+    return v / page * page;
+}
+
+static uint64_t page_ceil(uint64_t v, uint64_t page) {
+    return (v + page - 1) / page * page;
+}
+
+// Sorts and merges ranges that overlap or touch. Empty ranges are dropped.
+static std::vector<file_map_range> merge_ranges(std::vector<file_map_range> in) {
+    in.erase(std::remove_if(in.begin(), in.end(), [](const file_map_range & r) { return r.length == 0; }), in.end());
+    std::sort(in.begin(), in.end(),
+              [](const file_map_range & a, const file_map_range & b) { return a.file_offset < b.file_offset; });
+    std::vector<file_map_range> out;
+    for (const file_map_range & r : in) {
+        if (!out.empty() && r.file_offset <= out.back().file_end()) {
+            out.back().length = std::max(out.back().file_end(), r.file_end()) - out.back().file_offset;
+        } else {
+            out.push_back(r);
+        }
+    }
+    return out;
+}
+
+// `a` intersected with `b`, both sorted and merged.
+static std::vector<file_map_range> intersect_ranges(const std::vector<file_map_range> & a,
+                                                    const std::vector<file_map_range> & b) {
+    std::vector<file_map_range> out;
+    for (const file_map_range & x : a) {
+        for (const file_map_range & y : b) {
+            const uint64_t lo = std::max(x.file_offset, y.file_offset);
+            const uint64_t hi = std::min(x.file_end(), y.file_end());
+            if (lo < hi) {
+                out.push_back({ lo, hi - lo });
+            }
+        }
+    }
+    return merge_ranges(out);
+}
+
+file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & tensor_ranges,
+                                        const std::vector<file_map_range> &    lazy_ranges,
+                                        uint64_t                               page,
+                                        uint64_t                               random_window) {
+    file_segment_plan plan;
+    if (page == 0 || (page & (page - 1)) != 0) {
+        plan.error = "the page size is not a power of two";
+        return plan;
+    }
+    const std::vector<file_map_range> lazy = merge_ranges(lazy_ranges);
+
+    std::vector<file_map_range> all;
+    std::vector<file_map_range> host;
+    std::vector<file_map_range> others;  // device-only tensors: bytes a host advice or lock must not reach
+    for (const file_tensor_range & t : tensor_ranges) {
+        if (t.length == 0) {
+            continue;
+        }
+        for (const file_map_range & z : lazy) {
+            if (t.file_offset < z.file_end() && z.file_offset < t.file_offset + t.length) {
+                plan.error = "a tensor range overlaps a lazy range";
+                return plan;
+            }
+        }
+        all.push_back({ t.file_offset, t.length });
+        if (t.host_executed) {
+            host.push_back({ t.file_offset, t.length });
+        } else {
+            others.push_back({ t.file_offset, t.length });
+        }
+    }
+
+    // Map segments: outward, merged, never a complement.
+    std::vector<file_map_range> outward;
+    for (const file_map_range & r : all) {
+        const uint64_t lo = page_floor(r.file_offset, page);
+        outward.push_back({ lo, page_ceil(r.file_end(), page) - lo });
+    }
+    plan.map = merge_ranges(outward);
+
+    // WILLNEED / lock segments. GGUF pads tensors to 32 B, so two host tensors usually straddle a page with a few
+    // padding bytes between them; that page holds nothing of anybody else, so the host ranges are first merged across a
+    // gap shorter than a page that holds no lazy byte and no device-only tensor byte (the loader's lock_range rounds
+    // outward at such an end for the same reason). The merged ranges are then rounded inward. An inward-rounded page
+    // lies inside a merged range, which has no lazy byte (a tensor overlapping one was refused above, and a merged gap
+    // holds none), so no page of this set holds a lazy byte.
+    std::vector<file_map_range> blocked = lazy;
+    blocked.insert(blocked.end(), others.begin(), others.end());
+    blocked = merge_ranges(blocked);
+    std::vector<file_map_range> joined;
+    for (const file_map_range & r : merge_ranges(host)) {
+        if (!joined.empty() && r.file_offset - joined.back().file_end() < page) {
+            const uint64_t gap_begin = joined.back().file_end();
+            bool           clear     = true;
+            for (const file_map_range & b : blocked) {
+                if (b.file_offset < r.file_offset && gap_begin < b.file_end()) {
+                    clear = false;
+                    break;
+                }
+            }
+            if (clear) {
+                joined.back().length = r.file_end() - joined.back().file_offset;
+                continue;
+            }
+        }
+        joined.push_back(r);
+    }
+    for (const file_map_range & r : joined) {
+        const uint64_t lo = page_ceil(r.file_offset, page);
+        const uint64_t hi = page_floor(r.file_end(), page);
+        if (lo < hi) {
+            plan.willneed.push_back({ lo, hi - lo });
+        }
+    }
+
+    // MADV_RANDOM windows at both edges of every lazy range, the shared pages inside, kept to what is mapped.
+    std::vector<file_map_range> windows;
+    for (const file_map_range & z : lazy) {
+        const uint64_t before = z.file_offset > random_window ? z.file_offset - random_window : 0;
+        const uint64_t lo     = page_floor(before, page);
+        const uint64_t hi     = page_ceil(z.file_offset, page);
+        if (lo < hi) {
+            windows.push_back({ lo, hi - lo });
+        }
+        const uint64_t after_lo = page_floor(z.file_end(), page);
+        const uint64_t after_hi = page_ceil(z.file_end() + random_window, page);
+        if (after_lo < after_hi) {
+            windows.push_back({ after_lo, after_hi - after_lo });
+        }
+    }
+    plan.random_windows = intersect_ranges(merge_ranges(windows), plan.map);
+    return plan;
+}
+
+uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page) {
+    const uint64_t floor_bytes = 2ull * 1024 * 1024;
+    const uint64_t w           = std::max(2 * read_ahead_bytes, floor_bytes);
+    return page == 0 ? w : page_ceil(w, page);
+}
+
+#if !defined(_WIN32)
+
+static uint64_t file_map_page_size() {
+    return (uint64_t) sysconf(_SC_PAGESIZE);
+}
+
+// The one munmap of this translation unit (a gate counts the calls), so the private counter sits at the syscall:
+// a second release added anywhere is either a gate failure or visible in the counter.
+static void file_map_munmap(void * base, size_t length) {
+    munmap(base, length);
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_munmap_count.fetch_add(1, std::memory_order_acq_rel);
+#    endif
+}
+
+file_map_status unified_cache_raw_map_file(int                                 fd,
+                                           uint64_t                            file_size,
+                                           const file_map_range &              reservation,
+                                           const std::vector<file_map_range> & segments,
+                                           file_mapping *                      out) {
+    if (out == nullptr || fd < 0 || reservation.length == 0 || segments.empty() ||
+        reservation.file_end() < reservation.file_offset || reservation.file_end() > file_size) {
+        return file_map_status::INVALID_ARGUMENT;
+    }
+    const uint64_t page      = file_map_page_size();
+    const uint64_t res_begin = page_floor(reservation.file_offset, page);
+    const uint64_t res_end   = page_ceil(reservation.file_end(), page);
+
+    // Every segment is checked before anything is opened or mapped, so a refusal leaves nothing behind.
+    std::vector<file_map_range> sorted = segments;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const file_map_range & a, const file_map_range & b) { return a.file_offset < b.file_offset; });
+    uint64_t prev_end = res_begin;
+    for (const file_map_range & seg : sorted) {
+        if (seg.length == 0 || seg.file_offset % page != 0 || seg.file_end() < seg.file_offset ||
+            seg.file_offset < prev_end || page_ceil(seg.file_end(), page) > res_end) {
+            return file_map_status::INVALID_ARGUMENT;
+        }
+        prev_end = page_ceil(seg.file_end(), page);
+    }
+
+    // The loader recorded the file's size when it opened it (register_file_identity); a different size now means the
+    // file was replaced or truncated under us.
+    struct stat st = {};
+    if (fstat(fd, &st) != 0) {
+        return file_map_status::FSTAT_FAILED;
+    }
+    if ((uint64_t) st.st_size != file_size) {
+        return file_map_status::SIZE_MISMATCH;
+    }
+
+    const int dup_fd = dup(fd);
+    if (dup_fd < 0) {
+        return file_map_status::DUP_FAILED;
+    }
+    const size_t length = (size_t) (res_end - res_begin);
+    void *       base   = mmap(nullptr, length, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) {
+        close(dup_fd);
+        return file_map_status::RESERVE_FAILED;
+    }
+    for (const file_map_range & seg : sorted) {
+        void * at = (char *) base + (seg.file_offset - res_begin);
+        if (mmap(at, (size_t) seg.length, PROT_READ, MAP_SHARED | MAP_FIXED, dup_fd, (off_t) seg.file_offset) ==
+            MAP_FAILED) {
+            const int    err = errno;
+            file_mapping partial;
+            partial.base        = base;
+            partial.length      = length;
+            partial.file_offset = res_begin;
+            partial.fd          = dup_fd;
+            unified_cache_raw_unmap_file(&partial);
+            errno = err;
+            return file_map_status::SEGMENT_MAP_FAILED;
+        }
+    }
+    out->base        = base;
+    out->length      = length;
+    out->file_offset = res_begin;
+    out->fd          = dup_fd;
+    return file_map_status::OK;
+}
+
+file_map_status unified_cache_raw_lock_file_segments(const file_mapping &                mapping,
+                                                     const std::vector<file_map_range> & lock_segments) {
+    if (mapping.base == nullptr) {
+        return file_map_status::INVALID_ARGUMENT;
+    }
+    const uint64_t page = file_map_page_size();
+    const uint64_t lo   = mapping.file_offset;
+    const uint64_t hi   = mapping.file_offset + mapping.length;
+
+    // Validate all of them first: a refused set locks nothing. A range is never widened here, because mlock rounds a
+    // mid-page start down to the page and would lock a neighbouring page (a lazy one) the caller meant to leave out.
+    for (const file_map_range & seg : lock_segments) {
+        if (seg.length == 0 || seg.file_offset % page != 0 || seg.length % page != 0 || seg.file_offset < lo ||
+            seg.file_end() < seg.file_offset || seg.file_end() > hi) {
+            return file_map_status::INVALID_ARGUMENT;
+        }
+    }
+    for (const file_map_range & seg : lock_segments) {
+        if (mlock((char *) mapping.base + (seg.file_offset - lo), (size_t) seg.length) != 0) {
+            return file_map_status::LOCK_FAILED;  // errno names why; the unmap releases whatever was locked
+        }
+    }
+    return file_map_status::OK;
+}
+
+file_map_status unified_cache_raw_advise_file_segments(const file_mapping &                mapping,
+                                                       const std::vector<file_map_range> & segments,
+                                                       file_advice                         advice) {
+    if (mapping.base == nullptr) {
+        return file_map_status::INVALID_ARGUMENT;
+    }
+    const uint64_t page = file_map_page_size();
+    const uint64_t lo   = mapping.file_offset;
+    const uint64_t hi   = mapping.file_offset + mapping.length;
+
+    // Validated first, like the lock: a refused set advises nothing, and a range is never widened, because an advice
+    // that reached a neighbouring page would reach a lazy one.
+    for (const file_map_range & seg : segments) {
+        if (seg.length == 0 || seg.file_offset % page != 0 || seg.length % page != 0 || seg.file_offset < lo ||
+            seg.file_end() < seg.file_offset || seg.file_end() > hi) {
+            return file_map_status::INVALID_ARGUMENT;
+        }
+    }
+    const int      flag  = advice == file_advice::WILLNEED ? MADV_WILLNEED : MADV_RANDOM;
+    // The kernel clamps one MADV_WILLNEED to max(io_pages, ra_pages) of the backing device (a single call over a 56 MiB
+    // segment populates 128 pages here, and 1 MiB chunks populate half of it where max_sectors_kb is 512), so a WILLNEED
+    // segment is advised in chunks no larger than the smallest plausible cap: 128 KiB, the default read_ahead_kb and
+    // below any io_pages that max_sectors_kb >= 128 gives. Advising a segment must mean prefetching all of it. The
+    // chunks stay inside the segment, so no advice reaches a page outside it, and are at least a page.
+    const uint64_t chunk = advice == file_advice::WILLNEED ? std::max(page, 128 * 1024 / page * page) : ~0ull;
+    for (const file_map_range & seg : segments) {
+        for (uint64_t done = 0; done < seg.length; done += chunk) {
+            const uint64_t n = std::min(chunk, seg.length - done);
+            if (madvise((char *) mapping.base + (seg.file_offset - lo + done), (size_t) n, flag) != 0) {
+                return file_map_status::ADVISE_FAILED;  // errno names why
+            }
+        }
+    }
+    return file_map_status::OK;
+}
+
+void unified_cache_raw_unmap_file(file_mapping * mapping) {
+    if (mapping == nullptr || mapping->base == nullptr) {
+        return;
+    }
+    // One munmap of the whole reservation, never one per segment: the segments are not separate allocations.
+    file_map_munmap(mapping->base, mapping->length);
+    if (mapping->fd >= 0) {
+        close(mapping->fd);
+    }
+    *mapping = {};
+}
+
+#else   // _WIN32: the tier needs PROT_NONE reservations and MAP_FIXED, so it is absent; see file_mapping_supported()
+
+file_map_status unified_cache_raw_map_file(int,
+                                           uint64_t,
+                                           const file_map_range &,
+                                           const std::vector<file_map_range> &,
+                                           file_mapping *) {
+    return file_map_status::UNSUPPORTED;
+}
+
+file_map_status unified_cache_raw_lock_file_segments(const file_mapping &, const std::vector<file_map_range> &) {
+    return file_map_status::UNSUPPORTED;
+}
+
+file_map_status unified_cache_raw_advise_file_segments(const file_mapping &,
+                                                       const std::vector<file_map_range> &,
+                                                       file_advice) {
+    return file_map_status::UNSUPPORTED;
+}
+
+void unified_cache_raw_unmap_file(file_mapping * mapping) {
+    // nothing was ever mapped here; leave the struct empty, as the POSIX release does
+    if (mapping != nullptr) {
+        *mapping = {};
+    }
+}
+
+#endif  // !_WIN32
+
+}  // namespace ggml_sycl

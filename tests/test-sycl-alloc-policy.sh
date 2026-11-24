@@ -22,6 +22,9 @@ if ! command -v rg >/dev/null 2>&1 && ! grep -Eq 'a\sb' <<< 'a b' 2>/dev/null; t
 fi
 
 "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/good"
+# Positive control for clause (q) of the canonical contract: exactly the pinned
+# mmap/munmap sites of the two device-free tier TUs pass.
+"$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/good-tier-mapping"
 "$CHECKER" "$ROOT_DIR/ggml/src/ggml-sycl"
 
 if "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/bad-alloc" >/dev/null 2>&1; then
@@ -823,5 +826,22 @@ if "$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/bad-fill" >/dev/null 2
     echo "expected bad fill fixture to fail policy check" >&2
     exit 1
 fi
+
+# Clause (q) allows the tier TUs' mapping sites by file, function and count: an
+# extra mmap in a pinned function, and an mmap in a third file, must still fail.
+# The checker must also name the extra call (marked EXTRA-MMAP) as its one
+# violation, so a count rule cannot report a pinned site instead.
+for fixture in bad-host-cpu-mapping-extra-mmap bad-file-mapping-extra-mmap bad-tier-third-file-mmap; do
+    if out="$("$CHECKER" "$ROOT_DIR/tests/sycl-alloc-policy-fixtures/$fixture" 2>&1)"; then
+        echo "expected $fixture fixture to fail policy check" >&2
+        exit 1
+    fi
+    if [[ "$(grep -c '^forbidden raw host VM' <<<"$out" || true)" != 1 ]] ||
+       ! grep -q '^forbidden raw host VM.*EXTRA-MMAP' <<<"$out"; then
+        echo "expected $fixture to report only its EXTRA-MMAP call; got:" >&2
+        echo "$out" >&2
+        exit 1
+    fi
+done
 
 echo "sycl alloc policy fixtures passed"

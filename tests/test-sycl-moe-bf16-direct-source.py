@@ -42,7 +42,8 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       one that cannot be chunked is refused; the float4 activation load runs only on a 16-byte aligned src1 base and
       row strides, and the 8-byte weight load only on an 8-byte aligned weight row (opencl:cpu reads unaligned loads
       correctly, so the kernel test cannot see either guard go); the file allocates, frees and waits on nothing;
-  (h) the MMVQ tables stay BF16-free and moe_type_needs_direct_kernel stays Q1_0/NVFP4.
+  (h) the MMVQ tables stay BF16-free and moe_type_has_immutable_host_recipe (the Q1_0/NVFP4 type predicate, which the
+      planner's MMID workspace pools and the host recipe chooser ask) stays Q1_0/NVFP4.
 """
 
 import re
@@ -134,7 +135,7 @@ COMPAT_HEAD = "static ggml_sycl_graph_compat check_graph_compatibility(ggml_back
 COMPAT_CASE = "case GGML_OP_MUL_MAT_ID:"
 COMPAT_QUANT_GUARD = "if (ggml_is_quantized(src0->type)) {"
 SUBMIT_DECL = "bool moe_bf16_direct_submit("
-NEEDS_DIRECT_HEAD = "inline bool moe_type_needs_direct_kernel(ggml_type type) {"
+NEEDS_DIRECT_HEAD = "inline bool moe_type_has_immutable_host_recipe(ggml_type type) {"
 NEEDS_DIRECT_BODY = "returntype==GGML_TYPE_Q1_0||type==GGML_TYPE_NVFP4;"
 # A host wait is spelled .wait(, ->wait( or sycl::event::wait(: the three spellings are listed apart.
 ROUTE_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "ids_host", "ggml_sycl_copy_ids_to_host",
@@ -452,7 +453,7 @@ def claim_h_tables(s):
         fails.append("moe-mmvq-tables.hpp names GGML_TYPE_BF16: the MMVQ tables gained a type they have no kernel for")
     body = braced_body(s["resolved"], NEEDS_DIRECT_HEAD)
     if body is None or tight(body) != NEEDS_DIRECT_BODY:
-        fails.append("moe_type_needs_direct_kernel is no longer exactly Q1_0/NVFP4")
+        fails.append("moe_type_has_immutable_host_recipe is no longer exactly Q1_0/NVFP4")
     return fails
 
 

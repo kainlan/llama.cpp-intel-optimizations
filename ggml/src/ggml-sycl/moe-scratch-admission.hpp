@@ -75,12 +75,30 @@ static constexpr size_t PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT = 256;
 // pick up a wrapped -- and therefore admissible-looking -- size.
 bool pp_moe_onednn_checked_align_slot_bytes(size_t value, size_t * out);
 
-// The ring's activation and output slots at `n_ubatch` rows, from their per-row bytes: n_ubatch * per_row each,
-// rounded up to the slot alignment, every multiply and rounding checked. Returns false, leaving both outputs
-// untouched, on overflow. n_ubatch 0 sizes two empty slots: 0 rows is not an overflow. The ring's admission, the
-// explicit micro-batch's room and the cache's re-plan of the ring all size the slots here, so no two of them can
-// round or overflow-check a slot differently.
+// Rows the batched prompt executor's activation or output scratch can need for a micro-batch of `n_ubatch` rows,
+// once it is laid out per GEMM group (moe-pp-pack.hpp). With used = min(n_expert_used, n_expert) and
+// active = min(n_expert, n_ubatch * used), the experts that can hold a row:
+//
+//     min(2 * n_ubatch * used + 63 * active,  align64(n_ubatch) * active)
+//
+// First term: a group's members have at least half its head's rows, so padding to the head at most doubles a member,
+// and rounding a slot up to 64 rows adds at most 63 per expert. Second term: the rectangle, every active expert
+// padded to the busiest one, which is smaller for very few rows. Both terms rise with n_ubatch, so the bound never
+// falls as the micro-batch grows and a largest fitting micro-batch can be searched for. It assumes what MUL_MAT_ID
+// routing gives: a row's picks are distinct experts. Returns false, leaving *rows untouched, for a null output or
+// for a micro-batch with no experts or none used; n_ubatch 0 needs 0 rows.
+bool pp_moe_onednn_packed_rows_at(uint32_t n_ubatch, uint32_t n_expert, uint32_t n_expert_used, size_t * rows);
+
+// The ring's activation and output slots at `n_ubatch` rows: the rows the packed scratch can need
+// (pp_moe_onednn_packed_rows_at) times the bytes of one scratch row, rounded up to the slot alignment, every multiply
+// and rounding checked. `activation_bytes_per_row` is one activation row of the widest expert (its input width in
+// half floats); `output_bytes_per_row` one output row (its output width in floats). Returns false, leaving both
+// outputs untouched, on overflow or when a non-empty micro-batch has no experts or none used. n_ubatch 0 sizes two
+// empty slots. The ring's admission, the explicit micro-batch's room, the load-time publish and the cache's re-plan
+// all size the slots here, so no two of them can size a slot differently.
 bool pp_moe_onednn_slots_at(uint32_t n_ubatch,
+                            uint32_t n_expert,
+                            uint32_t n_expert_used,
                             size_t   activation_bytes_per_row,
                             size_t   output_bytes_per_row,
                             size_t * activation_slot_bytes,
@@ -184,12 +202,15 @@ inline bool pp_moe_onednn_reserve_if_admitted(const pp_moe_onednn_scratch_shape 
 // that fits the RUNTIME zone competes with none of them.
 //
 // Each KV-zone slot is one allocation, so free space in pieces cannot hold it.
-// The whole KV-zone part must fit the zone's largest free block. That is an
-// estimate: the allocator reports the head of its largest size class, not a
-// scanned maximum, and with two or more KV-zone slots the later allocations
-// can still miss. It covers the single-allocation case; for the rest, a failed
-// reserve refuses the ring, which the automatic -ub ladder treats as its
-// ceiling, keeping its last accepted size.
+// The whole KV-zone part must fit the zone's largest free block. The allocator
+// reports that block's exact size, and the slots fit it together whenever their
+// sum does: each is a multiple of the allocator's grain, a slot placed in that
+// block is carved from its front and leaves the rest whole behind it, and a slot
+// placed elsewhere leaves it untouched. The check is still not a guarantee,
+// because the zone can change between the read and the reserve: another KV-zone
+// tenant can allocate in between, and the read is not taken under the zone's
+// allocator lock. A failed reserve refuses the ring, which the automatic -ub
+// ladder treats as its ceiling, keeping its last accepted size.
 //
 // The KV-zone part is charged to the plan's VRAM, so it must also fit what the
 // plan's VRAM budget leaves on the device once KV and the MMID pools are
@@ -202,8 +223,12 @@ struct pp_moe_onednn_ring_admission_inputs {
     size_t   kv_zone_largest_block_bytes   = std::numeric_limits<size_t>::max();  // largest free KV-zone block
     size_t   vram_budget_room_bytes        = std::numeric_limits<size_t>::max();  // budget left after KV + MMID
     size_t   weight_slot_bytes             = 0;
+    // Bytes of one activation and of one output scratch row, and the expert counts the packed scratch's rows depend
+    // on (pp_moe_onednn_slots_at).
     size_t   activation_bytes_per_row      = 0;
     size_t   output_bytes_per_row          = 0;
+    uint32_t n_expert                      = 0;  // experts per layer
+    uint32_t n_expert_used                 = 0;  // experts a row routes to
     uint32_t ring_depth                    = 0;
     uint32_t n_ubatch                      = 0;
 };
@@ -212,8 +237,8 @@ struct pp_moe_onednn_ring_admission {
     bool     admit                    = false;
     bool     activation_in_kv_zone    = false;
     bool     output_in_kv_zone        = false;
-    size_t   activation_slot_bytes    = 0;  // align256(n_ubatch * activation_bytes_per_row)
-    size_t   output_slot_bytes        = 0;  // align256(n_ubatch * output_bytes_per_row)
+    size_t   activation_slot_bytes    = 0;  // pp_moe_onednn_slots_at(n_ubatch, ...)'s activation slot
+    size_t   output_slot_bytes        = 0;  // pp_moe_onednn_slots_at(n_ubatch, ...)'s output slot
     size_t   kv_zone_bytes            = 0;  // ring bytes placed in the KV zone; 0 when it all fits RUNTIME
     size_t   kv_zone_headroom_bytes   = 0;  // available - admitted, clamped at 0
     size_t   compute_reserve_bytes    = 0;  // n_ubatch * compute_reserve_bytes_per_row, saturating
@@ -224,7 +249,8 @@ struct pp_moe_onednn_ring_admission {
 };
 
 // Pure: every input is passed in. Not admitted on degenerate input (ring_depth
-// or n_ubatch 0, or both per-row terms 0) or when a slot size overflows size_t.
+// or n_ubatch 0, both per-row terms 0, or no experts or none used) or when a
+// slot size overflows size_t.
 pp_moe_onednn_ring_admission pp_moe_onednn_admit_ring(const pp_moe_onednn_ring_admission_inputs & in);
 
 // An explicit micro-batch (-ub N) whose ring the RUNTIME zone planned for the load's own micro-batch cannot hold is
@@ -241,8 +267,10 @@ struct pp_moe_onednn_explicit_ubatch_inputs {
     uint32_t n_ubatch                    = 0;  // the explicit micro-batch; 0 = none
     uint32_t n_ubatch_default            = 0;  // the load's own planning micro-batch
     size_t   weight_slot_bytes           = 0;
-    size_t   activation_bytes_per_row    = 0;
-    size_t   output_bytes_per_row        = 0;
+    size_t   activation_bytes_per_row    = 0;  // bytes of one activation scratch row
+    size_t   output_bytes_per_row        = 0;  // bytes of one output scratch row
+    uint32_t n_expert                    = 0;  // experts per layer
+    uint32_t n_expert_used               = 0;  // experts a row routes to
     uint32_t ring_depth                  = 0;
     size_t   runtime_fixed_bytes         = 0;  // RUNTIME requirement apart from the ring and the dense scratch
     size_t   dense_scratch_default_bytes = 0;  // the dense scratch at n_ubatch_default
@@ -279,7 +307,7 @@ struct pp_moe_onednn_explicit_ubatch_decision {
 };
 
 // Pure: the room an explicit micro-batch needs. Not valid when in.n_ubatch does not exceed in.n_ubatch_default, the
-// default is 0, or there is no ring (weight slot 0, ring_depth 0, or both per-row terms 0).
+// default is 0, or there is no ring (weight slot 0, ring_depth 0, both per-row terms 0, or no experts or none used).
 pp_moe_onednn_explicit_ubatch_room pp_moe_onednn_explicit_ubatch_plan_room(
     const pp_moe_onednn_explicit_ubatch_inputs & in);
 

@@ -10,9 +10,16 @@
 #include "cpu-job-signal.hpp"
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
+#include "file-mapping.hpp"
 #include "ggml-sycl.h"
+#include "host-budget.hpp"
+#include "host-cpu-mapping.hpp"
+#include "host-reserve-env.hpp"
+#include "host-zone-kinds.hpp"
+#include "host-zone-plan.hpp"
 #include "kv-room-cost.hpp"
 #include "kv-runtime-demotion.hpp"
+#include "lazy-io-pool.hpp"
 #include "mem-handle.hpp"
 #include "model-lifecycle.hpp"
 #include "moe-control-plan.hpp"
@@ -22,7 +29,9 @@
 #include "residency-plan.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-cache-key.hpp"
+#include "zone-raw-gate.hpp"
 #include "zone-sizing.hpp"
+#include "zone-tag-census.hpp"
 
 #include <array>
 #include <atomic>
@@ -59,6 +68,16 @@ struct onednn_scratch_token;
 
 // Forward declaration — needed by unified_cache::process_deferred_frees_public()
 bool unified_cache_is_graph_compute_active();
+
+// The host SCRATCH transaction's steps (§4.4, §M75), valued as the GGML_SYCL_HOST_SCRATCH_TRIAL_* constants the
+// proc-table entry takes as a plain int.
+enum class host_scratch_trial_op : int {
+    OPEN           = 0,
+    KEEP           = 1,
+    RETURN         = 2,
+    MARK           = 3,
+    RETURN_TO_MARK = 4,
+};
 
 // Check if VRAM arena mode is enabled (GGML_SYCL_VRAM_ARENA=1).
 bool vram_arena_enabled();
@@ -105,7 +124,8 @@ struct vram_zone {
     size_t              size  = 0;  // Total zone capacity
     std::atomic<size_t> used{ 0 };  // Bytes currently allocated (from TLSF)
 
-    // TLSF O(1) sub-allocator for this zone.
+    // TLSF sub-allocator for this zone: O(1) free, and O(1) allocation unless it
+    // walks the request's own size class (see tlsf_allocator::allocate).
     // Nullptr for WEIGHT zone in single-chunk mode (delegates to KV allocator).
     std::unique_ptr<tlsf_allocator> allocator;
     std::mutex                      alloc_mutex;  // Serialize concurrent alloc/free
@@ -357,6 +377,16 @@ struct placement_alternate_layout {
     int              target_device    = -1;  // -1 means same device as the owning placement_entry
 };
 
+// Whose memory a planned weight's host bytes live in (design 5efe §4.4). For a host-executed entry it is the memory
+// the CPU executes from; for a device-planned FILE_MAPPED entry it is the staging source. The plan keeps one byte term
+// per meaning, so a backing decides which term an entry's bytes land in and whether host_bytes is charged.
+enum class placement_host_backing : uint8_t {
+    PINNED,       // copied into the cache's pinned host pool
+    FILE_MAPPED,  // served from the model file's mapping; the page cache is not charged to host_bytes
+    HOST_CPU,     // copied into a cache-owned pageable host allocation
+    CPU_OWNED,    // copied by ggml-cpu outside the cache (CPU_REPACK); anonymous memory, charged
+};
+
 struct expert_placement_result {
     expert_placement_status                 status    = expert_placement_status::MISSING;
     int                                     layer_id  = -1;
@@ -364,6 +394,9 @@ struct expert_placement_result {
     expert_tensor_role                      role      = expert_tensor_role::UNKNOWN;
     std::string                             tensor_name;
     bool                                    on_device        = false;
+    // The plan's host backing for this expert. For a host-executed expert, a backing that sizes the WEIGHT zone means
+    // the preload holds it there; FILE_MAPPED means the CPU reads the mapping in place.
+    placement_host_backing                  host_backing     = placement_host_backing::PINNED;
     int                                     target_device    = -1;
     size_t                                  src_size         = 0;
     size_t                                  dst_size         = 0;
@@ -396,22 +429,33 @@ inline size_t placement_vram_charge_bytes(size_t bytes, size_t alignment = 256) 
     return std::max<size_t>(charged, 256);
 }
 
+// Which of an entry's sizes a group charge sums. The planner's host groups do not agree on one: the MoE host group
+// charges the file bytes, the dense layer unit and the multi-device MoE group the materialized layout's bytes.
+enum class placement_size_basis : uint8_t {
+    SRC,  // placement_entry::src_size
+    DST,  // placement_entry::dst_size
+};
+
 // Single entry in the placement plan: one weight tensor's placement decision.
 struct placement_entry {
-    std::string        name;  // Tensor name (for logging and S1-PRELOAD lookup)
-    ggml_type          type              = GGML_TYPE_COUNT;
-    int64_t            ne[GGML_MAX_DIMS] = {};
-    size_t             src_size          = 0;  // AOS source bytes
-    size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
+    std::string            name;  // Tensor name (for logging and S1-PRELOAD lookup)
+    ggml_type              type              = GGML_TYPE_COUNT;
+    int64_t                ne[GGML_MAX_DIMS] = {};
+    // The loader's role, copied from placement_tensor_info: the weight is consumed only by a row gather (GET_ROWS) and
+    // is never a MUL_MAT operand, so a question about its MUL_MAT kernel has no answer for it.
+    bool                   get_rows_only     = false;
+    size_t                 src_size          = 0;  // AOS source bytes
+    size_t                 dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
     // The layer's KV bytes, the sum over the KV slots it executes, on one anchor entry per layer (its attention entry
     // when it has one) and 0 on the rest. It is the cost, not the placement: kv_device[slot] says where each slot's KV
     // lives, which can differ from on_device.
-    size_t             kv_size           = 0;
-    placement_priority priority          = placement_priority::COUNT;  // Sort key
-    int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
-    int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
-    expert_tensor_role expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
-    ggml_layout_mode   layout            = GGML_LAYOUT_AOS;         // Materialized device layout planned for this entry
+    size_t                 kv_size           = 0;
+    placement_priority     priority          = placement_priority::COUNT;  // Sort key
+    int                    layer_id          = -1;  // Layer number (earlier = higher priority within same level)
+    int                    expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
+    expert_tensor_role     expert_role       = expert_tensor_role::UNKNOWN;  // gate/up/down for MoE expert tensors
+    ggml_layout_mode       layout            = GGML_LAYOUT_AOS;  // Materialized device layout planned for this entry
+    placement_host_backing host_backing = placement_host_backing::PINNED;  // which host term this entry's bytes reach
     // Two meanings, two fields (llama.cpp-21jd). alternate_layouts: layouts a device
     // holds as a REPLICA, materialized there instead of the primary (multi-device
     // and no-P2P candidates, MoE PP/i8 variants; readers filter per alternate by
@@ -468,6 +512,29 @@ struct placement_tensor_info {
         size(tensor_size) {}
 
     bool has_shape() const { return type >= 0 && type < GGML_TYPE_COUNT && ne[0] > 0 && ne[1] > 0; }
+};
+
+// A lazy table, a distinct inventory class (th32 §4.1): its rows are read per ubatch, either from a locked HOST_CPU
+// body or from the file (lazy_residency). It is never a placement entry and never a placement_tensor_info: a device
+// tier is forbidden for it, so the planner cannot offer one, and it sits outside the tensor inventory, so
+// max_tensor_bytes, max_staging_pair_bytes and every zone maximum that populate_host_zone_sizing() and
+// unified_cache_adapt_zone_inventory() compute never see it (a 30 GiB table counted as max_tensor would make the host
+// STAGING zone alone ~60 GiB). The planner decides its residency from these fields (§4.3 step 4).
+struct placement_lazy_table_info {
+    std::string name;
+    ggml_type   type              = GGML_TYPE_COUNT;
+    int64_t     ne[GGML_MAX_DIMS] = {};
+    size_t      row_size          = 0;   // bytes of one row in the file's type, the unit a STORAGE cache holds
+    uint32_t    rows_per_token    = 0;   // rows one token reads; sizes the cache floor
+    int32_t     consumer_layer    = -1;  // the layer that reads it; orders the decision (ascending)
+    // The table's byte range in the model's files, by value from the loader's per-file lazy-range record.
+    uint32_t    file_index        = 0;
+    size_t      file_offset       = 0;
+    size_t      table_bytes       = 0;
+    // libllama's answer for a table that is never held whole on the host: the planner places it STORAGE whatever room
+    // the host has, and caps its row cache, index included, at min(2 GiB, the table's HOST body), or at its floor when
+    // the floor alone is larger.
+    bool        storage_only      = false;
 };
 
 // Adapt a placement inventory into the dependency-free descriptors that the
@@ -613,6 +680,15 @@ inline bool kv_layer_phys_is_identity(const std::vector<int32_t> & layer_phys) {
     return true;
 }
 
+// The micro-batch a load plans at when its inventory names none (n_ubatch 0): the loader's default.
+constexpr uint32_t PLACEMENT_LOAD_N_UBATCH_DEFAULT = 512;
+
+// The micro-batch a load plans at: the inventory's n_ubatch, or PLACEMENT_LOAD_N_UBATCH_DEFAULT when it names none. The
+// one rule the stage's dense scratch, the lazy tables' cache floor and the MoE prompt ring all read.
+inline uint32_t placement_load_n_ubatch(uint32_t n_ubatch) {
+    return n_ubatch != 0 ? n_ubatch : PLACEMENT_LOAD_N_UBATCH_DEFAULT;
+}
+
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
     uint32_t              n_layer      = 0;
@@ -667,8 +743,9 @@ struct placement_kv_info {
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, from ggml_sycl_tensor_inventory::n_ctx_context: the caller's
-    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
-    // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
+    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one sizes the KV room the planner
+    // holds ahead of the routed experts, and the plan's context shape (placement_plan::context_n_ctx), which the oneDNN
+    // Graph scratch floor is sized for. 0 = no request reached the load: no room is held, and the floor takes n_ctx.
     uint32_t              n_ctx_context    = 0;
     // llama.cpp-7fmt: n_ctx_context is the model's default context (the training context, which a caller that names
     // no n_ctx creates) rather than one the caller named; from ggml_sycl_tensor_inventory::n_ctx_context_is_default.
@@ -676,6 +753,38 @@ struct placement_kv_info {
     // expert type with no measured CPU rate refuses the room for every layer instead of being priced at
     // cpu_expert_gbps (kv_room_expert_rate_for, kv-room-cost.hpp). It never makes a room held.
     bool                  n_ctx_context_is_default = false;
+    // The load's host-backing fact (design 5efe §4.3-4.4), which the staging proc derives once from libllama's resolved
+    // inputs in ggml_sycl_tensor_inventory (use_mmap_resolved, use_mlock_resolved, host_weight_layout); the plan
+    // copies it and is the store every reader asks. load_maps_files: libllama resolved use_mmap and this build has the
+    // file-mapping tier, so a host-resident weight is FILE_MAPPED (a routed expert, token_embd, a dense weight read in
+    // the file layout) or CPU_OWNED (a dense weight ggml-cpu repacks), and a device-planned weight's staging source is
+    // the mapping. false keeps every backing PINNED, today's figures. load_locks_files: -lm mmap+mlock, so the mapped
+    // bytes are locked and charged (§4.5). host_weight_layout: libllama's resolved GGML_SYCL_HOST_WEIGHT_LAYOUT, copied
+    // unchanged (enum ggml_sycl_host_weight_layout). cpu, its default, is the one layout whose dense weights are
+    // CPU_OWNED; cpu and plain put a host-planned dense weight of a load that maps no files outside the loader's
+    // SYCL_Host buffer (placement_loader_holds_host_dense). Unstaged it is OFF, a zeroed inventory's value.
+    bool                  load_maps_files          = false;
+    bool                  load_locks_files         = false;
+    uint8_t               host_weight_layout       = GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF;
+    // Whether the inventory the kv_info was filled from is unbound: it names every weight of the file, the ones the
+    // loader will put outside SYCL buffers included. The load's early pass and the plan dry run plan such an
+    // inventory (libllama's early builder walks weights_map); the late pass plans the one libllama builds once the
+    // tensors are created, which keeps only the tensors on SYCL buffers. Set by the pass that fills the kv_info, not
+    // from the inventory. Unstaged it is false: every entry is counted in the loader's buffer, the safe direction.
+    bool                  load_inventory_unbound   = false;
+    // Whether the loader binds the SYCL_Host buffer type for a SYCL layer's weights: the backend's
+    // ggml_backend_sycl_weights_evictable(), the answer libllama's prefer_host_weights reads. With load_maps_files it
+    // decides placement_loader_fact_for(). Unstaged it is false: no loader buffer is charged.
+    bool                  load_weights_evictable   = false;
+    // The device whose cache's pinned pool holds that buffer: the one device the backend scheduler sees, whose
+    // SYCL_Host buffer type libllama binds for every SYCL layer, so every chunk of the buffer comes from that device's
+    // cache. -1 when the scheduler sees more than one device: libllama then binds each layer's device's buffer type, so
+    // the buffer is split across their pools by layer. Unstaged it is -1: no pool is known to hold it.
+    int                   load_loader_device       = -1;
+    // The SYCL_Host buffer type's chunk cap (GGML_SYCL_HOST_BUFFER_CHUNK_MB): the largest buffer it lets ggml-alloc
+    // request before the WEIGHT zone bounds it (host_zone_buffer_max_size). The plan replays the loader's split of
+    // its tensors into buffers with it. Unstaged it is 0: no cap beyond the zone's.
+    size_t                load_loader_buffer_cap   = 0;
     // llama.cpp-w013, llama.cpp-7fmt: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room
     // is held for a layer only when the attention it keeps on the device is worth more per decode token than the
     // routed experts it displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at
@@ -700,6 +809,10 @@ struct placement_kv_info {
     // where it copies the inventory in; a test sets them directly. Mask 0 sizes no ring and holds no room.
     uint64_t              moe_stream_staged_types  = 0;
     size_t                moe_stream_group_cap     = 0;
+    // GGML_SYCL_MOE_SPREAD_PLACEMENT: the single-device planner walks the routed experts in the spread order when they
+    // do not all fit; a multi-device plan ignores it and keeps the layer-first order. The backend fills it where it
+    // copies the inventory in; a test sets it directly.
+    bool                  moe_spread               = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention
@@ -727,13 +840,38 @@ struct placement_kv_info {
     std::vector<int32_t>  layer_phys;
 
     // The micro-batch the caller named, from ggml_sycl_tensor_inventory::n_ubatch_context; 0 = none named. n_ubatch
-    // above stays the load's planning shape.
+    // above stays the load's planning shape. When it is non-zero it is also the plan's context micro-batch
+    // (placement_plan::context_n_ubatch, which the oneDNN Graph scratch floor is sized for), held to the context.
     uint32_t                           n_ubatch_context = 0;
     // The RUNTIME zone room the PP MoE oneDNN scratch ring of that micro-batch needs above the default ring's zone. The
     // backend fills it on the single-device path before each plan (unified_cache_explicit_ubatch_room()); it is invalid
     // when no micro-batch above n_ubatch was named, the model has no ring, or there is no arena. The planner weighs it
     // against the routed experts (placement_plan::explicit_ubatch).
     pp_moe_onednn_explicit_ubatch_room explicit_ubatch;
+
+    // The lazy tables (th32 §4.1), copied from the inventory's lazy-table class; empty for a model with none, which
+    // leaves every plan figure as it was. They never enter tensor_inventory, so no zone maximum sees them.
+    std::vector<placement_lazy_table_info> lazy_tables;
+    // MemAvailable from the load's one host-budget sample (host_ledger_mem_available()): P3's reading (§4.3 step 4,
+    // MemAvailable_pre - expected_host - 5 >= 24 GiB), from the same sample as the budget. 0 = no sample: P3 cannot
+    // hold, so a plan that carries lazy tables refuses.
+    size_t                                 host_mem_available_pre = 0;
+    // Whether the budget this plan is made against is GGML_SYCL_HOST_RESERVE_MB's override, from the same sample as
+    // the budget (host_ledger_budget_overridden() for a load): the source the [HOST-PLAN] lazy line prints (§10).
+    bool                                   host_budget_overridden = false;
+    // Whether the budget this plan is made against is the refusal host-headroom-exhausted, with the MemTotal and the
+    // headroom it compared, from the same sample as the budget (the stored values for a load, a dry run's own): the
+    // reason the plan's would-refuse line names (design 5efe §4.5).
+    bool                                   host_headroom_exhausted = false;
+    size_t                                 host_mem_total          = 0;
+    size_t                                 host_headroom           = 0;
+    // A cold expert class is selected (§4.3 step 4): the cold set is not implemented, so a plan that carries lazy
+    // tables refuses it rather than plan a set it cannot hold.
+    bool                                   cold_expert_class      = false;
+    // The load transaction this plan is made for (g_sycl_plan_load_effect_txn at the stage), which the STORAGE decline
+    // line names and which keys it, one line per table and load (§3.3, §10); 0 for a plan made outside a load, a dry
+    // run's or a direct fixture's, which prints every decline.
+    uint64_t                               lazy_load_txn           = 0;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
 
@@ -987,6 +1125,23 @@ size_t placement_explicit_ubatch_compute_room(const placement_explicit_ubatch & 
                                               size_t                            compute_term,
                                               uint32_t *                        n_ubatch);
 
+struct placement_plan;
+
+// The compute room the RUNTIME zone of `plan` holds on `device`, for the hold-spill fit to credit: `compute_term` at
+// the micro-batch the zone was sized for, in *n_ubatch. A placed explicit micro-batch names its own. Otherwise, for a
+// plan that named no micro-batch, the room is credited at the micro-batch the load measured the term at (the planning
+// micro-batch only for an inventory that sent none), which the caller passes as `measured_n_ubatch`: the plan's
+// planner_n_ubatch is the context's micro-batch, rewritten by every runtime context transaction, so it cannot say what
+// the load measured. The fit credits that rung and the rungs below it (zone_hold_fit_rung_has_compute_room), except a
+// rung whose own record is larger than the room, a rung without a record above the micro-batch the term was measured
+// at, and the rung whose own buffer was held out. 0 with *n_ubatch 0 for a multi-device plan, another device, a
+// measured micro-batch of 0 and a named micro-batch the plan did not place.
+size_t placement_plan_compute_room(const placement_plan & plan,
+                                   int                    device,
+                                   size_t                 compute_term,
+                                   uint32_t               measured_n_ubatch,
+                                   uint32_t *             n_ubatch);
+
 // Whether a context announces the load's explicit micro-batch placement at WARN: it is the first non-probe context
 // since the load whose plan PLACED the micro-batch and whose room cost device bytes of routed experts. The bytes
 // decide, not the count of triplets: with triplets of unequal size the device can keep as many triplets and still hold
@@ -1002,6 +1157,86 @@ bool placement_explicit_ubatch_announces(const placement_explicit_ubatch & xub, 
 // so it keeps its own and the re-plan reports it.
 uint32_t placement_explicit_ubatch_ring_n_ubatch(const placement_explicit_ubatch & xub, uint32_t n_ubatch);
 
+// The host bytes a plan commits, term by term, as configuring its host zones commits them (th32 §4.2: the plan's host
+// figure is what the sizing code will commit, not a second estimate of it). The four zones are the sizes
+// ggml_sycl_configure_host_zones_for_plan() hands configure_host_zones(), KV and SCRATCH at their floors; runtime is
+// the RUNTIME pool it pre-allocates; rounding is what growing the pinned pool in whole chunks adds to both, each chunk
+// with its header. loader_grown is what the pool grows while the loader allocates, for a buffer no chunk segment holds.
+// total() is the pool's growth from an empty pool. placement_plan_host_zone_commit_terms() computes it, for the planner
+// and for the configure step alike.
+struct host_zone_commit_terms {
+    size_t weight   = 0;  // host_zone_weight_bytes, its loader term as the zone bytes the loader's buffers take
+    size_t kv       = 0;  // host_zone_kv_bytes, at least 64 MiB
+    size_t staging  = 0;  // host_zone_staging_bytes
+    size_t scratch  = 0;  // host_zone_scratch_bytes, at least live oneDNN scratch + max_copied_tensor_bytes + 32 MiB
+    size_t runtime  = 0;  // the RUNTIME pool: the oneDNN scratchpad and the DMA staging pool
+    size_t rounding = 0;  // the zones and the runtime bytes each grown to whole chunks, chunk headers included
+
+    // The loader's SYCL_Host buffers (placement_loader_pool_footprint): loader_zone is inside weight, loader_grown is
+    // outside the zones. Both are 0 for a plan that charges no loader term and on a card whose pool does not hold it.
+    size_t loader_zone  = 0;
+    size_t loader_grown = 0;
+
+    // The inputs the terms were computed from, the live oneDNN scratch and the pool's chunk, so a re-plan re-records
+    // from the record's inputs and never from the cache's state at the re-plan.
+    size_t onednn_live = 0;
+    size_t chunk       = 0;
+
+    size_t zones() const { return weight + kv + staging + scratch; }
+
+    size_t total() const { return zones() + runtime + rounding + loader_grown; }
+};
+
+// Defined below the plan, with the commit terms it recomputes: the KV refresh inside placement_plan calls it.
+inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan);
+
+// Defined with the lazy table's body below; the plan records each table's residency.
+enum class lazy_residency : uint8_t;
+
+// One lazy table's residency as the plan decided it (th32 §4.3 step 4), in the order the decision ran.
+//   host_resident_bytes  the host bytes the table holds, each allocation counted at host_cpu_mapped_size: the mapped
+//                        body for HOST, the cache slab chunks plus the index row for STORAGE (floor plus the yieldable
+//                        share)
+//   cache_slots          the STORAGE cache's slots (rows), floor plus yieldable; 0 for HOST
+//   cache_floor_slots    the slots one double-buffered ubatch working set needs, 2 x n_ubatch x rows_per_token
+//   consumer_device      the device that runs the consumer layer, -1 when the layer runs on the CPU
+struct placement_lazy_table {
+    std::string    name;
+    lazy_residency residency{};
+    int            consumer_device     = -1;
+    size_t         table_bytes         = 0;
+    size_t         host_resident_bytes = 0;
+    size_t         cache_slots         = 0;
+    size_t         cache_floor_slots   = 0;
+};
+
+// One immutable Q1_0/NVFP4 host expert recipe's shape: what its CPU workspace scales with. K is the input width, N the
+// output width, q8_row_bytes one activation row in the recipe's vec-dot type.
+struct moe_host_recipe_shape {
+    int64_t K            = 0;
+    int64_t N            = 0;
+    size_t  q8_row_bytes = 0;
+};
+
+// The CPU workspace the immutable Q1_0/NVFP4 host recipes need for a micro-batch of n_tokens: the largest
+// plan_moe_host_workspace() total over `shapes` at one row per token, the rows the executor's own request carries
+// (ggml_sycl_build_moe_resolved_batch: count / slots_per_token). 0 for no shapes or no tokens. Returns false, and
+// leaves *out untouched when it is not null, for a null `out`, for a shape whose K, N or q8_row_bytes is not positive
+// (at any token count, 0 included) and on an overflow.
+bool placement_moe_host_recipe_workspace_bytes_at(const std::vector<moe_host_recipe_shape> & shapes,
+                                                  uint32_t                                   n_tokens,
+                                                  size_t *                                   out);
+
+// One MoE block's share of the device expert slots: of the block's `experts` routed experts, the pack put
+// `device_slots` whole triplets on a device (any device of a multi-device plan). `ranked` says the block's experts
+// carry popularity ranks, which the spread order follows in place of their indices.
+struct placement_moe_block_slots {
+    int    layer_id     = -1;
+    size_t experts      = 0;
+    size_t device_slots = 0;
+    bool   ranked       = false;
+};
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
@@ -1009,7 +1244,36 @@ struct placement_plan {
     size_t                       vram_bytes;         // Total planned bytes on device(s), including KV
     size_t                       host_bytes;         // Total planned bytes on host, including KV
     size_t                       weight_vram_bytes;  // Weight bytes on device(s)
-    size_t                       weight_host_bytes;  // Weight bytes on host
+    // The host weight terms by backing (design 5efe §4.4). Only charge_host_weight / uncharge_host_weight write the
+    // first three, so no site adds host weight without testing the entry's backing.
+    //   weight_host_bytes         host-executed PINNED / HOST_CPU entries; charged; sizes the host WEIGHT zone
+    //   host_cpu_owned_bytes      CPU_OWNED entries; charged (anonymous memory); sizes nothing
+    //   host_mapped_bytes         host-executed FILE_MAPPED entries; not charged (the page cache is not ours)
+    //   host_mapped_source_bytes  device-planned FILE_MAPPED entries' file bytes, the staging sources; not charged
+    size_t                       weight_host_bytes;
+    size_t                       host_cpu_owned_bytes     = 0;
+    size_t                       host_mapped_bytes        = 0;
+    size_t                       host_mapped_source_bytes = 0;
+
+    // The load's fact as the builder read it from placement_kv_info: host_backing_maps_files gives the entries their
+    // §4.4 backings, and host_mapped_locked charges host_mapped_bytes as locked memory (§4.5).
+    bool host_backing_maps_files = false;
+    bool host_mapped_locked      = false;
+    // The loader's SYCL_Host buffer as the plan's fact (placement_loader_fact_for, copied with the fact above).
+    // loader_holds_weights: the loader binds the buffer for the weights the plan places. loader_device: the device
+    // whose pinned pool holds it, -1 when no one pool does; the host WEIGHT zone charges the buffer as its
+    // loader_residency term once, host-wide, when one does, and only that device's zone commits it.
+    // loader_serves_host_experts: S1-PRELOAD serves each host-planned PINNED expert from that buffer in place, under
+    // the buffer's owner, so such an expert takes no block of its own. loader_buffer_cap:
+    // placement_kv_info::load_loader_buffer_cap, the buffer type's chunk cap. loader_holds_host_dense: the buffer holds
+    // the plan's host-planned dense weights too (placement_loader_holds_host_dense);
+    // placement_plan_loader_holds_entry() applies it to an entry.
+    bool   loader_holds_weights       = false;
+    int    loader_device              = -1;
+    bool   loader_serves_host_experts = false;
+    size_t loader_buffer_cap          = 0;
+    bool   loader_holds_host_dense    = true;
+
     size_t                       kv_vram_bytes;      // KV bytes on device(s)
     size_t                       kv_host_bytes;      // KV bytes on host
     size_t                       vram_budget;        // VRAM budget used for planning (primary device)
@@ -1033,6 +1297,20 @@ struct placement_plan {
     // when the runtime context transaction re-derives the KV totals, because the ring is reserved again at every
     // prompt. 0 when the plan stages nothing, has no host expert, or is a multi-device plan.
     size_t                                     moe_stream_ring_reserve_bytes = 0;
+    // The order the routed-expert pack walked the triplets in: true for the spread order, rank-major over every block,
+    // which GGML_SYCL_MOE_SPREAD_PLACEMENT asks for and the single-device planner takes only when the experts do not
+    // all fit; false for the layer-first order, which a multi-device plan always keeps. moe_block_device_slots is each
+    // block's share of the device slots, in block order.
+    bool                                       moe_spread                    = false;
+    std::vector<placement_moe_block_slots>     moe_block_device_slots;
+    // A spread plan's room in the host WEIGHT zone for swaps (host_weight_zone_terms::swap_headroom): this many extra
+    // triplets, one per device expert slot unless the host plan cannot afford them, at these bytes. The ledger record
+    // holds them after the lazy tables, so host_zone_weight_bytes and host_planned_bytes count them. 0 otherwise, and
+    // 0 on a plan whose routed host experts stay mapped, where no swap can be issued. Like the HOST_COMPUTE reserve,
+    // they are the figure planned at load, not a reservation: any role-WEIGHT host allocation takes from the same
+    // room, a prompt-phase loan's host copies included, and the loan's republish of the plan does not update them.
+    size_t                                     moe_swap_host_headroom_triplets = 0;
+    size_t                                     moe_swap_host_headroom_bytes    = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/
     // layer_v_width -- see that struct's field comments. Copied in at plan
@@ -1052,6 +1330,12 @@ struct placement_plan {
     std::vector<int32_t>                       layer_phys;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
+    // The context shape the per-context scratch is sized for: at load the context the model opens with (the one the
+    // caller named, or the model's default) and the micro-batch the caller named, each else the planning shape above,
+    // the micro-batch held to the context (unified_cache_plan_onednn_graph_scratch_shape(), the shape the oneDNN Graph
+    // scratch floor is published with); at a context transaction the context's own (zone_plan_context_shape()).
+    uint32_t                                   context_n_ctx            = 0;
+    uint32_t                                   context_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
     // llama.cpp-3aos: mirrors placement_kv_info::kv_unified -- see that
     // field's comment. Default false matches llama_cparams::kv_unified's
@@ -1093,18 +1377,70 @@ struct placement_plan {
     size_t                       host_zone_staging_bytes  = 0;
     size_t                       host_zone_scratch_bytes  = 0;
     size_t                       max_tensor_bytes         = 0;
+    // Largest tensor that can be copied through a host zone: max_tensor_bytes, leaving out a gather-only tensor with at
+    // least one plan entry, none on a device. The CPU reads such a table in place, so no staging, readback or fallback
+    // copy of it exists to hold. A gather-only tensor with no entry stays counted.
+    size_t                       max_copied_tensor_bytes  = 0;
     size_t                       max_staging_pair_bytes   = 0;
+    // th32 §4.2: the ledger's stored budget when the plan was made, the host bytes the plan commits term by term (both
+    // planner builders record them after populate_host_zone_sizing, and a re-plan that moves a zone term re-records
+    // them through placement_plan_rerecord_host_zone_terms), and the plan's host figure. The zone terms are
+    // host_planned_bytes less the lazy tables' terms below, so the zone configuration checks its pool growth against
+    // host_zone_terms, never against the sum.
+    size_t                                     host_budget                = 0;
+    size_t                                     host_planned_bytes         = 0;
+    host_zone_commit_terms                     host_zone_terms;
+    // The loader_residency term inside host_zone_weight_bytes, which populate_host_zone_sizing records with it: the
+    // bytes only loader_device's pool commits (placement_plan_host_zone_commit_terms_on_device).
+    size_t                                     host_zone_loader_bytes = 0;
+    // Recorded with it, empty when it is 0: the loader's tensors in the order the loader allocates them, each padded to
+    // the loader's tensor alignment, which placement_loader_pool_footprint_for() splits into buffers as ggml-alloc
+    // does.
+    std::vector<size_t>                        loader_tensor_bytes;
+    // th32 §3.3, §4.3 step 4: the lazy tables' residency and the block ring their STORAGE reads need. The ring is
+    // sized after the residency pass over the tables that stayed STORAGE: block_ring_need = block_ring_qd x
+    // block_ring_span_max, and block_ring_charge is its mapped size when the live ring the coverage pin reads is
+    // smaller, 0 when it already holds the need. host_planned_bytes = host_zone_terms.total() + the tables'
+    // host_resident_bytes + block_ring_charge. A refused decision leaves no table and no ring and names the reason
+    // (lazy-table-ring-unpinned, lazy-table-ring-too-narrow, lazy-table-cache-below-floor, cold-set-not-implemented)
+    // in lazy_refusal, with the figures in lazy_refusal_detail; the load's stage turns it into a typed rejection.
+    size_t                                     block_ring_qd       = 0;
+    size_t                                     block_ring_span_max = 0;
+    size_t                                     block_ring_need     = 0;
+    size_t                                     block_ring_charge   = 0;
+    std::vector<placement_lazy_table>          lazy_tables;
+    std::string                                lazy_refusal;
+    std::string                                lazy_refusal_detail;
 
     // --- Inference memory categories (computed by populate_host_zone_sizing) ---
     // oneDNN reorder: one temp buffer reused per layer, sized to the largest
     // oneDNN-eligible tensor (see zone-sizing.hpp), not the largest in the model.
     size_t   onednn_reorder_bytes                = 0;  // Zone: SCRATCH (device VRAM)
-    // MoE Q8_1 workspace: quantized activations for batched expert dispatch.
-    size_t   moe_q8_workspace_bytes              = 0;  // Zone: SCRATCH (device VRAM)
     // CPU expert fallback act/out staging. EXPERT_STAGING HOST_COMPUTE uses
     // smart-handle scoped ownership and routes to host SCRATCH.
     size_t   moe_cpu_expert_staging_bytes        = 0;  // Zone: SCRATCH (host pinned)
     size_t   moe_host_recipe_workspace_bytes     = 0;  // Zone: SCRATCH (host pinned)
+
+    // The immutable Q1_0/NVFP4 host recipes' distinct shapes, from the inventory. The load sets
+    // moe_host_recipe_workspace_bytes to placement_moe_host_recipe_workspace_bytes_at() of these at its planning
+    // micro-batch, or SIZE_MAX when that overflows. A context's runtime transaction re-sizes it at the context's
+    // micro-batch and never lowers a finite figure, so in a published plan it is the largest figure the load or any
+    // context of this model has asked for. The shapes stay on the plan so that the workspace can be sized by the same
+    // rule at another micro-batch. Blank lines around it keep its longer type out of the size_t block's alignment
+    // column.
+    std::vector<moe_host_recipe_shape> moe_host_recipe_shapes;
+
+    // The MoE batched MMVQ scratch the SCRATCH zone is sized to hold (zone_scratch_zone_plan): one operand per admitted
+    // expert op, the routed slots a token, and the bound over every op at once at a micro-batch, with the micro-batch
+    // it was computed at. The load computes it at the context's micro-batch (context_n_ubatch); a context's runtime
+    // transaction re-sizes it at its own and never lowers it. The operands stay on the plan so that the bound can be
+    // computed by the same rule at another micro-batch.
+    std::vector<zone_moe_mmvq_operand> moe_mmvq_scratch_ops;
+
+    int      moe_mmvq_scratch_n_expert_used = 0;
+    size_t   moe_mmvq_scratch_bytes         = 0;  // Zone: SCRATCH (device VRAM)
+    uint32_t moe_mmvq_scratch_n_ubatch      = 0;
+
     // Expert bias D2H copy: float bias tensors staged to host for gate computation.
     size_t   expert_bias_bytes                   = 0;  // Zone: STAGING (host pinned)
     // MoE routing: per-batch expert ID control buffer (n_expert * max_batch_tokens * sizeof(int32_t)).
@@ -1351,6 +1687,12 @@ struct placement_plan {
     // The slot's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
     size_t kv_main_size_for_layer(uint32_t slot) const { return kv_size_for_layer(slot) - kv_idx_size_for_layer(slot); }
 
+    // What a layer asks of the tier that holds its KV, read by both runtime demotion sites so the printed host-KV
+    // figure counts what the load pins. kv_size_for_layer() already charges the indexer keys cached beside the K/V
+    // (kv_idx_size_for_layer(), from the per-layer width), so the demand is that one figure: a second sum here would
+    // count the indexer twice.
+    size_t kv_demand_for_layer(uint32_t slot) const { return kv_size_for_layer(slot); }
+
     // The number of KV cache slots (a looped model has more slots than weight layers).
     size_t kv_layer_count() const {
         size_t n = swa_layer_mask.size();
@@ -1365,6 +1707,124 @@ struct placement_plan {
             }
         }
         return n;
+    }
+
+    // Whether a host-planned weight of this backing is charged to weight_host_bytes, and so holds a block in the host
+    // WEIGHT zone. The charge helpers below and placement_plan_host_weight_zone_terms() all ask this one rule, so the
+    // zone's walk and its running total cannot disagree on which entries they count.
+    static constexpr bool host_backing_sizes_weight_zone(placement_host_backing backing) noexcept {
+        switch (backing) {
+            case placement_host_backing::PINNED:
+            case placement_host_backing::HOST_CPU:
+                return true;
+            case placement_host_backing::FILE_MAPPED:
+            case placement_host_backing::CPU_OWNED:
+                return false;
+        }
+        return false;
+    }
+
+    // Adds a host-planned weight's bytes to its backing's term. FILE_MAPPED bytes stay out of host_bytes unless the
+    // load locks the mapping (design 5efe §4.5): until then the page cache is not ours.
+    void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
+        if (host_backing_sizes_weight_zone(backing)) {
+            weight_host_bytes += bytes;
+        } else if (backing == placement_host_backing::FILE_MAPPED) {
+            host_mapped_bytes += bytes;
+            if (!host_mapped_locked) {
+                return;
+            }
+        } else {  // CPU_OWNED
+            // Overcharged on a mapping load, and deferred: libllama keeps use_mmap there, so a CPU_OWNED weight that
+            // ggml-cpu cannot repack lands in a from-host-ptr CPU buffer over the loader's mapping, while this charges
+            // it as anonymous memory. Planning such a weight FILE_MAPPED, or clearing use_mmap for it, needs a
+            // libllama change (design 5efe §4.3-4.4: in sycl-mmap-host-tier.md §4.4 "Which weights stay mapped, and
+            // the planner's split", the CPU_OWNED row of the weights table and the host_cpu_owned_bytes plan term).
+            host_cpu_owned_bytes += bytes;
+        }
+        host_bytes += bytes;
+    }
+
+    // The inverse of charge_host_weight, saturating at 0 per term.
+    void uncharge_host_weight(placement_host_backing backing, size_t bytes) noexcept {
+        if (host_backing_sizes_weight_zone(backing)) {
+            saturating_sub(weight_host_bytes, bytes);
+        } else if (backing == placement_host_backing::FILE_MAPPED) {
+            saturating_sub(host_mapped_bytes, bytes);
+            if (!host_mapped_locked) {
+                return;
+            }
+        } else {  // CPU_OWNED
+            saturating_sub(host_cpu_owned_bytes, bytes);
+        }
+        saturating_sub(host_bytes, bytes);
+    }
+
+    // Charges a host-planned group, each entry by its own backing, on one size basis; an out-of-range index is
+    // skipped. host_bytes takes host_bytes_figure for the group's charged share instead of the per-entry sum, because
+    // some sites charge a rounded figure; a group that mixes backings takes that figure pro rata, and a group whose
+    // entries charge no bytes takes none of it.
+    void charge_host_weight_entries(const std::vector<size_t> & indices,
+                                    placement_size_basis        basis,
+                                    size_t                      host_bytes_figure) {
+        const size_t host_bytes_before = host_bytes;
+        size_t       group_bytes       = 0;
+        for (size_t idx : indices) {
+            if (idx >= entries.size()) {
+                continue;
+            }
+            const placement_entry & e     = entries[idx];
+            const size_t            bytes = basis == placement_size_basis::SRC ? e.src_size : e.dst_size;
+            charge_host_weight(e.host_backing, bytes);
+            group_bytes += bytes;
+        }
+        const size_t charged_bytes = host_bytes - host_bytes_before;
+        size_t       figure_share  = 0;
+        if (charged_bytes != 0) {
+            figure_share =
+                charged_bytes == group_bytes ?
+                    host_bytes_figure :
+                    static_cast<size_t>(static_cast<long double>(host_bytes_figure) * charged_bytes / group_bytes);
+        }
+        host_bytes = host_bytes_before + figure_share;
+    }
+
+    // "Placed on host" (what the tiering verdict reads) and "charged" (what the ledger reads), design 5efe §4.4.
+    size_t placed_host_weight_bytes() const noexcept {
+        return weight_host_bytes + host_cpu_owned_bytes + host_mapped_bytes;
+    }
+
+    size_t charged_host_weight_bytes() const noexcept {
+        return weight_host_bytes + host_cpu_owned_bytes + locked_mapped_weight_bytes();
+    }
+
+    // The mapped host weights' bytes the load locks, and so charges (design 5efe §4.5); 0 while the mapping is only
+    // page cache.
+    size_t locked_mapped_weight_bytes() const noexcept { return host_mapped_locked ? host_mapped_bytes : 0; }
+
+    // Whether any entry is PINNED-backed: a host weight held in pinned memory, or a device weight whose staging source
+    // is (design 5efe §4.4). The DMA staging pool exists to stream such a weight; a FILE_MAPPED source refuses
+    // streaming (§5.3), so a plan with no PINNED backing sizes no pool. The census reads the backings the planner
+    // derived from the load's fact, so a load that maps nothing (-lm none) keeps every entry PINNED and its pool.
+    bool has_pinned_backing() const noexcept {
+        for (const placement_entry & e : entries) {
+            if (e.host_backing == placement_host_backing::PINNED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Re-derives the staging sources from the entries instead of accumulating them, so no placement move can leave
+    // the term stale: the file bytes of every device-planned FILE_MAPPED entry.
+    void recount_host_mapped_source_bytes() noexcept {
+        size_t bytes = 0;
+        for (const placement_entry & e : entries) {
+            if (e.on_device && e.host_backing == placement_host_backing::FILE_MAPPED) {
+                bytes += e.src_size;
+            }
+        }
+        host_mapped_source_bytes = bytes;
     }
 
     void refresh_kv_byte_totals() {
@@ -1387,11 +1847,14 @@ struct placement_plan {
         // The KV of this shape replaces the room the load plan held for the context it expected.
         kv_context_reserve_bytes = 0;
         vram_bytes               = weight_vram_bytes + kv_vram_bytes;
-        host_bytes               = weight_host_bytes + kv_host_bytes;
+        // Mapped weights are placed on host but not charged: the page cache is not ours until it is locked.
+        host_bytes = weight_host_bytes + host_cpu_owned_bytes + kv_host_bytes + locked_mapped_weight_bytes();
         // The window ring's room is not KV: it stays held, since the ring is reserved again at every prompt.
         vram_bytes += moe_stream_ring_reserve_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
+            // the KV zone grew past the plan's record, so the plan's host figures follow it (th32 §4.2)
+            placement_plan_rerecord_host_zone_terms(*this);
         }
     }
 
@@ -1452,6 +1915,7 @@ struct placement_plan {
         result.on_device         = e.on_device;
         result.target_device     = e.target_device;
         result.src_size          = e.src_size;
+        result.host_backing      = e.host_backing;
         result.dst_size          = e.dst_size;
         result.vram_charge_size  = e.vram_charge_size;
         result.layout            = e.layout;
@@ -1478,22 +1942,31 @@ struct placement_plan {
             return true;
         }
 
-        auto saturating_sub = [](size_t & value, size_t delta) {
-            value = value > delta ? value - delta : 0;
-        };
-
         const size_t charge = e.vram_charge_size != 0 ? e.vram_charge_size : placement_vram_charge_bytes(e.dst_size);
+        // A FILE_MAPPED entry's file bytes are a staging source exactly while it is device-planned. Only e changes
+        // here, so moving its src_size in or out keeps host_mapped_source_bytes equal to a recount in O(1); the
+        // expert loan/refill transaction calls this per move. The builders' recount before the Totals stays the
+        // authority.
+        const bool   mapped = e.host_backing == placement_host_backing::FILE_MAPPED;
 
+        // The host terms take src_size, the file bytes the host executes, the same basis the MoE host group charges
+        // the same entries on; the VRAM terms take the materialized layout through charge.
         if (e.on_device && !on_device) {
             saturating_sub(weight_vram_bytes, charge);
             saturating_sub(vram_bytes, charge + e.kv_size);
-            weight_host_bytes += e.dst_size;
-            host_bytes += e.dst_size + e.kv_size;
+            charge_host_weight(e.host_backing, e.src_size);
+            host_bytes += e.kv_size;
+            if (mapped) {
+                saturating_sub(host_mapped_source_bytes, e.src_size);
+            }
         } else if (!e.on_device && on_device) {
-            saturating_sub(weight_host_bytes, e.dst_size);
-            saturating_sub(host_bytes, e.dst_size + e.kv_size);
+            uncharge_host_weight(e.host_backing, e.src_size);
+            saturating_sub(host_bytes, e.kv_size);
             weight_vram_bytes += charge;
             vram_bytes += charge + e.kv_size;
+            if (mapped) {
+                host_mapped_source_bytes += e.src_size;
+            }
         }
 
         auto group_it = expert_groups_.find(expert_residency_group_key(layer_id, role));
@@ -1517,6 +1990,38 @@ struct placement_plan {
         } else {
             expert_device[layer_id][expert_id] = target;
         }
+        return true;
+    }
+
+    // Says whose memory an expert's host bytes live in now, and moves its file bytes between the backings' terms so
+    // each term stays equal to a recount in O(1). The loan transaction calls it beside update_expert_placement: a lent
+    // expert's host copy is a pinned block the transaction minted, whatever backed the entry while it was on the
+    // device, and a re-admitted one is staged from the load's own source again.
+    bool set_expert_host_backing(int layer_id, int expert_id, expert_tensor_role role, placement_host_backing backing) {
+        const expert_placement_key key{ layer_id, expert_id, role };
+        auto                       it = expert_placement_index_.find(key);
+        if (it == expert_placement_index_.end()) {
+            return false;
+        }
+
+        placement_entry & e = entries[it->second];
+        if (e.host_backing == backing) {
+            return true;
+        }
+        if (e.on_device) {
+            // A device-planned entry is charged to no host term. Its file bytes count as a mapped staging source
+            // exactly while its backing is FILE_MAPPED.
+            if (e.host_backing == placement_host_backing::FILE_MAPPED) {
+                saturating_sub(host_mapped_source_bytes, e.src_size);
+            }
+            if (backing == placement_host_backing::FILE_MAPPED) {
+                host_mapped_source_bytes += e.src_size;
+            }
+        } else {
+            uncharge_host_weight(e.host_backing, e.src_size);
+            charge_host_weight(backing, e.src_size);
+        }
+        e.host_backing = backing;
         return true;
     }
 
@@ -1831,6 +2336,9 @@ struct placement_plan {
     }
 
   private:
+    // The plan's byte terms are unsigned and never go below 0, so every un-charge subtracts through this.
+    static void saturating_sub(size_t & value, size_t delta) noexcept { value = value > delta ? value - delta : 0; }
+
     // Computed in unsigned arithmetic: a name without "blk." parses to layer -1,
     // and left-shifting a negative signed value is undefined before C++20.
     static uint64_t expert_residency_group_key(int layer_id, expert_tensor_role role) {
@@ -1930,6 +2438,423 @@ struct placement_plan {
     std::unordered_set<size_t>                                 expert_fallback_entries_;  // entries counted there
 };
 
+// The host WEIGHT zone's size, term by term: the bytes the cache materializes for every host weight the zone holds,
+// plus one named term for each real extra, never a ratio over the weights. A ratio is slack nobody can name, a second
+// source for a fact the plan already knows, and over a large host-expert set it is more than the host budget holds.
+// host_zone_weight_bytes is total(), written in two places: populate_host_zone_sizing(), which zeroes the swap headroom
+// first and prints every other term on a [HOST-PLAN] line, and the ledger record's swap-headroom hold, which writes the
+// zone again once it holds the room. swap_headroom is not on the [HOST-PLAN] line, which prints before it is held;
+// the hold's own [PLACEMENT-MOE] line prints it. One writer moves the zone by a term's change instead of writing
+// total(): the runtime MMID re-plan (replan_moe_mmid_workspaces_for_runtime) adds exactly the growth it gives
+// mmid_host_pool. Its plan may hold entries that changed since the zone was configured (a prompt-phase loan
+// republishes the plan), and a total() there would resize the zone by bytes the re-plan did not move.
+//
+// The model loader's SYCL_Host buffer is a term when the plan's loader holds weights in one device's pinned pool
+// (placement_loader_fact_for: loader_device >= 0): on a load that does not map files, with evictable weights, the
+// loader binds that buffer for every weight the plan places (role WEIGHT, lifetime MODEL), device-planned ones
+// included, but for the host-planned dense weights the cpu and plain layouts put in a CPU-owned buffer
+// (placement_plan_loader_holds_entry), and keeps it for the model's life. The term is charged once, host-wide,
+// whichever builder made the plan; every card's zones are sized from the plan, and only loader_device's commits the
+// term (placement_plan_host_zone_commit_terms_on_device). On a load that maps files the loader binds SYCL_Mapped
+// instead, whose bytes are the file's pages outside every host zone, and the term is 0. It is 0 too when the scheduler
+// sees more than one device (loader_device -1): the buffer is then split across their pools by layer, and no one pool
+// holds it. A plan made for loader_device also serves its host-planned PINNED experts from that buffer in place, so
+// those experts are counted once, inside loader_residency, and reported as loader_served instead of taking blocks.
+struct host_weight_zone_terms {
+    size_t host_weights         = 0;  // placement_entry_host_weight_bytes() over the entries that hold a block here
+    size_t blocks               = 0;  // the pinned allocations those weights take: one per entry that holds a block
+    size_t loader_residency     = 0;  // the loader's SYCL_Host buffer: each held entry's bytes and alignment bound
+    size_t loader_served        = 0;  // the host weights served from that buffer in place: inside loader_residency
+    size_t host_compute_reserve = 0;  // the runtime HOST_COMPUTE requests that also land in WEIGHT, unsized by the plan
+    size_t layout_copies        = 0;  // converted copies of a host weight the plan keeps beside the first: none today
+    size_t tlsf_bound           = 0;  // each block rounded up to the TLSF grain: blocks x grain
+    size_t mmid_host_pool       = 0;  // the MMID workspace host pool, held past every graph: moe_mmid_host_pool_bytes
+    size_t swap_headroom        = 0;  // a spread plan's room for swapped-out triplets: moe_swap_host_headroom_bytes
+
+    size_t total() const {
+        return host_weights + loader_residency + host_compute_reserve + layout_copies + tlsf_bound + mmid_host_pool +
+               swap_headroom;
+    }
+
+    // Whether these terms count the same host weights the plan charged to weight_host_bytes: each charged weight
+    // either holds a block or is served from the loader's buffer, never both and never neither.
+    bool matches_charge(size_t weight_host_bytes) const { return host_weights + loader_served == weight_host_bytes; }
+};
+
+// The loader's SYCL_Host buffer as a plan fact, from the load's inputs (placement_kv_info::load_maps_files,
+// load_weights_evictable and load_loader_device) and the builder's device, `plan_device` (-1 for the multi-device
+// builder). The loader binds that buffer for a SYCL layer's weights only when weights are evictable and the load does
+// not map files, and then it holds every weight the plan places but the ones placement_plan_loader_holds_entry leaves
+// out, in loader_device's pool, or split across the scheduler's devices when that is -1. A host-planned expert is
+// served from it in place only by a plan made for loader_device: a multi-device plan's experts are staged for every
+// device, and a chunk is ring-streamable only on the device whose cache queue allocated it.
+struct placement_loader_fact {
+    bool holds_weights       = false;
+    int  device              = -1;  // the device whose pinned pool holds the buffer; -1 when there is none or no one
+    bool serves_host_experts = false;
+};
+
+static constexpr placement_loader_fact placement_loader_fact_for(bool maps_files,
+                                                                 bool weights_evictable,
+                                                                 int  loader_device,
+                                                                 int  plan_device) noexcept {
+    const bool holds  = !maps_files && weights_evictable;
+    const int  device = holds ? loader_device : -1;
+    return { holds, device, device >= 0 && plan_device == device };
+}
+
+// What the load's host weight layout, the inventory's one byte (enum ggml_sycl_host_weight_layout), says of a dense
+// weight the plan places on the host. Every reader of the byte asks this one function.
+//   known               the byte names a layout; any other byte is a malformed inventory, which every entry point
+//                       refuses (ggml_sycl_inventory_malformed)
+//   loader_holds_dense  the loader keeps the weight in its SYCL_Host buffer (off); under cpu and plain it puts the
+//                       weight in a CPU-owned buffer instead
+//   dense_cpu_owned     on a load that maps files, ggml-cpu repacks the weight into a buffer of its own (cpu)
+//                       instead of reading the file's mapping (off, plain)
+struct host_weight_layout_facts {
+    bool known              = false;
+    bool loader_holds_dense = false;
+    bool dense_cpu_owned    = false;
+};
+
+static constexpr host_weight_layout_facts host_weight_layout_facts_of(uint8_t host_weight_layout) noexcept {
+    // A byte above the last layout is unknown before it is cast: the enum has no fixed underlying type, so a byte
+    // outside its values is undefined to cast to it. A new last layout moves this bound with it.
+    if (host_weight_layout > GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN) {
+        return { false, true, true };
+    }
+    switch (static_cast<ggml_sycl_host_weight_layout>(host_weight_layout)) {
+        case GGML_SYCL_HOST_WEIGHT_LAYOUT_OFF:
+            return { true, true, false };
+        case GGML_SYCL_HOST_WEIGHT_LAYOUT_CPU:
+            return { true, false, true };
+        case GGML_SYCL_HOST_WEIGHT_LAYOUT_PLAIN:
+            return { true, false, false };
+    }
+    // No default case, so a new layout is a -Wswitch warning here. A byte no case names, here or above, is read on the
+    // side that charges more (the loader's SYCL_Host buffer holds the weight, and ggml-cpu owns a buffer for it too),
+    // for the entry points' refusal to name.
+    return { false, true, true };
+}
+
+// Whether the loader's SYCL_Host buffer holds the host-planned dense weights of the inventory a plan was made from,
+// given the load's GGML_SYCL_HOST_WEIGHT_LAYOUT (enum ggml_sycl_host_weight_layout) and whether that inventory is
+// unbound (placement_kv_info::load_inventory_unbound). Under the cpu and plain layouts the loader puts a dense weight
+// the plan places on the host, on a load that maps no files, in a CPU-owned buffer instead
+// (llama-model-loader.cpp, the planned_target_device() == -1 branch), so that weight is not in the SYCL_Host buffer.
+// Only an unbound inventory names such a weight: the early pass's and the dry run's, which hold every weight of the
+// file (llama-model.cpp's early builder over weights_map). The late pass needs no rule: libllama builds its inventory
+// once the tensors are created and keeps only those whose buffer type is SYCL (llama_model_buft_backend_is_sycl, in
+// llama-model.cpp's late builder), and SYCL_Host is one, a CPU-owned buffer is not. So the late inventory holds
+// exactly the loader's SYCL_Host contents and its plan counts every entry. The off layout leaves the weight in
+// SYCL_Host. A user -ot override the plan does not see is outside this rule.
+static constexpr bool placement_loader_holds_host_dense(uint8_t host_weight_layout, bool inventory_unbound) noexcept {
+    return !inventory_unbound || host_weight_layout_facts_of(host_weight_layout).loader_holds_dense;
+}
+
+// Whether the loader's SYCL_Host buffer holds `entry`'s tensor, for a plan whose loader holds the weights: every entry
+// but a host-planned dense weight the loader puts in a CPU-owned buffer (plan.loader_holds_host_dense false), which is
+// not file-mapped. The loader_residency sum and the replay of the loader's buffers (placement_plan_loader_tensor_bytes)
+// both ask it, so the term and the replay count the same tensors.
+inline bool placement_plan_loader_holds_entry(const placement_plan & plan, const placement_entry & entry) {
+    const bool host_dense =
+        !entry.on_device && entry.expert_id < 0 && entry.host_backing != placement_host_backing::FILE_MAPPED;
+    return plan.loader_holds_host_dense || !host_dense;
+}
+
+// The bytes S1-PRELOAD materializes for a host-resident entry. A host weight is copied once, in AOS, with no layout
+// padding: a dense weight's copy is ggml_nbytes(tensor) and an expert's is tensor->nb[2], which are the entry's
+// src_size (the inventory's size is ggml_nbytes, and an expert's is that over ne[2]), except an unshaped expert row
+// whose own expert count is not the model-wide one (llama.cpp-y5x9).
+size_t placement_entry_host_weight_bytes(const placement_entry & entry);
+
+// The terms over the host-planned entries of `plan` whose backing placement_plan::host_backing_sizes_weight_zone()
+// accepts, the entries charge_host_weight() charges to weight_host_bytes: a FILE_MAPPED entry is served from the
+// file's mapping and a CPU_OWNED one is held by ggml-cpu, so neither takes a block here. Under the plan's
+// loader_holds_weights, with a loader_device, the loader's buffer is the loader_residency term, and under
+// loader_serves_host_experts a PINNED host expert is loader_served rather than a block. The one function both planner
+// builders size the WEIGHT zone through, by way of populate_host_zone_sizing(), and the one place the host weights are
+// summed.
+host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan);
+
+// The loader's tensors for the commit terms' replay of its buffers in the pool (plan.loader_tensor_bytes): the tensors
+// of `inventory` the loader's buffer holds (placement_plan_loader_holds_entry over the plan's entries), each at the
+// loader's alignment as ggml-alloc pads it, in the inventory's order. Empty when the plan charges no loader term.
+std::vector<size_t> placement_plan_loader_tensor_bytes(const placement_plan &                     plan,
+                                                       const std::vector<placement_tensor_info> & inventory);
+
+// What the WEIGHT-zone line says the loader_residency term is, from the plan's loader facts and `terms`, the terms
+// placement_plan_host_weight_zone_terms() computed for it. The line says the buffer serves host experts in place only
+// when the terms serve some (loader_served > 0): a plan made for loader_device whose host weights are all dense, a
+// dense model's, serves none, though its fact would let it.
+inline const char * placement_plan_loader_role(const placement_plan & plan, const host_weight_zone_terms & terms) {
+    if (!plan.loader_holds_weights) {
+        return "the loader binds no SYCL_Host buffer for weights";
+    }
+    if (plan.loader_device < 0) {
+        return "the loader's SYCL_Host buffer, not charged: the scheduler sees more than one device, so the buffer is "
+               "split across their pools by layer; the host weights are copied out of it";
+    }
+    if (terms.loader_served > 0) {
+        return "the loader's SYCL_Host buffer, serving the host experts in place";
+    }
+    return "the loader's SYCL_Host buffer, charged once, in loader_device's pool; it serves no host weight in place";
+}
+
+// The loader's SYCL_Host buffers in a fresh pinned pool of `chunk`-byte chunks. ggml-alloc splits the loader's tensors
+// into buffers of at most `max_size` bytes, next-fit in their order, and the pool serves each buffer from one chunk
+// segment of the WEIGHT zone, the first with room, so a buffer never spans two segments.
+//   buffers  the buffers ggml-alloc requests
+//   chunks   the chunk segments those buffers take
+//   zone     the WEIGHT zone bytes they need: every segment but the last whole, the last as far as it is filled
+//   grown    the chunks the pool grows for buffers larger than a chunk, each with its header
+struct placement_loader_pool_footprint {
+    size_t buffers = 0;
+    size_t chunks  = 0;
+    size_t zone    = 0;
+    size_t grown   = 0;
+};
+
+// The alignment a SYCL_Host buffer's allocation asks the pinned pool for: ggml_sycl_host_buft_alloc sets it on its
+// request, and placement_loader_pool_footprint_for sizes each of the loader's buffers at it, so the replay and the
+// pool size a buffer by one rule at one alignment.
+inline constexpr size_t host_buft_alloc_alignment = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+
+inline placement_loader_pool_footprint placement_loader_pool_footprint_for(const std::vector<size_t> & tensor_bytes,
+                                                                           size_t                      max_size,
+                                                                           size_t                      chunk) {
+    placement_loader_pool_footprint footprint;
+    if (chunk == 0) {
+        return footprint;
+    }
+    std::vector<size_t> filled;  // the bytes each chunk segment holds, in segment order
+    const auto          place = [&](size_t buffer) {
+        ++footprint.buffers;
+        // The block zone_alloc's TLSF takes for the buffer, in a segment or in a chunk grown for it.
+        const size_t bytes = pinned_chunk_pool::zone_grow_request(buffer, host_buft_alloc_alignment);
+        if (bytes > chunk) {
+            // no segment holds it: the pool grows one chunk for the block, by the pool's own rule
+            footprint.grown += pinned_chunk_pool::chunk_footprint_for(chunk, bytes).backing;
+            return;
+        }
+        for (size_t & used : filled) {
+            if (chunk - used >= bytes) {
+                used += bytes;
+                return;
+            }
+        }
+        filled.push_back(bytes);
+    };
+    // ggml_backend_buft_alloc_buffer_n_plan: a buffer is flushed when the next tensor would take it past max_size, so a
+    // tensor larger than max_size is a buffer of its own
+    size_t buffer = 0;
+    for (const size_t bytes : tensor_bytes) {
+        if (buffer > 0 && buffer + bytes > max_size) {
+            place(buffer);
+            buffer = 0;
+        }
+        buffer += bytes;
+    }
+    if (buffer > 0) {
+        place(buffer);
+    }
+    footprint.chunks = filled.size();
+    // A zone of that size has every segment but the last whole and the last as large as it is filled, so first fit
+    // places each buffer where the replay did.
+    footprint.zone   = filled.empty() ? 0 : (filled.size() - 1) * chunk + filled.back();
+    return footprint;
+}
+
+// The largest buffer a SYCL host buffer type lets ggml-alloc request from a configured zone: its chunk cap, bounded by
+// the zone's largest free block `largest_free` but never below the pool's default chunk, since the pool grows a chunk
+// for a request no block holds. A cap of 0 is no cap. The host buffer types answer get_max_size with it
+// (ggml_sycl_host_buft_max_size), and the commit terms replay the loader's split at it with an empty WEIGHT zone's
+// largest block, one chunk.
+inline size_t host_zone_buffer_max_size(size_t chunk_cap, size_t largest_free) {
+    const size_t bound = std::max(largest_free, static_cast<size_t>(pinned_chunk_pool::CHUNK_SIZE));
+    return chunk_cap == 0 ? bound : std::min(chunk_cap, bound);
+}
+
+// Sets `terms.rounding`: the pool aligns each zone to its default alignment and grows the zone chunks and the RUNTIME
+// chunks apart, in whole chunks of terms.chunk, each backed by the chunk plus a header of that same alignment, and the
+// rounding is what that commits beyond the zones and the RUNTIME bytes. terms.chunk is not 0.
+inline void host_zone_commit_terms_round(host_zone_commit_terms & terms) {
+    const size_t chunk_bytes = terms.chunk;
+    const size_t align       = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+    const auto   align_up    = [align](size_t bytes) {
+        return (bytes + align - 1) & ~(align - 1);
+    };
+    const auto chunks_for = [chunk_bytes](size_t bytes) {
+        return (bytes + chunk_bytes - 1) / chunk_bytes;
+    };
+    const size_t zone_bytes =
+        align_up(terms.weight) + align_up(terms.kv) + align_up(terms.staging) + align_up(terms.scratch);
+    const size_t n_chunks  = chunks_for(zone_bytes) + (terms.runtime > 0 ? chunks_for(terms.runtime) : 0);
+    const size_t committed = n_chunks * (chunk_bytes + align);
+    terms.rounding         = committed - terms.zones() - terms.runtime;
+}
+
+// The host bytes configuring `plan`'s zones commits on a fresh pinned pool of `chunk_bytes` chunks, with
+// `onednn_live_bytes` of oneDNN scratch already reserved (the SCRATCH zone's floor), and those two inputs. All zero but
+// the inputs when the plan has no entries, as the configure step then configures nothing. Inline, as is the re-record
+// below it, because the KV refresh inside placement_plan re-records, and tests that use the plan without libggml-sycl
+// call that refresh.
+inline host_zone_commit_terms placement_plan_host_zone_commit_terms(const placement_plan & plan,
+                                                                    size_t                 onednn_live_bytes,
+                                                                    size_t                 chunk_bytes) {
+    constexpr size_t       k_min_kv_zone_bytes      = 64ull * 1024ull * 1024ull;
+    constexpr size_t       k_scratch_headroom_bytes = 32ull * 1024ull * 1024ull;
+    host_zone_commit_terms terms;
+    terms.onednn_live = onednn_live_bytes;
+    terms.chunk       = chunk_bytes;
+    // configuring a plan with no entries commits nothing: the configure step returns before it sizes a zone
+    if (plan.entries.empty() || chunk_bytes == 0) {
+        return terms;
+    }
+    const auto sat_add = [](size_t a, size_t b) {
+        return a > SIZE_MAX - b ? SIZE_MAX : a + b;
+    };
+    // The loader's buffers are charged as the pool will hold them, not at their bytes. A plan within its budget then
+    // configures a WEIGHT zone whose segments hold every loader buffer a chunk can hold, and the pool's only growth for
+    // the others is loader_grown, which total() counts. A plan charged this term whose total exceeds its budget is
+    // refused by name at plan time (placement_plan_loader_pool_refusal), so once the plan admits, no loader pool growth
+    // fails, as long as the pool's own budget, which it computes when its cache is created, is at least the plan's host
+    // budget. A plan whose record carries no tensors charges the bytes.
+    terms.weight      = plan.host_zone_weight_bytes;
+    terms.loader_zone = plan.host_zone_loader_bytes;
+    if (plan.host_zone_loader_bytes > 0 && !plan.loader_tensor_bytes.empty()) {
+        const placement_loader_pool_footprint footprint = placement_loader_pool_footprint_for(
+            plan.loader_tensor_bytes, host_zone_buffer_max_size(plan.loader_buffer_cap, chunk_bytes), chunk_bytes);
+        terms.loader_zone  = footprint.zone;
+        terms.loader_grown = footprint.grown;
+        // the rest of the record, taken no lower than zero: a hand-built plan can record less than its loader term
+        terms.weight       = plan.host_zone_weight_bytes -
+                       std::min(plan.host_zone_weight_bytes, plan.host_zone_loader_bytes) + terms.loader_zone;
+    }
+    terms.kv      = std::max(plan.host_zone_kv_bytes, k_min_kv_zone_bytes);
+    terms.staging = plan.host_zone_staging_bytes;
+    terms.scratch =
+        std::max(plan.host_zone_scratch_bytes,
+                 sat_add(sat_add(onednn_live_bytes, plan.max_copied_tensor_bytes), k_scratch_headroom_bytes));
+    // The PP pipeline scratch and the PP MoE oneDNN ring are VRAM allocations, so neither host pool carries them
+    // (§4.4 "The runtime pre-allocate stops carrying the same two terms").
+    terms.runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes;
+    host_zone_commit_terms_round(terms);
+    return terms;
+}
+
+// `plan`'s commit terms `terms` (placement_plan_host_zone_commit_terms(), or the plan's record of them) on `device`'s
+// pinned pool. Every card's zones are configured from the one plan, and every card has its own pool, but the loader's
+// SYCL_Host buffers are in one of them, plan.loader_device's. So on every other device the WEIGHT zone leaves out the
+// loader_zone the plan charged for them, no chunk is grown for them (loader_grown), and the rounding is recomputed for
+// the smaller zone. On the loader's device, and for a plan that charged no loader term, they are `terms`. The other
+// terms stay whole-model on every device, the host weights among them, though each pool materializes only its own
+// share.
+inline host_zone_commit_terms placement_plan_host_zone_commit_terms_on_device(const placement_plan &         plan,
+                                                                              const host_zone_commit_terms & terms,
+                                                                              int                            device) {
+    if (device == plan.loader_device || (terms.loader_zone == 0 && terms.loader_grown == 0) || terms.chunk == 0) {
+        return terms;
+    }
+    host_zone_commit_terms on_device = terms;
+    on_device.weight -= std::min(on_device.weight, terms.loader_zone);
+    on_device.loader_zone  = 0;
+    on_device.loader_grown = 0;
+    host_zone_commit_terms_round(on_device);
+    return on_device;
+}
+
+// The lazy tables' part of host_planned_bytes (th32 §4.3 step 4): each table's host_resident_bytes and the block ring's
+// charge, the bytes the zone terms do not hold.
+inline size_t placement_plan_lazy_host_bytes(const placement_plan & plan) {
+    size_t bytes = 0;
+    for (const placement_lazy_table & table : plan.lazy_tables) {
+        bytes += table.host_resident_bytes;
+    }
+    return bytes + plan.block_ring_charge;
+}
+
+// host_planned_bytes (th32 §4.2): the zone terms and the lazy tables' part. The one sum: the planner's record and a
+// re-record both set the figure through it.
+inline size_t placement_plan_host_planned_bytes(const placement_plan & plan) {
+    return plan.host_zone_terms.total() + placement_plan_lazy_host_bytes(plan);
+}
+
+// The refusal of a plan charged the loader term (the loader holds the weights in loader_device's pool) whose commit
+// total, loader_grown included, exceeds its host budget: "loader-pool-over-budget" followed by total=, host_budget=,
+// loader_zone=, loader_grown= and loader_device=, or empty when the plan admits. For the loader the total counts the
+// replay's footprint (loader_zone, loader_grown), not loader_residency, which bounds an expert slice from above. A late
+// plan replays exactly the tensors the loader places, so its footprint is exact and such a load would fail in
+// grow_zone partway through. An early candidate's total can exceed what the pool receives (it also counts tensors the
+// loader skips or puts in a CPU-owned buffer), so it can refuse a load that fits. Once a late plan admits, no loader
+// pool growth fails where the pool's own budget is at least the plan's. Others keep the WARN check.
+inline std::string placement_plan_loader_pool_refusal(const placement_plan & plan) {
+    const bool charged = plan.loader_holds_weights && plan.loader_device >= 0 && plan.host_zone_loader_bytes > 0;
+    if (!charged || !(plan.host_zone_terms.total() > plan.host_budget)) {
+        return {};
+    }
+    const host_zone_commit_terms & terms = plan.host_zone_terms;
+    return "loader-pool-over-budget total=" + std::to_string(terms.total()) +
+           " host_budget=" + std::to_string(plan.host_budget) + " loader_zone=" + std::to_string(terms.loader_zone) +
+           " loader_grown=" + std::to_string(terms.loader_grown) +
+           " loader_device=" + std::to_string(plan.loader_device);
+}
+
+// The loader pool's check once the host weights are placed: how far loader_device's WEIGHT zone grew, from `baseline`,
+// its capacity when the load decided the card's host zones (configured them, or found them configured by an earlier
+// load and kept them), to `capacity`, its capacity now, against the growth the plan recorded for the loader's buffers,
+// `terms.loader_grown` (the plan's commit terms on that device). The window also holds the preload's host-weight
+// blocks, which the plan's record holds beside the loader's buffers. It holds no upload buffers: the device reports
+// async off while the load guard is set, so the loader takes none from SYCL_Host and uploads each tensor whole.
+// Returns one "[HOST-PLAN-BUG]" line naming the device and the planned, actual and excess bytes when the zone grew
+// past it, empty otherwise. A capacity at or below the baseline has not grown.
+inline std::string host_zone_weight_growth_check(int                            device,
+                                                 const host_zone_commit_terms & terms,
+                                                 size_t                         baseline,
+                                                 size_t                         capacity) {
+    const size_t planned = baseline > SIZE_MAX - terms.loader_grown ? SIZE_MAX : baseline + terms.loader_grown;
+    if (capacity <= planned) {
+        return {};
+    }
+    return "[HOST-PLAN-BUG] device=" + std::to_string(device) +
+           " the WEIGHT zone grew past the plan after this load decided its host zones: planned=" +
+           std::to_string(planned) + " actual=" + std::to_string(capacity) +
+           " excess=" + std::to_string(capacity - planned) + " baseline=" + std::to_string(baseline) +
+           " loader_grown=" + std::to_string(terms.loader_grown) +
+           "; the plan sized the zone to hold the loader's buffers as its replay places them, with the rest of its "
+           "record beside them, so the pool grew for bytes the plan did not place";
+}
+
+// One lazy table's fields as every lazy line prints them (th32 §10), so the planner's [PLACEMENT] lazy lines and the
+// dry run's [PLAN-DRY-RUN] LAZY lines name each alike: table=, resident=, cache_slots=, floor_slots= and
+// consumer_device=, the consumer's device or CPU. Given the table's inventory record `info`, it appends what only that
+// record holds: yieldable=, the STORAGE cache's bytes above its floor (0 for HOST), consumer_layer=, rows_per_token=,
+// file= and off=.
+std::string placement_lazy_table_fields(const placement_lazy_table & table, const placement_lazy_table_info * info);
+
+// The plan's lazy refusal as every lazy line prints it: none, or the reason followed by the figures the planner
+// recorded with it.
+std::string placement_lazy_refusal_text(const placement_plan & plan);
+
+// Re-records `plan`'s host figures after a re-plan moved one of its zone terms past the record (th32 §4.2): the commit
+// terms, from the inputs the record took, and their total, host_planned_bytes. Each writer that moves a term after the
+// record re-records what it moved: the KV refresh when it raises host_zone_kv_bytes, and the runtime MMID re-plan when
+// its host pool grows host_zone_weight_bytes. Any other write after the record records nothing, so configuring that
+// plan names the bytes it does not count (§10's zone check). A plan never recorded holds no chunk, so its terms stay
+// empty. Nothing is logged: the would-refuse line is the planner pass's own, and the runtime transaction re-plans on
+// every probe.
+inline void placement_plan_rerecord_host_zone_terms(placement_plan & plan) {
+    plan.host_zone_terms =
+        placement_plan_host_zone_commit_terms(plan, plan.host_zone_terms.onednn_live, plan.host_zone_terms.chunk);
+    plan.host_planned_bytes = placement_plan_host_planned_bytes(plan);
+}
+
+// The zone configuration's ledger check (th32 §4.2, §10): the pool grew from committed_before to committed_after while
+// a plan counting planned_bytes was configured. Growth past the plan logs one [HOST-PLAN-BUG] naming the device, the
+// planned bytes and the committed bytes, and returns false; growth within it returns true. Growth below the plan is no
+// defect here, since a pool that already held chunks grows less; a pre-allocation that runs short is phase (b)'s check.
+bool host_zone_commit_check(int device, size_t planned_bytes, size_t committed_before, size_t committed_after);
+
 struct moe_mmid_queue_binding {
     int                       owner_device = -1;
     sycl::queue *             queue        = nullptr;
@@ -1990,7 +2915,10 @@ struct lifecycle_plan_snapshot {
     uint32_t                              slot               = UINT32_MAX;
     uint64_t                              slot_generation    = 0;
     uint64_t                              version            = 0;
+    // Placed on host (design 5efe §4.4): what the tiering verdict reads, mapped weights included.
     uint64_t                              planned_host_bytes = 0;
+    // Charged on host: the placed bytes less the mapped ones, which the ledger does not own.
+    uint64_t                              charged_host_bytes = 0;
     uint64_t                              actual_host_bytes  = 0;
     lifecycle_plan_verdict                verdict            = lifecycle_plan_verdict::UNKNOWN;
     bool                                  explicit_no_plan   = false;
@@ -2055,14 +2983,24 @@ void                                           lifecycle_stage_probe_placement_p
                                                                                     uint32_t                  model_n_layer = 0);
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept;
 void                                           lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept;
+
+// Stages the load's candidate (th32 §3.3). `lease` is the candidate's reference on the IO pool, given only when the
+// plan has a STORAGE table; the record holds it, never the snapshot. The lease of the candidate this replaces is moved
+// to *displaced_out for the caller to drop after its own locks, or dropped here after the unlock when that is null.
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info       = {},
-                                    uint32_t                  model_n_layer = 0);
+                                    uint32_t                  model_n_layer = 0,
+                                    ring_lease                lease         = ring_lease(),
+                                    ring_lease *              displaced_out = nullptr);
+// Stages an explicit no-plan candidate, which holds no lease; the replaced candidate's lease goes as above.
 void lifecycle_stage_no_placement_plan(uint64_t                  load_txn_id,
                                        const placement_kv_info & kv_info       = {},
-                                       uint32_t                  model_n_layer = 0);
-void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept;
+                                       uint32_t                  model_n_layer = 0,
+                                       ring_lease *              displaced_out = nullptr);
+// Aborts the load's candidate and its probe placement; the candidate's lease goes as the stage's does.
+void lifecycle_abort_placement_plan(uint64_t load_txn_id, ring_lease * displaced_out = nullptr) noexcept;
+
 std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placement_plan(uint64_t load_txn_id) noexcept;
 bool lifecycle_publish_placement_plan(
     uint64_t                                         model_id,
@@ -2080,6 +3018,10 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_select_placement_plan(u
                                                                                uint64_t slot_generation) noexcept;
 void   lifecycle_erase_placement_plan(uint64_t model_id, uint64_t load_txn_id) noexcept;
 size_t lifecycle_published_placement_plan_count_for_test() noexcept;
+// The shutdown drain's take (th32 §3.3): moves one held lease out of a published or staged record, leaving the record,
+// and names its owner, model 0 for a staged candidate. An empty lease means no record holds one. The caller drops the
+// lease after this returns, with no lock held.
+ring_lease lifecycle_take_ring_lease(uint64_t * model_id, uint64_t * load_txn_id) noexcept;
 bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_plan_snapshot> & expected,
                                         const std::shared_ptr<const lifecycle_plan_snapshot> & replacement) noexcept;
 // Whether two plans plan the same MMID workspaces: the one answer to "can the pools materialized for `a` serve `b`".
@@ -2089,7 +3031,34 @@ bool   lifecycle_replace_placement_plan(const std::shared_ptr<const lifecycle_pl
 bool   moe_mmid_same_workspace_plan(const placement_plan & a, const placement_plan & b) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
+
+// Runs `fn(ctx)` holding g_lifecycle_plan_mutex: the plan records' half of the lazy lock witness's control (th32 §11).
+void lifecycle_plan_run_locked_for_test(void (*fn)(void *), void * ctx);
+
+// The staged and published records that hold a ring lease (th32 §3.3's drain).
+size_t lifecycle_plan_lease_count_for_test();
+
+// Drops every staged and published record as static destruction would: out of the maps under the lock, destroyed
+// after the unlock.
+void lifecycle_plan_clear_for_test();
 #endif
+
+// The opt-out of the single-device planner's pin of routed host experts on a load that maps files:
+// GGML_SYCL_MOE_PIN_HOST_EXPERTS=0 keeps them mapped. placement_pin_host_experts_enabled() is its one reader. It reads
+// the environment on every call, so a plan made after the variable changes sees it, and ggml_check_sycl reports the
+// value through it.
+static constexpr const char * MOE_PIN_HOST_EXPERTS_ENV = "GGML_SYCL_MOE_PIN_HOST_EXPERTS";
+bool                          placement_pin_host_experts_enabled();
+
+// The opt-in spread placement of routed experts, off by default: GGML_SYCL_MOE_SPREAD_PLACEMENT=1 has the single-device
+// planner walk the expert triplets rank-major over every block when they do not all fit, and plan host WEIGHT room for
+// swaps. Each block then gets an equal share of the device slots when every triplet charges the same; the pack is the
+// same first fit by bytes, so a mixed-quant pack, or one type carrying a PP-SOA alternate charge, gives the blocks
+// whose triplets charge less more slots. A multi-device plan keeps the layer-first order.
+// placement_moe_spread_enabled() is its one reader and reads the environment once; the backend hands the value to the
+// planner as placement_kv_info::moe_spread and ggml_check_sycl reports it.
+static constexpr const char * MOE_SPREAD_PLACEMENT_ENV = "GGML_SYCL_MOE_SPREAD_PLACEMENT";
+bool                          placement_moe_spread_enabled();
 
 // Compute placement plan for all model weights given a VRAM budget.
 // tensor_inventory: vector of (name, src_size) pairs from model header.
@@ -2112,18 +3081,30 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept;
 // planner annotate its log output with explicit source attribution and
 // is the entry point for future planner decisions that need the raw
 // envelope (n_seq_max, flash_attn_type) rather than the derived snapshot.
+// `host_budget` is the host ledger's budget the plan records and is weighed
+// against (th32 §4.2): a load passes host_ledger_budget(), the value its
+// transaction stored, and a caller planning against another budget passes
+// that one. The planner never reads the stored budget itself.
+// `coverage_pin` is the lazy tables' coverage pin (th32 §3.3), the lease the
+// caller holds across the planning: the planner reads the live block ring's
+// bytes through it to decide which tables may be STORAGE. Null makes none
+// STORAGE-eligible, so every table takes the HOST test (§4.3 step 4).
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
                                       const placement_kv_info &                           kv_info,
                                       const ggml_sycl_placement_envelope *                envelope,
-                                      int                                                 n_experts = 0);
+                                      int                                                 n_experts,
+                                      size_t                                              host_budget,
+                                      const ring_lease *                                  coverage_pin = nullptr);
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,
                                       size_t                                     vram_budget,
                                       int                                        device_id,
                                       const placement_kv_info &                  kv_info,
                                       const ggml_sycl_placement_envelope *       envelope,
-                                      int                                        n_experts = 0);
+                                      int                                        n_experts,
+                                      size_t                                     host_budget,
+                                      const ring_lease *                         coverage_pin = nullptr);
 
 // P4.5: Compute multi-device placement plan for hybrid parallelism.
 // Dense layers use layer parallelism (contiguous ranges per device, proportional to VRAM).
@@ -2137,13 +3118,19 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 // n_experts: experts per MoE layer (0 for dense models).  When > 0,
 //            MoE tensors are split into per-expert entries for fine-grained
 //            per-expert device assignment.
+// host_budget: the host ledger's budget the plan records, as for
+//            compute_placement_plan() above (th32 §4.2).
+// coverage_pin: the lazy tables' coverage pin, as for compute_placement_plan()
+//            above (th32 §3.3); the one-device delegation forwards it.
 placement_plan compute_multi_device_plan(const std::vector<device_budget> &                  device_budgets,
                                          const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                          int                                                 n_layers,
                                          multi_gpu_mode                                      mode,
                                          const placement_kv_info &                           kv_info,
                                          const ggml_sycl_placement_envelope *                envelope,
-                                         int                                                 n_experts = 0);
+                                         int                                                 n_experts,
+                                         size_t                                              host_budget,
+                                         const ring_lease *                                  coverage_pin = nullptr);
 // Recomputes MMID demand against updated planner capacity. If every owner fits
 // the immutable published pools, retains their exact geometry/accounting.
 // Otherwise publishes exact new geometry and checked accounting in `plan`.
@@ -2159,7 +3146,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          multi_gpu_mode                             mode,
                                          const placement_kv_info &                  kv_info,
                                          const ggml_sycl_placement_envelope *       envelope,
-                                         int                                        n_experts = 0);
+                                         int                                        n_experts,
+                                         size_t                                     host_budget,
+                                         const ring_lease *                         coverage_pin = nullptr);
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
@@ -2229,10 +3218,10 @@ bool     unified_cache_planned_dense_scratch_owner_rejected(int                 
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
 // llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
 // zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
-// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack. It
-// is measured at the load's requested context (-c via the n_ctx hint, else the padded training context) and ubatch 512;
-// -ub does not reach the measures (the load reads it only as the ring's n_ubatch hint; fkpg). So it is the planned term
-// for that shape, not for every context. moua L6 retires it into the FIRST_CONTEXT head slot.
+// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
+// It is measured at the context and micro-batch the caller told the load (the training context and the auto
+// ladder's bottom rung where it told none), so it is the planned term for that shape, not for every context. moua L6
+// retires it into the FIRST_CONTEXT head slot.
 // Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
 // that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
 // term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
@@ -2240,6 +3229,14 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 // (planned_load_terms::set).
 bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
 size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
+// The micro-batch the planned compute term was measured at on the device, for the hold-spill fit to credit the term
+// at that rung and below (placement_plan_compute_room), and to bound the credit of a rung without a record of its own
+// under a placed micro-batch (zone_hold_fit_inputs::compute_room_measured_n_ubatch). Each load records the micro-batch
+// it measured the term at (ggml_sycl_tensor_inventory::n_ubatch_measure) through zone_compute_term_n_ubatch_store,
+// which documents the rule; the setter WARNs once when a store turns the record off. The getter answers 0 for none,
+// for a record turned off, and for a device out of range.
+void             unified_cache_set_planned_compute_term_n_ubatch(int device_id, uint32_t n_ubatch);
+uint32_t         unified_cache_get_planned_compute_term_n_ubatch(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
 // device's plain buffer type occupies in the RUNTIME zone (the recurrent state: the real context allocates it there,
 // RUNTIME-first and outside the compute scope, before the compute buffer, so a compute term alone does not hold the
@@ -2295,6 +3292,10 @@ size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_
 // scheduler compute buffers (rows made by a request flagged as one, by origin: the rung's own bytes, which the
 // realized check credits back). One registry pass, so the two figures are consistent with each other.
 size_t       unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live);
+// The figure the raw-allocation gates compare for a device (zone-raw-gate.hpp): the device total, the arena
+// reservation, the raw rows above, and the bytes in use outside this process's accounting when the device's first
+// cache was made.
+zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & queue);
 // The card's free memory WITHOUT the rung's own compute buffers, from the ledger and never a driver read after a
 // release. A window's baseline (the free memory with no raw cache allocation held: `driver_free_now` plus the raw
 // bytes held) is the MAXIMUM reading taken since the owner's last publish (a driver's credit for a freed buffer lags,
@@ -2380,7 +3381,7 @@ void   unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t we
 size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
 size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 
-// llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
+// The SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) recorded
 // alongside the scratchpad bytes above, feeding
 // onednn_graph_scratch_zone_floor_bytes_swa()'s shape-derived floor (see
@@ -2389,7 +3390,7 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 // min(n_ctx, n_swa + n_ubatch) for SWA layers -- a ubatch of n_ubatch
 // queries against an n_swa-key sliding window spans n_swa + n_ubatch keys
 // in total, GPU-verified -- not a single n_head x n_ctx term for every
-// layer (correction on the ticket, llama.cpp-o3a0, after an earlier
+// layer (an earlier
 // version of this fix assumed every oneDNN-served layer's window was
 // n_ctx). All-zero means "never planned for this device".
 struct onednn_graph_scratch_planned_shape {
@@ -2407,6 +3408,30 @@ void                               unified_cache_set_planned_onednn_graph_scratc
                                                                                         uint32_t n_ubatch,
                                                                                         uint32_t n_ctx);
 onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratch_shape(int device_id);
+
+// The one definition of the Graph scratch shape a load plans: the heads and the window from `kv_info`, and the context
+// shape zone_plan_context_shape_for_envelope() gives from `kv_info` and the envelope's micro-batch. The shape sizes the
+// ONEDNN zone the plan packs weights against, so a single-device stage publishes it before it sizes the zones, and the
+// plan publishes it again from the same inputs; both plan builders take their context fields from it.
+onednn_graph_scratch_planned_shape unified_cache_plan_onednn_graph_scratch_shape(
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope);
+// Records unified_cache_plan_onednn_graph_scratch_shape(kv_info, envelope) for `device_id` and returns it. The backend
+// writes the planned shape nowhere else but the dry run, which puts back the value it read before it planned; a test
+// may call the setter directly to stage a shape.
+onednn_graph_scratch_planned_shape unified_cache_publish_planned_onednn_graph_scratch_shape(
+    int                                  device_id,
+    const placement_kv_info &            kv_info,
+    const ggml_sycl_placement_envelope * envelope);
+
+// The one definition of the oneDNN PP scratch pair a load plans into the ONEDNN zone (zone_onednn_pp_pair_plan over
+// `maxima`): its activations half is sized at the micro-batch of the Graph scratch shape above, the one the Graph floor
+// that shares the zone is sized at (the load's planning micro-batch when that shape names none). Both formula sites
+// call it: the inventory intake, whose pair is the one the arena sizes the zone from, and the plan's host zone sizing,
+// which reports it, so the two cannot size the zone differently.
+zone_onednn_pp_pair unified_cache_plan_onednn_pp_pair(const path_scoped_maxima &           maxima,
+                                                      const placement_kv_info &            kv_info,
+                                                      const ggml_sycl_placement_envelope * envelope);
 
 // llama.cpp-oyfl: the non-flash-attention batched mul_mat scratch floor.
 //
@@ -2428,9 +3453,8 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // The KQV call's staged operand is kq_soft_max, shaped
 // [n_kv, n_ubatch, n_head] -- at long context this dominates the KQ call's
 // staged Q operand ([head_dim, n_ubatch, n_head]), so the formula keeps only
-// this term, the same simplification the oneDNN activations-half placeholder
-// documented in docs/backend/sycl-memory-design.md's "Known limits" already
-// accepts. n_ctx stands in for n_kv the same way the oneDNN floor above uses
+// this term, accepting an under-count at a short context, where the Q operand
+// can be the larger and both are small. n_ctx stands in for n_kv the same way the oneDNN floor above uses
 // it for ne11: the planned/runtime context length is the worst-case n_kv a
 // layer's attention will ever see, and it is what every call site has on
 // hand. All-zero means "never planned for this device".
@@ -2620,12 +3644,14 @@ void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force);
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 // llama.cpp-o3a0: host-testable wrapper around the window-aware
 // onednn_graph_scratch_zone_floor_bytes_swa(), same internal-linkage/
-// memoization caveats as the wrapper above.
+// memoization caveats as the wrapper above. `direct_cap` bounds the floor as the zone's own reading does; 0 is no
+// cap known, the formula.
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                                 uint32_t n_head_swa_max,
                                                                 uint32_t n_swa,
                                                                 uint32_t n_ubatch,
-                                                                uint32_t n_ctx);
+                                                                uint32_t n_ctx,
+                                                                size_t   direct_cap);
 #endif
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,
@@ -2649,17 +3675,23 @@ void unified_cache_set_planned_pp_moe_onednn_kv_zone_slots(int device_id, bool a
 bool unified_cache_get_planned_pp_moe_onednn_activation_in_kv_zone(int device_id);
 bool unified_cache_get_planned_pp_moe_onednn_output_in_kv_zone(int device_id);
 
-// llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
+// Bytes of one activation and one output scratch row, and the expert counts,
 // carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
-// so the runtime-context transaction can re-plan the ring for the REAL
-// runtime n_ubatch -- the load-time plan above is always sized for the
-// loader's own inventory.n_ubatch (512 today), not whatever n_ubatch the
-// context is actually created with. 0 = no MoE PP ring planned (dense model).
-void   unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
-                                                         size_t activation_bytes_per_row,
-                                                         size_t output_bytes_per_row);
-size_t unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id);
-size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id);
+// so the runtime-context transaction can re-plan the ring for the context's
+// own micro-batch -- the load-time plan above is sized for the load's
+// micro-batch, not whatever n_ubatch the context is actually created with.
+// The slots hold the rows the packed scratch can need, which depend on the
+// expert counts as well as the micro-batch. 0 = no MoE prompt ring planned (a
+// dense model).
+void     unified_cache_set_planned_pp_moe_onednn_row_bytes(int      device_id,
+                                                           size_t   activation_bytes_per_row,
+                                                           size_t   output_bytes_per_row,
+                                                           uint32_t n_expert,
+                                                           uint32_t n_expert_used);
+size_t   unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id);
+size_t   unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id);
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_expert(int device_id);
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_expert_used(int device_id);
 
 // The n_ubatch the CURRENTLY PLANNED activation/output slots above were sized
 // for -- distinct from the loader's inventory.n_ubatch (always 512 today):
@@ -2670,31 +3702,30 @@ size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_i
 void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch);
 uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
 
-// Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
-// align256(n_ubatch * per_row) for both activation and output, through
-// pp_moe_onednn_slots_at() (moe-scratch-admission.hpp), the helper the ring's
-// admission and the explicit micro-batch's room size their slots with, so the
-// three cannot round or overflow-check differently. Returns false (leaving the
-// output params untouched) when the per-row bytes are 0 (dense model, no ring
-// planned) or the multiply/align would overflow.
+// Slot sizes the ring needs for `n_ubatch`, from the per-row bytes and expert
+// counts above: the slots `pp_moe_onednn_slots_at()` (moe-scratch-admission.hpp)
+// gives, the helper the ring's admission and the explicit micro-batch's room
+// size their slots with, so the three cannot size a slot differently. Returns
+// false (leaving the output params untouched) when the per-row bytes are 0
+// (dense model, no ring planned), the expert counts are 0, or the
+// multiply/align would overflow.
 bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
                                                   uint32_t n_ubatch,
                                                   size_t * activation_slot_bytes,
                                                   size_t * output_slot_bytes);
 
-// Inverse of the sizing above: the largest n_ubatch whose re-planned
-// activation+output slots -- plus the constant weight slot, both times
-// ring_depth -- fit within capacity_bytes, rounded DOWN to a multiple of 32
-// (llama's BLAS minimum; llama_context applies no 256-padding to n_ubatch).
-// Returns 0 when nothing fits (capacity_bytes does not clear the weight
-// slots' own total) or the inputs are degenerate (ring_depth == 0, or both
-// per-row terms 0). Same "hold the constant terms, divide the remainder by
-// the per-unit cost, round to the allocator granularity" method as
-// ggml_sycl_largest_fitting_n_ctx (ggml-sycl.cpp).
+// Inverse of the sizing above: the largest n_ubatch, a multiple of 32 (llama's
+// BLAS minimum), whose whole ring fits capacity_bytes: ring_depth times the
+// weight slot plus the two slots `pp_moe_onednn_slots_at` gives for it. Found
+// by bisection, which the slots' never shrinking with the micro-batch allows.
+// Returns 0 when not even 32 rows fit, or the inputs are degenerate
+// (ring_depth 0, both per-row terms 0, or no experts or none used).
 uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capacity_bytes,
                                                                   size_t   weight_slot_bytes,
                                                                   size_t   activation_bytes_per_row,
                                                                   size_t   output_bytes_per_row,
+                                                                  uint32_t n_expert,
+                                                                  uint32_t n_expert_used,
                                                                   uint32_t ring_depth);
 
 // These four figures are a HARD CAP, not a starting size. Before asking the
@@ -2720,11 +3751,126 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 void   unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
 
+// The MoE batched MMVQ scratch bound the SCRATCH zone is sized to hold (zone_scratch_zone_plan): every expert op's Q8_1
+// activations and ids at the context's micro-batch (placement_plan::moe_mmvq_scratch_bytes). populate_host_zone_sizing
+// publishes it with every plan, 0 for a model with no admitted expert op or a bound that overflows. A context's runtime
+// transaction raises it to its own micro-batch's figure and never lowers it (the raise answers the figure now
+// published); the next ensure of the arena's zones reads it.
+void   unified_cache_set_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_raise_planned_moe_mmvq_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_moe_mmvq_scratch_bytes(int device_id);
+
 // pp_pipeline + pp_moe_onednn + MoE CONTROL for one device, with every addition
 // checked. Returns false without writing *out when the device's CONTROL
 // requirement could not be computed, which is what stops an unsizable plan from
 // silently becoming a smaller RUNTIME zone.
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out);
+
+// The terms the placement planners publish for a device while they compute a plan (populate_host_zone_sizing() and
+// publish_moe_host_scatter_term()): the MoE CONTROL requirement and the MoE host scatter scratch, both in the RUNTIME
+// zone's requirement, the oneDNN Graph and non-FA attention scratch shapes, which floor zones the same ensure sizes,
+// and the MoE batched MMVQ scratch bound, which raises the SCRATCH zone. A plan that is computed and then discarded
+// publishes nothing, so a caller that may discard one takes this snapshot before it plans and restores it when it does.
+// Each setter stores what its getter reads, so the restore is exact. A term the planners start to publish is added
+// here, not at a caller. It lives beside the getters and setters it calls, so a test that links the cache without the
+// backend checks the restore against the cache's own state.
+struct planner_published_terms {
+    onednn_graph_scratch_planned_shape graph{};
+    nonfa_attn_scratch_planned_shape   nonfa{};
+    moe_control_requirement            control{};
+    size_t                             scatter  = 0;
+    size_t                             moe_mmvq = 0;
+
+    static planner_published_terms snapshot(int device);
+    void                           restore(int device) const;
+};
+
+// The device-wide terms a model load publishes for a device as it plans, with the planners' (planner): the PP pipeline
+// scratch; the PP MoE oneDNN ring's slots and depth, which of its slots the KV zone holds, and the row bytes, expert
+// counts and micro-batch it is re-planned from; the oneDNN scratchpad pair with its stored sum, which the pair's
+// reserve raises on its own; and the zone plan (the pair plan and the Graph floor the zone ensure stores on the
+// device's cache, unified_cache::onednn_zone_plan_), which the pair bound and the Graph room
+// a context check reads are derived from. Each model on the device plans with these, and every load overwrites them,
+// so a load that fails puts back what it published (load_published_record). The terms keyed by the load's owner are
+// not here (they leave with their owner, unified_cache_drop_planned_load_terms), nor is the compute term's
+// micro-batch, which is sticky by design and which every load records at the same planning value, nor the DIRECT
+// Graph-scratch cap's budget snapshot, which describes the arena as it stands: a failed load that rebuilt the arena
+// leaves the rebuilt arena in place, and the snapshot it stored at that rebuild is the one that arena's cap is derived
+// from. Each setter stores what its getter reads, so a restore is exact, but for the zone plan: it describes a
+// zone the failed load may have changed, so it goes back as zone_onednn_plan_keep_short of the prior plan over the
+// zone as it is then. The terms fall in groups (load_published_group), each the terms one publisher writes together,
+// and a restore puts back whole groups, so no group holds part of one publisher's terms and part of another's.
+enum load_published_group : uint32_t {
+    LOAD_PUBLISHED_GROUP_PIPELINE    = 1u << 0,  // the PP pipeline scratch
+    LOAD_PUBLISHED_GROUP_RING        = 1u << 1,  // the ring's slots and depth, its KV-zone slots and its micro-batch
+    LOAD_PUBLISHED_GROUP_RING_ROWS   = 1u << 2,  // the row bytes and expert counts the ring is re-planned from
+    LOAD_PUBLISHED_GROUP_ONEDNN_PAIR = 1u << 3,  // the oneDNN scratchpad pair's two halves
+    LOAD_PUBLISHED_GROUP_ONEDNN_SUM  = 1u << 4,  // the pair's stored sum
+    LOAD_PUBLISHED_GROUP_GRAPH       = 1u << 5,  // the planners' oneDNN Graph scratch shape
+    LOAD_PUBLISHED_GROUP_NONFA       = 1u << 6,  // the planners' non-FA attention scratch shape
+    LOAD_PUBLISHED_GROUP_CONTROL     = 1u << 7,  // the planners' MoE CONTROL requirement
+    LOAD_PUBLISHED_GROUP_SCATTER     = 1u << 8,  // the planners' MoE host scatter scratch
+    LOAD_PUBLISHED_GROUP_ZONE_PLAN   = 1u << 9,  // the plan the device's cache stores for its ONEDNN zone
+    // the planners' MoE batched MMVQ scratch bound
+    LOAD_PUBLISHED_GROUP_MOE_MMVQ    = 1u << 10,
+    LOAD_PUBLISHED_GROUP_ALL         = (1u << 11) - 1,
+};
+
+struct load_published_terms {
+    size_t                  pp_pipeline           = 0;
+    size_t                  ring_weight           = 0;
+    size_t                  ring_activation       = 0;
+    size_t                  ring_output           = 0;
+    uint32_t                ring_depth            = 0;
+    bool                    ring_activation_in_kv = false;
+    bool                    ring_output_in_kv     = false;
+    size_t                  ring_activation_row   = 0;
+    size_t                  ring_output_row       = 0;
+    uint32_t                ring_n_expert         = 0;
+    uint32_t                ring_n_expert_used    = 0;
+    uint32_t                ring_n_ubatch         = 0;
+    size_t                  onednn_weights        = 0;
+    size_t                  onednn_activations    = 0;
+    size_t                  onednn_stored         = 0;
+    zone_onednn_plan        onednn_zone_plan{};
+    planner_published_terms planner{};
+
+    static load_published_terms snapshot(int device);
+    // The groups whose terms differ between this and `other`.
+    uint32_t                    differing(const load_published_terms & other) const;
+    // Takes the terms of `groups` from `from`. Not named copy: a `.copy(` member call reads as a queue shortcut to the
+    // window-path launch census.
+    void                        take_groups(const load_published_terms & from, uint32_t groups);
+    // Stores the terms of `groups` as the device's published terms, each group through its own setters: the one list
+    // of what a load publishes. A failed load's record puts groups back through it, and the last release of a device
+    // stores a default-constructed set through it, which is what a device no load has planned on reads. The zone plan
+    // is stored as given, onto the device's existing cache; a caller that puts a plan back over a zone that may have
+    // changed since leaves that group out and uses unified_cache::onednn_zone_plan_put_back.
+    void                        restore(int device, uint32_t groups = LOAD_PUBLISHED_GROUP_ALL) const noexcept;
+};
+
+// One device's terms for one load transaction, kept so that a load that fails puts back what it published and nothing
+// another publisher wrote since. A runtime context transaction of a live model publishes some of the same terms while
+// the load runs (the ring when its micro-batch moves, the non-FA attention shape), and the oneDNN pair's reserve raises
+// the stored sum. `prior` is what each group held before this load wrote it, or what another publisher left in it
+// since; `written` is what each group held when this load last looked. note() takes one planner pass of the load: the
+// terms when it started and when it ended, both read under the inventory lock that every publisher but the reserve
+// holds, so only the pass wrote between them. restore() puts a group back only while it still holds `written`, the sum
+// by compare-exchange, so a raise outside that lock is kept, and the zone plan by a test and store on the device's
+// cache under that cache's zone-plan mutex (unified_cache::onednn_zone_plan_put_back), which the pair's reserve also
+// writes through. A publisher that writes exactly what the load published cannot be told from the load, and its group
+// goes back with the load's.
+struct load_published_record {
+    load_published_terms prior{};
+    load_published_terms written{};
+
+    load_published_record() = default;
+
+    explicit load_published_record(const load_published_terms & now) : prior(now), written(now) {}
+
+    void note(const load_published_terms & before, const load_published_terms & after);
+    void restore(int device) const noexcept;
+};
 
 // The RUNTIME zone's floor: 512 MiB, or GGML_SYCL_RUNTIME_ARENA_MB when it is set. ensure_planned_arena_zones()
 // reserves at least this, and an explicit micro-batch's room is measured against the same floor.
@@ -2881,17 +4027,6 @@ inline int64_t expert_group_key(int block_id, int expert_id) {
     return (static_cast<int64_t>(block_id) << 16) | static_cast<int64_t>(expert_id & 0xFFFF);
 }
 
-// Data needed to stage one tensor of an expert group.
-// fill_fn/fill_ctx allow per-tensor reorder (GPU or CPU).
-// When fill_fn is nullptr, a raw DMA memcpy is used.
-struct staging_tensor_data {
-    const void * src_ptr   = nullptr;  // host-accessible source data (AOS)
-    size_t       src_size  = 0;        // source bytes (AOS)
-    size_t       dst_size  = 0;        // destination bytes (SOA)
-    int          layer_id  = -1;
-    int          expert_id = -1;
-};
-
 // Cache entry readiness
 enum class cache_entry_state {
     READY,
@@ -2906,6 +4041,9 @@ enum class cache_location {
     HOST_PINNED,
     HOST_MMAP,
     UNKNOWN,  // Sentinel: entry exists but location is unresolved (cache miss)
+    // A lazy table's rows that stay in the file (llama.cpp-th32 T1). Reported only: there is no pointer to resolve,
+    // nothing allocates against it, and expert_resolution_allowed refuses it like a miss.
+    STORAGE,
 };
 
 // XMX layout metadata carried with cache entries/results
@@ -3066,59 +4204,48 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
            status == expert_retire_status::NOT_FOUND;
 }
 
-// One member of a resident expert triplet lent to the host for a prompt phase (llama.cpp-mwmr). key is the cache id the
-// member's AOS device entry was direct-staged under. host_keys are the ids the host copy is registered under, the set
-// S1-PRELOAD registers a host-planned expert under; the first must equal key, and its lease is the one returned.
-// host_owner is pinned host storage minted owner-first (unified_allocate_owner) by the caller before it took any listed
-// lock, so no allocation runs under one; its size must hold the device entry's (loan_copy_bytes()).
-struct expert_loan_member {
+// One member of an expert triplet moved between the device and pinned host storage: to the host by
+// loan_expert_triplet(), lent for a prompt phase, or back to the device by refill_lent_triplet() or
+// admit_host_triplet(). key is the cache id the member's AOS device entry is direct-staged under and its host copy is
+// published under. host_keys are every id the host copy is published under, the set S1-PRELOAD registers a host-planned
+// expert under, key first; the lease on key's entry is the one returned. owner is the destination storage, minted
+// owner-first by the caller before it took any listed lock, so no allocation for the bytes runs under one: pinned host
+// storage that holds logical_bytes for a move to the host, and WEIGHT zone storage on the device for a move to the
+// device, exactly staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes.
+// type, ncols and logical_bytes are the weight's type, row width and bytes per expert (nb[2]), which the caller
+// resolves from its tensor. An expert's size is a fact of its tensor, never of a cache entry, whose storage may be
+// padded: each direction copies logical_bytes from offset 0 of its source, so a padded device entry's tail never
+// reaches the host, and a host copy's tail never reaches the device, where the tail is zero-filled instead.
+struct expert_move_member {
     expert_placement_key            placement;
     ggml_sycl_cache_id              key;
     std::vector<ggml_sycl_cache_id> host_keys;
-    mem_handle                      host_owner;
+    mem_handle                      owner;
+    ggml_type                       type          = GGML_TYPE_COUNT;
+    int64_t                         ncols         = 0;
+    size_t                          logical_bytes = 0;
 };
 
-// What one loan did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
-// loan carries the device storage it returns, the three device entries' sizes (llama.cpp-pu8v: an entry can exceed the
-// plan's charge by the quantized tail direct staging pads), a lease on each member's host entry (whose bytes are valid
-// once copy_events[i] completes; the entry carries that event as its ready event) and each device entry's retire
-// status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after the entry's
-// leases are gone and behind the copy, which is the entry's last write. device_keys[i] is the key that device entry
-// was retired under: the caller drops every view it holds on the entry by that key, since a retired entry refuses the
-// resolve a view would otherwise be matched by once the cache generation moves (llama.cpp-6aj4).
-struct expert_loan_record {
-    bool                 accepted    = false;
-    const char *         reason      = "none";
-    size_t               bytes_freed = 0;
-    mem_handle           host_handles[3];
+// What one move of a triplet did. A refusal changes nothing: reason names why and every other field keeps its
+// default. An accepted move carries device_bytes, the device storage its three device entries gave back (a move to
+// the host: the entries' sizes, which can exceed the plan's charge by the quantized tail direct staging pads) or took
+// (a move to the device: the staged sizes), and a lease on each member's new entry in handles[i], whose bytes are
+// valid once copy_events[i] completes; the entry carries that event as its ready event, and on the device as its last
+// write too, the copy or the zero fill of the padded tail behind it. A move to the host also reports each device
+// entry's retire status, DEFERRED because the storage goes back to its zone through a later deferred-free pass, after
+// the entry's leases are gone and behind the copy, which is the entry's last write, and in device_keys[i] the key the
+// device entry was retired under: the caller drops every view it holds on the entry by that key, since a retired
+// entry refuses the resolve a view would otherwise be matched by once the cache generation moves. A move to the
+// device leaves both at their defaults.
+struct expert_move_record {
+    bool                 accepted     = false;
+    const char *         reason       = "none";
+    size_t               device_bytes = 0;
+    mem_handle           handles[3];
     sycl::event          copy_events[3];
     expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
                                               expert_retire_status::INVALID };
     unified_cache_key    device_keys[3]   = {};
-};
-
-// One member of a lent triplet re-admitted to the device after a prompt phase (llama.cpp-sif1), the loan's member
-// inverted. key is the cache id the member's AOS device entry was staged under and its host copy is published under;
-// host_keys are every id the loan published the host copy under, key first. device_owner is the member's device
-// storage, minted owner-first by the caller from the WEIGHT zone before it took any listed lock, so no allocation for
-// the bytes runs under one; its size must be the host copy's (refill_copy_bytes()).
-struct expert_refill_member {
-    expert_placement_key            placement;
-    ggml_sycl_cache_id              key;
-    std::vector<ggml_sycl_cache_id> host_keys;
-    mem_handle                      device_owner;
-};
-
-// What one refill did. A refusal changes nothing: reason names why and every other field keeps its default. An accepted
-// refill carries the device storage it takes, the three host copies' sizes, and a lease on each member's new device
-// entry, whose bytes are valid once copy_events[i] completes (the entry carries that event as its ready event and its
-// last write).
-struct expert_refill_record {
-    bool         accepted         = false;
-    const char * reason           = "none";
-    size_t       bytes_readmitted = 0;
-    mem_handle   device_handles[3];
-    sycl::event  copy_events[3];
 };
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -3145,6 +4272,7 @@ enum class expert_resolve_tier : uint8_t {
     HOST_PINNED = 1,
     HOST_MMAP   = 2,
     UNAVAILABLE = 3,
+    STORAGE     = 4,  // reported only (llama.cpp-th32 T1): the rows are in the file and no pointer exists
 };
 
 enum class expert_resolve_reason : uint8_t {
@@ -3194,10 +4322,10 @@ struct expert_resolve_result {
 // which check the unified cache directly.
 
 // Get popularity rank for a specific expert (0 = most popular, -1 = unranked).
-// Called by cache eviction scoring to boost popular experts.
+// Keyed by block number; the placement planner orders expert triplets by it.
 int get_expert_popularity_rank(int layer_id, int expert_id);
 
-// Set popularity rank for a specific expert (called after warmup profiling).
+// Set popularity rank for a specific expert, keyed by block number.
 void set_expert_popularity_rank(int layer_id, int expert_id, int rank);
 
 // Returns true if any popularity ranks have been set.
@@ -3322,7 +4450,6 @@ struct unified_cache_entry {
     ggml_layout_mode      layout;           // Target layout for this entry
     int64_t               onednn_pack_m;    // M dimension used for ONEDNN_PACKED/ONEDNN_WOQ (0 when unused)
     cache_layout_xmx_info xmx_info;         // XMX metadata (when applicable)
-    uint32_t              access_count;     // Access frequency for LFU
     int64_t               last_access;      // Timestamp for recency
     bool                  pinned;           // Protected from eviction
     bool                  hot;              // Hot-set hint for MoE experts
@@ -3465,17 +4592,37 @@ struct layer_weight_pointers {
     void * ffn_gate_up_proj = nullptr;  // Fused gate+up (optional)
 };
 
+// Why the release of the last model runs: the model's release, the abort of a load that failed, or the start of a
+// load, which runs again a release the failed load's buffers held off. At an abort those buffers are still alive (they
+// go with the model, after the abort), so what holds the arena then is no leak. At a start it may be either: before the
+// failed model is freed its buffers hold the arena, after that a holder is a leak, so the start names the holders at
+// WARN. Only the abort marks a release deferred.
+enum class unified_cache_release_cause { MODEL_RELEASED, LOAD_ABORTED, LOAD_START };
+
+// What unified_cache::release_for_no_live_model() did: EMPTIED when the cache holds nothing sized for a model (or held
+// nothing), otherwise what kept it, and nothing after that was released.
+enum class unified_cache_last_release {
+    EMPTIED,
+    MODEL_LIVE,        // a model is live, so nothing was released
+    BARRIER_FAILED,    // the device work before the release could not be waited for
+    RING_CLAIMED,      // a slot of the PP MoE oneDNN ring is claimed
+    PAIR_HELD,         // the oneDNN scratchpad pair is reserved
+    ARENA_HELD,        // something still holds the arena
+    TEARDOWN_REFUSED,  // the arena's teardown refused
+    FAILED,            // an exception ended the release
+};
+
 // Unified GPU cache for both dense weights and MoE experts
 //
 // Design principles:
 // 1. Single memory budget - avoids OOM from competing caches
 // 2. Type-aware eviction - dense weights and experts have equal priority
 // 3. Automatic partitioning - no manual budget splitting needed
-// 4. LFU+LRU hybrid eviction - keeps frequently used entries
+// 4. Tier-then-LRU eviction - evict_one takes the lowest eviction tier, then the least recently used entry
 //
 // Usage:
 // - call ensure_cached() for any weight (dense or expert)
-// - cache automatically evicts lowest-scoring entries when full
+// - cache automatically evicts by tier, then least recent access, when full
 // - for MoE: call with layer_id and expert_id
 // - for dense: call with layer_id=-1, expert_id=-1
 class unified_cache {
@@ -3844,43 +4991,62 @@ class unified_cache {
                                                    ggml_layout_mode   layout,
                                                    const char *       reason = nullptr);
 
-    // Lend one resident expert triplet to the host (llama.cpp-mwmr). Each member's device entry must own its storage
-    // exactly: an AOS entry (c-n4gw) on the device, not retired, whose direct_alloc_owner is its whole allocation and
-    // not a view into a bulk tensor's shared one (c-sepd), not cache backing, and held by nothing but the entry. What
-    // the host registration would refuse for is checked too, and a host id that already has an entry, idle or not,
-    // refuses the triplet as "host entry exists": the registration never replaces one, since a failed loan could not
-    // put a replaced entry back (c-mwmr-3). One member that fails refuses the triplet with a reason and leaves no state
-    // behind. Otherwise (c-tdra) the three D2H copies go on the DMA queue, each retaining its two
-    // owners until it completes; each device entry's last write becomes its copy, so its storage is freed behind the
-    // copy; each device entry is retired exactly; then each host copy is registered with register_host_expert_owned
-    // carrying its copy as the ready event. A registration that fails anyway puts the device entries back. Nothing
-    // here waits and nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of
-    // the device lease, and flips the plan.
-    bool loan_expert_triplet(const expert_loan_member members[3], expert_loan_record & out);
+    // Lend one resident expert triplet to the host. Each member's device entry must own its storage exactly: an AOS
+    // entry on the device, since only that layout keeps an expert's bytes contiguous from offset 0, not retired, whose
+    // direct_alloc_owner is its whole allocation and not a view into a bulk tensor's shared one, not cache backing,
+    // and held by nothing but the entry. What the host registration would refuse for is checked too, and a host id
+    // that already has an entry, idle or not, refuses the triplet, as "host entry retiring" while that entry is
+    // retired and waits for the deferred-free pass and as "host entry exists" while it is live: the registration never
+    // replaces one, since a failed loan could not put a replaced entry back. One member that fails refuses the
+    // triplet with a reason and leaves no state behind. Each member's device entry must hold its logical_bytes
+    // ("device entry size" otherwise) and its owner must hold them too ("host storage too small"). Otherwise the
+    // three D2H copies go on the DMA queue, each moving the member's logical_bytes from offset 0 of its device entry,
+    // so a padded entry's tail stays behind, and each retaining its two owners until it completes; each device
+    // entry's last write becomes its copy, so its storage is freed behind the copy; each device entry is retired
+    // exactly; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy as
+    // the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
+    // entries' whole size, which the deferred-free pass gives back once each entry is reaped. Nothing here waits and
+    // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the device
+    // lease, and flips the plan.
+    bool loan_expert_triplet(const expert_move_member members[3], expert_move_record & out);
 
-    // The size each direction's copy must be minted at (llama.cpp-pu8v): the size of the entry it will hold, which
-    // the transaction compares it with. loan_copy_bytes() is the AOS device entry direct staging filed under key, which
-    // a loan copies whole; refill_copy_bytes() is the host copy a loan published under key, which a refill's device
-    // storage must equal. Each can exceed the plan's dst_size: direct staging pads an AOS quantized expert's tail to
-    // MATRIX_ROW_PADDING columns, and the plan does not count it. Read under direct_stage_mutex_ and rw_mutex_, shared;
-    // the transaction checks again under its own locks, so an entry that changes in between is refused there. 0 when
-    // there is no such entry, or it is retired.
-    size_t loan_copy_bytes(ggml_sycl_cache_id key) const;
-    size_t refill_copy_bytes(ggml_sycl_cache_id key) const;
+    // Whether the cache holds the entry a move copies from, not retired: for a move to the host, the AOS device entry
+    // direct staging filed under key; for a move to the device, the host copy published under key. The transaction
+    // asks before it mints a member's storage, so a missing source stops it with the refusal the cache would give.
+    // Only presence is asked: the storage is sized from the member's tensor, never from an entry, which may be padded.
+    // Read under direct_stage_mutex_ and rw_mutex_, shared; the move checks again under its own locks, so an entry
+    // that changes in between is refused there.
+    bool has_expert_source(ggml_sycl_cache_id key, bool to_device) const;
 
-    // Re-admit one lent triplet to the device (llama.cpp-sif1), the inverse of loan_expert_triplet(). Each member's
-    // host copy must be the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is
-    // its whole pinned storage, which the direct mirror and the id mapping both name, with no device entry under the
-    // member's direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry
-    // exists", so a later boundary retries). One member that fails refuses the triplet with a reason and leaves no
-    // state behind. Otherwise the three H2D copies go on the BCS queue behind the host copy's writes, each retaining
-    // its two owners until it completes, so the pinned storage outlives the read whatever happens to its entry. Under
-    // direct_stage_mutex_ and rw_mutex_, all three or none, each device entry is published IN_PROGRESS behind its copy
-    // and takes over the direct mirror and the id mapping, then each host copy is retired exactly under every host id
-    // still naming its storage; what follows the device entries' insertion allocates nothing. Nothing here waits and
-    // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the host lease,
-    // remembers the device lease, and flips the plan.
-    bool refill_lent_triplet(const expert_refill_member members[3], expert_refill_record & out);
+    // Re-admit one lent triplet to the device, the inverse of loan_expert_triplet(). Each member's host copy must be
+    // the one a loan published: a live AOS host-pinned entry under key whose direct_alloc_owner is its whole pinned
+    // storage, which the direct mirror and the id mapping both name, with no device entry under the member's
+    // direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry exists",
+    // so a later boundary retries). A missing host copy refuses as "not lent", and one holding fewer than the member's
+    // logical_bytes as "host copy size". Each member's owner must be exactly staged_expert_bytes() of the host copy's
+    // layout and the member's type, ncols and logical_bytes, never less than logical_bytes ("device storage size").
+    // One member that fails refuses the triplet with a reason and leaves no state behind. Otherwise the three H2D
+    // copies go on the BCS queue behind the host copy's writes, each moving logical_bytes from offset 0 of the host
+    // copy and retaining its two owners until it completes, so the pinned storage outlives the read whatever happens to
+    // its entry; the tail past them is zero-filled on the same queue behind the copy, so the device entry, sized as its
+    // storage and published behind the fill, reads as direct staging leaves an expert. Under direct_stage_mutex_ and
+    // rw_mutex_, all three or none, each device entry is published IN_PROGRESS behind its last write and takes over
+    // the direct mirror and the id mapping, then each host copy is retired exactly under every host id still naming
+    // its storage; what follows the device entries' insertion allocates nothing. Nothing here waits and nothing asks
+    // an event's status. The caller holds the inventory mutex, forgets its own record of the host lease, remembers the
+    // device lease, and flips the plan.
+    bool refill_lent_triplet(const expert_move_member members[3], expert_move_record & out);
+
+    // Admit one host triplet to the device by name: refill_lent_triplet() with any pinned host copy as the source, not
+    // only a loan's. Each member's host copy must be a live AOS entry under key whose direct_alloc_owner is its whole
+    // pinned storage, the same base and the same size, so retiring the entry gives back exactly its bytes, and a slice
+    // of a host zone, the provenance the copy path proves host USM by, so the copy is a direct DMA. Any other is
+    // refused "host copy not pinned": an owner wider than its entry, or a copy that is no host-zone slice, such as one
+    // served in place from a file mapping, which would bounce through a synchronous staged copy. A missing host copy
+    // refuses as "not on host". The whole host entry is retired, its storage with it. The rest is the refill's: the
+    // sizes, the same checks before anything is copied, all three or none, and nothing waits or asks an event's
+    // status.
+    bool admit_host_triplet(const expert_move_member members[3], expert_move_record & out);
 
     // Optional layout copies (unified_cache_entry::optional_layout).
     // mark_optional_layout() tags a dense weight's staged copy in `layout`.
@@ -4031,7 +5197,7 @@ class unified_cache {
     // Get device pointer, waiting for IN_PROGRESS entries to complete.
     // Fast path for cache lookup using shared_lock (reader-writer lock).
     // Returns device_ptr if entry exists, is READY, and layout matches.
-    // Otherwise returns nullptr. Does not update LRU/LFU stats.
+    // Otherwise returns nullptr. Does not update the entry's last access.
     void * try_get_cached_fast(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout);
 
     // Like try_get_cached_fast, but also returns device_ptr for IN_PROGRESS
@@ -4055,42 +5221,12 @@ class unified_cache {
 
     // NOTE: Reorder state is tracked in tensor->extra->optimized_feature, not in cache
 
-    // === Atomic Expert Group Staging/Eviction ===
-    // All 3 tensors (gate, up, down) stage or evict together -- never partial.
-
-    // Stage all 3 tensors for an expert atomically.
-    // If VRAM is insufficient, evicts cold expert groups first.
-    // If any allocation fails after eviction, rolls back partial allocations.
-    // Each staging_tensor_data provides source pointer and sizes.
-    // Each cache_layout_request provides fill_fn/fill_ctx for reorder.
-    // When request pointers are non-null, fill_fn is called per tensor.
-    // When null, raw DMA memcpy via get_dma_queue() is used.
-    // Returns true if all 3 tensors were staged successfully.
-    bool stage_expert_group(int                          block_id,
-                            int                          expert_id,
-                            const expert_tensor_group &  keys,
-                            const staging_tensor_data &  gate_data,
-                            const staging_tensor_data &  up_data,
-                            const staging_tensor_data &  down_data,
-                            ggml_layout_mode             layout,
-                            const cache_layout_request * gate_req = nullptr,
-                            const cache_layout_request * up_req   = nullptr,
-                            const cache_layout_request * down_req = nullptr);
-
-    // Evict all 3 tensors for an expert atomically.
-    // Removes gate, up, and down from the cache together.
-    void evict_expert_group(const expert_tensor_group & keys, ggml_layout_mode layout);
-
-    // Evict the coldest expert group to free VRAM.
-    // Uses combined access frequency across all 3 tensors as coldness metric.
-    // expert_groups: the global registry mapping (block,expert) -> keys.
-    // Returns bytes freed, or 0 if no evictable expert group was found.
-    size_t evict_coldest_expert_group(const std::unordered_map<int64_t, expert_tensor_group> & expert_groups,
-                                      ggml_layout_mode                                         layout);
-
     // === Pinning for Graphs ===
 
-    void pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
+    // A pin is a flag, not a count: one unpin clears it whoever set it. pin() answers true only when this call set the
+    // flag on an entry where it was clear; false for an entry already pinned, no entry, or an invalid key. A caller
+    // that releases later should release only the pins it was answered true for.
+    bool pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);
     void unpin(const ggml_sycl_cache_id &   key,
                ggml_layout_mode             layout,
                const placement_cache_read * retained_read = nullptr);
@@ -4170,8 +5306,9 @@ class unified_cache {
     // Drain pending deferred frees at safe sync points (public accessor).
     // NEVER call during graph_compute — sycl::free() unmaps GPU page table
     // entries while in-flight kernels may still reference those addresses.
-    // The ONLY safe time is after queue.wait() in ggml_backend_sycl_synchronize()
-    // or during prestage yield loops (outside graph_compute_impl).
+    // Call it only outside graph_compute_impl, after the queues that could
+    // still read the freed memory have drained (for example after queue.wait()
+    // in ggml_backend_sycl_synchronize()).
     void process_deferred_frees_public();
 
     // Check if there are any pending deferred frees (device or host)
@@ -4363,8 +5500,7 @@ class unified_cache {
 
     void set_into_empty_foreign_key(uint64_t key) { into_empty_foreign_key_.store(key, std::memory_order_release); }
 
-    // Access the internal SYCL queue (for deferred free of temp allocations
-    // made on this queue's context, e.g. GPU-side reorder temp buffers).
+    // The queue the cache was built on (queue_), which the cache's own allocations and copies use.
     sycl::queue & get_queue() { return queue_; }
 
     // Memset/memcpy operations that dispatch to GPU or CPU based on handle location.
@@ -4389,8 +5525,22 @@ class unified_cache {
     // Ensure the VRAM arena's fixed zones match the latest planner inputs.
     // If an early arena exists but has no live zone allocations or chunk
     // leases, it may be rebuilt with larger planned zones. Live arenas are
-    // never force-reset or force-freed.
-    bool ensure_planned_arena_zones();
+    // never force-reset or force-freed. False when the zones cannot be sized:
+    // when `refusal` is given it is written with the reason and each zone's
+    // need (the sizes this call decided on) and have (the arena's zones).
+    // A rebuild whose teardown refuses is refused too, and no arena is
+    // reserved after it. A teardown that refused before it freed a chunk left
+    // the arena as it was, so a later call may try the rebuild again; while
+    // one that refused after it freed a chunk has left the arena partly freed
+    // and closed, every call refuses for it, whatever the zones hold.
+    // A rebuild that live allocations block keeps the zones as they are when
+    // the oneDNN Graph scratch floor is all they lack
+    // (zone_arena_shortfall_is_reservation_only): the call returns true and
+    // describes the ONEDNN zone by what it holds (zone_onednn_plan_keep_short),
+    // unless `options` asks to release a PP MoE ring that alone holds the
+    // arena first (zone_arena_ensure_options::ring_release_first).
+    bool ensure_planned_arena_zones(zone_arena_refusal *              refusal = nullptr,
+                                    const zone_arena_ensure_options & options = {});
 
     // Is arena active?
     bool arena_active() const { return zone_backed(); }
@@ -4433,6 +5583,21 @@ class unified_cache {
     size_t zone_used(vram_zone_id zone) const;
     size_t zone_available(vram_zone_id zone) const;
     size_t zone_largest_free(vram_zone_id zone) const;
+    // The bytes of the oneDNN weights and activations scratch pair that lie inside the arena, which a kept ONEDNN zone
+    // must go on holding, and which a failed load's restore of the zone's snapshot keeps room for. A buffer allocated
+    // outside the arena takes none of the zone. Takes no lock.
+    size_t arena_held_onednn_pair_bytes();
+    // The plan this cache stored for its own ONEDNN zone (onednn_zone_plan_ below; the default plan while none is
+    // stored). A reader that holds only a device id asks that device's existing cache. Takes onednn_zone_plan_mutex_
+    // alone.
+    zone_onednn_plan onednn_zone_plan_load() const;
+    // A failed load's restore (load_published_record::restore); see the definition. Takes onednn_zone_plan_mutex_.
+    void             onednn_zone_plan_put_back(const zone_onednn_plan & written, const zone_onednn_plan & prior);
+    // Stores `plan` as the zone plan. Only two callers may: the ensure, for the zone it built from that plan, and the
+    // published terms' restore (load_published_terms::restore), which stores it with the device's other terms. It is
+    // public for the restore alone; any other caller would describe the zone by a plan it was not built from. Takes
+    // onednn_zone_plan_mutex_ alone.
+    void             onednn_zone_plan_store(const zone_onednn_plan & plan);
     // Both free-space figures of one zone, read together under its allocator group's mutex: the
     // allocators' figures are only coherent under it (zone_available and zone_largest_free read
     // them bare), with the zone's capacity and used bytes read at the same instant. For a zone with its
@@ -4463,20 +5628,66 @@ class unified_cache {
     //
     // Returns -1 when the pointer is not owned by the arena (safe no-op on
     // release).  Otherwise returns the chunk index (0..N-1).
+    //
+    // Each lease is also counted by the tag it was taken with, and its release
+    // names the same tag, so the counts by tag sum to the chunks' leases and an
+    // arena rebuild refused for leases can say who holds them. The count is one
+    // relaxed atomic add on each side and takes no lock: the lease paths are
+    // per-resolve hot paths and the count is read only for a diagnostic.
     int      arena_find_chunk(const void * ptr) const;
-    int      arena_acquire_chunk_lease(const void * ptr);
-    void     arena_release_chunk_lease(int chunk_idx);
+    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag = chunk_lease_tag());
+    void     arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag = chunk_lease_tag());
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
+    uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
+    // The leases by site, each site apart from the copies of its handles, written into `out` (`size` bytes, always
+    // NUL-terminated when `size` is not 0) as " site=N" for every count that is not zero, and empty when all are.
+    // Returns the counts' sum. It writes only into the caller's buffer and allocates nothing, so a teardown can call it
+    // after it has closed the arena.
+    uint32_t arena_chunk_lease_census(char * out, size_t size) const noexcept;
 
     // Host pinned-pool chunk lease API (dyhdl) — routes through host_arena_.
     // Returns pinned_chunk_pool::INVALID_CHUNK_HANDLE (UINT64_MAX) on miss.
     // Safe to call even when host_arena_ is null (returns miss).
     uint64_t host_acquire_chunk_lease(const void * ptr);
-    void     host_release_chunk_lease(uint64_t handle);
+    // noexcept: its one caller, mem_handle::release_lease_state, is. A drop that empties an orphaned SCRATCH chunk's
+    // last lease releases the chunk through release_marked_chunk(), which allocates nothing.
+    void     host_release_chunk_lease(uint64_t handle) noexcept;
 
-    // Destroy arena (free all chunks).
+    // Destroy arena (free all chunks). A refusal records its cause, which arena_teardown_refusal() reads. One that
+    // refuses before it has freed a chunk puts the arena back as it was: each allocator group in the state it had, each
+    // retired authority reopened at the generation its handles carry. One that could not free a chunk after it freed
+    // another leaves the arena partly freed and closed, and frees no chunk a lease still holds.
     bool arena_destroy();
+
+    // Why the last teardown of this cache's arena refused: NONE when none refused since the last one completed. A cause
+    // zone_arena_teardown_left_closed() names left the arena partly freed and closed to new allocations, no arena may
+    // be reserved over it, and a later refusal keeps that cause.
+    zone_arena_teardown_refusal arena_teardown_refusal() const {
+        return arena_teardown_refusal_.load(std::memory_order_acquire);
+    }
+
+    // The release of the last model: with no model live, it gives back what this cache sized for one, so the next load
+    // plans and builds as a first load does. In order: it waits once for the device work submitted before it, releases
+    // the PP MoE oneDNN ring, the oneDNN scratchpad pair and the pooled oneDNN Graph scratch, drains the queued frees,
+    // then tears the arena down, which hands its memory back to the device. It stops at the first thing that holds on,
+    // with an ERROR line that names it (a WARN for what a failed load's own buffers hold at its abort, and at a load's
+    // start, LOAD_START, a WARN that names the holders, since one still there once the failed model is freed is a
+    // leak), and releases nothing after it; nothing is reaped, evicted or reset over a live handle. An arena a failed
+    // load's buffers hold at its abort (LOAD_ABORTED) marks the release deferred
+    // (last_release_deferred); the start never sets that mark, and only a release that empties the cache clears it.
+    // The next load's start reserves the arena of a cache it emptied again (reserve_released_arena). It reserves
+    // nothing itself and never throws: an exception ends it with an ERROR naming `site`.
+    unified_cache_last_release release_for_no_live_model(const char * site, unified_cache_release_cause cause) noexcept;
+
+    // The start of a load: a cache whose arena the last release tore down reserves its early arena again from the
+    // published terms, as the constructor did. True when there is nothing to reserve or the reserve succeeded; false
+    // with `refusal` written when it failed, and the cache stays released, so the next load's start tries again.
+    bool reserve_released_arena(zone_arena_refusal * refusal);
+
+    // A failed load's buffers held this cache's arena at its abort's release, and no release has emptied the cache
+    // since. The next load's start, before its reserve, runs that release again for a cache that answers true.
+    bool last_release_deferred() const { return last_release_deferred_.load(std::memory_order_acquire); }
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
     void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
     mem_handle test_scratch_pool_owner() const;
@@ -4623,6 +5834,10 @@ class unified_cache {
         bool          submitted          = false;
         bool          used_mmap_direct   = false;
         bool          mmap_direct_failed = false;
+        // llama.cpp-5efe C4: the source is a file mapping (alloc_registry::is_file_mapped), which no device may read
+        // (design 5efe §5.3, P3). A typed, counted refusal checked at entry, before copy_fn: it is deterministic, so a
+        // caller never retries it at a smaller slice, and routes it to the CPU executor (a host-tier weight runs there).
+        bool          refused_file_mapped = false;
         size_t        slices             = 0;
         size_t        slice_bytes        = 0;
         size_t        buffer_count       = 0;
@@ -4652,6 +5867,13 @@ class unified_cache {
                                  // Pass nothing.
                                  const char *                     caller_file = __builtin_FILE(),
                                  const char *                     caller_func = __builtin_FUNCTION());
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // copy_to_device_async on the cache's queue, so the outside-materialization counter's device test reaches each
+    // chokepoint the design names (docs/design/sycl-mmap-host-tier.md §5.3, §7 C4 test-sycl-file-mapped-bounce).
+    sycl::event copy_to_device_async_for_testing(void * dst, const void * src, size_t size) {
+        return copy_to_device_async(dst, src, size, {}, nullptr);
+    }
+#endif
 
     // Defer freeing host allocations until the associated event completes.
     void defer_host_free(void * ptr, size_t size, const sycl::event & event);
@@ -4933,19 +6155,6 @@ class unified_cache {
     void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
 
-    // === GPU Reorder Temp Buffer ===
-    // Pre-allocated device VRAM buffer reused by GPU-side AOS→SOA reorder.
-    // Avoids per-expert sycl::malloc_device that fails when VRAM is tight.
-
-    // Reserve the reorder temp buffer. Call once before weight loading begins.
-    // size_bytes: largest expert tensor size (AOS bytes) with margin.
-    bool reserve_reorder_temp(size_t size_bytes);
-
-    // Get pointer and size of the pre-allocated reorder temp buffer.
-    void * get_reorder_temp_buffer() const { return reorder_temp_buffer_; }
-
-    size_t get_reorder_temp_size() const { return reorder_temp_size_; }
-
     // === Persistent Scratch Buffers ===
     // Named scratch buffers for persistent kernels (TG optimization).
     // Unlike oneDNN scratch which is shared, these are dedicated per named buffer.
@@ -5149,13 +6358,72 @@ class unified_cache {
     // phase gate or pool budget blocks growth. Callers should treat a false
     // return as a hard failure and fall back to non-pinned allocation.
     bool   host_zone_grow(host_zone_id zone, size_t additional_bytes);
-    void   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
+    // Releases the device's empty marked SCRATCH chunks first. False only when a withdrawn chunk survives, so the pool
+    // refused the rebuild by name (with GGML_SYCL_STRICT_LEASES=1 it aborts instead); a capacity shortfall returns
+    // true with the zones unconfigured and the reserved figures zeroed, as before.
+    bool   configure_host_zones(size_t weight_bytes, size_t kv_bytes, size_t staging_bytes, size_t scratch_bytes);
     bool   host_zones_configured() const;
-    void   grow_scratch_zone(size_t additional_bytes);
+    // One grow_zone(SCRATCH, request) call, the host SCRATCH demand ledger's only growth (§4.4 "Ensure capacity").
+    // Prints `[HOST-ARENA] SCRATCH zone grown by %.1f MB for compute buffers` when it grows.
+    bool   grow_scratch_zone(size_t request_bytes);
+    // This cache's host SCRATCH demand ledger and the zone operations it ensures capacity with. `chunk_cap` is the
+    // host buffer chunk cap the demands split at (GGML_SYCL_HOST_BUFFER_CHUNK_MB). False when host zones are not
+    // configured, so there is no SCRATCH zone to ensure.
+    bool   host_scratch_ledger_ops(size_t chunk_cap, host_scratch_ledger ** ledger, host_scratch_zone_ops * ops);
+
+    // === The SCRATCH marked set (docs/design/sycl-mmap-host-tier.md §4.4) ===
+    // The chunks a transaction returned: withdrawn from zone allocation and filed here, each with the owner whose
+    // transaction returned it, until a release frees them. Every release goes through release_marked_chunk() or its
+    // _locked core, which erases the chunk's entries in the same step. Lock order (canon §12.5): marked_set_mutex_
+    // (L4, last) and then the pool's mutex_ (L5, first); no backing is released under either, and
+    // tests/test-sycl-marked-set-lock-order-gate.py pins it.
+    //
+    // RETURN / RETURN_TO_MARK: withdraw and file `chunk_idxs`, and release at once each one already empty.
+    size_t               host_scratch_return_chunks(const std::vector<size_t> & chunk_idxs, uint64_t owner);
+    // The begin entry, right after a scheduler creation: release every empty marked chunk, whatever its owner. Only a
+    // chunk of `owner` that is still in use is reported by name.
+    size_t               host_scratch_begin_release(uint64_t owner);
+    // The owner's end, before its backend context is deleted: release each of its empty chunks and mark the rest
+    // orphaned, so the free that empties one, or its last lease's drop, releases it.
+    size_t               host_scratch_owner_end(uint64_t owner);
+    // The public form, for a caller holding neither lock: the orphaned chunk's emptying free and last lease's drop.
+    pinned_chunk_release release_marked_chunk(size_t chunk_idx) noexcept;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test accessors: the set's entries, and those for one chunk.
+    size_t marked_entries() const;
+    size_t marked_entries(size_t chunk_idx) const;
+
+    // The cache's pinned pool, for the SCRATCH return's device REDs (§7 C4: "the fixture is the fixture cache's pinned
+    // pool"); null when the cache has none.
+    pinned_chunk_pool * host_arena_for_testing() const { return host_arena_.get(); }
+#endif
+
+    // === The SCRATCH transaction (docs/design/sycl-mmap-host-tier.md §4.4, §M75) ===
+    // One transaction per context, keyed by `owner` (its backend context's host_zone_owner_id). While it is open, each
+    // SCRATCH chunk this cache's zone grows on the transaction's own thread is recorded in it, by the ledger's ensure
+    // and by the miss path alike. OPEN opens the auto-n_ubatch trial's transaction. MARK opens the reserve's own when
+    // none is open, and records the chunk count. RETURN_TO_MARK files the chunks grown since the mark and keeps the
+    // transaction open. KEEP closes it; its chunks stay ordinary capacity. RETURN closes it, drops the context's demand
+    // and files every chunk. Filing is host_scratch_return_chunks(). Returns the chunks the step moved. The
+    // transactions sit under host_scratch_txn_mutex_, a leaf held alone (canon §12.5); the filing runs after it drops.
+    size_t host_scratch_trial(host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch);
+    // The grow hook: `chunk_idx`, a chunk the SCRATCH zone just appended, is charged to the open transaction of the
+    // calling thread, if any. Called with no lock held.
+    void   host_scratch_trial_note_grow(size_t chunk_idx);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test accessors: whether `owner` has an open transaction, and its chunk count (0 when none is open).
+    bool   host_scratch_trial_active(uint64_t owner) const;
+    size_t host_scratch_trial_chunks(uint64_t owner) const;
+#endif
 
     size_t pinned_pool_budget() const { return host_arena_ ? host_arena_->budget() : 0; }
 
     size_t pinned_pool_committed() const { return host_arena_ ? host_arena_->allocated() : 0; }
+
+    // The grain the plan's host bytes round to: GGML_SYCL_PINNED_CHUNK_MB, else the pool's 2 GiB default.
+    size_t pinned_pool_chunk_size() const {
+        return host_arena_ ? host_arena_->chunk_size() : pinned_chunk_pool::CHUNK_SIZE;
+    }
 
     size_t pinned_pool_chunk_count() const { return host_arena_ ? host_arena_->chunk_count() : 0; }
 
@@ -5283,6 +6551,8 @@ class unified_cache {
     friend void   unified_cache_zone_reclaim(int device_id, vram_zone_id zone);
     friend void   unified_cache_zone_boundary_check(int device_id, vram_zone_id zone);
     friend void * device_pool_arena_alloc(unified_cache * cache, size_t size, size_t align);
+    // Reads the allocator group's own allocation record under the group mutex, which is private to this class.
+    friend bool   unified_cache_zone_tag_census(int device, vram_zone_id zone, zone_tag_census & out) noexcept;
 
     // Evict lowest-scoring entry to make room for new_size bytes
     // Returns true if eviction succeeded, false if all entries are pinned
@@ -5322,10 +6592,6 @@ class unified_cache {
         unified_cache_key_hash,
         std::equal_to<unified_cache_key>,
         detail::cache_guard_allocator<std::pair<const unified_cache_key, unified_cache_entry>>>;
-
-    // Compute eviction score: higher = more valuable (keep longer)
-    // score = access_count * exp(-decay * age)
-    float compute_score(const unified_cache_entry & entry) const;
 
     // Copy data from mmap to device via staging. Returns event for the last transfer.
     sycl::event copy_to_device(void * dst, const void * src, size_t size);
@@ -5580,6 +6846,9 @@ class unified_cache {
     // The pool is destroyed (freeing all chunks) in the unified_cache destructor.
     std::unique_ptr<ggml_sycl::sycl_device_pool>                 layout_pool_;
     std::array<size_t, static_cast<size_t>(host_zone_id::COUNT)> host_zone_reserved_bytes_{};
+    // One demand per llama_context and per DEVICE holder on this device; its mutex is a leaf (canonical contract
+    // §12.5).
+    host_scratch_ledger                                          host_scratch_ledger_;
 
     // VRAM arena data members (merged from vram_arena class).
     // Single pre-allocated VRAM block with zone-based sub-allocation.
@@ -5602,6 +6871,117 @@ class unified_cache {
     // so the patched libze (~1.5 GB on Arc B580) does not reject the alloc.
     std::vector<arena_chunk> arena_chunks_;
     sycl::queue *            arena_queue_ = nullptr;
+
+    // The leases on all chunks by the site that took them (chunk_lease_site) and whether a handle copy took them
+    // (second index 1). Moved only beside a chunk's lease_count, so the cells sum to the chunks' leases up to a lease
+    // in flight between the two adds. Relaxed: read only by the rebuild refusal's diagnostic, never to synchronize.
+    mutable std::atomic<uint32_t> arena_chunk_leases_by_site_[static_cast<size_t>(chunk_lease_site::COUNT)][2] = {};
+
+    // The cell a lease of `tag` moves. A site out of range counts as UNTAGGED, so a corrupt tag cannot index past the
+    // array.
+    std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const {
+        const size_t site = static_cast<size_t>(tag.site);
+        return arena_chunk_leases_by_site_[site < static_cast<size_t>(chunk_lease_site::COUNT) ? site : 0]
+                                          [tag.copy ? 1 : 0];
+    }
+
+    // Adds the cache's scratch buffers to `holders`: those whose pointer the arena owns, which keep it from a
+    // rebuild, and those allocated outside it, which do not; of the first, the PP MoE ring's slot buffers; and the
+    // allocations live in the zones other than those slot buffers, read from each allocator group's own record of its
+    // allocations. Takes the PP MoE ring's lock, the persistent scratch lock, then each allocator group's lock, each
+    // alone.
+    void arena_count_scratch_holders(zone_arena_holders & holders);
+
+    // What holds the arena now: each zone's live bytes, written into `live_zone_used` (one figure per vram_zone_id),
+    // their sum, the chunk leases, and the cache's scratch buffers (arena_count_scratch_holders). A caller that decides
+    // on these figures prints them, not a second reading, which could disagree with them under a concurrent release.
+    zone_arena_holders arena_read_holders(size_t * live_zone_used);
+
+    // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one line at `level` with each
+    // zone's live bytes, the queued frees those zones still count, the device's releases waiting for a retry, the
+    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one WARN
+    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`.
+    // `level` is ERROR where a holder refuses what the caller needs (a rebuild, a model's release) and WARN at a
+    // load's start, where the holder may still be the failed model's buffers. It only reads: it drains, frees,
+    // evicts, resets and allocates nothing.
+    void arena_report_holders(int                  dev_id,
+                              const size_t *       live_zone_used,
+                              zone_arena_holders & holders,
+                              const char *         site,
+                              ggml_log_level       level);
+
+    // The oneDNN scratchpad pair's release for the last model. False, with nothing released, while a reservation holds
+    // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no
+    // other lock is taken under it. A caller first waits for the device work that read the pair.
+    bool              release_onednn_scratch_pair();
+    // Binds the compute arena to the SCRATCH zone, or unbinds it before the zones go.
+    void              compute_arena_bind();
+    void              compute_arena_unbind();
+    // The last release tore this cache's arena down, and no load's start has reserved it since.
+    std::atomic<bool> arena_released_{ false };
+    // Set where a failed load's buffers hold the arena at its abort's release, cleared where a release empties the
+    // cache (last_release_deferred).
+    std::atomic<bool> last_release_deferred_{ false };
+
+    // The load transaction whose keep of a short ONEDNN zone last warned on this device (zone_kept_onednn_warn_due). An
+    // exchange, so two ensures of one load racing on the device warn once between them.
+    std::atomic<uint64_t> onednn_zone_kept_warn_txn_{ 0 };
+
+    // The largest SCRATCH figure a keep of a short SCRATCH zone has warned about on this device, 0 for none
+    // (zone_scratch_warn_due). Raised by compare-exchange, so two ensures that keep the zone short of one figure
+    // warn once between them.
+    std::atomic<size_t> scratch_zone_kept_warn_bytes_{ 0 };
+
+    // Logs the WARN of a call that kept the SCRATCH zone of `kept_bytes` short of `plan`, when one is due.
+    void scratch_zone_kept_warn(int dev_id, const zone_scratch_plan & plan, size_t kept_bytes);
+
+    // The largest MoE batched MMVQ bound a clamp of the SCRATCH zone has warned about on this device, 0 for none
+    // (zone_scratch_warn_due), raised the same way.
+    std::atomic<size_t> scratch_zone_clamp_warn_bytes_{ 0 };
+
+    // Logs the WARN of a plan whose limit (plan.clamp: the budget quarter `budget_cap_bytes`, or the reserve's room
+    // `room_bytes` above plan.required) held the planned SCRATCH zone below the bound of `bound_bytes`, when one is
+    // due. The line is zone_scratch_clamp_text's; `reserve_accepts` says whether the reserve accepts plan.required.
+    void scratch_zone_clamp_warn(int                       dev_id,
+                                 const zone_scratch_plan & plan,
+                                 size_t                    bound_bytes,
+                                 size_t                    budget_cap_bytes,
+                                 size_t                    room_bytes,
+                                 bool                      reserve_accepts);
+
+    // The plan this cache's ONEDNN zone was sized from (zone_onednn_plan says what it holds and why it is kept apart
+    // from the planner's live figures). ensure_planned_arena_zones() writes it when it keeps or builds this cache's
+    // zone, and onednn_zone_plan_put_back() when a failed load's restore puts it back. The pair reserve reads it, and
+    // every reader of the pair bound reads it from the cache whose zone capacity it reads. It lives on the cache that
+    // owns the zone, so a zone is never judged by a plan another cache stored: a second cache on one device (an arena
+    // reserved by hand) has its own.
+    //
+    // No plan stored: a cache holds the default plan (every figure zero) until ensure_planned_arena_zones() sizes
+    // its zone, and that stores a plan whenever it builds or keeps one, so a zone with no plan stored was reserved by a
+    // direct arena_reserve() call, which only tests make. A pair in that zone is bounded by the zone's capacity alone
+    // (zone_onednn_pp_pair_bound of a zero plan and a zero floor is the capacity, as for a stored plan with neither a
+    // pair nor a floor), and its first reservation is the pair as asked (no planned pair for
+    // zone_onednn_scratch_reserve_target). That is safe: nothing planned a Graph SDPA floor into the zone, so there is
+    // no floor for the bound to keep free, and a Graph scratch the pair leaves no room for takes the DIRECT path under
+    // its cap, as one that misses any full ONEDNN zone does.
+    //
+    // onednn_zone_plan_mutex_ guards the plan alone. Each of the five accessors (the load, the put-back and the store
+    // declared above, the two below) takes it alone and calls only the pure rules of zone-sizing.hpp while it holds it,
+    // so it is a leaf: nothing is taken under it, and it may be taken under any lock.
+    mutable std::mutex onednn_zone_plan_mutex_;
+    zone_onednn_plan   onednn_zone_plan_{};
+
+    // Keeps the larger plan (zone_onednn_plan_keep) as the zone plan, in ONE critical section: the zone was found
+    // sufficient for `plan` and kept as built. Takes onednn_zone_plan_mutex_ alone.
+    void onednn_zone_plan_keep_and_store(const zone_onednn_plan & plan);
+    // Whether a rebuild that something live blocks is short of the oneDNN Graph floor alone, and when it is and `store`
+    // is true, the keep of a short zone; see the definition. Takes onednn_zone_plan_mutex_ alone.
+    bool onednn_zone_plan_keep_short_and_store(const zone_onednn_plan & live,
+                                               const zone_arena_sizes & have,
+                                               const zone_arena_sizes & need,
+                                               size_t                   held_pair_bytes,
+                                               bool                     store,
+                                               zone_onednn_plan *       kept);
 
     // Per-physical-chunk TLSF allocators for the WEIGHT zone in N-chunk mode.
     // A weight tensor must not span a chunk boundary (each chunk is its own
@@ -5645,9 +7025,17 @@ class unified_cache {
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
+
+    // How the SCRATCH zone was used over this cache's life, logged at teardown. Written by zone_alloc under the
+    // SCRATCH group's mutex, which that allocation already holds, and read under it at teardown.
+    zone_scratch_use scratch_zone_use_{};
+
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
+    // without that lock.
+    std::atomic<zone_arena_teardown_refusal> arena_teardown_refusal_{ zone_arena_teardown_refusal::NONE };
     // A copy of the allocators KV is carved from (kv_zone_model), and where
     // each of `ptrs` sits in it when `blocks` is given.
     kv_zone_model kv_zone_snapshot(const std::vector<const void *> & ptrs, std::vector<kv_zone_block> * blocks);
@@ -5663,7 +7051,8 @@ class unified_cache {
     bool arena_record_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id,
                                         size_t offset, size_t extent,
                                         zone_registry_commit_fn registry_commit, void * registry_context) noexcept;
-    bool arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr) noexcept;
+    // On success `record_zone` is the zone the block was charged to, read from its record, which a free must lower.
+    bool arena_unregister_exact_if_unleased_locked(vram_zone_id zone, void * ptr, vram_zone_id & record_zone) noexcept;
     void arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id = 0) noexcept;
 
     // Zone incarnation table. The physical-group mutex above is the lifecycle
@@ -5679,6 +7068,12 @@ class unified_cache {
     void arena_publish_authorities();
     std::shared_ptr<arena_authority> arena_close_authority(vram_zone_id zone);
     bool arena_zone_open(vram_zone_id zone) const;
+
+    // Empties the allocators of physical group `group` (KV and WEIGHT share group 0) and zeroes its zones' used
+    // counters, as a settle does once every lease on the group has ended. The caller holds that group's lock and no
+    // allocation is live in the group. It allocates nothing: a TLSF reset keeps its containers' capacity and rebuilds
+    // its one free block in it.
+    void arena_group_reset_allocators_locked(size_t group) noexcept;
 
     // Compute arena: pre-reserved VRAM for compute scratch buffers.
     // Single unified_alloc-owned device allocation made BEFORE S1-PRELOAD fills VRAM.
@@ -5701,13 +7096,6 @@ class unified_cache {
     size_t                         dma_buffer_count_   = 0;
     size_t                         dma_reserved_bytes_ = 0;
     std::mutex                     dma_staging_mutex_;
-
-    // Reusable temp VRAM buffer for GPU-side AOS→SOA reorder during MoE prestage.
-    // Pre-allocated at cache init to avoid per-expert malloc_device that fails
-    // when VRAM is full after S1-PRELOAD fills it with dense weights.
-    void *     reorder_temp_buffer_ = nullptr;
-    size_t     reorder_temp_size_   = 0;
-    mem_handle reorder_temp_owner_;
 
     // OneDNN FP16 scratch buffers for prompt processing.
     // Pre-allocated to avoid per-op allocations that cause OOM with large contexts.
@@ -5817,6 +7205,12 @@ class unified_cache {
     // and friends, always under that mutex) do not share a lock, so a plain
     // size_t here would be a data race.
     std::atomic<size_t> onednn_graph_scratch_direct_cap_plan_snapshot_bytes_{ 0 };
+
+    // Stores the snapshot above for zones kept as they are: the lower of the one held and available_budget() now, 0
+    // being unset (zone_graph_direct_cap_snapshot_kept). The cap sizes the oneDNN Graph floor, so a snapshot that rose
+    // across tenants while the arena is kept would grow the floor of a zone that already serves the shape (with the
+    // DIRECT path) and ask for a rebuild. Only a rebuild stores the current budget outright.
+    void onednn_graph_direct_cap_snapshot_keep();
 
     // llama.cpp-0oxf: these three were previously
     // function-local `static` variables inside their respective member
@@ -6564,6 +7958,11 @@ class unified_cache {
     // restore_expert_entry_at_locked(). Allocates nothing. Callers hold direct_stage_mutex_ and rw_mutex_.
     expert_retire_status retire_expert_entry_at_locked(const unified_cache_key & exact, expert_retire_nodes * released);
 
+    // The body refill_lent_triplet() and admit_host_triplet() share: one set of checks, sizes, copies and publication,
+    // so the two cannot drift apart. `admit` widens the source from a loan's host copy to any pinned host copy in a
+    // host zone, sized exactly as its entry; it never loosens the refill.
+    bool copy_host_triplet_to_device(const expert_move_member members[3], bool admit, expert_move_record & out);
+
     // Undo retire_expert_entry_at_locked() for an entry the caller still holds a lease on: live again, counted out of
     // the retired entries, and each node retire took re-inserted unless another entry has published its own under the
     // id since. Re-inserting a node allocates no node; it can grow a map's bucket array only when the map holds more
@@ -6575,10 +7974,79 @@ class unified_cache {
     mutable std::atomic<size_t> hits_{ 0 };
     mutable std::atomic<size_t> misses_{ 0 };
 
-    static constexpr float DECAY_ALPHA = 0.01f;
-
     mutable std::shared_mutex           rw_mutex_;
     mutable std::condition_variable_any entry_cv_;
+
+    // The SCRATCH marked set's entries, and the walk's record of a chunk it could not release.
+    struct marked_chunk_entry {
+        size_t   chunk_idx;
+        uint64_t owner;
+    };
+
+    struct marked_chunk_refusal {
+        size_t               chunk_idx;
+        pinned_chunk_release status;
+    };
+
+    // The core, called with marked_set_mutex_ held: release_zone_chunk(), and on DONE erase the chunk's entries and
+    // hand over its carrier. The vector form appends to a vector its caller reserved; the single-slot form is the
+    // public form's, and allocates nothing.
+    pinned_chunk_release release_marked_chunk_locked(size_t                                           chunk_idx,
+                                                     std::vector<pinned_chunk_pool::released_chunk> & out,
+                                                     bool                                             orphan_if_live);
+    pinned_chunk_release release_marked_chunk_locked(size_t chunk_idx, pinned_chunk_pool::released_chunk & out);
+    // A walk's candidates: one per chunk, in set order, owned by `owner` when any of the chunk's entries is.
+    static void          marked_candidate_note(std::vector<marked_chunk_entry> & candidates,
+                                               const marked_chunk_entry &        entry,
+                                               uint64_t                          owner);
+    // The `released` and `return refused` lines, printed after both locks have dropped.
+    void                 print_marked_released(size_t n_released, size_t released_bytes);
+    void                 print_marked_refusals(const std::vector<marked_chunk_refusal> & refusals);
+
+    mutable std::mutex              marked_set_mutex_;
+    std::vector<marked_chunk_entry> marked_set_;
+
+    // One context's open SCRATCH transaction: its thread (the one whose grows it records), whether it is the trial's
+    // (OPEN) or the reserve's own (MARK), the n_ubatch it opened at, which the witness names, the chunk count at its
+    // MARK, and the chunks it grew, in order.
+    struct host_scratch_txn {
+        uint64_t            owner = 0;
+        std::thread::id     thread;
+        bool                trial    = false;
+        uint32_t            n_ubatch = 0;
+        size_t              mark     = 0;
+        std::vector<size_t> chunks;
+    };
+
+    // What a closing or truncating step took out of a transaction under host_scratch_txn_mutex_, acted on after it
+    // drops: whether the owner had one open, whose it was, and the chunks it gives up.
+    struct host_scratch_txn_taken {
+        bool                found    = false;
+        bool                trial    = false;
+        uint32_t            n_ubatch = 0;
+        std::vector<size_t> chunks;
+    };
+
+    // OPEN and MARK, each under host_scratch_txn_mutex_ alone. They move no chunk and return 0.
+    size_t                 host_scratch_trial_open(uint64_t owner, uint32_t n_ubatch);
+    size_t                 host_scratch_trial_mark(uint64_t owner, uint32_t n_ubatch);
+    // KEEP and RETURN take every chunk and close the transaction; RETURN_TO_MARK (`to_mark`) takes the chunks grown
+    // since the mark and leaves it open.
+    host_scratch_txn_taken host_scratch_trial_take(uint64_t owner, bool to_mark);
+    // RETURN and RETURN_TO_MARK: the witness, the filing, and the withdrawn bytes given back to the ledger.
+    size_t host_scratch_trial_file(uint64_t owner, const host_scratch_txn_taken & taken, const char * txn);
+    // The SCRATCH bytes of `chunks` still counted in the zone (each chunk's zone share; a withdrawn or released chunk
+    // counts 0).
+    size_t host_scratch_counted_bytes(const std::vector<size_t> & chunks) const;
+    // `[HOST-ARENA] SCRATCH <txn> dev=%d n_ubatch=%u kept|returned %.1f MB (%zu chunk(s))`, only when chunks moved.
+    void   host_scratch_trial_witness(const char * txn,
+                                      uint32_t     n_ubatch,
+                                      const char * verb,
+                                      size_t       bytes,
+                                      size_t       n_chunks);
+
+    mutable std::mutex            host_scratch_txn_mutex_;
+    std::vector<host_scratch_txn> host_scratch_txns_;
 
     // Host memory arena (pinned_chunk_pool).
     // Bypasses Intel Level Zero's ~11GB per-allocation limit via 2GB chunks.
@@ -6677,6 +8145,12 @@ unified_cache * get_unified_cache_for_device(int device_id);
 // Use from destructors and shutdown paths where creating a new cache would
 // re-enter allocator/static teardown.
 unified_cache * get_existing_unified_cache_for_device(int device_id);
+
+// Whether compute_multi_device_plan subtracts the arena's SCRATCH, ONEDNN and RUNTIME reservations from the budget of
+// physical device `device_id`: the VRAM arena is enabled, the cache mode is not GLOBAL (one physical arena, which the
+// planner never lends to every device), and the device's existing cache has an active arena. The planner and the plan
+// dry run's caveat ask the same rule. Reads the existing cache and creates none.
+bool multi_device_plan_subtracts_arena(int device_id);
 
 // The MoE join queue for a CPU expert job whose scatter goes on `stream`, or nullptr to join on `stream`
 // (llama.cpp-wfsl); see unified_cache::get_moe_join_queue() and moe_join_queue_after() for *after. It is used
@@ -6813,18 +8287,8 @@ enum class alloc_hint : uint8_t {
     DEBUG      = 4,  // Debug/profiling allocations (env-gated, not production)
 };
 
-// Classification of runtime (non-weight) VRAM reservations for diagnostics.
-enum class runtime_category : uint8_t {
-    KV_CACHE     = 0,  // KV buffer allocations
-    COMPUTE      = 1,  // Compute buffer pool + scratch
-    STAGING      = 2,  // Expert staging, DMA staging, BLAS fallback
-    GRAPH        = 3,  // Persistent TG temp allocs, get_rows_pool
-    HOST_COMPUTE = 4,  // Host-pinned scratch for CPU offload layers
-    EXPERT_CACHE = 5,  // MoE expert VRAM cache pool
-    CONTROL      = 6,  // Small CPU-produced control tensors read by any GPU
-    OTHER        = 7,  // Everything else (default for backward compat)
-    COUNT        = 8
-};
+// runtime_category, alloc_role and host_zone_id live in host-zone-kinds.hpp, SYCL-free, so the host zone routing
+// and its host-only tests share them (host-zone-plan.hpp).
 
 // Unified runtime allocation API.
 // Managed runtime allocations must flow through this API so budget accounting,
@@ -6832,19 +8296,26 @@ enum class runtime_category : uint8_t {
 enum class alloc_tier : uint8_t {
     DEVICE_VRAM  = 0,
     HOST_PINNED  = 1,
-    MMAP_TRACKED = 2,
+    // Not an allocation: the query result for a pointer the registry does not know (llama.cpp-5efe C2). Nobody may
+    // allocate it; a file mapping is not this either, it has its own owner.
+    UNREGISTERED = 2,
+    // One PROT_NONE reservation with a model file's segments mapped over it, made by the cache and read by the CPU
+    // only (llama.cpp-5efe C2). Not charged to the host ledger unless locked. Every census and test keys on names,
+    // never on this value.
+    FILE_MAPPED  = 3,
+    // Host memory only the CPU reads: one anonymous mapping, MADV_HUGEPAGE, mlocked in full, never mapped into a
+    // device (llama.cpp-th32 T1). Requested only through alloc_constraints::must_host_cpu; nothing falls into it and
+    // nothing falls out of it. host_accessible() is true for it and device_mappable() is false.
+    HOST_CPU     = 4,
 };
 
-enum class alloc_role : uint8_t {
-    WEIGHT         = 0,
-    COMPUTE        = 1,
-    KV             = 2,
-    STAGING        = 3,
-    GRAPH_TMP      = 4,
-    TP_TMP         = 5,
-    EXPERT_STAGING = 6,
-    CONTROL        = 7,
-    OTHER          = 8,
+// Where the planner puts a lazy table's rows (llama.cpp-th32 T1). Not an allocation tier: no byte is allocated "in"
+// STORAGE, so an allocatable enum value would be a latent path to request it. A lazy_table carries this beside its
+// body; cache_location::STORAGE and expert_resolve_tier::STORAGE report the same state and nothing allocates against
+// them.
+enum class lazy_residency : uint8_t {
+    HOST,     // the rows are loaded, locked, into a HOST_CPU body
+    STORAGE,  // the rows stay in the file and are read per ubatch
 };
 
 // Location-transparent descriptor for any managed allocation.
@@ -6853,7 +8324,7 @@ enum class alloc_role : uint8_t {
 // Immutable during inference (allocations do not migrate mid-token).
 struct memory_location {
     void *           ptr        = nullptr;  // Current data pointer (device or host)
-    alloc_tier       tier       = alloc_tier::MMAP_TRACKED;
+    alloc_tier       tier       = alloc_tier::UNREGISTERED;
     ggml_layout_mode layout     = GGML_LAYOUT_AOS;
     alloc_role       role       = alloc_role::OTHER;
     vram_zone_id     zone       = vram_zone_id::COUNT;  // COUNT = not in arena
@@ -6865,6 +8336,11 @@ struct memory_location {
     bool on_device() const { return tier == alloc_tier::DEVICE_VRAM; }
 
     bool host_accessible() const { return tier != alloc_tier::DEVICE_VRAM; }
+
+    // May a device be handed this pointer? host_accessible() stays true for a file mapping and for a HOST_CPU
+    // allocation because the CPU reads them; a device read of either is at best a slow driver-staged copy and at
+    // worst a device loss. Every path that hands a host-accessible pointer to a device checks this instead.
+    bool device_mappable() const { return tier == alloc_tier::DEVICE_VRAM || tier == alloc_tier::HOST_PINNED; }
 };
 
 // Query only registered allocations, preserving registry authority even when
@@ -6900,6 +8376,11 @@ enum class offload_buffer_role : uint8_t {
 struct alloc_constraints {
     bool         must_device                = false;
     bool         must_host_pinned           = false;
+    // HOST_CPU (llama.cpp-th32 T1): host memory only the CPU reads, locked. Selects the tier and nothing else: the
+    // owner entry refuses it beside a routing constraint (must_device, must_host_pinned, prefer_same_tier_as_cohort,
+    // use_pinned_pool, forbid_host_zone_growth, require_host_usm_base, a prefer_vram_zone), charges the host ledger
+    // for it (th32 §4.2), and no tier falls into or out of it.
+    bool         must_host_cpu              = false;
     bool         prefer_same_tier_as_cohort = false;
     bool         use_pinned_pool            = false;
     // Refuse dynamic host-zone growth for planner-bounded staging pools. A
@@ -6913,8 +8394,8 @@ struct alloc_constraints {
     // The allocation's owner outlives every graph: it is released at model or cache teardown, never by the graph that
     // first asked for it. A host-zone request carrying it goes to the WEIGHT host zone, which no graph boundary checks
     // and host_zone_settle() never settles. It must carry neither role KV nor role EXPERT_STAGING (nor be a KV spill):
-    // those choose the KV and SCRATCH zones before WEIGHT is considered, so unified_alloc_host_zone() asserts against
-    // the combination. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives
+    // those choose the KV and SCRATCH zones before WEIGHT is considered, so select_zone() asserts against the
+    // combination. The host STAGING and SCRATCH zones must be empty at every graph boundary, so one row that lives
     // for the process there makes every boundary check refuse (llama.cpp-nqbe). Role alone cannot say this: CONTROL
     // also names scoped host transients, which belong in STAGING so a leaked one is still caught at the boundary. Set
     // on such a transient, the flag would hide exactly that leak, so its setters are pinned
@@ -6974,6 +8455,12 @@ struct alloc_intent {
     alloc_constraints constraints;
     const char *      site_file = __builtin_FILE();
     int               site_line = __builtin_LINE();
+    // How long the owner keeps the allocation, and who that owner is (docs/design/sycl-mmap-host-tier.md §4.4
+    // "Lifetimes"). select_zone() reads the lifetime (UNOWNED goes to WEIGHT), the graph-boundary check counts only
+    // GRAPH rows, and each other lifetime is checked at its owner's boundary. Stamped on the registry row at
+    // registration. Declared last so every positional initialiser of the fields above keeps its meaning.
+    alloc_lifetime    lifetime  = alloc_lifetime::GRAPH;
+    alloc_owner_ref   owner{};
 };
 
 // Why unified_alloc()'s host-pinned pool path handed out no pointer.
@@ -7012,6 +8499,10 @@ struct alloc_request {
     host_zone_alloc_miss * host_zone_miss = nullptr;
     const char *           site_file      = __builtin_FILE();
     int                    site_line      = __builtin_LINE();
+    // The host ledger's charge entry (th32 §4.2): only a HOST_CPU request charges. may_yield stays false everywhere
+    // but the loader-thread sites that hold no lock; load_txn_id is that load's transaction, which a yield skips.
+    bool                   may_yield      = false;
+    uint64_t               load_txn_id    = 0;
 };
 
 // Copyable, non-owning exact allocation identity and geometry. Registry rows,
@@ -7052,6 +8543,10 @@ struct alloc_metadata {
     bool         zone_managed = false;
     bool         cache_backing = false;  // Lifecycle annotation; not part of the exact release key.
     host_zone_id host_zone    = host_zone_id::COUNT;
+    // The request's alloc_intent::lifetime and owner, stamped at registration: lifecycle annotations, not part of
+    // the exact release key.
+    alloc_lifetime  lifetime      = alloc_lifetime::GRAPH;
+    alloc_owner_ref owner{};
 
     struct exact_key {
         void *           ptr;
@@ -7343,6 +8838,18 @@ struct allocation_result {
     explicit operator bool() const noexcept { return error == allocation_error::NONE && static_cast<bool>(owner); }
 };
 
+// Whether the registry still holds the exact row `metadata` names (found by ptr, compared by key()): GONE when no row
+// has that pointer or the row there is another allocation, else the row's own state. It takes g_runtime_alloc_mutex
+// alone and writes nothing. The pinned pool's released-chunk carrier and its stranded reconcile read it to move the
+// footprint only when the memory is gone (docs/design/sycl-mmap-host-tier.md §4.4, §M92, §M97).
+enum allocation_registered_state {
+    ALLOCATION_REGISTERED_GONE,
+    ALLOCATION_REGISTERED_LIVE,
+    ALLOCATION_REGISTERED_RELEASING,
+};
+
+allocation_registered_state unified_allocation_registered_exact(const alloc_metadata & metadata) noexcept;
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 struct allocation_owner_test_fixture {
     allocation_result result{};
@@ -7428,6 +8935,11 @@ bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
 bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadata) noexcept;
+// Hold a registered row's physical release (§M88 (1)): set its test_no_physical_release and take one exact test lease,
+// so its release is refused and the row returns to LIVE with a retry scheduled. unhold drops that lease and clears the
+// flag. Each is true when the row of `metadata` was found with the matching key.
+bool                      allocation_registry_test_hold_physical_release(const alloc_metadata & metadata) noexcept;
+bool                      allocation_registry_test_unhold_physical_release(const alloc_metadata & metadata) noexcept;
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
 registered_release_status allocation_registry_test_release_exact(
     const alloc_metadata & metadata, registered_release_mode mode) noexcept;
@@ -7449,10 +8961,169 @@ bool                      allocation_registry_test_publish_raw(void * ptr,
                                                                bool   releasing) noexcept;
 #endif
 
+// ---- the process-global host ledger (th32 §4.2, §11 T2) ----
+//
+// One budget for the host bytes th32's own consumers hold: every HOST_CPU allocation charges it at the top of
+// unified_allocate_owner, before any allocator lock, and the free credits it. Three lock-free atomics hold it (the
+// committed bytes, the stored budget and the yieldable bytes), so a charge or a credit is legal at any lock depth and
+// the ledger has no mutex. Only a yield needs a caller that holds no lock (may_yield below).
+//
+// The budget is stored once per load transaction, by the first host_budget_pass_scope of that transaction, and every
+// later reader loads the stored value, so the early plan, the late plan and every device's plan read one number. It
+// starts at 0: before the first store the ledger API refuses every charge by name, which fails closed. Phase (a) of
+// th32 T2 charges with warn_only at its one charge site, the owner entry, so there a charge before the first store
+// logs its would-refuse WARN and is made.
+
+// The budget's inputs, read into a local before any lock is taken (th32 §4.2). The pinned share looks each cache up by
+// device index, holding the cache lock shared for each lookup alone, and reads each pool under that pool's own mutex
+// with no other lock held.
+struct host_budget_sample {
+    detail::host_reserve_parse_result reserve{};              // GGML_SYCL_HOST_RESERVE_MB through its strict parser
+    size_t                            total_bytes     = 0;    // the host's RAM; 0 when detection failed
+    size_t                            available_bytes = 0;    // MemAvailable; 0 when the read failed
+    int                               budget_pct      = 100;  // the host-budget percentage, clamped to 1..100 when used
+    size_t                            pinned_bytes    = 0;    // the sum of pinned_pool_committed() over the caches
+};
+
+// Reads the inputs. Takes no allocator lock and creates no cache: the pinned share is summed over the caches that
+// exist. It runs before any lock is taken, and the lock witness aborts it when one is held other than the replan token.
+host_budget_sample host_ledger_sample();
+
+// The budget for `sample` with `committed` bytes already charged: host_budget_compute (host-budget.hpp, design 5efe
+// §4.5). Saturating: a pinned share above the percentage cap, or an available reading at or below
+// host_headroom(total), the refusal host-headroom-exhausted, gives a budget at or below `committed`, which refuses
+// the next charge by name. An accepted GGML_SYCL_HOST_RESERVE_MB caps the budget and never raises it. `result`, when
+// given, receives the whole result: its override_binds is whether the override is the budget, its status and headroom
+// whether the budget is the headroom refusal.
+size_t host_ledger_compute_budget(const host_budget_sample & sample,
+                                  size_t                     committed,
+                                  host_budget_result *       result = nullptr);
+
+// Computes against the live committed bytes and stores the result, and beside it the sample's MemAvailable, MemTotal
+// and the headroom the budget left, whether that budget is the refusal host-headroom-exhausted (design 5efe §4.5), and
+// whether GGML_SYCL_HOST_RESERVE_MB's override set it. The one writer of the stored budget besides the test setter,
+// which clears the refusal flag and leaves the sample's figures and the override flag as they were; it counts its
+// stores, the setter does not.
+size_t host_ledger_store_budget(const host_budget_sample & sample);
+
+size_t host_ledger_budget();           // one atomic load of the stored budget
+size_t host_ledger_mem_available();    // one atomic load of the stored budget's sample MemAvailable (0: none stored)
+size_t host_ledger_committed();        // one atomic load of the committed bytes
+size_t host_ledger_yieldable_bytes();  // one atomic load of the yieldable bytes
+
+// One atomic load: whether the stored budget is GGML_SYCL_HOST_RESERVE_MB's override (false: computed, or none stored).
+bool host_ledger_budget_overridden();
+
+// One atomic load each, of the stored budget's sample (design 5efe §4.5): whether that budget is the refusal
+// host-headroom-exhausted, its MemTotal, and the headroom it compared (false and 0: none stored).
+bool   host_ledger_headroom_exhausted();
+size_t host_ledger_mem_total();
+size_t host_ledger_headroom();
+
+// A cache's yieldable chunk appears (add) or goes (sub). One call is one chunk: a yield makes at most one round per
+// chunk counted at its first shortfall.
+void host_ledger_yieldable_add(size_t bytes);
+void host_ledger_yieldable_sub(size_t bytes);
+
+struct host_ledger_charge_request {
+    size_t   bytes       = 0;
+    // True only at a loader-thread site that holds no lock (th32 §4.2: the ring ensure and the HOST body load). A
+    // shortfall with false refuses at once, whatever the yielders hold.
+    bool     may_yield   = false;
+    // The caller's load transaction: a yielder never gives back a chunk of the same nonzero id. 0 is no transaction.
+    uint64_t load_txn_id = 0;
+    // Phase (a) of th32 T2: a refusal is logged as a would-refuse WARN carrying each term, and the bytes are charged
+    // anyway, saturating.
+    bool     warn_only   = false;
+};
+
+struct host_ledger_charge_result {
+    bool     charged         = false;  // the ask is in the committed bytes
+    bool     over_budget     = false;  // charged by warn_only past a refusal
+    size_t   ask             = 0;
+    size_t   committed       = 0;      // the committed bytes the last attempt saw
+    size_t   budget          = 0;      // the stored budget the call loaded
+    size_t   deficit         = 0;      // the bytes the last attempt was short; 0 when it fit
+    size_t   yieldable_bytes = 0;
+    uint32_t retries         = 0;      // yield rounds made
+};
+
+// A CAS loop on the committed bytes against one load of the budget: it adds the ask only when committed <= budget
+// and ask <= budget - committed, the form that cannot overflow. On a shortfall it yields when the request allows it
+// and no yield is running on this thread, and otherwise refuses, logging host-budget-exceeded with each term.
+host_ledger_charge_result host_ledger_try_charge(const host_ledger_charge_request & req);
+
+// An atomic subtract, saturating at 0. A credit above the committed bytes is a [HOST-PLAN-BUG].
+void host_ledger_credit(size_t bytes);
+
+// The yielder interface (th32 §4.2): a cache registers one callback, which frees up to `deficit` bytes of its
+// yieldable chunks, skips the chunks of `load_txn_id` when it is nonzero, credits the ledger for each free, and
+// returns the bytes it freed. A charge the callback makes never yields. It does not throw: a yield runs inside a
+// charge, which has no failure path for an exception to take. A using alias, not a typedef: the static-storage audit's
+// declaration parser rejects a function-pointer typedef that carries noexcept.
+using host_ledger_yield_fn = size_t (*)(void * ctx, size_t deficit, uint64_t load_txn_id) noexcept;
+
+// Returns the slot, or -1 after logging host-yielder-slots-exhausted when every slot is taken; that cache then runs
+// unregistered, with no yieldable bytes.
+int  host_ledger_register_yielder(host_ledger_yield_fn fn, void * ctx);
+// The only unregister, from the cache's destructor: stores null, then waits until no yield that loaded the callback is
+// still running. The caller holds no cache, shard or registry lock, since a running callback may wait on one.
+void host_ledger_unregister_yielder(int slot);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The yielder slots claimed now, so a test can watch a cache register and, at its last reference, unregister.
+int host_ledger_yielder_slots_claimed_for_testing();
+
+// One yield round over the registered yielders with `deficit` asked, as a charge runs it (th32 §3.3's yield entry).
+size_t host_ledger_test_yield_round(size_t deficit, uint64_t load_txn_id);
+#endif
+
 // Foundation owner path. The intrusive control is allocated before any physical
 // allocation. The legacy alloc_handle adapter remains inside the allocator;
 // broad caller migration is intentionally deferred.
 allocation_result unified_allocate_owner(const alloc_request & req) noexcept;
+
+// The owner-first front door of the FILE_MAPPED tier (llama.cpp-5efe C2). One owner and one registry record per
+// reservation: ptr = the reservation's base, size = its length; the segments are not separate records. The owner
+// class is EXTERNAL_EXACT: exact, independently released, never a slice of cache backing. The intrusive control is
+// minted before anything is mapped, and the last reference unmaps the whole reservation in one munmap.
+struct file_mapping_request {
+    int                         device    = -1;  // the owning device's cache; the mapping is read by the CPU only
+    int                         fd        = -1;  // the loader's open file: the owner dups it, the caller keeps its own
+    uint64_t                    file_size = 0;   // the size the loader recorded (register_file_identity)
+    file_map_range              reservation;     // the file range the reservation stands for
+    std::vector<file_map_range> segments;        // page aligned, inside the reservation, not overlapping
+    alloc_role                  role      = alloc_role::WEIGHT;
+    const char *                cohort_id = nullptr;
+};
+
+allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept;
+
+// The host-ledger charge the live HOST_CPU registry row of `meta`'s exact allocation holds: host_cpu_mapped_size of its
+// request, the ledger's figure and never the handle's requested size. 0 when no live row has that exact key or the row
+// is not HOST_CPU. A lazy table's activation check sums it over the table's records (th32 §10).
+size_t unified_alloc_host_cpu_charged_bytes(const alloc_metadata & meta);
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The registry's host-pinned and file-mapped byte sums: the figures unified_alloc_validate_registry compares with the
+// host ledger and reports beside it. A file mapping is in the second and never in the first.
+void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) noexcept;
+
+// The registry's HOST_CPU byte sum (llama.cpp-th32 T1b): the requested bytes of the live HOST_CPU allocations. It is
+// in neither of the two sums above, so the host-pinned figure the validator compares with the host ledger never
+// carries a locked CPU-only mapping.
+void unified_alloc_registry_host_cpu_sum_for_test(size_t * host_cpu) noexcept;
+
+// The pointers of the live HOST_CPU registry rows, so a test can find the row an allocation left behind.
+std::vector<void *> unified_alloc_registry_host_cpu_ptrs_for_test();
+
+// Configures `cache`'s host zones for `plan` as a model load does (ggml-sycl.cpp), so a test can measure the pool's
+// growth against the plan's host bytes.
+void configure_host_zones_for_plan_for_testing(unified_cache * cache, int device, const placement_plan & plan);
+
+// How often unified_free_record reached ::free and sycl::free, so a test can tell a file mapping that was
+// unmapped from one that fell through to another branch.
+void unified_cache_test_free_branch_counts(uint64_t * malloc_free, uint64_t * sycl_free) noexcept;
+#endif
 namespace detail {
 // Narrow compatibility bridge for allocation sites still returning alloc_handle.
 // Atomically promotes the exact legacy registry row to intrusive ownership.
@@ -7515,7 +9186,7 @@ enum class alloc_category : uint8_t {
 // 0 = compute scratch (pre-reserved arena, must stay in VRAM for FP16 attention)
 // 1 = KV cache (hot tokens, latency-critical)
 // 2 = attention weights / control buffers (used every token)
-// 3 = MoE expert cache (evictable via LRU/frequency)
+// 3 = MoE expert cache (evicted before weights; within a tier, least recently used first)
 // 4 = staging buffers (always host-ok)
 int alloc_category_priority(alloc_category cat);
 
@@ -7547,6 +9218,8 @@ struct offload_stats_snapshot {
     uint64_t alloc_count_host                          = 0;
     uint64_t alloc_count_device                        = 0;
     uint64_t alloc_count_shared                        = 0;
+    uint64_t alloc_count_file_mapped                   = 0;
+    uint64_t alloc_count_host_cpu                      = 0;
     uint64_t pool_hit_count                            = 0;
     uint64_t pool_miss_count                           = 0;
     uint64_t cross_domain_transfer_count               = 0;
@@ -7692,7 +9365,7 @@ void                   zero_alloc_check(const char * tag, int device);
 enum ggml_sycl_replan_kind : int {
     GGML_SYCL_REPLAN_KIND_ANY         = 0,
     GGML_SYCL_REPLAN_KIND_TRANSACTION = 1,  // a context's own planned transaction
-    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_inventory_plan, load_end
+    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_load_inventory_plan, load_end
     GGML_SYCL_REPLAN_KIND_LIFECYCLE   = 3,  // every other holder
 };
 
@@ -7964,11 +9637,24 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
 
 // llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
-// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone-plan snapshot ensure_planned_arena_zones
-// stores: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure). False (and *bound
-// untouched) when there is no cache or no active arena, i.e. no zone exists to plan against. This is the one source
-// for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
-bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
+// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone plan ensure_planned_arena_zones stored on
+// the same cache: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure; see
+// unified_cache::onednn_zone_plan_). `planned_weights` and `planned_activations` receive the two halves of that same
+// stored plan, from the one read the bound is computed from, so an admission never pairs one plan's bound with another
+// plan's halves. Each out-pointer may be null. False (and every out untouched) when there is no cache or no active
+// arena, i.e. no zone exists to plan against. This is the one source for "does an op's pair fit what was planned"
+// (zone_onednn_pp_scratch_planned).
+bool unified_cache_get_onednn_pp_pair_bound(int      device_id,
+                                            size_t * bound,
+                                            size_t * planned_weights,
+                                            size_t * planned_activations);
+
+// The ONEDNN zone's oneDNN Graph room on `device_id`: the part of the zone no other planned consumer may take, the
+// capacity less unified_cache_get_onednn_pp_pair_bound()'s bound over that same capacity. Both come from ONE capacity
+// read, so an ensure that rebuilds the zone between two reads cannot pair one capacity with another's bound, and the
+// plan comes from the cache whose capacity is read. False (and *room untouched) when there is no cache or no active
+// arena, as for the bound.
+bool unified_cache_get_onednn_graph_room(int device_id, size_t * room);
 
 // llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`
 // (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH, and the default type set when it is unset). ONE answer for the op arm,
@@ -8195,7 +9881,10 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Reserve the compute arena (pre-reserved VRAM for compute scratch).
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
-bool unified_cache_ensure_planned_arena_zones(int device_id);
+// unified_cache::ensure_planned_arena_zones() on the device's cache; a device with no cache is a NO_CACHE refusal.
+bool unified_cache_ensure_planned_arena_zones(int                               device_id,
+                                              zone_arena_refusal *              refusal = nullptr,
+                                              const zone_arena_ensure_options & options = {});
 
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: external entry point for reclaiming (real release) every
@@ -8289,6 +9978,26 @@ void unified_cache_dump_live_zone_allocations(int          device,
                                               const char * where,
                                               size_t       max_entries = 32);
 
+// Diagnostic only: `zone`'s capacity, free bytes and largest free block on `device`'s existing cache, and every
+// allocation its allocator group records at an address `zone` owns, summed by tag. The group records every
+// zone_alloc(), registry row or not, so the count is complete. A tag is the registry row's cohort_id ("(none)" without
+// one), a slash and its alloc_role; an allocation with no row matching its allocation id is "(no registry row)/" and
+// the zone it was made for. Bytes are each allocation's extent.
+// WEIGHT and KV share one allocator group, so a WEIGHT census can carry KV-role tags; that is expected, not a census
+// defect. In single-chunk mode WEIGHT and KV share one address range and one allocator: every KV allocation is
+// counted, and the figures cover that same range. In N-chunk mode WEIGHT is the weight chunks: a KV allocation that
+// fell through to a weight chunk is counted, and the KV zone's own tail allocator in the last chunk is outside both
+// the figures and the census. A KV census is not coherent in N-chunk mode: KV's free figures sum its tail and every
+// weight chunk while the zone's address range is the tail alone, so used reads 0 and unattributed reads minus the
+// attributed bytes; census KV only in single-chunk mode.
+// Three acquisitions in order, never two at once: g_cache_rw_mutex (L4), shared, for the cache lookup, released; the
+// zone's allocator group mutex (L5) for the figures and the record set, released; then g_runtime_alloc_mutex (L5)
+// alone for the tags. The figures and the tags are therefore two instants, not one snapshot. The caller must hold no
+// L4 or L5 lock. Host containers only; no address outlives the call and none is dereferenced. Never throws. False, with
+// `out` empty, when `zone` is not a zone of the arena's table, the device has no cache or no active arena, or the
+// census could not allocate its host containers. Never creates a cache.
+bool unified_cache_zone_tag_census(int device, vram_zone_id zone, zone_tag_census & out) noexcept;
+
 // ---------------------------------------------------------------------------
 // Zone-reset escape audit (GGML_SYCL_ZONE_RESET_AUDIT)
 // ---------------------------------------------------------------------------
@@ -8365,6 +10074,44 @@ void zone_reset_audit_report(const char * where);
 // it is owned by the arena and released when the arena is destroyed.
 void * unified_cache_kv_arena_alloc(int device_id, size_t size);
 
+// llama.cpp-5efe C4: how many times stream_dma refused a file-mapped source (design 5efe §5.3). A refusal means
+// dispatch routed a host-tier weight to a device kernel, so a correct build reads 0.
+uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept;
+
+// How many host registrations (register_host_expert, register_host_weight) were refused for a pointer no registry
+// names (design 5efe §4.8, §7 C6). A refusal on a real load means a caller registered memory with no owner, so a
+// correct build reads 0 after one.
+uint64_t unified_cache_unregistered_host_registration_refusals() noexcept;
+
+// A device-bound copy of file-mapped bytes outside a load transaction or a cache materialization
+// (docs/design/sycl-mmap-host-tier.md §5.3 "Gates"). It is noted at the instrumented chokepoints only, once per copy:
+// mem_copy and mem_copy_async (both reach mem_copy_submit, as unified_cache::copy_to_device_async and stream_dma's
+// default copy do), mem_copy_ptr_async, and stream_dma's custom copy_fn. A copy through any other path is not counted.
+// `src` is the copy's source. `device_dst` is null when the caller has established that the destination is a device;
+// otherwise the note asks the registry whether it is one, after its cheaper checks. A correct load reads 0.
+void     unified_cache_file_mapped_device_copy_note(const void * src, const void * device_dst = nullptr);
+uint64_t unified_cache_file_mapped_device_copies_outside_materialization() noexcept;
+
+// The load transaction's span, process-wide: from a successful ggml_backend_sycl_model_load_begin to the end of the
+// model_load_end call that finishes it. Copies inside it are the load's own and are not counted.
+void unified_cache_file_mapped_load_enter() noexcept;
+void unified_cache_file_mapped_load_leave() noexcept;
+
+// `[FILE-MAPPED] counters: stream_dma_refusals=%llu device_copies_outside_materialization=%llu`, at WARN, so it
+// survives llama-completion's default log threshold (§5.3 "Where the lead reads both counters").
+void unified_cache_file_mapped_counters_log();
+
+// A cache materialization on this thread: direct_stage_weight, the expert stages and the fills they run. Its copies of
+// mapped bytes are the materialization itself, not a device read of the file, so they are not counted. Thread-local:
+// another thread's copy during the materialization is still counted.
+class file_mapped_materialization_scope {
+  public:
+    file_mapped_materialization_scope() noexcept;
+    ~file_mapped_materialization_scope();
+    file_mapped_materialization_scope(const file_mapped_materialization_scope &)             = delete;
+    file_mapped_materialization_scope & operator=(const file_mapped_materialization_scope &) = delete;
+};
+
 // Reserve the inference scratch pool on a device.
 bool unified_cache_reserve_scratch_pool(int device_id, size_t pool_bytes);
 
@@ -8416,9 +10163,37 @@ bool                    unified_cache_allocate_moe_q8_1_graph_scratch(int       
                                                                       const moe_q8_1_scratch_demand & demand,
                                                                       alloc_handle *                  out);
 
-// Grow the host SCRATCH zone to accommodate compute buffer needs.
-// Called after the ggml scheduler is created and compute buffer sizes are known.
-void unified_cache_grow_host_scratch_zone(size_t additional_bytes);
+// The host SCRATCH demand ledger of `device`'s cache (§4.4 "What the SYCL side does with it"). Every demand ensures
+// capacity, a high-water mark, never an additive grow: the target is the plan's SCRATCH plus the sum of the live
+// demands, and only a deficit grows the zone. A context's demand and the DEVICE holders' demands are driven through
+// the ledger unified_cache_host_scratch_ledger hands out (host-zone-plan.hpp).
+//   drop:    the context's demand, at its owner boundary, on every device; capacity is never returned.
+void unified_cache_host_scratch_drop_context(uint64_t context_key);
+// The ledger and zone operations of `device`'s cache, for callers that drive the ledger through host-zone-plan.hpp.
+// `chunk_cap` is the host buffer chunk cap. False when the device has no cache or no host zones.
+bool unified_cache_host_scratch_ledger(int                     device,
+                                       size_t                  chunk_cap,
+                                       host_scratch_ledger **  ledger,
+                                       host_scratch_zone_ops * ops);
+
+// The begin entry's release of `device`'s marked SCRATCH chunks for `owner`
+// (unified_cache::host_scratch_begin_release). Returns the chunks released; 0 when the device has no cache.
+size_t unified_cache_host_scratch_begin_release(int device, uint64_t owner);
+
+// One step of `owner`'s SCRATCH transaction on `device`'s cache (unified_cache::host_scratch_trial). Returns the chunks
+// the step moved; 0 when the device has no cache.
+size_t unified_cache_host_scratch_trial(int device, host_scratch_trial_op op, uint64_t owner, uint32_t n_ubatch);
+
+// The owner's end on `device`, before its backend context is deleted (§4.4 "Every withdrawn chunk has an owner and a
+// bounded release"): a transaction the owner left open is returned first, then unified_cache::host_scratch_owner_end
+// releases its empty marked chunks and orphans the rest. Returns the chunks released; 0 when the device has no cache.
+size_t unified_cache_host_scratch_owner_end(int device, uint64_t owner);
+
+// The owner-boundary check (§4.4 "Each lifetime keeps a leak check at its owner's boundary", §M57 (b)): every live
+// registry row with this lifetime and owner prints `[HOST-ZONE] leaked <lifetime> record: ...` at WARN, and under
+// GGML_SYCL_STRICT_LEASES=1 the check aborts once every line has printed. The rows are copied under the registry
+// mutex and reported after it is released. Returns the number of leaked rows.
+size_t unified_cache_host_zone_owner_check(alloc_lifetime lifetime, alloc_owner_ref owner);
 
 [[deprecated("use unified_allocate() with must_host_pinned + use_pinned_pool instead")]] void *
      unified_cache_host_zone_alloc(host_zone_id zone, size_t size, size_t alignment = 64);
@@ -8638,7 +10413,14 @@ struct vram_budget_authority {
     int    budget_pct        = 100;  // resolved GGML_SYCL_VRAM_BUDGET_PCT
     size_t base_mem          = 0;    // host-unified-adjusted device total
     size_t external_headroom = 0;    // unified_cache_max_external_headroom(base_mem)
-    size_t budget_bytes      = 0;    // min(base_mem*pct/100, free_vram_at_init) - external_headroom, floored at 0
+    size_t budget_bytes      = 0;    // min(base_mem*pct/100, free_floored) - external_headroom, floored at 0
+    // The free reading that caps the budget, rounded down to a 64 MiB grid so that run-to-run jitter of the driver's
+    // figure does not move the plan; a reading below one step is kept as it is, and 0 means no reading (no cap).
+    // Set by compute_vram_budget_authority() only: a budget read off a live cache leaves it 0.
+    size_t free_floored      = 0;
+    // The reading free_floored was taken from: the hint's reading at init when it has one, else the caller's free
+    // figure. Set with free_floored, so the log states the figure that was rounded, whichever caller supplied it.
+    size_t free_reading      = 0;
 };
 
 // llama.cpp-o3h1 quality review (final batch, F2/F4): the shared entry
@@ -8878,20 +10660,42 @@ bool unified_cache_shutdown_state_clean() noexcept;
 bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
 bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept;
 bool unified_cache_shutdown_allocation_control_census_for_test(uint64_t out[3]) noexcept;
+// The live bytes the runtime-allocation registry holds under `role` on `device` (llama.cpp-th32 T1b), written to
+// *out. Unconditional like the census accessors beside it, so a vehicle test that links libllama can read it through
+// ggml_backend_sycl_role_bytes_for_testing. Returns false, with *out zero, when the device has no cache or the
+// arguments are invalid: the reading is VOID, never a zero that could be mistaken for "nothing allocated".
+bool unified_cache_role_bytes_for_testing(int device, alloc_role role, uint64_t * out) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void unified_cache_test_fail_next_arena_free();
+// The free hook: a teardown reads one free as refused by the device, the free it tries once it has freed exactly
+// `freed_chunks` of its chunks (0 fails the first free, before any chunk is freed, and 1 fails the free after the first
+// chunk was freed). The teardown that tries that free consumes the hook. One that stops before it, at a refusal before
+// the free loop or at a leased chunk before any chunk is freed, leaves it armed.
+void unified_cache_test_fail_next_arena_free(size_t freed_chunks);
+// The drain hook: the next teardown that reaches its wait for the leases on its retired authorities reads that wait as
+// timed out, and consumes the hook. A teardown that refuses before it closes the arena never reaches the wait and
+// leaves the hook armed.
+void unified_cache_test_fail_next_arena_drain();
+// Disarms both hooks above. A test that arms one calls this when it is done, so a hook no teardown reached cannot fire
+// in a later teardown or in the cache's destructor.
+void unified_cache_test_disarm_arena_teardown_failures();
 void unified_cache_test_fail_next_shutdown_clean();
+// How long a settle waits for its drains, and a teardown for the leases on its retired authorities and on each chunk
+// (5000 ms unless set). A test that sets it puts it back when it is done.
 void unified_cache_test_set_arena_drain_timeout_ms(uint32_t timeout_ms);
 void unified_cache_test_pause_zone_settle(bool pause);
 bool unified_cache_test_zone_settle_reached();
 bool unified_cache_test_arena_destroy_closing_reached();
-// Whether g_device_caches holds an entry for the device; creates nothing.
+// Whether the per-device cache map holds an entry for the device; creates nothing.
 bool unified_cache_test_cache_exists(int device);
+// Sets the device total the raw-allocation gates read for `device`; 0 reads the driver's figure again.
+void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes);
 // Called from cache destruction once arena_destroy() has returned, with the
 // members the cache still holds then. Pass nullptr to remove it.
 using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,
                                                      bool zone_backed);
 void unified_cache_test_set_destroy_observer(unified_cache_test_destroy_observer observer);
+// Plants the STORAGE decline record's mutant (th32 §3.3): with `on`, every plan prints its declines, as with no record.
+void unified_cache_test_lazy_decline_every_plan(bool on);
 #endif
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
 // Private direct-source fixture seam; never compiled into the ordinary backend DSO.
@@ -8930,7 +10734,7 @@ size_t ggml_sycl_compute_arena_bytes(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,
-//  get_expert_popularity_rank() for eviction scoring.)
+//  get_expert_popularity_rank() for the planner's expert order.)
 
 }  // namespace ggml_sycl
 

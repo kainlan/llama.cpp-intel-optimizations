@@ -30,9 +30,12 @@ loop, which is why it runs last):
 
 - **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
   process.
-- **Shmem ceiling** — `Shmem` in `/proc/meminfo`, net of the summed "Used" of
-  tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), above 10 GB
-  (the TTM-shmem OOM signature this repo has hit repeatedly). This became net
+- **GPU host backing ceiling** — `Shmem` in `/proc/meminfo`, net of the summed
+  "Used" of tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), plus
+  the meminfo remainder (`scripts/sycl-host-backing.sh`; a discrete card's
+  host-pinned memory is in no meminfo field, so `Shmem` alone is flat for it),
+  above 10 GiB (`SHMEM_CEIL_KB`; the TTM-shmem OOM signature this repo has hit
+  repeatedly). An unreadable meminfo, or one without `MemTotal`, refuses. This became net
   of tmpfs on 2026-09-04, after the guard refused every baseline run because
   other sessions' ordinary `/tmp`/`/dev/shm` files — not GPU-BO backing — held
   ~9.7 GB of Shmem. If tmpfs usage meets or exceeds raw Shmem the effective
@@ -44,8 +47,13 @@ loop, which is why it runs last):
   Shmem, tmpfs used, and the net figure separately for both the pre- and
   post-run sample
   (`pre_shmem_raw`/`pre_tmpfs`/`pre_shmem_eff`, mirrored for `post_*`) rather
-  than only the net number, so a SUSPECT-for-growth verdict can still be
-  traced back to which component moved.
+  than only the net number, and adds the remainder and the sum
+  (`pre_remainder`/`pre_backing`, mirrored for `post_*`), so a SUSPECT-for-growth
+  verdict (`backing-grew`, more than 5 GiB across the run) can still be traced
+  back to which component moved. A first post-run sample over that threshold is
+  re-taken after `BENCH_GUARD_POST_RECHECK_S` seconds (default 5), because the
+  exiting process's host backing is released a moment after exit; only the
+  second sample counts and it is the one the header records.
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
@@ -501,7 +509,7 @@ check engages the ring.
 - **Script.** `scripts/sycl-moe-exec-gate.sh <merge sha>`, run by the lead only, detached, one run at a
   time, under `GPU.lock`. The lead form runs a snapshot copy of the script against a build whose source
   tree is the merge tree:
-  `cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snapshot>/scripts/`,
+  `cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-host-backing.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snapshot>/scripts/`,
   then `bash <snapshot>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>`.
   The prompts resolve next to the script (the snapshot); the head check and the binary-newer-than-head
   check read the build's own source tree, `--src-dir`, which defaults to the parent of `--build-dir`. The
@@ -509,9 +517,9 @@ check engages the ring.
   head comparison and the newer-than-head check, so it gives up the guarantee that the binaries were built
   from the sha, and it still validates the sha format and still refuses a missing binary. A table taken
   under it is not a baseline.
-  The script refuses unless the host has settled (`Shmem` under 30 GB, `MemAvailable` over 150 GB) and the
+  The script refuses unless the host has settled (GPU host backing under 30 GiB; `MemAvailable` is not a condition) and the
   builders (ninja plus icpx) clear. A running build is waited out, before the lock at the start and before
-  every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem` and
+  every arm, like the settle wait (15 minutes at most, then the run stops). It samples `Shmem`, GPU host backing and
   `MemAvailable` before every arm and 5 s after it, with builders also sampled every 5 s during the arm.
   The log ends `verdicts_pass=N GATE_DONE`.
 - **Repeats and spread.** Every `llama-bench` arm uses `-r 3` except `Q_staged`, which uses `-r 1`: it
@@ -699,13 +707,13 @@ Per-window budget of one engaged layer-ubatch (2688 windows over 368 layer-ubatc
 `t_ring` 69-88 ms per layer-ubatch. Candidates (b) pageable source, (c) readers_done serialisation and (d) copy
 granularity are dead by measurement; (a) launch overhead is real but small.
 
-**The largest contributor is not the ring.** The per-layer-embedding table `per_layer_token_embd.weight` (IQ4_NL
-[160, 320001536], 27466 MiB, 16 random 90-byte rows per token) stays mmap-backed under upstream's lazy-read AUTO
-mode ("lazy read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faults it
-from the degraded bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
-`bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch, the DWARF stack runs
+**The largest contributor is not the ring.** The per-layer-embedding table `per_layer_token_embd.weight` (IQ4_NL [160,
+320001536], 27466 MiB, 16 random 90-byte rows per token) stays mmap-backed under upstream's lazy-read AUTO mode ("lazy
+read enabled", `CPU_Mapped model buffer size = 27465.95 MiB`) and the CPU scheduler split page-faulted it from the
+bcachefs array on every ubatch: a state+wchan sampler put the bench main thread in D state on
+`bch2_read_single_folio` for 90 of 138 samples in ~4.7 s bursts per ~6.8 s ubatch, the DWARF stack ran
 `ggml_compute_forward_get_rows` -> `dequantize_row_iq4_nl` -> page fault -> bcachefs read, and the GT idle sampler
-shows the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on `llama-bench -lzm`:
+showed the B70 busy ~2 s then idle for the rest of each ubatch. Same-binary ABBA on `llama-bench -lzm`:
 
 | arm | lazy mode | pp2048 t/s | sd |
 |---|---|---:|---:|
@@ -719,8 +727,11 @@ ring executes at or under its predicted `t_ring` (a 512-token ubatch takes 1.93 
 is `llama.cpp-th32` (planner-decided placement of lazy n-gram tables). The remaining gap to the 500 floor is device
 time the kernel profiler does not attribute (434 ms of ~1930 ms per ubatch are labelled; the `moe.pp.dequant` label
 records ~100 ns per launch): `llama.cpp-qmen`, then the dequant/GEMM work under `llama.cpp-36j0`. **These are
-records, not baselines**; at the default load mode every Qwen3.8 prefill figure on this host measures the disk, not
-the executor, and the 200/500 floors were set for the executor.
+records, not baselines**; at the default load mode every Qwen3.8 prefill figure on this host measured the disk, not
+the executor, on the bcachefs layout, and the 200/500 floors were set for the executor.
+
+History: /models moved to XFS per drive under mergerfs on 2026-11-01; the stall has not been re-measured on that layout
+(Task 27 of `docs/plans/2026-11-01-th32-storage-tier-lazy-tables.md` re-measures).
 
 Against the 4229a205d record (c-4m7d): Q_pp pp512 30.9 ± 29.39 -> 76.5 ± 0.17, because the straddle is gone and the
 ring engages on the first context with no loan (`llama.cpp-86bl`, `llama.cpp-384v`); pp2048 66.5 -> 75.7; Q_pp_ub2048

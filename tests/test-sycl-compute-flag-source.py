@@ -5,13 +5,16 @@ A node without GGML_TENSOR_FLAG_COMPUTE is an unselected branch of ggml_build_fo
 upload that node's inputs, so a kernel run for it reads memory nobody wrote (on the B50 at default context: a
 GET_ROWS on the token embedding with garbage ids, a GPU page fault and a lost device).
 
-With `#if 0` regions, comments and string literals blanked, in ggml-sycl.cpp:
-  H. ggml_sycl_node_is_computed, the one statement of the rule, tests `(node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0`.
+With `#if 0` regions, comments and string literals blanked, in ggml-sycl.cpp (H in prestage-class.hpp):
+  H. ggml_sycl_graph_node_is_computed (prestage-class.hpp), the one statement of the rule, tests
+     `(node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0`.
   P. ggml_sycl_is_noop, the predicate every dispatching walker consults, returns true for a node that is not
-     computed: `!ggml_sycl_node_is_computed(node) ||`.
+     computed: `!ggml_sycl_graph_node_is_computed(node) ||`.
   E1-E5. The walks that must keep views (ggml_sycl_is_noop is true for views) test the helper themselves:
      the block executor's two alias walks (ggml_sycl_probe_block_exec_runtime_context,
-     ggml_sycl_block_exec_publish_aliases) and extract_persistent_plan's recipe replay, fast path and full build.
+     ggml_sycl_block_exec_publish_aliases) skip an uncomputed node before they ask whether it needs a local output;
+     extract_persistent_plan's recipe replay looks each recipe node up through a lookup that answers null for an
+     uncomputed node and fails the replay on null; its fast path and full build skip an uncomputed node.
   B1. extract_persistent_plan's cached path compares the selection hash stored with the plan against the current
      graph's before it replays anything, and on a mismatch drops the plan and rebuilds. Without it, a node computed
      now but not when the plan was built (a token decode after embedding decodes) would never run.
@@ -23,10 +26,11 @@ With `#if 0` regions, comments and string literals blanked, in ggml-sycl.cpp:
      opt-in paths (GGML_SYCL_PERSISTENT_TG, GGML_SYCL_PERSISTENT_SPLIT) with no test vehicle: this contract is
      their gate.
   S. ggml_sycl_graph_signature mixes node->flags, so a graph recorded for one selection is not replayed for another.
-  W. Dispatch census: every function that calls ggml_sycl_compute_forward( also consults ggml_sycl_is_noop or
-     ggml_sycl_node_is_computed, unless WALKER_ALLOW names it with its reason. A dispatch helper counts as much as
-     a walker: its guard is the only protection for the loops in its callers.
-  W0. The census fails closed: every ggml_sycl_compute_forward( call must lie inside a function it parsed.
+  W. Dispatch census: every function that calls ggml_sycl_compute_forward( or the segment paths' dispatch helper
+     ggml_sycl_segment_forward_or_throw( also consults ggml_sycl_is_noop or ggml_sycl_graph_node_is_computed, unless
+     WALKER_ALLOW names it with its reason. A dispatch helper counts as much as a walker: its guard is the only
+     protection for the loops in its callers.
+  W0. The census fails closed: every call of either must lie inside a function it parsed.
   W1. The census has a floor (CENSUS_MIN_FUNCTIONS, CENSUS_MIN_GUARDED): losing a dispatch function to a parser
      miss or to blanking fails the contract instead of shrinking it.
 
@@ -42,24 +46,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SYCL = ROOT / "ggml/src/ggml-sycl"
 
-HELPER_SIG = "static inline bool ggml_sycl_node_is_computed(const ggml_tensor * node) {"
+HELPER_SIG = "static inline bool ggml_sycl_graph_node_is_computed(const ggml_tensor * node) {"
 NOOP_SIG = "static inline bool ggml_sycl_is_noop(const ggml_tensor * node) {"
 GRAPH_SIG = "static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph) {"
 SELECTION_SIG = "static uint64_t ggml_sycl_graph_selection_hash(const ggml_cgraph * cgraph) {"
 
 HELPER_TEST = re.compile(r"\(\s*node->flags\s*&\s*GGML_TENSOR_FLAG_COMPUTE\s*\)\s*!=\s*0")
-NOOP_TEST = re.compile(r"!\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*\|\|")
+# the rule is one disjunct of is_noop's answer, first or last
+NOOP_TEST = re.compile(r"!\s*ggml_sycl_graph_node_is_computed\(\s*node\s*\)\s*\|\||"
+                       r"\|\|\s*!\s*ggml_sycl_graph_node_is_computed\(\s*node\s*\)(?=\s*;)")
 FLAG_MIX = re.compile(r"\bmix\(\s*static_cast<uint64_t>\(\s*node->flags\s*\)\s*\)\s*;")
-ALIAS_TEST = re.compile(
-    r"!\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*\|\|\s*ggml_sycl_block_exec_node_needs_local_output\(\s*node\s*\)")
-RECIPE_TEST = re.compile(r"recipe_node\s*&&\s*!\s*ggml_sycl_node_is_computed\(\s*recipe_node\s*\)")
-FAST_TEST = re.compile(r"if\s*\(\s*!node\s*\|\|\s*!\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*\)")
-BUILD_TEST = re.compile(r"if\s*\(\s*node\s*&&\s*!\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*\)")
+SKIP_TEST = r"if\s*\(\s*!node\s*\|\|\s*!\s*ggml_sycl_graph_node_is_computed\(\s*node\s*\)\s*\)\s*\{\s*continue\s*;\s*\}"
+ALIAS_TEST = re.compile(SKIP_TEST + r"\s*if\s*\(\s*ggml_sycl_block_exec_node_needs_local_output\(\s*node\s*\)")
+# The replay's lookup answers null for an uncomputed node, and the replay fails on null.
+RECIPE_TEST = re.compile(r"node\s*&&\s*ggml_sycl_graph_node_is_computed\(\s*node\s*\)\s*\?\s*node\s*:\s*nullptr")
+RECIPE_USE = re.compile(r"ggml_tensor\s*\*\s*node\s*=\s*recipe_node\(\s*entry\s*\)\s*;\s*"
+                        r"if\s*\(\s*!node\s*\)\s*\{\s*recipe_ok\s*=\s*false\s*;")
+FAST_TEST = re.compile(r"if\s*\(\s*!node\s*\|\|\s*!\s*ggml_sycl_graph_node_is_computed\(\s*node\s*\)\s*\)")
+BUILD_TEST = FAST_TEST
 SELECTION_COMPARE = re.compile(r"kernel\.plan_selection_hash\(\)\s*!=\s*ggml_sycl_graph_selection_hash\(\s*cgraph\s*\)")
 SELECTION_STORE = re.compile(r"kernel\.set_plan_selection_hash\(\s*ggml_sycl_graph_selection_hash\(\s*cgraph\s*\)\s*\)")
-SELECTION_FOLD = re.compile(r"ggml_sycl_node_is_computed\(\s*node\s*\)")
-WALKER_GUARD = re.compile(r"\bggml_sycl_(?:is_noop|node_is_computed)\(")
-SPLIT_WEIGHTS = re.compile(r"node\s*&&\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*&&\s*node->op\s*==\s*GGML_OP_MUL_MAT")
+SELECTION_FOLD = re.compile(r"ggml_sycl_graph_node_is_computed\(\s*node\s*\)")
+WALKER_GUARD = re.compile(r"\bggml_sycl_(?:is_noop|graph_node_is_computed)\(")
+DISPATCH_CALL = re.compile(r"\bggml_sycl_(?:compute_forward|segment_forward_or_throw)\(")
+SPLIT_WEIGHTS = re.compile(SKIP_TEST + r"\s*if\s*\(\s*node->op\s*==\s*GGML_OP_MUL_MAT")
 SPLIT_CACHED_CALL = re.compile(r"if\s*\(\s*!\s*extract_persistent_plan\(\s*primary\s*,")
 SPLIT_REBUILT = re.compile(
     r"if\s*\(\s*!\s*primary\.has_cached_plan\(\)\s*\)\s*\{\s*(?:GGML_SYCL_DEBUG\([^;]*\);\s*)?"
@@ -79,6 +89,10 @@ WALKER_ALLOW = {
     "ggml_sycl_try_route_simple_consumer":
         "its only caller is ggml_sycl_compute_forward_impl, which hands it the dst it was asked to compute; that dst "
         "was already admitted by the walker that called ggml_sycl_compute_forward",
+    "ggml_sycl_segment_forward_or_throw":
+        "the segment paths' dispatch helper; its callers, moe_graph_record_segments and moe_graph_replay_segments, "
+        "hand it a segment node they filtered with ggml_sycl_is_noop or a MoE node of a layer pairing, which never "
+        "admits a node that is not computed; the census checks those callers as walkers",
 }
 
 
@@ -237,26 +251,26 @@ def functions(text):
 
 
 def walkers(text):
-    return [(name, b) for name, b in functions(text) if "ggml_sycl_compute_forward(" in b]
+    return [(name, b) for name, b in functions(text) if DISPATCH_CALL.search(b)]
 
 
 def stray_dispatch_calls(text):
-    """Line numbers of ggml_sycl_compute_forward( calls outside every function the census parsed. The census fails
-    closed on any: a parser miss must not hide a walker. Declarations and the definition do not count."""
+    """Line numbers of dispatch calls outside every function the census parsed. The census fails closed on any: a
+    parser miss must not hide a walker. Declarations and the definitions do not count."""
     bodies = [(lo, hi) for _, lo, hi in function_spans(text)]
     stray = []
-    for m in re.finditer(r"\bggml_sycl_compute_forward\(", text):
+    for m in DISPATCH_CALL.finditer(text):
         if any(lo <= m.start() < hi for lo, hi in bodies):
             continue
         line_start = text.rfind("\n", 0, m.start()) + 1
-        if re.fullmatch(r"\s*(?:static\s+)?(?:inline\s+)?bool\s*", text[line_start:m.start()]):
+        if re.fullmatch(r"\s*(?:static\s+)?(?:inline\s+)?(?:bool|void)\s*", text[line_start:m.start()]):
             continue
         stray.append(text.count("\n", 0, m.start()) + 1)
     return stray
 
 
-def claims(sycl):
-    helper = body(sycl, HELPER_SIG)
+def claims(sycl, prestage):
+    helper = body(prestage, HELPER_SIG)
     noop = body(sycl, NOOP_SIG)
     sig = body(sycl, GRAPH_SIG)
     sel = body(sycl, SELECTION_SIG)
@@ -278,13 +292,14 @@ def claims(sycl):
     n_guarded = sum(1 for _, b in found if WALKER_GUARD.search(b))
     stray = stray_dispatch_calls(sycl)
     return {
-        "H ggml_sycl_node_is_computed tests GGML_TENSOR_FLAG_COMPUTE != 0": HELPER_TEST.search(helper) is not None,
+        "H ggml_sycl_graph_node_is_computed tests GGML_TENSOR_FLAG_COMPUTE != 0": HELPER_TEST.search(helper) is not None,
         "P ggml_sycl_is_noop is true for a node that is not computed": NOOP_TEST.search(noop) is not None,
         "E1 ggml_sycl_probe_block_exec_runtime_context alias walk tests the helper":
             probe is not None and ALIAS_TEST.search(sycl[probe[0]:probe[1]]) is not None,
         "E2 ggml_sycl_block_exec_publish_aliases tests the helper":
             aliases is not None and ALIAS_TEST.search(sycl[aliases[0]:aliases[1]]) is not None,
-        "E3 extract_persistent_plan recipe replay tests the helper": RECIPE_TEST.search(cached) is not None,
+        "E3 extract_persistent_plan recipe replay tests the helper":
+            RECIPE_TEST.search(cached) is not None and RECIPE_USE.search(cached) is not None,
         "E4 extract_persistent_plan fast path tests the helper": FAST_TEST.search(cached) is not None,
         "E5 extract_persistent_plan full build tests the helper": BUILD_TEST.search(build) is not None,
         "B1 extract_persistent_plan compares the stored selection hash before it replays": compare_ok,
@@ -302,8 +317,8 @@ def claims(sycl):
     }
 
 
-def check(sycl):
-    return [name for name, ok in claims(sycl).items() if not ok]
+def check(sycl, prestage):
+    return [name for name, ok in claims(sycl, prestage).items() if not ok]
 
 
 def mutate_span(text, s, pattern, repl):
@@ -383,7 +398,8 @@ def split_rebuilt_span(sycl):
     return (m.start(), m.end()) if m else None
 
 
-def mutants(sycl, raw):
+def mutants(sycl, raw, prestage):
+    """Each mutant as (ggml-sycl.cpp text, prestage-class.hpp text); only the helper's own mutant edits the header."""
     guarded = [name for name, b in walkers(sycl) if WALKER_GUARD.search(b)]
     victim = "moe_graph_replay_segments" if "moe_graph_replay_segments" in guarded else (guarded[0] if guarded else "")
     victim_span = function_span(sycl, victim) if victim else None
@@ -391,21 +407,20 @@ def mutants(sycl, raw):
     if victim_span:
         stripped = WALKER_GUARD.sub("ggml_sycl_guard_removed(", sycl[victim_span[0]:victim_span[1]])
         strip_guards = sycl[:victim_span[0]] + stripped + sycl[victim_span[1]:]
-    return {
+    skip_dropped = re.compile(r"\|\|\s*!\s*ggml_sycl_graph_node_is_computed\(\s*node\s*\)")
+    texts = {
         "flag test removed from ggml_sycl_is_noop": mutate_in_body(sycl, NOOP_SIG, NOOP_TEST, ""),
         "flag test inverted in ggml_sycl_is_noop": mutate_in_body(
-            sycl, NOOP_SIG, re.compile(r"!\s*(ggml_sycl_node_is_computed\(\s*node\s*\)\s*\|\|)"), r"\1"),
-        "flag test inverted in ggml_sycl_node_is_computed": mutate_in_body(
-            sycl, HELPER_SIG, re.compile(r"(\(\s*node->flags\s*&\s*GGML_TENSOR_FLAG_COMPUTE\s*\)\s*)!=(\s*0)"),
-            r"\1==\2"),
+            sycl, NOOP_SIG, re.compile(r"!\s*(ggml_sycl_graph_node_is_computed\(\s*node\s*\))"), r"\1"),
         "helper test removed from ggml_sycl_probe_block_exec_runtime_context": mutate_span(
-            sycl, function_span(sycl, "ggml_sycl_probe_block_exec_runtime_context"),
-            re.compile(r"!\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*\|\|"), ""),
+            sycl, function_span(sycl, "ggml_sycl_probe_block_exec_runtime_context"), skip_dropped, ""),
         "helper test removed from ggml_sycl_block_exec_publish_aliases": mutate_span(
-            sycl, function_span(sycl, "ggml_sycl_block_exec_publish_aliases"),
-            re.compile(r"!\s*ggml_sycl_node_is_computed\(\s*node\s*\)\s*\|\|"), ""),
-        "helper test removed from the persistent recipe replay": mutate_span(
-            sycl, persistent_span(sycl, "cached"), RECIPE_TEST, "false"),
+            sycl, function_span(sycl, "ggml_sycl_block_exec_publish_aliases"), skip_dropped, ""),
+        "helper test removed from the persistent recipe replay's lookup": mutate_span(
+            sycl, persistent_span(sycl, "cached"), RECIPE_TEST, "node"),
+        "the persistent recipe replay runs on a null lookup": mutate_span(
+            sycl, persistent_span(sycl, "cached"), re.compile(r"if\s*\(\s*!node\s*\)\s*\{\s*recipe_ok\s*=\s*false\s*;"),
+            "if (false) { recipe_ok = false;"),
         "helper test removed from the persistent fast path": mutate_span(
             sycl, persistent_span(sycl, "cached"), FAST_TEST, "if (!node)"),
         "helper test removed from the persistent full build": mutate_span(
@@ -424,21 +439,27 @@ def mutants(sycl, raw):
             re.compile(r"\|\|\s*ggml_sycl_is_noop\(\s*node\s*\)"), ""),
         "selection hash compare wrapped in #if 0": disable_selection_compare(sycl, raw),
         "computed test removed from the split weight list": mutate_span(
-            sycl, function_span(sycl, "extract_persistent_plan_split"),
-            re.compile(r"ggml_sycl_node_is_computed\(\s*node\s*\)\s*&&"), ""),
+            sycl, function_span(sycl, "extract_persistent_plan_split"), skip_dropped, ""),
         "rebuilt-plan test removed from the cached split path": mutate_span(
             sycl, split_rebuilt_span(sycl), re.compile(r"!\s*primary\.has_cached_plan\(\)"), "false"),
         "guarded moe_graph_dispatch_direct_node wrapped whole in #if 0 (the census loses it)":
             function_disabled(sycl, raw, "moe_graph_dispatch_direct_node"),
     }
+    out = {name: (text, prestage) for name, text in texts.items()}
+    out["flag test inverted in ggml_sycl_graph_node_is_computed"] = (sycl, mutate_in_body(
+        prestage, HELPER_SIG, re.compile(r"(\(\s*node->flags\s*&\s*GGML_TENSOR_FLAG_COMPUTE\s*\)\s*)!=(\s*0)"),
+        r"\1==\2"))
+    return out
 
 
 def main():
     raw = (SYCL / "ggml-sycl.cpp").read_text()
     sycl = prepare(raw)
-    failed = check(sycl)
+    prestage = prepare((SYCL / "prestage-class.hpp").read_text())
+    failed = check(sycl, prestage)
     found = walkers(sycl)
-    print("compute flag source contract: dispatch census: %d functions call ggml_sycl_compute_forward "
+    print("compute flag source contract: dispatch census: %d functions call ggml_sycl_compute_forward or "
+          "ggml_sycl_segment_forward_or_throw "
           "(%d guarded, %d allowlisted): %s" %
           (len(found), sum(1 for _, b in found if WALKER_GUARD.search(b)),
            sum(1 for n, b in found if not WALKER_GUARD.search(b) and n in WALKER_ALLOW),
@@ -456,17 +477,17 @@ def main():
             if text == sycl:
                 print(f"compute flag source contract: control '{name}' did not apply", file=sys.stderr)
                 return 1
-            broken = check(text)
+            broken = check(text, prestage)
             if broken or len(walkers(text)) != len(found):
                 print(f"compute flag source contract: control '{name}' failed: census %d, %s" %
                       (len(walkers(text)), "; ".join(broken)), file=sys.stderr)
                 return 1
             print(f"compute flag source contract: control '{name}' still passes (census %d)" % len(walkers(text)))
-        for name, text in mutants(sycl, raw).items():
-            if text == sycl:
+        for name, (text, header) in mutants(sycl, raw, prestage).items():
+            if text == sycl and header == prestage:
                 print(f"compute flag source contract: mutant '{name}' did not apply", file=sys.stderr)
                 return 1
-            if not check(text):
+            if not check(text, header):
                 print(f"compute flag source contract: mutant '{name}' was not caught", file=sys.stderr)
                 return 1
             print(f"compute flag source contract: mutant '{name}' caught")

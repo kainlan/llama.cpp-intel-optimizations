@@ -90,6 +90,7 @@ CACHE_HPP_REL = "ggml/src/ggml-sycl/unified-cache.hpp"
 ROOM_COST_REL = "ggml/src/ggml-sycl/kv-room-cost.hpp"
 FATTN_REL = "ggml/src/ggml-sycl/fattn.cpp"
 BENCH_REL = "tools/llama-bench/llama-bench.cpp"
+TOOL_REL = "tools/sycl-plan-dry-run/sycl-plan-dry-run.cpp"
 
 
 def read_or_empty(rel: str) -> str:
@@ -108,6 +109,7 @@ SYCL = read(SYCL_REL)
 CACHE = read(CACHE_REL)
 CACHE_HPP = read(CACHE_HPP_REL)
 ROOM_COST = read_or_empty(ROOM_COST_REL)
+TOOL = read(TOOL_REL)
 # Every C/C++ source of the SYCL backend, by path from the repository root: where a second reader of the provenance
 # would hide.
 BACKEND_TREE = {
@@ -205,8 +207,11 @@ def claim_api_defines_the_default(llama_h: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
-               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
+# common maps -c to the hint in one function, which common_model_params_to_llama and every tool that takes -c ask, so
+# the sentinel keeps one setter (llama.cpp-h187: the plan dry run mapped -c itself).
+COMMON_HINT_SIG = "uint32_t common_n_ctx_hint(int32_t n_ctx)"
+COMMON_HINT = "return n_ctx > 0 ? (uint32_t) n_ctx : n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;"
+COMMON_HINT_CALL = "mparams.n_ctx_hint = common_n_ctx_hint(params.n_ctx);"
 COMMON_FIT = "common_fit_params(params.model.get_paths(), &mparams, &cparams,"
 COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = common_model_load(params.model.get_paths(), mparams);"
@@ -221,7 +226,9 @@ def claim_common_asks_for_the_default(common: str) -> bool:
     signed -c gates the refresh. Those are the only two setters."""
     n = norm(common)
     b = body(n, COMMON_SIG)
-    return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
+    hint = body(n, COMMON_HINT_SIG)
+    return (bool(b) and bool(hint) and hint == "{ " + COMMON_HINT + " }" and COMMON_HINT_CALL in b
+            and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
             and n.count("mparams.n_ctx_hint =") == 2 and n.count(SENTINEL) == 1)
 
 
@@ -276,7 +283,7 @@ PICK_DEFAULT = "inventory.n_ctx_context_is_default = ctx_room.is_default;"
 def claim_loader_resolves_once(model: str) -> bool:
     """llama-model.cpp resolves the hint in exactly one place, where it fills the inventory, and copies both the
     context and its provenance; it neither resolves the hint itself nor calls the resolver anywhere else. The load
-    measures reach the same resolver through llama_load_measure_request_n_ctx (src/llama-load-measure.h), not through
+    measures reach the same resolver through llama_load_measure_shape_resolve (src/llama-load-measure.h), not through
     a second call in this file."""
     m = norm(model)
     pop = body(m, POPULATE_SIG)
@@ -340,40 +347,70 @@ def claim_sentinel_has_one_reader(tree: dict[str, str], value_tree: dict[str, st
     return counts == SENTINEL_OWNERS and backend_never_spells_the_value(value_tree)
 
 
+TOOL_MAIN_SIG = "int main(int argc, char ** argv)"
+TOOL_HINT = "params.n_ctx_hint = common_n_ctx_hint(args.n_ctx);"
+# Every write to the hint: plain and compound assignment, and increment or decrement either side of it.
+HINT_WRITE_RE = re.compile(r"\bn_ctx_hint\s*(?:<<|>>|[-+*/%|&^])?=(?!=)"
+                           r"|\bn_ctx_hint\s*(?:\+\+|--)"
+                           r"|(?:\+\+|--)\s*(?:\w+\s*(?:\.|->)\s*)*n_ctx_hint\b")
+
+
+def claim_tool_asks_common(tool: str) -> bool:
+    """The plan dry run keeps -c as given and maps it to the load's hint by asking common_n_ctx_hint, in main, and
+    writes the hint nowhere else in the tool: a raw cast would plan no room for the default context (0 is not the
+    sentinel) and a negative -c would plan a context of four billion cells (llama.cpp-h187). The args test checks the
+    mapping only by calling common, so this is the tool's one witness."""
+    n = norm(tool)
+    main = body(n, TOOL_MAIN_SIG)
+    return bool(main) and TOOL_HINT in main and len(HINT_WRITE_RE.findall(n)) == 1
+
+
 # ---- the backend ----------------------------------------------------------------------------------------------------
 
 
 INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
-# The named micro-batch follows the provenance, in its padding (test-sycl-explicit-ubatch-placement-source), and the
-# slot-to-layer map follows that (test-sycl-kv-slot-layer-source): the size grew, the provenance did not move.
+# libllama's resolved storage inputs follow the provenance, in its padding (test-sycl-mapped-loader-source pins their
+# offsets), the named micro-batch follows them (test-sycl-explicit-ubatch-placement-source), the lazy tables are
+# appended after it (th32 §4.1), with the measured micro-batch in their padding (test-sycl-load-measure-source), and
+# the slot-to-layer map follows that (test-sycl-kv-slot-layer-source): the size grew, the provenance did not move.
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
-            "bool n_ctx_context_is_default; uint32_t n_ubatch_context; const int32_t * kv_layer_phys; "
-            "uint32_t kv_layer_phys_count; }")
+            "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
+            "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
+            "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
+            "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }")
 SIZE_PINS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 224,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
 )
 FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
             "const ggml_sycl_tensor_inventory * inventory)")
-COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
-COPY_DEFAULT = "g_placement_kv_info.n_ctx_context_is_default = inventory->n_ctx_context_is_default;"
+# The stage fills g_placement_kv_info through the one KV intake the plan dry run also uses (llama.cpp-4zup), so the copy
+# is written once, in the intake, over the KV inputs it is handed.
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory)")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
+COPY_DEFAULT = "kv.n_ctx_context_is_default = inventory->n_ctx_context_is_default;"
 KV_FIELD = "bool n_ctx_context_is_default = false;"
 
 
 def claim_backend_carries_the_source(sycl_h: str, sycl: str, cache_hpp: str) -> bool:
-    """The provenance is appended after the indexer widths (the named micro-batch and the slot-to-layer map follow it),
-    with the size pins moved to match; the backend copies it once, next to the context, into a KV input that defaults
-    to a named context."""
+    """The provenance is appended after the indexer widths (libllama's storage inputs, the named micro-batch, the lazy
+    tables and the slot-to-layer map follow it), with the size pins moved to match; the backend copies it once, next to
+    the context, into a KV input that defaults to a named context: the copy is in the KV intake, and the stage hands the
+    intake g_placement_kv_info."""
     h = norm(sycl_h)
     at = h.find(INVENTORY_STRUCT)
     inv = body(h[at:], "struct ggml_sycl_tensor_inventory") if at >= 0 else ""
     s = norm(sycl)
     fill = body(s, FILL_SIG)
+    intake = body(s, INTAKE_SIG)
     hpp = norm(cache_hpp)
     kv_at = hpp.find("struct placement_kv_info {")
     kv = body(hpp[kv_at:], "struct placement_kv_info") if kv_at >= 0 else ""
-    return (inv.endswith(INV_TAIL) and all(p in s for p in SIZE_PINS) and bool(fill)
-            and ordered(fill, COPY_CTX, COPY_DEFAULT) and s.count(COPY_DEFAULT) == 1 and KV_FIELD in kv)
+    return (inv.endswith(INV_TAIL) and all(p in s for p in SIZE_PINS) and bool(fill) and INTAKE_CALL in fill
+            and bool(intake) and ordered(intake, COPY_CTX, COPY_DEFAULT) and s.count(COPY_DEFAULT) == 1
+            and KV_FIELD in kv)
 
 
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
@@ -439,6 +476,24 @@ def claim_default_only_refuses(tree: dict[str, str]) -> bool:
             and RATE_RULE in rate and HOLD_IFF in body(cost, WEIGH_SIG) and body(cost, WEIGH_SIG).count("priced") == 1)
 
 
+SHARED_CTX_SIG = ("static uint32_t bench_shared_load_n_ctx(const std::vector<cmd_params_instance> & instances, "
+                  "size_t i) {")
+SHARED_CTX_HINT = "mparams.n_ctx_hint = bench_shared_load_n_ctx(params_instances, params_idx - 1);"
+
+
+def claim_bench_tells_the_largest_shared_context(bench: str) -> bool:
+    """A reused model's compute term is measured at the context its load was told, so llama-bench tells it the
+    largest context of the consecutive instances that share it."""
+    if SHARED_CTX_SIG not in bench:
+        return False
+    fn = bench[bench.index("static uint32_t bench_shared_load_n_ctx("):]
+    fn = fn[: fn.index("\n}\n")]
+    if "instances[j].equal_mparams(instances[i])" not in fn or "std::max(n_ctx, instances[j].n_ctx())" not in fn:
+        return False
+    loop = bench[bench.index("auto mparams = inst.to_llama_mparams();"):]
+    return SHARED_CTX_HINT in loop and loop.index(SHARED_CTX_HINT) < loop.index("if (do_fit) {")
+
+
 # ---- the claims hold on the tree ------------------------------------------------------------------------------------
 
 
@@ -466,6 +521,10 @@ def test_sentinel_has_one_reader():
     assert claim_sentinel_has_one_reader(TREE, VALUE_TREE)
 
 
+def test_tool_asks_common():
+    assert claim_tool_asks_common(TOOL)
+
+
 def test_backend_carries_the_source():
     assert claim_backend_carries_the_source(SYCL_H, SYCL, CACHE_HPP)
 
@@ -476,6 +535,10 @@ def test_room_lines_name_the_default():
 
 def test_default_only_refuses():
     assert claim_default_only_refuses(BACKEND_TREE)
+
+
+def test_bench_tells_the_load_the_largest_shared_context():
+    assert claim_bench_tells_the_largest_shared_context(read(BENCH_REL))
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -522,15 +585,20 @@ def test_mutant_api_field_undocumented_fails():
 def test_mutant_common_keeps_zero_without_c_fails():
     """master's line: without -c the hint is 0 and no room is held for the context llama then creates."""
     assert not claim_common_asks_for_the_default(
-        _once(COMMON, COMMON_HINT, "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"))
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : 0;"))
 
 
 def test_mutant_common_negative_c_asks_for_the_default_fails():
     """A negative -c, which names no context, asks for the default: the load would hold the training context's room
     for a context llama_context cannot create."""
     assert not claim_common_asks_for_the_default(
-        _once(COMMON, COMMON_HINT,
-              "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
+        _once(COMMON, COMMON_HINT, "return n_ctx > 0 ? (uint32_t) n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
+
+
+def test_mutant_common_load_skips_the_mapping_fails():
+    """common_model_params_to_llama sets the hint some other way: the mapping is still right, and unasked."""
+    assert not claim_common_asks_for_the_default(
+        _once(COMMON, COMMON_HINT_CALL, "mparams.n_ctx_hint = (uint32_t) params.n_ctx;"))
 
 
 def test_mutant_common_fit_refresh_unguarded_fails():
@@ -674,6 +742,32 @@ def test_mutant_bench_asks_for_the_default_fails():
     assert not claim_sentinel_has_one_reader(_tree_with(BENCH_REL, text), VALUE_TREE)
 
 
+def test_mutant_bench_tells_the_first_context_fails():
+    """The load is told the first instance's own context instead of the largest of the run that shares it."""
+    bench = read(BENCH_REL)
+    assert SHARED_CTX_HINT in bench
+    text = bench.replace(SHARED_CTX_HINT, "mparams.n_ctx_hint = inst.n_ctx();", 1)
+    assert not claim_bench_tells_the_largest_shared_context(text)
+
+
+def test_mutant_bench_shared_context_ignores_the_run_fails():
+    """The helper stops widening over the instances that share the model."""
+    bench = read(BENCH_REL)
+    assert "std::max(n_ctx, instances[j].n_ctx())" in bench
+    text = bench.replace("std::max(n_ctx, instances[j].n_ctx())", "n_ctx", 1)
+    assert not claim_bench_tells_the_largest_shared_context(text)
+
+
+def test_mutant_bench_hint_after_the_fit_fails():
+    """The hint is set after the fit branch instead of before it."""
+    bench = read(BENCH_REL)
+    assert SHARED_CTX_HINT in bench
+    anchor = "// keep the same model between tests when possible"
+    assert anchor in bench
+    text = bench.replace(SHARED_CTX_HINT, "", 1).replace(anchor, SHARED_CTX_HINT + "\n        " + anchor, 1)
+    assert not claim_bench_tells_the_largest_shared_context(text)
+
+
 def test_mutant_resolver_without_the_sentinel_fails():
     """The resolver stops spelling the sentinel (it resolves nothing): the owner set no longer matches."""
     tree = dict(TREE)
@@ -685,6 +779,38 @@ def _value_tree_with(rel: str, text: str) -> dict[str, str]:
     tree = dict(VALUE_TREE)
     tree[rel] = text
     return tree
+
+
+def test_mutant_tool_casts_c_itself_fails():
+    """The tool hands -c to the load as a raw cast instead of asking common."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, "params.n_ctx_hint = (uint32_t) args.n_ctx;"))
+
+
+def test_mutant_tool_overwrites_the_hint_fails():
+    """The tool asks common, then sets the hint a second time."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint = 0;"))
+
+
+def test_mutant_tool_adjusts_the_hint_after_asking_fails():
+    """The tool asks common, then adjusts the hint with a compound assignment."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint += 1;"))
+
+
+def test_mutant_tool_increments_the_hint_after_asking_fails():
+    """The tool asks common, then increments the hint."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " params.n_ctx_hint++;"))
+
+
+def test_mutant_tool_decrements_the_hint_before_use_fails():
+    """The tool asks common, then pre-decrements the hint."""
+    assert not claim_tool_asks_common(_once(TOOL, TOOL_HINT, TOOL_HINT + " --params.n_ctx_hint;"))
+
+
+def test_mutant_tool_asks_outside_main_fails():
+    """The call moves out of main into a helper nothing calls, and main leaves the default hint."""
+    text = _once(TOOL, TOOL_HINT, "") + "\nstatic void h187_mutant(llama_model_params & params, " \
+        "const sycl_plan_dry_run_args & args) { " + TOOL_HINT + " }\n"
+    assert not claim_tool_asks_common(text)
 
 
 def test_mutant_backend_compares_the_context_to_all_ones_fails():
@@ -711,9 +837,14 @@ def test_mutant_backend_drops_the_provenance_fails():
     assert not claim_backend_carries_the_source(SYCL_H, _once(SYCL, COPY_DEFAULT, ""), CACHE_HPP)
 
 
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the copy still exists, and reaches no KV input."""
+    assert not claim_backend_carries_the_source(SYCL_H, _once(SYCL, INTAKE_CALL, ""), CACHE_HPP)
+
+
 def test_mutant_inventory_without_the_field_fails():
     assert not claim_backend_carries_the_source(
-        _once(SYCL_H, "bool n_ctx_context_is_default; uint32_t n_ubatch_context;", "uint32_t n_ubatch_context;"),
+        _once(SYCL_H, "bool n_ctx_context_is_default; bool use_mmap_resolved;", "bool use_mmap_resolved;"),
         SYCL, CACHE_HPP)
 
 
@@ -724,7 +855,7 @@ def test_mutant_size_pin_not_moved_fails():
 
 def test_mutant_provenance_inserted_mid_struct_fails():
     """Inserted before the indexer widths instead of appended: every pinned offset after it moves."""
-    h = _once(SYCL_H, "bool n_ctx_context_is_default; uint32_t n_ubatch_context;", "uint32_t n_ubatch_context;")
+    h = _once(SYCL_H, "bool n_ctx_context_is_default; bool use_mmap_resolved;", "bool use_mmap_resolved;")
     tail = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer;"
     assert h.count(tail) == 1
     h = h.replace(tail, tail.replace("n_ctx_context;", "n_ctx_context; bool n_ctx_context_is_default;"), 1)

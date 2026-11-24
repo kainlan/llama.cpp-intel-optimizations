@@ -1149,7 +1149,39 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
   The failure is first seen in `ggml_backend_synchronize`, which cannot return a status, so the outputs of the graph
   that failed (its logits or embeddings, and a token sampled from them) reach the caller before the next
   `llama_decode` reports it. Treat every output read after the error line as invalid, and create a new context: a
-  failed context never computes again. A context created after the failure starts clean.
+  failed context never computes again. A context created after the failure starts clean. A lost device is the
+  exception: the process then ends with status 69 (next subsection).
+
+### Exit status 69 after a device loss
+
+When the backend records a lost device, it prints `[SYCL-FATAL] device lost: ...`. From then on the process ends
+with status 69 at its next failed SYCL check, or when it exits. A site that cannot continue after a loss ends the
+process at once, with its own `[SYCL-FATAL] <function>:` line and the same status. A `ggml_backend_synchronize`
+whose drain fails after the loss is such a check: it prints its `[SYCL-SYNC-DIAG]` line and then
+`[SYCL-FATAL] SYCL_CHECK failed after a device loss`, before the context's cleanup would drain the lost card. A
+drain that fails for any other reason is latched and reported as above, and the process runs on.
+
+No teardown runs on the way out. Only when the process leaves through a normal exit do exit handlers registered after
+the loss still run first. On a lost card the driver's teardown can hang, and the process would then hold its memory
+and the card until it was killed.
+
+This has consequences for a normal exit after the loss:
+
+- The process exits with status 69, whatever `main` returned or `exit()` was given. This also happens when only a
+  start-up probe saw the loss and the run then finished on another card or on the CPU.
+- Exit handlers and static destructors that were registered before the loss do not run. That covers the
+  application's own and the backend's own, such as the CPU worker shutdown and the end-of-run dumps (the counter
+  dump, the alloc-trace dump and the mem-copy census).
+- Log lines still queued in the application's logger are lost.
+- C stdio streams (`FILE *`) are flushed first, so output already written through them reaches its file. A C++ file
+  stream that is still open loses what its buffer holds.
+
+Read status 69 as "the device was lost". It means that even when the run's output was complete.
+
+After such an exit, wait a few seconds before starting another process on the same card. A process started about one
+second after a fast exit on a healthy card has been seen to hang on its first copy, and the kernel reset the card
+about 35 seconds later. This applies to an exit with status 1 as well: the backend leaves the same way when an
+operation fails for a reason other than a lost device.
 
 ## Runtime Allocation Policy
 

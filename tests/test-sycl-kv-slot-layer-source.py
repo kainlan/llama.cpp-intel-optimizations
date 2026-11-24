@@ -8,13 +8,15 @@ their own, fell to the host tier, and their attention ran on the CPU, while the 
 
 The fix this gate pins:
   - libllama names the weight layer of each slot (llama_model::layer_phys, the identity unless a looped model
-    overrides it) and hands the map to the backend in the inventory, one entry per slot; the struct grew from 192 to
-    208 bytes, appended, so no existing offset moved, and both sides pin the layout; every model whose source aliases
-    one slot's layer to another's (layers[a] = layers[b]) overrides it;
-  - the backend takes the map once, at intake: only with one entry per slot and every entry a weight layer id below
-    the slot count, otherwise it plans every slot as its own layer and says so at WARN; an identity map is kept empty,
-    so a model whose slots are its layers plans and prints exactly as before. The backend computes no map of its own,
-    and the residency hook still answers for the slot libllama asks about;
+    overrides it) and hands the map to the backend in the inventory, one entry per slot; the map is the struct's last
+    field, appended after the lazy tables and the measured micro-batch, which grew it from 192 to 208 bytes, and it grew
+    the struct from 208 to 224 bytes, so no existing offset moved, and both sides pin the layout; every model whose
+    source aliases one slot's layer to another's (layers[a] = layers[b]) overrides it;
+  - the backend takes the map once, in the KV intake the stage and the plan dry run share: only with one entry per
+    slot and every entry a weight layer id below the slot count, otherwise it plans every slot as its own layer and the
+    stage says so at WARN; an identity map is kept empty, so a model whose slots are its layers plans and prints exactly
+    as before. The backend computes no map of its own, and the residency hook still answers for the slot libllama asks
+    about;
   - the planner keys KV by slot: each layer is charged for every slot it executes, a slot's KV goes where its layer's
     weights are (the single-device KV phase decides slot by slot, in slot order, and a host layer's slots are host
     slots), the multi-device planner and its blocks move and count a layer's slots with the layer, and the block
@@ -123,7 +125,9 @@ ARRAYS_FILL = "out.phys[il] = model.layer_phys((int) il);"
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory & inventory,"
 POPULATE_SET = ("inventory.kv_layer_phys = kv_layer_phys; "
                 "inventory.kv_layer_phys_count = kv_layer_phys != nullptr ? n_layer : 0;")
-CALLER_PASSES = "kv_layer_arrays.idx_k_width.get(), kv_layer_arrays.phys.get(), total_size,"
+# The early builder reads its arrays from its `out` record, the late one from locals: either form passes the map.
+CALLER_PASSES = re.compile(r"(?:out\.)?kv_layer_arrays\.idx_k_width\.get\(\), (?:out\.)?kv_layer_arrays\.phys\.get\(\), "
+                           r"(?:out\.)?total_size,")
 
 
 def claim_libllama_names_each_slots_layer(model_h: str, models_h: str, model: str) -> bool:
@@ -135,7 +139,7 @@ def claim_libllama_names_each_slots_layer(model_h: str, models_h: str, model: st
     m = norm(model)
     return (BASE_LAYER_PHYS in norm(model_h) and LOOP_OVERRIDE in loop
             and ARRAYS_FILL in body(m, ARRAYS_SIG) and POPULATE_SET in body(m, POPULATE_SIG)
-            and m.count(CALLER_PASSES) == 2)
+            and len(CALLER_PASSES.findall(m)) == 2)
 
 
 MODEL_SRCS = {p.name: p.read_text() for p in sorted((ROOT / "src" / "models").glob("*.cpp"))}
@@ -181,12 +185,13 @@ def claim_every_aliasing_model_names_its_layers(models_h: str, model_srcs: dict)
 
 
 INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
-INV_TAIL = "uint32_t n_ubatch_context; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }"
+INV_TAIL = "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }"
 HEADER_PINS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 224,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,",
-    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 192,",
-    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 200,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 208,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 216,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204,",
 )
 BACKEND_PINS = HEADER_PINS + (
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
@@ -197,7 +202,7 @@ BACKEND_PINS = HEADER_PINS + (
 
 
 def claim_map_is_appended_and_pinned(sycl_h: str, sycl: str) -> bool:
-    """The map ends the struct, after the named micro-batch, and both sides of the dlopen boundary pin the new size and
+    """The map ends the struct, after the measured micro-batch, and both sides of the dlopen boundary pin the new size and
     every offset that existed before it, so growing the struct moved nothing."""
     h = norm(sycl_h)
     at = h.find(INVENTORY_STRUCT)
@@ -211,8 +216,14 @@ def claim_map_is_appended_and_pinned(sycl_h: str, sycl: str) -> bool:
 
 FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
             "const ggml_sycl_tensor_inventory * inventory)")
-INTAKE_CALL = "ggml_sycl::placement_kv_layer_phys_from_inventory(*inventory);"
-INTAKE_COPY = "g_placement_kv_info.layer_phys = phys.layer_phys;"
+# The KV intake the stage and the plan dry run share writes the map; the stage reads the intake again, after it, only
+# to say what was taken.
+KV_FILL_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+               "const ggml_sycl_tensor_inventory * inventory)")
+KV_FILL_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+INTAKE_CALL = ("const ggml_sycl::placement_kv_layer_phys_intake phys = "
+               "ggml_sycl::placement_kv_layer_phys_from_inventory(*inventory);")
+INTAKE_COPY = "kv.layer_phys = ggml_sycl::placement_kv_layer_phys_from_inventory(*inventory).layer_phys;"
 REFUSED_WARN = '"[SYCL-PLAN] KV slot map ignored: kv_layer_phys_count=%u kv_layer_count=%u%s;'
 REFUSED_COST = "\"as its own layer (a looped model's repeated slots go to the host tier)\\n\""
 INTAKE_SIG = ("placement_kv_layer_phys_intake placement_kv_layer_phys_from_inventory("
@@ -236,10 +247,12 @@ def claim_backend_takes_the_map_once(sycl: str, cache: str, kv_cache: str) -> bo
     answers for the slot libllama asks about."""
     s = norm(sycl)
     fill = body(s, FILL_SIG)
+    kv_fill = body(s, KV_FILL_SIG)
     intake = body(norm(cache), INTAKE_SIG)
     hook = body(s, HOOK_SIG)
-    return (bool(fill) and ordered(fill, INTAKE_CALL, INTAKE_COPY, REFUSED_WARN, REFUSED_COST)
-            and s.count(INTAKE_CALL) == 1 and len(re.findall(r"\.layer_phys = ", s)) == 1
+    return (bool(fill) and ordered(fill, KV_FILL_CALL, INTAKE_CALL, REFUSED_WARN, REFUSED_COST)
+            and INTAKE_COPY in kv_fill and s.count(INTAKE_CALL) == 1
+            and s.count("placement_kv_layer_phys_from_inventory(") == 2 and len(re.findall(r"\.layer_phys = ", s)) == 1
             and bool(intake) and ordered(intake, NO_MAP, COUNT_CHECK, IDENTITY_EMPTY, RANGE_CHECK, ACCEPT)
             and bool(hook) and HOOK_ANSWER in hook and HOOK_ASK in norm(kv_cache))
 
@@ -423,21 +436,21 @@ def test_mutant_one_builder_drops_the_map_fails():
     """The late inventory without the map: the late plan, the one the residency hook answers from, keys by layer."""
     n = norm(MODEL)
     at = n.find("static void llama_model_sycl_set_late_inventory(")
-    k = n.find(CALLER_PASSES, at)
-    assert at >= 0 and k >= 0
-    mutant = n[:k] + "kv_layer_arrays.idx_k_width.get(), nullptr, total_size," + n[k + len(CALLER_PASSES):]
+    m = CALLER_PASSES.search(n, at) if at >= 0 else None
+    assert m is not None
+    mutant = n[:m.start()] + "kv_layer_arrays.idx_k_width.get(), nullptr, total_size," + n[m.end():]
     assert not claim_libllama_names_each_slots_layer(MODEL_H, MODELS_H, mutant)
 
 
 def test_mutant_map_inserted_before_the_micro_batch_fails():
-    """Inserted instead of appended: n_ubatch_context would move from the offset the consumer reads."""
-    h = _once(SYCL_H, "uint32_t n_ubatch_context; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }",
-              "const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; uint32_t n_ubatch_context; }")
+    """Inserted instead of appended: n_ubatch_measure would move from the offset the consumer reads."""
+    h = _once(SYCL_H, "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }",
+              "const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; uint32_t n_ubatch_measure; }")
     assert not claim_map_is_appended_and_pinned(h, SYCL)
 
 
-def test_mutant_backend_size_pin_left_at_192_fails():
-    mutant = _once(SYCL, BACKEND_PINS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,")
+def test_mutant_backend_size_pin_left_at_208_fails():
+    mutant = _once(SYCL, BACKEND_PINS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,")
     assert not claim_map_is_appended_and_pinned(SYCL_H, mutant)
 
 
@@ -447,7 +460,7 @@ def test_mutant_header_offset_unpinned_fails():
 
 def test_mutant_backend_copies_the_raw_map_fails():
     """The map copied as given, past the intake: a map of the wrong length is read past its end."""
-    mutant = _once(SYCL, INTAKE_COPY, "g_placement_kv_info.layer_phys.assign(inventory->kv_layer_phys, "
+    mutant = _once(SYCL, INTAKE_COPY, "kv.layer_phys.assign(inventory->kv_layer_phys, "
                    "inventory->kv_layer_phys + inventory->kv_layer_phys_count);")
     assert not claim_backend_takes_the_map_once(mutant, CACHE, KV_CACHE)
 
@@ -487,7 +500,7 @@ def test_mutant_refusal_hides_its_cost_fails():
 
 def test_mutant_backend_computes_its_own_map_fails():
     """A second writer: the backend deriving the map itself instead of reading what libllama names."""
-    mutant = _once(SYCL, INTAKE_COPY, INTAKE_COPY + " g_placement_kv_info.layer_phys = {};")
+    mutant = _once(SYCL, KV_FILL_CALL, KV_FILL_CALL + " g_placement_kv_info.layer_phys = {};")
     assert not claim_backend_takes_the_map_once(mutant, CACHE, KV_CACHE)
 
 

@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-lazy-mode.h"
+#include "llama-lazy-storage.h"
 #include "llama-mmap.h"
 #include "llama-n-ctx-hint.h"
 #include "llama-cparams.h"
@@ -73,10 +74,15 @@ struct llama_model_sycl_lifecycle_hooks {
     decltype(&ggml_backend_sycl_model_unloaded_token)    unload     = nullptr;
     decltype(&ggml_backend_sycl_model_quarantine_token)  quarantine = nullptr;
     decltype(&ggml_backend_sycl_activate_model_plan)           activate        = nullptr;
-    decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context = nullptr;
-    decltype(&ggml_backend_sycl_stage_inventory_plan)          stage_inventory = nullptr;
+    decltype(&ggml_backend_sycl_set_runtime_context_for_model) runtime_context               = nullptr;
     decltype(&ggml_backend_sycl_weights_evictable)             weights_evictable           = nullptr;
     decltype(&ggml_backend_sycl_host_buffer_type_for_device)   host_buffer_type_for_device = nullptr;
+    // The staging proc reads this libllama's inventory layout (its resolved storage inputs, design 5efe §4.3), and the
+    // loader binds SYCL_Mapped buffers from the plan it stages. Not part of llama_model_sycl_hooks_enabled: a backend
+    // that lacks them is refused by name in the loading guard rather than silently treated as a non-SYCL load.
+    decltype(&ggml_backend_sycl_stage_load_inventory_plan)     stage_inventory               = nullptr;
+    decltype(&ggml_backend_sycl_mapped_buffer_type_for_device) mapped_buffer_type_for_device = nullptr;
+    decltype(&ggml_backend_sycl_mapped_buffer_from_file)       mapped_buffer_from_file       = nullptr;
 };
 
 static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
@@ -103,12 +109,16 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_activate_model_plan"));
         result.runtime_context = reinterpret_cast<decltype(result.runtime_context)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
-        result.stage_inventory = reinterpret_cast<decltype(result.stage_inventory)>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_inventory_plan"));
         result.weights_evictable = reinterpret_cast<decltype(result.weights_evictable)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_weights_evictable"));
         result.host_buffer_type_for_device = reinterpret_cast<decltype(result.host_buffer_type_for_device)>(
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_host_buffer_type_for_device"));
+        result.stage_inventory = reinterpret_cast<decltype(result.stage_inventory)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_stage_load_inventory_plan"));
+        result.mapped_buffer_type_for_device = reinterpret_cast<decltype(result.mapped_buffer_type_for_device)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_mapped_buffer_type_for_device"));
+        result.mapped_buffer_from_file = reinterpret_cast<decltype(result.mapped_buffer_from_file)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_mapped_buffer_from_file"));
         break;
     }
     return result;
@@ -116,8 +126,8 @@ static llama_model_sycl_lifecycle_hooks llama_model_sycl_hooks() {
 
 static bool llama_model_sycl_hooks_enabled(const llama_model_sycl_lifecycle_hooks & hooks) {
     return !ggml_backend_device_backends_disabled() && hooks.begin && hooks.nested && hooks.end && hooks.unload &&
-           hooks.quarantine && hooks.activate && hooks.runtime_context && hooks.stage_inventory &&
-           hooks.weights_evictable && hooks.host_buffer_type_for_device;
+           hooks.quarantine && hooks.activate && hooks.runtime_context && hooks.weights_evictable &&
+           hooks.host_buffer_type_for_device;
 }
 
 static bool llama_model_sycl_hooks_enabled() {
@@ -162,6 +172,7 @@ struct llama_model_sycl_loading_guard {
         outer(true),
         out_model(out) {
         if (active) {
+            require_host_backing_hooks();
             const auto rc = hooks.begin(&txn);
             if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error(format("SYCL model lifecycle begin failed: result=%d", (int) rc));
         }
@@ -172,8 +183,29 @@ struct llama_model_sycl_loading_guard {
         active(enabled && llama_model_sycl_hooks_enabled(hooks)),
         txn(parent) {
         if (active) {
+            require_host_backing_hooks();
             const auto rc = hooks.nested(txn);
             if (rc != GGML_SYCL_LIFECYCLE_OK) throw std::runtime_error(format("SYCL nested model lifecycle begin failed: txn=%llu result=%d", (unsigned long long) txn.id, (int) rc));
+        }
+    }
+
+    // Runs before begin(), so a refusal leaves no transaction to roll back. The two libraries share the
+    // placement inventory layout and the host-backing protocol, so a libggml-sycl without these procs
+    // predates this libllama and cannot be driven by it.
+    void require_host_backing_hooks() const {
+        const char * missing = nullptr;
+        if (!hooks.stage_inventory) {
+            missing = "ggml_backend_sycl_stage_load_inventory_plan";
+        } else if (!hooks.mapped_buffer_type_for_device) {
+            missing = "ggml_backend_sycl_mapped_buffer_type_for_device";
+        } else if (!hooks.mapped_buffer_from_file) {
+            missing = "ggml_backend_sycl_mapped_buffer_from_file";
+        }
+        if (missing != nullptr) {
+            throw std::runtime_error(
+                format("the SYCL backend does not export %s, so it predates this libllama: "
+                       "rebuild libllama and libggml-sycl together",
+                       missing));
         }
     }
 
@@ -234,6 +266,14 @@ struct llama_model_sycl_loading_guard {
 static bool llama_model_buft_backend_is_sycl(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     return llama_model_dev_is_sycl(dev);
+}
+
+// The shape every load-time measure of this model runs at: the context and micro-batch the caller told the load
+// (llama_model_params::n_ctx_hint, n_ubatch_hint). The measures and the inventory's n_ubatch_measure read the same
+// resolver over the same hints, so the backend credits the term at the micro-batch it was measured at.
+static llama_load_measure_shape llama_model_load_measure_shape(const llama_model & model) {
+    return llama_load_measure_shape_resolve(model.get_n_ctx_hint(), model.get_n_ubatch_hint(),
+                                            model.hparams.n_ctx_train);
 }
 
 static ggml_sycl_placement_envelope llama_model_sycl_make_placement_envelope() {
@@ -395,9 +435,22 @@ static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(c
     return out;
 }
 
+// Which layers carry attention sinks. The oneDNN SDPA path refuses an op with sinks, so those layers never draw
+// oneDNN Graph scratch and the floor's head maxima leave them out. Read from the file's tensor list, the same source
+// for the early and the late inventory.
+static std::unique_ptr<bool[]> llama_model_sycl_attn_sinks_layers(const llama_model_loader & ml, uint32_t n_layer) {
+    std::unique_ptr<bool[]> sinks(new bool[n_layer]());
+    const LLM_TN            tn(ml.get_arch());
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        sinks[il] = ml.weights_map.find(tn(LLM_TENSOR_ATTN_SINKS, "weight", il).str()) != ml.weights_map.end();
+    }
+    return sinks;
+}
+
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
                                                 std::vector<ggml_sycl_tensor_info> & tensors,
                                                 const bool *                         swa_layer_mask,
+                                                const bool *                         sinks_layer_mask,
                                                 const uint32_t *                     kv_k_width_per_layer,
                                                 const uint32_t *                     kv_v_width_per_layer,
                                                 const uint8_t *                      kv_layer_kind,
@@ -452,15 +505,21 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // the one place the hint is resolved. With no hint at all (0, a caller that never sets the field) no room is held,
     // and the KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
     // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
-    // dense weights and their KV leave. The room and the load measures (llama_load_measure_request_n_ctx) read the
-    // hint; the planning shape above keeps its inputs (the placement envelope's n_ctx, still 0).
+    // dense weights and their KV leave. The room, the oneDNN Graph scratch floor (sized for the context the model opens
+    // with) and the load measures (llama_load_measure_shape_resolve) read the hint; the planning shape above and the
+    // placement envelope's n_ctx (still 0) keep their inputs.
     const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);
     inventory.n_ctx_context                    = ctx_room.n_ctx_context;
     inventory.n_ctx_context_is_default         = ctx_room.is_default;
     // The micro-batch the caller named (llama_model_params::n_ubatch_hint, 0 for none): the planner plans the PP MoE
     // scratch ring in the RUNTIME zone for it and moves routed experts to the host tier for the room. Like the context
-    // room above, only that decision reads it; n_ubatch stays the load's planning shape.
+    // above, that decision and the oneDNN Graph scratch floor read it; n_ubatch stays the load's planning shape.
     inventory.n_ubatch_context                 = n_ubatch_hint;
+    // The micro-batch the load measures its compute term at, from the resolver the measures use
+    // (llama_model_load_measure_shape), so the backend credits the term at the rung it was measured at. The early and
+    // the late inventory are both built here from the same hints, so both carry the same value.
+    inventory.n_ubatch_measure =
+        llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, hparams.n_ctx_train).n_ubatch;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
@@ -521,48 +580,17 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             const size_t       worst_case_active_experts    = static_cast<size_t>(hparams.n_expert);
             inventory.pp_moe_onednn_weight_slot_bytes       = per_expert_weight_slot_bytes * worst_case_active_experts;
 
-            // Activation/output slots are allocated RECTANGULARLY by the executor:
-            // max_rows_per_expert (the busiest active expert's row count) times
-            // active_count (how many distinct experts are active at all). A
-            // uniform split would total n_ubatch * n_expert_used rows, but
-            // routing need not be uniform: a token's n_expert_used picks are
-            // distinct experts, so any single expert can independently hold up to
-            // n_ubatch rows (one per token) while up to n_expert-1 other experts
-            // still count toward active_count with as little as one row each.
-            // The executor's true worst case is therefore one expert holding all
-            // n_ubatch rows times n_expert active experts, i.e. n_ubatch *
-            // n_expert -- which can exceed n_ubatch * n_expert_used by up to
-            // n_expert / n_expert_used (8x for GPT-OSS 20B, 32/4). Size for that.
-            const size_t max_rows = static_cast<size_t>(inventory.n_ubatch) * static_cast<size_t>(hparams.n_expert);
-            // llama.cpp-ibj0: per-row bytes behind the two slot formulas below
-            // -- max_rows already factors out to inventory.n_ubatch * per_row
-            // (max_rows = n_ubatch * n_expert, and each per-row term below is
-            // n_expert * max_{k,n} * sizeof(...)), so the backend can later
-            // reproduce align256(runtime_n_ubatch * per_row) for a DIFFERENT
-            // n_ubatch than the load-time 512 this loader always plans for.
-            // The asserts right after tie the two formulas together at the one
-            // n_ubatch this loader itself computes, so they cannot drift.
-            inventory.pp_moe_onednn_activation_bytes_per_row =
-                static_cast<size_t>(hparams.n_expert) * max_k * sizeof(ggml_fp16_t);
-            inventory.pp_moe_onednn_output_bytes_per_row =
-                static_cast<size_t>(hparams.n_expert) * max_n * sizeof(float);
-            inventory.pp_moe_onednn_activation_slot_bytes =
-                llama_model_sycl_align_up(max_rows * max_k * sizeof(ggml_fp16_t), 256);
-            inventory.pp_moe_onednn_output_slot_bytes =
-                llama_model_sycl_align_up(max_rows * max_n * sizeof(float), 256);
-            GGML_ASSERT(
-                inventory.pp_moe_onednn_activation_slot_bytes ==
-                llama_model_sycl_align_up(
-                    static_cast<size_t>(inventory.n_ubatch) * inventory.pp_moe_onednn_activation_bytes_per_row, 256));
-            GGML_ASSERT(
-                inventory.pp_moe_onednn_output_slot_bytes ==
-                llama_model_sycl_align_up(
-                    static_cast<size_t>(inventory.n_ubatch) * inventory.pp_moe_onednn_output_bytes_per_row, 256));
-            inventory.pp_moe_onednn_ring_depth = pp_moe_onednn_ring_depth;
+            // One scratch row of the widest expert: its input width in half floats, its output width in floats. The
+            // backend sizes the ring's activation and output slots from these and the expert counts, for the
+            // micro-batch a context actually runs, so this loader sizes neither slot.
+            inventory.pp_moe_onednn_activation_bytes_per_row = max_k * sizeof(ggml_fp16_t);
+            inventory.pp_moe_onednn_output_bytes_per_row     = max_n * sizeof(float);
+            inventory.pp_moe_onednn_activation_slot_bytes    = 0;
+            inventory.pp_moe_onednn_output_slot_bytes        = 0;
+            inventory.pp_moe_onednn_ring_depth               = pp_moe_onednn_ring_depth;
+            // The weight slots only. The backend adds the two row-scaled slots when it plans the ring.
             inventory.pp_moe_onednn_scratch_bytes =
-                static_cast<size_t>(pp_moe_onednn_ring_depth) *
-                (inventory.pp_moe_onednn_weight_slot_bytes + inventory.pp_moe_onednn_activation_slot_bytes +
-                 inventory.pp_moe_onednn_output_slot_bytes);
+                static_cast<size_t>(pp_moe_onednn_ring_depth) * inventory.pp_moe_onednn_weight_slot_bytes;
         }
     }
     // llama.cpp-o3a0: window-aware refinement of the query-head count that
@@ -627,6 +655,10 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         // feeds runs on every attention layer, not just the oneDNN-eligible
         // ones the two per-class maxima below are scoped to.
         n_head_all_max = std::max(n_head_all_max, hparams.n_head(il));
+        // The oneDNN SDPA path refuses attention with sinks, whatever the head size.
+        if (sinks_layer_mask && sinks_layer_mask[il]) {
+            continue;
+        }
         if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), model_attention_scale)) {
             continue;
         }
@@ -648,6 +680,8 @@ static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory & 
     if (!llama_model_sycl_hooks_enabled(hooks)) {
         return;
     }
+    // Both callers run inside an active loading guard, whose require_host_backing_hooks() refused a backend without
+    // the staging proc before begin().
     const auto rc = hooks.stage_inventory(&inventory, &envelope, early);
     if (rc != GGML_SYCL_LIFECYCLE_OK) {
         throw std::runtime_error(format("SYCL inventory planning failed: early=%d result=%d", early, (int) rc));
@@ -715,10 +749,110 @@ static void llama_model_sycl_mark_get_rows_only(std::vector<ggml_sycl_tensor_inf
     }
 }
 
+// Both inventories carry libllama's resolved storage inputs (design 5efe §4.3): use_mmap after the caps
+// loop, the load mode's mlock, and the host weight layout. The staging proc derives the host-backing fact from them
+// and keeps it on the plan, which every later reader asks; libllama never derives it.
+static void llama_model_sycl_set_inventory_host_backing(ggml_sycl_tensor_inventory & inventory,
+                                                        const llama_model_loader &   ml,
+                                                        bool                         use_mlock) {
+    inventory.use_mmap_resolved  = ml.use_mmap;
+    inventory.use_mlock_resolved = use_mlock;
+    inventory.host_weight_layout = llama_model_loader::host_weight_layout_sycl();
+}
+
+// The STORAGE rows an inventory's lazy tables describe, and the infos that point at them. Each info's name points into
+// tables[i].name, so the owner is never copied (a copy's infos would point into the source), and `tables` is not
+// touched once the infos are filled. It must live as long as the inventory that carries the infos. Moving it is safe: a
+// vector move keeps its elements where they are.
+struct llama_model_sycl_lazy_tables {
+    std::vector<llama_lazy_storage_table>  tables;
+    std::vector<ggml_sycl_lazy_table_info> infos;
+
+    llama_model_sycl_lazy_tables()                                                 = default;
+    llama_model_sycl_lazy_tables(const llama_model_sycl_lazy_tables &)             = delete;
+    llama_model_sycl_lazy_tables & operator=(const llama_model_sycl_lazy_tables &) = delete;
+    llama_model_sycl_lazy_tables(llama_model_sycl_lazy_tables &&)                  = default;
+    llama_model_sycl_lazy_tables & operator=(llama_model_sycl_lazy_tables &&)      = default;
+};
+
+// Hands the planner the record's STORAGE rows as the inventory's lazy tables, owned by `owner`.
+static void llama_model_sycl_set_inventory_lazy_tables(ggml_sycl_tensor_inventory &   inventory,
+                                                       const llama_model_loader &     ml,
+                                                       llama_model_sycl_lazy_tables & owner) {
+    owner.tables =
+        llama_lazy_range_storage_tables(ml.lazy_record, [&](const std::string & name) -> const ggml_tensor * {
+            const auto it = ml.weights_map.find(name);
+            return it != ml.weights_map.end() ? it->second.tensor : nullptr;
+        });
+    owner.infos.clear();
+    for (const llama_lazy_storage_table & t : owner.tables) {
+        owner.infos.push_back(llama_lazy_storage_table_info(t));
+    }
+    inventory.lazy_tables      = owner.infos.empty() ? nullptr : owner.infos.data();
+    inventory.lazy_table_count = static_cast<uint32_t>(owner.infos.size());
+}
+
+// The early plan's inventory, built from weights_map before create_tensor() runs, with the storage its raw pointers
+// point into. The tensor names point into the loader's metadata, so the loader must outlive it. The load's early plan
+// and the plan dry run's header read build it here, so the dry run plans what the load plans.
+struct llama_model_sycl_early_inventory {
+    std::vector<ggml_sycl_tensor_info> tensors;
+    std::unique_ptr<bool[]>            swa_layer_mask;
+    llama_model_sycl_kv_layer_arrays   kv_layer_arrays;
+    ggml_sycl_tensor_inventory         inventory  = {};
+    size_t                             total_size = 0;
+    llama_model_sycl_lazy_tables       lazy;
+};
+
+// False when no weight remains for the plan.
+static bool llama_model_sycl_build_early_inventory(llama_model_loader &               ml,
+                                                   const llama_model &                model,
+                                                   bool                               use_mlock,
+                                                   llama_model_sycl_early_inventory & out) {
+    const llama_hparams & hparams = model.hparams;
+
+    out.tensors.reserve(ml.weights_map.size());
+    size_t max_pp_pipeline_weight_bytes = 0;
+    for (auto & weight : ml.weights_map) {
+        // a lazy table the record defers to the SYCL storage tier is not an ordinary weight:
+        // it is not placed, staged, or counted in the maxima and the host total. An
+        // ineligible row (OFF, or AUTO at or below 4 GiB) is the ordinary weight it is.
+        if (llama_lazy_early_plan_excludes(ml.lazy_record, weight.first)) {
+            continue;
+        }
+        llama_model_sycl_add_tensor_info(out.tensors, out.total_size, max_pp_pipeline_weight_bytes,
+                                         weight.second.tensor);
+    }
+    if (out.tensors.empty()) {
+        return false;
+    }
+
+    llama_model_sycl_mark_get_rows_only(out.tensors, ml);
+
+    const uint32_t n_layer = hparams.n_layer();
+    out.swa_layer_mask.reset(new bool[n_layer]);
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        out.swa_layer_mask[il] = hparams.is_swa(il);
+    }
+    out.kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
+
+    const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
+
+    ggml_sycl_tensor_inventory & inventory = out.inventory;
+    llama_model_sycl_populate_inventory(inventory, out.tensors, out.swa_layer_mask.get(), sinks_layer_mask.get(),
+                                        out.kv_layer_arrays.k_width.get(), out.kv_layer_arrays.v_width.get(),
+                                        out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
+                                        out.kv_layer_arrays.phys.get(), out.total_size, max_pp_pipeline_weight_bytes,
+                                        hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
+    llama_model_sycl_set_inventory_lazy_tables(inventory, ml, out.lazy);
+    return true;
+}
+
 static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
                                                 const llama_model &  model,
+                                                bool                 use_mlock,
                                                 const char *         log_func) {
-    const llama_hparams & hparams = model.hparams;
     if (!llama_model_sycl_hooks_enabled()) {
         return;
     }
@@ -726,40 +860,22 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
         return;
     }
 
-    std::vector<ggml_sycl_tensor_info> tensors;
-    tensors.reserve(ml.weights_map.size());
-    size_t total_size                   = 0;
-    size_t max_pp_pipeline_weight_bytes = 0;
-    for (auto & weight : ml.weights_map) {
-        llama_model_sycl_add_tensor_info(tensors, total_size, max_pp_pipeline_weight_bytes, weight.second.tensor);
-    }
-    if (tensors.empty()) {
+    llama_model_sycl_early_inventory early;
+    if (!llama_model_sycl_build_early_inventory(ml, model, use_mlock, early)) {
         return;
     }
-
-    llama_model_sycl_mark_get_rows_only(tensors, ml);
-
-    const uint32_t n_layer = hparams.n_layer();
-    std::unique_ptr<bool[]> swa_layer_mask(new bool[n_layer]);
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        swa_layer_mask[il] = hparams.is_swa(il);
-    }
-    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
-
-    ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(
-        inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(), kv_layer_arrays.v_width.get(),
-        kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(), kv_layer_arrays.phys.get(), total_size,
-        max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
-    llama_model_sycl_apply_inventory(inventory, envelope, true);
+    llama_model_sycl_apply_inventory(early.inventory, envelope, true);
+    // From here the bound load has a staged plan, and the loader's buffer-type choices ask it for the fact.
+    ml.sycl_load_plan_staged = true;
 
     LLAMA_LOG_INFO("%s: SYCL early placement plan: %zu weights, %.2f GiB (computed pre-create_tensor)\n", log_func,
-                   tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
+                   early.tensors.size(), early.total_size / (1024.0 * 1024.0 * 1024.0));
 }
 
 static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
                                                 const llama_model &  model,
+                                                bool                 use_mlock,
                                                 const char *         log_func) {
     const llama_hparams & hparams = model.hparams;
     if (!llama_model_sycl_hooks_enabled()) {
@@ -802,11 +918,18 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
     }
     llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
 
+    const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
+
     ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(
-        inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(), kv_layer_arrays.v_width.get(),
-        kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(), kv_layer_arrays.phys.get(), total_size,
-        max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), sinks_layer_mask.get(),
+                                        kv_layer_arrays.k_width.get(), kv_layer_arrays.v_width.get(),
+                                        kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(),
+                                        kv_layer_arrays.phys.get(), total_size, max_pp_pipeline_weight_bytes, hparams,
+                                        model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
+    llama_model_sycl_lazy_tables lazy;
+    llama_model_sycl_set_inventory_lazy_tables(inventory, ml, lazy);
+
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 
@@ -824,6 +947,125 @@ static std::vector<llama_measure_dummy_entry> llama_model_measure_weights(const 
     return weights;
 }
 #endif  // GGML_USE_SYCL || GGML_BACKEND_DL
+
+const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch) {
+    // the two architectures that create a table with TENSOR_READ_LAZY: qwen4exp
+    // (src/models/qwen4exp.cpp) and gemma4 (src/models/gemma4.cpp)
+    static const std::vector<std::string> qwen4exp = { LLM_TN(LLM_ARCH_QWEN4EXP)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str() };
+    static const std::vector<std::string> gemma4   = { LLM_TN(LLM_ARCH_GEMMA4)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str() };
+    static const std::vector<std::string> none;
+
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP: return qwen4exp;
+        case LLM_ARCH_GEMMA4:   return gemma4;
+        default:                return none;
+    }
+}
+
+// The lazy-range record: one row per TENSOR_READ_LAZY tensor this arch declares and the
+// file carries, filled before the early plan, which builds its inventory from weights_map
+// and so cannot see a row that create_tensor() would fill later. It runs the same way
+// under no_alloc, so the memory-fit pass and the plan dry run plan what the real load plans.
+static void llama_model_prefill_lazy_record(llama_model_loader &  ml,
+                                            llm_arch              arch,
+                                            const llama_hparams & hparams,
+                                            enum llama_lazy_mode  lazy_mode_pre,
+                                            bool                  lazy_taker) {
+    llama_lazy_range_record_prefill(
+        ml.lazy_record, arch, hparams, llama_model_lazy_tensor_names(arch),
+        [&ml](const std::string & name, llama_lazy_range_source & out) {
+            const llama_model_loader::llama_tensor_weight * w = ml.get_weight(name.c_str());
+            if (w == nullptr) {
+                return false;
+            }
+            out = { w->idx, w->offs, ggml_nbytes(w->tensor) };
+            return true;
+        },
+        lazy_mode_pre, ml.lazy.mode, lazy_taker, llama_mmap::SUPPORTED);
+}
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+bool llama_model_sycl_header_inventory(const char *                         fname,
+                                       const llama_model_params &           params,
+                                       llama_model_sycl_header_inventory_cb callback,
+                                       void *                               user_data) {
+    if (fname == nullptr || callback == nullptr) {
+        return false;
+    }
+    try {
+        // The header only: no_alloc, so no tensor data is read and no buffer is allocated, and no load transaction
+        // is opened, so nothing is staged.
+        std::vector<std::string> splits;
+        llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr, fname,
+                              splits, /*file*/ nullptr, params.load_mode, /*check_tensors*/ false,
+                              /*no_alloc*/ true, params.load_mtp, params.kv_overrides,
+                              /*param_tensor_buft_overrides_p*/ nullptr);
+        ml.lazy.mode = params.lazy_mode;
+
+        // the model reads no_alloc from its own params, so the copy it is built from carries it
+        llama_model_params mparams = params;
+        mparams.no_alloc           = true;
+
+        std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, mparams));
+        auto *                       model = dynamic_cast<llama_model_base *>(model_ptr.get());
+        if (model == nullptr) {
+            return false;
+        }
+        model->hparams.vocab_only = false;
+        model->load_hparams(ml);
+
+        // The load resolves AUTO against its devices, keeping it wherever SYCL owns placement; the dry run plans for
+        // SYCL-owned weights, so AUTO stays AUTO, and the model is the lazy taker as a SYCL-owned load is.
+        llama_model_prefill_lazy_record(ml, model->arch, model->hparams, ml.lazy.mode, /*lazy_taker*/ true);
+
+        // The storage inputs the load's inventory carries, resolved as the load resolves them: mlock from the load
+        // mode, use_mmap as the loader set it. The load's caps loop, which turns use_mmap off when one of its devices
+        // cannot map the file, is not run; it matters only where the load would plan on an integrated GPU alone, which
+        // it adds to its devices only when no discrete card is found.
+        const bool use_mlock =
+            params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+        llama_model_sycl_early_inventory early;
+        if (!llama_model_sycl_build_early_inventory(ml, *model, use_mlock, early)) {
+            return false;
+        }
+        const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
+        callback(&early.inventory, &envelope, user_data);
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+#endif  // GGML_USE_SYCL || GGML_BACKEND_DL
+
+llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name) {
+    const llama_lazy_tensor_attrs unknown = { 0, -1, false };
+
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP:
+            if (name == LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str()) {
+                // the one layer that consumes the table comes from hparams, never a literal:
+                // the loader refuses more than one PLE layer (src/models/qwen4exp.cpp)
+                int32_t consumer_layer = -1;
+                if (hparams.is_ple_impl.count() == 1) {
+                    for (uint32_t il = 0; il < LLAMA_MAX_LAYERS; ++il) {
+                        if (hparams.is_ple_impl.test(il)) {
+                            consumer_layer = (int32_t) il;
+                        }
+                    }
+                }
+                return { hparams.ple_n_heads, consumer_layer, true };
+            }
+            return unknown;
+        case LLM_ARCH_GEMMA4:
+            if (name == LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str()) {
+                return { 1, 0, false };
+            }
+            return unknown;
+        default:
+            return unknown;
+    }
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -2040,8 +2282,11 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
     return fallback;
 }
 
-// CPU: ACCEL -> GPU host -> CPU extra -> CPU
-static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
+// CPU: ACCEL -> SYCL mapped (a load that maps its files) -> GPU host -> CPU extra -> CPU
+static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
+                                      bool                              use_extra_bufts,
+                                      bool                              no_host,
+                                      bool                              sycl_maps_files) {
     buft_list_t buft_list;
 
     // add ACCEL buffer types
@@ -2064,6 +2309,24 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     // a better approach would be to handle this on a weight-by-weight basis using the offload_op
     // function of the device to determine if it would benefit from being stored in a host buffer
     if (!no_host) {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        // A load that maps its files serves a host-resident weight from the file's pages in place, ahead of the copy a
+        // pinned host buffer would take (design 5efe §4.3).
+        if (sycl_maps_files) {
+            const auto hooks = llama_model_sycl_hooks();
+            for (const auto & dev : devices) {
+                if (hooks.mapped_buffer_type_for_device && llama_model_dev_is_sycl(dev.dev)) {
+                    ggml_backend_buffer_type_t buft = hooks.mapped_buffer_type_for_device(dev.dev);
+                    if (buft) {
+                        buft_list.emplace_back(dev.dev, buft);
+                    }
+                    break;
+                }
+            }
+        }
+#else
+        GGML_UNUSED(sycl_maps_files);
+#endif
         for (const auto & dev : devices) {
             ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
             if (buft) {
@@ -2200,6 +2463,13 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // The STORAGE tables' tensors, in no buffer and never in ctxs_bufs (memory_breakdown expects a buffer for every
+    // context there), and the handle each table is read through. The handles go with pimpl: when the model has a
+    // token, ~llama_model destroys pimpl before its unload hook runs, so every open table closes while its plan still
+    // exists; a model that never got a token never opened a table, so it has nothing to close.
+    ggml_context_ptr                                 storage_ctx;
+    std::vector<std::unique_ptr<llama_lazy_storage>> lazy_storage;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -2552,6 +2822,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    // the model's weights are SYCL-owned and the SYCL hooks resolve: the fact the early
+    // plan is gated on, not the process-level "a SYCL backend is registered" (a `-ngl 0`
+    // load in a SYCL build registers the hooks without taking the weights)
+    bool lazy_taker = false;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     const bool sycl_layer_assignment =
         this->n_gpu_layers() > 0 && std::any_of(devices.begin(), devices.end(), [](const llama_device & device) {
@@ -2568,9 +2842,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const bool                     resolved_sycl_weight_owner = sycl_layer_assignment || sycl_tensor_override;
     llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner, &sycl_model_token);
-    if (sycl_model_loading_guard.active) {
-        llama_model_sycl_compute_early_plan(ml, *this, __func__);
-    }
+    lazy_taker = sycl_model_loading_guard.active;
 #endif
 
     const auto & split_mode   = params.split_mode;
@@ -2595,6 +2867,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the lazy mode as requested, before the fallback below: the SYCL storage tier reads
+    // through its own O_DIRECT fd and must not be disengaged by a device that cannot mmap
+    const enum llama_lazy_mode lazy_mode_pre = ml.lazy.mode;
+
     // resolve AUTO: a device without mmap support (e.g. an iGPU) falls back to OFF unless mmap is in use; see #28160,
     // #31943. The exception is a device whose backend owns placement (SYCL): its planner decides where
     // each weight lives and reads the tensors itself, so lazy reads stay available there
@@ -2617,6 +2893,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    llama_model_prefill_lazy_record(ml, arch, hparams, lazy_mode_pre, lazy_taker);
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    if (sycl_model_loading_guard.active) {
+        llama_model_sycl_compute_early_plan(ml, *this, use_mlock, __func__);
+    }
+#endif
+
     const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO
         ? llama_load_mode_name(ml.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
         : llama_load_mode_name(params.load_mode);
@@ -2625,7 +2909,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, load_mode_name);
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    pimpl->cpu_buft_list =
+        make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host, ml.sycl_load_maps_files());
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -2873,6 +3158,47 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
             }
         }
+
+        // The loop above asks for a sidecar only when its weight was loaded. The MTP block's weights are skipped
+        // (by the caller's choice, or always by some architectures), so their pointers are null and its sidecars,
+        // which are in the file, would never be counted and done_getting_tensors() would find the count short.
+        // Skip them with their weights: a sidecar of a loaded weight is never asked for here. A virtual load has no
+        // file and ignores TENSOR_SKIP, so it would build an orphan tensor for each ask; TENSOR_SKIP_IF_VIRTUAL
+        // makes it return nullptr there, as before.
+        const auto skip_scales = [&](int il, llm_tensor tensor, const ggml_tensor * weight, int64_t n) {
+            if (weight == nullptr) {
+                const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL;
+                create_tensor(tn(tensor, "scale",       il), {n}, skip);
+                create_tensor(tn(tensor, "input_scale", il), {n}, skip);
+            }
+        };
+        for (int i = hparams.n_layer(); i < n_layer_all; ++i) {
+            const auto & layer = layers[i];
+
+            skip_scales(i, LLM_TENSOR_ATTN_Q,                 layer.wq,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_K,                 layer.wk,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_V,                 layer.wv,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_OUT,               layer.wo,                     1);
+            skip_scales(i, LLM_TENSOR_ATTN_QKV,               layer.wqkv,                   1);
+            skip_scales(i, LLM_TENSOR_ATTN_GATE,              layer.wqkv_gate,              1);
+            skip_scales(i, LLM_TENSOR_FFN_GATE,               layer.ffn_gate,               1);
+            skip_scales(i, LLM_TENSOR_FFN_DOWN,               layer.ffn_down,               1);
+            skip_scales(i, LLM_TENSOR_FFN_UP,                 layer.ffn_up,                 1);
+            skip_scales(i, LLM_TENSOR_FFN_GATE_SHEXP,         layer.ffn_gate_shexp,         1);
+            skip_scales(i, LLM_TENSOR_FFN_DOWN_SHEXP,         layer.ffn_down_shexp,         1);
+            skip_scales(i, LLM_TENSOR_FFN_UP_SHEXP,           layer.ffn_up_shexp,           1);
+            skip_scales(i, LLM_TENSOR_FFN_GATE_EXPS,          layer.ffn_gate_exps,          n_expert);
+            skip_scales(i, LLM_TENSOR_FFN_DOWN_EXPS,          layer.ffn_down_exps,          n_expert);
+            skip_scales(i, LLM_TENSOR_FFN_UP_EXPS,            layer.ffn_up_exps,            n_expert);
+            skip_scales(i, LLM_TENSOR_FFN_GATE_UP_EXPS,       layer.ffn_gate_up_exps,       n_expert);
+            skip_scales(i, LLM_TENSOR_SSM_IN,                 layer.ssm_in,                 1);
+            skip_scales(i, LLM_TENSOR_SSM_OUT,                layer.ssm_out,                1);
+            skip_scales(i, LLM_TENSOR_SSM_ALPHA,              layer.ssm_alpha,              1);
+            skip_scales(i, LLM_TENSOR_SSM_BETA,               layer.ssm_beta,               1);
+            skip_scales(i, LLM_TENSOR_NEXTN_EH_PROJ,          layer.nextn.eh_proj,          1);
+            skip_scales(i, LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, layer.nextn.shared_head_head, 1);
+        }
+
         // output scales
         if (output) {
             // weight scale
@@ -2907,6 +3233,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
+    }
+
+    // the STORAGE tables, before the measure below builds a graph: their consumer builds its F32 input from them, and
+    // the table tensor itself must never enter a graph, tensors_by_name or ctxs_bufs
+    pimpl->storage_ctx = std::move(ml.storage_ctx);
+    // Driven by the record's STORAGE rows, not by whether storage_ctx exists: a STORAGE row whose tensor was never
+    // created then aborts in llama_lazy_range_storage_tables() instead of leaving the table silently unread.
+    const std::vector<llama_lazy_storage_table> storage_tables =
+        llama_lazy_range_storage_tables(ml.lazy_record, [&](const std::string & name) -> const ggml_tensor * {
+            return pimpl->storage_ctx ? ggml_get_tensor(pimpl->storage_ctx.get(), name.c_str()) : nullptr;
+        });
+    // a load with no STORAGE table does not touch the backend registry
+    const llama_lazy_storage_procs procs =
+        storage_tables.empty() ? llama_lazy_storage_procs{} : llama_lazy_storage_sycl_procs();
+    for (const llama_lazy_storage_table & t : storage_tables) {
+        // a file loaded from an open handle has no path, and the table is read through its own O_DIRECT
+        // descriptor, which needs one
+        if (t.value.file_idx >= ml.file_paths.size() || ml.file_paths[t.value.file_idx].empty()) {
+            throw std::runtime_error(
+                format("STORAGE table %s: its file was opened from a handle and has no path "
+                       "to read the table from; load the model from a file path",
+                       t.name.c_str()));
+        }
+        pimpl->lazy_storage.push_back(std::make_unique<llama_lazy_storage>(t, ml.file_paths[t.value.file_idx], procs));
     }
 
     // map each weight to its "<name>.scale" tensor: shape {1} for a 2D weight, {n_expert} for a 3D weight
@@ -2955,29 +3305,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
     if (sycl_model_backend) {
-        // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
-        // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
-        // its room. It is measured at the context the caller requested from the load (the n_ctx hint; the training
-        // context when none was named, padded to 256 under the default hint) and ubatch 512: the caller's -ub does not
-        // reach the measures, which the load reads only as the n_ubatch hint, to place the PP MoE ring (fkpg (a)). A
-        // dense model's default auto ubatch climbs above 512 into whatever room is left; that part is not reserved.
-        const uint32_t load_measure_n_ctx = llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);
+        // (a) the probe measure: the probe placement's compute term C-hat, before the late plan packs the weights,
+        // handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer its room. It is
+        // measured at the context and micro-batch the caller told the load (the training context and the auto
+        // ladder's bottom rung where it told none); the admitted measure below runs at the same shape. A dense
+        // model's auto micro-batch climbs above the bottom rung into whatever room is left; that part is not reserved.
+        const llama_load_measure_shape               measure_shape = llama_model_load_measure_shape(*this);
         const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
 
         const int64_t                 probe_t0 = ggml_time_us();
         const llama_load_probe_result probe =
-            llama_load_probe_bound(*this, load_measure_n_ctx, sycl_model_loading_guard.txn, probe_weights);
+            llama_load_probe_bound(*this, measure_shape, sycl_model_loading_guard.txn, probe_weights);
         const int64_t probe_ms = (ggml_time_us() - probe_t0) / 1000;
         if (!probe.unsupported.empty()) {
-            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
-            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the load continues on the unplanned path: %s\n",
+            // not a refusal of the load: the probe cannot be measured (a model the measure cannot walk, or no plan
+            // staged for the probe), so no compute term is reserved; a late plan, where one is staged, still places
+            // the weights
+            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the compute slot is not planned at load: %s\n",
                            __func__, probe.unsupported.c_str());
         }
         if (!probe.refusal.empty()) {
             throw std::runtime_error(probe.refusal);
         }
 
-        llama_model_sycl_set_late_inventory(ml, *this, __func__);
+        llama_model_sycl_set_late_inventory(ml, *this, use_mlock, __func__);
 
         // (b) the admitted measure, llama.cpp-p6i0: c(P) at the placement the late plan just packed, before the
         // dev_layer sync, so the late check below compares the final placement with it. Refused when it outgrew
@@ -2986,8 +3337,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const std::vector<llama_measure_dummy_entry> admitted_weights = llama_model_measure_weights(ml);
 
             const int64_t                     admitted_t0 = ggml_time_us();
-            const llama_admitted_check_result admitted    = llama_load_admitted_check(
-                *this, load_measure_n_ctx, sycl_model_loading_guard.txn, admitted_weights, probe);
+            const llama_admitted_check_result admitted =
+                llama_load_admitted_check(*this, measure_shape, sycl_model_loading_guard.txn, admitted_weights, probe);
             const int64_t admitted_ms = (ggml_time_us() - admitted_t0) / 1000;
             if (!admitted.unsupported.empty()) {
                 LLAMA_LOG_WARN("%s: admitted compute-slot measure skipped, the load continues: %s\n", __func__,
@@ -2999,13 +3350,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const llama_admitted_term & t : admitted.terms) {
                 LLAMA_LOG_WARN(
                     "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
-                    "%zu recorded); measured at n_ctx %u ubatch %u, n_ctx is the load's requested context (the "
-                    "training context when none was requested, padded to 256 under the default hint), the caller's "
-                    "-ub is not transported to the measure (fkpg); measure %lld ms probe, %lld ms admitted\n",
+                    "%zu recorded); measured at n_ctx %u ubatch %u, the context and micro-batch this load was told "
+                    "(the training context and ubatch %u where it was told none); measure %lld ms probe, %lld ms "
+                    "admitted\n",
                     __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
                     t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
                     t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
-                    admitted.n_ubatch, (long long) probe_ms, (long long) admitted_ms);
+                    admitted.n_ubatch, llama_auto_ubatch_ladder[0], (long long) probe_ms, (long long) admitted_ms);
                 if (t.kv_excess != 0) {
                     LLAMA_LOG_WARN(
                         "%s: [LOAD-PLAN] compute slot on device %d: admitted %.1f MiB exceeds the probe bound by %.1f "
@@ -3179,13 +3530,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (c) the late measure: the final placement's compute term, over stand-ins for the weights
         // that are not yet allocated, handed to the backend to compare with the term it admitted.
         // Inert until the backend exports the L4 entry points; a refusal is the load's.
-        const uint32_t load_measure_n_ctx = llama_load_measure_request_n_ctx(get_n_ctx_hint(), hparams.n_ctx_train);
-        const std::vector<llama_measure_dummy_entry> late_weights = llama_model_measure_weights(ml);
+        // It runs at the shape the admitted term was measured and recorded at, so the two compare like for like.
+        const llama_load_measure_shape               measure_shape = llama_model_load_measure_shape(*this);
+        const std::vector<llama_measure_dummy_entry> late_weights  = llama_model_measure_weights(ml);
         const llama_late_check_result                late =
-            llama_load_late_check(*this, load_measure_n_ctx, sycl_model_loading_guard.txn, late_weights);
+            llama_load_late_check(*this, measure_shape, sycl_model_loading_guard.txn, late_weights);
         if (!late.unsupported.empty()) {
-            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
-            LLAMA_LOG_WARN("%s: late compute-slot check skipped, the load continues on the unplanned path: %s\n",
+            // not a refusal of the load: the late check cannot be measured (a model the measure cannot walk, or no
+            // plan staged for it), so the final placement's compute term is compared with nothing
+            LLAMA_LOG_WARN("%s: late compute-slot check skipped, the compute slot is not checked at load: %s\n",
                            __func__, late.unsupported.c_str());
         }
         for (size_t i = 0; i < late.not_recorded.size(); ++i) {
@@ -3204,15 +3557,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
     if (sycl_model_backend && ml.use_mmap) {
-        LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
-        ml.use_mmap = false;
+        // A load whose staged plan maps its files keeps the mapping: host-resident weights bind SYCL_Mapped in place
+        // and device weights are staged from it (design 5efe §4.3). Only a load without the tier still
+        // uploads every weight through the loader's own reads.
+        if (!ml.sycl_load_maps_files()) {
+            LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
+            ml.use_mmap = false;
+        }
     }
 #endif
 
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // A SYCL load maps with prefetch 0: its weights are placed by the unified cache, the mapping is only a source for
+    // them, and WILLNEED/SEQUENTIAL over the whole file would read the lazy tables and the device-only weights into
+    // the page cache for nothing. A load whose plan maps its files keeps use_mmap, and the host-executed ranges are
+    // advised by the SYCL_Mapped buffers themselves, so the loader's mapping prefetches nothing. Off SYCL the mapping
+    // prefetches as before.
+    bool prefetch_mappings = true;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    if (sycl_model_backend) {
+        prefetch_mappings = false;
+    }
+#endif
+    ml.init_mappings(prefetch_mappings, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -3250,13 +3619,57 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        const auto & sycl_hooks     = sycl_model_loading_guard.hooks;
+        const bool   is_sycl_mapped = sycl_hooks.mapped_buffer_type_for_device && llama_model_dev_is_sycl(dev) &&
+                                    buft == sycl_hooks.mapped_buffer_type_for_device(dev);
+#else
+        const bool is_sycl_mapped = false;
+#endif
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (is_sycl_mapped && !ml.no_alloc) {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+            // One buffer per file over the file's own mapping, built by the unified cache from the tensors' ranges
+            // (design 5efe §4.3). The lazy ranges stay out of every advised and locked segment; the
+            // tensors are addressed in load_all_data from the base offset the cache returns.
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                std::vector<ggml_sycl_mapped_tensor_range> tensor_ranges;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    const auto * w = ml.get_weight(ggml_get_name(t));
+                    if (w == nullptr || w->idx != idx) {
+                        continue;
+                    }
+                    tensor_ranges.push_back({ ggml_get_name(t), (uint64_t) w->offs, (uint64_t) ggml_nbytes(t) });
+                }
+                if (tensor_ranges.empty()) {
+                    continue;
+                }
+                const llama_mmap::ranges          excluded = ml.lazy_record.excluded_for_file(idx);
+                std::vector<ggml_sycl_file_range> lazy_ranges;
+                lazy_ranges.reserve(excluded.size());
+                for (const auto & range : excluded) {
+                    lazy_ranges.push_back({ (uint64_t) range.first, (uint64_t) (range.second - range.first) });
+                }
+                const auto &          file             = ml.files.at(idx);
+                uint64_t              base_file_offset = 0;
+                ggml_backend_buffer_t buf              = sycl_hooks.mapped_buffer_from_file(
+                    dev, idx, file->file_id(), (uint64_t) file->size(), tensor_ranges.data(), tensor_ranges.size(),
+                    lazy_ranges.data(), lazy_ranges.size(), &base_file_offset);
+                if (buf == nullptr) {
+                    throw std::runtime_error(
+                        format("unable to map %s buffer for model file %u", ggml_backend_buft_name(buft), idx));
+                }
+                ml.sycl_mapped_base_offsets[buf] = { idx, base_file_offset };
+                bufs.emplace_back(buf);
+            }
+#endif
+        } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported &&
+                   is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
@@ -3401,10 +3814,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     if (has_sycl_weight_buffer) {
         sycl_model_loading_guard.finish(true);
+        // the open reads the published plan by the model token, which exists only from here
+        for (auto & s : pimpl->lazy_storage) {
+            if (!s->open(sycl_model_token)) {
+                throw std::runtime_error(format("failed to open STORAGE table %s", s->name().c_str()));
+            }
+        }
     } else {
         sycl_model_loading_guard.cancel();
     }
 #endif
+    // a STORAGE table has no data in memory, so a load that could not open one has no way to read it
+    for (const auto & s : pimpl->lazy_storage) {
+        if (!s->is_open()) {
+            throw std::runtime_error(format(
+                "STORAGE table %s cannot be read: this load put no weight in a SYCL buffer, so no placement plan was "
+                "published to read the table through; let the SYCL backend hold the weights (remove any tensor "
+                "override that sends them elsewhere), or load with --lazy-mode off to read the whole table into memory",
+                s->name().c_str()));
+        }
+    }
 
     return true;
 }
@@ -4126,6 +4555,15 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+const llama_lazy_storage * llama_model::lazy_storage(const std::string & name) const {
+    for (const auto & s : pimpl->lazy_storage) {
+        if (s->name() == name) {
+            return s.get();
+        }
+    }
+    return nullptr;
 }
 
 llama_rope_params llama_model::get_rope_params(const llama_cparams & cparams, int il) const {

@@ -26,8 +26,10 @@ Every recorder honours it (review fold I2). The two full-graph sites were not th
 then record or replay: the dense split recorder, the MoE block graphlets and the MoE segment replay and record
 all called the pre-stage as a statement and carried on. They are the same hazard (a recorded graph reading a
 host-resident input), so each now goes through graph_prestage_or_decline and, on a decline, runs the graph
-directly. The gate enumerates every call of graph_prestage_leaf_tensors: the only legal caller is
-graph_prestage_or_decline itself, so a new recording site that pre-stages without consuming the result fails.
+directly. The gate enumerates every call of graph_prestage_leaf_tensors: the only legal callers are
+graph_prestage_or_decline itself and the decode prologue memo's prestage (graph_prologue_memo_prestage), which only
+the gateway calls, so a new recording site that pre-stages without consuming the result fails. The pass's stage
+actions live in its stage_effect lambda (the memo replays them from there), and stage_tensor decides which one runs.
 
 The staging handle and every recorder that baked its pointer (review r5, r6, r7). graph_input_stage used to drop an
 input's staging handle BEFORE allocating the replacement. The drop frees the buffer with no event gate while a
@@ -68,6 +70,21 @@ reuse. A staging failure is also not permanent for a signature: the memo forgets
 skipped tokens, so a transient failure (a staging allocation) recovers while a structural one (a
 host-resident input) re-declines at the cost of one pass.
 
+A host-resident op output is a graph input too. When the plan has no CPU work, the CPU backend computes
+into the generic host buft, and the scheduler makes no device copy of an activation it produces (an op the SYCL
+backend does not support): a SYCL split reads it in host memory. Classed COPY, the cache arm would refuse it and the
+graph would never be recorded. The class rule lives in prestage-class.hpp
+(ggml_sycl_prestage_class_of, unit-tested by test-sycl-prestage-class); the checks below pin that the backend asks it
+instead of carrying a second copy, that the rule reads the VIEW ROOT's op (a view's own op is GGML_OP_VIEW), that the
+flag still precedes KV_HOST and KV_HOST precedes the op-output rule (KV state is never per-call staging), and that the
+replay refresh discovers these tensors as it discovers flagged inputs, since a replay that skips the pre-stage would
+otherwise leave their staging at the recorded token's bytes.
+The rule is "another split's activation": an op output the graph being staged produces stays COPY. With
+GGML_SYCL_HOST_COMPUTE=1 every intermediate of the SYCL graph is a host op output; staging those as inputs would copy
+each one before its producer ran, and GET_ROWS, which looks staging up by name while recording, would bake that copy.
+So the pre-stage and the refresh pass the graph's node set, and a caller with none (the bytes predicate behind the
+resolver host-return counter) reports bytes for COPY and for a host op output alike, never for a flagged INPUT.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -82,6 +99,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--common", default=str(sycl / "common.hpp"))
 parser.add_argument("--memo", default=str(sycl / "graph-prestage-decline-memo.hpp"))
+parser.add_argument("--prestage-class", default=str(sycl / "prestage-class.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -246,18 +264,20 @@ def entry_blocks_graphs(compute):
     return reason
 
 
-def evaluate(backend, common, memo_hdr):
+def evaluate(backend, common, memo_hdr, class_hdr=None):
     results = {}
+    if class_hdr is None:
+        class_hdr = CLASS_HDR
 
     prestage = function_body(backend, r"static bool graph_prestage_leaf_tensors\([^)]*\)\s*\{")
     refresh = function_body(backend, r"static void graph_refresh_input_tensors\([^)]*\)\s*\{")
-    is_input = function_body(backend, r"static bool graph_tensor_is_input\([^)]*\)\s*\{")
+    is_input = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_is_input\([^)]*\)\s*\{")
     decline = function_body(backend, r"static bool graph_prestage_or_decline\([^)]*\)\s*\{")
     declined = function_body(backend, r"static bool graph_prestage_skip_declined\([^)]*\)\s*\{")
     compute = function_body(backend, r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{")
     results["anchor: prestage returns bool"] = prestage is not None
     results["anchor: graph_refresh_input_tensors exists"] = refresh is not None
-    results["anchor: graph_tensor_is_input exists"] = is_input is not None
+    results["anchor: ggml_sycl_prestage_is_input exists"] = is_input is not None
     results["anchor: graph_prestage_or_decline exists"] = decline is not None
     results["anchor: graph_prestage_skip_declined exists"] = declined is not None
     results["anchor: graph_compute_unchecked exists"] = compute is not None
@@ -269,21 +289,77 @@ def evaluate(backend, common, memo_hdr):
     # Pre-stage decides INPUT through the shared classifier (llama.cpp-zhcn's prestage predicate), which asks the
     # view-aware test; the flag-only test must be gone from both.
     classify = function_body(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{") or ""
+    facts_fn = function_body(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{") or ""
     results["pre-stage asks the view-aware INPUT test"] = \
-        "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in classify
+        "ggml_sycl_prestage_classify(" in prestage and "ggml_sycl_prestage_is_input(tensor)" in facts_fn
     results["pre-stage has no flag-only INPUT test left"] = \
-        "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify
-    results["refresh discovery asks the view-aware INPUT test"] = "graph_tensor_is_input(" in refresh
+        "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify and \
+        "flags & GGML_TENSOR_FLAG_INPUT" not in facts_fn
+    # A host-resident op output is another split's per-token activation. The backend gathers the facts and asks the
+    # shared rule; it returns no class of its own.
+    results["classify asks the shared class rule, with the view root's op as a fact"] = \
+        re.search(r"return\s+ggml_sycl_prestage_class_of\(ggml_sycl_prestage_facts_of\(", classify) is not None and \
+        "ggml_sycl_prestage_root_is_op_output(tensor)" in facts_fn and \
+        re.search(r"return\s+ggml_sycl_prestage_class::", classify + facts_fn) is None
+    # Without a node set the producer is unknown, and the fact says "this graph's own": the conservative answer (COPY,
+    # the class every host op output had before), which the bytes predicate does not depend on.
+    results["the graph-node fact asks the graph's node set, and a caller with none gets this graph's own"] = \
+        re.search(r"const bool reaches_rule\s*=\s*facts\.root_is_op_output\s*&&\s*!facts\.is_control\s*&&\s*"
+                  r"!facts\.is_weight\s*&&\s*!facts\.is_device\s*&&\s*!facts\.is_input\s*&&\s*!facts\.is_kv_host\s*;\s*"
+                  r"facts\.root_is_graph_node\s*=\s*reaches_rule\s*&&\s*"
+                  r"\(\s*!graph_nodes\s*\|\|\s*graph_nodes->contains\(ggml_sycl_prestage_view_root\(tensor\)\)\s*\)\s*;",
+                  facts_fn) is not None
+    node_set = function_body(backend, r"bool\s+contains\(const ggml_tensor \* tensor\)\s*\{") or ""
+    results["the node set holds the graph's nodes"] = \
+        re.search(r"for\s*\(int i = 0; i < cgraph->n_nodes; i\+\+\)\s*\{\s*nodes\.insert\(cgraph->nodes\[i\]\);\s*\}", node_set) is not None
+    results["the pre-stage classifies against the node set of the graph it stages"] = \
+        re.search(r"ggml_sycl_graph_node_set\s+graph_nodes\(cgraph\);", prestage) is not None and \
+        re.search(r"ggml_sycl_prestage_classify\(tensor,\s*ggml_sycl_prestage_source_buft\(tensor\),\s*&graph_nodes\)", prestage) is not None
+    needs_copy = function_body(backend, r"size_t ggml_sycl_prestage_needs_device_copy\([^)]*\)\s*\{") or ""
+    reports = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_reports_bytes\([^)]*\)\s*\{") or ""
+    results["the bytes predicate counts COPY and a host op output, never a flagged INPUT"] = \
+        re.search(r"ggml_sycl_prestage_reports_bytes\(ggml_sycl_prestage_facts_of\(tensor,\s*src_buft,\s*nullptr\)\)",
+                  needs_copy) is not None and \
+        re.search(r"return\s+c\s*==\s*ggml_sycl_prestage_class::COPY\s*\|\|\s*"
+                  r"\(c\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*!facts\.is_input\);", reports) is not None
+    class_of = function_body(class_hdr, r"ggml_sycl_prestage_class\s+ggml_sycl_prestage_class_of\([^)]*\)\s*\{") or ""
+    results["the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY"] = \
+        re.fullmatch(r"\{\s*"
+                     r"if\s*\(facts\.is_control\)\s*\{\s*return ggml_sycl_prestage_class::CONTROL;\s*\}\s*"
+                     r"if\s*\(facts\.is_weight\)\s*\{\s*return ggml_sycl_prestage_class::WEIGHT;\s*\}\s*"
+                     r"if\s*\(facts\.is_device\)\s*\{\s*return ggml_sycl_prestage_class::DEVICE;\s*\}\s*"
+                     r"if\s*\(facts\.is_input\)\s*\{\s*return ggml_sycl_prestage_class::INPUT;\s*\}\s*"
+                     r"if\s*\(facts\.is_kv_host\)\s*\{\s*return ggml_sycl_prestage_class::KV_HOST;\s*\}\s*"
+                     r"if\s*\(facts\.root_is_op_output\s*&&\s*!facts\.root_is_graph_node\)\s*\{\s*"
+                     r"return ggml_sycl_prestage_class::INPUT;\s*\}\s*"
+                     r"return ggml_sycl_prestage_class::COPY;\s*\}", class_of) is not None
+    view_root = function_body(class_hdr, r"ggml_tensor\s*\*\s*ggml_sycl_prestage_view_root\([^)]*\)\s*\{") or ""
+    root_walk = function_body(class_hdr, r"bool\s+ggml_sycl_prestage_root_is_op_output\([^)]*\)\s*\{") or ""
+    results["the op-output fact reads the view root's op, not the view's"] = \
+        re.search(r"while\s*\(\s*tensor->view_src\s*\)\s*\{\s*tensor\s*=\s*tensor->view_src;\s*\}\s*return tensor;", view_root) is not None \
+        and re.search(r"const ggml_tensor \*\s*root\s*=\s*ggml_sycl_prestage_view_root\(tensor\);\s*"
+                      r"return\s+root\s*&&\s*root->op\s*!=\s*GGML_OP_NONE;", root_walk) is not None
+    results["refresh discovery asks the view-aware INPUT test"] = "ggml_sycl_prestage_is_input(" in refresh
+    results["refresh discovery also takes the host op outputs the pre-stage stages as INPUT"] = \
+        re.search(r"ggml_sycl_graph_node_set\s+graph_nodes\(cgraph\);", refresh) is not None and \
+        re.search(r"ggml_sycl_prestage_is_input\(tensor\)\s*\|\|\s*"
+                  r"ggml_sycl_prestage_classify\(tensor,\s*ggml_sycl_prestage_source_buft\(tensor\),\s*&graph_nodes\)\s*==\s*"
+                  r"ggml_sycl_prestage_class::INPUT", refresh) is not None
     results["refresh discovery has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in refresh
-    # A zero-byte tensor has nothing to stage; reporting it as a failure is what made fail-closed unusable.
-    failed_at = prestage.find("Failed to stage")
-    zero_at = re.search(r"ggml_nbytes\(tensor\)\s*==\s*0", prestage)
+    # A zero-byte tensor has nothing to stage; reporting it as a failure is what made fail-closed unusable. The test
+    # returns from stage_tensor before its first stage action (stage_effect holds the actions that can fail).
+    stage_tensor = function_body(prestage, r"auto stage_tensor = \[&\]\([^)]*\)\s*\{") or ""
+    act_at = stage_tensor.find("stage_effect(")
+    zero_at = re.search(r"ggml_nbytes\(tensor\)\s*==\s*0", stage_tensor)
     results["a zero-byte tensor is a no-op, not a staging failure"] = \
-        zero_at is not None and 0 <= zero_at.start() < failed_at
+        zero_at is not None and 0 <= zero_at.start() < act_at
 
     # --- (b) fail closed ----------------------------------------------------------------------
+    # Both ends of the pass report it: the walk's own end and a replay of the decode prologue memo's list.
     results["a staging failure is reported to the caller"] = \
-        re.search(r"all_staged\s*=\s*false", prestage) is not None and "return all_staged" in prestage
+        re.search(r"all_staged\s*=\s*false", prestage) is not None and \
+        re.search(r"return all_staged;\s*\}\s*$", prestage) is not None and \
+        re.search(r"if\s*\(replay\)\s*\{[^{}]*\{[^{}]*\}\s*return all_staged;\s*\}", prestage) is not None
     results["the decline names itself at WARN"] = "GGML_LOG_WARN" in decline and "not recording" in decline
     results["the decline returns false on failure"] = "return false" in decline
     results["a declined graph is remembered on the context, so the pass is not repeated per token"] = \
@@ -344,9 +420,15 @@ def evaluate(backend, common, memo_hdr):
         return [m.start() for m in re.finditer(r"(?<!bool )\b%s\(" % name, backend)]
 
     decl_span = (backend.find(decline), backend.find(decline) + len(decline))
-    stray = [at for at in calls("graph_prestage_leaf_tensors") if not decl_span[0] <= at < decl_span[1]]
+    # The decode prologue memo's prestage runs the pass for the gateway (on its last argument): it is the one other
+    # caller of the pass, and only the gateway calls it.
+    memo_pre = function_body(backend, r"static bool graph_prologue_memo_prestage\([^)]*\)\s*\{") or ""
+    memo_span = (backend.find(memo_pre), backend.find(memo_pre) + len(memo_pre)) if memo_pre else (-1, -1)
+    stray = [at for at in calls("graph_prestage_leaf_tensors")
+             if not decl_span[0] <= at < decl_span[1] and not memo_span[0] <= at < memo_span[1]]
+    memo_callers = [at for at in calls("graph_prologue_memo_prestage") if not decl_span[0] <= at < decl_span[1]]
     results["no code pre-stages as a statement: graph_prestage_or_decline is the only caller of the pre-stage"] = \
-        not stray
+        not stray and bool(memo_pre) and not memo_callers
     consumers = calls("graph_prestage_or_decline")
     consumed = [at for at in consumers
                 if re.search(r"if\s*\([^;{]*!\s*$", backend[max(0, at - 160):at]) is not None]
@@ -389,16 +471,29 @@ def evaluate(backend, common, memo_hdr):
     # llama.cpp-7pm2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
     # decline; a replay or a record runs only past it, and each re-reads the slot, since a staging swap at the
     # gateway retires every slot after begin() chose the action. A replay whose inputs now stage to other buffers
-    # than the slot's graphs read forgets the slot and runs direct.
+    # than the slot's graphs read forgets the slot and runs direct. The token-start trace stamps (each the sole
+    # statement of its trace-flag guard, pinned by test-sycl-token-start-stamps-source.py) may sit between these
+    # statements: they record a clock and change no control flow.
+    def stamp(call):
+        return r"(?:if\s*\(moe_hostpath_waits_enabled\(\)\)\s*\{\s*" + call + r";\s*\}\s*)?"
+
+    # The keyed slot alone passes the gateway's last argument: its pass goes through the decode prologue memo, and
+    # the gateway treats that answer as the full pass's.
+    keyed_site = r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash,\s*true" + r"\)\s*\{\s*"
     keyed = re.search(
-        r"\}\s*else if\s*\(slot_action == gsc::action::DIRECT\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*" + site +
-        r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*"
+        r"\}\s*else if\s*\(slot_action == gsc::action::DIRECT\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*" +
+        keyed_site +
+        r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*" +
+        stamp(r"moe_token_stamps_note_step\(MOE_TOKEN_STEP_PRESTAGE_END\)") +
         r"const auto \* slot = sycl_ctx->moe_segment_slots\.payload\(slot_key\);\s*if\s*\(!slot\)\s*\{\s*"
         r"compute_impl_unlocked\(\);\s*\}\s*"
         r"else if\s*\(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{[^{}]*?"
         r"sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*compute_impl_unlocked\(\);\s*\}\s*"
-        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*"
-        r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*graph_executed = true;\s*\}\s*\}\s*"
+        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*" +
+        stamp(r"moe_token_stamps_note_replay\(\)") +
+        r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*" +
+        stamp(r"moe_token_stamps_note_replay_end\(\)") +
+        r"graph_executed = true;\s*\}\s*\}\s*"
         r"else if\s*\(!sycl_ctx->moe_segment_slots\.state\(slot_key\)\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{",
         compute)
     results["site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists"] = \
@@ -501,15 +596,21 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"graph_input_staging\.clear\(\);\s*graph_input_staging_swapped\s*=\s*false;", clear_fn) is not None
     results["a staging failure for an INPUT tensor is terminal for the pass (no fallthrough to the cache paths)"] = \
         re.search(r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\ball_staged\s*=\s*false;\s*return;\s*\}", prestage) is not None
+    # stage_tensor sends a named INPUT to the INPUT action and returns; stage_effect's INPUT action returns on success.
     results["the INPUT arm tests exactly 'is input, named' and its success path returns"] = \
-        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{[^{}]*"
-                  r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\}\s*staged_count\+\+;\s*mark_staged\(tensor\);\s*"
-                  r"GGML_SYCL_DEBUG\([^;]*;\s*return;\s*\}", prestage) is not None
+        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*"
+                  r"tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
+                  r"stage_effect\(tensor,\s*prestage_arm::INPUT,\s*source_desc\);\s*return;\s*\}", prestage) is not None \
+        and re.search(r"if\s*\(arm\s*==\s*prestage_arm::INPUT\)\s*\{[^{}]*"
+                      r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\}\s*staged_count\+\+;\s*"
+                      r"mark_staged\(tensor\);\s*GGML_SYCL_DEBUG\([^;]*;\s*return;\s*\}", prestage) is not None
     results["the gateway consumes the swapped flag and retires the recorders, with no second pass"] = \
-        re.search(r"const bool staged\s*=\s*graph_prestage_leaf_tensors\(ctx, cgraph\);\s*bool\s+retired\s*=\s*true;\s*"
+        re.search(r"const bool staged\s*=\s*through_prologue_memo\s*\?\s*graph_prologue_memo_prestage\(ctx, cgraph\)\s*:\s*"
+                  r"graph_prestage_leaf_tensors\(ctx, cgraph\);\s*bool\s+retired\s*=\s*true;\s*"
                   r"if\s*\(ctx->graph_input_staging_swapped\)\s*\{\s*retired = graph_staging_swap_retire\(ctx\);\s*\}\s*"
                   r"if\s*\(staged && retired\)\s*\{", decline) is not None and \
-        len(re.findall(r"graph_prestage_leaf_tensors\(", decline)) == 1
+        len(re.findall(r"graph_prestage_leaf_tensors\(", decline)) == 1 and \
+        len(re.findall(r"graph_prologue_memo_prestage\(", decline)) == 1
     # I1 (r7): the gateway and the swap retire run INSIDE a graph_compute that has already pinned weights and experts,
     # so they must not call the whole clear_active (it unpins leases, clears the CPU staging cache and the MoE layout
     # cache) and must not release the staging map. They leave leases, pins and those caches alone.
@@ -545,7 +646,10 @@ def evaluate(backend, common, memo_hdr):
     inv_ok = True
     for name, flag in invalidators.items():
         body = function_body(common, r"\bbool\s+" + name + r"\(\)\s*\{") or ""
-        inv_ok = inv_ok and bool(re.match(r"\{\s*if\s*\(!ggml_sycl_retire_moe_graph_epoch\(this\)\)\s*\{\s*" +
+        # invalidate_moe_segments drops the decode prologue memo first (test-sycl-graph-prologue-memo-source.py pins
+        # that statement); it cannot fail and changes no retire.
+        lead = r"(?:prologue_memo\.clear\(\);\s*)?" if name == "invalidate_moe_segments" else ""
+        inv_ok = inv_ok and bool(re.match(r"\{\s*" + lead + r"if\s*\(!ggml_sycl_retire_moe_graph_epoch\(this\)\)\s*\{\s*" +
                                           flag + r"\s*=\s*true;\s*return false;\s*\}", body)) and \
             re.search(r"return true;\s*\}\s*$", body) is not None
     results["each MoE invalidator reports whether it retired the epoch (false on failure)"] = inv_ok
@@ -574,7 +678,7 @@ def evaluate(backend, common, memo_hdr):
         print("NOTE: compute-entry check: " + entry_reason)
     results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = entry_reason == ""
     results["the INPUT arm stages on the backend's own queue"] = \
-        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
+        re.search(r"if\s*\(arm\s*==\s*prestage_arm::INPUT\)\s*\{\s*"
                   r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void\s*\*\s*dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
                   prestage) is not None
     dense_drop = function_body(backend, r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
@@ -619,6 +723,7 @@ def run(label, sources, expect_fail=None):
 
 backend, common = read(args.backend), read(args.common)
 memo_hdr = read(args.memo) if Path(args.memo).exists() else ""
+CLASS_HDR = read(args.prestage_class) if Path(args.prestage_class).exists() else ""
 failed = run("tree", (backend, common, memo_hdr))
 
 if args.self_test:
@@ -689,6 +794,10 @@ if args.self_test:
         return rest[:k2] + block + "\n" + rest[k2:]
 
     mem_ = memo_hdr
+    keyed_check = "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists"
+    only_caller = "no code pre-stages as a statement: graph_prestage_or_decline is the only caller of the pre-stage"
+    gateway_once = "the gateway consumes the swapped flag and retires the recorders, with no second pass"
+    input_arm = "the INPUT arm tests exactly 'is input, named' and its success path returns"
     mutants = [
         # review r13
         ("the entry condition compares the flag to false", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
@@ -802,18 +911,65 @@ if args.self_test:
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
-         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "ggml_sycl_prestage_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
+        ("classify returns a class of its own", "classify asks the shared class rule, with the view root's op as a fact",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{",
+                         "return ggml_sycl_prestage_class_of(", "if (facts.is_kv_host) { return ggml_sycl_prestage_class::KV_HOST; }\n    return ggml_sycl_prestage_class_of("),
+          common, mem_)),
+        ("classify drops the op-output fact", "classify asks the shared class rule, with the view root's op as a fact",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{",
+                         "ggml_sycl_prestage_root_is_op_output(tensor)", "false"), common, mem_)),
+        ("the graph-node fact is dropped", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{",
+                         "graph_nodes->contains(ggml_sycl_prestage_view_root(tensor))", "false"), common, mem_)),
+        ("a caller with no node set gets another split's activation", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "(!graph_nodes ||", "(graph_nodes &&"), common, mem_)),
+        ("every op output asks the node set", "the graph-node fact asks the graph's node set, and a caller with none gets this graph's own",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_facts ggml_sycl_prestage_facts_of\([^)]*\)\s*\{", "!facts.is_device &&", ""),
+          common, mem_)),
+        ("the node set is empty", "the node set holds the graph's nodes",
+         (mutate_in_func(backend, r"bool\s+contains\(const ggml_tensor \* tensor\)\s*\{", "nodes.insert(cgraph->nodes[i]);", "(void) i;"),
+          common, mem_)),
+        ("the pre-stage classifies without the node set", "the pre-stage classifies against the node set of the graph it stages",
+         (mutate_in_func(backend, pre_sig, "ggml_sycl_prestage_source_buft(tensor), &graph_nodes)", "ggml_sycl_prestage_source_buft(tensor), nullptr)"),
+          common, mem_)),
+        ("the bytes predicate counts COPY only", "the bytes predicate counts COPY and a host op output, never a flagged INPUT",
+         (backend, common, mem_, mutate(CLASS_HDR, " || (c == ggml_sycl_prestage_class::INPUT && !facts.is_input)", ""))),
+        ("the bytes predicate counts a flagged INPUT", "the bytes predicate counts COPY and a host op output, never a flagged INPUT",
+         (backend, common, mem_, mutate(CLASS_HDR, "(c == ggml_sycl_prestage_class::INPUT && !facts.is_input)", "c == ggml_sycl_prestage_class::INPUT"))),
+        ("the bytes predicate asks the class alone", "the bytes predicate counts COPY and a host op output, never a flagged INPUT",
+         (mutate_in_func(backend, r"size_t ggml_sycl_prestage_needs_device_copy\([^)]*\)\s*\{",
+                         "ggml_sycl_prestage_reports_bytes(ggml_sycl_prestage_facts_of(tensor, src_buft, nullptr))",
+                         "ggml_sycl_prestage_classify(tensor, src_buft, nullptr) == ggml_sycl_prestage_class::COPY"), common, mem_)),
+        ("a graph's own op output is staged as an input", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_, mutate(CLASS_HDR, "facts.root_is_op_output && !facts.root_is_graph_node", "facts.root_is_op_output"))),
+        ("the op-output fact reads the tensor, not the root", "the op-output fact reads the view root's op, not the view's",
+         (backend, common, mem_, mutate(CLASS_HDR, "return root && root->op != GGML_OP_NONE;", "return tensor && tensor->op != GGML_OP_NONE;"))),
+        ("the op-output rule moves ahead of KV_HOST", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_,
+          re.sub(r"(if \(facts\.is_kv_host\) \{\s*return ggml_sycl_prestage_class::KV_HOST;\s*\})(\s*)"
+                 r"(if \(facts\.root_is_op_output && !facts\.root_is_graph_node\) \{\s*return ggml_sycl_prestage_class::INPUT;\s*\})",
+                 r"\3\2\1", CLASS_HDR, count=1))),
+        ("a host op output is copied", "the class rule: CONTROL, WEIGHT, DEVICE, the INPUT flag, KV_HOST, a host op output as INPUT, else COPY",
+         (backend, common, mem_, mutate(CLASS_HDR, "if (facts.root_is_op_output && !facts.root_is_graph_node) {", "if (false) {"))),
+        ("the op-output fact reads the view's own op", "the op-output fact reads the view root's op, not the view's",
+         (backend, common, mem_, mutate(CLASS_HDR, "tensor = tensor->view_src;", "break;"))),
+        ("refresh discovery skips host op outputs", "refresh discovery also takes the host op outputs the pre-stage stages as INPUT",
+         (mutate_in_func(backend, ref_sig, "ggml_sycl_prestage_is_input(tensor) ||", "ggml_sycl_prestage_is_input(tensor) || false &&"),
+          common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
-         (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, ref_sig, "ggml_sycl_prestage_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("view walk dropped", "the INPUT test walks view_src",
-         (mutate_in_func(backend, r"static bool graph_tensor_is_input\([^)]*\)\s*\{", "view_src", "view_XXXX"),
-          common, mem_)),
+         (backend, common, mem_,
+          mutate_in_func(CLASS_HDR, r"bool\s+ggml_sycl_prestage_is_input\([^)]*\)\s*\{", "view_src", "view_XXXX"))),
         ("zero-byte failure restored", "a zero-byte tensor is a no-op, not a staging failure",
          (mutate_in_func(backend, pre_sig, "ggml_nbytes(tensor) == 0", "ggml_nbytes(tensor) == 12345"), common, mem_)),
         ("failure swallowed", "a staging failure is reported to the caller",
          (mutate_in_func(backend, pre_sig, "return all_staged", "return true"), common, mem_)),
+        ("failure swallowed at the end of the walk", "a staging failure is reported to the caller",
+         (mutate_re(backend, pre_sig, r"(skipped_control\);\s*)return all_staged;", r"\1return true;"), common, mem_)),
         ("decline is silent", "the decline names itself at WARN",
          (mutate_in_func(backend, dec_sig, "GGML_LOG_WARN", "GGML_SYCL_DEBUG"), common, mem_)),
         ("decline not remembered", "a declined graph is remembered on the context, so the pass is not repeated per token",
@@ -1025,9 +1181,39 @@ if args.self_test:
          (mutate_in_func(backend, cmp_sig, "if (!slot) {", "if (false) {"), common, mem_)),
         ("the keyed slot records a slot a staging swap retired", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
          (mutate_in_func(backend, cmp_sig, "} else if (!sycl_ctx->moe_segment_slots.state(slot_key)) {", "} else if (false) {"), common, mem_)),
-        ("the keyed slot records past a decline", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
-         (mutate_in_func(backend, r"slot_action == gsc::action::DIRECT\)", "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
+        ("the keyed slot records past a decline", keyed_check,
+         (mutate_in_func(backend, r"slot_action == gsc::action::DIRECT\)",
+                         "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash, true)) {",
                          "} else if (false) {"), common, mem_)),
+        ("a second caller of the memo prestage", only_caller,
+         (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
+                    "{ return graph_prologue_memo_prestage(c, g); }\n", common, mem_)),
+        ("the memo prestage is gone", only_caller,
+         (backend.replace("static bool graph_prologue_memo_prestage(", "static bool graph_prologue_memo_prestage_gone("),
+          common, mem_)),
+        ("the gateway passes through the memo a second time", gateway_once,
+         (mutate_in_func(backend, dec_sig, "graph_staging_swap_retire(ctx);",
+                         "graph_staging_swap_retire(ctx);\n"
+                         "        staged = staged && graph_prologue_memo_prestage(ctx, cgraph);"),
+          common, mem_)),
+        ("the gateway always runs the full pass", gateway_once,
+         (mutate_in_func(backend, dec_sig, "through_prologue_memo ?", "false ?"), common, mem_)),
+        ("a named INPUT also takes the cache action", input_arm,
+         (mutate_re(backend, pre_sig, r"(stage_effect\(tensor, prestage_arm::INPUT, source_desc\);)\s*return;", r"\1"),
+          common, mem_)),
+        ("a named INPUT takes the cache action", input_arm,
+         (mutate_in_func(backend, pre_sig, "stage_effect(tensor, prestage_arm::INPUT, source_desc);",
+                         "stage_effect(tensor, prestage_arm::CACHE, source_desc);"), common, mem_)),
+        ("the zero-byte test moves past the stage action", "a zero-byte tensor is a no-op, not a staging failure",
+         (mutate_re(mutate_re(backend, pre_sig, r"if \(ggml_nbytes\(tensor\) == 0\) \{\s*return;\s*\}", ""), pre_sig,
+                    r"stage_effect\(tensor, prestage_arm::CACHE, source_desc\);",
+                    "stage_effect(tensor, prestage_arm::CACHE, source_desc);\n"
+                    "        if (ggml_nbytes(tensor) == 0) { return; }"),
+          common, mem_)),
+        ("a trace-stamp guard in the keyed replay also runs the graph direct",
+         "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, cmp_sig, "moe_token_stamps_note_replay();",
+                         "moe_token_stamps_note_replay(); compute_impl_unlocked();"), common, mem_)),
         ("an eighth recorder appears", "no unnamed pre-stage consumer: the seven recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),

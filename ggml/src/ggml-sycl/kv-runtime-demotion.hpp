@@ -1,4 +1,5 @@
 #pragma once
+#include "exit-settle.hpp"
 #include "shared-zone-tags.hpp"
 #include "tlsf-allocator.hpp"
 
@@ -837,6 +838,7 @@ inline std::atomic<kv_fit_misuse_fn> & kv_fit_misuse_handler() {
     } else {
         std::fprintf(stderr, "%s:%d: [KV-FIT-MISUSE] %s\n", file, line, detail);
     }
+    ggml_sycl::exit_settle();
     std::abort();
 }
 

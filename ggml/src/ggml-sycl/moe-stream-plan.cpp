@@ -156,6 +156,12 @@ bool moe_stream_phase::executor_claims(int layer) {
            moe_stream_executor_claims(it->second, geo_) && ring_ready(nullptr);
 }
 
+// The decision alone answers: begin_layer decides only a layer the index names, and decision_of answers NOT_CONSULTED
+// for any other layer and for one this micro-batch has not reached.
+bool moe_stream_phase::cpu_decided(int layer) const {
+    return decision_of(layer).choice == moe_exec_choice::CPU;
+}
+
 // A window the last call prefetched is staged already; any other is staged now, whole, into a region of its own. Then
 // the next window goes into the other region, where its copies overlap this window's dequants.
 uint32_t moe_stream_phase::window_begin(const moe_stream_window_request & req,
@@ -610,6 +616,12 @@ bool moe_stream_phase::ring_ready(const moe_stream_loan_sizer * sizer) {
     size_t bytes_short = 0;
     if (!ring->reserve(device_, geo_, &bytes_short)) {
         reserve_failed_ = true;
+        // A zone short of slots, not a refused geometry: name what holds the WEIGHT zone while the refused ring still
+        // holds its slots, once per context, since the reserve is retried every micro-batch.
+        if (bytes_short != 0 && !weight_zone_warned_) {
+            weight_zone_warned_ = true;
+            moe_stream_ring_warn_weight_zone(device_, ring->slots_held(), geo_.slot_bytes);
+        }
         if (moe_stream_loan_on_short_reserve(loan_latch_, device_, bytes_short, geo_.slot_bytes, request_loan_,
                                              loan_refusals_, sizer) == moe_stream_loan_step::REFUSED) {
             warn_loan_refused(bytes_short);

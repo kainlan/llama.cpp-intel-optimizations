@@ -28,12 +28,17 @@ bool       test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle l
 // ggml_sycl_plan_has_cpu_work() on a synthetic plan: true when the CPU would
 // execute any part of the graph (llama.cpp-38af).
 bool test_plan_has_cpu_work(const placement_plan & plan);
+// The clause of that predicate which fired, by the name the "[SYCL-CPU-ACT] plan CPU work:" line prints, or nullptr
+// when the plan leaves the CPU no work.
+const char * test_plan_cpu_work_reason(const placement_plan & plan);
 
 // Mutable controls are declared only for private direct-source fixtures.
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_set_layout_override(ggml_layout_mode layout);
 void test_clear_layout_override();
 bool test_get_layout_override(ggml_layout_mode * out);
+// Sets the model-load flag the SYCL_Host buffer type reads to choose its role and lifetime.
+void test_set_in_model_load(bool loading);
 #endif
 void               test_clear_host_weight_registry();
 bool               test_backend_supports_graphs(ggml_backend_t backend);
@@ -550,6 +555,10 @@ void test_clear_kv_placement_plan();
 bool test_moe_multi_gpu_for_executor();
 bool test_moe_multi_gpu_latch();
 bool test_moe_multi_gpu_wanted(const placement_plan & plan);
+// The stage's refusal of a cross-card expert plan, given whether the cards have a peer path, and the peer-path
+// answer the stage passes it for a set of devices, read from the device info's peer-link records.
+bool test_cross_card_expert_plan_refused(const placement_plan & plan, bool peer_path);
+bool test_cards_have_peer_path(const std::vector<int> & devices);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
 // Forces the planner's XMX_TILED grouped-DPAS PP route predicate on or off (its env read is latched per process).
@@ -615,6 +624,12 @@ struct test_moe_mmid_route_reachable_override_guard {
 #endif
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The plan dry run's record of one plan (th32 §4.2): every term and residency line it prints for `plan` under
+// `index`, and the result it fills. A hand-built plan reaches backing mixes and charges a shaped inventory does not.
+ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const placement_plan & plan);
+#endif
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 // The expert loan transaction (llama.cpp-mwmr) on synthetic MoE tensors staged on logical device 0. Each returns an
 // empty string on a pass and otherwise names the first failed assertion. The shared-storage case reserves a WEIGHT
 // arena, so run it last: with an arena the other cases' experts become zone sub-allocations instead of raw device rows.
@@ -638,10 +653,11 @@ std::string test_expert_refill_cancelled_by_a_loan();
 std::string test_expert_refill_runs_once_per_decode_graph();
 std::string test_expert_refill_drops_an_unpreparable_triplet();
 std::string test_expert_refill_moves_two_triplets_per_call();
-// The loan and the refill size their copies from the cache entry, which can exceed the plan's dst_size by the tail
-// S1-PRELOAD pads, and a host copy smaller than its entry is still refused (llama.cpp-pu8v).
-std::string test_expert_loan_sizes_its_copies_from_the_entry();
-// With no entry to size a copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
+// The loan and the refill size their copies from the tensor, never from a padded cache entry: the loan's host copy
+// holds the expert's own bytes, and the refill's device copy is the staged size with its tail zero-filled. Host
+// storage that cannot hold the bytes, and an expert longer than its device entry, are refused.
+std::string test_expert_loan_and_refill_size_from_the_tensor();
+// With no entry to copy from, a loan stops "not resident" and a refill "not lent", the latter only at the
 // ledger's back, and either moves and publishes nothing (llama.cpp-pu8v).
 std::string test_expert_loan_and_refill_stop_on_a_missing_entry();
 // A loan leaves no lease on a withdrawn device entry in the pointer tables a prompt graph's preload built, and marks
@@ -665,6 +681,46 @@ std::string test_expert_refill_returns_a_loan_an_ended_context_owes();
 // refill re-admits the rest, one per decode graph, with no second bulk line (llama.cpp-i4ny).
 std::string test_expert_refill_returns_a_partial_bulk_refills_leftovers_per_graph();
 std::string test_expert_refill_returns_a_refused_bulk_refills_loan_per_graph();
+// On a plan that maps files, a loan publishes its lent members PINNED, the pinned copy it made, and a refill publishes
+// them FILE_MAPPED again; on a plan that maps nothing they read PINNED throughout.
+std::string test_expert_loan_on_a_mapping_plan_publishes_its_lent_members_as_pinned();
+// The named move's admit, on the same fixture with each host triplet copied to the pinned pool as S1-PRELOAD copies
+// one. A padded width's tail reads zero in storage poisoned before the admit, and the payload is the expert's bytes; a
+// member served from a file mapping refuses its triplet and leaves it as it was, while a triplet named after it moves;
+// a loan outstanding and a WEIGHT zone with room for one member are BUSY and leave no state; the host zone gets the
+// moved copies' bytes back once their retired entries go; and the admit that completes a block is read from the card
+// through the selected-ids pointer table built right after it, behind the copy's ready event, and through the decode
+// direct route's table, which refused the block before the admit and serves it after.
+std::string test_expert_admit_zero_fills_a_padded_tail();
+std::string test_expert_admit_refuses_a_file_mapped_member();
+std::string test_expert_admit_is_busy_while_lent_or_the_zone_is_full();
+std::string test_expert_admit_returns_the_host_zone_bytes();
+std::string test_expert_admit_completes_a_block_read_through_its_table();
+// An admit sizes from the tensor, never the host copy: from a host copy longer than the expert it copies only the
+// tensor's bytes, mints their staged size, zero-fills the tail and records the tensor's bytes; a host copy shorter
+// than the expert is refused "host copy size" and leaves the triplet as it was.
+std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy();
+std::string test_expert_admit_refuses_a_host_copy_shorter_than_the_tensor();
+std::string test_expert_admit_completes_a_block_the_direct_route_serves();
+// The named move's evict, on the same fixture. A resident triplet moves to pinned host storage through the loan's
+// cache body, writes no ledger, so the refill never re-admits it, and its device entries go only when a deferred-free
+// pass reaps them. A bulk-staged triplet is REFUSED "shared storage" while one staged per expert moves in the same
+// call; right after an admit, or with a loan outstanding, an evict is BUSY and changes nothing; a swap keeps the
+// block's resident count and, once reaped, the zone's room; evict and admit cycles keep no storage on either side, and
+// each cycle's evict shows its copies in the host zone and its reaped room in the WEIGHT zone; a refused evict leaves
+// the admit beside it to move; an evict's device room is never an admit's in the same call; and an evict out of a
+// block the decode direct route served moves the tensor's storage generation, so the route refuses the block instead
+// of its old table.
+std::string test_expert_evict_moves_a_resident_triplet();
+std::string test_expert_evict_is_not_refilled();
+std::string test_expert_evict_refuses_shared_storage();
+std::string test_expert_evict_is_busy_right_after_an_admit();
+std::string test_expert_evict_is_busy_while_lent();
+std::string test_expert_evict_and_admit_swap_in_one_call();
+std::string test_expert_evict_and_admit_cycles_return_the_room();
+std::string test_expert_evict_refusal_leaves_the_admit_list_alone();
+std::string test_expert_evict_room_is_not_an_admit_in_the_same_call();
+std::string test_expert_evict_takes_a_block_off_the_direct_route();
 #endif
 
 }  // namespace ggml_sycl
@@ -685,3 +741,74 @@ int ggml_sycl_get_blind_preload_threshold();
 // Check if blind preload should be skipped for given expert count
 // Returns true if should SKIP blind preload (expert count exceeds threshold)
 bool ggml_sycl_should_skip_blind_preload(int64_t n_experts);
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// test-sycl-seg-refusal-cleanup's seams in ggml-sycl.cpp (docs/design/sycl-mmap-host-tier.md §4.4, §7 C4). The
+// refusal is forced at the armed node through ggml_sycl::host_dispatch_fail_closed, the one function a real refusal
+// throws from, and the report records what the design's preconditions and assertions read. Identities are the
+// executables' addresses, compared only while the test holds the context.
+#    define GGML_SYCL_TEST_SEG_IDS_MAX 8
+
+struct ggml_sycl_test_seg_seam {
+    // The refusal, and the context's state the seam read just before its throw.
+    bool         fired;
+    size_t       weight_leases;  // graph_weight_leases.size()
+    size_t       moe_leases;     // graph_moe_expert_leases.size()
+    bool         exec_graph;     // exec_graph non-null
+    bool         active_valid;   // active_exec_graph.valid
+    // The note taken at a recorded segment's moe_after site, just before its helper call; the last one taken.
+    bool         noted;
+    size_t       seg_idx;
+    int          moe_after;
+    bool         submitted;           // segment_submitted
+    int          last_recorded_node;  // recording_node_index
+    size_t       n_recorded;          // recorded_segments.size()
+    const void * seg_exec;            // recorded_segments.back().exec_graph
+    size_t       n_recorded_ids;      // the non-null executables recorded so far, in order
+    const void * recorded_ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+    // moe_segments.size() at the fallback catch's first statement (s1), the cleanup step's entry (s2) and its exit
+    // (s3); -1 until taken. s1's executables too.
+    long         s1;
+    long         s2;
+    long         s3;
+    size_t       n_s1_ids;
+    const void * s1_ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+    // The record function's entries since the arm, and the context's segments at the last one.
+    size_t       record_entries;
+    size_t       entry_segments;
+    bool         entry_disabled;  // moe_graphs_disabled
+    size_t       n_entry_ids;
+    const void * entry_ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+    // The retires the retire seam failed since the arm.
+    int          retire_hits;
+};
+
+struct ggml_sycl_test_seg_state {
+    bool         recording;        // g_ggml_sycl_graph_recording
+    bool         graph_ptr;        // g_recording_graph_ptr non-null
+    bool         queue_ptr;        // g_recording_queue_ptr non-null
+    bool         sink;             // a retained-handle sink attached
+    bool         queue_recording;  // the context's queue is in the recording state
+    size_t       weight_leases;
+    size_t       moe_leases;
+    bool         exec_graph;
+    bool         active_valid;
+    bool         rerecord;                      // moe_graph_rerecord
+    bool         moe_graphs_disabled;
+    uint64_t     optional_layout_epoch;         // the context's
+    uint64_t     global_optional_layout_epoch;  // g_ggml_sycl_optional_layout_epoch
+    size_t       n_segments;                    // moe_segments.size()
+    size_t       n_ids;
+    const void * ids[GGML_SYCL_TEST_SEG_IDS_MAX];
+};
+
+// Arms the refusal at the node named node_name when the helper runs it in `role` (null disarms), and the samples.
+// Every call clears the report.
+extern "C" void ggml_backend_sycl_test_seg_seam_arm(const char * node_name, const char * role, bool samples);
+extern "C" void ggml_backend_sycl_test_seg_seam_read(ggml_sycl_test_seg_seam * out);
+// While on, moe_graph_retention_retire_exact fails on every call, and each failure counts in retire_hits.
+extern "C" void ggml_backend_sycl_test_seg_retire_fail(bool on);
+// Sets active_exec_graph.valid for the prompt phase with exec_graph left null; false when exec_graph is set.
+extern "C" bool ggml_backend_sycl_test_seg_set_active_valid_alone(ggml_backend_t backend);
+extern "C" bool ggml_backend_sycl_test_seg_state_read(ggml_backend_t backend, ggml_sycl_test_seg_state * out);
+#endif

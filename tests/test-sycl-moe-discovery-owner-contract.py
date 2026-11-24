@@ -71,6 +71,18 @@ def locked_regions(text):
     return regions
 
 
+# The inventory guard in either guard type, with or without a template argument: the lock is a witnessed_mutex, which
+# a test build cannot spell std::mutex, so its guards deduce the type (std::lock_guard lock(m)).
+INVENTORY_LOCK_RE = re.compile(
+    r"std::(?:lock_guard|unique_lock)(?:<[^<>]*>)?\s+\w+\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;")
+
+
+def inventory_lock(text):
+    """The first inventory guard statement in `text`, or a needle no source contains when it has none."""
+    found = INVENTORY_LOCK_RE.search(text)
+    return found.group(0) if found else "\0no inventory guard\0"
+
+
 def ordered(text, *needles):
     """True when every needle appears, in the given order."""
     at = -1
@@ -167,7 +179,7 @@ def evaluate(backend, registry):
             "ggml_sycl_moe_owner_key(token)" in activate_impl
             and "moe_discovery_activate_retrying(g_moe_discovery_registry, moe_owner)" in activate_impl,
         "explicit activation transitions outside the publication lock":
-            ordered(activate_impl, "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);",
+            ordered(activate_impl, inventory_lock(activate_impl),
                     "ggml_sycl_publish_plan_locked(snapshot);", "}",
                     "moe_discovery_activate_retrying("),
         "model teardown releases exactly one owner, before its slot resources go":
@@ -248,14 +260,16 @@ ABSENCE_MUTANTS = {
         "        if (result.committed) {",
         "        ggml_sycl_reset_moe_module_state();\n        if (result.committed) {"),
     "the all-owner sweep exists only in module shutdown": (
-        "    g_adaptive_prestage.reset_after_stop();",
-        "    g_moe_discovery_registry.release_all_for_module_shutdown();\n    g_adaptive_prestage.reset_after_stop();"),
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);",
+        "    g_moe_discovery_registry.release_all_for_module_shutdown();\n"
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);"),
     "no integration site discards the transition result": (
         "        ggml_sycl_release_model_slot_resources(owner);",
         "        (void) g_moe_discovery_registry.activate(moe_owner);\n        ggml_sycl_release_model_slot_resources(owner);"),
     "module shutdown reuses the owner path's clear list": (
-        "    g_adaptive_prestage.reset_after_stop();",
-        "    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);\n    g_adaptive_prestage.reset_after_stop();"),
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);",
+        "    g_moe_hybrid_init_done.store(false, std::memory_order_relaxed);\n"
+        "    g_moe_post_pp_preload_pending.store(false, std::memory_order_relaxed);"),
 }
 
 

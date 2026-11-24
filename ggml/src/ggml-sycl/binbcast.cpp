@@ -2,6 +2,7 @@
 
 #include "dnnl-ops.hpp"
 #include "ggml.h"
+#include "graph-input-staged.hpp"
 #include "mem-ops.hpp"
 #include "sycl-kernel-profiler.hpp"
 
@@ -424,6 +425,14 @@ static bool ggml_sycl_binbcast_needs_raw_host_staging(const ggml_tensor * tensor
 
 bool ggml_sycl_test_binbcast_needs_raw_host_staging(const ggml_tensor * tensor, const void * resolved_ptr, int device) {
     return ggml_sycl_binbcast_needs_raw_host_staging(tensor, resolved_ptr, device);
+}
+
+void * ggml_sycl_test_binbcast_graph_input_staged_ptr(ggml_backend_sycl_context & ctx,
+                                                      const ggml_tensor *         tensor,
+                                                      size_t                      span_bytes,
+                                                      int                         device) {
+    ggml_sycl::mem_handle handle;
+    return ggml_sycl_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &handle);
 }
 
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
@@ -850,6 +859,23 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
         if (span_bytes == 0) {
             ggml_sycl_binbcast_tracef("zero-stage tensor=%s ptr=%p", tensor ? tensor->name : "(null)", source_ptr);
             return source_ptr;
+        }
+
+        // A recorded kernel bakes this pointer. The handle joins the op's terminal owners, which a recording keeps
+        // for the graph's lifetime; a size change that replaces the staging buffer also retires every recorder that
+        // baked the old pointer (graph_input_staging_swapped in common.hpp). No wait follows: the pre-stage's copy is
+        // ordered ahead on the same stream.
+        ggml_sycl::mem_handle graph_input_handle;
+        if (void * staged = ggml_sycl_graph_input_staged_ptr(ctx, tensor, span_bytes, device, &graph_input_handle)) {
+            ggml_sycl_binbcast_tracef("graph-input-staged tensor=%s bytes=%zu device=%d src=%p dst=%p", tensor->name,
+                                      span_bytes, device, source_ptr, staged);
+            stage = std::move(graph_input_handle);
+            return staged;
+        }
+        if (ggml_sycl_graph_recording_this_thread()) {
+            ggml_sycl_binbcast_tracef("graph-input-miss tensor=%s bytes=%zu device=%d flags=0x%x",
+                                      tensor ? tensor->name : "(null)", span_bytes, device,
+                                      tensor ? (unsigned) tensor->flags : 0u);
         }
 
         if (ggml_sycl_tensor_is_weight(tensor) && !g_ggml_sycl_graph_recording && span_bytes <= 1024ull * 1024ull) {

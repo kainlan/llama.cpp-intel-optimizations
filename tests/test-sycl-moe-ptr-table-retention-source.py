@@ -69,7 +69,7 @@ with gate('L56 prompt_down = section('):
     prompt_down = section(
         SYCL,
         "if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {",
-        "if (release_prompt_down_soa_after_dispatch) {",
+        "release_prompt_down_soa_once(true);",
     )
 with gate('L61 assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)" in promp'):
     assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)" in prompt_down

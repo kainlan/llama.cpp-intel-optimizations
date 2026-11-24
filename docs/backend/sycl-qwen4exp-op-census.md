@@ -287,28 +287,28 @@ GPU work, lead session only, holding `GPU.lock`, one command at a time.
 
 1. Sources oneAPI when needed, then checks that `GGML_SYCL` is ON and that `ldd` resolves at least
    two SYCL libraries (it counts only lines with `=> /`, never "not found").
-2. Waits for CLAUDE.md's post-lock settle: Shmem < 30 GB and MemAvailable > max(150 GB, the mode's
-   need). The qwen4exp need is 215 GB (200 GiB). After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with
-   "release GPU.lock and escalate". Every memory figure the script compares or prints is decimal GB
-   (10^9 bytes), CLAUDE.md's unit; it compares in bytes, so the floor is exactly 150e9 bytes, and
-   prints two decimals, with the bytes on a refusal, so a refusal at the floor never reads like a
-   pass. Under the host's permanent load MemAvailable can sit near or below that floor, and then an
-   exit 3 "not settled" is the rule working as intended, not a defect to work around: the lead
-   retries later or escalates, and never lowers the floor.
+2. Waits for CLAUDE.md's post-lock settle: GPU host backing (Shmem + the meminfo remainder) < 30 GiB and nothing else. `MemAvailable` is
+   logged and is not a condition (ruling 2026-11-12): it sits near 55 GB on purpose while another tenant
+   holds a model, and the planner refuses a load that exceeds the host budget by name, so the script does
+   not check that the load fits. After 600 s (`SETTLE_TIMEOUT_S`) it exits 3 with "release GPU.lock and
+   escalate". Every memory figure the script compares or prints is GiB (kB / 1048576), CLAUDE.md's
+   unit; it compares in kB and prints GiB to two decimals, and a settle refusal prints the read it decided on,
+   or `unreadable` when the host backing cannot be read (an unreadable meminfo is never settled).
 3. Launches the run in its own session through `bench-guard.sh`. bench-guard enforces the budget
-   (`timeout -k`), refuses to start if Shmem net of tmpfs exceeds its 10 GiB ceiling
-   (`bench-guard.sh:73,190`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
-   Its ceiling is the binding pre-run gate; the script's Shmem < 30 GB check is the looser one.
+   (`timeout -k`), refuses to start if GPU host backing (Shmem net of tmpfs, plus the remainder) exceeds its 10 GiB ceiling
+   (`SHMEM_CEIL_KB` in `bench-guard.sh`), checks the kernel journal for GPU faults, and stamps VALID or SUSPECT.
+   Its ceiling is the binding pre-run gate; the script's host backing < 30 GiB check is the looser one.
    One second after the launch it checks the session. If bench-guard has already exited, which is
    what a refusal looks like, it says so and takes the normal rc path (steps 5 and 6). If
    `setsid` forked instead, so the run is not in the session the watchdog would kill, it kills the
    forked session, waits for it to empty, and exits 3. It never kills its own session: a child that
    has not yet reached setsid() still carries the caller's session id, and that id is skipped.
 4. Runs a watchdog that samples every 2 s into `mem.log`. It kills the **session**, TERM then KILL
-   after 5 s, if MemAvailable drops under 20 GB (`WATCHDOG_FLOOR_GB`), or, in the control and
-   vehicle modes, if Shmem exceeds 100 GB (`WATCHDOG_SHMEM_GB`). The controls measured ~1-2 GB (the
-   vehicle has not run yet), so 100 GB means a runaway. The qwen4exp mode has no Shmem abort (see
-   "The real model: blocked on host memory"). A process-group kill would miss the binary, because
+   after 5 s, in every mode, if GPU host backing (Shmem + the meminfo remainder)
+   exceeds 100 GiB (`WATCHDOG_HOST_BACKING_GIB`, a whole number; the old name `WATCHDOG_SHMEM_GB` is refused
+   with exit 3), or if it cannot be read. Idle reads 12.7 to 15 GiB and the
+   largest planned load about 85 to 91 GiB, so 100 GiB means a runaway. There is no `MemAvailable` floor. The qwen4exp mode keeps
+   the same ceiling (see "The real model: blocked on host memory"). A process-group kill would miss the binary, because
    `timeout` moves itself and its child into their own group.
 5. Blocks until the session is empty before it stamps the post sample or exits. If a process
    survives 120 s it exits 3 with "do NOT start another GPU run".
@@ -574,8 +574,10 @@ K = 320. It cannot confirm the full-model counts, the placement rows, or the GDN
 
 ### The real model: blocked on host memory
 
-The qwen4exp mode needs 215 GB (200 GiB) MemAvailable. The lead measured 151-159 GiB (162-171 GB)
-under the host's permanent load, so the script's settle step times out and exits 3. The cause is
+The qwen4exp mode reads the whole model into host memory (about 175 GiB). The script no longer waits
+for `MemAvailable` (it once required 215 GB, and the lead measured 151-159 GiB under the host's
+permanent load, so the settle step timed out). Whether the load fits is the planner's check: it refuses
+an oversized load by name. The cause of the large host footprint is
 that SYCL leaves `caps.mmap_support` unset. The caps aggregate at :107798-107803 never names it, and
 `src/llama-model.cpp:2245-2265` then turns off both `use_mmap` and AUTO lazy mode. The whole 177 GiB
 is therefore read into host buffers.
@@ -598,9 +600,15 @@ not a quote):
   or `-lzm on` becomes the documented requirement. Whichever holds, the unified cache must own the
   bytes (P1), and `llama.cpp-qptd` (`-ngl 0` loses mmap) has the same root.
 
-If the qwen4exp run does start (after mmap, or on a quieter host): Shmem may legitimately exceed
-CLAUDE.md's ~100 GB abort line when the host experts are USM-backed. The MemAvailable watchdog, which
-kills by session, stands in for that line on this run.
+If the qwen4exp run does start (after mmap, or on a quieter host): GPU host backing may legitimately exceed
+CLAUDE.md's ~100 GiB abort line when the host experts are USM-backed. The script keeps its 100 GiB ceiling in
+this mode, so such a run is killed unless the operator raises `WATCHDOG_HOST_BACKING_GIB` for it on a host that has
+the room. No mode runs without the ceiling, and there is no `MemAvailable` floor.
+
+What this leaves unguarded: a valid Qwen run on 2026-11-23 read about 20 GiB of `MemAvailable` at its lowest, so the
+old 20 GB floor (decimal, as that script compared) sat inside normal operation and stays removed. A runaway of ordinary process memory (malloc) by the run is
+in `AnonPages`, which the sum leaves out on purpose, so no script sees it, and the planner's named refusal bounds
+planned memory only. A guard for that class is tracked in the task tracker.
 
 ### Order and commands
 

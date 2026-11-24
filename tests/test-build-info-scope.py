@@ -34,7 +34,7 @@ COMPILE_RULE = re.compile(r"^C(XX)?_COMPILER__")
 BUILD_NUMBER_DEFINE = re.compile(r"-DLLAMA_BUILD_NUMBER=([0-9]+)")
 BUILD_NUMBER_SOURCE = re.compile(r"^int LLAMA_BUILD_NUMBER = ([0-9]+);", re.M)
 # The one edge that needs the build number: it names the UI assets to fetch.
-BUILD_NUMBER_EDGES = ("tools/ui/ui-assets.stamp",)
+BUILD_NUMBER_EDGES = ("ui/apps/chat/ui-assets.stamp",)
 
 
 def parse_edges(path):

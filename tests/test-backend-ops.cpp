@@ -63,6 +63,35 @@ static unsigned test_hardware_concurrency() {
 #   define N_THREADS test_hardware_concurrency()
 #endif
 
+// The uniform tensors (init_tensor_uniform) and the MUL_MAT_ID ids (init_mul_mat_id_ids) of a run derive from one
+// base seed, so a failing draw can be run again: GGML_TEST_SEED=<n> sets the base, and without it the run draws one.
+// Either way the run prints it once to stderr as "[TEST-SEED] base=<n>", outside the stdout stream the printers write
+// (so a csv or sql output stays machine-readable). The k-th draw is the same in every run that has the same base and
+// the same list of test cases (so the same -o and -p filters), runs them with one worker (no -j > 1: workers take
+// draws in the order they reach them), and runs on a host with the same hardware thread count (init_tensor_uniform
+// splits a tensor into slices, one draw each, and fixes the slice count on first use from that count and the first
+// tensor's size). Not derived from this seed: every other initializer in this file. Of those, the dense attention
+// mask (init_tensor_kq_mask) and the rand() and std::random_device draws of other ops' index tensors draw fresh values
+// each run; the others use fixed seeds of their own.
+static uint32_t test_seed_next() {
+    static const uint32_t base = [] {
+        const char *   env = getenv("GGML_TEST_SEED");
+        const uint32_t seed =
+            (env != nullptr && *env != '\0') ? (uint32_t) strtoul(env, nullptr, 0) : std::random_device{}();
+        fprintf(stderr, "[TEST-SEED] base=%u\n", seed);
+        return seed;
+    }();
+    static std::atomic<uint32_t> counter{ 0 };
+    // A splitmix-style finalizer of base + k * golden ratio: distinct, well-mixed engine seeds for consecutive k.
+    uint32_t                     x = base + 0x9E3779B9u * (counter.fetch_add(1, std::memory_order_relaxed) + 1);
+    x ^= x >> 16;
+    x *= 0x85EBCA6Bu;
+    x ^= x >> 13;
+    x *= 0xC2B2AE35u;
+    x ^= x >> 16;
+    return x;
+}
+
 static int test_parallel_workers(int default_workers) {
     const char * env = std::getenv("TEST_ARG_PARALLEL_WORKERS");
     if (env != nullptr) {
@@ -86,8 +115,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         // parallel initialization
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
-        auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
+        // Each slice draws from its own engine, seeded on this thread before the slice is handed out, so the values do
+        // not depend on which pool thread runs which slice.
+        auto init_thread = [&](size_t start, size_t end, uint32_t seed) {
+            std::default_random_engine            gen(seed);
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
                 data[i] = distribution(gen);
@@ -95,14 +126,14 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         };
 
         if (n_threads == 1) {
-            init_thread(0, nels);
+            init_thread(0, nels, test_seed_next());
         } else {
             std::vector<std::future<void>> tasks;
             tasks.reserve(n_threads);
             for (size_t i = 0; i < n_threads; i++) {
                 size_t start =     i*nels/n_threads;
                 size_t end   = (i+1)*nels/n_threads;
-                tasks.push_back(std::async(std::launch::async, init_thread, start, end));
+                tasks.push_back(std::async(std::launch::async, init_thread, start, end, test_seed_next()));
             }
             for (auto & t : tasks) {
                 t.get();
@@ -6044,14 +6075,36 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = false) {
+// GGML_TEST_MMID_TRACE=1 prints to stderr, beside the seed line, per ids tensor, how many rows name each expert in
+// each of the first four id columns, as "[MMID-IDS] seed=<s> rows=<n> n_mats=<e> col0:<c0>,<c1>,... col1:...". With
+// n_used columns in use, the rows an expert receives are the sum of its counts over the first n_used columns.
+static void print_mul_mat_id_ids(const ggml_tensor *          t,
+                                 const std::vector<int64_t> & counts,
+                                 int                          n_mats,
+                                 uint32_t                     seed) {
+    fprintf(stderr, "[MMID-IDS] seed=%u rows=%lld n_mats=%d", seed, (long long) ggml_nrows(t), n_mats);
+    for (int c = 0; c < t->ne[0] && c < 4; c++) {
+        fprintf(stderr, " col%d:", c);
+        for (int e = 0; e < n_mats; e++) {
+            fprintf(stderr, "%s%lld", e == 0 ? "" : ",", (long long) counts[(size_t) c * (size_t) n_mats + (size_t) e]);
+        }
+    }
+    fprintf(stderr, "\n");
+}
 
-    std::random_device rd;
-    std::default_random_engine rng(rd());
+static bool mul_mat_id_ids_trace_enabled() {
+    static const bool trace = getenv("GGML_TEST_MMID_TRACE") != nullptr;
+    return trace;
+}
+
+static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = false) {
+    const uint32_t             seed = test_seed_next();
+    std::default_random_engine rng(seed);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
             continue;
         }
+        std::vector<int64_t> counts((size_t) t->ne[0] * (size_t) n_mats, 0);
         for (int64_t r = 0; r < ggml_nrows(t); r++) {
             std::vector<int32_t> data(t->ne[0]);
             for (int i = 0; i < t->ne[0]; i++) {
@@ -6061,7 +6114,16 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats, bool skip = fals
             if (skip) {
                 mask_skipped_ids(data, r);
             }
+            for (int i = 0; i < t->ne[0]; i++) {
+                // a skipped slot (-1) names no expert
+                if (data[i] >= 0) {
+                    counts[(size_t) i * (size_t) n_mats + (size_t) data[i]]++;
+                }
+            }
             ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+        }
+        if (mul_mat_id_ids_trace_enabled()) {
+            print_mul_mat_id_ids(t, counts, n_mats, seed);
         }
     }
 }
@@ -6215,6 +6277,99 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
     }
+};
+
+// MUL_MAT_ID whose ids are constructed, not shuffled: experts 0, 1, 2 and 3 receive exactly 1, 8, 9 and 0 of the
+// n * n_used selections, and the rest are spread over the other experts as evenly as possible. A backend that runs
+// a prompt as one multiplication per expert sizes each one by its expert's row count, so these counts hold a group
+// of a single row, the largest group a mat-vec kernel takes on the SYCL backend (8, MMVQ_MAX_BATCH_SIZE), the
+// smallest group above it, and an expert no row names, in every run. The random cases reach those sizes only by
+// chance. "groups=" in vars() lists the counts per expert, so -p 'groups=' selects these cases.
+struct test_mul_mat_id_groups : public test_mul_mat_id {
+    std::vector<int64_t> groups;  // selections per expert, summing to n * n_used
+
+    static std::vector<int64_t> make_groups(int n_mats, int n_used, int64_t n) {
+        static const int64_t fixed[] = { 1, 8, 9, 0 };
+        const int            n_fixed = (int) (sizeof(fixed) / sizeof(fixed[0]));
+        GGML_ASSERT(n_mats > n_fixed);
+        std::vector<int64_t> g(fixed, fixed + n_fixed);
+        const int64_t        rest   = n * n_used - (1 + 8 + 9);
+        const int64_t        n_rest = n_mats - n_fixed;
+        GGML_ASSERT(rest >= 0);
+        for (int64_t e = 0; e < n_rest; e++) {
+            g.push_back(rest / n_rest + (e < rest % n_rest ? 1 : 0));
+        }
+        return g;
+    }
+
+    test_mul_mat_id_groups(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k) :
+        test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k),
+        groups(make_groups(n_mats, n_used, n)) {
+        for (int64_t g : groups) {
+            // An expert named by more than n selections would have to appear twice in some row.
+            GGML_ASSERT(g <= n);
+        }
+    }
+
+    std::string vars() override {
+        std::string s = test_mul_mat_id::vars() + ",groups=";
+        for (size_t e = 0; e < groups.size(); e++) {
+            s += (e == 0 ? "" : "/") + std::to_string(groups[e]);
+        }
+        return s;
+    }
+
+    // Lay the selections out expert by expert in one list of n * n_used entries and give row r, column c the entry
+    // c * n + r. An expert's entries are a run no longer than n, so they land on distinct rows, and a row's n_used
+    // columns hold distinct experts. The columns past n_used (not read) take the row's unused experts in order.
+    void set_ids(ggml_context * ctx) {
+        std::vector<int32_t> list;
+        list.reserve((size_t) (n * n_used));
+        for (size_t e = 0; e < groups.size(); e++) {
+            list.insert(list.end(), (size_t) groups[e], (int32_t) e);
+        }
+        GGML_ASSERT((int64_t) list.size() == n * n_used);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            GGML_ASSERT(t->ne[0] == n_mats && ggml_nrows(t) == n);
+            std::vector<int64_t> counts((size_t) n_mats * (size_t) n_mats, 0);
+            for (int64_t r = 0; r < n; r++) {
+                std::vector<int32_t> row;
+                std::vector<bool>    used((size_t) n_mats, false);
+                for (int c = 0; c < n_used; c++) {
+                    const int32_t e = list[(size_t) (c * n + r)];
+                    GGML_ASSERT(!used[(size_t) e]);
+                    used[(size_t) e] = true;
+                    row.push_back(e);
+                }
+                for (int32_t e = 0; e < n_mats; e++) {
+                    if (!used[(size_t) e]) {
+                        row.push_back(e);
+                    }
+                }
+                for (int c = 0; c < n_mats; c++) {
+                    counts[(size_t) c * (size_t) n_mats + (size_t) row[(size_t) c]]++;
+                }
+                ggml_backend_tensor_set(t, row.data(), r * t->nb[1], n_mats * sizeof(int32_t));
+            }
+            if (mul_mat_id_ids_trace_enabled()) {
+                print_mul_mat_id_ids(t, counts, n_mats, 0);
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+        set_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override { set_ids(ctx); }
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
@@ -11370,6 +11525,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
     }
 
+    // SYCL fork: the qwen4exp indexer form, one decode row and a short prefill: one mask row, blocks of consecutive
+    // cells, live scores and the tail as extra cells. A loop of its own, so upstream additions to the one above merge
+    // without a conflict.
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_top_k_mask(type, 4096, 4, 1024, 512, 3, true, 1, 1, 1, true, true));
+        test_cases.emplace_back(new test_top_k_mask(type, 4096, 4, 1024, 512, 3, true, 37, 1, 1, true, true));
+    }
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -13089,6 +13252,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 16, 10, 256));
+    }
+
+    // Constructed expert groups of 1, 8, 9 and 0 rows (test_mul_mat_id_groups) for the two types that have
+    // reordered MoE layouts on the SYCL backend, with 8 experts, at two batch sizes. On the SYCL backend the grouped
+    // MoE mat-vec (ggml_sycl_mul_mat_id_vec_q) declines a batch above n_experts * GGML_SYCL_ONEDNN_PP_MIN_BATCH (16)
+    // / n_used: 128 with one expert per row, 64 with two. n = 33 is above the 32-row fused MoE ceiling
+    // (get_fused_moe_max_batch) and below that threshold, so it stays on the grouped mat-vec; n = 129 is above it, so
+    // the op reaches the per-expert prompt loop. MXFP4 also runs with two experts per row.
+    for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 }) {
+        for (int n_used : { 1, 2 }) {
+            if (n_used == 2 && type_a != GGML_TYPE_MXFP4) {
+                continue;
+            }
+            for (bool b : { false, true }) {
+                for (int64_t n : { 33, 129 }) {
+                    test_cases.emplace_back(new test_mul_mat_id_groups(type_a, 8, n_used, b, 512, n, 256));
+                }
+            }
+        }
     }
 
     for (ggml_type type_a : base_types) {

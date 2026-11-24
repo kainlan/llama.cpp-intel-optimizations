@@ -2,6 +2,8 @@
 #    include <oneapi/dnnl/dnnl.hpp>
 #    include <oneapi/dnnl/dnnl_sycl.hpp>
 #    include <sycl/sycl.hpp>
+// The attribute production builds with, so the answer is about the primitive the backend would run.
+#    include "ggml-sycl/dnnl-deterministic.hpp"
 #endif
 
 #include "test-skip.h"
@@ -26,6 +28,7 @@ static void probe_f4_e2m1_matmul(dnnl::engine & eng) {
     const dnnl::memory::desc c_md({ m, n }, dnnl::memory::data_type::f16, { n, 1 });
 
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
     try {
@@ -68,6 +71,7 @@ static void probe_s4_woq_matmul(dnnl::engine & eng) {
     const dnnl::memory::desc c_md({ m, n }, dnnl::memory::data_type::f16, { n, 1 });
 
     dnnl::primitive_attr attr;
+    ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
     const int   mask       = (1 << 0) | (1 << 1);

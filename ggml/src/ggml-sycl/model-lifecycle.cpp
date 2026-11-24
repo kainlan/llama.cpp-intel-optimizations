@@ -663,10 +663,12 @@ end_result Registry::finalize_end(const finish_ticket &             ticket,
                                                      txn.finish_reason;
         if (commit) {
             try {
-                auto state = prepared_state ? std::move(prepared_state) :
-                                              std::make_shared<const ModelState>(ModelState{
-                                                  txn.token, model_phase::LIVE, publication.planned_host_bytes,
-                                                  publication.actual_host_bytes, publication.verdict });
+                auto state =
+                    prepared_state ?
+                        std::move(prepared_state) :
+                        std::make_shared<const ModelState>(ModelState{
+                            txn.token, model_phase::LIVE, publication.planned_host_bytes,
+                            publication.charged_host_bytes, publication.actual_host_bytes, publication.verdict });
                 auto model = models_.find(txn.token.model.value);
                 if (model == models_.end()) {
                     throw std::bad_alloc();
@@ -754,7 +756,11 @@ end_result Registry::end(LoadTxnId id, bool success, uint64_t planned, uint64_t 
         return ticket.replay.token.model.value ? ticket.replay :
                                                  end_result{ ticket.code, ticket.token, ticket.outer, ticket.commit };
     }
-    return finalize_end(ticket, true, { planned, actual, verdict });
+    publication_data publication;
+    publication.planned_host_bytes = planned;
+    publication.actual_host_bytes  = actual;
+    publication.verdict            = verdict;
+    return finalize_end(ticket, true, publication);
 }
 
 live_update_ticket Registry::prepare_live_update(ModelToken token) {

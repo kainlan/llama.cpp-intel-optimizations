@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-layer-shapes.h"
+#include "llama-lazy-range-record.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
@@ -19,6 +20,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_model;
+class llama_lazy_storage;
 
 struct llama_sycl_model_token {
     uint64_t model_id = 0;
@@ -1109,6 +1111,10 @@ struct llama_model {
 
     const llama_sycl_model_token & get_sycl_model_token() const { return sycl_model_token; }
 
+    // The STORAGE lazy table of that name, or null: such a table is read from its file per ubatch and has no tensor in
+    // tensors_by_name or in any buffer.
+    const llama_lazy_storage * lazy_storage(const std::string & name) const;
+
     // llama_model_params::n_ctx_hint, for the SYCL plan builders, which take the model by reference.
     uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }
 
@@ -1215,6 +1221,36 @@ const char * llm_type_name(llm_type type);
     const int64_t n_expert       = hparams.n_expert;         GGML_UNUSED(n_expert); \
     const int64_t n_expert_used  = hparams.n_expert_used();  GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
+
+// The GGUF names, or name patterns with one "%d" standing for the block index, that
+// `arch` creates with TENSOR_READ_LAZY (llama.cpp-5efe C1). Static and immutable:
+// names only, no hparams-valued field. Keyed by arch: gemma3n creates the same
+// "per_layer_token_embd.weight" without the flag, so a name-only key would give
+// every gemma3n load a row. tests/test-llama-lazy-declaration-source.py pins every
+// entry to a flagged create_tensor() call in src/models/ and back.
+const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch);
+
+// One per-arch function, next to the declaration, reading the loaded hparams. The
+// pre-fill stores its result on that model's record entry; nothing is cached in a
+// static, because two loaded models may have different hparams.
+llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name);
+
+struct ggml_sycl_tensor_inventory;
+struct ggml_sycl_placement_envelope;
+
+// The early plan's inventory for the model in `fname`, read from its GGUF header alone, for the host-only plan dry run
+// (tools/sycl-plan-dry-run, th32 §4.2): the loader reads the header with no_alloc, the model reads its hparams, the
+// lazy-range record is pre-filled, and the inventory is built by the function the load's early plan builds it with.
+// No tensor data is read, no load is opened and nothing is applied. `callback` sees the inventory and the envelope
+// the load would stage, valid for the call only. False when the header cannot be read or no weight is planned.
+// Defined where libllama carries the SYCL hooks (GGML_USE_SYCL or GGML_BACKEND_DL).
+typedef void (*llama_model_sycl_header_inventory_cb)(const ggml_sycl_tensor_inventory *   inventory,
+                                                     const ggml_sycl_placement_envelope * envelope,
+                                                     void *                               user_data);
+bool llama_model_sycl_header_inventory(const char *                         fname,
+                                       const llama_model_params &           params,
+                                       llama_model_sycl_header_inventory_cb callback,
+                                       void *                               user_data);
 
 // For internal test use
 // TODO: remove

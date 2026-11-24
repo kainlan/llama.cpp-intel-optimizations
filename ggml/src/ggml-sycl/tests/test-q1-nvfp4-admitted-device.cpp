@@ -44,8 +44,12 @@ constexpr int     prompt_capacity                     = 40;
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
 // The backend's refusal lines, so a case can require that a refusal named its cause. Every log line still reaches
-// stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]) and the direct route's host job's
-// ([MOE-HOST-JOB], logged on the job's thread). Host tasks and jobs can log, so the text is guarded.
+// stderr; only lines that carry a refusal tag are kept: a route's (-REFUSAL]), the direct route's host job's
+// ([MOE-HOST-JOB], logged on the job's thread), the direct route's decline ([MOE-DIRECT-DECLINE]; that op runs on
+// the retained route core, so it is no refusal, but a case that requires the direct route to take its batch fails on
+// it), a context bind's refusal of the MMID workspaces, which names the pool that was not served, and a host zone's
+// refusal of a request that may not grow it, which names the bound it applied. Host tasks and jobs can log, so the
+// text is guarded.
 std::mutex  g_refusal_log_mutex;
 std::string g_refusal_log;
 
@@ -54,7 +58,10 @@ void capture_log(ggml_log_level, const char * text, void *) {
         return;
     }
     std::fputs(text, stderr);
-    if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr) {
+    if (std::strstr(text, "-REFUSAL]") != nullptr || std::strstr(text, "[MOE-HOST-JOB]") != nullptr ||
+        std::strstr(text, "[MOE-DIRECT-DECLINE]") != nullptr ||
+        std::strstr(text, "MoE MMID workspace materialization refused") != nullptr ||
+        std::strstr(text, "host zone refused a no-growth request") != nullptr) {
         const std::lock_guard<std::mutex> lock(g_refusal_log_mutex);
         g_refusal_log += text;
     }
@@ -301,6 +308,11 @@ struct synthetic_inventory {
 // or after it, as a real model load does (load_end defers them to the context bind).
 enum class backend_order { BEFORE_LOAD_END, AFTER_LOAD_END };
 
+// What the fixture's load leaves in the WEIGHT host zone before the deferred bind. AS_MAPPED is a load that maps its
+// file: it places no host weight. GROWN_PAST_RESERVATION is a load that places host weights no plan sized, through the
+// SYCL host buffer type while the load is open: the zone grows for them and its used bytes pass its reservation.
+enum class weight_zone_state { AS_MAPPED, GROWN_PAST_RESERVATION };
+
 // Whether the fixture's context also holds the route-testing build's private authorization. PRODUCTION mints no scope,
 // so the route's admission reads only what a production build reads: the validated gate and the input-shape checks.
 enum class route_authorization { TEST_SCOPE, PRODUCTION };
@@ -309,7 +321,6 @@ struct lifecycle_fixture {
     ggml_backend_t backend = nullptr;
     int backend_device = -1;  // the registry device `backend` was created for
     std::vector<ggml_backend_t> retained_backends;
-    ggml_backend_buffer_t       unplanned_host_weights = nullptr;  // the deferred order's host weights no plan sized
     ggml_sycl_load_txn load{};
     bool load_open = false;
     ggml_sycl_model_token model{};
@@ -319,11 +330,14 @@ struct lifecycle_fixture {
     // Every case marker from this index on was published while this fixture was alive: the cases its teardown names.
     size_t first_case = g_case_markers.size();
     route_authorization authorization = route_authorization::TEST_SCOPE;  // named in each passing case's line
+    // The host weights of a GROWN_PAST_RESERVATION load: the model's, freed before the model is.
+    ggml_backend_buffer_t unplanned_host_weights = nullptr;
 
     // `capacity` is the workspace capacity in tokens: 2 for the decode cases, prompt_capacity for the prompt cases.
-    explicit lifecycle_fixture(backend_order       order         = backend_order::BEFORE_LOAD_END,
-                               route_authorization requested     = route_authorization::TEST_SCOPE,
-                               uint32_t            capacity      = 2) :
+    explicit lifecycle_fixture(backend_order       order       = backend_order::BEFORE_LOAD_END,
+                               route_authorization requested   = route_authorization::TEST_SCOPE,
+                               uint32_t            capacity    = 2,
+                               weight_zone_state   weight_zone = weight_zone_state::AS_MAPPED) :
         authorization(requested) {
         try {
             const auto begin_result = ggml_backend_sycl_model_load_begin(&load);
@@ -332,8 +346,8 @@ struct lifecycle_fixture {
             }
             load_open = true;
             synthetic_inventory fixture(capacity);
-            const auto stage_result =
-                ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false);
+            const auto          stage_result =
+                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
             if (stage_result != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error("inventory staging result=" +
                                          std::to_string(static_cast<int>(stage_result)));
@@ -419,6 +433,9 @@ struct lifecycle_fixture {
             if (order == backend_order::BEFORE_LOAD_END) {
                 create_retained_backends();
             }
+            if (weight_zone == weight_zone_state::GROWN_PAST_RESERVATION) {
+                place_unplanned_host_weights(plan, primary_device);
+            }
 
             const auto commit_result = ggml_backend_sycl_model_load_end(load, true, &model);
             if (commit_result != GGML_SYCL_LIFECYCLE_BUSY) load_open = false;
@@ -428,9 +445,14 @@ struct lifecycle_fixture {
                                          std::to_string(static_cast<int>(commit_result)));
             }
             // A real model load ends before llama_context creates any backend: load_end finds no backend context
-            // for the owner device and defers the MMID workspaces to the context bind.
+            // for the owner device and defers the MMID workspaces to the context bind. Nothing goes into WEIGHT
+            // between load_end and that bind: a load places SYCL_Host weights only while it is open, and a SYCL_Host
+            // buffer allocated after load_end is a context's compute buffer and lands in SCRATCH.
+            weight_zone_reading before_bind{};
+            size_t              log_before_bind = 0;
             if (order == backend_order::AFTER_LOAD_END) {
-                place_unplanned_host_weights(plan, primary_device);
+                before_bind     = read_weight_zone(primary_device);
+                log_before_bind = refusal_log_size();
                 create_retained_backends();
             }
             require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK,
@@ -461,6 +483,11 @@ struct lifecycle_fixture {
                                                                         /*flash_attn_enabled=*/true) ==
                             GGML_SYCL_LIFECYCLE_OK,
                         "second model root bind failed");
+                require_host_pool_from_weight(before_bind, read_weight_zone(primary_device),
+                                              plan.moe_mmid_host_pool_bytes, log_before_bind, weight_zone);
+                if (weight_zone == weight_zone_state::GROWN_PAST_RESERVATION) {
+                    require_no_growth_request_refused_at_capacity(primary_device);
+                }
             }
             if (authorization == route_authorization::TEST_SCOPE) {
                 require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
@@ -478,27 +505,122 @@ struct lifecycle_fixture {
         }
     }
 
-    // A real load also places host weights the plan never sized, through the SYCL host buffer type, and grows the
-    // WEIGHT host zone for them (Inkling: the plan places no host weight; the load grows WEIGHT from 64 MiB by twelve
-    // 2 GiB chunks). The MMID workspace host pool is a request that may not grow its zone, allocated from WEIGHT at
-    // the context bind, so the deferred order fills WEIGHT past its reservation first, the way such a load leaves it.
-    void place_unplanned_host_weights(const ggml_sycl::placement_plan & plan, int device) {
-        require(plan.moe_mmid_host_pool_bytes > 0, "the candidate plan has no MMID host pool to place");
+    // The WEIGHT host zone of a device at one moment. Zones are configured once per process and keep what earlier
+    // loads left, so the deferred order compares two readings rather than any one against the plan.
+    struct weight_zone_reading {
+        size_t reserved = 0;
+        size_t used     = 0;
+        size_t capacity = 0;
+    };
+
+    static weight_zone_reading read_weight_zone(int device) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(device);
         require(cache && cache->host_zones_configured(), "the primary device's host zones are not configured");
-        const size_t reserved = cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT);
-        const size_t used     = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
-        require(reserved > used, "the WEIGHT host zone is already past its reservation");
+        return { cache->host_zone_reserved_capacity(ggml_sycl::host_zone_id::WEIGHT),
+                 cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT),
+                 cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT) };
+    }
+
+    // A load places host weights no plan sized through the SYCL host buffer type and grows the WEIGHT host zone for
+    // them. Inside the open load that buffer type asks role WEIGHT and lifetime MODEL, so the bytes land in WEIGHT as
+    // the loader's do. One megabyte past the reservation is enough to make the zone grow by a chunk.
+    void place_unplanned_host_weights(const ggml_sycl::placement_plan & plan, int device) {
+        require(plan.moe_mmid_host_pool_bytes > 0, "the candidate plan has no MMID host pool to place");
+        const weight_zone_reading before = read_weight_zone(device);
+        require(before.reserved > before.used, "the WEIGHT host zone is already past its reservation");
         constexpr size_t past_reservation = 1024ull * 1024ull;
-        unplanned_host_weights =
-            ggml_backend_buft_alloc_buffer(ggml_backend_sycl_host_buffer_type(), reserved - used + past_reservation);
+        const size_t     bytes            = before.reserved - before.used + past_reservation;
+
+        unplanned_host_weights = ggml_backend_buft_alloc_buffer(ggml_backend_sycl_host_buffer_type(), bytes);
         require(unplanned_host_weights != nullptr, "the unplanned host weight buffer was not allocated");
-        const size_t now_used = cache->host_zone_used(ggml_sycl::host_zone_id::WEIGHT);
-        const size_t capacity = cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);
-        require(now_used > reserved && capacity > reserved,
-                "the unplanned host weights did not grow the WEIGHT host zone past its reservation");
-        std::cerr << "unplanned host weights: WEIGHT used " << now_used << " of capacity " << capacity
-                  << ", reservation " << reserved << "; MMID host pool " << plan.moe_mmid_host_pool_bytes << " bytes\n";
+        const weight_zone_reading after = read_weight_zone(device);
+        std::cerr << "unplanned host weights: WEIGHT used " << before.used << " -> " << after.used << ", capacity "
+                  << before.capacity << " -> " << after.capacity << ", reservation " << after.reserved << '\n';
+        require(after.used > after.reserved && after.capacity > before.capacity,
+                "the load's unplanned host weights did not grow the WEIGHT host zone past its reservation");
+    }
+
+    // The MMID workspace host pool is a request that may not grow its zone, allocated from WEIGHT when the deferred
+    // order's context binds. Across the binds WEIGHT must not have grown, and its used bytes must have risen by at
+    // least the pool: the pool was served from WEIGHT. No bind may have refused the workspaces, so the rise is the
+    // pool's and nothing else's. In the grown state the zone's used bytes are already past its reservation when the
+    // bind begins, so a pool that is served there was bounded by the zone's capacity: a bound at the reservation
+    // refuses it.
+    static void require_host_pool_from_weight(const weight_zone_reading & before,
+                                              const weight_zone_reading & after,
+                                              size_t                      pool_bytes,
+                                              size_t                      log_from,
+                                              weight_zone_state           weight_zone) {
+        const bool grown = weight_zone == weight_zone_state::GROWN_PAST_RESERVATION;
+        std::cerr << "deferred bind (" << (grown ? "WEIGHT grown past its reservation" : "WEIGHT as a mapped load")
+                  << "): WEIGHT used " << before.used << " -> " << after.used << ", capacity " << before.capacity
+                  << " -> " << after.capacity << ", reservation " << after.reserved << "; MMID host pool " << pool_bytes
+                  << " bytes\n";
+        require(pool_bytes > 0, "the candidate plan has no MMID host pool");
+        const std::string refusals = refusal_log_since(log_from);
+        if (grown && !(before.used > before.reserved && before.capacity > before.reserved)) {
+            throw std::runtime_error("the WEIGHT host zone was not past its reservation when the bind began: used " +
+                                     std::to_string(before.used) + ", capacity " + std::to_string(before.capacity) +
+                                     ", reservation " + std::to_string(before.reserved));
+        }
+        if (refusals.find("MoE MMID workspace materialization refused") != std::string::npos ||
+            refusals.find("host zone refused a no-growth request") != std::string::npos) {
+            throw std::runtime_error("a context bind refused the MMID workspaces; refusal lines: [" + refusals + "]");
+        }
+        if (after.capacity != before.capacity) {
+            throw std::runtime_error("the MMID host pool request grew the WEIGHT host zone from " +
+                                     std::to_string(before.capacity) + " to " + std::to_string(after.capacity) +
+                                     " bytes; refusal lines: [" + refusals + "]");
+        }
+        if (after.used < before.used + pool_bytes) {
+            throw std::runtime_error("the MMID host pool was not served from the WEIGHT host zone: used rose by " +
+                                     std::to_string(after.used >= before.used ? after.used - before.used : 0) +
+                                     " bytes, the pool is " + std::to_string(pool_bytes) + "; refusal lines: [" +
+                                     refusals + "]");
+        }
+    }
+
+    // The other side of the bound: a host-pinned request that may not grow WEIGHT, one byte larger than what the
+    // grown zone has left, is refused by the no-growth bound, by name, and the zone does not grow for it. It allocates
+    // nothing. A zone with no bound at all would miss on the contiguous block instead, and one that grew would serve
+    // it. The bound is the zone's, whatever sent the request there: the host pool reaches WEIGHT as a persistent
+    // owner, a flag whose setters are a census of two, so the probe reaches it by role, as a host weight does.
+    static void require_no_growth_request_refused_at_capacity(int device) {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        require(cache != nullptr, "the primary device has no unified cache");
+        const weight_zone_reading before = read_weight_zone(device);
+        require(before.capacity > before.used, "the grown WEIGHT host zone has no room left to probe");
+        const size_t                    log_from = refusal_log_size();
+        ggml_sycl::host_zone_alloc_miss miss     = ggml_sycl::host_zone_alloc_miss::NONE;
+        ggml_sycl::alloc_request        request{};
+        request.queue                                      = &cache->get_queue();
+        request.device                                     = device;
+        request.size                                       = before.capacity - before.used + 1;
+        request.alignment                                  = 64;
+        request.suppress_failure_log                       = true;
+        request.host_zone_miss                             = &miss;
+        request.intent.role                                = ggml_sycl::alloc_role::WEIGHT;
+        request.intent.category                            = ggml_sycl::runtime_category::HOST_COMPUTE;
+        request.intent.cohort_id                           = "no_growth_bound_probe";
+        request.intent.constraints.must_host_pinned        = true;
+        request.intent.constraints.use_pinned_pool         = true;
+        request.intent.constraints.forbid_host_zone_growth = true;
+
+        const ggml_sycl::mem_handle handle  = ggml_sycl::unified_allocate(request);
+        const weight_zone_reading   after   = read_weight_zone(device);
+        const std::string           refusal = refusal_log_since(log_from);
+        std::cerr << "no-growth probe: request " << request.size << " bytes against WEIGHT used " << before.used
+                  << " of capacity " << before.capacity << ": miss=" << ggml_sycl::host_zone_alloc_miss_name(miss)
+                  << '\n';
+        require(!handle.valid(), "a no-growth request larger than the WEIGHT host zone's free bytes was served");
+        require(after.capacity == before.capacity && after.used == before.used,
+                "a refused no-growth request changed the WEIGHT host zone");
+        if (miss != ggml_sycl::host_zone_alloc_miss::OVER_NO_GROWTH_BOUND ||
+            refusal.find("miss=over-no-growth-bound zone=") == std::string::npos) {
+            throw std::runtime_error(
+                std::string("the no-growth request was not refused by the no-growth bound: miss=") +
+                ggml_sycl::host_zone_alloc_miss_name(miss) + "; refusal lines: [" + refusal + "]");
+        }
     }
 
     void cleanup() noexcept {
@@ -510,6 +632,10 @@ struct lifecycle_fixture {
             drain_context();
         }
         context = {};
+        if (unplanned_host_weights) {
+            ggml_backend_buffer_free(unplanned_host_weights);
+            unplanned_host_weights = nullptr;
+        }
         if (model.model_id) {
             (void) ggml_backend_sycl_model_unloaded_token(model);
             model = {};
@@ -522,10 +648,6 @@ struct lifecycle_fixture {
             ggml_backend_free(*it);
         }
         retained_backends.clear();
-        if (unplanned_host_weights) {
-            ggml_backend_buffer_free(unplanned_host_weights);
-            unplanned_host_weights = nullptr;
-        }
         backend        = nullptr;
         backend_device = -1;
     }
@@ -1337,7 +1459,7 @@ struct mixed_fixture {
             require(begin_result == GGML_SYCL_LIFECYCLE_OK, "mixed fixture: load begin failed");
             load_open = true;
             mixed_inventory fixture(type);
-            require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
+            require(ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
                         GGML_SYCL_LIFECYCLE_OK,
                     "mixed fixture: inventory staging failed");
             const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
@@ -1499,9 +1621,10 @@ struct mixed_fixture {
 
 // One mixed batch through the production route. Every row matches the CPU oracle, the card rows from the device kernel
 // and the host rows from the host leg; a kernel that computed a host row from another expert fails, and so does one
-// that left a card row unwritten. The route takes the batch once, submits its host occurrences once, and names no
-// refusal. Afterwards the weight's pointer table holds a null slot for every host expert, a pointer for every card
-// expert a case selected, and still a null slot for a card expert no case on this fixture has selected yet.
+// that left a card row unwritten. The route takes the batch once, submits its card occurrences to its kernel and its
+// host occurrences to its host leg once, and names no refusal and no decline. Afterwards the weight's pointer table
+// holds a null slot for every host expert, a pointer for every card expert a case selected, and still a null slot for a
+// card expert no case on this fixture has selected yet.
 void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tokens, const expert_selector & select) {
     const std::string at = " (type=" + std::string(ggml_type_name(mix.type)) + " ne11=" + std::to_string(ne11) +
                            " tokens=" + std::to_string(tokens) + ")";
@@ -1560,8 +1683,14 @@ void mixed_case(mixed_fixture & mix, const std::string & name, int ne11, int tok
                        std::to_string(after.host_submit - before.host_submit) + " host_occurrences=+" +
                        std::to_string(after.host_occurrences - before.host_occurrences),
                    before);
+    require_stages(after.card_occurrences == before.card_occurrences + (occurrences - host_occurrences),
+                   "the kernel was not submitted the batch's " + std::to_string(occurrences - host_occurrences) +
+                       " card occurrences" + at + ": card_occurrences=+" +
+                       std::to_string(after.card_occurrences - before.card_occurrences),
+                   before);
     const std::string refusals = refusal_log_since(log_from);
-    require_stages(refusals.empty(), "a refusal was named for a mixed batch" + at + ": [" + refusals + "]", before);
+    require_stages(refusals.empty(), "a refusal or a decline was named for a mixed batch" + at + ": [" + refusals + "]",
+                   before);
 
     const void * slots[route_experts] = {};
     require_stages(ggml_sycl_q1_nvfp4_test_read_expert_table(mix.backend, mix.gate.tensor, route_experts, slots),
@@ -1745,6 +1874,15 @@ int main() {
             lifecycle_fixture life(backend_order::AFTER_LOAD_END);
             successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "deferred-bind");
             successful_reuse_case(life, GGML_TYPE_NVFP4, 1, "deferred-bind");
+        }
+        require_clean_teardown();
+        // The same order after a load that grew WEIGHT past its reservation for host weights no plan sized: the
+        // bind's host pool is bounded by the zone's capacity, not by its reservation.
+        {
+            lifecycle_fixture life(backend_order::AFTER_LOAD_END, route_authorization::TEST_SCOPE, 2,
+                                   weight_zone_state::GROWN_PAST_RESERVATION);
+            successful_reuse_case(life, GGML_TYPE_Q1_0, 1, "deferred-bind-grown-weight");
+            successful_reuse_case(life, GGML_TYPE_NVFP4, 1, "deferred-bind-grown-weight");
         }
         require_clean_teardown();
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK, false);

@@ -423,6 +423,9 @@ DISPATCH_SCOPE_OWNERS = {
 PRE_SCOPE_CALLS = {
     # The per-graph precomputed-skip reset, before the compute guard is taken.
     "ggml_backend_sycl_graph_compute_impl": frozenset({"ggml_sycl_moe_precomputed_skip_new_graph"}),
+    # The scratch-mutant build's seam, which notes the record's entry for the segment-guard mutant before the refusal
+    # of a context that still holds segments; that refusal returns before any node, so it needs no scope.
+    "moe_graph_record_segments": frozenset({"ggml_sycl_seg_seam_note_record_entry"}),
     "moe_graph_try_block_graphlets": frozenset({
         # The aggregation decision and its diagnostics, which may still decline the graphlets.
         "ggml_sycl_graph_diag_enabled",

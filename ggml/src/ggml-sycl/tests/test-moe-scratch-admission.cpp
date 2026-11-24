@@ -11,17 +11,26 @@
 // produced a wrong-sized buffer instead; the required behaviour is refusal with
 // an attributable reason.
 
+#include "moe-pp-pack.hpp"
 #include "moe-scratch-admission.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
+using ggml_sycl::moe_pp_pack_gemm_groups;
+using ggml_sycl::moe_pp_packed_layout;
 using ggml_sycl::pp_moe_onednn_admit_scratch;
 using ggml_sycl::pp_moe_onednn_align_scratch_shape;
 using ggml_sycl::pp_moe_onednn_checked_align_slot_bytes;
+using ggml_sycl::pp_moe_onednn_packed_rows_at;
 using ggml_sycl::pp_moe_onednn_preflight_scratch;
 using ggml_sycl::pp_moe_onednn_reserve_if_admitted;
 using ggml_sycl::pp_moe_onednn_scratch_admission;
@@ -89,24 +98,138 @@ static void test_checked_alignment() {
     check(!pp_moe_onednn_align_scratch_shape(shape, nullptr), "one unalignable dimension fails the whole shape");
 }
 
-// The one slot sizer the ring's admission, the explicit micro-batch's room and the cache's re-plan share.
+// The one slot sizer the ring's admission, the explicit micro-batch's room and the cache's re-plan share: packed
+// rows times the bytes of one scratch row, rounded up to the slot alignment.
 static void test_slots_at() {
     const size_t max_size = std::numeric_limits<size_t>::max();
     size_t       act      = 7;
     size_t       out      = 7;
 
-    check(pp_moe_onednn_slots_at(0, 192, 96, &act, &out) && act == 0 && out == 0, "0 rows size two empty slots");
-    check(pp_moe_onednn_slots_at(2048, 192, 96, &act, &out) && act == 2048 * 192 && out == 2048 * 96,
-          "aligned products are the slots");
-    check(pp_moe_onednn_slots_at(3, 100, 1, &act, &out) && act == 512 && out == PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT,
-          "300 and 3 bytes round up to whole slots");
+    check(pp_moe_onednn_slots_at(0, 32, 4, 192, 96, &act, &out) && act == 0 && out == 0, "0 rows size two empty slots");
+    // Qwen3.8: 42496 rows of 2560 half floats and of 2560 floats.
+    check(pp_moe_onednn_slots_at(512, 512, 10, 5120, 10240, &act, &out) && act == 217579520u && out == 435159040u,
+          "Qwen3.8 at 512 rows");
+    check(pp_moe_onednn_slots_at(2048, 512, 10, 5120, 10240, &act, &out) && act + out == 1124597760u,
+          "Qwen3.8 at 2048 rows");
+    check(pp_moe_onednn_slots_at(4096, 512, 10, 5120, 10240, &act, &out) && act + out == 1753743360u,
+          "Qwen3.8 at 4096 rows");
+    // GPT-OSS 20B: 6112 rows of 2880 half floats and of 2880 floats.
+    check(pp_moe_onednn_slots_at(512, 32, 4, 5760, 11520, &act, &out) && act == 35205120u && out == 70410240u,
+          "GPT-OSS 20B at 512 rows");
+    // One row, 4 used of 32: 256 rows. 100 and 1 bytes a row give 25600 and 256 bytes, both already aligned.
+    check(pp_moe_onednn_slots_at(1, 32, 4, 100, 1, &act, &out) && act == 25600 && out == 256, "one row");
+    // 1 expert, 1 used, 3 rows: 64 rows of 3 bytes round up from 192 to one 256-byte slot.
+    check(pp_moe_onednn_slots_at(3, 1, 1, 3, 1, &act, &out) && act == PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT &&
+              out == PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT,
+          "192 and 64 bytes round up to whole slots");
 
     act = 7;
     out = 7;
-    check(!pp_moe_onednn_slots_at(4, max_size / 2, 96, &act, &out), "an overflowing activation product fails");
-    check(!pp_moe_onednn_slots_at(4, 192, max_size / 2, &act, &out), "an overflowing output product fails");
-    check(!pp_moe_onednn_slots_at(1, 192, max_size, &act, &out), "an unalignable output slot fails");
+    check(!pp_moe_onednn_slots_at(4, 32, 4, max_size / 2, 96, &act, &out), "an overflowing activation product fails");
+    check(!pp_moe_onednn_slots_at(4, 32, 4, 192, max_size / 2, &act, &out), "an overflowing output product fails");
+    // One row of one expert is 64 scratch rows: 64 * (max / 64) is max - 63, which has no aligned size.
+    check(!pp_moe_onednn_slots_at(1, 1, 1, 192, max_size / 64, &act, &out), "an unalignable output slot fails");
+    check(!pp_moe_onednn_slots_at(4, 0, 4, 192, 96, &act, &out), "no experts fails");
+    check(!pp_moe_onednn_slots_at(4, 32, 0, 192, 96, &act, &out), "no experts used fails");
     check(act == 7 && out == 7, "a failed sizing leaves both slots untouched");
+}
+
+// The bound the planner sizes the ring from is never below what the executor's layout asks for. Routings with
+// distinct picks per row, in three shapes: uniform, one hot set, and picks from a hot eighth of the experts.
+static void test_packed_bound_covers_the_layout() {
+    std::mt19937 rng(11152026);
+    for (int round = 0; round < 3000; ++round) {
+        const uint32_t        n_expert = 1 + rng() % 600;
+        const uint32_t        n_used   = 1 + rng() % std::min<uint32_t>(n_expert, 12);
+        const uint32_t        n_ubatch = 1 + rng() % 3000;
+        const int             shape    = static_cast<int>(rng() % 3);
+        std::vector<size_t>   rows_per(n_expert, 0);
+        std::vector<uint32_t> pick(n_expert);
+        for (uint32_t i = 0; i < n_expert; ++i) {
+            pick[i] = i;
+        }
+        for (uint32_t t = 0; t < n_ubatch; ++t) {
+            if (shape == 1) {
+                for (uint32_t i = 0; i + 1 < n_used; ++i) {
+                    rows_per[i]++;
+                }
+                rows_per[(n_used - 1) + rng() % (n_expert - (n_used - 1))]++;
+                continue;
+            }
+            const uint32_t pool = shape == 0 ? n_expert : std::max(n_used, n_expert / 8);
+            for (uint32_t i = 0; i < n_used; ++i) {
+                std::swap(pick[i], pick[i + rng() % (pool - i)]);
+                rows_per[pick[i]]++;
+            }
+        }
+        std::vector<size_t> rows_desc;
+        for (size_t r : rows_per) {
+            if (r != 0) {
+                rows_desc.push_back(r);
+            }
+        }
+        std::sort(rows_desc.begin(), rows_desc.end(), std::greater<size_t>());
+        moe_pp_packed_layout layout;
+        size_t               bound = 0;
+        if (!moe_pp_pack_gemm_groups(rows_desc, &layout) ||
+            !pp_moe_onednn_packed_rows_at(n_ubatch, n_expert, n_used, &bound) || layout.packed_rows > bound) {
+            check(false, "the executor's packed rows fit the planner's bound");
+            return;
+        }
+    }
+}
+
+// Rows the packed scratch can need at a micro-batch: min(2 * n * used + 63 * active, align64(n) * active).
+static void test_packed_rows_at() {
+    size_t rows = 7;
+    check(pp_moe_onednn_packed_rows_at(0, 512, 10, &rows) && rows == 0, "0 rows need no scratch rows");
+    rows = 7;
+    check(!pp_moe_onednn_packed_rows_at(512, 0, 10, &rows), "no experts is refused");
+    check(!pp_moe_onednn_packed_rows_at(512, 512, 0, &rows), "no experts used is refused");
+    check(!pp_moe_onednn_packed_rows_at(512, 512, 10, nullptr), "a null output is refused");
+    check(rows == 7, "a refusal leaves the rows untouched");
+
+    struct table_row {
+        uint32_t n_ubatch;
+        uint32_t n_expert;
+        uint32_t n_expert_used;
+        size_t   want;
+    };
+
+    const table_row table[] = {
+        { 512,  512, 10, 42496  }, // Qwen3.8: 2 * 5120 + 63 * 512
+        { 1024, 512, 10, 52736  },
+        { 2048, 512, 10, 73216  },
+        { 4096, 512, 10, 114176 },
+        { 32,   512, 10, 20480  }, // few rows: only 320 experts can be active, and the rectangle 64 * 320 is smaller
+        { 512,  32,  4,  6112   }, // GPT-OSS 20B: 2 * 2048 + 63 * 32
+        { 1,    32,  4,  256    }, // one row: four experts, one 64-row slot each
+        { 512,  4,   8,  2048   }, // more used than experts: every expert takes every row, 512 * 4
+    };
+    for (const table_row & t : table) {
+        size_t got = 0;
+        check(pp_moe_onednn_packed_rows_at(t.n_ubatch, t.n_expert, t.n_expert_used, &got) && got == t.want,
+              "the packed rows of a known shape");
+    }
+
+    for (uint32_t n_expert : { 4u, 32u, 128u, 512u }) {
+        for (uint32_t n_used : { 1u, 4u, 10u, 600u }) {
+            size_t prev = 0;
+            for (uint32_t n = 1; n <= 8192; ++n) {
+                size_t got = 0;
+                if (!pp_moe_onednn_packed_rows_at(n, n_expert, n_used, &got) || got < prev) {
+                    check(false, "the packed rows never fall as the micro-batch grows");
+                    return;
+                }
+                prev = got;
+            }
+        }
+    }
+
+    size_t big = 0;
+    check(pp_moe_onednn_packed_rows_at(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, &big) &&
+              big == size_t(0x100000000ull) * size_t(0xFFFFFFFFull),
+          "the largest counts do not wrap");
 }
 
 static void test_exact_and_smaller_requests_are_admitted() {
@@ -445,6 +568,8 @@ int main() {
     } cases[] = {
         { "checked-alignment",                       test_checked_alignment                       },
         { "slots-at",                                test_slots_at                                },
+        { "packed-rows-at",                          test_packed_rows_at                          },
+        { "packed-bound-covers-the-layout",          test_packed_bound_covers_the_layout          },
         { "exact-and-smaller-requests-are-admitted", test_exact_and_smaller_requests_are_admitted },
         { "an-unaligned-plan-admits-itself",         test_an_unaligned_plan_admits_itself         },
         { "missing-plan-fails-closed",               test_missing_plan_fails_closed               },

@@ -1196,7 +1196,7 @@ def kv_overflow_announcement_violations(sycl_cpp: str) -> list[str]:
 def kv_publish_order_violations(ctx_cpp: str) -> list[str]:
     found: list[str] = []
     ctor = strip_comments(function(ctx_cpp, LLAMA_CONTEXT_CTOR_SIGNATURE))
-    publish = ctor.find("sycl_resync_runtime_context_flash_attn();")
+    publish = ctor.find("sycl_publish_runtime_context(cparams.flash_attn);")
     memory = ctor.find("memory.reset(model.create_memory(")
     ladder = ctor.find("sycl_select_auto_ubatch(")
     if min(publish, memory, ladder) < 0 or not publish < memory < ladder:
@@ -1634,11 +1634,12 @@ def test_mutation_budget_demotion_warns_ungated_is_witnessed() -> None:
 def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
     ctx = LLAMA_CONTEXT_CPP.read_text()
     ctor = function(ctx, LLAMA_CONTEXT_CTOR_SIGNATURE)
-    first = ctor.index("        sycl_resync_runtime_context_flash_attn();\n")
-    moved = ctor[:first] + ctor[first + len("        sycl_resync_runtime_context_flash_attn();\n"):]
+    line = "                const sched_reserve_result published = sycl_publish_runtime_context(cparams.flash_attn);\n"
+    first = ctor.index(line)
+    moved = ctor[:first] + ctor[first + len(line):]
     at = moved.index("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
     at += len("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
-    moved = moved[:at] + "        sycl_resync_runtime_context_flash_attn();\n" + moved[at:]
+    moved = moved[:at] + line + moved[at:]
     _assert_witnessed(ctx, ctx.replace(ctor, moved, 1), kv_publish_order_violations,
                       "a backend's first publish can run after the context's KV is allocated",
                       "the constructor publishes after creating the KV cache")
@@ -2338,7 +2339,9 @@ def test_mutation_woq_resolve_unleased_is_witnessed() -> None:
 def yield_lock_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
     found: list[str] = []
     txn = strip_comments(function(sycl_cpp, TRANSACTION_SIGNATURE))
-    if "std::unique_lock<std::mutex> lock(g_tensor_inventory_mutex);" not in txn:
+    # A unique_lock, with or without a template argument (the lock is a witnessed_mutex, so the guard deduces it): a
+    # lock_guard cannot be released for the yield.
+    if not re.search(r"std::unique_lock(?:<[^<>]*>)?\s+lock\s*\(\s*g_tensor_inventory_mutex\s*\)\s*;", txn):
         found.append("the transaction cannot release its inventory lock")
     begin = txn.find("unified_cache_yield_optional_layouts_begin(")
     retired = re.search(r"retired_any\s*=\s*retired_any\s*\|\|\s*releases\[i\]\.result\.retired\s*>\s*0;", txn)

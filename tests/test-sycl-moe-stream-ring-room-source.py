@@ -61,7 +61,7 @@ CLAIM_SIG = ("static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const gg
 
 KV_ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
 PP_ALT_LINE = 'GGML_LOG_INFO("[PLACEMENT-MOE] PP executable alternate reserve: '
-RING_ROOM_CALL = "hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining);"
+RING_ROOM_CALL = "hold_moe_stream_ring_room(plan, moe_groups, kv_info, device_id, remaining, host_experts_pinned);"
 PACK_STATS = "moe_triplet_pack_stats stats;"
 WITHOUT_KV_ROOM = "size_t without_room = remaining + room.held;"
 PACK_FIT = "const bool on_device = group.charge_bytes <= remaining;"
@@ -235,8 +235,13 @@ def test_mutant_refresh_zeroes_the_room_fails():
 
 # ---- (f) the backend fills the inputs, and the mask is the staged claim's type half ------------------------------
 
-FILL_MASK = "g_placement_kv_info.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();"
-FILL_CAP = "g_placement_kv_info.moe_stream_group_cap = ggml_sycl_moe_pp_f16_group_experts_max();"
+# The backend fills its KV inputs through the one KV intake the plan dry run also uses (llama.cpp-4zup), written over the
+# KV inputs it is handed; the stage hands it g_placement_kv_info.
+INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement_kv_info & kv, "
+              "const ggml_sycl_tensor_inventory * inventory) {")
+INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
+FILL_MASK = "kv.moe_stream_staged_types = ggml_sycl_moe_stream_staged_types();"
+FILL_CAP = "kv.moe_stream_group_cap = ggml_sycl_moe_pp_f16_group_experts_max();"
 TYPE_SIG = "static bool ggml_sycl_moe_pp_batched_claims_staged_type(ggml_type type) {"
 TYPE_TERMS = ("moe_pp_batched_takes_staged_type(type) && "
               "ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS)")
@@ -264,8 +269,12 @@ AFTER_STAGED_BRANCH = ("ggml_sycl_moe_tensor_plan_primary_layout(weight, device,
 
 
 def claim_backend_fills_the_inputs(sycl: str) -> bool:
+    """The KV intake fills the staged-type mask and the group cap once each, and the stage hands the intake
+    g_placement_kv_info."""
     p = body(sycl, POPULATE_SIG)
-    return bool(p) and p.count(FILL_MASK) == 1 and p.count(FILL_CAP) == 1
+    intake = body(sycl, INTAKE_SIG)
+    return (bool(p) and p.count(INTAKE_CALL) == 1 and bool(intake) and intake.count(FILL_MASK) == 1
+            and intake.count(FILL_CAP) == 1)
 
 
 def claim_mask_is_the_staged_claims_type_half(sycl: str) -> bool:
@@ -302,6 +311,11 @@ def test_mutant_mask_not_filled_fails():
 
 def test_mutant_group_cap_not_filled_fails():
     assert not claim_backend_fills_the_inputs(_once(SYCL, FILL_CAP, ""))
+
+
+def test_mutant_stage_skips_the_intake_fails():
+    """The stage stops handing g_placement_kv_info to the intake: the fills still exist, and reach no KV input."""
+    assert not claim_backend_fills_the_inputs(_once(SYCL, INTAKE_CALL, ""))
 
 
 def test_mutant_helper_drops_the_layout_term_fails():

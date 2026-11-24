@@ -10,6 +10,10 @@ HOST_TEST = ROOT / "tests/test-sycl-moe-resolved-batch.cpp"
 MEM_HANDLE_SOURCE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 CPU_DISPATCH_SOURCE = ROOT / "ggml/src/ggml-sycl/cpu-dispatch.cpp"
 UNIFIED_CACHE_SOURCE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
+UNIFIED_CACHE_HEADER = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
+MMVQ_SOURCE = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
+MMVQ_HEADER = ROOT / "ggml/src/ggml-sycl/mmvq.hpp"
+SEAM_HEADER = ROOT / "ggml/src/ggml-sycl/tests/q1-nvfp4-production-route-test-seam.hpp"
 
 # Identifiers, numeric literals and operators. A literal is a token like any other: dropped, `for (row = 2;` would read
 # as `for (row = 1;`, and a count passed as `1` as one passed as `ne11`.
@@ -164,6 +168,185 @@ def prompt_ids_snapshotted_once(text: str) -> bool:
     return len(refreshes) == 1 and len(snapshots) == 1
 
 
+# A lambda introducer with its optional parameter list and return type, up to the brace that opens its body. An array
+# subscript never matches: what follows its `]` is never an optional `(...)` and then `{`.
+LAMBDA_RE = re.compile(r"\[[^\[\]]*\]\s*(?:\([^()]*\))?\s*(?:->\s*[\w:<>*& ]+?)?\s*\{")
+# The calls through which mmvq_moe_batched_dispatch refuses: each records the reason (and the bytes) for its caller.
+DISPATCH_REJECTORS = ("reject", "log_dispatch_reject", "log_xmx_reject")
+DISPATCH_SIGNATURE = "bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &"
+REFUSAL_TEXT_SIGNATURE = "static const char * ggml_sycl_moe_q1_nvfp4_refusal_text("
+ROUTE_TESTING_MACRO = "GGML_SYCL_Q1_NVFP4_ROUTE_TESTING"
+
+
+def without_comments(text: str) -> str:
+    return re.sub(r"//.*?$|/\*.*?\*/", " ", text, flags=re.MULTILINE | re.DOTALL)
+
+
+def split_lambdas(function: str) -> tuple[str, dict[str, str]]:
+    """The function with every lambda body inside it emptied to `{}`, and each `auto NAME = [...]` lambda's body.
+
+    A `return false;` inside a lambda returns from the lambda, not from the function, so the function's own
+    returns are the ones left in the emptied text.
+    """
+    text = without_comments(function)
+    first = text.index("{") + 1
+    out = [text[:first]]
+    named: dict[str, str] = {}
+    pos = first
+    while True:
+        match = LAMBDA_RE.search(text, pos)
+        if not match:
+            break
+        brace = match.end() - 1
+        body = function_definition(text[brace:], "{")
+        name = re.search(r"auto\s+(\w+)\s*=\s*$", text[max(0, match.start() - 160):match.start()])
+        if name:
+            named[name.group(1)] = body
+        out.append(text[pos:brace] + "{}")
+        pos = brace + len(body)
+    out.append(text[pos:])
+    return "".join(out), named
+
+
+def call_arguments(text: str, name: str) -> list[list[str]]:
+    """The top-level comma-separated arguments of every call `name(...)` in text."""
+    calls: list[list[str]] = []
+    for match in re.finditer(r"(?<![\w.>])" + re.escape(name) + r"\s*\(", text):
+        depth, i, start, args = 0, match.end() - 1, match.end(), []
+        in_string = False
+        while i < len(text):
+            ch = text[i]
+            if in_string:
+                if ch == "\\":
+                    i += 1
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth == 0:
+                    args.append(text[start:i].strip())
+                    break
+            elif ch == "," and depth == 1:
+                args.append(text[start:i].strip())
+                start = i + 1
+            i += 1
+        calls.append(args)
+    return calls
+
+
+def macro_guarded_lines(text: str, macro: str) -> set[int]:
+    """Line numbers (0-based) that sit inside an `#ifdef macro` / `#if defined(macro)` region."""
+    guarded: set[int] = set()
+    stack: list[bool] = []
+    for number, line in enumerate(text.splitlines()):
+        directive = line.strip()
+        if re.match(r"#\s*if", directive):
+            stack.append(re.match(r"#\s*(ifdef\s+" + macro + r"\b|if\s+defined\s*\(\s*" + macro + r"\s*\))",
+                                  directive) is not None)
+        elif re.match(r"#\s*endif", directive):
+            if stack:
+                stack.pop()
+        elif re.match(r"#\s*(else|elif)", directive) and stack:
+            stack[-1] = False
+        if any(stack):
+            guarded.add(number)
+    return guarded
+
+
+def unguarded_mentions(text: str, needle: str, macro: str) -> list[int]:
+    guarded = macro_guarded_lines(text, macro)
+    return [n for n, line in enumerate(text.splitlines()) if needle in line and n not in guarded]
+
+
+def q1_nvfp4_case(function: str) -> str:
+    start = function.index("case GGML_TYPE_Q1_0:")
+    return function[start:function.index("case GGML_TYPE_IQ2_XXS:", start)]
+
+
+def dispatch_reject_violations(mmvq: str, mmvq_header: str, sycl: str, seam: str) -> list[str]:
+    """mmvq_moe_batched_dispatch names the cause of every false return; the Q1_0/NVFP4 refusal text covers them."""
+    failures: list[str] = []
+    if not has_tokens(mmvq_header, "const std::vector<sycl::event> * deps = nullptr, "
+                                   "const char ** reject_reason = nullptr, size_t * reject_bytes = nullptr);"):
+        failures.append("dispatch declaration lacks the trailing reject_reason/reject_bytes out-parameters")
+    if DISPATCH_SIGNATURE not in mmvq:
+        return failures + ["mmvq_moe_batched_dispatch definition"]
+    function = function_definition(mmvq, DISPATCH_SIGNATURE)
+    if not has_tokens(function, "const char ** reject_reason, size_t * reject_bytes) {"):
+        failures.append("dispatch definition lacks the reject_reason/reject_bytes out-parameters")
+    own, lambdas = split_lambdas(function)
+
+    reject = lambdas.get("reject", "")
+    for witness in ("*reject_reason = reason;", "*reject_bytes = bytes;", "return false;"):
+        if not has_tokens(reject, witness):
+            failures.append(f"reject() does not record the cause: {witness}")
+    for logger in ("log_dispatch_reject", "log_xmx_reject"):
+        if not has_tokens(lambdas.get(logger, ""), "return reject(reason, bytes);"):
+            failures.append(f"{logger} does not end in reject()")
+    own_tokens = tokens(own)
+    try:
+        first_return = token_sequence_index(own_tokens, "return")
+        if token_sequence_index(own_tokens, "*reject_reason = nullptr;") > first_return or \
+                token_sequence_index(own_tokens, "*reject_bytes = 0;") > first_return:
+            failures.append("dispatch resets its out-parameters after a return")
+    except ValueError:
+        failures.append("dispatch does not reset its out-parameters on entry")
+
+    for value in re.findall(r"\breturn\b([^;]*);", own):
+        value = value.strip()
+        if value == "true" or any(re.match(name + r"\s*\(", value) for name in DISPATCH_REJECTORS):
+            continue
+        failures.append(f"dispatch returns without naming a reason: return {value};")
+
+    for name in DISPATCH_REJECTORS:
+        for args in call_arguments(own, name):
+            if args and re.fullmatch(r'"[^"]*-alloc"', args[0]) and len(args) < 2:
+                failures.append(f"allocation refusal without its requested bytes: {name}({args[0]})")
+
+    case = q1_nvfp4_case(own)
+    take = ("if (ggml_sycl_q1_nvfp4_test_failure_take(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH)) "
+            '{ return log_dispatch_reject("test-failpoint"); }')
+    order = ('return log_dispatch_reject("int-max-bound");', take, "mmvq_submit_q1_nvfp4_aos_id(",
+             'return log_dispatch_reject("submit-precondition");')
+    case_tokens = tokens(case)
+    try:
+        at = [token_sequence_index(case_tokens, step) for step in order]
+        if at != sorted(at):
+            failures.append("Q1_0/NVFP4 case order: bound, failpoint, submit, submit refusal")
+    except ValueError as missing:
+        failures.append(f"Q1_0/NVFP4 case: {missing}")
+    for needle in ("ggml_sycl_q1_nvfp4_test_failure_take(", "q1-nvfp4-production-route-test-seam.hpp"):
+        if needle not in mmvq or unguarded_mentions(mmvq, needle, ROUTE_TESTING_MACRO):
+            failures.append(f"mmvq.cpp uses the route-testing seam outside {ROUTE_TESTING_MACRO}: {needle}")
+    if "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BATCHED_DISPATCH" not in seam or not has_tokens(
+            seam, "bool ggml_sycl_q1_nvfp4_test_failure_take(enum ggml_sycl_q1_nvfp4_test_failure failure);"):
+        failures.append("seam header declares the batched-dispatch failpoint and its take")
+    definition = "bool ggml_sycl_q1_nvfp4_test_failure_take(ggml_sycl_q1_nvfp4_test_failure failure) {"
+    if not has_tokens(sycl, definition) or unguarded_mentions(sycl, "ggml_sycl_q1_nvfp4_test_failure_take(",
+                                                              ROUTE_TESTING_MACRO):
+        failures.append(f"ggml-sycl.cpp defines the failpoint take under {ROUTE_TESTING_MACRO}")
+
+    # Every reason the dispatch can name for a Q1_0/NVFP4 operand (before its type switch, or in its case) has an
+    # exception text, and so has the caller's own no-ptr-table.
+    reachable = own[:own.index("switch (src0->type)")] + case
+    reasons = {"no-ptr-table"}
+    for name in DISPATCH_REJECTORS:
+        for args in call_arguments(reachable, name):
+            reasons.update(re.findall(r'"([^"]+)"', args[0]) if args else [])
+    if REFUSAL_TEXT_SIGNATURE not in sycl:
+        failures.append("Q1_0/NVFP4 refusal text table")
+    else:
+        table = function_definition(sycl, REFUSAL_TEXT_SIGNATURE)
+        texts = set(re.findall(r'GGML_SYCL_Q1_NVFP4_REFUSAL\(\s*"([^"]+)"\s*\)', table))
+        for reason in sorted(reasons - texts):
+            failures.append(f"Q1_0/NVFP4 refusal reason without an exception text: {reason}")
+    return failures
+
+
 def violations(header: str, source: str, host_test: str, mem_handle_source: str) -> list[str]:
     failures: list[str] = []
     required_header = {
@@ -261,6 +444,9 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained decode executor refused route\")",
         "main executor failure propagates":
             "throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained hybrid executor refused route\")",
+        # A Q1_0/NVFP4 AOS operand whose batched dispatch returns false ends the op, never the process.
+        "Q1/NVFP4 batched dispatch refusal":
+            "throw ggml_sycl_fallback_error(ggml_sycl_moe_q1_nvfp4_refusal_text(refusal_reason))",
         "ready guard suppresses exceptional publish":
             "std::uncaught_exceptions() != uncaught_on_entry",
         "ID admission failure propagates":
@@ -277,10 +463,10 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "decode GPU fast gate": "if (ne12 != 1) { if (!pp_cpu_reference_force_router",
         "decode precomputed gate": "src1 && src1->ne[2] != 1 && ggml_sycl_moe_precomputed_skip_contains",
         # Deliberately unconditional and type-blind; see the comment on the gate
-        # itself in ggml-sycl.cpp. A type carve-out here was tried and withdrawn
-        # (llama.cpp-t98c): it steers decode into the prompt-only else-branch,
-        # which resolves no route and reports a worse error than the honest
-        # capability refusal it was trying to avoid.
+        # itself in ggml-sycl.cpp. A type carve-out here was tried and withdrawn:
+        # it steers decode into the prompt-only else-branch, which resolves no
+        # route and reports a worse error than the retained partition's own
+        # refusal for an operand it cannot run.
         "all-local decode retained gate": "const bool moe_hybrid_with_plan = ne12 == 1 || selected_hybrid_route",
         "CPU-TG retains selected routing semantics":
             "const bool cpu_expert_tg_active = selected_hybrid_route && !prompt_batch",
@@ -541,6 +727,42 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
                       "mem_handle::from_chunk_ptr(", "mem_handle::from_direct("):
         if has_tokens(production, forbidden):
             failures.append(f"ownership bridge: {forbidden}")
+
+    # The executor choice asks no type: it takes the kernel the capability query answered, Q1_0 and NVFP4 included,
+    # and the recipe validator checks the direct kernel's exact workspace by that kernel.
+    choose = function_definition(header, "inline moe_batch_executor_choice choose_moe_batch_executor(")
+    for forbidden in ("CAPABILITY_UNSUPPORTED", "request.type", "moe_type_has_immutable_host_recipe(",
+                      "GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4"):
+        if has_tokens(choose, forbidden):
+            failures.append(f"executor choice refuses a type the capability admitted: {forbidden}")
+    validate = function_definition(header, "inline bool validate_moe_execution_recipe(")
+    if not has_tokens(validate, "if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {"):
+        failures.append("direct recipe workspace check keyed by its kernel")
+
+    # A Q1_0/NVFP4 AOS operand whose batched dispatch returns false: one WARN naming the tensor, the layout, the
+    # pointer table and the cause with its requested bytes, then a named refusal whose text carries the cause, which
+    # ends the op. No abort on that path, and the old abort text is gone.
+    refusal_guard = "if (!batched_ok && q1_nvfp4_aos)"
+    if refusal_guard not in source:
+        failures.append("Q1/NVFP4 batched dispatch refusal block")
+    else:
+        block = tokens(function_definition(source, refusal_guard))
+        warn = ('"[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s entries=%zu '
+                'ptr_table=%s reason=%s requested_bytes=%zu')
+        throw = "throw ggml_sycl_fallback_error(ggml_sycl_moe_q1_nvfp4_refusal_text(refusal_reason));"
+        if "GGML_ABORT" in block or "abort" in block:
+            failures.append("Q1/NVFP4 batched dispatch refusal aborts the process")
+        if not contains_tokens(block, "GGML_LOG_WARN(" + warn) or not contains_tokens(
+                block, 'expert_ptrs_dev ? "present" : "missing", refusal_reason, dispatch_reject_bytes);'):
+            failures.append("Q1/NVFP4 batched dispatch refusal WARN names the tensor, layout, pointer table and cause")
+        elif not contains_tokens(block, throw) or token_sequence_index(block, warn) > token_sequence_index(block, throw):
+            failures.append("Q1/NVFP4 batched dispatch refusal throws after its WARN")
+    if not has_tokens(source, "&dispatch_reject_reason, &dispatch_reject_bytes);") or not has_tokens(
+            source, 'const char * refusal_reason = !expert_ptrs_dev ? "no-ptr-table" : dispatch_reject_reason ? '
+                    'dispatch_reject_reason : "unnamed";'):
+        failures.append("Q1/NVFP4 refusal reason is not the one the batched dispatch named")
+    if has_tokens(source, "direct recipe failed before submit"):
+        failures.append("Q1/NVFP4 batched dispatch abort text remains")
     return failures
 
 
@@ -1091,7 +1313,7 @@ def test_direct_prompt_mutants_each_fail_their_claim() -> None:
 def test_refusal_behavior_never_publishes_ready_or_reports_success() -> None:
     # Behavioral model of the production exception chain: MMID ready guard
     # observes unwinding, compute_forward rethrows, and graph boundary fails.
-    for refusal in ("batch_rejected", "wrong_queue", "q1_capability", "nvfp4_capability",
+    for refusal in ("batch_rejected", "wrong_queue", "q1_nvfp4_batched_dispatch_false",
                     "planned_pointer_table_missing"):
         published = False
         graph_success = True
@@ -1216,6 +1438,47 @@ def test_contract_and_mutation_witnesses() -> None:
         ("enable-Q1-device-route", header,
          source.replace("if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)", "if (false)", 1),
          host_test, mem_source),
+        # The executor choice's early return restored: every Q1_0/NVFP4 device recipe refused whatever the
+        # capability query answered, so supports_op, the capability and the choice give three answers again.
+        ("restore-chooser-early-return",
+         header.replace("    moe_batch_executor_choice out;\n",
+                        "    moe_batch_executor_choice out;\n"
+                        "    if (operand.recipe().kind != moe_batch_executor::HOST_CPU &&\n"
+                        "        moe_type_has_immutable_host_recipe(operand.recipe().request.type)) {\n"
+                        "        out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;\n"
+                        "        return out;\n"
+                        "    }\n", 1),
+         source, host_test, mem_source),
+        ("validator-keys-direct-check-by-type",
+         header.replace("if (recipe.kernel == moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS) {",
+                        "if (moe_type_has_immutable_host_recipe(recipe.request.type)) {", 1),
+         source, host_test, mem_source),
+        ("restore-q1-nvfp4-dispatch-abort", header,
+         re.sub(r'throw\s+ggml_sycl_fallback_error\(\s*ggml_sycl_moe_q1_nvfp4_refusal_text\(\s*refusal_reason\s*\)\);',
+                'GGML_ABORT("[MOE-ROUTE] admitted primary Q1/NVFP4 direct recipe failed before submit");', source),
+         host_test, mem_source),
+        ("abort-before-q1-nvfp4-refusal", header,
+         re.sub(r'(throw\s+ggml_sycl_fallback_error\(\s*ggml_sycl_moe_q1_nvfp4_refusal_text)',
+                r'GGML_ABORT("dispatch returned false"); \1', source),
+         host_test, mem_source),
+        ("q1-nvfp4-refusal-warn-unnamed", header,
+         source.replace('"[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false: tensor=%s layout=%s "',
+                        '"[MOE-ROUTE] Q1_0/NVFP4 AOS batched dispatch returned false "', 1),
+         host_test, mem_source),
+        # The WARN keeps its tensor, layout and pointer-table fields but drops the cause.
+        ("q1-nvfp4-refusal-warn-drops-reason", header,
+         source.replace('"entries=%zu ptr_table=%s reason=%s requested_bytes=%zu\\n"', '"entries=%zu ptr_table=%s\\n"',
+                        1),
+         host_test, mem_source),
+        # The exception carries a fixed text again, whatever the dispatch named.
+        ("q1-nvfp4-refusal-text-unnamed", header,
+         source.replace("throw ggml_sycl_fallback_error(ggml_sycl_moe_q1_nvfp4_refusal_text(refusal_reason));",
+                        'throw ggml_sycl_fallback_error("MUL_MAT_ID Q1_0/NVFP4 batched dispatch refused");', 1),
+         host_test, mem_source),
+        # The caller stops passing the out-parameters, so every refusal reads as "unnamed".
+        ("q1-nvfp4-refusal-reason-not-passed", header,
+         re.sub(r"&dispatch_reject_reason,\s*&dispatch_reject_bytes\);", "nullptr, nullptr);", source, count=1),
+         host_test, mem_source),
         ("refusal-return", header,
          source.replace("throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained", "return; // MUL_MAT_ID retained"),
          host_test, mem_source),
@@ -1297,6 +1560,252 @@ def test_contract_and_mutation_witnesses() -> None:
         assert (mutant_header, mutant_source, mutant_test, mutant_mem) != (header, source, host_test, mem_source), (
             f"semantic mutation changed nothing: {name}")
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
+
+
+def replace_after(text: str, anchor: str, old: str, new: str) -> str:
+    at = text.index(anchor)
+    return text[:at] + text[at:].replace(old, new, 1)
+
+
+def test_batched_dispatch_names_every_refusal() -> None:
+    mmvq, mmvq_header = MMVQ_SOURCE.read_text(), MMVQ_HEADER.read_text()
+    sycl, seam = SOURCE.read_text(), SEAM_HEADER.read_text()
+    assert dispatch_reject_violations(mmvq, mmvq_header, sycl, seam) == []
+
+    # Positive control of the lambda split on a hand-built body: a lambda's own `return false;` is not a return of
+    # the function, an array subscript is not a lambda, and the function's own returns stay.
+    sample = ("bool f(int * a) {\n    auto ok = [&](int i) -> bool { if (a[i]) { return true; } return false; };\n"
+              '    if (a[0]) { return reject("x"); }\n    return true;\n}\n')
+    own, named = split_lambdas(sample)
+    assert "return false" not in own and "return false" in named["ok"] and 'return reject("x")' in own
+
+    xmx_logger = re.search(r"auto\s+log_xmx_reject\s*=", mmvq)
+    mutants = {
+        # One allocation refusal goes back to a bare false: its caller can no longer name it.
+        "bare-return-false": (re.sub(r'return log_dispatch_reject\("q8-scratch-alloc",\s*required_size\);',
+                                     "return false;", mmvq, count=1), mmvq_header, sycl, seam),
+        "submit-refusal-unnamed": (mmvq.replace('return log_dispatch_reject("submit-precondition");', "return false;",
+                                                1), mmvq_header, sycl, seam),
+        "alloc-without-bytes": (re.sub(r'log_dispatch_reject\("ids-scratch-alloc",\s*ids_bytes\)',
+                                       'log_dispatch_reject("ids-scratch-alloc")', mmvq, count=1),
+                                mmvq_header, sycl, seam),
+        "reject-drops-reason": (mmvq.replace("*reject_reason = reason;", "(void) reason;", 1), mmvq_header, sycl, seam),
+        "xmx-logger-drops-reason": (replace_after(mmvq, xmx_logger.group(0) if xmx_logger else "log_xmx_reject",
+                                                  "return reject(reason, bytes);", "return false;"),
+                                    mmvq_header, sycl, seam),
+        "declaration-without-out-params": (mmvq, re.sub(r",\s*const char \*\*\s+reject_reason\s*=\s*nullptr,\s*"
+                                                        r"size_t \*\s+reject_bytes\s*=\s*nullptr\);", ");",
+                                                        mmvq_header), sycl, seam),
+        "failpoint-dropped": (re.sub(r"if \(ggml_sycl_q1_nvfp4_test_failure_take\([^}]*\}", "", mmvq, count=1),
+                              mmvq_header, sycl, seam),
+        "failpoint-unguarded": (re.sub(r"#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING\n((?:\s*//[^\n]*\n)*\s*if \("
+                                       r"ggml_sycl_q1_nvfp4_test_failure_take)", r"\1", mmvq, count=1),
+                                mmvq_header, sycl, seam),
+        "refusal-text-drift": (mmvq, mmvq_header,
+                               re.sub(r'GGML_SYCL_Q1_NVFP4_REFUSAL\("ids-scratch-alloc"\),', "", sycl, count=1),
+                               seam),
+    }
+    for name, (m_mmvq, m_header, m_sycl, m_seam) in mutants.items():
+        assert (m_mmvq, m_header, m_sycl, m_seam) != (mmvq, mmvq_header, sycl, seam), f"mutation changed nothing: {name}"
+        assert dispatch_reject_violations(m_mmvq, m_header, m_sycl, m_seam), f"mutation survived: {name}"
+
+
+MUL_MAT_ID_SIGNATURE = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try"
+PRESTAGE_RECEIPT = "ggml_sycl::prestage_result routed_prestage;"
+PRESTAGE_PIN = "routed_prestage = ggml_sycl::prestage_routed_experts("
+UNPIN_GUARD_TYPE = "struct routed_prestage_unpin_on_exit {"
+UNPIN_GUARD_RECEIPT = "const std::vector<ggml_sycl::routed_expert_pin> & pins;"
+UNPIN_GUARD_RELEASE = ("~routed_prestage_unpin_on_exit() { if (!pins.empty()) { "
+                       "ggml_sycl::unpin_routed_experts(device, pins); } }")
+UNPIN_GUARD_OBJECT = "routed_prestage_unpin{ ctx.device, routed_prestage.pins };"
+UNPIN_GUARD_STATEMENT = re.compile(r"[ \t]*struct routed_prestage_unpin_on_exit \{.*?\} routed_prestage_unpin\{ "
+                                   r"ctx\.device, routed_prestage\.pins \};\n", re.DOTALL)
+
+
+def code_only(text: str) -> str:
+    """text without comments and with every string or character literal emptied, so no brace inside one counts."""
+    out: list[str] = []
+    state = "code"
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if state == "code":
+            if ch == "/" and (nxt == "/" or nxt == "*"):
+                state = "line-comment" if nxt == "/" else "block-comment"
+                i += 2
+                continue
+            if ch in "\"'":
+                state = ch
+            out.append(ch)
+        elif state == "line-comment":
+            if ch == "\n":
+                state = "code"
+                out.append(ch)
+        elif state == "block-comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+        elif ch == "\\":
+            i += 2
+            continue
+        elif ch == state:
+            state = "code"
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def routed_prestage_release_violations(source: str) -> list[str]:
+    """Every exit of ggml_sycl_mul_mat_id releases the expert pins its prestage took, once, from prestage's receipt.
+
+    The op leaves through its end, through batched paths that return early, and through the throw of a refusal, so
+    the release is a guard at the function's own scope, declared before the prestage that pins and reading the receipt
+    by reference (a copy taken before prestage fills it would release nothing).
+    """
+    if MUL_MAT_ID_SIGNATURE not in source:
+        return ["ggml_sycl_mul_mat_id definition"]
+    body = tokens(code_only(function_definition(source, MUL_MAT_ID_SIGNATURE)))
+    try:
+        receipt = token_sequence_index(body, PRESTAGE_RECEIPT)
+        pinned = token_sequence_index(body, PRESTAGE_PIN)
+        guard = token_sequence_index(body, UNPIN_GUARD_OBJECT)
+    except ValueError as missing:
+        return [f"routed prestage release: {missing}"]
+    failures: list[str] = []
+    if not receipt < guard < pinned:
+        failures.append("the unpin guard is not declared after the receipt and before the prestage that pins")
+    if body[:guard].count("{") - body[:guard].count("}") != 1:
+        failures.append("the unpin guard is not at the function's own scope, so an inner scope's end releases the pins")
+    for witness in (UNPIN_GUARD_TYPE, UNPIN_GUARD_RECEIPT, UNPIN_GUARD_RELEASE):
+        if not contains_tokens(body, witness):
+            failures.append(f"unpin guard: {witness}")
+    releases = body.count("unpin_routed_experts")
+    if releases != 1:
+        failures.append(f"ggml_sycl_mul_mat_id releases routed pins at {releases} sites; the guard is the only one")
+    # The guard reads the receipt when the function exits, so nothing after the prestage may change it: a clear(), a
+    # move or a reassignment would leave the guard nothing to release. After the prestage statement the result is
+    # named only to read a member other than the receipt (the counters the debug line prints).
+    statement_end = body.index(";", pinned)
+    for i in range(statement_end, len(body)):
+        if body[i] != "routed_prestage":
+            continue
+        member = body[i + 2] if i + 2 < len(body) and body[i + 1] == "." else None
+        if member is None or member == "pins":
+            failures.append("ggml_sycl_mul_mat_id names the prestage receipt after the prestage call, where the "
+                            "guard alone may read it")
+            break
+    return failures
+
+
+def test_routed_prestage_pins_released_on_every_exit() -> None:
+    source = SOURCE.read_text()
+    assert routed_prestage_release_violations(source) == []
+
+    # Positive control of the blanking: braces in a string, a character or a comment do not count, code braces do.
+    sample = "void f() { const char * s = \"{{\"; char c = '{'; /* { */ // {\n    int x{ 1 }; }"
+    assert sample.count("{") - sample.count("}") == 5
+    assert code_only(sample).count("{") - code_only(sample).count("}") == 0 and "int x{ 1 }" in code_only(sample)
+
+    fn = function_definition(source, MUL_MAT_ID_SIGNATURE)
+    statement = UNPIN_GUARD_STATEMENT.search(fn)
+    assert statement, "the unpin guard statement is not where the mutants expect it"
+    guard = statement.group(0)
+    without = fn.replace(guard, "", 1)
+    first_throw = re.compile(r"throw ggml_sycl_fallback_error\([^;]*\);\n").search(without, without.index(PRESTAGE_PIN))
+    prestage_block = "if (use_routing_prestage) {\n"
+    after_prestage = "    char * src1_original"
+    mutants = {
+        "guard-removed": without,
+        "guard-after-first-throw": (without[:first_throw.end()] + guard + without[first_throw.end():]
+                                    if first_throw else fn),
+        "guard-inside-prestage-block": without.replace(prestage_block, prestage_block + guard, 1),
+        "guard-copies-receipt": re.sub(r"const std::vector<ggml_sycl::routed_expert_pin> &\s+pins;",
+                                       "std::vector<ggml_sycl::routed_expert_pin> pins;", fn, count=1),
+        "guard-releases-nothing": fn.replace("ggml_sycl::unpin_routed_experts(device, pins);", "(void) device;", 1),
+        "explicit-release-restored": fn[:-1] + "    ggml_sycl::unpin_routed_experts(ctx.device, routed_prestage.pins);\n}",
+        "receipt-cleared-after-prestage": fn.replace(after_prestage,
+                                                     "    routed_prestage.pins.clear();\n" + after_prestage, 1),
+        "receipt-moved-after-prestage": fn.replace(after_prestage, "    auto moved = std::move(routed_prestage.pins);\n"
+                                                   + after_prestage, 1),
+    }
+    for name, mutated in mutants.items():
+        assert mutated != fn, f"mutation changed nothing: {name}"
+        assert routed_prestage_release_violations(source.replace(fn, mutated, 1)), f"mutation survived: {name}"
+
+
+PIN_DECLARATION = "bool pin(const ggml_sycl_cache_id & key, ggml_layout_mode layout);"
+PIN_DEFINITION = "unified_cache::pin(const ggml_sycl_cache_id & key_id, ggml_layout_mode layout) {"
+PIN_WAS_SET = "const bool was_pinned = entry_it->second.pinned;"
+PIN_SET = "entry_it->second.pinned = true;"
+PIN_ANSWER = "return !was_pinned;"
+PRESTAGE_SIGNATURE = "prestage_result prestage_routed_experts(void *"
+PRESTAGE_RECEIPT_PUSH = "if (cache->pin(layout_key, layout)) { result.pins.push_back({ layout_key, layout }); }"
+
+
+def prestage_receipt_violations(header: str, cache_source: str) -> list[str]:
+    """prestage_routed_experts lists in its receipt only the pins it set.
+
+    A pin is a flag, not a count. Other holders pin experts on the card (bulk expert staging creates its entries
+    pinned, the popularity pass pins resident experts), so prestage can find an entry already pinned, and a receipt
+    that listed it would make the release clear a pin the op does not own. pin() answers whether the call changed the
+    flag from unset to set, and the receipt takes an entry only on that answer.
+    """
+    failures: list[str] = []
+    if not has_tokens(header, PIN_DECLARATION):
+        failures.append("unified_cache::pin does not answer whether it set the flag")
+    if PIN_DEFINITION not in cache_source:
+        return failures + ["unified_cache::pin definition"]
+    start = cache_source.index(PIN_DEFINITION)
+    if cache_source[cache_source.rfind("\n", 0, start) + 1:start].strip() != "bool":
+        failures.append("unified_cache::pin is not defined to return bool")
+    pin = tokens(code_only(function_definition(cache_source, PIN_DEFINITION)))
+    try:
+        order = [token_sequence_index(pin, step) for step in (PIN_WAS_SET, PIN_SET, PIN_ANSWER)]
+    except ValueError as missing:
+        failures.append(f"unified_cache::pin: {missing}")
+    else:
+        if order != sorted(order):
+            failures.append("unified_cache::pin does not read the flag before it sets it and answer with the old flag")
+    answers = [pin[i + 1:i + 4] for i, tok in enumerate(pin) if tok == "return"]
+    flips = sum(answer == ["!", "was_pinned", ";"] for answer in answers)
+    others = [answer for answer in answers if answer != ["!", "was_pinned", ";"] and answer[:2] != ["false", ";"]]
+    if flips != 1 or others:
+        failures.append("unified_cache::pin answers something other than the flip on one path and false on the rest")
+    if PRESTAGE_SIGNATURE not in cache_source:
+        return failures + ["prestage_routed_experts definition"]
+    prestage = tokens(code_only(function_definition(cache_source, PRESTAGE_SIGNATURE)))
+    if not contains_tokens(prestage, PRESTAGE_RECEIPT_PUSH):
+        failures.append("prestage_routed_experts lists an entry without asking whether its pin() set the flag")
+    if prestage.count("pins") != 1 or prestage.count("pin") != 1:
+        failures.append("prestage_routed_experts pins or lists at a site other than the answered pin")
+    return failures
+
+
+def test_prestage_receipt_lists_only_pins_it_set() -> None:
+    header = UNIFIED_CACHE_HEADER.read_text()
+    source = UNIFIED_CACHE_SOURCE.read_text()
+    assert prestage_receipt_violations(header, source) == []
+
+    pin = function_definition(source, PIN_DEFINITION)
+    prestage = function_definition(source, PRESTAGE_SIGNATURE)
+    push = re.search(r"if \(cache->pin\(layout_key, layout\)\) \{\s*result\.pins\.push_back\(\{ layout_key, layout \}\);"
+                     r"\s*\}", prestage)
+    assert push, "the answered pin is not where the mutants expect it"
+    unconditional = "cache->pin(layout_key, layout);\n                result.pins.push_back({ layout_key, layout });"
+    source_mutants = {
+        "receipt-push-unconditional": source.replace(prestage, prestage.replace(push.group(0), unconditional, 1), 1),
+        "receipt-push-on-refusal": source.replace(prestage, prestage.replace("if (cache->pin(", "if (!cache->pin(", 1), 1),
+        "pin-answers-true": source.replace(pin, pin.replace(PIN_ANSWER, "return true;", 1), 1),
+        "pin-answers-new-flag": source.replace(pin, pin.replace(PIN_ANSWER, "return entry_it->second.pinned;", 1), 1),
+        "pin-answers-true-without-entry": source.replace(pin, pin.replace("return false;", "return true;", 1), 1),
+    }
+    for name, mutated in source_mutants.items():
+        assert mutated != source, f"mutation changed nothing: {name}"
+        assert prestage_receipt_violations(header, mutated), f"mutation survived: {name}"
+    void_header = header.replace(PIN_DECLARATION, PIN_DECLARATION.replace("bool pin", "void pin", 1), 1)
+    assert void_header != header and prestage_receipt_violations(void_header, source), "mutation survived: pin-void"
 
 
 if __name__ == "__main__":

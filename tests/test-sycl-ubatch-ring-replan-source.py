@@ -99,6 +99,31 @@ def _bounded_body(code: str, start_marker: str, end_marker: str, *, after: int =
     return code[start:end]
 
 
+def _call_args(text: str, name: str) -> list:
+    """The top-level arguments of the first `name(` call in `text`, each
+    whitespace-normalized, so a check can say which argument carries what
+    rather than only that a token appears somewhere in the call."""
+    start = text.find(name + "(")
+    assert start != -1, f"{name}( not found"
+    args = []
+    current = []
+    depth = 1
+    for c in text[start + len(name) + 1:]:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(_normalize_ws("".join(current)).strip())
+                return args
+        elif c == "," and depth == 1:
+            args.append(_normalize_ws("".join(current)).strip())
+            current = []
+            continue
+        current.append(c)
+    raise AssertionError(f"{name}( has no closing parenthesis")
+
+
 def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
     """Comment-strip `raw`, bound the result from `start_marker` to the next
     `end_marker`, and whitespace-normalize -- the strip+bound+normalize
@@ -1084,38 +1109,36 @@ def test_stale_batched_refusal_is_warn_not_info():
     )
 
 
+_LOADER_START = "static void llama_model_sycl_populate_inventory("
+_LOADER_END = "static void llama_model_sycl_apply_inventory("
+
+
 def test_loader_stores_both_per_row_fields():
-    """The loader (src/llama-model.cpp) must store BOTH new per-row fields
-    next to the existing slot formulas, tied together with an assertion so
-    the two cannot silently drift apart."""
-    body = _bounded_body(
-        LLAMA_MODEL_CPP_CODE,
-        "static void llama_model_sycl_populate_inventory(",
-        "static void llama_model_sycl_apply_inventory(",
+    """The loader (src/llama-model.cpp) stores the bytes of ONE scratch row --
+    the widest expert's input width in half floats and its output width in
+    floats -- and sizes neither row-scaled slot. The backend sizes both from
+    these and the expert counts, at the micro-batch a context runs, so a slot
+    formula or an assert tying a slot to the per-row bytes here would be a
+    second source for the slot's size."""
+    raw = _bounded_body(LLAMA_MODEL_CPP, _LOADER_START, _LOADER_END)
+    body = _body_of(LLAMA_MODEL_CPP, _LOADER_START, _LOADER_END)
+    assert "inventory.pp_moe_onednn_activation_bytes_per_row = max_k * sizeof(ggml_fp16_t);" in body, (
+        "the loader must store one activation scratch row's bytes, not one multiplied by the expert count"
     )
-    assert "inventory.pp_moe_onednn_activation_bytes_per_row =" in body, (
-        "the loader must store inventory.pp_moe_onednn_activation_bytes_per_row"
+    assert "inventory.pp_moe_onednn_output_bytes_per_row = max_n * sizeof(float);" in body, (
+        "the loader must store one output scratch row's bytes, not one multiplied by the expert count"
     )
-    assert "inventory.pp_moe_onednn_output_bytes_per_row =" in body, (
-        "the loader must store inventory.pp_moe_onednn_output_bytes_per_row"
+    assert "inventory.pp_moe_onednn_activation_slot_bytes = 0;" in body, "the loader must not size the activation slot"
+    assert "inventory.pp_moe_onednn_output_slot_bytes = 0;" in body, "the loader must not size the output slot"
+    assert "inventory.pp_moe_onednn_scratch_bytes = static_cast<size_t>(pp_moe_onednn_ring_depth) * " \
+        "inventory.pp_moe_onednn_weight_slot_bytes;" in body, (
+        "the loader's scratch bytes must be the weight slots alone: the backend adds the row-scaled slots"
     )
-    body_norm = _normalize_ws(body)
-    assert re.search(
-        r"GGML_ASSERT\(\s*inventory\.pp_moe_onednn_activation_slot_bytes\s*==.*?"
-        r"pp_moe_onednn_activation_bytes_per_row",
-        body_norm,
-    ), (
-        "the activation slot formula and the new per-row field must be tied together with a GGML_ASSERT, "
-        "so the two cannot drift apart silently"
+    assert not re.search(r"GGML_ASSERT\([^;]*pp_moe_onednn_\w*(slot_bytes|bytes_per_row)", body), (
+        "no GGML_ASSERT on the ring's slot sizes may remain in the loader"
     )
-    assert re.search(
-        r"GGML_ASSERT\(\s*inventory\.pp_moe_onednn_output_slot_bytes\s*==.*?"
-        r"pp_moe_onednn_output_bytes_per_row",
-        body_norm,
-    ), (
-        "the output slot formula and the new per-row field must be tied together with a GGML_ASSERT, "
-        "so the two cannot drift apart silently"
-    )
+    assert not re.search(r"\bmax_rows\b", body), "the loader must not size the slots' rows"
+    assert "rectang" not in raw.lower(), "the loader must no longer size or describe a rectangle"
 
 
 def test_inventory_struct_declares_both_per_row_fields():
@@ -1137,13 +1160,92 @@ def test_populate_inventory_globals_wires_the_row_bytes():
         "populate_inventory_globals() must call unified_cache_set_planned_pp_moe_onednn_row_bytes() "
         "so a real model load actually publishes the per-row bytes"
     )
-    assert "inventory->pp_moe_onednn_activation_bytes_per_row" in body_norm
-    assert "inventory->pp_moe_onednn_output_bytes_per_row" in body_norm
+    args = _call_args(body_norm, "unified_cache_set_planned_pp_moe_onednn_row_bytes")
+    assert len(args) == 5, f"the setter takes the device, two per-row bytes and two expert counts, got {args}"
+    assert args[1] == "inventory->pp_moe_onednn_activation_bytes_per_row"
+    assert args[2] == "inventory->pp_moe_onednn_output_bytes_per_row"
+    assert re.search(r"\binventory->n_expert\b", args[3]), (
+        f"the setter's fourth argument must carry the inventory's expert count, got {args[3]!r}"
+    )
+    assert "inventory->n_expert_used" in args[4], (
+        f"the setter's fifth argument must carry the inventory's used-expert count, got {args[4]!r}"
+    )
     assert "unified_cache_set_planned_pp_moe_onednn_n_ubatch(" in body_norm, (
         "populate_inventory_globals() must record the load-time plan's own n_ubatch as the ring's "
         "initially-planned n_ubatch, or the re-plan's idempotence check starts every fresh model load "
         "believing nothing was ever planned"
     )
+    n_ubatch_args = _call_args(body_norm, "unified_cache_set_planned_pp_moe_onednn_n_ubatch")
+    assert n_ubatch_args[1] == "ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch)", (
+        "the ring's recorded micro-batch must be the one the publish sized its slots at, "
+        f"placement_load_n_ubatch(inventory->n_ubatch), got {n_ubatch_args[1]!r}"
+    )
+
+
+def test_publish_sizes_the_slots_with_the_shared_function():
+    """The load-time publish must size the row-scaled slots with pp_moe_onednn_slots_at, the function the ring's
+    admission and re-plan use, at the micro-batch the rest of the load plans at (placement_load_n_ubatch, not the raw
+    inventory field), with the expert counts the packed rows depend on. It must not copy slot sizes the loader
+    computed, and a ring it cannot size must be reported, not dropped silently."""
+    body = _bounded_body(
+        GGML_SYCL_CPP_CODE,
+        "static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_inputs(",
+        "return in;",
+    )
+    body_norm = _normalize_ws(body)
+    assert "ggml_sycl::pp_moe_onednn_slots_at(" in body_norm
+    assert "inventory->pp_moe_onednn_activation_slot_bytes" not in body_norm
+    assert "inventory->pp_moe_onednn_output_slot_bytes" not in body_norm
+
+    args = _call_args(body_norm, "ggml_sycl::pp_moe_onednn_slots_at")
+    assert len(args) == 7, f"pp_moe_onednn_slots_at takes n_ubatch, two counts, two per-row bytes, two outputs: {args}"
+    load_n_ubatch = "ggml_sycl::placement_load_n_ubatch(inventory->n_ubatch)"
+    assert args[0] == load_n_ubatch or (
+        re.fullmatch(r"\w+", args[0]) and re.search(rf"\b{args[0]} = {re.escape(load_n_ubatch)};", body_norm)
+    ), f"the slots must be sized at placement_load_n_ubatch(inventory->n_ubatch), got {args[0]!r}"
+    assert re.search(r"\binventory->n_expert\b", args[1]), f"second argument: the expert count, got {args[1]!r}"
+    assert "inventory->n_expert_used" in args[2], f"third argument: the used-expert count, got {args[2]!r}"
+    assert args[3] == "inventory->pp_moe_onednn_activation_bytes_per_row"
+    assert args[4] == "inventory->pp_moe_onednn_output_bytes_per_row"
+
+    call = body_norm.find("ggml_sycl::pp_moe_onednn_slots_at(")
+    warn = body_norm.find("GGML_LOG_WARN(", call)
+    reset = body_norm.find("in.pp_moe_onednn_ring_depth = 0;", call)
+    assert warn != -1 and reset != -1 and warn < reset, (
+        "the branch that plans no ring because the slots cannot be sized must WARN before it drops the ring"
+    )
+
+
+def test_largest_fitting_inverse_searches_with_the_shared_function():
+    """The inverse must ask pp_moe_onednn_slots_at for each candidate, not divide by a per-row cost: a sizing rule
+    that is not linear in the micro-batch has no per-row cost to divide by."""
+    body = _bounded_body(
+        CACHE_CPP_CODE,
+        "uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(",
+        "static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_pp",
+    )
+    body_norm = _normalize_ws(body)
+    assert "pp_moe_onednn_slots_at(" in body_norm
+    assert "/ per_row_total" not in body_norm
+    args = _call_args(body_norm, "pp_moe_onednn_slots_at")
+    assert len(args) == 7 and args[1] == "n_expert" and args[2] == "n_expert_used", (
+        f"each candidate must be sized with the expert counts the packed rows depend on, got {args}"
+    )
+    assert "n_expert == 0" in body_norm and "n_expert_used == 0" in body_norm, (
+        "no expert counts must answer 0, not an unbounded micro-batch"
+    )
+
+
+def test_replan_sizes_the_ring_with_the_planned_expert_counts():
+    """The re-plan's admission and its largest-fitting fallback size the ring with the expert counts the load
+    recorded: without them the packed rows, and so both slots, cannot be sized and every re-plan is refused."""
+    body = _normalize_ws(_replan_ring_fn_body())
+    assert "admit_in.n_expert = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert(device);" in body
+    assert "admit_in.n_expert_used = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert_used(device);" in body
+    args = _call_args(body, "ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn")
+    assert len(args) == 7, f"the inverse takes capacity, weight, two per-row bytes, two counts and depth: {args}"
+    assert args[4] == "ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert(device)"
+    assert args[5] == "ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_expert_used(device)"
 
 
 def test_new_functions_are_not_file_static_in_the_shared_header():
@@ -1157,6 +1259,8 @@ def test_new_functions_are_not_file_static_in_the_shared_header():
         "unified_cache_set_planned_pp_moe_onednn_row_bytes",
         "unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row",
         "unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row",
+        "unified_cache_get_planned_pp_moe_onednn_n_expert",
+        "unified_cache_get_planned_pp_moe_onednn_n_expert_used",
         "unified_cache_set_planned_pp_moe_onednn_n_ubatch",
         "unified_cache_get_planned_pp_moe_onednn_n_ubatch",
         "unified_cache_pp_moe_onednn_slots_for_ubatch",

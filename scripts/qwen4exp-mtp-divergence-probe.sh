@@ -67,7 +67,10 @@ done
 [ -z "$(ps -eo comm= | grep -E '^(llama-|test-)')" ] || { echo "another llama-*/test-* process is running" >&2; exit 1; }
 mkdir -p "$OUT"
 ulimit -c 0
-echo "pre: $(grep -E '^(Shmem|MemAvailable):' /proc/meminfo | tr '\n' ' ') load: $(cut -d' ' -f1-3 /proc/loadavg)"
+[ -r "$ROOT/scripts/sycl-host-backing.sh" ] || { echo "$ROOT/scripts/sycl-host-backing.sh is missing" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-host-backing.sh"
+echo "pre: $(sycl_gpu_host_backing_log_line) load: $(cut -d' ' -f1-3 /proc/loadavg)"
 for ub in $UBS; do
     for p in $PROMPTS; do
         mapfile -t cmd < <(run_cmd "$p" "$ub")
@@ -78,4 +81,4 @@ for ub in $UBS; do
         sleep 5
     done
 done
-echo "post: $(grep -E '^(Shmem|MemAvailable):' /proc/meminfo | tr '\n' ' ')"
+echo "post: $(sycl_gpu_host_backing_log_line)"

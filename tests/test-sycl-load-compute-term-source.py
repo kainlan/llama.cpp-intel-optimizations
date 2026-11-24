@@ -67,6 +67,7 @@ def read(rel: str) -> str:
 
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
+ZONE = read("ggml/src/ggml-sycl/zone-sizing.cpp")
 LLAMA_CTX = read("src/llama-context.cpp")
 
 
@@ -160,12 +161,16 @@ STORE_SIG = ("template <typename F> static bool planned_load_terms_store(int dev
              "F && store_locked)")
 DROP_SIG = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner)"
 REQ_SIG = "bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out)"
+# The pure sum the requirement hands its terms to (zone-sizing.cpp).
+ZONE_REQ_SIG = "bool zone_runtime_requirement(const zone_runtime_terms & terms, size_t * out)"
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 LANDING_SIG = "static void ggml_sycl_log_compute_buffer_landing(int device, const std::string & name, size_t size,"
 LOAD_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer)"
 TEARDOWN_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,"
 DROP_CALL = "(void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);"
+LAST_RELEASE_CALL = ("ggml_sycl_release_last_model_effects(site, ggml_sycl::unified_cache_release_cause::LOAD_ABORTED, "
+                     "ggml_sycl_last_release_scope::EVERY_CACHE);")
 DROP_DECL = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept;"
 DROP_DEF = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept {"
 STALE_LOOP = "for (int stale_device = 0; stale_device < GGML_SYCL_MAX_DEVICES; ++stale_device) {"
@@ -183,11 +188,12 @@ MERGE_WRITE_RE = re.compile(
     r"|\bg_planned_(?:compute|state)_term_bytes\s*\[[^\]]*\]\s*"
     r"(?:\.\s*(?:store|exchange|fetch_\w+|compare_exchange_\w+)\s*\(|(?:<<|>>|[-+*/%&|^])?=(?!=)|\+\+|--)")
 HEADER = read("ggml/src/ggml-sycl/unified-cache.hpp")
-STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * inventory,"
+STAGE_SIG = ("ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggml_sycl_tensor_inventory "
+             "* inventory,")
 STAGE_PROBE = ("if (early) { const uint64_t txn = effect.owner.load.value; "
                "const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn); "
                "if (candidate && candidate->plan) { ggml_sycl::lifecycle_stage_probe_placement_plan(txn, "
-               "ggml_sycl::placement_plan(*candidate->plan), candidate->kv_info, candidate->model_n_layer); } }")
+               "ggml_sycl::placement_plan(*candidate->plan), candidate->kv_info, candidate->model_n_layer); }")
 
 
 # ---- (a) the reservation: refusals first, the allocator's grain, the planner term only ----------------------------
@@ -288,13 +294,16 @@ def claim_setter_stores_the_owners_term(cache: str) -> bool:
 # ---- (b) the term is drawn against: requirement, ring admission, landing line --------------------------------------
 
 
-def claim_requirement_folds_in_the_term(cache: str) -> bool:
-    """The RUNTIME zone requirement adds the term with the overflow checked, as it does the dense plans."""
+def claim_requirement_folds_in_the_term(cache: str, zone: str = ZONE) -> bool:
+    """The RUNTIME zone requirement reads the term and hands it to the pure sum, which adds it with the overflow
+    checked, as it does the dense plans."""
     req = body(norm(cache), REQ_SIG)
-    return (bool(req) and ordered(
-        req, "const size_t compute = unified_cache_get_planned_compute_term_bytes(device_id);",
-        "compute > SIZE_MAX - base - mmq_src1 - dequant_f16 ||",
-        "*out = base + mmq_src1 + dequant_f16 + compute + state;"))
+    pure = body(norm(zone), ZONE_REQ_SIG)
+    return (bool(req) and bool(pure)
+            and ordered(req, "const size_t compute = unified_cache_get_planned_compute_term_bytes(device_id);",
+                        "terms.compute = compute;", "return zone_runtime_requirement(terms, out);")
+            and ordered(pure, "terms.dequant_f16, terms.compute", "if (term > SIZE_MAX - total) { return false; }",
+                        "total += term;"))
 
 
 def claim_ring_leaves_the_term_room(sycl: str) -> bool:
@@ -341,9 +350,10 @@ def claim_teardown_drops_only_its_slot(sycl: str) -> bool:
 def claim_abort_drops_only_its_owner(sycl: str) -> bool:
     """The aborted load drops its own contribution after the last try stage, whichever stage that is, unconditionally
     and outside any try, so no failed stage before it skips it and no catch handler is added for it; whatever is live
-    is left alone."""
+    is left alone. Only the last release follows it, which decides for itself whether a model is live."""
     b = body(norm(sycl), ABORT_SIG)
-    return (bool(b) and b.endswith("} catch (...) { clean = false; } " + DROP_CALL + " return clean; }")
+    return (bool(b) and b.endswith("} catch (...) { clean = false; } " + DROP_CALL + " " + LAST_RELEASE_CALL
+                                   + " return clean; }")
             and b.count("unified_cache_drop_planned_load_terms(") == 1 and depth_at(b, b.find(DROP_CALL)) == 1
             and "live_mask" not in b)
 
@@ -380,7 +390,9 @@ def claim_early_plan_stages_the_probe_plan(sycl: str) -> bool:
     of the load's early candidate, after every device planned it. Without it every SYCL load's probe measure refuses
     (no plan staged), and nothing on the host would notice."""
     b = body(norm(sycl), STAGE_SIG)
-    return (bool(b) and ordered(b, "if (early) { ggml_backend_sycl_compute_placement_plan_early(backend, inventory); }",
+    return (bool(b) and ordered(b, "if (early) { const int planned = ggml_sycl_compute_placement_plan_early_impl("
+                                "backend, inventory, &plan_refused); if (plan_refused) { return "
+                                "GGML_SYCL_LIFECYCLE_PLAN_REJECTED; }",
                                 STAGE_PROBE)
             and b.count("lifecycle_stage_probe_placement_plan(") == 1)
 
@@ -641,12 +653,16 @@ def test_mutant_publish_for_one_device_only_fails():
 
 def test_mutant_requirement_without_the_term_fails():
     assert not claim_requirement_folds_in_the_term(
-        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute + state;", "*out = base + mmq_src1 + dequant_f16 + state;"))
+        CACHE, _once(ZONE, "terms.dequant_f16, terms.compute, terms.state", "terms.dequant_f16, terms.state"))
+
+
+def test_mutant_requirement_never_hands_over_the_term_fails():
+    assert not claim_requirement_folds_in_the_term(_once(CACHE, "terms.compute = compute;", ""), ZONE)
 
 
 def test_mutant_requirement_unchecked_fails():
     assert not claim_requirement_folds_in_the_term(
-        _once(CACHE, "compute > SIZE_MAX - base - mmq_src1 - dequant_f16", "false"))
+        CACHE, _once(ZONE, "if (term > SIZE_MAX - total) { return false; }", ""))
 
 
 def test_mutant_ring_not_charged_the_term_fails():
@@ -907,14 +923,17 @@ def claim_state_setter_stores_the_owners_term(cache: str) -> bool:
             and claim_owner_store_republishes_under_the_lock(cache) and claim_publish_is_the_merge_with_release(cache))
 
 
-def claim_requirement_folds_in_the_state_term(cache: str) -> bool:
-    """The RUNTIME zone requirement adds the state term after the compute term, with the overflow checked."""
+def claim_requirement_folds_in_the_state_term(cache: str, zone: str = ZONE) -> bool:
+    """The RUNTIME zone requirement reads the state term after the compute term and hands both to the pure sum, which
+    adds the state term after the compute term with the overflow checked."""
     req = body(norm(cache), REQ_SIG)
-    return (bool(req) and ordered(
-        req, "const size_t compute = unified_cache_get_planned_compute_term_bytes(device_id);",
-        "const size_t state = unified_cache_get_planned_state_term_bytes(device_id);",
-        "state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute) { return false; }",
-        "*out = base + mmq_src1 + dequant_f16 + compute + state;"))
+    pure = body(norm(zone), ZONE_REQ_SIG)
+    return (bool(req) and bool(pure)
+            and ordered(req, "const size_t compute = unified_cache_get_planned_compute_term_bytes(device_id);",
+                        "const size_t state = unified_cache_get_planned_state_term_bytes(device_id);",
+                        "terms.state = state;", "return zone_runtime_requirement(terms, out);")
+            and ordered(pure, "terms.compute, terms.state }", "if (term > SIZE_MAX - total) { return false; }",
+                        "total += term;"))
 
 
 def claim_ring_leaves_the_state_room(sycl: str) -> bool:
@@ -991,12 +1010,16 @@ def test_mutant_state_publish_not_the_merge_fails():
 
 def test_mutant_requirement_without_the_state_term_fails():
     assert not claim_requirement_folds_in_the_state_term(
-        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute + state;", "*out = base + mmq_src1 + dequant_f16 + compute;"))
+        CACHE, _once(ZONE, "terms.compute, terms.state }", "terms.compute }"))
+
+
+def test_mutant_requirement_never_hands_over_the_state_term_fails():
+    assert not claim_requirement_folds_in_the_state_term(_once(CACHE, "terms.state = state;", ""), ZONE)
 
 
 def test_mutant_requirement_state_unchecked_fails():
     assert not claim_requirement_folds_in_the_state_term(
-        _once(CACHE, "state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute", "false"))
+        CACHE, _once(ZONE, "if (term > SIZE_MAX - total) { return false; }", ""))
 
 
 def test_mutant_ring_not_charged_the_state_fails():

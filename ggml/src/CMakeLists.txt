@@ -395,7 +395,13 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         ggml-backend-dl.cpp
         ggml-backend-reg.cpp)
     target_compile_definitions(ggml-private-test-registry PRIVATE
-        GGML_USE_CPU
+        GGML_USE_CPU)
+    # The registry registers the SYCL backend, so whatever links it runs on that backend: it publishes GGML_USE_SYCL
+    # to its consumers the way ggml_add_backend() publishes it from ggml. The private fixture executables link this
+    # registry instead of ggml (through ggml-sycl-private-fixtures), so this is where their GGML_USE_SYCL comes from;
+    # without it a test body behind #if defined(GGML_USE_SYCL) compiles out and the binary runs nothing.
+    # tests/test-sycl-guarded-tests-source.py checks that every target compiling such a test receives the define.
+    target_compile_definitions(ggml-private-test-registry PUBLIC
         GGML_USE_SYCL)
     target_include_directories(ggml-private-test-registry PRIVATE
         .

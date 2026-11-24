@@ -99,16 +99,22 @@ enum class model_phase { LOADING, LIVE, DRAINING_UPDATES, TEARING_DOWN, QUARANTI
 enum class tier_verdict { UNKNOWN, DEVICE, HOST, MIXED };
 enum class finish_phase { ACTIVE, COMMITTING, ROLLING_BACK, COMMITTED, ABORTED };
 
+// planned_host_bytes is the weight bytes the plan places on host, which the tiering verdict reads; charged_host_bytes
+// is the share of them the host ledger owns, without the file-mapped weights (design 5efe §4.4).
 struct ModelState {
     const ModelToken   token;
     const model_phase  phase;
     const uint64_t     planned_host_bytes;
+    const uint64_t     charged_host_bytes;
     const uint64_t     actual_host_bytes;
     const tier_verdict verdict;
 };
 
+// In ModelState's order. Set the fields by name: charged_host_bytes and actual_host_bytes are adjacent uint64_t, so a
+// positional initialiser that swaps them still compiles.
 struct publication_data {
     uint64_t     planned_host_bytes = 0;
+    uint64_t     charged_host_bytes = 0;
     uint64_t     actual_host_bytes  = 0;
     tier_verdict verdict            = tier_verdict::UNKNOWN;
 };

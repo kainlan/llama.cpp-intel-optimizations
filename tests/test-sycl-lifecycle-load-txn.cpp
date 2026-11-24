@@ -22,6 +22,15 @@ static void require(bool v, const char * marker) {
     }
 }
 
+// Sets the publication by name: its two adjacent uint64_t fields would swap silently under a positional initialiser.
+static publication_data make_publication(uint64_t planned, uint64_t actual, tier_verdict verdict) {
+    publication_data p;
+    p.planned_host_bytes = planned;
+    p.actual_host_bytes  = actual;
+    p.verdict            = verdict;
+    return p;
+}
+
 static ModelToken commit_one(Registry & r, publication_data p = {}) {
     auto b = r.begin_outer();
     require(b.code == error::OK, "begin failed");
@@ -124,6 +133,32 @@ static void run_case(const std::string & name, test_mutation mutation) {
         auto failed = r.finalize_cleanup(ticket, true);
         require(failed.code == error::POISONED && !failed.committed, "depth underflow cleanup terminal mismatch");
         require(!r.find(b.token.model), "depth-underflow model became LIVE");
+    } else if (name == "commit-validate-fails-only-by-poison") {
+        // load_end runs the owner-effects abort after a failed validation only when finalize_end asks for cleanup, and
+        // that abort is what puts back the device-wide terms the load published. A commit ticket's validation fails
+        // only by poison, which finalize_end answers with a cleanup request: while the ticket's transaction is
+        // COMMITTING, a second end and a binding recovery wait for it and a begin is refused, so nothing but the
+        // ticket's own finalize moves the phase, serial or active transaction validate_end compares.
+        Registry r;
+        auto     b      = r.begin_outer();
+        auto     ticket = r.prepare_end(b.txn, true);
+        require(ticket.finisher && ticket.commit, "no commit finisher");
+        auto second   = std::async(std::launch::async, [&] { return r.prepare_end(b.txn, true); });
+        auto recovery = std::async(std::launch::async, [&] { return r.recover_binding_failure(b.txn); });
+        require(second.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
+                "a second end did not wait for the committing finisher");
+        require(recovery.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout,
+                "a binding recovery did not wait for the committing finisher");
+        require(r.begin_outer().code == error::LOAD_BUSY, "a begin was admitted while the load was committing");
+        require(r.validate_end(ticket) == error::OK, "a second end, recovery or begin made the commit ticket stale");
+        require(r.enter_nested(b.txn) == error::DEPTH_UNDERFLOW, "the post-prepare poison was not taken");
+        require(r.validate_end(ticket) == error::POISONED, "a poisoned commit ticket did not fail by poison");
+        auto pending = r.finalize_end(ticket, true);
+        require(pending.code == error::POISONED && pending.cleanup_required && !pending.committed,
+                "a commit ticket whose validation failed was finalized without a cleanup request");
+        auto failed = r.finalize_cleanup(ticket, true);
+        require(failed.code == error::POISONED && !failed.committed, "the cleanup did not end the load aborted");
+        require(!second.get().finisher && !recovery.get().finisher, "a waiter became a second finisher");
     } else if (name == "depth-overflow") {
         Registry r(UINT64_MAX, 1, mutation);
         auto     b = r.begin_outer();
@@ -451,19 +486,19 @@ static void run_case(const std::string & name, test_mutation mutation) {
         require(!failed.load(std::memory_order_acquire), "mixed placement publication observed");
     } else if (name == "multi-model" || name == "sequential-aba") {
         Registry r;
-        auto     a       = commit_one(r, { 11, 7, tier_verdict::MIXED });
+        auto     a       = commit_one(r, make_publication(11, 7, tier_verdict::MIXED));
         auto     a_state = r.find(a.model);
         require(a_state && a_state->planned_host_bytes == 11 && a_state->actual_host_bytes == 7 &&
                     a_state->verdict == tier_verdict::MIXED,
                 "published planner reporting snapshot mismatch");
-        auto b = commit_one(r, { 22, 0, tier_verdict::HOST });
+        auto b = commit_one(r, make_publication(22, 0, tier_verdict::HOST));
         require(r.find(a.model) == a_state && r.find(b.model), "B load changed A");
         auto bad = r.begin_outer();
         r.end(bad.txn, false);
         require(r.find(a.model) == a_state && r.find(b.model), "failed load changed live model");
         if (name == "sequential-aba") {
             r.teardown(a);
-            auto a2 = commit_one(r, { 11, 7, tier_verdict::MIXED });
+            auto a2 = commit_one(r, make_publication(11, 7, tier_verdict::MIXED));
             require(a2.model.value != a.model.value && a2.owner.generation != a.owner.generation &&
                         r.find(a2.model)->planned_host_bytes == 11,
                     "A-B-A identity/plan contamination");
