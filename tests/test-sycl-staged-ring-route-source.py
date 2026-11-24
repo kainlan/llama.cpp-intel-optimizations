@@ -1536,6 +1536,10 @@ PER_EXPERT_REFUSE = ("if (ggml_sycl::moe_batch_names_staged_ring(retained_prompt
                      "release_prompt_down_soa_once(false); throw ggml_sycl_fallback_error(\"MUL_MAT_ID retained prompt "
                      "per-expert path refused a staged ring slot\"); }")
 PER_EXPERT_ANCHOR = "if (try_pp_onednn_f16_batched()) { return; }"
+# A node the direct MMID route stepped aside for leaves after the executor's try (it runs again on that route), so the
+# per-expert path, and its refusal, start after that exit.
+PER_EXPERT_REENTRY_OPEN = "if (pp_direct_deferred) {"
+PER_EXPERT_REENTRY_TAIL = "g_mmid_direct_reentry.requested = dst; return; }"
 PER_EXPERT_STEPS = (
     "pp_moe_onednn_scratch_claim pp_moe_onednn_scratch_claim_state;",
     "std::vector<ggml_sycl::mem_handle> pp_gpu_leases;",
@@ -1556,16 +1560,18 @@ XMX_STEPS = (
 def claim_staged_batch_refused_by_name(sycl: str) -> bool:
     """The non-hybrid retained prompt per-expert path multiplies each expert at its own resolved layout through
     ggml_sycl_mul_mat, which can reach oneDNN, while a staged slot's reuse is ordered only for a plain kernel on the
-    submit queue: a batch naming a staged slot throws a fallback error directly after the batched executor's try,
-    before the path's scratch setup claims the oneDNN scratch slot, allocates its staging or refuses on a failed
-    allocation, and before its first route and its multiply.
+    submit queue: a batch naming a staged slot throws a fallback error directly after the batched executor's try and
+    the direct MMID route's exit that follows it, before the path's scratch setup claims the oneDNN scratch slot,
+    allocates its staging or refuses on a failed allocation, and before its first route and its multiply.
     try_xmx_sorted_moe reads each expert through a payload with no staged slot: it rejects such a batch at its head,
     before the policy check and before any upload, instead of through the payload's missing entry."""
     n = norm(sycl)
     mmid = body(n, MMID_SIG)
     xmx = body(n, XMX_SIG)
-    return (n.count(PER_EXPERT_REFUSE) == 1 and mmid.count(PER_EXPERT_ANCHOR + " " + PER_EXPERT_REFUSE) == 1
-            and ordered(mmid, PER_EXPERT_ANCHOR, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
+    return (n.count(PER_EXPERT_REFUSE) == 1
+            and mmid.count(PER_EXPERT_ANCHOR + " " + PER_EXPERT_REENTRY_OPEN) == 1
+            and mmid.count(PER_EXPERT_REENTRY_TAIL + " " + PER_EXPERT_REFUSE) == 1
+            and ordered(mmid, PER_EXPERT_ANCHOR, PER_EXPERT_REENTRY_TAIL, PER_EXPERT_REFUSE, *PER_EXPERT_STEPS)
             and n.count(XMX_REFUSE) == 1 and ordered(xmx, XMX_REJECT, XMX_REFUSE, *XMX_STEPS))
 
 
@@ -1574,7 +1580,8 @@ def test_staged_batch_refused_by_name():
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id (the xmx refusal is searched in the "
         "body of try_xmx_sorted_moe)",
         body(norm(SYCL), MMID_SIG),
-        PER_EXPERT_ANCHOR + " " + PER_EXPERT_REFUSE, *PER_EXPERT_STEPS,
+        PER_EXPERT_ANCHOR + " " + PER_EXPERT_REENTRY_OPEN, PER_EXPERT_REENTRY_TAIL + " " + PER_EXPERT_REFUSE,
+        *PER_EXPERT_STEPS,
         signature=MMID_SIG)
 
 
