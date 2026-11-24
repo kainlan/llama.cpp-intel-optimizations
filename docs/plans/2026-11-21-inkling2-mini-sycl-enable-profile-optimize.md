@@ -6066,8 +6066,14 @@ any host or secondary expert keeps the admitted route of Task 8c unchanged.
   one handle taken twice is the table's own.
 - *Not exercised on a device.* The failure paths (a throwing submit, a failed drain) run only when the runtime
   throws. Their evidence is the source contract's pins and mutants and the reviews.
-- *The next decode target.* A bench token is now about 47 ms against about 36.5 ms of device-timed kernel work, so
-  decode on the B70 is mostly kernel-bound. The largest kernel row is the NVFP4 expert mat-vec (row S9).
+- *Merged (`8af32c220`, evidence `docs/backend/data/inkling2/t18-merged-8af32c220.txt`).* The final head's sweeps
+  fail the known eight and no other. The merged build passes the Inkling gate and reads 47.45 / 21.22.
+- *The next decode target is the NVFP4 expert kernel (row S9), with a measured bound.* At the decode shape the
+  kernel takes 179.4 us for the 2304 x 2304 experts and 113.8 us for the 1152 x 2304 ones, 12.9 ms per token for
+  the 88 calls. The figure of 16.2 ms this plan carried divided a total that included the prompt's calls. The BF16
+  expert kernel on the same card reads 3.6 times the bytes for the same weights in less time (151.3 and 76.0 us,
+  about 560 GB/s on both shapes), so the NVFP4 kernel is bound by its arithmetic, not by memory: at that read rate
+  its 88 calls would cost 2.8 ms.
 
 ---
 
