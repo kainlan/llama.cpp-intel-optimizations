@@ -1,7 +1,9 @@
-// Host test of ggml_sycl_mul_mat_f32_batched_route_of (nonfa-stage.hpp): which F32 x F32 MUL_MAT nodes the backend
+// Host test of the batched F32 MUL_MAT route's predicates (nonfa-stage.hpp): which F32 x F32 MUL_MAT nodes the backend
 // runs as one oneDNN matmul, and which it leaves to the per-plane loop of ggml_sycl_op_mul_mat.
 //
-// The predicate is a pure function of the three tensors and a small environment, so every accept and decline
+// The route is two pure functions: ggml_sycl_mul_mat_f32_batched_route_of reads the three tensors only, and
+// ggml_sycl_mul_mat_f32_batched_env_admits reads the environment only. The dispatch asks the tensors first and builds
+// the environment (a queue-state query among its facts) only for a node they admit. Every accept and decline
 // condition is one case here, with the tensors built by ggml itself in a no_alloc context (no device, no data).
 // The three Inkling shapes are built at their model dimensions (n_embd 2304, n_head 24, n_relative 16, the sliding
 // window's bias table 1024 + 1 rows, at most 4 earlier blocks and 3 queries in graph::mix) at T = 512.
@@ -27,17 +29,16 @@ constexpr ggml_sycl_mul_mat_f32_batched_route NONE    = GGML_SYCL_MUL_MAT_F32_BA
 constexpr ggml_sycl_mul_mat_f32_batched_route COLUMNS = GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_COLUMNS;
 constexpr ggml_sycl_mul_mat_f32_batched_route BATCHED = GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_BATCHED;
 
-// The environment of a node the route may take: activations in this device's memory, no split, no tensor
-// parallelism, no recording. Each decline case below changes one field.
+// The environment the route admits: activations in this device's memory, no split, no tensor parallelism, no
+// recording. Each environment case below changes one field.
 ggml_sycl_mul_mat_f32_batched_env env_taken() {
     ggml_sycl_mul_mat_f32_batched_env env;
     env.on_device = true;
     return env;
 }
 
-ggml_sycl_mul_mat_f32_batched_route route_of(const ggml_tensor *                       dst,
-                                             const ggml_sycl_mul_mat_f32_batched_env & env = env_taken()) {
-    return ggml_sycl_mul_mat_f32_batched_route_of(dst->src[0], dst->src[1], dst, env);
+ggml_sycl_mul_mat_f32_batched_route route_of(const ggml_tensor * dst) {
+    return ggml_sycl_mul_mat_f32_batched_route_of(dst->src[0], dst->src[1], dst);
 }
 
 ggml_tensor * t4(ggml_context * ctx, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2 = 1, int64_t ne3 = 1) {
@@ -86,8 +87,10 @@ int run(ggml_context * ctx) {
 
     // ---- declined: the batch ----
 
+    // Decode's T = 1 node: the tensor predicate alone, which takes no environment, declines it, so the dispatch never
+    // builds an environment (nor queries the queue's state) for it.
     CHECK(route_of(ggml_mul_mat(ctx, t4(ctx, GGML_TYPE_F32, 64, 24), t4(ctx, GGML_TYPE_F32, 64, 10))) == NONE,
-          "a batch of 1 is not this route's (decode's T = 1 node)");
+          "a batch of 1 is not this route's, decided from the tensors alone");
     CHECK(route_of(ggml_mul_mat(ctx, t4(ctx, GGML_TYPE_F32, 64, 24, 2), t4(ctx, GGML_TYPE_F32, 64, 10, 6))) == NONE,
           "a partial broadcast in dim 2 (src0 batch 2 of 6) declines");
     CHECK(
@@ -143,34 +146,39 @@ int run(ggml_context * ctx) {
     CHECK(route_of(ggml_mul_mat(ctx, t4(ctx, GGML_TYPE_F32, 4, INT64_C(1) << 31, 2),
                                 t4(ctx, GGML_TYPE_F32, 4, 3, 2))) == NONE,
           "a row count ne01 above INT32_MAX declines");
+    CHECK(route_of(ggml_mul_mat(ctx, t4(ctx, GGML_TYPE_F32, INT64_C(1) << 31, 2, 2),
+                                t4(ctx, GGML_TYPE_F32, INT64_C(1) << 31, 3, 2))) == NONE,
+          "a depth ne00 above INT32_MAX declines");
 
-    // ---- declined: the environment, one field each ----
+    // ---- the environment, one field each ----
 
     {
-        ggml_tensor * dst = ggml_mul_mat(ctx, t4(ctx, GGML_TYPE_F32, 64, 24, 6), t4(ctx, GGML_TYPE_F32, 64, 10, 6));
-        CHECK(route_of(dst) == BATCHED, "the environment cases start from a taken node");
+        CHECK(ggml_sycl_mul_mat_f32_batched_env_admits(env_taken()),
+              "the environment cases start from an admitted one");
 
         ggml_sycl_mul_mat_f32_batched_env env = env_taken();
         env.split                             = true;
-        CHECK(route_of(dst, env) == NONE, "a src0 in a row-split buffer declines");
+        CHECK(!ggml_sycl_mul_mat_f32_batched_env_admits(env), "a src0 in a row-split buffer declines");
 
         env                 = env_taken();
         env.tensor_parallel = true;
-        CHECK(route_of(dst, env) == NONE, "tensor parallelism declines");
+        CHECK(!ggml_sycl_mul_mat_f32_batched_env_admits(env), "tensor parallelism declines");
 
         env            = env_taken();
         env.has_weight = true;
-        CHECK(route_of(dst, env) == NONE, "an operand that is a weight declines");
+        CHECK(!ggml_sycl_mul_mat_f32_batched_env_admits(env), "an operand that is a weight declines");
 
         env           = env_taken();
         env.recording = true;
-        CHECK(route_of(dst, env) == NONE, "a command graph recording declines (a new key would JIT into it)");
+        CHECK(!ggml_sycl_mul_mat_f32_batched_env_admits(env),
+              "a command graph recording declines (a new key would JIT into it)");
 
         env           = env_taken();
         env.on_device = false;
-        CHECK(route_of(dst, env) == NONE, "an operand outside this device's memory declines");
+        CHECK(!ggml_sycl_mul_mat_f32_batched_env_admits(env), "an operand outside this device's memory declines");
 
-        CHECK(route_of(dst, ggml_sycl_mul_mat_f32_batched_env{}) == NONE, "an environment nobody filled declines");
+        CHECK(!ggml_sycl_mul_mat_f32_batched_env_admits(ggml_sycl_mul_mat_f32_batched_env{}),
+              "an environment nobody filled declines");
     }
 
     std::printf("test-sycl-mul-mat-f32-batched-route: PASS\n");

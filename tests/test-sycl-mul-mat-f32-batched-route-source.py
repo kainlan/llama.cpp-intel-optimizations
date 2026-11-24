@@ -5,13 +5,16 @@ Which nodes the route takes is the host test's (test-sycl-mul-mat-f32-batched-ro
 test's (test-sycl-mul-mat-f32-batched-device). This gate pins the form those two cannot see, on comment-stripped,
 whitespace-canonical text:
 
-- the dispatch consults the route before the orchestrator: in ggml_sycl_mul_mat the predicate
-  ggml_sycl_mul_mat_f32_batched_route_of is asked once, and the route op is called once, in the condition of the
-  `else if` that directly precedes the `else` holding the orchestrator's select(), and only for a route that is not
-  NONE;
+- the dispatch consults the route after the f16 chain and before the orchestrator, and reads no environment for a
+  node the tensors decline: in ggml_sycl_mul_mat the tensor predicate ggml_sycl_mul_mat_f32_batched_route_of, the
+  environment predicate ggml_sycl_mul_mat_f32_batched_env_admits and the environment's builder are each evaluated
+  once, all inside the condition of one `else if` of the chain that tests the f16 route, which declares the tensor
+  route and then reads `route != NONE && environment admits && op(..., route, ...)` in that order (so the queue
+  state is read only for a node the tensors admit, and nothing of the route runs for a node an f16 branch takes);
+  its `else` is the orchestrator's, reached with select() when the route declines;
 - a decline falls through and does not throw: the route op returns the has_value() of the one gemm() result it
   holds, and its body has no throw and no abort, so a declined scratchpad (nullopt) is false and the dispatch goes
-  on to the orchestrator;
+  on to the orchestrator; a pointer that resolves to null is a decline before gemm();
 - the environment the predicate reads is filled from the backend's own facts: the recording flag from
   ggml_sycl_graph_recording_active() and the queue's state, tensor parallelism from g_sycl_tp_config, split and
   weight from the route environment the f16 chain reads;
@@ -61,7 +64,10 @@ _ENV_OF = (
 )
 _ROUTE_OF = (
     "inline ggml_sycl_mul_mat_f32_batched_route ggml_sycl_mul_mat_f32_batched_route_of(const ggml_tensor * src0, "
-    "const ggml_tensor * src1, const ggml_tensor * dst, const ggml_sycl_mul_mat_f32_batched_env & env)"
+    "const ggml_tensor * src1, const ggml_tensor * dst)"
+)
+_ENV_ADMITS_DEF = (
+    "inline bool ggml_sycl_mul_mat_f32_batched_env_admits(const ggml_sycl_mul_mat_f32_batched_env & env)"
 )
 _NONE = "GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_NONE"
 
@@ -98,33 +104,95 @@ def call_args(code: str, open_at: int) -> list:
     return args
 
 
-# ---- the dispatch consults the route before the orchestrator, and a decline falls through to it ----
+# ---- the dispatch consults the route after the f16 chain and before the orchestrator; a decline falls through ----
+_ENV_ADMITS = "ggml_sycl_mul_mat_f32_batched_env_admits("
+_ENV_OF_CALL = "ggml_sycl_mul_mat_f32_batched_env_of("
+_ROUTE_OF_CALL = "ggml_sycl_mul_mat_f32_batched_route_of("
+
+
+def split_top(text: str, sep: str) -> list:
+    """`text` split at each `sep` outside brackets."""
+    parts, depth, start, j = [], 0, 0, 0
+    while j < len(text):
+        ch = text[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and text.startswith(sep, j):
+            parts.append(text[start:j])
+            j += len(sep)
+            start = j
+            continue
+        j += 1
+    parts.append(text[start:])
+    return parts
+
+
+def _chain_reaches(b: str, chain_if: int, head: int) -> bool:
+    """Whether the if-else chain whose `if(` is at chain_if has the `}else if(` at head as one of its links."""
+    pos = chain_if
+    while True:
+        cond_close = balanced_end(b, pos + len("if"), "(", ")")
+        if b[cond_close + 1] != "{":
+            return False
+        block_close = balanced_end(b, cond_close + 1, "{", "}")
+        if block_close == head:
+            return True
+        if not b.startswith("else if(", block_close + 1):
+            return False
+        pos = block_close + 1 + len("else ")
+
+
 def dispatch_errors(code: str) -> list:
     errs = []
     b = function_body(code, _MUL_MAT)
-    if b.count("ggml_sycl_mul_mat_f32_batched_route_of(") != 1:
-        errs.append("the predicate is not asked exactly once")
+    for call, what in ((_ROUTE_OF_CALL, "the tensor predicate"), (_ENV_ADMITS, "the environment predicate"),
+                       (_ENV_OF_CALL, "the environment")):
+        if b.count(call) != 1:
+            errs.append("%s is not asked exactly once (%d)" % (what, b.count(call)))
+    if "ext_oneapi_get_state(" in b:
+        errs.append("the dispatch reads the queue state itself")
     calls = [m.start() for m in re.finditer(r"\bggml_sycl_mul_mat_f32_batched\(", b)]
     if len(calls) != 1:
         return errs + ["the route op is not called exactly once (%d)" % len(calls)]
     call = calls[0]
-    asked = b.find("ggml_sycl_mul_mat_f32_batched_route_of(")
-    if asked == -1 or asked > call:
-        errs.append("the predicate is not asked before the route op runs")
-    # the call is in the condition of an `else if`, after a route != NONE guard joined by &&
+    # the route is a link of the f16 chain: the chain's first if tests the f16 route, and every f16 branch comes first
+    f16 = re.search(r"\bggml_sycl_mul_mat_f16_route (\w+)=ggml_sycl_mul_mat_f16_route_of\([^;]*\);", b)
     head = b.rfind("}else if(", 0, call)
-    if head == -1:
-        return errs + ["the route op is not in an else-if condition"]
+    if not f16 or head == -1:
+        return errs + ["the route op is not in an else-if of the f16 route's chain"]
+    chain_if = b.find("if(" + f16.group(1) + "==", f16.end())
+    if chain_if == -1 or not _chain_reaches(b, chain_if, head):
+        errs.append("the route's else-if is not a link of the chain that tests the f16 route")
     cond_open = head + len("}else if")
     cond_close = balanced_end(b, cond_open, "(", ")")
     if not (cond_open < call < cond_close):
         return errs + ["the route op is not in the else-if's condition"]
     cond = b[cond_open + 1 : cond_close]
-    m = re.fullmatch(r"(\w+)!=" + _NONE + r"&&ggml_sycl_mul_mat_f32_batched\(ctx,src0,src1,dst,(\w+)\)", cond)
-    if not m or m.group(1) != m.group(2):
-        errs.append("the condition is not `route != NONE && op(ctx, src0, src1, dst, route)`: %r" % cond)
-    elif not re.search(r"\b" + m.group(1) + r"=ggml_sycl_mul_mat_f32_batched_route_of\(", b):
-        errs.append("the route the op is called with is not the predicate's answer")
+    # nothing of the route is evaluated outside that condition: not ahead of the f16 chain, not before its own turn
+    for c in (_ROUTE_OF_CALL, _ENV_ADMITS, _ENV_OF_CALL):
+        if b.count(c) != cond.count(c):
+            errs.append("%s) is evaluated outside the route's else-if condition" % c[:-1])
+    init_test = split_top(cond, ";")
+    if len(init_test) != 2:
+        return errs + ["the else-if does not declare the tensor route in its condition: %r" % cond[:160]]
+    init = re.fullmatch(r"(?:const )?ggml_sycl_mul_mat_f32_batched_route (\w+)=" + re.escape(_ROUTE_OF_CALL) + r".*\)",
+                        init_test[0])
+    if not init:
+        return errs + ["the else-if's declaration is not the tensor predicate's answer: %r" % init_test[0]]
+    var = init.group(1)
+    terms = split_top(init_test[1], "&&")
+    # the tensors first, then the environment, then the op: no environment read before the tensors admit the node
+    route_test = [i for i, t in enumerate(terms) if t in (var + "!=" + _NONE, _NONE + "!=" + var)]
+    env_test = [i for i, t in enumerate(terms) if t.startswith(_ENV_ADMITS) and _ENV_OF_CALL in t]
+    op = terms[-1]
+    if not (op.startswith("ggml_sycl_mul_mat_f32_batched(") and op.endswith(")")
+            and var in [a for a in call_args(op, len("ggml_sycl_mul_mat_f32_batched"))]):
+        errs.append("the condition does not end in the route op called with the route: %r" % op)
+    if len(terms) != 3 or route_test != [0] or env_test != [1]:
+        errs.append("the condition is not `route != NONE && environment admits && op(route)`, in that order: %r"
+                    % init_test[1])
     # the branch body is empty: a taken route did the op; its `else` is the orchestrator's
     body_open = cond_close + 1
     if b[body_open] != "{":
@@ -132,17 +200,16 @@ def dispatch_errors(code: str) -> list:
     body_close = balanced_end(b, body_open, "{", "}")
     if b[body_open + 1 : body_close].strip():
         errs.append("the taken branch does more than end the chain: %r" % b[body_open + 1 : body_close][:120])
-    tail = b[body_close:]
-    if not tail.startswith("}else{ggml_sycl::test_record_orchestrator_call();"):
-        errs.append("the branch after the route is not the orchestrator's else")
+    if not b.startswith("}else{", body_close):
+        errs.append("the branch after the route is not a plain else")
     else:
         else_close = balanced_end(b, body_close + len("}else"), "{", "}")
         if "ctx.matmul_orchestrator.select(" not in b[body_close:else_close]:
-            errs.append("the orchestrator's select() is not in the else after the route")
+            errs.append("the declined route does not reach the orchestrator's select() in the else")
     return errs
 
 
-def test_the_dispatch_consults_the_route_before_the_orchestrator():
+def test_the_dispatch_consults_the_route_after_the_f16_chain_and_before_the_orchestrator():
     assert dispatch_errors(code_of(SYCL_CPP)) == []
 
 
@@ -159,22 +226,46 @@ def test_dispatch_mutants():
     b = function_body(code, _MUL_MAT)
     branch = _route_branch(b)
     cond = branch[len("}else if(") : branch.index("){")]
-    route_var = cond.split("!=")[0]
+    init, test = split_top(cond, ";")
+    route_var = re.search(r"route (\w+)=", init).group(1)
+    route_test, env_term, op = split_top(test, "&&")
+    chain_if = b.index("if(f16_route==")
+    env_of = env_term[len(_ENV_ADMITS) : -1]
+
+    # the order of the route test's operands is spelling: it passes
+    flipped = code.replace(b, mutate(b, route_test + "&&", _NONE + "!=" + route_var + "&&"), 1)
+    assert dispatch_errors(flipped) == [], dispatch_errors(flipped)
+
     for name, new_b in [
         ("the route branch is gone", b.replace(branch, "}", 1)),
         ("the route is asked after the orchestrator",
-         b.replace(branch, "}", 1).replace("ggml_sycl::test_record_orchestrator_call();",
-                                           "ggml_sycl::test_record_orchestrator_call();if(" + cond + "){return;}", 1)),
+         b.replace(branch, "}", 1).replace("ctx.matmul_orchestrator.select(",
+                                           "if(" + cond + "){return;}ctx.matmul_orchestrator.select(", 1)),
         ("a decline returns instead of falling through", mutate(b, branch, branch + "else if(true){return;}")),
-        ("the op runs whatever the predicate said", mutate(b, cond, cond.replace(route_var + "!=" + _NONE + "&&", ""))),
-        ("the op runs only for a NONE route", mutate(b, cond, cond.replace("!=" + _NONE, "==" + _NONE))),
-        ("the op runs with another route", mutate(b, cond, cond.replace(",dst," + route_var + ")",
-                                                                         ",dst,GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_BATCHED)"))),
-        ("a taken route also runs the orchestrator", mutate(b, branch, branch[:-1] + "ctx.matmul_orchestrator.select(src0,src1,dst,forced_layout);}")),
+        ("the op runs whatever the tensors said", mutate(b, test, env_term + "&&" + op)),
+        ("the op runs only for a NONE route", mutate(b, route_test + "&&", route_var + "==" + _NONE + "&&")),
+        ("the op runs with another route",
+         mutate(b, op, op.replace("," + route_var + ")", ",GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_BATCHED)"))),
+        ("a taken route also runs the orchestrator",
+         mutate(b, branch, branch[:-1] + "ctx.matmul_orchestrator.select(src0,src1,dst,forced_layout);}")),
         ("the route is called a second time",
-         mutate(b, branch, branch + "else if(ggml_sycl_mul_mat_f32_batched(ctx,src0,src1,dst," + route_var + ")){}")),
-        ("the predicate is asked twice", b[:-1] + z("(void) ggml_sycl_mul_mat_f32_batched_route_of(src0, src1, dst, {});") + "}"),
+         mutate(b, branch, branch + "else if(ggml_sycl_mul_mat_f32_batched(ctx,src0,src1,dst,"
+                + "GGML_SYCL_MUL_MAT_F32_BATCHED_ROUTE_BATCHED)){}")),
+        ("the predicate is asked twice", b[:-1] + z("(void) ggml_sycl_mul_mat_f32_batched_route_of(src0, src1, dst);") + "}"),
+        ("the tensor route is hoisted ahead of the f16 chain",
+         b[:chain_if] + init + ";" + b[chain_if:].replace(cond, test, 1)),
+        ("the environment is read before the tensors admit the node",
+         mutate(b, test, env_term + "&&" + route_test + "&&" + op)),
+        ("the environment is built ahead of the f16 chain",
+         b[:chain_if] + "const auto f32_env=" + env_of + ";" + b[chain_if:].replace(env_of, "f32_env", 1)),
+        ("the environment is not asked", mutate(b, test, route_test + "&&" + op)),
+        ("the dispatch reads the queue state",
+         b[:chain_if] + "(void)ctx.stream()->ext_oneapi_get_state();" + b[chain_if:]),
+        ("a declined route does not reach the orchestrator's select",
+         b.replace("ctx.matmul_orchestrator.select(src0,src1,dst,forced_layout)",
+                   "ctx.matmul_orchestrator.pick(src0,src1,dst,forced_layout)", 1)),
     ]:
+        assert new_b != b, f"mutant {name!r} changed nothing"
         assert dispatch_errors(code.replace(b, new_b, 1)), f"mutant {name!r} slipped through"
 
 
@@ -183,6 +274,33 @@ _ALLOC = re.compile(r"\bunified_alloc\w*\(|\bunified_allocate\w*\(|\bggml_sycl_p
                     r"\bsycl::malloc\w*|\bmem_handle\b|\balloc_owner\b|\bfree\(")
 _WAIT = re.compile(r"\bwait(?:_and_throw)?\(|\bext_oneapi_submit_barrier\(|\bsynchronize\(")
 _STORE = re.compile(r"(?:->|\.)\w+(?:\[[^\]]*\])*=(?!=)")
+
+
+_NULL_TERM = re.compile(r"!(\w+)|(\w+)==nullptr|nullptr==(\w+)")
+
+
+def null_check_errors(b: str, gemm_at: int) -> list:
+    """A null resolved pointer is a decline: after the three resolutions and before gemm(), one `if` whose condition
+    tests each of them for null returns false (the orchestrator resolves and reports on its own path)."""
+    resolved = [m for m in re.finditer(r"\b(\w+)=[^;]*\bggml_sycl_resolve_tensor_ptr\(", b)]
+    if len(resolved) != 3:
+        return ["the route op does not resolve exactly three pointers (%d)" % len(resolved)]
+    names = {m.group(1) for m in resolved}
+    after = b.index(";", resolved[-1].end())
+    for m in re.finditer(r"\bif\(", b):
+        cond_close = balanced_end(b, m.end() - 1, "(", ")")
+        tested = [_NULL_TERM.fullmatch(t) for t in split_top(b[m.end() : cond_close], "||")]
+        if not all(tested) or {next(g for g in t.groups() if g) for t in tested} != names:
+            continue
+        if not (after < m.start() < gemm_at):
+            return ["the null check is not between the pointers' resolution and gemm()"]
+        if b[cond_close + 1] != "{":
+            return ["the null check has no block"]
+        block = b[cond_close + 2 : balanced_end(b, cond_close + 1, "{", "}")]
+        if not re.fullmatch(r"(?:GGML_SYCL_DEBUG\([^;]*\);)?return false;", block):
+            return ["a null pointer is not a plain decline: %r" % block]
+        return []
+    return ["no check declines when one of %s resolves to null" % sorted(names)]
 
 
 def route_op_errors(code: str) -> list:
@@ -207,7 +325,9 @@ def route_op_errors(code: str) -> list:
     if _STORE.search(b):
         errs.append("the route op stores through a member or pointer: %r" % _STORE.search(b).group(0))
     if gemms:
-        # the one result is held, and its has_value() is what the op returns: nullopt (a declined scratchpad) is false
+        errs += null_check_errors(b, gemms[0])
+        # has_value() is the semantic, not a spelling: true only when gemm() produced an event, nullopt (a declined
+        # scratchpad) being false
         m = re.search(r"(?:const)?std::optional<sycl::event>(\w+)=DnnlGemmWrapper::gemm\(", b)
         if not m:
             errs.append("the gemm() result is not held in a std::optional<sycl::event>")
@@ -253,7 +373,31 @@ def test_route_op_mutants():
         assert route_op_errors(code.replace(full, new, 1)), f"mutant {name!r} slipped through"
 
 
+def test_null_pointer_mutants():
+    code = code_of(SYCL_CPP)
+    full = function_body(code, _ROUTE_OP)
+    check = re.search(r"if\(!\w+\|\|!\w+\|\|!\w+\)\{[^}]*\}", full).group(0)
+    names = re.findall(r"!(\w+)", check)
+    held = re.search(r"(?:const)?std::optional<sycl::event>\w+=DnnlGemmWrapper::gemm\(", full)
+    gemm_stmt = full[held.start() : full.index(";", held.start()) + 1]
+    # the spelling of a null test and the order of the three are not the form: they pass
+    respelled = check.replace("!" + names[0], names[0] + "==nullptr", 1).replace(
+        "!" + names[1] + "||!" + names[2], "!" + names[2] + "||!" + names[1], 1)
+    assert route_op_errors(code.replace(full, mutate(full, check, respelled), 1)) == []
+    for name, new in [
+        ("no null check", mutate(full, check, "")),
+        ("one pointer unchecked", mutate(full, check, check.replace("||!" + names[2], "", 1))),
+        ("a null pointer reads as done", mutate(full, check, check.replace("return false;", "return true;"))),
+        ("the check comes after gemm()", full.replace(check, "", 1).replace(gemm_stmt, gemm_stmt + check, 1)),
+    ]:
+        assert new != full, f"mutant {name!r} changed nothing"
+        assert route_op_errors(code.replace(full, new, 1)), f"mutant {name!r} slipped through"
+
+
 # ---- the environment is filled from the backend's own facts ----
+_BACKEND_REC = r"ggml_sycl_graph_recording_active\(\)"
+_QUEUE_REC = r"[^;|]*ext_oneapi_get_state\(\)==sycl::ext::oneapi::experimental::queue_state::recording"
+_RECORDING = "(?:" + _BACKEND_REC + r"\|\|" + _QUEUE_REC + "|" + _QUEUE_REC + r"\|\|" + _BACKEND_REC + ")"
 def env_errors(code: str) -> list:
     errs = []
     b = function_body(code, _ENV_OF)
@@ -261,7 +405,7 @@ def env_errors(code: str) -> list:
         ("split", r"route_env\.split"),
         ("has_weight", r"route_env\.has_weight"),
         ("tensor_parallel", r"g_sycl_tp_config\.enabled"),
-        ("recording", r"ggml_sycl_graph_recording_active\(\)\|\|[^;]*ext_oneapi_get_state\(\)==sycl::ext::oneapi::experimental::queue_state::recording"),
+        ("recording", _RECORDING),
         ("on_device", r"on_device"),
     ):
         found = re.findall(r"\benv\." + field + r"=([^;]*);", b)
@@ -281,9 +425,14 @@ def test_env_mutants():
     b = function_body(code, _ENV_OF)
     rec = re.search(r"\benv\.recording=[^;]*;", b).group(0)
     tp = re.search(r"\benv\.tensor_parallel=[^;]*;", b).group(0)
+    # the order of the two recording terms is spelling: it passes
+    terms = rec[len("env.recording=") : -1].split("||")
+    swapped = mutate(b, rec, "env.recording=" + terms[1] + "||" + terms[0] + ";")
+    assert env_errors(code.replace(b, swapped, 1)) == []
     for name, new in [
         ("recording never set", mutate(b, rec, "env.recording=false;")),
         ("recording reads only the backend flag", mutate(b, rec, "env.recording=ggml_sycl_graph_recording_active();")),
+        ("recording reads only the queue state", mutate(b, rec, rec.replace("ggml_sycl_graph_recording_active()||", ""))),
         ("tensor parallelism never set", mutate(b, tp, "env.tensor_parallel=false;")),
         ("split from elsewhere", mutate(b, "env.split=route_env.split;", "env.split=false;")),
         ("weight from elsewhere", mutate(b, "env.has_weight=route_env.has_weight;", "env.has_weight=false;")),
@@ -292,11 +441,13 @@ def test_env_mutants():
         assert env_errors(code.replace(b, new, 1)), f"mutant {name!r} slipped through"
 
 
-# ---- the predicate lives beside the f16 one ----
-def test_the_predicate_is_defined_once_in_nonfa_stage():
+# ---- the predicates live beside the f16 one; the tensor part reads no environment ----
+def test_the_predicates_are_defined_once_in_nonfa_stage():
     hdr = code_of(STAGE_HPP)
-    assert hdr.count(z(_ROUTE_OF) + "{") == 1
-    assert z(_ROUTE_OF) not in code_of(SYCL_CPP)
+    for sig in (_ROUTE_OF, _ENV_ADMITS_DEF):
+        assert hdr.count(z(sig) + "{") == 1, sig
+        assert z(sig) not in code_of(SYCL_CPP), sig
+    assert "env" not in function_body(hdr, _ROUTE_OF), "the tensor predicate reads an environment"
 
 
 # ---- gemm() labels by batch count ----
