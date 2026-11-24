@@ -1233,6 +1233,12 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-q2-0-wiring-source.py
         LABEL "sycl;quant;source;hostonly;python"
         TIMEOUT 30)
+    # Which decode the NVFP4 dot product uses; the bits are test-sycl-nvfp4-decode-host's.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-nvfp4-decode-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-nvfp4-decode-source.py
+        LABEL "sycl;quant;source;hostonly;python"
+        TIMEOUT 30)
     # The opt-in ESIMD Q4_0 mmq kernels crash ocloc 26.35 / IGC 2.41 and are compiled out unless the CMake option
     # GGML_SYCL_MMQ_ESIMD is ON (llama.cpp-xtvl). Structural half; the proof is that the device link succeeds.
     llama_test_pytest(${Python3_EXECUTABLE}
