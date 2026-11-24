@@ -96296,7 +96296,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const char * env = std::getenv("GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED");
             return env && std::atoi(env) != 0;
         }();
-        if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && try_pp_planned_local_batched()) {
+        // A node the direct MMID route stepped aside for (pp_direct_deferred) goes to the batched executor, or back to
+        // that route: this batched MMVQ dispatch is neither, and it has no NVFP4 or Q1_0 coverage of its own.
+        if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && !pp_direct_deferred &&
+            try_pp_planned_local_batched()) {
             return;
         }
 
