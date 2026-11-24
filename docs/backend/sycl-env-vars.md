@@ -654,9 +654,10 @@ under one of two labels chosen per call by its batch count:
 most prefill Q8_0 M≥512 GEMMs take, the per-plane loop's GEMMs, and the batched
 F32 route's 2-D-src0 case, which folds the batch into one GEMM's columns). Before
 the batched row existed every call reported as `unbatched`: the F16 KQ/KQV
-batched route's calls and the batched F32 MUL_MAT route's calls now report under
-`batched`, so compare an older profiler CSV's `unbatched` row with the sum of
-both rows; the full
+batched route's calls and the batched F32 MUL_MAT route's equal-batch calls
+(src0 and src1 carry the same batch) now report under `batched`, while that
+route's 2-D-src0 calls (batch counts 1 and 1) stay under `unbatched`, so compare
+an older profiler CSV's `unbatched` row with the sum of both rows; the full
 RMS_NORM family (`norm.rms_norm`, `norm.rms_norm_mul`, `norm.rms_norm_mul_add`,
 `norm.add_rms_norm`) plus `norm.norm` / `norm.group_norm`. `l2_norm` is
 deliberately unwrapped.
