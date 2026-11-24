@@ -579,9 +579,11 @@ struct lifecycle_fixture {
         }
     }
 
-    // The other side of the bound: a request with the host pool's intent, one byte larger than what the grown zone
-    // has left, is refused by the no-growth bound, by name, and the zone does not grow for it. It allocates nothing.
-    // A zone with no bound at all would miss on the contiguous block instead, and one that grew would serve it.
+    // The other side of the bound: a host-pinned request that may not grow WEIGHT, one byte larger than what the
+    // grown zone has left, is refused by the no-growth bound, by name, and the zone does not grow for it. It allocates
+    // nothing. A zone with no bound at all would miss on the contiguous block instead, and one that grew would serve
+    // it. The bound is the zone's, whatever sent the request there: the host pool reaches WEIGHT as a persistent
+    // owner, a flag whose setters are a census of two, so the probe reaches it by role, as a host weight does.
     static void require_no_growth_request_refused_at_capacity(int device) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(device);
         require(cache != nullptr, "the primary device has no unified cache");
@@ -596,14 +598,12 @@ struct lifecycle_fixture {
         request.alignment                                  = 64;
         request.suppress_failure_log                       = true;
         request.host_zone_miss                             = &miss;
-        request.intent.role                                = ggml_sycl::alloc_role::CONTROL;
-        request.intent.category                            = ggml_sycl::runtime_category::CONTROL;
-        request.intent.cohort_id                           = "moe_mmid_workspace";
+        request.intent.role                                = ggml_sycl::alloc_role::WEIGHT;
+        request.intent.category                            = ggml_sycl::runtime_category::HOST_COMPUTE;
+        request.intent.cohort_id                           = "no_growth_bound_probe";
         request.intent.constraints.must_host_pinned        = true;
         request.intent.constraints.use_pinned_pool         = true;
         request.intent.constraints.forbid_host_zone_growth = true;
-        request.intent.constraints.persistent_owner        = true;
-        request.intent.constraints.prefer_vram_zone        = ggml_sycl::vram_zone_id::COUNT;
 
         const ggml_sycl::mem_handle handle  = ggml_sycl::unified_allocate(request);
         const weight_zone_reading   after   = read_weight_zone(device);
