@@ -80,6 +80,15 @@ inline std::atomic<int64_t> & args_map_calls_accum() {
 // 3. Cache key includes all parameters that affect primitive creation
 // =============================================================================
 
+// The float math a gemm() primitive may use. BUILD is the build's choice: fpmath f16 under GGML_SYCL_F16, which lets
+// oneDNN round f32 inputs to f16 where it chooses to, and otherwise no fpmath call, so oneDNN's process default
+// applies. STRICT sets fpmath strict on the primitive: no down-conversion, whatever the build or the process default.
+// dnnl::fpmath_mode cannot stand in for this, since it has no value for "no fpmath call".
+enum dnnl_gemm_fpmath {
+    DNNL_GEMM_FPMATH_BUILD,
+    DNNL_GEMM_FPMATH_STRICT,
+};
+
 struct DnnlPrimitiveKey {
     int64_t                 m, n, k;
     int64_t                 batches_a, batches_b;
@@ -101,6 +110,9 @@ struct DnnlPrimitiveKey {
     int64_t                 woq_group_size;
     int                     woq_scales_mask;
     int                     woq_zp_mask;
+    // gemm()'s float math: one shape under strict and under f16 is two primitives. Every other family keeps the
+    // zero-initialised BUILD, its math being fixed by its variant.
+    dnnl_gemm_fpmath        fpmath;
 
     bool operator==(const DnnlPrimitiveKey & other) const {
         return m == other.m && n == other.n && k == other.k && batches_a == other.batches_a &&
@@ -111,7 +123,7 @@ struct DnnlPrimitiveKey {
                stride_a == other.stride_a && stride_b == other.stride_b && stride_c == other.stride_c &&
                lda == other.lda && ldb == other.ldb && ldc == other.ldc && batch_size == other.batch_size &&
                variant == other.variant && woq_group_size == other.woq_group_size &&
-               woq_scales_mask == other.woq_scales_mask && woq_zp_mask == other.woq_zp_mask;
+               woq_scales_mask == other.woq_scales_mask && woq_zp_mask == other.woq_zp_mask && fpmath == other.fpmath;
     }
 };
 
@@ -135,6 +147,7 @@ struct DnnlPrimitiveKeyHash {
         h ^= std::hash<int64_t>{}(k.woq_group_size) << 14;
         h ^= std::hash<int>{}(k.woq_scales_mask) << 15;
         h ^= std::hash<int>{}(k.woq_zp_mask) << 16;
+        h ^= std::hash<int>{}(static_cast<int>(k.fpmath)) << 17;
         return h;
     }
 };
@@ -319,7 +332,8 @@ class DnnlGemmWrapper {
     // the caller takes its declared next path (llama.cpp-23mk S3-4). A value is the primitive's completion event.
     // query_only asks the scratchpad question and stops: it submits nothing, does not count as an engaged call, and
     // returns an empty event when not declined. A caller that will run the same descriptor over many batches asks once
-    // with it before its first write.
+    // with it before its first write. fpmath is the primitive's float math (see dnnl_gemm_fpmath); the default keeps
+    // the build's.
     [[nodiscard]] static std::optional<sycl::event> gemm(ggml_backend_sycl_context &      ctx,
                                                          int                              m,
                                                          int                              n,
@@ -342,7 +356,8 @@ class DnnlGemmWrapper {
                                                          int                              ldc        = -1,
                                                          const std::vector<sycl::event> & deps       = {},
                                                          const char *                     op_context = nullptr,
-                                                         bool                             query_only = false) {
+                                                         bool                             query_only = false,
+                                                         dnnl_gemm_fpmath fpmath = DNNL_GEMM_FPMATH_BUILD) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
 
         auto stream = ctx.stream_dnnl(q);
@@ -370,6 +385,7 @@ class DnnlGemmWrapper {
         key.strb2     = strb2;
         key.ldc       = ldc;
         key.variant   = 0;  // gemm variant
+        key.fpmath    = fpmath;
 
         // A call with a batch above 1 is a profiler row of its own, so one batched GEMM is told apart from the
         // per-plane GEMMs a loop submits for the same planes.
@@ -392,9 +408,13 @@ class DnnlGemmWrapper {
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
+        if (fpmath == DNNL_GEMM_FPMATH_STRICT) {
+            primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::strict);
+        } else {
 #    ifdef GGML_SYCL_F16
-        primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
+            primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
 #    endif
+        }
 
         // Get or create cached primitive
         auto &                      cache  = get_dnnl_primitive_cache();

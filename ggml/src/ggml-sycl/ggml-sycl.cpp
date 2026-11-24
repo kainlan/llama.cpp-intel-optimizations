@@ -62439,11 +62439,13 @@ static ggml_sycl_mul_mat_f32_batched_env ggml_sycl_mul_mat_f32_batched_env_of(
         n       = static_cast<int>(ne11);
         batches = ne12 * ne13;
     }
-    const auto                       f32 = DnnlGemmWrapper::to_dt<float>();
-    const std::optional<sycl::event> batched_gemm =
-        DnnlGemmWrapper::gemm(ctx, m, n, k, a, f32, 1, k, static_cast<dnnl_dim_t>(k) * m, b, f32, 1, k,
-                              static_cast<dnnl_dim_t>(k) * n, c, f32, stream, batches, batches, static_cast<int>(ne0),
-                              /* deps = */ {}, ggml_type_name(src0->type));
+    // Strict float math: the op is F32 x F32 and what it replaces computes in F32 wherever oneDNN does not use the
+    // build's f16 licence, so the route does not take that licence (its output feeds softmax in Inkling's mix).
+    const auto                       f32          = DnnlGemmWrapper::to_dt<float>();
+    const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(
+        ctx, m, n, k, a, f32, 1, k, static_cast<dnnl_dim_t>(k) * m, b, f32, 1, k, static_cast<dnnl_dim_t>(k) * n, c,
+        f32, stream, batches, batches, static_cast<int>(ne0),
+        /* deps = */ {}, ggml_type_name(src0->type), /* query_only = */ false, DNNL_GEMM_FPMATH_STRICT);
     return batched_gemm.has_value();
 #else
     GGML_UNUSED(ctx);
