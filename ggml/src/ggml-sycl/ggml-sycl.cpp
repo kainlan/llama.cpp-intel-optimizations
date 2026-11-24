@@ -96804,7 +96804,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // Same thread_local reason as the tiled message above.
                     static thread_local std::string deferred_submitted_msg;
                     deferred_submitted_msg = std::string("[MOE-PP-ONEDNN-BATCHED] op '") +
-                                             (src0 && src0->name ? src0->name : "?") +
+                                             (src0 != nullptr ? src0->name : "?") +
                                              "' that the direct MMID route deferred to this executor declined (" +
                                              reason + ") after its first submission";
                     throw ggml_sycl_fallback_error(deferred_submitted_msg.c_str());
@@ -97715,7 +97715,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (pp_direct_deferred) {
                     static thread_local std::string deferred_gemm_msg;
                     deferred_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] op '") +
-                                        (src0 && src0->name ? src0->name : "?") +
+                                        (src0 != nullptr ? src0->name : "?") +
                                         "' that the direct MMID route deferred to this executor: GEMM dispatch failed "
                                         "after its first submission: " +
                                         what;
