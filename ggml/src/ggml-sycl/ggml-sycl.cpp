@@ -23607,9 +23607,9 @@ struct test_loan_fixture {
         }
         // Every queue a case's copies ran on: the cache's own, and the DMA and BCS queues its loans, refills and
         // staged copies use. The cache's three queues share one context.
-        queue->wait();
-        cache->get_dma_queue().wait();
-        cache->get_bcs_queue().wait();
+        queue->wait_and_throw();
+        cache->get_dma_queue().wait_and_throw();
+        cache->get_bcs_queue().wait_and_throw();
         if (!drain_retained_handles(true, 5000)) {
             fprintf(stderr, "ERROR: test_loan_fixture teardown: the retained owners did not drain in 5000 ms\n");
             g_test_loan_teardown_failures.fetch_add(1, std::memory_order_relaxed);
