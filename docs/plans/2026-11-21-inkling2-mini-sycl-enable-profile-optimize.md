@@ -5939,6 +5939,19 @@ and they decide whether graph replay engages at all (S1); then S7 (the smallest 
 for a quarter of the prompt); S4 as a grouped prompt kernel (half of the prompt, the largest piece of work); the
 S5 profiler label; S9 and the rest of S1 only after a new profile, because replay changes what a token costs.
 
+**First Stage 3 measurement (lead, 2026-11-23, B70, tree `242753162` = master `b3e761180` plus the
+`mulmat.bf16_native` profiler row).** The user asked to continue with the optimization. Evidence:
+`docs/backend/data/inkling2/s5-profile-b70-242753162.txt` and the two kprof CSVs beside it.
+
+| # | Verdict | Measured |
+|---|---------|----------|
+| S5 | **closed, not a candidate** | 641 dense BF16 launches per token, 10.4 ms of device time, mean 16 us. A 2304x3072 weight (14.2 MB) takes 31.3 us, about 450 GB/s; the output head (926 MB) takes 1557 us, about 595 GB/s. The kernel is at the card's memory bandwidth. The lead's guess that launch count was the cost was wrong. |
+| S9 | open, second | The NVFP4 expert kernel is 16.2 ms per token (88 launches of 184 us), the largest single device item. |
+| S10 | **new, first** | Device time is about 36.5 ms of a 65 ms token. The submitting thread spends 52.3 ms per token inside the 96 `MUL_MAT_ID` nodes (545 us each) for 17.4 ms of kernel time. Task 18. |
+
+Order for decode now: Task 18 (the host wait), then a new profile, then S9. A token bounded by device time would
+be about 36 to 40 ms; that is an estimate until Task 18 is measured.
+
 **Acceptance Criteria:**
 - [ ] Every row is either closed with its measured number or expanded into tasks that meet the Task Detail Standard.
 - [ ] Every Stage 3 task's acceptance is an interleaved paired A/B (ABBA order) plus the three Inkling gates, the
@@ -5946,6 +5959,77 @@ S5 profiler label; S9 and the rest of S1 only after a new profile, because repla
 - [ ] No task changes placement policy to make a kernel's layout fit; no task adds a second source for a fact the
       loaded operand already carries.
 - [ ] The user has approved the rewritten Stage 3.
+
+### Task 18: An all-resident NVFP4 `MUL_MAT_ID` decode node submits without a host wait (written 2026-11-23)
+
+**Track:** S3-decode. **Depends on:** Task 8c (merged), the `mulmat.bf16_native` profiler row (`task/inkling2-s5`).
+**Found by:** the first Stage 3 measurement (`docs/backend/data/inkling2/s5-profile-b70-242753162.txt`). On the
+B70 a decoded token is 65 ms in a bench and about 72 ms profiled. Its kernels need about 36.5 ms of device time.
+The submitting thread spends 52.3 ms per token inside the 96 `MUL_MAT_ID` nodes, 545 us each, and their kernels
+need 17.4 ms. GPT-OSS on the same card (72 `MUL_MAT_ID` per token, MXFP4) decodes a token in about 19 ms.
+
+**Description (traced by an explorer in `242753162`, read not run; line numbers move, find each site by name):**
+- A decode node with NVFP4 experts is refused by the cached-table direct route (the block in
+  `ggml_sycl_mul_mat_id` that ends in `mmvq_moe_batched_dispatch`) because `dedicated_decode_route`
+  (`moe-decode-hostpath.hpp`) is set for MXFP4, Q1_0 and NVFP4. The event-chained route refuses it for the same
+  reason. It then runs the admitted route of Task 8b and 8c.
+- On that route the only blocking wait is `ggml_sycl_copy_ids_to_host` for the layer's ids (a synchronous copy:
+  `mem_copy` then `wait_and_throw`), once per layer through `g_moe_layer_ids_cache`, which is cleared at every
+  graph boundary. On an in-order queue that wait drains everything submitted before it.
+- The host uses the ids for the resolved batch (`ggml_sycl_build_moe_resolved_batch`), the card-or-host split,
+  the host leg's preparation and the table upload. Per node it also takes a workspace slot (two slots, freed only
+  in the terminal host task), mints an execution snapshot and submits one host task.
+- When every expert of the tensor is PRIMARY on the context's device none of that needs the ids on the host: a
+  full per-tensor pointer table and a range check on the device answer all of it.
+- `[MOE-DECODE-CANONICAL]` prints `published=0` on every decode node of the measured run: the per-node canonical
+  publish does not republish and the table is not re-uploaded per node (checked in the run's log and its
+  memcpy rows).
+- The BF16 route (`ggml_sycl_mul_mat_id_bf16_direct`) already has no host wait: it uses the cached full-local
+  table, the ids on the device, and retains the table's dispatch bundle until the kernel's event.
+- `mmvq_moe_batched_dispatch` already reaches `mmvq_submit_q1_nvfp4_aos_id` (`mmvq.cpp`), the kernel the admitted
+  route runs. The decode-direct table is `ggml_sycl_moe_decode_direct_table`, stamped by replan epoch, storage
+  generation and selected rows (`moe_decode_direct_stamp`).
+
+**Ruling (lead, 2026-11-23):** placement decides the route. A decode node whose tensor has every expert PRIMARY
+on the context's device, in AOS, submits its kernel with the ids read on the device from a full per-tensor
+pointer table, with no host copy of the ids, no resolved batch, no workspace slot and no host task. A tensor with
+any host or secondary expert keeps the admitted route of Task 8c unchanged.
+- One predicate decides it, asked by the route and by nothing else's copy of the rule. It is answered from the
+  plan and the table, not from the ids.
+- The kernel is the loaded layout's kernel that exists (`mmvq_submit_q1_nvfp4_aos_id` or the admitted one):
+  nothing is converted or re-staged. If the route needs the checked-slot form (a null slot or an id out of range
+  writes NaN rows, an id below zero writes zero), it uses that form; an unchecked read of a slot is not allowed.
+- Lifetime: the node retains the table's dispatch bundle (the table's allocation and its expert leases) and the
+  ids' storage until the kernel's event, the way `ggml_sycl_mul_mat_id_bf16_direct` does
+  (`ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle`, `retain_handles_until_event`). No persistent lease is
+  relied on without that retain.
+- No new host wait, no new abort, no new allocation outside the unified cache.
+- Q1_0 follows NVFP4 only if it is the same code path with no extra work; otherwise it stays as it is and the
+  hand-back says so. The prompt path is not this task.
+- Graph replay: the node still runs eagerly between replayed segments. Recording it into a segment is a later
+  task; say in the hand-back what stops it.
+
+**Checkpoint before any GREEN code (report to the lead, then wait):**
+1. What the activation needs on the cached-table route for NVFP4 (the Q8_1 quantized activation and where its
+   buffer comes from), and whether `mmvq_moe_batched_dispatch` already provides it without a workspace slot.
+2. Whether the decode-direct table holds every expert of an all-resident tensor or only the selected rows, what
+   its stamp invalidates on, and what the node must retain.
+3. The predicate: its exact inputs, and why it cannot say yes for a tensor with a host expert (the B50).
+4. What the 545 us per node is made of after the ids wait is gone: name every remaining per-node host cost on the
+   new route (plan walks, vector builds, barriers, logs) and which of them this task removes.
+5. The device test you will extend and the RED you will write first.
+
+**Acceptance Criteria:**
+- [ ] On the B70 a decode node with NVFP4 experts reaches the kernel with no `ggml_sycl_copy_ids_to_host`, no
+      `ggml_sycl_build_moe_resolved_batch`, no workspace admission and no host task: pinned by a source contract
+      with mutants, and shown by a route log line that names the route.
+- [ ] A tensor with a host expert takes the admitted route as before: the admitted device test and the mixed
+      fixture pass unchanged on both cards.
+- [ ] A device test drives the new route through the production entry with a bad id and a null slot.
+- [ ] Lead runs: the Inkling gate on the B70, the B50 alone and both cards; the Mistral and GPT-OSS gates;
+      `test-backend-ops -o MUL_MAT_ID` on each card; one ABBA on the B70 against the tree before the task; one
+      host-stage profile that shows the `moe` stage's host time per node.
+- [ ] Full build, the two source-contract sweeps with only the known eight red, the inventory regenerated.
 
 ---
 
