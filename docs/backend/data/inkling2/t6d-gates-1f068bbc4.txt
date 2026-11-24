@@ -1,0 +1,52 @@
+Task 6d lead GPU checks at 1f068bbc4, one run per arm, 2026-11-22.
+ninja processes on the host: 2
+GGML_SYCL:BOOL=ON
+  01:02:54 build/bin/test-sycl-select-unselected-branch newer than ggml-sycl.cpp: yes
+  01:02:55 build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  01:02:55 build/bin/llama-cli newer than ggml-sycl.cpp: yes
+   libggml-sycl 01:02:54
+== 1 device test, B50  2026-11-22T01:04:22-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  ok: idx=0 selected a computed, unselected b kept its sentinel
+  ok: idx=1 selected b computed, unselected a kept its sentinel
+test-sycl-select-unselected-branch: PASS
+  kernel fault lines since start: 0
+== 2 device test, B70  2026-11-22T01:04:30-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  ok: idx=0 selected a computed, unselected b kept its sentinel
+  ok: idx=1 selected b computed, unselected a kept its sentinel
+test-sycl-select-unselected-branch: PASS
+  kernel fault lines since start: 0
+== 3 Mistral gate, B50  2026-11-22T01:04:38-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  mistral-b50 rc=0 output:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 4 GPT-OSS gate, B50, NO -c (default context)  2026-11-22T01:05:40-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  gptoss-b50-noc rc=0 answer_lines=1 device_lost=0
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 4b Mistral health, B50, after the default-context gate  2026-11-22T01:06:35-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  mistral-b50-after rc=0 output:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 5 GPT-OSS gate, B50, -c 4096  2026-11-22T01:07:40-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  gptoss-b50-c4096 rc=0 answer_lines=1 device_lost=0
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 6 Mistral gate, B70  2026-11-22T01:08:20-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  mistral-b70 rc=0 output:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 7 GPT-OSS gate, B70  2026-11-22T01:09:06-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  gptoss-b70 rc=0 answer_lines=1 device_lost=0
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+lock released

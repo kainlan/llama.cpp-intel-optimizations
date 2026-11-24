@@ -1,0 +1,193 @@
+Integration of master (6687ccc7e) with the Inkling line (feat/inkling2 b0a50e6c1, Tasks 18-20): the lead's runs of
+integ/inkling2-on-master at 641c7e065, 2026-11-24. Driver 26.44. Each run was made once; pairs are interleaved
+(a, b, b2, a2). Before-arms: wt-t8c = the Inkling line before the merge (code 6345c83d6), wt-master-base = a clean
+build of master 6687ccc7e. No ninja, icpx or ctest process was alive at the start or end of any timed run.
+
+== 1. Device checks (no timing claim)
+=== T20 device test b50 (registered selector)
+  card the test ran on: B50 (wanted B50)
+=== T20 device test b70 (binary)
+  card the test ran on: B70 (wanted B70)
+  b50: PASS=1 taken=27 scratch0=27 FAIL=0
+  b70: PASS=1 taken=27 scratch0=27 FAIL=0
+=== admitted b70
+  card the test ran on: B70 (wanted B70)
+=== admitted b50
+  card the test ran on: B50 (wanted B50)
+=== inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=b0a50e6c1
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+=== inkling gate B50 alone
+GATE inkling PASS rc=0 selector=level_zero:1 sha=b0a50e6c1
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+=== inkling gate both
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=b0a50e6c1
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+=== mistral b70 and gpt-oss b50 gates
+== mistral B70 -v  2026-11-24T13:15:42-05:00 shmem=9GB
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+== gptoss B50 -v, no -c  2026-11-24T13:16:23-05:00
+  answer lines: 1  device_lost: 0
+=== fixed-seed text b70 (64 tokens)
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, ||
+  TEXT EQUAL to the pre-merge Inkling tree's
+=== prompt kernel profile b70 (691-token prompt)
+  out: The harbour town woke slowly. Fishing boats came back before the sun cleared the eastern ridge, and the gulls followed them in long ragged lines. On the quay th
+directly dispatched submissions 22825 per pass; device-timed 5094.42 ms per pass; failed_timestamps 11187
+    mulmat.onednn_gemm.batched                 480.0 per pass    20.612 ms per pass  mean     42.9 us
+    mulmat.onednn_gemm.unbatched               528.0 per pass    12.005 ms per pass  mean     22.7 us
+=== DEVICE CHECKS END 2026-11-24T13:18:38-05:00  ninja=0 icpx=0
+
+== 2. Long real-text prompt (4737 tokens of docs/backend/sycl-host-safety.md, then 255 generated tokens; seed 42,
+      temp 0). Inkling: llama-completion -c 8192 (no -c is refused: the training context is 1048576). Mistral:
+      llama-completion, default flags. GPT-OSS: llama-cli with the model's chat template, default context.
+### ink-b70 (a = wt-t8c, b = integ 641c7e065)
+  long-ink-b70-a-641c7e065           pp   92.27 t/s over  4737 tok  tg  23.94 t/s over  255 tok  [DONE rc=0 ]
+  long-ink-b70-b-641c7e065           pp   92.46 t/s over  4737 tok  tg  26.14 t/s over  255 tok  [DONE rc=0 ]
+  long-ink-b70-b2-641c7e065          pp   92.16 t/s over  4737 tok  tg  26.10 t/s over  255 tok  [DONE rc=0 ]
+  long-ink-b70-a2-641c7e065          pp   91.72 t/s over  4737 tok  tg  23.96 t/s over  255 tok  [DONE rc=0 ]
+  TEXT a != b
+  TEXT b == b2
+### mistral-b70 (a = wt-master-base, b = integ 641c7e065)
+  long-mistral-b70-a-641c7e065       pp       ?  tg      ?  [DONE rc=2 ]
+  long-mistral-b70-b-641c7e065       pp       ?  tg      ?  [DONE rc=2 ]
+  long-mistral-b70-b2-641c7e065      pp       ?  tg      ?  [DONE rc=2 ]
+  long-mistral-b70-a2-641c7e065      pp       ?  tg      ?  [DONE rc=2 ]
+  TEXT a == b
+  TEXT b == b2
+### gptoss-b50 (a = wt-master-base, b = integ 641c7e065)
+  long-gptoss-b50-a-641c7e065        pp       ?  tg      ?  [DONE rc=0 ]
+  long-gptoss-b50-b-641c7e065        pp       ?  tg      ?  [DONE rc=0 ]
+  long-gptoss-b50-b2-641c7e065       pp       ?  tg      ?  [DONE rc=0 ]
+  long-gptoss-b50-a2-641c7e065       pp       ?  tg      ?  [DONE rc=0 ]
+  TEXT a != b
+  TEXT b != b2
+### gptoss-b70 (a = wt-master-base, b = integ 641c7e065)
+  long-gptoss-b70-a-641c7e065        pp       ?  tg      ?  [DONE rc=0 ]
+  long-gptoss-b70-b-641c7e065        pp       ?  tg      ?  [DONE rc=0 ]
+  long-gptoss-b70-b2-641c7e065       pp       ?  tg      ?  [DONE rc=0 ]
+  long-gptoss-b70-a2-641c7e065       pp       ?  tg      ?  [DONE rc=0 ]
+  TEXT a != b
+  TEXT b != b2
+### mistral-b50 (a = wt-master-base, b = integ 641c7e065)
+  long-mistral-b50-a-641c7e065       pp       ?  tg      ?  [DONE rc=2 ]
+  long-mistral-b50-b-641c7e065       pp       ?  tg      ?  [DONE rc=2 ]
+  long-mistral-b50-b2-641c7e065      pp       ?  tg      ?  [DONE rc=2 ]
+  long-mistral-b50-a2-641c7e065      pp       ?  tg      ?  [DONE rc=2 ]
+  TEXT a == b
+  TEXT b == b2
+### ink-both (a = wt-t8c, b = integ 641c7e065)
+  long-ink-both-a-641c7e065          pp   92.25 t/s over  4737 tok  tg  23.96 t/s over  255 tok  [DONE rc=0 ]
+  long-ink-both-b-641c7e065          pp   92.33 t/s over  4737 tok  tg  26.16 t/s over  255 tok  [DONE rc=0 ]
+  TEXT a != b
+### ink-b50 (a = wt-t8c, b = integ 641c7e065)
+  long-ink-b50-a-641c7e065           pp   16.26 t/s over  4737 tok  tg   6.33 t/s over  255 tok  [DONE rc=0 ]
+  long-ink-b50-b-641c7e065           pp   18.94 t/s over  4737 tok  tg   7.12 t/s over  255 tok  [DONE rc=0 ]
+  TEXT a != b
+  GPT-OSS speeds as llama-cli prints them (the summary rows above could not parse them):
+    gptoss-b70-a   [ Prompt: 1043.1 t/s | Generation: 48.6 t/s ]
+    gptoss-b70-b   [ Prompt: 1097.6 t/s | Generation: 50.1 t/s ]
+    gptoss-b70-b2  [ Prompt: 1099.8 t/s | Generation: 50.5 t/s ]
+    gptoss-b70-a2  [ Prompt: 1104.7 t/s | Generation: 50.7 t/s ]
+    gptoss-b50-a   [ Prompt: 118.7 t/s | Generation: 20.7 t/s ]
+    gptoss-b50-b   [ Prompt: 133.3 t/s | Generation: 21.3 t/s ]
+    gptoss-b50-b2  [ Prompt: 119.6 t/s | Generation: 21.0 t/s ]
+    gptoss-b50-a2  [ Prompt: 127.7 t/s | Generation: 20.0 t/s ]
+  GPT-OSS text: lines that differ once the tool's build line and speed line are set aside:
+    b70 a vs b: equal
+    b70 b vs b2: equal
+    b70 a vs a2: equal
+    b50 a vs b: equal
+    b50 b vs b2: equal
+    b50 a vs a2: equal
+  peak GPU host backing (Shmem plus the meminfo remainder) per run, in run order:
+    long ink-b70 arm a (wt-t8c)                  rc=0 peak=49 GiB
+    long ink-b70 arm b (wt-integ)                rc=0 peak=21 GiB
+    long ink-b70 arm b2 (wt-integ)               rc=0 peak=21 GiB
+    long ink-b70 arm a2 (wt-t8c)                 rc=0 peak=49 GiB
+    long mistral-b70 arm a (wt-master-base)      rc=1 peak=15 GiB
+    long mistral-b70 arm b (wt-integ)            rc=1 peak=15 GiB
+    long mistral-b70 arm b2 (wt-integ)           rc=1 peak=15 GiB
+    long mistral-b70 arm a2 (wt-master-base)     rc=1 peak=15 GiB
+    long gptoss-b50 arm a (wt-master-base)       rc=0 peak=23 GiB
+    long gptoss-b50 arm b (wt-integ)             rc=0 peak=23 GiB
+    long gptoss-b50 arm b2 (wt-integ)            rc=0 peak=23 GiB
+    long gptoss-b50 arm a2 (wt-master-base)      rc=0 peak=23 GiB
+    long gptoss-b70 arm a (wt-master-base)       rc=0 peak=19 GiB
+    long gptoss-b70 arm b (wt-integ)             rc=0 peak=19 GiB
+    long gptoss-b70 arm b2 (wt-integ)            rc=0 peak=19 GiB
+    long gptoss-b70 arm a2 (wt-master-base)      rc=0 peak=19 GiB
+    long mistral-b50 arm a (wt-master-base)      rc=1 peak=17 GiB
+    long mistral-b50 arm b (wt-integ)            rc=1 peak=15 GiB
+    long mistral-b50 arm b2 (wt-integ)           rc=1 peak=17 GiB
+    long mistral-b50 arm a2 (wt-master-base)     rc=1 peak=15 GiB
+    long ink-both arm a (wt-t8c)                 rc=0 peak=49 GiB
+    long ink-both arm b (wt-integ)               rc=0 peak=21 GiB
+    long ink-b50 arm a (wt-t8c)                  rc=0 peak=57 GiB
+    long ink-b50 arm b (wt-integ)                rc=0 peak=21 GiB
+  Mistral with default flags is refused on both trees and both cards (rc=1):
+    [DEQUANT-F16] graph refused before submission on device 0: the dense f16 dequant src0 buffer needs 112.0 MB
+    (widest op ffn_gate-0) but the RUNTIME zone cannot hold it (planned 0.0 MB for both buffers at the runtime
+    n_ubatch=2048, buffer holds 0.0 MB, zone has 32.5 MB free). Reduce -ub, or free RUNTIME-zone demand; this is a
+    plan-accounting refusal, not a missing kernel (llama.cpp-479i)
+    [SYCL-PLAN] auto n_ubatch=2048 for n_ctx=32768 n_batch=2048 (tried 2048; cached); pass -ub N to override
+  Inkling with no -c is refused on both trees:
+    [LOAD-PLAN] load refused: the compute buffer measured at n_ctx 1048576 needs 150637.7 MiB on SYCL device 0, and
+    that device has 32656.0 MiB in total; request a context that fits with -c
+
+== 3. test-backend-ops -o MUL_MAT, each card, against the Inkling line before the merge (t20-tbo-MUL_MAT-3657fe3f3)
+  MUL_MAT dev0 vs the Inkling line before the merge: cases base=3300 new=3300 changed=0  base {'OK': 1995, 'not supported': 1337, 'FAIL': 1}  new {'OK': 1995, 'not supported': 1337, 'FAIL': 1}
+  MUL_MAT dev1 vs the Inkling line before the merge: cases base=3300 new=3300 changed=0  base {'OK': 1995, 'not supported': 1337, 'FAIL': 1}  new {'OK': 1995, 'not supported': 1337, 'FAIL': 1}
+
+== 4. llama-bench -p 512 -n 128, interleaved, in run order
+=== ABBA llama-bench inkling-b70 (a = wt-t8c, b = integ 641c7e065)  builders: ninja=0 icpx=0
+  RESULT a pp512 avg=112.23 t/s stddev=0.00 samples=[112.23]
+  RESULT a tg128 avg=25.19 t/s stddev=0.00 samples=[25.19]
+  RESULT b pp512 avg=113.33 t/s stddev=0.00 samples=[113.33]
+  RESULT b tg128 avg=27.57 t/s stddev=0.00 samples=[27.57]
+  RESULT b2 pp512 avg=112.32 t/s stddev=0.00 samples=[112.32]
+  RESULT b2 tg128 avg=27.57 t/s stddev=0.00 samples=[27.57]
+  RESULT a2 pp512 avg=112.34 t/s stddev=0.00 samples=[112.34]
+  RESULT a2 tg128 avg=25.26 t/s stddev=0.00 samples=[25.26]
+=== ABBA llama-bench mistral-b70 (a = wt-master-base, b = integ 641c7e065)  builders: ninja=0 icpx=0
+  RESULT a pp512 avg=3356.11 t/s stddev=0.00 samples=[3356.11]
+  RESULT a tg128 avg=107.87 t/s stddev=0.00 samples=[107.87]
+  RESULT b pp512 avg=3348.74 t/s stddev=0.00 samples=[3348.74]
+  RESULT b tg128 avg=108.06 t/s stddev=0.00 samples=[108.06]
+  RESULT b2 pp512 avg=3355.43 t/s stddev=0.00 samples=[3355.43]
+  RESULT b2 tg128 avg=107.92 t/s stddev=0.00 samples=[107.92]
+  RESULT a2 pp512 avg=3350.19 t/s stddev=0.00 samples=[3350.19]
+  RESULT a2 tg128 avg=108.19 t/s stddev=0.00 samples=[108.19]
+=== ABBA llama-bench gptoss-b50 (a = wt-master-base, b = integ 641c7e065)  builders: ninja=0 icpx=0
+  RESULT a pp512 avg=874.68 t/s stddev=0.00 samples=[874.68]
+  RESULT a tg128 avg=35.53 t/s stddev=0.00 samples=[35.53]
+  RESULT b pp512 avg=873.03 t/s stddev=0.00 samples=[873.03]
+  RESULT b tg128 avg=35.73 t/s stddev=0.00 samples=[35.73]
+  RESULT b2 pp512 avg=872.71 t/s stddev=0.00 samples=[872.71]
+  RESULT b2 tg128 avg=35.81 t/s stddev=0.00 samples=[35.81]
+  RESULT a2 pp512 avg=872.50 t/s stddev=0.00 samples=[872.50]
+  RESULT a2 tg128 avg=35.65 t/s stddev=0.00 samples=[35.65]
+
+== 5. Mistral long prompt with an explicit -ub 512 (a = master build, b = integ)
+  rc=0  out bytes: 16617  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+  rc=0  out bytes: 16617  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+  rc=0  out bytes: 16617  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+  rc=0  out bytes: 16617  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+### mistral-ub512-b70 (a = master build, b = integ 641c7e065)
+  long-mistral-ub512-b70-a-641c7e065 pp 1519.15 t/s over  5037 tok  tg  88.44 t/s over  255 tok  [DONE rc=0 ]
+  long-mistral-ub512-b70-b-641c7e065 pp 2451.80 t/s over  5037 tok  tg  88.50 t/s over  255 tok  [DONE rc=0 ]
+  long-mistral-ub512-b70-b2-641c7e065 pp 2365.85 t/s over  5037 tok  tg  88.33 t/s over  255 tok  [DONE rc=0 ]
+  long-mistral-ub512-b70-a2-641c7e065 pp 2451.11 t/s over  5037 tok  tg  88.65 t/s over  255 tok  [DONE rc=0 ]
+  TEXT a == b
+  TEXT b == b2
+  rc=0  out bytes: 16598  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+  rc=0  out bytes: 16598  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+  rc=0  out bytes: 16598  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+  rc=0  out bytes: 16598  err lines: 486  peak host backing: 17 GiB  builders at end: ninja=0 icpx=0 ctest=0
+### mistral-ub512-b50 (a = master build, b = integ 641c7e065)
+  long-mistral-ub512-b50-a-641c7e065 pp  878.85 t/s over  5037 tok  tg  39.34 t/s over  255 tok  [DONE rc=0 ]
+  long-mistral-ub512-b50-b-641c7e065 pp 1062.50 t/s over  5037 tok  tg  39.35 t/s over  255 tok  [DONE rc=0 ]
+  long-mistral-ub512-b50-b2-641c7e065 pp 1062.92 t/s over  5037 tok  tg  39.34 t/s over  255 tok  [DONE rc=0 ]
+  long-mistral-ub512-b50-a2-641c7e065 pp 1063.53 t/s over  5037 tok  tg  39.37 t/s over  255 tok  [DONE rc=0 ]
+  TEXT a == b
+  TEXT b == b2

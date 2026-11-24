@@ -1,0 +1,17 @@
+== CPU (opencl:cpu)
+device: Intel(R) Core(TM) Ultra 7 270K Plus
+(h1) later good event: after plain wait=0, after good.wait_and_throw=1 (threw=0), after q.throw_asynchronous=1
+(h2) earlier good event: after plain waits=0, after good.wait_and_throw=1 (threw=0), after q.throw_asynchronous=1
+(h3) control, own event: after bad.wait_and_throw=1 (threw=0)
+probe7c: done
+rc=0
+== B50 (level_zero:1)
+device: Intel(R) Arc(TM) Pro B50 Graphics
+(h1) later good event: after plain wait=0, after good.wait_and_throw=1 (threw=0), after q.throw_asynchronous=1
+(h2) earlier good event: after plain waits=0, after good.wait_and_throw=1 (threw=0), after q.throw_asynchronous=1
+(h3) control, own event: after bad.wait_and_throw=1 (threw=0)
+probe7c: done
+rc=0
+probe: shmem=7GB
+probe: done 2026-11-21T21:00:58-05:00
+probe: lock released

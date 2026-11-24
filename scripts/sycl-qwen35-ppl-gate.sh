@@ -27,15 +27,29 @@
 # is printed, so a B50 run shows the decline path was reached. Only the B50 arm discriminates the fix: the B70
 # layout has no overlapping chain, declines 0, and did not race before it either.
 #
-# Exit status: 0 pass, 1 fail, 77 skipped (a precondition is missing, which proves nothing).
+# Exit status: 0 pass, 1 fail, 77 skipped (a precondition is missing, which proves nothing), 143 a signal during the
+# lock take or its wait.
 #
 # --score-logs LOG... scores existing multi-ubatch logs for shape and determinism without running anything.
 # --score-oracle LOG  scores one existing -b 512 log (shape and the --oracle values) without running anything.
 # --dry-run prints the plan and runs nothing.
+# --lock-selftest takes, checks and releases the lock through the run's own wait loop and exits (no GPU work).
+#
+# GPU.lock is taken and released through scripts/sycl-lock.sh (mkdir(2) through python3, a `holder` line unique to
+# this run): the system mkdir command checks, then creates, and exits 0 when the directory appears in between, so two
+# takers that arrive together can both win. The gate waits for a busy lock (up to
+# LLAMA_GPU_LOCK_WAIT_SECONDS, polling every LLAMA_GPU_LOCK_POLL_SECONDS) and stops at once when waiting cannot clear
+# the failure. Each take reads its holder back after LLAMA_GPU_LOCK_VERIFY_SECONDS (default 1). It does not read
+# its holder again during the run: a co-taker that still uses plain mkdir and writes its holder after the verify
+# window goes unseen here. The run path cannot be exercised by a stub test on this host
+# (its settle waits for MemAvailable > 150 GB), so that check waits until it can be tested. A signal after the take
+# releases the lock at once and does not stop the model run: stop the run first.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091  # sourced by a path computed from this file
+source "$ROOT_DIR/scripts/sycl-lock.sh" || { echo "sycl-qwen35-ppl-gate: cannot load $ROOT_DIR/scripts/sycl-lock.sh" >&2; exit 1; }
 
 BUILD_DIR="$ROOT_DIR/build"
 MODEL="/models/Qwen3.6-27B-UD-Q4_K_XL.gguf"
@@ -50,6 +64,13 @@ ORACLE_B50="7.4953 5.6207 5.5623 4.9452"  # level_zero:1
 ORACLE_B70="7.4816 5.6277 5.5713 4.9400"  # level_zero:0
 ORACLE=""
 LOCK_DIR="${LLAMA_GPU_LOCK:-/Apps/llama.cpp/GPU.lock}"
+LOCK_VERIFY="${LLAMA_GPU_LOCK_VERIFY_SECONDS:-1}"
+LOCK_POLL="${LLAMA_GPU_LOCK_POLL_SECONDS:-15}"
+LOCK_WAIT="${LLAMA_GPU_LOCK_WAIT_SECONDS:-1800}"
+LOCK_HELD=0
+LOCK_TEXT=""
+LOCK_RC=0
+LOCK_SELFTEST=0
 TAKE_LOCK=1
 OUT_DIR=""
 DRY_RUN=0
@@ -73,9 +94,17 @@ Options:
                      0 = B70 7.4816 5.6277 5.5713 4.9400; any other device needs --oracle)
   --out-dir DIR     where run logs go (default: a fresh directory under $TMPDIR)
   --no-lock         the caller already holds the GPU lock
+  --lock-selftest   take, check and release the lock through the run's wait loop, then exit (no GPU work)
   --score-logs LOG... score existing multi-ubatch logs (n_seq=4, identical chunks) and exit
   --score-oracle LOG score one existing -b 512 log (n_seq=1, the --oracle values) and exit
   --dry-run         print the plan and exit
+
+Environment:
+  LLAMA_GPU_LOCK                  the lock directory (default /Apps/llama.cpp/GPU.lock)
+  LLAMA_GPU_LOCK_VERIFY_SECONDS   how long a take waits before it reads its holder back (default 1)
+  LLAMA_GPU_LOCK_POLL_SECONDS     seconds between takes while the lock is busy (default 15, at least 1)
+  LLAMA_GPU_LOCK_WAIT_SECONDS     how long to wait for a busy lock before stopping (default 1800, 0 allowed)
+  Each is a whole number of seconds from 0 to 999999 without a leading zero; anything else stops the gate.
 EOF
 }
 
@@ -89,6 +118,70 @@ skip() {
     exit 77
 }
 
+# GPU.lock, shared by --lock-selftest and the real run. This script runs under set -e: every call that can fail is
+# guarded by || or if.
+lock_take() { # 0 held | the sycl_lock_take status; LOCK_RC keeps it for the refusal text
+    if [ "$LOCK_HELD" != 0 ]; then # never take twice: the second text would replace the first
+        LOCK_RC=5
+        echo "sycl-qwen35-ppl-gate: lock_take called while the lock is held" >&2
+        return 5
+    fi
+    LOCK_TEXT="sycl-qwen35-ppl-gate pid=$$ device=level_zero:$DEVICE start=$(date +%FT%T)"
+    LOCK_HELD=1 # before the take: a signal during it is handled right after it returns, and must release
+    LOCK_RC=0
+    sycl_lock_take "$LOCK_DIR" "$LOCK_TEXT" "$LOCK_VERIFY" || LOCK_RC=$?
+    # An unknown status can follow a holder the helper already wrote; after 1 to 4 no holder of ours exists.
+    [ "$LOCK_RC" != 5 ] || sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" 2>/dev/null || true
+    [ "$LOCK_RC" = 0 ] || LOCK_HELD=0
+    return "$LOCK_RC"
+}
+
+lock_release() {
+    [ "$LOCK_HELD" = 1 ] || return 0
+    [ "$BASHPID" = "$$" ] || return 0 # a subshell inherits LOCK_HELD and must never release the lock
+    LOCK_HELD=0
+    sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" || true # a foreign or missing holder: its stderr line, nothing removed
+}
+
+lock_why() { # the reason for the last failed take
+    case "$LOCK_RC" in
+        1) echo "held: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo "no holder file")" ;;
+        2) echo "another taker's holder is there: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo none)" ;;
+        3) echo "the directory was created without a holder: remove it by hand" ;;
+        4) echo "the directory cannot be created" ;;
+        *) echo "the lock helper could not run (python3 missing?)" ;;
+    esac
+}
+
+# The gate has no signal handler, so a TERM would end bash at once while the take's child (which ignores the signal)
+# goes on to create the directory. For the span of the take, signals are only recorded. The caller installs
+# `trap lock_release EXIT` first.
+LOCK_SIGNALLED=0
+lock_wait_take() {
+    local waited=0 rc
+    # Deferred until the take's child returns. Reset to the default disposition below: a caller's own trap for these
+    # signals is not restored.
+    trap 'LOCK_SIGNALLED=1' TERM INT HUP
+    while :; do
+        rc=0
+        lock_take || rc=$?
+        [ "$LOCK_SIGNALLED" = 0 ] || exit 143 # the EXIT trap releases a lock this take won
+        case "$rc" in
+            0) break ;;
+            1 | 2) ;; # busy, or a co-taker won: wait
+            *) die "could not take $LOCK_DIR ($(lock_why)): waiting will not clear it" ;;
+        esac
+        [ "$waited" -lt "$LOCK_WAIT" ] || die "could not take $LOCK_DIR in ${LOCK_WAIT}s ($(lock_why))"
+        # A signal interrupts the wait at once (a foreground sleep would defer the trap until it ends).
+        sleep "$LOCK_POLL" &
+        local slp=$!
+        wait "$slp" || true
+        [ "$LOCK_SIGNALLED" = 0 ] || { kill "$slp" 2>/dev/null || true; exit 143; }
+        waited=$((waited + LOCK_POLL))
+    done
+    trap - TERM INT HUP
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
@@ -99,6 +192,7 @@ while [ $# -gt 0 ]; do
         --oracle) ORACLE="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --no-lock) TAKE_LOCK=0; shift ;;
+        --lock-selftest) LOCK_SELFTEST=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --score-logs)
             SCORE_ONLY=1
@@ -113,6 +207,32 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1" ;;
     esac
 done
+
+# A leading zero would be an octal error in the wait loop's arithmetic, and a bound keeps a typo from becoming a
+# hang or an overflow (the verify window goes to the helper's sleep).
+for lock_var in "LLAMA_GPU_LOCK_VERIFY_SECONDS=$LOCK_VERIFY" "LLAMA_GPU_LOCK_POLL_SECONDS=$LOCK_POLL" \
+    "LLAMA_GPU_LOCK_WAIT_SECONDS=$LOCK_WAIT"; do
+    [[ "${lock_var#*=}" =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+        die "${lock_var%%=*} must be a whole number of seconds from 0 to 999999 without a leading zero:" \
+            "'${lock_var#*=}'"
+done
+[ "$LOCK_POLL" -ge 1 ] || die "LLAMA_GPU_LOCK_POLL_SECONDS must be at least 1: '$LOCK_POLL'"
+
+if [ "$LOCK_SELFTEST" = 1 ]; then
+    trap lock_release EXIT
+    lock_wait_take
+    sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" || die "lock-selftest: the holder is not ours after the take"
+    # A second taker with its own text: calling lock_take again would replace LOCK_TEXT.
+    second_rc=0
+    sycl_lock_take "$LOCK_DIR" "lock-selftest second taker" 0 || second_rc=$?
+    [ "$second_rc" = 1 ] || die "lock-selftest: a second take returned $second_rc, not 1 (busy)"
+    ( lock_release )
+    sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" || die "lock-selftest: a release in a subshell removed our holder"
+    lock_release
+    [ ! -e "$LOCK_DIR" ] || die "lock-selftest: the lock directory survived the release"
+    echo "lock-selftest: ok"
+    exit 0
+fi
 
 if [ -z "$ORACLE" ]; then
     case "$DEVICE" in
@@ -250,31 +370,35 @@ if [ "$(ldd "$PPL_BIN" 2>/dev/null | grep -cE 'libggml-sycl|libsycl')" -lt 2 ]; 
     skip "$PPL_BIN does not link the SYCL backend (source oneAPI setvars.sh first)"
 fi
 
-mem() { grep -E '^(MemAvailable|Shmem):' /proc/meminfo | tr '\n' ' '; }
+[ -r "$ROOT_DIR/scripts/sycl-host-backing.sh" ] || die "$ROOT_DIR/scripts/sycl-host-backing.sh is missing"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/sycl-host-backing.sh"
+mem() { sycl_gpu_host_backing_log_line; }
 
-# GPU.lock serialises access, not memory recovery: TTM shmem is released after the lock is, so wait for
-# the host to settle before each model load and fail closed if it never does.
+# GPU.lock serialises access, not memory recovery: GPU host backing (Shmem + the meminfo remainder) is released
+# after the lock is, so wait for the host to settle before each model load and fail closed if it never does.
+# An unreadable meminfo is not settled. MemAvailable is not a condition (ruling 2026-11-12): it sits near 55 GB on
+# purpose while another tenant holds a model, and the planner refuses an oversized load by name.
 settle() {
-    local s a
+    local st line="unreadable"
     for _ in $(seq 60); do
-        s="$(awk '/^Shmem:/{print $2}' /proc/meminfo)"
-        a="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
-        if [ "$s" -lt 31457280 ] && [ "$a" -gt 157286400 ]; then
-            return 0
+        # One read decides, and the refusal prints that read.
+        if st="$(sycl_gpu_host_state_kb)"; then
+            line="$(sycl_gpu_host_format_state "$st")"
+            if [ "$(sycl_gpu_host_state_backing_kb "$st")" -lt 31457280 ]; then
+                return 0
+            fi
+        else
+            line="unreadable"
         fi
         sleep 10
     done
-    die "host never settled (Shmem < 30 GB and MemAvailable > 150 GB): $(mem)"
+    die "host never settled (GPU host backing < 30 GiB): $line"
 }
 
 if [ "$TAKE_LOCK" = 1 ]; then
-    waited=0
-    until mkdir "$LOCK_DIR" 2>/dev/null; do
-        sleep 15
-        waited=$((waited + 15))
-        [ "$waited" -lt 1800 ] || die "could not take $LOCK_DIR in 30 minutes"
-    done
-    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+    trap lock_release EXIT
+    lock_wait_take
 fi
 
 [ -n "$OUT_DIR" ] || OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qwen35-ppl-gate.XXXXXX")"

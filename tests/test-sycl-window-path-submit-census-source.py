@@ -249,6 +249,10 @@ EXCLUDED_FILES = {
                         + BY_RECEIVER_CHECKED + ")",
     "moe-tile-convert.cpp": "MXFP4 to XMX-tiled weight conversion, run when a weight is materialized "
                             "(ggml_sycl_fill_xmx_tiled, convert_tensor_layout), not by an op of the graph",
+    "moe-bf16-direct.cpp": "the BF16 expert kernel of MUL_MAT_ID: ggml_sycl_mul_mat_id_bf16_direct (ggml-sycl.cpp) "
+                           "runs it only for a BF16 expert weight (ggml_sycl_moe_bf16_direct_route_available), and "
+                           "the Qwen3.8-Flash-Next packs hold none (their ffn_*_exps are Q4_K, Q5_K, Q5_1, Q8_0 and "
+                           "IQ4_NL)",
     "moe-mmid-workspace.cpp": "no launch: its .fill( calls are std::array::fill in moe_mmid_workspace_registry::admit",
     "mxfp4-stored-gemm.cpp": "its header mxfp4-stored-gemm.hpp (besides this file): " + NOT_INCLUDED,
     "mmvq-rmsnorm.hpp": NOT_INCLUDED,
@@ -471,9 +475,13 @@ ALLOW: dict[str, tuple[int, str]] = {
     "shortcut:ggml-sycl.cpp:ggml_sycl_op_mul_mat":
         (1, shortcut("copies an f32 MUL_MAT result into its f16 destination")),
     "shortcut:ggml-sycl.cpp:ggml_sycl_op_pool2d": (1, shortcut("POOL_2D")),
+    "shortcut:ggml-sycl.cpp:ggml_sycl_q1_nvfp4_test_read_expert_table": (1, TEST_ENTRY),
+    "shortcut:ggml-sycl.cpp:ggml_sycl_q1_nvfp4_test_write_expert_slot": (1, TEST_ENTRY),
     "shortcut:ggml-sycl.cpp:ggml_sycl_readback_via_shared_kernel":
         (1, shortcut("a device readback through shared memory")),
     "shortcut:ggml-sycl.cpp:ggml_sycl_tp_launch_async_ffn": (1, shortcut(TP + "the async FFN's GLU")),
+    "shortcut:ggml-sycl.cpp:scale_f32_strided_sycl":
+        (1, shortcut("SCALE of a view, or into one, read and written in its own strides")),
     "shortcut:ggml-sycl.cpp:scale_f32_sycl": (1, shortcut("SCALE")),
     "shortcut:ggml-sycl.cpp:sum_rows_f32_sycl": (1, shortcut("SUM_ROWS")),
     "shortcut:ggml-sycl.cpp:tp_device1_worker_thread_func": (1, shortcut(TP + "device 1's worker GLU")),
@@ -542,6 +550,8 @@ ALLOW: dict[str, tuple[int, str]] = {
     "submit:ggml-sycl.cpp:ggml_sycl_add_f32": (1, kernel("an in-place f32 add (dst += src), waited on at once")),
     "submit:ggml-sycl.cpp:ggml_sycl_copy_ids_to_host":
         (1, kernel("packs the MUL_MAT_ID ids for their copy to the host")),
+    "submit:ggml-sycl.cpp:ggml_sycl_moe_direct_host_join":
+        (1, host_task("waits the MUL_MAT_ID direct route's host expert job (Q1_0 / NVFP4 experts on the host)")),
     "submit:ggml-sycl.cpp:ggml_sycl_moe_down_weighted_sum_sycl":
         (1, kernel("the MoE down projection's weighted sum over the selected experts")),
     "submit:ggml-sycl.cpp:ggml_sycl_mul_mat_batched_sycl":

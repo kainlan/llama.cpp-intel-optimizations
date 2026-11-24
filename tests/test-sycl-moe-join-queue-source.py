@@ -43,9 +43,16 @@ THE CONTRACT.  With comments blanked:
      a join that falls back to the stream is itself recorded; cpu_submit_async records
      its submissions on a non-CPU queue (all host tasks); and every host_task in the
      backend sources is the join, or goes through cpu_submit_async, or is exempt for a
-     stated reason that the gate also pins (host_task_mode is only ever set false; the
-     Q1/NVFP4 direct route is not validated; a test hook; dpct's host_buffer, which no
-     backend source reaches).  The test programs under ggml-sycl/tests are not backend
+     stated reason that the gate also pins (host_task_mode is only ever set false; a test
+     hook; dpct's host_buffer, which no backend source reaches).  The Q1/NVFP4 direct
+     route's host tasks on its exact queue (the stream) are recorded: each submit is
+     assigned to an event, and the statement right after it is
+     unified_cache_note_host_task(*exact_queue, <that event>).  The one statement allowed
+     between them is the terminal task's `terminal_submitted = true;`: a bool store
+     submits nothing, and the flag must be set before the record, which can throw, or the
+     catch would move the host leg the submitted task resets.  So is the join of a mixed
+     batch's host leg (ggml_sycl_moe_direct_host_join), on the stream it is handed:
+     unified_cache_note_host_task(queue, joined).  The test programs under ggml-sycl/tests are not backend
      code and are not censused.
   L. (unified-cache.cpp) the latch: a host task or a join on a queue that is not a
      cache's queue_, or on a second cache, refuses the join queue for the process, as
@@ -58,7 +65,8 @@ THE CONTRACT.  With comments blanked:
      the token went on the join queue: each join is counted by where it went, under the
      trace only, and the counts are reset with the token's.
   O. (unified-cache) the cache owns the join queue: a unique_ptr member made once under
-     std::call_once, in_order, without enable_profiling, on queue_'s context and device,
+     std::call_once through ggml_sycl_make_queue (so it carries the recording async
+     handler), in_order, without enable_profiling, on queue_'s context and device,
      and drained by drain_all_queues_noexcept.
   D. (ggml-sycl.cpp flush_pending_cpu_scatter_slot) the scatter still depends on the
      join events (compact, per-run copies, flagged), the job buffers are still retained
@@ -296,6 +304,8 @@ def classify_host_task(name: str, heads: list[str]) -> str | None:
             return "test-hook"
         if any("exact_queue->submit" in h for h in heads):
             return "q1-direct"
+        if any(re.search(r"\bggml_sycl_moe_direct_host_join\s*\(", h) for h in heads):
+            return "q1-direct-host-join"
     if name == "cpu-dispatch.cpp":
         if any(re.search(r"cpu_submit_async\s*\(\s*gpu_q\b", h) for h in heads):
             return "cpu-submit-async"
@@ -307,6 +317,56 @@ def classify_host_task(name: str, heads: list[str]) -> str | None:
     return None
 
 
+Q1_DIRECT_SUBMIT = "exact_queue->submit("
+# The host leg's join of a mixed batch, in its helper: submitted on `queue`, the node's stream.
+Q1_HOST_JOIN_SUBMIT = "queue.submit("
+
+
+def check_q1_direct_recorded(code: str, host_task_pos: int) -> None:
+    """The direct route's host task at `host_task_pos` is recorded right after its submit returns."""
+    check_recorded_after_submit(code, host_task_pos, Q1_DIRECT_SUBMIT, "*exact_queue", "Q1/NVFP4 direct host task",
+                                flag_event="terminal_task")
+
+
+def check_q1_host_join_recorded(code: str, host_task_pos: int) -> None:
+    """The direct route's host-leg join at `host_task_pos` is recorded right after its submit returns."""
+    check_recorded_after_submit(code, host_task_pos, Q1_HOST_JOIN_SUBMIT, "queue", "Q1/NVFP4 direct host-leg join")
+
+
+def check_recorded_after_submit(code: str, host_task_pos: int, submit: str, queue: str, what: str,
+                                flag_event: str | None = None) -> None:
+    """The host task at `host_task_pos`, submitted by the nearest `submit` before it into an event, is recorded on
+    `queue` with that event as the statement right after the submit. For `flag_event` alone, the terminal task's
+    `terminal_submitted = true;` may come first: it submits nothing, and it must precede a record that can throw."""
+    at = code.rfind(submit, 0, host_task_pos)
+    line = line_of(code, host_task_pos)
+    target = re.search(r"(?:sycl::event\s+)?(\w+)\s*=\s*$", code[max(0, at - 200) : at])
+    if at < 0 or not target:
+        fail("G", f"the {what} at ggml-sycl.cpp:{line} is not submitted into an event, so its "
+             "event cannot be recorded for the join queue's guard")
+    flat = strip_strings(code)
+    open_paren = at + len(submit) - 1
+    depth = 0
+    close = -1
+    for j in range(open_paren, len(flat)):
+        if flat[j] == "(":
+            depth += 1
+        elif flat[j] == ")":
+            depth -= 1
+            if depth == 0:
+                close = j
+                break
+    event = target.group(1)
+    rest = code[close + 1 :] if close >= 0 else ""
+    queue_re = r"\*\s*" + re.escape(queue[1:]) if queue.startswith("*") else re.escape(queue)
+    flag = r"(?:\s*terminal_submitted\s*=\s*true\s*;)?" if event == flag_event else ""
+    note = (r"\s*;" + flag + r"\s*ggml_sycl::unified_cache_note_host_task\s*\(\s*" + queue_re + r"\s*,\s*" +
+            re.escape(event) + r"\s*\)\s*;")
+    if close < 0 or not re.match(note, rest):
+        fail("G", f"the {what} at ggml-sycl.cpp:{line} is not recorded on its stream right after its "
+             f"submit returns (want unified_cache_note_host_task({queue}, {event}) as the next statement)")
+
+
 def check_census(sources: dict) -> None:
     kinds = set()
     for name, text in sorted(sources.items()):
@@ -315,6 +375,10 @@ def check_census(sources: dict) -> None:
         code = blank_comments(text)
         for m in re.finditer(r"\bhost_task\s*\(\s*\[", code):
             kind = classify_host_task(name, enclosing_headers(code, m.start()))
+            if kind == "q1-direct":
+                check_q1_direct_recorded(code, m.start())
+            if kind == "q1-direct-host-join":
+                check_q1_host_join_recorded(code, m.start())
             if kind is None:
                 fail("G", f"host_task at {name}:{line_of(code, m.start())} is not recorded for the join queue's guard; "
                      "submit it through cpu_submit_async or record its event with unified_cache_note_host_task")
@@ -335,10 +399,6 @@ def check_census(sources: dict) -> None:
         if not backend_calls or any(arg != "false" for _, arg in backend_calls):
             fail("G", "ggml_sycl_host_task_mode_set is called with something other than false, so cpu-dispatch's "
                  "host_task_mode branches can run and their host tasks are not recorded")
-    if "q1-direct" in kinds:
-        backend = blank_comments(sources["ggml-sycl.cpp"])
-        if not re.search(r"constexpr\s+bool\s+k_moe_mmid_direct_route_validated\s*=\s*false\s*;", backend):
-            fail("G", "the Q1/NVFP4 direct route is validated, so its terminal host task runs and is not recorded")
     if "dpct-host-buffer" in kinds:
         for name, text in sources.items():
             if name.startswith("dpct/") or "dpct_memcpy" not in text:
@@ -394,10 +454,13 @@ def check_owner(cache_hpp: str, cache_cpp: str) -> None:
     code = blank_comments(cache_cpp)
     body, _ = body_of(code, GET_QUEUE_SIG, "O")
     once = re.search(r"std::call_once\s*\(\s*moe_join_queue_once_", body)
-    make = re.search(r"moe_join_queue_\s*=\s*std::make_unique\s*<\s*sycl::queue\s*>\s*\(\s*queue_\.get_context\s*\(\s*\)"
-                     r"\s*,\s*queue_\.get_device\s*\(\s*\)\s*,\s*sycl::property::queue::in_order\s*\{\s*\}\s*\)\s*;", body)
+    make = re.search(r"moe_join_queue_\s*=\s*std::make_unique\s*<\s*sycl::queue\s*>\s*\(\s*ggml_sycl_make_queue\s*\(\s*"
+                     r"queue_\.get_context\s*\(\s*\)\s*,\s*queue_\.get_device\s*\(\s*\)\s*,\s*"
+                     r"ggml_sycl_get_device_id_from_queue\s*\(\s*queue_\s*\)\s*,\s*"
+                     r"sycl::property_list\s*\{\s*sycl::property::queue::in_order\s*\{\s*\}\s*\}\s*\)\s*\)\s*;", body)
     if not once or not make or make.start() < once.end():
-        fail("O", "get_moe_join_queue does not make one in-order queue on queue_'s context and device under call_once")
+        fail("O", "get_moe_join_queue does not make one in-order queue, with the recording handler, on queue_'s context and "
+                  "device under call_once")
     if "enable_profiling" in body:
         fail("O", "the join queue is profiling-enabled, which makes any status query on it a busy-wait")
     if not re.search(r"return\s+moe_join_queue_\.get\s*\(\s*\)\s*;", body):
@@ -583,9 +646,23 @@ def self_test(s: dict) -> int:
              r"\1\n    ggml_sycl_get_cpu_queue()->submit([&](sycl::handler & cgh) { cgh.host_task([]() {}); });")),
         ("G", "backend", "host_task_mode switched on", sub(r"ggml_sycl_host_task_mode_set\(false\);",
                                                           "ggml_sycl_host_task_mode_set(true);")),
-        ("G", "backend", "Q1/NVFP4 direct route validated",
-         sub(r"constexpr bool k_moe_mmid_direct_route_validated = false;",
-             "constexpr bool k_moe_mmid_direct_route_validated = true;")),
+        ("G", "backend", "Q1/NVFP4 direct terminal not recorded",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);", ";")),
+        ("G", "backend", "Q1/NVFP4 direct terminal recorded on another queue",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);",
+             "ggml_sycl::unified_cache_note_host_task(*ctx.stream(), terminal_task);")),
+        ("G", "backend", "Q1/NVFP4 direct terminal records another event",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, terminal_task\);",
+             "ggml_sycl::unified_cache_note_host_task(*exact_queue, final);")),
+        ("G", "backend", "Q1/NVFP4 direct terminal has another statement before its record",
+         sub(r"terminal_submitted = true;", "terminal_submitted = true; (void) 0;")),
+        ("G", "backend", "Q1/NVFP4 injected terminal not recorded",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(\*exact_queue, final\);", ";")),
+        ("G", "backend", "Q1/NVFP4 host-leg join not recorded",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(queue, joined\);", ";")),
+        ("G", "backend", "Q1/NVFP4 host-leg join records another event",
+         sub(r"ggml_sycl::unified_cache_note_host_task\(queue, joined\);",
+             "ggml_sycl::unified_cache_note_host_task(queue, sycl::event{});")),
         ("L", "cache_cpp", "latch accepts any queue",
          sub(r"cache && cache->get_queue\(\) == q \? cache : nullptr", "cache")),
         ("L", "cache_cpp", "refusal not sticky",
@@ -600,12 +677,21 @@ def self_test(s: dict) -> int:
          sub(r"if \(q\.ext_oneapi_get_state\(\) == sycl::ext::oneapi::experimental::queue_state::recording\) \{",
              "if (false) {")),
         ("O", "cache_cpp", "join queue profiling-enabled",
-         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(queue_\.get_context\(\), queue_\.get_device\(\),\s*)"
-             r"sycl::property::queue::in_order\{\}\);",
-             r"\1sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} });")),
+         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(ggml_sycl_make_queue\("
+             r"[^;]*?ggml_sycl_get_device_id_from_queue\(queue_\),\s*)"
+             r"sycl::property_list\{ sycl::property::queue::in_order\{\} \}\)\);",
+             r"\1sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} }));")),
         ("O", "cache_cpp", "join queue out of order",
-         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(queue_\.get_context\(\), queue_\.get_device\(\)),\s*"
-             r"sycl::property::queue::in_order\{\}\);", r"\1);")),
+         sub(r"(moe_join_queue_ = std::make_unique<sycl::queue>\(ggml_sycl_make_queue\("
+             r"[^;]*?ggml_sycl_get_device_id_from_queue\(queue_\),\s*)"
+             r"sycl::property_list\{ sycl::property::queue::in_order\{\} \}\)\);",
+             r"\1sycl::property_list{}));")),
+        ("O", "cache_cpp", "join queue without the recording handler",
+         sub(r"moe_join_queue_ = std::make_unique<sycl::queue>\(ggml_sycl_make_queue\(\s*queue_\.get_context\(\), "
+             r"queue_\.get_device\(\), ggml_sycl_get_device_id_from_queue\(queue_\),\s*"
+             r"sycl::property_list\{ sycl::property::queue::in_order\{\} \}\)\);",
+             "moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),\n"
+             "                sycl::property::queue::in_order{});")),
         ("O", "cache_cpp", "join queue not drained", sub(r",\s*moe_join_queue_\.get\(\)", "")),
         ("O", "cache_hpp", "join queue not owned",
          sub(r"std::unique_ptr<sycl::queue>(\s+)moe_join_queue_;", r"sycl::queue *\1moe_join_queue_;")),

@@ -1,0 +1,31 @@
+Inkling 2 Mini (UD-Q8_K_XL), Arc Pro B70 alone (level_zero:0), Task 8b's tree. 2026-11-22.
+
+Gate (scripts/sycl-canonical-gates.sh --gate inkling, 6ee2a4058 build):
+GATE inkling PASS rc=0 selector=level_zero:0 sha=e8b13c2b5
+  MOE-DECODE-REFUSAL lines: 0  MOE-PROMPT-REFUSAL lines: 0  EXECUTION-TRIPWIRE lines: 0
+
+Scheduler print of one decode token (GGML_SCHED_DEBUG=2 -v, e9452b615 build; the split structure does not
+depend on the route fix that followed):
+  splits: 282  on CPU: 141  on SYCL0: 141
+  nodes by op and backend of the node's own buffer (count op backend):
+       104 SCALE            CPU
+        48 SET_ROWS         CPU
+        24 FLASH_ATTN       CPU
+         8 MUL              CPU
+         8 MUL_MAT_ID       CPU
+         8 TANH             CPU
+         4 SIGMOID          CPU
+         1 GET_ROWS         CPU
+
+CPU split classes (an explorer parsed all 282 splits and read the declining clause for each):
+  88  SCALE only                      SCALE declines a strided source (the gate/up view halves)      Task 8f
+  24  SET_ROWS only (K and V)         KV of cache slots 24..47 planned on the host                   Task 8e
+  24  FLASH_ATTN_EXT only             the same                                                       Task 8e
+   4  MUL_MAT_ID + SiTU chain         BF16 experts of blk.20..23 have no device kernel               Task 8g
+   1  GET_ROWS only                   BF16 missing from the GET_ROWS type list (token_embd.weight)   Task 8h
+ 141  total; each is paired with a re-entry split on SYCL0
+
+First figures (llama-bench -p 512 -n 128 -r 1, 4 threads, no -ngl, one sample, orientation only):
+  RESULT ink pp512 avg=39.47 t/s stddev=0.00 samples=[39.47]
+  RESULT ink tg128 avg=4.36 t/s stddev=0.00 samples=[4.36]
+  CPU-only reference (earlier in the plan): prompt 17.1 t/s on 1208 tokens, decode 4.8 to 5.8 t/s.

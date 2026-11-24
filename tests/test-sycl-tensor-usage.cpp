@@ -84,6 +84,36 @@ int main() {
     ggml_tensor * t_ple_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
     ggml_set_name(t_ple_proj, "per_layer_model_proj.weight");
 
+    // An expert family's per-expert scale vectors ({n_expert} F32 beside an NVFP4 or FP8 expert matrix) are small
+    // dense tensors, not expert matrices: MOE_INTERMEDIATE, as the family's ".bias" already is. As an expert weight
+    // a 1-D scale was split into one entry, e0, that duplicated expert 0's (layer, expert, role) key, and the S1
+    // preload skipped it (ne[2] <= 1), so it never reached the card and every REPEAT that read it staged it from
+    // host memory. The view name is the one the REPEAT sees (build_lora_mm_id reshapes the scale).
+    struct named_usage {
+        const char * name;
+        tensor_usage expected;
+    };
+
+    static const named_usage expert_aux_cases[] = {
+        { "blk.0.ffn_gate_up_exps.scale",            tensor_usage::MOE_INTERMEDIATE  },
+        { "blk.0.ffn_down_exps.scale",               tensor_usage::MOE_INTERMEDIATE  },
+        { "blk.9.ffn_gate_up_exps.scale (reshaped)", tensor_usage::MOE_INTERMEDIATE  },
+        { "blk.0.ffn_gate_exps.input_scale",         tensor_usage::MOE_INTERMEDIATE  },
+        { "blk.0.ffn_down_exps.scales",              tensor_usage::MOE_INTERMEDIATE  },
+        { "blk.0.ffn_gate_chexps.scale",             tensor_usage::MOE_INTERMEDIATE  },
+        // Controls: the expert matrices themselves, and the family's bias, keep their classes.
+        { "blk.0.ffn_gate_up_exps.weight",           tensor_usage::MOE_EXPERT_WEIGHT },
+        { "blk.0.ffn_down_exps.weight",              tensor_usage::MOE_EXPERT_WEIGHT },
+        { "blk.0.ffn_gate_chexps.weight",            tensor_usage::MOE_EXPERT_WEIGHT },
+        { "blk.0.ffn_down_exps.bias",                tensor_usage::MOE_INTERMEDIATE  },
+    };
+    const size_t  n_expert_aux = sizeof(expert_aux_cases) / sizeof(expert_aux_cases[0]);
+    ggml_tensor * t_expert_aux[sizeof(expert_aux_cases) / sizeof(expert_aux_cases[0])];
+    for (size_t i = 0; i < n_expert_aux; ++i) {
+        t_expert_aux[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        ggml_set_name(t_expert_aux[i], expert_aux_cases[i].name);
+    }
+
     bool ok = true;
     ok = ok && check_usage(t_attn, tensor_usage::ATTENTION_WEIGHT, "attn");
     ok = ok && check_usage(t_ffn, tensor_usage::FFN_WEIGHT, "ffn");
@@ -93,6 +123,10 @@ int main() {
     ok = ok && check_usage(t_norm, tensor_usage::NORM, "norm");
     ok = ok && check_usage(t_unknown, tensor_usage::UNKNOWN, "unknown");
     ok = ok && check_usage(t_ple_proj, tensor_usage::NORM, "gemma_per_layer_model_proj");
+    for (size_t i = 0; i < n_expert_aux; ++i) {
+        // Not short-circuited: a red run names every case that is wrong, not only the first.
+        ok = check_usage(t_expert_aux[i], expert_aux_cases[i].expected, expert_aux_cases[i].name) && ok;
+    }
 
     // llama.cpp-kmeq: ggml_sycl_bf16_weight_dispatch_available() coverage.
     // This predicate gates whether ggml_backend_sycl_device_supports_op()

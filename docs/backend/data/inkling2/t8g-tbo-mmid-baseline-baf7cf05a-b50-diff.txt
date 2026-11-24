@@ -1,0 +1,36 @@
+# test-backend-ops -o MUL_MAT_ID, merged tree baf7cf05a, B50 (level_zero:1), 2026-11-22
+# Lines that differ from the B70 run (t8g-tbo-mmid-baseline-baf7cf05a-b70.txt); '<' is the B70, '>' is the B50.
+<   Device description: Intel(R) Arc(TM) Pro B70 Graphics
+<   Device memory: 32656 MB (29900 MB free)
+>   Device description: Intel(R) Arc(TM) Pro B50 Graphics
+>   Device memory: 16304 MB (14292 MB free)
+<   MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0): OK
+>   MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=1.789593)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=1,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=4.223479)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=1,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=2.943664)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=1,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=1.505022)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=1,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-4.232454)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=6.111829)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=2,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-2.185934)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=2,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-4.158292)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=2,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-2.383920)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=1.150283)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=4,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=1.851012)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=4,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-3.245910)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=4,n_used=4,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-10.839362)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=1,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=10.080517)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=1,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=4.839400)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=1,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-0.649805)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=1,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-4.805413)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=2,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-0.528048)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=2,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=5.357312)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=2,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-4.691476)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=2,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=7.890862)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=4,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=1.306610)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=4,b=0,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+< [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=2.939809)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=4,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+> [MUL_MAT_ID] NaN at index 0 (SYCL0=-nan CPU=-5.012691)   MUL_MAT_ID(type_a=mxfp4,type_b=f32,n_mats=8,n_used=4,b=1,m=512,n=129,k=256,m_v=0,ids_offset=0,skip=0): FAIL
+<   1227/1375 tests passed
+>   1226/1375 tests passed
+>   MUL_MAT_ID(type_a=q8_0,type_b=f32,n_mats=16,n_used=16,b=0,m=32,n=65536,k=256,m_v=0,ids_offset=0,skip=0)
+# B50 totals:   1226/1375 tests passed

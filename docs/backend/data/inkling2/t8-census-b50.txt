@@ -1,0 +1,16 @@
+Inkling 2 Mini (UD-Q8_K_XL), Arc Pro B50 alone (level_zero:1), Task 8b's build 6ee2a4058. 2026-11-22.
+
+GATE inkling FAIL rc=1 selector=level_zero:1 sha=e8b13c2b5
+stdout: 1, 2, 3, 4, 5,
+
+Refusal lines, by text with numbers kept (count line):
+      1 [MOE-DECODE-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight occurrence=7 expert=0 owner=0 reason=capability_unsupported type=nvfp4 layout=aos kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate queue_ready=1
+      1 [MOE-DECODE-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight route=direct step=precondition failed=all_primary occurrence=0 expert=23 residency=host owner=-1 layout=aos operands=8
+      1 [MOE-PROMPT-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight occurrence=87 expert=2 owner=0 reason=capability_unsupported type=nvfp4 layout=aos kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate queue_ready=1
+      1 [MOE-PROMPT-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight route=direct step=precondition failed=all_primary occurrence=0 expert=23 residency=host owner=-1 layout=aos operands=112
+      1 [SYCL] recoverable runtime fallback failed: MUL_MAT_ID retained hybrid executor refused route
+
+Load: [HOSTMEM] phase=load-end | process: rss_anon=0.60 rss_file=0.26 rss_shmem=0.00 GB | pinned pool (not in RssAnon): 46.00 GB zones(used/cap GB): dev0{pool=46.00 GB chunks=23 WEIGHT=31.53/32.36 KV=0.00/0.06 STAGING=0.00/2.55 SCRATCH=0.00/6.15} | ledger: sycl_host_buffers=21.29 host_expert_copy_cumulative=10.25 host_dense_copy_cumul
+
+Cause: about 10 GB of experts are host-pinned on the 16 GB card; the direct route admits a node only when every
+selected expert is on the card. Task 8c.

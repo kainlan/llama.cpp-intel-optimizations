@@ -343,6 +343,22 @@
       "reason": "ggml_sycl_host_tenants_erase is noexcept and runs from ~ggml_backend_sycl_context, from the clear of an ended execution context's bindings and from the publish's install guard: its try body takes the slot table the caller's id keyed out of the registry and drops it, which releases carves through their owners' destructors, and nothing in it raises a planned refusal; a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. The handler says the failed drop at ERROR (the carves then stay pinned until the process ends). Permanent; llama.cpp-moua L4 step 3c."
     },
     {
+      "id": "E-MOE-RESIDENT-DECODE-RETENTION-DRAIN",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_moe_resident_decode_retention::~ggml_sycl_moe_resident_decode_retention",
+      "count": 1,
+      "reason": "The NVFP4 resident decode route's retention drains its stream from its destructor on any exit that did not publish the handles a submitted kernel reads, so no slice or lease is released under that kernel; that exit is often the unwinding of the route's own ggml_sycl_fallback_error refusal. The try body is one queue::wait_and_throw: the backend's async handler records a device failure and throws nothing (async-failure.hpp), so the handler can only meet the runtime's own synchronous error, never a planned refusal, and a rethrow out of a destructor would std::terminate. A drain that threw has not shown the work done, so the handler keeps the handles instead of releasing them: keep_handles_after_failed_wait, which cannot throw, parks them in the store's unwaitable list as the drain worker parks a record whose wait failed (or leaks them when they cannot be parked), and the handler says so at ERROR. Permanent."
+    },
+    {
+      "id": "E-MEM-HANDLE-KEEP-AFTER-FAILED-WAIT",
+      "code": "G-CATCH",
+      "file": "mem-handle.cpp",
+      "function": "keep_handles_after_failed_wait",
+      "count": 1,
+      "reason": "keep_handles_after_failed_wait is noexcept: it keeps the handles of work a wait that threw could not show done, for a caller that must not throw (the NVFP4 resident decode retention's destructor). Its try body is one retained_park_unwaitable, a store operation of this file that takes the owner ids, the store's lock and room in both store vectors before it moves any handle, so it has no planned-refusal path and throws no ggml_sycl_fallback_error, and whatever it throws (std::bad_alloc, the lock's std::system_error, a reserve's std::length_error) leaves the handles whole; a rethrow would reach noexcept and std::terminate. The handler catches every such throw and the handles are then leaked through a nothrow-allocated vector, never released, which the function says at ERROR; only when that allocation fails too does it return false with the handles whole, and its caller reports at ERROR that they are released. Permanent."
+    },
+    {
       "id": "E-L4-TENANT-CLAIM-DROP",
       "code": "G-CATCH",
       "file": "tenant-claim-scope.hpp",
@@ -429,6 +445,84 @@
       "function": "unified_cache::loan_expert_triplet",
       "count": 1,
       "reason": "The expert loan's exact-owner check (llama.cpp-mwmr, tracker ruling c-sepd): a resident expert's AOS device entry is lent only when its direct_alloc_owner is held by the entry alone, under direct_stage_mutex_ and rw_mutex_. A count other than 1 means a copy, a recording or a view still retains the storage, so the loan refuses the whole triplet with \"storage still referenced\" before anything is copied or published. The count decides a refusal, never a free: the lent entry is retired, and its storage is released by the deferred-free pass only when its last handle drops, as for any retired entry. This is the residual refusal of the design's replace_within classification (a non-zero residual is SHARED, old unconsumed), applied to a loan."
+    },
+    {
+      "id": "E-KJOC-ASYNC-HANDLER",
+      "code": "G-CATCH",
+      "file": "common.cpp",
+      "function": "lambda in ggml_sycl_async_handler",
+      "count": 2,
+      "reason": "The lambda ggml_sycl_async_handler returns is the SYCL asynchronous-error handler of every backend queue and context, and it is noexcept: the runtime calls it from whichever wait_and_throw delivers, including ones in noexcept code, so a rethrow of any type would std::terminate. Its try body is one std::rethrow_exception of an error the runtime delivered, and both handlers record it in the per-device failure latch, which the graph boundaries read and turn into a failed graph. Nothing is swallowed: an error of any type, a planned refusal thrown inside a host task included, fails the next boundary. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-DRAIN-RETRY-WAIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_execution_recover_and_release_graph",
+      "count": 2,
+      "reason": "ggml_sycl_execution_recover_and_release_graph is noexcept and its try body is one wait_and_throw on the context's stream, which raises no planned refusal: an asynchronous error goes to the queue's recording handler, and what the wait itself throws is a SYCL runtime error. Both handlers record the failed wait in the failure latch and return false, which sends the caller to its abort path with the workspace slot still quarantined; a rethrow would std::terminate through the noexcept boundary. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-BEGIN-DRAIN-WAIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_execution_drain_own_terminal",
+      "count": 2,
+      "reason": "ggml_sycl_execution_drain_own_terminal is noexcept and its one try wraps the wait on the deferred decode event or the context's stream, which raises no planned refusal. Both handlers record the failed wait in the failure latch and fall through to the quarantine path, which retains every root and backing lease instead of releasing on an unproven terminal; a rethrow would std::terminate through the noexcept boundary. The catch-all was shrink-only debt until the std::exception handler joined it; the pair is exempt together because both sit on the same try. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-CONTEXT-DRAIN-WAIT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "lambda in ggml_sycl_execution_drain_context_terminal_events",
+      "count": 2,
+      "reason": "The lambda runs once for each backend bound to an ending execution context. Its one try wraps the wait on the deferred decode event or the backend's stream, which raises no planned refusal. Both handlers record the failed wait in the failure latch and fall through to the quarantine path, which retains every root and backing lease instead of releasing on an unproven terminal; a rethrow would leave the remaining bound backends undrained. The catch-all was shrink-only debt until the std::exception handler joined it; the pair is exempt together because both sit on the same try. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-SYNC-DRAIN-WAIT-EXC",
+      "code": "G-CATCH",
+      "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:exception#0",
+      "count": 1,
+      "reason": "The first unguarded std::exception handler of ggml_backend_sycl_synchronize, which by source order is the one on the drain's try. That try's body is one wait_and_throw on the deferred decode event or on stream 0, which raises no planned refusal. The handler keeps the wait's error in drain_error, and the code after the try records it in the failure latch, so the boundary reports a failed graph and cleans up. A rethrow would skip the CPU-job gate clear that follows the try. Keyed to the handler and not to the function, because the function's other three unguarded handlers (the diagnostic memory read and the outer boundary pair) stay shrink-only debt. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-KJOC-SYNC-DRAIN-WAIT-ALL",
+      "code": "G-CATCH",
+      "key": "ggml-sycl.cpp::ggml_backend_sycl_synchronize::catch_clause:all#0",
+      "count": 1,
+      "reason": "The first unguarded catch-all of ggml_backend_sycl_synchronize, which by source order is the one on the drain's try. That try's body is one wait_and_throw on the deferred decode event or on stream 0, which raises no planned refusal. The handler keeps the wait's error in drain_error, and the code after the try records it in the failure latch, so the boundary reports a failed graph and cleans up. A rethrow would skip the CPU-job gate clear that follows the try. Keyed to the handler and not to the function, because the function's other three unguarded handlers (the diagnostic memory read and the outer boundary pair) stay shrink-only debt. Permanent; llama.cpp-kjoc."
+    },
+    {
+      "id": "E-MMID-BIND-RETIRE-CATCH",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_bind_materialize_live_mmid_workspaces",
+      "count": 1,
+      "reason": "The context bind's MMID deferral resolution runs after the bind's runtime transaction has published and returned OK, so its result is not the bind's. Its try body selects the live plan snapshot under the inventory mutex, materializes the planned MMID pools through the unified cache, asks the MMID registry whether a context follows a snapshot, and reconciles the published context with the live snapshot; none of that is an op execution path, and ggml_sycl_fallback_error is raised only by op execution (compute forward, get_rows, out_prod) when a kernel cannot run, so no planned refusal can reach the handler. The handler retires a context this attempt PUBLISHED and reports the deferral as refused, which leaves it pending; a rethrow ahead of it would skip that retirement and leave a context for a snapshot nothing made it follow. Permanent."
+    },
+    {
+      "id": "E-MMID-RECONCILE-FOLLOWS-CATCH",
+      "code": "G-CATCH",
+      "file": "moe-mmid-workspace.cpp",
+      "function": "lambda in moe_mmid_reconcile_live_plan",
+      "count": 1,
+      "reason": "moe_mmid_reconcile_live_plan is noexcept and the lambda's try wraps only the caller's follows callable, which the backend answers with a read-only exact-queue lookup in the MMID registry for each workspace owner: no allocation, no op execution, so no ggml_sycl_fallback_error. The handler answers 'does not follow', which the reconcile reports as a refusal that retires the bind's own publication. A rethrow would std::terminate through the noexcept boundary, and the registry translation unit is host-linkable without the backend's common header that defines the fallback error. Permanent."
+    },
+    {
+      "code": "G-CATCH",
+      "count": 1,
+      "file": "moe-mmid-workspace.cpp",
+      "function": "moe_mmid_materialize_refusal_reported",
+      "id": "E-MMID-REFUSAL-FOLLOWS-CATCH",
+      "reason": "moe_mmid_materialize_refusal_reported is noexcept and its try wraps only the caller's follows callable, which the backend answers with a read-only exact-queue lookup in the MMID registry for each workspace owner: no allocation, no op execution, so no ggml_sycl_fallback_error. The handler answers 'reported', so the context bind's tripwire still fires. A rethrow would std::terminate through the noexcept boundary, and the registry translation unit is host-linkable without the backend's common header that defines the fallback error. Permanent."
+    },
+    {
+      "id": "H-MOE-RESIDENT-DECODE-Q8",
+      "code": "H-CASCADE",
+      "key": "ggml-sycl.cpp::ggml_sycl_mul_mat_id_nvfp4_resident_decode::declaration:req:0a08dde2::write:cascade_step#0",
+      "count": 1,
+      "outcome": "CASCADE",
+      "reason": "The NVFP4 resident decode route's Q8_1 input slice in the SCRATCH zone, spill forbidden. A refusal has a declared next path in the caller: the route declines the node by name (reason=scratch) and the admitted MUL_MAT_ID route runs it from its own workspace, so the miss is a counted cascade miss, not a plan fault."
     }
   ]
 }

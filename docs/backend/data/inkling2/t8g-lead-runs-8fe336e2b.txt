@@ -1,0 +1,122 @@
+Task 8g, lead runs on 8fe336e2b (before the quality-review fixes), 2026-11-22/23. Driver: libze_intel_gpu.so.1.18.40734.
+Every run is one load, under GPU.lock, selector pinned. Throughput under the permanent host load: orientation, not a baseline.
+
+== Device and kernel tests (card named by each log)
+      2 The following tests passed:
+      2 100% tests passed, 0 tests failed out of 1
+      2   card the test ran on: B50 (wanted B50)
+  CONTROL unplanned-device-tensor supports_op=0 -> ok
+  CONTROL strided-expert-view supports_op=0 -> ok
+  CASE model=off32 tensor=blk.0.ffn_up_exps.weight k=99 m=50 experts=16 used=4 ne11=1 tokens=33 supports_op=1 status=0 max_row_nmse=5.024e-15 route_lines=1 want_vec4=0 form_lines=1 refusals=0 -> PASS
+  CASE model=off32 tensor=blk.0.ffn_up_exps.weight k=99 m=50 experts=16 used=4 ne11=1 tokens=1 supports_op=1 status=0 max_row_nmse=1.580e-15 route_lines=1 want_vec4=0 form_lines=1 refusals=0 -> PASS
+  CASE model=off32 tensor=blk.0.ffn_gate_exps.weight k=100 m=50 experts=16 used=4 ne11=1 tokens=33 supports_op=1 status=0 max_row_nmse=6.554e-15 route_lines=1 want_vec4=1 form_lines=1 refusals=0 -> PASS
+  CASE model=off32 tensor=blk.0.ffn_gate_exps.weight k=100 m=50 experts=16 used=4 ne11=1 tokens=1 supports_op=1 status=0 max_row_nmse=3.922e-15 route_lines=1 want_vec4=1 form_lines=1 refusals=0 -> PASS
+  CASE model=inkling tensor=blk.0.ffn_gate_up_exps.weight k=2304 m=2304 experts=8 used=8 ne11=1 tokens=33 supports_op=1 status=0 max_row_nmse=1.437e-14 route_lines=1 want_vec4=1 form_lines=1 refusals=0 
+  CASE model=inkling tensor=blk.0.ffn_gate_up_exps.weight k=2304 m=2304 experts=8 used=8 ne11=1 tokens=1 supports_op=1 status=0 max_row_nmse=1.298e-14 route_lines=1 want_vec4=1 form_lines=1 refusals=0 -
+  CASE model=inkling tensor=blk.0.ffn_down_exps.weight k=1152 m=2304 experts=8 used=8 ne11=8 tokens=33 supports_op=1 status=0 max_row_nmse=1.041e-14 route_lines=1 want_vec4=1 form_lines=1 refusals=0 -> 
+  CASE model=inkling tensor=blk.0.ffn_down_exps.weight k=1152 m=2304 experts=8 used=8 ne11=8 tokens=1 supports_op=1 status=0 max_row_nmse=9.719e-15 route_lines=1 want_vec4=1 form_lines=1 refusals=0 -> P
+      1   tests selected: 1  PASS lines: 1  context-bind: 0  abort lines: 0
+      1   tests selected: 0  PASS lines: 56  context-bind: 0  abort lines: 0
+      1   tests selected: 0  PASS lines: 1  context-bind: 0  abort lines: 0
+      1   card the test ran on: B70 (wanted B70)
+
+== Gate chain console (gates, plan lines, test-backend-ops, first ABBA)
+=== 1 inkling gate b70
+GATE inkling PASS rc=0 selector=level_zero:0 sha=86b40679c   (sha= is the gate script's tree; the binaries are the task tree's build/, 8fe336e2b)
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+1.02.864.930 I common_perf_print: prompt eval time =     905.93 ms /    14 tokens (   64.71 ms per token,    15.45 tokens per second)
+1.02.864.930 I common_perf_print:        eval time =    3565.40 ms /    14 runs   (  254.67 ms per token,     3.93 tokens per second)
+--- step rc=0
+=== 2 inkling diag b70
+  rc=0  err lines: 334617  SPLIT headers: 40
+  out: 1, 2, 3, 4, 5, 6||
+0.50.546.792 I common_perf_print: prompt eval time =     884.63 ms /    14 tokens (   63.19 ms per token,    15.83 tokens per second)
+0.50.546.792 I common_perf_print:        eval time =     403.42 ms /     1 runs   (  403.42 ms per token,     2.48 tokens per second)
+--- step rc=0
+=== 3 planlines
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kept 179 plan lines of 3360
+  kept 198 plan lines of 4285
+--- step rc=0
+=== 4 inkling gate both
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=86b40679c   (sha= is the gate script's tree; the binaries are the task tree's build/, 8fe336e2b)
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+0.52.590.387 I common_perf_print: prompt eval time =     842.72 ms /    14 tokens (   60.19 ms per token,    16.61 tokens per second)
+0.52.590.388 I common_perf_print:        eval time =    3166.22 ms /    14 runs   (  226.16 ms per token,     4.42 tokens per second)
+--- step rc=0
+=== 5 binbcast trace b70
+  rc=0  err lines: 51197  SPLIT headers: 0
+  out: 1, 2, 3, 4, 5, 6, ||
+0.49.768.519 I common_perf_print: prompt eval time =     870.84 ms /    14 tokens (   62.20 ms per token,    16.08 tokens per second)
+0.49.768.520 I common_perf_print:        eval time =     907.91 ms /     3 runs   (  302.64 ms per token,     3.30 tokens per second)
+--- step rc=0
+=== 6 tbo MUL_MAT_ID
+  rc=1  out lines: 1890  op lines: 1864  OK: 1258  FAIL: 150  not supported: 322
+  1258/1406 tests passed
+  Backend SYCL0: FAIL
+1/2 backends passed
+  rc=1  out lines: 1891  op lines: 1865  OK: 1257  FAIL: 151  not supported: 322
+  1257/1406 tests passed
+  Backend SYCL0: FAIL
+1/2 backends passed
+--- step rc=1
+=== 7 inkling ABBA b70
+== arm a  2026-11-22T23:54:05-05:00  shmem=11GB  load=11.59
+  arm env: none  builders: ninja=0 icpx=0
+  RESULT a pp512 avg=42.97 t/s stddev=0.00 samples=[42.97]
+  RESULT a tg128 avg=4.04 t/s stddev=0.00 samples=[4.04]
+== arm g  2026-11-22T23:55:57-05:00  shmem=11GB  load=11.24
+  arm env: none  builders: ninja=0 icpx=0
+  RESULT g pp512 avg=40.86 t/s stddev=0.00 samples=[40.86]
+  RESULT g tg128 avg=2.00 t/s stddev=0.00 samples=[2.00]
+== arm g2  2026-11-22T23:58:24-05:00  shmem=11GB  load=30.79
+  arm env: none  builders: ninja=1 icpx=24
+  RESULT g2 pp512 avg=47.27 t/s stddev=0.00 samples=[47.27]
+  RESULT g2 tg128 avg=2.73 t/s stddev=0.00 samples=[2.73]
+== arm a2  2026-11-23T00:00:37-05:00  shmem=11GB  load=32.15
+  arm env: none  builders: ninja=1 icpx=3
+  RESULT a2 pp512 avg=39.86 t/s stddev=0.00 samples=[39.86]
+  RESULT a2 tg128 avg=3.82 t/s stddev=0.00 samples=[3.82]
+--- step rc=0
+=== 8G GATES END 2026-11-23T00:02:32-05:00
+
+== test-backend-ops -o MUL_MAT_ID, per case, against integ-tbo-mmid-baf7cf05a (both cards identical)
+     31 bf16 cases: not supported -> OK. No other case changed.
+
+== Split census (GGML_SCHED_DEBUG=2, B70)
+g: graphs printed 40; largest graph: 1 splits, 0 CPU splits, 0 nodes in CPU splits
+    ops in CPU splits: 
+
+== The slow tg128 of the first ABBA (g 2.00, g2 2.73 against a 4.04, a2 3.82), and what it was
+Controls, same binary, one load each, B70:
+  text, 128 tokens, kernel profiler on:        eval time =   29511.10 ms /   127 runs   (  232.37 ms per token,     4.30 tokens per second)
+  bench -p 0 -n 128, profiler on:               RESULT g tg128 avg=3.87 t/s stddev=0.00 samples=[3.87]
+  691-token prompt then 48 tokens:             prompt eval time =   15951.15 ms /   691 tokens (   23.08 ms per token,    43.32 tokens per second)
+  691-token prompt then 48 tokens:             eval time =   10549.33 ms /    47 runs   (  224.45 ms per token,     4.46 tokens per second)
+  == arm n  2026-11-23T00:14:54-05:00  shmem=11GB  load=15.22
+    arm env: GGML_SYCL_DISABLE_GRAPH=1  builders: ninja=1 icpx=2
+    RESULT n pp512 avg=44.47 t/s stddev=0.00 samples=[44.47]
+    RESULT n tg128 avg=3.86 t/s stddev=0.00 samples=[3.86]
+  == arm g  2026-11-23T00:16:47-05:00  shmem=11GB  load=14.38
+    arm env: none  builders: ninja=1 icpx=2
+    RESULT g pp512 avg=47.45 t/s stddev=0.00 samples=[47.45]
+    RESULT g tg128 avg=4.66 t/s stddev=0.00 samples=[4.66]
+Reading: the same command that read 2.00 and 2.73 t/s reads 4.66 t/s on a minute with one foreign ninja and two
+compilers alive; with GGML_SYCL_DISABLE_GRAPH=1 it reads 3.86. The slow arms sat in a window where implementer
+builds started inside the pair (arm g2 began with 24 compilers alive; the runner sampled builders only at the
+start of an arm, and has been changed to sample at both ends). The slow readings are not attributed to the tree.
+Not established: the size of the replay gain (one pair, 4.66 against 3.86), and a clean ABBA against the
+integration tree. Both are owed on the fix commit.
+
+== Device-time profile, decode, 128 tokens of text (per decoded token; kernel profiler on)
+  submissions per token 5876, device-timed 20.73 ms per token; the BF16 expert kernel has no profiler row yet
+  mulmat.mmvq.id_aos_nvfp4                     88.7 per token   14.069 ms
+  sycl.binbcast.mul                           762.0 per token    1.142 ms
+  sycl.binbcast.add                           663.9 per token    0.961 ms
+  sycl.binbcast.event                        1836.4 per token    0.935 ms
+  mulmat.onednn_gemm.unbatched                214.3 per token    0.611 ms
+  fattn.decode.esimd_partitioned               48.0 per token    0.566 ms
+  sycl.memcpy.mem_ops                         337.0 per token    0.407 ms
+  norm.rms_norm                               356.9 per token    0.391 ms
+  sycl.set_rows.generic                        88.9 per token    0.311 ms
+  sycl.binbcast.repeat                        158.4 per token    0.275 ms

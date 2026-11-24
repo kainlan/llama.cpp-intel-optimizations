@@ -109,7 +109,15 @@ body is exactly `throw;`. The same pattern runs over the `catch_clause` nodes an
 is keyed `(file, #define NAME)`; its guard must come earlier in the body with no `try` between). The unguarded handlers
 today are the shrink-only debt, keyed `file::function::catch_clause:<all|exception>#ordinal`, so a new handler in a listed
 function takes the next ordinal and fails. Exemptions are allowlist entries `code: "G-CATCH"` by `file` + `function`
-with a `count` and a reason (`file` + `function: "#define NAME"` for a macro).
+with a `count` and a reason (`file` + `function: "#define NAME"` for a macro). When the function's other unguarded
+handlers stay debt, an exemption may instead be keyed to one handler with `key`, spelled as its debt key
+(`file::function::catch_clause:<all|exception>#ordinal`); such an entry pins `count: 1`. The ordinal counts unguarded
+handlers of that kind in source order, so an unguarded handler added before it in the same function shifts the
+ordinals: the keyed entry then names a different handler, and the gate fails on the shifted handler as a new finding.
+The six `E-KJOC-*` entries (the async handler's lambda, the drain-retry wait, the begin-path and context drains, and
+synchronize's drain pair, keyed) share one shape: a try whose body is one SYCL wait or the async handler's
+`std::rethrow_exception`, with handlers that record the error in the failure latch, so the next graph boundary fails
+instead of the error being swallowed.
 
 Clause (h), `H-*`: `cascade_step` and `unconverted_ticket` have no writer today, so every write is a finding. Each is
 exempted by an allowlist entry keyed by the construction or call node (the declaration of the object whose field is written,

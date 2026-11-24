@@ -392,3 +392,28 @@ comparisons; `--reasoning-format none` is not a substitute for pinning. GPT-OSS
 was trained for OpenAI's Harmony format — wrong formatting causes cascading
 generation failures, and `llama-bench` proves throughput only, never chat
 correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
+
+## 10. A pinned-context arm is a control, never the gate
+
+Added 2026-11-21. The canonical GPT-OSS gate in `scripts/sycl-canonical-gates.sh` carried `-c 4096` from
+`9cf92860b` until `252d8a687`, and the upstream `19bc41dbb` sync (`3b3962534`) passed it with a defect that loses
+the B50. That sync brought a 3-way `ggml_build_forward_select` on the input embedding and a scheduler that does
+not upload the inputs of an unselected branch; the SYCL backend still ran unselected nodes, until
+`ggml_sycl_is_noop` learned to skip a node without `GGML_TENSOR_FLAG_COMPUTE`. At `-c 4096` every KV layer fits
+on the device, the plan has no CPU work, and the token-embedding `GET_ROWS` of the unselected branch read a zeroed
+`SYCL_Host` input in place, an in-range read: no fault, and the selected branch gave the right answer. At the
+default context the KV goes partly to the host tier, the input becomes a device copy nobody wrote, and the gather
+reads activations as row ids: a GPU page fault and a lost device. The gate runs at the context a user gets. A
+pinned `-c` arm is the all-VRAM control for an A/B, and a pass there says nothing about the default context.
+
+## 11. A flat peak `Shmem` after a large host-tiered load is the instrument, not the load
+
+Added 2026-11-23. A sweep arm that pins host experts on a discrete card (SYCL host USM) printed a peak
+`Shmem` equal to the idle figure of its day (6 to 12 GiB), for about 45 arms, while the same runs pinned
+47 GiB and `MemAvailable` fell by 60 GiB. The driver owns those pages and `/proc/meminfo` counts them in no
+field, so `Shmem` cannot move. Do not read "peak `Shmem` flat" as "the load held no host memory".
+
+Read GPU host backing instead: `source scripts/sycl-host-backing.sh; sycl_gpu_host_backing_gib` (`Shmem` plus
+the meminfo remainder). It reads 12.7 GiB idle and 65.4 GiB in the Qwen3.8 default-mode load that left `Shmem`
+flat. A positive control is a load known to pin host memory: if the sum does not rise for it, the instrument is
+wrong. Measurements and thresholds: `docs/backend/sycl-host-safety.md`, section 10.

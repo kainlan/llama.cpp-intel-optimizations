@@ -1,0 +1,83 @@
+Inkling 2 Mini UD-Q8_K_XL, Arc B70 (level_zero:0), integration tree fe79b7062 (code of 70292d66e), 2026-11-22.
+GGML_SYCL_KERNEL_PROFILE=1, one model load per run, llama-completion -c 8192 --temp 0. Host load ~6, no builders.
+Device time is from sycl::event command_start/command_end. Coverage is not complete: the dense BF16 MUL_MAT kernels
+(495 dispatch entries per decoded token) have no device-time row, and the four BF16 expert layers run on the CPU.
+So every "device-timed total" below is a lower bound on GPU time.
+
+RUN 1: decode. Prompt '1, 2, 3, 4, 5,' (14 tokens), -n 24: 24 graph passes (1 prompt pass, 23 decode passes).
+  prompt eval 900.89 ms / 14 tokens; eval 5872.10 ms / 23 runs = 255.31 ms per token (3.92 t/s with the profiler on).
+RUN 2: prompt. 691-token prose prompt (micro-batches of 512 and 179), -n 1.
+  prompt eval 17178.35 ms / 691 tokens = 24.86 ms per token (40.23 t/s). GGML_SYCL_E2E_TG_PROFILE=1 was also set.
+
+RUN 1 (decode): device-timed total 710 ms over 143612 events
+  kernel family                                    events  device ms   mean us  per pass
+  nvfp4 expert ncols=2304 pairs=8                    1056      187.0     177.1      44.0
+  nvfp4 expert ncols=1152 pairs=8                    1056      117.9     111.7      44.0
+  (prompt pass) nvfp4 expert ncols=2304 pairs=112       44      105.6    2401.1       1.8
+  (prompt pass) nvfp4 expert ncols=1152 pairs=112       44       66.2    1505.5       1.8
+  sycl.binbcast.mul                                 19504       53.6       2.7     812.7
+  sycl.binbcast.add                                 18124       26.6       1.5     755.2
+  (prompt pass) fattn.compute.xmx_v2                   48       25.0     520.0       2.0
+  sycl.binbcast.event                               48632       24.8       0.5    2026.3
+  mulmat.onednn_gemm.unbatched (all m)               9152       24.2       2.6     381.3
+  fattn.decode.esimd_partitioned                     1152       13.5      11.7      48.0
+  sycl.memcpy.mem_ops                                9688       12.6       1.3     403.7
+  norm.*                                             9748       12.0       1.2     406.2
+  sycl.memcpy.graph_safe                             7416        8.7       1.2     309.0
+  sycl.set_rows.generic                              2356        8.2       3.5      98.2
+  sycl.binbcast.repeat                               4210        7.5       1.8     175.4
+  sycl.binbcast.sub                                  3050        5.2       1.7     127.1
+  sycl.binbcast.div                                  3744        5.2       1.4     156.0
+  sycl.softmax.forward                               2010        4.5       2.2      83.8
+  sycl.get_rows.marker                               2384        1.2       0.5      99.3
+  sycl.binbcast.mul_add_fused                         192        0.2       1.1       8.0
+  sycl.memcpy.mem_fill                                  2        0.0       4.3       0.1
+  decode-shaped rows only: 513 ms and 143476 events over 24 passes = 21.4 ms and 5978 events per pass,
+  against 255.3 ms wall per decoded token: 8% of a token is device-timed kernel work.
+
+RUN 2 (prompt): device-timed total 9609 ms over 217053 events
+  kernel family                                    events  device ms   mean us  per token
+  nvfp4 expert ncols=2304 pairs=4096                   44     3902.0   88682.9       0.1
+  nvfp4 expert ncols=1152 pairs=4096                   44     2467.5   56079.0       0.1
+  nvfp4 expert ncols=2304 pairs=1432                   44     1352.0   30726.4       0.1
+  nvfp4 expert ncols=1152 pairs=1432                   44      853.0   19386.1       0.1
+  mulmat.onednn_gemm.unbatched (all m)             199440      445.3       2.2     288.2
+  fattn.compute.xmx_v2                                 96      432.4    4503.7       0.1
+  sycl.binbcast.mul                                  2448       62.7      25.6       3.5
+  sycl.binbcast.add                                  2328       31.8      13.6       3.4
+  sycl.binbcast.sub                                   432       14.1      32.7       0.6
+  norm.*                                             1542       11.3       7.3       2.2
+  nvfp4 expert ncols=2304 pairs=8                      44        7.8     176.6       0.1
+  sycl.memcpy.mem_ops                                1149        7.0       6.1       1.7
+  nvfp4 expert ncols=1152 pairs=8                      44        4.9     111.5       0.1
+  sycl.binbcast.repeat                                624        4.7       7.6       0.9
+  sycl.set_rows.generic                               288        4.2      14.7       0.4
+  sycl.binbcast.event                                6408        3.3       0.5       9.3
+  sycl.memcpy.graph_safe                              659        2.0       3.0       1.0
+  sycl.softmax.forward                                360        1.4       3.8       0.5
+  sycl.binbcast.div                                   576        0.9       1.6       0.8
+  fattn.decode.esimd_partitioned                       48        0.5      10.5       0.1
+  sycl.get_rows.marker                                293        0.2       0.5       0.4
+  sycl.binbcast.mul_add_fused                          96        0.1       1.1       0.1
+  sycl.memcpy.mem_fill                                  2        0.0       4.5       0.0
+
+RUN 2 host-time stage totals (GGML_SYCL_E2E_TG_PROFILE, 18 blocks, wall 16933 ms, host 15031 ms):
+  moe              calls=    264  host=9718.5 ms  (36.8 ms per call; its device time above is 8587 ms)
+  non_moe_matmul   calls=   2930  host=4482.0 ms  (1.53 ms per call)
+  other            calls=  13407  host= 526.6 ms
+  elementwise      calls=   5749  host= 165.7 ms
+  attention        calls=    432  host= 130.5 ms
+  kv               calls=    288  host=   7.1 ms
+
+Readings.
+- Decode is not GPU-bound. About 21 ms of each 255 ms token is device-timed kernel work (12.7 ms of it the 88 NVFP4
+  expert mat-vecs: 44 at 177 us and 44 at 112 us). A decoded token is ~6000 device submissions; 2026 of them are
+  sycl.binbcast.event marker submissions (one per bin-broadcast op in the default event mode), 2034 are the
+  bin-broadcast kernels themselves, 713 are memcpys, 381 are oneDNN GEMMs of the graph's small mixing matmuls.
+- The prompt has two hotspots. (1) The NVFP4 expert kernel: 8587 ms of 17178 ms. One call with 4096 (token, expert)
+  pairs takes 88.7 ms (2304 columns) or 56.1 ms (1152 columns): 21.7 us per pair, the same per-pair cost as decode
+  (177 us / 8 = 22.1 us). The prompt path is the decode mat-vec applied per pair; tokens that select the same expert
+  do not share the read of its weights. (2) Small 3-D matmuls run as one oneDNN GEMM per token: 199440 GEMM
+  submissions (288 per token; src/models/inkling2.cpp graph::mix and the relative-bias table), 445 ms of device
+  time, 4482 ms of host time in the non_moe_matmul stage.
+- Flash attention is 432 ms of the prompt (2.5%).

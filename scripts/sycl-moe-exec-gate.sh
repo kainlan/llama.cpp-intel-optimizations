@@ -114,19 +114,25 @@
 #
 # Preflights refuse (rc 2): no <sha> or a head that differs from it; GGML_SYCL not ON; a binary missing, older than
 # the head commit, or not linked to the SYCL runtime; a model file missing; a failed grep control; builders
-# (ninja + icpx) that do not clear within 15 minutes; Shmem >= 30 GB or MemAvailable <= 150 GB; GPU.lock already held;
+# (ninja + icpx) that do not clear within 15 minutes; GPU host backing (Shmem + the meminfo remainder) >= 30 GiB;
+# GPU.lock already held;
 # a GGML_SYCL_* or LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a
 # non-empty --out-dir unless --arm names the arms to redo or --clobber is given (a reused directory would score one
-# run's files as another's). Before each arm the host must settle (Shmem < 30 GB and MemAvailable > 150 GB, up to
+# run's files as another's). Before each arm the host must settle (GPU host backing < 30 GiB, up to
 # 10 minutes) and
 # the builders must reach 0 (the gate waits for them like settle, up to 15 minutes, 10 s polls); only an expired wait
-# stops the gate. Shmem, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
+# stops the gate. Shmem, host backing, MemAvailable, load and builders are sampled before each arm and 5 s after it, and builders
 # every 5 s during it; every verdict line carries builders_pre= and builders_post= (the highest count seen during or
 # after the arm). A PASS with builders_post > 0 becomes NOT_SCORED(tainted=builders,was=PASS), exit class 3: a build
 # running next to the arm depresses throughput and flips CPU-path timing. A FAIL stays a FAIL and carries the flag.
 # Once the lock is held, every stop (a refusal such as an expired wait, or a signal) prints STOPPED: <reason>, the
 # summary over the verdicts scored so far, and the final line; exit 2 for a refusal, 143 for a signal.
-# GPU.lock is `mkdir $LOCK_DIR` with a `holder` file inside, released with `rm -f holder && rmdir`.
+# GPU.lock is taken, checked and released through scripts/sycl-lock.sh (mkdir(2) through python3, a `holder` line
+# unique to this run): the system mkdir command checks, then creates, and exits 0 when the directory appears in
+# between, so two takers that arrive together can both win. A holder that is no longer ours stops the run before each
+# arm, before each device arm's launch and after the last arm. The gate does not wait for the lock: a failed take is a
+# refusal that names why (held, a co-taker's holder, a directory created without a holder that must be removed by
+# hand, a directory it cannot create, or a helper that cannot run).
 #
 # Exit codes: 0 every requested verdict PASS; 1 at least one FAIL; 2 refused or usage; 3 none failed but at least
 # one arm was NOT_EXERCISED or NOT_SCORED, or a ring-scoring arm ran and no arm engaged the ring (the summary line
@@ -139,7 +145,8 @@
 # is released; --help and --dry-run keep the plain form.
 #
 # The lead form: the script runs from a snapshot copy, against a build whose source tree is the merge tree:
-#   cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-moe-exec-prompts scripts/qwen4exp-mtp-prompts <snap>/scripts/
+#   cp -a scripts/sycl-moe-exec-gate.sh scripts/sycl-lock.sh scripts/sycl-host-backing.sh scripts/sycl-moe-exec-prompts \
+#       scripts/qwen4exp-mtp-prompts <snap>/scripts/
 #   bash <snap>/scripts/sycl-moe-exec-gate.sh --build-dir <merge-tree>/build --out-dir <fresh dir> <sha>
 # The prompts resolve next to the script (the snapshot); the head check, the binary-newer-than-head check and the
 # prompt source docs come from --src-dir, which defaults to the parent of --build-dir. --no-head-check stays as an
@@ -176,6 +183,9 @@
 #   --check-controls                    run only the grep controls
 #   --build-dir DIR  --src-dir DIR (source tree of the build; default: the parent of --build-dir)
 #   --out-dir DIR  --clobber (accept a non-empty --out-dir)  --lock-dir DIR  --no-lock  --no-head-check
+#   environment: LLAMA_GPU_LOCK (the lock directory when --lock-dir is not given; default /Apps/llama.cpp/GPU.lock),
+#   LLAMA_GPU_LOCK_VERIFY_SECONDS (how long the take waits before it reads its holder back; default 1, a whole number
+#   from 0 to 999999 without a leading zero, anything else is a usage refusal)
 #   --since 'YYYY-MM-DD HH:MM:SS'
 #   --qwen F --gptoss F --mistral F   model files
 #   --tuning-dir DIR   export GGML_SYCL_TUNING_CACHE_DIR (default: the real cache, so acceptance runs write it)
@@ -190,10 +200,16 @@ export LC_NUMERIC=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck disable=SC1091  # sourced by a path computed from this file
+source "$SCRIPT_DIR/sycl-lock.sh" || { echo "sycl-moe-exec-gate: cannot load $SCRIPT_DIR/sycl-lock.sh" >&2; exit 2; }
 
 BUILD_DIR="$ROOT_DIR/build"
 OUT_DIR=""
 LOCK_DIR="${LLAMA_GPU_LOCK:-/Apps/llama.cpp/GPU.lock}"
+LOCK_VERIFY="${LLAMA_GPU_LOCK_VERIFY_SECONDS:-1}"
+LOCK_HELD=0
+LOCK_TEXT=""
+LOCK_RC=0
 TAKE_LOCK=1
 HEAD_CHECK=1
 EXPECT_SHA=""
@@ -404,6 +420,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "${#ARMS[@]}" -gt 0 ] || ARMS=("${ALL_ARMS[@]}")
+# The verify window goes to the lock helper's sleep: a bounded unsigned integer keeps a typo from becoming a hang or an
+# overflow inside the take.
+[[ "$LOCK_VERIFY" =~ ^(0|[1-9][0-9]{0,5})$ ]] ||
+    die_usage "LLAMA_GPU_LOCK_VERIFY_SECONDS must be a whole number of seconds from 0 to 999999 without a leading zero:" \
+        "'$LOCK_VERIFY'"
 
 # A real run sources oneAPI here, after the options are parsed and before any variable is derived from them, because
 # setvars.sh overwrites shell variables (see the caveat in the header). The modes that run nothing on a device do not
@@ -1235,24 +1256,65 @@ print_arm_plan() {
 
 # ---------------------------------------------------------------- GPU.lock
 
-lock_take() {
-    mkdir "$LOCK_DIR" 2>/dev/null || return 1
-    LOCK_HELD=1
-    printf 'sycl-moe-exec-gate pid=%s sha=%s start=%s\n' "$$" "${EXPECT_SHA:-none}" "$(date +%FT%T)" \
-        > "$LOCK_DIR/holder"
+# Taken, checked and released only through scripts/sycl-lock.sh: the system mkdir command checks, then creates, and
+# exits 0 when the directory appears in between, so two takers that arrive together can both win with it.
+lock_take() { # 0 held | the sycl_lock_take status; LOCK_RC keeps it for the refusal text
+    if [ "$LOCK_HELD" != 0 ]; then # never take twice: the second text would replace the first
+        LOCK_RC=5
+        echo "sycl-moe-exec-gate: lock_take called while the lock is held" >&2
+        return 5
+    fi
+    LOCK_TEXT="sycl-moe-exec-gate pid=$$ sha=${EXPECT_SHA:-none} start=$(date +%FT%T)"
+    LOCK_HELD=1 # before the take: a signal during it is handled right after it returns, and must release
+    sycl_lock_take "$LOCK_DIR" "$LOCK_TEXT" "$LOCK_VERIFY"
+    LOCK_RC=$?
+    # An unknown status can follow a holder the helper already wrote; after 1 to 4 no holder of ours exists.
+    [ "$LOCK_RC" != 5 ] || sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" 2>/dev/null || true
+    [ "$LOCK_RC" = 0 ] || LOCK_HELD=0
+    return "$LOCK_RC"
 }
 
 lock_release() {
-    [ "${LOCK_HELD:-0}" = 1 ] || return 0
-    rm -f "$LOCK_DIR/holder"
-    rmdir "$LOCK_DIR" 2>/dev/null
+    [ "$LOCK_HELD" = 1 ] || return 0
+    [ "$BASHPID" = "$$" ] || return 0 # a subshell inherits LOCK_HELD and must never release the lock
     LOCK_HELD=0
+    sycl_lock_release "$LOCK_DIR" "$LOCK_TEXT" || true # a foreign or missing holder: its stderr line, nothing removed
+}
+
+lock_why() { # the reason for the last failed take
+    case "$LOCK_RC" in
+        1) echo "held: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo "no holder file")" ;;
+        2) echo "another taker's holder is there: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo none)" ;;
+        3) echo "the directory was created without a holder: remove it by hand" ;;
+        4) echo "the directory cannot be created" ;;
+        *) echo "the lock helper could not run (python3 missing?)" ;;
+    esac
+}
+
+# A co-taker that still uses the non-atomic mkdir and writes its holder after the verify window is visible only as a
+# holder that is no longer ours.
+lock_check() { # refuse when the holder is no longer ours; a run without the lock has nothing to check
+    [ "$LOCK_HELD" = 1 ] || return 0
+    sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" && return 0
+    refuse "GPU.lock holder is no longer ours (now: $(head -n 1 "$LOCK_DIR/holder" 2>/dev/null || echo none)):" \
+        "another taker may be on the card"
 }
 
 # ---------------------------------------------------------------- host state
 
-kb() { awk -v k="$1" '$1 == k ":" { print $2 }' /proc/meminfo; }
-mem_line() { echo "Shmem=$(kb Shmem) kB MemAvailable=$(kb MemAvailable) kB"; }
+# GPU host backing (Shmem + the meminfo remainder) is the settle and ceiling figure: a discrete card's host-USM memory
+# is in no meminfo field, so Shmem alone reads flat for it. The library is read from the script's own directory, so a
+# snapshot copy must carry it, and a copy without it refuses by name. An unreadable meminfo returns 1 and counts as
+# not settled. The gate does not also check that the load fits: the planner refuses a load that exceeds the host
+# budget by name, and a second check here would be a second source for that fact.
+if [ ! -r "$SCRIPT_DIR/sycl-host-backing.sh" ]; then
+    say "REFUSED: $SCRIPT_DIR/sycl-host-backing.sh is missing (a snapshot copy of this script must carry it)"
+    say "verdicts_pass=0 GATE_DONE"
+    exit 2
+fi
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/sycl-host-backing.sh"
+mem_line() { sycl_gpu_host_backing_log_line; } # one read for all three figures
 builders() {
     local n i c
     if [ -n "$BUILDERS_FILE" ]; then # test hook: a file holding the count
@@ -1265,10 +1327,12 @@ builders() {
     echo "$c"
 }
 host_settled() {
-    local s a
-    s="$(kb Shmem)"
-    a="$(kb MemAvailable)"
-    [ "${s:-999999999}" -lt 31457280 ] && [ "${a:-0}" -gt 157286400 ]
+    local st
+    # One read decides, and SETTLE_LINE is that read, so a refusal prints the figure it decided on.
+    SETTLE_LINE="Shmem: unreadable kB HostBacking: unreadable kB MemAvailable: unreadable kB"
+    st="$(sycl_gpu_host_state_kb)" || return 1
+    SETTLE_LINE="$(sycl_gpu_host_format_state "$st")"
+    [ "$(sycl_gpu_host_state_backing_kb "$st")" -lt 31457280 ]
 }
 
 # refuse <why>: before the first arm it prints REFUSED and the final line. Once arms have run, a refusal must not drop
@@ -1307,7 +1371,7 @@ settle() { # waits up to 10 minutes; GPU.lock serialises access, not memory reco
         host_settled && return 0
         sleep 10
     done
-    refuse "host never settled (Shmem < 30 GB and MemAvailable > 150 GB): $(mem_line)"
+    refuse "host never settled (GPU host backing < 30 GiB): $SETTLE_LINE"
 }
 
 # sample_builders_during <pid> <file>: the highest builder count seen every 5 s while <pid> runs.
@@ -1421,11 +1485,25 @@ if [ "$CHECK_CONTROLS" = 1 ]; then
 fi
 
 if [ "$LOCK_SELFTEST" = 1 ]; then
-    lock_take || { say "lock-selftest: first take failed"; exit 1; }
-    [ -f "$LOCK_DIR/holder" ] || { say "lock-selftest: no holder file"; exit 1; }
-    if lock_take; then say "lock-selftest: second take succeeded"; exit 1; fi
+    lock_selftest_fail() { say "lock-selftest: $*"; lock_release; exit 1; } # the release removes only our holder
+    # The run's traps are installed later; a signal during this take must still release the lock it wins.
+    trap lock_release EXIT
+    trap 'exit 143' TERM INT HUP
+    lock_take || lock_selftest_fail "first take failed ($(lock_why))"
+    sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" || lock_selftest_fail "the holder is not ours after the take"
+    # A second taker with its own text: calling lock_take again would replace LOCK_TEXT.
+    second_text="lock-selftest second taker pid=$$"
+    sycl_lock_take "$LOCK_DIR" "$second_text" 0
+    second_rc=$?
+    if [ "$second_rc" = 0 ]; then
+        sycl_lock_release "$LOCK_DIR" "$second_text" || true
+        lock_selftest_fail "a second take succeeded"
+    fi
+    [ "$second_rc" = 1 ] || lock_selftest_fail "a second take returned $second_rc, not 1 (busy)"
+    ( lock_release )
+    sycl_lock_holder_is "$LOCK_DIR" "$LOCK_TEXT" || lock_selftest_fail "a release in a subshell removed our holder"
     lock_release
-    [ ! -e "$LOCK_DIR" ] || { say "lock-selftest: lock dir survived release"; exit 1; }
+    [ ! -e "$LOCK_DIR" ] || lock_selftest_fail "the lock directory survived the release"
     say "lock-selftest: ok"
     exit 0
 fi
@@ -1467,8 +1545,7 @@ if [ "$DRY_RUN" = 1 ]; then
     say "dry-run: nothing is executed, no lock is taken, no device is touched"
     say "build-dir: $BUILD_DIR   src-dir: $SRC_DIR   lock: $LOCK_DIR (take=$TAKE_LOCK)"
     say "preflights: <sha> == head of src-dir, GGML_SYCL ON, binaries newer than head and linked to SYCL, models," \
-        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), Shmem < 30 GB," \
-        "MemAvailable > 150 GB," \
+        "grep controls, no exported GGML_SYCL_*/LLAMA_ARG_*, builders clear (waited for, 15 min), GPU host backing < 30 GiB," \
         "an empty or --arm/--clobber out-dir"
     for arm in "${ARMS[@]}"; do
         print_arm_plan "$arm"
@@ -1479,7 +1556,6 @@ fi
 
 # ---------------------------------------------------------------- the real run
 
-LOCK_HELD=0
 trap 'lock_release' EXIT
 trap on_signal TERM INT HUP
 
@@ -1490,13 +1566,13 @@ seed_verdicts() {
 }
 
 if [ "$REFUSE_SELFTEST" = 1 ]; then
-    lock_take || refuse "refuse-selftest: could not take $LOCK_DIR"
+    lock_take || refuse "refuse-selftest: could not take $LOCK_DIR ($(lock_why))"
     seed_verdicts
     refuse "synthetic stop"
 fi
 
 if [ "$SIGNAL_SELFTEST" = 1 ]; then
-    lock_take || refuse "signal-selftest: could not take $LOCK_DIR"
+    lock_take || refuse "signal-selftest: could not take $LOCK_DIR ($(lock_why))"
     seed_verdicts
     sleep 30 &
     CHILD=$!
@@ -1571,9 +1647,9 @@ for arm in "${ARMS[@]}"; do
     [ "$A_KIND" = journal ] || device_arms=1
 done
 [ "$device_arms" = 0 ] || wait_builders start
-[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $(mem_line)"
+[ "$device_arms" = 0 ] || host_settled || refuse "host not settled: $SETTLE_LINE"
 if [ "$TAKE_LOCK" = 1 ]; then
-    lock_take || refuse "could not take $LOCK_DIR (held: $(cat "$LOCK_DIR/holder" 2>/dev/null || echo unknown))"
+    lock_take || refuse "could not take $LOCK_DIR ($(lock_why))"
 fi
 
 mkdir -p "$OUT_DIR"
@@ -1598,6 +1674,7 @@ run_arm() { # <arm>: runs it, writes <arm>.out/.err/.rc, prints the sample lines
     fi
     wait_builders "$arm"
     settle
+    lock_check # the waits above can take 25 minutes: a lock lost during them must stop the run before the load
     pre="$(builders)"
     echo "$pre" > "$OUT_DIR/$arm.builders_pre"
     echo 0 > "$OUT_DIR/$arm.builders_max"
@@ -1641,10 +1718,12 @@ score_arm_in_outdir() { # <arm>
 }
 
 for arm in "${ARMS[@]}"; do
+    lock_check
     run_arm "$arm"
     score_arm_in_outdir "$arm"
 done
 
+lock_check
 lock_release
 say "post: $(mem_line)"
 summarize "${VERDICTS[@]}"

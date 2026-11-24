@@ -35,8 +35,9 @@ canonical contract §1 for the formal version):
 
 1. **Planner** (`compute_placement_plan` → `placement_plan`) — the sole
    authority for *deciding where memory lives*. Runs once at model-load time and
-   produces a plan covering dense weights, MoE experts, KV cache (per layer),
-   and oneDNN scratch, assigning each to a device and a VRAM zone.
+   produces a plan covering dense weights, MoE experts, KV cache (per slot,
+   where the layer that executes the slot lives), and oneDNN scratch, assigning
+   each to a device and a VRAM zone.
 
 2. **Unified cache** (`ggml_sycl::unified_cache`) — the sole *allocator and
    owner* of backend memory. Holds the tiered weight cache (device VRAM / pinned
@@ -3229,6 +3230,22 @@ batched prompt MoE dispatch on a device whose publish could not size the ring. O
 GPT-OSS 20B (32 experts, 4 used) `-ub 512` packs into 6,112 rows instead of the
 rectangle's 16,384: slots of 33.6 MB and 67.1 MB instead of 90 MB and 180 MB.
 
+**Which models plan a ring.** The loader sizes a ring for every MoE model, from
+its gate, up and down experts. Only two consumers claim its slots: the batched
+prompt executor (its WOQ and f16 tables) and the MXFP4 SOA per-expert staging.
+The load-time publish therefore plans no ring, weight slot and depth 0, when no
+gate, up or down expert has a type one of them runs
+(`moe_pp_onednn_ring_serves_type` in `moe-mmvq-tables.hpp`, asked by
+`ggml_sycl_inventory_ring_has_consumer`). It asks no runtime knob, so the ring a
+load plans does not change with a knob that turns an executor off for one run.
+Inkling 2 Mini is such a model: its NVFP4 experts run on the MMID direct route
+and its BF16 experts on the BF16 direct route. Its loader-sized ring was 350.7 MB
+at `-ub 512` (a 172.1 MB weight slot), which the load reserved and each context
+demanded again. That demand sat in the RUNTIME zone beside the MMID device
+workspace, which the zone's requirement does not count, so a second context at
+`-ub 128` was refused for a ring nothing would claim. A model with no ring logs
+"[SYCL-PLAN] no PP MoE oneDNN scratch ring on device N" and no ring line.
+
 **Why the RUNTIME zone is not grown at load (`llama.cpp-u1bb`).** Growing it at
 model load looks natural and is wrong. The arena is one chunk with fixed zones,
 `[shared KV+WEIGHT][ONEDNN][RUNTIME][SCRATCH]`, each with its own TLSF sized
@@ -3257,18 +3274,24 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
 - The RUNTIME zone is counted without what the transaction still places there
   after the ring: the MoE MMID workspace pools, when this update materializes
   them. It materializes them only for a route that can run them, the predicate
-  `load_end` and the context-bind hook already use. In an ordinary build that
-  route is closed, so this is 0.
+  `load_end` and the context-bind hook already use, and only the pools the plan
+  holds. The route is open in an ordinary build since 2026-11-22 (the
+  `sycl-q1-nvfp4-admitted-device` oracle passed on the B70 and the B50), but
+  the plan holds pools only for a model with Q1_0 or NVFP4 experts, so for any
+  other model this is 0.
 - The plan charges the MMID pools on the same fact. `plan_moe_mmid_workspaces()`
   plans them, and `vram_bytes` carries their device bytes, only when
-  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`). So
-  in an ordinary build no pool bytes are charged. A pool rejected by the load
+  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`), and
+  only from the experts whose type the route admits (`moe_type_needs_direct_kernel`:
+  Q1_0, NVFP4). So a model without such an expert (GPT-OSS's MXFP4, any dense
+  model) is charged no pool bytes. A pool rejected by the load
   plan (budget, geometry or owner) stays rejected: the runtime re-plan neither
   re-plans its demand nor asks the growth admission for it, so it cannot demote
   KV or refuse a context.
-  A closed route is not a rejection. Its plan is valid and empty
-  (`moe_mmid_workspace_valid` stays true, and no owner check runs), because a
-  closed route is a fact about the build. A rejection is an outcome of one load
+  A closed route (a test override) is not a rejection, and neither is a model
+  without a Q1_0/NVFP4 expert. Its plan is valid and empty
+  (`moe_mmid_workspace_valid` stays true, and no owner check runs or none is
+  required), because each is a fact about the build or the model. A rejection is an outcome of one load
   plan for a route that could run, and the runtime keeps it rejected.
   `reject_moe_mmid_workspaces()` clears its workspaces, so the materialization
   wrapper returns `NOT_APPLICABLE` before the implementation's `INVALID` check
@@ -4430,9 +4453,10 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 
 **Limits.**
 
-- The term is measured at the context and micro-batch the caller tells the load (`n_ctx_hint`, `n_ubatch_hint`), and at
-  `n_ctx_train` and ubatch 512 where it tells none. A load whose model is reused for a later context keeps the term of
-  the shape it was loaded for. Without a named `-ub` the term is measured at 512, and above 512 it under-reserves, which
+- The term is measured at the context and micro-batch the caller tells the load (`n_ctx_hint`, padded like the
+  context, and `n_ubatch_hint`), and at `n_ctx_train` and ubatch 512 where it tells none. A load whose model is
+  reused for a later context keeps the term of the shape it was loaded for; llama-bench tells a shared load the largest
+  context of the instances that reuse it (`bench_shared_load_n_ctx`). Without a named `-ub` the term is measured at 512, and above 512 it under-reserves, which
   is the **default** for a dense model: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch`
   of 2048 a dense model's auto pick climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a
   448.0 MB compute buffer at the auto 2048, `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack

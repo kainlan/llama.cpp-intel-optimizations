@@ -1,0 +1,54 @@
+# Task 7d lead runs, one per arm. First block: b6acf0455 (four arms). Second block: 060c5a330 (oracle only).
+ninja processes on the host: 0
+GGML_SYCL:BOOL=ON
+  02:40:12 build/bin/test-sycl-q1-nvfp4-admitted-device newer than ggml-sycl.cpp: yes
+  02:40:11 build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  02:40:12 build/bin/llama-cli newer than ggml-sycl.cpp: yes
+   02:40:10 build/bin/libggml-sycl.so.1.0.0
+   02:40:11 build/bin/libllama.so.1.0.0
+ldd sycl libs (llama-cli): 2
+== 1 oracle, B70 (ctest)  2026-11-22T02:42:21-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+rc=0
+341: Q1/NVFP4 scoped production-route lifecycle: PASS
+1/1 Test #341: sycl-q1-nvfp4-admitted-device ....   Passed    1.46 sec
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 2 oracle, B50 (binary)  2026-11-22T02:42:35-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+rc=0
+Q1/NVFP4 scoped production-route lifecycle: PASS
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+  unreleased-drain case lines B70/B50: 0/0
+  forbidden lines (want 0): 0  ASYNC-FAILURE lines B70: 2
+== 3 Mistral completion gate, B70  2026-11-22T02:42:48-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  output:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== 4 GPT-OSS chat gate, B50, -c 4096  2026-11-22T02:43:34-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  answer lines: 1
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T02:44:13-05:00
+lock released
+
+# --- 060c5a330
+# (console of this run was not saved to a file; the lines below are copied from the session, the full oracle
+#  logs of this run are t7d-oracle-b70.txt and t7d-oracle-b50.txt)
+  02:48:33 build/bin/test-sycl-q1-nvfp4-admitted-device newer than ggml-sycl.cpp: yes
+== 1 oracle, B70 (ctest)  2026-11-22T02:49:08-05:00
+rc=0
+341: Q1/NVFP4 scoped production-route lifecycle: PASS
+  kernel fault lines since start: 0
+== 2 oracle, B50 (binary)  2026-11-22T02:49:22-05:00
+rc=0
+Q1/NVFP4 scoped production-route lifecycle: PASS
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T02:49:36-05:00

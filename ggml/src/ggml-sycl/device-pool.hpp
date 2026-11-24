@@ -191,7 +191,7 @@ class sycl_device_pool {
         }
         if (bcs_queue_) {
             try {
-                bcs_queue_->wait();
+                bcs_queue_->wait_and_throw();
             } catch (...) {
             }
         }
@@ -315,7 +315,7 @@ class sycl_device_pool {
         }
         if (bcs_queue_) {
             try {
-                bcs_queue_->wait();
+                bcs_queue_->wait_and_throw();
             } catch (...) {
             }
         }

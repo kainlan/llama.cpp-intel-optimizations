@@ -199,8 +199,11 @@ def transaction_violations(sycl_cpp: str) -> list[str]:
     if not re.search(r"if\s*\(\s*!stable_mmid\s*&&\s*mmid_route_reachable\s*&&\s*"
                      r"!ggml_sycl_materialize_published_mmid_workspaces\(", txn):
         found.append("the MMID pools are materialized for a route that cannot run them")
-    pending = re.search(r"if\s*\(\s*mmid_route_reachable\s*&&\s*!ggml_sycl_same_mmid_workspace_plan\(\s*\*current->plan"
-                        r"\s*,\s*next_plan\s*\)\s*\)\s*\{[^{}]*\{\s*if\s*\(\s*workspace\.owner_device\s*==\s*ctx->device"
+    # The pools are pending when this transaction materializes them (a changed workspace plan) and when no context
+    # holds them yet (a load_end deferral the context bind materializes after this transaction).
+    pending = re.search(r"if\s*\(\s*mmid_route_reachable\s*&&\s*\(\s*!ggml_sycl::moe_mmid_same_workspace_plan\(\s*\*current->plan"
+                        r"\s*,\s*next_plan\s*\)\s*\|\|\s*!ggml_sycl_mmid_workspaces_follow\(\s*current_token\s*,\s*current"
+                        r"\s*\)\s*\)\s*\)\s*\{[^{}]*\{\s*if\s*\(\s*workspace\.owner_device\s*==\s*ctx->device"
                         r"\s*\)\s*\{\s*ring_kv_zone\.runtime_pending_bytes\s*\+=\s*workspace\.device_pool_bytes\s*;", txn)
     if pending is None or pending.start() > call_at:
         found.append("the ring does not leave the RUNTIME zone room for the MMID pools placed after it")
@@ -456,6 +459,9 @@ MUTATIONS = [
      "the MMID pools are materialized for a route that cannot run them"),
     ("no MMID room", "sycl",
      "                ring_kv_zone.runtime_pending_bytes += workspace.device_pool_bytes;\n", "",
+     "the ring does not leave the RUNTIME zone room for the MMID pools placed after it"),
+    ("no room for deferred MMID pools", "sycl",
+     " ||\n                                 !ggml_sycl_mmid_workspaces_follow(current_token, current))) {", ")) {",
      "the ring does not leave the RUNTIME zone room for the MMID pools placed after it"),
     ("idempotent despite a re-fit", "sycl",
      " &&\n        !(kv_zone && kv_zone->readmit)) {", ") {",

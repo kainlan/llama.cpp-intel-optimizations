@@ -935,6 +935,60 @@ int main() {
         }
     }
 
+    // 16. The PP MoE oneDNN ring is planned only for a model with an expert a ring consumer runs: the batched prompt
+    // executor (the WOQ and f16 tables, in any layout) or the MXFP4 SOA per-expert staging (the f16 table's MXFP4
+    // row). An Inkling 2 Mini load runs its NVFP4 experts on the MMID direct route and its BF16 experts on the BF16
+    // direct route, neither of which draws on the ring, so it plans none. The answer does not follow the runtime
+    // knobs: it is the union of the two tables with both of them on, so a knob that turns the executor off keeps the
+    // ring a load plans, and every type the ring stages for a host expert is served.
+    {
+        const struct {
+            ggml_type    type;
+            bool         want;
+            const char * why;
+        } ring_cases[] = {
+            { GGML_TYPE_MXFP4,  true,  "GPT-OSS: the WOQ arm and the per-expert MXFP4 SOA staging" },
+            { GGML_TYPE_IQ4_NL, true,  "Qwen's host-pinned experts stage through the ring"         },
+            { GGML_TYPE_Q8_0,   true,  "an f16 row at AOS and SOA"                                 },
+            { GGML_TYPE_Q4_0,   true,  "an f16 row at AOS and SOA"                                 },
+            { GGML_TYPE_IQ4_XS, true,  "an f16 row at AOS, though no MMVQ-ID kernel"               },
+            { GGML_TYPE_NVFP4,  false, "Inkling's NVFP4 experts run on the MMID direct route"      },
+            { GGML_TYPE_Q1_0,   false, "Q1_0 experts run on the MMID direct route"                 },
+            { GGML_TYPE_BF16,   false, "Inkling's BF16 experts run on the BF16 direct route"       },
+            { GGML_TYPE_F16,    false, "a float expert needs no dequant and keeps its own route"   },
+            { GGML_TYPE_F32,    false, "a float expert needs no dequant and keeps its own route"   },
+        };
+
+        for (const auto & c : ring_cases) {
+            const bool got = moe_pp_onednn_ring_serves_type(c.type);
+            std::printf("ring consumer check: %s serves=%d want=%d (%s)\n", ggml_type_name(c.type), got ? 1 : 0,
+                        c.want ? 1 : 0, c.why);
+            if (got != c.want) {
+                std::printf("FAIL: the PP MoE oneDNN ring is %s for %s experts: %s\n", got ? "planned" : "not planned",
+                            ggml_type_name(c.type), c.why);
+                ++failures;
+            }
+        }
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type   = static_cast<ggml_type>(t);
+            bool            tables = false;
+            for (const ggml_layout_mode layout : all_layouts()) {
+                tables = tables || moe_pp_batched_supports_layout(type, layout, true, true);
+            }
+            if (moe_pp_onednn_ring_serves_type(type) != tables) {
+                std::printf(
+                    "FAIL: ring consumer answer for type=%d is %d, but the executor tables with every knob on "
+                    "say %d\n",
+                    t, moe_pp_onednn_ring_serves_type(type) ? 1 : 0, tables ? 1 : 0);
+                ++failures;
+            }
+            if (moe_pp_batched_takes_staged_type(type) && !moe_pp_onednn_ring_serves_type(type)) {
+                std::printf("FAIL: type=%d is staged through the ring for a host expert, but plans no ring\n", t);
+                ++failures;
+            }
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;

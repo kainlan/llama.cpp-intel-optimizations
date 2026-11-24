@@ -282,7 +282,9 @@ PICK_DEFAULT = "inventory.n_ctx_context_is_default = ctx_room.is_default;"
 
 def claim_loader_resolves_once(model: str) -> bool:
     """llama-model.cpp resolves the hint in exactly one place, where it fills the inventory, and copies both the
-    context and its provenance; it neither resolves the hint itself nor calls the resolver anywhere else."""
+    context and its provenance; it neither resolves the hint itself nor calls the resolver anywhere else. The load
+    measures reach the same resolver through llama_load_measure_shape_resolve (src/llama-load-measure.h), not through
+    a second call in this file."""
     m = norm(model)
     pop = body(m, POPULATE_SIG)
     return (RESOLVER_INCLUDE in m and bool(pop) and m.count("llama_n_ctx_hint_resolve(") == 1
@@ -368,15 +370,16 @@ def claim_tool_asks_common(tool: str) -> bool:
 
 INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 # libllama's resolved storage inputs follow the provenance, in its padding (test-sycl-mapped-loader-source pins their
-# offsets), the named micro-batch follows them (test-sycl-explicit-ubatch-placement-source), and the lazy tables are
-# appended after it (th32 §4.1), with the measured micro-batch in their padding (test-sycl-load-measure-source).
+# offsets), the named micro-batch follows them (test-sycl-explicit-ubatch-placement-source), the lazy tables are
+# appended after it (th32 §4.1), with the measured micro-batch in their padding (test-sycl-load-measure-source), and
+# the slot-to-layer map follows that (test-sycl-kv-slot-layer-source): the size grew, the provenance did not move.
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
             "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
             "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
-            "uint32_t n_ubatch_measure; }")
+            "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }")
 SIZE_PINS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 224,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
 )
 FILL_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
@@ -392,9 +395,10 @@ KV_FIELD = "bool n_ctx_context_is_default = false;"
 
 
 def claim_backend_carries_the_source(sycl_h: str, sycl: str, cache_hpp: str) -> bool:
-    """The inventory ends with the provenance, appended after the indexer widths with the size pins moved to match;
-    the backend copies it once, next to the context, into a KV input that defaults to a named context: the copy is in
-    the KV intake, and the stage hands the intake g_placement_kv_info."""
+    """The provenance is appended after the indexer widths (libllama's storage inputs, the named micro-batch, the lazy
+    tables and the slot-to-layer map follow it), with the size pins moved to match; the backend copies it once, next to
+    the context, into a KV input that defaults to a named context: the copy is in the KV intake, and the stage hands the
+    intake g_placement_kv_info."""
     h = norm(sycl_h)
     at = h.find(INVENTORY_STRUCT)
     inv = body(h[at:], "struct ggml_sycl_tensor_inventory") if at >= 0 else ""
@@ -846,7 +850,7 @@ def test_mutant_inventory_without_the_field_fails():
 
 def test_mutant_size_pin_not_moved_fails():
     assert not claim_backend_carries_the_source(
-        SYCL_H, _once(SYCL, SIZE_PINS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,"), CACHE_HPP)
+        SYCL_H, _once(SYCL, SIZE_PINS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,"), CACHE_HPP)
 
 
 def test_mutant_provenance_inserted_mid_struct_fails():

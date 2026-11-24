@@ -94,6 +94,20 @@ void llama_model_hrm_text::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+// The weight layer (blk.N) KV cache slot il runs. Each h cycle is n_hrm_l_cycles low passes and then one high pass, of
+// lps slots each. load_arch_tensors() creates blk.0..lps-1 in the first low pass's slots and blk.lps..2*lps-1 in the
+// first high pass's slots, and aliases every later pass's slots to them; the graph runs slot s with layers[s]. So a
+// high pass's slot runs blk.(lps + il % lps) and a low pass's slot runs blk.(il % lps).
+int llama_model_hrm_text::layer_phys(int il) const {
+    const int lps    = (int) hparams.n_hrm_layers_per_stack;
+    const int passes = (int) hparams.n_hrm_l_cycles + 1;
+    if (lps <= 0) {
+        return il;
+    }
+    const bool high = (il / lps) % passes == passes - 1;
+    return (high ? lps : 0) + il % lps;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_hrm_text::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }

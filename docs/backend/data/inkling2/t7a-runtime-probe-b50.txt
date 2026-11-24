@@ -1,0 +1,36 @@
+== mode main
+device: Intel(R) Arc(TM) Pro B50 Graphics
+(a) queue::wait_and_throw returns                          yes
+    delivered: queue handler +1, context handler +0
+(b) event::wait_and_throw returns                          yes
+    delivered: queue handler +1, context handler +0
+(b) later queue::wait_and_throw returns                    yes
+    delivered again: queue +0, context +0
+(c) default-ctx event::wait_and_throw returns              yes
+    delivered: queue handler +1
+(c) default-ctx queue::wait_and_throw returns              yes
+    delivered: queue handler +1
+(d) dependent host task: saw=1 (1 = saw the failure in the latch, 0 = ran but latch unmoved, 2 = wait threw, -1 = never ran)
+(d) final drain returns                                    yes
+    totals: queue handler 5, context handler 0
+(e) ctx-handler-only queue::wait_and_throw returns         yes
+    delivered: context handler +1
+(e) ctx-handler-only event::wait_and_throw returns         yes
+    delivered: context handler +1
+probe: end
+rc=0
+== mode dtor
+device: Intel(R) Arc(TM) Pro B50 Graphics
+(f) after plain wait: queue handler +0
+(f) after destructor: queue handler +0
+probe: end
+rc=0
+== mode plain
+device: Intel(R) Arc(TM) Pro B50 Graphics
+(g) event.wait(): threw=0, queue handler +0
+(g) after queue::wait_and_throw: queue handler +1
+probe: end
+rc=0
+probe: shmem=6GB
+probe: done 2026-11-21T20:20:27-05:00
+probe: lock released

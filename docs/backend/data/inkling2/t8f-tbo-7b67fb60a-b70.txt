@@ -1,0 +1,35 @@
+test-backend-ops -o SCALE, ONEAPI_DEVICE_SELECTOR=level_zero:0 (b70), lead run 2026-11-22, tree 7b67fb60a, colour codes stripped
+Testing 2 devices
+
+Backend 1/2: SYCL0
+  Device description: Intel(R) Arc(TM) Pro B70 Graphics
+  Device memory: 32656 MB (29900 MB free)
+
+  SCALE(type=f32,ne=[10,10,10,10],scale=2.000000,bias=0.000000,inplace=0,v=0): OK
+  SCALE(type=f32,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=0,v=0): OK
+  SCALE(type=f32,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=1,v=0): OK
+  SCALE(type=f32,ne=[100,10,10,10],scale=2.000000,bias=1.000000,inplace=0,v=0): OK
+  SCALE(type=bf16,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=0,v=0): not supported [SYCL0] 
+  SCALE(type=bf16,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=1,v=0): not supported [SYCL0] 
+  SCALE(type=bf16,ne=[100,10,10,10],scale=0.500000,bias=0.000000,inplace=0,v=0): not supported [SYCL0] 
+  SCALE(type=f16,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=0,v=0): not supported [SYCL0] 
+  SCALE(type=f16,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=1,v=0): not supported [SYCL0] 
+  SCALE(type=f16,ne=[100,10,10,10],scale=0.500000,bias=0.000000,inplace=0,v=0): not supported [SYCL0] 
+  SCALE(type=f32,ne=[10,10,10,10],scale=2.000000,bias=0.000000,inplace=0,v=1): OK
+  SCALE(type=f32,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=0,v=1): OK
+  SCALE(type=f32,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=1,v=1): OK
+  SCALE(type=bf16,ne=[10,10,10,10],scale=2.000000,bias=1.000000,inplace=1,v=1): not supported [SYCL0] 
+  SCALE(type=f32,ne=[65,7,3,1],scale=0.500000,bias=0.000000,inplace=0,v=2): OK
+  SCALE(type=f32,ne=[65,7,3,1],scale=2.000000,bias=1.000000,inplace=0,v=2): OK
+  SCALE(type=f32,ne=[65,7,3,1],scale=2.000000,bias=1.000000,inplace=1,v=2): OK
+  SCALE(type=f32,ne=[1024,8,1,1],scale=0.500000,bias=0.000000,inplace=0,v=2): OK
+  SCALE(type=f32,ne=[65,7,3,1],scale=0.500000,bias=0.000000,inplace=0,v=4): OK
+  SCALE(type=f32,ne=[65,7,3,1],scale=2.000000,bias=1.000000,inplace=0,v=4): OK
+  SCALE(type=f32,ne=[1024,8,1,1],scale=0.500000,bias=0.000000,inplace=0,v=4): OK
+  SCALE(type=f32,ne=[65,7,3,2],scale=2.000000,bias=1.000000,inplace=0,v=8): OK
+  15/15 tests passed
+  Backend SYCL0: OK
+Backend 2/2: CPU
+  Skipping CPU backend
+2/2 backends passed
+OK

@@ -3885,7 +3885,7 @@ struct test_scale : public test_case {
     float scale;
     float bias;
     bool inplace;
-    int v; // view (1 : non-contiguous a)
+    int v;  // view (1 : non-contiguous a, 2 / 4 : upper / lower half of a twice as wide, 8 : a permuted)
 
     std::string vars() override {
         return VARS_TO_STR6(type, ne, scale, bias, inplace, v);
@@ -3907,6 +3907,19 @@ struct test_scale : public test_case {
             ne_a[2] *= 5;
             ne_a[3] *= 4;
         }
+        const bool half = (v & (2 | 4)) != 0;
+        if (half) {
+            // build_moe_ffn splits the fused gate_up output [2*n_ff, n_expert_used, n_tokens] into two
+            // ggml_view_3d halves: "gate" at offset 0, "up" n_ff elements into each row; both step rows by 2*n_ff
+            GGML_ASSERT(!(v & 1) && !(v & 8) && (v & (2 | 4)) != (2 | 4) && ne[3] == 1);
+            ne_a[0] *= 2;
+        }
+        if (v & 8) {
+            // a is built with dims 1 and 2 swapped and permuted back, so rows stay contiguous (nb0 is the type
+            // size, as ggml_scale requires) while nb1 > nb2
+            GGML_ASSERT(!(v & 1));
+            std::swap(ne_a[1], ne_a[2]);
+        }
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_set_param(a);
         ggml_set_name(a, "a");
@@ -3914,6 +3927,22 @@ struct test_scale : public test_case {
         if (v & 1) {
             a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
+        }
+        if (half) {
+            const size_t offs = (v & 2) ? ne[0] * a->nb[0] : 0;
+            a                 = ggml_view_3d(ctx, a, ne[0], ne[1], ne[2], a->nb[1], a->nb[2], offs);
+            ggml_set_name(a, (v & 2) ? "upper_half_of_a" : "lower_half_of_a");
+            // the case proves nothing unless the source really is strided, at the offset it claims
+            GGML_ASSERT(!ggml_is_contiguous(a));
+            GGML_ASSERT(a->nb[1] == 2 * a->ne[0] * ggml_type_size(type));
+            GGML_ASSERT(a->view_offs == offs);
+        }
+        if (v & 8) {
+            a = ggml_permute(ctx, a, 0, 2, 1, 3);
+            ggml_set_name(a, "permuted_a");
+            GGML_ASSERT(!ggml_is_contiguous(a));
+            GGML_ASSERT(a->nb[0] == ggml_type_size(type));
+            GGML_ASSERT(a->ne[1] == ne[1] && a->ne[2] == ne[2]);
         }
 
         ggml_tensor * out;
@@ -5417,33 +5446,39 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted_k;
     // lower bound of the log-gate; a mild gate keeps the state alive over the whole sequence
     const float   g_min;
+    // k holds one sequence that every sequence of v reads, so k repeats over sequences at a different ratio than q
+    const bool    k_seq_bcast;
 
     std::string vars() override {
         std::string s = VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, correlated, padded_v, padded_q, permuted_k);
         if (g_min != -20.0f) {
             s += "," + VAR_TO_STR(g_min);
         }
+        if (k_seq_bcast) {
+            s += "," + VAR_TO_STR(k_seq_bcast);
+        }
         return s;
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool correlated = false, bool padded_v = false, bool padded_q = false, bool permuted_k = false, float g_min = -20.0f)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool correlated = false, bool padded_v = false, bool padded_q = false, bool permuted_k = false, float g_min = -20.0f, bool k_seq_bcast = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), correlated(correlated), padded_v(padded_v), padded_q(padded_q), permuted_k(permuted_k), g_min(g_min) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), correlated(correlated), padded_v(padded_v), padded_q(padded_q), permuted_k(permuted_k), g_min(g_min), k_seq_bcast(k_seq_bcast) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
         ggml_tensor * k;
         ggml_tensor * v;
+        const int64_t k_seqs = k_seq_bcast ? 1 : n_seqs;
         if (permuted) {
             // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
             q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
-            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+            k = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, k_seqs), 0, 2, 1, 3);
             v = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size + padded_v, n_seq_tokens, head_count * v_repeat, n_seqs), 0, 2, 1, 3);
         } else {
             q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
-            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+            k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, k_seqs);
             v = ggml_new_tensor_4d(ctx, type, head_size + padded_v, head_count * v_repeat, n_seq_tokens, n_seqs);
         }
         if (padded_v) {
@@ -5470,7 +5505,7 @@ struct test_gated_delta_net : public test_case {
             q = ggml_cpy(ctx, q, q_padded);
         }
         if (permuted_k) {
-            ggml_tensor * k_permuted = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs);
+            ggml_tensor * k_permuted = ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, k_seqs);
             k_permuted = ggml_permute(ctx, k_permuted, 0, 2, 1, 3);
             k = ggml_cpy(ctx, k, k_permuted);
         }
@@ -11535,13 +11570,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
+    // BF16: Inkling's token_embd.weight is a BF16 table resident on the card (the small and view cases are in the
+    // all_types loop below)
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
         test_cases.emplace_back(new test_get_rows(type,     256,   5,         4, 700, 100, false));
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 1, 8, 2, 1, 1, false));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
@@ -11575,6 +11613,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_BF16, 256, 8, 2, 1, 1, false, true, 3));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -12365,6 +12404,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, false, 1)); // view test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1));  // view test, inplace
     test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 2.0f, 1.0f, true, 1)); // view test, inplace
+    // upper half of a fused gate_up row (offset view, nb1 twice the row size), as build_moe_ffn scales it;
+    // the last case is one decode token's shape
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 0.5f, 0.0f, false, 2));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 2.0f, 1.0f, false, 2));  // with bias
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 2.0f, 1.0f, true, 2));   // inplace
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 1024, 8, 1, 1 }, 0.5f, 0.0f, false, 2));
+    // lower half of the same row (offset 0, nb1 twice the row size): the "gate" view
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 0.5f, 0.0f, false, 4));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 1 }, 2.0f, 1.0f, false, 4));  // with bias
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 1024, 8, 1, 1 }, 0.5f, 0.0f, false, 4));
+    // permuted source: dims 1 and 2 swapped, rows still contiguous
+    test_cases.emplace_back(new test_scale(GGML_TYPE_F32, { 65, 7, 3, 2 }, 2.0f, 1.0f, false, 8));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
@@ -13854,6 +13905,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {281, 128, 1, 1}, 2, 2));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {257, 7, 1, 1}, 0, 256));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 16777217, 1, 1}, 1, 1));
+    // More planes than one SYCL launch covers (8388607 work-groups of 256), on axis 2 and on axis 3. 2^24 planes, not
+    // the smallest count above that bound: the smallest leaves one plane to the stride loop, and a regression that
+    // skips it moves the error only to the NMSE threshold. At 2^24 half the planes depend on the stride loop.
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 16777216, 1}, 1, 1));
+    test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {2, 1, 1, 16777216}, 1, 1));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
@@ -14060,6 +14116,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // hsk=512 is a separate route family; the head-size loop only pairs it with hsv=512
+    test_cases.emplace_back(new test_flash_attn_ext(512, 256, 4, {1, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -14472,6 +14530,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // k broadcast over sequences: q and k repeat over v's sequences at different ratios
+    // CUDA asserts nek3 == neq3 (gated_delta_net.cu:308), so a CUDA run aborts on these two unless its supports_op declines them
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, false, 1, false, false, false, false, -20.0f, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, false, true,  1, false, false, false, false, -20.0f, true));
     // chunked path: multi-chunk and non-multiple-of-chunk-size (chunk_size=64 GDN, 16 KDA)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 1));

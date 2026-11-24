@@ -139,7 +139,10 @@ step_cmd() { # $1 kind, $2 prompt
     if [ "$1" = base ]; then base_cmd "$2"; else arm_cmd "q4_n${PAIR_ARM_N}_$2"; fi
 }
 
-meminfo() { grep -E '^(MemAvailable|Shmem):' /proc/meminfo | tr '\n' ' '; echo; }
+[ -r "$ROOT/scripts/sycl-host-backing.sh" ] || { echo "refusing: $ROOT/scripts/sycl-host-backing.sh is missing" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$ROOT/scripts/sycl-host-backing.sh"
+meminfo() { sycl_gpu_host_backing_log_line; }
 
 if [ "$DRY" = 1 ] && [ "$PAIRS" = 1 ]; then
     mapfile -t steps < <(pair_steps)
@@ -179,10 +182,12 @@ if [ -n "$busy" ]; then
     echo "$busy" >&2
     exit 1
 fi
-avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-shmem_kb=$(awk '/^Shmem:/ {print $2}' /proc/meminfo)
-if [ "$avail_kb" -lt $((100 * 1024 * 1024)) ] || [ "$shmem_kb" -gt $((30 * 1024 * 1024)) ]; then
-    echo "refusing: host memory not settled (MemAvailable ${avail_kb} kB, Shmem ${shmem_kb} kB; want >100 GB / <30 GB)" >&2
+# GPU host backing (Shmem + the meminfo remainder); an unreadable meminfo is not settled. MemAvailable is not a
+# condition (ruling 2026-11-12): it sits near 55 GB on purpose while another tenant holds a model, and the
+# planner refuses a load that exceeds the host budget by name.
+backing_kb=$(sycl_gpu_host_backing_kb) || { echo "refusing: cannot read GPU host backing from /proc/meminfo" >&2; exit 1; }
+if [ "$backing_kb" -ge $((30 * 1048576)) ]; then
+    echo "refusing: host memory not settled (GPU host backing ${backing_kb} kB; want below 30 GiB = $((30 * 1048576)) kB)" >&2
     exit 1
 fi
 echo "uptime: $(uptime)"

@@ -377,6 +377,7 @@ struct llama_model_sycl_kv_layer_arrays {
     std::unique_ptr<uint32_t[]> v_width;
     std::unique_ptr<uint8_t[]>  kind;
     std::unique_ptr<uint32_t[]> idx_k_width;  // indexer key width per layer (llama_kv_layer_owners::idx_k_width)
+    std::unique_ptr<int32_t[]>  phys;         // the weight layer that executes each KV slot (llama_model::layer_phys)
 };
 
 // llama.cpp-3aos: per-layer (attention kind, K width, V width) for the SYCL
@@ -401,6 +402,10 @@ struct llama_model_sycl_kv_layer_arrays {
 // widths, so the planner budgets both buffers and the allocator sizes each one
 // from its own cache. A layer whose only KV is indexer keys is FULL with zero
 // K/V widths, so it is still charged.
+// The arrays are indexed by KV cache slot. A looped model runs one weight layer
+// for several slots: `phys` names the weight layer of each
+// (llama_model::layer_phys), so the planner puts a slot's KV where that layer's
+// weights are. The backend computes no map of its own.
 static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_model & model,
                                                                                uint32_t            n_layer) {
     const llama_hparams &            hparams = model.hparams;
@@ -410,7 +415,10 @@ static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(c
     out.v_width.reset(new uint32_t[n_layer]);
     out.kind.reset(new uint8_t[n_layer]);
     out.idx_k_width.reset(new uint32_t[n_layer]);
+    out.phys.reset(new int32_t[n_layer]);
     for (uint32_t il = 0; il < n_layer; ++il) {
+        out.phys[il] = model.layer_phys((int) il);
+
         const bool owns_kv = owners.modelled ? il < owners.owns.size() && owners.owns[il] : hparams.has_kv(il);
         const uint32_t idx_k_width = il < owners.idx_k_width.size() ? owners.idx_k_width[il] : 0;
         out.idx_k_width[il]        = idx_k_width;
@@ -447,6 +455,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                                                 const uint32_t *                     kv_v_width_per_layer,
                                                 const uint8_t *                      kv_layer_kind,
                                                 const uint32_t *                     kv_idx_k_width_per_layer,
+                                                const int32_t *                      kv_layer_phys,
                                                 size_t                               total_size,
                                                 size_t                               max_pp_pipeline_weight_bytes,
                                                 const llama_hparams &                hparams,
@@ -497,8 +506,8 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // and the KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
     // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
     // dense weights and their KV leave. The room, the oneDNN Graph scratch floor (sized for the context the model opens
-    // with) and the load measures read the hint; the planning shape above and the placement envelope's n_ctx (still 0)
-    // keep their inputs.
+    // with) and the load measures (llama_load_measure_shape_resolve) read the hint; the planning shape above and the
+    // placement envelope's n_ctx (still 0) keep their inputs.
     const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);
     inventory.n_ctx_context                    = ctx_room.n_ctx_context;
     inventory.n_ctx_context_is_default         = ctx_room.is_default;
@@ -627,6 +636,10 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.kv_layer_kind        = kv_layer_kind;
     inventory.kv_layer_count       = n_layer;
     inventory.kv_idx_k_width_per_layer = kv_idx_k_width_per_layer;
+
+    // The weight layer that executes each KV slot (llama_model_sycl_build_kv_layer_arrays), one entry per slot.
+    inventory.kv_layer_phys       = kv_layer_phys;
+    inventory.kv_layer_phys_count = kv_layer_phys != nullptr ? n_layer : 0;
 
     uint32_t    n_head_ctx_max        = 0;
     uint32_t    n_head_swa_max        = 0;
@@ -826,10 +839,11 @@ static bool llama_model_sycl_build_early_inventory(llama_model_loader &         
     const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
 
     ggml_sycl_tensor_inventory & inventory = out.inventory;
-    llama_model_sycl_populate_inventory(
-        inventory, out.tensors, out.swa_layer_mask.get(), sinks_layer_mask.get(), out.kv_layer_arrays.k_width.get(),
-        out.kv_layer_arrays.v_width.get(), out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
-        out.total_size, max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    llama_model_sycl_populate_inventory(inventory, out.tensors, out.swa_layer_mask.get(), sinks_layer_mask.get(),
+                                        out.kv_layer_arrays.k_width.get(), out.kv_layer_arrays.v_width.get(),
+                                        out.kv_layer_arrays.kind.get(), out.kv_layer_arrays.idx_k_width.get(),
+                                        out.kv_layer_arrays.phys.get(), out.total_size, max_pp_pipeline_weight_bytes,
+                                        hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
     llama_model_sycl_set_inventory_lazy_tables(inventory, ml, out.lazy);
     return true;
@@ -907,10 +921,11 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
     const std::unique_ptr<bool[]> sinks_layer_mask = llama_model_sycl_attn_sinks_layers(ml, n_layer);
 
     ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(
-        inventory, tensors, swa_layer_mask.get(), sinks_layer_mask.get(), kv_layer_arrays.k_width.get(),
-        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(), total_size,
-        max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());
+    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), sinks_layer_mask.get(),
+                                        kv_layer_arrays.k_width.get(), kv_layer_arrays.v_width.get(),
+                                        kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(),
+                                        kv_layer_arrays.phys.get(), total_size, max_pp_pipeline_weight_bytes, hparams,
+                                        model.get_n_ctx_hint(), model.get_n_ubatch_hint());
     llama_model_sycl_set_inventory_host_backing(inventory, ml, use_mlock);
     llama_model_sycl_lazy_tables lazy;
     llama_model_sycl_set_inventory_lazy_tables(inventory, ml, lazy);

@@ -7,7 +7,8 @@
 
 // The context a load holds KV room for, resolved from llama_model_params::n_ctx_hint (llama.cpp-ak0p,
 // llama.cpp-7fmt). This is the one place the hint is resolved: src/llama-model.cpp copies the result into the SYCL
-// inventory, and the backend never sees the hint itself.
+// inventory, the load's probe, admitted and late measures read it through llama_load_measure_shape_resolve
+// (src/llama-load-measure.h), and the backend never sees the hint itself.
 struct llama_n_ctx_hint_resolution {
     uint32_t n_ctx_context;  // cells the room is for; 0 = no room
     bool     is_default;     // n_ctx_context is the model's default context, not one the caller named

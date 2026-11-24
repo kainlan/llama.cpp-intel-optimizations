@@ -152,7 +152,10 @@ class L2PrefetchManager {
   public:
     explicit L2PrefetchManager(sycl::queue * compute_queue) :
         // Create separate queue for async prefetch (same context/device)
-        prefetch_queue_(compute_queue->get_context(), compute_queue->get_device()) {
+        prefetch_queue_(ggml_sycl_make_queue(compute_queue->get_context(),
+                                             compute_queue->get_device(),
+                                             ggml_sycl_get_device_id_from_queue(*compute_queue),
+                                             sycl::property_list{})) {
 
         GGML_LOG_INFO("[L2-PREFETCH] Manager initialized (max_bytes=%zu MB)\n",
                       L2_PREFETCH_MAX_BYTES / (1024 * 1024));
@@ -161,7 +164,7 @@ class L2PrefetchManager {
     ~L2PrefetchManager() {
         // Wait for any pending prefetch
         try {
-            prefetch_queue_.wait();
+            prefetch_queue_.wait_and_throw();
         } catch (...) {
             // Ignore exceptions during destruction
         }

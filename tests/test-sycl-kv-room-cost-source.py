@@ -285,12 +285,12 @@ HOST_GUARD = "GGML_ASSERT(std::isfinite(kv_info.host_attn_gbps) && kv_info.host_
 RATE_GUARD = "GGML_ASSERT(std::isfinite(rate.gbps) && rate.gbps > 0.0);"
 SPLIT_GUARD = "GGML_ASSERT(std::isfinite(kv_info.host_split_us) && kv_info.host_split_us >= 0.0);"
 FILLED_CALL = "const uint32_t filled = kv_room_filled_cells(kv_info.n_ctx_context, kv_info.ctx_fill_pct);"
-HOST_READ = "in.host_read_bytes = kv_info.kv_bytes_for_layer_at(il, filled);"
-SPLITS = "in.n_host_splits = placement_host_attn_splits(kv_info.idx_k_width(il) > 0);"
+HOST_READ = "in.host_read_bytes = kv_info.kv_bytes_for_layer_at(static_cast<uint32_t>(slot), filled);"
+SPLITS = "in.n_host_splits = placement_host_attn_splits(kv_info.idx_k_width(static_cast<uint32_t>(slot)) > 0);"
 INPUTS = ("in.room_bytes = extra; in.n_experts = n_experts; in.n_expert_used = kv_info.n_expert_used; "
           "in.host_attn_gbps = kv_info.host_attn_gbps; in.host_split_us = kv_info.host_split_us; "
           "in.cpu_expert_gbps = rate.gbps; in.priced = rate.priced;")
-WEIGH_RETURN = "return { kv_room_weigh(in), layer_id, in.n_host_splits };"
+WEIGH_RETURN = "return { kv_room_weigh(in), slot, in.n_host_splits };"
 
 
 def claim_room_weighs_attention_against_experts(cache: str, room_cost: str) -> bool:
@@ -412,7 +412,7 @@ def claim_planner_reads_the_rate_once(cache: str) -> bool:
             and b.count(TYPES_ADD) == 1 and b.count("kv_room_expert_rate_for(") == 1)
 
 
-WEIGH_CALL = ("const kv_context_room_cost cost = weigh_kv_context_room(kv_info, layer_id, extra, n_experts, "
+WEIGH_CALL = ("const kv_context_room_cost cost = weigh_kv_context_room(kv_info, slot, extra, n_experts, "
               "room.expert_rate);")
 COUNT_HELD = ("if (cost.held) { room.wanted += std::min(extra, SIZE_MAX - room.wanted); room.n_held++; } else { "
               "room.refused += std::min(extra, SIZE_MAX - room.refused); room.n_refused++; }")
@@ -438,11 +438,11 @@ def claim_room_counts_each_attention_class(cache: str) -> bool:
     return bool(b) and ordered(b, WEIGH_CALL, "room.n_layers++;", SWA_COUNT, COUNT_HELD)
 
 
-DEVICE_LAYERS = "if (layer_id >= 0 && owner == device_id) { layers.push_back(layer_id); }"
-SORT = "std::sort(layers.begin(), layers.end());"
+DEVICE_LAYERS = "if (slot >= 0 && owner == device_id) { slots.push_back(slot); }"
+SORT = "std::sort(slots.begin(), slots.end());"
 PASSES = "for (const bool swa_pass : { false, true }) {"
-LATEST_FIRST = "for (auto it = layers.rbegin(); it != layers.rend(); ++it) {"
-PASS_FILTER = "if (kv_info.is_swa_layer(layer_id) != swa_pass) { continue; }"
+LATEST_FIRST = "for (auto it = slots.rbegin(); it != slots.rend(); ++it) {"
+PASS_FILTER = "if (kv_info.is_swa_layer(slot) != swa_pass) { continue; }"
 
 
 def claim_decision_iterates_latest_first(cache: str) -> bool:
@@ -1133,7 +1133,7 @@ def test_mutant_room_forgets_the_rate_fails():
 
 def test_mutant_earliest_first_fails():
     assert not claim_decision_iterates_latest_first(
-        _once(CACHE, LATEST_FIRST, "for (auto it = layers.begin(); it != layers.end(); ++it) {"))
+        _once(CACHE, LATEST_FIRST, "for (auto it = slots.begin(); it != slots.end(); ++it) {"))
 
 
 def test_mutant_swa_first_fails():

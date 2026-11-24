@@ -1,0 +1,48 @@
+# Task 6f-2, lead runs at 4cb961040 (B50), one per arm: support mode, MUL_MAT without the weights=1 cases, Mistral gate
+GGML_SYCL:BOOL=ON
+  03:27:51 build/bin/test-backend-ops newer than ggml-sycl.cpp: yes
+  03:27:52 build/bin/llama-completion newer than ggml-sycl.cpp: yes
+ldd sycl libs (test-backend-ops): 2
+== 1 support mode, task build  2026-11-22T03:29:46-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  lines: 24649  verdicts:   16131 NOT SUPPORTED    8518 SUPPORTED 
+  vs parent: same case list: yes
+    now declined (was SUPPORTED), by op:       6 ADD     120 MUL_MAT       1 MUL_MAT_HADAMARD       1 MUL_MAT_ID 
+    now admitted (was not), by op:            2 REPEAT 
+  vs task: same case list: yes
+    now declined (was SUPPORTED), by op:       4 MUL_MAT 
+    now admitted (was not), by op:      
+  declined since the previous task build:
+    MUL_MAT(type_a=mxfp4,type_b=f16,m=16,n=16,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): SUPPORTED
+    MUL_MAT(type_a=mxfp4,type_b=f16,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): SUPPORTED
+    MUL_MAT(type_a=q4_0,type_b=f16,m=16,n=16,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): SUPPORTED
+    MUL_MAT(type_a=q4_0,type_b=f16,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): SUPPORTED
+  kernel fault lines since start: 0
+== 2 MUL_MAT without the weights=1 cases  2026-11-22T03:29:54-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=1
+  OK: 1993  FAIL: 1  not supported [SYCL0]: 1013  not supported [CPU]: 9
+  abort lines: 0
+MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): FAIL
+  the four single-plane quantized x f16 cases:
+    MUL_MAT(type_a=q4_0,type_b=f16,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): not supported [SYCL0, CPU] 
+    MUL_MAT(type_a=q4_0,type_b=f16,m=16,n=16,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): not supported [SYCL0, CPU] 
+    MUL_MAT(type_a=mxfp4,type_b=f16,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): not supported [SYCL0, CPU] 
+    MUL_MAT(type_a=mxfp4,type_b=f16,m=16,n=16,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): not supported [SYCL0, CPU] 
+  settle: shmem=10GB
+  kernel fault lines since start: 0
+== 3 Mistral completion gate, B50  2026-11-22T03:31:09-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  output:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  settle: shmem=10GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T03:31:56-05:00
+lock released
+== vs the fix-round-1 build's list: 0 differing lines
+
+
+# MUL_MAT sweep result lines that are not OK and not 'not supported'
+MUL_MAT(type_a=f16,type_b=f32,m=16,n=2105344,k=32,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1,src_overlap=0,m_v=0,pad=0,offset_a=0): FAIL
+1993/1994 tests passed

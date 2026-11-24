@@ -359,6 +359,24 @@ static void test_measure_n_ctx() {
           "the measure's n_ctx and the recorded n_ctx disagree");
 }
 
+// The context the load's measures run at is the one the caller requested from the load: the n_ctx hint, resolved and
+// padded as the context pads it, or the training context when the caller requested none.
+static void test_measure_requested_context() {
+    CHECK(llama_load_measure_shape_resolve(8192, 0, 1048576).n_ctx == 8192, "a named context was not kept");
+    CHECK(llama_load_measure_shape_resolve(8000, 0, 1048576).n_ctx == 8192,
+          "the request is not padded like the context");
+    CHECK(llama_load_measure_shape_resolve(LLAMA_N_CTX_HINT_DEFAULT, 0, 1048576).n_ctx == 1048576,
+          "no -c did not resolve to the training context");
+    CHECK(llama_load_measure_shape_resolve(0, 0, 262144).n_ctx == 262144,
+          "hint 0 does not measure at the training context");
+    // the default pads a training context that is not a multiple of 256, and a hint above the training context (a
+    // rope-extended -c) is not clamped
+    CHECK(llama_load_measure_shape_resolve(LLAMA_N_CTX_HINT_DEFAULT, 0, 40000).n_ctx == 40192,
+          "no -c did not pad the training context like the context");
+    CHECK(llama_load_measure_shape_resolve(2097152, 0, 1048576).n_ctx == 2097152,
+          "a context above the training context was clamped");
+}
+
 // The shape a load measures its compute term at: the caller's context and micro-batch, from the two hints, with the
 // training context and the ladder's bottom rung where the caller names none. One resolver, so the KV room, the
 // measure and the micro-batch the backend credits the term at read one shape.
@@ -1152,6 +1170,73 @@ static void test_state_excess() {
     CHECK(llama_context_state_excess_text(0, 4, 0, 0).empty(), "no state and no term warned");
 }
 
+// A compute term larger than its device's total memory is refused by name, before any reservation; a term that
+// fits, the host tier and a device of unknown capacity are not judged.
+static void test_probe_unfundable_text() {
+    const size_t              mib = 1024 * 1024;
+    llama_load_measure_device big;
+    big.device      = 0;
+    big.chunk_bytes = { 1024 * mib, 2048 * mib, 49152 * mib, 49152 * mib, 49152 * mib };
+    big.total       = 150528 * mib;
+    llama_load_measure_device host;
+    host.host  = true;
+    host.total = 900000 * mib;
+
+    std::vector<llama_load_device_capacity> caps;
+    caps.push_back({ 0, 32656ull * mib });
+    caps.push_back({ 1, 16304ull * mib });
+
+    const std::string refused = llama_load_probe_unfundable_text({ host, big }, caps, 1048576);
+    CHECK(refused.rfind("[LOAD-PLAN] load refused", 0) == 0, "no tagged refusal for a 150 GiB term on a 32 GiB device");
+    CHECK(refused.find("n_ctx 1048576") != std::string::npos, "the refusal does not name the context");
+    CHECK(refused.find("device 0") != std::string::npos, "the refusal does not name the device");
+    CHECK(refused.find("needs 150528.0 MiB") != std::string::npos, "the refusal does not name the term: %s",
+          refused.c_str());
+    CHECK(refused.find("has 32656.0 MiB in total") != std::string::npos,
+          "the refusal does not name the device total: %s", refused.c_str());
+    CHECK(refused.find("-c") != std::string::npos, "the refusal does not name the remedy");
+
+    llama_load_measure_device fits = big;
+    fits.total                     = 1052 * mib;
+    CHECK(llama_load_probe_unfundable_text({ fits }, caps, 8192).empty(), "a term that fits was refused");
+    CHECK(llama_load_probe_unfundable_text({ host }, caps, 1048576).empty(), "the host tier was judged");
+    // a host entry whose index collides with a listed device is still the host tier
+    llama_load_measure_device host0 = host;
+    host0.device                    = 0;
+    CHECK(llama_load_probe_unfundable_text({ host0 }, caps, 1048576).empty(), "a host entry was judged as device 0");
+    // a term equal to the device's total fits
+    llama_load_measure_device exact = big;
+    exact.total                     = 32656ull * mib;
+    CHECK(llama_load_probe_unfundable_text({ exact }, caps, 1048576).empty(), "a term equal to the total was refused");
+    llama_load_measure_device unknown = big;
+    unknown.device                    = 7;
+    CHECK(llama_load_probe_unfundable_text({ unknown }, caps, 1048576).empty(), "an unknown device was refused");
+    std::vector<llama_load_device_capacity> zero_caps;
+    zero_caps.push_back({ 0, 0 });
+    CHECK(llama_load_probe_unfundable_text({ big }, zero_caps, 1048576).empty(), "a zero capacity was trusted");
+
+    // the second device is the unfundable one, and the capacities are listed in the other order
+    llama_load_measure_device first  = big;
+    first.total                      = 1052 * mib;
+    llama_load_measure_device second = big;
+    second.device                    = 1;
+    second.total                     = 20000 * mib;
+    std::vector<llama_load_device_capacity> swapped;
+    swapped.push_back({ 1, 16304ull * mib });
+    swapped.push_back({ 0, 32656ull * mib });
+    const std::string refused1 = llama_load_probe_unfundable_text({ first, second }, swapped, 4096);
+    CHECK(refused1.find("device 1") != std::string::npos, "the second device was not judged: %s", refused1.c_str());
+    CHECK(refused1.find("needs 20000.0 MiB") != std::string::npos, "the second device's term is not named: %s",
+          refused1.c_str());
+    CHECK(refused1.find("has 16304.0 MiB in total") != std::string::npos, "the second device's total is not named: %s",
+          refused1.c_str());
+    // and with the capacities in the devices' order, where the unfundable device is not the first capacity listed
+    const std::string refused2 = llama_load_probe_unfundable_text({ first, second }, caps, 4096);
+    CHECK(refused2.find("device 1") != std::string::npos &&
+              refused2.find("has 16304.0 MiB in total") != std::string::npos,
+          "the second capacity was not consulted: %s", refused2.c_str());
+}
+
 int main() {
     test_guard();
     test_plan_absent();
@@ -1164,12 +1249,14 @@ int main() {
     test_measure_params_tie_to_the_ladder();
     test_measure_kv_shape();
     test_measure_n_ctx();
+    test_measure_requested_context();
     test_measure_shape_resolve();
     test_admitted_fold();
     test_admitted_record();
     test_probe_reserve();
     test_state_terms();
     test_state_excess();
+    test_probe_unfundable_text();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

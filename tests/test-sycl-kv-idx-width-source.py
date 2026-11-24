@@ -15,7 +15,7 @@ host-KV figure short by the indexer, and so that no second source of the width c
    `g_placement_kv_info.layer_idx_k_width` (through the KV intake ggml_sycl_inventory_fill_kv_info), and both plan builders mirror it into the persisted plan, beside the
    per-layer truth;
 4. `placement_plan::kv_size_for_layer` adds `kv_idx_size_for_layer` on its per-layer branch, and
-   `kv_demand_for_layer` returns `kv_size_for_layer(layer_id)` and reads no width itself (a second sum would count the
+   `kv_demand_for_layer` returns `kv_size_for_layer(slot)` and reads no width itself (a second sum would count the
    indexer twice);
 5. both demotion sites (the runtime demotion input and the residency re-fit input) read `kv_demand_for_layer`, and no
    `layer_kv_bytes` input reads `kv_main_size_for_layer` or `kv_idx_size_for_layer`, the figures that leave part of the
@@ -81,8 +81,8 @@ EARLY = r"static\s+void\s+llama_model_sycl_compute_early_plan\s*\("
 EARLY_BUILD = r"static\s+bool\s+llama_model_sycl_build_early_inventory\s*\("
 OWNER_ARRAY = r"(?:\bout\s*\.\s*)?\bkv_layer_arrays\s*\.\s*idx_k_width\s*\.\s*get\s*\(\s*\)"
 LATE = r"static\s+void\s+llama_model_sycl_set_late_inventory\s*\("
-DEMAND = r"size_t\s+kv_demand_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const"
-SIZE = r"size_t\s+kv_size_for_layer\s*\(\s*uint32_t\s+layer_id\s*\)\s*const"
+DEMAND = r"size_t\s+kv_demand_for_layer\s*\(\s*uint32_t\s+slot\s*\)\s*const"
+SIZE = r"size_t\s+kv_size_for_layer\s*\(\s*uint32_t\s+slot\s*\)\s*const"
 
 
 # ---- 1. the inventory field ----
@@ -226,16 +226,16 @@ def test_both_plan_builders_mirror_the_width_beside_the_per_layer_truth():
 
 
 SIZE_WITHOUT_INDEXER = "kv_size_for_layer does not add kv_idx_size_for_layer: the budgets would leave the indexer out"
-DEMAND_SECOND_SUM = "kv_demand_for_layer is not exactly kv_size_for_layer(layer_id): a second sum counts the indexer twice"
+DEMAND_SECOND_SUM = "kv_demand_for_layer is not exactly kv_size_for_layer(slot): a second sum counts the indexer twice"
 
 
 def accessor_problems(text: str) -> list:
     bad = []
     size = function_body(text, SIZE)
-    if not re.search(r"\+\s*kv_idx_size_for_layer\s*\(\s*layer_id\s*\)", size):
+    if not re.search(r"\+\s*kv_idx_size_for_layer\s*\(\s*slot\s*\)", size):
         bad.append(SIZE_WITHOUT_INDEXER)
     demand = function_body(text, DEMAND)
-    if not re.fullmatch(r"\s*return\s+kv_size_for_layer\s*\(\s*layer_id\s*\)\s*;\s*", demand):
+    if not re.fullmatch(r"\s*return\s+kv_size_for_layer\s*\(\s*slot\s*\)\s*;\s*", demand):
         bad.append(DEMAND_SECOND_SUM)
     return bad
 
@@ -246,16 +246,16 @@ def test_the_demand_is_the_size_and_the_size_charges_the_indexer():
 
 def test_mutation_witness_a_second_indexer_sum_is_caught():
     code = read(CACHE_HPP)
-    good = "return kv_size_for_layer(layer_id); }"
+    good = "return kv_size_for_layer(slot); }"
     assert code.count(good) == 1, "the delegating body moved"
-    mutated = code.replace(good, "return kv_size_for_layer(layer_id) + kv_idx_size_for_layer(layer_id); }", 1)
+    mutated = code.replace(good, "return kv_size_for_layer(slot) + kv_idx_size_for_layer(slot); }", 1)
     assert accessor_problems(mutated) == [DEMAND_SECOND_SUM]
 
 
 def test_mutation_witness_a_size_without_the_indexer_is_caught():
     code = read(CACHE_HPP)
     size = function_body(code, SIZE)
-    mutated_size = re.sub(r"\s*\+\s*kv_idx_size_for_layer\s*\(\s*layer_id\s*\)", "", size, count=1)
+    mutated_size = re.sub(r"\s*\+\s*kv_idx_size_for_layer\s*\(\s*slot\s*\)", "", size, count=1)
     assert mutated_size != size, "mutation did not apply"
     mutated = code.replace(size, mutated_size, 1)
     assert accessor_problems(mutated) == [SIZE_WITHOUT_INDEXER]

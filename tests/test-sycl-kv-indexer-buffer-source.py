@@ -129,12 +129,13 @@ HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == devic
 # The indexer widths follow n_ctx_context; the context's provenance is appended after them (llama.cpp-7fmt, pinned by
 # test-sycl-ctx-hint-default-source), then libllama's resolved storage inputs in the provenance's padding (pinned by
 # test-sycl-mapped-loader-source), the named micro-batch after that (pinned by
-# test-sycl-explicit-ubatch-placement-source), and the lazy tables last (th32 §4.1) with the measured micro-batch in
-# their padding (pinned by test-sycl-load-measure-source), so the struct no longer ends here.
+# test-sycl-explicit-ubatch-placement-source), the lazy tables (th32 §4.1) with the measured micro-batch in their
+# padding (pinned by test-sycl-load-measure-source), and the slot-to-layer map last (pinned by
+# test-sycl-kv-slot-layer-source), so the struct no longer ends here.
 FIELD = ("uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; bool n_ctx_context_is_default; "
          "bool use_mmap_resolved; bool use_mlock_resolved; uint8_t host_weight_layout; uint32_t n_ubatch_context; "
          "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
-         "uint32_t n_ubatch_measure; };")
+         "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; };")
 # The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
 # (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
 STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
@@ -145,15 +146,15 @@ INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);
 READ = ("kv.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 224,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
 )
-KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
-KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t layer_id) const"
-AT_ADDS = "+ kv_idx_bytes_for_layer_at(il, ctx);"
-SIZE_ADDS = "+ kv_idx_size_for_layer(layer_id);"
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const"
+KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t slot) const"
+AT_ADDS = "+ kv_idx_bytes_for_layer_at(slot, ctx);"
+SIZE_ADDS = "+ kv_idx_size_for_layer(slot);"
 PLAN_COPY = "plan.layer_idx_k_width = kv_info.layer_idx_k_width;"
 HINT = ("const uint32_t widths = kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer] + "
         "kv_info.idx_k_width(layer);")
@@ -167,9 +168,9 @@ HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\"
 
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
-    """The field follows n_ctx_context (with the context's provenance, libllama's resolved storage inputs and the
-    named micro-batch after it), the backend copies it (in the KV intake, which the stage hands g_placement_kv_info),
-    and the consumer pins the layout."""
+    """The field follows n_ctx_context (with the context's provenance, libllama's resolved storage inputs, the named
+    micro-batch, the lazy tables and the slot-to-layer map after it), the backend copies it (in the KV intake, which
+    the stage hands g_placement_kv_info), and the consumer pins the layout."""
     n = norm(sycl_cpp)
     return (FIELD in norm(header) and READ in body(n, INTAKE_SIG) and INTAKE_CALL in body(n, STAGE_SIG)
             and all(a in n for a in LAYOUT))

@@ -2255,6 +2255,10 @@ static void ggml_sycl_get_rows_dispatch_slice(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_F16:
             get_rows_sycl_float(ctx, src0, src1, dst, (const sycl::half *) src0_dd, src1_dd, dst_dd, stream);
             break;
+        case GGML_TYPE_BF16:
+            get_rows_sycl_float(ctx, src0, src1, dst, (const sycl::ext::oneapi::bfloat16 *) src0_dd, src1_dd, dst_dd,
+                                stream);
+            break;
         case GGML_TYPE_F32:
             get_rows_sycl_float(ctx, src0, src1, dst, (const float *) src0_dd, src1_dd, dst_dd, stream);
             break;

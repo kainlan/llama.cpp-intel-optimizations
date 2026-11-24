@@ -526,7 +526,7 @@ SITE_TABLE = [
      "fused_handle@ensure_fused_buf", "UNOWNED"),
     (_GS, "ggml_sycl_fill_onednn_woq", 1, "assign", _HC, _ES, "-", "-", "-", "host", "SCRATCH", "-", "EXPERT"),
     (_GS, "ggml_sycl_fill_xmx_tiled", 1, "assign", _HC, _ES, "-", "-", "-", "host", "SCRATCH", "-", "EXPERT"),
-    (_GS, "ggml_backend_sycl_buffer_get_tensor", 1, "assign", _HC, "STAGING", "-", "-", "-", "host", "SCRATCH",
+    (_GS, "ggml_sycl_buffer_read_stored_bytes", 1, "assign", _HC, "STAGING", "-", "-", "-", "host", "SCRATCH",
      "fallback_handle", "GRAPH"),
     (_GS, "ggml_sycl_readback_via_shared_kernel", 1, "assign", _HC, "STAGING", "-", "-", "-", "host", "SCRATCH",
      "host_stage_handle", "GRAPH"),
@@ -574,6 +574,11 @@ SITE_TABLE = [
     (_GS, "ggml_sycl_mul_mat_id", i + 2, _AMHP, _HC, _ES, "-", cohort, "-", "host", "SCRATCH", "-", "EXPERT")
     for i, cohort in enumerate(['"moe_cpu_dispatch_act"', '"moe_cpu_dispatch_out"', '"moe_q1_nvfp4_recipe_workspace"',
                                 '"moe_planner_cpu_act"', '"moe_planner_cpu_out"', '"moe_planner_cpu_weight"'])
+] + [
+    (_GS, "ggml_sycl_moe_direct_host_prepare", i + 1, _AMHP, _HC, _ES, "-", cohort, "-", "host", "SCRATCH", "-",
+     "EXPERT")
+    for i, cohort in enumerate(['"moe_direct_host_activation"', '"moe_direct_host_output"',
+                                '"moe_q1_nvfp4_recipe_workspace"'])
 ] + [
     (_GS, "ggml_sycl_mul_mat_id", 8, "assign", _HC, _ES, "-", '"moe_pp_cpu_island_act"', "-", "host", "SCRATCH", "-",
      "EXPERT"),
@@ -660,7 +665,7 @@ GRAPH_TERMS = {
     (_C, "ggml_sycl_get_staged_handle_device", 2): SINGLE_TENSOR,
     (_GS, "moe_hybrid_init_once", 1): SINGLE_TENSOR,  # one expert slice per iteration, released before the next
     (_GS, "moe_hybrid_init_once", 2): SINGLE_TENSOR,
-    (_GS, "ggml_backend_sycl_buffer_get_tensor", 1): SINGLE_TENSOR,
+    (_GS, "ggml_sycl_buffer_read_stored_bytes", 1): SINGLE_TENSOR,
     (_GS, "ggml_sycl_readback_via_shared_kernel", 1): SINGLE_TENSOR,
     (_GS, "ggml_sycl_attn_host_staging_per_call", 1): SLOT_CAPACITY,
     (_GS, "ggml_sycl_dispatch_host_flash_attn_sync", 1): SLOT_CAPACITY,  # a re-copy of Q, the Q kind's size
@@ -697,7 +702,7 @@ DOC_ROW_MAP = {
     "`common.cpp:1414`": ([((_C, "ggml_sycl_tp_cache_ffn_norm", 1), 0)], "host_handle"),
     "`gs:8549`, `gs:8711`": ([((_GS, "moe_hybrid_init_once", 1), 0), ((_GS, "moe_hybrid_init_once", 2), 0)],
                              "d2h_staging"),
-    "`gs:36787`": ([((_GS, "ggml_backend_sycl_buffer_get_tensor", 1), 0)], "fallback_handle"),
+    "`gs:36787`": ([((_GS, "ggml_sycl_buffer_read_stored_bytes", 1), 0)], "fallback_handle"),
     "`gs:36906`": ([((_GS, "ggml_sycl_readback_via_shared_kernel", 1), 0)], "host_stage_handle"),
     "`gs:44294`": ([((_GS, "ggml_sycl_cpu_fallback_graph", 1), 0)], "host_copies"),
     "`gs:48244`": ([((_GS, "tp_device1_worker_thread_func", 1), 0)], "w.results"),
@@ -755,8 +760,9 @@ NEW_ROWS = {
 
 # The doc's per-class counts that the tree no longer matches: (phrase in the doc, class, role, the tree's count).
 DOC_COUNT_DRIFT = [
-    ("23 `EXPERT_STAGING`", "EXPERT", _ES, 24,
-     "ggml_sycl_mul_mat_id's moe_q1_nvfp4_recipe_workspace is new; moe_stream_ring::reserve is a 25th, device tier"),
+    ("23 `EXPERT_STAGING`", "EXPERT", _ES, 27,
+     "ggml_sycl_mul_mat_id's moe_q1_nvfp4_recipe_workspace and ggml_sycl_moe_direct_host_prepare's activation, output "
+     "and recipe workspace are new; moe_stream_ring::reserve is a 28th, device tier"),
 ]
 
 

@@ -288,7 +288,9 @@ void moe_stream_phase::flush_window_timing() {
 // profiling, and not the compute queue, whose readers would then wait for the prefetch copies.
 sycl::queue & moe_stream_phase::timing_queue() {
     if (!timing_queue_) {
-        timing_queue_.emplace(ccs_->get_context(), ccs_->get_device(), default_queue_properties());
+        timing_queue_.emplace(ggml_sycl_make_queue(ccs_->get_context(), ccs_->get_device(),
+                                                   ggml_sycl_get_device_id_from_queue(*ccs_),
+                                                   default_queue_properties()));
     }
     return *timing_queue_;
 }

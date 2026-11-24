@@ -1142,11 +1142,24 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
 
 ## Known Issues
 
+- **An asynchronous SYCL error fails its device's contexts one graph late.** A command that fails after it was
+  submitted (a device fault, a host task that throws) is recorded by the backend's async handler for its device; it no
+  longer terminates the process. The backend logs `[SYCL-ASYNC-FAILURE]`, and every later `graph_compute` of every
+  context on that device that existed before the failure returns `GGML_STATUS_FAILED`, so `llama_decode` returns -3.
+  The failure is first seen in `ggml_backend_synchronize`, which cannot return a status, so the outputs of the graph
+  that failed (its logits or embeddings, and a token sampled from them) reach the caller before the next
+  `llama_decode` reports it. Treat every output read after the error line as invalid, and create a new context: a
+  failed context never computes again. A context created after the failure starts clean. A lost device is the
+  exception: the process then ends with status 69 (next subsection).
+
 ### Exit status 69 after a device loss
 
 When the backend records a lost device, it prints `[SYCL-FATAL] device lost: ...`. From then on the process ends
 with status 69 at its next failed SYCL check, or when it exits. A site that cannot continue after a loss ends the
-process at once, with its own `[SYCL-FATAL] <function>:` line and the same status.
+process at once, with its own `[SYCL-FATAL] <function>:` line and the same status. A `ggml_backend_synchronize`
+whose drain fails after the loss is such a check: it prints its `[SYCL-SYNC-DIAG]` line and then
+`[SYCL-FATAL] SYCL_CHECK failed after a device loss`, before the context's cleanup would drain the lost card. A
+drain that fails for any other reason is latched and reported as above, and the process runs on.
 
 No teardown runs on the way out. Only when the process leaves through a normal exit do exit handlers registered after
 the loss still run first. On a lost card the driver's teardown can hang, and the process would then hold its memory

@@ -27,8 +27,8 @@ The fix this gate pins:
     training context (llama.cpp-7fmt), and llama-bench from its test's context), padded the way llama_context pads
     n_ctx for a single sequence, or 0 when no request reached the load (a caller that never sets the field), which
     holds no room. The hint is resolved in one place, src/llama-n-ctx-hint.h, whose default-context rule
-    test-sycl-ctx-hint-default-source pins. The placement envelope's n_ctx stays 0, so the load measures and the
-    planning shape keep their inputs.
+    test-sycl-ctx-hint-default-source pins. The placement envelope's n_ctx stays 0, so the planning shape keeps its
+    inputs; the load measures read the resolved hint (llama_load_measure_shape_resolve).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -169,13 +169,14 @@ def claim_dense_pass_charges_weights_only(cache: str) -> bool:
 
 
 def claim_layer_kv_follows_the_dense_layer(cache: str) -> bool:
-    """A layer's KV is charged on the device only when its dense weights are there and it fits; otherwise host."""
+    """A KV slot is charged on the device only when the dense weights of the layer that executes it are there and it
+    fits; otherwise host. The slots go in slot order (a looped model's later slots run an earlier layer)."""
     b = body(norm(cache), LAYER_KV_SIG)
     return (bool(b) and ordered(
-        b, "for (const auto & [layer_id, has_attention] : layer_has_attention)",
+        b, "for (const auto & [slot, layer_id] : slot_layers)",
         "const bool kv_on_device = plan.get_layer_device(layer_id) == device_id && kv_cost <= remaining;",
         "remaining -= kv_cost;", "plan.kv_vram_bytes += kv_cost;", "plan.kv_host_bytes += kv_cost;",
-        "plan.kv_device[layer_id] = kv_on_device ? device_id : -1;"))
+        "plan.kv_device[slot] = kv_on_device ? device_id : -1;"))
 
 
 def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
@@ -183,8 +184,8 @@ def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
     cost test, llama.cpp-w013), takes no more than is left, and counts in the plan's device bytes."""
     b = body(norm(cache), ROOM_SIG)
     return (bool(b) and ordered(
-        b, "if (layer_id >= 0 && owner == device_id) { layers.push_back(layer_id); }",
-        "kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));",
+        b, "if (slot >= 0 && owner == device_id) { slots.push_back(slot); }",
+        "kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(slot));",
         "room.held = std::min(room.wanted, remaining);", "remaining -= room.held;",
         "plan.kv_context_reserve_bytes = room.held;", "plan.vram_bytes += room.held;"))
 
@@ -238,15 +239,16 @@ def claim_room_line_is_visible_and_names_its_source(cache: str) -> bool:
 def claim_extra_is_the_context_minus_the_charge(hpp: str) -> bool:
     """The context's extra KV comes from the same per-layer rule as the charge, at n_ctx_context."""
     n = norm(hpp)
-    return ("size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }" in n
+    return ("size_t kv_bytes_for_layer(uint32_t slot) const { return kv_bytes_for_layer_at(slot, n_ctx); }" in n
             and ordered(n, "size_t kv_context_extra_bytes_for_layer(uint32_t il) const {",
                         "const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);",
                         "const size_t charged = kv_bytes_for_layer(il);",
                         "return at_context > charged ? at_context - charged : 0;"))
 
 
-KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
-UNIFORM_FALLBACK = "return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);"
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t slot, uint32_t ctx) const"
+UNIFORM_FALLBACK = ("return is_swa_layer(static_cast<int>(slot)) ? kv_bytes_per_swa_layer(ctx) : "
+                    "kv_bytes_per_layer(ctx);")
 
 
 def claim_uniform_fallback_has_one_formula(hpp: str) -> bool:
@@ -278,15 +280,16 @@ HINT_PICK_RE = re.compile(r"return \{ n_ctx_hint != 0 \? GGML_PAD\(n_ctx_hint, (
 HINT_PICK = "inventory.n_ctx_context = ctx_room.n_ctx_context;"
 HINT_RESOLVE = "const llama_n_ctx_hint_resolution ctx_room = llama_n_ctx_hint_resolve(n_ctx_hint, hparams.n_ctx_train);"
 # Both builders pass the model's context hint, with its micro-batch hint after it (test-sycl-explicit-ubatch-placement-
-# source pins that one), and the inventory ends with the lazy tables (th32 §4.1), after the micro-batch, the context's
-# provenance and libllama's resolved storage inputs (test-sycl-mapped-loader-source pins those), with the measured
-# micro-batch in the lazy tables' padding.
+# source pins that one), and the inventory ends with the slot-to-layer map (test-sycl-kv-slot-layer-source pins its
+# use), after the lazy tables (th32 §4.1), the micro-batch, the context's provenance and libllama's resolved storage
+# inputs (test-sycl-mapped-loader-source pins those), with the measured micro-batch in the lazy tables' padding.
+# Growing the struct moves none of the pinned offsets.
 HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint(), model.get_n_ubatch_hint());"
 INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
             "bool n_ctx_context_is_default; bool use_mmap_resolved; bool use_mlock_resolved; "
             "uint8_t host_weight_layout; uint32_t n_ubatch_context; "
             "const struct ggml_sycl_lazy_table_info * lazy_tables; uint32_t lazy_table_count; "
-            "uint32_t n_ubatch_measure; }")
+            "uint32_t n_ubatch_measure; const int32_t * kv_layer_phys; uint32_t kv_layer_phys_count; }")
 # The backend copies the inventory into its KV inputs through the one KV intake the plan dry run also uses
 # (llama.cpp-4zup), written over the KV inputs it is handed; the stage hands it g_placement_kv_info.
 STAGE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
@@ -296,10 +299,14 @@ INTAKE_SIG = ("static void ggml_sycl_inventory_fill_kv_info(ggml_sycl::placement
 INTAKE_CALL = "ggml_sycl_inventory_fill_kv_info(g_placement_kv_info, inventory);"
 COPY_CTX = "kv.n_ctx_context = inventory->n_ctx_context;"
 TAIL_ASSERTS = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 208,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 224,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_is_default) == 184,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 208,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 216,",
 )
 
 
@@ -338,8 +345,8 @@ def claim_hint_is_padded_like_the_context(resolver: str, context: str) -> bool:
 
 
 def claim_envelope_keeps_no_context(model: str) -> bool:
-    """The hint reaches the room only: the placement envelope still carries n_ctx 0, so the probe, admitted and late
-    measures (llama_load_measure_n_ctx of the envelope's n_ctx) and the planning shape keep n_ctx_train and 512."""
+    """The envelope still carries n_ctx 0, so the planning shape keeps n_ctx_train and 512; the probe, admitted and
+    late measures read the resolved hint (llama_load_measure_shape_resolve)."""
     env = body(norm(model), ENVELOPE_SIG)
     return bool(env) and "envelope.n_ctx = 0;" in env and "n_ctx_hint" not in env
 
@@ -634,15 +641,15 @@ def test_mutant_field_inserted_before_the_indexer_widths_fails():
 
 
 def test_mutant_field_appended_fails():
-    """A field appended after the measured micro-batch: the struct no longer ends where the consumer's size pin says."""
-    mutant = _once(SYCL_H, "uint32_t n_ubatch_measure; };", "uint32_t n_ubatch_measure; uint8_t spare; };")
+    """A field appended after the slot-to-layer map: the struct no longer ends where the consumer's size pin says."""
+    mutant = _once(SYCL_H, "uint32_t kv_layer_phys_count; };", "uint32_t kv_layer_phys_count; uint8_t spare; };")
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant, RESOLVER)
 
 
 def test_mutant_size_pin_left_at_the_old_size_fails():
-    """The provenance appended but the size pin left at 184: the static_assert would stop the build, and the gate
-    says so first."""
-    mutant = _once(SYCL, TAIL_ASSERTS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,")
+    """The slot-to-layer map appended but the size pin left at 192: the static_assert would stop the build, and the
+    gate says so first."""
+    mutant = _once(SYCL, TAIL_ASSERTS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,")
     assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, mutant, SYCL_H, RESOLVER)
 
 

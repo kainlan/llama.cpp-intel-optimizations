@@ -1,0 +1,35 @@
+Task 6d, B50 (level_zero:1), llama-bench -m mistral-7b-v0.1.Q4_0.gguf -p 512 -n 128, interleaved A B B A.
+A = parent of the fix (product code 1ce4cd442), B = fix (9013f01c2). One run per arm, 2026-11-22.
+Host load was about 5 during these runs, far below this host's usual load: the figures are a paired
+comparison, not baselines.
+
+== bench A1  2026-11-22T00:12:46-05:00 load=5.77 ninja=0
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  pp512 =        1336.99 ± 1.25 
+  tg128 =          46.10 ± 0.14 
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== bench B1  2026-11-22T00:13:47-05:00 load=5.83 ninja=0
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  pp512 =        1343.95 ± 2.37 
+  tg128 =          46.05 ± 0.09 
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== bench B2  2026-11-22T00:14:49-05:00 load=5.49 ninja=0
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  pp512 =        1342.43 ± 1.47 
+  tg128 =          45.99 ± 0.05 
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+== bench A2  2026-11-22T00:15:50-05:00 load=5.38 ninja=0
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  pp512 =        1334.93 ± 1.44 
+  tg128 =          46.00 ± 0.09 
+  settle: shmem=9GB
+  kernel fault lines since start: 0
+
+mean A: pp512 1335.96, tg128 46.05    mean B: pp512 1343.19, tg128 46.02

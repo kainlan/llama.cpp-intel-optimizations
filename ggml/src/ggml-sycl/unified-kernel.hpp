@@ -3052,6 +3052,12 @@ class UnifiedKernel {
     bool                  update_op_descriptor(int op_idx, const OperationDescriptor & desc);
     OperationDescriptor * get_op_descriptor_mut(int op_idx);  // Direct mutable access (no copy)
 
+    // Which nodes the graph the cached plan was built from computes (ggml_sycl_graph_selection_hash in
+    // ggml-sycl.cpp). The plan is reused only for a graph with the same selection; invalidate_plan_cache clears it.
+    void set_plan_selection_hash(uint64_t hash) { plan_selection_hash_ = hash; }
+
+    uint64_t plan_selection_hash() const { return plan_selection_hash_; }
+
     // Update recipe: compact per-token refresh that skips the full ggml graph walk
     bool has_update_recipe() const { return update_recipe_valid_; }
 
@@ -3180,6 +3186,7 @@ class UnifiedKernel {
     std::vector<ggml_sycl::mem_handle> cached_temp_device_handles_;
     size_t                             cached_temp_device_alloc_bytes_ = 0;
     bool                               plan_cache_valid_               = false;
+    uint64_t                           plan_selection_hash_            = 0;
 
     // Update recipe: compact per-token refresh (see UpdateRecipeEntry)
     std::vector<UpdateRecipeEntry> update_recipe_;

@@ -161,6 +161,13 @@ const ggml_type_traits_cpu * ggml_sycl_get_baseline_type_traits_cpu(enum ggml_ty
 
 const ggml_type_traits_cpu * ggml_sycl_get_type_traits_cpu(enum ggml_type type) noexcept {
 #ifndef GGML_BACKEND_DL
+    // ggml-cpu's own table. Its vec_dot and from_float read block scales through ggml-cpu's lookup tables
+    // (ggml_table_f32_f16 on x86, ggml_table_f32_ue4m3 for NVFP4), which hold zeros until ggml_cpu_init() fills them.
+    // The CPU backend's registration and ggml_backend_cpu_init() call it, but a process can drive this backend with
+    // neither (a backend from ggml_backend_sycl_init, no registry): every dot then reads a zero scale and returns
+    // exactly 0, with no error anywhere. So the first caller fills them, once; later callers pay one guard load.
+    static const bool cpu_tables_filled = (ggml_cpu_init(), true);
+    (void) cpu_tables_filled;
     const int index = static_cast<int>(type);
     return index >= 0 && index < GGML_TYPE_COUNT ? ggml_get_type_traits_cpu(type) : nullptr;
 #else

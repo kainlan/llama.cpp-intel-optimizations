@@ -49,9 +49,9 @@ a unit test cannot show is where the driver runs and what it does not do there. 
   D14 a device where no driver ran still reports: ggml_sycl_moe_swap_report, with no driver, takes both counters
       kept apart and prints them in one WARN line when either is nonzero;
   D15 the evict batch's room and the evict mint's cap are one figure: the driver's room callback returns
-      unified_cache::host_zone_no_growth_room for the WEIGHT zone, the mint refuses a no-growth request past that
-      same accessor, and the accessor is the zone's capacity capped at its reserved figure, less what it holds,
-      never below zero;
+      unified_cache::host_zone_no_growth_room for the WEIGHT zone, the mint refuses a no-growth request past
+      host_zone_no_growth_bound for that zone, and the accessor is that same bound (the zone's capacity when it has
+      none) less what the zone holds, never below zero;
   D16 a replaced route table's driver hands over what is in flight only under the load the instance last saw: the
       caller carries only when the snapshot's model and load ids both match, otherwise drops the moves as open slots
       and forces the old driver's report when it dropped any, and the report prints when forced even if an earlier
@@ -160,9 +160,11 @@ NO_DRIVER_FIELDS = ("const uint64_t off = inst.off_multithreaded.exchange(0, std
                     "const uint64_t skipped = inst.skipped.exchange(0, std::memory_order_relaxed);",
                     "if (off != 0 || skipped != 0) { GGML_LOG_WARN(\"[MOE-SWAP] device %d: no driver ran: ")
 ROOM_RETURN = "return cache->host_zone_no_growth_room(ggml_sycl::host_zone_id::WEIGHT);"
-MINT_CAP = ("if (req.intent.constraints.forbid_host_zone_growth && alloc_size > ucache->host_zone_no_growth_room(zone)) "
-            "{ return nullptr; }")
-NO_GROWTH_ROOM_FIELDS = ("const size_t limit = reserved > 0 ? std::min(capacity, reserved) : capacity;",
+MINT_BOUND = ("const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone), "
+              "ucache->host_zone_capacity(zone));")
+MINT_CAP = "if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {"
+ROOM_BOUND = "host_zone_no_growth_bound(zone, host_zone_reserved_capacity(zone), capacity)"
+NO_GROWTH_ROOM_FIELDS = (f"const size_t bound = {ROOM_BOUND};", "const size_t limit = bound > 0 ? bound : capacity;",
                          "return limit > used ? limit - used : 0;")
 
 WAITS = re.compile(
@@ -501,8 +503,8 @@ def check(raw: dict[str, str]) -> None:
     room = norm(body(sycl, ROOM_SIG))
     if not room or ROOM_RETURN not in room or "host_zone_capacity" in room or "host_zone_used" in room:
         fail("D15", "the evict batch's room is not the WEIGHT zone's no-growth room")
-    if norm(cache).count(MINT_CAP) != 1:
-        fail("D15", "the evict mint's no-growth cap is not the cache's no-growth room")
+    if norm(cache).count(MINT_BOUND) != 1 or norm(cache).count(MINT_CAP) != 1:
+        fail("D15", "the evict mint's no-growth cap is not host_zone_no_growth_bound less what the zone holds")
     # D16 --------------------------------------------------------------------------------------------------------------
     replaced = norm(caller)
     if replaced.count(SAME_LOAD) != 1 or replaced.count(CARRY_GATE) != 1 or replaced.count(FORCED_REPORT) != 1:
@@ -513,7 +515,8 @@ def check(raw: dict[str, str]) -> None:
 
     accessor_room = norm(body(cache, NO_GROWTH_ROOM_SIG))
     if not accessor_room or not all(f in accessor_room for f in NO_GROWTH_ROOM_FIELDS):
-        fail("D15", "the no-growth room is not capacity capped at the reserved figure, less what is used, never below 0")
+        fail("D15", "the no-growth room is not host_zone_no_growth_bound (capacity when it has none) less what is "
+                    "used, never below 0")
 
     # D17 --------------------------------------------------------------------------------------------------------------
     calls = [m.start() for m in re.finditer(re.escape(TXN_CALL), step)]
@@ -738,12 +741,14 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", ROOM_SIG, "return cache->host_zone_no_growth_room(ggml_sycl::host_zone_id::WEIGHT);",
                   "return cache->host_zone_capacity(ggml_sycl::host_zone_id::WEIGHT);")])
     expect_fail("mint-caps-at-reserved", "D15",
-                [("cache", "", "alloc_size > ucache->host_zone_no_growth_room(zone)",
+                [("cache", "", "ucache->host_zone_used(zone) + alloc_size > bound",
                   "ucache->host_zone_used(zone) + alloc_size > ucache->host_zone_reserved_capacity(zone)")])
     expect_fail("no-growth-room-negative", "D15",
                 [("cache", NO_GROWTH_ROOM_SIG, "return limit > used ? limit - used : 0;", "return limit - used;")])
-    expect_fail("no-growth-room-ignores-capacity", "D15",
-                [("cache", NO_GROWTH_ROOM_SIG, "std::min(capacity, reserved)", "reserved")])
+    expect_fail("no-growth-room-ignores-bound", "D15",
+                [("cache", NO_GROWTH_ROOM_SIG, ROOM_BOUND, "host_zone_reserved_capacity(zone)")])
+    expect_fail("no-growth-room-unbounded-zone-is-zero", "D15",
+                [("cache", NO_GROWTH_ROOM_SIG, "bound > 0 ? bound : capacity", "bound")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])

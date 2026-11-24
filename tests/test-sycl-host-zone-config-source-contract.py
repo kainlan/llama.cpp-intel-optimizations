@@ -170,11 +170,13 @@ texts = {
     "populate_zone_sizing_fn": function_window(
         cache_cpp,
         "static void populate_host_zone_sizing(placement_plan &                           plan,",
-        window=45000),
+        window=60000),
     "weight_zone_terms_fn": function_window(
         cache_cpp,
         "host_weight_zone_terms placement_plan_host_weight_zone_terms(const placement_plan & plan) {"),
     "swap_headroom_hold_fn": function_window(cache_cpp, "static void placement_plan_hold_moe_swap_host_headroom("),
+    "mmid_replan_fn": function_window(
+        cache_cpp, "bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,", window=20000),
     "charge_host_weight_fn": function_window(
         cache_hpp, "void charge_host_weight(placement_host_backing backing, size_t bytes) noexcept {"),
     "uncharge_host_weight_fn": function_window(
@@ -184,6 +186,8 @@ texts = {
     # the default window ended inside it.
     "host_arena_ctor_window": statement_window(
         cache_cpp, "size_t host_mem_budget = g_unified_cache_host_budget;", window=3200),
+    "unified_alloc_fn": function_window(
+        cache_cpp, "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {", window=120000),
     "cache_cpp": cache_cpp,
     "pool_cpp": pool_cpp,
     "env_doc": env_doc,
@@ -447,11 +451,11 @@ def witness_c_headroom(t):
 # plan already knows).
 # Any write to the zone size counts, compound ones included (`*= k_..._ratio`
 # after the terms assignment would otherwise pass); `==` comparisons do not.
-# The zone has two writers, and both write the terms' total(): the sizing in
+# Two writers write the terms' total(): the sizing in
 # populate_host_zone_sizing(), and the spread plan's swap-headroom hold, which
 # sets the swap_headroom term and writes the total again (a `base + bytes`
-# there would be a second formula for the same zone). The planner file holds
-# no other write.
+# there would be a second formula for the same zone). The third, the runtime
+# MMID re-plan, is checked below. The planner file holds no other write.
 WEIGHT_ZONE_WRITE_RE = re.compile(r"host_zone_weight_bytes\s*[-+*/]?=(?!=)")
 HOLD_ZONE_FROM_TERMS_RE = re.compile(
     r"plan\.host_zone_weight_bytes\s*=\s*placement_plan_host_weight_zone_terms\(plan\)\.total\(\);")
@@ -468,7 +472,9 @@ def check_c2_weight_zone_is_terms(t):
         and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
         and len(WEIGHT_ZONE_WRITE_RE.findall(hold_fn)) == 1
         and len(HOLD_ZONE_FROM_TERMS_RE.findall(hold_fn)) == 1
-        and len(WEIGHT_ZONE_WRITE_RE.findall(t["cache_cpp"])) == 2
+        and len(WEIGHT_ZONE_WRITE_RE.findall(t["cache_cpp"]))
+        == len(WEIGHT_ZONE_WRITE_RE.findall(fn)) + len(WEIGHT_ZONE_WRITE_RE.findall(hold_fn))
+        + len(WEIGHT_ZONE_WRITE_RE.findall(t["mmid_replan_fn"])) == 3
         and "_ratio" not in fn
         and "_ratio" not in terms_fn
     )
@@ -485,6 +491,45 @@ def witness_c2_hold_adds_its_own_bytes(t):
     # The hold's zone as the base it read plus its own bytes, a second formula beside the terms' total().
     t["swap_headroom_hold_fn"] = HOLD_ZONE_FROM_TERMS_RE.sub(
         "plan.host_zone_weight_bytes = base + plan.moe_swap_host_headroom_bytes;", t["swap_headroom_hold_fn"])
+    return t
+
+
+# --- C2 (the third writer): the MMID workspace host pool is a WEIGHT term
+# (host_weight_zone_terms::mmid_host_pool, set from moe_mmid_host_pool_bytes),
+# and the runtime MMID re-plan, the zone's third writer, moves the zone by
+# exactly that term's growth: one `+= growth`, growth the demand's pool less the
+# plan's, and the pool field then takes the demand's, so a zone that was its
+# terms' total() stays one. A total() there would resize the zone by entries a
+# prompt-phase loan changed since the zone was configured, bytes the re-plan did
+# not move.
+POOL_TERM_RE = re.compile(r"terms\.mmid_host_pool\s*=\s*plan\.moe_mmid_host_pool_bytes\s*;")
+REPLAN_GROWTH_RE = re.compile(
+    r"const size_t growth\s*=\s*demand\.moe_mmid_host_pool_bytes\s*-\s*plan\.moe_mmid_host_pool_bytes\s*;")
+REPLAN_ZONE_WRITE = "plan.host_zone_weight_bytes += growth;"
+REPLAN_POOL_SET_RE = re.compile(r"plan\.moe_mmid_host_pool_bytes\s*=\s*demand\.moe_mmid_host_pool_bytes\s*;")
+
+
+def check_c2_replan_moves_by_pool_growth(t):
+    fn = t["mmid_replan_fn"]
+    terms_fn = t["weight_zone_terms_fn"]
+    return (
+        bool(fn) and bool(terms_fn)
+        and len(POOL_TERM_RE.findall(terms_fn)) == 1
+        and REPLAN_GROWTH_RE.search(fn) is not None
+        and len(WEIGHT_ZONE_WRITE_RE.findall(fn)) == 1
+        and fn.count(REPLAN_ZONE_WRITE) == 1
+        and REPLAN_POOL_SET_RE.search(fn) is not None
+    )
+
+
+def witness_c2_pool_not_a_term(t):
+    t["weight_zone_terms_fn"] = POOL_TERM_RE.sub("", t["weight_zone_terms_fn"])
+    return t
+
+
+def witness_c2_replan_rewrites_the_total(t):
+    t["mmid_replan_fn"] = t["mmid_replan_fn"].replace(
+        REPLAN_ZONE_WRITE, "plan.host_zone_weight_bytes = placement_plan_host_weight_zone_terms(plan).total();")
     return t
 
 
@@ -627,6 +672,51 @@ def witness_e_docs(t):
     return t
 
 
+# --- F: unified_alloc's no-growth pre-check bounds a request by
+# host_zone_no_growth_bound(), not by the zone's configured reservation. The
+# load grows the WEIGHT zone past its reservation for host-buffer weights, so
+# a reservation bound refused the MMID host pool at every context bind while
+# the zone had room. The host test calls the bound helper directly and passes
+# whatever the pre-check compares against; only this check pins the use site.
+NO_GROWTH_PRECHECK = "if (req.intent.constraints.forbid_host_zone_growth) {"
+NO_GROWTH_BOUND_DECL = "const size_t bound = host_zone_no_growth_bound(zone, ucache->host_zone_reserved_capacity(zone),"
+NO_GROWTH_BOUND_CMP = "if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) {"
+
+
+def no_growth_precheck_block(fn: str) -> str:
+    """The first forbid_host_zone_growth block in unified_alloc (the pre-check
+    ahead of host_zone_alloc), brace-matched, or "" when absent."""
+    idx = fn.find(NO_GROWTH_PRECHECK)
+    if idx < 0:
+        return ""
+    return function_window(fn[idx:], NO_GROWTH_PRECHECK, window=2000)
+
+
+def check_f_no_growth_bound_use_site(t):
+    block = no_growth_precheck_block(t["unified_alloc_fn"])
+    return (
+        bool(block)
+        and NO_GROWTH_BOUND_DECL in block
+        and NO_GROWTH_BOUND_CMP in block
+        and "> reserved" not in block
+        and "host_zone_reserved_capacity(zone);" not in block
+    )
+
+
+def witness_f_no_growth_bound_use_site(t):
+    # Restore the pre-fix comparison: the request bounded by the reservation alone.
+    block = no_growth_precheck_block(t["unified_alloc_fn"])
+    head = block.find(NO_GROWTH_BOUND_DECL)
+    tail = block.find(NO_GROWTH_BOUND_CMP)
+    if not block or head < 0 or tail < 0:
+        return t
+    old = (block[:head] + "const size_t reserved = ucache->host_zone_reserved_capacity(zone);\n"
+           "                    if (reserved > 0 && ucache->host_zone_used(zone) + alloc_size > reserved) {"
+           + block[tail + len(NO_GROWTH_BOUND_CMP):])
+    t["unified_alloc_fn"] = t["unified_alloc_fn"].replace(block, old, 1)
+    return t
+
+
 # (name, check, witness): the witness reproduces the defect textually in a
 # copy of `texts`; the check must then fail against that copy.
 checks = [
@@ -653,8 +743,11 @@ checks = [
      check_c_headroom, witness_c_headroom),
     ("C2: WEIGHT zone is the sum of its named terms, not a ratio",
      check_c2_weight_zone_is_terms, witness_c2_weight_zone_is_terms),
-    ("C2: the swap-headroom hold writes the WEIGHT zone as its terms' total(), the planner's only other writer",
+    ("C2: the swap-headroom hold writes the WEIGHT zone as its terms' total(), the planner's second writer",
      check_c2_weight_zone_is_terms, witness_c2_hold_adds_its_own_bytes),
+    ("C2: the MMID host pool is a WEIGHT term", check_c2_replan_moves_by_pool_growth, witness_c2_pool_not_a_term),
+    ("C2: the runtime MMID re-plan, the third writer, moves the WEIGHT zone by its pool's growth",
+     check_c2_replan_moves_by_pool_growth, witness_c2_replan_rewrites_the_total),
     ("C3: the WEIGHT-term walk and charge_host_weight ask one backing predicate",
      check_c3_one_backing_predicate, witness_c3_one_backing_predicate),
     ("D: pre-zone runtime chunk growth WARNs with running total vs budget",
@@ -669,6 +762,8 @@ checks = [
      check_e2_rejection_warns_and_falls_through, witness_e2_rejection_warns_and_falls_through),
     ("E: env-var catalog documents the wiring and the staging-buffer distinction",
      check_e_docs, witness_e_docs),
+    ("F: unified_alloc's no-growth pre-check compares against host_zone_no_growth_bound(), not the reservation",
+     check_f_no_growth_bound_use_site, witness_f_no_growth_bound_use_site),
 ]
 
 failed = [name for name, check, _witness in checks if not check(texts)]

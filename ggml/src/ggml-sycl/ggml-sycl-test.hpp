@@ -126,6 +126,18 @@ bool               test_moe_block_graphlet_bulk_xmx_phase_disabled_from_env(cons
                                                                             const char * phase_materialize_env);
 size_t             test_layout_bytes(const ggml_tensor * tensor, ggml_layout_mode layout, int device);
 const char *       test_layout_name(ggml_layout_mode layout);
+
+// Read-only: the two layout records on a tensor's SYCL extra. reorder_record names what a kernel last resolved for
+// the tensor (optimized_feature.get_reorder(): "none", "soa", "coalesced", "xmx_coalesced" or "xmx_gemm_tiled"),
+// which may be a cache copy elsewhere; own_range_layout is the order of the bytes in the tensor's own range (the
+// extra's own_data_layout). Without an extra, has_extra is false and the other fields keep their defaults.
+struct test_tensor_layout_records {
+    bool             has_extra        = false;
+    const char *     reorder_record   = "none";
+    ggml_layout_mode own_range_layout = GGML_LAYOUT_AOS;
+};
+
+test_tensor_layout_records test_get_tensor_layout_records(const ggml_tensor * tensor);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void test_set_moe_planned_layout_probe_override(const ggml_tensor * tensor,
                                                 int                 device,

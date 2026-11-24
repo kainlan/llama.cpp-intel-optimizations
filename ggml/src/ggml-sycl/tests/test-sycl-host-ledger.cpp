@@ -954,12 +954,13 @@ arm_result leg_k() {
 
 // The runtime MMID re-plan re-records the terms its host pool grows (th32 §4.2). The re-plan runs on a recorded plan
 // with one executing expert and no workspace yet, at the context's micro-batch: its demand's host pool goes into the
-// SCRATCH zone (the growth tail of replan_moe_mmid_workspaces_for_runtime), and the plan's terms follow. Then the same
-// zone grown by hand, outside any re-plan, is the positive control: configuring it names the bytes the plan does not
-// count, so the silence after the re-plan is the re-record's and not the paper configure's.
-// Engagement: the re-plan succeeds and grows SCRATCH by exactly its host pool, more than two chunks; the control's
+// WEIGHT zone, whose term the pool is (host_weight_zone_terms::mmid_host_pool; the growth tail of
+// replan_moe_mmid_workspaces_for_runtime), SCRATCH stays as it was, and the plan's terms follow. Then the same zone
+// grown by hand, outside any re-plan, is the positive control: configuring it names the bytes the plan does not count,
+// so the silence after the re-plan is the re-record's and not the paper configure's.
+// Engagement: the re-plan succeeds and grows WEIGHT by exactly its host pool, more than two chunks; the control's
 // growth moves the same term.
-// Mutants: the re-plan not re-recording, or re-recording before its write (the plan holds the old scratch term and the
+// Mutants: the re-plan not re-recording, or re-recording before its write (the plan holds the old weight term and the
 // check names the bytes); a re-record from another chunk (the rounding differs); a re-record through the planner's
 // record (a plan line). The configure step checking against its own recomputation instead of the recorded terms is the
 // device fixture's mutant (plan-against-committed, device 1), since the configure step needs a cache.
@@ -979,10 +980,13 @@ arm_result leg_m() {
     plan.planner_n_ubatch        = 4096;
     plan.planner_n_seq_max       = 1;
     record_terms(plan);
+    const size_t weight_before  = plan.host_zone_weight_bytes;
     const size_t scratch_before = plan.host_zone_scratch_bytes;
 
-    placement_tensor_info info(k_expert, 4096ull * 1024ull * 8ull / 2ull);
-    info.type                                          = GGML_TYPE_Q4_0;
+    // NVFP4, a type the MMID direct route runs: the planner sizes a pool only for those types
+    // (moe_type_has_immutable_host_recipe), so an expert of any other type plans no pool and leaves nothing to grow.
+    placement_tensor_info info(k_expert, ggml_row_size(GGML_TYPE_NVFP4, 4096) * 1024ull * 8ull);
+    info.type                                          = GGML_TYPE_NVFP4;
     info.ne[0]                                         = 4096;
     info.ne[1]                                         = 1024;
     info.ne[2]                                         = 8;
@@ -1001,26 +1005,29 @@ arm_result leg_m() {
         test_moe_mmid_route_reachable_override_guard route_guard(/*reachable=*/true);
         planned = replan_moe_mmid_workspaces_for_runtime(plan, inventory, /*n_expert_used=*/4, &reason);
     }
-    const size_t growth = plan.host_zone_scratch_bytes - scratch_before;
+    const size_t growth = plan.host_zone_weight_bytes - weight_before;
     if (!planned || plan.moe_mmid_host_pool_bytes == 0 || growth != plan.moe_mmid_host_pool_bytes ||
         growth < 2 * k_record_chunk) {
-        void_arm(r, std::string("the re-plan did not grow SCRATCH by its host pool of at least two chunks: ok=") +
+        void_arm(r, std::string("the re-plan did not grow WEIGHT by its host pool of at least two chunks: ok=") +
                         (planned ? "1" : "0") + " reason=" + moe_mmid_runtime_reason_name(reason) +
                         " host_pool=" + num(plan.moe_mmid_host_pool_bytes) + " growth=" + num(growth));
         ledger_settle();
         return r;
     }
+    expect(r, plan.host_zone_scratch_bytes == scratch_before,
+           "the re-plan moved SCRATCH from " + num(scratch_before) + " to " + num(plan.host_zone_scratch_bytes) +
+               "; its host pool is a WEIGHT term");
     expect_rerecorded(r, "the MMID re-plan", plan);
 
     const size_t held_total = plan.host_zone_terms.total();
-    plan.host_zone_scratch_bytes += 3 * k_record_chunk;  // outside any re-plan
+    plan.host_zone_weight_bytes += 3 * k_record_chunk;  // outside any re-plan
     const size_t committed = placement_plan_host_zone_commit_terms(plan, 0, k_record_chunk).total();
     log_clear();
     const bool        control_ok = host_zone_commit_check(0, plan.host_zone_terms.total(), 0, committed);
     const size_t      lines      = log_count_with("[HOST-PLAN-BUG]");
     const std::string line       = log_line_with("[HOST-PLAN-BUG]");
     expect(r, !control_ok && lines == 1,
-           "the control: a SCRATCH growth outside any re-plan gave " + num(lines) + " [HOST-PLAN-BUG] lines, want 1");
+           "the control: a WEIGHT growth outside any re-plan gave " + num(lines) + " [HOST-PLAN-BUG] lines, want 1");
     expect(r, printed(line, "planned") == held_total && printed(line, "committed") == committed,
            "the control's line does not name the plan's " + num(held_total) + " and the pool's " + num(committed) +
                " bytes: " + line);

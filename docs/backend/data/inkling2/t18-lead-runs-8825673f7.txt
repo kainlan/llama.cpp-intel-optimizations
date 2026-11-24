@@ -1,0 +1,251 @@
+Task 18 (NVFP4 resident decode route), fix round: the lead's runs on 8825673f7
+================================================================================
+Date: 2026-11-24. Tree: task/inkling2-t18 at 8825673f7 (full build). Before-arm of every pair: feat/inkling2 at
+8467d66f6 (llama-bench, llama-cli, llama-completion rebuilt there). Driver: compute-runtime 26.44. No builder
+(ninja, icpx) alive at either end of any bench arm. Each device run was made once. Throughput figures were taken
+under the host's permanent load and are orientation figures, not baselines.
+
+Reading
+-------
+- Contract sweeps on the full build: sweep 1 fails the eight tests that fail on master and no other (213 selected);
+  sweep 2 passes 22 of 22. No test skipped or not run.
+- Device tests: sycl-q1-nvfp4-admitted-device passes on the B70 and on the B50 (68 PASS lines each),
+  test-sycl-moe-resolved-batch, sycl-q1-nvfp4-adapter-device and sycl-moe-bf16-direct-device pass on the B70.
+- Inkling count gate passes on the B70, on the B50 alone and on both cards: 0 refusals, 0 abort lines, no device
+  loss, no kernel fault line.
+- Route log (GGML_SYCL_MOE_ROUTE_LOG=1, 16 tokens): 64 "resident decode" lines (the line is capped at 64), and
+  every decline is reason=prompt, on the B70 and on both cards. No operand_not_on_device decline.
+- test-backend-ops -o MUL_MAT_ID: 0 of 1693 cases change status on either card against the census of 8fe336e2b.
+  The exit code is 1 on both cards from the FAIL set already recorded in the plan (150 and 151 lines).
+- Decode profile (GGML_SYCL_E2E_TG_PROFILE=1, 48 tokens, B70): the moe stage costs 107 us of host time per
+  MUL_MAT_ID node; it was 545 us before the task (242753162).
+- Inkling, B70, pp512 / tg128 in t/s, in run order: before 47.56 / 14.62, after 47.19 / 21.17, after 47.24 / 21.14,
+  before 47.53 / 14.70. Decode +44%. The prompt figure is 0.7% lower in both after-arms; the first round's pair
+  (48390d4bb) showed no such order, so it is recorded and not attributed.
+- The retained-handle publication changed for every route, so one pair each on the baseline models:
+  Mistral 7B Q4_0, B70: before 3357.02 / 106.96, after 3355.03 / 107.51, after 3358.31 / 107.14, before
+  3360.55 / 107.60. GPT-OSS 20B MXFP4, B50: before 551.28 / 35.41, after 551.70 / 35.50, after 546.94 / 35.50,
+  before 550.98 / 35.37. Neither moves.
+- Plan lines (Mistral on the B70, GPT-OSS on the B50) against e9cbe30dc: the differing lines are the arena size
+  read from the driver's free memory (29898 MB then, 29900 MB now), the planner's measured milliseconds and the
+  host-memory sample. No placement line differs.
+- Not from this task, seen in both arms: GPT-OSS on the B50 reads pp512 about 551 t/s. The plan already records
+  the same figure from Task 8b's pair under "Tracker tasks owed"; it is below the baseline document's figure.
+
+Scored console lines
+--------------------
+=== sweep 1 (-L source)  2026-11-24T01:10:58-05:00
+96% tests passed, 8 tests failed out of 213
+=== sweep 2 (-R alloc-zone|-source$|source-contract$|-audit$)  2026-11-24T01:17:34-05:00
+100% tests passed, 0 tests failed out of 22
+=== SWEEPS END 2026-11-24T01:23:39-05:00
+=== 1 admitted b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  tests selected: 1  PASS lines: 68  context-bind: 0  abort lines: 0
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 68  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 2 admitted b50
+  rc=0
+  card the test ran on: B50 (wanted B50)
+  tests selected: 0  PASS lines: 68  context-bind: 0  abort lines: 0
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 68  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 3 resolved-batch b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  tests selected: 1  PASS lines: 1  context-bind: 0  abort lines: 0
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 1  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 4 adapter b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  tests selected: 1  PASS lines: 4  context-bind: 0  abort lines: 0
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 4  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 5 bf16 direct b70
+  rc=0
+  card the test ran on: B70 (wanted B70)
+  tests selected: 1  PASS lines: 1  context-bind: 0  abort lines: 0
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  kernel fault lines since start: 0
+--- step rc=0
+  PASS lines: 1  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 6 inkling gate b70
+  refusals: 0  abort lines: 0  device_lost: 0
+0.50.644.418 I common_perf_print: prompt eval time =     816.55 ms /    14 tokens (   58.32 ms per token,    17.15 tokens per second)
+0.50.644.419 I common_perf_print:        eval time =     989.39 ms /    14 runs   (   70.67 ms per token,    14.15 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 7 inkling gate B50 alone
+  refusals: 0  abort lines: 0  device_lost: 0
+0.56.895.894 I common_perf_print: prompt eval time =    1844.92 ms /    14 tokens (  131.78 ms per token,     7.59 tokens per second)
+0.56.895.894 I common_perf_print:        eval time =    2644.89 ms /    14 runs   (  188.92 ms per token,     5.29 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 8 inkling gate both
+  refusals: 0  abort lines: 0  device_lost: 0
+0.51.607.035 I common_perf_print: prompt eval time =     799.71 ms /    14 tokens (   57.12 ms per token,    17.51 tokens per second)
+0.51.607.035 I common_perf_print:        eval time =     977.24 ms /    14 runs   (   69.80 ms per token,    14.33 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+=== 9 route log b70 (-v, 16 tokens)
+  rc=0  err lines: 12275  SPLIT headers: 0
+  refusals: 0  abort lines: 0  device_lost: 0
+0.50.750.876 I common_perf_print: prompt eval time =     830.88 ms /    14 tokens (   59.35 ms per token,    16.85 tokens per second)
+0.50.750.877 I common_perf_print:        eval time =    1029.84 ms /    15 runs   (   68.66 ms per token,    14.57 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+  route lines: resident=104  decline=40  all MOE-ROUTE=168
+=== 10 route log both (-v, 16 tokens)
+  rc=0  err lines: 12300  SPLIT headers: 0
+  refusals: 0  abort lines: 0  device_lost: 1
+0.51.754.559 I common_perf_print: prompt eval time =     788.09 ms /    14 tokens (   56.29 ms per token,    17.76 tokens per second)
+0.51.754.560 I common_perf_print:        eval time =    1029.93 ms /    15 runs   (   68.66 ms per token,    14.56 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+  route lines: resident=104  decline=40  all MOE-ROUTE=168
+=== 11 planlines (Mistral B70, GPT-OSS B50)
+  rc=0
+  kept 179 plan lines of 3360
+  kernel fault lines since start: 0
+  rc=0
+  answer lines: 1  device_lost: 0
+  kept 198 plan lines of 4285
+  kernel fault lines since start: 0
+--- step rc=0
+  plan lines mistral-b70 vs e9cbe30dc: 12 differing
+  plan lines gptoss-b50 vs e9cbe30dc: 4 differing
+=== 12 test-backend-ops MUL_MAT_ID, each card
+  rc=1  out lines: 1890  op lines: 1864  OK: 1258  FAIL: 150  not supported: 322
+  1258/1406 tests passed
+  kernel fault lines since start: 0
+  rc=1  out lines: 1891  op lines: 1865  OK: 1257  FAIL: 151  not supported: 322
+  1257/1406 tests passed
+  kernel fault lines since start: 0
+--- step rc=1
+=== 13 e2e tg profile b70 (48 tokens)
+  rc=0  err lines: 7808  SPLIT headers: 0
+  refusals: 0  abort lines: 0  device_lost: 0
+0.52.754.683 I common_perf_print: prompt eval time =     802.36 ms /    14 tokens (   57.31 ms per token,    17.45 tokens per second)
+0.52.754.683 I common_perf_print:        eval time =    2424.56 ms /    47 runs   (   51.59 ms per token,    19.38 tokens per second)
+  kernel fault lines since start: 0
+--- step rc=0
+    moe              calls=   4704 host=    505.5 ms  (107 us/call)
+    other            calls=  18038 host=    360.3 ms  (20 us/call)
+    non_moe_matmul   calls=   3908 host=    286.0 ms  (73 us/call)
+    attention        calls=   7056 host=    212.6 ms  (30 us/call)
+    elementwise      calls=   7982 host=    153.6 ms  (19 us/call)
+    kv               calls=    384 host=      6.6 ms  (17 us/call)
+    moe              calls=   4704 host=   2563.8 ms  (545 us/call)
+    other            calls=  18038 host=    359.6 ms  (20 us/call)
+    non_moe_matmul   calls=   3908 host=    246.4 ms  (63 us/call)
+    attention        calls=   7056 host=    242.7 ms  (34 us/call)
+    elementwise      calls=   7982 host=    170.2 ms  (21 us/call)
+    kv               calls=    384 host=      6.6 ms  (17 us/call)
+=== 14 ABBA b70 (a = base 8467d66f6, b = 8825673f7)
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=5.96 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a pp512 avg=47.56 t/s stddev=0.00 samples=[47.56]
+  RESULT a tg128 avg=14.62 t/s stddev=0.00 samples=[14.62]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=5.52 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 13038  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b pp512 avg=47.19 t/s stddev=0.00 samples=[47.19]
+  RESULT b tg128 avg=21.17 t/s stddev=0.00 samples=[21.17]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=5.43 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 13038  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b2 pp512 avg=47.24 t/s stddev=0.00 samples=[47.24]
+  RESULT b2 tg128 avg=21.14 t/s stddev=0.00 samples=[21.14]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.80 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a2 pp512 avg=47.53 t/s stddev=0.00 samples=[47.53]
+  RESULT a2 tg128 avg=14.70 t/s stddev=0.00 samples=[14.70]
+  kernel fault lines since start: 0
+--- step rc=0
+=== 15 ABBA Mistral b70
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.12 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4583  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a pp512 avg=3357.02 t/s stddev=0.00 samples=[3357.02]
+  RESULT a tg128 avg=106.96 t/s stddev=0.00 samples=[106.96]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.60 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4583  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b pp512 avg=3355.03 t/s stddev=0.00 samples=[3355.03]
+  RESULT b tg128 avg=107.51 t/s stddev=0.00 samples=[107.51]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.04 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4583  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b2 pp512 avg=3358.31 t/s stddev=0.00 samples=[3358.31]
+  RESULT b2 tg128 avg=107.14 t/s stddev=0.00 samples=[107.14]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.23 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4583  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a2 pp512 avg=3360.55 t/s stddev=0.00 samples=[3360.55]
+  RESULT a2 tg128 avg=107.60 t/s stddev=0.00 samples=[107.60]
+  kernel fault lines since start: 0
+--- step rc=0
+=== 16 ABBA GPT-OSS b50
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.01 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4739  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a pp512 avg=551.28 t/s stddev=0.00 samples=[551.28]
+  RESULT a tg128 avg=35.41 t/s stddev=0.00 samples=[35.41]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.57 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4739  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b pp512 avg=551.70 t/s stddev=0.00 samples=[551.70]
+  RESULT b tg128 avg=35.50 t/s stddev=0.00 samples=[35.50]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=5.27 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4739  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b2 pp512 avg=546.94 t/s stddev=0.00 samples=[546.94]
+  RESULT b2 tg128 avg=35.50 t/s stddev=0.00 samples=[35.50]
+  kernel fault lines since start: 0
+  arm env: none  builders: ninja=0 icpx=0
+  arm end: load=4.66 builders: ninja=0 icpx=0  (a builder at either end makes this arm's tg a lower bound)
+  rc=0  err lines: 4739  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a2 pp512 avg=550.98 t/s stddev=0.00 samples=[550.98]
+  RESULT a2 tg128 avg=35.37 t/s stddev=0.00 samples=[35.37]
+  kernel fault lines since start: 0
+--- step rc=0
+=== T18 CHAIN END 2026-11-24T01:46:33-05:00  ninja=0 icpx=0
+
+Route-log census
+----------------
+-- b70
+     56 [MOE-ROUTE] bf16 direct tensor=T device=0 tokens=1 slots=8 vec4=1
+     39 [MOE-ROUTE] resident decode declined tensor=T device=0 reason=prompt
+     32 [MOE-ROUTE] resident decode tensor=T device=0 experts=128 slots=8 ne11=8
+     32 [MOE-ROUTE] resident decode tensor=T device=0 experts=128 slots=8 ne11=1
+      8 [MOE-ROUTE] bf16 direct tensor=T device=0 tokens=14 slots=8 vec4=1
+      1 I [MOE-ROUTE] resident decode declined tensor=T device=0 reason=prompt
+-- both
+     56 [MOE-ROUTE] bf16 direct tensor=T device=0 tokens=1 slots=8 vec4=1
+     40 [MOE-ROUTE] resident decode declined tensor=T device=0 reason=prompt
+     32 [MOE-ROUTE] resident decode tensor=T device=0 experts=128 slots=8 ne11=8
+     32 [MOE-ROUTE] resident decode tensor=T device=0 experts=128 slots=8 ne11=1
+      8 [MOE-ROUTE] bf16 direct tensor=T device=0 tokens=14 slots=8 vec4=1

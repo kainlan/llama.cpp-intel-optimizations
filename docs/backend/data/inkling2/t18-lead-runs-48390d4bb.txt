@@ -1,0 +1,165 @@
+Task 18 (an all-resident NVFP4 MUL_MAT_ID decode node submits without a host wait): lead device runs, round 1
+Tree under test: task/inkling2-t18 at 48390d4bb (base 242753162). Before-arm of the A/B: feat/inkling2 at 8467d66f6,
+the code the task started from, built by the same script in its own build directory.
+Date 2026-11-23, driver 26.44, each run once, under GPU.lock, no ninja or icpx alive at either end of the A/B.
+Host: load average: 3.09, 3.59, 4.69  (sampled when this file was written)
+
+== Scored console of the chain (scratch script chain-t18.sh)
+=== 1 admitted b70
+  rc=0
+  tests selected: 1  PASS lines: 68  context-bind: 0  abort lines: 0
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:30:02-05:00
+--- step rc=0
+  PASS lines: 68  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 2 admitted b50
+  rc=0
+  tests selected: 0  PASS lines: 68  context-bind: 0  abort lines: 0
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:30:15-05:00
+--- step rc=0
+  PASS lines: 68  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 3 resolved-batch b70
+  rc=0
+  tests selected: 1  PASS lines: 1  context-bind: 0  abort lines: 0
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:30:26-05:00
+--- step rc=0
+  PASS lines: 1  FAIL lines: 0  SEGFAULT/Exception: 0
+=== 4 inkling gate b70
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0 sha=8467d66f6
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.49.536.631 I common_perf_print: prompt eval time =     813.41 ms /    14 tokens (   58.10 ms per token,    17.21 tokens per second)
+0.49.536.632 I common_perf_print:        eval time =    1047.74 ms /    14 runs   (   74.84 ms per token,    13.36 tokens per second)
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:31:37-05:00
+--- step rc=0
+=== 5 inkling gate B50 alone
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:1 sha=8467d66f6
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.54.943.948 I common_perf_print: prompt eval time =    1851.97 ms /    14 tokens (  132.28 ms per token,     7.56 tokens per second)
+0.54.943.948 I common_perf_print:        eval time =    2699.52 ms /    14 runs   (  192.82 ms per token,     5.19 tokens per second)
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:32:54-05:00
+--- step rc=0
+=== 6 inkling gate both
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0,1 sha=8467d66f6
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.51.395.033 I common_perf_print: prompt eval time =     802.65 ms /    14 tokens (   57.33 ms per token,    17.44 tokens per second)
+0.51.395.034 I common_perf_print:        eval time =    1015.82 ms /    14 runs   (   72.56 ms per token,    13.78 tokens per second)
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:34:07-05:00
+--- step rc=0
+=== 7 route log b70 (-v, 16 tokens)
+  rc=0  err lines: 12275  SPLIT headers: 0
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.51.719.803 I common_perf_print: prompt eval time =     806.89 ms /    14 tokens (   57.63 ms per token,    17.35 tokens per second)
+0.51.719.804 I common_perf_print:        eval time =    1064.54 ms /    15 runs   (   70.97 ms per token,    14.09 tokens per second)
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:35:14-05:00
+--- step rc=0
+  route lines: resident=104  decline=40  all MOE-ROUTE=168
+=== 8 route log both (-v, 16 tokens)
+  rc=0  err lines: 12300  SPLIT headers: 0
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ||
+  refusals: 0  abort lines: 0  device_lost: 1
+0.51.991.749 I common_perf_print: prompt eval time =     804.18 ms /    14 tokens (   57.44 ms per token,    17.41 tokens per second)
+0.51.991.750 I common_perf_print:        eval time =    1070.98 ms /    15 runs   (   71.40 ms per token,    14.01 tokens per second)
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:36:22-05:00
+--- step rc=0
+  route lines: resident=104  decline=40  all MOE-ROUTE=168
+=== 9 planlines (Mistral B70, GPT-OSS B50)
+  rc=0
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kept 179 plan lines of 3360
+  kernel fault lines since start: 0
+  rc=0
+  kept 198 plan lines of 4285
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:37:47-05:00
+--- step rc=0
+  plan lines mistral-b70 vs e9cbe30dc: 4 differing
+  plan lines gptoss-b50 vs e9cbe30dc: 4 differing
+=== 10 test-backend-ops MUL_MAT_ID, each card
+  rc=1  out lines: 1890  op lines: 1864  OK: 1258  FAIL: 150  not supported: 322
+  kernel fault lines since start: 0
+  rc=1  out lines: 1891  op lines: 1865  OK: 1257  FAIL: 151  not supported: 322
+  kernel fault lines since start: 0
+DONE rc=1 2026-11-23T22:39:31-05:00
+--- step rc=1
+=== 11 e2e tg profile b70 (48 tokens)
+  rc=0  err lines: 7808  SPLIT headers: 0
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.51.139.461 I common_perf_print: prompt eval time =     790.82 ms /    14 tokens (   56.49 ms per token,    17.70 tokens per second)
+0.51.139.462 I common_perf_print:        eval time =    2431.92 ms /    47 runs   (   51.74 ms per token,    19.33 tokens per second)
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:40:38-05:00
+--- step rc=0
+t18: profile blocks=98 ops=42072 sum_wall=1283 ms sum_host=1496 ms
+    moe              calls=   4704 host=    525.7 ms  (112 us/call)
+    other            calls=  18038 host=    349.1 ms  (19 us/call)
+    non_moe_matmul   calls=   3908 host=    258.2 ms  (66 us/call)
+    attention        calls=   7056 host=    204.7 ms  (29 us/call)
+    elementwise      calls=   7982 host=    150.9 ms  (19 us/call)
+    kv               calls=    384 host=      7.3 ms  (19 us/call)
+base: profile blocks=98 ops=42072 sum_wall=1298 ms sum_host=3589 ms
+    moe              calls=   4704 host=   2563.8 ms  (545 us/call)
+    other            calls=  18038 host=    359.6 ms  (20 us/call)
+    non_moe_matmul   calls=   3908 host=    246.4 ms  (63 us/call)
+    attention        calls=   7056 host=    242.7 ms  (34 us/call)
+    elementwise      calls=   7982 host=    170.2 ms  (21 us/call)
+    kv               calls=    384 host=      6.6 ms  (17 us/call)
+=== 12 ABBA b70 (a = base 8467d66f6, b = 48390d4bb)
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a pp512 avg=47.29 t/s stddev=0.00 samples=[47.29]
+  RESULT a tg128 avg=14.87 t/s stddev=0.00 samples=[14.87]
+  kernel fault lines since start: 0
+  rc=0  err lines: 13038  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b pp512 avg=47.41 t/s stddev=0.00 samples=[47.41]
+  RESULT b tg128 avg=21.02 t/s stddev=0.00 samples=[21.02]
+  kernel fault lines since start: 0
+  rc=0  err lines: 13038  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT b2 pp512 avg=47.26 t/s stddev=0.00 samples=[47.26]
+  RESULT b2 tg128 avg=21.09 t/s stddev=0.00 samples=[21.09]
+  kernel fault lines since start: 0
+  rc=0  err lines: 14062  refusals: 0  tripwire: 0  abort lines: 0
+  RESULT a2 pp512 avg=47.18 t/s stddev=0.00 samples=[47.18]
+  RESULT a2 tg128 avg=14.77 t/s stddev=0.00 samples=[14.77]
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-23T22:46:29-05:00
+--- step rc=0
+=== T18 CHAIN END 2026-11-23T22:46:29-05:00  ninja=0 icpx=0
+
+== Route log, B70 and both cards (GGML_SYCL_MOE_ROUTE_LOG=1 -v, 16 tokens)
+-- b70
+     20 [MOE-ROUTE] resident decode declined tensor=blk.N.ffn_down_exps.weight device=0 reason=prompt
+     20 [MOE-ROUTE] resident decode declined tensor=blk.N.ffn_gate_up_exps.weight device=0 reason=prompt
+     32 [MOE-ROUTE] resident decode tensor=blk.N.ffn_down_exps.weight device=0 experts=128 slots=8 ne11=8
+     32 [MOE-ROUTE] resident decode tensor=blk.N.ffn_gate_up_exps.weight device=0 experts=128 slots=8 ne11=1
+-- both
+     20 [MOE-ROUTE] resident decode declined tensor=blk.N.ffn_down_exps.weight device=0 reason=prompt
+     20 [MOE-ROUTE] resident decode declined tensor=blk.N.ffn_gate_up_exps.weight device=0 reason=prompt
+     32 [MOE-ROUTE] resident decode tensor=blk.N.ffn_down_exps.weight device=0 experts=128 slots=8 ne11=8
+     32 [MOE-ROUTE] resident decode tensor=blk.N.ffn_gate_up_exps.weight device=0 experts=128 slots=8 ne11=1
+The taken-route line is capped at 64 lines. 'device_lost: 1' on the two-card run is the startup warning
+('2 GPUs visible ... DEVICE_LOST'), which the profile runner's count does not exclude.
+
+== test-backend-ops -o MUL_MAT_ID against the Task 8g census (8fe336e2b)
+B70: OK 1258, FAIL 150, not supported 322. B50: OK 1257, FAIL 151, not supported 322.
+Case/status lines that differ from the census: 0 of 1728 on each card. The FAIL set is the recorded baseline.
+
+== Reading
+A/B on the B70 (pp512 / tg128, t/s): before 47.29 / 14.87 and 47.18 / 14.77; after 47.41 / 21.02 and 47.26 / 21.09.
+Stage 'moe' host time per MUL_MAT_ID node: 545 us before (s5-profile-b70-242753162.txt), 112 us after.
+Gate decode (14 tokens, not a throughput figure): B70 13.36 t/s (was 10.71), both cards 13.78 (was 10.36),
+B50 alone 5.19 (was 4.77; its nodes are mixed and decline to the admitted route).
+The quality review of this head failed on a failure-path lifetime window; the fix round reruns the changed cases.

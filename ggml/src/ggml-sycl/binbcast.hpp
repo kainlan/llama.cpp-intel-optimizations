@@ -24,6 +24,10 @@ static __dpct_inline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+// Whether ggml_sycl_op_bin_bcast (ADD, SUB, MUL, DIV, REPEAT) has a kernel for this (src0, src1, dst) type triple.
+// REPEAT hands (dst, src, dst) to it.
+bool ggml_sycl_bin_bcast_types_supported(ggml_type src0, ggml_type src1, ggml_type dst);
+
 void ggml_sycl_add(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
 
 // Specialized ADD1: add single scalar to all elements (more efficient than broadcast)

@@ -55,6 +55,10 @@ _ENV_OF = (
     "static ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_of(const ggml_tensor * src0, "
     "const ggml_tensor * src1)"
 )
+_SRC1_READER = (
+    "static bool ggml_sycl_mul_mat_src1_has_reader(const ggml_tensor * src0, const ggml_tensor * src1, "
+    "const ggml_tensor * dst, int device)"
+)
 _ADAPTER = (
     "bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env)"
 )
@@ -209,8 +213,12 @@ def test_the_environment_is_one_function_both_sites_call():
     assert env_ok(code)
     a = "namespace ggml_sycl { " + _ADAPTER
     assert z(a) in code
-    # the two environment readers are the only callers
-    assert code.count(z("ggml_sycl_mul_mat_route_env_of(")) == 3  # definition, dispatch, adapter
+    # the environment readers are the only callers: the dispatch, the measure adapter, and supports_op's
+    # src1 reader, which asks the dispatch's classifier with the same environment
+    assert code.count(z("ggml_sycl_mul_mat_route_env_of(")) == 4  # definition, dispatch, adapter, src1 reader
+    reader = function_body(code, _SRC1_READER)
+    assert reader.count(
+        z("ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, ggml_sycl_mul_mat_route_env_of(src0, src1))")) == 1
     assert code.count(z("ggml_sycl_mul_mat_route_env_from(")) == 1  # only the one function builds it
 
 

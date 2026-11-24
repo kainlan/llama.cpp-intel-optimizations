@@ -1140,7 +1140,7 @@ def mutation_matrix(files, cmake):
                  f, cmake))
 
     # The arena-active mirror: set sites and the two clears.
-    note_call = "ext_alloc_note_arena_state(queue, true);"
+    note_call = "ext_alloc_note_arena_state(device_id_, true);"
     first = cache_raw.index(note_call)
     muts.append(("arena mirror set once", "H13 M74(m): arena-active mirror set at 1 site(s)",
                  with_cache(cache_raw[:first] + cache_raw[first + len(note_call):]), cmake))
@@ -1149,7 +1149,7 @@ def mutation_matrix(files, cmake):
         at = cache_raw.find(fn)
         if at < 0:
             at = cache_raw.find(fn.replace("bool ", "void ", 1))
-        clear = "ext_alloc_note_arena_state(queue_, false);"
+        clear = "ext_alloc_note_arena_state(device_id_, false);"
         k = cache_raw.index(clear, at)
         qualified = "unified_cache::" + fn.split("::")[1].split("(")[0]
         muts.append((label, f"H13 M74(m): {qualified} does not clear the arena-active mirror",

@@ -599,7 +599,10 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                  const std::vector<sycl::event> * deps      = nullptr,
                                  sycl::event *                    event_out = nullptr);
 
-// Allocation-free single-dependency overload used by admitted executors.
+// Allocation-free single-dependency overload used by admitted executors. Unlike the overload above, the table may hold
+// fewer than every selected expert: n_expert_slots is its length, and an id outside [0, n_expert_slots) or a null slot
+// is written as a quiet NaN row without reading through the slot (a negative id as a zero row). A mixed card-and-host
+// batch leaves its host experts' slots null and writes those rows afterwards.
 bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  ggml_type            weight_type,
                                  ggml_layout_mode     weight_layout,
@@ -619,6 +622,7 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  int64_t              q8_nb12,
                                  int64_t              dst_nb1,
                                  int64_t              dst_nb2,
+                                 int                  n_expert_slots,
                                  const sycl::event &  dependency,
                                  sycl::event *        event_out = nullptr);
 
@@ -662,21 +666,29 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
                               const std::vector<sycl::event> * deps      = nullptr,
                               sycl::event *                    event_out = nullptr);
 
-// Decode-only composition over caller-supplied admitted workspace slices.
-// activation_f32 is contiguous [token][ne11][K]. ids_host is the packed,
-// immutable retained snapshot [token][top_k]; the adapter uploads that exact
-// snapshot into ids_device after dependency completes. Callers must retain
-// ids_host until the returned terminal event completes, and dependency must
-// not mutate ids_host. Independent/pre-populated device IDs are never trusted.
-// The wrapper quantizes into buffers.activation_q8, writes
-// [token][top_k][N] to buffers.output_f32, and returns the actual terminal
-// kernel event. No destination scatter is implied.
+// Composition over caller-supplied admitted workspace slices, for one decode
+// token or a prompt's n_tokens alike. activation_f32 is contiguous
+// [token][ne11][K]. ids_device is the ids tensor's own device storage, read in
+// place with its strides (ids_nb0 between slots, which must be adjacent, and
+// ids_nb1 between tokens, which may leave a view's other columns between
+// them); the adapter never writes it, since an op must not write its input.
+// ids_host is the packed snapshot [token][top_k] the caller read from that
+// same storage: the adapter range-checks it before it submits anything and
+// does not read it after returning. The wrapper quantizes into
+// buffers.activation_q8 after dependency, writes [token][top_k][N] to
+// buffers.output_f32, and returns the actual terminal kernel event. No
+// destination scatter is implied. The table holds n_experts slots, and a slot
+// may be null (an expert not on this card): that occurrence's rows are written
+// as quiet NaN without reading through the slot, for the caller to overwrite.
+// `device` is q's device index: the entry reads that card's half support from the capabilities the backend asked
+// for at init.
 bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                          q,
+                                          int                                    device,
                                           ggml_type                              weight_type,
                                           ggml_layout_mode                       weight_layout,
                                           const void * const *                   expert_ptrs_device,
                                           const float *                          activation_f32,
-                                          int32_t *                              ids_device,
+                                          const int32_t *                        ids_device,
                                           const int32_t *                        ids_host,
                                           int                                    n_experts,
                                           int                                    ncols,
@@ -689,6 +701,71 @@ bool mmvq_submit_q1_nvfp4_aos_id_admitted(sycl::queue &                         
                                           const mmvq_q1_nvfp4_admitted_buffers & buffers,
                                           const sycl::event *                    dependency = nullptr,
                                           sycl::event *                          event_out  = nullptr);
+
+// The sizes and strides one Q1_0/NVFP4 MMVQ-ID dispatch of the checked kernel needs, from its shape alone: both entries
+// that launch it (the admitted one above and the resident one below) take them from mmvq_q1_nvfp4_id_geometry_of, so
+// the two cannot size the same node differently.
+struct mmvq_q1_nvfp4_id_geometry {
+    size_t occurrences    = 0;  // top_k * n_tokens: the kernel's batches, one per (token, slot)
+    size_t quant_blocks   = 0;  // Q8_1 blocks of the quantized input
+    size_t q8_row_bytes   = 0;  // one quantized input row
+    size_t q8_bytes       = 0;  // the whole quantized input: n_tokens * ne11 rows
+    size_t q8_nb12        = 0;  // one token's quantized rows
+    size_t output_bytes   = 0;  // the [token][top_k][N] float output
+    size_t dst_nb1        = 0;  // one output row
+    size_t dst_nb2        = 0;  // one token's output rows
+    size_t kernel_items   = 0;  // the kernel's global range
+    size_t quantize_items = 0;  // the quantize kernel's global range
+};
+
+// What mmvq_q1_nvfp4_id_geometry_of finds for a node. LAUNCH_PAST_INT is a node the kernels take whose kernel or
+// quantize range passes INT_MAX work-items: DPC++ throws at the submit of such a range, so no entry submits it.
+enum class mmvq_q1_nvfp4_id_fit : uint8_t {
+    FITS,             // the kernels take the node and both launches fit an int
+    NO_KERNEL,        // a type, shape or ids view the kernel does not take, or a size that overflows
+    LAUNCH_PAST_INT,  // the kernels take the node, and a launch range passes INT_MAX
+};
+
+// Sizes a Q1_0 or NVFP4 weight of ncols x nrows_per_expert per expert, top_k slots per token, n_tokens tokens and ne11
+// input rows per token (1, or one per slot), with ids strides ids_nb0 and ids_nb1 in bytes. *out is filled for FITS and
+// for LAUNCH_PAST_INT, and unspecified for NO_KERNEL. Both entries refuse anything but FITS.
+mmvq_q1_nvfp4_id_fit mmvq_q1_nvfp4_id_geometry_of(ggml_type                   weight_type,
+                                                  int                         ncols,
+                                                  int                         nrows_per_expert,
+                                                  int                         top_k,
+                                                  int                         n_tokens,
+                                                  int                         ne11,
+                                                  int64_t                     ids_nb0,
+                                                  int64_t                     ids_nb1,
+                                                  mmvq_q1_nvfp4_id_geometry * out);
+
+// The resident decode form: every expert is on this card, so the kernel reads the ids where they are with no host
+// snapshot and the table's slot checks stand for the range check. activation_f32 is contiguous [token][ne11][K];
+// activation_q8 is the caller's Q8_1 slice of exactly the geometry's q8_bytes, and dst the node's own [token][top_k][N]
+// output of exactly its output_bytes. Quantization is its own submission and profiler row, ordered on q after
+// whatever q already holds; the kernel follows it, and *event_out is the kernel's event. Nothing is allocated, waited
+// on or read on the host. An id below zero writes a zero row, and an id past n_experts or a null slot a quiet NaN row.
+// `device` is q's device index, as for the admitted entry.
+bool mmvq_submit_q1_nvfp4_aos_id_resident(sycl::queue &        q,
+                                          int                  device,
+                                          ggml_type            weight_type,
+                                          ggml_layout_mode     weight_layout,
+                                          const void * const * expert_ptrs_device,
+                                          int                  n_experts,
+                                          const float *        activation_f32,
+                                          const int32_t *      ids_device,
+                                          int                  ncols,
+                                          int                  nrows_per_expert,
+                                          int                  top_k,
+                                          int                  n_tokens,
+                                          int                  ne11,
+                                          int64_t              ids_nb0,
+                                          int64_t              ids_nb1,
+                                          void *               activation_q8,
+                                          size_t               activation_q8_bytes,
+                                          float *              dst,
+                                          size_t               dst_bytes,
+                                          sycl::event *        event_out);
 
 sycl::event mmvq_submit_mxfp4_soa_batched(sycl::queue &                    q,
                                           const void * const *             expert_ptrs_device,

@@ -1222,6 +1222,26 @@ def test_the_inventory_carries_the_measured_micro_batch():
     assert not inventory_shape_ok(code.replace(helper, mutate(helper, "model.get_n_ubatch_hint()", "0"), 1))
 
 
+def test_mutant_measure_rides_the_envelope_again_fails():
+    """A measure fed the envelope's n_ctx (0, the training context) instead of the load's requested context."""
+    code = code_of(MODEL_CPP)
+    new = z("*this, measure_shape, sycl_model_loading_guard.txn,")
+    old = z("*this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    assert code.count(new) == 3, "the probe, admitted and late calls must each carry the requested shape"
+    at = -1
+    for site in ("probe", "admitted", "late"):
+        at = code.index(new, at + 1)
+        mutant = code[:at] + old + code[at + len(new) :]
+        assert not stage_order_ok(mutant), f"the {site} measure on the envelope's n_ctx slipped through"
+    # the shape local itself read from the envelope again
+    request = "llama_model_load_measure_shape(*this);"
+    envelope_shape = "llama_load_measure_shape{ llama_model_sycl_make_placement_envelope().n_ctx, 512 };"
+    assert z(request) in code, "the measure shape local is no longer resolved from the model's hints"
+    assert not stage_order_ok(
+        code.replace(z(request), z(envelope_shape), 1)
+    ), "the requested shape read from the envelope slipped through"
+
+
 if __name__ == "__main__":
     import sys
 

@@ -22,8 +22,9 @@ string.
 THE FLAG IS AN EXEMPTION, SO ITS SETTERS ARE A CENSUS.  A request carrying persistent_owner lands in WEIGHT, which no
 graph boundary checks.  Set on a transient request, it would silence exactly the STAGING leak the boundary check exists
 to catch: the leaked row would sit in WEIGHT until the cache dies and no boundary would ever refuse on it.  So the
-only function that may set it is the one whose owner provably lives as long as the cache, and a new setter must be
-added here by name, with that argument made for it (Z5).
+only functions that may set it are those whose owner provably outlives every graph (the input marker's word lives as
+long as the cache; the MMID workspace host pool as long as its registry context holds the model's plan), and a new
+setter must be added here by name, with that argument made for it (Z5).
 
 THE CONTRACT.  With comments and string literals blanked:
   Z1. alloc_constraints has `bool persistent_owner = false;`.  unified_cache::arm_cpu_job_input_marker builds the
@@ -45,8 +46,9 @@ THE CONTRACT.  With comments and string literals blanked:
   Z4. host_zone_settle asserts that WEIGHT is never settled, which is what keeps a persistent owner out of the sweep.
   Z5. Across every .cpp and .hpp under ggml/src/ggml-sycl/ (ggml-sycl.cpp included), the writes to persistent_owner
       (an assignment, compound assignment or brace initialiser through `.` or `->`, a designated initialiser
-      included) are exactly one, in the allowlisted function unified_cache::arm_cpu_job_input_marker, named by its
-      enclosing function.
+      included) are exactly one per allowlisted function, named by its enclosing function:
+      unified_cache::arm_cpu_job_input_marker, and materialize_moe_mmid_workspaces_impl for the MMID workspace host
+      pool, which its registry context holds for the model's plan.
   S1. host_zone_settle takes its refusal report once, as `const host_zone_refusal_report report =
       host_zone_refusal_take(zone_refusals, audit.active());`, inside the block of
       `if (runtime_registry_host_zone_live_locked(zone)) {`, and calls runtime_registry_scan_host_zone_locked exactly
@@ -163,6 +165,10 @@ FLAG = "persistent_owner"
 SETTERS_ALLOWED = {
     # The input marker's word lives as long as the cache: published once by the arm, ended at shutdown.
     ("ggml/src/ggml-sycl/unified-cache.cpp", "arm_cpu_job_input_marker"),
+    # The MMID workspace host pool is owned by its registry context, which holds it for the model's plan (until a
+    # re-plan replaces the context or the model is retired), never by the graph that admits it; set only on the host
+    # pool's request (host_pinned), not on the device pool's.
+    ("ggml/src/ggml-sycl/unified-cache.cpp", "materialize_moe_mmid_workspaces_impl"),
 }
 FLAG_WRITE = re.compile(r"(?:\.|->)\s*" + FLAG + r"\s*(?:[|&^]?=(?!=)|\{)")
 HEAD_KEYWORDS = {"if", "for", "while", "switch", "catch", "return", "sizeof", "decltype", "alignof", "noexcept"}
@@ -473,7 +479,7 @@ def check_setters(census: dict, fails: list) -> None:
     allowed = sorted(SETTERS_ALLOWED)
     if sorted((rel, fn) for rel, fn, _ in writes) != allowed:
         got = ", ".join(f"{rel}:{line} in {fn or '<no function>'}" for rel, fn, line in writes) or "none"
-        fails.append(("Z5", f"the writes to {FLAG} are [{got}]; want exactly one, in "
+        fails.append(("Z5", f"the writes to {FLAG} are [{got}]; want exactly one in each of "
                             f"{', '.join(fn for _, fn in allowed)}: the flag sends a request to the WEIGHT host zone, "
                             "which no graph boundary checks, so set on a transient request it hides exactly the "
                             "STAGING leak the boundary check exists to catch"))
@@ -887,8 +893,9 @@ def main(argv: list) -> int:
     if fails:
         return 1
     print("PASS: the CPU job input marker's word is a persistent owner in the WEIGHT host zone, which no graph "
-          "boundary checks, only arm_cpu_job_input_marker sets that flag, and a refused host-zone boundary check walks "
-          f"the registry only for its first 8 refusals per zone or an active zone audit {TAG}")
+          "boundary checks, only arm_cpu_job_input_marker and the MMID workspace host pool set that flag, and a refused "
+          "host-zone boundary check walks the registry only for its first 8 refusals per zone or an active zone audit "
+          f"{TAG}")
     print("PASS: the five host-zone owner checks run in their boundary functions after their owners' releases, and the "
           f"two host dispatch intercepts count before any staging {XFJ3_TAG}")
     return 0

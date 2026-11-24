@@ -19,8 +19,9 @@ replace it (set at both populate sites, read by the planner).
 
 The fact and the ABI
   F1. ggml_sycl_tensor_inventory carries use_mmap_resolved, use_mlock_resolved and host_weight_layout in the padding
-      after n_ctx_context_is_default (offsets 185-187, so n_ubatch_context stays at 188; the struct is 208 bytes
-      since the lazy tables were appended after it), and both static_assert blocks pin the three offsets.
+      after n_ctx_context_is_default (offsets 185-187, so n_ubatch_context stays at 188; the struct is 224 bytes
+      since the lazy tables and then the KV slot-to-layer map were appended after it), and both static_assert blocks
+      pin the three offsets.
       host_weight_layout is one byte holding three values (enum ggml_sycl_host_weight_layout: OFF 0, CPU 1, PLAIN 2),
       so every read in the backend and libllama compares it with a named value, or passes it to a function that does
       (the backend's host_weight_layout_facts_of switches over the named values), and none tests it as a bool, where
@@ -248,8 +249,8 @@ def clause_f1_inventory_fields(t: dict) -> list:
             problems.append(f"the inventory carries the derived fact `{field}`, not libllama's input")
     for rel in (H, GS):
         text = t[rel]
-        if not re.search(r"static_assert\s*\(\s*sizeof\s*\(\s*ggml_sycl_tensor_inventory\s*\)\s*==\s*208\s*,", text):
-            problems.append(f"{rel}: the inventory size pin is not 208")
+        if not re.search(r"static_assert\s*\(\s*sizeof\s*\(\s*ggml_sycl_tensor_inventory\s*\)\s*==\s*224\s*,", text):
+            problems.append(f"{rel}: the inventory size pin is not 224")
         for field, off in INVENTORY_OFFSETS.items():
             if not re.search(rf"offsetof\s*\(\s*ggml_sycl_tensor_inventory\s*,\s*{field}\s*\)\s*==\s*{off}\s*,", text):
                 problems.append(f"{rel}: no static_assert pins offsetof({field}) == {off}")

@@ -496,21 +496,34 @@ struct ggml_sycl_tensor_inventory {
     const struct ggml_sycl_lazy_table_info * lazy_tables;
     uint32_t                                 lazy_table_count;
     // The micro-batch the load measured its compute term at (libllama's llama_load_measure_shape_resolve over the
-    // caller's hints), which the backend credits the term at. It sits in the padding after lazy_table_count, so the
-    // struct stays 208 bytes. libllama and libggml-sycl are rebuilt together. When the field is 0 the backend reads
-    // n_ubatch instead.
+    // caller's hints), which the backend credits the term at. It sits in the padding after lazy_table_count, so it
+    // added no bytes. libllama and libggml-sycl are rebuilt together. When the field is 0 the backend reads n_ubatch
+    // instead.
     uint32_t                                 n_ubatch_measure;
+    // The weight layer (`blk.N`) that executes each KV cache slot [kv_layer_phys_count]. A looped model runs one weight
+    // layer for several slots, and the planner puts each slot's KV where the layer that executes it has its weights.
+    // The backend accepts the map only when kv_layer_phys_count == kv_layer_count and every entry is valid, that is in
+    // range [0, kv_layer_count); otherwise, a nonzero count with a NULL map included, it plans every slot as its own
+    // layer and says so at WARN. A count of 0 and an identity map both mean every slot is its own layer. Appended: the
+    // struct grew from 208 to 224 bytes, pinned below and in ggml-sycl.cpp. The struct carries no size field, so a
+    // libllama built before these fields passes a 208-byte object, and libggml-sycl reads the 16 bytes past its end as
+    // a pointer and a count: this layout does not protect a stale producer. libllama and libggml-sycl must be rebuilt
+    // together.
+    const int32_t *                          kv_layer_phys;
+    uint32_t                                 kv_layer_phys_count;
 };
 
 #if defined(__cplusplus) && UINTPTR_MAX == UINT64_MAX
 // Both sides of the dlopen boundary compile the inventory's layout and each lazy table's from here: libllama, which
 // fills them, and libggml-sycl, which reads them (ggml-sycl.cpp pins the same figures). A field that moves fails both
 // builds instead of being read from the wrong place.
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 208, "ggml_sycl_tensor_inventory layout changed");
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 224, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_context) == 188, "n_ubatch_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_tables) == 192, "lazy_tables moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, lazy_table_count) == 200, "lazy_table_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ubatch_measure) == 204, "n_ubatch_measure moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys) == 208, "kv_layer_phys moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_phys_count) == 216, "kv_layer_phys_count moved");
 static_assert(sizeof(ggml_sycl_lazy_table_info) == 88, "ggml_sycl_lazy_table_info layout changed");
 static_assert(offsetof(ggml_sycl_lazy_table_info, name) == 0, "lazy table name moved");
 static_assert(offsetof(ggml_sycl_lazy_table_info, type) == 8, "lazy table type moved");

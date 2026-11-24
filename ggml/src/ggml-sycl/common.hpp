@@ -14,6 +14,7 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include "alloc-registry.hpp"
+#include "async-failure.hpp"
 #include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
 #include "fallback-error.hpp"
@@ -699,6 +700,7 @@ enum ggml_sycl_ready_query_site {
     GGML_SYCL_READY_QUERY_SITE_MOE_SORT,
     GGML_SYCL_READY_QUERY_SITE_MOE_XMX,
     GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH,
+    GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED,
     GGML_SYCL_READY_QUERY_SITE_COUNT,
 };
 
@@ -735,6 +737,8 @@ inline const char * ggml_sycl_ready_query_site_name(ggml_sycl_ready_query_site s
             return "moe_xmx";
         case GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH:
             return "cpu_dispatch";
+        case GGML_SYCL_READY_QUERY_SITE_MUL_MAT_F32_BATCHED:
+            return "mul_mat_f32_batched";
         case GGML_SYCL_READY_QUERY_SITE_OTHER:
         case GGML_SYCL_READY_QUERY_SITE_COUNT:
             break;
@@ -2276,15 +2280,26 @@ inline bool ggml_sycl_is_canonical_tied_embedding_name(const char * name) {
     return name != nullptr && std::strcmp(name, "token_embd.weight") == 0;
 }
 
+// An expert family's per-expert scale: "<family>.scale", ".scales" or ".input_scale", {n_expert} (or {1}) F32
+// metadata beside an NVFP4 or FP8 expert matrix, or a view of one ("... .scale (reshaped)" is the name the REPEAT in
+// build_lora_mm_id reads). It is a small dense tensor, not an expert matrix. The name rule (infer_tensor_usage) and
+// the weight-usage registry (ggml_backend_sycl_try_register_weight_usage) both ask this one predicate: the planner
+// reads the first and gives the scale a dense entry with its layer, the S1 preload reads the second and stages that
+// dense entry, so the two must agree. Meaningful only for a name already in an expert family.
+inline bool ggml_sycl_moe_expert_scale_name(const char * name) {
+    return name != nullptr && (strstr(name, "exps.scale") != nullptr || strstr(name, "exps.input_scale") != nullptr);
+}
+
 inline tensor_usage infer_tensor_usage(const char * name) {
     if (!name) {
         return tensor_usage::UNKNOWN;
     }
 
-    // MoE expert weights (highest priority - check first).  Bias tensors share
-    // the same ffn_*_exps prefix but are separate small tensors; treating them
-    // as per-expert weights duplicates the planner's semantic
-    // (layer, expert, role) entries.
+    // MoE expert weights (highest priority - check first).  Bias and scale
+    // tensors (ggml_sycl_moe_expert_scale_name) share the same ffn_*_exps
+    // prefix but are separate small tensors; treating them as per-expert
+    // weights duplicates the planner's semantic (layer, expert, role) entries
+    // and leaves them without the dense entry that stages them with their layer.
     // "ffn_gate_up_exps" is the FUSED gate+up expert tensor and contains
     // neither "ffn_gate_exps" nor "ffn_up_exps", so it needs its own literal.
     // Omitting it made the planner treat the whole fused tensor as ONE dense
@@ -2310,7 +2325,7 @@ inline tensor_usage infer_tensor_usage(const char * name) {
                                strstr(name, "ffn_down_exps") || strstr(name, "ffn_gate_up_exps") ||
                                strstr(name, "ffn_gate_chexps") || strstr(name, "ffn_up_chexps") ||
                                strstr(name, "ffn_down_chexps");
-    if (moe_exps_name && !strstr(name, ".bias")) {
+    if (moe_exps_name && !strstr(name, ".bias") && !ggml_sycl_moe_expert_scale_name(name)) {
         return tensor_usage::MOE_EXPERT_WEIGHT;
     }
     if (moe_exps_name) {
@@ -2409,8 +2424,23 @@ bool ggml_sycl_moe_prepare_compact_list(ggml_backend_sycl_context & ctx,
                                         const ggml_tensor *         src0,
                                         int64_t                     total_batches,
                                         bool                        allow_alloc);
+// Whether a dispatch bundle snapshot leaves out a handle whose allocation it already holds. A full-local table holds one
+// lease per expert, so a route that dispatches from it alone takes its leases as they are (NONE) and skips comparing
+// every handle with every other, O(n^2) per node. NONE changes no lifetime and keeps the handles BY_IDENTITY would:
+// each lease is a different expert's slice, and a slice's identity includes its offset and size, so no two leases
+// compare equal even when every slice is of one buffer. The one handle NONE takes twice is the table's own, which
+// ggml_sycl_set_moe_ptr_table_leases adds to the leases and the snapshot appends again after them: one extra
+// reference, to what the first already keeps alive.
+enum class moe_dispatch_bundle_dedup : uint8_t {
+    BY_IDENTITY,  // compare each handle's stable identity with every handle taken before it
+    NONE,         // take every handle that has an identity
+};
 std::vector<ggml_sycl::mem_handle> ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(
-    const ggml_tensor_extra_gpu * extra, int device, bool include_compact = false, bool include_missing = false);
+    const ggml_tensor_extra_gpu * extra,
+    int                           device,
+    bool                          include_compact = false,
+    bool                          include_missing = false,
+    moe_dispatch_bundle_dedup     dedup           = moe_dispatch_bundle_dedup::BY_IDENTITY);
 void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * extra, int device, sycl::event event);
 const int32_t * ggml_sycl_get_moe_ids_device_ptr(ggml_backend_sycl_context & ctx,
                                                  const ggml_tensor *         ids,
@@ -2856,7 +2886,8 @@ bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
 // (GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the admission above). Defined beside it; the router's helper reads the same knob.
 bool   ggml_sycl_onednn_pp_mmq_types_admitted(ggml_type type);
 // llama.cpp-84ck: whether this build can execute the MoE MMID direct route at all. Defined in ggml-sycl.cpp from the
-// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds.
+// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds,
+// and then only for the Q1_0/NVFP4 experts the route admits.
 bool   ggml_sycl_moe_mmid_route_reachable_in_build();
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.
@@ -3931,6 +3962,19 @@ static inline bool ggml_sycl_valid_device_index(int dev) {
 // Defined in ggml-sycl.cpp with the route that builds it (llama.cpp-7pvo).
 struct moe_hybrid_decode_record;
 
+// The NVFP4 resident decode route's memoized plan answer for one weight on one device: whether the plan puts every
+// expert of the weight on the device at AOS. Walking the plan's experts is the costly part of the route's per-node
+// question, and the answer changes only with the plan object, a mid-load replan (which keeps the object and bumps the
+// epoch) or the weight's expert storage; those three are the key. The node's shapes, strides and ids are not in the
+// key and are asked of every node.
+struct ggml_sycl_moe_resident_decode_plan_memo {
+    std::weak_ptr<const ggml_sycl::placement_plan> plan;
+    uint64_t                                       replan_epoch       = 0;
+    uint64_t                                       storage_generation = 0;
+    bool                                           valid              = false;
+    bool                                           all_aos            = false;
+};
+
 struct ggml_tensor_extra_gpu_weight_ext {
     dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
 
@@ -4399,6 +4443,14 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    // The NVFP4 resident decode route's plan answer per device, and per device a bit for each reason the route has
+    // declined this weight under GGML_SYCL_MOE_ROUTE_LOG, so the route log names each reason once.
+    ggml_sycl_moe_resident_decode_plan_memo         moe_resident_decode_plan[GGML_SYCL_MAX_DEVICES];
+    uint32_t                                        moe_resident_decode_declines_logged[GGML_SYCL_MAX_DEVICES]  = {};
+    // Per device, the expert storage generation at which the direct routes' publish of this weight's AOS slices from
+    // its own buffer, with the table build after it, last left the full-local table unbuilt (0: never; the generation
+    // starts at 1). A node at that generation does not publish again (ggml_sycl_moe_direct_ensure_aos_table).
+    uint64_t                                        moe_direct_publish_failed_generation[GGML_SYCL_MAX_DEVICES] = {};
     // Batch-1 decode direct-dispatch eligibility and layout, per device; see
     // moe-decode-hostpath.hpp (llama.cpp-yx28).
     ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];
@@ -4773,6 +4825,21 @@ struct ggml_tensor_extra_gpu {
     // Unified layout descriptor (new system - coexists with optimize_feature during migration)
     tensor_layout_info layout;
     bool               layout_dirty = false;                // Weight data overwritten; layout must be re-materialized
+
+    // The order of the bytes in the tensor's own range (tensor->data). It is written only by code that writes those
+    // bytes (ggml_backend_sycl_buffer_set_tensor, ggml_backend_sycl_set_tensor_async when its write went to the own
+    // range, and the in-place reorders reorder_tensor_to_soa and convert_tensor_to_coalesced); a cache-side copy in
+    // another layout never changes it. optimized_feature and layout record what a kernel last resolved, which may be
+    // such a copy. ggml_backend_sycl_buffer_get_tensor decides from this field of the root tensor's extra alone.
+    // It is not complete. These writers of the own range do not keep it right: the destination of
+    // ggml_backend_sycl_buffer_cpy_tensor (and of ggml_backend_sycl_cpy_tensor_async, which is not wired: the
+    // backend interface's cpy_tensor_async slot is NULL) and a partial ggml_backend_sycl_buffer_memset_tensor do not
+    // write it; a partial ggml_backend_sycl_buffer_set_tensor or ggml_backend_sycl_set_tensor_async records AOS for
+    // the whole range; a write through a view records on the view's own extra (tensor->extra; init_tensor gives a
+    // view in a SYCL buffer its own extra), or nowhere when the view has none, while the reader decides from the
+    // root's; tied-weight aliases share one extra and so one record.
+    // ggml_backend_sycl_get_tensor_async does not consult it and returns the stored bytes.
+    ggml_layout_mode own_data_layout = GGML_LAYOUT_AOS;
 
     tp_layer_type tp_type        = tp_layer_type::TP_NONE;  // Cached TP type (set once, avoids string compare)
     bool          tp_type_cached = false;                   // Whether tp_type has been computed
@@ -6473,6 +6540,11 @@ struct ggml_backend_sycl_context {
     uint64_t                             execution_graph_epoch = 0;
     uint64_t                             execution_invocation_id = 0;
     bool                                 execution_graph_sealed = false;
+    // Dispatch scopes (ggml_sycl_execution_dispatch_scope) holding the tracked graph open on this backend. Ending or
+    // clearing the graph while this is nonzero is a contract violation, reported once per invocation through
+    // execution_tripwire_invocation. Both guarded by execution_state_mutex.
+    int                                  execution_dispatch_depth      = 0;
+    uint64_t                             execution_tripwire_invocation = 0;
     std::vector<int>                     execution_aggregate_devices;
     uint64_t                             execution_root_model_id = 0;
     uint64_t                             execution_root_load_txn_id = 0;
@@ -6614,11 +6686,26 @@ struct ggml_backend_sycl_context {
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
+    // The asynchronous-failure counts when this context was created. Once either moves, this context's graph boundaries
+    // fail for the rest of its life: a failed command does not cancel its dependents, so its outputs and the KV rows it
+    // wrote may come from work that never ran, and the handler cannot tell whose command failed on a queue every
+    // context of the device shares. A context created later starts from the counts at its creation. The two flags are
+    // separate facts: `reported` means the [SYCL-ASYNC-FAILURE] line was logged, by whichever boundary saw the failure
+    // first; `cleaned` means synchronize's failure branch ran the boundary cleanup for what the context submitted before
+    // the failure was seen. graph_compute's refusal never cleans up, because it refuses before any submission. A cleanup
+    // run by an exception catch (graph_compute's or synchronize's own) does not set the flag, so the next synchronize may
+    // run the cleanup a second time, which finds nothing to release.
+    ggml_sycl_async_failure_cursor async_failure_cursor;
+    bool                           async_failure_reported = false;
+    bool                           async_failure_cleaned  = false;
+
     explicit ggml_backend_sycl_context(int device) :
         device(device),
         name(GGML_SYCL_NAME + std::to_string(device)),
         supports_soa_reorder(ggml_sycl_info().devices[device].supports_soa_reorder),
-        matmul_orchestrator(*this) {}
+        matmul_orchestrator(*this) {
+        async_failure_cursor = ggml_sycl_async_failure_snapshot(device);
+    }
 
     ~ggml_backend_sycl_context();
 
@@ -8690,14 +8777,16 @@ static __dpct_inline__ float ggml_sycl_e8m0_to_fp32(uint8_t x) {
 }
 
 static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
-    if (x == 0 || x == 0x7f || x == 0xff) {
-        return 0.0f;
-    }
-
-    const int   exp = (x >> 3) & 0xf;
-    const int   man = x & 0x7;
-    const float raw = exp == 0 ? sycl::ldexp((float) man, -9) : sycl::ldexp(1.0f + (float) man / 8.0f, exp - 7);
-    return raw * 0.5f;
+    // Half the format's value, because kvalues_mxfp4 holds the E2M1 values doubled.
+    // exp > 0: (1 + man/8) * 2^(exp - 8), written as its bits. exp == 0: man * 2^-10. 0x7f and 0xff read as 0.
+    const uint32_t exp  = (x >> 3) & 0xfu;
+    const uint32_t man  = x & 0x7u;
+    const uint32_t bits = ((exp + 119u) << 23) | (man << 20);
+    float          normal;
+    memcpy(&normal, &bits, sizeof(float));
+    const float small = (float) man * 0x1p-10f;
+    const float value = exp == 0 ? small : normal;
+    return (x & 0x7fu) == 0x7fu ? 0.0f : value;
 }
 
 static inline bool ggml_sycl_type_is_fp8_e4m3(ggml_type type) {

@@ -349,7 +349,9 @@ UPLOAD_CLEAR = ("if (staged) { expert_handles[slot] = ggml_sycl::mem_handle{}; p
                 "any_updated = true; " + UPLOAD_RECORD + " } else if (!same_entry) {")
 UPLOAD_LEASE = "if (!staged) { leases.push_back(std::move(handle)); }"
 FROM_BATCH_STAGED = "const std::vector<int32_t> staged_experts = ggml_sycl::moe_batch_staged_ring_experts(batch);"
-FROM_BATCH_PASS = "table_event_out, table_event_set, staged_experts.empty() ? nullptr : &staged_experts);"
+# The upload from a batch passes its staged experts, then (skip_host, a mixed node's card part) its HOST experts.
+FROM_BATCH_PASS = ("table_event_out, table_event_set, staged_experts.empty() ? nullptr : &staged_experts, "
+                   "host_experts.empty() ? nullptr : &host_experts);")
 HYBRID_COLLECT = ("if (entry->admitted_recipe_ticket.valid() && entry->admitted_recipe_ticket.recipe().transfer == "
                   "ggml_sycl::moe_recipe_transfer::STAGED_RING &&")
 HYBRID_PASS = ("ggml_sycl_upload_moe_transient_ptr_table(ctx, src0, route_slots, layer_id, dispatch_layout, nullptr, "
@@ -378,9 +380,13 @@ NAMES_STAGED_BODY = ("{ return ggml_sycl::moe_batch_names_staged_ring(roles.gate
                      "ggml_sycl::moe_batch_names_staged_ring(roles.down.batch); }")
 
 TRIAD_ROLES = ("gate_layout", "up_layout", "down_layout")
+# Every prompt build ends this way: no materialization, the invocation's context and queue, then the Q1_0/NVFP4 direct
+# recipe's queue capability. The capability is invalid for every other type, so it changes nothing this file asserts;
+# the claims pin it only because it is the call's last argument.
+PROMPT_BUILD_TAIL = "false, &ctx, ctx.stream(), prompt_queue_capability.valid() ? &prompt_queue_capability : nullptr);"
 RETAINED_PROMPT = ("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, ctx.device, "
                    "prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]), "
-                   "retained_prompt_layout, false, &ctx, ctx.stream());")
+                   "retained_prompt_layout, " + PROMPT_BUILD_TAIL)
 
 VALIDATOR_CLAUSE = ("if (recipe.transfer == moe_recipe_transfer::STAGED_RING && (recipe.kind != "
                     "moe_batch_executor::PRIMARY_DEVICE || residency != moe_batch_residency::PRIMARY_DEVICE || "
@@ -858,7 +864,7 @@ STAGED_LAYER_SITE = ("*ctx.stream(), stream_call.op); ggml_sycl_moe_stream_relea
                      + STAGED_LAYER_SET + " " + CPU_SPLIT_SET + " }")
 RETAINED_BUILD = ("retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, ctx.device, "
                   "prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]), "
-                  "retained_prompt_layout, false, &ctx, ctx.stream());")
+                  "retained_prompt_layout, " + PROMPT_BUILD_TAIL)
 PROBE_CLAIM = ("const bool pp_onednn_batched_claims_op = ne12 > 1 && (pp_onednn_batched_claims_staged_layer || "
                "ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device));")
 PLAN_HAS_CPU = ("plan_has_cpu_experts = plan_owner->has_host_experts(src0->name, n_exp, ctx.device) && "
@@ -941,8 +947,8 @@ def test_fully_staged_layer_leaves_hybrid_mutants():
     # Decode steered by the staged bool: the unconditional decode term dropped.
     assert not c(mutate(SYCL, HYBRID_WITH_PLAN, "const bool moe_hybrid_with_plan = selected_hybrid_route;"))
     # The retained prompt batch materializes, so a staged layer's host experts are copied twice.
-    assert not c(mutate(SYCL, "retained_prompt_layout, false, &ctx, ctx.stream());",
-                        "retained_prompt_layout, true, &ctx, ctx.stream());"))
+    assert not c(mutate(SYCL, "retained_prompt_layout, " + PROMPT_BUILD_TAIL,
+                        "retained_prompt_layout, " + PROMPT_BUILD_TAIL.replace("false", "true", 1)))
     # A second writer of the bool.
     assert not c(mutate(SYCL, PLAN_HAS_CPU, "pp_onednn_batched_claims_staged_layer = false; " + PLAN_HAS_CPU))
 
@@ -1748,7 +1754,7 @@ def test_admission_cache_graph_keyed_mutants():
 def claim_prompt_builds_pass_invocation(sycl: str) -> bool:
     """The triad and the retained prompt build pass the invocation's context and queue."""
     mmid = body(norm(sycl), MMID_SIG)
-    triad = all(f"{role}, false, &ctx, ctx.stream());" in mmid for role in TRIAD_ROLES)
+    triad = all(f"{role}, {PROMPT_BUILD_TAIL}" in mmid for role in TRIAD_ROLES)
     return triad and RETAINED_PROMPT in mmid
 
 
@@ -1756,15 +1762,19 @@ def test_prompt_builds_pass_invocation():
     assert claim_prompt_builds_pass_invocation(SYCL), first_missing(
         "ggml/src/ggml-sycl/ggml-sycl.cpp: body of ggml_sycl_mul_mat_id",
         body(norm(SYCL), MMID_SIG),
-        *[f"{role}, false, &ctx, ctx.stream());" for role in TRIAD_ROLES], RETAINED_PROMPT,
+        *[f"{role}, {PROMPT_BUILD_TAIL}" for role in TRIAD_ROLES], RETAINED_PROMPT,
         signature=MMID_SIG)
 
 
 def test_prompt_builds_pass_invocation_mutants():
     assert not claim_prompt_builds_pass_invocation(
-        mutate(SYCL, "up_layout, false, &ctx, ctx.stream());", "up_layout, false);"))
+        mutate(SYCL, "up_layout, " + PROMPT_BUILD_TAIL, "up_layout, false);"))
     assert not claim_prompt_builds_pass_invocation(
-        mutate(SYCL, "retained_prompt_layout, false, &ctx, ctx.stream());", "retained_prompt_layout, false);"))
+        mutate(SYCL, "retained_prompt_layout, " + PROMPT_BUILD_TAIL, "retained_prompt_layout, false);"))
+    # The queue dropped while the capability stays: the claim reads the queue, not only the call's last argument.
+    assert not claim_prompt_builds_pass_invocation(
+        mutate(SYCL, "down_layout, " + PROMPT_BUILD_TAIL,
+               "down_layout, " + PROMPT_BUILD_TAIL.replace("ctx.stream()", "nullptr", 1)))
 
 
 # ---- the validator ---------------------------------------------------------------------------------------------------

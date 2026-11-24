@@ -1,0 +1,142 @@
+#### dev tests B70
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  binaries newer than their sources: yes
+lock wait: 0s
+== sycl-q1-nvfp4-admitted-device on b70  2026-11-22T18:15:30-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 56  context-bind: 0  abort lines: 0
+342: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+342: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+342: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+342: [SYCL-ASYNC-FAILURE] device 0: graph_compute: an asynchronous SYCL error was delivered after this context was created (device errors=2, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+342: Q1/NVFP4 scoped production-route lifecycle: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=12GB
+  kernel fault lines since start: 0
+== sycl-q1-nvfp4-adapter-device on b70  2026-11-22T18:15:41-05:00
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 0  context-bind: 0  abort lines: 0
+331: Q1/NVFP4 lifecycle-aware admitted device adapter: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:15:50-05:00
+lock released
+#### rc=0
+#### inkling B70
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+gate script: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt/scripts/sycl-canonical-gates.sh at e8b13c2b5
+== inkling gate, level_zero:0  2026-11-22T18:15:52-05:00  shmem=11GB
+  gate script rc=0
+GATE inkling PASS rc=0 selector=level_zero:0 sha=e8b13c2b5
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 0
+0.53.210.282 I common_perf_print:        load time =   48169.33 ms
+0.53.210.283 I common_perf_print: prompt eval time =     934.78 ms /    14 tokens (   66.77 ms per token,    14.98 tokens per second)
+0.53.210.283 I common_perf_print:        eval time =    3643.27 ms /    14 runs   (  260.23 ms per token,     3.84 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:17:04-05:00
+lock released
+#### rc=0
+#### plan lines (Mistral B70, GPT-OSS B50)
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+  libggml-sycl newer than ggml/src/ggml-sycl/ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml/src/ggml-sycl/unified-cache.cpp: yes
+lock wait: 0s
+== mistral B70 -v  2026-11-22T18:17:07-05:00 shmem=11GB
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  rc=0
+  out:  1, 2, 3, 4, 5, 6, 7, 8, 9, 10||
+  kept 179 plan lines of 3360
+  shmem=11GB
+  kernel fault lines since start: 0
+== gptoss B50 -v, no -c  2026-11-22T18:17:51-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  answer lines: 1  device_lost: 0
+  kept 198 plan lines of 4285
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:18:30-05:00
+lock released
+#### rc=0
+#### dev tests B50
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  binaries newer than their sources: yes
+lock wait: 0s
+== sycl-q1-nvfp4-admitted-device on b50  2026-11-22T18:18:33-05:00
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+  rc=0
+  tests selected: 1  PASS lines: 56  context-bind: 0  abort lines: 0
+342: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+342: [MOE-PROMPT-REFUSAL] tensor=blk.0.ffn_gate_exps.weight reason=workspace_capacity tokens=41 capacity=40
+342: [SYCL-ASYNC-FAILURE] device 0: synchronize: an asynchronous SYCL error was delivered after this context was created (device errors=1, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+342: [SYCL-ASYNC-FAILURE] device 0: graph_compute: an asynchronous SYCL error was delivered after this context was created (device errors=2, shared errors=0; first on device: injected Q1/NVFP4 asynchronous terminal failure; first shared: (none)). The outputs of this context's last graph are not valid, and this context computes nothing more.
+342: Q1/NVFP4 scoped production-route lifecycle: PASS
+The following tests passed:
+100% tests passed, 0 tests failed out of 1
+  shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:18:43-05:00
+lock released
+#### rc=0
+#### inkling B50
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+gate script: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt/scripts/sycl-canonical-gates.sh at e8b13c2b5
+== inkling gate, level_zero:1  2026-11-22T18:18:45-05:00  shmem=11GB
+  gate script rc=1
+GATE inkling FAIL rc=1 selector=level_zero:1 sha=e8b13c2b5
+  out: 1, 2, 3, 4, 5,
+  refusals: 2  abort lines: 0  device_lost: 0
+0.49.679.009 E [MOE-DECODE-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight route=direct step=precondition failed=all_primary occurrence=0 expert=23 residency=host owner=-1 layout=aos operands=8
+0.49.679.122 E [MOE-DECODE-REFUSAL] tensor=blk.15.ffn_gate_up_exps.weight occurrence=7 expert=0 owner=0 reason=capability_unsupported type=nvfp4 layout=aos kernel=device-mmvq-q1-nvfp4-aos capability=direct-recipe-candidate queue_ready=1
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:19:55-05:00
+lock released
+#### rc=0
+#### inkling both
+tree=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/wt-t8b head=6ee2a4058 tracked-changes=0 ninja=0
+GGML_SYCL:BOOL=ON
+  build/bin/llama-completion newer than ggml-sycl.cpp: yes
+  libggml-sycl newer than ggml-sycl.cpp: yes
+  route flag in source: constexpr bool k_moe_mmid_direct_route_validated = true;
+lock wait: 0s
+  preflight: drm/0000:04:00.0/vram0 holds 39 MiB
+  preflight: drm/0000:09:00.0/vram0 holds 39 MiB
+gate script: /home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/upstream-merge/wt/scripts/sycl-canonical-gates.sh at e8b13c2b5
+== inkling gate, level_zero:0,1  2026-11-22T18:19:57-05:00  shmem=11GB
+  gate script rc=1
+GATE inkling FAIL rc=0 selector=level_zero:0,1 sha=e8b13c2b5
+  out: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,||
+  refusals: 0  abort lines: 0  device_lost: 1
+0.53.172.169 I common_perf_print:        load time =   47437.20 ms
+0.53.172.170 I common_perf_print: prompt eval time =     957.48 ms /    14 tokens (   68.39 ms per token,    14.62 tokens per second)
+0.53.172.170 I common_perf_print:        eval time =    3748.79 ms /    14 runs   (  267.77 ms per token,     3.73 tokens per second)
+  settle: shmem=11GB
+  kernel fault lines since start: 0
+DONE rc=0 2026-11-22T18:21:09-05:00
+lock released
+#### rc=0
+CHAIN_DONE

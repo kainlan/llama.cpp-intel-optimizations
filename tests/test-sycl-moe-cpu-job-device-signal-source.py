@@ -97,8 +97,8 @@ THE CONTRACT.  With comments blanked:
   J2. (ggml_backend_sycl_synchronize) the gate sleep is one unconditional statement after
      the CPU-expert flush and before both stream-wait branches, and no site but the
      synchronize and the graph code's queue wait (B9) calls ggml_sycl_cpu_job_gates_sleep;
-     the statement right after the stream wait clears
-     what it slept on; the sleep asks the device's list (unified_cache_cpu_job_gates) and
+     the statement right after the drain (a try block around both waits, and its catch
+     clauses) clears what it slept on; the sleep asks the device's list (unified_cache_cpu_job_gates) and
      waits all of it; that lookup reads the device's existing ring
      (existing_cpu_job_signal_ring) and never get_cpu_job_signal_ring, which would make one.
   J3. Clears: the synchronize clears up to the newest gate it slept on before the trace
@@ -679,11 +679,14 @@ def check_gates(s: dict) -> None:
     heads = enclosing_headers(sync, sraw) if sraw >= 0 else []
     if heads[:1] != ["try"]:
         fail("J2", "the synchronize's gate sleep is under a condition")
-    # The waits sit in the block that runs when the injected device loss ahead of them did not throw; the clear follows
-    # that block's close, so it runs whether the waits did or not.
-    if not re.search(r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\); \} "
+    # The drain is a try block whose first statement is the test-only device-loss injection, then both waits
+    # (synchronize must not abort on a throwing drain or on the injected loss), and the clear is the first statement
+    # after its catch clauses, so a throw from the injection or from either wait cannot skip it.
+    if not re.search(r"try \{ ggml_sycl_test_inject_device_lost\(\"sync\"\); if \(use_deferred_decode_event\) \{ "
+                     r"sycl_ctx->last_graph_event->wait_and_throw\(\); \} "
+                     r"else \{ stream->wait_and_throw\(\); \} \}(?: catch \([^()]*\) \{[^{}]*\})+ "
                      r"ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", sf):
-        fail("J2", "the statement after the synchronize's stream wait does not clear the gates it slept on")
+        fail("J2", "the statement after the synchronize's drain does not clear the gates it slept on")
     gs, _ = body_of(code, GATES_SLEEP_SIG, "J2")
     if "sleep.gates = ggml_sycl::unified_cache_cpu_job_gates(stream);" not in flat(gs) or \
             "sleep.waited = sleep.gates->wait_all(&sleep.newest);" not in flat(gs):
@@ -1069,11 +1072,15 @@ def self_test(s: dict) -> int:
              r"\n\2ggml_sycl::cpu_job_signal_gate_push(signal_mark, group[k]->future.share());\1")),
         ("J2", "backend", "the synchronize does not sleep",
          sub(r"ggml_sycl_cpu_job_gates_sleep\(\*stream\);", "ggml_sycl_cpu_job_gate_sleep{};")),
-        ("J2", "backend", "the synchronize sleeps after its stream wait",
-         lambda t: re.sub(r"(CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);)",
-                          r"\1\n        const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);",
+        ("J2", "backend", "the synchronize sleeps after its drain",
+         lambda t: re.sub(r"(\n\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);)",
+                          r"\n        const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);\1",
                           re.sub(r"\n\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);",
                                  "", t, count=1), count=1)),
+        ("J2", "backend", "the synchronize clears inside its drain's try",
+         lambda t: re.sub(r"(\n\s*\} catch \(const std::exception & e\) \{\n\s*drain_error = e\.what\(\);)",
+                          r"\n            ggml_sycl_cpu_job_gates_clear(gate_sleep);\1",
+                          re.sub(r"\n\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", "", t, count=1), count=1)),
         ("J2", "backend", "the synchronize sleeps before its flush",
          lambda t: re.sub(r"(\n(\s*)if \(!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test\(\)\) \{)",
                           r"\n\2const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);\1",
@@ -1084,9 +1091,10 @@ def self_test(s: dict) -> int:
              r"\1if (sycl_ctx->last_graph_event_deferred_decode) {\1    \3\1}")),
         ("J2", "backend", "the synchronize keeps its gates", sub(r"\n\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", "")),
         ("J2", "backend", "the synchronize clears its gates only when it waited",
-         sub(r"(CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);)\n(\s*)\}\n"
-             r"\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);",
-             r"\1\n\2    ggml_sycl_cpu_job_gates_clear(gate_sleep);\n\2}")),
+         lambda t: re.sub(r"(\n(\s*)sycl_ctx->last_graph_event->wait_and_throw\(\);)"
+                          r"(\n\s*\} else \{\n\s*stream->wait_and_throw\(\);)",
+                          r"\1\n\2ggml_sycl_cpu_job_gates_clear(gate_sleep);\3\n\2ggml_sycl_cpu_job_gates_clear(gate_sleep);",
+                          re.sub(r"\n\s*ggml_sycl_cpu_job_gates_clear\(gate_sleep\);", "", t, count=1), count=1)),
         ("J2", "backend", "the sleep waits part of the list",
          sub(r"sleep\.waited = sleep\.gates->wait_all\(&sleep\.newest\);", "sleep.waited = sleep.gates->wait_upto(1);")),
         ("J3", "backend", "an untraced synchronize never clears",
