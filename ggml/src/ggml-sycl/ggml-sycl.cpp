@@ -75606,9 +75606,25 @@ static void ggml_sycl_mul_mat_bf16_weight(ggml_backend_sycl_context & ctx,
     GGML_ASSERT(ggml_sycl_bf16::f32_columns_uniform(src1, &ldx) && ggml_sycl_bf16::f32_columns_uniform(dst, &ldy));
 
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat.bf16_native");
-    (void) ggml_sycl_bf16::mul_mat_bf16_f32(*ctx.stream(), static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf,
-                                            src0->ne[0], src0->ne[1], src1->ne[1] * src1->ne[2] * src1->ne[3], ldx, ldy,
-                                            ggml_sycl_info().max_work_group_sizes[ctx.device]);
+    // GGML_SYCL_KERNEL_PROFILE row. The wrapper times the event the kernel returns, so the row is device time per
+    // launch; the shape in the metadata separates the skinny mat-vecs from the tiled products.
+    const int64_t n_vecs = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    std::string   profile_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        profile_metadata = "ncols=" + std::to_string(src0->ne[0]) + ";nrows=" + std::to_string(src0->ne[1]) +
+                           ";n_vecs=" + std::to_string(n_vecs);
+    }
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "mulmat.bf16_native";
+    profile_label.category   = "mulmat";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = profile_metadata.c_str();
+    profile_label.device     = ctx.device;
+    (void) ggml_sycl_profile_submit(*ctx.stream(), profile_label, [&](sycl::queue & queue) {
+        return ggml_sycl_bf16::mul_mat_bf16_f32(queue, static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf,
+                                                src0->ne[0], src0->ne[1], n_vecs, ldx, ldy,
+                                                ggml_sycl_info().max_work_group_sizes[ctx.device]);
+    });
 } catch (const sycl::exception & exc) {
     if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
         return;
