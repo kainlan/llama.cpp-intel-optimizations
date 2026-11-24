@@ -26,7 +26,8 @@ whitespace-canonical text:
   weight from the route environment the f16 chain reads;
 - the route body makes one submission and keeps nothing: exactly one DnnlGemmWrapper::gemm call and no other
   submission or USM call (memset, memcpy, fill, copy, submit, parallel_for, single_task, std::mem*), no loop, no
-  allocation of any kind, no wait, no static, and no store through a member, a dereference or an index;
+  allocation of any kind, no wait, no static, and no store, plain or compound, through a member, a dereference
+  (parenthesised or not) or an index;
 - gemm() chooses its profiler label by batch count: both of its labels name one variable that is the batched row
   when a batch count is above 1 and the unbatched row otherwise;
 - the route computes in F32: gemm() takes its float math as a ggml_sycl_dnnl_fpmath parameter whose default,
@@ -332,9 +333,13 @@ def test_dispatch_mutants():
 _ALLOC = re.compile(r"\bunified_alloc\w*\(|\bunified_allocate\w*\(|\bggml_sycl_pool_alloc\b|\bmalloc\w*\(|\.alloc\(|"
                     r"\bsycl::malloc\w*|\bmem_handle\b|\balloc_owner\b|\bfree\(")
 _WAIT = re.compile(r"\bwait(?:_and_throw)?\(|\bext_oneapi_submit_barrier\(|\bsynchronize\(")
-# a store through a member (`p->x =`, `s.x =`), a dereference (`*p =`) or an index (`p[i] =`); declarations such as
-# `float * c = ...` are not stores, since a statement's first character is never `*` in them
-_STORE = re.compile(r"(?:->|\.)\w+(?:\[[^\]]*\])*=(?!=)|[;{}]\*[^;=]*=(?!=)|[;{}][\w.>-]+\[[^\]]*\]=(?!=)")
+# a store through a member (`p->x =`, `s.x =`), a dereference (`*p =`, `(*p) =`) or an index (`p[i] =`), by plain
+# or compound assignment (`+=` ... `>>=`); declarations such as `float * c = ...` are not stores, since a statement's
+# first character is never `*` or `(` in them, and a comparison (`==`, `!=`, `<=`, `>=`) is not an assignment
+_ASSIGN = r"(?:<<|>>|[-+*/%&|^])?=(?!=)"
+_STORE = re.compile(r"(?:->|\.)\w+(?:\[[^\]]*\])*" + _ASSIGN
+                    + r"|[;{}]\(*\*[^;=]*(?:<<=|>>=|(?<![<>!])=(?!=))"
+                    + r"|[;{}]\(*[\w.>-]+\[[^\]]*\]\)*" + _ASSIGN)
 # a submission or USM call other than the one gemm()
 _SUBMIT = re.compile(r"(?:->|\.)(?:memset|memcpy|fill|copy|submit|parallel_for|single_task|prefetch|mem_advise)\(|"
                      r"\bstd::mem\w+\(|(?<![\w:])(?:memset|memcpy|memmove)\(")
@@ -470,13 +475,29 @@ def test_route_op_mutants():
         ("a static", mutate(full, ret, "static const void*last=nullptr;" + ret)),
         ("a store through a dereference", mutate(full, ret, "*c=0.0f;" + ret)),
         ("a store through an index", mutate(full, ret, "c[0]=0.0f;" + ret)),
+        ("a compound store through an index", mutate(full, ret, "c[0]+=1.0f;" + ret)),
+        ("a store through a parenthesised dereference", mutate(full, ret, "(*c)=0.0f;" + ret)),
+        ("a compound store through a parenthesised dereference", mutate(full, ret, "(*c)*=2.0f;" + ret)),
+        ("a compound store through a member", mutate(full, ret, "ctx.n_calls+=1;" + ret)),
         ("a memset", mutate(full, ret, "stream->memset(c,0,4);" + ret)),
         ("a memcpy", mutate(full, ret, "stream->memcpy(c,a,4);" + ret)),
         ("a submit", mutate(full, ret, "stream->submit([&](sycl::handler&h){});" + ret)),
         ("a parallel_for", mutate(full, ret, "stream->parallel_for(sycl::range<1>(1),[=](sycl::id<1>){});" + ret)),
         ("a std::memset", mutate(full, ret, "std::memset(nullptr,0,0);" + ret)),
-    ]:
+    ] + [("an index store with " + op, mutate(full, ret, "c[0]" + op + "1;" + ret))
+         for op in ("-=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=")]:
         assert route_op_errors(code.replace(full, new, 1)), f"mutant {name!r} slipped through"
+
+
+def test_route_op_store_check_keeps_comparisons_and_declarations():
+    code = code_of(SYCL_CPP)
+    full = function_body(code, _ROUTE_OP)
+    var = re.search(r"(?:const)?std::optional<sycl::event>(\w+)=DnnlGemmWrapper::gemm\(", full).group(1)
+    ret = "return " + var + ".has_value();"
+    for stmt in ("if(c[0]<=a[0]){}", "if((*c)>=1.0f){}", "if(a!=b){}", "if(ctx.device==0){}", "const float*d=a;",
+                 "if(src0_r.ptr!=nullptr){}"):
+        new = mutate(full, ret, stmt + ret)
+        assert not route_op_errors(code.replace(full, new, 1)), f"{stmt!r} is not a store"
 
 
 def test_resolution_mutants():
