@@ -33211,8 +33211,9 @@ struct moe_profile_state {
         cur_layer.secondary.batches++;
     }
 
-    // Called at MoE MUL_MAT_ID exit
-    void moe_op_end() {
+    // Called at MoE MUL_MAT_ID exit. counts_call is false on a node's second pass on the direct MMID route: its time
+    // adds to the node's, and its first pass already counted the op.
+    void moe_op_end(bool counts_call) {
         if (!token_active) {
             return;
         }
@@ -33237,7 +33238,9 @@ struct moe_profile_state {
         cur_layer.post_compute_us += post_compute_us;
         cur_layer.n_cpu_experts += op_n_cpu;
         cur_layer.n_gpu_experts += op_n_gpu;
-        cur_layer.n_calls++;
+        if (counts_call) {
+            cur_layer.n_calls++;
+        }
 
         auto & role_t = cur_layer.role_timings[moe_profile_role_index(cur_op_role)];
         role_t.ids_d2h_us += ids_us;
@@ -33247,7 +33250,9 @@ struct moe_profile_state {
         role_t.post_compute_us += post_compute_us;
         role_t.n_cpu_experts += op_n_cpu;
         role_t.n_gpu_experts += op_n_gpu;
-        role_t.n_calls++;
+        if (counts_call) {
+            role_t.n_calls++;
+        }
 
         // U6 diagnostic: detect when compute_done was never set (falls back to
         // op_start or routing_done), causing entire op time to be misattributed
@@ -89362,15 +89367,21 @@ static sycl::event ggml_sycl_moe_direct_host_scatter(sycl::queue &              
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
+    // A node's second pass on the direct MMID route (ggml_sycl_mul_mat_id_with_direct_reentry) is the node its first
+    // pass declined: every per-call count below counts the node once, on its first pass, and every timer adds both
+    // passes' time, which is the node's.
+    const bool mmid_second_pass = dst->src[0] != nullptr && dst->src[0] == g_mmid_direct_reentry.suppressed_weight;
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
     // call takes. The v1 census's print trigger sat at the ne12==1
     // fallback admission (~line 66936 pre-rework), which the team lead
     // proved is DEAD on the production decode path -- the decode-fused
     // RESTORE-T1 pair-GLU block dispatches and returns before reaching it.
-    g_moe_decode_route_census.mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);
-    if (g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed) % 200 == 0) {
-        moe_decode_route_census_maybe_print();
+    if (!mmid_second_pass) {
+        g_moe_decode_route_census.mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);
+        if (g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed) % 200 == 0) {
+            moe_decode_route_census_maybe_print();
+        }
     }
     // llama.cpp-1tjn (B3 rework census v3, temporary): segment-timing
     // markers S1-S4 for the decode path, per the team lead's pivot after the
@@ -89395,7 +89406,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // the destructor. Enabled by GGML_SYCL_MOE_PROLOGUE_TIMING=1; removed by
     // task B5 (llama.cpp-rty8).
     struct b1_mmid_host_timer {
-        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point t0          = std::chrono::steady_clock::now();
+        bool                                  counts_call = true;  // false on a node's second pass
         static bool enabled() {
             static const bool e = [] {
                 const char * v = std::getenv("GGML_SYCL_MOE_PROLOGUE_TIMING");
@@ -89412,6 +89424,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const uint64_t ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
             const uint64_t t = ns_total.fetch_add(ns, std::memory_order_relaxed) + ns;
+            if (!counts_call) {
+                return;
+            }
             const uint64_t c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
             if (c % 720 == 0) {
                 fprintf(stderr, "[B1-MMID-HOST] calls=%llu total_ms=%.1f avg_us=%.1f\n", (unsigned long long) c,
@@ -89419,6 +89434,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
     } b1_mmid_host_timer_instance;
+
+    b1_mmid_host_timer_instance.counts_call = !mmid_second_pass;
 #if GGML_SYCL_DNNL
     // llama.cpp-iikr (unphased-host-time cycle): brackets the WHOLE function,
     // entry to every exit (RAII -- return, throw, or the six-phase block's
@@ -89435,8 +89452,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // function it was declared, as long as it is declared before first use
     // and stays in scope, which it does for the rest of this function body.
     struct mxfp4_pp_host_whole_span_guard {
-        std::chrono::high_resolution_clock::time_point t0     = std::chrono::high_resolution_clock::now();
-        bool                                           active = mxfp4_pp_batched_profile_enabled();
+        std::chrono::high_resolution_clock::time_point t0          = std::chrono::high_resolution_clock::now();
+        bool                                           active      = mxfp4_pp_batched_profile_enabled();
+        bool                                           counts_call = true;  // false on a node's second pass
 
         ~mxfp4_pp_host_whole_span_guard() {
             if (!active) {
@@ -89446,9 +89464,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             auto & p = g_mxfp4_pp_batched_profile;
             p.host_whole_us += us;
-            ++p.host_whole_calls;
+            if (counts_call) {
+                ++p.host_whole_calls;
+            }
         }
     } mxfp4_pp_host_whole_span;
+
+    mxfp4_pp_host_whole_span.counts_call = !mmid_second_pass;
 
     const bool host_phase_profile = mxfp4_pp_batched_profile_enabled();
     auto       host_phase_clock   = mxfp4_pp_host_whole_span.t0;
@@ -89462,7 +89484,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         host_phase_clock   = now;
         auto & p           = g_mxfp4_pp_batched_profile;
         p.*total_field += delta;
-        ++(p.*calls_field);
+        if (!mmid_second_pass) {
+            ++(p.*calls_field);
+        }
     };
 #endif
     const ggml_tensor * src0 = dst->src[0];
@@ -89508,13 +89532,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // RAII guard to call moe_op_end at ALL exit points
     struct moe_profile_guard_t {
         bool active;
+        bool counts_call;  // false on a node's second pass
 
         ~moe_profile_guard_t() {
             if (active) {
-                g_moe_profile.moe_op_end();
+                g_moe_profile.moe_op_end(counts_call);
             }
         }
-    } moe_profile_guard_{ g_moe_profile_enabled };
+    } moe_profile_guard_{ g_moe_profile_enabled, !mmid_second_pass };
 
     // --- Drain deferred scatter from previous CPU-TG call ---
     // The previous call's H2D scatter may still be in-flight reading from
