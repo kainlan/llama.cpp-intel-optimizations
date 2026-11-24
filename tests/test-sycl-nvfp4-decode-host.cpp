@@ -13,12 +13,21 @@
 // format (64 weights, four 16-weight sub-blocks, a UE4M3 scale each, codes from the E2M1 table).
 // The oracle calls none of the code under test.
 //
+// The UE4M3 scale helper, ggml_sycl_ue4m3_to_fp32 (common.hpp), is compared bit for bit (memcmp, so
+// the sign of zero and NaN-ness count) for all 256 bytes with two references: the value written
+// from the format, and the body it had before it built the float from its bits (compares and
+// sycl::ldexp), kept here and not in the header.
+//
 // These comparisons pass before and after a decode is swapped: they guard that the bits stay the
-// same. tests/test-sycl-nvfp4-decode-source.py pins which decode the functor uses.
+// same. tests/test-sycl-nvfp4-decode-source.py pins which form the code takes.
 //
 // The functions are plain inline code, so main() calls them directly: no queue is opened and no
-// device is touched. A host comparison speaks for the device because the decode is integer
-// arithmetic (shifts, masks, byte-wise adds), which a device computes the same way.
+// device is touched. A host comparison speaks for the device because no step in either decode
+// rounds. The codes are integer arithmetic (shifts, masks, byte-wise adds). Every scale is a 3-bit
+// integer or 1 + man/8 times a power of two between 2^-10 and 2^8: man/8 and each power-of-two
+// scaling are exact in binary32 (ldexp is exact by definition, 0 ulp in the OpenCL spec), the bit
+// form puts the same exponent and mantissa fields down directly, and the smallest nonzero value,
+// 2^-10, is far above binary32's normal range floor, so a device that flushes denormals sees none.
 
 #include "dequantize.hpp"
 #include "ggml-common.h"
@@ -55,6 +64,37 @@ static double oracle_ue4m3(uint8_t x) {
     const int exp = (x >> 3) & 0xf;
     const int man = x & 0x7;
     return exp == 0 ? std::ldexp((double) man, -9) : std::ldexp(1.0 + man / 8.0, exp - 7);
+}
+
+// The helper's body before it built the float from its bits.
+static float legacy_ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7f || x == 0xff) {
+        return 0.0f;
+    }
+    const int   exp = (x >> 3) & 0xf;
+    const int   man = x & 0x7;
+    const float raw = exp == 0 ? sycl::ldexp((float) man, -9) : sycl::ldexp(1.0f + (float) man / 8.0f, exp - 7);
+    return raw * 0.5f;
+}
+
+static bool same_bits(float a, float b) {
+    return std::memcmp(&a, &b, sizeof(float)) == 0;
+}
+
+// ggml stores the scale halved, because kvalues_mxfp4 holds the E2M1 values doubled.
+static void check_scale_all() {
+    for (int i = 0; i < 256; i++) {
+        const uint8_t x      = (uint8_t) i;
+        const float   got    = ggml_sycl_ue4m3_to_fp32(x);
+        const float   format = (float) (0.5 * oracle_ue4m3(x));
+        const float   legacy = legacy_ue4m3_to_fp32(x);
+        uint32_t      bits[3];
+        std::memcpy(&bits[0], &got, sizeof(float));
+        std::memcpy(&bits[1], &format, sizeof(float));
+        std::memcpy(&bits[2], &legacy, sizeof(float));
+        CHECK(same_bits(got, format), "scale 0x%02x: 0x%08x, format says 0x%08x", i, bits[0], bits[1]);
+        CHECK(same_bits(got, legacy), "scale 0x%02x: 0x%08x, the old body gave 0x%08x", i, bits[0], bits[2]);
+    }
 }
 
 static int checks_codes = 0;
@@ -157,6 +197,8 @@ static void check_functor() {
 int main() {
     check_codes_all();
     std::printf("codes: %d inputs compared\n", checks_codes);
+    check_scale_all();
+    std::printf("scale: 256 bytes compared\n");
     check_functor();
     if (g_failed != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failed);
