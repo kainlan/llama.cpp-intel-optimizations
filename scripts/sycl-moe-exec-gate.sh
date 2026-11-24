@@ -115,7 +115,7 @@
 # Preflights refuse (rc 2): no <sha> or a head that differs from it; GGML_SYCL not ON; a binary missing, older than
 # the head commit, or not linked to the SYCL runtime; a model file missing; a failed grep control; builders
 # (ninja + icpx) that do not clear within 15 minutes; GPU host backing (Shmem + the meminfo remainder) >= 30 GiB;
-# GPU.lock not taken;
+# GPU.lock already held;
 # a GGML_SYCL_* or LLAMA_ARG_* variable in the environment (every arm would inherit it; each arm sets its own); a
 # non-empty --out-dir unless --arm names the arms to redo or --clobber is given (a reused directory would score one
 # run's files as another's). Before each arm the host must settle (GPU host backing < 30 GiB, up to
