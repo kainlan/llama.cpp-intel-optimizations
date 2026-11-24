@@ -26,8 +26,10 @@ whitespace-canonical text:
   weight from the route environment the f16 chain reads;
 - the route body makes one submission and keeps nothing: exactly one DnnlGemmWrapper::gemm call and no other
   submission or USM call (memset, memcpy, fill, copy, submit, parallel_for, single_task, std::mem*), no loop, no
-  allocation of any kind, no wait, no static, and no store, plain or compound, through a member, a dereference
-  (parenthesised or not) or an index;
+  allocation of any kind, no wait, no static, no `++` or `--` anywhere (the body has no loop to step), and no plain
+  or compound assignment through a member, a dereference (parenthesised or not) or an index (any number of them, a
+  parenthesised base, one level of brackets inside); this is a pattern over the whitespace-stripped text that refuses
+  the spellings it names, not a parser;
 - gemm() chooses its profiler label by batch count: both of its labels name one variable that is the batched row
   when a batch count is above 1 and the unbatched row otherwise;
 - the route computes in F32: gemm() takes its float math as a ggml_sycl_dnnl_fpmath parameter whose default,
@@ -333,13 +335,19 @@ def test_dispatch_mutants():
 _ALLOC = re.compile(r"\bunified_alloc\w*\(|\bunified_allocate\w*\(|\bggml_sycl_pool_alloc\b|\bmalloc\w*\(|\.alloc\(|"
                     r"\bsycl::malloc\w*|\bmem_handle\b|\balloc_owner\b|\bfree\(")
 _WAIT = re.compile(r"\bwait(?:_and_throw)?\(|\bext_oneapi_submit_barrier\(|\bsynchronize\(")
-# a store through a member (`p->x =`, `s.x =`), a dereference (`*p =`, `(*p) =`) or an index (`p[i] =`), by plain
-# or compound assignment (`+=` ... `>>=`); declarations such as `float * c = ...` are not stores, since a statement's
-# first character is never `*` or `(` in them, and a comparison (`==`, `!=`, `<=`, `>=`) is not an assignment
+# A pattern over whitespace-stripped text, not a parser: it refuses the spellings named here. Any `++` or `--` (the
+# route op has no loop, so nothing in it is stepped), and a plain or compound assignment (`=`, `+=` ... `>>=`) through
+# a member (`p->x =`, `s.x =`), a dereference (`*p =`, `(*p) =`) or an index (`p[i] =`, `p[i][j] =`, `(p)[i] =`,
+# `p[a[i]] =`, one level of brackets inside an index). Declarations such as `float * c = ...` are not refused, since a
+# statement's first character is never `*` or `(` in them, nor is a comparison (`==`, `!=`, `<=`, `>=`). Stripping the
+# whitespace makes `x = - -y` read as `--`, which is refused.
 _ASSIGN = r"(?:<<|>>|[-+*/%&|^])?=(?!=)"
-_STORE = re.compile(r"(?:->|\.)\w+(?:\[[^\]]*\])*" + _ASSIGN
+_INDEX = r"\[(?:[^\[\]]|\[[^\[\]]*\])*\]"
+_STORE = re.compile(r"\+\+|--"
+                    + r"|(?:->|\.)\w+(?:" + _INDEX + r")*" + _ASSIGN
                     + r"|[;{}]\(*\*[^;=]*(?:<<=|>>=|(?<![<>!])=(?!=))"
-                    + r"|[;{}]\(*[\w.>-]+\[[^\]]*\]\)*" + _ASSIGN)
+                    + r"|[;{}]\(*[\w.>-]+\)*(?:" + _INDEX + r")+\)*" + _ASSIGN)
+_STORE_ERROR = "the route op steps a value or stores through a member, a dereference or an index"
 # a submission or USM call other than the one gemm()
 _SUBMIT = re.compile(r"(?:->|\.)(?:memset|memcpy|fill|copy|submit|parallel_for|single_task|prefetch|mem_advise)\(|"
                      r"\bstd::mem\w+\(|(?<![\w:])(?:memset|memcpy|memmove)\(")
@@ -424,7 +432,7 @@ def route_op_errors(code: str) -> list:
     if re.search(r"\bstatic\b", b):
         errs.append("the route op keeps a static")
     if _STORE.search(b):
-        errs.append("the route op stores through a member, a dereference or an index: %r" % _STORE.search(b).group(0))
+        errs.append(_STORE_ERROR + ": %r" % _STORE.search(b).group(0))
     if _SUBMIT.search(b):
         errs.append("the route op submits or calls USM besides gemm(): %r" % _SUBMIT.search(b).group(0))
     if gemms:
@@ -489,13 +497,31 @@ def test_route_op_mutants():
         assert route_op_errors(code.replace(full, new, 1)), f"mutant {name!r} slipped through"
 
 
+# Each is refused for the store reason: increments and decrements in every form, and the index spellings.
+_STEPS_AND_INDEX_STORES = (
+    "++c[0];", "c[0]++;", "--c[0];", "(*c)++;", "(*c)--;", "++*c;", "*c++;", "p->x++;", "ctx.n++;", "++ctx.n;",
+    "c[i][j]=1;", "(c)[0]=1;", "c[a[0]]=1;", "c[a[0]]+=1;",
+)
+
+
+def test_route_op_steps_and_index_store_mutants():
+    code = code_of(SYCL_CPP)
+    full = function_body(code, _ROUTE_OP)
+    var = re.search(r"(?:const)?std::optional<sycl::event>(\w+)=DnnlGemmWrapper::gemm\(", full).group(1)
+    ret = "return " + var + ".has_value();"
+    for stmt in _STEPS_AND_INDEX_STORES:
+        errs = route_op_errors(code.replace(full, mutate(full, ret, stmt + ret), 1))
+        assert any(e.startswith(_STORE_ERROR) for e in errs), f"mutant {stmt!r} slipped through the store check"
+
+
 def test_route_op_store_check_keeps_comparisons_and_declarations():
     code = code_of(SYCL_CPP)
     full = function_body(code, _ROUTE_OP)
     var = re.search(r"(?:const)?std::optional<sycl::event>(\w+)=DnnlGemmWrapper::gemm\(", full).group(1)
     ret = "return " + var + ".has_value();"
     for stmt in ("if(c[0]<=a[0]){}", "if((*c)>=1.0f){}", "if(a!=b){}", "if(ctx.device==0){}", "const float*d=a;",
-                 "if(src0_r.ptr!=nullptr){}"):
+                 "if(src0_r.ptr!=nullptr){}", "const int s=a+b;", "const int t=a-b;", "const int u=-x;", "x=-y;",
+                 "const int v=a->b;", "f(c[0],a[1]);"):
         new = mutate(full, ret, stmt + ret)
         assert not route_op_errors(code.replace(full, new, 1)), f"{stmt!r} is not a store"
 
