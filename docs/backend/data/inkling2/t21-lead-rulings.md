@@ -50,10 +50,53 @@ attributed by a read-only explorer), then the BF16 experts and dense BF16 weight
 - **R6.** No new host wait, no allocation outside the unified cache, expert leases and the ring claim held until
   the executor's done event.
 
+- **R5 amended (the ring is sized before placement is known).** The loader sizes the ring and the backend
+  publishes it before the planner packs experts, so "a claimable node on this device" cannot be read at sizing
+  time. Ruling: plan with the ring; if no weight of a ring-served type has every expert planned on that device,
+  publish the ring as 0 and plan once more (one retry, the ring-0 plan is final). It applies to the ring as such,
+  MXFP4 included, and prints its decision once at WARN.
+- **R7, a decline does not abort a prompt.** The direct NVFP4 route steps aside for a prompt node only when the
+  claim holds and the device has a planned ring slot. A decline the executor reports before its first device
+  submission re-enters the direct route with one WARN per reason; a failure after the first submission throws
+  with a named reason.
+
+## The oneDNN probe (lead's run, once, B50, `f1fe27068`, no model loaded)
+
+`test-sycl-onednn-woq-nvfp4`: rc=0, seven arms, no kernel fault line. All through `impl=jit:gemm:any`.
+
+| arm | result | worst relative error | us per execute |
+|---|---|---|---|
+| NVFP4 2-D, f16 [32,2304] x f4_e2m1 [2304,2304], f8_e4m3 scales, groups {16,1} | PASS | 6.99e-07 | 80.1 |
+| NVFP4 3-D, 4 experts of [1152,2304], mask 7, groups {16,1} | PASS | 6.57e-07 | 158.9 |
+| MXFP4 3-D control, e8m0 scales, groups {32,1} | PASS | 6.61e-07 | 157.3 |
+| MXFP4 3-D with the group dims the backend passes today ({1,32,1}) | refused: "could not set scales primitive attribute" | | |
+| NVFP4 2-D and 3-D with scales widened to f16 | PASS, same figures | | |
+
+Scale bytes 0x00, 0x7F and 0xFF read exactly 0 and no output is non-finite. So the weight-only-quantised arm
+takes NVFP4 as stored (nibbles re-ordered, scales sanitised), in one execute per group of experts. After step 1
+the old steps 2 and 3 merge: NVFP4 goes to that arm in its 3-D form and leaves the F16 table again. The
+backend's opt-in 3-D MXFP4 arm (`GGML_SYCL_MOE_PP_WOQ_3D`) is wrong because it passes three group dims where
+the API takes two: a GPT-OSS follow-up. From the call times, 44 gate_up and 44 down nodes of 128 experts would
+cost about 0.7 s per micro-batch on the B50 (an estimate from single calls, not a measured prompt).
+
+## The exposed host time (read by an explorer on `dd59d8710`, then one experiment)
+
+- For every prompt MoE layer application the host copies the ids from the device and waits
+  (`ggml_sycl_refresh_moe_ids_cache`), then builds a resolved batch of n_tokens x 8 leased operands before it
+  submits anything. The device is idle meanwhile: 96 times in the 691-token prompt.
+- No prompt node of this model is ever graph-recorded: `check_graph_compatibility` admits a MUL_MAT_ID only for
+  quantised Q4_0, Q8_0 or MXFP4 experts at up to 32 rows, and a global plan runs every prompt direct.
+- Every binbcast op submits a second, empty job for its completion event (6,432 of the 22,825 submissions).
+  `GGML_SYCL_BINBCAST_EVENT_MODE=reuse` returns the kernel's own event. Measured on the long prompt, B70,
+  interleaved, each run once (barrier, reuse, reuse, barrier): pp 91.65, 91.61, 92.18, 91.89 t/s; tg 25.33,
+  26.84, 26.78, 26.01 t/s; text byte-equal in all four. The extra submissions are not the prompt's host time.
+  The decode difference is inside the B70's run-to-run noise and is not claimed.
+- The existing fusions do not match this graph: the router has a sigmoid before its bias add, the expert sum is
+  seven serial adds behind a per-expert scale, and the activation is built from unary ops.
+- Consequence: the grouped executor of this task keeps one ids read per layer application but leases 128 experts
+  where the direct route builds 4,096 operands. Whether that removes the exposed time is step 1's measurement.
+
 ## What is not known yet
 
-- Whether the Xe2 oneDNN matmul accepts `f4_e2m1` weights with `f8_e4m3` scales in groups of 16 (headers of oneDNN
-  3.13.2 declare it; a device probe written under this task decides it).
-- Why the 3-D weight-only-quantised arm gives wrong numbers today; the checkpoint's reading is that it passes a
-  three-entry scale group where the API takes zero or two.
+- How much of the exposed host time is the ids wait and how much the operand build.
 - How many Inkling prompt nodes are fully device-resident on the B50 alone.
