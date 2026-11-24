@@ -32,8 +32,8 @@ SYCL = ROOT / "ggml/src/ggml-sycl"
 FUNCTOR = "static __dpct_inline__ float vec_dot_nvfp4_q8_1("
 SCALE = "static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x)"
 
-# A float read from integer bits: memcpy into a float, or a bit_cast to float.
-FROM_BITS = re.compile(r"memcpy\(&\w+,&\w+,sizeof\(float\)\)|bit_cast<float>\(")
+# A float read from integer bits: memcpy into a float (any size spelling), or a bit_cast to float.
+FROM_BITS = re.compile(r"memcpy\(&\w+,&\w+,[^;]*\)|bit_cast<float>\(")
 
 
 def read(name: str) -> str:
@@ -76,6 +76,8 @@ def check_codes(vecdotq: str) -> list:
         failures.append("vec_dot_nvfp4_q8_1 still decodes its codes with get_int_from_table_16 (emulated permutes)")
     if "get_int_from_mxfp4(" not in body:
         failures.append("vec_dot_nvfp4_q8_1 does not decode its codes with get_int_from_mxfp4")
+    if "kvalues_mxfp4" in body:
+        failures.append("vec_dot_nvfp4_q8_1 reads the code table kvalues_mxfp4; decode with get_int_from_mxfp4")
     return failures
 
 
@@ -124,6 +126,9 @@ def test_gate_fails_on_each_mutation() -> None:
         "second code int back on the table": lambda: mutate(
             "get_int_from_mxfp4(get_int_b4(bq4->qs, iqs1))",
             "get_int_from_table_16(get_int_b4(bq4->qs, iqs1), kvalues_mxfp4)"),
+        "second code int through a direct table lookup": lambda: mutate(
+            "get_int_from_mxfp4(get_int_b4(bq4->qs, iqs1))",
+            "sycl::int2(kvalues_mxfp4[get_int_b4(bq4->qs, iqs1) & 0xf], 0)"),
     }
     for label, run in mutants.items():
         assert run(), f"gate still passes under mutation: {label}"
@@ -158,6 +163,8 @@ def test_scale_gate_fails_on_each_mutation() -> None:
         "a comment naming the old form must not fail the gate"
     assert not mutate("memcpy(&normal, &bits, sizeof(float));", "normal = sycl::bit_cast<float>(bits);"), \
         "reading the bits with bit_cast is the same form and must pass"
+    assert not mutate("memcpy(&normal, &bits, sizeof(float));", "memcpy(&normal, &bits, sizeof(normal));"), \
+        "a memcpy sized as sizeof(normal) is the same form and must pass"
 
 
 if __name__ == "__main__":
