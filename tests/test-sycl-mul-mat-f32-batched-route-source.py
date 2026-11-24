@@ -356,13 +356,13 @@ def null_check_errors(b: str, gemm_at: int) -> list:
     if len(resolved) != 3:
         return ["the route op does not take exactly three pointers from resolved operands (%d)" % len(resolved)]
     names = {m.group(1) for m in resolved}
-    after = b.index(";", resolved[-1].end())
+    after = resolved[-1].end()  # the match ends with the last pointer's `;`
     for m in re.finditer(r"\bif\(", b):
         cond_close = balanced_end(b, m.end() - 1, "(", ")")
         tested = [_NULL_TERM.fullmatch(t) for t in split_top(b[m.end() : cond_close], "||")]
         if not all(tested) or {next(g for g in t.groups() if g) for t in tested} != names:
             continue
-        if not (after < m.start() < gemm_at):
+        if not (after <= m.start() < gemm_at):
             return ["the null check is not between the pointers' resolution and gemm()"]
         if b[cond_close + 1] != "{":
             return ["the null check has no block"]
@@ -385,7 +385,7 @@ def resolution_errors(full: str, b: str, gemm_at: int) -> list:
     args = call_args(b, gemm_at + len("DnnlGemmWrapper::gemm"))
     taken = {m.group(1): m.group(2) for m in _pointers(b)}
     if len(args) < 17 or [taken.get(args[i]) for i in (4, 9, 14)] != params:
-        errs.append("gemm()'s A, B and C are not the .ptr of the src0, src1 and dst operands: %r"
+        errs.append("gemm()'s A, B and C are not the .ptr of the src0, src1 and dst operands: %r from %r"
                     % ([args[i] for i in (4, 9, 14)] if len(args) > 14 else args, taken))
         return errs
     chained = []
