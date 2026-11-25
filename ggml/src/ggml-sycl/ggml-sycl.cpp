@@ -23883,6 +23883,11 @@ constexpr size_t test_loan_expert_bytes() {
     return 1024 * 1024;
 }
 
+// Fixtures whose teardown could not settle: a retained-owner drain that timed out. A destructor cannot return a
+// string, so the runner reads this after each case (test_expert_loan_take_teardown_failures) and fails the run,
+// rather than letting a case pass with copies still in flight on the entries the next case reuses.
+std::atomic<int> g_test_loan_teardown_failures{ 0 };
+
 std::string test_loan_fail(const char * fmt, ...) {
     char    message[512];
     va_list args;
@@ -23997,7 +24002,10 @@ struct test_loan_fixture {
         n_layers(layers),
         n_experts(experts) {
         cache = get_unified_cache_for_device(device);
-        queue = &ggml_sycl_get_device(device).default_queue();
+        // The cache's own queue, as a load stages through. A fill on a queue of another SYCL context leaves its event
+        // in the entry, and every later copy of that entry (a loan's, a refill's) then depends on an event of a
+        // foreign context, which the runtime serves through a host-task connector for each.
+        queue = cache ? &cache->get_queue() : nullptr;
         found = ::ggml_sycl_global_plan_snapshot();
         // A model load configures its device's host zones before anything runs, so a loan's host copies are slices of
         // the WEIGHT host zone, and the loan refuses without them. Configured here as a load does: a pinned-pool copy
@@ -24048,8 +24056,17 @@ struct test_loan_fixture {
         for (const ggml_sycl_cache_id & key : keys) {
             (void) cache->retire_expert_entry_exact(key, GGML_LAYOUT_AOS, "test/expert loan cleanup");
         }
-        queue->wait();
-        (void) drain_retained_handles(true, 5000);
+        // Every queue a case's copies ran on: the cache's own, and the DMA and BCS queues its loans, refills and
+        // staged copies use. The cache's three queues share one context.
+        queue->wait_and_throw();
+        cache->get_dma_queue().wait_and_throw();
+        cache->get_bcs_queue().wait_and_throw();
+        constexpr int drain_ms = 5000;
+        if (!drain_retained_handles(true, drain_ms)) {
+            fprintf(stderr, "ERROR: test_loan_fixture teardown: the retained owners did not drain in %d ms\n",
+                    drain_ms);
+            g_test_loan_teardown_failures.fetch_add(1, std::memory_order_relaxed);
+        }
         cache->process_deferred_frees_public();
         if (owner_slot_live) {
             (void) cache->release_model_slot(test_move_owner_slot());
@@ -25000,6 +25017,10 @@ std::string test_evict_landed(const test_loan_fixture & fx, int layer, int exper
 }
 
 }  // namespace
+
+int test_expert_loan_take_teardown_failures() {
+    return g_test_loan_teardown_failures.exchange(0, std::memory_order_acq_rel);
+}
 
 std::string test_expert_loan_refuses_without_host_zones() {
     // A loan whose host copies would not be host-zone slices is refused by name, as REFUSED, so the boundary runner
