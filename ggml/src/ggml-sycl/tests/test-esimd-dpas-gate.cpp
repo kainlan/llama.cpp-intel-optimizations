@@ -56,11 +56,12 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using ggml_sycl::sycl_gpu_family;
 
 // ---- Link seams -------------------------------------------------------------
-// This file defines three symbols of the backend library. dispatch.hpp's gate
+// This file defines four symbols of the backend library. dispatch.hpp's gate
 // needs exactly two: ggml_sycl_map_device_id (common.cpp) and
-// XMXConfig::from_device (unified-kernel.cpp). The third,
-// ggml_sycl_async_handler (common.cpp), is referenced by dpct/helper.hpp's
-// device_ext, whose code the headers emit here but this test never runs.
+// XMXConfig::from_device (unified-kernel.cpp). The other two,
+// ggml_sycl_async_handler and ggml_sycl_queue_profiling_enabled (both common.cpp),
+// are referenced by dpct/helper.hpp's create_queue_impl overloads, whose code the
+// headers emit here at -O0 but this test never runs.
 // Defining them here instead of linking libggml-sycl is what keeps this test
 // host-only — the library would bring in dpct::dev_mgr, whose first use
 // enumerates every SYCL device on the machine, which is far more than a unit
@@ -85,6 +86,12 @@ XMXConfig XMXConfig::from_device(int /*device_id*/) {
 // seam only has to link; reaching it would mean the test touched a device.
 sycl::async_handler ggml_sycl_async_handler(int /*slot*/) {
     GGML_ABORT("test-esimd-dpas-gate created a dpct queue");
+}
+
+// The same create_queue_impl bodies ask the resolver whether the queue carries profiling. This test creates no queue, so
+// the answer is never used; the seam only has to link, and false is the resolver's default answer.
+bool ggml_sycl_queue_profiling_enabled() {
+    return false;
 }
 
 int main() {
