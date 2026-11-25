@@ -3202,43 +3202,161 @@ was refused for a ring nothing would claim. The weight slot still sits beside
 that workspace, which the zone's requirement still does not count; what a second
 context fits now has not been measured.
 
-**A resident-only ring that displaces experts is dropped (Task 21, step 1d).**
-NVFP4 experts reach the executor's resident claim and nothing else
-(`moe_pp_ring_uses_of_type` in `moe-mmvq-tables.hpp`: RESIDENT, against STAGED
-for the types the window ring stages and SOA_EXPERT for MXFP4's per-expert
-staging). Such a ring serves a layer only when every expert of the weight is on
-the card, and it stages no host expert. Its room comes out of the weights, so on
-a card too small for the whole model it moves experts to the host and buys
-nothing for them: on the B50 Inkling 2 Mini started its CPU layers at 14 instead
-of 15, served 10774.6 MB of experts from the mapping instead of 10215.0 MB, and
-ran pp 16.46 t/s and tg 6.56 t/s against 17.32 and 7.00 without the ring. So the
-load keeps such a ring on a device only if the plan made with it leaves no expert
-of those weights on the host (`moe_pp_ring_check_resident_only` in
-`moe-ring-consumer.hpp`, asked through `ggml_sycl_plan_ring_resident_check`).
-Otherwise `ggml_sycl_stage_drop_displacing_ring` puts the dense scratch back at
-the planning shape, publishes the ring as 0, puts back the planner terms the
-plans made with the ring published, and asks for the zones again with the
-RUNTIME surplus given back (below), and the device is planned once more. That
-plan is final even if it then holds every expert: its NVFP4 nodes take the MMID
-direct route, as before Task 21. The WARN "[SYCL-PLAN] device N drops its PP MoE
-oneDNN scratch ring" names the ring's MB, the host experts that caused it, and
-whether the RUNTIME zone was rebuilt smaller or kept because something points
-into the arena. The drop holds for the rest of the load: its late pass publishes
-no ring before its entry ensure (`ggml_sycl_stage_ring_dropped_by_this_load`).
-A ring with any weight of a staged or SOA use is kept as before, so Qwen and
-GPT-OSS plans do not change, and the B70, which holds all of Inkling's experts,
-keeps its 558.6 MB ring. The plan dry run calls the same decision and reports
-the plan made without the ring (it sizes no zone, so it gives none back).
+**A resident-only ring that displaces experts is dropped where that returns room
+(Task 21, step 1d).**
+The rule is by use, not by model or type name. `moe_pp_ring_uses_of_type` in
+`moe-mmvq-tables.hpp` gives each expert type the ring uses it reaches: RESIDENT
+for the executor's resident claim, STAGED for the types the window ring stages,
+and SOA_EXPERT for MXFP4's per-expert staging. A ring is dropped only when every
+weight that uses it (a) has the RESIDENT use alone, and (b) has another device
+route for a resident prompt node, and (c) the plan made with the ring leaves at
+least one expert of those weights on the host, and (d) the drop returns room to
+the weights: the RUNTIME zone needs less without the ring, and the arena may be
+rebuilt. `moe_pp_ring_decide` in `moe-ring-consumer.hpp` answers (a) to (d) in
+that order and names each outcome (`moe_pp_ring_decision`). Today (a) holds for
+NVFP4, IQ1_S, IQ1_M and IQ4_XS, and (b) is the MMID direct route
+(`moe_mmid_direct_route_runs_type`, Q1_0 and NVFP4), so the drop set is NVFP4
+only. A ring with any STAGED or SOA_EXPERT use, or with any weight that has no
+other device route (IQ1_S, IQ1_M and IQ4_XS today), is sized, published and kept
+exactly as before. (b) exists because the ring is the only device prompt route of
+a resident IQ1_S, IQ1_M or IQ4_XS layer (they have no MMVQ id kernel, and decode
+stays refused for them): the executor's claim admits such a node without asking
+for the ring, so a drop would leave it with no kernel. A model whose experts of
+those types overflow a card therefore still pays the ring's room; that is a
+known cost, owed as a follow-up in the Inkling plan.
+
+A ring that serves only resident layers serves a layer only when every expert
+of the weight is on the card, and it stages no host expert. Its room comes out
+of the weights, so on a card too small for the whole model it moves experts to
+the host and buys nothing for them: on the B50 Inkling 2 Mini started its CPU
+layers at 14 instead of 15, served 10774.6 MB of experts from the mapping
+instead of 10215.0 MB, and ran pp 16.46 t/s and tg 6.56 t/s against 17.32 and
+7.00 without the ring. The check is `moe_pp_ring_check_resident_only` in
+`moe-ring-consumer.hpp`, asked through `ggml_sycl_plan_ring_resident_check`. It
+counts an expert the plan does not place on a device as on the host, by the
+plan's own convention (`placement_plan::expert_on_device`), a missing entry
+included.
+
+Where (a) to (c) hold, `ggml_sycl_stage_drop_displacing_ring` keeps what the
+plan made with the ring published (`ggml_sycl_stage_ring_published`: the ring and
+planner terms by `load_published_terms`, and the inventory's copy of the ring),
+reads the RUNTIME zone that plan needs, no more than the arena holds, then
+publishes the device as a model with no ring consumer plans it (the dense
+scratch at the planning shape, the ring as 0, the planner terms from before the
+plans made with the ring) and reads the zone again. (d) is read from those two
+figures and from the ensure. Where the zone needs no less without the ring
+(another consumer sizes it, or there is no arena), a drop would only take the
+batched executor from the resident layers' prompts and return nothing to the
+experts. Where it needs less, the zones are asked for again with the RUNTIME
+surplus given back (below), and the drop stands only where that rebuilt the zone
+smaller. A drop therefore always means the ring gone, the zone rebuilt smaller
+and one more plan. That plan is final even if it then holds every expert: its
+NVFP4 nodes take the MMID direct route, as before Task 21. The WARN "[SYCL-PLAN]
+device N drops its PP MoE oneDNN scratch ring" names the ring's MB, the host
+experts that caused it, and the RUNTIME zone's new size and how much smaller it
+is, and it says that the plan lines above it, from the plan made with the ring,
+describe a plan that is not kept.
+
+In every other case the ring is published again as it was
+(`ggml_sycl_stage_ring_published::put_back`: the dense scratch re-planned at the
+ring's micro-batch where it differs from the planning shape, then the ring's own
+terms), and the plan made with it stands, with no second plan. Where no room
+returns, one INFO line, "device N keeps its PP MoE oneDNN scratch ring ... its
+RUNTIME zone had no room to give back", gives both zone figures. Where the arena
+has live allocations and cannot be rebuilt, one WARN says that the zone would
+need that much less without the ring, that something points into the arena, and
+how many experts' worth of room the ring displaces in this load
+(`moe_pp_ring_experts_worth`: the room over the ring weights' mean expert size).
+A keep marks nothing, so the next pass of the load decides afresh on its own
+plan; a held keep can print its WARN at each pass.
+
+A drop holds for the rest of the load: the stage marks the device with the
+load's transaction (`moe_pp_ring_drop_marks`), and the late pass publishes no
+ring before its entry ensure (`ggml_sycl_stage_ring_dropped_by_this_load`). A
+direct planner entry has no load transaction, so it marks nothing and decides
+afresh. One mark per device means a second load interleaved with the first can
+overwrite it; the first's next pass then decides afresh with the same check,
+which costs at most one more arena rebuild, never a wrong plan. The plan dry run
+asks the same decision on its own figures
+(`ggml_sycl_plan_dry_run_drop_displacing_ring`): the planned RUNTIME zone with
+the ring and without it, read after it publishes no ring and puts back the
+planner terms from before its plan. It rebuilds no arena and reads no holders,
+so it decides as a load whose arena nothing points into: where no room would
+return it puts the ring back and keeps its plan, and where room would return it
+plans once more without the ring, against the budget it planned the first with.
+Where a load's give-back rebuilds RUNTIME smaller, the load's last plan can
+therefore place more experts on the device than the dry run's does.
+
+The plans that change are those with NVFP4 experts that overflow a card and
+whose RUNTIME zone the ring enlarges. Inkling 2 Mini on the B50 is the one
+measured: its RUNTIME zone was rebuilt at 512.0 MB, and the final plan equals
+base's. Qwen3.6-35B NVFP4 on the B50 keeps its ring: another consumer sizes its
+RUNTIME zone, 726.4 MB with the ring and without it, so a drop returns nothing.
+The tree measured below had no clause (d) and dropped it anyway, with no change
+to the final plan; the tree with (d) has not run it yet. A ring with a STAGED or
+SOA_EXPERT use (Qwen's IQ4_NL, GPT-OSS's MXFP4) is unchanged by construction.
+
+What is verified, and on what. On the host: the decision on synthetic plans,
+every type class named, and every outcome of `moe_pp_ring_decide` by name on
+zone figures, the Inkling and Qwen B50 ones among them
+(`test-sycl-moe-ring-consumer`); both type sets by name
+(`test-sycl-moe-mmvq-tables` case 19); the zone rules (`test-zone-sizing` Case
+51); and the source contracts (`test-sycl-moe-ring-drop-source`, whose mutants
+include a keep that leaves the ring published as 0, and
+`test-sycl-onednn-zone-keep-source`). On the cards, the lead measured the step
+1d tree before the second spec review's fixes and before clause (d)
+(69c4ea428, against base b44cb4b5f; driver 26.44; each run once;
+`llama-completion` at `-c 8192`, seed 42, temp 0, on a real prompt: Inkling
+4737 tokens then 254, Qwen 4485 then 127): the drop, the give-back rebuild, the
+WARN and the late pass's republish on the B50, and the ring kept on the B70 and
+on both cards. The review's fixes change no NVFP4 decision, and (d) changes the
+Qwen B50 one alone, from a drop that returned nothing to a keep; the lead runs
+the fixed tree again. Not yet run on a card: either keep path of (d) (the
+no-room keep, which Qwen3.6-35B NVFP4 on the B50 should take, and the held
+arena, one with live allocations), and the dry run's line. Throughput has no
+verdict for Inkling on the B50: builders were alive in both arms, and a clean
+pair follows. No builder was alive in any Qwen arm.
+
+<!-- MEASURED: the lead's device chain on 69c4ea428 filled the Inkling and Qwen rows; the fixed tree's pair, and
+     Qwen on the B50 with clause (d), are still to come. -->
+Measured on the cards (69c4ea428, 2026-11-24; zero kernel fault lines in every run):
+
+| card | model | ring | outcome |
+|------|-------|------|---------|
+| B50 (`level_zero:1`) | Inkling 2 Mini (NVFP4) | dropped (558.6 MB): the plan with it left 908 experts of its 40 resident-only weights on the host; RUNTIME rebuilt at 512.0 MB, 46.6 MB less | the early pass served 9715.3 MB of experts from the mapping with the ring and 9668.3 MB without; the late pass's plan, the one kept, 10215.0 MB, as base; MoE layers on the CPU from layer 15 in both trees; text byte-equal to base; count gate passes; peak GPU host backing 21 GiB (base 24 GiB) |
+| B70 (`level_zero:0`) | Inkling 2 Mini (NVFP4) | kept, no drop line | text byte-equal to the step 1 run at 87524b0d8; count gate passes; peak GPU host backing 21 GiB |
+| both (`level_zero:0,1`, `GGML_SYCL_MOE_MULTI_GPU=0`) | Inkling 2 Mini (NVFP4) | kept | text byte-equal to the B70 alone; count gate passes; peak GPU host backing 22 GiB |
+| B50 (`level_zero:1`) | Qwen3.6-35B NVFP4 | dropped, with "no room to give back": its RUNTIME zone, which another consumer sizes, is 726.4 MB with the ring and without it | final plan 6572.8 MB, as base; text byte-equal to base. With (d) this ring is kept and the plan made with it stands (not yet run) |
+| B70 (`level_zero:0`) | Qwen3.6-35B NVFP4 | kept | text differs from base inside the summary and reads right |
+
+The same runs' throughput, prompt / decode in t/s:
+
+| run | new (69c4ea428) | base (b44cb4b5f) |
+|-----|-----------------|------------------|
+| Inkling 2 Mini, B70 | 160.89 / 26.13 | not in this chain |
+| Inkling 2 Mini, both cards | 160.92 / 25.80 | 91.29 / 26.02 |
+| Inkling 2 Mini, B50 alone (not a speed verdict: builders alive) | 15.17 / 7.38 | 17.76 / 4.74 |
+| Qwen3.6-35B NVFP4, B70 | 74.37 / 14.31 | 68.07 / 14.31 |
+| Qwen3.6-35B NVFP4, B50 | 25.02 / 7.81 | 23.94 / 7.52 |
+
+Why the B70 prompt gains 9% on Qwen3.6-35B NVFP4 and 75% on Inkling is not yet
+known.
+
+On the B50 the device tests `test-moe-pp-batched-dequant`,
+`test-moe-q1-nvfp4-dispatch-refusal` and `test-moe-mixed-residency-q1-nvfp4`
+pass, and so do the Mistral B70 and GPT-OSS B50 gates.
 
 **The RUNTIME give-back.** A sufficient arena is kept as built however much
 larger its zones are, so a later, smaller plan beside a live one never shrinks
-them. The drop is the one exception: it asks the ensure with
+them. The ring decision is the one exception, and it asks only where the zone
+needs less without the ring: it asks the ensure with
 `zone_arena_ensure_options::give_back`, and an arena whose zones all hold the
 plan and whose RUNTIME zone is larger (`zone_arena_runtime_surplus`) is rebuilt
 with SCRATCH and ONEDNN as built and RUNTIME at the plan's
 (`zone_arena_give_back_sizes`), when nothing points into it
-(`zone_arena_rebuild_allowed`). An arena a live model or a freed context's
-allocations hold is kept as built, its surplus with it. Both ends keep the
+(`zone_arena_rebuild_allowed`). An arena with live allocations is kept as
+built, its surplus with it; the ring is then put back and kept, since a drop
+would return nothing to the experts in that load. Both ends keep the
 DIRECT Graph-scratch cap's snapshot and the ONEDNN zone plan as a kept arena
 does.
 
