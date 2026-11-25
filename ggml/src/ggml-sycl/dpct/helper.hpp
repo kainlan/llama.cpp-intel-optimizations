@@ -835,7 +835,7 @@ namespace dpct
       /// Caller should acquire resource \p m_mutex before calling this
       /// function.
       // enable_profiling is added here through ggml_sycl_queue_profiling_enabled() (queue-profiling.hpp), NOT gated on
-      // `#ifdef DPCT_PROFILING_ENABLED` (llama.cpp-yke2). These
+      // `#ifdef DPCT_PROFILING_ENABLED`. These
       // create_queue_impl() overloads, like the rest of device_ext, are
       // header-only inlines: any translation unit that includes this header
       // compiles its own copy, and ordinary ELF symbol resolution lets

@@ -36,6 +36,7 @@
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "q8-dense-layout-rule.hpp"
+#include "queue-profiling.hpp"
 #include "soa-reorder-types.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl_hw.hpp"
@@ -8799,7 +8800,7 @@ void ggml_sycl_watchdog_non_graph_end();
 
 // Standard property list for all directly-created GPU in-order queues.
 // Includes enable_profiling unless GGML_SYCL_QUEUE_PROFILING=0 (ggml_sycl_queue_profiling_enabled()). The property was
-// added "to activate counter-based events on L0 (~15% TG speedup)", measured on an older adapter and not re-measured
+// added "to activate counter-based events on L0 (~15% TG speedup)", a claim made when it was added and not re-measured
 // since. What is known today: on the Level Zero v2 adapter it costs one device timestamp query per submitted command,
 // which only the diagnostics that read event profiling info use, and the default stays on while that is measured.
 // Use this for every `new sycl::queue(...)` call that targets a GPU device.

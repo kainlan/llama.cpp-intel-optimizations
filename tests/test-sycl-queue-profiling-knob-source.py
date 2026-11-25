@@ -22,6 +22,7 @@ the mutants run inside the tests, on in-memory copies of the sources.
 """
 from __future__ import annotations
 
+import bisect
 import pathlib
 import re
 import sys
@@ -165,7 +166,7 @@ def check_predicate(src: dict[str, str]) -> list[str]:
             bad.append(f"{WARN} does not log at WARN (INFO is dropped at the default verbosity)")
         if f"{ENV_NAME}=1" not in text:
             bad.append(f"{WARN} does not tell the reader to set {ENV_NAME}=1")
-        if not re.search(r"\.insert\s*\(", text) or ".second" not in text:
+        if not re.search(r"if\s*\(\s*!\s*warned\.insert\s*\(\s*name\s*\)\s*\.second\s*\)\s*\{\s*return\s*;\s*\}", text):
             bad.append(f"{WARN} does not warn once per diagnostic")
     return bad
 
@@ -264,19 +265,51 @@ def reader_sites(src: dict[str, str], only: str | None = None) -> list[tuple[str
     return sites
 
 
+def guard_dominates(masked: str, pairs: dict[int, int], opens: list[int], fn: int, pos: int) -> bool:
+    """A guard before `pos` whose own innermost block still encloses `pos`: a guard in a closed sibling block (or in a
+    branch that has ended) does not decide the read."""
+    for g in GUARD_RE.finditer(masked, fn, pos):
+        i = bisect.bisect_left(opens, g.start()) - 1
+        while i >= 0 and pairs[opens[i]] < g.start():
+            i -= 1
+        if (pairs[opens[i]] if i >= 0 else len(masked)) > pos:
+            return True
+    return False
+
+
 def check_readers(src: dict[str, str], only: str | None = None) -> list[str]:
     """`only` limits the scan to one file, for the mutants, which change one file at a time."""
     bad: list[str] = []
-    masked_cache: dict[str, str] = {}
+    cache: dict[str, tuple[str, dict[int, int], list[int]]] = {}
     sites = reader_sites(src, only)
     if not sites:
         return ["no get_profiling_info call found in the backend: the scan is void"]
     for rel, line, fn, pos in sites:
-        masked = masked_cache.setdefault(rel, mask(src[rel]))
+        if rel not in cache:
+            masked = mask(src[rel])
+            pairs = brace_pairs(masked)
+            cache[rel] = (masked, pairs, sorted(pairs))
+        masked, pairs, opens = cache[rel]
         if fn < 0:
             bad.append(f"{rel}:{line} get_profiling_info outside any function")
-        elif not GUARD_RE.search(masked, fn, pos):
-            bad.append(f"{rel}:{line} get_profiling_info is not preceded, in its function, by {PREDICATE}/{READABLE}")
+        elif not guard_dominates(masked, pairs, opens, fn, pos):
+            bad.append(f"{rel}:{line} get_profiling_info is not preceded, in a block that contains it, by "
+                       f"{PREDICATE}/{READABLE}")
+    return bad
+
+
+READABLE_NAME_RE = re.compile(r"\b%s\s*\(\s*(\"[^\"]*\")" % READABLE)
+
+
+def check_names(src: dict[str, str]) -> list[str]:
+    """One variable name per readable() call: the warning names a diagnostic by the variable that asks for it."""
+    bad: list[str] = []
+    for rel, text in src.items():
+        if rel.endswith((".md", ".txt")) or READABLE not in text:
+            continue
+        for m in READABLE_NAME_RE.finditer(mask_comments(text)):
+            if not re.fullmatch(r"\"GGML_SYCL_[A-Z0-9_]+\"", m.group(1)):
+                bad.append(f"{rel}: {READABLE}({m.group(1)}) does not name exactly one GGML_SYCL_ variable")
     return bad
 
 
@@ -297,8 +330,17 @@ def check_gates(src: dict[str, str]) -> list[str]:
         body = body_of(masked, sig)
         if body is None:
             bad.append(f"{rel}: gate {sig} not found")
-        elif not GUARD_RE.search(masked, body[0], body[1]):
+            continue
+        g = GUARD_RE.search(masked, body[0], body[1])
+        if g is None:
             bad.append(f"{rel}: gate {sig} stays open when {ENV_NAME}=0")
+            continue
+        start = max(masked.rfind(c, body[0], g.start()) for c in ";{}")
+        stmt = masked[start + 1:g.start()]
+        # the diagnostic's own enabled flag decides first, the guard last: with nothing requested the WARN path is never
+        # reached on a per-op call and no WARN names a diagnostic nobody asked for
+        if not (re.search(r"(?:\breturn\b|[^=!<>]=)\s*(?:\w+\.)?enabled\s*&&", stmt) and stmt.rstrip().endswith("&&")):
+            bad.append(f"{rel}: gate {sig} asks the guard before the diagnostic's own enabled flag")
     return bad
 
 
@@ -339,7 +381,7 @@ SOURCES = load_sources()
 
 def test_unmutated_tree_passes_every_pin():
     for name, check in (("P", check_predicate), ("Q", check_property_sites), ("R", check_readers),
-                        ("D", check_gates), ("docs", check_docs)):
+                        ("D", check_gates), ("names", check_names), ("docs", check_docs)):
         problems = check(SOURCES)
         assert not problems, f"pin {name}:\n  " + "\n  ".join(problems)
 
@@ -370,6 +412,9 @@ def test_predicate_mutants():
     assert flags(check_predicate(mutant), "does not log at WARN")
     # the warning is not once per diagnostic
     mutant[COMMON_CPP] = text[:body[0]] + text[body[0]:body[1]].replace(".second", ".first") + text[body[1]:]
+    assert flags(check_predicate(mutant), "once per diagnostic")
+    # the once-per-name test inverted: the first call is dropped and every later one warns
+    mutant[COMMON_CPP] = (text[:body[0]] + text[body[0]:body[1]].replace("!warned.insert", "warned.insert") + text[body[1]:])
     assert flags(check_predicate(mutant), "once per diagnostic")
 
 
@@ -427,6 +472,27 @@ def test_reader_mutants():
                    "#include \"common.hpp\"\nstatic int ggml_sycl_mutant_reader(sycl::event e) { return (int) e.get_profiling_info<"
                    "sycl::info::event_profiling::command_end>(); }\n")
     assert any("common.cpp" in p and "not preceded" in p for p in check_readers(extra, "ggml/src/ggml-sycl/common.cpp"))
+
+
+def test_reader_guard_in_a_closed_sibling_block_does_not_count():
+    old = r"if\s*\(\s*!\s*ggml_sycl_queue_profiling_enabled\s*\(\s*\)\s*\)\s*\{\s*return\s+-1\.0;\s*\}"
+    mutant = mutate_re(SOURCES, MMVQ, old, '{ ggml_sycl_queue_profiling_readable("GGML_SYCL_X"); }')
+    problems = check_readers(mutant, MMVQ)
+    assert flags(problems, f"{MMVQ}:") and flags(problems, "not preceded"), "a guard in a closed block was accepted"
+
+
+def test_reader_names_mutants():
+    mutant = mutate(SOURCES, MMVQ, 'readable("GGML_SYCL_MXFP4_TG_PROFILE")', 'readable("GGML_SYCL_A / GGML_SYCL_B")')
+    assert flags(check_names(mutant), "exactly one GGML_SYCL_ variable")
+
+
+def test_gate_operand_order_mutant():
+    old = r'return enabled && !ggml_sycl_graph_recording_active\(\) &&\s*ggml_sycl_queue_profiling_readable\("GGML_SYCL_MXFP4_TG_PROFILE"\);'
+    new = 'return ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_TG_PROFILE") && enabled && !ggml_sycl_graph_recording_active();'
+    assert flags(check_gates(mutate_re(SOURCES, MMVQ, old, new)), "before the diagnostic's own enabled flag")
+    old = r'cfg\.enabled = cfg\.enabled &&\s*ggml_sycl_queue_profiling_readable\("GGML_SYCL_KERNEL_PROFILE"\);'
+    new = 'cfg.enabled = ggml_sycl_queue_profiling_readable("GGML_SYCL_KERNEL_PROFILE") && cfg.enabled;'
+    assert flags(check_gates(mutate_re(SOURCES, PROFILER, old, new)), "before the diagnostic's own enabled flag")
 
 
 def test_gate_mutants():

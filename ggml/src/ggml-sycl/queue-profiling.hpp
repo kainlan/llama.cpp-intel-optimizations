@@ -15,7 +15,8 @@
 // readers of profiling info are header-only inlines or sit in many translation units, and each translation unit
 // compiles its own copy of an inline; a macro read there would let the linker's pick of one copy decide for the whole
 // process, and the queues and their readers could then disagree. An environment read gives every copy the same answer.
-// The value is read once and kept, so a queue built early and a reader run late cannot see two answers.
+// The value is read once per copy of this inline function, and every copy reads the same process environment, so the
+// copies agree.
 //
 // This header sits below dpct/helper.hpp so both it and common.hpp can use the predicate without an include cycle.
 inline bool ggml_sycl_queue_profiling_enabled() {

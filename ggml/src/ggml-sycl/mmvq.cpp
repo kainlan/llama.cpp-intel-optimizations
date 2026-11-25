@@ -13,6 +13,7 @@
 #include "moe-xmx-fused.hpp"
 #include "quantize.hpp"
 #include "quants.hpp"
+#include "queue-profiling.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-profiling.hpp"
 #include "unified-cache.hpp"
@@ -1461,7 +1462,8 @@ static int mxfp4_moe_xmx_tiled_output_validate_rows() {
 // mmvq_moe_{tg,pp}_profile_enabled(), which stay closed then) and never
 // unconditionally on the dispatch hot path (ruling 6: no host waits).
 static double mmvq_sycl_event_duration_us(const sycl::event & ev) {
-    if (!ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_TG_PROFILE / GGML_SYCL_MXFP4_PP_PROFILE")) {
+    // The callers sit behind the TG and PP gates, which warned and closed when the knob is off; no second WARN here.
+    if (!ggml_sycl_queue_profiling_enabled()) {
         return -1.0;
     }
     try {

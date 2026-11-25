@@ -16,6 +16,7 @@
 #include "exit-settle.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "queue-profiling.hpp"
 #include "unified-cache.hpp"
 
 #include <atomic>

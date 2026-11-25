@@ -144,6 +144,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/prestage-class.hpp"
 #include "ggml-sycl/quantize.hpp"
+#include "ggml-sycl/queue-profiling.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/residency-probe.hpp"
 #include "ggml-sycl/runtime-context-section.hpp"
