@@ -98,12 +98,10 @@ int main(int, char ** argv) {
                      std::strerror(errno));
     }
 
-    // Requested by the plan (llama.cpp-yke2): exercise the same env-gated
-    // configuration a real profiling run uses. The queue PROPERTY under test
-    // (enable_profiling) is unconditional in both fixes and does not itself
-    // depend on this variable, but setting it documents that the fix holds
-    // under the configuration it is meant to serve, and matches the G4
-    // test's own profiling_requested gate.
+    // The queue property under test (enable_profiling) is on only when asked: GGML_SYCL_QUEUE_PROFILING=1, or a profiling
+    // diagnostic with the knob unset. This test asks the way a real profiling run does, with a diagnostic and no knob.
+    // The answer is resolved once, at the first queue the backend builds, so the variable is set before
+    // ggml_backend_sycl_init() and nothing before this point in main() builds a queue.
     setenv("GGML_SYCL_KERNEL_PROFILE", "1", 1);
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);

@@ -366,8 +366,9 @@ constexpr int kSlowReleaseMs = 1500;
 // of this file's own release events are deliberately still pending at
 // their own "elapsed=" print site; this helper is for the OTHER prints,
 // after an explicit wait()). Requires the queue the event was submitted on
-// to be profiling-enabled (every real backend stream in this codebase is,
-// via default_queue_properties()) -- returns -1 if the query itself
+// to be profiling-enabled (main() sets GGML_SYCL_QUEUE_PROFILING=1 before the
+// backend starts, so every backend stream is, via default_queue_properties())
+// -- returns -1 if the query itself
 // throws, so a caller can print "n/a" rather than propagate the exception
 // into an unrelated check. Defined here, ahead of
 // ensure_slow_release_calibrated() below, because that function also uses
@@ -2244,6 +2245,11 @@ int main(int, char ** argv) {
     // direct run of this specific binary should ever set this, never a
     // production process.
     setenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1", 1);
+    // The ordering checks read command_start/command_end of events on the cache's queue (actual_kernel_duration_ms(),
+    // and the write-order check after the early-exit re-park). The backend's queues carry profiling only when asked
+    // (GGML_SYCL_QUEUE_PROFILING=1, or a profiling diagnostic), and the answer is resolved once at the first queue, so
+    // it is set here, before ggml_backend_sycl_init.
+    setenv("GGML_SYCL_QUEUE_PROFILING", "1", 1);
 
     const int device = 0;  // in-process index after selector filtering
 
