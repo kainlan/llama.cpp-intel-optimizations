@@ -449,6 +449,15 @@ inline uint32_t moe_pp_ring_uses_of_type(enum ggml_type type) {
     return uses;
 }
 
+// The expert types the MMID direct route in ggml_sycl_mul_mat_id runs, a card's experts and the host experts beside
+// them in one node. The route's admission asks this, and so does the hybrid decode record build, which runs before it
+// and leaves such a tensor to it, so the two cannot name different types. The ring decision asks it as well: a resident
+// prompt node of such a weight still has a device route when the batched executor has no ring to run in, so a ring
+// that serves only such weights may be dropped (moe_pp_ring_check_resident_only, moe-ring-consumer.hpp).
+inline bool moe_mmid_direct_route_runs_type(enum ggml_type type) {
+    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
+}
+
 // Whether the Q1_0/NVFP4 direct MMID route steps aside for a MUL_MAT_ID node so the batched prompt executor runs it:
 // a prompt (more than one token per expert row), a weight the executor claims on the device (every expert planned there,
 // in a layout its tables take: ggml_sycl_moe_pp_onednn_batched_claims_tensor), and a PP MoE oneDNN ring weight slot
