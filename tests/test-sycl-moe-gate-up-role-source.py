@@ -113,10 +113,10 @@ SEAM_FN = ("inline bool moe_mmid_direct_defers_to_executor(bool prompt, bool exe
            "size_t ring_weight_slot_bytes) {")
 SEAM_BODY = "{ return prompt && executor_claims && ring_weight_slot_bytes > 0; }"
 ROUTE_CLAIM = "const bool pp_onednn_batched_route = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);"
-DEFERRED_DEF = ("const bool pp_direct_deferred = ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) && "
+DEFERRED_DEF = ("const bool pp_direct_deferred = moe_mmid_direct_route_runs_type(src0->type) && "
                 "moe_mmid_direct_defers_to_executor(ne12 != 1, pp_onednn_batched_route, "
                 "ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device));")
-DIRECT_GATE = ("ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && "
+DIRECT_GATE = ("moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && "
                "direct_admission && !pp_direct_deferred) {")
 SUPPRESS_FN = "static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {"
 SUPPRESS_BODY = ("{ if (weight != nullptr && weight == g_mmid_direct_reentry.suppressed_weight) { return false; } "

@@ -6,11 +6,14 @@ then cannot be placed. It used to abort the process; it is now refused by name a
 keep running. These checks pin that:
 
 No GGML_ABORT stays on the load's plan path: compute_and_store_plan_for_inventory, the two planner entries that call
-it (ggml_sycl_compute_placement_plan_early_impl, ggml_sycl_set_tensor_inventory_impl) and the stage.
+it (ggml_sycl_compute_placement_plan_early_impl, ggml_sycl_set_tensor_inventory_impl), the stage, and the ring drop
+the plan function calls (ggml_sycl_stage_drop_displacing_ring).
 
-compute_and_store_plan_for_inventory returns bool. At both zone ensures (the entry ensure and the micro-batch
-fallback's) a false ensure logs the refusal line, which zone_arena_refusal_text formats from what the ensure wrote, and
-returns false.
+compute_and_store_plan_for_inventory returns bool. At each of its zone ensures (the entry ensure, the micro-batch
+fallback's, and the ring drop's, which asks for the zones again with the RUNTIME zone's surplus given back where a drop
+would return room) a false ensure logs the refusal line, which zone_arena_refusal_text formats from what the ensure
+wrote, and the plan function returns false: the ring drop answers REFUSED, and both of the plan function's plans
+(multi-device and single-device) return false on it. Those four are its only false returns.
 
 Every caller propagates it: each planner entry reports a refused plan through its plan_refused out-flag, and the stage
 returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED from either pass, the late one before it checks the staged candidate (a
@@ -29,11 +32,11 @@ A failed load puts back what it published: the stage captures the device-wide pl
 plans (a load_published_record per device, kept for the one open load transaction), the abort of a load's owner
 effects restores them for that transaction, and load_end forgets them once the load committed. Every device-wide
 unified_cache_set_planned_* call on the load's publish path (ggml_sycl_inventory_publish_planner_inputs,
-populate_inventory_globals, ggml_sycl_publish_load_ubatch_scratch), and each planner term, is restored by
-load_published_terms::restore, the one list of the terms' setters, which load_published_record::restore calls for
-every group but the sum and the zone plan; the oneDNN pair's setter by the halves' store and the sum's own store.
-Owner-keyed terms leave with their owner instead, and the compute term's micro-batch is sticky by design
-(EXEMPT_SETTERS).
+populate_inventory_globals, ggml_sycl_publish_load_ubatch_scratch, ggml_sycl_publish_no_pp_moe_onednn_ring), and each
+planner term, is restored by load_published_terms::restore, the one list of the terms' setters, which
+load_published_record::restore calls for every group but the sum and the zone plan; the oneDNN pair's setter by the
+halves' store and the sum's own store. Owner-keyed terms leave with their owner instead, and the compute term's
+micro-batch is sticky by design (EXEMPT_SETTERS).
 
 The terms are one struct, and nothing about them is kept in a second list. Each group of the load_published_group enum
 has an arm in load_published_terms::restore, in take_groups and in differing, and LOAD_PUBLISHED_GROUP_ALL is every
@@ -146,7 +149,8 @@ LATE_SIG = "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggm
 STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan("
 EXPORTED_EARLY_SIG = "void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t backend,"
 EXPORTED_LATE_SIG = "void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend,"
-PATH_SIGS = (COMPUTE_SIG, EARLY_SIG, LATE_SIG, STAGE_SIG)
+DROP_SIG = "static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring("
+PATH_SIGS = (COMPUTE_SIG, EARLY_SIG, LATE_SIG, STAGE_SIG, DROP_SIG)
 
 # The entry ensure goes through the load's last-resort ring release (test-sycl-load-stage-effect-pass-source pins it),
 # which writes the same refusal.
@@ -156,6 +160,13 @@ FALLBACK_ENSURE = ("if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx
                    "ggml_sycl_load_arena_options())) {")
 REFUSE = 'GGML_LOG_ERROR("%s\\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str()); return false; }'
 ABORT_LINE = 'GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");'
+# Where a ring drop would return room, the zones are asked for again with the RUNTIME zone's surplus given back; a false
+# ensure there logs the same refusal line and answers REFUSED, which each of the plan function's two plans turns into
+# its own false.
+DROP_ENSURE = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options)) {"
+DROP_REFUSE = ('GGML_LOG_ERROR("%s\\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str()); '
+               "return ggml_sycl_stage_ring_drop::REFUSED; }")
+DROP_PROPAGATE = "case ggml_sycl_stage_ring_drop::REFUSED: return false; }"
 
 
 def claim_no_abort_on_the_path(gs: str) -> bool:
@@ -165,11 +176,15 @@ def claim_no_abort_on_the_path(gs: str) -> bool:
         "failed to size VRAM arena zones" not in c
 
 
-def claim_both_ensures_refuse_by_name(gs: str) -> bool:
-    body = fn_body(code(gs), COMPUTE_SIG)
+def claim_every_ensure_refuses_by_name(gs: str) -> bool:
+    c = code(gs)
+    body = fn_body(c, COMPUTE_SIG)
+    drop = fn_body(c, DROP_SIG)
     return (ordered(body, "ggml_sycl::zone_arena_refusal refusal;", ENTRY_ENSURE, REFUSE)
             and ordered(body, "published_before.restore(ctx->device);", FALLBACK_ENSURE, REFUSE)
-            and body.count("return false;") == 2 and body.rstrip("} ").endswith("return true;"))
+            and ordered(drop, "ggml_sycl::zone_arena_refusal refusal;", DROP_ENSURE, DROP_REFUSE)
+            and drop.count("ggml_sycl_stage_ring_drop::REFUSED") == 1 and body.count(DROP_PROPAGATE) == 2
+            and body.count("return false;") == 4 and body.rstrip("} ").endswith("return true;"))
 
 
 # The stage's per-device calls and what each does with a refused plan. The late refusal is read before the staged
@@ -278,6 +293,7 @@ PUBLISH_SIGS = (
     "static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const ggml_sycl_tensor_inventory * "
     "inventory)",
     "static bool ggml_sycl_publish_load_ubatch_scratch(int device, uint32_t n_ubatch)",
+    "static void ggml_sycl_publish_no_pp_moe_onednn_ring(int device)",
 )
 # Not device-wide: the compute term's micro-batch is sticky by design and every load records the same fixed planning
 # value (unified-cache.hpp says so at its setter).
@@ -587,8 +603,8 @@ def test_witness_entry_ensure_aborts():
     assert not claim_no_abort_on_the_path(mutate_in(GS, COMPUTE_SIG, "return false; }", ABORT_LINE + " }"))
 
 
-def test_both_ensures_refuse_by_name():
-    assert claim_both_ensures_refuse_by_name(GS), (
+def test_every_ensure_refuses_by_name():
+    assert claim_every_ensure_refuses_by_name(GS), (
         "compute_and_store_plan_for_inventory does not return bool, or a zone ensure that fails does not log the "
         "refusal line and return false")
 
@@ -596,7 +612,7 @@ def test_both_ensures_refuse_by_name():
 def test_witness_entry_ensure_fills_no_refusal():
     m = mutate_in(GS, COMPUTE_SIG, "!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) { GGML_LOG",
                   "!ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) { GGML_LOG")
-    assert not claim_both_ensures_refuse_by_name(m)
+    assert not claim_every_ensure_refuses_by_name(m)
 
 
 def test_witness_fallback_ensure_plans_on():
@@ -606,7 +622,30 @@ def test_witness_fallback_ensure_plans_on():
     assert k != -1, "witness anchor: the fallback ensure"
     tail = body[k:].replace("return false; }", "}", 1)
     m = c.replace(body, body[:k] + tail, 1)
-    assert not claim_both_ensures_refuse_by_name(m)
+    assert not claim_every_ensure_refuses_by_name(m)
+
+
+def test_witness_drop_ensure_aborts():
+    # Not ABORT_LINE: its text alone fails the claim wherever it lands, so it would not show the drop is on the path.
+    m = mutate_in(GS, DROP_SIG, "return ggml_sycl_stage_ring_drop::REFUSED; }",
+                  'GGML_ABORT("[SYCL-PLAN] the ring drop cannot ask for the zones"); }')
+    assert not claim_no_abort_on_the_path(m)
+
+
+def test_witness_drop_refusal_plans_on():
+    m = mutate_in(GS, DROP_SIG, "return ggml_sycl_stage_ring_drop::REFUSED; }",
+                  "return ggml_sycl_stage_ring_drop::DROPPED; }")
+    assert not claim_every_ensure_refuses_by_name(m)
+
+
+def test_witness_drop_refusal_names_nothing():
+    m = mutate_in(GS, DROP_SIG, 'GGML_LOG_ERROR("%s\\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str()); ', "")
+    assert not claim_every_ensure_refuses_by_name(m)
+
+
+def test_witness_plan_ignores_the_drop_refusal():
+    m = mutate_in(GS, COMPUTE_SIG, DROP_PROPAGATE, "case ggml_sycl_stage_ring_drop::REFUSED: break; }")
+    assert not claim_every_ensure_refuses_by_name(m)
 
 
 def test_every_caller_propagates_the_refusal():

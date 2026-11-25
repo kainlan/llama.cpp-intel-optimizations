@@ -16,9 +16,11 @@
 #include "../ggml/src/ggml-sycl/soa-reorder-types.hpp"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <vector>
 
 namespace {
@@ -1039,10 +1041,14 @@ int main() {
     }
 
     // 19. The ring uses a type reaches (moe_pp_ring_uses_of_type): each bit is the table its consumer reads, so a type
-    // gains or loses a use only with that table. NVFP4 reaches the resident claim alone, so a load keeps its ring only
-    // while the plan made with it leaves no NVFP4 expert on the host (moe_pp_ring_check_resident_only); a staged type
-    // (Qwen's IQ4_NL) and MXFP4, which the per-expert path stages at SOA, keep their ring as before. Q1_0 and F32 reach
-    // none.
+    // gains or loses a use only with that table. The ring decision (moe_pp_ring_check_resident_only) reads two sets of
+    // types from these tables, and both are pinned here by name. The resident-only set is the types that reach the
+    // resident claim alone: NVFP4 (its host experts run an immutable recipe, so the ring never stages them) and IQ1_S,
+    // IQ1_M and IQ4_XS (no MMVQ id kernel, so the ring never stages them either). The drop set is the resident-only types
+    // the MMID direct route also runs (moe_mmid_direct_route_runs_type): NVFP4 alone. A load drops a ring only when its
+    // weights are all of the drop set and the plan made with it leaves one of their experts on the host; IQ1_S, IQ1_M and
+    // IQ4_XS keep it, because the ring is their resident layers' only device prompt route. A staged type (Qwen's IQ4_NL)
+    // and MXFP4, which the per-expert path stages at SOA, keep their ring as before. Q1_0 and F32 reach none.
     {
         const auto check_uses = [&](ggml_type type, uint32_t want, const char * why) {
             const uint32_t got = moe_pp_ring_uses_of_type(type);
@@ -1052,6 +1058,9 @@ int main() {
             }
         };
         check_uses(GGML_TYPE_NVFP4, MOE_PP_RING_USE_RESIDENT, "Inkling: the executor's f16 arm, never staged");
+        check_uses(GGML_TYPE_IQ1_S, MOE_PP_RING_USE_RESIDENT, "the f16 arm, no MMVQ id kernel to stage beside");
+        check_uses(GGML_TYPE_IQ1_M, MOE_PP_RING_USE_RESIDENT, "the f16 arm, no MMVQ id kernel to stage beside");
+        check_uses(GGML_TYPE_IQ4_XS, MOE_PP_RING_USE_RESIDENT, "the f16 arm, no MMVQ id kernel to stage beside");
         check_uses(GGML_TYPE_IQ4_NL, MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_STAGED,
                    "Qwen: host-pinned experts stage through the ring");
         check_uses(GGML_TYPE_MXFP4, MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_SOA_EXPERT,
@@ -1059,7 +1068,11 @@ int main() {
         check_uses(GGML_TYPE_Q1_0, MOE_PP_RING_USE_NONE, "the MMID direct route draws on no ring");
         check_uses(GGML_TYPE_F32, MOE_PP_RING_USE_NONE, "a float expert keeps its own route");
         // Every bit against its own table, over every type: the function adds no type of its own, and a type with any
-        // use is one the ring is planned for (moe_pp_onednn_ring_serves_type).
+        // use is one the ring is planned for (moe_pp_onednn_ring_serves_type). Then the two sets the ring decision reads,
+        // by name: a type that gains a kernel or a use leaves its set here, and a type that loses one joins it.
+        const auto in_types = [](ggml_type type, std::initializer_list<ggml_type> types) {
+            return std::find(types.begin(), types.end(), type) != types.end();
+        };
         for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
             const ggml_type type = static_cast<ggml_type>(t);
             const uint32_t  uses = moe_pp_ring_uses_of_type(type);
@@ -1069,6 +1082,21 @@ int main() {
             if (res != moe_pp_onednn_ring_serves_type(type) || stg != moe_pp_batched_takes_staged_type(type) ||
                 soa != (type == GGML_TYPE_MXFP4) || (uses != MOE_PP_RING_USE_NONE && !res)) {
                 std::printf("FAIL: type=%d ring uses 0x%x disagree with the consumers' tables\n", t, uses);
+                ++failures;
+            }
+            const bool direct        = moe_mmid_direct_route_runs_type(type);
+            const bool resident_only = uses == MOE_PP_RING_USE_RESIDENT;
+            const bool want_direct   = in_types(type, { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 });
+            const bool want_resident_only =
+                in_types(type, { GGML_TYPE_NVFP4, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS });
+            const bool want_drop_set = in_types(type, { GGML_TYPE_NVFP4 });
+            if (direct != want_direct || resident_only != want_resident_only ||
+                (resident_only && direct) != want_drop_set) {
+                std::printf(
+                    "FAIL: %s direct_route=%d resident_only=%d drop_set=%d (want %d %d %d): the ring decision's type "
+                    "sets moved\n",
+                    ggml_type_name(type), direct ? 1 : 0, resident_only ? 1 : 0, (resident_only && direct) ? 1 : 0,
+                    want_direct ? 1 : 0, want_resident_only ? 1 : 0, want_drop_set ? 1 : 0);
                 ++failures;
             }
         }
