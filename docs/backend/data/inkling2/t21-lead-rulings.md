@@ -130,7 +130,51 @@ fused tensor, and the re-entry of the direct route on a decline.
 - Spec review of a-c (fresh reviewer, read-only): pass, eight minor findings, all sent to the implementer. Only
   Inkling, of the models on this machine whose headers were read, stores a fused `ffn_gate_up_exps`.
 
+## Step 1d measured, and R5 as it stands (lead's runs, each once, `69c4ea428` against base `b44cb4b5f`)
+
+Long real prompt as above (Inkling: 4,737 tokens then 254 generated; Qwen: 4,485 then 127), `-c 8192`, seed 42,
+temp 0, `llama-completion`. Zero kernel fault lines in every run.
+
+| run | prompt t/s | decode t/s | what the log and the text say |
+|-----|------------|------------|-------------------------------|
+| Inkling, B70, new | 160.89 | 26.13 | ring kept; text byte-equal to step 1's run at `87524b0d8` |
+| Inkling, both cards, new | 160.92 | 25.80 | text byte-equal to the B70 run |
+| Inkling, both cards, base | 91.29 | 26.02 | |
+| Inkling, B50 alone, new | 15.17 | 7.38 | ring dropped, RUNTIME zone rebuilt at 512.0 MB; final plan 10215.0 MB |
+| Inkling, B50 alone, base | 17.76 | 4.74 | final plan 10215.0 MB; text byte-equal to new |
+| Qwen3.6-35B NVFP4, B70, base | 68.07 | 14.31 | |
+| Qwen3.6-35B NVFP4, B70, new | 74.37 | 14.31 | ring kept; text differs from base inside the summary, reads right |
+| Qwen3.6-35B NVFP4, B50, new | 25.02 | 7.81 | ring dropped, "no room to give back"; final plan 6572.8 MB |
+| Qwen3.6-35B NVFP4, B50, base | 23.94 | 7.52 | final plan 6572.8 MB; text byte-equal to new |
+
+- The Inkling B50 pair is **not a speed verdict**: a `ctest` was alive at the end of the new arm and `ninja` with
+  four `icpx` at the end of the base arm, and prompt and decode move in opposite directions. Plan and text are
+  base's. A second pair runs on the fixed tree. No builder was alive in any Qwen arm.
+- Device checks at `69c4ea428`: `test-moe-pp-batched-dequant`, `test-moe-q1-nvfp4-dispatch-refusal` and
+  `test-moe-mixed-residency-q1-nvfp4` on the B50 exit 0; the Inkling count gate passes on the B70, the B50 alone
+  and both cards; the Mistral B70 and GPT-OSS B50 (no `-c`) gates pass.
+- Second spec review (fresh reviewer): fail, two major and five minor findings, all sent to the implementer.
+  The majors: the drop mark was a file-scope static missing from the static-storage inventory, and the text
+  said "NVFP4 today" and "Qwen and GPT-OSS plans do not change" where the rule by use also reached IQ1_S, IQ1_M
+  and IQ4_XS and a Qwen with NVFP4 experts.
+- **R5 as it stands** (it replaces every earlier form). A device's ring is dropped only when all four hold:
+  (a) every weight that uses the ring has the resident use alone (no staged window, no SOA per-expert staging);
+  (b) every such weight has another device route for a resident prompt node (today the MMID direct route, so
+  the set is NVFP4; the ring is the only device prompt route of IQ1_S, IQ1_M and IQ4_XS, found by the
+  implementer from the code); (c) the plan made with the ring leaves an expert of those weights on the host;
+  (d) dropping returns room to the weights: the zone needs less without the ring and the arena may be rebuilt.
+  A drop then means ring gone, zone rebuilt smaller, one more plan. In every other case the ring stays
+  published and the first plan stands. Clause (d) comes from the Qwen B50 row: there the RUNTIME zone is sized
+  by another consumer (726.4 MB with and without the ring), so the drop at `69c4ea428` returned nothing and
+  only took the executor from the resident layers' prompts.
+- Known cost left open: a model with IQ1_S, IQ1_M or IQ4_XS experts that overflow a card still pays the ring's
+  room, because those types have no device prompt route without it.
+- Sweeps at `69c4ea428` (implementer): master's five red, plus `test-sycl-static-storage-audit` and three
+  source contracts that pinned the structure 1d changed on purpose; each contract is strengthened to name the
+  new exits, not loosened.
+
 ## What is not known yet
 
 - How much of the exposed host time is the ids wait and how much the operand build.
 - How many Inkling prompt nodes are fully device-resident on the B50 alone.
+- Why the route change gives Qwen3.6 NVFP4 on the B70 only 9% where Inkling gains 75%.
