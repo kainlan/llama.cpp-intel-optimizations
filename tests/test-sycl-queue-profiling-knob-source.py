@@ -527,10 +527,10 @@ def check_docs(src: dict[str, str]) -> list[str]:
             if n not in row:
                 bad.append(f"{rel}: the {ENV_NAME} row does not name the diagnostic {n}")
     for rel, text in src.items():
-        if rel.endswith(".txt"):
-            continue
-        if re.search(r"default stays on|activate counter-based events on L0|~\s*15\s*%\s*TG speedup", text):
-            bad.append(f"{rel} still says the default stays on or quotes the unmeasured ~15% TG speedup")
+        if re.search(r"default stays on|activate counter-based events on L0|~\s*15\s*%\s*TG\s+(?:speedup|improvement)"
+                     r"|profiling[^.]{0,40}enabled unconditionally", text):
+            bad.append(f"{rel} still says the default stays on, that profiling is unconditional, or quotes the unmeasured "
+                       "~15% TG speedup")
     return bad
 
 
@@ -781,6 +781,13 @@ def test_docs_mutants():
     stale = dict(src)
     stale["docs/backend/sycl-env-vars.md"] = src["docs/backend/sycl-env-vars.md"] + "\nThe default stays on while that is measured.\n"
     assert flags(check_docs(stale), "still says the default stays on")
+    # the stale claim back in a CMakeLists.txt: the gate scans build files too
+    cmake = "ggml/src/ggml-sycl/CMakeLists.txt"
+    assert cmake in src, f"{cmake} is not among the scanned sources"
+    for stale_text in ("# Result: ~15% TG improvement on Arc B580.\n", "# SYCL queue profiling is enabled unconditionally here.\n"):
+        cmake_stale = dict(src)
+        cmake_stale[cmake] = src[cmake] + "\n" + stale_text
+        assert flags(check_docs(cmake_stale), cmake + " still says"), stale_text
     unnamed = dict(src)
     unnamed[".claude/rules/sycl-backend.md"] = src[".claude/rules/sycl-backend.md"].replace(row, row.replace("GGML_SYCL_ATTN_SYNC_PROFILE", "X"))
     assert flags(check_docs(unnamed), "does not name the diagnostic GGML_SYCL_ATTN_SYNC_PROFILE")

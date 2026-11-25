@@ -1477,19 +1477,15 @@ else()
     endif()
 endif()
 
-# SYCL queue profiling (L0 counter-based events) is enabled unconditionally
-# in dpct::device_ext::create_queue_impl() (ggml-sycl/dpct/helper.hpp), not
-# via a compile definition here -- see that function's comment for why
-# (llama.cpp-yke2: a PRIVATE compile definition here used to be read by an
-# `#ifdef` inside those header-only inline functions, which is not
-# interposition-safe across translation units).
+# SYCL queue profiling is not set through a compile definition here. The enable_profiling queue property is added by
+# default_queue_properties() (ggml-sycl/common.hpp) and by the dpct create_queue_impl() overloads
+# (ggml-sycl/dpct/helper.hpp), and only when the resolver in queue-profiling.hpp answers on: GGML_SYCL_QUEUE_PROFILING=1,
+# or a requested profiling diagnostic with the knob unset. A compile definition read by an `#ifdef` inside those
+# header-only inline functions would not be interposition-safe across translation units, which is why the decision is an
+# out-of-line function in common.cpp.
 #
-# The enable_profiling queue property is the SYCL API-correct way to request
-# profiling-capable event pools.  On the L0 backend this triggers counter-based
-# events (ZE_experimental_event_pool_counter_based) which use GPU hardware
-# counters instead of signal-based synchronization, eliminating CPU busy-wait
-# in oneDNN's after_exec_hook.  Result: ~15% TG improvement on Arc B580.
-# Users can also set UR_L0_USE_DRIVER_COUNTER_BASED_EVENTS=1 before launch.
+# On the Level Zero v2 adapter a profiling queue reads a device timestamp for every command, so the default is off:
+# turning it off measured GPT-OSS 20B decode 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower.
 
 target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MKL_FALLBACK=${GGML_SYCL_MKL_FALLBACK_ENABLED})
