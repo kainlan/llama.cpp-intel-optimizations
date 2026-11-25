@@ -38,7 +38,8 @@ dequant. These claims pin that shape:
       planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
   (i) the f16 arm runs in the weight slot the inventory planned, never a wider one: the backend keeps the planned
       slot size as the inventory gave it (no plan-time widening, which displaced routed experts with no cost
-      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula of its own
+      decision; a ring the drop decision keeps is put back once, from a snapshot of the slot itself), the planner
+      site that publishes the ring's sizes computes no expert-count or f16 formula of its own
       (the expert counts reach it only through the row-scaled slots' shared sizer and that sizer's refusal warning)
       and hands the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups
       the active experts by what the slot it claimed holds;
@@ -197,6 +198,11 @@ PLAN_SITE_CALL = "unified_cache_set_planned_pp_moe_onednn_scratch( device, in.pp
 STAGE_PUBLISH = ("const ggml_sycl_inventory_planner_inputs published = "
                  "ggml_sycl_inventory_publish_planner_inputs(ctx->device, inventory);")
 STAGE_KEEPS = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = published.pp_moe_onednn_weight_slot_bytes;"
+# A ring the drop decision keeps is published again as the plan made with it found it (ggml_sycl_stage_ring_published):
+# the snapshot reads the global itself before the drop publishes no ring, and the put-back writes that value back.
+RING_PUBLISHED_STRUCT = "struct ggml_sycl_stage_ring_published {"
+RING_SNAPSHOT_SLOT = "published.inventory_weight_slot_bytes = g_tensor_inventory_pp_moe_onednn_weight_slot_bytes;"
+RING_PUT_BACK_SLOT = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory_weight_slot_bytes;"
 # The device test's capped cases: one Q4_0 case per cap, each in its own process.
 GROUP_CAPS = "constexpr int k_group_caps[] = { 1, 3 };"
 GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || buffers != 2"
@@ -801,15 +807,32 @@ def claim_i_slot(s):
                  "g_tensor_inventory_pp_moe_onednn_scratch_bytes"):
         if gone in sycl:
             fails.append(f"{gone} is still in ggml-sycl.cpp: the planned weight slot must not be widened")
-    # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, or as the
-    # publish helper returned it to the stage. Every write to the helper's slot is the inventory's own value or a reset
+    # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, as the publish
+    # helper returned it to the stage, or put back from the global's own earlier value where the ring drop decision
+    # keeps the ring. Every write to the helper's slot is the inventory's own value or a reset
     # to 0 (a ring that cannot be sized is planned as no ring), and at least one write takes the inventory's own value.
     publish = one_definition(sycl, PUBLISH_FN) or ""
     kept = ["0", "inventory->pp_moe_onednn_weight_slot_bytes"]
     if STAGE_PUBLISH in sycl:
         kept.append("published.pp_moe_onednn_weight_slot_bytes")
+    # A kept ring's put-back writes the global from a snapshot of the global itself, so it brings in no value of its
+    # own. It is taken once, inside the snapshot's struct, and only while every write to the snapshot's field is its
+    # default 0 or that read of the global.
+    struct_at = sycl.find(RING_PUBLISHED_STRUCT)
+    struct_end = match_close(sycl, struct_at + len(RING_PUBLISHED_STRUCT) - 1) if struct_at >= 0 else -1
+    put_back_at = sycl.find(RING_PUT_BACK_SLOT)
+    field_writes = list(re.finditer(r"\binventory_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl))
+    put_back_kept = (struct_at >= 0 and struct_at < put_back_at < struct_end and sycl.count(RING_PUT_BACK_SLOT) == 1
+                     and RING_SNAPSHOT_SLOT in sycl
+                     and all(m.group(1) == "=" and m.group(2).strip() in
+                             ("0", "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes") for m in field_writes))
+    if put_back_at >= 0 and not put_back_kept:
+        fails.append("a kept ring's put-back writes the planned weight slot from a value that is not the snapshot of "
+                     "the slot itself, or outside ggml_sycl_stage_ring_published, or more than once")
     writes = re.finditer(r"\bg_tensor_inventory_pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl)
     for m in writes:
+        if m.group(0) == RING_PUT_BACK_SLOT and put_back_kept:
+            continue
         if m.group(1) != "=" or m.group(2).strip() not in kept:
             fails.append(f"the planned weight slot is written as `{m.group(0)}`, not reset or taken from the inventory")
     if STAGE_KEEPS not in sycl:
@@ -1338,6 +1361,14 @@ MUTANTS = [
      "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(published.pp_moe_onednn_weight_slot_bytes, "
      "size_t(inventory->n_expert) << 20);"),
     ("i", "sycl", STAGE_PUBLISH, "const ggml_sycl_inventory_planner_inputs published = {};"),
+    # A kept ring's put-back that widens, that writes a snapshot not taken from the slot, that has no snapshot, or
+    # that is written again outside the snapshot's struct.
+    ("i", "sycl", RING_PUT_BACK_SLOT,
+     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(inventory_weight_slot_bytes, size_t(1) << 20);"),
+    ("i", "sycl", RING_SNAPSHOT_SLOT,
+     "published.inventory_weight_slot_bytes = g_tensor_inventory_pp_moe_onednn_weight_slot_bytes * 2;"),
+    ("i", "sycl", RING_SNAPSHOT_SLOT, ""),
+    ("i", "sycl", STAGE_KEEPS, STAGE_KEEPS + " " + RING_PUT_BACK_SLOT),
     ("i", "sycl", "weight_bytes = f16_expert_bytes;", "weight_bytes = f16_expert_bytes * active_count;"),
     ("i", "sycl", "moe_pp_batched_f16_plan_groups(reserved.weight_size, ",
      "moe_pp_batched_f16_plan_groups(weight_bytes * active_count, "),
