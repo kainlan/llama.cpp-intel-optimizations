@@ -30,13 +30,13 @@
 //
 // Today the drop set is NVFP4 alone, and a plan changes only where all four hold: every weight of its ring is NVFP4 (one
 // IQ1_S, IQ1_M or IQ4_XS weight beside them keeps the ring, for want of another device prompt route), its NVFP4 experts
-// overflow the card, the ring enlarges the arena's zones (its total less the WEIGHT zone) by room the WEIGHT zone takes
-// back once the ring is gone, and nothing points into the arena (a held arena keeps the ring, with a WARN). Inkling 2
-// Mini on the B50 is the one measured. (b) exists because the ring is the only device prompt route of a resident IQ1_S,
-// IQ1_M or IQ4_XS layer (decode stays refused for them): a drop would leave a node the executor's claim admits with no
-// kernel to run it. A model whose experts of those types overflow a card therefore still pays the ring's room. A ring
-// with any STAGED or SOA_EXPERT use, or with any weight that has no other device route, is sized, published and kept
-// exactly as before.
+// overflow the card, the ring enlarges the arena total (the ONEDNN, RUNTIME and SCRATCH zones) by room the WEIGHT zone
+// takes back once the ring is gone, and nothing points into the arena (a held arena keeps the ring, with a WARN).
+// Inkling 2 Mini on the B50 is the one measured. (b) exists because the ring is the only device prompt route of a
+// resident IQ1_S, IQ1_M or IQ4_XS layer (decode stays refused for them): a drop would leave a node the executor's claim
+// admits with no kernel to run it. A model whose experts of those types overflow a card therefore still pays the ring's
+// room. A ring with any STAGED or SOA_EXPERT use, or with any weight that has no other device route, is sized,
+// published and kept exactly as before.
 //
 // Host-only: the plan is data, so tests/test-sycl-moe-ring-consumer.cpp checks the answer on synthetic plans.
 
