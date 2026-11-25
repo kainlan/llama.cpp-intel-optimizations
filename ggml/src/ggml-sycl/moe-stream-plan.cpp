@@ -11,6 +11,7 @@
 #include "ggml-impl.h"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "queue-profiling.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -30,9 +31,12 @@ const char * moe_stream_getenv(const char * name) {
 }
 
 // A mark's or a read gate's device command_end in ns, for the window timing line; false when the event has none (its
-// queue was built without profiling, or the runtime refuses the query). Read only at the synchronize boundary, and
-// never of a copy: the copy queue has no profiling.
+// queue was built without profiling, which GGML_SYCL_QUEUE_PROFILING=0 does to every queue, or the runtime refuses the
+// query). Read only at the synchronize boundary, and never of a copy: the copy queue has no profiling.
 bool moe_stream_event_end(const sycl::event & ev, uint64_t * end_ns) {
+    if (!ggml_sycl_queue_profiling_readable("GGML_SYCL_MOE_EXEC_TRACE")) {
+        return false;
+    }
     uint64_t start_ns = 0;
     try {
         start_ns = ev.get_profiling_info<sycl::info::event_profiling::command_start>();

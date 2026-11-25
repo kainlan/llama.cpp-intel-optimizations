@@ -4787,7 +4787,8 @@ class unified_cache {
     // --- DMA queue for cache operations (separate from compute) ---
     // tests/test-unified-cache-unpin-event.cpp depends on this queue staying
     // NON-profiling: every backend stream is created with both `in_order` and
-    // `enable_profiling` via default_queue_properties(), and on a profiling-enabled
+    // `enable_profiling` via default_queue_properties() (unless GGML_SYCL_QUEUE_PROFILING=0
+    // takes the property off every queue, which only removes this hazard), and on a profiling-enabled
     // queue the bare command_execution_status query in event_complete() BLOCKS
     // instead of polling -- confirmed on hardware
     // (tests/test-sycl-event-status-blocking-probe.cpp) to hold specifically
