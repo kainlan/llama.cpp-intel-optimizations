@@ -255,9 +255,15 @@
 
 static bool run_case(const char * name, std::string (*body)()) {
     fprintf(stderr, "[TEST] %s ... ", name);
-    const std::string failure = body();
+    const std::string failure   = body();
+    // The fixture's teardown ran inside body(): a drain that timed out there fails the case it ended.
+    const int         torn_down = ggml_sycl::test_expert_loan_take_teardown_failures();
     if (!failure.empty()) {
         fprintf(stderr, "FAILED: %s\n", failure.c_str());
+        return false;
+    }
+    if (torn_down != 0) {
+        fprintf(stderr, "FAILED: the fixture's teardown did not settle (%d drain timeout(s))\n", torn_down);
         return false;
     }
     fprintf(stderr, "PASSED\n");
