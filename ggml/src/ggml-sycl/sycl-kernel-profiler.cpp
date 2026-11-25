@@ -137,19 +137,10 @@ std::string to_lower_ascii(std::string value) {
     return value;
 }
 
+// The same parse the queue-profiling resolver uses for GGML_SYCL_KERNEL_PROFILE (queue-profiling.hpp): the profiler and
+// the resolver cannot disagree on whether the profiler was asked for.
 bool parse_bool_env(const char * value, bool default_value) {
-    if (value == nullptr || value[0] == '\0') {
-        return default_value;
-    }
-
-    std::string lowered = to_lower_ascii(value);
-    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
-        return true;
-    }
-    if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
-        return false;
-    }
-    return true;
+    return ggml_sycl_profile_env_flag(value, default_value);
 }
 
 int parse_positive_int_env(const char * value, int default_value) {
@@ -598,7 +589,7 @@ void drain_pending_events(bool wait_for_events, bool store_raw_events) {
         }
 
         // An event of a queue without profiling throws on the query: count it as a failed timestamp and read nothing.
-        if (!ggml_sycl_queue_profiling_readable("GGML_SYCL_KERNEL_PROFILE")) {
+        if (!ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_KERNEL_PROFILE")) {
             std::lock_guard<std::mutex> lock(state.mutex);
             add_failed_timestamp_locked(state, pending_event.label, false);
             if (store_raw_events) {
@@ -732,9 +723,9 @@ ggml_sycl_kernel_profile_node_scope::~ggml_sycl_kernel_profile_node_scope() {
 ggml_sycl_kernel_profile_config ggml_sycl_kernel_profile_config_from_env() {
     ggml_sycl_kernel_profile_config cfg;
 
-    cfg.enabled = parse_bool_env(std::getenv("GGML_SYCL_KERNEL_PROFILE"), false);
+    cfg.enabled = ggml_sycl_profile_env_flag(std::getenv("GGML_SYCL_KERNEL_PROFILE"), false);
     // Every figure of the census is a device timestamp: without queue profiling it records nothing and says so once.
-    cfg.enabled = cfg.enabled && ggml_sycl_queue_profiling_readable("GGML_SYCL_KERNEL_PROFILE");
+    cfg.enabled = cfg.enabled && ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_KERNEL_PROFILE");
     if (const char * output = std::getenv("GGML_SYCL_KERNEL_PROFILE_OUTPUT")) {
         cfg.output_path = output;
     }

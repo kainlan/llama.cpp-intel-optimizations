@@ -2,14 +2,15 @@
 """Source gate for llama.cpp-yke2. Full mechanism: see
 ggml/src/ggml-sycl/dpct/helper.hpp's create_queue_impl() comment (the
 canonical explanation of why sycl::property::queue::enable_profiling() must
-not depend on `#ifdef DPCT_PROFILING_ENABLED`; since llama.cpp-atiz it is on by
-default and only the environment, GGML_SYCL_QUEUE_PROFILING=0, turns it off,
-through ggml_sycl_queue_profiling_enabled()) and
+not depend on `#ifdef DPCT_PROFILING_ENABLED`; since llama.cpp-vwmj it is off
+by default and only the environment turns it on (GGML_SYCL_QUEUE_PROFILING=1, or
+a profiling diagnostic with the knob unset), through
+ggml_sycl_queue_profiling_enabled()) and
 tests/test-sycl-profiling-queue-property.cpp's header comment (why that
 GPU test has two phases). This gate checks two fixes at the SOURCE TEXT
 level only, without touching a SYCL device: (1) both create_queue_impl()
-overloads in dpct/helper.hpp add the property by default, through the
-environment predicate and never a macro, with the macro itself no longer defined for the ggml-sycl target; (2)
+overloads in dpct/helper.hpp add the property when the environment predicate
+says so, never through a macro, with the macro itself no longer defined for the ggml-sycl target; (2)
 unified-cache.cpp's create_cache_for_device() calls
 ensure_single_device_context_queue() unconditionally, not gated on
 `total_gpus > 1`.

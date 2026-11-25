@@ -2330,10 +2330,7 @@ static void pp_split_timing_dump_and_reset(const char * reason) {
 // Queue-synchronized diagnostic for comparing SOA MMVQ TG against AOS unified TG.
 // ============================================================================
 static bool mxfp4_tg_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MXFP4_TG_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl_profile_env_nonzero(std::getenv("GGML_SYCL_MXFP4_TG_PROFILE"));
     // This profile mode measures by inserting host queue waits around MXFP4
     // dispatch. Level Zero forbids waiting on a queue while it is being recorded
     // into a command graph, so profiling must not perturb graph capture.
@@ -86239,13 +86236,12 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
 // proven decode instrument, GGML_SYCL_MXFP4_TG_PROFILE (mmvq.cpp): SYCL
 // device-event profiling (get_profiling_info<command_start/command_end>),
 // not host chrono deltas. No separate queue-creation/activation step is
-// needed here -- by default every ggml-sycl GPU queue already carries
-// sycl::property::queue::enable_profiling (common.hpp's
-// default_queue_properties(); see unified-cache.hpp's dma_queue_ comment,
-// "every backend stream is created with... enable_profiling"), so
-// ctx.stream() already supports these queries. With
-// GGML_SYCL_QUEUE_PROFILING=0 it does not: the gate below then stays closed
-// and the readers below report -1 without making the query.
+// needed here -- setting GGML_SYCL_MXFP4_PP_PROFILE makes the queue-profiling
+// resolver (queue-profiling.hpp) put sycl::property::queue::enable_profiling
+// on every queue the backend builds (common.hpp's default_queue_properties()),
+// so ctx.stream() supports these queries. With GGML_SYCL_QUEUE_PROFILING=0 it
+// does not: the gate below then stays closed and the readers below report -1
+// without making the query.
 // llama.cpp-iikr (quality review fix cycle, F-1): declared (not static) in
 // moe-resolved-batch.hpp, included well above this point in the TU -- the
 // resolve-loop instrument brackets there need external linkage to this
@@ -86257,17 +86253,14 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
 // function also consults ggml_sycl_graph_recording_active(), not just the
 // env var.
 bool mxfp4_pp_batched_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl_profile_env_nonzero(std::getenv("GGML_SYCL_MXFP4_PP_PROFILE"));
     // Same guard as mmvq_moe_pp_profile_enabled/mmvq_moe_tg_profile_enabled
     // (mmvq.cpp): this diagnostic submits extra marker kernels and reads
     // command_start/command_end (an implicit host wait on an incomplete
     // event), both forbidden while a SYCL command-graph is being recorded.
     // Without queue profiling there is nothing to read: warn once, print no figure.
     return enabled && !ggml_sycl_graph_recording_active() &&
-           ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_PP_PROFILE");
+           ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE");
 }
 
 // GGML_SYCL_MOE_PP_WOQ_3D selects which oneDNN primitive arm
@@ -86285,7 +86278,7 @@ static bool mxfp4_pp_woq_3d_requested() {
 }
 
 static double mxfp4_pp_event_duration_us(const sycl::event & ev) {
-    if (!ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_PP_PROFILE")) {
+    if (!ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE")) {
         return -1.0;
     }
     try {
@@ -86301,7 +86294,7 @@ static double mxfp4_pp_event_duration_us(const sycl::event & ev) {
 // on the same in-order queue -- used to bracket a run of kernels (e.g. one
 // expert's two-kernel repack) that was not individually timed.
 static double mxfp4_pp_event_span_us(const sycl::event & begin, const sycl::event & end) {
-    if (!ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_PP_PROFILE")) {
+    if (!ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE")) {
         return -1.0;
     }
     try {
@@ -86322,7 +86315,7 @@ static double mxfp4_pp_event_span_us(const sycl::event & begin, const sycl::even
 // this reads (prev_end.command_end, next_begin.command_start) to measure
 // the hole BETWEEN two brackets, so the two operands play opposite roles.
 static double mxfp4_pp_gap_us(const sycl::event & prev_end, const sycl::event & next_begin) {
-    if (!ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_PP_PROFILE")) {
+    if (!ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE")) {
         return -1.0;
     }
     try {
@@ -86929,7 +86922,7 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         // it does not increment read_failures a second time.
         std::vector<mxfp4_pp_device_interval> window_intervals;
         window_intervals.reserve(record.repack_begin.size() + record.stage_events.size() + 1);
-        const bool intervals_readable = ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_PP_PROFILE");
+        const bool intervals_readable = ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE");
         for (size_t i = 0; intervals_readable && i < record.repack_begin.size() && i < record.repack_end.size(); ++i) {
             try {
                 const uint64_t s =
@@ -101583,7 +101576,7 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
 // churn); it is a temporary TKV-11 observable -- delete at TKV-12 cleanup
 // together with the env check, like the decline counters.
 static bool ggml_sycl_attn_sync_profile_enabled() {
-    static const bool enabled = std::getenv("GGML_SYCL_ATTN_SYNC_PROFILE") != nullptr;
+    static const bool enabled = ggml_sycl_profile_env_set(std::getenv("GGML_SYCL_ATTN_SYNC_PROFILE"));
     return enabled;
 }
 
@@ -101772,14 +101765,16 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
             return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
         };
 
-        // Device-side event timing: by default every backend stream in this
-        // fork carries property::queue::enable_profiling (common.hpp
-        // default_queue_properties), so these normally report real times.
-        // -1 means no figure: either GGML_SYCL_QUEUE_PROFILING=0 (warned once,
-        // the query is not made) or get_profiling_info threw for some OTHER
-        // reason, which deserves a look, not a shrug.
+        // Device-side event timing: GGML_SYCL_ATTN_SYNC_PROFILE makes the
+        // queue-profiling resolver (queue-profiling.hpp) put
+        // property::queue::enable_profiling on every backend queue
+        // (common.hpp default_queue_properties), so these normally report
+        // real times. -1 means no figure: either the queues carry no
+        // profiling (GGML_SYCL_QUEUE_PROFILING=0; warned once, the query is
+        // not made) or get_profiling_info threw for some OTHER reason, which
+        // deserves a look, not a shrug.
         long long q_dev_ns = -1, mask_dev_ns = -1;
-        if (ggml_sycl_queue_profiling_readable("GGML_SYCL_ATTN_SYNC_PROFILE")) {
+        if (ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_ATTN_SYNC_PROFILE")) {
             try {
                 q_dev_ns = (long long) (q_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_end>() -
                                         q_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_start>());

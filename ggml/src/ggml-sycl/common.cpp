@@ -16,6 +16,7 @@
 #include "exit-settle.hpp"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "moe-exec-policy.hpp"
 #include "queue-profiling.hpp"
 #include "unified-cache.hpp"
 
@@ -3365,6 +3366,94 @@ sycl::queue ggml_sycl_make_queue(const sycl::device & dev, int slot, const sycl:
     return sycl::queue(dev, ggml_sycl_async_handler(slot), props);
 }
 
+ggml_sycl_queue_profiling_decision ggml_sycl_queue_profiling_decide(const char * knob_value,
+                                                                    const char * requested_diagnostic) {
+    const bool requested = requested_diagnostic != nullptr;
+    if (knob_value != nullptr) {
+        if (std::strcmp(knob_value, "1") == 0) {
+            return { true, ggml_sycl_queue_profiling_reason::KNOB_ON };
+        }
+        if (std::strcmp(knob_value, "0") == 0) {
+            return { false, ggml_sycl_queue_profiling_reason::KNOB_OFF };
+        }
+        return { requested, requested ? ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC :
+                                        ggml_sycl_queue_profiling_reason::BAD_VALUE_OFF };
+    }
+    return { requested,
+             requested ? ggml_sycl_queue_profiling_reason::DIAGNOSTIC : ggml_sycl_queue_profiling_reason::DEFAULT_OFF };
+}
+
+// Whether the diagnostic `name` asks for itself, by the diagnostic's own parse of its own variable. The helpers are the
+// ones the diagnostics call (queue-profiling.hpp). A name without a branch here counts as requested when its variable is
+// set, non-empty and not exactly "0": the resolver errs towards on, never towards a diagnostic that is enabled while the
+// queues carry no profiling.
+static bool ggml_sycl_queue_profiling_diagnostic_requested(const char * name,
+                                                           const char * (*getenv_fn)(const char *) ) {
+    const char * value = getenv_fn(name);
+    if (std::strcmp(name, "GGML_SYCL_KERNEL_PROFILE") == 0) {
+        return ggml_sycl_profile_env_flag(value, false);
+    }
+    if (std::strcmp(name, "GGML_SYCL_MXFP4_TG_PROFILE") == 0 || std::strcmp(name, "GGML_SYCL_MXFP4_PP_PROFILE") == 0) {
+        return ggml_sycl_profile_env_nonzero(value);
+    }
+    if (std::strcmp(name, "GGML_SYCL_ATTN_SYNC_PROFILE") == 0) {
+        return ggml_sycl_profile_env_set(value);
+    }
+    if (std::strcmp(name, "GGML_SYCL_MOE_EXEC_TRACE") == 0) {
+        // Only level 2 times the ring windows from device events (moe_stream_phase); level 1 prints host lines.
+        return ggml_sycl::moe_exec_config_parse(getenv_fn).trace >= 2;
+    }
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+const char * ggml_sycl_queue_profiling_requested_diagnostic(const char * (*getenv_fn)(const char * name)) {
+    for (size_t i = 0; i < ggml_sycl_queue_profiling_diagnostic_count; ++i) {
+        const char * name = ggml_sycl_queue_profiling_diagnostics[i];
+        if (ggml_sycl_queue_profiling_diagnostic_requested(name, getenv_fn)) {
+            return name;
+        }
+    }
+    return nullptr;
+}
+
+static const char * ggml_sycl_queue_profiling_process_getenv(const char * name) {
+    return std::getenv(name);
+}
+
+// The one resolution of the knob. A function-local static runs once per process, on the first query, which is the first
+// queue the backend builds: the knob and the diagnostics' variables are read here and nowhere else, and the WARN lines
+// that describe the answer print here, so each prints at most once.
+static const ggml_sycl_queue_profiling_decision & ggml_sycl_queue_profiling_state() {
+    static const ggml_sycl_queue_profiling_decision state = [] {
+        const char * knob = std::getenv("GGML_SYCL_QUEUE_PROFILING");
+        const char * requested =
+            ggml_sycl_queue_profiling_requested_diagnostic(ggml_sycl_queue_profiling_process_getenv);
+        const ggml_sycl_queue_profiling_decision decision = ggml_sycl_queue_profiling_decide(knob, requested);
+        if (decision.reason == ggml_sycl_queue_profiling_reason::BAD_VALUE_OFF ||
+            decision.reason == ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC) {
+            GGML_LOG_WARN("[SYCL] GGML_SYCL_QUEUE_PROFILING=%s is neither 0 nor 1; treating it as unset.\n", knob);
+        }
+        if (decision.reason == ggml_sycl_queue_profiling_reason::DIAGNOSTIC ||
+            decision.reason == ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC) {
+            GGML_LOG_WARN(
+                "[SYCL] %s is set, so the backend's queues carry event profiling and every command reads a device "
+                "timestamp: this run is slower than an unprofiled one (decode measured 12 to 26 %% slower on the Level "
+                "Zero v2 adapter) and its figures include that cost. GGML_SYCL_QUEUE_PROFILING=0 refuses profiling.\n",
+                requested);
+        }
+        return decision;
+    }();
+    return state;
+}
+
+bool ggml_sycl_queue_profiling_enabled() {
+    return ggml_sycl_queue_profiling_state().enabled;
+}
+
+ggml_sycl_queue_profiling_reason ggml_sycl_queue_profiling_resolved_reason() {
+    return ggml_sycl_queue_profiling_state().reason;
+}
+
 void ggml_sycl_queue_profiling_warn_unavailable(const char * diagnostic) {
     static std::mutex                      warned_mutex;
     static std::unordered_set<std::string> warned;
@@ -3375,8 +3464,20 @@ void ggml_sycl_queue_profiling_warn_unavailable(const char * diagnostic) {
             return;
         }
     }
+    if (ggml_sycl_queue_profiling_resolved_reason() == ggml_sycl_queue_profiling_reason::KNOB_OFF) {
+        GGML_LOG_WARN(
+            "[SYCL] %s reads event profiling, which the backend's queues do not carry because "
+            "GGML_SYCL_QUEUE_PROFILING=0; "
+            "it reports no figure. Set GGML_SYCL_QUEUE_PROFILING=1 to read it.\n",
+            name.c_str());
+        return;
+    }
+    // Not the knob: the diagnostic's variable was set after the queues were built, so the one resolution did not see it.
     GGML_LOG_WARN(
-        "[SYCL] %s reads event profiling, which the backend's queues do not carry because GGML_SYCL_QUEUE_PROFILING=0; "
-        "it reports no figure. Set GGML_SYCL_QUEUE_PROFILING=1 to read it.\n",
-        name.c_str());
+        "[SYCL] %s reads event profiling, which the backend's queues do not carry: the knob was resolved off when the "
+        "first "
+        "queue was built, before %s asked for profiling. It reports no figure. Set %s before the process starts, or "
+        "set "
+        "GGML_SYCL_QUEUE_PROFILING=1.\n",
+        name.c_str(), name.c_str(), name.c_str());
 }

@@ -835,31 +835,20 @@ namespace dpct
       /// Caller should acquire resource \p m_mutex before calling this
       /// function.
       // enable_profiling is added here through ggml_sycl_queue_profiling_enabled() (queue-profiling.hpp), NOT gated on
-      // `#ifdef DPCT_PROFILING_ENABLED`. These
-      // create_queue_impl() overloads, like the rest of device_ext, are
-      // header-only inlines: any translation unit that includes this header
-      // compiles its own copy, and ordinary ELF symbol resolution lets
-      // whichever TU's copy the linker happens to pick interpose over every
-      // other TU's for the whole process -- including the ggml-sycl shared
-      // library's own copy, which used to be the only one built with the
-      // macro defined (it was a PRIVATE compile definition of the
-      // `ggml-sycl` CMake target). A test executable that includes
-      // ggml-sycl/common.hpp (and so this header) compiled its copy WITHOUT
-      // the macro, and that copy silently won process-wide, dropping
-      // enable_profiling from dpct::device_ext::default_queue() (and
-      // everything built through it -- roughly five dozen call sites across
-      // ggml-sycl.cpp/common.cpp/unified-cache.cpp/etc. that call
-      // ggml_sycl_get_device(...).default_queue() directly, not just the
-      // unified cache's owner queue). A macro read inside a header-only
-      // inline can never be interposition-safe, because "which TU's copy
-      // wins" is exactly what interposition means; the property therefore
-      // depends on no macro at all. It depends on the environment: the
-      // predicate answers true unless GGML_SYCL_QUEUE_PROFILING is "0", and
-      // an environment read gives every copy of these inlines the same
-      // answer, so which one the linker resolves still does not matter. With
-      // the knob unset the list is what it always was, enable_profiling
-      // first and the caller's properties after it, matching this
-      // backend's own default_queue_properties() (ggml-sycl/common.hpp).
+      // `#ifdef DPCT_PROFILING_ENABLED`. On the Level Zero v2 adapter a profiling queue reads a device timestamp for
+      // every command it submits, and only diagnostics read the result; without the property GPT-OSS 20B decode
+      // measured 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower (driver 26.44, 2026-11-24). The
+      // predicate answers on only for GGML_SYCL_QUEUE_PROFILING=1 or for the knob unset with a profiling diagnostic
+      // requested.
+      //
+      // These create_queue_impl() overloads, like the rest of device_ext, are header-only inlines: any translation unit
+      // that includes this header compiles its own copy, and ordinary ELF symbol resolution lets whichever TU's copy
+      // the linker happens to pick interpose over every other TU's for the whole process. A macro read inside a
+      // header-only inline can never be interposition-safe, because "which TU's copy wins" is exactly what
+      // interposition means; the property therefore depends on no macro at all. It depends on the answer of the
+      // out-of-line resolver in libggml-sycl (common.cpp), which reads the environment once per process, so every copy
+      // of these inlines gets the same answer. When it answers on, the list is enable_profiling first and the caller's
+      // properties after it, matching this backend's own default_queue_properties() (ggml-sycl/common.hpp).
       template <class... Properties>
       sycl::queue create_queue_impl(bool enable_exception_handler,
                                     Properties... properties) {

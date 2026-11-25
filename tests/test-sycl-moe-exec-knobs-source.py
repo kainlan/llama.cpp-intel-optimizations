@@ -68,8 +68,38 @@ def count_in(src, needle):
     return strip_comments(src).count(needle)
 
 
+# A name spelled as a diagnostic LABEL is not a read of the variable: the queue-profiling resolver (llama.cpp-vwmj) lists
+# GGML_SYCL_MOE_EXEC_TRACE in queue-profiling.hpp, branches on it by name in common.cpp, and the window timing names it in
+# its warn_unless_readable() call. None of the three reads the environment by that literal; the one read is still the
+# parser's, through the constant. Only these three shapes are exempt, so a getenv("...") of the name anywhere counts.
+_LABEL_USES = (
+    re.compile(r'warn_unless_readable\(\s*"[A-Z0-9_]+"\s*\)'),
+    re.compile(r'strcmp\(\s*name\s*,\s*"[A-Z0-9_]+"\s*\)'),
+    re.compile(r'(?m)^[ \t]*"GGML_SYCL_[A-Z0-9_]+",(?:[ \t]*"GGML_SYCL_[A-Z0-9_]+",)*[ \t]*$'),
+)
+
+
+def strip_label_uses(code, path):
+    for pattern in _LABEL_USES:
+        if pattern is _LABEL_USES[2] and path.name != "queue-profiling.hpp":
+            continue
+        code = pattern.sub("", code)
+    return code
+
+
 def count_literal(text):
-    return sum(count_in(p.read_text(errors="replace"), text) for p in sources())
+    return sum(count_in(strip_label_uses(strip_comments(p.read_text(errors="replace")), p), text) for p in sources())
+
+
+def test_label_uses_are_exempt_but_reads_are_not():
+    lit = '"GGML_SYCL_MOE_EXEC_TRACE"'
+    plan = Path("moe-stream-plan.cpp")
+    assert count_in(strip_label_uses('f(warn_unless_readable(%s));' % lit, plan), lit) == 0
+    assert count_in(strip_label_uses('if (strcmp(name, %s) == 0) {}' % lit, plan), lit) == 0
+    assert count_in(strip_label_uses('  %s,\n' % lit, Path("queue-profiling.hpp")), lit) == 0
+    assert count_in(strip_label_uses('  %s,\n' % lit, plan), lit) == 1
+    assert count_in(strip_label_uses('const char * v = getenv(%s);' % lit, plan), lit) == 1
+    assert count_in(strip_label_uses('const char * v = getenv(%s);' % lit, Path("queue-profiling.hpp")), lit) == 1
 
 
 def test_count_ignores_comments():

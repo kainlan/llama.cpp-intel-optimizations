@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Source gate for the GGML_SYCL_QUEUE_PROFILING knob (llama.cpp-atiz).
+"""Source gate for the GGML_SYCL_QUEUE_PROFILING knob (llama.cpp-atiz, default flipped by llama.cpp-vwmj).
 
-Every queue of the SYCL backend is built with sycl::property::queue::enable_profiling by default. On the Level Zero
-v2 adapter that makes every submitted command pay one device timestamp query, which only diagnostics read. The knob
-GGML_SYCL_QUEUE_PROFILING=0 removes the property from every queue the backend builds; unset, or any other value,
-keeps today's property lists. This gate reads the source text only (no device, no build) and pins four things:
+Every queue of the SYCL backend is built WITHOUT sycl::property::queue::enable_profiling by default. On the Level Zero
+v2 adapter a profiling queue reads a device timestamp for every command, and only diagnostics read the result. The knob
+GGML_SYCL_QUEUE_PROFILING has three states: unset is off unless a profiling diagnostic is requested in the environment
+(then on, with one WARN naming the variable); "1" is on; "0" is off and a requested diagnostic prints its refusal WARN and
+no figure; any other value is one WARN and then counts as unset. The answer is resolved once and never changes. This gate
+reads the source text only (no device, no build) and pins:
 
-  P  the predicate: one inline function in queue-profiling.hpp that reads the environment with getenv (never a
-     macro: every translation unit compiles its own copy of the header-only inlines, so a macro read would let the
-     linker pick one answer for all of them), whose "0" is the only value that turns profiling off, and which is
-     reachable from both dpct/helper.hpp and common.hpp;
+  P  the resolver: the pure decision function in common.cpp (no environment, no static, the three states and the unknown
+     value), the one memoised wrapper that reads the knob's environment variable exactly once inside a function-local
+     static initialiser, the predicate declared out of line in queue-profiling.hpp (never an inline, never a macro: every
+     translation unit would compile its own copy), and the warning once per diagnostic;
+  L  the one list of diagnostic variable names in queue-profiling.hpp: every warn_unless_readable() call names exactly one
+     entry of it, and the resolver has a parse branch for every entry;
+  E  each diagnostic's own parse of its own variable is the one the resolver uses for it (a diagnostic that considers
+     itself enabled while the resolver does not count it as requested would run with queues that carry no profiling);
   Q  the three places that add enable_profiling (both create_queue_impl overloads in dpct/helper.hpp and
-     default_queue_properties() in common.hpp) go through the predicate, keep today's list and order when it is
-     true, and leave the property out when it is false; no other backend code names enable_profiling;
+     default_queue_properties() in common.hpp) go through the predicate, keep today's list and order when it is true,
+     and leave the property out when it is false; no other backend code names enable_profiling;
   R  every get_profiling_info call in non-test backend code sits in a function that first consults the predicate (a
      query on an event of a queue without profiling throws, and a diagnostic must report no figure instead);
-  D  the diagnostics whose enabling predicate gates every figure they print close when the knob is off.
+  D  the diagnostics whose enabling predicate gates every figure they print close when the queues carry no profiling;
+  docs  the two docs rows say default off and name every diagnostic.
 
 Runs under pytest (llama_test_pytest registration) and as a plain script. Each pin has a mutant that must fail it;
 the mutants run inside the tests, on in-memory copies of the sources.
@@ -40,10 +47,34 @@ PROFILER = "ggml/src/ggml-sycl/sycl-kernel-profiler.cpp"
 PLAN = "ggml/src/ggml-sycl/moe-stream-plan.cpp"
 
 PREDICATE = "ggml_sycl_queue_profiling_enabled"
-READABLE = "ggml_sycl_queue_profiling_readable"
+READABLE = "ggml_sycl_queue_profiling_warn_unless_readable"
 WARN = "ggml_sycl_queue_profiling_warn_unavailable"
+DECIDE = "ggml_sycl_queue_profiling_decide"
+REQUESTED = "ggml_sycl_queue_profiling_requested_diagnostic"
+DIAG_REQUESTED = "ggml_sycl_queue_profiling_diagnostic_requested"
+LIST = "ggml_sycl_queue_profiling_diagnostics"
+STATE_FN = "ggml_sycl_queue_profiling_state"
 GUARD_RE = re.compile(r"\b(?:%s|%s)\s*\(" % (PREDICATE, READABLE))
 ENV_NAME = "GGML_SYCL_QUEUE_PROFILING"
+
+
+# The parse each diagnostic applies to its own variable. The resolver's branch and every consumer use the same helper, so
+# the two cannot disagree. GGML_SYCL_MOE_EXEC_TRACE is parsed by moe_exec_config_parse (moe-exec-policy.hpp), and only
+# level 2 reads event profiling (the ring windows' timing), so the resolver asks for level 2.
+HELPER_FOR = {
+    "GGML_SYCL_KERNEL_PROFILE":    "ggml_sycl_profile_env_flag",
+    "GGML_SYCL_MXFP4_TG_PROFILE":  "ggml_sycl_profile_env_nonzero",
+    "GGML_SYCL_MXFP4_PP_PROFILE":  "ggml_sycl_profile_env_nonzero",
+    "GGML_SYCL_ATTN_SYNC_PROFILE": "ggml_sycl_profile_env_set",
+}
+CONSUMERS = {
+    "GGML_SYCL_KERNEL_PROFILE":    (PROFILER,),
+    "GGML_SYCL_MXFP4_TG_PROFILE":  (MMVQ, GGML_SYCL),
+    "GGML_SYCL_MXFP4_PP_PROFILE":  (MMVQ, GGML_SYCL),
+    "GGML_SYCL_ATTN_SYNC_PROFILE": (GGML_SYCL,),
+}
+MOE_TRACE = "GGML_SYCL_MOE_EXEC_TRACE"
+PLAN_HPP_POLICY = "ggml/src/ggml-sycl/moe-exec-policy.hpp"
 
 
 # ---- reading and masking -------------------------------------------------------------------------------------------
@@ -120,7 +151,16 @@ def body_of(masked: str, signature_re: str, pairs: dict[int, int] | None = None)
     return None
 
 
-# ---- P: the predicate ------------------------------------------------------------------------------------------------
+# ---- P: the resolver ------------------------------------------------------------------------------------------------
+
+def header_list(src: dict[str, str]) -> list[str] | None:
+    """The names in the header's one list of diagnostic variables, in order; None when the list is missing."""
+    code = mask_comments(src.get(PREDICATE_HEADER, ""))
+    m = re.search(r"inline\s+constexpr\s+const\s+char\s*\*\s*%s\s*\[\s*\]\s*=\s*\{([^}]*)\}\s*;" % LIST, code)
+    if m is None:
+        return None
+    return re.findall(r"\"([^\"]*)\"", m.group(1))
+
 
 def check_predicate(src: dict[str, str]) -> list[str]:
     bad: list[str] = []
@@ -128,16 +168,13 @@ def check_predicate(src: dict[str, str]) -> list[str]:
     if header is None:
         return [f"{PREDICATE_HEADER} does not exist: there is no predicate for {ENV_NAME}"]
     code = mask_comments(header)
-    body = body_of(code, r"inline\s+bool\s+%s\s*\(\s*\)" % PREDICATE)
-    if body is None:
-        bad.append(f"{PREDICATE_HEADER} defines no `inline bool {PREDICATE}()`")
-    else:
-        text = code[body[0]:body[1]]
-        if not re.search(r"getenv\s*\(\s*\"%s\"\s*\)" % ENV_NAME, text):
-            bad.append(f"{PREDICATE} does not read {ENV_NAME} with getenv")
-        if not re.search(r"return\s+\w+\s*==\s*nullptr\s*\|\|\s*(?:std::)?strcmp\s*\(\s*\w+\s*,\s*\"0\"\s*\)\s*!=\s*0\s*;",
-                         text):
-            bad.append(f"{PREDICATE} is not true for an unset value and for every value but exactly \"0\"")
+    # the predicate is declared out of line: one definition in libggml-sycl, not a copy per translation unit
+    if re.search(r"inline\s+bool\s+%s\s*\(" % PREDICATE, code):
+        bad.append(f"{PREDICATE} is an inline in {PREDICATE_HEADER}: every translation unit would resolve the knob itself")
+    if not re.search(r"(?<!inline )\bbool\s+%s\s*\(\s*\)\s*;" % PREDICATE, code):
+        bad.append(f"{PREDICATE_HEADER} does not declare `bool {PREDICATE}();` out of line")
+    if re.search(r"\bgetenv\s*\(", code):
+        bad.append(f"{PREDICATE_HEADER} reads the environment: only the memoised wrapper in {COMMON_CPP} may")
     if re.search(r"^[ \t]*#[ \t]*(?:if|ifdef|ifndef|elif)\b", code, re.M):
         bad.append(f"{PREDICATE_HEADER} has a preprocessor conditional: the answer must come from the environment")
     for rel, text in src.items():
@@ -157,6 +194,58 @@ def check_predicate(src: dict[str, str]) -> list[str]:
         if PREDICATE + "(" not in text or WARN + "(" not in text:
             bad.append(f"{READABLE} does not ask {PREDICATE} and warn through {WARN}")
     cpp = mask_comments(src.get(COMMON_CPP, ""))
+    # the knob's variable is read exactly once in the whole backend, inside the memoised wrapper's static initialiser
+    reads = [rel for rel, text in src.items()
+             if not rel.endswith((".md", ".txt")) for _ in re.finditer(r"getenv\s*\(\s*\"%s\"\s*\)" % ENV_NAME, mask_comments(text))]
+    if reads != [COMMON_CPP]:
+        bad.append(f"{ENV_NAME} is read with getenv {len(reads)} times ({sorted(set(reads))}), expected exactly once in "
+                   f"{COMMON_CPP}: the answer is resolved once and never re-read")
+    body = body_of(cpp, r"static\s+const\s+ggml_sycl_queue_profiling_decision\s*&\s*%s\s*\(\s*\)" % STATE_FN)
+    if body is None:
+        bad.append(f"{COMMON_CPP} defines no `static const ggml_sycl_queue_profiling_decision & {STATE_FN}()`")
+    else:
+        text = cpp[body[0]:body[1]]
+        m = re.search(r"static\s+const\s+ggml_sycl_queue_profiling_decision\s+\w+\s*=\s*\[\s*\]\s*\{(.*?)\}\s*\(\s*\)\s*;", text, re.S)
+        if m is None:
+            bad.append(f"{STATE_FN} does not resolve inside a function-local `static const` initialiser: the environment "
+                       "would be read again on a later call")
+        else:
+            init = m.group(1)
+            if not re.search(r"getenv\s*\(\s*\"%s\"\s*\)" % ENV_NAME, init):
+                bad.append(f"{STATE_FN}'s static initialiser does not read {ENV_NAME}")
+            if DECIDE + "(" not in init or REQUESTED + "(" not in init:
+                bad.append(f"{STATE_FN}'s static initialiser does not resolve through {REQUESTED} and {DECIDE}")
+            if not re.search(r"reason\s*==\s*ggml_sycl_queue_profiling_reason::DIAGNOSTIC.*?GGML_LOG_WARN\s*\(.*?requested\s*\)\s*;",
+                             init, re.S):
+                bad.append(f"{STATE_FN} does not WARN, naming the requested diagnostic, when the knob is unset and a "
+                           "diagnostic turns profiling on")
+            if not re.search(r"BAD_VALUE_OFF.*?GGML_LOG_WARN\s*\(", init, re.S):
+                bad.append(f"{STATE_FN} does not WARN once for a value that is neither 0 nor 1")
+        tail = cpp[body[1]:]
+        enabled_body = body_of(tail, r"bool\s+%s\s*\(\s*\)" % PREDICATE)
+        if enabled_body is None or STATE_FN + "()" not in tail[enabled_body[0]:enabled_body[1]]:
+            bad.append(f"{COMMON_CPP} does not define {PREDICATE}() out of line, answering from {STATE_FN}()")
+    # the pure decision: no environment, no static, no logging; the three states and the unknown value
+    body = body_of(cpp, r"ggml_sycl_queue_profiling_decision\s+%s\s*\([^)]*\)" % DECIDE)
+    if body is None:
+        bad.append(f"{COMMON_CPP} defines no pure {DECIDE}()")
+    else:
+        text = cpp[body[0]:body[1]]
+        if re.search(r"getenv|\bstatic\b|GGML_LOG|sycl::", text):
+            bad.append(f"{DECIDE} is not pure: it touches the environment, a static, a log or SYCL")
+        if not re.search(r"strcmp\s*\(\s*knob_value\s*,\s*\"1\"\s*\)\s*==\s*0\s*\)\s*\{\s*return\s*\{\s*true\s*,\s*"
+                         r"ggml_sycl_queue_profiling_reason::KNOB_ON\s*\}\s*;", text):
+            bad.append(f"{DECIDE}: \"1\" does not turn profiling on")
+        if not re.search(r"strcmp\s*\(\s*knob_value\s*,\s*\"0\"\s*\)\s*==\s*0\s*\)\s*\{\s*return\s*\{\s*false\s*,\s*"
+                         r"ggml_sycl_queue_profiling_reason::KNOB_OFF\s*\}\s*;", text):
+            bad.append(f"{DECIDE}: \"0\" does not turn profiling off")
+        if not re.search(r"return\s*\{\s*requested\s*,\s*requested\s*\?\s*ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC\s*:\s*"
+                         r"ggml_sycl_queue_profiling_reason::BAD_VALUE_OFF\s*\}\s*;", text):
+            bad.append(f"{DECIDE}: an unknown value is not treated as unset (off unless a diagnostic is requested)")
+        if not re.search(r"return\s*\{\s*requested\s*,\s*requested\s*\?\s*ggml_sycl_queue_profiling_reason::DIAGNOSTIC\s*:\s*"
+                         r"ggml_sycl_queue_profiling_reason::DEFAULT_OFF\s*\}\s*;\s*$", text.rstrip()):
+            bad.append(f"{DECIDE}: the unset knob is not off unless a diagnostic is requested")
+    # the warning of a refusing reader
     body = body_of(cpp, r"void\s+%s\s*\([^)]*\)" % WARN)
     if body is None:
         bad.append(f"{COMMON_CPP} does not define {WARN}")
@@ -168,6 +257,83 @@ def check_predicate(src: dict[str, str]) -> list[str]:
             bad.append(f"{WARN} does not tell the reader to set {ENV_NAME}=1")
         if not re.search(r"if\s*\(\s*!\s*warned\.insert\s*\(\s*name\s*\)\s*\.second\s*\)\s*\{\s*return\s*;\s*\}", text):
             bad.append(f"{WARN} does not warn once per diagnostic")
+    return bad
+
+
+# ---- L: the one list of diagnostics, and E: each diagnostic's own parse -------------------------------------------------
+
+def check_list(src: dict[str, str]) -> list[str]:
+    bad: list[str] = []
+    names = header_list(src)
+    if names is None:
+        return [f"{PREDICATE_HEADER} has no `inline constexpr const char * {LIST}[]` list of diagnostic variables"]
+    if len(set(names)) != len(names):
+        bad.append(f"{LIST} names a variable twice")
+    for n in names:
+        if not re.fullmatch(r"GGML_SYCL_[A-Z0-9_]+", n):
+            bad.append(f"{LIST} entry {n!r} is not a GGML_SYCL_ variable name")
+    # every readable() call names exactly one entry of the list
+    for rel, text in src.items():
+        if rel.endswith((".md", ".txt")) or READABLE not in text:
+            continue
+        for m in re.finditer(r"\b%s\s*\(\s*([^)]*?)\s*\)" % READABLE, mask_comments(text)):
+            arg = m.group(1)
+            if arg.startswith("const char *"):
+                continue  # the definition in the header
+            lit = re.fullmatch(r"\"([^\"]*)\"", arg)
+            if lit is None:
+                bad.append(f"{rel}: {READABLE}({arg}) does not pass exactly one string literal")
+            elif lit.group(1) not in names:
+                bad.append(f"{rel}: {READABLE}(\"{lit.group(1)}\") names a variable that is not in {LIST}")
+    # the resolver has a parse branch for every entry, and it is the parse the diagnostic itself uses
+    cpp = mask_comments(src.get(COMMON_CPP, ""))
+    body = body_of(cpp, r"static\s+bool\s+%s\s*\([^)]*\)" % DIAG_REQUESTED)
+    if body is None:
+        return bad + [f"{COMMON_CPP} defines no {DIAG_REQUESTED}()"]
+    text = cpp[body[0]:body[1]]
+    for n in names:
+        if n == MOE_TRACE:
+            want = r"moe_exec_config_parse\s*\(\s*getenv_fn\s*\)\s*\.trace\s*>=\s*2"
+        elif n in HELPER_FOR:
+            want = r"%s\s*\(\s*value\b" % HELPER_FOR[n]
+        else:
+            bad.append(f"{LIST} entry {n} has no row in this test's HELPER_FOR table: add its parse here on purpose")
+            continue
+        m = re.search(r"strcmp\s*\(\s*name\s*,\s*\"%s\"\s*\)\s*==\s*0[^{]*\)\s*\{\s*return\s+([^;]*);" % n, text)
+        if m is None:
+            bad.append(f"{COMMON_CPP}: {DIAG_REQUESTED} has no branch for {n}: it would count as requested only by the "
+                       "fallback rule")
+        elif not re.search(want, m.group(1)):
+            bad.append(f"{COMMON_CPP}: {DIAG_REQUESTED} parses {n} with something other than the diagnostic's own parse")
+    if not re.search(r"return\s+value\s*!=\s*nullptr\s*&&\s*value\[0\]\s*!=\s*'\\0'\s*&&\s*(?:std::)?strcmp\s*\(\s*value\s*,\s*\"0\"\s*\)\s*!=\s*0\s*;\s*$",
+                     text.rstrip()):
+        bad.append(f"{COMMON_CPP}: {DIAG_REQUESTED} has no fallback that counts a set, non-empty value other than \"0\" as "
+                   "requested (a diagnostic added to the list without a parse must not run unrequested)")
+    return bad
+
+
+def check_consumers(src: dict[str, str]) -> list[str]:
+    """E: every read of a diagnostic's variable goes through the helper the resolver uses for it."""
+    bad: list[str] = []
+    for n, helper in HELPER_FOR.items():
+        total = 0
+        for rel, text in src.items():
+            if rel.endswith((".md", ".txt")):
+                continue
+            code = mask_comments(text)
+            reads = len(re.findall(r"getenv\s*\(\s*\"%s\"\s*\)" % n, code))
+            via = len(re.findall(r"\b%s\s*\(\s*(?:std::)?getenv\s*\(\s*\"%s\"\s*\)" % (helper, n), code))
+            total += via
+            if reads != via:
+                bad.append(f"{rel}: reads {n} {reads - via} time(s) without {helper}(), the parse the resolver uses for it")
+        for rel in CONSUMERS[n]:
+            if not re.search(r"\b%s\s*\(\s*(?:std::)?getenv\s*\(\s*\"%s\"\s*\)" % (helper, n), mask_comments(src.get(rel, ""))):
+                bad.append(f"{rel} no longer reads {n} through {helper}()")
+    # GGML_SYCL_MOE_EXEC_TRACE: the ring windows are timed from device events only at level 2
+    if not re.search(r"\btrace\s*>=\s*2\b", mask_comments(src.get(PLAN, ""))):
+        bad.append(f"{PLAN} no longer gates the window timing on trace level 2, which is what the resolver asks for")
+    if f"\"{MOE_TRACE}\"" not in src.get(PLAN_HPP_POLICY, ""):
+        bad.append(f"{PLAN_HPP_POLICY} no longer names {MOE_TRACE}")
     return bad
 
 
@@ -348,10 +514,23 @@ def check_gates(src: dict[str, str]) -> list[str]:
 
 def check_docs(src: dict[str, str]) -> list[str]:
     bad: list[str] = []
+    names = header_list(src) or []
     for rel in ("docs/backend/sycl-env-vars.md", ".claude/rules/sycl-backend.md"):
-        rows = [ln for ln in src.get(rel, "").split("\n") if ln.lstrip().startswith("|") and ENV_NAME in ln]
+        rows = [ln for ln in src.get(rel, "").split("\n") if ln.lstrip().startswith("|") and f"`{ENV_NAME}" in ln]
         if not rows:
             bad.append(f"{rel} has no table row for {ENV_NAME}")
+            continue
+        row = " ".join(rows)
+        if "OFF" not in row:
+            bad.append(f"{rel}: the {ENV_NAME} row does not say the default is OFF")
+        for n in names:
+            if n not in row:
+                bad.append(f"{rel}: the {ENV_NAME} row does not name the diagnostic {n}")
+    for rel, text in src.items():
+        if rel.endswith(".txt"):
+            continue
+        if re.search(r"default stays on|activate counter-based events on L0|~\s*15\s*%\s*TG speedup", text):
+            bad.append(f"{rel} still says the default stays on or quotes the unmeasured ~15% TG speedup")
     return bad
 
 
@@ -380,8 +559,8 @@ SOURCES = load_sources()
 
 
 def test_unmutated_tree_passes_every_pin():
-    for name, check in (("P", check_predicate), ("Q", check_property_sites), ("R", check_readers),
-                        ("D", check_gates), ("names", check_names), ("docs", check_docs)):
+    for name, check in (("P", check_predicate), ("L", check_list), ("E", check_consumers), ("Q", check_property_sites),
+                        ("R", check_readers), ("D", check_gates), ("names", check_names), ("docs", check_docs)):
         problems = check(SOURCES)
         assert not problems, f"pin {name}:\n  " + "\n  ".join(problems)
 
@@ -390,19 +569,50 @@ def test_predicate_mutants():
     # no predicate header at all
     gone = {k: v for k, v in SOURCES.items() if k != PREDICATE_HEADER}
     assert flags(check_predicate(gone), "does not exist")
-    # a macro read instead of the environment
-    assert flags(check_predicate(mutate(SOURCES, PREDICATE_HEADER, "std::getenv(\"%s\")" % ENV_NAME, "std::getenv(\"OTHER\")")),
-                 "does not read")
-    # any value but "0" turns it off: the default flips
-    assert flags(check_predicate(mutate(SOURCES, PREDICATE_HEADER, "== nullptr ||", "!= nullptr &&")),
-                 'exactly "0"')
+    # the predicate is an inline again: a copy per translation unit
+    assert flags(check_predicate(mutate(SOURCES, PREDICATE_HEADER, "bool                             %s();" % PREDICATE,
+                                        "inline bool %s() { return false; }" % PREDICATE)),
+                 "is an inline")
+    # the header reads the environment itself
+    assert flags(check_predicate(mutate(SOURCES, PREDICATE_HEADER, "inline bool ggml_sycl_profile_env_set(const char * value) {",
+                                        "inline bool ggml_sycl_profile_env_set(const char * value) {\n    (void) std::getenv(\"X\");")),
+                 "reads the environment")
     # a preprocessor conditional inside the header
-    assert flags(check_predicate(mutate(SOURCES, PREDICATE_HEADER, "inline bool %s" % PREDICATE,
-                                        "#ifdef GGML_SYCL_QUEUE_PROFILING_MACRO\ninline bool %s" % PREDICATE)),
+    assert flags(check_predicate(mutate(SOURCES, PREDICATE_HEADER, "enum class ggml_sycl_queue_profiling_reason",
+                                        "#ifdef GGML_SYCL_QUEUE_PROFILING_MACRO\nenum class ggml_sycl_queue_profiling_reason")),
                  "preprocessor conditional")
     # the dpct header cannot see it
     assert flags(check_predicate(mutate(SOURCES, HELPER, "queue-profiling.hpp", "async-failure.hpp")),
                  "does not include queue-profiling.hpp")
+    # the default flipped back to on: the unset knob answers on with nothing requested
+    assert flags(check_predicate(mutate_re(SOURCES, COMMON_CPP, r"return \{ requested,\s+requested \? ggml_sycl_queue_profiling_reason::DIAGNOSTIC",
+                                           "return { true, requested ? ggml_sycl_queue_profiling_reason::DIAGNOSTIC")),
+                 "the unset knob is not off")
+    # an unknown value flips the answer instead of counting as unset
+    assert flags(check_predicate(mutate_re(SOURCES, COMMON_CPP, r"return \{ requested,\s+requested \? ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC",
+                                           "return { true, requested ? ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC")),
+                 "unknown value is not treated as unset")
+    # "0" no longer refuses, "1" no longer forces on
+    assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "return { false, ggml_sycl_queue_profiling_reason::KNOB_OFF };",
+                                        "return { true, ggml_sycl_queue_profiling_reason::KNOB_OFF };")), "does not turn profiling off")
+    assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "return { true, ggml_sycl_queue_profiling_reason::KNOB_ON };",
+                                        "return { requested, ggml_sycl_queue_profiling_reason::KNOB_ON };")), "does not turn profiling on")
+    # the decision reads the environment itself
+    assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "    const bool requested = requested_diagnostic != nullptr;\n    if (knob_value != nullptr) {",
+                                        "    const bool requested = requested_diagnostic != nullptr;\n    if (std::getenv(\"X\") != nullptr) {}\n    if (knob_value != nullptr) {")),
+                 "is not pure")
+    # the resolver re-reads the environment on a later call: no function-local static initialiser
+    assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "static const ggml_sycl_queue_profiling_decision state = [] {",
+                                        "const ggml_sycl_queue_profiling_decision state = [] {")),
+                 "function-local `static const` initialiser")
+    # ... or a second read of the knob elsewhere
+    assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "bool ggml_sycl_queue_profiling_enabled() {\n",
+                                        "bool ggml_sycl_queue_profiling_enabled() {\n    if (std::getenv(\"%s\") != nullptr) { return true; }\n" % ENV_NAME)),
+                 "read with getenv")
+    # no WARN naming the diagnostic that turned it on
+    assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "                requested);\n        }\n        return decision;",
+                                        "                \"x\");\n        }\n        return decision;")),
+                 "does not WARN, naming the requested diagnostic")
     # the warning is not a WARN
     body = body_of(mask_comments(SOURCES[COMMON_CPP]), r"void\s+%s\s*\([^)]*\)" % WARN)
     assert body is not None
@@ -416,6 +626,56 @@ def test_predicate_mutants():
     # the once-per-name test inverted: the first call is dropped and every later one warns
     mutant[COMMON_CPP] = (text[:body[0]] + text[body[0]:body[1]].replace("!warned.insert", "warned.insert") + text[body[1]:])
     assert flags(check_predicate(mutant), "once per diagnostic")
+
+
+def test_list_mutants():
+    # one diagnostic dropped from the list: its readable() call names a variable outside it, and the resolver has a
+    # branch for a name the list no longer holds
+    dropped = mutate(SOURCES, PREDICATE_HEADER, '"GGML_SYCL_ATTN_SYNC_PROFILE", ', "")
+    assert flags(check_list(dropped), "is not in %s" % LIST)
+    # a readable() call naming a variable that is not a diagnostic
+    mutant = mutate(SOURCES, MMVQ, 'warn_unless_readable("GGML_SYCL_MXFP4_TG_PROFILE")', 'warn_unless_readable("GGML_SYCL_NOT_A_DIAGNOSTIC")')
+    assert flags(check_list(mutant), "GGML_SYCL_NOT_A_DIAGNOSTIC")
+    # a readable() call that does not pass a literal
+    mutant = mutate(SOURCES, MMVQ, 'warn_unless_readable("GGML_SYCL_MXFP4_TG_PROFILE")', "warn_unless_readable(kName)")
+    assert flags(check_list(mutant), "exactly one string literal")
+    # a diagnostic added to the list without a parse in the resolver and without a row in this table
+    added = mutate(SOURCES, PREDICATE_HEADER, '"GGML_SYCL_MOE_EXEC_TRACE",\n', '"GGML_SYCL_MOE_EXEC_TRACE",\n    "GGML_SYCL_NEW_PROFILE",\n')
+    assert flags(check_list(added), "GGML_SYCL_NEW_PROFILE has no row")
+    # the list is gone
+    assert flags(check_list(mutate(SOURCES, PREDICATE_HEADER, "ggml_sycl_queue_profiling_diagnostics[] = {", "other[] = {")),
+                 "has no `inline constexpr")
+    # the resolver parses a diagnostic differently from the diagnostic: ATTN_SYNC is on for any set value, "0" included
+    mutant = mutate(SOURCES, COMMON_CPP, "return ggml_sycl_profile_env_set(value);", "return ggml_sycl_profile_env_nonzero(value);")
+    assert flags(check_list(mutant), "GGML_SYCL_ATTN_SYNC_PROFILE with something other than the diagnostic's own parse")
+    # no branch for a diagnostic
+    mutant = mutate(SOURCES, COMMON_CPP, 'std::strcmp(name, "GGML_SYCL_ATTN_SYNC_PROFILE") == 0', 'std::strcmp(name, "GGML_SYCL_OTHER") == 0')
+    assert flags(check_list(mutant), "has no branch for GGML_SYCL_ATTN_SYNC_PROFILE")
+    # MoE trace: level 1 would count as requested
+    mutant = mutate(SOURCES, COMMON_CPP, ".trace >= 2;", ".trace >= 1;")
+    assert flags(check_list(mutant), "GGML_SYCL_MOE_EXEC_TRACE with something other")
+    # the fallback for a name without a parse is gone
+    mutant = mutate(SOURCES, COMMON_CPP, "return value != nullptr && value[0] != '\\0' && std::strcmp(value, \"0\") != 0;", "return false;")
+    assert flags(check_list(mutant), "no fallback")
+
+
+def test_consumer_parse_mutants():
+    # a diagnostic parses its own variable with something else than the resolver's helper
+    for rel, name, helper in ((MMVQ, "GGML_SYCL_MXFP4_TG_PROFILE", "ggml_sycl_profile_env_nonzero"),
+                              (MMVQ, "GGML_SYCL_MXFP4_PP_PROFILE", "ggml_sycl_profile_env_nonzero"),
+                              (GGML_SYCL, "GGML_SYCL_ATTN_SYNC_PROFILE", "ggml_sycl_profile_env_set"),
+                              (PROFILER, "GGML_SYCL_KERNEL_PROFILE", "ggml_sycl_profile_env_flag")):
+        old = re.search(r"%s\s*\(\s*std::getenv\(\"%s\"\)" % (helper, name), SOURCES[rel])
+        assert old, f"mutant precondition: {rel} reads {name} through {helper}"
+        mutant = mutate(SOURCES, rel, old.group(0), 'std::getenv("%s") != nullptr || ggml_sycl_unrelated(std::getenv("%s")' % (name, name))
+        problems = check_consumers(mutant)
+        assert flags(problems, name) and flags(problems, "without " + helper), f"{rel} {name}: {problems}"
+    # a second, unshared read of a diagnostic variable anywhere in the backend
+    extra = mutate(SOURCES, COMMON_CPP, '#include "common.hpp"',
+                   '#include "common.hpp"\nstatic const bool g_mutant = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE") != nullptr;', 1)
+    assert flags(check_consumers(extra), "GGML_SYCL_MXFP4_PP_PROFILE")
+    # the window timing no longer waits for trace level 2
+    assert flags(check_consumers(mutate(SOURCES, PLAN, "op.log->trace >= 2", "op.log->trace >= 1")), "level 2")
 
 
 def test_property_site_mutants():
@@ -476,7 +736,7 @@ def test_reader_mutants():
 
 def test_reader_guard_in_a_closed_sibling_block_does_not_count():
     old = r"if\s*\(\s*!\s*ggml_sycl_queue_profiling_enabled\s*\(\s*\)\s*\)\s*\{\s*return\s+-1\.0;\s*\}"
-    mutant = mutate_re(SOURCES, MMVQ, old, '{ ggml_sycl_queue_profiling_readable("GGML_SYCL_X"); }')
+    mutant = mutate_re(SOURCES, MMVQ, old, '{ ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_X"); }')
     problems = check_readers(mutant, MMVQ)
     assert flags(problems, f"{MMVQ}:") and flags(problems, "not preceded"), "a guard in a closed block was accepted"
 
@@ -487,11 +747,11 @@ def test_reader_names_mutants():
 
 
 def test_gate_operand_order_mutant():
-    old = r'return enabled && !ggml_sycl_graph_recording_active\(\) &&\s*ggml_sycl_queue_profiling_readable\("GGML_SYCL_MXFP4_TG_PROFILE"\);'
-    new = 'return ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_TG_PROFILE") && enabled && !ggml_sycl_graph_recording_active();'
+    old = r'return enabled && !ggml_sycl_graph_recording_active\(\) &&\s*ggml_sycl_queue_profiling_warn_unless_readable\("GGML_SYCL_MXFP4_TG_PROFILE"\);'
+    new = 'return ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_TG_PROFILE") && enabled && !ggml_sycl_graph_recording_active();'
     assert flags(check_gates(mutate_re(SOURCES, MMVQ, old, new)), "before the diagnostic's own enabled flag")
-    old = r'cfg\.enabled = cfg\.enabled &&\s*ggml_sycl_queue_profiling_readable\("GGML_SYCL_KERNEL_PROFILE"\);'
-    new = 'cfg.enabled = ggml_sycl_queue_profiling_readable("GGML_SYCL_KERNEL_PROFILE") && cfg.enabled;'
+    old = r'cfg\.enabled = cfg\.enabled &&\s*ggml_sycl_queue_profiling_warn_unless_readable\("GGML_SYCL_KERNEL_PROFILE"\);'
+    new = 'cfg.enabled = ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_KERNEL_PROFILE") && cfg.enabled;'
     assert flags(check_gates(mutate_re(SOURCES, PROFILER, old, new)), "before the diagnostic's own enabled flag")
 
 
@@ -513,6 +773,17 @@ def test_docs_mutants():
     stripped = dict(src)
     stripped["docs/backend/sycl-env-vars.md"] = src["docs/backend/sycl-env-vars.md"].replace(ENV_NAME, "GGML_SYCL_X")
     assert flags(check_docs(stripped), "no table row")
+    # a row that says the default is ON again, and the old sentence back
+    row = [ln for ln in src[".claude/rules/sycl-backend.md"].split("\n") if f"`{ENV_NAME}" in ln][0]
+    on = dict(src)
+    on[".claude/rules/sycl-backend.md"] = src[".claude/rules/sycl-backend.md"].replace(row, row.replace("OFF", "ON"))
+    assert flags(check_docs(on), "does not say the default is OFF")
+    stale = dict(src)
+    stale["docs/backend/sycl-env-vars.md"] = src["docs/backend/sycl-env-vars.md"] + "\nThe default stays on while that is measured.\n"
+    assert flags(check_docs(stale), "still says the default stays on")
+    unnamed = dict(src)
+    unnamed[".claude/rules/sycl-backend.md"] = src[".claude/rules/sycl-backend.md"].replace(row, row.replace("GGML_SYCL_ATTN_SYNC_PROFILE", "X"))
+    assert flags(check_docs(unnamed), "does not name the diagnostic GGML_SYCL_ATTN_SYNC_PROFILE")
 
 
 if __name__ == "__main__":

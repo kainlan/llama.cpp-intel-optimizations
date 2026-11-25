@@ -192,16 +192,13 @@ static void mmvq_moe_trace(const ggml_tensor * src0,
 }
 
 static bool mmvq_moe_tg_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MXFP4_TG_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl_profile_env_nonzero(std::getenv("GGML_SYCL_MXFP4_TG_PROFILE"));
     // This diagnostic inserts host waits to time individual MXFP4 MoE kernels.
     // Level Zero command-graph recording forbids queue/event waits, so profiling
     // must be silent while capture is active. Without queue profiling it has nothing to read: it warns once and every
     // figure it would print stays off.
     return enabled && !ggml_sycl_graph_recording_active() &&
-           ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_TG_PROFILE");
+           ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_TG_PROFILE");
 }
 
 static bool mxfp4_moe_tg_profile_launch_enabled() {
@@ -213,15 +210,12 @@ static bool mxfp4_moe_tg_profile_launch_enabled() {
 }
 
 static bool mmvq_moe_pp_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl_profile_env_nonzero(std::getenv("GGML_SYCL_MXFP4_PP_PROFILE"));
     // This diagnostic inserts host waits to split prompt MoE latency.  Do not
     // run it during graph capture. Without queue profiling it has nothing to read: it warns once and every figure it
     // would print stays off.
     return enabled && !ggml_sycl_graph_recording_active() &&
-           ggml_sycl_queue_profiling_readable("GGML_SYCL_MXFP4_PP_PROFILE");
+           ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE");
 }
 
 static bool mxfp4_moe_gateup_m2_tg1_index_enabled() {
@@ -1455,9 +1449,10 @@ static int mxfp4_moe_xmx_tiled_output_validate_rows() {
 }
 
 // get_profiling_info() BLOCKS the calling host thread until `ev` completes.
-// By default every backend queue carries enable_profiling, so the call
-// succeeds and waits; with GGML_SYCL_QUEUE_PROFILING=0 it would throw, so this
-// returns -1.0 ("not available") without making it. Only call it behind a
+// A requested profiling diagnostic puts enable_profiling on every backend
+// queue, so the call succeeds and waits; with GGML_SYCL_QUEUE_PROFILING=0 (or
+// no diagnostic requested) it would throw, so this returns -1.0 ("not
+// available") without making it. Only call it behind a
 // profile guard (detail_profile / tg_profile / pp_profile / profile_launch, or
 // mmvq_moe_{tg,pp}_profile_enabled(), which stay closed then) and never
 // unconditionally on the dispatch hot path (ruling 6: no host waits).

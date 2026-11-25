@@ -9826,6 +9826,46 @@ else()
         LABELS "sycl;expert-predict;41bs;hostonly;not-built")
 endif()
 
+# The queue-profiling resolver's pure parts: ggml_sycl_queue_profiling_decide() and
+# ggml_sycl_queue_profiling_requested_diagnostic() (common.cpp), plus the parse helpers of queue-profiling.hpp. The test
+# calls them with plain values and an injected getenv: it opens no SYCL device, loads no model and allocates nothing, so
+# it carries the `hostonly` label and none of `model`, `cache` or `mem-handle`, and the sweep may run it. It needs the
+# ordinary libggml-sycl for the two out-of-line functions, hence the same `NOT GGML_BACKEND_DL` guard and disabled
+# placeholder as sycl-expert-predictor-guard above. No ONEAPI_DEVICE_SELECTOR pin and no SKIP_RETURN_CODE: there is no
+# "no device" case.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-queue-profiling-resolver
+        tests/test-sycl-queue-profiling-resolver.cpp
+    )
+    target_include_directories(test-sycl-queue-profiling-resolver PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-queue-profiling-resolver PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-sycl-queue-profiling-resolver PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_libraries(test-sycl-queue-profiling-resolver PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-queue-profiling-resolver PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-sycl-queue-profiling-resolver PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-queue-profiling-resolver COMMAND test-sycl-queue-profiling-resolver)
+    set_tests_properties(sycl-queue-profiling-resolver PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;queue-profiling;hostonly"
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-queue-profiling-resolver
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for the resolver)")
+    set_tests_properties(sycl-queue-profiling-resolver PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;queue-profiling;hostonly;not-built")
+endif()
+
 # Host zone routing, host-allocation lifetimes, the host SCRATCH demand ledger and the host holder plan
 # (docs/design/sycl-mmap-host-tier.md §4.4). host-zone-plan.cpp includes no SYCL header and is also globbed into
 # libggml-sycl, where it is the production copy; these targets compile it host-only, with no -fsycl, and link

@@ -8799,10 +8799,11 @@ void ggml_sycl_watchdog_non_graph_begin();
 void ggml_sycl_watchdog_non_graph_end();
 
 // Standard property list for all directly-created GPU in-order queues.
-// Includes enable_profiling unless GGML_SYCL_QUEUE_PROFILING=0 (ggml_sycl_queue_profiling_enabled()). The property was
-// added "to activate counter-based events on L0 (~15% TG speedup)", a claim made when it was added and not re-measured
-// since. What is known today: on the Level Zero v2 adapter it costs one device timestamp query per submitted command,
-// which only the diagnostics that read event profiling info use, and the default stays on while that is measured.
+// Includes enable_profiling only when ggml_sycl_queue_profiling_enabled() answers on: GGML_SYCL_QUEUE_PROFILING=1, or the
+// knob unset while a profiling diagnostic is requested (queue-profiling.hpp). On the Level Zero v2 adapter a profiling
+// queue reads a device timestamp for every command it submits, and only the diagnostics read the result; without the
+// property GPT-OSS 20B decode measured 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower (driver 26.44,
+// 2026-11-24).
 // Use this for every `new sycl::queue(...)` call that targets a GPU device.
 inline sycl::property_list default_queue_properties() {
     if (ggml_sycl_queue_profiling_enabled()) {
