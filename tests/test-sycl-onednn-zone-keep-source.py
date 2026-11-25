@@ -170,7 +170,8 @@ CAP_KEEP = f"{CAP_FN}();"
 KEEP_ARENA = "keep_arena_as_built();"
 KEEP_ARENA_DEF = "const auto keep_arena_as_built = [&]() {"
 KEEP_ARENA_BIND = "if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) { compute_arena_bind(); }"
-SUFFICIENT = "if (zones_sufficient && !surplus_asked) {"
+# A give-back with no surplus to take keeps the arena as built too, where another zone would grow.
+SUFFICIENT = "if (!surplus_asked && (zones_sufficient || options.give_back != nullptr)) {"
 # The two ends of a RUNTIME give-back: an arena something holds is kept as built, and a rebuilt one keeps its SCRATCH and
 # ONEDNN zones as they were, so both keep the snapshot as a kept arena does.
 GIVE_BACK_HELD = "if (surplus_asked && !zone_arena_rebuild_allowed(holders)) {"

@@ -1,19 +1,20 @@
 // Whether a load keeps a device's PP MoE oneDNN scratch ring, from the plan made with it (moe-ring-consumer.hpp).
 //
-// The rule is by use. A ring is dropped only when every weight that uses it reaches the batched executor's resident
-// claim alone, every one keeps a device route for a resident prompt node without the ring (the MMID direct route), the
-// plan made with the ring leaves at least one expert of those weights on the host, and the drop returns room to the
-// weights: the RUNTIME zone needs less without the ring, and the arena may be rebuilt. Each type class has a case that
-// names its types: the resident-only types with the direct route (the drop set: NVFP4 today), the resident-only types
-// without it (IQ1_S, IQ1_M and IQ4_XS today, whose only device prompt route is the ring, so it is kept), a staged type
-// (Qwen's IQ4_NL), the per-expert SOA staging (GPT-OSS's MXFP4) and a type with no ring use (Q1_0). The model-shaped
-// plans are Inkling 2 Mini (NVFP4, a fused gate_up and a down per layer), Qwen (IQ4_NL, separate gate, up and down) and
-// GPT-OSS (MXFP4), each decided with a zone that returns room and an arena that may be rebuilt, so a case that says it
-// drops the ring is decided by its plan. An expert the plan does not place on a device is on the host, by the plan's
-// own convention (placement_plan::expert_on_device), whether it has a host entry, a name-keyed fallback entry on the
-// host or no entry. A section then names every outcome of the decision (moe_pp_ring_decide), the two the zone decides
-// with the figures measured on the B50; the last pins the per-device marks a load's later passes read. Each case names
-// the answer it pins and the placement that decides it.
+// The rule is by use. A ring is dropped only when all four hold: every weight that uses it reaches the batched
+// executor's resident claim alone, every one keeps a device route for a resident prompt node without the ring (the MMID
+// direct route), the plan made with the ring leaves at least one expert of those weights on the host, and the drop
+// returns room to the weights: the arena's WEIGHT zone, the one both planners pack the weights against, grows once the
+// ring is gone, in an arena nothing points into. Each type class has a case that names its types: the resident-only
+// types with the direct route (the drop set: NVFP4 today), the resident-only types without it (IQ1_S, IQ1_M and IQ4_XS
+// today, whose only device prompt route is the ring, so it is kept), a staged type (Qwen's IQ4_NL), the per-expert SOA
+// staging (GPT-OSS's MXFP4) and a type with no ring use (Q1_0). The model-shaped plans are Inkling 2 Mini (NVFP4, a
+// fused gate_up and a down per layer), Qwen (IQ4_NL, separate gate, up and down) and GPT-OSS (MXFP4), each decided with
+// an answer whose WEIGHT zone grows, so a case that says it drops the ring is decided by its plan. An expert the plan
+// does not place on a device is on the host, by the plan's own convention (placement_plan::expert_on_device), whether
+// it has a host entry, a name-keyed fallback entry on the host or no entry. A section then names every outcome of the
+// decision (moe_pp_ring_decide), the arena's on a model of the arena's zones; the next pins the RUNTIME figures the load
+// stage and the plan dry run ask first, through the one cap both read; the last pins the per-device marks a load's later
+// passes read. Each case names the answer it pins and the placement or zones that decide it.
 //
 // Host-only: synthetic plans, no queue, no device, no model.
 
@@ -44,11 +45,63 @@ constexpr size_t kBytes   = 4096;
 constexpr int    kHost    = -1;
 constexpr size_t kMiB     = 1024 * 1024;
 
-// The RUNTIME zone figures of the two B50 runs, rounded to the MiB. Inkling 2 Mini: the ring took the zone to 558.6 MB
-// and the zone was rebuilt at its 512 MB floor without it. Qwen3.6 NVFP4: another consumer sizes the zone, 726.4 MB with
-// the ring and without it.
-constexpr moe_pp_ring_zone_answer kInklingB50Zone = { 559 * kMiB, 512 * kMiB, true };
-constexpr moe_pp_ring_zone_answer kQwenB50Zone    = { 726 * kMiB, 726 * kMiB, true };
+// The RUNTIME zone of the Inkling 2 Mini B50 run, rounded to the MiB: the ring took the zone to 558.6 MB, and the zone
+// was rebuilt at its 512 MB floor without it.
+constexpr size_t kInklingB50RuntimeWithRing    = 559 * kMiB;
+constexpr size_t kInklingB50RuntimeWithoutRing = 512 * kMiB;
+constexpr size_t kRuntimeFloor                 = 512 * kMiB;
+// A premise, not read by this tree: the 69c4ea428 runs' lines printed a RUNTIME zone of 726.4 MB with the ring and
+// without it for Qwen3.6 NVFP4 on the B50, sized by another consumer.
+constexpr size_t kQwenB50RuntimePremise        = 726 * kMiB;
+
+// An arena of one chunk, as the reserve lays it out: the ONEDNN, RUNTIME and SCRATCH zones at the chunk's tail and the
+// WEIGHT zone, which the KV cache shares, the rest. The chunk and the ONEDNN and SCRATCH zones are premises, not read
+// from a run; the RUNTIME zone is the Inkling B50 run's. The decision reads only the WEIGHT zone's change.
+struct single_chunk_arena {
+    size_t chunk   = 14336 * kMiB;
+    size_t onednn  = 64 * kMiB;
+    size_t runtime = kInklingB50RuntimeWithRing;
+    size_t scratch = 256 * kMiB;
+
+    size_t weight() const { return chunk - (onednn + runtime + scratch); }
+};
+
+// An arena of several chunks: the tail chunk holds the ONEDNN, RUNTIME and SCRATCH zones and a KV share, no larger than
+// the per-chunk cap, and the WEIGHT zone is the rest of the allocation. With the tail chunk at its cap, a smaller zone at
+// its tail grows the KV share at its head, not the WEIGHT zone. Every figure is a premise.
+struct n_chunk_arena {
+    size_t alloc           = 30720 * kMiB;
+    size_t per_chunk_cap   = 4096 * kMiB;
+    size_t tail_kv_reserve = 4096 * kMiB;
+    size_t onednn          = 64 * kMiB;
+    size_t runtime         = kInklingB50RuntimeWithRing;
+    size_t scratch         = 256 * kMiB;
+
+    size_t tail_chunk() const {
+        const size_t wanted = onednn + runtime + scratch + tail_kv_reserve;
+        const size_t capped = wanted < per_chunk_cap ? wanted : per_chunk_cap;
+        return capped < alloc ? capped : alloc;
+    }
+
+    size_t weight() const { return alloc - tail_chunk(); }
+};
+
+// What the load stage reads from an arena asked for its RUNTIME surplus without the ring: the WEIGHT zone before and
+// after, and whether something pointed into the arena, so it was kept as built.
+template <typename Arena> moe_pp_ring_zone_answer arena_answer(const Arena & with_ring, const Arena & without_ring) {
+    moe_pp_ring_zone_answer zone;
+    zone.weight_with_ring    = with_ring.weight();
+    zone.weight_without_ring = without_ring.weight();
+    return zone;
+}
+
+// The Inkling B50 give-back on one chunk: the RUNTIME zone rebuilt at its floor, nothing else changed, so the WEIGHT
+// zone grows by the 47 MiB the ring took. The answer a case decides with when its plan alone decides.
+moe_pp_ring_zone_answer inkling_b50_give_back() {
+    single_chunk_arena without_ring;
+    without_ring.runtime = kInklingB50RuntimeWithoutRing;
+    return arena_answer(single_chunk_arena{}, without_ring);
+}
 
 int failures = 0;
 
@@ -131,8 +184,8 @@ std::vector<moe_pp_ring_weight> ring_weights(const std::vector<weight_spec> & we
     return out;
 }
 
-// What a case wants of the check: its four fields and the decision with a zone that returns room and an arena that may
-// be rebuilt (kInklingB50Zone), where the plan alone decides.
+// What a case wants of the check: its four fields and the decision with an answer whose WEIGHT zone grows in an arena
+// nothing points into (inkling_b50_give_back), where the plan alone decides.
 struct want_check {
     size_t  weights;
     bool    resident_only;
@@ -147,7 +200,7 @@ void expect(const std::string &                     what,
             const want_check &                      want) {
     const moe_pp_ring_resident_check c =
         ggml_sycl::moe_pp_ring_check_resident_only(plan, weights.data(), weights.size());
-    const moe_pp_ring_decision d = ggml_sycl::moe_pp_ring_decide(c, kInklingB50Zone);
+    const moe_pp_ring_decision d = ggml_sycl::moe_pp_ring_decide(c, inkling_b50_give_back());
     std::printf("%s: weights=%zu resident_only=%d other_route=%d host_experts=%" PRId64
                 " displaces=%d decision=%s (want %zu %d %d %" PRId64 " %s)\n",
                 what.c_str(), c.n_weights, c.resident_only ? 1 : 0, c.other_device_prompt_route ? 1 : 0, c.host_experts,
@@ -201,6 +254,14 @@ expert_spot on_device(int device, ggml_layout_mode layout = GGML_LAYOUT_AOS) {
 
 expert_spot on_host(ggml_layout_mode layout = GGML_LAYOUT_AOS) {
     return expert_spot{ kHost, layout };
+}
+
+void expect_bytes(const char * what, size_t got, size_t want) {
+    std::printf("%s: %zu (want %zu)\n", what, got, want);
+    if (got != want) {
+        std::printf("FAIL: %s\n", what);
+        ++failures;
+    }
 }
 
 void expect_mark(const char * what, bool got, bool want) {
@@ -374,10 +435,11 @@ int main() {
         }
     }
 
-    // Every outcome of the decision by name (moe_pp_ring_decide). The plan answers the first four and the zone the last
-    // three: the drop is carried out only when it returns room to the weights, so a ring that does not enlarge the
-    // RUNTIME zone is kept, and so is one whose arena may not be rebuilt in this load. Room is asked before the arena:
-    // where none would return, nothing needs rebuilding.
+    // Every outcome of the decision by name (moe_pp_ring_decide). The plan answers the first four and the arena the last
+    // three: the drop is carried out only when the WEIGHT zone grows once the zones are asked for without the ring, so a
+    // ring whose RUNTIME room goes to another zone, or to no zone, is kept, and so is one whose arena is held. A held
+    // arena is asked first: the ensure keeps it as built, so its WEIGHT zone reads as no room, and the keep is the held
+    // one.
     {
         using D             = moe_pp_ring_decision;
         const auto check_of = [](const placement_plan & plan, const std::vector<moe_pp_ring_weight> & weights) {
@@ -388,32 +450,54 @@ int main() {
         const moe_pp_ring_resident_check tiered =
             check_of(make_plan(w, [&](size_t i, int) { return w[i].layer == 0 ? on_device(0) : on_host(); }), r);
 
+        // The four the arena decides on one chunk, the RUNTIME zone 559 MiB with the ring.
+        const single_chunk_arena with_ring;
+        single_chunk_arena       runtime_only = with_ring;
+        runtime_only.runtime                  = kInklingB50RuntimeWithoutRing;
         expect_decision(
-            "nvfp4 host-tiered with the inkling b50 zone: rebuilt at its floor without the ring, so dropped", tiered,
-            kInklingB50Zone, D::DROP);
-        moe_pp_ring_zone_answer one_grain = kInklingB50Zone;
-        one_grain.runtime_without_ring    = one_grain.runtime_with_ring - 256;
-        expect_decision("nvfp4 host-tiered with a zone one arena grain smaller without the ring: dropped", tiered,
-                        one_grain, D::DROP);
-        expect_decision("nvfp4 host-tiered with the qwen3.6 b50 zone, sized by another consumer: no room returns",
-                        tiered, kQwenB50Zone, D::KEEP_NO_ROOM_RETURNS);
-        moe_pp_ring_zone_answer larger = kInklingB50Zone;
-        larger.runtime_without_ring    = larger.runtime_with_ring + kMiB;
-        expect_decision("nvfp4 host-tiered with a zone that needs more without the ring: no room returns", tiered,
-                        larger, D::KEEP_NO_ROOM_RETURNS);
+            "nvfp4 host-tiered, RUNTIME 559 -> 512 MiB and nothing else grows: the WEIGHT zone takes the 47 MiB, so "
+            "dropped",
+            tiered, arena_answer(with_ring, runtime_only), D::DROP);
+        single_chunk_arena scratch_grows = runtime_only;
+        scratch_grows.scratch += kInklingB50RuntimeWithRing - kInklingB50RuntimeWithoutRing;
+        expect_decision(
+            "nvfp4 host-tiered, RUNTIME 559 -> 512 MiB and SCRATCH grows by the same 47 MiB: the WEIGHT zone does not "
+            "grow, so kept and the ring put back",
+            tiered, arena_answer(with_ring, scratch_grows), D::KEEP_NO_ROOM_RETURNS);
+        expect_decision("nvfp4 host-tiered, no RUNTIME shrink: the WEIGHT zone does not grow, so kept", tiered,
+                        arena_answer(with_ring, with_ring), D::KEEP_NO_ROOM_RETURNS);
+        moe_pp_ring_zone_answer held = arena_answer(with_ring, with_ring);
+        held.held                    = true;
+        expect_decision("nvfp4 host-tiered, a RUNTIME surplus in an arena something points into: kept as built, held",
+                        tiered, held, D::KEEP_HELD);
+
+        // The rest of the arena's answers.
+        single_chunk_arena one_grain = with_ring;
+        one_grain.runtime -= 256;
+        expect_decision("nvfp4 host-tiered, a RUNTIME zone one arena grain smaller and nothing else: dropped", tiered,
+                        arena_answer(with_ring, one_grain), D::DROP);
+        n_chunk_arena n_chunk_with_ring;
+        n_chunk_arena n_chunk_without_ring = n_chunk_with_ring;
+        n_chunk_without_ring.runtime       = kInklingB50RuntimeWithoutRing;
+        expect_bytes("the n-chunk premise's tail chunk is at its cap with the ring", n_chunk_with_ring.tail_chunk(),
+                     n_chunk_with_ring.per_chunk_cap);
+        expect_decision(
+            "nvfp4 host-tiered, RUNTIME 559 -> 512 MiB in an n-chunk arena whose tail chunk is at its cap: the KV "
+            "share takes the room, the WEIGHT zone does not grow, so kept",
+            tiered, arena_answer(n_chunk_with_ring, n_chunk_without_ring), D::KEEP_NO_ROOM_RETURNS);
+        single_chunk_arena smaller = runtime_only;
+        smaller.scratch += 2 * (kInklingB50RuntimeWithRing - kInklingB50RuntimeWithoutRing);
+        expect_decision("nvfp4 host-tiered, a WEIGHT zone smaller without the ring: kept", tiered,
+                        arena_answer(with_ring, smaller), D::KEEP_NO_ROOM_RETURNS);
+        moe_pp_ring_zone_answer held_with_room = arena_answer(with_ring, runtime_only);
+        held_with_room.held                    = true;
+        expect_decision("nvfp4 host-tiered, held although the figures read room: held, asked first", tiered,
+                        held_with_room, D::KEEP_HELD);
         expect_decision("nvfp4 host-tiered on a device with no arena: no zone, so no room returns", tiered,
                         moe_pp_ring_zone_answer{}, D::KEEP_NO_ROOM_RETURNS);
-        moe_pp_ring_zone_answer held = kInklingB50Zone;
-        held.rebuild_allowed         = false;
-        expect_decision("nvfp4 host-tiered with live allocations in the arena: held, the room cannot return", tiered,
-                        held, D::KEEP_HELD);
-        moe_pp_ring_zone_answer no_room_held = kQwenB50Zone;
-        no_room_held.rebuild_allowed         = false;
-        expect_decision("nvfp4 host-tiered with no room and a held arena: no room returns, asked first", tiered,
-                        no_room_held, D::KEEP_NO_ROOM_RETURNS);
 
-        expect_decision("nvfp4 all on device 0: no expert on the host, whatever the zone",
-                        check_of(make_plan(w, [](size_t, int) { return on_device(0); }), r), kInklingB50Zone,
+        expect_decision("nvfp4 all on device 0: no expert on the host, whatever the arena",
+                        check_of(make_plan(w, [](size_t, int) { return on_device(0); }), r), inkling_b50_give_back(),
                         D::KEEP_NO_HOST_EXPERT);
 
         const std::vector<weight_spec> iq4_xs = triplet_weights(GGML_TYPE_IQ4_XS, 2);
@@ -421,13 +505,13 @@ int main() {
             "iq4_xs host-tiered: the ring is its only device prompt route",
             check_of(make_plan(iq4_xs, [&](size_t i, int) { return iq4_xs[i].layer == 0 ? on_device(0) : on_host(); }),
                      ring_weights(iq4_xs)),
-            kInklingB50Zone, D::KEEP_NO_OTHER_DEVICE_ROUTE);
+            inkling_b50_give_back(), D::KEEP_NO_OTHER_DEVICE_ROUTE);
 
         const std::vector<weight_spec> qwen = triplet_weights(GGML_TYPE_IQ4_NL, 2);
         expect_decision("iq4_nl (qwen) host-tiered: a staged use",
                         check_of(make_plan(qwen, [](size_t, int e) { return e == 0 ? on_device(0) : on_host(); }),
                                  ring_weights(qwen)),
-                        kInklingB50Zone, D::KEEP_STAGED_OR_SOA_USE);
+                        inkling_b50_give_back(), D::KEEP_STAGED_OR_SOA_USE);
         const std::vector<weight_spec> gpt_oss = triplet_weights(GGML_TYPE_MXFP4, 2);
         expect_decision("mxfp4 (gpt-oss) hybrid: an SOA per-expert staging use",
                         check_of(make_plan(gpt_oss,
@@ -435,14 +519,66 @@ int main() {
                                                return e == 0 ? on_device(0, GGML_LAYOUT_SOA) : on_host(GGML_LAYOUT_SOA);
                                            }),
                                  ring_weights(gpt_oss)),
-                        kInklingB50Zone, D::KEEP_STAGED_OR_SOA_USE);
+                        inkling_b50_give_back(), D::KEEP_STAGED_OR_SOA_USE);
 
         const std::vector<weight_spec> q1 = triplet_weights(GGML_TYPE_Q1_0, 1);
         expect_decision("q1_0 weights alone: no ring weight",
                         check_of(make_plan(q1, [](size_t, int) { return on_host(); }), ring_weights(q1)),
-                        kInklingB50Zone, D::KEEP_NO_RING_WEIGHT);
+                        inkling_b50_give_back(), D::KEEP_NO_RING_WEIGHT);
         expect_decision("a device with no ring published: no ring weight", moe_pp_ring_resident_check{},
-                        kInklingB50Zone, D::KEEP_NO_RING_WEIGHT);
+                        inkling_b50_give_back(), D::KEEP_NO_RING_WEIGHT);
+
+        // The plan dry run's answer (moe_pp_ring_dry_run_answer): the RUNTIME room alone, as a give-back on one chunk
+        // nothing points into.
+        expect_decision(
+            "dry run, nvfp4 host-tiered with 47 MiB of RUNTIME room: dropped", tiered,
+            ggml_sycl::moe_pp_ring_dry_run_answer(kInklingB50RuntimeWithRing - kInklingB50RuntimeWithoutRing), D::DROP);
+        expect_decision("dry run, nvfp4 host-tiered with no RUNTIME room: kept", tiered,
+                        ggml_sycl::moe_pp_ring_dry_run_answer(0), D::KEEP_NO_ROOM_RETURNS);
+        const moe_pp_ring_zone_answer dry = ggml_sycl::moe_pp_ring_dry_run_answer(kMiB);
+        if (dry.held || dry.weight_with_ring != 0 || dry.weight_without_ring != kMiB) {
+            std::printf("FAIL: the dry run's answer must be unheld, counted from 0, the room its WEIGHT growth\n");
+            ++failures;
+        }
+    }
+
+    // The RUNTIME figures the load stage and the plan dry run ask before the arena, through the one cap both read
+    // (moe_pp_ring_runtime_with_ring, moe_pp_ring_runtime_room). The zone with the ring is no more than the arena's
+    // RUNTIME zone where an arena is active, and an unanswerable figure is never read as room.
+    {
+        using ggml_sycl::moe_pp_ring_runtime_room;
+        using ggml_sycl::moe_pp_ring_runtime_with_ring;
+        const size_t with  = kInklingB50RuntimeWithRing;
+        const size_t floor = kRuntimeFloor;
+        expect_bytes("with an arena, the planned zone below the arena's",
+                     moe_pp_ring_runtime_with_ring(with, true, 600 * kMiB, floor), with);
+        expect_bytes("with an arena, no more than the arena's RUNTIME zone",
+                     moe_pp_ring_runtime_with_ring(600 * kMiB, true, with, floor), with);
+        expect_bytes("with an arena, an unanswerable planned zone reads as the arena's",
+                     moe_pp_ring_runtime_with_ring(SIZE_MAX, true, with, floor), with);
+        expect_bytes("with no arena, the planned zone", moe_pp_ring_runtime_with_ring(with, false, 0, floor), with);
+        expect_bytes("with no arena, an unanswerable planned zone reads as the floor the ensure keeps",
+                     moe_pp_ring_runtime_with_ring(SIZE_MAX, false, 0, floor), floor);
+
+        expect_bytes("inkling b50: 47 MiB of room", moe_pp_ring_runtime_room(with, kInklingB50RuntimeWithoutRing),
+                     with - kInklingB50RuntimeWithoutRing);
+        expect_bytes("no less without the ring: no room", moe_pp_ring_runtime_room(floor, floor), 0);
+        expect_bytes("more without the ring: no room", moe_pp_ring_runtime_room(floor, with), 0);
+        expect_bytes("unanswerable without the ring: no room", moe_pp_ring_runtime_room(with, SIZE_MAX), 0);
+        expect_bytes("qwen3.6 b50, the premise of another consumer's zone: no room",
+                     moe_pp_ring_runtime_room(kQwenB50RuntimePremise, kQwenB50RuntimePremise), 0);
+
+        // The dry run that read an unanswerable zone with the ring uncapped printed a room of ~1.8e13 MB and dropped:
+        // with no arena, the zone with the ring is the floor, the floor without it gives no room, and the ring is kept.
+        const std::vector<weight_spec>        w = inkling_weights(2);
+        const std::vector<moe_pp_ring_weight> r = ring_weights(w);
+        const placement_plan                  plan =
+            make_plan(w, [&](size_t i, int) { return w[i].layer == 0 ? on_device(0) : on_host(); });
+        const moe_pp_ring_resident_check tiered = ggml_sycl::moe_pp_ring_check_resident_only(plan, r.data(), r.size());
+        const size_t room = moe_pp_ring_runtime_room(moe_pp_ring_runtime_with_ring(SIZE_MAX, false, 0, floor), floor);
+        expect_bytes("no arena, unanswerable with the ring, the floor without it: no room", room, 0);
+        expect_decision("no arena, unanswerable with the ring: kept", tiered,
+                        ggml_sycl::moe_pp_ring_dry_run_answer(room), moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS);
     }
 
     // The experts' worth of room a held ring keeps from its weights (moe_pp_ring_experts_worth): the room over the ring
@@ -473,7 +609,8 @@ int main() {
     }
 
     // The per-device marks a load's later passes read (moe_pp_ring_drop_marks). A load's pass marks a device with its
-    // transaction; a direct planner entry (transaction 0) marks nothing and never erases a load's mark.
+    // transaction; a direct planner entry (transaction 0) marks nothing and never erases a load's mark. One load is open
+    // at a time (the lifecycle registry refuses a second begin), so a later load's mark replaces a finished one's.
     {
         moe_pp_ring_drop_marks marks;
         expect_mark("no mark before a drop", marks.dropped(0, 7), false);
@@ -489,8 +626,8 @@ int main() {
         expect_mark("a device out of range is never marked", marks.dropped(GGML_SYCL_MAX_DEVICES, 7), false);
         expect_mark("a negative device is never marked", marks.dropped(-1, 7), false);
         marks.mark(0, 8);
-        expect_mark("an interleaved load's drop overwrites the slot", marks.dropped(0, 7), false);
-        expect_mark("the interleaved load sees its own mark", marks.dropped(0, 8), true);
+        expect_mark("a later load's drop replaces finished load 7's mark", marks.dropped(0, 7), false);
+        expect_mark("the later load sees its own mark", marks.dropped(0, 8), true);
     }
 
     if (failures != 0) {

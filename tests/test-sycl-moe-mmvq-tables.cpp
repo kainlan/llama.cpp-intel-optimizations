@@ -1100,6 +1100,79 @@ int main() {
                 ++failures;
             }
         }
+        // The use mask of every type the loop visits, by name. The checks above hold each bit to its own table, so a
+        // type that gains a use with its table (Q4_K gaining the SOA per-expert staging, say) still passes them; it fails
+        // here by name. A live type this table does not name fails as unlisted, and a slot whose type support was
+        // removed (ggml_blck_size 0) reaches none.
+        constexpr uint32_t use_none     = MOE_PP_RING_USE_NONE;
+        constexpr uint32_t use_resident = MOE_PP_RING_USE_RESIDENT;
+        constexpr uint32_t use_staged   = MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_STAGED;
+        constexpr uint32_t use_soa      = MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_SOA_EXPERT;
+
+        struct type_uses {
+            ggml_type type;
+            uint32_t  uses;
+        };
+
+        const std::vector<type_uses> want_uses = {
+            { GGML_TYPE_F32,     use_none     },
+            { GGML_TYPE_F16,     use_none     },
+            { GGML_TYPE_Q4_0,    use_staged   },
+            { GGML_TYPE_Q4_1,    use_staged   },
+            { GGML_TYPE_Q5_0,    use_staged   },
+            { GGML_TYPE_Q5_1,    use_staged   },
+            { GGML_TYPE_Q8_0,    use_staged   },
+            { GGML_TYPE_Q8_1,    use_none     },
+            { GGML_TYPE_Q2_K,    use_staged   },
+            { GGML_TYPE_Q3_K,    use_staged   },
+            { GGML_TYPE_Q4_K,    use_staged   },
+            { GGML_TYPE_Q5_K,    use_staged   },
+            { GGML_TYPE_Q6_K,    use_staged   },
+            { GGML_TYPE_Q8_K,    use_none     },
+            { GGML_TYPE_IQ2_XXS, use_staged   },
+            { GGML_TYPE_IQ2_XS,  use_staged   },
+            { GGML_TYPE_IQ3_XXS, use_staged   },
+            { GGML_TYPE_IQ1_S,   use_resident },
+            { GGML_TYPE_IQ4_NL,  use_staged   },
+            { GGML_TYPE_IQ3_S,   use_staged   },
+            { GGML_TYPE_IQ2_S,   use_staged   },
+            { GGML_TYPE_IQ4_XS,  use_resident },
+            { GGML_TYPE_I8,      use_none     },
+            { GGML_TYPE_I16,     use_none     },
+            { GGML_TYPE_I32,     use_none     },
+            { GGML_TYPE_I64,     use_none     },
+            { GGML_TYPE_F64,     use_none     },
+            { GGML_TYPE_IQ1_M,   use_resident },
+            { GGML_TYPE_BF16,    use_none     },
+            { GGML_TYPE_TQ1_0,   use_none     },
+            { GGML_TYPE_TQ2_0,   use_none     },
+            { GGML_TYPE_MXFP4,   use_soa      },
+            { GGML_TYPE_NVFP4,   use_resident },
+            { GGML_TYPE_Q1_0,    use_none     },
+            { GGML_TYPE_Q2_0,    use_staged   },
+            { GGML_TYPE_F8_E4M3, use_none     },
+        };
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            const uint32_t  uses = moe_pp_ring_uses_of_type(type);
+            if (ggml_blck_size(type) == 0) {
+                if (uses != use_none) {
+                    std::printf("FAIL: removed type slot %d reaches ring uses 0x%x\n", t, uses);
+                    ++failures;
+                }
+                continue;
+            }
+            const auto want = std::find_if(want_uses.begin(), want_uses.end(),
+                                           [type](const type_uses & entry) { return entry.type == type; });
+            if (want == want_uses.end()) {
+                std::printf("FAIL: %s (type=%d) is not in the ring-use table: name its uses (0x%x)\n",
+                            ggml_type_name(type), t, uses);
+                ++failures;
+            } else if (uses != want->uses) {
+                std::printf("FAIL: %s ring uses 0x%x, want 0x%x\n", ggml_type_name(type), uses, want->uses);
+                ++failures;
+            }
+        }
     }
 
     if (failures != 0) {

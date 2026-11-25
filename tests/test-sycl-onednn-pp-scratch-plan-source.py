@@ -65,13 +65,13 @@ root = Path(__file__).resolve().parents[1]
 sycl = root / "ggml/src/ggml-sycl"
 
 # The exits of unified_cache::ensure_planned_arena_zones that keep the ONEDNN zone as it was built, so it stays
-# described by the larger plan it was built from (onednn_zone_plan_keep_and_store): an arena whose zones hold the plan;
-# a RUNTIME give-back that the arena's holders refuse, kept as built; a blocked rebuild whose other zones hold while it
-# keeps a short SCRATCH zone; and a give-back rebuild, which rebuilds the ONEDNN zone as it was. Only the rebuilt-zone
-# exit stores the live plan alone.
+# described by the larger plan it was built from (onednn_zone_plan_keep_and_store): an arena whose zones hold the plan,
+# or one a RUNTIME give-back has no surplus to take from; a RUNTIME give-back that the arena's holders refuse, kept as
+# built; a blocked rebuild whose other zones hold while it keeps a short SCRATCH zone; and a give-back rebuild, which
+# rebuilds the ONEDNN zone as it was. Only the rebuilt-zone exit stores the live plan alone.
 _KEEP = r"keep_arena_as_built\(\);\s*onednn_zone_plan_keep_and_store\(live_plan\);\s*"
 KEPT_ZONE_EXITS = {
-    "sufficient": r"if \(zones_sufficient\b[^{]*\{\s*" + _KEEP + r"return true;",
+    "sufficient": r"if \(!surplus_asked && \(zones_sufficient\b[^{]*\{\s*" + _KEEP + r"return true;",
     "give-back held": r"options\.give_back->held = true;\s*" + _KEEP + r"return true;",
     "short scratch kept": r"if \(others_hold\) \{\s*" + _KEEP,
     "give-back rebuilt": r"if \(giving_back\) \{\s*" + _KEEP + r"options\.give_back->rebuilt = true;\s*return true;",
