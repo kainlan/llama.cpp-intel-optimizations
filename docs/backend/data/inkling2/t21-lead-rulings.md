@@ -150,6 +150,12 @@ temp 0, `llama-completion`. Zero kernel fault lines in every run.
 - The Inkling B50 pair is **not a speed verdict**: a `ctest` was alive at the end of the new arm and `ninja` with
   four `icpx` at the end of the base arm, and prompt and decode move in opposite directions. Plan and text are
   base's. A second pair runs on the fixed tree. No builder was alive in any Qwen arm.
+- The drop on the Inkling B50 at `69c4ea428`, from the log: "the plan made with it left 908 experts of its 40
+  resident-only expert weights on the host ... its RUNTIME zone was rebuilt at 512.0 MB, 46.6 MB less". The three
+  plans of that load served 9715.3 MB (with the ring), 9668.3 MB (after the drop) and 10215.0 MB (the load's own
+  final plan, equal to base's 10215.0 MB) of experts from the mapping. Peak GPU host backing (`Shmem` plus the
+  `/proc/meminfo` remainder): 21 GiB new and 24 GiB base on the B50 alone; 21 GiB on the B70 alone and 22 GiB on
+  both cards. Qwen3.6-35B NVFP4: 17 GiB in every arm.
 - Device checks at `69c4ea428`: `test-moe-pp-batched-dequant`, `test-moe-q1-nvfp4-dispatch-refusal` and
   `test-moe-mixed-residency-q1-nvfp4` on the B50 exit 0; the Inkling count gate passes on the B70, the B50 alone
   and both cards; the Mistral B70 and GPT-OSS B50 (no `-c`) gates pass.
