@@ -11,25 +11,32 @@
 //
 // The loader sizes the ring for a model with an expert weight of a type a ring consumer runs
 // (ggml_sycl_inventory_ring_has_consumer in ggml-sycl.cpp), and the ring's room comes out of the device's weight
-// capacity. The rule is by use, not by model or type name. A ring is dropped only when every weight that uses it (a)
-// reaches the batched executor's resident claim alone (the types moe_pp_ring_uses_of_type answers with
-// MOE_PP_RING_USE_RESIDENT alone: today NVFP4, IQ1_S, IQ1_M and IQ4_XS), and (b) has another device route for a
-// resident prompt node (today the MMID direct route, moe_mmid_direct_route_runs_type), and (c) the plan made with the
-// ring leaves at least one expert of those weights on the host, and (d) the drop returns room to the weights: the
-// RUNTIME zone needs less without the ring, and the arena may be rebuilt (moe_pp_ring_decide). Such a ring serves a
-// layer only when every expert of it is planned on the device and stages no host expert, so where (c) holds it has
-// traded prompt room for a decode loss on every token, and measured on the B50 with Inkling 2 Mini it lost on the
-// prompt as well. Where (d) holds too the load drops the ring, its RUNTIME zone is rebuilt smaller, and the device is
-// planned once more (ggml_sycl_stage_drop_displacing_ring in ggml-sycl.cpp): a drop always means that. Where (d) fails,
-// a drop would only take the batched executor from the resident layers' prompts and give the experts nothing: a zone
-// another consumer sizes (Qwen3.6 NVFP4 on the B50, measured) needs as much without the ring, and an arena with live
-// allocations is not rebuilt in this load. The ring then stays published as it was and the plan made with it stands.
-// Today the drop set is NVFP4 alone, and the plans that change are those whose NVFP4 experts overflow a card and whose
-// RUNTIME zone the ring enlarges: Inkling 2 Mini on the B50 is the one measured. (b) exists because the ring is the
-// only device prompt route of a resident IQ1_S, IQ1_M or IQ4_XS layer (decode stays refused for them): a drop would
-// leave a node the executor's claim admits with no kernel to run it. A model whose experts of those types overflow a
-// card therefore still pays the ring's room. A ring with any STAGED or SOA_EXPERT use, or with any weight that has no
-// other device route, is sized, published and kept exactly as before.
+// capacity. The rule is by use, not by model or type name. A ring is dropped only when all four of these hold: (a)
+// every weight that uses it reaches the batched executor's resident claim alone (the types moe_pp_ring_uses_of_type
+// answers with MOE_PP_RING_USE_RESIDENT alone: today NVFP4, IQ1_S, IQ1_M and IQ4_XS); (b) every one has another device
+// route for a resident prompt node (today the MMID direct route, moe_mmid_direct_route_runs_type); (c) the plan made
+// with the ring leaves at least one expert of those weights on the host; and (d) the drop returns room to the weights:
+// the arena's WEIGHT zone, the one both planners pack the weights against, grows once the ring is gone
+// (moe_pp_ring_decide). Such a ring serves a layer only when every expert of it is planned on the device and stages no
+// host expert, so where (c) holds it has traded prompt room for a decode loss on every token, and measured on the B50
+// with Inkling 2 Mini it lost on the prompt as well. Where (d) holds too the load drops the ring, the arena is rebuilt
+// with a smaller RUNTIME zone and a larger WEIGHT zone, and the device is planned once more
+// (ggml_sycl_stage_drop_displacing_ring in ggml-sycl.cpp): a drop always means that. Where (d) fails, a drop would only
+// take the batched executor from the resident layers' prompts and give the experts nothing: a RUNTIME zone another
+// consumer sizes needs as much without the ring, a plan without the ring that would grow another zone (the SCRATCH
+// zone's MoE MMVQ bound is held to the room RUNTIME leaves beside it) would hand that zone the room, and an arena with
+// live allocations is not rebuilt in this load. The ring then stays published as it was and the plan made with it
+// stands.
+//
+// Today the drop set is NVFP4 alone, and a plan changes only where all four hold: every weight of its ring is NVFP4 (one
+// IQ1_S, IQ1_M or IQ4_XS weight beside them keeps the ring, for want of another device prompt route), its NVFP4 experts
+// overflow the card, the ring enlarges the arena's zones (its total less the WEIGHT zone) by room the WEIGHT zone takes
+// back once the ring is gone, and nothing points into the arena (a held arena keeps the ring, with a WARN). Inkling 2
+// Mini on the B50 is the one measured. (b) exists because the ring is the only device prompt route of a resident IQ1_S,
+// IQ1_M or IQ4_XS layer (decode stays refused for them): a drop would leave a node the executor's claim admits with no
+// kernel to run it. A model whose experts of those types overflow a card therefore still pays the ring's room. A ring
+// with any STAGED or SOA_EXPERT use, or with any weight that has no other device route, is sized, published and kept
+// exactly as before.
 //
 // Host-only: the plan is data, so tests/test-sycl-moe-ring-consumer.cpp checks the answer on synthetic plans.
 
@@ -108,16 +115,50 @@ inline moe_pp_ring_resident_check moe_pp_ring_check_resident_only(const placemen
     return check;
 }
 
-// The RUNTIME zone figures (d) reads, each as the arena reserves the zone (zone_runtime_reserved_bytes over the floor
-// and the planned requirement): the zone the plan made with the ring needs, no more than the arena holds of it; the zone
-// the device needs without the ring, at the load's planning shape and with the planner terms from before that plan; and
-// whether the arena may be rebuilt (zone_arena_rebuild_allowed: nothing points into it). A device with no arena has no
-// zone: both figures are 0.
+// The RUNTIME zone figures (d) asks first, each as the arena reserves the zone (zone_runtime_reserved_bytes over the
+// floor and the planned requirement), SIZE_MAX where the requirement is unanswerable. Where the ring takes no room in
+// the RUNTIME zone a drop cannot give the weights any, and the load asks the arena nothing.
+//
+// The RUNTIME zone the plan made with the ring holds: `planned`, the zone the terms published with the ring ask for, no
+// more than `held`, the arena's RUNTIME zone, where an arena is active, so the room never counts more than the arena
+// has; with no arena, `planned`, the zone a load's entry ensure reserves for those terms, an unanswerable one read as
+// `floor`, the zone the ensure keeps for it. The load stage and the plan dry run read it alike
+// (ggml_sycl_ring_runtime_with_ring_bytes in ggml-sycl.cpp), so neither reads an unanswerable figure as room.
+inline size_t moe_pp_ring_runtime_with_ring(size_t planned, bool arena_active, size_t held, size_t floor) {
+    if (arena_active) {
+        return planned < held ? planned : held;
+    }
+    return planned == SIZE_MAX ? floor : planned;
+}
+
+// The room the ring takes in the RUNTIME zone: `with_ring` (moe_pp_ring_runtime_with_ring) less `without_ring`, the zone
+// the device needs with no ring published; 0 where it needs no less, an unanswerable figure without the ring included.
+inline size_t moe_pp_ring_runtime_room(size_t with_ring, size_t without_ring) {
+    return without_ring < with_ring ? with_ring - without_ring : 0;
+}
+
+// The figures (d) decides on: the room the weights have, read as both planners read it (the arena's WEIGHT zone,
+// unified_cache_kv_weight_capacity), as the plan made with the ring found it and once the zones were asked for without
+// the ring with the RUNTIME zone's surplus given back (zone_arena_ensure_options::give_back); and whether the arena had
+// that surplus to give but something pointed into it, so it was kept as built. The WEIGHT zone is the measure, not the
+// RUNTIME zone: a rebuild that grows another zone with the room RUNTIME gives up leaves the WEIGHT zone as it was, and
+// so does an N-chunk arena whose tail chunk is at its cap, where the KV share at the head of that chunk takes the room.
+// A device with no arena has no zone: every figure is 0.
 struct moe_pp_ring_zone_answer {
-    size_t runtime_with_ring    = 0;
-    size_t runtime_without_ring = 0;
-    bool   rebuild_allowed      = false;
+    size_t weight_with_ring    = 0;
+    size_t weight_without_ring = 0;
+    bool   held                = false;
 };
+
+// The answer the plan dry run decides on, from `runtime_room` (moe_pp_ring_runtime_room) alone. The dry run rebuilds no
+// arena, so it answers as a give-back on an arena nothing points into whose WEIGHT zone takes the whole RUNTIME room, as
+// a single chunk's does (its WEIGHT zone is the chunk less the ONEDNN, RUNTIME and SCRATCH zones), counted from 0. It
+// cannot see a plan without the ring that would grow another zone, for which a load keeps the ring.
+inline moe_pp_ring_zone_answer moe_pp_ring_dry_run_answer(size_t runtime_room) {
+    moe_pp_ring_zone_answer zone;
+    zone.weight_without_ring = runtime_room;
+    return zone;
+}
 
 // What a load does with a device's ring after the plan made with it, and why.
 enum class moe_pp_ring_decision {
@@ -125,14 +166,14 @@ enum class moe_pp_ring_decision {
     KEEP_STAGED_OR_SOA_USE,      // (a): a weight reaches the staged claim or the SOA per-expert staging
     KEEP_NO_OTHER_DEVICE_ROUTE,  // (b): a weight's resident prompt node has no device route but the ring
     KEEP_NO_HOST_EXPERT,         // (c): the plan left no expert of the ring's weights on the host
-    KEEP_NO_ROOM_RETURNS,        // (d): the zone needs no less without the ring (another consumer sizes it, or none)
-    KEEP_HELD,                   // (d): the zone would need less, but the arena may not be rebuilt in this load
-    DROP,                        // all four hold: the ring dropped, the zone rebuilt smaller, one more plan
+    KEEP_NO_ROOM_RETURNS,        // (d): the WEIGHT zone would not grow without the ring
+    KEEP_HELD,                   // (d): the RUNTIME zone had room to give back, but something points into the arena
+    DROP,                        // all four hold: the ring dropped, the WEIGHT zone grown, one more plan
 };
 
-// The decision on a device's ring from the plan's check and the zone's figures, (a) to (d) in that order. Room is asked
-// before the arena: where none would return, nothing needs rebuilding. Pure: the load stage and the plan dry run ask
-// it, each with its own zone figures.
+// The decision on a device's ring from the plan's check and the arena's answer, (a) to (d) in that order. A held arena
+// is asked before the room: the ensure keeps a held arena as built, so its WEIGHT zone reads as no room, and the keep is
+// the held one. Pure: the load stage and the plan dry run ask it, each with its own answer.
 inline moe_pp_ring_decision moe_pp_ring_decide(const moe_pp_ring_resident_check & check,
                                                const moe_pp_ring_zone_answer &    zone) {
     if (check.n_weights == 0) {
@@ -147,11 +188,11 @@ inline moe_pp_ring_decision moe_pp_ring_decide(const moe_pp_ring_resident_check 
     if (check.host_experts <= 0) {
         return moe_pp_ring_decision::KEEP_NO_HOST_EXPERT;
     }
-    if (zone.runtime_without_ring >= zone.runtime_with_ring) {
-        return moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS;
-    }
-    if (!zone.rebuild_allowed) {
+    if (zone.held) {
         return moe_pp_ring_decision::KEEP_HELD;
+    }
+    if (zone.weight_without_ring <= zone.weight_with_ring) {
+        return moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS;
     }
     return moe_pp_ring_decision::DROP;
 }
@@ -179,10 +220,12 @@ inline int64_t moe_pp_ring_experts_worth(const moe_pp_ring_weight * weights, siz
 // The load that dropped each device's ring, one slot per device: the load transaction of the pass that dropped it, 0
 // for none. A load plans a device at its early pass and again at its late one; a later pass of the load that dropped
 // the ring plans without it again (dropped()), so it does not size the ring's zone back in. A pass that keeps the ring
-// marks nothing, and the next pass decides afresh on its own plan. A direct planner entry has
-// no load transaction (0) and marks nothing, so it never erases a staged load's mark, and asks afresh. One slot per
-// device means a second load interleaved with the first can overwrite the first's mark: the first's next pass then
-// decides afresh with the same check, which costs at most one more arena rebuild and never a wrong plan.
+// marks nothing, and the next pass decides afresh on its own plan. A direct planner entry has no load transaction (0)
+// and marks nothing, so it never erases a staged load's mark, and asks afresh. A mark is keyed by its load's
+// transaction, and every load's is new, so a mark a failed or finished load left is never read as a later load's. One
+// slot per device is enough because one load transaction is open at a time: the lifecycle registry refuses a second
+// begin while one is open (LOAD_BUSY, Registry::begin_outer), so a second load is refused, never interleaved, and no
+// mark of an open load is overwritten.
 struct moe_pp_ring_drop_marks {
     uint64_t load_txn[GGML_SYCL_MAX_DEVICES] = {};
 

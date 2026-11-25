@@ -8133,7 +8133,11 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
                                       arena_zones.runtime >= planned_zones.runtime;
         const bool surplus_asked =
             options.give_back != nullptr && zone_arena_runtime_surplus(arena_zones, planned_zones);
-        if (zones_sufficient && !surplus_asked) {
+        // A give-back asks for the RUNTIME zone's surplus and nothing else. With none to give, or with a zone the plan
+        // needs larger than built, the arena is kept as built: a give-back never takes the ordinary rebuild, so it never
+        // hands the room RUNTIME gives up to another zone (the SCRATCH zone's MoE MMVQ bound is held to the room beside
+        // RUNTIME), and its caller reads the WEIGHT zone unchanged.
+        if (!surplus_asked && (zones_sufficient || options.give_back != nullptr)) {
             keep_arena_as_built();
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must

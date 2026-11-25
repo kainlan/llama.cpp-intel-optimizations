@@ -16281,9 +16281,9 @@ static void ggml_sycl_publish_no_pp_moe_onednn_ring(int device) {
 }
 
 // The RUNTIME zone the arena reserves for `device`'s terms as published now, as ensure_planned_arena_zones() sizes it
-// (zone_runtime_reserved_bytes over the floor and the planned requirement): the figure the ring decision's zone clause
-// compares with the ring and without it (moe_pp_ring_zone_answer). SIZE_MAX when a term is unanswerable, so an
-// unanswerable figure without the ring never reads as room returned.
+// (zone_runtime_reserved_bytes over the floor and the planned requirement): the figure the ring decision's room asks
+// for without the ring (moe_pp_ring_runtime_room), and the one ggml_sycl_ring_runtime_with_ring_bytes caps with it.
+// SIZE_MAX when a term is unanswerable, so an unanswerable figure without the ring never reads as room returned.
 static size_t ggml_sycl_planned_runtime_zone_bytes(int device) {
     size_t requirement = 0;
     size_t reserved    = 0;
@@ -16293,6 +16293,18 @@ static size_t ggml_sycl_planned_runtime_zone_bytes(int device) {
         return SIZE_MAX;
     }
     return reserved;
+}
+
+// The RUNTIME zone `device` holds for the plan made with its ring, read before the ring is unpublished
+// (moe_pp_ring_runtime_with_ring): the planned figure no more than the arena's RUNTIME zone where an arena is active,
+// else the planned figure with an unanswerable one read as the floor the ensure keeps for it. The load stage and the
+// plan dry run both read it here, so both cap it alike. Reads a cache that exists and creates none.
+static size_t ggml_sycl_ring_runtime_with_ring_bytes(int device) {
+    ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    const bool                       arena = cache != nullptr && cache->arena_active();
+    return ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), arena,
+                                                    arena ? cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) : 0,
+                                                    ggml_sycl::unified_cache_runtime_zone_floor_bytes());
 }
 
 // Publishes again on `device` what a ring drop writes before it knows whether the drop returns room, as `with_ring`
@@ -17146,11 +17158,10 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
 }
 
 // The load that dropped each device's PP MoE oneDNN scratch ring (ggml_sycl_stage_drop_displacing_ring), by its load
-// transaction; moe_pp_ring_drop_marks says why one slot per device costs at most a rebuild, never a wrong plan. The
-// inventory intake of each pass publishes the ring the loader sized. Where the early pass dropped it, the late pass
-// publishes none again before its zones are asked for, so the zone the early pass gave back is not asked for again and
-// the late plan is made without the ring, as the early pass's last plan was. Written and read under
-// g_tensor_inventory_mutex.
+// transaction; moe_pp_ring_drop_marks says why one slot per device is enough: one load is open at a time. The inventory
+// intake of each pass publishes the ring the loader sized. Where the early pass dropped it, the late pass publishes none
+// again before its zones are asked for, so the zone the early pass gave back is not asked for again and the late plan is
+// made without the ring, as the early pass's last plan was. Written and read under g_tensor_inventory_mutex.
 static ggml_sycl::moe_pp_ring_drop_marks g_sycl_ring_drop_marks;
 
 // Whether an earlier pass of this thread's staged load dropped `device`'s ring. Never for a direct planner entry.
@@ -17221,8 +17232,8 @@ static void ggml_sycl_stage_unpublish_ring(int                                  
 // What the load stage did with a device's PP MoE oneDNN scratch ring after a plan made with it.
 enum class ggml_sycl_stage_ring_drop {
     KEPT,     // the ring is published as the plan made with it found it, and that plan stands
-    DROPPED,  // no ring is published and the RUNTIME zone was rebuilt smaller: the caller plans once more, and that is
-              // final
+    DROPPED,  // no ring is published and the arena was rebuilt with a smaller RUNTIME zone and a larger WEIGHT zone: the
+              // caller plans once more, and that is final
     REFUSED,  // the zones could not be asked for again: the refusal is logged, and the caller refuses the load
 };
 
@@ -17239,16 +17250,23 @@ enum class ggml_sycl_stage_ring_drop {
 // resident IQ1_S, IQ1_M or IQ4_XS layer has no device prompt route but the ring, so the decision keeps either, sized
 // and published exactly as before, and reads no zone figure for it.
 //
-// The zone answers (d). The device is first published as a model with no ring consumer plans it
-// (ggml_sycl_stage_unpublish_ring), and the RUNTIME zone it needs is read with the ring, no more than the arena holds,
-// and without it. Where it needs no less without the ring (another consumer sizes the zone, as for Qwen3.6 NVFP4 on the
-// B50, measured; or there is no arena) a drop would give the weights nothing. Where it needs less, the zones are asked
-// for with the RUNTIME zone's surplus given back (zone_arena_ensure_options::give_back), and the ensure answers whether
-// the arena may be rebuilt: it rebuilds it, that zone smaller, only where nothing points into it, read under its own
-// lock. A ring the decision keeps is published again as it was (ggml_sycl_stage_ring_published::put_back) and the plan
-// made with it stands, with no second plan: one INFO line where no room returns, one WARN with the experts' worth of
-// room the ring keeps from the weights where the arena is held. A drop always means the ring gone, the zone rebuilt
-// smaller and one more plan; the WARN says so, and the drop holds for the rest of this load
+// The arena answers (d): the room the weights have is the WEIGHT zone, the one both planners pack them against
+// (unified_cache_kv_weight_capacity), and the drop returns room only where that zone grows. The RUNTIME zone the plan
+// made with the ring holds is read first (ggml_sycl_ring_runtime_with_ring_bytes, the figure the dry run reads too),
+// then the device is published as a model with no ring consumer plans it (ggml_sycl_stage_unpublish_ring) and the
+// RUNTIME zone it needs without the ring is read. Where the ring takes no room there (another consumer sizes the zone, as
+// the 69c4ea428 runs printed for Qwen3.6 NVFP4 on the B50), or there is no arena, the arena is asked nothing. Otherwise
+// the zones are asked for with the RUNTIME zone's surplus given back (zone_arena_ensure_options::give_back): the ensure
+// rebuilds the arena with only that zone smaller, SCRATCH and ONEDNN as built, and only where nothing points into it,
+// read under its own lock; where another zone of the plan without the ring would grow, it keeps the arena as built, so
+// no zone takes the room. The WEIGHT zone is read before and after. A ring the decision keeps is published again as it
+// was (ggml_sycl_stage_ring_published::put_back) and the plan made with it stands, with no second plan. Where the
+// give-back rebuilt the arena and the WEIGHT zone did not grow (an N-chunk arena whose tail chunk is at its cap gives
+// the room to the KV share of that chunk), the zones are asked for again with the ring, so the arena holds the zones
+// the published ring needs, with a WARN; what that cannot undo is in docs/backend/sycl-memory-design.md ("Kept after a
+// give-back"). One WARN with the experts' worth of room the ring keeps from the weights where the arena is held, one
+// INFO line where no room returns. A drop always means the ring gone, the arena rebuilt with a smaller RUNTIME zone and a
+// larger WEIGHT zone, and one more plan; the WARN says so, and the drop holds for the rest of this load
 // (ggml_sycl_stage_ring_dropped_by_this_load), while a direct planner entry marks nothing. Caller holds
 // g_tensor_inventory_mutex.
 static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
@@ -17262,19 +17280,22 @@ static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
     }
     const size_t   ring_bytes        = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
     const uint32_t planning_n_ubatch = ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);
-    ggml_sycl::unified_cache * const cache = ggml_sycl::get_unified_cache_for_device(device);
-    const size_t                     runtime_held =
-        cache != nullptr && cache->arena_active() ? cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) : 0;
 
-    const ggml_sycl_stage_ring_published with_ring = ggml_sycl_stage_ring_published::snapshot(device);
-    ggml_sycl::moe_pp_ring_zone_answer   zone;
-    zone.runtime_with_ring = std::min(ggml_sycl_planned_runtime_zone_bytes(device), runtime_held);
+    ggml_sycl::unified_cache * const     cache             = ggml_sycl::get_unified_cache_for_device(device);
+    const bool                           arena             = cache != nullptr && cache->arena_active();
+    const ggml_sycl_stage_ring_published with_ring         = ggml_sycl_stage_ring_published::snapshot(device);
+    const size_t                         runtime_with_ring = ggml_sycl_ring_runtime_with_ring_bytes(device);
     ggml_sycl_stage_unpublish_ring(device, planning_n_ubatch, published_before);
-    zone.runtime_without_ring = ggml_sycl_planned_runtime_zone_bytes(device);
-    zone.rebuild_allowed      = true;  // the ensure below answers it
+    const size_t runtime_room =
+        ggml_sycl::moe_pp_ring_runtime_room(runtime_with_ring, ggml_sycl_planned_runtime_zone_bytes(device));
 
-    ggml_sycl::zone_arena_give_back give_back;
-    if (ggml_sycl::moe_pp_ring_decide(check, zone) == ggml_sycl::moe_pp_ring_decision::DROP) {
+    ggml_sycl::moe_pp_ring_zone_answer zone;
+    ggml_sycl::zone_arena_give_back    give_back;
+    if (arena) {
+        zone.weight_with_ring    = cache->zone_capacity(ggml_sycl::vram_zone_id::WEIGHT);
+        zone.weight_without_ring = zone.weight_with_ring;
+    }
+    if (arena && runtime_room > 0) {
         ggml_sycl::zone_arena_ensure_options options = ggml_sycl_load_arena_options();
         options.give_back                            = &give_back;
         ggml_sycl::zone_arena_refusal refusal;
@@ -17282,31 +17303,46 @@ static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
             GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
             return ggml_sycl_stage_ring_drop::REFUSED;
         }
-        zone.runtime_with_ring = std::min(zone.runtime_with_ring, give_back.have_runtime);
-        zone.rebuild_allowed   = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) < give_back.have_runtime;
+        zone.weight_without_ring = cache->zone_capacity(ggml_sycl::vram_zone_id::WEIGHT);
+        zone.held                = give_back.held;
     }
     const ggml_sycl::moe_pp_ring_decision decision = ggml_sycl::moe_pp_ring_decide(check, zone);
     constexpr double                      mb       = 1024.0 * 1024.0;
     if (decision != ggml_sycl::moe_pp_ring_decision::DROP) {
         with_ring.put_back(device, planning_n_ubatch);
-        if (decision == ggml_sycl::moe_pp_ring_decision::KEEP_HELD) {
+        if (give_back.rebuilt) {
+            // The arena was rebuilt for the plan without the ring, so the zones are asked for again with the ring put
+            // back: the RUNTIME zone the published ring needs is reserved again before anything plans against it.
+            ggml_sycl::zone_arena_refusal refusal;
+            if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal,
+                                                                     ggml_sycl_load_arena_options())) {
+                GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+                return ggml_sycl_stage_ring_drop::REFUSED;
+            }
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): its arena was rebuilt with a "
+                "RUNTIME zone %.1f MB smaller without it, but its WEIGHT zone did not grow (%.1f MB with the ring, "
+                "%.1f MB without it), so the zones were asked for again with the ring and the plan made with it "
+                "stands\n",
+                device, ring_bytes / mb, (give_back.have_runtime - give_back.need_runtime) / mb,
+                zone.weight_with_ring / mb, zone.weight_without_ring / mb);
+        } else if (decision == ggml_sycl::moe_pp_ring_decision::KEEP_HELD) {
             const std::vector<ggml_sycl::moe_pp_ring_weight> weights =
                 ggml_sycl_inventory_ring_weights(g_tensor_inventory_detail);
-            const size_t room = zone.runtime_with_ring - zone.runtime_without_ring;
             GGML_LOG_WARN(
                 "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB) although the plan made with it "
                 "left %" PRId64
                 " experts of its %zu resident-only expert weights on the host: its RUNTIME zone would need %.1f MB "
                 "less without it, but something points into the arena, so it could not be rebuilt, and in this load "
                 "the ring displaces %" PRId64 " experts' worth of room from the weights\n",
-                device, ring_bytes / mb, check.host_experts, check.n_weights, room / mb,
-                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), room));
+                device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_room / mb,
+                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room));
         } else {
             GGML_LOG_INFO(
-                "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): its RUNTIME zone had no room "
-                "to give back (%.1f MB with the ring, %.1f MB without it), so a drop would return nothing to the "
-                "experts\n",
-                device, ring_bytes / mb, zone.runtime_with_ring / mb, zone.runtime_without_ring / mb);
+                "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the weights "
+                "no room (its RUNTIME zone needs %.1f MB less without it, and its WEIGHT zone holds %.1f MB with the "
+                "ring and %.1f MB without it)\n",
+                device, ring_bytes / mb, runtime_room / mb, zone.weight_with_ring / mb, zone.weight_without_ring / mb);
         }
         return ggml_sycl_stage_ring_drop::KEPT;
     }
@@ -17316,10 +17352,11 @@ static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
         "[SYCL-PLAN] device %d drops its PP MoE oneDNN scratch ring (%.1f MB): the plan made with it left %" PRId64
         " experts of its %zu resident-only expert weights on the host, and a ring that serves only resident layers "
         "trades prompt room for a decode loss on every token; its RUNTIME zone was rebuilt at %.1f MB, %.1f MB less, "
-        "for the weights, and the device is planned once more without it. The [PLACEMENT] and [SYCL-PLAN] lines of "
-        "the plan made with the ring, above this one, describe a plan that is not kept\n",
+        "and its WEIGHT zone grew from %.1f MB to %.1f MB, and the device is planned once more without it. The "
+        "[PLACEMENT] and [SYCL-PLAN] lines of the plan made with the ring, above this one, describe a plan that is "
+        "not kept\n",
         device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_rebuilt / mb,
-        (give_back.have_runtime - runtime_rebuilt) / mb);
+        (give_back.have_runtime - runtime_rebuilt) / mb, zone.weight_with_ring / mb, zone.weight_without_ring / mb);
     return ggml_sycl_stage_ring_drop::DROPPED;
 }
 
@@ -18754,12 +18791,15 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 
 // The plan dry run's side of the ring decision the load stage makes (ggml_sycl_stage_drop_displacing_ring), through the
 // same decision (moe_pp_ring_decide) on the dry run's own figures: the plan made with `device`'s PP MoE oneDNN scratch
-// ring answers (a) to (c), and the RUNTIME zone the device needs with the ring and without it answers (d), read after
-// no ring is published and the planner terms are put back as `terms_before_plan` holds them. A drop is a rebuild of
-// that zone smaller, and the dry run rebuilds none and reads no holders: it decides as a load whose arena nothing points
-// into, and its plan without the ring is made against the budget it planned the first with. A ring it keeps is
-// published again as it was (ggml_sycl_put_back_ring_terms) and the plan made with it stands. Its saved state puts the
-// ring back at the end. True when it dropped the ring, for the caller to plan the device once more.
+// ring answers (a) to (c), and the room the ring takes in the RUNTIME zone answers (d). The RUNTIME zone with the ring
+// is read as the load stage reads it (ggml_sycl_ring_runtime_with_ring_bytes, the same cap), and the zone without it
+// after no ring is published and the planner terms are put back as `terms_before_plan` holds them. The dry run
+// rebuilds no arena and reads no holders, so it answers as a give-back on an arena nothing points into whose WEIGHT
+// zone takes the whole room, as a single chunk's does (moe_pp_ring_dry_run_answer); it cannot see a plan without the
+// ring that would grow another zone, for which a load keeps the ring, and its drop line says so. Its plan without the
+// ring is made against the budget it planned the first with. A ring it keeps is published again as it was
+// (ggml_sycl_put_back_ring_terms) and the plan made with it stands. Its saved state puts the ring back at the end. True
+// when it dropped the ring, for the caller to plan the device once more.
 static bool ggml_sycl_plan_dry_run_drop_displacing_ring(int                                                   device,
                                                         const std::vector<ggml_sycl::placement_tensor_info> & detail,
                                                         const ggml_sycl::placement_plan &                     plan,
@@ -18769,29 +18809,29 @@ static bool ggml_sycl_plan_dry_run_drop_displacing_ring(int                     
         return false;
     }
     const size_t ring_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
-    const ggml_sycl::load_published_terms with_ring = ggml_sycl::load_published_terms::snapshot(device);
-    ggml_sycl::moe_pp_ring_zone_answer    zone;
-    zone.runtime_with_ring = ggml_sycl_planned_runtime_zone_bytes(device);
+    const ggml_sycl::load_published_terms with_ring         = ggml_sycl::load_published_terms::snapshot(device);
+    const size_t                          runtime_with_ring = ggml_sycl_ring_runtime_with_ring_bytes(device);
     ggml_sycl_publish_no_pp_moe_onednn_ring(device);
     terms_before_plan.restore(device);
-    zone.runtime_without_ring = ggml_sycl_planned_runtime_zone_bytes(device);
-    zone.rebuild_allowed      = true;
-    constexpr double mb       = 1024.0 * 1024.0;
-    if (ggml_sycl::moe_pp_ring_decide(check, zone) != ggml_sycl::moe_pp_ring_decision::DROP) {
+    const size_t runtime_room =
+        ggml_sycl::moe_pp_ring_runtime_room(runtime_with_ring, ggml_sycl_planned_runtime_zone_bytes(device));
+    constexpr double mb = 1024.0 * 1024.0;
+    if (ggml_sycl::moe_pp_ring_decide(check, ggml_sycl::moe_pp_ring_dry_run_answer(runtime_room)) !=
+        ggml_sycl::moe_pp_ring_decision::DROP) {
         ggml_sycl_put_back_ring_terms(device, with_ring);
         GGML_LOG_INFO(
             "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB), as a load would: its RUNTIME "
-            "zone had no room to give back (%.1f MB with the ring, %.1f MB without it)\n",
-            device, ring_bytes / mb, zone.runtime_with_ring / mb, zone.runtime_without_ring / mb);
+            "zone needs no less without it (%.1f MB with it)\n",
+            device, ring_bytes / mb, runtime_with_ring / mb);
         return false;
     }
     GGML_LOG_INFO(
-        "[PLAN-DRY-RUN] device=%d drops its PP MoE oneDNN scratch ring (%.1f MB), as a load whose arena may be rebuilt "
-        "would: the plan made with it left %" PRId64
+        "[PLAN-DRY-RUN] device=%d drops its PP MoE oneDNN scratch ring (%.1f MB), as a load would whose arena nothing "
+        "points into and whose WEIGHT zone takes the RUNTIME zone's room: the plan made with it left %" PRId64
         " experts of its %zu resident-only expert weights on the host, and its RUNTIME zone needs %.1f MB less "
-        "without it; the device is planned once more without it\n",
-        device, ring_bytes / mb, check.host_experts, check.n_weights,
-        (zone.runtime_with_ring - zone.runtime_without_ring) / mb);
+        "without it; the device is planned once more without it. A load keeps the ring where the plan without it "
+        "would grow another zone, which the dry run cannot see\n",
+        device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_room / mb);
     return true;
 }
 

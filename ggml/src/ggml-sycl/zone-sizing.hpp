@@ -944,11 +944,14 @@ struct zone_arena_ensure_options {
     // load transaction and device (zone_kept_onednn_warn_due), and at every keep for 0.
     uint64_t load_txn           = 0;
     // Set by a caller that published a smaller RUNTIME term than the arena was built for and wants the zone's surplus
-    // back: the load stage, after it drops a PP MoE ring that displaced experts (ggml_sycl_stage_drop_displacing_ring in
-    // ggml-sycl.cpp). An arena with a surplus (zone_arena_runtime_surplus) is rebuilt with the zones
-    // zone_arena_give_back_sizes names when nothing points into it (zone_arena_rebuild_allowed), so the WEIGHT zone
-    // takes the surplus; otherwise it is kept as built. What the call did is written here. Unset, an arena that holds
-    // every zone is kept as built however much larger it is: a later, smaller plan beside a live one must not shrink it.
+    // back: the load stage, after it unpublishes a PP MoE ring that displaced experts (ggml_sycl_stage_drop_displacing_ring
+    // in ggml-sycl.cpp). An arena with a surplus (zone_arena_runtime_surplus) is rebuilt with the zones
+    // zone_arena_give_back_sizes names when nothing points into it (zone_arena_rebuild_allowed); otherwise it is kept as
+    // built. An arena with no surplus is kept as built too, even where the plan needs another zone larger: a give-back
+    // never takes the ordinary rebuild, so the room the RUNTIME zone gives up goes to the WEIGHT zone or nowhere (an
+    // N-chunk arena whose tail chunk is at its cap gives it to the KV share of that chunk), never to another zone. What
+    // the call did is written here. Unset, an arena that holds every zone is kept as built however much larger it is: a
+    // later, smaller plan beside a live one must not shrink it.
     zone_arena_give_back * give_back          = nullptr;
 };
 
