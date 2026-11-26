@@ -23,8 +23,8 @@ in-memory copy of the normalized source, never a file:
     sink is INFO, which llama-bench drops without -v);
   - the cache's copy queue has no profiling at any level: the BCS queue is built in order only, by one assignment
     through ggml_sycl_make_queue (which adds the recording async handler and passes the properties on), with no trace
-    switch and not from default_queue_properties() (which carries enable_profiling), and the literal enable_profiling
-    appears nowhere in unified-cache.cpp;
+    switch and not from default_queue_properties() (which carries enable_profiling when the resolver answers on), and
+    the literal enable_profiling appears nowhere in unified-cache.cpp;
   - the marks: stage_window, at trace level 2 only, submits the window's free and start marks just before its first
     copy (after the read gate is chosen, before the gate joins the copy's dependencies) and its end mark after the
     loop, behind the last copy. The free mark waits on the copy's dependencies without the read gate plus the copy
@@ -251,8 +251,9 @@ BCS_ASSIGN_RE = re.compile(r"\bbcs_queue_ =(?!=)")
 
 def claim_bcs_plain(uc_cpp: str) -> bool:
     """The BCS queue is built in order only, by its one assignment: no trace level switches it, it is not built from
-    default_queue_properties() (which carries enable_profiling), and the literal enable_profiling appears nowhere in
-    the file. Other queues in the file may still use default_queue_properties(); this claim binds the BCS queue."""
+    default_queue_properties() (which carries enable_profiling when the resolver answers on), and the literal
+    enable_profiling appears nowhere in the file. Other queues in the file may still use default_queue_properties();
+    this claim binds the BCS queue."""
     n = norm(uc_cpp)
     return (n.count(BCS_PLAIN) == 1 and len(BCS_ASSIGN_RE.findall(n)) == 1 and "enable_profiling" not in n
             and "bcs_profiling" not in n and "moe_exec_config_parse(" not in n)

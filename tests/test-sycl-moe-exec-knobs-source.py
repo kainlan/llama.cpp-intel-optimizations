@@ -69,8 +69,8 @@ def count_in(src, needle):
 
 
 # A name spelled as a diagnostic LABEL is not a read of the variable: the queue-profiling resolver lists
-# GGML_SYCL_MOE_EXEC_TRACE in queue-profiling.hpp, branches on it by name in common.cpp, and the window timing names it in
-# its warn_unless_readable() call. None of the three reads the environment by that literal; the one read is still the
+# GGML_SYCL_MOE_EXEC_TRACE in queue-profiling.hpp, branches on it by name in common.cpp, and the window timing names it
+# in its warn_unless_readable() call. None of the three reads the environment by that literal; the one read is still the
 # parser's, through the constant. Only these three shapes are exempt, so a getenv("...") of the name anywhere counts.
 _LABEL_USES = (
     re.compile(r'warn_unless_readable\(\s*"[A-Z0-9_]+"\s*\)'),

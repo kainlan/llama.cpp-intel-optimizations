@@ -14897,9 +14897,14 @@ sycl::event unified_cache::copy_to_device_async(void *                          
     return mem_copy_async(dst_handle, src_handle, size, q, deps);
 }
 
-// NOTE for any NEW caller: this BLOCKS rather than polls on a
-// profiling-enabled queue (see unified-cache.hpp's own get_dma_queue()
-// comment). Callers that hold a lock across this call
+// NOTE for any NEW caller: this BLOCKS rather than polls on a queue that
+// carries profiling (see unified-cache.hpp's own get_dma_queue() comment).
+// A backend queue carries profiling only when the queue-profiling resolver
+// answers on (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling
+// diagnostic, queue-profiling.hpp); by default none does and the query
+// polls. A caller must still be written for the blocking case, because a
+// profiling run is exactly when it is exercised. Callers that hold a lock
+// across this call
 // serialise the allocation/lookup path behind whatever produced `evt` --
 // that was the exact bug in the oneDNN Graph-scratch DIRECT reuse pool
 // (llama.cpp-c6ah). Pool entries must go through
