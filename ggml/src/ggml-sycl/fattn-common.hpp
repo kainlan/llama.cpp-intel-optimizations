@@ -270,4 +270,9 @@ struct fattn_params {
     int32_t kv_base_pos;              // Base position of KV cache (typically 0, used for offset calculation)
 };
 
+// Whether the D=512 tile launcher (launch_fattn_tile_d512, fattn-tile.hpp)
+// may group the Q heads of one K/V head into one block (ncols2 > 1). Host
+// callable so a host-only test pins it (tests/test-sycl-fattn-onednn-gates.cpp).
+bool ggml_sycl_fattn_tile_d512_use_gqa_opt(const fattn_params & params);
+
 #endif // GGML_SYCL_FATTN_COMMON_HPP

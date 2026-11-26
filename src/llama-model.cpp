@@ -11,6 +11,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-load-measure.h"
+#include "llama-sycl-expert-names.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -285,14 +286,6 @@ static ggml_sycl_placement_envelope llama_model_sycl_make_placement_envelope() {
     return envelope;
 }
 
-static bool llama_model_sycl_is_moe_expert_weight(const ggml_sycl_tensor_info & tensor) {
-    if (tensor.name == nullptr) {
-        return false;
-    }
-    return std::strstr(tensor.name, "ffn_gate_exps") != nullptr || std::strstr(tensor.name, "ffn_up_exps") != nullptr ||
-           std::strstr(tensor.name, "ffn_down_exps") != nullptr;
-}
-
 static size_t llama_model_sycl_align_up(size_t value, size_t alignment) {
     if (alignment == 0) {
         return value;
@@ -542,7 +535,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         size_t           max_k           = 0;
         size_t           max_n           = 0;
         for (const ggml_sycl_tensor_info & tensor : tensors) {
-            if (!llama_model_sycl_is_moe_expert_weight(tensor)) {
+            if (!llama_sycl_is_moe_expert_weight_name(tensor.name)) {
                 continue;
             }
             if (tensor.ne[0] <= 0 || tensor.ne[1] <= 0) {

@@ -11,7 +11,7 @@ dequant. These claims pin that shape:
       ggml_sycl_moe_pp_batched_takes_layout(), which asks moe_pp_batched_supports_layout() in moe-mmvq-tables.hpp,
       and neither tests GGML_TYPE_MXFP4 itself;
   (b) the f16 table lists each required type on AOS, Q4_0, Q8_0, Q4_K and Q6_K on AOS and SOA, MXFP4 on SOA only,
-      never Q1_0 or NVFP4, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
+      NVFP4 on AOS only, never Q1_0, its non-MXFP4 types and REQUIRED_AOS are one set (a type added to the table
       without a pin is red), and every type it lists has a case in convert.cpp's
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
@@ -38,7 +38,8 @@ dequant. These claims pin that shape:
       planned-layout lookup refuses a layer with a host or other-device expert, so a hybrid layer is never admitted;
   (i) the f16 arm runs in the weight slot the inventory planned, never a wider one: the backend keeps the planned
       slot size as the inventory gave it (no plan-time widening, which displaced routed experts with no cost
-      decision), the planner site that publishes the ring's sizes computes no expert-count or f16 formula of its own
+      decision; a ring the drop decision keeps is put back once, from a snapshot of the slot itself), the planner
+      site that publishes the ring's sizes computes no expert-count or f16 formula of its own
       (the expert counts reach it only through the row-scaled slots' shared sizer and that sizer's refusal warning)
       and hands the unified cache the inventory's slot, the arm asks the admission for one f16 expert, and it groups
       the active experts by what the slot it claimed holds;
@@ -86,20 +87,22 @@ dequant. These claims pin that shape:
       and for both success branches, and one helper drains (drain_submitted_phases), for this path and for a
       deferred expert the phase loop declines (llama.cpp-8epx).
   (s) one type question for a host-staged weight (llama.cpp-3460): moe_pp_batched_takes_staged_type in
-      moe-mmvq-tables.hpp is exactly an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The
-      staged claim asks it through ggml_sycl_moe_pp_batched_claims_staged_type, which is exactly it beside the
-      runtime knobs (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost model's device-rate seed
-      (moe_exec_dev_gflops_seed) asks it before it seeds any type but MXFP4; none of them asks either table term
-      itself. So no type is seeded at the executor's rate while the claim refuses it (IQ1_S, IQ1_M
-      and IQ4_XS have the f16 row and no MMVQ-ID kernel), and (h) holds for the staged claim too: it never takes a
-      type with no MMVQ-ID kernel, so such a type is never admitted on a hybrid layer.
+      moe-mmvq-tables.hpp is exactly a type without an immutable host recipe (moe_type_has_immutable_host_recipe:
+      Q1_0 and NVFP4, whose host experts keep their own planned workspace, so NVFP4 is never staged although it has
+      an f16 row), an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The staged claim asks it
+      through ggml_sycl_moe_pp_batched_claims_staged_type, which is exactly it beside the runtime knobs
+      (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost model's device-rate seed (moe_exec_dev_gflops_seed)
+      asks it before it seeds any type but MXFP4; none of them asks either table term itself. So no type is seeded at
+      the executor's rate while the claim refuses it (IQ1_S, IQ1_M and IQ4_XS have the f16 row and no MMVQ-ID kernel),
+      and (h) holds for the staged claim too: it never takes a type with no MMVQ-ID kernel, so such a type is never
+      admitted on a hybrid layer.
   (t) the ring is planned only for a model with an expert a ring consumer runs. moe_pp_onednn_ring_serves_type in
       moe-mmvq-tables.hpp is exactly the WOQ and f16 tables over every layout, and asks no runtime knob. The publish
       helper, after it takes the inventory's ring and before it sizes and publishes it, plans no ring (weight slot and
       depth 0) when ggml_sycl_inventory_ring_has_consumer finds no gate, up or down expert (moe_classify_tensor, the
       names the loader sizes the ring from) of a type that predicate serves. The consumer asks no knob predicate, so the
-      ring a load plans never follows a runtime knob. An Inkling 2 Mini load (NVFP4 experts on the MMID direct route,
-      BF16 experts on the BF16 direct route) plans none, so its RUNTIME zone carries no ring nobody would use.
+      ring a load plans never follows a runtime knob. A model whose experts are only Q1_0 (the MMID direct route) or
+      BF16 (the BF16 direct route) plans none, so its RUNTIME zone carries no ring nobody would use.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -125,23 +128,24 @@ FILES = {
     "ggml_c": ROOT / "ggml" / "src" / "ggml.c",
 }
 
-# Every quantized type ggml_get_to_fp16_sycl_for_layout decodes on AOS, except MXFP4 (its own SOA arm) and Q1_0 and
-# NVFP4 (FORBIDDEN below). The first thirteen are the brief's list and the Qwen3.8 GSQ-RCO census (see the memory "a
-# GGUF file name is not its expert quant type"); the last seven complete the f16 arm's rule in moe-mmvq-tables.hpp,
-# that every type the converter decodes is admitted but the three above (llama.cpp-348c).
+# Every quantized type ggml_get_to_fp16_sycl_for_layout decodes on AOS, except MXFP4 (its own SOA arm) and Q1_0
+# (FORBIDDEN below). NVFP4 is last: Inkling 2 Mini's prompt experts that are all on the device. The first thirteen are
+# the brief's list and the Qwen3.8 GSQ-RCO census (see the memory "a GGUF file name is not its expert quant type"); the
+# last seven complete the f16 arm's rule in moe-mmvq-tables.hpp, that every type the converter decodes is admitted but
+# the three above (llama.cpp-348c).
 REQUIRED_AOS = [
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K", "GGML_TYPE_IQ3_XXS",
     "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ4_XS", "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q2_0", "GGML_TYPE_IQ2_S",
     "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_XXS", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q2_K",
-    "GGML_TYPE_Q3_K", "GGML_TYPE_IQ1_S", "GGML_TYPE_IQ1_M",
+    "GGML_TYPE_Q3_K", "GGML_TYPE_IQ1_S", "GGML_TYPE_IQ1_M", "GGML_TYPE_NVFP4",
 ]
 # The types the planner may materialize SOA that have a per-expert SOA dequant to f16 (the B50 loads Q8_0 and Q6_K
 # experts SOA; the device test's RED run refused both).
 REQUIRED_SOA = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q6_K"]
 AOS_SOA_EXPR = "layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA"
-# Q1_0 and NVFP4 run on a device through their MMVQ id kernel, and the table lists them only once
-# test-moe-pp-batched-dequant runs them against the CPU; float experts are not a dequant case.
-FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
+# Q1_0 runs on a device through its MMVQ id kernel, and the table lists it only once test-moe-pp-batched-dequant
+# runs it against the CPU; float experts are not a dequant case.
+FORBIDDEN = ["GGML_TYPE_Q1_0", "GGML_TYPE_F16", "GGML_TYPE_F32", "GGML_TYPE_BF16"]
 AOS_EXPR = "layout == GGML_LAYOUT_AOS"
 KNOB = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS"
 KNOB_CONST = "GGML_SYCL_MOE_PP_F16_BATCHED_AOS_ENV"
@@ -196,6 +200,11 @@ PLAN_SITE_CALL = "unified_cache_set_planned_pp_moe_onednn_scratch( device, in.pp
 STAGE_PUBLISH = ("const ggml_sycl_inventory_planner_inputs published = "
                  "ggml_sycl_inventory_publish_planner_inputs(ctx->device, inventory);")
 STAGE_KEEPS = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = published.pp_moe_onednn_weight_slot_bytes;"
+# A ring the drop decision keeps is published again as the plan made with it found it (ggml_sycl_stage_ring_published):
+# the snapshot reads the global itself before the drop publishes no ring, and the put-back writes that value back.
+RING_PUBLISHED_STRUCT = "struct ggml_sycl_stage_ring_published {"
+RING_SNAPSHOT_SLOT = "published.inventory_weight_slot_bytes = g_tensor_inventory_pp_moe_onednn_weight_slot_bytes;"
+RING_PUT_BACK_SLOT = "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = inventory_weight_slot_bytes;"
 # The device test's capped cases: one Q4_0 case per cap, each in its own process.
 GROUP_CAPS = "constexpr int k_group_caps[] = { 1, 3 };"
 GROUP_EXACT = "groups != want_groups || group_experts != size_t(group_cap) || buffers != 2"
@@ -210,7 +219,8 @@ FAIL_RETAIN = "retain_expert_leases_until(drained);"
 CLAIM_RELEASE = "batched_scratch_claim.finish_or_release();"
 LEASE_HELPER = "auto retain_expert_leases_until = [&](const sycl::event & until) {"
 STAGED_TYPE = "moe_pp_batched_takes_staged_type"
-STAGED_TYPE_BODY = ("{ return moe_mmvq_admission_supports_type(type) && "
+STAGED_TYPE_BODY = ("{ return !ggml_sycl::moe_type_has_immutable_host_recipe(type) && "
+                    "moe_mmvq_admission_supports_type(type) && "
                     "moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS); }")
 CLAIMS_STAGED_TYPE = "ggml_sycl_moe_pp_batched_claims_staged_type"
 CLAIMS_STAGED_TYPE_BODY = ("{ return moe_pp_batched_takes_staged_type(type) && "
@@ -799,15 +809,32 @@ def claim_i_slot(s):
                  "g_tensor_inventory_pp_moe_onednn_scratch_bytes"):
         if gone in sycl:
             fails.append(f"{gone} is still in ggml-sycl.cpp: the planned weight slot must not be widened")
-    # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, or as the
-    # publish helper returned it to the stage. Every write to the helper's slot is the inventory's own value or a reset
+    # Every write to the planned weight slot's global is a reset or the inventory's own value: directly, as the publish
+    # helper returned it to the stage, or put back from the global's own earlier value where the ring drop decision
+    # keeps the ring. Every write to the helper's slot is the inventory's own value or a reset
     # to 0 (a ring that cannot be sized is planned as no ring), and at least one write takes the inventory's own value.
     publish = one_definition(sycl, PUBLISH_FN) or ""
     kept = ["0", "inventory->pp_moe_onednn_weight_slot_bytes"]
     if STAGE_PUBLISH in sycl:
         kept.append("published.pp_moe_onednn_weight_slot_bytes")
+    # A kept ring's put-back writes the global from a snapshot of the global itself, so it brings in no value of its
+    # own. It is taken once, inside the snapshot's struct, and only while every write to the snapshot's field is its
+    # default 0 or that read of the global.
+    struct_at = sycl.find(RING_PUBLISHED_STRUCT)
+    struct_end = match_close(sycl, struct_at + len(RING_PUBLISHED_STRUCT) - 1) if struct_at >= 0 else -1
+    put_back_at = sycl.find(RING_PUT_BACK_SLOT)
+    field_writes = list(re.finditer(r"\binventory_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl))
+    put_back_kept = (struct_at >= 0 and struct_at < put_back_at < struct_end and sycl.count(RING_PUT_BACK_SLOT) == 1
+                     and RING_SNAPSHOT_SLOT in sycl
+                     and all(m.group(1) == "=" and m.group(2).strip() in
+                             ("0", "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes") for m in field_writes))
+    if put_back_at >= 0 and not put_back_kept:
+        fails.append("a kept ring's put-back writes the planned weight slot from a value that is not the snapshot of "
+                     "the slot itself, or outside ggml_sycl_stage_ring_published, or more than once")
     writes = re.finditer(r"\bg_tensor_inventory_pp_moe_onednn_weight_slot_bytes ?([-+*/|&^]?=)(?!=) ?([^;]*);", sycl)
     for m in writes:
+        if m.group(0) == RING_PUT_BACK_SLOT and put_back_kept:
+            continue
         if m.group(1) != "=" or m.group(2).strip() not in kept:
             fails.append(f"the planned weight slot is written as `{m.group(0)}`, not reset or taken from the inventory")
     if STAGE_KEEPS not in sycl:
@@ -1157,7 +1184,8 @@ def claim_s_staged_type(s):
     if helper is None:
         return [f"{STAGED_TYPE} is not defined exactly once in moe-mmvq-tables.hpp"]
     if helper != STAGED_TYPE_BODY:
-        fails.append(f"{STAGED_TYPE} is not exactly an MMVQ-ID kernel and an f16 row at AOS")
+        fails.append(f"{STAGED_TYPE} is not exactly a type without an immutable host recipe, an MMVQ-ID kernel and "
+                     "an f16 row at AOS")
     claim = claim_predicate_body(s["sycl"])
     if claim is None:
         return fails + ["the plan-taking ggml_sycl_moe_pp_onednn_batched_claims_tensor definition was not found"]
@@ -1292,7 +1320,7 @@ MUTANTS = [
      "return trace_batched_skip(moe_pp_batched_refusal::NO_ACTIVE_EXPERTS"),
     ("e", "sycl", "ggml_sycl_moe_pp_batched_refusal_first(ctx.device, refusal)", "true"),
     ("e", "tables", "case moe_pp_batched_refusal::GEMM:", ""),
-    ("e", "tables", "GEMM, COUNT", "GEMM"),
+    ("e", "tables", "ROW_MAP_STAGING, COUNT", "ROW_MAP_STAGING"),
     ("e", "sycl", "static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,",
      "static_assert(true,"),
     ("e", "sycl", "refusal >= moe_pp_batched_refusal::COUNT", "false"),
@@ -1335,6 +1363,14 @@ MUTANTS = [
      "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(published.pp_moe_onednn_weight_slot_bytes, "
      "size_t(inventory->n_expert) << 20);"),
     ("i", "sycl", STAGE_PUBLISH, "const ggml_sycl_inventory_planner_inputs published = {};"),
+    # A kept ring's put-back that widens, that writes a snapshot not taken from the slot, that has no snapshot, or
+    # that is written again outside the snapshot's struct.
+    ("i", "sycl", RING_PUT_BACK_SLOT,
+     "g_tensor_inventory_pp_moe_onednn_weight_slot_bytes = std::max(inventory_weight_slot_bytes, size_t(1) << 20);"),
+    ("i", "sycl", RING_SNAPSHOT_SLOT,
+     "published.inventory_weight_slot_bytes = g_tensor_inventory_pp_moe_onednn_weight_slot_bytes * 2;"),
+    ("i", "sycl", RING_SNAPSHOT_SLOT, ""),
+    ("i", "sycl", STAGE_KEEPS, STAGE_KEEPS + " " + RING_PUT_BACK_SLOT),
     ("i", "sycl", "weight_bytes = f16_expert_bytes;", "weight_bytes = f16_expert_bytes * active_count;"),
     ("i", "sycl", "moe_pp_batched_f16_plan_groups(reserved.weight_size, ",
      "moe_pp_batched_f16_plan_groups(weight_bytes * active_count, "),
@@ -1453,8 +1489,9 @@ MUTANTS = [
     ("r", "sycl", DRAIN_CALL, "if (tiled_claimed_op) {"),
     ("r", "sycl", DRAIN_CALL, FAIL_BARRIER + " " + DRAIN_CALL),
     ("r", "sycl", "ggml_sycl::retain_handles_until_event(std::move(leases), until);", ""),
-    ("s", "tables", "return moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(",
-     "return moe_pp_batched_f16_supports_layout("),
+    ("s", "tables", "moe_mmvq_admission_supports_type(type) && moe_pp_batched_f16_supports_layout(",
+     "moe_pp_batched_f16_supports_layout("),
+    ("s", "tables", "return !ggml_sycl::moe_type_has_immutable_host_recipe(type) && ", "return "),
     ("s", "tables", "&& moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_AOS); }",
      "&& moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA); }"),
     ("s", "sycl", STAGED_CLAIM_HEAD, "planned = plan != nullptr && moe_mmvq_admission_supports_type(weight->type) && "),

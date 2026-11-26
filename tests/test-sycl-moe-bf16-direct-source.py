@@ -58,7 +58,6 @@ FILES = {
     "hpp": SYCL_DIR / "moe-bf16-direct.hpp",
     "cpp": SYCL_DIR / "moe-bf16-direct.cpp",
     "tables": SYCL_DIR / "moe-mmvq-tables.hpp",
-    "resolved": SYCL_DIR / "moe-resolved-batch.hpp",
 }
 
 PREDICATE = "ggml_sycl_moe_bf16_direct_route_available"
@@ -399,7 +398,7 @@ def claim_f_flush_first(s):
         return ["ggml_sycl_compute_forward_impl was not found"]
     flush = sycl.find(OP_ENTRY_FLUSH, head)
     case = sycl.find(MUL_MAT_ID_DISPATCH, head)
-    call = sycl.find("ggml_sycl_mul_mat_id(ctx, dst);", head)
+    call = sycl.find("ggml_sycl_mul_mat_id_with_direct_reentry(ctx, dst);", head)
     if min(flush, case, call) < 0 or not flush < case < call:
         return ["the op-entry pending-scatter flush does not precede the MUL_MAT_ID dispatch"]
     return []
@@ -451,7 +450,7 @@ def claim_h_tables(s):
     fails = []
     if "GGML_TYPE_BF16" in s["tables"]:
         fails.append("moe-mmvq-tables.hpp names GGML_TYPE_BF16: the MMVQ tables gained a type they have no kernel for")
-    body = braced_body(s["resolved"], NEEDS_DIRECT_HEAD)
+    body = braced_body(s["tables"], NEEDS_DIRECT_HEAD)
     if body is None or tight(body) != NEEDS_DIRECT_BODY:
         fails.append("moe_type_has_immutable_host_recipe is no longer exactly Q1_0/NVFP4")
     return fails
@@ -546,7 +545,7 @@ MUTANTS = [
     ("g", "cpp", None, "sycl::reduce_over_group(", "sycl::select_from_group("),
     ("g", "cpp", None, "quiet_NaN()", "infinity()"),
     ("g", "cpp", None, "reqd_sub_group_size(16)", "reqd_sub_group_size(32)"),
-    ("h", "resolved", None, "return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;",
+    ("h", "tables", None, "return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;",
      "return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_BF16;"),
 ]
 
@@ -584,7 +583,7 @@ def test_claims_are_not_vacuous(sources):
     assert sources["sycl"].find(MUL_MAT_ID_HEAD) >= 0
     assert sources["sycl"].find(FORWARD_HEAD) >= 0
     assert braced_body(sources["sycl"], COMPAT_HEAD) is not None
-    assert braced_body(sources["resolved"], NEEDS_DIRECT_HEAD) is not None
+    assert braced_body(sources["tables"], NEEDS_DIRECT_HEAD) is not None
     assert sources["tables"]
 
 

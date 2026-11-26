@@ -15,12 +15,14 @@ the blocked rebuild keeps the zones when the floor is all they lack. These check
   applies the predicate, and the only other site of zone_onednn_plan_keep_short is a failed load's put-back (restore);
 - entry: the load stage's entry ensure asks with ring_release_first first, and every call after its last resort asks
   without it; a ring the release kept is asked about again only when the refusal says the zones would be kept;
-- cap: the DIRECT Graph-scratch cap's budget snapshot does not rise while the arena is kept. The sufficient path and
-  both keep paths (a short ONEDNN zone, and a SCRATCH zone short of the MoE batched MMVQ bound alone) call one local
-  lambda, keep_arena_as_built, which binds the compute arena when it is unbound and stores min(held, current) through
-  one compare-exchange helper over zone_graph_direct_cap_snapshot_kept (test-zone-sizing Case 42), and only a rebuild
-  stores the current budget. A snapshot that rose across tenants would grow the Graph floor of a kept zone and ask for
-  a rebuild the zone does not need;
+- cap: the DIRECT Graph-scratch cap's budget snapshot does not rise while the arena is kept. The sufficient path,
+  both keep paths (a short ONEDNN zone, and a SCRATCH zone short of the MoE batched MMVQ bound alone) and both ends of
+  a RUNTIME give-back (an arena something holds, kept as built, and an arena rebuilt with its SCRATCH and ONEDNN zones
+  as they were: zone_arena_ensure_options::give_back) call one local lambda, keep_arena_as_built, which binds the
+  compute arena when it is unbound and stores min(held, current) through one compare-exchange helper over
+  zone_graph_direct_cap_snapshot_kept (test-zone-sizing Case 42), and only a rebuild for larger zones stores the
+  current budget. A snapshot that rose across tenants would grow the Graph floor of a kept zone and ask for a rebuild
+  the zone does not need;
 - warn: a keep logs one WARN naming the planned Graph floor, the zone kept and the Graph room it leaves, behind a
   latch (zone_kept_onednn_warn_due, Case 43) that exchanges the load transaction in: once per load and device, since
   the stage asks for the zones in two passes and again in its grow leg, and at every keep for a direct entry (0);
@@ -168,7 +170,12 @@ CAP_KEEP = f"{CAP_FN}();"
 KEEP_ARENA = "keep_arena_as_built();"
 KEEP_ARENA_DEF = "const auto keep_arena_as_built = [&]() {"
 KEEP_ARENA_BIND = "if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) { compute_arena_bind(); }"
-SUFFICIENT = "if (zones_sufficient) {"
+# A give-back with no surplus to take keeps the arena as built too, where another zone would grow.
+SUFFICIENT = "if (!surplus_asked && (zones_sufficient || options.give_back != nullptr)) {"
+# The two ends of a RUNTIME give-back: an arena something holds is kept as built, and a rebuilt one keeps its SCRATCH
+# and ONEDNN zones as they were, so both keep the snapshot as a kept arena does.
+GIVE_BACK_HELD = "if (surplus_asked && !zone_arena_rebuild_allowed(holders)) {"
+GIVE_BACK_TAIL = "if (giving_back) {"
 # A blocked rebuild keeps a SCRATCH zone short of the MoE batched MMVQ bound alone before the ONEDNN keep is decided.
 SCRATCH_BLOCKED = "if (scratch_kept < scratch_zone && !zone_arena_rebuild_allowed(holders)) {"
 REBUILD_STORE = f"{SNAPSHOT}.store(available_budget(), std::memory_order_release);"
@@ -299,20 +306,23 @@ def claim_entry_spends_its_last_resort_first(gs: str) -> bool:
 
 
 def claim_cap_snapshot_rises_only_at_a_rebuild(uc: str) -> bool:
-    """The DIRECT cap's budget snapshot has four stores, all in the ensure: the sufficient path, the keep of a SCRATCH
-    zone short of the MoE batched MMVQ bound alone and the keep of a short ONEDNN zone each call keep_arena_as_built,
-    which stores min(held, current) through one compare-exchange helper (0 is unset), and the rebuild stores current.
-    No other site stores it."""
+    """The DIRECT cap's budget snapshot has six stores, all in the ensure: the sufficient path, the keep of a SCRATCH
+    zone short of the MoE batched MMVQ bound alone, the keep of a short ONEDNN zone and both ends of a RUNTIME give-back
+    each call keep_arena_as_built, which stores min(held, current) through one compare-exchange helper (0 is unset), and
+    the rebuild for larger zones stores current. No other site stores it."""
     c = code(uc)
     ensure = _ensure(uc)
     helper = fn_body(c, CAP_SIG)
     if not ordered(helper, CAP_CURRENT, CAP_HELD, CAP_LOOP) or c.count("zone_graph_direct_cap_snapshot_kept(") != 1:
         return False
-    if any(a not in ensure for a in (SUFFICIENT, BLOCKED, SCRATCH_BLOCKED, KEEP_ARENA_DEF)):
+    anchors = (SUFFICIENT, BLOCKED, SCRATCH_BLOCKED, KEEP_ARENA_DEF, GIVE_BACK_HELD, GIVE_BACK_TAIL)
+    if any(a not in ensure for a in anchors):
         return False
     keep_arena = block_at(ensure, ensure.index(KEEP_ARENA_DEF) + len(KEEP_ARENA_DEF) - 1)
     sufficient = block_at(ensure, ensure.index(SUFFICIENT))
     scratch_kept = block_at(ensure, ensure.index(SCRATCH_BLOCKED))
+    give_back_held = block_at(ensure, ensure.index(GIVE_BACK_HELD))
+    give_back_tail = block_at(ensure, ensure.index(GIVE_BACK_TAIL))
     blocked = block_at(ensure, ensure.index(BLOCKED))
     kept = block_at(blocked, blocked.find(KEPT_RETURN)) if KEPT_RETURN in blocked else ""
     return (
@@ -324,10 +334,14 @@ def claim_cap_snapshot_rises_only_at_a_rebuild(uc: str) -> bool:
         and SNAPSHOT not in scratch_kept
         and ordered(kept, KEEP_ARENA, "return true;")
         and SNAPSHOT not in kept
+        and ordered(give_back_held, KEEP_ARENA, "return true;")
+        and SNAPSHOT not in give_back_held
+        and ordered(give_back_tail, KEEP_ARENA, "return true;")
+        and SNAPSHOT not in give_back_tail
         and ensure.count(CAP_KEEP) == 1
-        and ensure.count(KEEP_ARENA) == 3
+        and ensure.count(KEEP_ARENA) == 5
         and ensure.count(SNAPSHOT) == 1
-        and ordered(ensure, BLOCKED, REBUILD_STORE, REBUILD_TAIL)
+        and ordered(ensure, BLOCKED, GIVE_BACK_TAIL, REBUILD_STORE, REBUILD_TAIL)
         and c.count(SNAPSHOT + ".store(") == 1
     )
 
@@ -603,6 +617,10 @@ def test_witnesses():
     only_fails(mutate_in(UC, ENSURE_SIG, KEEP_ARENA + " " + LATCH_READ, LATCH_READ), GS, "cap")
     # The SCRATCH keep leaving the snapshot as it was: an arena kept for a short SCRATCH zone is not bounded either.
     only_fails(in_ensure_block(SCRATCH_BLOCKED, KEEP_ARENA, ""), GS, "cap")
+    # A held give-back leaving the snapshot as it was: the arena it keeps is not bounded.
+    only_fails(in_ensure_block(GIVE_BACK_HELD, KEEP_ARENA, ""), GS, "cap")
+    # A give-back rebuild storing the current budget: its ONEDNN zone is the one it had, so the snapshot must not rise.
+    only_fails(in_ensure_block(GIVE_BACK_TAIL, KEEP_ARENA, REBUILD_STORE), GS, "cap")
     # The lambda every keep calls leaving the snapshot as it was: no kept arena is bounded.
     only_fails(mutate_in(UC, ENSURE_SIG, CAP_KEEP + " #endif };", "#endif };"), GS, "cap")
     # The lambda leaving an unbound compute arena unbound: a kept arena would serve no compute scratch.

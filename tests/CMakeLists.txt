@@ -687,6 +687,35 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# NVFP4 weight-only-quantisation probe: does this device's oneDNN run f16 x f4_e2m1 with f8_e4m3 scales grouped {16,1}
+# (NVFP4's stored bits, its UE4M3 scales sanitised), in 2-D and in the 3-D batched form, and does the 3-D MXFP4 form
+# work with groups {32,1} where the backend's opt-in 3-D arm passes {1,32,1}? Two more arms widen the NVFP4 scales to
+# f16, the fallback if f8_e4m3 scales are refused. Each arm prints "PROBE <name> <PASS|FAIL|UNSUPPORTED> <detail>",
+# and the binary exits 0 once every arm has run, whatever it found. Built, not registered: a ctest must be able to
+# fail, and no shipped path relies on an arm yet (the NVFP4 prompt executor runs its F16 arm; the weight-only arm is
+# later work). The lead runs it by hand on the B50 and reads the PROBE lines:
+#   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4
+# Same build shape as test-onednn-woq-mxfp4 above (oneDNN and SYCL only, no backend).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build(test-sycl-onednn-woq-nvfp4.cpp)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-onednn-woq-nvfp4 PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-onednn-woq-nvfp4 PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-onednn-woq-nvfp4 PRIVATE "-fsycl")
+        target_link_options(test-sycl-onednn-woq-nvfp4 PRIVATE "-fsycl")
+    endif()
+    find_package(DNNL QUIET)
+    if (TARGET DNNL::dnnl)
+        target_link_libraries(test-sycl-onednn-woq-nvfp4 PRIVATE DNNL::dnnl)
+        # ggml-sycl/dnnl-deterministic.hpp: the attribute production builds with.
+        target_include_directories(test-sycl-onednn-woq-nvfp4 PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    else()
+        message(WARNING "test-sycl-onednn-woq-nvfp4: DNNL::dnnl not found in this directory scope; "
+                        "the target will fail to link")
+    endif()
+endif()
+
 # SOA MXFP4 -> WOQ repack kernel device test (perf-recovery epic, track C,
 # llama.cpp-8rug): the production repack_mxfp4_soa_to_woq (ggml-sycl/convert.
 # cpp/.hpp) must reproduce a CPU reference of the nibble de-interleave +
@@ -1176,6 +1205,22 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
     set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # The fused gate_up expert role (its enum slot, classifier order, switches, claim, paired-path exclusions, ring
+    # consumer and loader name test) and the seam where the direct MMID route steps aside for the batched prompt
+    # executor and takes a node back only while the executor has submitted nothing. Run WITH --self-test so each
+    # mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-gate-up-role-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-gate-up-role-source.py --self-test)
+    set_tests_properties(test-sycl-moe-gate-up-role-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # A load drops a PP MoE oneDNN scratch ring that serves resident layers only and displaced experts: the one
+    # decision the stage and the plan dry run call, the stage's order (no ring, the planner terms put back, the RUNTIME
+    # surplus given back, one more plan), the drop held for the load, and the cache's give-back. Run WITH --self-test so
+    # each mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-ring-drop-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-ring-drop-source.py --self-test)
+    set_tests_properties(test-sycl-moe-ring-drop-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The swap policy header is plain host code: standard includes only, and no mutable state outside the struct the
     # caller owns. Run WITH --self-test so each pin is shown to catch its mutant.
     add_test(NAME test-sycl-moe-swap-policy-source

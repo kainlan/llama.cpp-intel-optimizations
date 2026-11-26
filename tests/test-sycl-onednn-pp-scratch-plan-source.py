@@ -64,6 +64,24 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 sycl = root / "ggml/src/ggml-sycl"
 
+# The exits of unified_cache::ensure_planned_arena_zones that keep the ONEDNN zone as it was built, so it stays
+# described by the larger plan it was built from (onednn_zone_plan_keep_and_store): an arena whose zones hold the plan,
+# a RUNTIME give-back that the arena's holders refuse, kept as built; a blocked rebuild whose other zones hold while it
+# keeps a short SCRATCH zone; and a give-back rebuild, which rebuilds the ONEDNN zone as it was. Only the rebuilt-zone
+# exit stores the live plan alone. A RUNTIME give-back with no surplus to take keeps the arena as built at the first
+# exit too, but stores the plan only where the zones hold it: where the plan needs a zone larger than built, it changes
+# nothing and stores nothing, so the stored plan stays the one the zone was built or kept with, not a live plan that
+# describes room the zone does not hold.
+_KEEP = r"keep_arena_as_built\(\);\s*onednn_zone_plan_keep_and_store\(live_plan\);\s*"
+KEPT_ZONE_EXITS = {
+    "sufficient": r"if \(!surplus_asked && \(zones_sufficient\b[^{]*\{\s*keep_arena_as_built\(\);\s*"
+                  r"if \(zones_sufficient\) \{\s*onednn_zone_plan_keep_and_store\(live_plan\);\s*\}\s*return true;",
+    "give-back held": r"options\.give_back->held = true;\s*" + _KEEP + r"return true;",
+    "short scratch kept": r"if \(others_hold\) \{\s*" + _KEEP,
+    "give-back rebuilt": r"if \(giving_back\) \{\s*" + _KEEP + r"options\.give_back->rebuilt = true;\s*return true;",
+}
+KEPT_ZONE_EXITS_CHECK = "every kept-zone exit stores the larger of the held and live plan, in one critical section"
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
@@ -373,8 +391,11 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     ensure_zones = function_body(cache, r"bool unified_cache::ensure_planned_arena_zones\([^)]*\)\s*\{")
     results["anchor: ensure_planned_arena_zones exists"] = ensure_zones is not None
     if ensure_zones is not None:
-        results["the kept-zone exit stores the larger of the held and live plan, in one critical section"] = \
-            re.search(r"onednn_zone_plan_keep_and_store\(live_plan\);\s*return true;", ensure_zones) is not None
+        # Every exit that keeps the ONEDNN zone as it was built describes it by the larger of the held and the live
+        # plan, each by name, and there is no other: a new kept exit needs review, then an entry here.
+        kept_exits = [re.search(pattern, ensure_zones) is not None for pattern in KEPT_ZONE_EXITS.values()]
+        results[KEPT_ZONE_EXITS_CHECK] = \
+            all(kept_exits) and ensure_zones.count("onednn_zone_plan_keep_and_store(live_plan);") == len(kept_exits)
         keep_store = function_body(
             cache, r"void unified_cache::onednn_zone_plan_keep_and_store\(const zone_onednn_plan & plan\)\s*\{")
         results["anchor: the locked keep-and-store helper exists"] = keep_store is not None
@@ -895,9 +916,28 @@ if args.self_test and not failed:
          (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
                                   "*planned_activations = zone_plan.activations_bytes;", "*planned_activations = 0;"),
           cache_hpp)),
-        ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
+        ("kept-zone exit describes the zone by the live plan", KEPT_ZONE_EXITS_CHECK,
          (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
                                   "onednn_zone_plan_store(live_plan)"), cache_hpp)),
+        ("short give-back keep stores the live plan", KEPT_ZONE_EXITS_CHECK,
+         (backend, mutate_in_func(cache, ensure_sig, "if (zones_sufficient) {", "if (true) {"), cache_hpp)),
+        ("held give-back describes the zone by the live plan", KEPT_ZONE_EXITS_CHECK,
+         (backend, mutate_in_func(cache, ensure_sig,
+                                  "options.give_back->held = true;\n            keep_arena_as_built();\n"
+                                  "            onednn_zone_plan_keep_and_store(live_plan);",
+                                  "options.give_back->held = true;\n            keep_arena_as_built();\n"
+                                  "            onednn_zone_plan_store(live_plan);"), cache_hpp)),
+        ("give-back rebuild describes the zone by the live plan", KEPT_ZONE_EXITS_CHECK,
+         (backend, mutate_in_func(cache, ensure_sig,
+                                  "onednn_zone_plan_keep_and_store(live_plan);\n        options.give_back->rebuilt",
+                                  "onednn_zone_plan_store(live_plan);\n        options.give_back->rebuilt"),
+          cache_hpp)),
+        ("a fifth kept exit", KEPT_ZONE_EXITS_CHECK,
+         (backend, mutate_in_func(cache, ensure_sig, "compute_arena_bind();\n    if (giving_back) {",
+                                  "compute_arena_bind();\n    if (scratch_zone == 0) {\n"
+                                  "        keep_arena_as_built();\n"
+                                  "        onednn_zone_plan_keep_and_store(live_plan);\n        return true;\n    }\n"
+                                  "    if (giving_back) {"), cache_hpp)),
         ("rebuilt-zone exit stops storing", "the rebuilt-zone exit stores the live plan the zone was built from",
          (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(live_plan);\n    return true;\n}",
                                   "return true;\n}"), cache_hpp)),
@@ -1042,7 +1082,7 @@ if args.self_test and not failed:
          (backend, mutate_in_func(cache, reserve_sig, "const size_t pair_bound_now",
                                   "void * early_probe = zone_alloc(vram_zone_id::ONEDNN, weights_size); (void) early_probe; "
                                   "const size_t pair_bound_now"), cache_hpp)),
-        ("kept exit loads then stores", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
+        ("kept exit loads then stores", KEPT_ZONE_EXITS_CHECK,
          (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
                                   "onednn_zone_plan_store(zone_onednn_plan_keep(onednn_zone_plan_load(), "
                                   "live_plan))"), cache_hpp)),

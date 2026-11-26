@@ -14,7 +14,8 @@
 //     backend prints that line at most 96 times per process, so the cases must stay under that cap (static_assert
 //     below). Every such line names the case's f16 groups (groups=, group_experts=, buffers=; see below);
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
-//     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch".
+//     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch", and no "direct MMID route
+//     re-entered" (an executor decline that sent a node back to the direct MMID route).
 //
 // The ring is planned the way libllama plans it by default (src/llama-model.cpp): weight slots sized for the MXFP4
 // WOQ arm, about a quarter of every expert in f16. The f16 arm runs in that slot, never a wider one: it groups the
@@ -32,6 +33,20 @@
 // half the rectangle's, the token count rounded up to the GEMM row alignment times every expert: the scratch is laid
 // out per GEMM group, so a small group costs its own rows and not the busiest expert's.
 //
+// NVFP4 runs three cases more, each on a fixture of its own, at 64 tokens with the activation broadcast:
+//   * every UE4M3 scale byte of the weight rewritten from a cycle of small ones (zero, subnormals, the NaN code, and
+//     their sign-set forms), and again from a cycle of large ones (the largest finite value, its sign-set form, and
+//     the NaN code), so each case's whole signal is scaled by those bytes and the NMSE sees how they decode. 0xFF is
+//     never written: the CPU decode reads it as 240, the SYCL decode as 0, and no quantizer writes the sign bit;
+//   * a fused gate_up tensor (blk.0.ffn_gate_up_exps) beside a down tensor, as Inkling 2 Mini's NVFP4 layers hold
+//     them: the executor claims the fused weight as a plain matrix per expert.
+// The executor's resident claim takes the fused role for every type it runs, so Q8_0 runs the fused fixture too, at
+// 64 tokens with the activation broadcast. At this shape Q8_0 is materialized SOA where NVFP4 is AOS, so the fused
+// role meets both of the executor's readers.
+// NVFP4 and Q1_0 also have the direct MMID route, which runs ahead of the executor and steps aside for a prompt the
+// executor claims while the ring is planned (moe_mmid_direct_defers_to_executor). The success line is what shows it
+// stepped aside: had it run the node, no success line would print.
+//
 // The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on. With it off, libllama puts these
 // device-planned experts in the device buffer instead, which this fixture does not model: that upload reorders an SOA
 // type over the whole tensor and publishes no per-expert records for it, and the claim declines such a layout. So with
@@ -46,6 +61,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "moe-planned-model-fixture.hpp"  // the planned model's shape, experts, inventory and lifecycle
 #include "moe-pp-pack.hpp"  // moe_pp_gemm_row_align: the GEMM row rounding the rectangle is measured against
 
 #include <sys/wait.h>
@@ -57,6 +73,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -77,6 +94,30 @@ constexpr double   k_nmse_tol = 5e-4;
 
 constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
                                              "blk.0.ffn_down_exps.weight" };
+// The fused model's two tensors: the fused gate_up weight the case runs, and the down weight.
+constexpr const char * k_fused_tensor_names[2] = { "blk.0.ffn_gate_up_exps.weight", "blk.0.ffn_down_exps.weight" };
+
+// What a fixture loads. SMALL_SCALES and LARGE_SCALES are NVFP4 models; PLAIN and FUSED_GATE_UP take any type.
+enum class fixture_variant {
+    PLAIN,          // gate, up and down, one quantization shared by all three; the gate runs
+    SMALL_SCALES,   // PLAIN with every UE4M3 scale byte rewritten from k_small_scales
+    LARGE_SCALES,   // PLAIN with every UE4M3 scale byte rewritten from k_large_scales
+    FUSED_GATE_UP,  // a fused gate_up weight and a down weight; the gate_up runs
+};
+
+// UE4M3 scale bytes both decodes read alike (ggml_ue4m3_to_fp32 on the CPU, ggml_sycl_ue4m3_to_fp32 on the device):
+// zero, subnormals, the NaN code 0x7f (zero in both) and sign-set forms (both ignore the sign); then the largest
+// finite value 0x7e, its sign-set form, and an exponent-15 value. Never 0xff, which the two decode differently.
+constexpr uint8_t k_small_scales[] = { 0x00, 0x01, 0x02, 0x07, 0x7f, 0x80, 0x81, 0x87 };
+constexpr uint8_t k_large_scales[] = { 0x7e, 0xfe, 0x78, 0x7f };
+
+int fixture_tensor_count(fixture_variant variant) {
+    return variant == fixture_variant::FUSED_GATE_UP ? 2 : 3;
+}
+
+const char * const * fixture_tensor_names(fixture_variant variant) {
+    return variant == fixture_variant::FUSED_GATE_UP ? k_fused_tensor_names : k_tensor_names;
+}
 
 // Every expert type the batched executor's f16 table takes (moe_pp_batched_f16_supports_layout) that this fixture
 // can quantize, each of which must run the executor. The fixture quantizes with no importance matrix, so the table's
@@ -85,12 +126,22 @@ constexpr const char * k_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.
 constexpr ggml_type k_types[] = {
     GGML_TYPE_Q4_0,  GGML_TYPE_Q8_0,   GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K,  GGML_TYPE_IQ3_XXS,
     GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,  GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
-    GGML_TYPE_Q3_K,  GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_M,
+    GGML_TYPE_Q3_K,  GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0, GGML_TYPE_IQ2_S, GGML_TYPE_IQ1_M, GGML_TYPE_NVFP4,
 };
+// The NVFP4 fixtures beyond the plain one, one case each.
+constexpr fixture_variant k_nvfp4_variants[]    = { fixture_variant::SMALL_SCALES, fixture_variant::LARGE_SCALES,
+                                                    fixture_variant::FUSED_GATE_UP };
+constexpr int             k_nvfp4_variant_cases = int(sizeof(k_nvfp4_variants) / sizeof(k_nvfp4_variants[0]));
+
+// The other types that run the fused gate_up fixture, one case each.
+constexpr ggml_type k_fused_other_types[] = { GGML_TYPE_Q8_0 };
+constexpr int       k_fused_other_cases   = int(sizeof(k_fused_other_types) / sizeof(k_fused_other_types[0]));
+
 // 64 tokens with the activation broadcast to every used expert (gate/up, ne11 1), and 300 tokens with one
 // activation row per used expert (down, ne11 k_used).
 constexpr int k_cases_per_type = 2;
-constexpr int k_cases          = k_cases_per_type * int(sizeof(k_types) / sizeof(k_types[0]));
+constexpr int k_cases =
+    k_cases_per_type * int(sizeof(k_types) / sizeof(k_types[0])) + k_nvfp4_variant_cases + k_fused_other_cases;
 
 // The backend prints its [MOE-PP-ONEDNN-F16-BATCHED] success line at most this many times per process (the
 // batched_log counter in ggml-sycl.cpp). Each case runs one MUL_MAT_ID op and so prints one line, and a case past the
@@ -111,15 +162,7 @@ constexpr int k_capped_cases = int(sizeof(k_group_caps) / sizeof(k_group_caps[0]
 constexpr int k_skew_rows[] = { 1024, 2048 };
 constexpr int k_skew_cases  = int(sizeof(k_skew_rows) / sizeof(k_skew_rows[0]));
 
-void require(bool condition, const std::string & message) {
-    if (!condition) {
-        throw std::runtime_error(message);
-    }
-}
-
-size_t align_256(size_t n) {
-    return (n + 255u) & ~size_t(255u);
-}
+using moe_planned_fixture::require;
 
 // Every log chunk the backend emits, in order, so a case can count what appeared while it ran. Also echoed to stderr,
 // so the run's log carries the backend's own lines.
@@ -202,184 +245,65 @@ void log_callback(ggml_log_level level, const char * text, void * user_data) {
     std::fputs(text, stderr);
 }
 
-// One expert tensor's quantized bytes: k_experts experts of k_out rows of k_in values.
-std::vector<uint8_t> make_weights(ggml_type type, std::mt19937 & rng) {
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float>                    weight_f32(size_t(k_experts) * k_out * k_in);
-    for (float & v : weight_f32) {
-        v = 0.5f * dist(rng);
+// Rewrites every UE4M3 scale byte of NVFP4 `bytes` from `scales`, in turn. A block is 4 scale bytes, one per
+// 16-element sub-block, then 32 bytes of E2M1 nibbles (block_nvfp4 in ggml-common.h).
+void rewrite_nvfp4_scales(std::vector<uint8_t> & bytes, const uint8_t * scales, size_t n_scales) {
+    constexpr size_t block_bytes = 36;
+    constexpr size_t scale_bytes = 4;
+    require(ggml_type_size(GGML_TYPE_NVFP4) == block_bytes && bytes.size() % block_bytes == 0,
+            "the NVFP4 block is not 4 scale bytes and 32 nibble bytes");
+    size_t next = 0;
+    for (size_t block = 0; block < bytes.size(); block += block_bytes) {
+        for (size_t j = 0; j < scale_bytes; ++j) {
+            bytes[block + j] = scales[next++ % n_scales];
+        }
     }
-    std::vector<uint8_t> bytes(ggml_row_size(type, k_in) * k_out * k_experts);
-    const size_t         written =
-        ggml_quantize_chunk(type, weight_f32.data(), bytes.data(), 0, int64_t(k_experts) * k_out, k_in, nullptr);
-    require(written == bytes.size(), std::string("quantize wrote a short buffer for ") + ggml_type_name(type));
-    return bytes;
 }
 
-// One planned model: its three expert tensors share one shape, so the gate tensor the cases run is representative.
-// The PP MoE ring fields are what libllama computes for this shape with GGML_SYCL_MOE_PP_WOQ at its default (on).
-struct expert_inventory {
-    ggml_sycl_tensor_info        tensors[3]{};
-    ggml_sycl_tensor_inventory   inventory{};
-    ggml_sycl_placement_envelope envelope{};
+// The planned model a case runs (moe_planned_fixture::planned_model): the variant's expert tensors at this test's
+// shape, planned for `n_ubatch` and a context of at least k_n_ctx. The one split is named per type and variant, so no
+// two cases' weights share a file identity. The NVFP4 scale variants rewrite every scale byte of the quantized weights
+// before they fill the tensors.
+moe_planned_fixture::planned_shape fixture_shape(ggml_type type, uint32_t n_ubatch, fixture_variant variant) {
+    return { type,
+             k_experts,
+             k_used,
+             k_in,
+             k_out,
+             fixture_tensor_names(variant),
+             fixture_tensor_count(variant),
+             std::max(k_n_ctx, n_ubatch),
+             n_ubatch };
+}
 
-    explicit expert_inventory(ggml_type type, uint32_t n_ubatch = k_n_ubatch) {
-        const uint32_t n_ctx = std::max(k_n_ctx, n_ubatch);
-        envelope             = ggml_sycl_placement_envelope{ n_ctx, n_ubatch, 1, -1 };
-        for (int i = 0; i < 3; ++i) {
-            tensors[i].name  = k_tensor_names[i];
-            tensors[i].type  = type;
-            tensors[i].ne[0] = k_in;
-            tensors[i].ne[1] = k_out;
-            tensors[i].ne[2] = k_experts;
-            tensors[i].ne[3] = 1;
-            tensors[i].size  = ggml_row_size(type, k_in) * k_out * k_experts;
-            inventory.total_size += tensors[i].size;
-        }
-        inventory.tensors       = tensors;
-        inventory.count         = 3;
-        inventory.n_expert      = k_experts;
-        inventory.n_expert_used = k_used;
-        inventory.n_layer       = 1;
-        inventory.n_ctx         = n_ctx;
-        inventory.n_ubatch      = n_ubatch;
+std::string fixture_split_path(ggml_type type, fixture_variant variant) {
+    return std::string("test-moe-pp-batched-dequant-") + ggml_type_name(type) + "-" +
+           std::to_string(static_cast<int>(variant)) + ".gguf";
+}
 
-        const size_t woq_slot = align_256(size_t(k_out) * (k_in / 2)) + align_256(size_t(k_in / 32) * k_out);
-        inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * k_experts;
-        // One scratch row: k_in half floats in, k_out floats out. The backend sizes the activation and output slots
-        // from these and the expert counts, so the loader leaves both slots 0 and plans only the weight slot.
-        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_in) * sizeof(ggml_fp16_t);
-        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_out) * sizeof(float);
-        inventory.pp_moe_onednn_activation_slot_bytes    = 0;
-        inventory.pp_moe_onednn_output_slot_bytes        = 0;
-        inventory.pp_moe_onednn_ring_depth               = 1;
-        inventory.pp_moe_onednn_scratch_bytes            = inventory.pp_moe_onednn_weight_slot_bytes;
+std::function<void(std::vector<uint8_t> &)> fixture_rewrite(fixture_variant variant) {
+    if (variant == fixture_variant::SMALL_SCALES) {
+        return [](std::vector<uint8_t> & bytes) {
+            rewrite_nvfp4_scales(bytes, k_small_scales, sizeof(k_small_scales));
+        };
     }
-};
-
-// The model lifecycle a real load drives, through the public entry points: stage the inventory plan, load the
-// weights, commit the load (its preload materializes the experts), activate the plan, and bind an execution context
-// and the runtime context to a backend on the pinned card.
-struct lifecycle_fixture {
-    ggml_backend_t            backend = nullptr;
-    ggml_sycl_load_txn        load{};
-    bool                      load_open = false;
-    ggml_sycl_model_token     model{};
-    ggml_sycl_exec_context_id context{};
-    ggml_context *            weight_ctx    = nullptr;
-    ggml_backend_buffer_t     weight_buffer = nullptr;
-    ggml_tensor *             gate          = nullptr;  // the loaded expert tensor every case runs
-    std::vector<uint8_t>      gate_bytes;               // its quantized bytes, for the CPU reference
-
-    lifecycle_fixture(ggml_type type, std::mt19937 & rng, uint32_t n_ubatch = k_n_ubatch) {
-        try {
-            require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
-            load_open = true;
-            expert_inventory fixture(type, n_ubatch);
-            const auto       stage =
-                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
-            require(stage == GGML_SYCL_LIFECYCLE_OK,
-                    "inventory staging result=" + std::to_string(static_cast<int>(stage)));
-            // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue
-            // lookup cannot observe a transient context that was cleared.
-            backend = ggml_backend_sycl_init(0);
-            require(backend != nullptr, "ggml_backend_sycl_init(0) returned null");
-            load_weights(type, rng);
-            const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
-            if (commit != GGML_SYCL_LIFECYCLE_BUSY) {
-                load_open = false;
-            }
-            require(commit == GGML_SYCL_LIFECYCLE_OK, "load commit result=" + std::to_string(static_cast<int>(commit)));
-            require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK, "plan activation failed");
-            require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
-                    "context create failed");
-            require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
-                    "context bind failed");
-            require(ggml_backend_sycl_set_runtime_context_for_model(
-                        backend, model, std::max(k_n_ctx, n_ubatch), n_ubatch, 1,
-                        /*kv_unified=*/false, /*swa_full=*/false,
-                        /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
-                    "runtime context bind failed");
-        } catch (...) {
-            cleanup();
-            throw;
-        }
+    if (variant == fixture_variant::LARGE_SCALES) {
+        return [](std::vector<uint8_t> & bytes) {
+            rewrite_nvfp4_scales(bytes, k_large_scales, sizeof(k_large_scales));
+        };
     }
+    return {};
+}
 
-    // What libllama's loader does for each weight, in its order: create the tensor and register its split's file
-    // identity, its own identity, its host-weight row (only while weights are evictable, as the loader gates it) and
-    // its usage while the load is open (register_sycl_tensor_metadata in src/llama-model-loader.cpp), allocate the
-    // tensors in the device's SYCL host buffer type, then fill them. The one split is named per type, so no two
-    // cases' weights share a file identity.
-    void load_weights(ggml_type type, std::mt19937 & rng) {
-        ggml_init_params params = { 3 * ggml_tensor_overhead(), nullptr, true };
-        weight_ctx              = ggml_init(params);
-        require(weight_ctx != nullptr, "ggml_init for the weights failed");
-        ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
-        ggml_tensor *      tensors[3] = {};
-        const std::string  split_path = std::string("test-moe-pp-batched-dequant-") + ggml_type_name(type) + ".gguf";
-        for (int i = 0; i < 3; ++i) {
-            tensors[i] = ggml_new_tensor_3d(weight_ctx, type, k_in, k_out, k_experts);
-            ggml_set_name(tensors[i], k_tensor_names[i]);
-            const size_t nbytes = ggml_nbytes(tensors[i]);
-            ggml_backend_sycl_register_gguf_file_identity(0, split_path.c_str(), uint64_t(3 * nbytes));
-            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
-            if (ggml_backend_sycl_weights_evictable()) {
-                ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
-            }
-            require(ggml_backend_sycl_try_register_weight_usage(k_tensor_names[i],
-                                                                GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
-                    std::string("usage registration refused for ") + k_tensor_names[i]);
-        }
-        ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
-        require(buft != nullptr, "no SYCL host buffer type for the pinned card");
-        weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
-        require(weight_buffer != nullptr, "host weight buffer allocation failed");
-        ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        // One quantization serves all three tensors: only the gate runs, and the single-threaded IQ quantizers
-        // (IQ2_S, IQ1_M) dominate the test's time.
-        gate_bytes = make_weights(type, rng);
-        for (int i = 0; i < 3; ++i) {
-            ggml_backend_tensor_set(tensors[i], gate_bytes.data(), 0, gate_bytes.size());
-        }
-        gate = tensors[0];
-    }
-
-    void cleanup() noexcept {
-        ggml_sycl_exec_drain_ticket             ticket{};
-        ggml_sycl_exec_control_host_alloc_batch batch{};
-        if (context.value &&
-            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
-            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
-                GGML_SYCL_EXECUTION_OK) {
-            (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
-            (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
-        }
-        context = {};
-        // libllama frees the model's buffers before it reports the model unloaded (llama_model's destructor).
-        if (weight_buffer) {
-            ggml_backend_buffer_free(weight_buffer);
-            weight_buffer = nullptr;
-        }
-        if (weight_ctx) {
-            ggml_free(weight_ctx);
-            weight_ctx = nullptr;
-        }
-        gate = nullptr;
-        if (model.model_id) {
-            (void) ggml_backend_sycl_model_unloaded_token(model);
-            model = {};
-        } else if (load_open) {
-            (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
-            load_open = false;
-        }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
-    }
-
-    ~lifecycle_fixture() { cleanup(); }
+struct lifecycle_fixture : moe_planned_fixture::planned_model {
+    lifecycle_fixture(ggml_type       type,
+                      std::mt19937 &  rng,
+                      uint32_t        n_ubatch = k_n_ubatch,
+                      fixture_variant variant  = fixture_variant::PLAIN) :
+        planned_model(fixture_shape(type, n_ubatch, variant),
+                      fixture_split_path(type, variant),
+                      rng,
+                      fixture_rewrite(variant)) {}
 };
 
 ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft,
@@ -538,6 +462,7 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     const size_t       refused   = g_log.count_since(from, { "[PP-MOE] refused" });
     const size_t       prompt_rf = g_log.count_since(from, { "[MOE-PROMPT-REFUSAL]" });
     const size_t       unplanned = g_log.count_since(from, { "refusing unplanned PP MoE oneDNN batched scratch" });
+    const size_t       reentered = g_log.count_since(from, { "direct MMID route re-entered" });
     const size_t       groups    = g_log.min_field_since(from, "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", "groups=");
 
     // The rest of the group plan the success line names, and what a cap must give: every case activates all k_experts
@@ -560,7 +485,7 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
         // Unreachable while the static_assert above holds, but a cap reached would otherwise read as a skip.
         why += batch_all >= size_t(k_route_log_cap) ? " route-log-cap" : " executor-did-not-run";
     }
-    if (refused != 0 || prompt_rf != 0 || unplanned != 0) {
+    if (refused != 0 || prompt_rf != 0 || unplanned != 0 || reentered != 0) {
         why += " refusal";
     }
     // A success line with no groups= field fails too: the parse returns SIZE_MAX for it, which no minimum catches.
@@ -578,9 +503,9 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     std::fprintf(stderr,
                  "CASE type=%s tokens=%d ne11=%d cap=%d status=%d nmse=%.3e pp_moe_lines=%zu pp_moe_total=%zu "
                  "batched_lines=%zu groups=%zu group_experts=%zu buffers=%zu pp_moe_refused=%zu prompt_refusal=%zu "
-                 "unplanned_scratch=%zu -> %s%s\n",
+                 "unplanned_scratch=%zu direct_reentry=%zu -> %s%s\n",
                  type_name.c_str(), c.n_tokens, c.ne11, group_cap, static_cast<int>(status), err, pp_moe, pp_total,
-                 batched, shown(groups), shown(group_experts), shown(buffers), refused, prompt_rf, unplanned,
+                 batched, shown(groups), shown(group_experts), shown(buffers), refused, prompt_rf, unplanned, reentered,
                  why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
@@ -709,6 +634,20 @@ int main(int argc, char ** argv) {
                 ++failed;
             }
             if (!run_case(life, cpu.get(), make_case(type, 300, k_used, rng), false, 0)) {
+                ++failed;
+            }
+        }
+        // After NVFP4's plain fixture, so its [PP-MOE] line has printed and none of these may print another.
+        for (fixture_variant variant : k_nvfp4_variants) {
+            lifecycle_fixture life(GGML_TYPE_NVFP4, rng, k_n_ubatch, variant);
+            if (!run_case(life, cpu.get(), make_case(GGML_TYPE_NVFP4, 64, 1, rng), false, 0)) {
+                ++failed;
+            }
+        }
+        // After each type's plain fixture, for the same reason.
+        for (ggml_type type : k_fused_other_types) {
+            lifecycle_fixture life(type, rng, k_n_ubatch, fixture_variant::FUSED_GATE_UP);
+            if (!run_case(life, cpu.get(), make_case(type, 64, 1, rng), false, 0)) {
                 ++failed;
             }
         }

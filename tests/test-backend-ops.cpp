@@ -9940,6 +9940,29 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
+// KQ scale 1.0 instead of 1/sqrt(hsk), as passed by models that pre-scale Q
+struct test_flash_attn_ext_kq_scale : public test_flash_attn_ext {
+    static constexpr float kq_scale = 1.0f;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",kq_scale=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ref = test_flash_attn_ext::build_graph(ctx);
+        ggml_set_name(ref, "ref");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, ref->src[0], ref->src[1], ref->src[2], ref->src[3], kq_scale, max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(out, ref->src[4]);
+        ggml_prec_set_acc(out, prec);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -14309,6 +14332,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 4));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {4, 1}, 512, 3, true, true, 8, 10, GGML_PREC_F32,
         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 4));
+
+    // Fork note (llama.cpp-44d0): per-head masks without sinks at prompt batch sizes, the shapes that
+    // reach the SYCL backend's oneDNN SDPA and tile_d512 routes; mask_heads=1 is each arm's control.
+
+    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) without sinks
+    for (int nq : {32, 35}) {
+        for (int mh : {1, 2, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+        for (int mh : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+    }
+    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) without sinks, D=512, default and pre-scaled-Q KQ scale
+    for (int nq : {32, 35}) {
+        for (int mh : {1, 2, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+            test_cases.emplace_back(new test_flash_attn_ext_kq_scale(512, 512, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+        for (int mh : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+            test_cases.emplace_back(new test_flash_attn_ext_kq_scale(512, 512, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+    }
 
     // FLASH_ATTN_EXT: large logits
     test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

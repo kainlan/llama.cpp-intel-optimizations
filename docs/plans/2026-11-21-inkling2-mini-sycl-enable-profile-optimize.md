@@ -624,6 +624,10 @@ substrings, so the prompt-scratch sizing loop at `:476-485` never sees its dimen
 (`ggml/src/ggml-sycl/ggml-sycl.cpp:7131`). This task makes the loader agree and puts the name test where a unit test
 can reach it.
 
+**LANDED WITH TASK 21 (2026-11-24).** Task 21 gives fused NVFP4 prompt nodes the executor that uses the ring, the
+second branch of the decision rule below, so this change lands with it: ported by hand from `98c3d4bc2` onto
+`task/inkling2-t21`, with the four Minor findings settled (see Task 21's step 1 record).
+
 **HELD 2026-11-21 (lead ruling after quality review). Implemented on `task/inkling2-t5` (`98c3d4bc2`), reviewed, NOT
 merged.** The code does what this task says. The task's premise is not established, and two statements in it are
 wrong:
@@ -6406,9 +6410,10 @@ merges master into the line: `331457e43` (with Tasks 18 and 19), `186ebed61` (on
   872.5 / 35.7 against 873.0 / 35.7 and 872.7 / 35.8.
 
 **The long real-text arm (user direction, 2026-11-24: "we should test things with longer prompts so we actually
-exercise real usage").** A 4,737-token document (5,037 in Mistral's tokenizer) and 255 generated tokens, seed 42, temperature 0, through the
-completion tool (Inkling, Mistral) or the chat tool (GPT-OSS). From now on every verification round of this plan
-carries this arm. Runner: the lead's `run-long.sh`; it becomes a script in `scripts/` when Task 21 lands.
+exercise real usage").** A 4,737-token document (5,037 in Mistral's tokenizer) and 255 generated tokens, seed 42,
+temperature 0, through the completion tool (Inkling, Mistral) or the chat tool (GPT-OSS). From now on every
+verification round of this plan carries this arm. Runner: the lead's `run-long.sh`; it becomes a script in
+`scripts/` when Task 21 lands.
 
 | model, setup | before | integrated |
 |---|---|---|
@@ -6510,9 +6515,329 @@ with no case changing; the two contract sweeps with no new red; the interleaved 
 tree; the same long arm on the B50 alone and on both cards. No `-ngl`, no context shrink, no new host wait, no
 allocation outside the unified cache.
 
+**Lead rulings after the checkpoint (2026-11-24).** Step 1 acceptance: the long arm on the B70 at least 1.25x the
+92 t/s; the NVFP4 expert device time per 512-token micro-batch from the kernel profiler; text byte-equal run to run;
+decode not slower; peak host backing not higher; the B50 alone and both cards not slower. Per-dispatch conversion
+into planned, cache-owned scratch is allowed for prompts; the F16 arm is scaffolding and the weight-only-quantised arm
+is the target; AoS stays the only layout; decode is untouched. `MOE_TENSOR_GATE_UP` is its own role: every
+role-indexed array grows with it, every switch names it with no default arm, and the pair-GLU does not apply to it.
+NVFP4 is not staged: `moe_pp_batched_takes_staged_type` excludes it through `moe_type_has_immutable_host_recipe`,
+and the B50 host route, the CPU-island refusal and the host recipe pools do not change. No new host wait, no
+allocation outside the unified cache, and the leases and the ring claim are held until the done event. The ring
+order (R5): option A, as its own step 1d after steps a, b and c (below). The route seam: the direct route steps aside
+for a prompt node only when the claim holds and the device has a planned ring weight slot; a decline the executor
+reports before its first submission re-enters the direct route; a failure after it throws with a named reason.
+
+**Step 1, a to c (implementer's record, 2026-11-24, `task/inkling2-t21`).**
+- (a) `MOE_TENSOR_GATE_UP` is role 3 and `MOE_TENSOR_UNKNOWN` moved to 4; the profile's role arrays are sized
+  `UNKNOWN + 1`. The classifier tests the fused name first. Both switches on the role name it with no default; the
+  group registry breaks for it (a fused block is registered, never complete). The executor's resident claim admits
+  it, its staged claim does not (the ring's windows stage the separate gate, up and down host matrices only). The
+  routed-expert count counts it as a block's counting tensor. The paired gate/up paths do not take it: the bundle and
+  single-XMX helpers name GATE and UP alone, and the pair scan, which records a fused weight as `gate_weight` by its
+  `ffn_gate` prefix, matches a GLU only to a layer with an up output, which a fused layer never has. How Inkling's
+  graph consumes the fused output: `src/models/inkling2.cpp:397-410` builds the MoE through `build_moe_ffn` with
+  the fused weight and no separate gate or up weight. There one `MUL_MAT_ID` of the fused weight (with the NVFP4
+  BF16-accumulation request and the per-expert scale multiply of `build_lora_mm_id`) is split into a gate view and
+  an up view (`src/llama-graph.cpp:2544-2558`), and `LLM_FFN_SITU` activates them as a chain of scale, tanh,
+  sigmoid and mul ops (`:2615`), not a `GLU` op, so no pair-GLU pattern exists for the scan to find.
+- (b) NVFP4 is in the executor's f16 table at AOS (the `convert.cpp` NVFP4 dequant to f16) and in the ring's served
+  types, and not in the staged-type predicate (`moe_type_has_immutable_host_recipe` moved to
+  `moe-mmvq-tables.hpp`, which both predicates read).
+- (c) The loader names the fused tensor: Task 5's `src/llama-sycl-expert-names.h`, ported by hand from `98c3d4bc2`
+  with its four review findings settled (the header's `.bias` comment corrected, the sizing loop calls the name test
+  with no wrapper, a negative check for `ffn_norm_exps`, and grovemoe's `_chexps` left out on purpose, with a
+  negative check: the executor's claim does not take them).
+- The seam. `moe_mmid_direct_defers_to_executor` (prompt, claim, planned ring weight slot) makes the direct route
+  step aside. A decline before the executor's first submission returns false, and so does a prompt row-map staging
+  that does not fit (the direct route needs no row map); either way the pass asks for a second pass through one
+  helper, `request_direct_reentry`, which warns once per (device, cause), "[PP-MOE] direct MMID route re-entered"
+  (the row-map cause reads `row-map-staging`), and `ggml_sycl_mul_mat_id_with_direct_reentry` runs the second pass
+  once the first has unwound, with the claim answering false for the node's weight, so the node takes the route it
+  took before. No other prompt dispatch takes a deferred node: the planned-local batched MMVQ try, which runs ahead
+  of the executor under two GPUs or `GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED=1`, skips it. The first pass is not
+  free of device work: it may have submitted the row-map copy, and its ready guard submits a queue sync event as
+  dst's ready event on the way out; neither writes dst, and the second pass publishes its own. It releases the ring
+  slot claim and the expert leases on unwind; the ids snapshot and the prompt admission stay cached and the second
+  pass reads them with no device wait. A decline after the first submission, or a GEMM-stage failure, throws with a
+  named reason. A re-entered node is counted once: the routed-expert count skips the second pass, and so do the MMID
+  entry's other per-call counts (the decode-route census, the whole-call host timer, the MXFP4 prompt profile's
+  whole span and phase marks, and the MoE profile's per-layer and per-role op counts), while every timer adds both
+  passes' time. Pinned by `test-sycl-moe-gate-up-role-source`.
+- Device test for the lead: `test-moe-pp-batched-dequant` runs NVFP4 on the plain fixture, on a fused gate_up
+  fixture, and on two fixtures whose UE4M3 scale bytes are all rewritten (zero, subnormals, 0x7f and sign-set forms;
+  the largest finite values), and Q8_0 on a fused gate_up fixture, against the CPU at NMSE <= 5e-4, and fails a case
+  that printed the re-entry line. It does not arm the row-map re-entry (the staging failpoint lives in the private
+  fixture objects, which it does not link); `test-moe-pp-staging-refusal --direct-reentry` does (r7, below).
+- Which models store the fused tensor (the lead's header dump, 2026-11-24): only Inkling 2 Mini stores
+  `ffn_gate_up_exps`. Qwen 1.5 MoE, the Qwen3.8 Flash Next MTP and GSQ-RCO files, Qwen3.6-35B NVFP4, DeepSeek V4 and
+  V4.1 and GPT-OSS store separate gate, up and down tensors; the first two shards of the plain Qwen3.8 Q8_0 split
+  held no expert tensor and the later shards were not read. The role stays general (the resident claim takes it for
+  every executor type), hence the Q8_0 fused case.
+- RED evidence, said exactly: `tests/test-sycl-moe-mmvq-tables.cpp` cases 17 and 18 and
+  `tests/test-load-measure-guards.cpp:1241-1256` were red on the base by failing to compile (the names they call did
+  not exist yet), not by a failed assertion.
+- The spec review of a to c (2026-11-24) passed with eight minor findings; the seven that asked for a change are in
+  the bullets above, and the UE4M3 special-scale fixtures and the 0xFF owed note, outside the brief, were accepted.
+
+**Step 1d (R5 final, 2026-11-24; wording amended after the second spec review, clause (d) added after the Qwen B50 row
+and restated on the WEIGHT zone after the spec re-review of `99b141f198`).** Measured first: on the B50 alone, the a-c
+build served 10774.6 MB of experts from the host mapping where the base served 10215.0 MB, the CPU layers started at 14
+instead of 15, and the long arm lost pp 17.32 -> 16.46 and tg 7.00 -> 6.56 t/s, though the ring served nodes there. The
+rule, its clauses (a) to (d) and where (d) fails, is the header comment of `moe-ring-consumer.hpp`; what was measured is
+in `sycl-memory-design.md` ("A resident-only ring that displaces experts is dropped where that returns room"). The drop
+set today is NVFP4 alone, so a model with IQ experts that overflow a card still pays the ring's room, a known cost owed
+below. (d) exists because of the Qwen3.6-35B NVFP4 B50 row: the `69c4ea428` runs printed its RUNTIME zone, which another
+consumer sizes, at 726.4 MB with the ring and without it, a drop there that returned nothing. That line was the load's
+early pass; the late pass holds 1147.4 MB with the ring and its drop returns 421.0 MB (the lead's runs at `f011d5d1f2`),
+so (d) keeps the early pass's ring and lets the late pass drop it. (d) reads the WEIGHT room as the planner that made
+the plan reads it, not the RUNTIME zone, because a smaller RUNTIME zone returns nothing to the weights where another
+zone takes the room (the SCRATCH zone's MoE MMVQ bound is held to the room beside RUNTIME), where a rebuild that falls
+back from one chunk to several carves a KV share out of the WEIGHT zone, or where the planner reads no WEIGHT zone (a
+multi-device plan in GLOBAL cache mode packs every device to its budget). A drop always means the ring published as 0,
+the arena rebuilt with a smaller RUNTIME zone and a larger WEIGHT zone (only an arena with no live allocations is
+rebuilt, and that rebuild keeps SCRATCH and ONEDNN as built), and the plan made once more, and that plan is final even
+if it then holds every expert (those nodes take the direct route, as on master). The drop WARN names the device, the
+ring MB released, the host-planned expert count that caused it, the rebuilt RUNTIME zone and the WEIGHT zone before and
+after. In every other case the ring stays published as it was and the first plan stands, with no second plan: one INFO
+line where no room returns; one WARN where the arena has live allocations (kept because held), with the experts' worth
+of room the ring displaces in that load; and one WARN where a give-back rebuilt the arena but the WEIGHT room did not
+grow, after the ring is put back and the zones are asked for again with it. That second ensure can land in another
+layout, so where it leaves less WEIGHT room than the first plan was packed against, the device is planned once more with
+the ring, and that plan is final. The stage and the dry run call one decision function, read the RUNTIME zone with the
+ring through one capped helper, and ask one predicate whether a drop can return room
+(`moe_pp_ring_drop_can_return_room`, since r7). The reason: a resident-only ring that displaces an expert trades prompt
+room for a decode loss on every token, and on the B50 it lost on the prompt too. The plans that change are those with
+NVFP4 experts that overflow a card, whose zones beside WEIGHT the ring enlarges by room the WEIGHT zone takes back once
+it is gone, and whose arena nothing points into. Two are measured on the B50: Inkling 2 Mini (rebuilt at 512.0 MB, final
+plan equal to base's) and Qwen3.6-35B NVFP4, which keeps its ring in the load's early pass (no RUNTIME room there) and
+drops it in the late one (RUNTIME rebuilt at 726.4 MB, 421.0 MB less, final plan equal to base's).
+
+What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead's to verify):
+- The decision is data: `moe_pp_ring_uses_of_type` (`moe-mmvq-tables.hpp`) names each type's ring uses from the
+  executors' own tables, and `moe_pp_ring_check_resident_only` (`moe-ring-consumer.hpp`, new) answers on a plan:
+  resident-only only when every ring weight's use is RESIDENT alone, routed only when every one also has another
+  device prompt route (`moe_mmid_direct_route_runs_type`, now defined once in `moe-mmvq-tables.hpp` for the route's
+  admissions, the hybrid decode record build and the ring), and then every expert the plan does not place on a
+  device, by the plan's own convention (`placement_plan::expert_on_device`: a missing entry is host or miss).
+  `tests/test-sycl-moe-ring-consumer.cpp` (new, host-only) runs the ruling's cases on synthetic plans: Inkling all on
+  device keeps, one expert on the host drops, 14 of 24 layers resident drops, experts the plan lacks and fallback
+  entries on the host count, NVFP4 in the gate/up/down shape drops, each of IQ1_S, IQ1_M and IQ4_XS with host
+  experts keeps (named, with the reason), an IQ4_XS weight beside NVFP4 ones keeps, Qwen host-tiered and all-host
+  keep, GPT-OSS hybrid and resident keep, a staged weight beside NVFP4 keeps, Q1_0 asks nothing, and the drop marks.
+  `test-sycl-moe-mmvq-tables` case 19 pins the ring-use mask of every type by name (a live type outside its table
+  fails as unlisted, a removed slot reaches none) and the resident-only set and the drop set. The backend asks it
+  through one function, `ggml_sycl_plan_ring_resident_check`, which the stage's
+  `ggml_sycl_stage_drop_displacing_ring` and the dry run's `ggml_sycl_plan_dry_run_drop_displacing_ring` call.
+- A plain re-ensure gives nothing back: an arena that holds every zone is kept as built however much larger it is.
+  So the ensure takes an opt-in, `zone_arena_ensure_options::give_back`: an arena with a RUNTIME surplus
+  (`zone_arena_runtime_surplus`) is rebuilt with SCRATCH and ONEDNN as built and RUNTIME at the plan's
+  (`zone_arena_give_back_sizes`, test-zone-sizing Case 51) when nothing points into it, and kept, marked held,
+  otherwise. An arena with no surplus, or whose plan without the ring needs another zone larger than built, is kept
+  as built: a give-back never takes the ordinary rebuild, so the room RUNTIME gives up goes to the WEIGHT zone or
+  nowhere, never to SCRATCH (`test-sycl-onednn-zone-keep-source`, and the ring-drop contract's mutant that restores
+  the old keep condition). Only the ring decision asks for it, and only where the ring takes RUNTIME room. Both ends
+  keep the DIRECT cap's snapshot as a kept arena does (`test-sycl-onednn-zone-keep-source`'s cap claim now counts
+  five keeps). The drop's re-plan is the one other plan without the micro-batch room
+  (`test-sycl-explicit-ubatch-placement-source` counts it).
+- Before that ensure the decision publishes the device as a model with no ring consumer plans it: the dense scratch at
+  the planning shape (an explicit micro-batch's placement may have moved it), the ring 0, and the planner terms as
+  they were before the plans made with the ring, so the zones are asked for what master's ensure asked.
+- Clause (d) (after the Qwen B50 row, 2026-11-24; restated on the WEIGHT zone after the spec re-review of
+  `99b141f198`). `moe_pp_ring_decide` (`moe-ring-consumer.hpp`, pure) names each outcome on the arena's answer
+  (`moe_pp_ring_zone_answer`: the WEIGHT zone with the ring and without it, and held), held asked first. Since r7 it
+  answers (d) alone, (a) to (c) being `displaces_experts()`, asked before it, so `moe_pp_ring_decision` is
+  KEEP_NO_ROOM_RETURNS, KEEP_HELD and DROP. The stage reads the RUNTIME zone with the
+  ring through `ggml_sycl_ring_runtime_with_ring_bytes` (`moe_pp_ring_runtime_with_ring`: the planned zone no more
+  than the arena's, and with no arena an unanswerable figure read as the floor the ensure keeps), then without it;
+  where the ring takes no RUNTIME room there (`moe_pp_ring_runtime_room`) or there is no arena, the arena is asked
+  nothing and the ring is kept. Otherwise it reads the WEIGHT zone, asks the ensure with the give-back, and reads
+  the WEIGHT zone again. Every keep puts back what the plan made with the ring published
+  (`ggml_sycl_stage_ring_published`: the ring and planner groups by `load_published_terms::restore`, the dense
+  scratch re-planned at the ring's micro-batch, the inventory's copy of the ring), so the first plan stands on the
+  terms it was made with; a keep marks nothing. Where the give-back rebuilt the arena and the ring is kept, the
+  stage then asks the zones again with the ring (no give-back), and a refusal there refuses the load, so the arena
+  and the published ring agree. That second ensure is an ordinary rebuild for the plan with the ring, not a restore
+  of the arena from before the drop: SCRATCH and ONEDNN come back at the plan's sizes, and the ONEDNN zone plan and
+  the DIRECT cap's snapshot are taken again. A reserve that changes layout takes that path (a B50 reserve right
+  after a destroy has fallen back to two chunks); it has not run, and the third review's fixes below plan again where
+  it leaves less WEIGHT room. The no-room keep logs one INFO line with the RUNTIME
+  room and both WEIGHT figures; the held keep one WARN with the room and the experts' worth of it
+  (`moe_pp_ring_experts_worth`, the room over the ring weights' mean expert size); the keep after a give-back one
+  WARN with both WEIGHT figures. The dry run reads the same capped figure (it read an unanswerable zone uncapped,
+  about 1.8e13 MB of room, and dropped), answers as an unheld give-back on an arena whose layout it keeps
+  (`moe_pp_ring_dry_run_answer`),
+  puts the ring and the planner terms back where it keeps, and its drop line says it cannot see a plan that would
+  grow another zone. `test-sycl-moe-ring-consumer` names every outcome on a model of the arena's zones (premises
+  except the Inkling B50 RUNTIME figures and, since the third review, the Qwen B50 early pass's 726 MiB and late
+  pass's 1147 MiB with the ring and 726 MiB after the drop) and
+  the shared cap; the ring-drop contract pins the put-back on both keep paths and the second ensure, and its mutants
+  make fail a keep that leaves the ring published as 0, a drop decided on the RUNTIME zone, an uncapped dry run or
+  stage, a missing second ensure, and a give-back that takes the ordinary rebuild.
+- The drop holds for the load: a load plans each device at its early and late pass, and each intake publishes the
+  ring again. The stage marks the device with the load transaction that dropped its ring (`moe_pp_ring_drop_marks`),
+  and the late pass publishes none before its entry ensure, so the given-back zone is not asked for again. A direct
+  planner entry (no transaction) marks nothing, so it never erases a load's mark, and decides afresh at each pass. A
+  mark is keyed by its load's transaction, so one a failed or finished load left is never read as a later load's.
+  One slot per device is enough because one load is open at a time: the lifecycle registry refuses a second begin
+  while a load is open (`LOAD_BUSY`, `Registry::begin_outer`), so the load that would overwrite an open load's mark
+  is refused, never interleaved.
+- Deviation from the checkpoint's sketch: no per-type "serves" functions and no plan-method refactor. The checkpoint
+  sketched both for a decision the plan would make; the ruling puts the decision after the plan, on what the plan
+  placed, so the uses table and one rule over the plan's index carry it.
+- `tests/test-sycl-moe-ring-drop-source.py` (new) pins the uses, the one direct-route type set, the rule, the weight
+  list's filter, the one decision, the stage's order and the held WARN's wording, the one give-back writer, both call
+  sites, the drop marks and the late pass's republish, the dry run's two sites, the cache's give-back and the zone
+  rules. `test-sycl-moe-gate-up-role-source` follows the direct-route rename at its two route pins.
+- The second spec review's fixes (2026-11-24): the static-storage inventory gains the drop marks' row (it had no row
+  for the first form, so `test-sycl-static-storage-audit` was red on the branch); the drop set is NVFP4 alone, by the
+  (b) clause above; the check counts a missing or host fallback entry as on the host; a direct planner entry marks
+  nothing; the held WARN says what is known (the arena has live allocations, so it is not rebuilt and the ring's room
+  does not return to the experts in this load) and guesses no holder, and clause (d) above turned that case into a
+  keep whose WARN says the same; `sycl-memory-design.md` separates what is
+  verified on the host from the device rows. The drop WARN also says that the plan lines above it, from the plan
+  made with the ring, describe a plan that is not kept. Three source contracts follow the step's changes, each made
+  stronger: every kept-zone exit by name (`test-sycl-onednn-pp-scratch-plan-source`), the sixth set-planned site
+  (`test-sycl-pp-moe-scratch-admission-contract`), and every zone ensure on the plan path refusing by name, the
+  drop's included (`test-sycl-load-zone-refusal-source`).
+- On a card, the lead's chain on 69c4ea428 (the step before the second review's fixes, which change no NVFP4
+  decision, and before clause (d) and its WEIGHT measure, which change the Qwen B50 one and keep the Inkling B50
+  drop only where its give-back rebuilt one chunk with SCRATCH as built): Inkling on the B50 alone drops the ring
+  (558.6 MB, 908 host experts), rebuilds RUNTIME 46.6 MB smaller, and its late pass gives the base plan line (10215.0
+  MB from the mapping) with text byte-equal to base; Inkling on the B70 and on both cards keeps the ring; the count
+  gates pass. Qwen3.6-35B NVFP4 on the B50 dropped the ring with "no room to give back" (RUNTIME 726.4 MB with and
+  without it), final plan 6572.8 MB as base, text byte-equal; on the B70 it kept the ring, text differing from base
+  inside the summary and reading right. Prompt / decode t/s, new against base: Inkling both cards 160.92 / 25.80
+  against 91.29 / 26.02, B70 160.89 / 26.13; Inkling B50 15.17 / 7.38 against 17.76 / 4.74 (not a speed verdict:
+  builders alive); Qwen B70 74.37 / 14.31 against 68.07 / 14.31; Qwen B50 25.02 / 7.81 against 23.94 / 7.52. The rows
+  are in the lead's record, `docs/backend/data/inkling2/t21-lead-rulings.md`, and in `sycl-memory-design.md` except
+  Qwen on the B50, a drop that (d) no longer makes (r7 (8) and r8 (2), below). Not yet on a card: any path of (d) as it
+  now reads (the drop on the WEIGHT zone, the keep where SCRATCH would grow, the keep after a give-back rebuild, the
+  held arena, and the no-room keep Qwen on the B50 should take), the multi-device drop (opt-in
+  `GGML_SYCL_MOE_MULTI_GPU`), the dry run's lines, and an Inkling B50 pp/tg pair with no builders alive. Not known: why
+  the B70 prompt gains 9% on Qwen and 75% on Inkling. The dry run gives no zone back, so where a load's give-back
+  rebuilds RUNTIME smaller, the load's last plan can place more experts on the device than the dry run reports.
+- On a card, the lead's chain on `f011d5d1f2` (clause (d) on the WEIGHT zone, before the third review's fixes;
+  correctness only, since another session built through every arm; `docs/backend/data/inkling2/t21-lead-rulings.md`,
+  "The WEIGHT-zone rule on the cards", on this branch): Inkling on the B50 drops the ring (RUNTIME rebuilt at 512.0
+  MB, 46.6 MB less, WEIGHT zone 12579.9 to 12626.5 MB), final plan 10215.0 MB as base, text byte-equal to base.
+  Qwen3.6-35B NVFP4 on the B50 keeps the ring in the early pass (INFO only) and drops it in the late pass (RUNTIME
+  rebuilt at 726.4 MB, 421.0 MB less, WEIGHT zone 12164.6 to 12585.6 MB), final plan 6572.8 MB as base, text
+  byte-equal to base. Inkling on the B70 and on both cards: no drop line, text unchanged from `69c4ea428`. Qwen
+  perplexity on the B70 15.7449 +/- 0.6004 against base 15.7496 +/- 0.6006. The three B50 device tests and the five
+  gates pass. The rows are in `sycl-memory-design.md`.
+- The third spec review's fixes (r6, 2026-11-25). (1) An arena of several chunks is not dormant: the B70's always is
+  one (30552 MB against a 29472 MB cap), and a B50 reserve right after a destroy has fallen back to one, whose WEIGHT
+  zone is the 128 MiB KV share smaller; only a tail chunk at its cap is dormant (the tail is the zones beside WEIGHT
+  and at most 512 MiB of KV share). A plan must never stand against a WEIGHT zone smaller than the one it was packed
+  for (materialization refuses the planned expert the zone cannot hold and the S1 preload aborts the load), so after
+  a kept give-back rebuild the stage reads the WEIGHT room again and, where it is less than the plan was packed
+  against (`moe_pp_ring_kept_plan_again`), answers `KEPT_PLAN_AGAIN`: both callers plan once more with the ring (the
+  single-device one with the room its candidate held). (2) A give-back kept as built because its plan needs a zone
+  larger than built stores no ONEDNN zone plan: nothing changed, and the live plan would describe room the zone does
+  not hold (`test-sycl-onednn-pp-scratch-plan-source` pins it with a mutant). (4) The stage and the dry run decide
+  (d) on the figure the plan's planner reads (`ggml_sycl_ring_plan_weight_room`, `ggml_sycl_ring_planner_reads_zone`):
+  a multi-device plan in GLOBAL cache mode packs every device to its budget and reads no WEIGHT zone, so a drop
+  returns no room it sees and the ring is kept (AUTO is PER_DEVICE for more than one GPU, so unaffected). The
+  ring-drop contract adds S5: each pass decides afresh, so the late pass may drop a ring the early pass kept, as Qwen
+  on the B50 does, and the early keep leaves no mark, no changed term and no changed arena for the late drop to count
+  again. Not yet run on a card: all three.
+- The fourth review's fixes (r7, 2026-11-25; quality review of `dd59d8710..54acaaa5e1`).
+  (1) The direct route's re-entry has a device test: `test-moe-pp-staging-refusal --direct-reentry`, registered as
+  `test-moe-pp-staging-refusal-direct-reentry` (labels `sycl;moe;device;B50;model`, `level_zero:1`, run serial; the
+  lead runs it: `ctest --test-dir build -R '^test-moe-pp-staging-refusal-direct-reentry$' --output-on-failure`).
+  On an NVFP4 fixture planned with a ring weight slot it builds two `MUL_MAT_ID` nodes on one weight and runs them
+  four times, graph replay off: unarmed (both take the executor), with
+  `GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING` armed (the first node, deferred, re-enters the direct route
+  with one WARN naming `cause=row-map-staging`; the second, unarmed, takes the executor, so the refusal does not
+  persist), armed again (the same device and cause print no second WARN), and unarmed. Each run checks both nodes'
+  dst against the CPU at NMSE <= 5e-4, the failpoint's consumption, the executor's lines, the direct route's
+  candidate, admit, submit and terminal counts, and that no refusal line printed. Exit 77 (skipped: no SYCL GPU,
+  more than one card visible, or the fixture's weights not evictable) measures nothing. The other re-entry cause, an
+  executor decline before its first submission, has no failpoint, so no device test reaches it.
+  (3) (d)'s first question is one predicate, `moe_pp_ring_drop_can_return_room` (WEIGHT room and RUNTIME room both
+  above 0), asked by the stage before it asks the arena and by the dry run before its own answer. The dry run now
+  reads the WEIGHT room as the stage does, so on a device with no active arena it keeps the ring, as a load's stage
+  reading no WEIGHT room would, and says that a load's entry ensure builds the arena first; it used to drop there on
+  the RUNTIME room alone. RED first: `test-sycl-moe-ring-consumer` did not compile against the old header, and the
+  ring-drop contract failed at D1 (the WEIGHT room missing from the dry run).
+  (4) `moe_pp_ring_decide(zone)` answers (d) alone, with no arm (a) to (c) could reach, and every decision is recorded
+  for the load (`moe_pp_ring_drop_marks::record`, which marks only a drop).
+  (5) The stage calls no cache getter: the RUNTIME zone after a drop is
+  `ggml_sycl_ring_arena_runtime_zone_bytes` (a cache that exists, 0 with no active arena), so nothing creates a
+  cache or reads one unchecked.
+  (6) `test-sycl-moe-ring-drop-source` reads the backend and the cache alone. It no longer pins the bodies of the
+  headers' pure functions (the uses, the direct-route set, the rule, the decision, the RUNTIME figures, the marks,
+  the zone rules), which `test-sycl-moe-ring-consumer`, `test-sycl-moe-mmvq-tables` and `test-zone-sizing` check on
+  values, and its exact counts became structure: a call only inside the functions named, every kept exit after the
+  write inside the keep block, every ensure in the stage a refusal's condition. New pins: the predicate's two
+  callers, no cache getter in the stage, the arena helper, the record.
+  (7) `test-sycl-moe-ring-consumer` asks (d) through the functions the stage and the dry run call, in the stage's
+  order, on the B50 runs' figures, with the WEIGHT room through `kv_weight_capacity` and every decision through
+  `record`, the keep path included. Where the backend reads no WEIGHT zone the test reads 0 itself: that gate
+  (`ggml_sycl_ring_plan_weight_room`) is the ring-drop contract's, whose mutants drop either half of it.
+  (8) `sycl-memory-design.md`: the stale MEASURED comment and the 69c4ea428 Qwen B50 row (a drop (d) now keeps) are
+  gone, the two device-test sentences are one, and the tables wider than 120 columns are lists.
+  (9) The rule is stated once, in the header comment of `moe-ring-consumer.hpp`; the stage's comment, the test
+  header, this plan and the contract's docstring point to it, and no code comment carries a measured figure.
+  (10) Every line this task added over 120 columns is wrapped.
+  (11) `test-sycl-onednn-woq-nvfp4` is built but no longer a ctest: it exits 0 whatever its arms answer, and no
+  shipped path relies on an arm (the NVFP4 executor runs its F16 arm; `moe_pp_batched_woq_supports_layout` and
+  `pp_woq_arm` in `ggml-sycl.cpp` take MXFP4 alone, and an NVFP4 weight-only arm is later work). No Form-2 exclusion
+  was added. The lead runs it by hand: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4`.
+  (2) and the nits are formatting: two alignments in `ggml-sycl.cpp`, `kinds[]` as `static const char * const`
+  (its gate-up pin follows), and `k_snake` constants in the device test.
+- The fifth review's fixes (r8, 2026-11-26; quality re-review of `54acaaa5e1..77e1bb5701`, which approved r7).
+  (1) Where the plan read no WEIGHT room with the ring, the load stage's no-room keep INFO printed "its WEIGHT zone
+  holds 0.0 MB with the ring and 0.0 MB without it", which misled in GLOBAL mode, where the arena and its WEIGHT zone
+  exist. One helper, `ggml_sycl_ring_no_weight_room_reason`, now names why for the stage and the dry run: no reason
+  where the WEIGHT room is the planner's own figure; a multi-device plan in GLOBAL cache mode, which reads no WEIGHT
+  zone (a load reads none either); otherwise no active arena or no budget in the plan. The stage prints it instead of
+  zeros and otherwise prints the figures as the WEIGHT room its plan packs against; the dry run's keep line drops its
+  own three-way branch and adds the load's answer (none either, or may differ on the arena its entry ensure builds).
+  Both stay INFO. RED first: the ring-drop contract failed at D1 against the old backend; it now pins the helper whole
+  and its two callers, and has 95 mutants.
+  (2) `sycl-memory-design.md` drops the 69c4ea428 Qwen B50 throughput row, whose correctness row r7 removed.
+  (3) `test-moe-pp-batched-dequant` and `test-moe-pp-staging-refusal --direct-reentry` load their planned model through
+  one header, `ggml/src/ggml-sycl/tests/moe-planned-model-fixture.hpp` (shape, experts, inventory, lifecycle), with no
+  behaviour change; the dequant test keeps `lifecycle_fixture` as a subclass for its variants, so its gate-up pins read
+  as before. The lead reruns the device tests that use it, once each:
+  `ctest --test-dir build -R '^test-moe-pp-batched-dequant$' --output-on-failure` and
+  `ctest --test-dir build -R '^test-moe-pp-staging-refusal-direct-reentry$' --output-on-failure` (the default mode of
+  `test-moe-pp-staging-refusal` is rebuilt but loads its own unplanned model, not the fixture).
+  (4) `moe_pp_ring_drop_marks::mark` and the slots it writes are private, so `record` alone marks a device;
+  `test-sycl-moe-ring-consumer` asserts at compile time that `record` is callable and `mark` is not (RED first: it did
+  not compile while `mark` was public).
+  (5) r7 (1)'s exit 77 names all three skips: no SYCL GPU, more than one card visible, weights not evictable.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
+
+*Left by Task 21, step 1d (2026-11-24):*
+- IQ expert types have no device prompt route without the ring. IQ1_S, IQ1_M and IQ4_XS have no MMVQ id kernel, so
+  a resident prompt node of theirs runs only on the batched oneDNN executor, in the PP MoE ring, and decode stays
+  refused for them. Step 1d therefore keeps their ring even where the plan made with it leaves their experts on the
+  host, and a model whose IQ experts overflow a card pays the ring's room in experts moved to the host. The executor's
+  claim also admits such a node without asking for the ring (`ggml_sycl_moe_pp_onednn_batched_claims_tensor`), so a
+  device with no ring published would admit a node it then declines with SCRATCH_UNPLANNED and has no kernel for.
+  Wanted: an MMID kernel for these types (which would let step 1d drop their ring by its own rule), and a claim that
+  declines where no ring is planned.
+- A staged load logs one plan's `[PLACEMENT]` and `[SYCL-PLAN]` lines per pass, and nothing says that the early
+  pass's plan is replaced by the late pass's. On the B50 Inkling load the early pass served 9668.3 MB of experts from
+  the mapping and the late pass, whose plan is kept, 10215.0 MB, so the log gives two answers (three with the plan
+  the ring drop replaces, whose WARN says so). The planner cannot tell a plan that will be replaced; wanted: the
+  stage says which pass's lines describe the kept plan, or the early pass's plan lines move below WARN. The ring
+  decision's keep lines are per pass too: a keep marks nothing, so a held arena's WARN can print at the early and the
+  late pass of one load.
+- A ring kept after a give-back rebuilt the arena (its WEIGHT room did not grow) is followed by an ordinary rebuild
+  for the plan with the ring, not a restore: SCRATCH and ONEDNN zones a kept arena held above that plan come back at
+  the plan's sizes, and the DIRECT cap's snapshot is taken again. A reserve that changes layout takes that path (a B50
+  reserve right after a destroy falls back to two chunks); the second rebuild can land in several chunks too, and the
+  device is then planned once more with the ring, on less WEIGHT room than a drop would have left. Wanted: the
+  give-back answers the WEIGHT zone it would build before it rebuilds, so it never rebuilds an arena it must then
+  rebuild back. The give-back ensure can also print SCRATCH plan lines for the plan without the ring that a keep then
+  discards.
 
 *Left by the merged-tree runs of 2026-11-22 (`baf7cf05a`):*
 - `test-llama-archs` cannot load a model on this tree, on one card or two, for any architecture (rc 255,
@@ -6560,6 +6885,12 @@ allocation outside the unified cache.
   device run is evidence for a card only when its own log names that card.
 - The NVFP4 expert launch (`mul_mat_vec_q_id`, `mmvq.cpp`) has the range risk Task 8g's kernel had: its
   global range grows with the micro-batch and nothing checks it against an int. A read, not a failure seen.
+- The two UE4M3 scale decodes disagree on one byte: the CPU's (`ggml_ue4m3_to_fp32`, `ggml-impl.h`) reads 0xFF
+  as 240, because it zeroes only 0x00 and 0x7F and ignores the sign through `(x >> 3) & 0xF`; the SYCL one
+  (`ggml_sycl_ue4m3_to_fp32`, `common.hpp`) reads it as 0, because it zeroes `(x & 0x7f) == 0x7f`. Every other
+  sign-set byte decodes alike. No quantizer writes the sign bit, so no model holds 0xFF; Task 21's device test never
+  writes it. Neither decode was changed. The fix is to refuse a sign-set or NaN scale at load, the CPU decode's own
+  TODO.
 - `ggml_sycl_mul_mat_id`'s catch calls `std::exit(1)` on a SYCL exception it does not recognise. An exit is
   an abort by another name: the graph should fail at its boundary.
 - `test-sycl-bf16-mul-mat` throws uncaught when no `opencl:cpu` device exists, as Task 8g's kernel test
@@ -6578,6 +6909,13 @@ allocation outside the unified cache.
 - `test-sycl-moe-resolved-batch` was labelled `host` and reserves a ~29.9 GB VRAM arena on the B70; it also
   crashed at exit (a cache destructor asked a destroyed device manager for its index). Task 8c fixes both.
 - The kernel profiler reports `failed_timestamps` (11187 in the replay-off load): its totals are lower bounds.
+- The kernel profiler's `moe.pp.dequant.<type>` label times an empty marker, not the dequant kernel (Task 21's
+  profile: 17,086 samples of 0.1 us for NVFP4). The f16 converters return no event, so the label asks the queue for
+  `ext_oneapi_get_last_event()`, and the installed runtime (oneAPI 2026.2) answers that with a new marker it enqueues
+  (`urEnqueueEventsWait`), whose start follows the kernel's end on an in-order queue. The kernel's time is in no
+  label, and each sample adds one enqueue to a profiled run only. Fix: a two-event record in the profiler, a marker
+  before the converter and one after, timed end to end (`after.command_end - before.command_end`), which covers every
+  converter without changing their signatures and can label the MXFP4 SOA dequant too, which has no label today.
 - Task 8c, host leg cost: one `std::async` thread and one host SCRATCH leg per mixed node, about 96 spinning
   threads per decoded token on the B50. They are bounded to 2 or 3 in flight only by the ids host wait
   (`ggml_sycl_copy_ids_to_host`) and the per-layer ids cache: removing that wait needs a bound first.

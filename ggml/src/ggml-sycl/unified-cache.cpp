@@ -8134,20 +8134,40 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         return refuse_teardown(earlier, { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
                                           zone_capacity(vram_zone_id::RUNTIME) });
     }
+    // A caller that asks for the RUNTIME zone's surplus back (zone_arena_ensure_options::give_back) is told what the
+    // zone was and what the plan needs, whatever this call then does. A give-back rebuild is marked here, for the
+    // reserve's tail below.
+    bool giving_back = false;
+    if (options.give_back != nullptr) {
+        *options.give_back              = {};
+        options.give_back->need_runtime = runtime_zone;
+        options.give_back->have_runtime = arena_active() ? zone_capacity(vram_zone_id::RUNTIME) : 0;
+    }
     if (arena_active()) {
-        const bool zones_sufficient = zone_capacity(vram_zone_id::SCRATCH) >= scratch_zone &&
-                                      zone_capacity(vram_zone_id::ONEDNN) >= onednn_zone &&
-                                      zone_capacity(vram_zone_id::RUNTIME) >= runtime_zone;
-        if (zones_sufficient) {
+        const zone_arena_sizes planned_zones = { scratch_zone, onednn_zone, runtime_zone };
+        arena_zones                 = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
+                                        zone_capacity(vram_zone_id::RUNTIME) };
+        const bool zones_sufficient = arena_zones.scratch >= planned_zones.scratch &&
+                                      arena_zones.onednn >= planned_zones.onednn &&
+                                      arena_zones.runtime >= planned_zones.runtime;
+        const bool surplus_asked =
+            options.give_back != nullptr && zone_arena_runtime_surplus(arena_zones, planned_zones);
+        // A give-back asks for the RUNTIME zone's surplus and nothing else. With none to give, or with a zone the plan
+        // needs larger than built, the arena is kept as built: a give-back never takes the ordinary rebuild, so it
+        // never hands the room RUNTIME gives up to another zone (the SCRATCH zone's MoE MMVQ bound is held to the room
+        // beside RUNTIME), and its caller reads the WEIGHT zone unchanged.
+        if (!surplus_asked && (zones_sufficient || options.give_back != nullptr)) {
             keep_arena_as_built();
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
-            // not shrink it.
-            onednn_zone_plan_keep_and_store(live_plan);
+            // not shrink it. A give-back whose plan needs a zone larger than built changes nothing and stores nothing:
+            // the stored plan is the one the zone was built or kept with, and the live plan would describe room the
+            // zone does not hold.
+            if (zones_sufficient) {
+                onednn_zone_plan_keep_and_store(live_plan);
+            }
             return true;
         }
-        arena_zones = { zone_capacity(vram_zone_id::SCRATCH), zone_capacity(vram_zone_id::ONEDNN),
-                        zone_capacity(vram_zone_id::RUNTIME) };
 
         // Each zone's reading is kept, so a refusal below prints the same figures it decided on: a second read could
         // disagree with them under a concurrent release.
@@ -8155,6 +8175,23 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         zone_arena_holders holders         = arena_read_holders(live_zone_used);
         const size_t       live_zone_bytes = holders.live_zone_bytes;
         const uint32_t     chunk_leases    = holders.chunk_leases;
+        // A give-back rebuilds only an arena nothing points into: one a live model's allocations or a freed context's
+        // leftovers hold is kept as built, its surplus with it, as a sufficient arena always was. The rebuild gives
+        // back the RUNTIME zone alone (zone_arena_give_back_sizes), so the checks below, read on the same holders, pass
+        // through to it.
+        if (surplus_asked && !zone_arena_rebuild_allowed(holders)) {
+            options.give_back->held = true;
+            keep_arena_as_built();
+            onednn_zone_plan_keep_and_store(live_plan);
+            return true;
+        }
+        if (surplus_asked) {
+            const zone_arena_sizes sizes = zone_arena_give_back_sizes(arena_zones, planned_zones);
+            scratch_zone                 = sizes.scratch;
+            onednn_zone                  = sizes.onednn;
+            runtime_zone                 = sizes.runtime;
+            giving_back                  = true;
+        }
         // A rebuild that something live blocks keeps a SCRATCH zone that holds what it must and is short of the MoE
         // batched MMVQ bound alone (zone_scratch_kept_bytes), so the zones are asked for no more SCRATCH than they
         // hold. When the other zones hold their plan the arena is kept as it is; otherwise the keep of a short ONEDNN
@@ -8278,6 +8315,14 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         return false;
     }
     compute_arena_bind();
+    if (giving_back) {
+        // SCRATCH and ONEDNN were rebuilt as they were, so they stay described as a kept arena's are: the DIRECT cap's
+        // snapshot does not rise, and the ONEDNN plan keeps the larger one the zone was built from.
+        keep_arena_as_built();
+        onednn_zone_plan_keep_and_store(live_plan);
+        options.give_back->rebuilt = true;
+        return true;
+    }
 #if GGML_SYCL_DNNL
     // The zones were rebuilt for this plan, so the DIRECT cap's snapshot is the budget it was planned with, whether
     // that is above or below the one held (see keep_arena_as_built above for why it is a snapshot).

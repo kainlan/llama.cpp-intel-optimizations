@@ -8,6 +8,7 @@
 #include "mem-handle.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-mmid-workspace.hpp"
+#include "moe-mmvq-tables.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -251,17 +252,8 @@ inline size_t moe_admitted_recipe_signature(const moe_execution_recipe & recipe,
     return h;
 }
 
-// Q1_0 and NVFP4 host experts run an immutable recipe: a HOST_CPU recipe whose host workspace is planned for the
-// micro-batch (plan_moe_host_workspace) and checked exactly by validate_moe_execution_recipe, never the pinned buffer
-// pool the other host experts share. The prompt CPU island does not run them for that reason
-// (ggml_sycl_moe_pp_cpu_island_runs_type). On a device they need nothing of their own: the capability query answers
-// the MMVQ_COMPAT id kernel for them, but more narrowly than for other MMVQ id types (only an expert local to the
-// submitting card, in AOS, with a block-aligned K), and validate_moe_execution_recipe checks the direct kernel's
-// recipe by its kernel, not by this type test. They are also the types the MMID direct route in ggml_sycl_mul_mat_id
-// runs on the primary card, so the planner's MMID workspace pools (plan_moe_mmid_workspaces) are planned for them.
-inline bool moe_type_has_immutable_host_recipe(ggml_type type) {
-    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
-}
+// moe_type_has_immutable_host_recipe (Q1_0 and NVFP4) is defined in moe-mmvq-tables.hpp, beside the ring's staged-type
+// question that also asks it.
 
 inline bool validate_moe_execution_recipe(const moe_execution_recipe & recipe,
                                           size_t                       admitted_signature,

@@ -835,7 +835,15 @@ static void flash_attn_tile(const char *  Q,
     const sycl::half2 * V_h2 =
         (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
 
-    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
+    // A mask with a head axis (ne32 > 1) holds one plane per Q head, broadcast
+    // as head % ne32 (as in ggml-cuda/fattn-tile.cuh). One pointer serves the
+    // whole block, so the launchers group Q heads (ncols2 > 1) only for a
+    // head-broadcast mask (ne32 == 1); with ncols2 == 1, head0 is this
+    // block's only head (llama.cpp-44d0). The head term is a 64-bit product:
+    // nb32 is an int32 byte stride and head0 reaches H-1, so n_kv*ne31*2*(H-1)
+    // passes 2^31 at long context (nb33 is already int64).
+    const sycl::half * maskh =
+        mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) + (int64_t) nb32 * (head0 % ne32)) : nullptr;
 
     const int stride_K2   = nb11 / sizeof(sycl::half2);
     const int stride_V2   = nb21 / sizeof(sycl::half2);
@@ -1207,6 +1215,9 @@ static void submit_fattn_tile_d512(const fattn_params & params, dpct::queue_ptr 
     constexpr int ncols  = ncols1 * ncols2;
     constexpr int nwarps = ggml_sycl_fattn_tile_get_nthreads(DKQ, DV, ncols) / warp_size;
     static_assert(ggml_sycl_fattn_tile_get_config(DKQ, DV, ncols) != 0, "kernel config not defined");
+    // flash_attn_tile reads one mask plane per block: grouped heads (ncols2 > 1)
+    // must share it, which only a head-broadcast mask allows (llama.cpp-44d0).
+    GGML_ASSERT(ncols2 == 1 || params.mask == nullptr || params.ne32 == 1);
 
     // Grid dim0 selects (sequence, head-group); dim1 is the KV-partition
     // index (fixed at 1 -- no split-KV, see above); dim2 selects the
@@ -1287,12 +1298,9 @@ static void launch_fattn_tile_d512(const fattn_params & params, dpct::queue_ptr 
     GGML_ASSERT(params.ne02 % params.ne12 == 0);
     const int gqa_ratio = params.ne02 / params.ne12;
     const int ne01      = params.ne01;
-    // DV==512 forces launch_fattn_tile_switch_ncols2's own
-    // `gqa_ratio<=4 && DV<=256 ? 16 : INT_MAX` ternary to INT_MAX
-    // unconditionally (the DV<=256 half is always false here) -- so unlike
-    // the D<=256 kernels, ne01 never gates GQA-grouping eligibility at D=512.
-    const bool use_gqa_opt =
-        params.mask != nullptr && params.max_bias == 0.0f && (params.ne11 % FATTN_KQ_STRIDE == 0);
+    // The grouping condition lives in a host-callable predicate (fattn-tile.cpp)
+    // so the host-only gate test pins it: no grouping for a per-head mask.
+    const bool use_gqa_opt = ggml_sycl_fattn_tile_d512_use_gqa_opt(params);
 
     if (use_gqa_opt && gqa_ratio % 16 == 0) {
         submit_fattn_tile_d512<DKQ, DV, 2, 16, use_logit_softcap, warp_size>(params, stream);
@@ -1323,6 +1331,9 @@ static void launch_fattn_tile_d512(const fattn_params & params, dpct::queue_ptr 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
+    // Every launch below shares this entry: grouped heads (ncols2 > 1) share
+    // one mask plane per block, which only a head-broadcast mask allows.
+    GGML_ASSERT(ncols2 == 1 || dst->src[3] == nullptr || dst->src[3]->ne[2] == 1);
 
     const int id        = ggml_sycl_get_device();
     const int cc        = ggml_sycl_info().devices[id].cc;
@@ -1418,7 +1429,9 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // a mask with a head dimension is not shared by the Q heads of a K/V head
+    const bool use_gqa_opt =
+        mask && mask->ne[2] == 1 && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DV == 512) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {

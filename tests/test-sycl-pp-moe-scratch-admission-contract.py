@@ -83,15 +83,21 @@ RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
 # explicit micro-batch's load placement (ggml_sycl_publish_load_ubatch_scratch: the same planner-sized ring, published
 # at the micro-batch the caller named), replan x2, and, fifth, the plan dry run's write-back
 # (~ggml_sycl_plan_dry_run_saved_state: the values the matching getters returned when the dry run started, put back on
-# every exit). That fifth call is why the count is 5: it exists because the dry run publishes its ring through the
-# process-global setter (llama.cpp-kj90); the fix for that ticket removes the write-back and lowers this pin back to 4.
-SET_PLANNED_CALLS_IN_FILE = 5
+# every exit). That fifth call exists because the dry run publishes its ring through the process-global setter
+# (llama.cpp-kj90); the fix for that ticket removes the write-back and lowers this pin by one. Sixth,
+# ggml_sycl_publish_no_pp_moe_onednn_ring publishes no ring (every slot and the depth zero, as a model with no ring
+# consumer publishes) when the plan made with a resident-only ring left an expert of its weights on the host
+# (moe_pp_ring_check_resident_only): the load stage and the plan dry run publish none to read the RUNTIME zone without
+# the ring, and put it back through load_published_terms::restore (ggml_sycl_put_back_ring_terms) where the decision
+# keeps it. It only lowers the published ring to none, reserves nothing and reads no ceiling back, and the dry run's
+# write-back puts the dry run's call back.
+SET_PLANNED_CALLS_IN_FILE = 6
 # Whole ggml-sycl directory, comments and strings removed: reserve is definition + the wrapper's call + hpp declaration
 # + 5 calls + the dry run device test's arms (f) and (h), each of which reserves exactly the 1 MiB depth-1 ring it
 # planned, (f) so the ring holds KV-zone bytes a load refused in its early pass must leave alone and (h) so the ring
 # alone holds the arena a load must release it from (neither raises a ceiling or reads one back) + the runtime-alloc
 # device test's reserve_ring_and_pair, which reserves the same 1 MiB depth-1 ring it planned on a hand-built cache, so
-# the release of the last model has a ring to give back or keep; setter is definition + hpp declaration + the 5 calls
+# the release of the last model has a ring to give back or keep; setter is definition + hpp declaration + the 6 calls
 # above + load_published_terms::restore in unified-cache.cpp (a refused or failed load puts back the ring that stood
 # before it, a planned size, never a reserve) + the dry run device test's 6 (tests/test-sycl-plan-dry-run.cpp:
 # withdraw_published_inputs zeroes the ring, write_planner_state puts back the saved one, and arms (f) and (h) each plan
@@ -100,7 +106,7 @@ SET_PLANNED_CALLS_IN_FILE = 5
 # publishes the ring at the planning shape, at the room's micro-batch, and at the planning shape again, and
 # reserve_ring_and_pair plans the ring it reserves). None of the test uses reads back a ceiling. The write-back and the
 # dry run test's first two uses follow llama.cpp-kj90; its fix revisits all three.
-DIRECTORY_TOKENS = {"reserve": 11, "wrapper": 2, "setter": 19}
+DIRECTORY_TOKENS = {"reserve": 11, "wrapper": 2, "setter": 20}
 _DIRECTORY_TOKEN_PATTERNS = {
     "reserve": r"(?<!\w)reserve_pp_moe_onednn_scratch\b",
     "wrapper": r"\bunified_cache_reserve_pp_moe_onednn_scratch\b",
