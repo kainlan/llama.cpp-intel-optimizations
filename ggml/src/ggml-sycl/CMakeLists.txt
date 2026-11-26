@@ -2683,6 +2683,22 @@ set_tests_properties(sycl-kv-region-registry PROPERTIES
     TIMEOUT 60
 )
 
+# The chunk lease holder table (chunk-lease-holders.hpp), which GGML_SYCL_LEASE_HOLDERS=1 uses to name the code that
+# holds each VRAM arena chunk lease: header-only and SYCL-free, so it needs neither SYCL_LINK_ONLY_TEST_OPTIONS nor
+# ggml-base. One case claims from eight threads, hence Threads.
+add_executable(test-chunk-lease-holders
+    tests/test-chunk-lease-holders.cpp
+)
+target_include_directories(test-chunk-lease-holders PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(test-chunk-lease-holders PRIVATE Threads::Threads)
+add_test(NAME sycl-chunk-lease-holders COMMAND test-chunk-lease-holders)
+set_tests_properties(sycl-chunk-lease-holders PROPERTIES
+    LABELS "sycl;hostonly"
+    TIMEOUT 60
+)
+
 # The same suite under ThreadSanitizer (llama.cpp-moua L4 1a fold). Three of the
 # registry's guarantees -- the slot table's shared_lock pin in claim(), the slot
 # spin lock's acquire/release ordering and the generation read under that lock --
