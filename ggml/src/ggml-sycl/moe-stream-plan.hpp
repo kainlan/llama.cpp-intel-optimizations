@@ -1292,6 +1292,10 @@ class moe_stream_phase {
 // ---- Loan selection (llama.cpp-0zmf, plan Task 11a): which resident expert triplets a loan may take. -------------------
 // Pure over the plan, like the stream list above: no device, no queue. The plan's build_index() must have run.
 
+// The slot of (layer, expert) in an indexed plan, defined with the slot below: the bulk answer mirrors the load's
+// decline of a slot its one stride cannot hold.
+static inline size_t moe_expert_triplet_slot_bytes(const placement_plan & plan, int layer, int expert);
+
 namespace detail {
 
 // True iff a SOA-to-AOS inverse of the load fill's reorder (reorder_aos_to_soa_device, ggml-sycl.cpp) exists for
@@ -1316,21 +1320,25 @@ static inline bool moe_loan_layout_lendable(const placement_entry & e) {
 // WEIGHT allocation, so no single expert can be handed back. The load path also compares layouts (after
 // ggml_sycl_adjust_layout_for_tensor, which the plan cannot see); that comparison is not mirrored, so a disagreement
 // still reads as bulk here: the fail-safe over-skip. Checks that need runtime state (tensor->data,
-// GGML_SYCL_MOE_BULK_STAGE=0) are likewise not mirrored, nor is the AOS slot-stride decline (an AOS tensor is not
-// bulk-staged when an expert's triplet has a slot past the one stride its staged bytes give, since the bulk copy has
-// no room for the slot), which needs the staged bytes the load computes. Each can only make the load path not bulk
-// where this says bulk, which skips more, never less.
+// GGML_SYCL_MOE_BULK_STAGE=0) are likewise not mirrored. Each can only make the load path not bulk where this says
+// bulk, which skips more, never less. The AOS slot-stride decline is mirrored: the bulk copy stages every expert at one
+// stride, its own bytes, with no room for a slot past them, so a tensor staged as AOS (the primary's layout, or the
+// alternate's in the "stage-alt-bulk" branch) with an expert whose triplet's slot passes its staged bytes stages
+// expert by expert, each at its slot, and reads as not bulk here. The load adjusts no AOS layout to another one, so an
+// AOS layout here is the one it stages.
 static inline bool moe_loan_tensor_bulk_staged(const placement_plan & plan, const std::string & name, int device) {
     int n_experts = 0;
     for (const placement_entry & e : plan.entries) {
         if (e.expert_id < 0 || e.name != name) {
             continue;
         }
-        int n_alt = 0;
+        int              n_alt         = 0;
+        ggml_layout_mode staged_layout = e.layout;
         for (const placement_alternate_layout & alt : e.alternate_layouts) {
             const int alt_target = alt.target_device >= 0 ? alt.target_device : e.target_device;
             if (alt_target == device) {
                 ++n_alt;
+                staged_layout = alt.layout;
             }
         }
         if (e.on_device && e.target_device == device) {
@@ -1339,6 +1347,12 @@ static inline bool moe_loan_tensor_bulk_staged(const placement_plan & plan, cons
             }
         } else if (n_alt != 1) {
             return false;
+        }
+        if (staged_layout == GGML_LAYOUT_AOS) {
+            const size_t stride = staged_expert_bytes(GGML_LAYOUT_AOS, e.type, e.ne[0], e.src_size);
+            if (moe_expert_triplet_slot_bytes(plan, e.layer_id, e.expert_id) > stride) {
+                return false;
+            }
         }
         ++n_experts;
     }
@@ -1427,49 +1441,55 @@ static inline size_t moe_expert_triplet_slot_bytes(const placement_plan & plan, 
     return moe_expert_triplet_slot_bytes(detail::moe_loan_triplet_of(plan, layer, expert).e);
 }
 
-// Charges every member of each triplet that has a slot the slot's bytes, the WEIGHT-zone room its device copy takes,
-// so the plan and the zone agree on what one routed expert costs. A complete triplet with no slot charges each member
-// that stages as AOS its own staged bytes, so a member a layout pass left at a slot its triplet has lost gives the slot
-// back; a member that stages another way keeps the charge its layout pass gave it. Pure over `entries` and needs no
-// index: the planner runs it while it builds the plan, before an index exists. A triplet a role of which appears twice,
-// or that misses a role, is left alone. Returns the number of triplets charged a slot.
+// Charges each entry of a complete triplet that stages as AOS what the load stages it at
+// (ggml_sycl_expert_stage_bytes): the triplet's slot when it has one, the WEIGHT-zone room each member's device copy
+// takes, so the plan and the zone agree on what one routed expert costs, and else its own staged bytes, so a member a
+// layout pass left at a slot its triplet has lost gives the slot back. An entry that stages another way keeps the
+// charge its layout pass gave it. The triplet is resolved as the plan's index resolves it (placement_plan::build_index,
+// find_expert_entry): its members are the first entry of each role, and an entry with no layer is in no triplet. An
+// entry whose role was met before is staged too, at the members' slot when that is no smaller than its own staged
+// bytes. Pure over `entries` and needs no index: the planner runs it while it builds the plan, before an index exists.
+// A triplet that misses a role is left alone. Returns the number of triplets charged a slot.
 static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries) {
-    struct triplet_members {
-        placement_entry * e[3]      = { nullptr, nullptr, nullptr };
-        bool              ambiguous = false;
+    struct triplet_entries {
+        placement_entry *              members[3] = { nullptr, nullptr, nullptr };
+        std::vector<placement_entry *> repeats;  // an entry of a role met before: staged, but no member
     };
 
-    std::unordered_map<uint64_t, triplet_members> triplets;
+    std::unordered_map<uint64_t, triplet_entries> triplets;
     for (placement_entry & e : entries) {
-        if (e.expert_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) {
+        if (e.expert_id < 0 || e.layer_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) {
             continue;
         }
-        triplet_members &  t    = triplets[detail::moe_loan_triplet_key(e.layer_id, e.expert_id)];
-        placement_entry *& slot = t.e[detail::moe_loan_role_slot(e.expert_role)];
-        t.ambiguous             = t.ambiguous || slot != nullptr;
-        slot                    = &e;
+        triplet_entries &  t      = triplets[detail::moe_loan_triplet_key(e.layer_id, e.expert_id)];
+        placement_entry *& member = t.members[detail::moe_loan_role_slot(e.expert_role)];
+        if (member) {
+            t.repeats.push_back(&e);
+        } else {
+            member = &e;
+        }
     }
     size_t charged = 0;
     for (auto & [key, t] : triplets) {
         GGML_UNUSED(key);
-        const placement_entry * const members[3] = { t.e[0], t.e[1], t.e[2] };
-        if (t.ambiguous || !members[0] || !members[1] || !members[2]) {
+        const placement_entry * const members[3] = { t.members[0], t.members[1], t.members[2] };
+        if (!members[0] || !members[1] || !members[2]) {
             continue;
         }
-        const size_t slot = moe_expert_triplet_slot_bytes(members);
-        if (slot == 0) {
-            for (placement_entry * e : t.e) {
-                const size_t staged = moe_expert_entry_staged_bytes(*e);
-                if (staged != 0) {
-                    e->vram_charge_size = placement_vram_charge_bytes(staged);
-                }
+        const size_t slot_bytes = moe_expert_triplet_slot_bytes(members);
+        const auto   charge     = [slot_bytes](placement_entry * e) {
+            const size_t staged = moe_expert_entry_staged_bytes(*e);
+            if (staged != 0) {
+                e->vram_charge_size = placement_vram_charge_bytes(std::max(slot_bytes, staged));
             }
-            continue;
+        };
+        for (placement_entry * e : t.members) {
+            charge(e);
         }
-        for (placement_entry * e : t.e) {
-            e->vram_charge_size = placement_vram_charge_bytes(slot);
+        for (placement_entry * e : t.repeats) {
+            charge(e);
         }
-        charged++;
+        charged += slot_bytes != 0 ? 1 : 0;
     }
     return charged;
 }

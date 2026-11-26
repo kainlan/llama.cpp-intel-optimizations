@@ -110,6 +110,7 @@
 #include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/exit-settle.hpp"
+#include "ggml-sycl/expert-slot.hpp"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
@@ -156,6 +157,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/tenant-claim-scope.hpp"
+#include "ggml-sycl/tlsf-allocator.hpp"
 #include "ggml-sycl/top-k-mask.hpp"
 #include "ggml-sycl/topk.hpp"
 #include "model-lifecycle.hpp"
@@ -22044,7 +22046,8 @@ static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
 // one refusal that passes only once the zone gains room, so its caller can wait for that instead of asking again, and
 // can say what the zone was asked for. zone_room_ask is what the whole triplet asks (its slot, 0 for none, and its
 // members' bytes summed). zone_largest_free_at_refusal is the zone's largest free block when it refused, which is
-// smaller than the member's size.
+// smaller than the member's size: read only for the refusal a boundary's line keeps
+// (ggml_sycl_expert_zone_refusal_kept), and 0 for every other.
 struct ggml_sycl_expert_move_outcome {
     ggml_sycl::moe_expert_triplet_ref triplet;
     bool                               to_device                    = true;
@@ -22322,18 +22325,26 @@ static const char * ggml_sycl_expert_named_stop(const std::vector<ggml_sycl_expe
 // preparation spent in the resolver, which looks each member up in the expert metadata. mint_refused_bytes is the size
 // the member whose device mint was refused asked (expert_triplet_member_bytes), 0 when none was: with a transient
 // refusal that is the WEIGHT zone answering that it has no room for those bytes. mint_refused_ask is what the whole
-// triplet asks of the zone (expert_triplet_zone_ask_of). mint_refused_largest_free is the zone's largest free block
-// read right after that refusal, before anything the triplet took goes back.
+// triplet asks of the zone (expert_triplet_zone_ask_of).
 struct ggml_sycl_expert_prepared_triplet {
     ggml_sycl::expert_move_member      members[3];
-    ggml_tensor_extra_gpu *            extras[3]                 = { nullptr, nullptr, nullptr };
-    ggml_sycl_expert_move_kind         kind                      = ggml_sycl_expert_move_kind::LOAN;
-    size_t                             named                     = 0;
-    uint64_t                           resolve_us                = 0;
-    size_t                             mint_refused_bytes        = 0;
-    ggml_sycl::expert_triplet_zone_ask mint_refused_ask          = {};
-    size_t                             mint_refused_largest_free = 0;
+    ggml_tensor_extra_gpu *            extras[3]          = { nullptr, nullptr, nullptr };
+    ggml_sycl_expert_move_kind         kind               = ggml_sycl_expert_move_kind::LOAN;
+    size_t                             named              = 0;
+    uint64_t                           resolve_us         = 0;
+    size_t                             mint_refused_bytes = 0;
+    ggml_sycl::expert_triplet_zone_ask mint_refused_ask   = {};
 };
+
+// Whether a WEIGHT-zone refusal of a triplet that asks the zone `ask` in all takes the place of the refusal kept so
+// far (`kept`, none while `any_kept` is false) as the one a boundary's line reports: the first, and after it each that
+// asks more. The transaction reads the zone's figures only for such a refusal, and the boundary's callback keeps the
+// last such one, the same refusal: both meet the admits in the order the batch named them.
+static bool ggml_sycl_expert_zone_refusal_kept(bool                                       any_kept,
+                                               const ggml_sycl::expert_triplet_zone_ask & kept,
+                                               const ggml_sycl::expert_triplet_zone_ask & ask) {
+    return !any_kept || ask.total > kept.total;
+}
 
 // What a named move's own give-backs do to the device WEIGHT zone's room epoch: the epoch is read right before and
 // right after each, and the moves are summed. A give-back returns storage the transaction itself took from the zone,
@@ -22395,8 +22406,8 @@ struct ggml_sycl_expert_prepared_give_back {
 // with no cache entry to copy from stops with the refusal the cache would give. Returns null when every member is
 // prepared, else the refusal, with *transient true when a later boundary may prepare it: a full WEIGHT zone, which the
 // ring gives back, or an evict's exhausted pinned pool. A refused device mint leaves the size it asked for in
-// out.mint_refused_bytes and the zone's largest free block at that moment in out.mint_refused_largest_free. The
-// storage minted before a refusal goes back with `out`.
+// out.mint_refused_bytes and what its triplet asks in out.mint_refused_ask. The storage minted before a refusal goes
+// back with `out`.
 static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache &             cache,
                                                      int                                    device,
                                                      const ggml_sycl::placement_plan &      plan,
@@ -22443,13 +22454,6 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
             if (!storage.valid()) {
                 out.mint_refused_bytes = member_bytes;
                 out.mint_refused_ask   = ggml_sycl::expert_triplet_zone_ask_of(staged);
-                // The zone's largest free block as it refused, with the members minted before still held: what the
-                // refusal line prints beside the slot. Left 0 with no arena.
-                size_t capacity        = 0;
-                size_t used            = 0;
-                size_t available       = 0;
-                (void) cache.zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, available,
-                                               out.mint_refused_largest_free);
                 // A full zone is transient: the ring gives its room back, so the next boundary tries again. No
                 // WEIGHT arena is not, since only a model load makes one, and a load replaces the ledger too.
                 const bool arena = cache.arena_active() && cache.zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0;
@@ -22756,6 +22760,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
 
     const char * stop      = nullptr;
     bool         transient = false;
+    // The WEIGHT-zone refusal whose figures were read last, the one a boundary's line keeps so far.
+    bool                               zone_refusal_read = false;
+    ggml_sycl::expert_triplet_zone_ask zone_refusal_read_ask;
     // The batch's host time, in microseconds, for the named move's result line: the members' metadata lookups in the
     // preparation, and the cache's copy submissions and id handovers (expert_move_record).
     uint64_t     meta_us   = 0;
@@ -22782,8 +22789,20 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             (*named_moves)[triplet.named].zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;
             (*named_moves)[triplet.named].zone_room_ask =
                 transient ? triplet.mint_refused_ask : ggml_sycl::expert_triplet_zone_ask{};
-            (*named_moves)[triplet.named].zone_largest_free_at_refusal =
-                transient ? triplet.mint_refused_largest_free : 0;
+            // The zone's largest free block as it refused, with the members minted before still held, read only for
+            // the refusal the boundary's line keeps: the read walks the zone's largest free class under its allocator
+            // group's lock, and one batch can refuse hundreds of admits. Left 0 with no arena.
+            if ((*named_moves)[triplet.named].zone_room_bytes != 0 &&
+                ggml_sycl_expert_zone_refusal_kept(zone_refusal_read, zone_refusal_read_ask,
+                                                   triplet.mint_refused_ask)) {
+                size_t capacity = 0;
+                size_t used     = 0;
+                size_t avail    = 0;
+                (void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, avail,
+                                                (*named_moves)[triplet.named].zone_largest_free_at_refusal);
+                zone_refusal_read     = true;
+                zone_refusal_read_ask = triplet.mint_refused_ask;
+            }
 
             stop      = nullptr;
             transient = false;
@@ -23707,7 +23726,8 @@ struct ggml_sycl_moe_swap_instance {
     // The final refusal reasons already WARNed, per direction, for the instance's life. Touched only under the claim.
     std::unordered_set<std::string>                         refusals_warned_evict;
     std::unordered_set<std::string>                         refusals_warned_admit;
-    // The WEIGHT zone's free-block census was printed, at the first refusal for room. Touched only under the claim.
+    // The WEIGHT zone's free-block census was printed, once per swap instance, at the first refusal for room whose
+    // free blocks could be read. Touched only under the claim.
     bool                                                    zone_census_printed = false;
 };
 
@@ -23842,9 +23862,9 @@ static constexpr size_t GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP = 6;
 // it has no slot), the largest free block the zone had when it refused, and what the zone has free now that the
 // batch's other mints are taken. The two free figures are read together under the zone's allocator lock, held for the
 // read alone: all the free bytes, and the largest free block, so bytes that are free and still too small for the
-// member refused show as that. With no arena the figures print 0. The first refusal on a device also prints the zone's
-// free blocks by size, counted in allocations of that triplet's refused member (`member` bytes), so holes read apart
-// from real exhaustion. Under the claim.
+// member refused show as that. With no arena the figures print 0. Once per swap instance, the first refusal whose zone
+// free blocks can be read also prints them by size, counted in allocations of that triplet's refused member (`member`
+// bytes), so holes read apart from real exhaustion. Under the claim.
 static void ggml_sycl_moe_swap_warn_zone_refusal(ggml_sycl_moe_swap_instance &      inst,
                                                  ggml_sycl::unified_cache *         cache,
                                                  int                                device,
@@ -23866,17 +23886,18 @@ static void ggml_sycl_moe_swap_warn_zone_refusal(ggml_sycl_moe_swap_instance &  
     if (inst.zone_census_printed || !cache) {
         return;
     }
-    inst.zone_census_printed = true;
     // The block the zone takes for the refused member: an allocation's size rounded to the allocator's grain.
     const size_t member_block =
         ggml_sycl::tlsf_allocator::round_request(member, ggml_sycl::tlsf_allocator::block_grain);
 
     std::vector<size_t> free_sizes;
-    if (cache->zone_free_block_sizes(ggml_sycl::vram_zone_id::WEIGHT, free_sizes)) {
-        const std::string census = ggml_sycl::moe_swap_zone_free_census_line(device, free_sizes, member, member_block,
-                                                                             GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP);
-        GGML_LOG_WARN("%s\n", census.c_str());
+    if (!cache->zone_free_block_sizes(ggml_sycl::vram_zone_id::WEIGHT, free_sizes)) {
+        return;  // no arena to read yet: a later refusal prints the census
     }
+    inst.zone_census_printed = true;
+    const std::string census = ggml_sycl::moe_swap_zone_free_census_line(device, free_sizes, member, member_block,
+                                                                         GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP);
+    GGML_LOG_WARN("%s\n", census.c_str());
 }
 
 // The host room an evict batch may take: what the pinned host WEIGHT zone can still hand out without growing, the
@@ -24038,7 +24059,8 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
                                                             ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;
                     if (o.zone_room_bytes != 0) {
                         ++zone_refused;
-                        if (zone_refused_member == 0 || o.zone_room_ask.total > zone_refused_ask.total) {
+                        if (ggml_sycl_expert_zone_refusal_kept(zone_refused_member != 0, zone_refused_ask,
+                                                               o.zone_room_ask)) {
                             zone_refused_member = o.zone_room_bytes;
                             zone_refused_ask    = o.zone_room_ask;
                             zone_refused_free   = o.zone_largest_free_at_refusal;
@@ -27338,10 +27360,10 @@ std::string test_expert_admit_zero_fills_a_padded_tail() {
     ::ggml_sycl_expert_move_result result;
     const uint64_t                 staged_before = mem_copy_staged_wait_census_this_thread().staged_h2d;
     const ::ggml_sycl_txn_result code = ::ggml_sycl_expert_move_transaction_run(fx.device, request, &resolver, &result);
-    // Both ends of each copy are typed owners, so the copy path takes the direct DMA, never the slot branch: that is
+    // Both ends of each copy are typed owners, so the copy path takes the direct DMA, never the staged branch: that is
     // a synchronous bounce the boundary thread would wait on.
     if (const uint64_t copies = mem_copy_staged_wait_census_this_thread().staged_h2d - staged_before; copies != 0) {
-        return test_loan_fail("the admit took %llu slot host-to-device copies, not the direct DMA",
+        return test_loan_fail("the admit took %llu staged host-to-device copies, not the direct DMA",
                               (unsigned long long) copies);
     }
     if (code != ::ggml_sycl_txn_result::ACCEPTED || !result.accepted || result.n_admitted != 1 ||

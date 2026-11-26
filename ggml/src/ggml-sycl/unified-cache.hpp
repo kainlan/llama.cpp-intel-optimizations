@@ -7116,6 +7116,14 @@ class unified_cache {
     void arena_note_allocators_made() noexcept;
 
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // Calls visit(allocator) for each allocator `zone` draws on, the one place that choice is made: WEIGHT in
+    // single-chunk mode the KV allocator, WEIGHT and KV in chunked mode the per-chunk allocators (KV its own tail
+    // allocator first), any other zone its own. True when the zone is served that way, even with no allocator made
+    // yet; false for a zone with no allocator outside those modes, whose room only its counters give. Takes no lock:
+    // the caller holds the group's mutex, or reads the figures bare as zone_largest_free does. Defined in, and used
+    // only by, unified-cache.cpp.
+    template <typename F> bool arena_visit_zone_allocators(vram_zone_id zone, F && visit) const;
+
     // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
     // without that lock.
     std::atomic<zone_arena_teardown_refusal> arena_teardown_refusal_{ zone_arena_teardown_refusal::NONE };

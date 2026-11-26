@@ -883,6 +883,79 @@ void test_recharge_on_moves_the_target_devices_room() {
     CHECK(remaining_tight == 256);
 }
 
+// A role met twice in one (layer, expert) is resolved as the plan's index resolves it (find_expert_entry keeps the
+// first): the triplet's slot is the first entries', each of them is charged it, and an entry met again is charged
+// what the load stages it at, the slot when it stages as AOS and is no larger. Here the first down is AOS with a tail,
+// so the triplet has a slot; a later SOA down (which stages no AOS bytes) would give it none, and a later, smaller AOS
+// gate stages at the slot.
+void test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    entries.resize(3);
+    entries.push_back(slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA));
+    entries.push_back(slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 460800));
+    const size_t soa_charge = entries[3].vram_charge_size;
+    CHECK(entries[4].vram_charge_size == 460800);
+    CHECK(ggml_sycl::placement_entries_charge_expert_slots(entries) == 1);
+    for (size_t i = 0; i < 3; ++i) {
+        CHECK(entries[i].vram_charge_size == 921856);
+    }
+    CHECK(entries[3].vram_charge_size == soa_charge);
+    CHECK(entries[4].vram_charge_size == 921856);
+    // The load's own lookup agrees: the indexed plan gives the triplet the first entries' slot.
+    placement_plan plan{};
+    plan.entries = entries;
+    plan.build_index();
+    CHECK(ggml_sycl::moe_expert_triplet_slot_bytes(plan, 0, 0) == 921856);
+}
+
+const char * const kBulkNames[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                     "blk.0.ffn_down_exps.weight" };
+
+// Four IQ4_NL experts of one layer, each a (gate, up, down) triplet named as a model's tensors are, planned AOS on
+// `device`. A down of 640 columns carries a row-padding tail, so each triplet's slot (921856) passes its members'
+// staged bytes; with 2560 columns none does, and the slot is each member's own size (921600). With `alternate`, each
+// entry also carries one alternate of that layout on device 0.
+placement_plan bulk_plan(int64_t          down_cols,
+                         int              device,
+                         bool             alternate        = false,
+                         ggml_layout_mode alternate_layout = GGML_LAYOUT_AOS) {
+    placement_plan           plan{};
+    const expert_tensor_role roles[3] = { kGate, kUp, kDown };
+    for (int e = 0; e < 4; ++e) {
+        for (int r = 0; r < 3; ++r) {
+            ggml_sycl::placement_entry m =
+                slot_member(0, e, roles[r], GGML_TYPE_IQ4_NL, r == 2 ? down_cols : 2560, 921600);
+            m.name          = kBulkNames[r];
+            m.target_device = device;
+            if (alternate) {
+                ggml_sycl::placement_alternate_layout alt;
+                alt.layout        = alternate_layout;
+                alt.target_device = 0;
+                m.alternate_layouts.push_back(alt);
+            }
+            plan.entries.push_back(m);
+        }
+    }
+    plan.build_index();
+    return plan;
+}
+
+// The load's bulk copy stages every expert of a tensor at one stride, its staged bytes, so it declines an AOS tensor
+// whose triplets have a slot past that stride and stages it expert by expert, each at its slot: each such expert can
+// be lent. The answer follows the layout the load stages, the alternate's for a tensor staged through its alternates.
+void test_bulk_staged_mirrors_the_slot_stride_decline() {
+    const placement_plan padded  = bulk_plan(640, 0);
+    const placement_plan aligned = bulk_plan(2560, 0);
+    const placement_plan alt_aos = bulk_plan(640, 1, true);
+    const placement_plan alt_soa = bulk_plan(640, 1, true, GGML_LAYOUT_SOA);
+    for (const char * name : kBulkNames) {
+        CHECK(!ggml_sycl::detail::moe_loan_tensor_bulk_staged(padded, name, 0));
+        CHECK(ggml_sycl::detail::moe_loan_tensor_bulk_staged(aligned, name, 0));
+        CHECK(!ggml_sycl::detail::moe_loan_tensor_bulk_staged(alt_aos, name, 0));
+        CHECK(ggml_sycl::detail::moe_loan_tensor_bulk_staged(alt_soa, name, 0));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -979,6 +1052,8 @@ int main() {
     test_charge_move();
     test_recharge_gives_back_a_lost_slot();
     test_recharge_on_moves_the_target_devices_room();
+    test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry();
+    test_bulk_staged_mirrors_the_slot_stride_decline();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);

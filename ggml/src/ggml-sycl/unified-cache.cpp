@@ -12,6 +12,7 @@
 #include "cpu-traits-support.hpp"
 #include "e2e-profile.hpp"
 #include "expert-prefetch.hpp"
+#include "expert-slot.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
@@ -33,6 +34,7 @@
 #include "range-index.hpp"
 #include "scratch-test-mutant.hpp"
 #include "sycl-timeline.hpp"
+#include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
 #include "weight-row-padding.hpp"
@@ -31485,36 +31487,37 @@ void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * w
     fflush(stderr);
 }
 
-size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+template <typename F> bool unified_cache::arena_visit_zone_allocators(vram_zone_id zone, F && visit) const {
     const auto & z = arena_zones_[static_cast<int>(zone)];
-
     if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
-        const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
-        if (kv.allocator) {
-            return kv.allocator->largest_free_block();
+        if (const tlsf_allocator * kv = arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get()) {
+            visit(*kv);
         }
-        return 0;
+        return true;
     }
-
-    // N-chunk shared WEIGHT/KV: max across per-chunk allocators (a single alloc cannot
-    // span chunks, so the largest fittable size is the largest single chunk's
-    // largest free block).  KV includes its dedicated tail allocator too.
+    // N-chunk shared WEIGHT/KV: the per-chunk allocators, and KV's dedicated tail allocator too.
     if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
-        size_t best = 0;
         if (zone == vram_zone_id::KV && z.allocator) {
-            best = z.allocator->largest_free_block();
+            visit(*z.allocator);
         }
         for (const auto & wca : weight_chunk_allocators_) {
-            best = std::max(best, wca.allocator->largest_free_block());
+            visit(*wca.allocator);
         }
-        return best;
+        return true;
     }
-
     if (z.allocator) {
-        return z.allocator->largest_free_block();
+        visit(*z.allocator);
+        return true;
     }
+    return false;
+}
 
-    return zone_available(zone);
+size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+    // A single allocation cannot span chunks, so the largest fittable size is the largest of the allocators' own.
+    size_t     best   = 0;
+    const bool served = arena_visit_zone_allocators(
+        zone, [&best](const tlsf_allocator & allocator) { best = std::max(best, allocator.largest_free_block()); });
+    return served ? best : zone_available(zone);
 }
 
 bool unified_cache::zone_free_figures(vram_zone_id zone,
@@ -31538,31 +31541,15 @@ bool unified_cache::zone_free_block_sizes(vram_zone_id zone, std::vector<size_t>
     if (!arena_active()) {
         return false;
     }
-    const auto add = [&sizes](const tlsf_allocator * allocator) {
-        if (!allocator) {
-            return;
-        }
-        for (const tlsf_allocator::extent & e : allocator->block_census()) {
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    // The allocators zone_largest_free reads the top of.
+    (void) arena_visit_zone_allocators(zone, [&sizes](const tlsf_allocator & allocator) {
+        for (const tlsf_allocator::extent & e : allocator.block_census()) {
             if (e.free) {
                 sizes.push_back(e.size);
             }
         }
-    };
-    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
-    // The same allocators zone_largest_free reads, in the same three cases.
-    const auto &                z = arena_zones_[static_cast<int>(zone)];
-    if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
-        add(arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get());
-    } else if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
-        if (zone == vram_zone_id::KV) {
-            add(z.allocator.get());
-        }
-        for (const auto & wca : weight_chunk_allocators_) {
-            add(wca.allocator.get());
-        }
-    } else {
-        add(z.allocator.get());
-    }
+    });
     return true;
 }
 
@@ -34821,26 +34808,14 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
             const size_t new_charge =
                 planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
-            if (new_charge > old_charge) {
-                const size_t extra = new_charge - old_charge;
-                if (remaining[dev_index] < extra) {
-                    skipped_capacity++;
-                    continue;
-                }
-                remaining[dev_index] -= extra;
-                plan.weight_vram_bytes += extra;
-                plan.vram_bytes += extra;
-                plan.per_device_vram[dev_index] += extra;
-                charged_delta += static_cast<int64_t>(extra);
-            } else if (old_charge > new_charge) {
-                const size_t freed = old_charge - new_charge;
-                remaining[dev_index] += freed;
-                plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-                plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-                plan.per_device_vram[dev_index] =
-                    plan.per_device_vram[dev_index] > freed ? plan.per_device_vram[dev_index] - freed : 0;
-                charged_delta -= static_cast<int64_t>(freed);
+            // A layout that needs more room than the device has left is skipped: the move would charge past it.
+            if (new_charge > old_charge && remaining[dev_index] < new_charge - old_charge) {
+                skipped_capacity++;
+                continue;
             }
+            (void) placement_charge_move(old_charge, new_charge, remaining[dev_index], plan.per_device_vram[dev_index],
+                                         plan.weight_vram_bytes, plan.vram_bytes);
+            charged_delta += static_cast<int64_t>(new_charge) - static_cast<int64_t>(old_charge);
             entry.vram_charge_size = new_charge;
             device_changed++;
         } else {
@@ -34951,24 +34926,17 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
         const size_t new_charge = planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
         if (new_charge > old_charge) {
+            // An upgrade that would leave the device less than the guard is skipped: the move would charge into it.
             const size_t extra = new_charge - old_charge;
             if (remaining <= k_layout_upgrade_guard || extra > remaining - k_layout_upgrade_guard) {
                 continue;
             }
-            remaining -= extra;
-            plan.weight_vram_bytes += extra;
-            plan.vram_bytes += extra;
-            plan.per_device_vram[device_index] += extra;
             charged_bytes += extra;
-        } else if (old_charge > new_charge) {
-            const size_t freed = old_charge - new_charge;
-            remaining += freed;
-            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-            plan.per_device_vram[device_index] =
-                plan.per_device_vram[device_index] > freed ? plan.per_device_vram[device_index] - freed : 0;
-            released_bytes += freed;
+        } else {
+            released_bytes += old_charge - new_charge;
         }
+        (void) placement_charge_move(old_charge, new_charge, remaining, plan.per_device_vram[device_index],
+                                     plan.weight_vram_bytes, plan.vram_bytes);
 
         entry.layout           = target_layout;
         entry.dst_size         = new_size;
@@ -41346,14 +41314,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                         add_single_moe_pp_executable_alternates(plan, remaining[d], device_budgets[d].device_id,
                                                                 kv_info, envelope, &plan.per_device_vram[d]);
                     }
-                    // An I8 member leaves AOS: its triplet's AOS members give back the slot it lost, before the
-                    // gate/up upgrade reads the room, and again after it.
-                    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
-                                                  "I8 down layout upgrades");
                     const size_t gate_up_charged = maybe_upgrade_moe_gate_up_layouts_to_i8(
                         plan, remaining[d], device_budgets[d].device_id, n_experts);
-                    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
-                                                  "I8 gate/up layout upgrades");
                     plan.per_device_vram[d] += down_charged + gate_up_charged;
                 }
             } else {
