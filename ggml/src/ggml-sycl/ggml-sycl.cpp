@@ -29525,6 +29525,8 @@ void test_swap_forget(int device) {
     inst.reported    = 0;
     inst.skipped.store(0, std::memory_order_relaxed);
     inst.off_multithreaded.store(0, std::memory_order_relaxed);
+    // The WEIGHT zone census prints once per instance: a process that never ran the driver has not printed it.
+    inst.zone_census_printed = false;
 }
 
 struct test_swap_scope {

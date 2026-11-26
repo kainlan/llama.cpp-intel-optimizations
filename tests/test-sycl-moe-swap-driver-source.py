@@ -313,6 +313,16 @@ ROOM_STOOD_SIG = "inline bool moe_swap_room_stood("
 METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT); release(); "
                  "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
 GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
+# The guard writes the batch's three host-time parts into the answer on every exit, the one place the body writes them.
+GIVE_BACK_COST = ("answer->meta_us = meta_us;", "answer->copy_us = copy_us;", "answer->remap_us = remap_us;")
+# The refusal the line keeps is tracked across the whole batch: one flag, declared once before the prepare loop, so
+# the zone's figures are read for the first refusal and then only for each that asks the zone more.
+REFUSAL_READ_DECL = "bool zone_refusal_read = false;"
+PREPARE_LOOP = "for (uint32_t t = 0; t < n_selected && !stop; ++t) {"
+# The test hook that resets a device's swap instance between cases clears the census latch too, so a case after one
+# that printed the census prints it again.
+FORGET_SIG = "void test_swap_forget(int device) {"
+FORGET_CENSUS = "inst.zone_census_printed = false;"
 GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
                   "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
                   "meta_us, copy_us, remap_us };")
@@ -816,6 +826,11 @@ def check(raw: dict[str, str]) -> None:
             or len(word_matches(r"zone_largest_free_at_refusal\s*=(?!=)", sycl)) != 1):
         fail("D18", "the transaction does not read the largest free block at a refused device mint onto the named "
                     "triplet's outcome, before its members go back, for the refusal the boundary's line keeps alone")
+    if (txn_norm.count(REFUSAL_READ_DECL) != 1 or txn_norm.count(PREPARE_LOOP) != 1
+            or not ordered(txn_norm, REFUSAL_READ_DECL, PREPARE_LOOP)
+            or len(word_matches(r"zone_refusal_read\s*=(?!=)", sycl)) != 2):
+        fail("D18", "the refusal whose figures were read is not tracked across the batch by one flag declared before "
+                    "the prepare loop, so the zone's figures could be read at every refusal")
     if (norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1
             or len(word_matches(r"zone_room_bytes\s*=(?!=)", sycl)) != 2
             or norm(body(sycl, TXN_SIG)).count(ZONE_ASK_OUTCOME) != 1
@@ -844,9 +859,12 @@ def check(raw: dict[str, str]) -> None:
             and ordered(zone_warn, ZONE_CENSUS_BLOCK, ZONE_CENSUS_LOG)
             and ordered(zone_warn, ZONE_WARN_FIELDS[1], ZONE_CENSUS_ONCE, ZONE_CENSUS_BLOCK, ZONE_CENSUS_READ,
                         ZONE_CENSUS_LOG)
-            and len(word_matches(r"zone_census_printed\s*=(?!=)", sycl)) == 2):
+            and len(word_matches(r"zone_census_printed\s*=(?!=)", sycl.replace(body(sycl, FORGET_SIG), ""))) == 2):
         fail("D19", "the WEIGHT zone's free-block census is not logged at WARN once per swap instance, at the first "
                     "refusal for room whose free blocks it read, after the refusal line")
+    if norm(body(sycl, FORGET_SIG)).count(FORGET_CENSUS) != 1:
+        fail("D19", "the test hook that resets a device's swap instance leaves the census latch set, so a case after "
+                    "one that printed the census never prints it")
     visit = norm(body(cache, ZONE_VISIT_SIG))
     census_body = norm(body(cache, ZONE_CENSUS_SIG))
     largest_body = norm(body(cache, ZONE_LARGEST_SIG))
@@ -867,6 +885,9 @@ def check(raw: dict[str, str]) -> None:
             or len(word_matches(r"room_self_delta\s*=(?!=)", sycl)) != 4):
         fail("D20", "the prepared list is not given back measured by a guard that then writes the answer's "
                     "room_self_delta, the one place it is written besides the entry's copy")
+    if not all(give_back.count(f) == 1 for f in GIVE_BACK_COST):
+        fail("D20", "the give-back guard does not write the batch's meta, copy and remap host time into the answer on "
+                    "every exit")
     if txn.count(GIVE_BACK_DECL) != 1 or not ordered(txn, "prepared.reserve(n_selected);", GIVE_BACK_DECL, PREPARE_CALL):
         fail("D20", "the named move does not declare its meter and its give-back guard before the first triplet is "
                     "prepared, so an exit could give minted storage back unmeasured")
@@ -1337,6 +1358,20 @@ def self_test(raw: dict[str, str]) -> int:
                           ("total", "r.total_us        = ggml_sycl::expert_move_us_since(call_start);")):
         expect_fail(f"{field}-cost-not-carried-by-the-entry", "D20", [("sycl", ENTRY_SIG, anchor, "")])
     clock = "    const auto                   call_start = std::chrono::steady_clock::now();\n"
+    for field, anchor in (("meta", "answer->meta_us         = meta_us;\n"),
+                          ("copy", "answer->copy_us         = copy_us;\n"),
+                          ("remap", "answer->remap_us        = remap_us;\n")):
+        expect_fail(f"{field}-cost-not-written-by-the-give-back", "D20",
+                    [("sycl", GIVE_BACK_SIG, "            " + anchor, "")])
+    expect_fail("refusal-read-flag-redeclared-in-the-loop", "D18",
+                [("sycl", TXN_SIG, "        ggml_sycl_expert_prepared_triplet triplet;\n",
+                  "        ggml_sycl_expert_prepared_triplet triplet;\n        bool zone_refusal_read = false;\n")])
+    expect_fail("refusal-read-flag-declared-in-the-loop", "D18",
+                [("sycl", TXN_SIG, "    bool                               zone_refusal_read = false;\n", ""),
+                 ("sycl", TXN_SIG, "        ggml_sycl_expert_prepared_triplet triplet;\n",
+                  "        ggml_sycl_expert_prepared_triplet triplet;\n        bool zone_refusal_read = false;\n")])
+    expect_fail("census-latch-left-set-by-the-test-hook", "D19",
+                [("sycl", FORGET_SIG, "    inst.zone_census_printed = false;\n", "")])
     expect_fail("entry-clock-after-the-run", "D20",
                 [("sycl", ENTRY_SIG, clock, ""),
                  ("sycl", ENTRY_SIG, "    // Each outcome goes back to its own list",
