@@ -26,12 +26,13 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       live-update lease, and again under the inventory lock while the ledger holds a lent triplet;
   A4  an expert's size is its tensor's, never a cache entry's, in every direction: the resolver reads the tensor's
       bytes per expert (nb[2]) with its type and width, and the preparation hands all three to the cache. A move to
-      the device mints its storage at the padded staged size of those bytes, asked of the layout
-      (staged_expert_bytes), and a move to the host mints pinned storage for exactly those bytes; the preparation
-      sizes by the kind's direction alone, and the transaction sizes nothing. Never the host copy's size and never
-      computed for one type: the cache refuses a host copy shorter than the expert ("host copy size", a refusal a
-      later boundary meets again) and storage that is not exactly the staged size or is smaller than the expert, for
-      a refill as for an admit, and the device entry takes the storage's size;
+      the device mints every member's storage at its triplet's slot (expert_triplet_slot_bytes), the largest of the
+      padded staged sizes of the three members' bytes, asked of the layout (staged_expert_bytes), and a move to the
+      host mints pinned storage for exactly those bytes; the preparation sizes by the kind's direction alone, and the
+      transaction sizes nothing. Never the host copy's size, never a member's own staged size and never computed for
+      one type: the cache refuses a host copy shorter than the expert ("host copy size", a refusal a later boundary
+      meets again) and storage that is not exactly the triplet's slot or is smaller than the expert, for a refill as
+      for an admit, and the device entry takes the storage's size;
   A5  the copy moves exactly the expert's bytes from offset 0 of the host copy, the padded tail is zero-filled on the
       copy's queue behind the copy, and the device entry is published behind the fill (its ready event and last
       write), as the record the transaction remembers is, whose logical bytes are the tensor's bytes per expert in
@@ -265,9 +266,10 @@ LEASE = "registry.acquire_live_update(current_token)"
 LEDGER_LOCKED = "ggml_sycl_expert_lent_ledger & ledger = ggml_sycl_expert_lent_ledger_locked(device, *current);"
 
 PREP_DIRECTION = "const bool to_device = ggml_sycl_expert_move_to_device(out.kind);"
-STAGED_SIZE = ("const size_t staged = "
+STAGED_SIZE = ("staged[r] = "
                "ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, target.logical_bytes);")
-MINT = "storage = ggml_sycl_device_expert_alloc(device, staged);"
+SLOT = "const size_t slot = to_device ? ggml_sycl::expert_triplet_slot_bytes(staged) : 0;"
+MINT = "storage = ggml_sycl_device_expert_alloc(device, slot);"
 HOST_MINT = "storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);"
 MEMBER_TYPE = "m.type = target.type;"
 MEMBER_NCOLS = "m.ncols = target.ncols;"
@@ -279,8 +281,10 @@ STAGED_GUARD = "if (layout != GGML_LAYOUT_AOS ||"
 STAGED_AOS = "return aos_staged_weight_bytes(type, ncols, expert_bytes);"
 CACHE_LOGICAL = "const size_t logical = members[i].logical_bytes;"
 HOST_SIZE_GUARD = 'if (e.size < logical) { refusal = "host copy size"; break; }'
-CACHE_STAGED = "const size_t staged = staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical);"
-SIZE_GUARD = 'if (device_size[i] != staged || staged < logical) { refusal = "device storage size"; break; }'
+CACHE_STAGED = ("staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, "
+                "members[i].logical_bytes);")
+CACHE_SLOT = "const size_t slot = expert_triplet_slot_bytes(staged);"
+SIZE_GUARD = 'if (device_size[i] != slot || slot < logical) { refusal = "device storage size"; break; }'
 COPY_BYTES = "bytes[i] = logical;"
 FINAL_SIG = "static bool ggml_sycl_expert_move_refusal_is_final("
 ENTRY_SIZE = "entry.size = device_size[i];"
@@ -515,9 +519,10 @@ def check(raw: dict[str, str]) -> None:
                    "before the admit")
 
     # A4 ---------------------------------------------------------------------------------------------------------------
-    if not (prep.count(PREP_DIRECTION) == 1 and prep.count(STAGED_SIZE) == 1 and prep.count(MINT) == 1
-            and ordered(prep, PREP_DIRECTION, STAGED_SIZE, MINT)):
-        fail("A4", "a move to the device is not minted at the staged size, decided by the kind's direction")
+    if not (prep.count(PREP_DIRECTION) == 1 and prep.count(STAGED_SIZE) == 1 and prep.count(SLOT) == 1
+            and prep.count(MINT) == 1 and prep.count("ggml_sycl_device_expert_alloc(") == 1
+            and ordered(prep, PREP_DIRECTION, STAGED_SIZE, SLOT, MINT)):
+        fail("A4", "a move to the device is not minted at the triplet's slot, decided by the kind's direction")
     if prep.count(HOST_MINT) != 1 or "staged_expert_bytes(" in txn:
         fail("A4", "a move to the host is not minted at the tensor's bytes, or the transaction sizes a copy itself")
     if not (prep.count(MEMBER_TYPE) == 1 and prep.count(MEMBER_NCOLS) == 1 and RESOLVED_TYPE in resolve
@@ -526,12 +531,13 @@ def check(raw: dict[str, str]) -> None:
     if not (prep.count(MEMBER_LOGICAL) == 1 and RESOLVED_LOGICAL in resolve):
         fail("A4", "the expert's bytes every move sizes, copies and records are not its tensor's nb[2]")
     if not (copy.count(CACHE_LOGICAL) == 1 and copy.count(HOST_SIZE_GUARD) == 1
-            and ordered(copy, CACHE_LOGICAL, HOST_SIZE_GUARD, CACHE_STAGED) and '"host copy size"' in final):
+            and ordered(copy, CACHE_LOGICAL, HOST_SIZE_GUARD, SIZE_GUARD) and '"host copy size"' in final):
         fail("A4", "the cache does not refuse, as final, a host copy shorter than the expert's tensor bytes")
     if not (STAGED_GUARD in staged and staged.count(STAGED_AOS) == 1):
         fail("A4", "staged_expert_bytes does not ask the layout, or does not give AOS the padded size")
-    if not (copy.count(CACHE_STAGED) == 1 and copy.count(SIZE_GUARD) == 1 and ordered(copy, CACHE_STAGED, SIZE_GUARD)):
-        fail("A4", "the cache does not refuse admit storage that is not exactly the staged size")
+    if not (copy.count(CACHE_STAGED) == 1 and copy.count(CACHE_SLOT) == 1 and copy.count(SIZE_GUARD) == 1
+            and ordered(copy, CACHE_STAGED, CACHE_SLOT, SIZE_GUARD)):
+        fail("A4", "the cache does not refuse admit storage that is not exactly the triplet's slot")
     if not (copy.count(ENTRY_SIZE) == 1 and copy.count(MIRROR_SIZE) == 1):
         fail("A4", "the device entry is not sized as its storage")
     for name, text in (("transaction body", txn), ("triplet preparation", prep), ("cache shared body", copy),
@@ -752,9 +758,9 @@ def self_test(raw: dict[str, str]) -> int:
                                                   "(void) finalize_retired_entries_locked();\n"
                                                   "                refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;")])
     expect_fail("lock-before-mint", "A2", [("sycl", PREP_SIG,
-                                            "            storage = ggml_sycl_device_expert_alloc(device, staged);",
+                                            "            storage = ggml_sycl_device_expert_alloc(device, slot);",
                                             "            std::lock_guard early(g_tensor_inventory_mutex);\n"
-                                            "            storage = ggml_sycl_device_expert_alloc(device, staged);")])
+                                            "            storage = ggml_sycl_device_expert_alloc(device, slot);")])
     expect_fail("lock-before-prepare", "A2", [("sycl", TXN_SIG, "        stop = ggml_sycl_expert_prepare_triplet(",
                                                "        std::lock_guard early(g_tensor_inventory_mutex);\n"
                                                "        stop = ggml_sycl_expert_prepare_triplet(")])
@@ -772,23 +778,26 @@ def self_test(raw: dict[str, str]) -> int:
                                                     "outstanding\");\n    }\n    if (!refill && !named) {",
                                                     "        return refuse(ggml_sycl_txn_result::REFUSED, \"loans "
                                                     "outstanding\");\n    }\n    if (!refill && !named) {")])
-    expect_fail("minted-at-host-size", "A4", [("sycl", PREP_SIG, "ggml_sycl_device_expert_alloc(device, staged)",
+    expect_fail("minted-at-host-size", "A4", [("sycl", PREP_SIG, "ggml_sycl_device_expert_alloc(device, slot)",
                                                "ggml_sycl_device_expert_alloc(device, target.logical_bytes)")])
+    expect_fail("minted-at-own-staged-size", "A4", [("sycl", PREP_SIG, "ggml_sycl_device_expert_alloc(device, slot)",
+                                                     "ggml_sycl_device_expert_alloc(device, staged[r])")])
+    expect_fail("slot-from-one-member", "A4", [("sycl", PREP_SIG, "ggml_sycl::expert_triplet_slot_bytes(staged)",
+                                                "staged[0]")])
     expect_fail("host-copy-at-entry-size", "A4",
                 [("sycl", PREP_SIG, "ggml_sycl_host_expert_alloc(device, target.logical_bytes)",
                   "ggml_sycl_host_expert_alloc(device, cache.loan_copy_bytes(target.key))")])
     expect_fail("transaction-sizes-a-copy", "A4", [("sycl", TXN_SIG, "        triplet.named = named ? named_place[t] : 0;",
                                                     "        triplet.named = named ? named_place[t] : 0;\n        (void) "
                                                     "staged_expert_bytes(GGML_LAYOUT_AOS, GGML_TYPE_COUNT, 0, 0);")])
-    expect_fail("cache-checks-host-size", "A4", [("cache", COPY_SIG,
-                                                  "staged_expert_bytes(e.layout, members[i].type, members[i].ncols, "
-                                                  "logical)",
-                                                  "e.size")])
+    expect_fail("cache-checks-host-size", "A4", [("cache", COPY_SIG, "if (device_size[i] != slot || slot < logical)",
+                                                  "if (device_size[i] != e.size || e.size < logical)")])
     expect_fail("refill-staged-at-host-copy-size", "A4", [("cache", COPY_SIG,
-                                                           "staged_expert_bytes(e.layout, members[i].type, "
-                                                           "members[i].ncols, logical)",
-                                                           "(admit ? staged_expert_bytes(e.layout, members[i].type, "
-                                                           "members[i].ncols, logical) : e.size)")])
+                                                           "if (device_size[i] != slot || slot < logical)",
+                                                           "if (device_size[i] != (admit ? slot : e.size) || "
+                                                           "slot < logical)")])
+    expect_fail("cache-checks-own-staged-size", "A4", [("cache", COPY_SIG, "if (device_size[i] != slot ||",
+                                                        "if (device_size[i] != staged[i] ||")])
     expect_fail("refill-copies-the-host-copy-whole", "A4", [("cache", COPY_SIG,
                                                              "const size_t logical = members[i].logical_bytes;",
                                                              "const size_t logical = admit ? members[i].logical_bytes "
@@ -798,7 +807,7 @@ def self_test(raw: dict[str, str]) -> int:
                                                  "target.ncols, e->dst_size)")])
     expect_fail("logical-not-handed-to-cache", "A4",
                 [("sycl", PREP_SIG, "        m.logical_bytes                   = target.logical_bytes;\n", "")])
-    expect_fail("cache-stages-host-copy-size", "A4", [("cache", COPY_SIG, "members[i].ncols, logical)",
+    expect_fail("cache-stages-host-copy-size", "A4", [("cache", COPY_SIG, "members[i].ncols, members[i].logical_bytes)",
                                                        "members[i].ncols, e.size)")])
     expect_fail("shorter-host-copy-admitted", "A4", [("cache", COPY_SIG, "if (e.size < logical) {", "if (false) {")])
     expect_fail("host-copy-size-retried", "A4", [("sycl", FINAL_SIG, '"host copy size",', "")])

@@ -5,12 +5,14 @@
 // a window's items are a pure function of the published plan, the executor's claims and the phase's experts, with no
 // device and no queue. The enqueue that consumes them is moe_stream_phase (bodies in moe-stream-plan.cpp).
 
+#include "expert-slot.hpp"
 #include "moe-exec-cost.hpp"
 #include "moe-exec-policy.hpp"
 #include "moe-mmvq-tables.hpp"  // moe_pp_batched_f16_window_experts: the window the ring is sized to
 #include "moe-stream-ring.hpp"
 #include "moe-swap-driver.hpp"  // moe_swap_plan_view: what moe_swap_plan_view_build fills
 #include "unified-cache.hpp"
+#include "weight-row-padding.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1396,6 +1398,68 @@ static inline bool moe_loan_triplet_is_lendable(const moe_loan_triplet &        
 }
 
 }  // namespace detail
+
+// ---- The WEIGHT-zone slot of a planned triplet (expert-slot.hpp). ---------------------------------------------------
+// A planned expert member's staged bytes: what direct staging gives it in the plan's layout, from its own bytes per
+// expert (src_size), its type and its row width. 0 for a layout that does not stage that way (only AOS does).
+static inline size_t moe_expert_entry_staged_bytes(const placement_entry & e) {
+    return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);
+}
+
+// The slot every member of the planned triplet `t` (gate, up, down) takes in a WEIGHT zone: expert_triplet_slot_bytes
+// of its members' staged bytes. 0 when a member is missing or does not stage as AOS: such a triplet never moves
+// between the host and the device, and each member keeps its own size.
+static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3]) {
+    size_t staged[3] = { 0, 0, 0 };
+    for (int r = 0; r < 3; ++r) {
+        if (!t[r]) {
+            return 0;
+        }
+        staged[r] = moe_expert_entry_staged_bytes(*t[r]);
+    }
+    return expert_triplet_slot_bytes(staged);
+}
+
+// The slot of (layer, expert) in an indexed plan (plan.build_index() has run).
+static inline size_t moe_expert_triplet_slot_bytes(const placement_plan & plan, int layer, int expert) {
+    return moe_expert_triplet_slot_bytes(detail::moe_loan_triplet_of(plan, layer, expert).e);
+}
+
+// Charges every member of each triplet that has a slot the slot's bytes, the WEIGHT-zone room its device copy takes,
+// so the plan and the zone agree on what one routed expert costs. Pure over `entries` and needs no index: the planner
+// runs it while it builds the plan, before an index exists. A triplet a role of which appears twice is left alone.
+// Returns the number of triplets charged.
+static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries) {
+    struct triplet_members {
+        placement_entry * e[3]      = { nullptr, nullptr, nullptr };
+        bool              ambiguous = false;
+    };
+
+    std::unordered_map<uint64_t, triplet_members> triplets;
+    for (placement_entry & e : entries) {
+        if (e.expert_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) {
+            continue;
+        }
+        triplet_members &  t    = triplets[detail::moe_loan_triplet_key(e.layer_id, e.expert_id)];
+        placement_entry *& slot = t.e[detail::moe_loan_role_slot(e.expert_role)];
+        t.ambiguous             = t.ambiguous || slot != nullptr;
+        slot                    = &e;
+    }
+    size_t charged = 0;
+    for (auto & [key, t] : triplets) {
+        GGML_UNUSED(key);
+        const placement_entry * const members[3] = { t.e[0], t.e[1], t.e[2] };
+        const size_t                  slot       = t.ambiguous ? 0 : moe_expert_triplet_slot_bytes(members);
+        if (slot == 0) {
+            continue;
+        }
+        for (placement_entry * e : t.e) {
+            e->vram_charge_size = placement_vram_charge_bytes(slot);
+        }
+        charged++;
+    }
+    return charged;
+}
 
 // The lendable tail of the resident set on `device`: whole (gate, up, down) triplets, walking plan.entries in REVERSE
 // (pack-group order, popularity rank when ranks exist, so the tail is the least popular), until what they free covers

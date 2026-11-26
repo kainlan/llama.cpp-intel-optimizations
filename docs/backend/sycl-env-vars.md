@@ -629,15 +629,22 @@ counted the moves it had in flight as open slots)
 - WARN `[MOE-SWAP] device %d: %s refused: %s (logged once per reason)`: `%s` is `evict` or `admit`, then the named
   move's final refusal reason. Logged as it happens, the first time each reason appears in each direction on the
   device's instance, so a run killed before backend free still says what the driver could not move.
-- WARN `[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: largest member asked %zu bytes,
-  zone_available %zu bytes, zone_largest_free %zu bytes`: one line for each boundary whose transaction refused at
-  least one admit because the device WEIGHT zone had no room, whether or not anything else in the batch moved: the
-  admits refused of the admits sent, the largest member the zone was asked for and refused, and what the zone had
-  free after the batch, read together (`unified_cache::zone_free_figures`). `zone_available` at or above the size
-  asked with `zone_largest_free` below it is fragmentation; both below it is a zone with no room. A boundary whose
+- WARN `[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: a triplet needs 3 x %zu = %zu bytes,
+  largest free block at refusal %zu bytes; after the batch zone_available %zu bytes, zone_largest_free %zu bytes`:
+  one line for each boundary whose transaction refused at least one admit because the device WEIGHT zone had no
+  room, whether or not anything else in the batch moved: the admits refused of the admits sent, what the largest
+  refused triplet needed (each of its three members is minted at the triplet's slot, `expert_triplet_slot_bytes`),
+  the largest free block the zone had when a mint was refused (the largest any refusal saw), and what the zone had
+  free after the batch, read together (`unified_cache::zone_free_figures`). `zone_available` at or above the slot
+  with the largest block below it is fragmentation; both below it is a zone with no room. A boundary whose
   transaction throws prints none. A refused admit is held, not sent, until the zone's room epoch moves for a
   reason other than the transaction's own give-backs, so the line does not repeat for it at the boundaries in
   between.
+- WARN `[MOE-SWAP] device %d: WEIGHT zone free blocks at the first refusal: %zu blocks, %zu bytes, room for %zu slots
+  of %zu bytes; largest: <size> x <count>, ...`: once per device, right after the first refusal line: the WEIGHT
+  zone's free blocks (`unified_cache::zone_free_block_sizes`), their bytes, how many slots of the refused size they
+  hold whole, and the six largest sizes with their counts, largest first, then how many smaller blocks of how many
+  sizes remain. Free bytes that hold no slot are holes, and their sizes say where they come from.
 - WARN `[MOE-SWAP] device %d: no driver ran: %llu boundaries off (multithreaded graphs), %llu skipped (a graph in
   flight, or the instance claimed)`: at backend free, for a device whose boundaries were all turned off or skipped
   before a driver existed (the multithreaded latch set from the first graph, say).

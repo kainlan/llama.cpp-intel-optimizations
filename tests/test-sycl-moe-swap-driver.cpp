@@ -1237,13 +1237,37 @@ static void test_a_throw_leaves_a_held_admit_pending() {
     CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
 }
 
-// The zone-refusal line names its five figures, the sizes in bytes, under the driver's prefix.
+// The zone-refusal line names what the refused triplet needed (its three members at one slot each), the largest free
+// block the zone had when it refused, and what the zone had free after the batch, the sizes in bytes, under the
+// driver's prefix.
 static void test_the_zone_refusal_line_names_its_figures() {
-    const std::string line = ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 3145728, 1048576, 524288);
+    const std::string line = ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 921856, 917504, 331806720, 924928);
     CHECK(line ==
-          "[MOE-SWAP] device 1: WEIGHT zone refused 276 of 300 admits for room: largest member asked 3145728 "
-          "bytes, zone_available 1048576 bytes, zone_largest_free 524288 bytes");
+          "[MOE-SWAP] device 1: WEIGHT zone refused 276 of 300 admits for room: a triplet needs 3 x 921856 = 2765568 "
+          "bytes, largest free block at refusal 917504 bytes; after the batch zone_available 331806720 bytes, "
+          "zone_largest_free 924928 bytes");
     std::printf("  zone-refusal line: %s\n", line.c_str());
+}
+
+// The free-block census names the zone's free blocks and bytes, how many slots they hold, and the largest sizes with
+// their counts, largest first, cut at `top` with the rest counted.
+static void test_the_zone_free_census_line_names_the_largest_sizes() {
+    const std::vector<size_t> free_sizes = { 262144, 917504, 2000000, 917504, 262144, 921344, 917504, 262144, 262144 };
+    const std::string         line       = ggml_sycl::moe_swap_zone_free_census_line(1, free_sizes, 921856, 3);
+    CHECK(line ==
+          "[MOE-SWAP] device 1: WEIGHT zone free blocks at the first refusal: 9 blocks, 6722432 bytes, room for 2 "
+          "slots of 921856 bytes; largest: 2000000 x 1, 921344 x 1, 917504 x 3, and 4 blocks of 1 smaller size");
+    std::printf("  zone-census line: %s\n", line.c_str());
+
+    const std::string all = ggml_sycl::moe_swap_zone_free_census_line(0, { 512, 1024, 512 }, 2048, 8);
+    CHECK(all ==
+          "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 3 blocks, 2048 bytes, room for 0 "
+          "slots of 2048 bytes; largest: 1024 x 1, 512 x 2");
+
+    const std::string none = ggml_sycl::moe_swap_zone_free_census_line(0, {}, 2048, 8);
+    CHECK(none ==
+          "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 0 blocks, 0 bytes, room for 0 slots of "
+          "2048 bytes; largest: none");
 }
 
 int main() {
@@ -1283,6 +1307,7 @@ int main() {
     test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_streak();
     test_a_throw_leaves_a_held_admit_pending();
     test_the_zone_refusal_line_names_its_figures();
+    test_the_zone_free_census_line_names_the_largest_sizes();
 
     if (g_failed != 0) {
         std::printf("test-sycl-moe-swap-driver: %d check(s) failed\n", g_failed);

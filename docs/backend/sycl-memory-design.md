@@ -377,22 +377,32 @@ plan with its last evict, and no admit could bring those experts back.
 An expert's size is a fact of its tensor, never of a cache entry: the
 transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
 width, and hands the three to the cache. The device copy is minted from the
-WEIGHT zone through `ggml_sycl_device_expert_alloc` at `staged_expert_bytes()`,
-the size direct staging gives the expert, never at the host copy's size. For
-AOS that is `aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight
-gets a tail that completes its last row to a multiple of `MATRIX_ROW_PADDING`
-columns, which the quantized kernels may read. The size is asked of the
-layout, so a layout that stages another way adds its own case in one place. A
+WEIGHT zone through `ggml_sycl_device_expert_alloc` at the triplet's slot,
+the size direct staging gives each of its members, never at the host copy's
+size. A member's staged size is `staged_expert_bytes()`, for AOS
+`aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight gets a tail
+that completes its last row to a multiple of `MATRIX_ROW_PADDING` columns,
+which the quantized kernels may read. The size is asked of the layout, so a
+layout that stages another way adds its own case in one place. The slot is
+`expert_triplet_slot_bytes()` (`expert-slot.hpp`): the largest of the three
+members' staged sizes, rounded to the TLSF grain. Every member of a triplet
+takes it, at the load, at a refill and at an admit, and the planner charges it
+for each member. Members of one triplet need not stage alike (a 640-column
+AOS down projection carries a tail its gate and up do not), and the load
+stages each tensor's experts as one run, so a swap that minted each member at
+its own size would split freed runs of the other size and leave holes a few
+grains short of any member; at one size per triplet any freed member's block
+holds any member. A
 host copy may be longer than the expert when another writer padded it; a loan
 or an evict copies only the expert's bytes, so the host copies they make hold
 exactly `nb[2]` and a padded device entry's tail stays on the card. The copy
 moves exactly `nb[2]` bytes from the host copy's offset 0 and never reads past
 them, so an expert that goes to the host and back does not grow. A host copy
 shorter than `nb[2]` is refused "host copy size", REFUSED. The cache requires
-the device size to equal the staged size and to be at least `nb[2]`. The tail
+the device size to equal the triplet's slot and to be at least `nb[2]`. The tail
 is zero-filled behind the copy on the same queue, the device entry is published
 behind the fill, and the extra's record covers
-`nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
+`nb[2]` bytes, as direct staging's does, while the entry holds the slot.
 The admit gives back the whole host entry, all of its zone bytes. A Q4_0
 expert 640 columns wide gains 216 bytes. The first graph after the publish
 serves the admitted expert from the card. The selected-ids pointer table

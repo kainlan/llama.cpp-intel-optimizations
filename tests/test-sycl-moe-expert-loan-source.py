@@ -993,11 +993,14 @@ def claim_refill_checks_before_copying(cache: str) -> bool:
             and ordered(b, REFILL_LOAD_EFFECT, COHERENCE, *REFILL_CHECKS, REFILL_SRC, REFUSE_EARLY, REFILL_COPY))
 
 
-# A move to the device mints its storage at the staged size the layout gives the expert's tensor's bytes per expert,
-# refill and admit alike, never at a host copy's size.
-DEVICE_BYTES = ("const size_t staged = ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, "
+# A move to the device mints every member's storage at its triplet's slot, the largest of the staged sizes the layout
+# gives the three members' tensors' bytes per expert, refill and admit alike, never at a host copy's size and never at
+# the member's own staged size: the load stages each member at the slot, so the block an admitted member takes is one
+# any evicted member gave back.
+DEVICE_BYTES = ("staged[r] = ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, "
                 "target.logical_bytes);")
-DEVICE_ALLOC = "storage = ggml_sycl_device_expert_alloc(device, staged);"
+DEVICE_SLOT = "const size_t slot = to_device ? ggml_sycl::expert_triplet_slot_bytes(staged) : 0;"
+DEVICE_ALLOC = "storage = ggml_sycl_device_expert_alloc(device, slot);"
 ZONE_ALLOC = ("ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(device, "
               "ggml_sycl::vram_zone_id::WEIGHT, size);")
 
@@ -1542,28 +1545,32 @@ LOAN_ENTRY_GUARD = 'if (e.size < members[i].logical_bytes) { refusal = "device e
 LOAN_SIZE_GUARD = 'if (host_md[i].size < members[i].logical_bytes) { refusal = "host storage too small"; break; }'
 LOAN_COPY_BYTES = "bytes[i] = members[i].logical_bytes; device_size[i] = e.size;"
 # A refill and an admit copy the expert's own bytes from a host copy that holds them, into device storage of exactly
-# the staged size of those bytes.
+# the triplet's slot, computed once from the three members' staged sizes as AOS.
+REFILL_STAGED = ("staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, "
+                 "members[i].logical_bytes);")
+REFILL_SLOT = "const size_t slot = expert_triplet_slot_bytes(staged);"
 REFILL_SIZE_GUARD = ('const size_t logical = members[i].logical_bytes; if (e.size < logical) { '
-                     'refusal = "host copy size"; break; } const size_t staged = staged_expert_bytes(e.layout, '
-                     "members[i].type, members[i].ncols, logical); if (device_size[i] != staged || "
-                     'staged < logical) { refusal = "device storage size"; break; }')
+                     'refusal = "host copy size"; break; } if (device_size[i] != slot || '
+                     'slot < logical) { refusal = "device storage size"; break; }')
 
 
 def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
     """The preparation mints each member's copy from its tensor's bytes per expert, never from a cache entry's size
-    or the plan's dst_size: a loan's host copy at those bytes, a refill's and an admit's device storage at the staged
-    size the layout gives them. The cache is asked only whether the source entry is there, under its two locks, and
-    the cache's size checks stay as the guards: a loan's against the device entry and the host copy, a refill's against
-    the host copy and the device storage. So an expert that goes to the host and back does not grow."""
+    or the plan's dst_size: a loan's host copy at those bytes, a refill's and an admit's device storage at the
+    triplet's slot, the largest of the staged sizes the layout gives the three members. The cache is asked only
+    whether the source entry is there, under its two locks, and the cache's size checks stay as the guards: a loan's
+    against the device entry and the host copy, a refill's against the host copy and the device storage. So an expert that goes to the host and back does not grow."""
     s = norm(sycl)
     txn = body(s, TXN_SIG)
     prep = body(s, PREP_SIG)
     c = norm(cache)
     source = body(c, SOURCE_SIG)
     loan = body(c, LOAN_SIG)
-    return (prep.count(SOURCE_CHECK) == 1 and prep.count(DEVICE_BYTES) == 1 and prep.count(DEVICE_ALLOC) == 1
-            and prep.count(HOST_ALLOC) == 1
-            and ordered(prep, RESOLVE_FAILED, SOURCE_CHECK, DEVICE_BYTES, DEVICE_ALLOC, HOST_ALLOC)
+    refill = body(c, REFILL_BODY_SIG)
+    return (prep.count(SOURCE_CHECK) == 1 and prep.count(DEVICE_BYTES) == 1 and prep.count(DEVICE_SLOT) == 1
+            and prep.count(DEVICE_ALLOC) == 1 and prep.count(HOST_ALLOC) == 1
+            and len(re.findall(r"\bggml_sycl_device_expert_alloc\(", prep)) == 1
+            and ordered(prep, RESOLVE_FAILED, SOURCE_CHECK, DEVICE_BYTES, DEVICE_SLOT, DEVICE_ALLOC, HOST_ALLOC)
             and "dst_size" not in prep and "staged_expert_bytes(" not in txn
             and source.count(SHARED_CACHE_LOCKS) == 1 and source.count(SOURCE_FIND) == 1
             and source.count(SOURCE_RETURN) == 1 and ordered(source, SHARED_CACHE_LOCKS, SOURCE_FIND, SOURCE_RETURN)
@@ -1571,7 +1578,8 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
             and "loan_copy_bytes(" not in c and "refill_copy_bytes(" not in c
             and loan.count(LOAN_ENTRY_GUARD) == 1 and loan.count(LOAN_SIZE_GUARD) == 1
             and loan.count(LOAN_COPY_BYTES) == 1 and ordered(loan, LOAN_ENTRY_GUARD, LOAN_SIZE_GUARD, LOAN_COPY_BYTES)
-            and body(c, REFILL_BODY_SIG).count(REFILL_SIZE_GUARD) == 1)
+            and refill.count(REFILL_STAGED) == 1 and refill.count(REFILL_SLOT) == 1
+            and refill.count(REFILL_SIZE_GUARD) == 1 and ordered(refill, REFILL_STAGED, REFILL_SLOT, REFILL_SIZE_GUARD))
 
 
 # --- a moved copy belongs to its source's models --------------------------------------------------------------------
@@ -3086,14 +3094,33 @@ def test_mutant_loan_copy_sized_from_dst_size_fails():
 
 
 def test_mutant_refill_storage_sized_from_dst_size_fails():
-    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, staged)", "(device, e->dst_size)"))
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, slot)", "(device, e->dst_size)"))
     assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_device_member_minted_at_its_own_staged_size_fails():
+    """Each member minted at its own staged size, as before one slot per triplet: an admitted down projection, a few
+    grains longer than a gate, splits the block an evicted gate gave back and leaves a hole no member fits."""
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, slot)", "(device, staged[r])"))
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_slot_from_one_member_fails():
+    """The slot taken from the first member alone, not the largest of the three."""
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_SLOT, "const size_t slot = to_device ? staged[0] : 0;")
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_cache_accepts_a_member_at_its_own_staged_size_fails():
+    """The cache's check against each member's own staged size: a device copy minted short of the slot published."""
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, "if (device_size[i] != slot ||", "if (device_size[i] != staged[i] ||")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
 def test_mutant_refill_device_bytes_from_the_host_copy_fails():
     """The device size taken from the host copy's bytes rather than staged from them: the padded tail the kernels
     read past an expert's own bytes is missing."""
-    mutant = _once_in(SYCL, PREP_SIG, DEVICE_BYTES, "const size_t staged = target.logical_bytes;")
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_BYTES, "staged[r] = target.logical_bytes;")
     assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
 
 
@@ -3957,6 +3984,121 @@ def test_mutant_definitions_in_production_fail():
     cache = _raw_once(cache, "    return true;\n}\n#endif\n\nuint64_t unified_cache::test_entry_pending_load_txn(",
                   "    return true;\n}\n\nuint64_t unified_cache::test_entry_pending_load_txn(")
     assert not claim_the_move_test_hooks_are_test_only(CACHE_HPP, cache)
+
+# --- one WEIGHT-zone slot per triplet: every member mint, load and swap alike, takes it -----------------------------
+
+# A triplet's members need not stage alike (an AOS down projection whose row width is not a multiple of
+# MATRIX_ROW_PADDING carries a tail its gate and up do not). Minted each at its own size, a swap's admitted member
+# splits a block another member size gave back and leaves a hole no member fits. So one function gives a triplet's
+# slot (expert_triplet_slot_bytes, the largest of the members' staged sizes rounded to the zone's grain), and every
+# mint of a member asks it: the load's per-expert staging through ggml_sycl_expert_stage_bytes, the swap's and the
+# refill's preparation, and the cache's check of the storage it is handed; the planner charges each member the slot.
+# The logical bytes stay the member's own: every copy moves them and no more. (The opt-in MXFP4 DPAS rollback restores
+# at the base layout's size: its reorder fill copies its whole destination, and MXFP4's members stage alike.)
+SLOT_HPP = read("ggml/src/ggml-sycl/expert-slot.hpp")
+SLOT_SIG = "inline size_t expert_triplet_slot_bytes(const size_t (&staged)[3])"
+SLOT_ROUND = "const size_t rounded = tlsf_allocator::round_request(bytes, tlsf_allocator::block_grain);"
+SLOT_MAX = "slot = rounded > slot ? rounded : slot;"
+PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
+PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
+PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
+CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries)"
+CHARGE_SET = "e->vram_charge_size = placement_vram_charge_bytes(slot);"
+STAGE_BYTES_SIG = "static size_t ggml_sycl_expert_stage_bytes(const ggml_sycl::placement_plan & plan,"
+STAGE_BYTES_BODY = ("if (layout != GGML_LAYOUT_AOS) { return staged; } const size_t slot = "
+                    "ggml_sycl::moe_expert_triplet_slot_bytes(plan, layer, expert); return slot >= staged ? slot : "
+                    "staged; }")
+PRELOAD_SLOT = ("expert_preload_bytes = ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), "
+                "expert_slot_layer, static_cast<int>(e), expert_preload_layout, expert_preload_bytes);")
+PRELOAD_STAGE = ("ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, expert_size, "
+                 "expert_preload_bytes, expert_preload_layout,")
+PRELOAD_LAYER = "expert_slot_layer = placement.layer_id;"
+PLANNER_CHARGES = "placement_entries_charge_expert_slots(plan.entries);"
+FIXTURES_END = "#endif  // GGML_SYCL_PRIVATE_TESTING"
+FIXTURES_IF = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+
+
+def production(text: str) -> str:
+    """`text` without the device fixtures' testing block (the one closed by FIXTURES_END), which sizes its own
+    entries; unchanged when it has none."""
+    end = text.find(FIXTURES_END)
+    if end < 0:
+        return text
+    start = text.rfind(FIXTURES_IF, 0, end)
+    return text[:start] + text[end + len(FIXTURES_END):] if start >= 0 else text
+
+
+def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_hpp: str, slot_hpp: str) -> bool:
+    """One function gives the slot, from the largest of the members' staged sizes rounded to the zone's grain; the plan
+    asks it of a triplet's three entries, the preparation and the cache of the three members they are handed; the
+    load's per-expert staging mints at the plan's slot, through one helper, and the planner charges each member the
+    slot at each of its three plan builds. Nothing else computes a slot."""
+    s = norm(production(sycl))
+    c = norm(production(cache))
+    p = norm(plan_hpp)
+    slot_body = body(norm(slot_hpp), SLOT_SIG)
+    return (slot_body.count(SLOT_ROUND) == 1 and slot_body.count(SLOT_MAX) == 1
+            and body(p, PLAN_SLOT_SIG).count(PLAN_SLOT_CALL) == 1
+            and PLAN_ENTRY_STAGED in p and p.count(CHARGE_SET) == 1 and ordered(p, CHARGE_SIG, CHARGE_SET)
+            and body(s, STAGE_BYTES_SIG).rstrip().endswith(STAGE_BYTES_BODY)
+            and s.count(PRELOAD_LAYER) == 1 and s.count(PRELOAD_SLOT) == 1 and s.count(PRELOAD_STAGE) == 1
+            and ordered(s, PRELOAD_LAYER, PRELOAD_SLOT, PRELOAD_STAGE)
+            and len(re.findall(r"\bggml_sycl_expert_stage_bytes\(", s)) == 2
+            and len(re.findall(r"\bexpert_triplet_slot_bytes\(", s)) == 1
+            and len(re.findall(r"\bexpert_triplet_slot_bytes\(", c)) == 1
+            and c.count(PLANNER_CHARGES) == 3)
+
+
+def test_every_member_mint_takes_the_triplet_slot():
+    assert claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_slot_from_the_first_member_fails():
+    mutant = _once_in(SLOT_HPP, SLOT_SIG, SLOT_MAX, "slot = slot == 0 ? rounded : slot;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, mutant)
+
+
+def test_mutant_slot_unrounded_fails():
+    mutant = _once_in(SLOT_HPP, SLOT_SIG, SLOT_ROUND, "const size_t rounded = bytes;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, mutant)
+
+
+def test_mutant_load_stages_a_member_at_its_own_size_fails():
+    mutant = _once(SYCL, PRELOAD_SLOT, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_load_slot_after_the_stage_fails():
+    mutant = _once(_once(SYCL, PRELOAD_SLOT, ""), PRELOAD_STAGE, PRELOAD_SLOT + " " + PRELOAD_STAGE)
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_load_slot_never_has_a_layer_fails():
+    mutant = _once(SYCL, PRELOAD_LAYER, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_stage_helper_ignores_the_slot_fails():
+    mutant = _once_in(SYCL, STAGE_BYTES_SIG, "return slot >= staged ? slot : staged;", "return staged;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_a_second_slot_source_fails():
+    """A second place computing a slot from the members' staged sizes, which could disagree with the first."""
+    mutant = _once(SYCL, PRELOAD_SLOT, PRELOAD_SLOT + " (void) ggml_sycl::expert_triplet_slot_bytes({ 1, 2, 3 });")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_planner_charges_one_member_alone_fails():
+    mutant = _once(PLAN_HPP, CHARGE_SET, "(void) e;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_planner_misses_a_build_fails():
+    n = norm(CACHE)
+    mutant = n.replace(PLANNER_CHARGES, "", 1)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
 
 if __name__ == "__main__":
     import sys

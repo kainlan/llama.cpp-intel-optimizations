@@ -11897,6 +11897,13 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         }
         deps[i].reserve(2);
     }
+    // The storage every member must own: its triplet's WEIGHT-zone slot (expert-slot.hpp), from the members' staged
+    // bytes as AOS, the one layout this stages (each host copy is checked to be AOS below).
+    size_t staged[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3; ++i) {
+        staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, members[i].logical_bytes);
+    }
+    const size_t slot = expert_triplet_slot_bytes(staged);
 
     // 1. Each member's host copy is one the direction copies from, a loan's for a refill and any whole pinned
     // host-zone copy for an admit, all three members before anything changes.
@@ -11961,11 +11968,11 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 refusal = "host copy size";
                 break;
             }
-            // The storage is the size direct staging gives the expert, its bytes and the padded tail the copy below
-            // zero-fills, asked of the layout; never less than its bytes. The entry is published at that size, so it
-            // owns its whole allocation, which a loan that later lends it again requires.
-            const size_t staged = staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical);
-            if (device_size[i] != staged || staged < logical) {
+            // The storage is the triplet's slot, the size direct staging gives each of its members: the expert's
+            // bytes and a tail the copy below zero-fills (the row padding the kernels may read, then the slot's own
+            // rounding), never less than its bytes. The entry is published at that size, so it owns its whole
+            // allocation, which a loan that later lends it again requires.
+            if (device_size[i] != slot || slot < logical) {
                 refusal = "device storage size";
                 break;
             }
@@ -31526,6 +31533,39 @@ bool unified_cache::zone_free_figures(vram_zone_id zone,
     return true;
 }
 
+bool unified_cache::zone_free_block_sizes(vram_zone_id zone, std::vector<size_t> & sizes) {
+    sizes.clear();
+    if (!arena_active()) {
+        return false;
+    }
+    const auto add = [&sizes](const tlsf_allocator * allocator) {
+        if (!allocator) {
+            return;
+        }
+        for (const tlsf_allocator::extent & e : allocator->block_census()) {
+            if (e.free) {
+                sizes.push_back(e.size);
+            }
+        }
+    };
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    // The same allocators zone_largest_free reads, in the same three cases.
+    const auto &                z = arena_zones_[static_cast<int>(zone)];
+    if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
+        add(arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get());
+    } else if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
+        if (zone == vram_zone_id::KV) {
+            add(z.allocator.get());
+        }
+        for (const auto & wca : weight_chunk_allocators_) {
+            add(wca.allocator.get());
+        }
+    } else {
+        add(z.allocator.get());
+    }
+    return true;
+}
+
 uint64_t unified_cache::zone_room_epoch(vram_zone_id zone) const noexcept {
     return arena_allocator_groups_[arena_allocator_group_index(zone)].room_epoch.load(std::memory_order_acquire);
 }
@@ -33818,7 +33858,8 @@ static ggml_layout_mode planner_multi_device_moe_common_layout(const placement_t
 // What a routed expert in `layout` costs the WEIGHT zone when it is on a device: its staged bytes, rounded as the zone
 // rounds them. A host-placed expert carries the same charge, because a later move to a device charges what the entry
 // says. An AOS quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and
-// refills size their copies from the entry.
+// refills size their copies from the entry. This is one member alone: once its triplet's three entries exist,
+// placement_entries_charge_expert_slots() charges each member of a triplet that has a slot the slot's bytes instead.
 static size_t planner_expert_vram_charge_bytes(ggml_type type, int64_t ncols, ggml_layout_mode layout, size_t bytes) {
     return placement_vram_charge_bytes(layout == GGML_LAYOUT_AOS ? aos_staged_weight_bytes(type, ncols, bytes) : bytes);
 }
@@ -38811,6 +38852,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
         plan.entries.push_back(std::move(entry));
     }
+    // Every member of a triplet takes its slot in the WEIGHT zone (expert-slot.hpp), so each is charged the slot's
+    // bytes before anything is packed against the zone.
+    placement_entries_charge_expert_slots(plan.entries);
 
     // Sort by (priority ASC, layer_id ASC, dst_size DESC).
     // This ensures highest-priority weights fill VRAM first, earlier layers
@@ -39168,6 +39212,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        // A host expert now stages as AOS, so its triplet may have a slot it lacked in another layout, and the charge a
+        // later move to the device reads is the slot's.
+        placement_entries_charge_expert_slots(plan.entries);
         room.expert_bytes  = stats.device_bytes;
         room.expert_groups = stats.device_groups;
 
@@ -40386,6 +40433,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
         plan.entries.push_back(std::move(entry));
     }
+    // Every member of a triplet takes its slot in a WEIGHT zone (expert-slot.hpp), so each is charged the slot's bytes
+    // before anything is packed against a device.
+    placement_entries_charge_expert_slots(plan.entries);
 
     // Step 3: Sort by (priority ASC, layer_id ASC, dst_size DESC, expert_id ASC).
     std::sort(plan.entries.begin(), plan.entries.end(), [](const placement_entry & a, const placement_entry & b) {
