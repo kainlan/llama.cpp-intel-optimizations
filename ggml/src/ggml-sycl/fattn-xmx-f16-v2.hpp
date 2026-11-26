@@ -327,8 +327,12 @@ inline bool fattn_xmx_v2_decode_m1n64_supported(const sycl::device & dev, int tk
 // that satisfies it safely:
 //
 //   * fattn.cpp passes ncols in {1, 2, 8, 16} on the D >= 128 ladder, and the
-//     sole ncols=32 site is D=64-only (`can_use_xmx_v2_d64_batched_pp` opens with
-//     `if constexpr (D != 64) return false;`), so D >= 128 caps ncols at 16.
+//     sole ncols=32 site was D=64-only (`can_use_xmx_v2_d64_batched_pp` opens with
+//     `if constexpr (D != 64) return false;`), so D >= 128 capped ncols at 16.
+//     (Since Inkling Task 23 S3 the ne01 > 16 arm under a float accumulator also
+//     launches ncols=32, but only the f32_sv leaf, which is TM=8: under
+//     GGML_SYCL_FA_XMX_V2_VARIANT=tm16 that arm runs the TM=16 leaf at ncols=16,
+//     so the reproducer below keeps its single-sub-group geometry.)
 //   * ncols == 16 was therefore the only value that could select TM=16, and it
 //     forces SG_ROWS_PER_Q = ceil(16/16) = 1 — a single-sub-group work-group.
 //
@@ -481,17 +485,20 @@ inline std::size_t fattn_xmx_v2_pick_variant_cached(ggml_backend_sycl_context & 
 //                                The XMX S@V paths (PREC_DEFAULT, and the
 //                                PREC_F32 f32_sv leaf with its float
 //                                accumulator) use its first half-sized portion.
+//                                s_half sizes it for half weights only; the
+//                                f32_sv leaf sets it, as it never writes a float
+//                                weight.
 //
 // All regions start at WORD-aligned offsets.  The ordering above places each
 // region right after the previous one with NO overlap.
 // =============================================================================
 
-template <int D, int ncols> struct fattn_v2_slm {
+template <int D, int ncols, bool s_half = false> struct fattn_v2_slm {
     static constexpr int Q_ELEMS         = ncols * D;
     static constexpr int K_ELEMS         = XMX_V2_BATCH_KV * D;
     static constexpr int V_ELEMS         = XMX_V2_BATCH_KV * D;
     static constexpr int S_HALF_ELEMS    = ncols * XMX_V2_BATCH_KV;
-    static constexpr int S_STORAGE_ELEMS = S_HALF_ELEMS * XMX_V2_FLOAT_AS_HALF_ELEMS;
+    static constexpr int S_STORAGE_ELEMS = S_HALF_ELEMS * (s_half ? 1 : XMX_V2_FLOAT_AS_HALF_ELEMS);
     static constexpr int TOTAL           = Q_ELEMS + K_ELEMS + V_ELEMS + S_STORAGE_ELEMS;
 
     static constexpr int Q_OFFSET = 0;
@@ -632,7 +639,9 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                   "kv_v8 is a copy of the TM8 f32_sv leaf's F16 K/V");
     static_assert(!kv_v8 || D % 8 == 0, "kv_v8 copies whole 16-byte chunks of a row");
 
-    using slm_layout            = fattn_v2_slm<D, ncols>;
+    // The f32_sv leaf writes only half weights, so its S region is half-sized
+    // and tile_S_f must not be used in it.
+    using slm_layout            = fattn_v2_slm<D, ncols, /*s_half=*/f32_sv>;
     constexpr int SG_ROWS_PER_Q = (ncols + TM - 1) / TM;  // ceil(ncols/TM)
     constexpr int NTHREADS      = SG_ROWS_PER_Q * XMX_V2_SG;
     static_assert(NTHREADS <= XMX_V2_MAX_NTHREADS, "XMX-v2 active workgroup exceeds historical max");
@@ -1156,7 +1165,7 @@ template <int  D,
           bool f32_sv = false,
           bool kv_v8  = false>
 static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queue_ptr stream) {
-    using slm_layout            = fattn_v2_slm<D, ncols>;
+    using slm_layout            = fattn_v2_slm<D, ncols, /*s_half=*/f32_sv>;
     constexpr int sg_rows_per_q = (ncols + TM - 1) / TM;
     constexpr int nthreads      = sg_rows_per_q * XMX_V2_SG;
     static_assert(nthreads <= XMX_V2_MAX_NTHREADS, "XMX-v2 active workgroup exceeds historical max");
@@ -2741,8 +2750,16 @@ bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
         // overrides run the original leaf body; fattn.cpp names that leaf, not
         // the f32_sv one, when the override is set.
         case 1:
-            launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
-                                         /*TM=*/16, /*TK=*/16, /*TN=*/16>(params, stream);
+            if constexpr (f32_sv) {
+                // fattn.cpp sends this case to launch_fattn_xmx_v2_f16 at
+                // ncols=16 (fattn_xmx_v2_f32sv_leaf_runs), so the f32sv
+                // launcher never gets here; declining keeps it from compiling a
+                // TM=16 leaf at its ncols=32 that nothing runs.
+                return false;
+            } else {
+                launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
+                                             /*TM=*/16, /*TK=*/16, /*TN=*/16>(params, stream);
+            }
             break;
         default:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
@@ -2791,8 +2808,9 @@ bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context & ctx,
 
 // Whether launch_fattn_xmx_v2_f16_f32sv runs the f32_sv leaf for this shape:
 // false when GGML_SYCL_FA_XMX_V2_VARIANT=tm16 picks variant 1, which has no
-// f32_sv body and runs the original TM=16 leaf. fattn.cpp names the kernel
-// from it, so the dispatch name reports the leaf that runs.
+// f32_sv body. fattn.cpp then runs the original TM=16 leaf through
+// launch_fattn_xmx_v2_f16 at ncols=16 and names it, so the dispatch name
+// reports the leaf that runs.
 inline bool fattn_xmx_v2_f32sv_leaf_runs(const sycl::device & dev, int D, int ncols, int ne01) noexcept {
     return fattn_xmx_v2_pick_variant_for_shape(dev, D, ncols, ne01) != 1;
 }

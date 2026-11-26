@@ -6915,6 +6915,15 @@ name `_f32sv`. The P tile is loaded once per kv_tile in both matrix-engine S·V 
 `d128_pp72_kv_unaligned` (scalar copy, same inputs) bit for bit. Nothing of S2 has run on a card yet; the acceptance
 run must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`.
 
+**S3 (2026-11-26).** The ne01 > 16 arm under a float accumulator launches the f32_sv leaf at ncols=32: four TM=8
+sub-groups per work-group share each K/V batch in SLM, and the S region is half-sized (`fattn_v2_slm<..., s_half>`),
+because that leaf writes P only as a half. Names: `xmx_v2_f16_ncols32_large_f32sv_v8` and `_f32sv`.
+`GGML_SYCL_FA_XMX_V2_VARIANT=tm16` keeps the TM=16 leaf at ncols=16 (`xmx_v2_f16_ncols16_large`), the geometry of the
+hang it reproduces. Derived, not measured: 26 KB of SLM per work-group at D=128, so 16 resident threads per core at
+128 KB of SLM (10 at S2) and 8 at 64 KB (4 at S2); the half S region alone changes neither count at D=128 (28 KB with a
+float one gives the same), only at D=64. Each K/V batch now serves 32 query rows, which halves the kernel's global K/V
+reads and its copy messages per query row; the number of threads launched does not change.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
