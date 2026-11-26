@@ -20603,6 +20603,17 @@ void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes) {
         g_test_raw_gate_device_total[device].store(bytes, std::memory_order_relaxed);
     }
 }
+
+// Per device, how often a raw gate read its figure: each read is one walk of the runtime registry. Only the tests read
+// it, to pin which requests never reach a raw gate.
+static std::array<std::atomic<uint64_t>, GGML_SYCL_MAX_DEVICES> g_test_raw_gate_reads{};
+
+uint64_t unified_cache_test_raw_gate_reads(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_test_raw_gate_reads[device].load(std::memory_order_relaxed);
+}
 #endif
 
 // Locks, one after the other and never two at once: g_cache_rw_mutex (L4), shared, for the cache lookup, released; then
@@ -20616,6 +20627,7 @@ zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & que
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const size_t test_total = g_test_raw_gate_device_total[device].load(std::memory_order_relaxed);
     in.device_total         = test_total != 0 ? test_total : in.device_total;
+    g_test_raw_gate_reads[device].fetch_add(1, std::memory_order_relaxed);
 #endif
     // The reservation is committed whole when the arena is made, on one chunk or N: all of it is taken, however empty
     // its zones are.
@@ -29413,6 +29425,9 @@ allocation_result unified_cache_zone_allocate_owner(
     req.intent.cohort_id                    = "exact_zone_allocate_owner";
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = zone;
+    // Only a block of `zone` is accepted below, so a zone with no room is the answer: a raw block would be made, found
+    // not zone-managed and given back, after its gate walked the whole runtime registry for a figure nobody uses.
+    req.intent.constraints.forbid_vram_zone_spill = true;
 
     allocation_result result = unified_allocate_owner(req);
     if (!result) return result;

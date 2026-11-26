@@ -10760,6 +10760,9 @@ bool unified_cache_test_arena_destroy_closing_reached();
 bool unified_cache_test_cache_exists(int device);
 // Sets the device total the raw-allocation gates read for `device`; 0 reads the driver's figure again.
 void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes);
+// How often a raw-allocation gate read its figure for `device`, which walks the runtime registry each time; 0 for a
+// device out of range.
+uint64_t unified_cache_test_raw_gate_reads(int device);
 // Called from cache destruction once arena_destroy() has returned, with the
 // members the cache still holds then. Pass nullptr to remove it.
 using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,
