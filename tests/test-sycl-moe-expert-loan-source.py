@@ -4088,6 +4088,12 @@ BULK_MIRROR_ALT = "++n_alt; staged_layout = alt.layout;"
 BULK_MIRROR = ("if (staged_layout == GGML_LAYOUT_AOS) { const size_t stride = staged_expert_bytes(GGML_LAYOUT_AOS, "
                "e.type, e.ne[0], e.src_size); if (moe_expert_triplet_slot_bytes(plan, e.layer_id, e.expert_id) > "
                "stride) { return false; } }")
+# The materialization reorder runs after the last charge and is the plan order the index reads: it keeps entries that
+# share a role in the order the charge saw, so the index's first entry of a role is the one charged as the member.
+REORDER_SIG = "static void reorder_plan_entries_for_moe_materialization(placement_plan & plan,"
+REORDER_SORT = ("std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return "
+                "moe_materialization_role_order(plan.entries[a].expert_role) < "
+                "moe_materialization_role_order(plan.entries[b].expert_role); });")
 STAGE_BYTES_SIG = "static size_t ggml_sycl_expert_stage_bytes(const ggml_sycl::placement_plan & plan,"
 STAGE_BYTES_BODY = ("if (layout != GGML_LAYOUT_AOS) { return staged; } const size_t slot = "
                     "ggml_sycl::moe_expert_triplet_slot_bytes(plan, layer, expert); return slot >= staged ? slot : "
@@ -4195,6 +4201,7 @@ def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_h
             and PLAN_ENTRY_STAGED in p and p.count(CHARGE_SET) == 1 and ordered(p, CHARGE_SIG, CHARGE_SET)
             and ordered(charge, CHARGE_INDEXED, CHARGE_FIRST, CHARGE_COMPLETE, CHARGE_STAGED, CHARGE_EACH)
             and ordered(body(p, BULK_MIRROR_SIG), BULK_MIRROR_ALT, BULK_MIRROR)
+            and body(c, REORDER_SIG).count(REORDER_SORT) == 1 and "std::sort(" not in body(c, REORDER_SIG)
             and body(s, STAGE_BYTES_SIG).rstrip().endswith(STAGE_BYTES_BODY)
             and s.count(PRELOAD_LAYER) == 1 and s.count(PRELOAD_SLOT) == 1 and s.count(PRELOAD_GUARD) == 1
             and s.count(PRELOAD_STAGE_END) == 1 and ordered(s, PRELOAD_LAYER, PRELOAD_GUARD, PRELOAD_STAGE_END)
@@ -4356,6 +4363,23 @@ def test_mutant_loan_bulk_mirror_reads_the_primarys_layout_for_an_alternate_fail
     """An alternate-staged tensor stages in the alternate's layout, not its primary's."""
     mutant = _once_in(PLAN_HPP, BULK_MIRROR_SIG, BULK_MIRROR_ALT, "++n_alt;")
     assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_materialization_reorder_sorts_unstably_fails():
+    """An unstable sort may swap two entries of one role after the charge: the index then reads as the member an entry
+    the charge took as a repeat, and the load stages the triplet at a slot the plan did not charge."""
+    mutant = _once_in(CACHE, REORDER_SIG, "std::stable_sort(indices.begin()", "std::sort(indices.begin()")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_materialization_reorder_breaks_a_role_tie_by_priority_fails():
+    """Stable or not, a priority tie-break moves a later entry of a role ahead of the first when its priority is
+    lower."""
+    mutant = _once_in(CACHE, REORDER_SIG, "moe_materialization_role_order(plan.entries[b].expert_role); });",
+                      "moe_materialization_role_order(plan.entries[b].expert_role) || "
+                      "static_cast<uint8_t>(plan.entries[a].priority) < "
+                      "static_cast<uint8_t>(plan.entries[b].priority); });")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
 
 
 def test_mutant_recharge_ignores_the_target_device_fails():

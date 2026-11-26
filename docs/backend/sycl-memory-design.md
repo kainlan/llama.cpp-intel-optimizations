@@ -407,7 +407,9 @@ lost its slot charges its AOS members their own staged sizes again, and the
 device totals move by each change. The charge resolves a triplet as the plan's
 index does, each role's first entry, so a role planned twice is charged the slot
 the load looks up; the later entry is charged what the load stages it at. The
-load stages each member at that size: a tensor whose experts' triplets have a
+materialization reorder that follows the last charge keeps entries of one role
+in plan order (a stable sort on the role alone), so the index's first entry is
+still the one charged. The load stages each member at that size: a tensor whose experts' triplets have a
 slot past their staged bytes is not bulk-staged, since the bulk copy has one
 stride, and is staged expert by expert, so the loan's selection reads it as not
 bulk and its experts can be lent (`moe_loan_tensor_bulk_staged`);

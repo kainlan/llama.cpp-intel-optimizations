@@ -33117,16 +33117,14 @@ static void reorder_plan_entries_for_moe_materialization(placement_plan &       
     }
 
     for (const moe_triplet_group & group : moe_groups) {
+        // A group's indices are in plan order, and this runs after the last slot charge. Entries that share a role
+        // keep that order (a stable sort keyed on the role alone): the first entry of each role is the one the slot
+        // charge (placement_entries_charge_expert_slots) and the index's find_expert_entry both read, so the slot the
+        // load looks up is the slot the plan charged.
         std::vector<size_t> indices = group.indices;
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            const placement_entry & ea     = plan.entries[a];
-            const placement_entry & eb     = plan.entries[b];
-            const int               role_a = moe_materialization_role_order(ea.expert_role);
-            const int               role_b = moe_materialization_role_order(eb.expert_role);
-            if (role_a != role_b) {
-                return role_a < role_b;
-            }
-            return static_cast<uint8_t>(ea.priority) < static_cast<uint8_t>(eb.priority);
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            return moe_materialization_role_order(plan.entries[a].expert_role) <
+                   moe_materialization_role_order(plan.entries[b].expert_role);
         });
 
         for (size_t idx : indices) {
