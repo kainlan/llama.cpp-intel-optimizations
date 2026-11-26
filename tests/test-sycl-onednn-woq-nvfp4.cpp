@@ -22,8 +22,11 @@
 //   nvfp4-3d-f16-scales   f8_e4m3 scales are refused: 0.125 instead of 0.0625 bytes of scale per element.
 //
 // Exit status: 0 once every arm has run, whatever each found; 77 without a SYCL GPU; 1 only when the probe itself
-// breaks outside an arm. Device buffers come from sycl::malloc_device, as in test-onednn-woq-mxfp4.cpp: the probe
-// calls oneDNN directly and links no backend, so there is no unified cache to allocate from.
+// breaks outside an arm. So it is built and not registered as a ctest, which must be able to fail: it measures what
+// oneDNN offers, and no shipped path relies on an arm yet (the NVFP4 prompt executor runs its F16 arm). The lead runs
+// it by hand: ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4. Device buffers come from
+// sycl::malloc_device, as in test-onednn-woq-mxfp4.cpp: the probe calls oneDNN directly and links no backend, so there
+// is no unified cache to allocate from.
 #include "test-skip.h"
 // The attribute production builds with, so the answer is about the primitive the backend would run.
 #include "ggml-sycl/dnnl-deterministic.hpp"
