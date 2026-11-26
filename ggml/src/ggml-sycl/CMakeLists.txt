@@ -5049,6 +5049,43 @@ set_tests_properties(test-sycl-bf16-mul-mat-backend PROPERTIES
     TIMEOUT 120
 )
 
+# Capability probe and microbenchmark for dense BF16 weights on oneDNN: whether bf16 x bf16 -> f32 and the two mixed
+# f32 x bf16 orientations create on this card, which implementation and scratchpad oneDNN picks, and their device
+# time against the native kernel (mul-mat-bf16.hpp, compiled here directly) and against the F32 -> BF16 activation
+# conversion. Standalone like test-sycl-onednn-mxfp4-feasibility: SYCL, oneDNN and the header-only kernel, no
+# backend. About 40 MB of device memory, no model. Its kernels are JIT-compiled for spir64 and warmed before timing.
+# Lead-run once per card: the ENVIRONMENT pins the B50, and the B70 run invokes the binary directly. Labelled
+# mem-handle so a sweep leaves it to the lead. 77 = could not probe (no GPU, no oneDNN build, engine creation failed).
+add_executable(test-sycl-bf16-onednn-probe
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-bf16-onednn-probe.cpp
+)
+target_include_directories(test-sycl-bf16-onednn-probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-bf16-onednn-probe PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-bf16-onednn-probe PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-bf16-onednn-probe PRIVATE
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-bf16-onednn-probe PRIVATE ggml-base)
+if (GGML_SYCL_DNNL)
+    target_link_libraries(test-sycl-bf16-onednn-probe PRIVATE DNNL::dnnl)
+endif()
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-bf16-onednn-probe PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-bf16-onednn-probe COMMAND test-sycl-bf16-onednn-probe)
+set_tests_properties(test-sycl-bf16-onednn-probe PROPERTIES
+    LABELS "sycl;bf16;onednn;device;mem-handle;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+
 # llama.cpp-asdt (plan task L2b): the tiered KV buffer's per-VIEW-tensor
 # extras must stay bounded across repeated graph rebuilds, the same property
 # test-sycl-compute-buffer-extra-reuse checks for the COMPUTE buffer above.
