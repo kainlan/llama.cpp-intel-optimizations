@@ -16344,6 +16344,29 @@ static size_t ggml_sycl_ring_plan_weight_room(int device, const ggml_sycl::place
     return ggml_sycl::unified_cache_kv_weight_capacity(device, budget, plan.multi_device);
 }
 
+// Why a ring decision read no WEIGHT room under the planner that made `plan`, from the figure
+// ggml_sycl_ring_plan_weight_room answered (`weight_room`), for the keep lines of the load stage and the plan dry run
+// to name. `reason` is null where that figure is the planner's own, which those lines print instead.
+// `load_reads_none` is true where a load reads none there either, whatever arena its entry ensure builds: a
+// multi-device plan in GLOBAL cache mode reads no WEIGHT zone at all. A device with no active arena, or no budget in
+// the plan, reads none only until an arena answers, which a dry run, building none, cannot see.
+struct ggml_sycl_ring_no_weight_room {
+    const char * reason          = nullptr;
+    bool         load_reads_none = false;
+};
+
+static ggml_sycl_ring_no_weight_room ggml_sycl_ring_no_weight_room_reason(const ggml_sycl::placement_plan & plan,
+                                                                          size_t weight_room) {
+    if (weight_room > 0) {
+        return {};
+    }
+    if (!ggml_sycl_ring_planner_reads_zone(plan)) {
+        return { "its multi-device plan in GLOBAL cache mode packs every device to its budget and reads no WEIGHT zone",
+                 true };
+    }
+    return { "its plan reads no WEIGHT room on the device, which has no active arena or no budget in the plan", false };
+}
+
 // Publishes again on `device` what a ring drop writes before it knows whether the drop returns room, as `with_ring`
 // holds it from before the drop: the ring (its slots, depth, KV-zone slots and micro-batch) and the planners' terms,
 // each group through its own setters (load_published_terms::restore), so they read exactly as they did. A ring the
@@ -17364,11 +17387,21 @@ static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
                 device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_room / mb,
                 ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room));
         } else {
-            GGML_LOG_INFO(
-                "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the weights "
-                "no room (its RUNTIME zone needs %.1f MB less without it, and its WEIGHT zone holds %.1f MB with the "
-                "ring and %.1f MB without it)\n",
-                device, ring_bytes / mb, runtime_room / mb, zone.weight_with_ring / mb, zone.weight_without_ring / mb);
+            const ggml_sycl_ring_no_weight_room no_room =
+                ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_with_ring);
+            if (no_room.reason != nullptr) {
+                GGML_LOG_INFO(
+                    "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the "
+                    "weights no room, as %s\n",
+                    device, ring_bytes / mb, no_room.reason);
+            } else {
+                GGML_LOG_INFO(
+                    "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the "
+                    "weights no room (its RUNTIME zone needs %.1f MB less without it, and the WEIGHT room its plan "
+                    "packs against is %.1f MB with the ring and %.1f MB without it)\n",
+                    device, ring_bytes / mb, runtime_room / mb, zone.weight_with_ring / mb,
+                    zone.weight_without_ring / mb);
+            }
         }
         if (plan_again) {
             return ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN;
@@ -18856,19 +18889,15 @@ static bool ggml_sycl_plan_dry_run_drop_displacing_ring(int                     
     if (ggml_sycl::moe_pp_ring_decide(ggml_sycl::moe_pp_ring_dry_run_answer(can_return, runtime_room)) !=
         ggml_sycl::moe_pp_ring_decision::DROP) {
         ggml_sycl_put_back_ring_terms(device, with_ring);
-        if (weight_room == 0 && !ggml_sycl_ring_planner_reads_zone(plan)) {
+        const ggml_sycl_ring_no_weight_room no_room = ggml_sycl_ring_no_weight_room_reason(plan, weight_room);
+        if (no_room.reason != nullptr) {
             GGML_LOG_INFO(
-                "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB), as a load would: its "
-                "multi-device plan in GLOBAL cache mode packs every device to its budget and reads no WEIGHT zone, so "
-                "a drop returns no room it sees\n",
-                device, ring_bytes / mb);
-        } else if (weight_room == 0) {
-            GGML_LOG_INFO(
-                "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB): its plan reads no WEIGHT "
-                "room on the device, which has no active arena or no budget in the plan, so a drop returns no room it "
-                "sees. A load's entry ensure builds the arena first, and its own drop decision, on that arena, may "
-                "differ\n",
-                device, ring_bytes / mb);
+                "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop returns no room it "
+                "sees, as %s%s\n",
+                device, ring_bytes / mb, no_room.reason,
+                no_room.load_reads_none ? "; a load reads none there either" :
+                                          ". A load's entry ensure builds the arena first, and its own drop "
+                                          "decision, on that arena, may differ");
         } else {
             GGML_LOG_INFO(
                 "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB), as a load would: its RUNTIME "
