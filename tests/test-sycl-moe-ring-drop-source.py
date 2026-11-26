@@ -17,8 +17,8 @@ back, refuses and records a drop. These checks pin it:
       caller of the rule; the stage and the dry run are the only callers of the resident check, of the decision (each
       deciding once) and of moe_pp_ring_drop_can_return_room, and with the capped helper the only readers of the
       RUNTIME zone figures; only the dry run answers from the RUNTIME room alone; the planner rule is asked by the
-      WEIGHT-room helper and the dry run, the WEIGHT room by the stage and the dry run; the zone figure, the cap, the
-      planner rule and the WEIGHT room are pinned whole;
+      WEIGHT-room helper and the no-room reason, the WEIGHT room and the reason by the stage and the dry run, the
+      reason once in each; the zone figure, the cap, the planner rule, the WEIGHT room and the reason are pinned whole;
   S1  the stage keeps before it writes where (a) to (c) keep the ring, then snapshots, reads the RUNTIME zone with the
       ring, unpublishes the ring, reads the room and the WEIGHT room, asks the zones with the give-back only where
       moe_pp_ring_drop_can_return_room says a drop can return room, refusing on a failed ensure, reads the WEIGHT room
@@ -27,7 +27,8 @@ back, refuses and records a drop. These checks pin it:
       zone after a drop through a helper that creates no cache and answers 0 with no arena;
   K1  every kept exit after the write is inside the keep block, which puts the ring back first and holds no drop
       exit; the kept rebuild asks the zones again and plans again where the WEIGHT room shrank, and each keep logs
-      which it is; every ensure in the stage is a refusal's condition, and the stage refuses nowhere else; the
+      which it is, the no-room keep naming the reason where the plan read no WEIGHT room with the ring and printing
+      the figures otherwise; every ensure in the stage is a refusal's condition, and the stage refuses nowhere else; the
       put-back restores the dense scratch, the ring and planner terms and the inventory's ring, and the ring terms'
       put-back is called by the stage's put-back and the dry run alone; the held WARN names no guessed holder;
   S2  the stage is the backend's one writer of the give-back option;
@@ -39,9 +40,9 @@ back, refuses and records a drop. These checks pin it:
       reader once, before its entry ensure;
   Y1  the dry run decides once per device plan, publishes no ring and puts the planner terms back before it reads the
       room and the WEIGHT room, asks the stage's predicate of both, keeps with the ring terms put back and a line that
-      says why (no WEIGHT zone in GLOBAL mode, no arena or budget, or no RUNTIME room), drops with a line that says what
-      it cannot see, sizes no zone, records no load, and is called by the dry run's plans alone, which plan again on
-      a drop;
+      says why (the no-room reason, with whether a load reads no WEIGHT room either or may differ on the arena its
+      entry ensure builds, or no RUNTIME room), drops with a line that says what it cannot see, sizes no zone, records
+      no load, and is called by the dry run's plans alone, which plan again on a drop;
   Z1  the cache's ensure gives back only when asked: the record is filled before the arena is read, a surplus is asked
       only with a record, an arena with none to give is kept as built, a held arena is kept and marked held, the
       rebuild takes the give-back's sizes and marks rebuilt; nothing else in the cache touches the record.
@@ -98,6 +99,15 @@ WEIGHT_ROOM_BODY = ("{ ggml_sycl::unified_cache * const cache = "
                     "== device) { budget = plan.per_device_vram_budgets[i]; } } } return "
                     "ggml_sycl::unified_cache_kv_weight_capacity(device, budget, plan.multi_device); }")
 WEIGHT_ROOM_CALL = "ggml_sycl_ring_plan_weight_room("
+NO_ROOM_STRUCT = "struct ggml_sycl_ring_no_weight_room {"
+NO_ROOM_STRUCT_BODY = "{ const char * reason = nullptr; bool load_reads_none = false; }"
+NO_ROOM_FN = ("static ggml_sycl_ring_no_weight_room ggml_sycl_ring_no_weight_room_reason("
+              "const ggml_sycl::placement_plan & plan, size_t weight_room) {")
+NO_ROOM_BODY = ('{ if (weight_room > 0) { return {}; } if (!ggml_sycl_ring_planner_reads_zone(plan)) { return { "its '
+                'multi-device plan in GLOBAL cache mode packs every device to its budget and reads no WEIGHT zone", '
+                'true }; } return { "its plan reads no WEIGHT room on the device, which has no active arena or no '
+                'budget in the plan", false }; }')
+NO_ROOM_CALL = "ggml_sycl_ring_no_weight_room_reason("
 DRY_ANSWER_CALL = "moe_pp_ring_dry_run_answer("
 CAN_RETURN_CALL = "moe_pp_ring_drop_can_return_room("
 ARENA_RUNTIME_FN = "static size_t ggml_sycl_ring_arena_runtime_zone_bytes(int device) {"
@@ -172,9 +182,13 @@ KEEP_ORDER = (
     "the ring displaces %\" PRId64 \" experts' worth of room from the weights\\n\",",
     "device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_room / mb, "
     "ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room)); } else {",
-    'GGML_LOG_INFO("[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the '
-    'weights "',
-    "device, ring_bytes / mb, runtime_room / mb, zone.weight_with_ring / mb, zone.weight_without_ring / mb); }",
+    "const ggml_sycl_ring_no_weight_room no_room = ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_with_ring); "
+    "if (no_room.reason != nullptr) {",
+    'GGML_LOG_INFO("[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the "',
+    '"weights no room, as %s\\n", device, ring_bytes / mb, no_room.reason); } else {',
+    'GGML_LOG_INFO("[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the "',
+    '"weights no room (its RUNTIME zone needs %.1f MB less without it, and the WEIGHT room its plan "',
+    "device, ring_bytes / mb, runtime_room / mb, zone.weight_with_ring / mb, zone.weight_without_ring / mb); } }",
     "if (plan_again) { return ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN; }",
     "return ggml_sycl_stage_ring_drop::KEPT; }",
     "const size_t runtime_rebuilt = ggml_sycl_ring_arena_runtime_zone_bytes(device);",
@@ -267,15 +281,13 @@ DRY_ORDER = (
     "const bool can_return = ggml_sycl::moe_pp_ring_drop_can_return_room(weight_room, runtime_room);",
     "if (ggml_sycl::moe_pp_ring_decide(ggml_sycl::moe_pp_ring_dry_run_answer(can_return, runtime_room)) != "
     "ggml_sycl::moe_pp_ring_decision::DROP) { ggml_sycl_put_back_ring_terms(device, with_ring);",
-    "if (weight_room == 0 && !ggml_sycl_ring_planner_reads_zone(plan)) {",
-    'GGML_LOG_INFO("[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB), as a load would: its "',
-    '"multi-device plan in GLOBAL cache mode packs every device to its budget and reads no WEIGHT zone, so "',
-    "device, ring_bytes / mb); } else if (weight_room == 0) {",
-    'GGML_LOG_INFO("[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB): its plan reads no '
-    'WEIGHT "',
-    '"room on the device, which has no active arena or no budget in the plan, so a drop returns no room it "',
-    '"sees. A load\'s entry ensure builds the arena first, and its own drop decision, on that arena, may "',
-    "device, ring_bytes / mb); } else {",
+    "const ggml_sycl_ring_no_weight_room no_room = ggml_sycl_ring_no_weight_room_reason(plan, weight_room); "
+    "if (no_room.reason != nullptr) {",
+    'GGML_LOG_INFO("[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop returns no room '
+    'it "',
+    '"sees, as %s%s\\n", device, ring_bytes / mb, no_room.reason, no_room.load_reads_none ? "; a load reads none '
+    'there either" : ". A load\'s entry ensure builds the arena first, and its own drop " "decision, on that arena, '
+    'may differ"); } else {',
     'GGML_LOG_INFO("[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB), as a load would: its '
     'RUNTIME "',
     "device, ring_bytes / mb, runtime_with_ring / mb); }",
@@ -481,13 +493,24 @@ def check_decision(s: Sources) -> None:
                             "plan's "
                             "mode, so a multi-device plan in GLOBAL cache mode reads none")
     only_in(be, PLANNER_ZONE_CALL,
-            {"its definition": PLANNER_ZONE_FN, "the WEIGHT room": WEIGHT_ROOM_FN, "the dry run": DRY_FN}, "D1",
-            "the planner rule is asked by the WEIGHT-room helper and the dry run")
+            {"its definition": PLANNER_ZONE_FN, "the WEIGHT room": WEIGHT_ROOM_FN, "the no-room reason": NO_ROOM_FN},
+            "D1", "the planner rule is asked by the WEIGHT-room helper and the no-room reason")
     if fn(be, WEIGHT_ROOM_FN, "D1", "the WEIGHT room") != squash(WEIGHT_ROOM_BODY):
         raise ContractError("FAIL [pin D1]: the WEIGHT room is the planner's own figure at the budget the plan packed "
                             "the device to, 0 where it reads no zone or the device has no active arena")
     only_in(be, WEIGHT_ROOM_CALL, {"its definition": WEIGHT_ROOM_FN, **stage_and_dry}, "D1",
             "the WEIGHT room is read by the stage and the dry run")
+    if fn(be, NO_ROOM_STRUCT, "D1", "the no-room reason's answer") != squash(NO_ROOM_STRUCT_BODY):
+        raise ContractError("FAIL [pin D1]: the no-room reason answers a reason, null by default, and whether a load "
+                            "reads no WEIGHT room either")
+    if fn(be, NO_ROOM_FN, "D1", "the no-room reason") != squash(NO_ROOM_BODY):
+        raise ContractError("FAIL [pin D1]: the no-room reason names none where the WEIGHT room is the planner's own "
+                            "figure, the GLOBAL multi-device plan (which a load reads alike) where the planner "
+                            "reads no zone, and otherwise no active arena or no budget")
+    only_in(be, NO_ROOM_CALL, {"its definition": NO_ROOM_FN, **stage_and_dry}, "D1",
+            "the stage and the dry run name why they read no WEIGHT room through the one reason")
+    for name, head in stage_and_dry.items():
+        need_once(fn(be, head, "D1", name), NO_ROOM_CALL, "D1", f"{name} asks the no-room reason once")
     only_in(be, CAN_RETURN_CALL, stage_and_dry, "D1",
             "the stage and the dry run ask whether a drop can return room through the one predicate")
 
@@ -712,11 +735,50 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("dry-run-answers-past-the-predicate", "Y1", B,
                 [("ggml_sycl::moe_pp_ring_dry_run_answer(can_return, runtime_room)",
                   "ggml_sycl::moe_pp_ring_dry_run_answer(true, runtime_room)")])
-    expect_fail("dry-run-global-keep-says-no-arena", "Y1", B,
-                [("        if (weight_room == 0 && !ggml_sycl_ring_planner_reads_zone(plan)) {\n",
-                  "        if (weight_room == 0 && !ggml_sycl_ring_planner_reads_zone(plan) && false) {\n")])
-    expect_fail("dry-run-no-arena-keep-says-as-a-load-would", "Y1", B,
-                [("        } else if (weight_room == 0) {\n", "        } else if (false) {\n")])
+    # D1: the no-room reason, one helper for the stage's and the dry run's keep lines.
+    expect_fail("no-room-reasons-swapped", "D1", B,
+                [("    if (!ggml_sycl_ring_planner_reads_zone(plan)) {\n",
+                  "    if (ggml_sycl_ring_planner_reads_zone(plan)) {\n")])
+    expect_fail("no-room-reason-for-the-planners-figure", "D1", B,
+                [("    if (weight_room > 0) {\n        return {};\n    }\n", "")])
+    expect_fail("no-room-global-reads-as-no-arena", "D1", B,
+                [("budget and reads no WEIGHT zone\",\n                 true };\n",
+                  "budget and reads no WEIGHT zone\",\n                 false };\n")])
+    expect_fail("no-room-reason-defaults-to-a-load-reading-none", "D1", B,
+                [("    bool         load_reads_none = false;\n", "    bool         load_reads_none = true;\n")])
+    expect_fail("dry-run-asks-the-planner-itself", "D1", B,
+                [("                no_room.load_reads_none ? \"; a load reads none there either\" :\n",
+                  "                !ggml_sycl_ring_planner_reads_zone(plan) ? \"; a load reads none there "
+                  "either\" :\n")])
+    expect_fail("dry-run-own-no-room-branch", "D1", B,
+                [("        const ggml_sycl_ring_no_weight_room no_room = ggml_sycl_ring_no_weight_room_reason(plan, "
+                  "weight_room);\n",
+                  "        const ggml_sycl_ring_no_weight_room no_room = { weight_room == 0 ? \"no WEIGHT room\" : "
+                  "nullptr, false };\n")])
+    # K1: the stage's no-room keep line.
+    expect_fail("stage-no-room-prints-figures", "K1", B,
+                [("ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_with_ring);\n"
+                  "            if (no_room.reason != nullptr) {\n",
+                  "ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_with_ring);\n"
+                  "            if (false) {\n")])
+    expect_fail("stage-no-room-reads-the-room-without-the-ring", "K1", B,
+                [("ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_with_ring);",
+                  "ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_without_ring);")])
+    expect_fail("stage-no-room-line-drops-the-reason", "K1", B,
+                [("\"weights no room, as %s\\n\",\n                    device, ring_bytes / mb, no_room.reason);\n",
+                  "\"weights no room\\n\",\n                    device, ring_bytes / mb);\n")])
+    # Y1: the dry run's no-room keep line.
+    expect_fail("dry-run-no-room-prints-the-runtime-line", "Y1", B,
+                [("ggml_sycl_ring_no_weight_room_reason(plan, weight_room);\n"
+                  "        if (no_room.reason != nullptr) {\n",
+                  "ggml_sycl_ring_no_weight_room_reason(plan, weight_room);\n"
+                  "        if (false) {\n")])
+    expect_fail("dry-run-no-arena-says-a-load-reads-none", "Y1", B,
+                [("                no_room.load_reads_none ? \"; a load reads none there either\" :\n",
+                  "                true ? \"; a load reads none there either\" :\n")])
+    expect_fail("dry-run-global-drops-the-load-answer", "Y1", B,
+                [("no_room.load_reads_none ? \"; a load reads none there either\" :",
+                  "no_room.load_reads_none ? \"\" :")])
     expect_fail("zone-figure-without-floor", "D1", B,
                 [("!ggml_sycl::zone_runtime_reserved_bytes(ggml_sycl::unified_cache_runtime_zone_floor_bytes(), "
                   "requirement,",
@@ -810,15 +872,9 @@ def self_test(raws: dict[str, str]) -> int:
                 [("        with_ring.put_back(device, planning_n_ubatch);\n"
                   "        bool plan_again = false;\n",
                   "        bool plan_again = false;\n"),
-                 ("        } else {\n            GGML_LOG_INFO(\n"
-                  "                \"[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop "
-                  "would "
-                  "give the weights \"\n",
+                 ("        } else {\n            const ggml_sycl_ring_no_weight_room no_room =\n",
                   "        } else {\n            with_ring.put_back(device, planning_n_ubatch);\n"
-                  "            GGML_LOG_INFO(\n"
-                  "                \"[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop "
-                  "would "
-                  "give the weights \"\n")])
+                  "            const ggml_sycl_ring_no_weight_room no_room =\n")])
     expect_fail("held-keep-replans", "K1", B,
                 [("                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), "
                   "runtime_room));\n",
