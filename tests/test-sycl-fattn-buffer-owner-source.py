@@ -11,9 +11,9 @@ arena. A cache allocation needs an owner with a defined lifetime, and a thread i
 The fix this gate pins: the buffers are members of ggml_backend_sycl_context. A llama_context owns its backends and
 every tool frees it before the model, so the buffers end before the last model's release.
 
-  C1. no thread_local in fattn.cpp has a type that holds a cache allocation (a mem_handle, an alloc_owner, an
-      alloc_handle, or a struct of fattn.cpp or common.hpp that holds one); the host-only std::vector<int32_t>
-      thread_locals stay legal;
+  C1. no thread_local and no static object in fattn.cpp has a type that holds a cache allocation (a mem_handle, an
+      alloc_owner, an alloc_handle, or a struct of fattn.cpp or common.hpp that holds one): a static outlives every
+      model as a thread_local does; the host-only std::vector<int32_t> thread_locals stay legal;
   C2. ggml_backend_sycl_context declares the three groups and one member that holds them, and each buffer's owner is
       a ggml_sycl::mem_handle held by value, never a pointer to one;
   C3. the three users reach the buffers through the context they were passed: the op (staged operands, sequence ids,
@@ -21,10 +21,14 @@ every tool frees it before the model, so the buffers end before the last model's
   C4. one function releases the three groups, each through the function that releases every owner of that group,
       all of them unconditionally (no early return, no branch);
   C5. a buffer is released by resetting its handle, whose destructor is the release: fattn.cpp never news a
-      mem_handle and never deletes an owner, and the counted release of a sequence-id buffer ends in that reset;
+      mem_handle and never deletes an owner, and the counted release ends in that reset whatever it counted;
   C6. the context's destructor calls that function exactly once, after it has waited for its queues (so no queued
       kernel still reads a buffer) and after it has destroyed its executable graph (which baked their addresses);
-  C7. no process-exit switch turns the release off: fattn.cpp registers no atexit handler and has no shutdown flag.
+  C7. no process-exit switch turns the release off: fattn.cpp registers no atexit handler and has no shutdown flag;
+  C8. a counted group (sequence ids, staged operands) is allocated in one function, its reserve, and nowhere else,
+      and the reserve first drops the whole group when the stream is not the one the group was allocated on: a
+      buffer left on another stream's device cannot be read on this one. The op reserves the sequence ids and the
+      staging function reserves its slot; nothing else can allocate, a test hook included.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -117,12 +121,34 @@ RELEASE_SIG = "void ggml_sycl_fattn_release_context_buffers(ggml_backend_sycl_co
 RELEASE_OWNER_SIG = ("template <typename T> static void ggml_sycl_fattn_release_owner(T *& ptr, size_t & capacity, "
                      "ggml_sycl::mem_handle & owner) {")
 RELEASE_OWNER_CALL = "ggml_sycl_fattn_release_owner(ptr, bytes, owner);"
-SEQ_ID_FREE_SIG = ("static void ggml_sycl_fattn_seq_ids_free(int32_t *& ptr, size_t & bytes, ggml_sycl::mem_handle & "
-                   "owner) {")
-STAGE_SLOT_FREE_SIG = ("static void ggml_sycl_fattn_operand_stage_slot_free(void *& ptr, size_t & bytes, "
-                       "ggml_sycl::mem_handle & owner) {")
-# The releases that also keep a count of live buffers for the device test.
-COUNTED_FREE_SIGS = (SEQ_ID_FREE_SIG, STAGE_SLOT_FREE_SIG)
+# The release that also keeps a count of live buffers for the device test: one template, the counter its argument.
+COUNTED_FREE_SIG = ("template <typename T> static void ggml_sycl_fattn_counted_free(std::atomic<int> & live, T *& ptr, "
+                    "size_t & bytes, ggml_sycl::mem_handle & owner) {")
+SEQ_IDS_RESERVE_SIG = ("static bool ggml_sycl_fattn_seq_ids_reserve(ggml_backend_sycl_context::fattn_seq_id_buffers & "
+                       "buffers, sycl::queue * stream, size_t q_count, size_t kv_count, size_t offsets_count) {")
+STAGE_RESERVE_SIG = ("static bool ggml_sycl_fattn_operand_stage_reserve(ggml_backend_sycl_context::fattn_operand_stage & "
+                     "stage, ggml_backend_sycl_context::fattn_operand_stage::slot & slot, size_t bytes, "
+                     "sycl::queue * stream) {")
+# A counted group's reserve: its signature, the statement it must open with, the text that marks an allocation of the
+# group, and how often that text may stand outside the reserve (the allocating helper's own definition, if any).
+RESERVES = (
+    (SEQ_IDS_RESERVE_SIG,
+     "if (buffers.alloc_queue && buffers.alloc_queue != stream) { ggml_sycl_fattn_seq_ids_free_all(buffers); } "
+     "buffers.alloc_queue = stream;",
+     "ggml_sycl_fattn_seq_ids_alloc(", 1),
+    (STAGE_RESERVE_SIG,
+     "if (stage.alloc_queue && stage.alloc_queue != stream) { ggml_sycl_fattn_operand_stage_free_all(stage); } "
+     "stage.alloc_queue = stream;",
+     '"fattn_weight_stage"', 0),
+)
+STAGE_SRC_SIG = ("static const char * ggml_sycl_fattn_operand_stage_src(ggml_backend_sycl_context::fattn_operand_stage "
+                 "& stage, ggml_backend_sycl_context::fattn_operand_stage::slot & slot, const ggml_tensor * src, "
+                 "int device, sycl::queue * stream, const char * role) {")
+# The production caller of each reserve, in the order of RESERVES: the function and the call it must make.
+RESERVE_CALLERS = (
+    (FLASH_SIG, "ggml_sycl_fattn_seq_ids_reserve("),
+    (STAGE_SRC_SIG, "ggml_sycl_fattn_operand_stage_reserve("),
+)
 V2_AUTO_FREE_SIG = ("static void ggml_sycl_fattn_v2_auto_free_all(ggml_backend_sycl_context::fattn_v2_auto_buffers & "
                     "buffers) {")
 SEQ_IDS_FREE_SIG = ("static void ggml_sycl_fattn_seq_ids_free_all(ggml_backend_sycl_context::fattn_seq_id_buffers & "
@@ -155,6 +181,9 @@ OWNING_TYPES = ("mem_handle", "alloc_owner", "alloc_handle", "allocation_result"
 OWNING_RE = re.compile(r"\b(?:" + "|".join(OWNING_TYPES) + r")\b")
 # A thread_local declaration: the type is what stands between the keyword and the declared name.
 THREAD_LOCAL_DECL = re.compile(r"\bthread_local\b\s+((?:[^;={}()]|\([^()]*\))*?)\s*\b(\w+)\s*(?:;|=|\{)")
+# A static object that is not thread_local. The type admits no parenthesis, so a static function, whose name is
+# followed by its parameter list, is not one.
+STATIC_DECL = re.compile(r"\bstatic\b\s+(?!thread_local\b)([^;={}()]*?)\s*\b(\w+)\s*(?:;|=|\{)")
 IDENT = re.compile(r"[A-Za-z_]\w*")
 
 
@@ -181,8 +210,8 @@ def type_holds_allocation(type_text: str, sources: tuple, seen: frozenset = froz
 
 
 def owning_thread_locals(fattn: str, common: str) -> list:
-    """C1: the names of the thread_locals in fattn.cpp whose type holds a cache allocation."""
-    return [m.group(2) for m in THREAD_LOCAL_DECL.finditer(fattn)
+    """C1: the names of the thread_locals and statics in fattn.cpp whose type holds a cache allocation."""
+    return [m.group(2) for decl in (THREAD_LOCAL_DECL, STATIC_DECL) for m in decl.finditer(fattn)
             if type_holds_allocation(m.group(1), (fattn, common))]
 
 
@@ -244,9 +273,9 @@ def release_is_the_handle_destructor(fattn: str) -> bool:
     """C5: a buffer is released by resetting its handle, a counted release ends in that reset whatever it counted,
     and no mem_handle is newed and no owner deleted."""
     b = body(fattn, RELEASE_OWNER_SIG)
-    counted = [body(fattn, sig) for sig in COUNTED_FREE_SIGS]
+    counted = body(fattn, COUNTED_FREE_SIG)
     return (bool(b) and "owner = {};" in b and not CONTROL_FLOW.search(b) and
-            all(c.endswith(RELEASE_OWNER_CALL + " }") and not re.search(r"\breturn\b", c) for c in counted) and
+            counted.endswith(RELEASE_OWNER_CALL + " }") and not re.search(r"\breturn\b", counted) and
             not re.search(r"\bnew ggml_sycl::mem_handle\b", fattn) and not re.search(r"\bdelete owner\b", fattn))
 
 
@@ -265,12 +294,25 @@ def no_exit_switch(fattn: str) -> bool:
     return not re.search(r"\batexit\b|shutting_down", fattn)
 
 
+def reserve_owns_the_allocation(fattn: str) -> bool:
+    """C8: a counted group is allocated only in its reserve, which opens by dropping the group on a new stream, and
+    its production caller reaches the group through that reserve."""
+    for sig, opening, alloc_marker, outside in RESERVES:
+        b = body(fattn, sig)
+        if not b.startswith("{ " + opening) or fattn.count(alloc_marker) - b.count(alloc_marker) != outside:
+            return False
+        if b.count(alloc_marker) == 0:
+            return False
+    return all(call in body(fattn, caller) for caller, call in RESERVE_CALLERS)
+
+
 # ---- the claims on the tree -----------------------------------------------------------------------------------------
 
 
 def test_sources_are_found():
     assert body(FATTN, FLASH_SIG), "ggml_sycl_flash_attn_ext() not found: the signature this gate keys on moved"
     assert body(FATTN, PREALLOC_SIG), "ggml_sycl_v2_pre_allocate_buffers() not found: its signature moved"
+    assert body(FATTN, STAGE_SRC_SIG), "ggml_sycl_fattn_operand_stage_src() not found: its signature moved"
     assert body(COMMON, CONTEXT_SIG), "struct ggml_backend_sycl_context not found in common.hpp"
     assert DTOR, "~ggml_backend_sycl_context() not found in ggml-sycl.cpp"
     assert "qptrs[dev][s]->wait();" in DTOR, "the destructor's queue wait moved: the ordering claim keys on it"
@@ -279,8 +321,8 @@ def test_sources_are_found():
 def test_no_thread_local_holds_a_cache_allocation():
     offenders = owning_thread_locals(FATTN, COMMON)
     assert not offenders, (
-        "fattn.cpp keeps a cache allocation in a thread_local, which outlives every model on a thread that never "
-        f"exits: {offenders}")
+        "fattn.cpp keeps a cache allocation in a thread_local or a static, which outlives every model (a "
+        f"thread_local on a thread that never exits): {offenders}")
 
 
 def test_host_only_thread_locals_stay_legal():
@@ -323,6 +365,12 @@ def test_no_exit_switch_disables_the_release():
     assert no_exit_switch(FATTN), "fattn.cpp must not gate a buffer release on an atexit handler or a shutdown flag"
 
 
+def test_a_counted_group_is_allocated_only_in_its_reserve():
+    assert reserve_owns_the_allocation(FATTN), (
+        "the sequence-id buffers and the operand-staging slots must each be allocated in one reserve function, "
+        "which first drops the whole group when the stream changed, and nowhere else")
+
+
 # ---- mutants: each must turn its own claim red ----------------------------------------------------------------------
 
 
@@ -349,6 +397,22 @@ def test_mutant_thread_local_of_a_local_struct():
 def test_mutant_thread_local_handle_container():
     m = FATTN + " thread_local std::vector<ggml_sycl::mem_handle> tl_owners;"
     assert owning_thread_locals(m, COMMON) == ["tl_owners"]
+
+
+def test_mutant_static_of_a_context_group():
+    # A namespace-scope static of a group type outlives every model exactly as the thread_local did.
+    for group in ("fattn_operand_stage", "fattn_seq_id_buffers", "fattn_v2_auto_buffers"):
+        m = FATTN + f" static ggml_backend_sycl_context::{group} g_stage;"
+        assert owning_thread_locals(m, COMMON) == ["g_stage"]
+    m = FATTN + " static ggml_sycl::mem_handle g_owner{};"
+    assert owning_thread_locals(m, COMMON) == ["g_owner"]
+
+
+def test_static_scan_sees_the_statics():
+    # The positive control of the static half of C1: it sees fattn.cpp's statics, and passes the counters.
+    names = [m.group(2) for m in STATIC_DECL.finditer(FATTN)]
+    assert "g_seq_id_buffer_allocs" in names and "g_fattn_operand_stage_allocs" in names, (
+        f"the static scan no longer sees the live-buffer counters, so C1 may be vacuous for statics: {names}")
 
 
 def test_mutant_member_removed():
@@ -416,13 +480,39 @@ def test_mutant_owner_deleted_by_hand():
 
 
 def test_mutant_counted_release_keeps_the_handle():
-    for sig in COUNTED_FREE_SIGS:
-        # The mutation is made in the function's whole text, so it lands on this counted release and no other.
-        counted = sig + body(FATTN, sig)[1:]
-        m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "ptr = nullptr;"))
-        assert not release_is_the_handle_destructor(m), sig
-        m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "return; " + RELEASE_OWNER_CALL))
-        assert not release_is_the_handle_destructor(m), sig
+    # The mutation is made in the function's whole text, so it lands on the counted release and nowhere else.
+    counted = COUNTED_FREE_SIG + body(FATTN, COUNTED_FREE_SIG)[1:]
+    m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "ptr = nullptr;"))
+    assert not release_is_the_handle_destructor(m)
+    m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "return; " + RELEASE_OWNER_CALL))
+    assert not release_is_the_handle_destructor(m)
+
+
+def test_mutant_reserve_keeps_buffers_from_another_stream():
+    for sig, opening, _, _ in RESERVES:
+        reserve = body(FATTN, sig)
+        # The drop is gone: the group grows on size alone.
+        m = _mutate(FATTN, reserve, _mutate(reserve, opening, opening.split("} ", 1)[1]))
+        assert not reserve_owns_the_allocation(m), sig
+        # The drop comes after an early exit.
+        m = _mutate(FATTN, reserve, "{ if (!stream) { return false; } " + reserve[2:])
+        assert not reserve_owns_the_allocation(m), sig
+
+
+def test_mutant_group_allocated_outside_its_reserve():
+    m = FATTN + " static void f(ggml_sycl::mem_handle & o) { (void) ggml_sycl_fattn_seq_ids_alloc(1, nullptr, o); }"
+    assert not reserve_owns_the_allocation(m)
+    m = FATTN + (' static void f(void ** p, ggml_sycl::mem_handle & o) { (void) ggml_sycl_fattn_alloc_device_owner('
+                 '8, nullptr, ggml_sycl::alloc_role::STAGING, ggml_sycl::runtime_category::STAGING, '
+                 '"fattn_weight_stage", p, o); }')
+    assert not reserve_owns_the_allocation(m)
+
+
+def test_mutant_caller_allocates_without_the_reserve():
+    for caller, call in RESERVE_CALLERS:
+        caller_body = body(FATTN, caller)
+        m = _mutate(FATTN, caller_body, _mutate(caller_body, call, "grow(").replace(call, "grow("))
+        assert not reserve_owns_the_allocation(m), caller
 
 
 def test_mutant_destructor_never_releases():
