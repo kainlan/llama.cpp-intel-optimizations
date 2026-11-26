@@ -872,6 +872,15 @@ void test_recharge_on_moves_the_target_devices_room() {
     CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 212);
     CHECK(remaining_tight == 0 && weight_tight == 512 && vram_tight == 512);
     CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+
+    // A triplet that loses its slot gives the room back: its gate leaves AOS, and the up member's 256 bytes return.
+    tight[0].layout           = GGML_LAYOUT_SOA;
+    tight[0].vram_charge_size = 921856;
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+    CHECK(remaining_tight == 256 && weight_tight == 256 && vram_tight == 256);
+    CHECK(tight[1].vram_charge_size == 921600);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+    CHECK(remaining_tight == 256);
 }
 
 }  // namespace

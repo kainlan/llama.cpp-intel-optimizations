@@ -71,10 +71,11 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       MOE_SWAP_BUSY_CAUSE_ZONE_ROOM from the outcome. Without either the driver holds nothing, sends a refused admit
       again at every boundary, and no unit test sees it;
   D19 a boundary whose transaction refused admits for device room says so in one WARN line: the callback counts the
-      answers that carry a refused size and keeps the largest, with the largest free block any refusal saw, and after
-      its loop over the batch, on that count alone (so a batch that moved nothing prints it too, and no admit prints
-      its own), calls ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT
-      zone's free figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN,
+      answers that carry a refused size and keeps the refused triplet that asks the most in all with its refused
+      member's size, and the largest free block any refusal saw, and after its loop over the batch, on that count
+      alone (so a batch that moved nothing prints it too, and no admit prints its own), calls
+      ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT zone's free
+      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN,
       and on the device's first such boundary alone (a flag on the instance, set before it prints) logs the zone's
       free blocks (unified_cache::zone_free_block_sizes) as moe_swap_zone_free_census_line at WARN;
   D20 the hold takes the transaction's own give-backs out of the epoch's move. A transaction that gives back storage
