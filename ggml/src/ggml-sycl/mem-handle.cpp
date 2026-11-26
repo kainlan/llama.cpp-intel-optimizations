@@ -714,8 +714,9 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
     if (ptr != nullptr && valid_cache_device_id(device)) {
         unified_cache * cache = get_existing_unified_cache_for_device(device);
         if (cache) {
-            const chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_SNAPSHOT, false };
-            const int             vram_idx = cache->arena_acquire_chunk_lease(ptr, lease_tag);
+            // The acquire writes the holder slot into the tag, so the handle keeps the tag after it.
+            chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_SNAPSHOT, false, __builtin_return_address(0) };
+            const int       vram_idx = cache->arena_acquire_chunk_lease(ptr, lease_tag);
             if (vram_idx >= 0) {
                 h.chunk_source_      = 2;
                 h.chunk_tag_         = lease_tag;
@@ -896,8 +897,10 @@ mem_handle mem_handle::from_chunk_ptr(void *           ptr,
     unified_cache * cache = valid_cache_device_id(device) ? get_existing_unified_cache_for_device(device) : nullptr;
     if (cache) {
         // Priority 1: VRAM arena (pointer is device-resident).
-        const chunk_lease_tag lease_tag{ site, false };
-        const int             vram_idx = cache->arena_acquire_chunk_lease(ptr, lease_tag);
+        // The tag records this call's return address: the code that asked for the view, which a holders report
+        // names. The acquire writes the holder slot into the tag, so the handle keeps the tag after it.
+        chunk_lease_tag lease_tag{ site, false, __builtin_return_address(0) };
+        const int       vram_idx = cache->arena_acquire_chunk_lease(ptr, lease_tag);
         if (vram_idx >= 0) {
             h.kind_              = mem_handle_kind::CHUNK_LEASE;
             h.chunk_source_      = 2;
@@ -1336,8 +1339,8 @@ resolved_ptr mem_handle::resolve_slow() const {
     // eviction, chunk refcount prevents arena-layer munmap.  If the resolved
     // ptr is not in any known arena (e.g. mmap-backed S1-PRELOAD direct
     // entries), chunk_source stays 0 and release is a no-op.
-    const chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_RESOLVE, false };
-    const int             vram_idx = cache->arena_acquire_chunk_lease(resolved.ptr, lease_tag);
+    chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_RESOLVE, false, __builtin_return_address(0) };
+    const int       vram_idx = cache->arena_acquire_chunk_lease(resolved.ptr, lease_tag);
     if (vram_idx >= 0) {
         fresh.chunk_source      = 2;
         fresh.chunk_tag         = lease_tag;
@@ -1782,13 +1785,14 @@ mem_handle::~mem_handle() {
 // all count mutations behind the pool's API and correctly handles the case
 // where the pool has been destroyed between the original acquisition and
 // the copy (returns a null handle, chunk_source_ gets zeroed below).  `tag` is
-// the copy's own: its source's site, marked as a copy.
-static void bump_chunk_lease_for_copy(uint8_t         chunk_source,
-                                      int             chunk_device,
-                                      const void *    ptr,
-                                      chunk_lease_tag tag,
-                                      uint64_t &      out_host_handle,
-                                      int32_t &       out_vram_idx) {
+// the copy's own: its source's site, marked as a copy, and its copier's
+// address; the acquire writes the holder slot into it.
+static void bump_chunk_lease_for_copy(uint8_t           chunk_source,
+                                      int               chunk_device,
+                                      const void *      ptr,
+                                      chunk_lease_tag & tag,
+                                      uint64_t &        out_host_handle,
+                                      int32_t &         out_vram_idx) {
     if (chunk_source == 0 || chunk_device < 0 || ptr == nullptr) {
         out_host_handle = UINT64_MAX;
         out_vram_idx    = -1;
@@ -1850,7 +1854,8 @@ mem_handle::mem_handle(const mem_handle & other) {
         leased_alloc_owner_      = other.leased_alloc_owner_;
         chunk_source_            = other.chunk_source_;
         chunk_device_            = other.chunk_device_;
-        chunk_tag_               = chunk_lease_tag{ other.chunk_tag_.site, true };
+        // The copy's own address, not its source's: the code that made this copy is the code that keeps its lease.
+        chunk_tag_               = chunk_lease_tag{ other.chunk_tag_.site, true, __builtin_return_address(0) };
         if (leased_entry_) {
             leased_entry_->in_use_count.fetch_add(1);
             // llama.cpp-2wv5: a copy takes its own lease, so it -- not whoever
@@ -1967,7 +1972,7 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
     std::shared_ptr<void> new_storage_owner;
     shared_alloc_owner               new_alloc_owner;
 
-    chunk_lease_tag new_chunk_tag;  // the source's site, marked as a copy
+    chunk_lease_tag new_chunk_tag;  // the source's site, marked as a copy, and this copier's address
     {
         mem_handle_lock_guard g(other.lock_);
         new_kind                    = other.kind_;
@@ -1994,7 +1999,8 @@ mem_handle & mem_handle::operator=(const mem_handle & other) {
         new_entry                   = other.leased_entry_;
         new_chunk_source            = other.chunk_source_;
         new_chunk_device            = other.chunk_device_;
-        new_chunk_tag               = chunk_lease_tag{ other.chunk_tag_.site, true };
+        // The copy's own address, not its source's (see the copy ctor).
+        new_chunk_tag               = chunk_lease_tag{ other.chunk_tag_.site, true, __builtin_return_address(0) };
         new_storage_owner           = other.leased_storage_owner_;
         new_alloc_owner             = other.leased_alloc_owner_;
         if (new_entry) {

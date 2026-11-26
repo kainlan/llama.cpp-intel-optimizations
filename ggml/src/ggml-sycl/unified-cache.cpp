@@ -40,6 +40,7 @@
 #include "zone-used-count.hpp"
 
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <level_zero/ze_api.h>
 
 #include <algorithm>
@@ -32299,13 +32300,84 @@ int unified_cache::arena_find_chunk(const void * ptr) const {
     return -1;
 }
 
-int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag) {
+// The one resolution of GGML_SYCL_LEASE_HOLDERS. A function-local static runs once per process, on the first cache's
+// construction, and each cache keeps the answer in a const member, so no take or release reads the environment.
+bool chunk_lease_holders_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_LEASE_HOLDERS");
+        const bool   on    = value != nullptr && std::strcmp(value, "1") == 0;
+        if (on) {
+            // backtrace() loads the unwinder on its first call. Make that call here, once, rather than in a take.
+            void * frame = nullptr;
+            (void) backtrace(&frame, 1);
+            GGML_LOG_WARN(
+                "[VRAM-ARENA] GGML_SYCL_LEASE_HOLDERS=1: every VRAM arena chunk lease's take walks its call stack, and "
+                "a held arena names the code that holds each lease; slower than a run without it\n");
+        } else if (value != nullptr && std::strcmp(value, "0") != 0) {
+            GGML_LOG_WARN("[VRAM-ARENA] GGML_SYCL_LEASE_HOLDERS=%s is neither 0 nor 1; treating it as unset\n", value);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+// The process's holder table. Constant-initialised and never destroyed early, so a report during teardown reads it.
+static chunk_lease_holder_table & chunk_lease_holders() {
+    static chunk_lease_holder_table table;
+    return table;
+}
+
+// The holder slot for a lease `tag` describes, from the stack of the take that is running. Called only with the knob
+// on. A tag with no address (a caller that keeps no tag) counts in slot 0 without a walk.
+static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag) {
+    if (tag.pc == nullptr) {
+        return 0;
+    }
+    // Deep enough to reach the take's frame under this helper, the acquire and a copy's bump, plus the holder's own
+    // frames above it.
+    void *    stack[CHUNK_LEASE_HOLDER_FRAMES + 16];
+    const int depth = backtrace(stack, static_cast<int>(sizeof(stack) / sizeof(stack[0])));
+    return chunk_lease_holders().claim(tag, stack, depth);
+}
+
+// A frame as module+offset (the offset addr2line takes for that module), with the exported symbol when dladdr knows
+// one. A frame is a return address, so the call it names is the instruction before the offset.
+static void chunk_lease_holder_frame_name(const void * pc, char * out, size_t size) {
+    Dl_info info{};
+    if (dladdr(pc, &info) == 0 || info.dli_fname == nullptr) {
+        snprintf(out, size, "%p", pc);
+        return;
+    }
+    const char * slash  = std::strrchr(info.dli_fname, '/');
+    const char * module = slash != nullptr ? slash + 1 : info.dli_fname;
+    const char * base   = static_cast<const char *>(info.dli_fbase);
+    const size_t offset = static_cast<size_t>(static_cast<const char *>(pc) - base);
+    if (info.dli_sname != nullptr && info.dli_saddr != nullptr) {
+        snprintf(out, size, "%s+0x%zx(%s+0x%zx)", module, offset, info.dli_sname,
+                 static_cast<size_t>(static_cast<const char *>(pc) - static_cast<const char *>(info.dli_saddr)));
+    } else {
+        snprintf(out, size, "%s+0x%zx", module, offset);
+    }
+}
+
+int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
+    chunk_lease_tag tag;
+    return arena_acquire_chunk_lease(ptr, tag);
+}
+
+int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag) {
     const int idx = arena_find_chunk(ptr);
     if (idx < 0) {
         return -1;
     }
     arena_chunks_[idx].lease_count.fetch_add(1);
     arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);
+    // With the knob off this is one load of a const member. With it on the take walks its stack; the slot goes back
+    // into the caller's tag, which the handle keeps for the release.
+    if (chunk_lease_holders_) {
+        tag.holder = chunk_lease_holder_claim(tag);
+        arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);
+    }
     return idx;
 }
 
@@ -32322,6 +32394,9 @@ void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag
         return;
     }
     arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);
+    if (chunk_lease_holders_) {
+        arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);
+    }
 }
 
 bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
@@ -32526,15 +32601,55 @@ void unified_cache::arena_report_holders(int                  dev_id,
     // after the per-chunk total the caller read, so a lease taken or dropped in between can set the two sums one apart.
     // Then each zone with live bytes lists its live allocations, through this cache's own dump, which takes only the
     // runtime registry's lock; that lock ranks after every scratch lock a caller can hold here.
+    // These lines print at the caller's level, the level of the line that called this report, so a tool that shows
+    // only errors shows who holds the leases beside the error that says they are held.
     char           leases_by_site[512];
     const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));
-    GGML_LOG_WARN("[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
-                  leases_by_site[0] != '\0' ? leases_by_site : " none", site_leases, holders.chunk_leases);
+    ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
+                      leases_by_site[0] != '\0' ? leases_by_site : " none", site_leases, holders.chunk_leases);
+    if (chunk_lease_holders_) {
+        arena_report_chunk_lease_holders(dev_id, level, holders.chunk_leases);
+    } else if (holders.chunk_leases != 0) {
+        ggml_log_internal(level,
+                          "[VRAM-ARENA] set GGML_SYCL_LEASE_HOLDERS=1 to name the code that took each of the %u chunk "
+                          "leases on device %d\n",
+                          holders.chunk_leases, dev_id);
+    }
     for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
         if (live_zone_used[z] != 0) {
             dump_live_zone_allocations(static_cast<vram_zone_id>(z), site);
         }
     }
+}
+
+void unified_cache::arena_report_chunk_lease_holders(int dev_id, ggml_log_level level, uint32_t chunk_leases) const {
+    uint32_t sum = 0;
+    for (size_t slot = 0; slot < CHUNK_LEASE_HOLDER_SLOTS; ++slot) {
+        const uint32_t held = arena_chunk_leases_by_holder_[slot].load(std::memory_order_relaxed);
+        sum += held;
+        if (held == 0) {
+            continue;
+        }
+        chunk_lease_holder holder;
+        char               taken_at[CHUNK_LEASE_HOLDER_FRAMES * 96] = "an unnamed take (no address, or a full table)";
+        if (chunk_lease_holders().read(static_cast<uint16_t>(slot), holder)) {
+            size_t used = 0;
+            for (int f = 0; f < holder.n_frames && used < sizeof(taken_at); ++f) {
+                char frame[96];
+                chunk_lease_holder_frame_name(holder.frames[f], frame, sizeof(frame));
+                const int n = snprintf(taken_at + used, sizeof(taken_at) - used, "%s%s", f == 0 ? "" : " < ", frame);
+                if (n > 0) {
+                    used = std::min(sizeof(taken_at), used + static_cast<size_t>(n));
+                }
+            }
+        }
+        const bool named = slot != 0 && holder.n_frames != 0;
+        ggml_log_internal(level, "[VRAM-ARENA] chunk lease holder on device %d: %u held, site %s%s, taken at %s\n",
+                          dev_id, held, named ? chunk_lease_site_name(holder.site) : "any",
+                          named && holder.copy ? "(copy)" : "", taken_at);
+    }
+    ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by holder: sum %u of %u\n", dev_id, sum,
+                      chunk_leases);
 }
 
 void unified_cache::compute_arena_bind() {

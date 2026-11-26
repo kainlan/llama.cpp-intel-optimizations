@@ -8,10 +8,11 @@ in mem-handle.cpp passes a site (a weight lease snapshot, a weight resolve, a ha
 caller names what keeps it, and a copy, which keeps its source's site and counts as a copy). The handle carries the tag
 to its release, and a move hands it on with the lease, so the release lowers the count the acquire raised. The count
 costs one relaxed atomic add on each side and takes no lock, and moves only when the per-chunk count moved, so the
-counts sum to the chunks' leases.
+counts sum to the chunks' leases. (The count by holder that GGML_SYCL_LEASE_HOLDERS=1 adds beside it, and the
+taker's address each tag records, are test-sycl-chunk-lease-holder-source.py's.)
 
-The rebuild refusal prints those counts on a WARN line and lists the live allocations of every zone with live bytes,
-through the cache's own dump, which takes no lock above the refusal's. The counts come from the one census helper the
+The rebuild refusal prints those counts at its own level (ERROR) and lists the live allocations of every zone with
+live bytes through the cache's own dump, which takes no lock above the refusal's. The counts come from the one census helper the
 arena teardown's lease line also calls, which counts every site and copy and writes each one that holds a lease.
 
 A cache scratch buffer blocks the rebuild only when the arena owns its pointer. The decision is the pure predicate
@@ -158,19 +159,19 @@ RELEASE_SIG = "void mem_handle::release_lease_state(const lease_state & state) n
 SITE_PATHS = (
     (
         SNAPSHOT_SIG,
-        "const chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_SNAPSHOT, false };",
+        "chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_SNAPSHOT, false, __builtin_return_address(0) };",
         "cache->arena_acquire_chunk_lease(ptr, lease_tag);",
         "h.chunk_tag_ = lease_tag;",
     ),
     (
         CHUNK_PTR_SIG,
-        "const chunk_lease_tag lease_tag{ site, false };",
+        "chunk_lease_tag lease_tag{ site, false, __builtin_return_address(0) };",
         "cache->arena_acquire_chunk_lease(ptr, lease_tag);",
         "h.chunk_tag_ = lease_tag;",
     ),
     (
         RESOLVE_SIG,
-        "const chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_RESOLVE, false };",
+        "chunk_lease_tag lease_tag{ chunk_lease_site::WEIGHT_RESOLVE, false, __builtin_return_address(0) };",
         "cache->arena_acquire_chunk_lease(resolved.ptr, lease_tag);",
         "fresh.chunk_tag = lease_tag;",
     ),
@@ -188,9 +189,9 @@ def claim_every_lease_names_a_site(mh: str) -> bool:
 
 # A copy takes a lease of its own, keeps its source's site and counts as a copy, so the counts by site and copy sum to
 # the chunks' leases.
-COPY_CTOR_TAG = "chunk_tag_ = chunk_lease_tag{ other.chunk_tag_.site, true };"
+COPY_CTOR_TAG = "chunk_tag_ = chunk_lease_tag{ other.chunk_tag_.site, true, __builtin_return_address(0) };"
 COPY_CTOR_BUMP = "bump_chunk_lease_for_copy(chunk_source_, chunk_device_, cached_.ptr, chunk_tag_, host_chunk_handle_,"
-COPY_ASSIGN_TAG = "new_chunk_tag = chunk_lease_tag{ other.chunk_tag_.site, true };"
+COPY_ASSIGN_TAG = "new_chunk_tag = chunk_lease_tag{ other.chunk_tag_.site, true, __builtin_return_address(0) };"
 COPY_ASSIGN_BUMP = "bump_chunk_lease_for_copy(new_chunk_source, new_chunk_device, new_cached.ptr, new_chunk_tag,"
 
 
@@ -227,19 +228,26 @@ def claim_release_lowers_the_raising_site(mh: str, mhh: str) -> bool:
 
 
 # The count is one relaxed add on each side and no lock. It moves only when the per-chunk count moved: the acquire adds
-# after it found the chunk, and the release subtracts only when the chunk's decrement did not underflow.
-UC_ACQUIRE_SIG = "int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag)"
+# after it found the chunk, and the release subtracts only when the chunk's decrement did not underflow. The block the
+# GGML_SYCL_LEASE_HOLDERS flag guards (the count by holder) is left out of these counts: the holder contract pins it.
+UC_ACQUIRE_SIG = "int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag)"
 UC_RELEASE_SIG = "void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag)"
 SITE_ADD = "arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);"
 SITE_SUB = "arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);"
 UNDERFLOW_RETURN = "lease_count.fetch_add(1); return; }"
 LOCK_WORDS = ("lock", "mutex")
+HOLDER_FLAG = "if (chunk_lease_holders_) {"
+
+
+def without_holder_block(body: str) -> str:
+    i = body.find(HOLDER_FLAG)
+    return body if i == -1 else body[:i] + body[i + len(block_at(body, i)) + len(HOLDER_FLAG) - 1 :]
 
 
 def claim_site_count_costs_one_relaxed_add(uc: str, uch: str) -> bool:
     c = code(uc)
-    acq = fn_body(c, UC_ACQUIRE_SIG)
-    rel = fn_body(c, UC_RELEASE_SIG)
+    acq = without_holder_block(fn_body(c, UC_ACQUIRE_SIG))
+    rel = without_holder_block(fn_body(c, UC_RELEASE_SIG))
     of = fn_body(code(uch), "std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const")
     return (
         ordered(acq, "if (idx < 0) { return -1; }", "lease_count.fetch_add(1);", SITE_ADD, "return idx;")
@@ -296,12 +304,12 @@ def refusal_segment(uc: str) -> str:
 
 
 def claim_refusal_prints_leases_by_site(uc: str) -> bool:
-    """After the holders line the refusal takes the census and prints it on a WARN line, its sum beside the per-chunk
-    total; the census counts every site and copy into the sum and writes each one that holds a lease."""
+    """After the holders line the refusal takes the census and prints it at the refusal's level, its sum beside the
+    per-chunk total; the census counts every site and copy into the sum and writes each one that holds a lease."""
     seg = refusal_segment(uc)
     census = fn_body(code(uc), CENSUS_SIG)
     return (
-        ordered(seg, HOLDERS_LINE, CENSUS_CALL, "GGML_LOG_WARN(" + SITE_LINE, SITE_WARN_ARGS)
+        ordered(seg, HOLDERS_LINE, CENSUS_CALL, "ggml_log_internal(level, " + SITE_LINE, SITE_WARN_ARGS)
         and ordered(census, *SITE_LOOP)
         and "GGML_LOG_INFO(" not in seg
     )
@@ -431,8 +439,8 @@ def test_site_count_costs_one_relaxed_add():
 
 def test_refusal_prints_leases_by_site():
     assert claim_refusal_prints_leases_by_site(UC), (
-        "the arena rebuild refusal does not print the chunk leases by site and copy on a WARN line after the holders "
-        "line, with their sum beside the per-chunk total, or it logs at INFO"
+        "the arena rebuild refusal does not print the chunk leases by site and copy at its own level after the "
+        "holders line, with their sum beside the per-chunk total, or it logs at INFO"
     )
 
 
@@ -532,7 +540,7 @@ def test_witness_refusal_without_site_line():
 
 def test_witness_site_line_at_info():
     assert not claim_refusal_prints_leases_by_site(
-        mutate_in(UC, REPORT_SIG, "GGML_LOG_WARN(" + SITE_LINE, "GGML_LOG_INFO(" + SITE_LINE)
+        mutate_in(UC, REPORT_SIG, "ggml_log_internal(level, " + SITE_LINE, "GGML_LOG_INFO(" + SITE_LINE)
     )
 
 

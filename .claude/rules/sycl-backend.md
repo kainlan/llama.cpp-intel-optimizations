@@ -203,6 +203,7 @@ most need to know:
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
 | `GGML_SYCL_QUEUE_PROFILING=<0\|1>` | OFF | Whether every queue is built with `enable_profiling`, which costs one device timestamp query per submitted command (off measured GPT-OSS 20B decode 12 to 26 % and Qwen prefill 34 % faster). Unset is off unless a profiling diagnostic is requested (`GGML_SYCL_KERNEL_PROFILE`, `GGML_SYCL_MXFP4_TG_PROFILE`, `GGML_SYCL_MXFP4_PP_PROFILE`, `GGML_SYCL_ATTN_SYNC_PROFILE`, `GGML_SYCL_MOE_EXEC_TRACE=2`): then on, with one WARN naming the variable. `1` is on. `0` is off and a requested diagnostic prints one WARN and no figure. Any other value: one WARN, treated as unset. Resolved once per process |
+| `GGML_SYCL_LEASE_HOLDERS=1` | OFF | Diagnostic. A held arena (last release, load start, refused rebuild) names the code holding each chunk lease: one `chunk lease holder ... taken at libggml-sycl.so+0xOFF < ...` line per holder, at the level of the line that reported the arena. Each take then walks its call stack (slower run). Off costs one pointer store per take. Read once per process |
 
 Common diagnostics: `GGML_SYCL_DEBUG=1` (verbose dispatch), `GGML_SYCL_NAN_CHECK=1`,
 `GGML_SYCL_SAFE_MODE=1` (drain queue per op to localize faults), and
