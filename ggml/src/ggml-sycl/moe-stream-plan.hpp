@@ -1446,10 +1446,14 @@ static inline size_t moe_expert_triplet_slot_bytes(const placement_plan & plan, 
 // takes, so the plan and the zone agree on what one routed expert costs, and else its own staged bytes, so a member a
 // layout pass left at a slot its triplet has lost gives the slot back. An entry that stages another way keeps the
 // charge its layout pass gave it. The triplet is resolved as the plan's index resolves it (placement_plan::build_index,
-// find_expert_entry): its members are the first entry of each role, and an entry with no layer is in no triplet. An
-// entry whose role was met before is staged too, at the members' slot when that is no smaller than its own staged
-// bytes. Pure over `entries` and needs no index: the planner runs it while it builds the plan, before an index exists.
-// A triplet that misses a role is left alone. Returns the number of triplets charged a slot.
+// find_expert_entry): its members are the first entry of each role, and an entry with no layer is in no triplet. The
+// load resolves an entry whose role was met before by name too, so it stages that repeat as its member, with the
+// member's layout and device. A repeat with its member's layout and device is charged what the load stages, the
+// members' slot when that is no smaller than its own staged bytes. A repeat in another layout or on another device is
+// charged on its own layout and device, which does not follow what the load stages: a known gap the planner warns for
+// (placement_entries_repeats_off_their_member). Pure over `entries` and needs no index: the planner runs it while it
+// builds the plan, before an index exists. A triplet that misses a role is left alone. Returns the number of triplets
+// charged a slot.
 static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries) {
     struct triplet_entries {
         placement_entry *              members[3] = { nullptr, nullptr, nullptr };
@@ -1492,6 +1496,39 @@ static inline size_t placement_entries_charge_expert_slots(std::vector<placement
         charged += slot_bytes != 0 ? 1 : 0;
     }
     return charged;
+}
+
+// A repeat of a triplet role (a later entry of a role in one (layer, expert)) whose layout or target device differs
+// from its member's, the first entry of that role.
+struct placement_repeat_off_member {
+    const placement_entry * member = nullptr;
+    const placement_entry * repeat = nullptr;
+};
+
+// Every repeat whose layout or target device differs from its member's, in entries order, resolved as
+// placement_entries_charge_expert_slots resolves a triplet. The load stages such a repeat as its member while the plan
+// charges it on its own layout and device, so its charge does not follow the slot the load stages it at.
+static inline std::vector<placement_repeat_off_member> placement_entries_repeats_off_their_member(
+    const std::vector<placement_entry> & entries) {
+    struct triplet_members {
+        const placement_entry * members[3] = { nullptr, nullptr, nullptr };
+    };
+
+    std::unordered_map<uint64_t, triplet_members> triplets;
+    std::vector<placement_repeat_off_member>      off;
+    for (const placement_entry & e : entries) {
+        if (e.expert_id < 0 || e.layer_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) {
+            continue;
+        }
+        triplet_members &        t      = triplets[detail::moe_loan_triplet_key(e.layer_id, e.expert_id)];
+        const placement_entry *& member = t.members[detail::moe_loan_role_slot(e.expert_role)];
+        if (!member) {
+            member = &e;
+        } else if (e.layout != member->layout || e.target_device != member->target_device) {
+            off.push_back({ member, &e });
+        }
+    }
+    return off;
 }
 
 // One entry whose charge a re-charge changed: its index in the entries, and its charge before and after.

@@ -4064,8 +4064,28 @@ PRIMARY_DOWN_I8_UPGRADE = ("maybe_upgrade_moe_down_layouts_to_i8(plan, remaining
                            "n_experts, false); if (!plan.per_device_vram.empty()) { "
                            "plan.per_device_vram[0] += primary_down_charged; }")
 PRIMARY_DOWN_I8_SITE = PRIMARY_DOWN_I8_UPGRADE + " " + MULTI_DOWN_I8_RECHARGE
-BRANCH_DOWN_I8_UPGRADE = "plan.per_device_vram[0] += primary_down_charged;"
-BRANCH_DOWN_I8_SITE = BRANCH_DOWN_I8_UPGRADE + " " + MULTI_DOWN_I8_RECHARGE
+# The second multi-device site is anchored on the end of both arms of its down upgrade, as the single-device one is,
+# so neither the re-charge nor the re-charge with the charge bookkeeping can move ahead of the arms.
+BRANCH_PP_ALTERNATES = "add_multi_moe_pp_executable_alternates(plan, remaining, device_budgets, kv_info, envelope);"
+BRANCH_DOWN_I8_CALL = ("primary_down_charged = maybe_upgrade_moe_down_layouts_to_i8(plan, remaining[0], "
+                       "device_budgets[0].device_id, n_experts, multi_static_i8_executor_supported);")
+BRANCH_DOWN_I8_ARMS = ("if (!planner_moe_prompt_down_specialized_layouts_enabled()) { " + BRANCH_PP_ALTERNATES + " "
+                       + BRANCH_DOWN_I8_CALL + " } else { " + BRANCH_DOWN_I8_CALL + " " + BRANCH_PP_ALTERNATES + " }")
+BRANCH_DOWN_I8_TOTAL = "plan.per_device_vram[0] += primary_down_charged;"
+BRANCH_DOWN_I8_SITE = BRANCH_DOWN_I8_ARMS + " " + BRANCH_DOWN_I8_TOTAL + " " + MULTI_DOWN_I8_RECHARGE
+# A repeat of a triplet role in another layout or on another device is charged on its own while the load stages it as
+# its member: the planner says so at WARN, naming the repeat, and a duplicated role raises the summary line to WARN.
+DIAG_SIG = "static void log_moe_placement_diagnostics(const char * tag, const placement_plan & plan, int n_experts)"
+DIAG_SUMMARY = ('ggml_log_internal(summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO, '
+                '"[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\\n",')
+DIAG_OFF_LOOP = ("for (const placement_repeat_off_member & off : "
+                 "placement_entries_repeats_off_their_member(plan.entries)) {")
+DIAG_OFF_WARN = ('GGML_LOG_WARN("[%s] layer %d expert %d %s: a repeated entry (%s on %s) differs from its member '
+                 '(%s on %s); the load stages it as its member, so the repeat\'s charge does not follow the slot the '
+                 'load stages it at\\n", tag, off.repeat->layer_id, off.repeat->expert_id, '
+                 'expert_tensor_role_name(off.repeat->expert_role),')
+OFF_SIG = "static inline std::vector<placement_repeat_off_member> placement_entries_repeats_off_their_member("
+OFF_TEST = "} else if (e.layout != member->layout || e.target_device != member->target_device) {"
 PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
 PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
 PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
@@ -4464,8 +4484,46 @@ def test_mutant_multi_primary_i8_down_recharge_before_the_upgrade_fails():
 
 
 def test_mutant_multi_branch_i8_down_recharge_before_the_upgrade_fails():
-    mutant = _once(CACHE, BRANCH_DOWN_I8_SITE, MULTI_DOWN_I8_RECHARGE + " " + BRANCH_DOWN_I8_UPGRADE)
+    """The re-charge runs ahead of both arms of the down upgrade: the slots the upgrade takes stay charged."""
+    mutant = _once(CACHE, BRANCH_DOWN_I8_SITE,
+                   MULTI_DOWN_I8_RECHARGE + " " + BRANCH_DOWN_I8_ARMS + " " + BRANCH_DOWN_I8_TOTAL)
     assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_branch_i8_down_total_and_recharge_before_the_upgrade_fails():
+    """The charge bookkeeping and the re-charge move together ahead of the arms: still before the upgrade."""
+    mutant = _once(CACHE, BRANCH_DOWN_I8_SITE,
+                   BRANCH_DOWN_I8_TOTAL + " " + MULTI_DOWN_I8_RECHARGE + " " + BRANCH_DOWN_I8_ARMS)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def claim_a_repeat_off_its_member_warns(cache: str, plan_hpp: str) -> bool:
+    """The planner names, at WARN, each repeat of a triplet role whose layout or device differs from its member's,
+    and raises the placement summary to WARN when a role is duplicated."""
+    diag = body(norm(cache), DIAG_SIG)
+    off = body(norm(plan_hpp), OFF_SIG)
+    return (diag.count(DIAG_SUMMARY) == 1 and diag.count(DIAG_OFF_LOOP) == 1 and diag.count(DIAG_OFF_WARN) == 1
+            and ordered(diag, DIAG_SUMMARY, DIAG_OFF_LOOP, DIAG_OFF_WARN) and off.count(OFF_TEST) == 1)
+
+
+def test_a_repeat_off_its_member_warns():
+    assert claim_a_repeat_off_its_member_warns(CACHE, PLAN_HPP)
+
+
+def test_mutant_duplicate_summary_demoted_to_info_fails():
+    mutant = _once_in(CACHE, DIAG_SIG, "summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO",
+                      "GGML_LOG_LEVEL_INFO")
+    assert not claim_a_repeat_off_its_member_warns(mutant, PLAN_HPP)
+
+
+def test_mutant_repeat_off_its_member_demoted_to_info_fails():
+    mutant = _once_in(CACHE, DIAG_SIG, 'GGML_LOG_WARN("[%s] layer %d expert', 'GGML_LOG_INFO("[%s] layer %d expert')
+    assert not claim_a_repeat_off_its_member_warns(mutant, PLAN_HPP)
+
+
+def test_mutant_repeat_off_its_member_ignores_the_device_fails():
+    mutant = _once_in(PLAN_HPP, OFF_SIG, " || e.target_device != member->target_device", "")
+    assert not claim_a_repeat_off_its_member_warns(CACHE, mutant)
 
 
 def test_mutant_bulk_stages_past_the_slot_fails():

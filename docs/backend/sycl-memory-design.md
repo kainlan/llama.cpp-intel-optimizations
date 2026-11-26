@@ -406,11 +406,15 @@ member moved into AOS is charged the slot its triplet now has, a triplet that
 lost its slot charges its AOS members their own staged sizes again, and the
 device totals move by each change. The charge resolves a triplet as the plan's
 index does, each role's first entry, so a role planned twice is charged the slot
-the load looks up; the later entry is charged what the load stages it at. The
+the load looks up. The load resolves the later entry by name too and stages it
+as its member: a repeat with its member's layout and device is charged what the
+load stages, and one in another layout or on another device is a known gap the
+planner warns for (`placement_entries_repeats_off_their_member`). The
 materialization reorder that follows the last charge keeps entries of one role
 in plan order (a stable sort on the role alone), so the index's first entry is
-still the one charged. The load stages each member at that size: a tensor whose experts' triplets have a
-slot past their staged bytes is not bulk-staged, since the bulk copy has one
+still the one charged. The load stages each member at that size: a tensor whose
+experts' triplets have a slot past their staged bytes is not bulk-staged, since
+the bulk copy has one
 stride, and is staged expert by expert, so the loan's selection reads it as not
 bulk and its experts can be lent (`moe_loan_tensor_bulk_staged`);
 a DPAS promotion that rolls back restores an AOS base at its triplet's slot. A

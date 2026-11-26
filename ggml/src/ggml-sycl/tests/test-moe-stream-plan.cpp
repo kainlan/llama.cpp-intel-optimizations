@@ -884,23 +884,35 @@ void test_recharge_on_moves_the_target_devices_room() {
 }
 
 // A role met twice in one (layer, expert) is resolved as the plan's index resolves it (find_expert_entry keeps the
-// first): the triplet's slot is the first entries', each of them is charged it, and an entry met again is charged
-// what the load stages it at, the slot when it stages as AOS and is no larger. Here the first down is AOS with a tail,
-// so the triplet has a slot; a later SOA down (which stages no AOS bytes) would give it none, and a later, smaller AOS
-// gate stages at the slot.
+// first): the triplet's slot is the first entries', and each of them is charged it. The load resolves a repeat by name
+// too, so it stages the repeat as its member, with the member's layout and device. A repeat with its member's layout
+// and device is charged what the load stages: here a later, smaller AOS gate is charged the slot. A repeat in another
+// layout or on another device is a known gap: its charge stays on its own layout and device, and the planner warns
+// for it (placement_entries_repeats_off_their_member). Here the first down is AOS with a tail, so the triplet has a
+// slot, and a later SOA down keeps its own SOA charge although the load stages the AOS member at the slot.
 void test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry() {
     std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
     entries.resize(3);
     entries.push_back(slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA));
     entries.push_back(slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 460800));
+    entries.push_back(slot_member(0, 0, kUp, GGML_TYPE_IQ4_NL, 2560, 921600));
+    entries.back().target_device = 1;
+
     const size_t soa_charge = entries[3].vram_charge_size;
     CHECK(entries[4].vram_charge_size == 460800);
     CHECK(ggml_sycl::placement_entries_charge_expert_slots(entries) == 1);
     for (size_t i = 0; i < 3; ++i) {
         CHECK(entries[i].vram_charge_size == 921856);
     }
-    CHECK(entries[3].vram_charge_size == soa_charge);
     CHECK(entries[4].vram_charge_size == 921856);
+    // The known gap the planner warns for: the SOA repeat keeps its own charge.
+    CHECK(entries[3].vram_charge_size == soa_charge);
+    // The warning names each repeat off its member, by layout (the SOA down) or by device (the up on device 1), and
+    // not the gate that matches its member.
+    const auto off = ggml_sycl::placement_entries_repeats_off_their_member(entries);
+    CHECK(off.size() == 2);
+    CHECK(off.size() == 2 && off[0].member == &entries[2] && off[0].repeat == &entries[3]);
+    CHECK(off.size() == 2 && off[1].member == &entries[1] && off[1].repeat == &entries[5]);
     // The load's own lookup agrees: the indexed plan gives the triplet the first entries' slot.
     placement_plan plan{};
     plan.entries = entries;

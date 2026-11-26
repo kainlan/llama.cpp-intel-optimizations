@@ -33290,8 +33290,23 @@ static void log_moe_placement_diagnostics(const char * tag, const placement_plan
     }
 
     const auto summary = plan.summarize_expert_placements(observed_layers, n_experts);
-    GGML_LOG_INFO("[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag, summary.expected,
-                  summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    // A duplicated role reaches a default-verbosity log: the load stages a repeat as its member, so a repeat planned
+    // in another layout or on another device is charged what the load does not stage.
+    ggml_log_internal(summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag,
+                      summary.expected, summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    for (const placement_repeat_off_member & off : placement_entries_repeats_off_their_member(plan.entries)) {
+        char member_buf[32];
+        char repeat_buf[32];
+        GGML_LOG_WARN(
+            "[%s] layer %d expert %d %s: a repeated entry (%s on %s) differs from its member (%s on %s); the load "
+            "stages it as its member, so the repeat's charge does not follow the slot the load stages it at\n",
+            tag, off.repeat->layer_id, off.repeat->expert_id, expert_tensor_role_name(off.repeat->expert_role),
+            scratch_layout_name(off.repeat->layout),
+            placement_target_name(off.repeat->target_device, repeat_buf, sizeof(repeat_buf)),
+            scratch_layout_name(off.member->layout),
+            placement_target_name(off.member->target_device, member_buf, sizeof(member_buf)));
+    }
     GGML_LOG_INFO("[%s] roles: gate=%zu up=%zu down=%zu gate_up=%zu unknown=%zu\n", tag,
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::GATE)],
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::UP)],
