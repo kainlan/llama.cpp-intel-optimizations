@@ -1060,7 +1060,8 @@ ticket reproduced on:
   device-kernel event on a non-profiling queue, both measured a few ms or
   less either way. Every real pool release event in production is
   device-kernel-produced (oneDNN's own free callback), matching the case
-  that actually blocks.
+  that blocks when the queue carries profiling (`GGML_SYCL_QUEUE_PROFILING=1`
+  or a requested profiling diagnostic).
 - **Without TP, a parked entry is reused while its release is still in
   flight (llama.cpp-jwjz).** Every Graph-scratch consumer submits on the
   cache's own in-order queue when TP is inactive. That is the fact the

@@ -204,8 +204,10 @@ int main(int, char ** argv) {
     try {
         sycl::device  dev{ sycl::gpu_selector_v };
         sycl::context ctx{ dev };
-        // Matches default_queue_properties() in common.hpp -- every real
-        // backend stream in this codebase is in_order + enable_profiling.
+        // Matches default_queue_properties() in common.hpp when the queues
+        // carry profiling (GGML_SYCL_QUEUE_PROFILING=1 or a requested
+        // profiling diagnostic): in_order + enable_profiling. This probe
+        // builds its own queues, so it does not depend on that answer.
         sycl::queue   q_profiling(
             ctx, dev,
             sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} });
