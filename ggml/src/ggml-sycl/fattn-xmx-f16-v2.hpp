@@ -54,6 +54,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 #include <sycl/sycl.hpp>
 #include <type_traits>
 #include <vector>
@@ -568,6 +569,12 @@ inline sycl::half fp8_e4m3_to_half_v2(uint8_t bits) {
 // float, as the CUDA and Vulkan backends do with a half P (Vulkan
 // flash_attn_cm1.comp, CUDA fattn-mma-f16.cuh) and as this backend's oneDNN SDPA
 // (F16 probabilities) and DPAS (fattn-dpas.cpp) paths already do.
+//
+// kv_v8 (f32_sv leaf only): K and V reach SLM in 16-byte vectors, and the next
+// batch's K/V rows are prefetched into L1 while this batch computes. The caller
+// sets it only when every K/V row starts on a 16-byte bound
+// (fattn_xmx_v2_kv_rows_v8); the SLM contents are bit-identical to the scalar
+// copy's.
 // =============================================================================
 
 template <int  D,
@@ -579,7 +586,8 @@ template <int  D,
           int  TM,
           int  TK,
           int  TN,
-          bool f32_sv = false>
+          bool f32_sv = false,
+          bool kv_v8  = false>
 static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                                               const char * __restrict__ K_base,
                                               const char * __restrict__ V_base,
@@ -620,6 +628,9 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     static_assert(D % TK == 0, "D must be divisible by TK");
     static_assert(ncols % TM == 0 || ncols < TM, "ncols must be <= TM or a multiple of TM");
     static_assert(!f32_sv || std::is_same_v<Acc_t, float>, "f32_sv is the float-accumulator leaf");
+    static_assert(!kv_v8 || (f32_sv && !kv_is_fp8 && TM == XMX_V2_TM),
+                  "kv_v8 is a copy of the TM8 f32_sv leaf's F16 K/V");
+    static_assert(!kv_v8 || D % 8 == 0, "kv_v8 copies whole 16-byte chunks of a row");
 
     using slm_layout            = fattn_v2_slm<D, ncols>;
     constexpr int SG_ROWS_PER_Q = (ncols + TM - 1) / TM;  // ceil(ncols/TM)
@@ -722,34 +733,108 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         const int kv_count = sycl::min(XMX_V2_BATCH_KV, ne11 - kv_start);
 
         // ---- Phase 1: Load tile_K and tile_V from global to SLM ----
-        for (int idx = tid; idx < kv_count * D; idx += NTHREADS) {
-            const int k      = idx / D;
-            const int d      = idx % D;
-            const int kv_pos = kv_start + k;
+        if constexpr (kv_v8) {
+            // 16-byte vectors. Consecutive work-items take consecutive 16-byte
+            // chunks of a row, so a sub-group reads 256 contiguous bytes, and
+            // each work-item issues a group of loads before their stores. Rows
+            // at or past kv_count are zero-padded, as in the scalar copy. SLM
+            // is written as dwords: the leaf already reads the S region as
+            // float, so the SLM base is dword-aligned, and nothing promises
+            // more.
+            constexpr int ROW_CHUNKS = D / 8;
+            constexpr int CHUNKS     = XMX_V2_BATCH_KV * ROW_CHUNKS;
+            constexpr int GROUP      = 2;  // per work-item: 2 K and 2 V chunks in flight (16 GRF)
+            static_assert(CHUNKS % (NTHREADS * GROUP) == 0, "the batch's chunks split evenly over the work-items");
+            const int n_mask_rows = sycl::min(ncols, ne01 - ic0);
 
-            const char * K_row_base = K_ptr + (int64_t) nb11 * kv_pos;
-            const char * V_row_base = V_ptr + (int64_t) nb21 * kv_pos;
-
-            sycl::half k_val, v_val;
-            if constexpr (kv_is_fp8) {
-                k_val = fp8_e4m3_to_half_v2(reinterpret_cast<const uint8_t *>(K_row_base)[d]);
-                v_val = fp8_e4m3_to_half_v2(reinterpret_cast<const uint8_t *>(V_row_base)[d]);
-            } else {
-                k_val = reinterpret_cast<const sycl::half *>(K_row_base)[d];
-                v_val = reinterpret_cast<const sycl::half *>(V_row_base)[d];
+            for (int g = 0; g < CHUNKS / NTHREADS; g += GROUP) {
+                sycl::uint4 k4[GROUP];
+                sycl::uint4 v4[GROUP];
+#    pragma unroll
+                for (int i = 0; i < GROUP; ++i) {
+                    const int e = tid + (g + i) * NTHREADS;
+                    const int k = e / ROW_CHUNKS;
+                    const int c = e % ROW_CHUNKS;
+                    if (k < kv_count) {
+                        const int kv_pos = kv_start + k;
+                        k4[i]            = reinterpret_cast<const sycl::uint4 *>(K_ptr + (int64_t) nb11 * kv_pos)[c];
+                        v4[i]            = reinterpret_cast<const sycl::uint4 *>(V_ptr + (int64_t) nb21 * kv_pos)[c];
+                    } else {
+                        k4[i] = sycl::uint4(0u);
+                        v4[i] = sycl::uint4(0u);
+                    }
+                }
+#    pragma unroll
+                for (int i = 0; i < GROUP; ++i) {
+                    const int         e     = tid + (g + i) * NTHREADS;
+                    const int         k     = e / ROW_CHUNKS;
+                    const int         c     = e % ROW_CHUNKS;
+                    // A dead cell's non-finite V halves are zeroed (see
+                    // fattn_v8_zero_if_dead). A pad row is zero, so finite.
+                    const sycl::uint4 v     = fattn_v8_zero_if_dead(v4[i], maskh, ne30, n_mask_rows, kv_start + k);
+                    uint32_t *        K_dst = reinterpret_cast<uint32_t *>(&tile_K[k * D + c * 8]);
+                    uint32_t *        V_dst = reinterpret_cast<uint32_t *>(&tile_V[k * D + c * 8]);
+#    pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        K_dst[q] = k4[i][q];
+                        V_dst[q] = v[q];
+                    }
+                }
             }
-            tile_K[k * D + d] = k_val;
-            // A dead cell's non-finite V is zeroed (see fattn_v_zero_if_dead).
-            tile_V[k * D + d] = fattn_v_zero_if_dead(v_val, maskh, ne30, sycl::min(ncols, ne01 - ic0), kv_pos);
-        }
-        // Zero-pad incomplete last batch so XMX never reads uninitialized SLM.
-        for (int idx = tid; idx < (XMX_V2_BATCH_KV - kv_count) * D; idx += NTHREADS) {
-            const int k       = kv_count + idx / D;
-            const int d       = idx % D;
-            tile_K[k * D + d] = sycl::half(0.0f);
-            tile_V[k * D + d] = sycl::half(0.0f);
+        } else {
+            for (int idx = tid; idx < kv_count * D; idx += NTHREADS) {
+                const int k      = idx / D;
+                const int d      = idx % D;
+                const int kv_pos = kv_start + k;
+
+                const char * K_row_base = K_ptr + (int64_t) nb11 * kv_pos;
+                const char * V_row_base = V_ptr + (int64_t) nb21 * kv_pos;
+
+                sycl::half k_val, v_val;
+                if constexpr (kv_is_fp8) {
+                    k_val = fp8_e4m3_to_half_v2(reinterpret_cast<const uint8_t *>(K_row_base)[d]);
+                    v_val = fp8_e4m3_to_half_v2(reinterpret_cast<const uint8_t *>(V_row_base)[d]);
+                } else {
+                    k_val = reinterpret_cast<const sycl::half *>(K_row_base)[d];
+                    v_val = reinterpret_cast<const sycl::half *>(V_row_base)[d];
+                }
+                tile_K[k * D + d] = k_val;
+                // A dead cell's non-finite V is zeroed (see fattn_v_zero_if_dead).
+                tile_V[k * D + d] = fattn_v_zero_if_dead(v_val, maskh, ne30, sycl::min(ncols, ne01 - ic0), kv_pos);
+            }
+            // Zero-pad incomplete last batch so XMX never reads uninitialized SLM.
+            for (int idx = tid; idx < (XMX_V2_BATCH_KV - kv_count) * D; idx += NTHREADS) {
+                const int k       = kv_count + idx / D;
+                const int d       = idx % D;
+                tile_K[k * D + d] = sycl::half(0.0f);
+                tile_V[k * D + d] = sycl::half(0.0f);
+            }
         }
         sycl::group_barrier(item.get_group());  // barrier: tile_K, tile_V ready
+
+        if constexpr (kv_v8) {
+            // Start the next batch's K and V rows toward L1 while this batch
+            // computes, as fattn-dpas.cpp:384-392 does. A 16-byte-aligned row
+            // of ROW_BYTES touches at most ROW_BYTES / 64 + 1 cache lines, and
+            // points ROW_BYTES - 1 or fewer bytes into the row, at most 64
+            // apart, hit each of them. Rows stop at ne11 like the copy, and the
+            // last point is the row's last byte, so nothing past the KV extent
+            // is touched.
+            namespace syclex         = sycl::ext::oneapi::experimental;
+            constexpr int ROW_BYTES  = D * (int) sizeof(sycl::half);
+            constexpr int ROW_POINTS = ROW_BYTES / 64 + 1;
+            const int     next_start = kv_start + XMX_V2_BATCH_KV;
+            for (int e = tid; e < XMX_V2_BATCH_KV * ROW_POINTS; e += NTHREADS) {
+                const int kv_pos = next_start + e / ROW_POINTS;
+                if (kv_pos < ne11) {
+                    const int off = sycl::min((e % ROW_POINTS) * 64, ROW_BYTES - 1);
+                    syclex::prefetch(const_cast<char *>(K_ptr) + (int64_t) nb11 * kv_pos + off,
+                                     syclex::properties{ syclex::prefetch_hint_L1 });
+                    syclex::prefetch(const_cast<char *>(V_ptr) + (int64_t) nb21 * kv_pos + off,
+                                     syclex::properties{ syclex::prefetch_hint_L1 });
+                }
+            }
+        }
 
         // ---- Phase 2: Q @ K^T via joint_matrix_mad ----
         constexpr int KV_TILES = XMX_V2_BATCH_KV / TN;
@@ -889,6 +974,17 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 // That is harmless: row r of the product depends only on row r
                 // of mat_S, and VKQ, KQ_sum and KQ_max of a row past ne01 are
                 // never written out (the output loop skips q_abs >= ne01).
+                //
+                // The P tile is the same for every d_tile, so it is loaded once.
+                sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
+                                       sycl_xmx::layout::row_major>
+                    mat_S;
+                sycl_xmx::joint_matrix_load(
+                    sg, mat_S,
+                    sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                        &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
+                    XMX_V2_BATCH_KV);
+
 #    pragma unroll
                 for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
                     const int d_start = d_tile * TN;
@@ -896,19 +992,9 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                     sycl_xmx::joint_matrix<sycl::sub_group, float, sycl_xmx::use::accumulator, TM, TN> mat_SV;
                     sycl_xmx::joint_matrix_fill(sg, mat_SV, 0.0f);
 
-                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
-                                           sycl_xmx::layout::row_major>
-                        mat_S;
                     sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
                                            sycl_xmx::layout::row_major>
                         mat_V;
-
-                    sycl_xmx::joint_matrix_load(
-                        sg, mat_S,
-                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                            &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
-                        XMX_V2_BATCH_KV);
-
                     sycl_xmx::joint_matrix_load(
                         sg, mat_V,
                         sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
@@ -945,25 +1031,27 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                     }
                 }
             } else {
+                // The P tile is the same for every d_tile, so it is loaded once
+                // (the rows past ne01 are read stale here too; see the f32_sv
+                // branch for why that is harmless).
+                sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
+                                       sycl_xmx::layout::row_major>
+                    mat_S;
+                sycl_xmx::joint_matrix_load(
+                    sg, mat_S,
+                    sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                        &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
+                    XMX_V2_BATCH_KV);
+
                 for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
                     const int d_start = d_tile * TN;
 
                     sycl_xmx::joint_matrix<sycl::sub_group, float, sycl_xmx::use::accumulator, TM, TN> mat_SV;
                     sycl_xmx::joint_matrix_fill(sg, mat_SV, 0.0f);
 
-                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
-                                           sycl_xmx::layout::row_major>
-                        mat_S;
                     sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
                                            sycl_xmx::layout::row_major>
                         mat_V;
-
-                    sycl_xmx::joint_matrix_load(
-                        sg, mat_S,
-                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
-                            &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
-                        XMX_V2_BATCH_KV);
-
                     sycl_xmx::joint_matrix_load(
                         sg, mat_V,
                         sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
@@ -1065,7 +1153,8 @@ template <int  D,
           int  TM,
           int  TK,
           int  TN,
-          bool f32_sv = false>
+          bool f32_sv = false,
+          bool kv_v8  = false>
 static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queue_ptr stream) {
     using slm_layout            = fattn_v2_slm<D, ncols>;
     constexpr int sg_rows_per_q = (ncols + TM - 1) / TM;
@@ -1108,7 +1197,7 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
             cgh.parallel_for(sycl::nd_range<3>(grid * block, block),
                              [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
                                  flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t,
-                                                                   kv_is_fp8, TM, TK, TN, f32_sv>(
+                                                                   kv_is_fp8, TM, TK, TN, f32_sv, kv_v8>(
                                      Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale_v, max_bias, m0, m1,
                                      n_head_log2, logit_sc, ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13,
                                      nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, item,
@@ -2615,7 +2704,8 @@ template <int  D,
           typename Q_type,
           typename Acc_t,
           bool kv_is_fp8 = false,
-          bool f32_sv    = false>
+          bool f32_sv    = false,
+          bool kv_v8     = false>
 bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
                                      const fattn_params &        params,
                                      dpct::queue_ptr             stream,
@@ -2646,17 +2736,17 @@ bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
         // Two overrides select it, and nothing else: GGML_SYCL_FA_XMX_V2_VARIANT=tm16
         // (the hang reproducer in fattn_xmx_v2_pick_variant_for_shape, reached
         // with forced_variant < 0) and GGML_SYCL_FA_FORCE_PATH=xmx-v2-tm16
-        // (forced_variant 1, fattn.cpp's forced XMX-v2 path). It keeps the
-        // original leaf body, so f32_sv has no TM=16 instantiation and both
-        // overrides run the same kernel they always did; fattn.cpp names that
-        // leaf, not the f32_sv one, when the override is set.
+        // (forced_variant 1, fattn.cpp's forced XMX-v2 path). It takes neither
+        // f32_sv nor kv_v8, which have no TM=16 instantiation, so both
+        // overrides run the original leaf body; fattn.cpp names that leaf, not
+        // the f32_sv one, when the override is set.
         case 1:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
                                          /*TM=*/16, /*TK=*/16, /*TN=*/16>(params, stream);
             break;
         default:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
-                                         /*TM=*/8, /*TK=*/16, /*TN=*/16, f32_sv>(params, stream);
+                                         /*TM=*/8, /*TK=*/16, /*TN=*/16, f32_sv, kv_v8>(params, stream);
             break;
     }
     return true;
@@ -2668,14 +2758,33 @@ bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params
                                                                                                   -1);
 }
 
+// Whether every K and V row of this call starts on a 16-byte bound, so the
+// f32_sv leaf may copy them to SLM in 16-byte vectors (kv_v8): F16 K/V whose
+// two base pointers and six row, head and sequence strides are all multiples
+// of 16 bytes. Otherwise the leaf takes its scalar copy. The f32sv launcher
+// picks the leaf from it and fattn.cpp the kernel's name.
+inline bool fattn_xmx_v2_kv_rows_v8(const fattn_params & params) noexcept {
+    const auto a16 = [](int64_t x) {
+        return (x & 15) == 0;
+    };
+    return !params.kv_is_fp8 && a16((int64_t) reinterpret_cast<uintptr_t>(params.K)) &&
+           a16((int64_t) reinterpret_cast<uintptr_t>(params.V)) && a16(params.nb11) && a16(params.nb12) &&
+           a16(params.nb13) && a16(params.nb21) && a16(params.nb22) && a16(params.nb23);
+}
+
 // The float-accumulator leaf with S@V on the matrix engine (f32_sv, see the
-// kernel leaf). Same signature as launch_fattn_xmx_v2_f16 so
-// DISPATCH_NCOLS_CTX_ACC can name it; Acc_t must be float.
+// kernel leaf), with the 16-byte K/V copy when fattn_xmx_v2_kv_rows_v8 allows
+// it. Same signature as launch_fattn_xmx_v2_f16 so DISPATCH_NCOLS_CTX_ACC can
+// name it; Acc_t must be float.
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t>
 bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context & ctx,
                                    const fattn_params &        params,
                                    dpct::queue_ptr             stream) {
     static_assert(std::is_same_v<Acc_t, float>, "the f32_sv leaf accumulates in float");
+    if (fattn_xmx_v2_kv_rows_v8(params)) {
+        return launch_fattn_xmx_v2_f16_variant<D, ncols, use_logit_softcap, Q_type, Acc_t, /*kv_is_fp8=*/false,
+                                               /*f32_sv=*/true, /*kv_v8=*/true>(ctx, params, stream, -1);
+    }
     return launch_fattn_xmx_v2_f16_variant<D, ncols, use_logit_softcap, Q_type, Acc_t, /*kv_is_fp8=*/false,
                                            /*f32_sv=*/true>(ctx, params, stream, -1);
 }
@@ -2704,7 +2813,8 @@ template <int  D,
           typename Q_type,
           typename Acc_t,
           bool kv_is_fp8 = false,
-          bool f32_sv    = false>
+          bool f32_sv    = false,
+          bool kv_v8     = false>
 bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr, int) {
     GGML_ABORT("XMX v2 not available at compile time");
     return false;
@@ -2723,6 +2833,10 @@ bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context &, const fattn_para
 }
 
 inline bool fattn_xmx_v2_f32sv_leaf_runs(const sycl::device &, int, int, int) noexcept {
+    return false;
+}
+
+inline bool fattn_xmx_v2_kv_rows_v8(const fattn_params &) noexcept {
     return false;
 }
 

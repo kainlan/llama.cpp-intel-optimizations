@@ -118,7 +118,11 @@
 //   d128_pp72_kv_unaligned  d128_pp72 with K and V views that start 8 bytes
 //                      into their buffers, so no row is 16-byte aligned and the
 //                      same kernel takes its scalar copy (no _v8). All variants,
-//                      under the same two arms.
+//                      under the same two arms. The inputs are d128_pp72's, and
+//                      the two copies put the same halves into the same SLM
+//                      cells, so wherever d128_pp72 ran <name>_v8 and this case
+//                      ran <name>, the two outputs must agree bit for bit (two
+//                      NaNs count as equal): a difference is a copy defect.
 // LEAF COVERAGE of that kernel, clean only: d256_pp72, d128_pp72_softcap and
 // d256_pp72_softcap under noonednn, d64_sinks_pp32 and d64_sinks_pp32_softcap
 // under noesimd (D=64 reaches it only below the 64-row XMX-v2 PP batch with
@@ -872,11 +876,15 @@ static bool ends_with(const std::string & s, const char * suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
-static void run_case(ggml_backend_t  sycl,
-                     ggml_backend_t  cpu,
-                     const fa_case & c,
-                     poison_kind     poison,
-                     const char *    expected) {
+// sycl_out and kernel_out, when given, receive the SYCL output and the kernel
+// name, for a comparison between cases (see check_v8_bit_identical).
+static void run_case(ggml_backend_t       sycl,
+                     ggml_backend_t       cpu,
+                     const fa_case &      c,
+                     poison_kind          poison,
+                     const char *         expected,
+                     std::vector<float> * sycl_out   = nullptr,
+                     std::string *        kernel_out = nullptr) {
     char label[160];
     std::snprintf(label, sizeof(label), "%s %s D=%d H_q=%d H_kv=%d ne01=%d n_kv=%d used=%d sinks=%d", c.name,
                   poison_name(poison), c.D, c.H_q, c.H_kv, c.ne01, c.n_kv, c.n_used, (int) c.sinks);
@@ -900,6 +908,12 @@ static void run_case(ggml_backend_t  sycl,
         std::printf("FAIL [%s]: output size mismatch (sycl=%zu cpu=%zu)\n", label, got.size(), ref.size());
         ++g_failures;
         return;
+    }
+    if (sycl_out) {
+        *sycl_out = got;
+    }
+    if (kernel_out) {
+        *kernel_out = kernel;
     }
 
     // dst is [D, H_q, ne01]: one row per (query, head).
@@ -1064,6 +1078,51 @@ static void run_case(ggml_backend_t  sycl,
     }
 }
 
+// The 16-byte K/V copy of a kernel (name suffix _v8) against its scalar copy:
+// d128_pp72 and d128_pp72_kv_unaligned share their inputs, and the two copies
+// move the same halves into the same SLM cells, so the outputs must agree bit
+// for bit (two NaNs count as equal whatever their payloads). Compared only when
+// the aligned run named <name>_v8 and the unaligned run <name>; any other pair
+// (force-tile's, or a routing failure, which run_case already fails) is not.
+static void check_v8_bit_identical(poison_kind                poison,
+                                   const std::string &        k_aligned,
+                                   const std::vector<float> & aligned,
+                                   const std::string &        k_unaligned,
+                                   const std::vector<float> & unaligned) {
+    if (k_unaligned.empty() || k_aligned != k_unaligned + "_v8") {
+        std::printf("  -- v8 bit identity [%s]: not compared, kernels %s and %s are not a <name>_v8 / <name> pair\n",
+                    poison_name(poison), k_aligned.empty() ? "<none>" : k_aligned.c_str(),
+                    k_unaligned.empty() ? "<none>" : k_unaligned.c_str());
+        return;
+    }
+    size_t n_diff = 0;
+    size_t first  = 0;
+    if (aligned.size() == unaligned.size()) {
+        for (size_t i = 0; i < aligned.size(); ++i) {
+            uint32_t a = 0;
+            uint32_t b = 0;
+            std::memcpy(&a, &aligned[i], sizeof(a));
+            std::memcpy(&b, &unaligned[i], sizeof(b));
+            if (a != b && !(std::isnan(aligned[i]) && std::isnan(unaligned[i]))) {
+                first = n_diff == 0 ? i : first;
+                ++n_diff;
+            }
+        }
+    }
+    const bool same_size = aligned.size() == unaligned.size();
+    const bool ok        = same_size && n_diff == 0;
+    std::printf("%s [v8 bit identity %s] kernel=%s vs %s: %zu of %zu values differ%s\n", ok ? "OK" : "FAIL",
+                poison_name(poison), k_aligned.c_str(), k_unaligned.c_str(), n_diff, aligned.size(),
+                same_size ? "" : ", and the output sizes differ");
+    if (n_diff > 0) {
+        std::printf("  first difference at %zu: %s %.9g, %s %.9g; the 16-byte copy must be bit-identical\n", first,
+                    k_aligned.c_str(), aligned[first], k_unaligned.c_str(), unaligned[first]);
+    }
+    if (!ok) {
+        ++g_failures;
+    }
+}
+
 int main(int, char ** argv) {
     // First statement: it may re-exec the process (see sycl-selector-fallback.hpp).
     sycl_test_selector_fallback(argv, "level_zero:1");
@@ -1137,6 +1196,12 @@ int main(int, char ** argv) {
     };
     const poison_kind variants[] = { POISON_NONE,      POISON_K,           POISON_V,        POISON_K_PARTIAL,
                                      POISON_V_PARTIAL, POISON_V_UNDERFLOW, POISON_NEGINF_QK };
+    constexpr size_t  N_VARIANTS = sizeof(variants) / sizeof(variants[0]);
+
+    // d128_pp72's SYCL outputs and kernels, per variant, for the bit-identity
+    // check of d128_pp72_kv_unaligned.
+    std::vector<float> pp72_out[N_VARIANTS];
+    std::string        pp72_kernel[N_VARIANTS];
 
     for (const fa_case & c : cases) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
@@ -1146,8 +1211,10 @@ int main(int, char ** argv) {
         }
         std::printf("== %s ==\n", c.name);
         ++n_run;
-        for (poison_kind p : variants) {
-            run_case(sycl, cpu, c, p, expected);
+        const bool keep = std::strcmp(c.name, "d128_pp72") == 0;
+        for (size_t v = 0; v < N_VARIANTS; ++v) {
+            run_case(sycl, cpu, c, variants[v], expected, keep ? &pp72_out[v] : nullptr,
+                     keep ? &pp72_kernel[v] : nullptr);
         }
     }
 
@@ -1193,7 +1260,8 @@ int main(int, char ** argv) {
     }
 
     // K/V rows off a 16-byte bound: a kernel that copies rows in 16-byte vectors
-    // must take its scalar copy instead. Every variant, as for d128_pp72.
+    // must take its scalar copy instead, and give d128_pp72's bits (see
+    // check_v8_bit_identical). Every variant, as for d128_pp72.
     std::printf("== unaligned K/V rows ==\n");
     const fa_case unaligned[] = {
         { "d128_pp72_kv_unaligned", 128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 4 },
@@ -1205,8 +1273,11 @@ int main(int, char ** argv) {
             continue;
         }
         ++n_run;
-        for (poison_kind p : variants) {
-            run_case(sycl, cpu, c, p, expected);
+        for (size_t v = 0; v < N_VARIANTS; ++v) {
+            std::vector<float> out;
+            std::string        kernel;
+            run_case(sycl, cpu, c, variants[v], expected, &out, &kernel);
+            check_v8_bit_identical(variants[v], pp72_kernel[v], pp72_out[v], kernel, out);
         }
     }
 

@@ -6901,6 +6901,20 @@ Branch acceptance: `fattn.compute.xmx_v2` device time at most 3,100 ms on the 4,
 2.5x below 7,695 ms), correctness as for S1 on both cards, and at merge the model gates and an interleaved pp pair. The
 ruling names S2, S3 and S2b; S4 stays as described in the checkpoint above.
 
+**S2 (2026-11-26).** Why S1 gave 1.40x, derived from the code and not measured: per sub-group and 32-key batch at
+D=128, the scalar K/V copy issues about 512 two-byte memory messages, about four in five of all the sub-group's memory
+messages, and S1 did not touch it; one work-group holds 22 KB of SLM, so a core keeps only about 10 threads resident (4
+if the core has 64 KB, the unverified B580 figure), too few to hide those messages. S2 adds the `kv_v8` leaf of the
+f32_sv kernel (`xmx_v2_f16_ncols16_large_f32sv_v8`): when `fattn_xmx_v2_kv_rows_v8()` finds both K/V base pointers
+and all six strides on 16-byte bounds, the copy moves 16-byte chunks (32 load messages per sub-group and batch, and 32
+to 128 dword-store messages depending on whether IGC merges them, unverified), zeroes a dead cell's non-finite V
+halves bit for bit as the scalar copy does (`fattn_v8_zero_if_dead`), and prefetches the next batch's K/V rows to L1
+after the copy barrier, clamped to `ne11` and to each row's last byte. Unaligned rows keep the scalar copy and the
+name `_f32sv`. The P tile is loaded once per kv_tile in both matrix-engine S·V bodies, so GPT-OSS's
+`xmx_v2_f16_pp_ncols32` is recompiled too. The masked-nonfinite harness compares `d128_pp72` (`_v8`) with
+`d128_pp72_kv_unaligned` (scalar copy, same inputs) bit for bit. Nothing of S2 has run on a card yet; the acceptance
+run must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)

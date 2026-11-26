@@ -3589,12 +3589,18 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                     // see the f32_sv kernel leaf). The ne01 <= 16 arms above and the
                     // forced path keep the scalar-S@V float leaf. Under
                     // GGML_SYCL_FA_XMX_V2_VARIANT=tm16 the launcher runs the
-                    // original TM=16 leaf instead, and the name says so.
+                    // original TM=16 leaf instead, and the name says so. When
+                    // every K and V row starts on a 16-byte bound the leaf
+                    // copies them to SLM in 16-byte vectors and prefetches the
+                    // next batch (kv_v8, suffix _v8); otherwise it takes the
+                    // scalar copy.
                     const bool f32sv_leaf = fattn_xmx_v2_f32sv_leaf_runs(dev, D, 16, ne01);
+                    const bool kv_v8      = fattn_xmx_v2_kv_rows_v8(params);
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16_f32sv, float);
                     dispatch_debug_kernel(!v2_dispatched ? "xmx_v2_f16_ncols16_large_f32sv_rejected" :
-                                          f32sv_leaf     ? "xmx_v2_f16_ncols16_large_f32sv" :
-                                                           "xmx_v2_f16_ncols16_large");
+                                          !f32sv_leaf    ? "xmx_v2_f16_ncols16_large" :
+                                          kv_v8          ? "xmx_v2_f16_ncols16_large_f32sv_v8" :
+                                                           "xmx_v2_f16_ncols16_large_f32sv");
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
                     dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large" :

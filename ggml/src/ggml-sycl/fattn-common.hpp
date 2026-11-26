@@ -88,6 +88,35 @@ static inline sycl::half4 fattn_v_zero_if_dead(sycl::half4        v,
     return v;
 }
 
+// The form for a copy that moves eight V halves at once, as the four dwords of
+// a 16-byte load. Each non-finite half of a dead cell becomes +0 and every other
+// half keeps its bits, which is what the half overload does element by element,
+// so a 16-byte copy and a scalar copy fill SLM with the same bits. (The half4
+// overload zeroes all four halves of a vector that holds any non-finite one,
+// finite ones included: in a dead cell that changes no output, but it does not
+// give the scalar copy's bits.) A half is non-finite exactly when its five
+// exponent bits are all set.
+static inline sycl::uint4 fattn_v8_zero_if_dead(sycl::uint4        v,
+                                                const sycl::half * mask,
+                                                int64_t            row_stride,
+                                                int                n_rows,
+                                                int                kv) {
+    sycl::uint4 nonfinite(0u);
+    bool        any = false;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const uint32_t w  = v[q];
+        const uint32_t lo = (w & 0x00007C00u) == 0x00007C00u ? 0x0000FFFFu : 0u;
+        const uint32_t hi = (w & 0x7C000000u) == 0x7C000000u ? 0xFFFF0000u : 0u;
+        nonfinite[q]      = lo | hi;
+        any               = any || (lo | hi) != 0u;
+    }
+    if (any && fattn_mask_is_dead_for_rows(mask, row_stride, n_rows, kv)) {
+        v &= ~nonfinite;
+    }
+    return v;
+}
+
 // The softmax flush-to-zero test: true when exp(diff) is flushed to 0. It is
 // written `diff < T` so that a NaN diff (a visible cell with a non-finite
 // score) compares false and is NOT flushed: it propagates as on the CPU
