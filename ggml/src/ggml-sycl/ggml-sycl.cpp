@@ -46677,7 +46677,8 @@ static std::shared_ptr<void> ggml_sycl_transfer_alloc_owner(ggml_sycl::alloc_han
 // source for a direct USM copy only on that evidence, and these experts are the prefill ring's copy source
 // (llama.cpp-36j0). The H2D rate probe allocates its source here too, for the same reason. Returns an invalid handle
 // when the pinned pool cannot hold it. With grow_zone false the request may not grow the pinned host zone, and a miss
-// is kept out of the error log: ggml_sycl_host_expert_alloc_no_growth below.
+// is kept out of the log, both the allocation-failed error and the zone's refusal warning, because it is
+// back-pressure its caller retries and counts: ggml_sycl_host_expert_alloc_no_growth below.
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size, bool grow_zone) {
     ggml_sycl::alloc_request req{};
     req.device                                     = device;
@@ -46697,7 +46698,9 @@ static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc(int device, size_t size
 // The same storage for a named evict's host copy, except that it never grows the pinned host zone. An evict runs at a
 // decode boundary, where a new pinned chunk would take host memory the plan did not size, so a zone without room
 // refuses it, and the evict answers BUSY "host pinned pool exhausted" for a later boundary. That miss is the swap
-// driver's to count, not an allocation failure to log. Returns an invalid handle when the zone has no room.
+// driver's to count, not an allocation failure to log: the request suppresses its failure log and is no persistent
+// owner, so the cache's refusal warning skips it too (unified_alloc's refuse_no_growth). Returns an invalid handle
+// when the zone has no room.
 static ggml_sycl::mem_handle ggml_sycl_host_expert_alloc_no_growth(int device, size_t size) {
     return ggml_sycl_host_expert_alloc(device, size, /*grow_zone=*/false);
 }

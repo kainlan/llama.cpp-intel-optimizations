@@ -21266,13 +21266,17 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
                 const auto refuse_no_growth = [&](host_zone_alloc_miss miss) -> void * {
                     host_miss = miss;
-                    // Only WEIGHT: its no-growth requests are persistent owners the planner sized the zone for, so a
-                    // refusal there is a planning fault. A STAGING miss is back-pressure its caller retries.
-                    if (zone == host_zone_id::WEIGHT) {
+                    // Only WEIGHT, and only for a request the planner sized the zone for: a persistent owner, or a
+                    // request that leaves its failure to the cache's own log. Its refusal is a planning fault. A
+                    // request that suppresses its failure log and is no persistent owner (the evict's host copy at a
+                    // decode boundary) is back-pressure its caller retries and counts, and a STAGING miss is the same,
+                    // so neither warns once per retry.
+                    if (zone == host_zone_id::WEIGHT &&
+                        (!req.suppress_failure_log || req.intent.constraints.persistent_owner)) {
                         host_zone_no_growth_refusal_warn(miss, zone, req, alloc_size,
-                                                                         ucache->host_zone_reserved_capacity(zone),
-                                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
-                                                                         ucache->host_zone_largest_free_block(zone));
+                                                         ucache->host_zone_reserved_capacity(zone),
+                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
+                                                         ucache->host_zone_largest_free_block(zone));
                     }
                     return nullptr;
                 };
