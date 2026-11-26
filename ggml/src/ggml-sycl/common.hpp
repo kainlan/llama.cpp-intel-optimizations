@@ -8781,6 +8781,17 @@ static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
     return (x & 0x7fu) == 0x7fu ? 0.0f : value;
 }
 
+// The SYCL backend has no FP8 E4M3 KV cache path, and this stub keeps it that way: it returns false even for
+// GGML_TYPE_F8_E4M3, so supports_op declines FLASH_ATTN_EXT over FP8 K/V (fattn.cpp,
+// ggml_sycl_flash_attn_ext_supported) and SET_ROWS into an FP8 dst (ggml-sycl.cpp). Every FP8 branch the FA
+// dispatch and kernels carry is unreachable behind it (llama.cpp-ol6a). Returning true for GGML_TYPE_F8_E4M3 needs
+// all of these first, or FP8 bytes are read as half:
+//   - the xmx_v2 ladder in ggml_sycl_flash_attn_ext_dispatch_ncols: DISPATCH_NCOLS_CTX_ACC and the force ladder
+//     never instantiate launch_fattn_xmx_v2_f16<..., kv_is_fp8 = true>, so every ncols arm reads K/V as half;
+//   - an FP8 reader in the tile kernels (fattn-tile.hpp casts K and V to half2);
+//   - an FP8 case in ggml_sycl_op_set_rows' dst-type switch (its kernel, set_rows_sycl_fp8, has no caller);
+//   - test-backend-ops FLASH_ATTN_EXT cases with F8_E4M3 K/V at D=64 and D=128 and nb >= 8, which are the RED.
+// The VEC, ESIMD, D=64 PP, oneDNN and xmx v1 routes decline FP8 on their own.
 static inline bool ggml_sycl_type_is_fp8_e4m3(ggml_type type) {
     GGML_UNUSED(type);
     return false;

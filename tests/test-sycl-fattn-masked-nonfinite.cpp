@@ -100,9 +100,9 @@
 // only at D=64 with one query row, which is the d64_sinks_decode shape.
 //
 // NOT COVERED, by construction: the FP8 K/V branches of XMX v1/v2 and ESIMD.
-// This tree has no FP8 ggml type (ggml_sycl_type_is_fp8_e4m3() returns false
-// for every type), so no FLASH_ATTN_EXT graph can reach them and the CPU
-// backend has no FP8 oracle. They are verified by code reading only. The paged
+// ggml_sycl_type_is_fp8_e4m3() returns false for every type, GGML_TYPE_F8_E4M3
+// included, so the SYCL backend declines FP8 K/V and no FLASH_ATTN_EXT graph
+// can reach them. They are verified by code reading only. The paged
 // V loads belong to the opt-in paged v2 path and are out of scope here.
 //
 // Exit 77 when no SYCL device is present. GPU test: never run it in a loop.

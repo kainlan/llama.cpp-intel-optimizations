@@ -1289,30 +1289,6 @@ void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context & ctx, ggml_cgr
 #endif  // GGML_SYCL_FA_V2_ENABLED
 
 // =============================================================================
-// FP8 KV Cache Configuration
-// =============================================================================
-// FP8 quantization provides 2x memory reduction for KV cache
-//
-// Enable with environment variable: GGML_SYCL_KV_FP8=1
-// Requires FP8-compatible KV cache allocation
-
-static bool g_sycl_kv_fp8_enabled     = false;
-static bool g_sycl_kv_fp8_initialized = false;
-
-static void init_kv_fp8_config() {
-    if (g_sycl_kv_fp8_initialized) {
-        return;
-    }
-    g_sycl_kv_fp8_initialized = true;
-
-    const char * env = std::getenv("GGML_SYCL_KV_FP8");
-    if (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) {
-        g_sycl_kv_fp8_enabled = true;
-        fprintf(stderr, "[SYCL] FP8 KV cache quantization enabled (2x memory savings)\n");
-    }
-}
-
-// =============================================================================
 // ESIMD Flash Attention Configuration
 // =============================================================================
 // ESIMD uses explicit SIMD operations for potentially better decode performance
@@ -2408,11 +2384,12 @@ bool ggml_sycl_fa_d512_decode_esimd_enabled() {
 //      finding, through a different door.
 //  (b) K/V type: flash_attn_tile hardcodes `(const sycl::half2 *)` C-style
 //      casts for K and V (fattn-tile.hpp, K_h2/V_h2). The generic
-//      supports_op check above this function admits F16 OR FP8 E4M3 K/V;
-//      do not inherit FP8 safety from whatever guards it elsewhere in the
-//      file (this function's contract must hold on its own, not depend on
-//      another admission path staying broken/absent) -- require F16
-//      explicitly.
+//      supports_op check (ggml_sycl_flash_attn_ext_supported) admits F16
+//      K/V today and is written to admit FP8 E4M3 too, the day
+//      ggml_sycl_type_is_fp8_e4m3() (common.hpp) stops returning false;
+//      do not inherit FP8 safety from that stub (this function's contract
+//      must hold on its own, not depend on another admission path staying
+//      broken/absent) -- require F16 explicitly.
 //  (c) V->ne[0] (DV) == 512: this function is only reached when
 //      Q->ne[0] (D/DKQ) == 512, but DKQ and DV are logically independent
 //      (the config table's 576/512 rows exist for exactly this split) and
@@ -3627,7 +3604,6 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 // Initialize configuration on first call
 #if GGML_SYCL_FA_V2_ENABLED
 #endif
-    init_kv_fp8_config();
     init_fa_esimd_config();
     init_fa_safe_decode_config();
 #if GGML_SYCL_DNNL
