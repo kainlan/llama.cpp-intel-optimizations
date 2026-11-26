@@ -829,12 +829,12 @@ def test_create_queue_impl_asks_the_predicate_without_a_macro():
         masked_body = _mask_comments_and_strings(body)
         assert ENABLE_PROFILING_CALL in masked_body, (
             f"create_queue_impl must add {ENABLE_PROFILING_CALL} to its property_list when the predicate answers on "
-            "(llama.cpp-yke2) -- a macro-gated `#ifdef DPCT_PROFILING_ENABLED` cannot be interposition-safe "
+            "-- a macro-gated `#ifdef DPCT_PROFILING_ENABLED` cannot be interposition-safe "
             "in a header-only inline"
         )
         assert "ggml_sycl_queue_profiling_enabled()" in masked_body, (
-            "the default is decided by the environment predicate (llama.cpp-atiz), the same answer in every "
-            "translation unit's copy of this inline"
+            "the default is decided by the library's one out-of-line resolver, so every translation unit's copy "
+            "of this inline asks the same function"
         )
         assert DPCT_PROFILING_MACRO not in masked_body, (
             f"create_queue_impl must not read {DPCT_PROFILING_MACRO} at all -- the property must be "
