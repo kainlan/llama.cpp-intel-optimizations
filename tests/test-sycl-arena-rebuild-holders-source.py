@@ -12,8 +12,9 @@ counts sum to the chunks' leases. (The count by holder that GGML_SYCL_LEASE_HOLD
 taker's address each tag records, are test-sycl-chunk-lease-holder-source.py's.)
 
 The rebuild refusal prints those counts at its own level (ERROR) and lists the live allocations of every zone with
-live bytes through the cache's own dump, which takes no lock above the refusal's. The counts come from the one census helper the
-arena teardown's lease line also calls, which counts every site and copy and writes each one that holds a lease.
+live bytes through the cache's own dump, which takes no lock above the refusal's. The counts come from the one census
+helper the arena teardown's lease line also calls, which counts every site and copy and writes each one that holds a
+lease.
 
 A cache scratch buffer blocks the rebuild only when the arena owns its pointer. The decision is the pure predicate
 zone_arena_rebuild_allowed (test-zone-sizing Case 36 checks it), fed by a count that asks vram_owns for every scratch
@@ -231,12 +232,12 @@ def claim_release_lowers_the_raising_site(mh: str, mhh: str) -> bool:
 # after it found the chunk, and the release subtracts only when the chunk's decrement did not underflow. The block the
 # GGML_SYCL_LEASE_HOLDERS flag guards (the count by holder) is left out of these counts: the holder contract pins it.
 UC_ACQUIRE_SIG = "int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag)"
-UC_RELEASE_SIG = "void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag)"
+UC_RELEASE_SIG = "void unified_cache::arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag)"
 SITE_ADD = "arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);"
 SITE_SUB = "arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);"
 UNDERFLOW_RETURN = "lease_count.fetch_add(1); return; }"
 LOCK_WORDS = ("lock", "mutex")
-HOLDER_FLAG = "if (chunk_lease_holders_) {"
+HOLDER_FLAG = "if (chunk_lease_holders_enabled_) {"
 
 
 def without_holder_block(body: str) -> str:
@@ -248,7 +249,7 @@ def claim_site_count_costs_one_relaxed_add(uc: str, uch: str) -> bool:
     c = code(uc)
     acq = without_holder_block(fn_body(c, UC_ACQUIRE_SIG))
     rel = without_holder_block(fn_body(c, UC_RELEASE_SIG))
-    of = fn_body(code(uch), "std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const")
+    of = fn_body(code(uch), "std::atomic<uint32_t> & arena_chunk_leases_of(const chunk_lease_tag & tag) const")
     return (
         ordered(acq, "if (idx < 0) { return -1; }", "lease_count.fetch_add(1);", SITE_ADD, "return idx;")
         and acq.count("fetch_add(") == 2
@@ -265,7 +266,8 @@ ENSURE_SIG = ("bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal
               "const zone_arena_ensure_options & options)")
 REFUSAL_LINE = '"[VRAM-ARENA] planned zones exceed active arena but live allocations prevent rebuild: "'
 HOLDERS_LINE = '"[VRAM-ARENA] live in the arena on device %d (MB): %s; "'
-SITE_LINE = '"[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\\n"'
+# The line's stable prefix; its arguments are pinned apart (SITE_WARN_ARGS).
+SITE_LINE = '"[VRAM-ARENA] chunk leases on device %d by site:'
 CENSUS_SIG = "uint32_t unified_cache::arena_chunk_lease_census(char * out, size_t size) const noexcept"
 CENSUS_CALL = "const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));"
 SITE_LOOP = (

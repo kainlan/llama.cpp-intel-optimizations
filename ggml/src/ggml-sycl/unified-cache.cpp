@@ -32322,7 +32322,7 @@ bool chunk_lease_holders_enabled() {
 }
 
 // The process's holder table. Constant-initialised and never destroyed early, so a report during teardown reads it.
-static chunk_lease_holder_table & chunk_lease_holders() {
+static chunk_lease_holder_table & chunk_lease_holder_table_get() {
     static chunk_lease_holder_table table;
     return table;
 }
@@ -32338,7 +32338,7 @@ static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag, uint16_t o
     // frames above it.
     void *    stack[CHUNK_LEASE_HOLDER_FRAMES + 16];
     const int depth = backtrace(stack, static_cast<int>(sizeof(stack) / sizeof(stack[0])));
-    return chunk_lease_holders().claim(tag, stack, depth, origin);
+    return chunk_lease_holder_table_get().claim(tag, stack, depth, origin);
 }
 
 // A frame as module+offset, the offset `addr2line -f -C -e <module>` takes. No symbol name: dladdr knows only exported
@@ -32370,7 +32370,7 @@ int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag &
     arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);
     // With the knob off this is one load of a const member. With it on the take walks its stack; the slot goes back
     // into the caller's tag, which the handle keeps for the release.
-    if (chunk_lease_holders_) {
+    if (chunk_lease_holders_enabled_) {
         tag.holder = chunk_lease_holder_claim(tag, 0);
         arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);
     }
@@ -32380,12 +32380,12 @@ int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag &
 void unified_cache::arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept {
     // Only a lease counted in a named slot moves: with the knob off the slot is always 0, and a lease in an unnamed
     // slot (no address, table full) stays where it is counted.
-    if (!chunk_lease_holders_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) {
+    if (!chunk_lease_holders_enabled_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) {
         return;
     }
     // The table's mutex is a leaf lock; nothing here throws short of a failed lock, which ends the process as it would
     // in any noexcept move.
-    const uint16_t moved = chunk_lease_holder_claim(tag, chunk_lease_holders().origin_of(tag.holder));
+    const uint16_t moved = chunk_lease_holder_claim(tag, chunk_lease_holder_table_get().origin_of(tag.holder));
     // A full table keeps the lease under its old holder rather than losing the name.
     if (moved < CHUNK_LEASE_HOLDER_FIRST || moved == tag.holder) {
         return;
@@ -32395,7 +32395,7 @@ void unified_cache::arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcep
     arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);
 }
 
-void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag) {
+void unified_cache::arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag) {
     if (chunk_idx < 0 || chunk_idx >= static_cast<int>(arena_chunks_.size())) {
         return;
     }
@@ -32408,7 +32408,7 @@ void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag
         return;
     }
     arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);
-    if (chunk_lease_holders_) {
+    if (chunk_lease_holders_enabled_) {
         arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);
     }
 }
@@ -32427,7 +32427,7 @@ uint32_t unified_cache::arena_chunk_lease_count(int chunk_idx) const {
     return arena_chunks_[chunk_idx].lease_count.load();
 }
 
-uint32_t unified_cache::arena_chunk_lease_count_at(chunk_lease_tag tag) const {
+uint32_t unified_cache::arena_chunk_lease_count_at(const chunk_lease_tag & tag) const {
     return arena_chunk_leases_of(tag).load(std::memory_order_relaxed);
 }
 
@@ -32621,7 +32621,7 @@ void unified_cache::arena_report_holders(int                  dev_id,
     const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));
     ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
                       leases_by_site[0] != '\0' ? leases_by_site : " none", site_leases, holders.chunk_leases);
-    if (chunk_lease_holders_) {
+    if (chunk_lease_holders_enabled_) {
         arena_report_chunk_lease_holders(dev_id, level, holders.chunk_leases);
     } else if (holders.chunk_leases != 0) {
         ggml_log_internal(level,
@@ -32666,7 +32666,7 @@ void unified_cache::arena_report_chunk_lease_holders(int dev_id, ggml_log_level 
         } else if (slot == CHUNK_LEASE_HOLDER_FULL) {
             snprintf(taken_at, sizeof(taken_at), "a take or move that found the holder table full (%zu slots)",
                      CHUNK_LEASE_HOLDER_SLOTS);
-        } else if (!chunk_lease_holders().read(static_cast<uint16_t>(slot), holder)) {
+        } else if (!chunk_lease_holder_table_get().read(static_cast<uint16_t>(slot), holder)) {
             snprintf(taken_at, sizeof(taken_at), "an unreadable holder slot %zu", slot);
         } else {
             site = chunk_lease_site_name(holder.site);
@@ -32674,7 +32674,7 @@ void unified_cache::arena_report_chunk_lease_holders(int dev_id, ggml_log_level 
             char last[CHUNK_LEASE_HOLDER_FRAMES * 96];
             frames_of(holder, last, sizeof(last));
             chunk_lease_holder origin;
-            if (holder.origin != 0 && chunk_lease_holders().read(holder.origin, origin)) {
+            if (holder.origin != 0 && chunk_lease_holder_table_get().read(holder.origin, origin)) {
                 // A moved lease: the code that keeps it now, then the take it came from.
                 char first[CHUNK_LEASE_HOLDER_FRAMES * 96];
                 frames_of(origin, first, sizeof(first));

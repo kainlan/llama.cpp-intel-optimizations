@@ -39,12 +39,24 @@ enum class chunk_lease_site : uint8_t {
 // carries the tag with the lease; when the lease is counted in a named slot (the knob is on) the move also records its
 // own address and the cache re-counts the lease under the mover's stack, so the report names the code that keeps it
 // now as well as the take it came from. With the knob off holder is 0 and a move only compares it.
+//
+// Widest member first, so the tag is 16 bytes (8 + 2 + 1 + 1, padded to the pointer's alignment) and a mem_handle,
+// which carries one, grows by no more than that; the cache's lease calls take it by reference.
 struct chunk_lease_tag {
-    chunk_lease_site site   = chunk_lease_site::UNTAGGED;
-    bool             copy   = false;
     const void *     pc     = nullptr;
     uint16_t         holder = 0;
+    chunk_lease_site site   = chunk_lease_site::UNTAGGED;
+    bool             copy   = false;
+
+    chunk_lease_tag() = default;
+
+    chunk_lease_tag(chunk_lease_site taken_site, bool taken_copy, const void * taken_pc = nullptr) :
+        pc(taken_pc),
+        site(taken_site),
+        copy(taken_copy) {}
 };
+
+static_assert(sizeof(chunk_lease_tag) == 16, "chunk_lease_tag is carried by every mem_handle: keep it at 16 bytes");
 
 // The site's name in the lines that print the counts.
 inline const char * chunk_lease_site_name(chunk_lease_site site) {

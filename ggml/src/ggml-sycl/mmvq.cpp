@@ -1981,10 +1981,11 @@ void ggml_sycl_mxfp4_moe_tg_reuse_new_graph() {
 // release finds the arena still leased. The graph compute call drops it when it ends instead, on the thread that
 // stored it. That comes before the model release: a llama_context holds a reference to its model, so llama.cpp frees a
 // model's contexts before the model (common_init_result declares the model first, so it is destroyed last), and no
-// graph call is in flight when the slot release runs. ggml_sycl_release_model_slot_resources WARNs if one is. The
-// release is no place for the drop: it runs on whichever thread calls llama_model_free, which the bundled tools make
-// the thread that decoded but the API does not require, and a thread_local of another thread is out of its reach. The
-// Q8 staging buffers the store owns are untouched, so the next graph reuses them without allocating.
+// graph call is in flight when the slot release runs; ggml_sycl_release_model_slot_resources WARNs if one is at the
+// last live model's release. The release is no place for the drop: it runs on whichever thread calls
+// llama_model_free, which the bundled tools make the thread that decoded but the API does not require, and a
+// thread_local of another thread is out of its reach. The Q8 staging buffers the store owns are untouched, so the next
+// graph reuses them without allocating.
 void ggml_sycl_mxfp4_moe_tg_reuse_end_graph() {
     mxfp4_moe_tg_reuse_invalidate();
 }

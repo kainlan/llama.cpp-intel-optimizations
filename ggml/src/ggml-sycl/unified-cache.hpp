@@ -5694,10 +5694,10 @@ class unified_cache {
     // lease is counted again under the stack of the move whose address `tag.pc` recorded, keeping the take it came
     // from, and `tag.holder` is updated; otherwise nothing changes. Never throws.
     void     arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept;
-    void     arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag = chunk_lease_tag());
+    void     arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag = chunk_lease_tag());
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
-    uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
+    uint32_t arena_chunk_lease_count_at(const chunk_lease_tag & tag) const;
     // The leases by site, each site apart from the copies of its handles, written into `out` (`size` bytes, always
     // NUL-terminated when `size` is not 0) as " site=N" for every count that is not zero, and empty when all are.
     // Returns the counts' sum. It writes only into the caller's buffer and allocates nothing, so a teardown can call it
@@ -6954,20 +6954,23 @@ class unified_cache {
 
     // The cell a lease of `tag` moves. A site out of range counts as UNTAGGED, so a corrupt tag cannot index past the
     // array.
-    std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const {
+    std::atomic<uint32_t> & arena_chunk_leases_of(const chunk_lease_tag & tag) const {
         const size_t site = static_cast<size_t>(tag.site);
         return arena_chunk_leases_by_site_[site < static_cast<size_t>(chunk_lease_site::COUNT) ? site : 0]
                                           [tag.copy ? 1 : 0];
     }
 
     // GGML_SYCL_LEASE_HOLDERS, resolved once per process and kept here so a lease's take and release read a member.
-    const bool                    chunk_lease_holders_ = chunk_lease_holders_enabled();
-    // The leases on all chunks by holder-table slot, moved only when chunk_lease_holders_ is set, beside the counts
-    // by site. Slots 0 and 1 count the leases taken with no address and those whose holder found the table full.
-    mutable std::atomic<uint32_t> arena_chunk_leases_by_holder_[CHUNK_LEASE_HOLDER_SLOTS] = {};
+    const bool                                     chunk_lease_holders_enabled_ = chunk_lease_holders_enabled();
+    // The leases on all chunks by holder-table slot, moved only when chunk_lease_holders_enabled_ is set, beside the
+    // counts by site. Slots 0 and 1 count the leases taken with no address and those whose holder found the table
+    // full. Allocated (zeroed) only when the knob is on, so a run without it carries no 16 KB of counters in the cache.
+    const std::unique_ptr<std::atomic<uint32_t>[]> arena_chunk_leases_by_holder_ =
+        chunk_lease_holders_enabled_ ? std::make_unique<std::atomic<uint32_t>[]>(CHUNK_LEASE_HOLDER_SLOTS) : nullptr;
 
     // The cell a lease of `tag` moves by holder. A slot out of range counts in slot 0, as a lease with no address.
-    std::atomic<uint32_t> & arena_chunk_lease_holder_of(chunk_lease_tag tag) const {
+    // Called only behind chunk_lease_holders_enabled_, which is when the counters exist.
+    std::atomic<uint32_t> & arena_chunk_lease_holder_of(const chunk_lease_tag & tag) const {
         return arena_chunk_leases_by_holder_[tag.holder < CHUNK_LEASE_HOLDER_SLOTS ? tag.holder : 0];
     }
 

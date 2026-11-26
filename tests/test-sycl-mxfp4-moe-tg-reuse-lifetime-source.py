@@ -103,28 +103,38 @@ INFLIGHT = "graph_inflight_guard inflight_guard(g_sycl_graph_inflight);"
 PHASE_RETURN = "return ms;"
 NEW_GRAPH = "ggml_sycl_mxfp4_moe_tg_reuse_new_graph();"
 END_GRAPH = "ggml_sycl_mxfp4_moe_tg_reuse_end_graph();"
-SCOPE = ("struct mxfp4_moe_tg_reuse_graph_scope { ~mxfp4_moe_tg_reuse_graph_scope() { " + END_GRAPH +
-         " } } mxfp4_moe_tg_reuse_scope;")
+# A local object of a local type whose destructor calls the end, whatever either is named.
+SCOPE_RE = re.compile(r"struct (\w+) \{ ~\1\(\) (?:noexcept )?\{ [^{}]*?" + re.escape(END_GRAPH) + r"[^{}]*\} \} \w+;")
+
+
+def scopes_in(body: str) -> list:
+    return list(SCOPE_RE.finditer(body))
 
 
 def claim_graph_compute_drops_the_store(gs: str) -> bool:
     c = code(gs)
     entry = fn_body(c, ENTRY_SIG)
     i = entry.find(INFLIGHT)
-    j = entry.find(SCOPE)
+    scopes = scopes_in(entry)
+    if i == -1 or len(scopes) != 1:
+        return False
+    j = scopes[0].start()
     # The scope is armed right after the in-flight guard, so it ends before the guard lowers the count, at the entry's
     # own level (not inside a branch, where it would end with the branch), and no exit of the entry comes before it,
     # so every exit of every route drops the store. compute_impl keeps the start's invalidation and arms nothing: a
     # scope there would miss the segmented paths. The end is called from this scope and nowhere else.
     return (
-        i != -1
-        and entry.count(SCOPE) == 1
-        and i < j
+        i < j
         and entry[i + len(INFLIGHT) : j].strip() == ""
         and entry[:j].count("return") == entry[:j].count(PHASE_RETURN)
         and fn_body(c, COMPUTE_SIG).count(NEW_GRAPH) == 1
+        and not scopes_in(fn_body(c, COMPUTE_SIG))
         and c.count(END_GRAPH) == 1
     )
+
+
+# The scope as the source spells it, for the mutants.
+SCOPE = scopes_in(fn_body(code(GS), ENTRY_SIG))[0].group(0) if scopes_in(fn_body(code(GS), ENTRY_SIG)) else "<no scope>"
 
 
 # ---- the end of a graph drops the copied handle and its event ----
@@ -160,26 +170,40 @@ def claim_end_drops_the_copied_handle(mmvq: str, mmvqh: str) -> bool:
 
 RELEASE_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 INFLIGHT_READ = "const int inflight = ggml_sycl_graph_inflight_count();"
-INFLIGHT_GUARD = "if (inflight != 0) {"
-INFLIGHT_WARN = ('ggml_sycl_diag_emit_warn( "[SYCL] model slot %u release: %d graph call(s) still in flight; a '
-                 'following [VRAM-ARENA] \\"it stays\\" line may be a lease the MXFP4 MoE decode reuse store of such a '
-                 'call still holds, not a leak\\n", slot, inflight);')
-SLOT_RECLAIM = "ggml_sycl::unified_cache_release_model_slot(slot);"
+# Only at the last live model's release: while another model is live the last-release step reports nothing, and a call
+# in flight is that model's decode.
+INFLIGHT_GUARD = "if (inflight != 0 && ggml_sycl_no_model_live()) {"
+NO_LIVE_SIG = "static bool ggml_sycl_no_model_live()"
+NO_LIVE_READ = "return cache->live_model_mask() == 0;"
+# The call at WARN, a stable part of its text, and its arguments; the rest of the wording is free.
+INFLIGHT_WARN_RE = re.compile(r'ggml_sycl_diag_emit_warn\( "\[SYCL\] model slot %u release: %d graph call\(s\) '
+                              r'still in flight;(?:[^"\\]|\\.)*", slot, inflight\);')
+LAST_RELEASE = "ggml_sycl_release_last_model_effects(\"model-release\","
 
 
 def claim_release_warns_on_a_call_in_flight(gs: str) -> bool:
-    # The drop rests on no graph call being in flight at the model release. The release checks that, and a call still
-    # in flight is named at WARN, with its count, before the slot's reclaim and the last-release arena check, so an E
-    # line that follows is read as that call's lease and not as a leak. Adjacent literals read as one.
-    body = fn_body(code(gs).replace('" "', ""), RELEASE_SIG)
-    w = body.find(INFLIGHT_WARN)
+    # The drop rests on no graph call being in flight at the model release. The last live model's release checks
+    # that, and a call still in flight is named at WARN, with its count, right before the last-release step whose
+    # arena line it explains, so an E line that follows is read as that call's lease and not as a leak. Adjacent
+    # literals read as one.
+    c = code(gs).replace('" "', "")
+    body = fn_body(c, RELEASE_SIG)
+    warns = list(INFLIGHT_WARN_RE.finditer(body))
+    if len(warns) != 1:
+        return False
+    w = warns[0].start()
     g = body.find(INFLIGHT_GUARD)
+    r = body.find(INFLIGHT_READ)
     return (
-        body.find(INFLIGHT_READ) != -1
-        and body.find(INFLIGHT_READ) < g < w < body.find(SLOT_RECLAIM)
+        r != -1
+        and r < g < w < body.find(LAST_RELEASE)
         and body[g + len(INFLIGHT_GUARD) : w].strip() == ""
-        and body.count(INFLIGHT_WARN) == 1
+        and NO_LIVE_READ in fn_body(c, NO_LIVE_SIG)
     )
+
+
+INFLIGHT_WARN = (lambda m: m.group(0) if m else "<no warn>")(
+    INFLIGHT_WARN_RE.search(fn_body(code(GS).replace('" "', ""), RELEASE_SIG)))
 
 
 # ---- checks ----
@@ -255,8 +279,9 @@ def test_witness_second_copy_site():
 
 def test_release_warns_on_a_call_in_flight():
     assert claim_release_warns_on_a_call_in_flight(GS), (
-        "ggml_sycl_release_model_slot_resources does not WARN, with the count and before the slot's reclaim, when a "
-        "graph call is still in flight, so an E-level arena line from that call's reuse store reads as a leak"
+        "ggml_sycl_release_model_slot_resources does not WARN, with the count, at the last live model's release and "
+        "right before the last-release step, when a graph call is still in flight, so an E-level arena line from that "
+        "call's reuse store reads as a leak"
     )
 
 
@@ -269,7 +294,20 @@ def test_witness_release_without_the_warn():
 
 
 def test_witness_release_warns_when_idle():
-    assert not claim_release_warns_on_a_call_in_flight(release_mutant(INFLIGHT_GUARD, "if (inflight == 0) {"))
+    assert not claim_release_warns_on_a_call_in_flight(
+        release_mutant(INFLIGHT_GUARD, "if (inflight == 0 && ggml_sycl_no_model_live()) {")
+    )
+
+
+def test_witness_release_warns_while_another_model_is_live():
+    # The process-wide count alone: model A's release would WARN while model B decodes on another thread.
+    assert not claim_release_warns_on_a_call_in_flight(release_mutant(INFLIGHT_GUARD, "if (inflight != 0) {"))
+
+
+def test_witness_liveness_read_inverted():
+    assert not claim_release_warns_on_a_call_in_flight(
+        mutate_in(code(GS), NO_LIVE_SIG, NO_LIVE_READ, "return cache->live_model_mask() != 0;")
+    )
 
 
 def test_witness_release_warns_below_default_verbosity():
@@ -278,10 +316,17 @@ def test_witness_release_warns_below_default_verbosity():
     )
 
 
-def test_witness_release_warns_after_the_reclaim():
+def test_witness_release_warns_without_the_count():
+    assert not claim_release_warns_on_a_call_in_flight(
+        release_mutant(INFLIGHT_WARN, INFLIGHT_WARN.replace("slot, inflight);", "slot, 0);"))
+    )
+
+
+def test_witness_release_warns_after_the_last_release():
     moved = release_mutant(INFLIGHT_GUARD + " " + INFLIGHT_WARN + " }", "")
     assert not claim_release_warns_on_a_call_in_flight(
-        mutate_in(moved, RELEASE_SIG, SLOT_RECLAIM, SLOT_RECLAIM + " " + INFLIGHT_GUARD + " " + INFLIGHT_WARN + " }")
+        mutate_in(moved, RELEASE_SIG, "ggml_sycl_last_release_scope::EVERY_CACHE);",
+                  "ggml_sycl_last_release_scope::EVERY_CACHE); " + INFLIGHT_GUARD + " " + INFLIGHT_WARN + " }")
     )
 
 

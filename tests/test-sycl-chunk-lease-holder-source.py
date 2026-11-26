@@ -134,15 +134,23 @@ def mutate(src: str, old: str, new: str) -> str:
 # ---- the tag carries the taker's address and the holder slot ----
 
 TAG_SIG = "struct chunk_lease_tag"
-TAG_FIELDS = ("chunk_lease_site site = chunk_lease_site::UNTAGGED;", "bool copy = false;",
-              "const void * pc = nullptr;", "uint16_t holder = 0;")
+# Widest first: 8 + 2 + 1 + 1 bytes, padded to 16. The tag rides in every mem_handle, so its size is a decode cost.
+TAG_FIELDS = ("const void * pc = nullptr;", "uint16_t holder = 0;",
+              "chunk_lease_site site = chunk_lease_site::UNTAGGED;", "bool copy = false;")
+TAG_CTOR = ("chunk_lease_tag(chunk_lease_site taken_site, bool taken_copy, const void * taken_pc = nullptr) : "
+            "pc(taken_pc), site(taken_site), copy(taken_copy) {}")
+TAG_SIZE = "static_assert(sizeof(chunk_lease_tag) == 16,"
 
 
 def claim_tag_carries_pc_and_slot(hold: str, mhh: str) -> bool:
     # The tag is defined in the SYCL-free header the host-only table test compiles, and mem-handle.hpp takes it from
-    # there rather than defining a second one.
+    # there rather than defining a second one. Its fields run widest first, so it stays 16 bytes, which the header
+    # asserts.
+    tag = fn_body(code(hold), TAG_SIG)
     return (
-        ordered(fn_body(code(hold), TAG_SIG), *TAG_FIELDS)
+        ordered(tag, *TAG_FIELDS)
+        and TAG_CTOR in tag
+        and TAG_SIZE in code(hold)
         and '#include "chunk-lease-holders.hpp"' in code(mhh)
         and TAG_SIG not in code(mhh)
     )
@@ -239,8 +247,8 @@ NOTE_SIG = ("static void note_chunk_lease_move(uint8_t chunk_source, int chunk_d
             "const void * pc) noexcept")
 NOTE_GATE = "{ if (tag.holder < CHUNK_LEASE_HOLDER_FIRST || chunk_source != 2) { return; }"
 UC_MOVE_SIG = "void unified_cache::arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept"
-UC_MOVE_GATE = "{ if (!chunk_lease_holders_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) { return; }"
-UC_MOVE_PARTS = ("chunk_lease_holder_claim(tag, chunk_lease_holders().origin_of(tag.holder));",
+UC_MOVE_GATE = "{ if (!chunk_lease_holders_enabled_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) { return; }"
+UC_MOVE_PARTS = ("chunk_lease_holder_claim(tag, chunk_lease_holder_table_get().origin_of(tag.holder));",
                  "if (moved < CHUNK_LEASE_HOLDER_FIRST || moved == tag.holder) { return; }",
                  "arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);",
                  "tag.holder = moved;",
@@ -286,15 +294,15 @@ def claim_acquire_writes_the_slot_back(mh: str, uch: str) -> bool:
 
 UC_ACQUIRE_SIG = "int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag)"
 UC_ACQUIRE_UNTAGGED_SIG = "int unified_cache::arena_acquire_chunk_lease(const void * ptr)"
-UC_RELEASE_SIG = "void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag)"
-FLAG = "if (chunk_lease_holders_) {"
+UC_RELEASE_SIG = "void unified_cache::arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag)"
+FLAG = "if (chunk_lease_holders_enabled_) {"
 SITE_ADD = "arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);"
 SITE_SUB = "arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);"
 HOLDER_CLAIM = "tag.holder = chunk_lease_holder_claim(tag, 0);"
 HOLDER_ADD = "arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);"
 HOLDER_SUB = "arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);"
 UNDERFLOW_RETURN = "lease_count.fetch_add(1); return; }"
-FLAG_MEMBER = "const bool chunk_lease_holders_ = chunk_lease_holders_enabled();"
+FLAG_MEMBER = "const bool chunk_lease_holders_enabled_ = chunk_lease_holders_enabled();"
 CLAIM_SIG = "static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag, uint16_t origin)"
 CLAIM_NULL = "if (tag.pc == nullptr) { return CHUNK_LEASE_HOLDER_NO_ADDRESS; }"
 
@@ -344,14 +352,13 @@ REPORT_SIG = ("void unified_cache::arena_report_holders(int dev_id, const size_t
 HOLDER_REPORT_SIG = ("void unified_cache::arena_report_chunk_lease_holders(int dev_id, ggml_log_level level, "
                      "uint32_t chunk_leases) const")
 CENSUS_CALL = "const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));"
-SITE_AT_LEVEL = 'ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\\n"'
+# Each line as its call, its level and a stable prefix of its text; the rest of the wording is free.
+SITE_AT_LEVEL = 'ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by site:'
 HOLDER_CALL = "arena_report_chunk_lease_holders(dev_id, level, holders.chunk_leases);"
 HINT_GUARD = "} else if (holders.chunk_leases != 0) {"
-HINT = ('ggml_log_internal(level, "[VRAM-ARENA] set GGML_SYCL_LEASE_HOLDERS=1 to name the code that took each of '
-        'the %u chunk leases on device %d\\n"')
-HOLDER_LINE = ('ggml_log_internal(level, "[VRAM-ARENA] chunk lease holder on device %d: %u held, site %s%s, '
-               'taken at %s\\n"')
-HOLDER_SUM = 'ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by holder: sum %u of %u\\n"'
+HINT = 'ggml_log_internal(level, "[VRAM-ARENA] set GGML_SYCL_LEASE_HOLDERS=1'
+HOLDER_LINE = 'ggml_log_internal(level, "[VRAM-ARENA] chunk lease holder on device %d:'
+HOLDER_SUM = 'ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by holder:'
 
 
 def claim_report_at_the_callers_level(uc: str) -> bool:
@@ -395,9 +402,21 @@ def claim_frame_is_module_and_offset(uc: str) -> bool:
 
 def test_tag_carries_pc_and_slot():
     assert claim_tag_carries_pc_and_slot(HOLD, MHH), (
-        "chunk_lease_tag does not carry the taker's address and the holder slot, or is not the one the SYCL-free "
-        "chunk-lease-holders.hpp defines"
+        "chunk_lease_tag does not carry the taker's address and the holder slot, widest field first at 16 bytes, or "
+        "is not the one the SYCL-free chunk-lease-holders.hpp defines"
     )
+
+
+def test_witness_tag_site_first():
+    # The first layout: site and copy ahead of the pointer pad the tag to 24 bytes.
+    c = code(HOLD)
+    narrow = TAG_FIELDS[2] + " " + TAG_FIELDS[3]
+    swapped = c.replace(narrow, "", 1).replace(TAG_FIELDS[0], narrow + " " + TAG_FIELDS[0], 1)
+    assert not claim_tag_carries_pc_and_slot(swapped, MHH)
+
+
+def test_witness_tag_size_unasserted():
+    assert not claim_tag_carries_pc_and_slot(mutate(HOLD, TAG_SIZE, "static_assert(sizeof(chunk_lease_tag) >= 2,"), MHH)
 
 
 def test_takes_record_the_takers_address():
@@ -464,7 +483,7 @@ def test_witness_move_note_without_the_gate():
 
 def test_witness_cache_move_without_the_flag():
     assert not claim_moves_note_their_keeper(
-        MH, mutate_in(UC, UC_MOVE_SIG, "if (!chunk_lease_holders_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) {",
+        MH, mutate_in(UC, UC_MOVE_SIG, "if (!chunk_lease_holders_enabled_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) {",
                       "if (tag.holder < CHUNK_LEASE_HOLDER_FIRST) {")
     )
 
@@ -584,7 +603,9 @@ def test_witness_take_reads_the_knob():
 
 
 def test_witness_flag_not_cached():
-    assert not claim_holder_counts_only_behind_the_flag(UC, mutate(UCH, FLAG_MEMBER, "bool chunk_lease_holders_;"))
+    assert not claim_holder_counts_only_behind_the_flag(
+        UC, mutate(UCH, FLAG_MEMBER, "bool chunk_lease_holders_enabled_;")
+    )
 
 
 def test_witness_null_address_claims_a_slot():
@@ -622,7 +643,9 @@ def test_witness_hint_with_no_lease_held():
 
 
 def test_witness_hint_with_the_knob_on():
-    assert not claim_report_at_the_callers_level(mutate_in(UC, REPORT_SIG, HOLDER_CALL, HINT + ", 0u, 0);"))
+    assert not claim_report_at_the_callers_level(
+        mutate_in(UC, REPORT_SIG, HOLDER_CALL, HINT + ' names them\\n", 0u, 0);')
+    )
 
 
 if __name__ == "__main__":

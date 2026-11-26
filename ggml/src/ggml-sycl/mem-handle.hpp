@@ -729,8 +729,12 @@ class mem_handle {
     // and no production path does it.
     mutable mem_handle_spin_lock lock_;
 
-    mem_handle_kind   kind_   = mem_handle_kind::DIRECT;
-    int               device_ = HOST_DEVICE;
+    mem_handle_kind   kind_         = mem_handle_kind::DIRECT;
+    // Which chunk lease the handle holds; described with the chunk lease fields below. It sits here, in the padding
+    // after the one-byte lock and kind, so the 16-byte chunk_tag_ costs the handle no size over a 2-byte one: a tensor
+    // extra embeds dozens of handles, and handles are copied per op.
+    mutable uint8_t   chunk_source_ = 0;  // GUARDED by lock_
+    int               device_       = HOST_DEVICE;
     unified_cache_key key_    = {};
 
     // Arena-specific fields (only used for ARENA_* kinds).
@@ -813,7 +817,8 @@ class mem_handle {
     //
     // A CHUNK_LEASE-kind handle stores its protected raw ptr in cached_.ptr;
     // resolve() returns cached_ directly (never re-queries the cache).
-    mutable uint8_t  chunk_source_      = 0;           // GUARDED by lock_
+    //
+    // chunk_source_ is declared beside kind_ above, for the handle's size.
     mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // GUARDED (pinned_chunk_pool::INVALID_CHUNK_HANDLE)
     mutable int32_t  vram_chunk_idx_    = -1;          // GUARDED by lock_
     mutable int32_t  chunk_device_      = -1;          // GUARDED by lock_
