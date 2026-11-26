@@ -61,6 +61,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "moe-planned-model-fixture.hpp"  // the planned model's shape, experts, inventory and lifecycle
 #include "moe-pp-pack.hpp"  // moe_pp_gemm_row_align: the GEMM row rounding the rectangle is measured against
 
 #include <sys/wait.h>
@@ -72,6 +73,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -113,8 +115,8 @@ int fixture_tensor_count(fixture_variant variant) {
     return variant == fixture_variant::FUSED_GATE_UP ? 2 : 3;
 }
 
-const char * fixture_tensor_name(fixture_variant variant, int i) {
-    return variant == fixture_variant::FUSED_GATE_UP ? k_fused_tensor_names[i] : k_tensor_names[i];
+const char * const * fixture_tensor_names(fixture_variant variant) {
+    return variant == fixture_variant::FUSED_GATE_UP ? k_fused_tensor_names : k_tensor_names;
 }
 
 // Every expert type the batched executor's f16 table takes (moe_pp_batched_f16_supports_layout) that this fixture
@@ -160,15 +162,7 @@ constexpr int k_capped_cases = int(sizeof(k_group_caps) / sizeof(k_group_caps[0]
 constexpr int k_skew_rows[] = { 1024, 2048 };
 constexpr int k_skew_cases  = int(sizeof(k_skew_rows) / sizeof(k_skew_rows[0]));
 
-void require(bool condition, const std::string & message) {
-    if (!condition) {
-        throw std::runtime_error(message);
-    }
-}
-
-size_t align_256(size_t n) {
-    return (n + 255u) & ~size_t(255u);
-}
+using moe_planned_fixture::require;
 
 // Every log chunk the backend emits, in order, so a case can count what appeared while it ran. Also echoed to stderr,
 // so the run's log carries the backend's own lines.
@@ -251,20 +245,6 @@ void log_callback(ggml_log_level level, const char * text, void * user_data) {
     std::fputs(text, stderr);
 }
 
-// One expert tensor's quantized bytes: k_experts experts of k_out rows of k_in values.
-std::vector<uint8_t> make_weights(ggml_type type, std::mt19937 & rng) {
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    std::vector<float>                    weight_f32(size_t(k_experts) * k_out * k_in);
-    for (float & v : weight_f32) {
-        v = 0.5f * dist(rng);
-    }
-    std::vector<uint8_t> bytes(ggml_row_size(type, k_in) * k_out * k_experts);
-    const size_t         written =
-        ggml_quantize_chunk(type, weight_f32.data(), bytes.data(), 0, int64_t(k_experts) * k_out, k_in, nullptr);
-    require(written == bytes.size(), std::string("quantize wrote a short buffer for ") + ggml_type_name(type));
-    return bytes;
-}
-
 // Rewrites every UE4M3 scale byte of NVFP4 `bytes` from `scales`, in turn. A block is 4 scale bytes, one per
 // 16-element sub-block, then 32 bytes of E2M1 nibbles (block_nvfp4 in ggml-common.h).
 void rewrite_nvfp4_scales(std::vector<uint8_t> & bytes, const uint8_t * scales, size_t n_scales) {
@@ -280,182 +260,50 @@ void rewrite_nvfp4_scales(std::vector<uint8_t> & bytes, const uint8_t * scales, 
     }
 }
 
-// One planned model: its expert tensors (gate, up and down, or the fused gate_up and down) share one shape, so the
-// first of them, the one the cases run, is representative.
-// The PP MoE ring fields are what libllama computes for this shape with GGML_SYCL_MOE_PP_WOQ at its default (on).
-struct expert_inventory {
-    ggml_sycl_tensor_info        tensors[3]{};
-    ggml_sycl_tensor_inventory   inventory{};
-    ggml_sycl_placement_envelope envelope{};
+// The planned model a case runs (moe_planned_fixture::planned_model): the variant's expert tensors at this test's
+// shape, planned for `n_ubatch` and a context of at least k_n_ctx. The one split is named per type and variant, so no
+// two cases' weights share a file identity. The NVFP4 scale variants rewrite every scale byte of the quantized weights
+// before they fill the tensors.
+moe_planned_fixture::planned_shape fixture_shape(ggml_type type, uint32_t n_ubatch, fixture_variant variant) {
+    return { type,
+             k_experts,
+             k_used,
+             k_in,
+             k_out,
+             fixture_tensor_names(variant),
+             fixture_tensor_count(variant),
+             std::max(k_n_ctx, n_ubatch),
+             n_ubatch };
+}
 
-    expert_inventory(ggml_type type, uint32_t n_ubatch, fixture_variant variant) {
-        const uint32_t n_ctx = std::max(k_n_ctx, n_ubatch);
-        envelope             = ggml_sycl_placement_envelope{ n_ctx, n_ubatch, 1, -1 };
-        const int count      = fixture_tensor_count(variant);
-        for (int i = 0; i < count; ++i) {
-            tensors[i].name  = fixture_tensor_name(variant, i);
-            tensors[i].type  = type;
-            tensors[i].ne[0] = k_in;
-            tensors[i].ne[1] = k_out;
-            tensors[i].ne[2] = k_experts;
-            tensors[i].ne[3] = 1;
-            tensors[i].size  = ggml_row_size(type, k_in) * k_out * k_experts;
-            inventory.total_size += tensors[i].size;
-        }
-        inventory.tensors       = tensors;
-        inventory.count         = count;
-        inventory.n_expert      = k_experts;
-        inventory.n_expert_used = k_used;
-        inventory.n_layer       = 1;
-        inventory.n_ctx         = n_ctx;
-        inventory.n_ubatch      = n_ubatch;
+std::string fixture_split_path(ggml_type type, fixture_variant variant) {
+    return std::string("test-moe-pp-batched-dequant-") + ggml_type_name(type) + "-" +
+           std::to_string(static_cast<int>(variant)) + ".gguf";
+}
 
-        const size_t woq_slot = align_256(size_t(k_out) * (k_in / 2)) + align_256(size_t(k_in / 32) * k_out);
-        inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * k_experts;
-        // One scratch row: k_in half floats in, k_out floats out. The backend sizes the activation and output slots
-        // from these and the expert counts, so the loader leaves both slots 0 and plans only the weight slot.
-        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_in) * sizeof(ggml_fp16_t);
-        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_out) * sizeof(float);
-        inventory.pp_moe_onednn_activation_slot_bytes    = 0;
-        inventory.pp_moe_onednn_output_slot_bytes        = 0;
-        inventory.pp_moe_onednn_ring_depth               = 1;
-        inventory.pp_moe_onednn_scratch_bytes            = inventory.pp_moe_onednn_weight_slot_bytes;
+std::function<void(std::vector<uint8_t> &)> fixture_rewrite(fixture_variant variant) {
+    if (variant == fixture_variant::SMALL_SCALES) {
+        return [](std::vector<uint8_t> & bytes) {
+            rewrite_nvfp4_scales(bytes, k_small_scales, sizeof(k_small_scales));
+        };
     }
-};
+    if (variant == fixture_variant::LARGE_SCALES) {
+        return [](std::vector<uint8_t> & bytes) {
+            rewrite_nvfp4_scales(bytes, k_large_scales, sizeof(k_large_scales));
+        };
+    }
+    return {};
+}
 
-// The model lifecycle a real load drives, through the public entry points: stage the inventory plan, load the
-// weights, commit the load (its preload materializes the experts), activate the plan, and bind an execution context
-// and the runtime context to a backend on the pinned card.
-struct lifecycle_fixture {
-    ggml_backend_t            backend = nullptr;
-    ggml_sycl_load_txn        load{};
-    bool                      load_open = false;
-    ggml_sycl_model_token     model{};
-    ggml_sycl_exec_context_id context{};
-    ggml_context *            weight_ctx    = nullptr;
-    ggml_backend_buffer_t     weight_buffer = nullptr;
-    ggml_tensor *             gate          = nullptr;  // the loaded expert tensor every case runs
-    std::vector<uint8_t>      gate_bytes;               // its quantized bytes, for the CPU reference
-
+struct lifecycle_fixture : moe_planned_fixture::planned_model {
     lifecycle_fixture(ggml_type       type,
                       std::mt19937 &  rng,
                       uint32_t        n_ubatch = k_n_ubatch,
-                      fixture_variant variant  = fixture_variant::PLAIN) {
-        try {
-            require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
-            load_open = true;
-            expert_inventory fixture(type, n_ubatch, variant);
-            const auto       stage =
-                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
-            require(stage == GGML_SYCL_LIFECYCLE_OK,
-                    "inventory staging result=" + std::to_string(static_cast<int>(stage)));
-            // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue
-            // lookup cannot observe a transient context that was cleared.
-            backend = ggml_backend_sycl_init(0);
-            require(backend != nullptr, "ggml_backend_sycl_init(0) returned null");
-            load_weights(type, rng, variant);
-            const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
-            if (commit != GGML_SYCL_LIFECYCLE_BUSY) {
-                load_open = false;
-            }
-            require(commit == GGML_SYCL_LIFECYCLE_OK, "load commit result=" + std::to_string(static_cast<int>(commit)));
-            require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK, "plan activation failed");
-            require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
-                    "context create failed");
-            require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
-                    "context bind failed");
-            require(ggml_backend_sycl_set_runtime_context_for_model(
-                        backend, model, std::max(k_n_ctx, n_ubatch), n_ubatch, 1,
-                        /*kv_unified=*/false, /*swa_full=*/false,
-                        /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
-                    "runtime context bind failed");
-        } catch (...) {
-            cleanup();
-            throw;
-        }
-    }
-
-    // What libllama's loader does for each weight, in its order: create the tensor and register its split's file
-    // identity, its own identity, its host-weight row (only while weights are evictable, as the loader gates it) and
-    // its usage while the load is open (register_sycl_tensor_metadata in src/llama-model-loader.cpp), allocate the
-    // tensors in the device's SYCL host buffer type, then fill them. The one split is named per type, so no two
-    // cases' weights share a file identity.
-    void load_weights(ggml_type type, std::mt19937 & rng, fixture_variant variant) {
-        const int        count  = fixture_tensor_count(variant);
-        ggml_init_params params = { size_t(count) * ggml_tensor_overhead(), nullptr, true };
-        weight_ctx              = ggml_init(params);
-        require(weight_ctx != nullptr, "ggml_init for the weights failed");
-        ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
-        ggml_tensor *      tensors[3] = {};
-        const std::string  split_path = std::string("test-moe-pp-batched-dequant-") + ggml_type_name(type) + "-" +
-                                       std::to_string(static_cast<int>(variant)) + ".gguf";
-        for (int i = 0; i < count; ++i) {
-            const char * name = fixture_tensor_name(variant, i);
-            tensors[i]        = ggml_new_tensor_3d(weight_ctx, type, k_in, k_out, k_experts);
-            ggml_set_name(tensors[i], name);
-            const size_t nbytes = ggml_nbytes(tensors[i]);
-            ggml_backend_sycl_register_gguf_file_identity(0, split_path.c_str(), uint64_t(count) * nbytes);
-            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
-            if (ggml_backend_sycl_weights_evictable()) {
-                ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
-            }
-            require(ggml_backend_sycl_try_register_weight_usage(name, GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
-                    std::string("usage registration refused for ") + name);
-        }
-        ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
-        require(buft != nullptr, "no SYCL host buffer type for the pinned card");
-        weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
-        require(weight_buffer != nullptr, "host weight buffer allocation failed");
-        ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        // One quantization serves all three tensors: only the gate runs, and the single-threaded IQ quantizers
-        // (IQ2_S, IQ1_M) dominate the test's time.
-        gate_bytes = make_weights(type, rng);
-        if (variant == fixture_variant::SMALL_SCALES) {
-            rewrite_nvfp4_scales(gate_bytes, k_small_scales, sizeof(k_small_scales));
-        } else if (variant == fixture_variant::LARGE_SCALES) {
-            rewrite_nvfp4_scales(gate_bytes, k_large_scales, sizeof(k_large_scales));
-        }
-        for (int i = 0; i < count; ++i) {
-            ggml_backend_tensor_set(tensors[i], gate_bytes.data(), 0, gate_bytes.size());
-        }
-        gate = tensors[0];
-    }
-
-    void cleanup() noexcept {
-        ggml_sycl_exec_drain_ticket             ticket{};
-        ggml_sycl_exec_control_host_alloc_batch batch{};
-        if (context.value &&
-            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
-            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
-                GGML_SYCL_EXECUTION_OK) {
-            (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
-            (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
-        }
-        context = {};
-        // libllama frees the model's buffers before it reports the model unloaded (llama_model's destructor).
-        if (weight_buffer) {
-            ggml_backend_buffer_free(weight_buffer);
-            weight_buffer = nullptr;
-        }
-        if (weight_ctx) {
-            ggml_free(weight_ctx);
-            weight_ctx = nullptr;
-        }
-        gate = nullptr;
-        if (model.model_id) {
-            (void) ggml_backend_sycl_model_unloaded_token(model);
-            model = {};
-        } else if (load_open) {
-            (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
-            load_open = false;
-        }
-        if (backend) {
-            ggml_backend_free(backend);
-            backend = nullptr;
-        }
-    }
-
-    ~lifecycle_fixture() { cleanup(); }
+                      fixture_variant variant  = fixture_variant::PLAIN) :
+        planned_model(fixture_shape(type, n_ubatch, variant),
+                      fixture_split_path(type, variant),
+                      rng,
+                      fixture_rewrite(variant)) {}
 };
 
 ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft,
