@@ -16090,8 +16090,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // flag_slot this pool entry will be checked against
         // (onednn_graph_scratch_pool_entry_release_complete()), instead of
         // leaving pool lookups to query `event` directly (which BLOCKS
-        // rather than polls on the profiling-enabled queue `event` lives
-        // on -- see event_complete()'s comment). A marker kernel with no
+        // rather than polls when the queue `event` lives on carries
+        // profiling -- see event_complete()'s comment). A marker kernel with no
         // dependency but this one release event costs nothing on the
         // allocation path: it runs on get_event_watch_queue(), a dedicated
         // queue nothing else waits on, and (unlike an earlier, host_task-
@@ -16297,8 +16297,9 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // pattern (see get_dma_queue()'s comment above): a dedicated
     // NON-profiling queue whose events CAN be polled via
     // event.get_info<command_execution_status>() without blocking, unlike
-    // every other backend stream (profiling-enabled, where that same query
-    // blocks instead of polling).
+    // every other backend stream when it carries profiling
+    // (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling diagnostic),
+    // where that same query blocks instead of polling.
     //
     // THE ASSUMPTION IS ALREADY KNOWN TO BREAK UNDER TP: ggml_backend_sycl_context::
     // stream()/ctx.stream() (common.hpp) returns the TP shared-context queue

@@ -3615,8 +3615,8 @@ bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 // flag_slot == -1 fallback runs its query against a genuinely UNWATCHED
 // event -- which behaves like the real pre-fix code path: it blocks for
 // real (a bare command_execution_status query on an unwatched
-// device-kernel event blocks on a profiling-enabled queue, confirmed on
-// hardware, both cards; see event_complete()'s own comment). An earlier
+// device-kernel event blocks on a queue that carries profiling, confirmed
+// on hardware, both cards; see event_complete()'s own comment). An earlier
 // version of this hook instead short-circuited the completion CHECK to
 // query release_event directly regardless of whether a flag had been
 // armed; that design was abandoned because it queried a WATCHED event,
@@ -6603,7 +6603,7 @@ class unified_cache {
                                      const std::vector<sycl::event> & deps,
                                      sycl::queue *                    override_q = nullptr);
     // See this function's own comment at its definition in unified-cache.cpp
-    // for the full BLOCKS-not-polls hazard on a profiling-enabled queue,
+    // for the full BLOCKS-not-polls hazard on a queue that carries profiling,
     // and (llama.cpp-c6ah) a related but SEPARATE hazard in anything that
     // submits a host_task depending on one of these events:
     // that submit call itself blocks its calling thread until the event
@@ -7287,10 +7287,12 @@ class unified_cache {
         // DEVICE MARKER KERNEL (not a host_task -- see this struct's own
         // history below for why) submitted on get_event_watch_queue() at
         // park time, depending on release_event, once release_event
-        // completes. release_event lives on a profiling-enabled backend
-        // stream, and event_complete()'s own comment documents that the
-        // bare command_execution_status query BLOCKS rather than polls on
-        // such a queue -- so querying release_event directly here would
+        // completes. When the backend streams carry profiling
+        // (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling diagnostic),
+        // release_event lives on a profiling-enabled stream, and
+        // event_complete()'s own comment documents that the bare
+        // command_execution_status query BLOCKS rather than polls on such a
+        // queue -- so querying release_event directly here would
         // turn "skip an in-flight entry" into "wait for it", exactly the
         // bug this ticket closes. Pool lookups must go through
         // pool_entry_release_complete() rather than event_complete()
@@ -7397,9 +7399,11 @@ class unified_cache {
     // host-visible flag at entry.flag_slot (written by a device marker
     // kernel armed at park time -- see onednn_graph_scratch_pool_entry::flag_slot's
     // own comment for the full mechanism and history) over querying
-    // entry.release_event directly, because release_event lives on a
-    // profiling-enabled backend stream and event_complete()'s own comment
-    // documents that a bare query BLOCKS instead of polling there for an
+    // entry.release_event directly, because, when the backend streams carry
+    // profiling (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling
+    // diagnostic), release_event lives on a profiling-enabled stream and
+    // event_complete()'s own comment documents that a bare query BLOCKS
+    // instead of polling there for an
     // UNWATCHED device-kernel event -- so entry.flag_slot, once armed
     // (>= 0), is the predicate this entry's completion is actually checked
     // through; this function only falls through to
@@ -7510,7 +7514,8 @@ class unified_cache {
     // performs the one completion query (via
     // onednn_graph_scratch_pool_entry_release_complete(), llama.cpp-c6ah --
     // NOT a direct event_complete() query, which blocks rather than polls
-    // on the profiling-enabled queues every backend stream uses) and, if
+    // on a queue that carries profiling: GGML_SYCL_QUEUE_PROFILING=1 or a
+    // requested profiling diagnostic) and, if
     // that passes, the one resolve() query this entry needs for this
     // request -- a caller must NOT query completion on the same entry
     // itself first; doubling the query here would double that cost per

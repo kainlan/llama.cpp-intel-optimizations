@@ -19,8 +19,9 @@
 // TWO ORTHOGONAL AXES, both varied, because either alone would leave the
 // other as an unexamined confound:
 //
-//   - QUEUE PROPERTIES: in_order + enable_profiling (what every real
-//     backend stream in this codebase uses, via default_queue_properties()
+//   - QUEUE PROPERTIES: in_order + enable_profiling (what every backend
+//     stream is when the queues carry profiling, GGML_SYCL_QUEUE_PROFILING=1
+//     or a requested profiling diagnostic, via default_queue_properties()
 //     in common.hpp) vs. in_order alone (what dma_queue_ uses, and what
 //     unified-cache.hpp's own comment claims is the one queue where the
 //     query is actually non-blocking).
