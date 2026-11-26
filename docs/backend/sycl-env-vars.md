@@ -624,9 +624,10 @@ counted the moves it had in flight as open slots)
   moves of a thrown batch not settled yet when the line prints (`unsettled at report: %llu moves`), the cost of the
   transactions sent (`transaction cost over %llu: copy submit %llu us, id remap %llu us, meta lookup %llu us, total
   %llu us`: what the boundary thread spent, a refused transaction included and a thrown one not counted; a call
-  refused before its preparation adds only to the total), and each refusal, BUSY and drop reason with its count. When the driver met boundaries after prompt graphs and no single-row decode
-  graph, it ends `; no single-row decode graph at %llu boundaries: every one read as a prompt, so nothing swapped`:
-  parallel slots or speculative decoding make every graph more than one row.
+  refused before its preparation adds only to the total), and each refusal, BUSY and drop reason with its count. When
+  the driver met boundaries after prompt graphs and no single-row decode graph, it ends `; no single-row decode
+  graph at %llu boundaries: every one read as a prompt, so nothing swapped`: parallel slots or speculative decoding
+  make every graph more than one row.
 - WARN `[MOE-SWAP] device %d: %s refused: %s (logged once per reason)`: `%s` is `evict` or `admit`, then the named
   move's final refusal reason. Logged as it happens, the first time each reason appears in each direction on the
   device's instance, so a run killed before backend free still says what the driver could not move.

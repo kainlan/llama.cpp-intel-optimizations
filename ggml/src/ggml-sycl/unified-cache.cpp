@@ -9646,8 +9646,8 @@ static unified_cache_key make_direct_stage_key(cache_entry_type           type,
 }
 
 // The two keys an expert's id is resolved by as it moves between the card and the host: its device entry's (the AOS
-// layout, which every named move and loan stages) and a host copy's. The loan's checks, its rollback and the restore
-// name them through these.
+// layout, which every named move and loan stages) and a host copy's. The loan, with its rollback and the restore,
+// copy_host_triplet_to_device and has_expert_source name them through these.
 static unified_cache_key expert_device_key(const ggml_sycl_cache_id & id) {
     return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);
 }

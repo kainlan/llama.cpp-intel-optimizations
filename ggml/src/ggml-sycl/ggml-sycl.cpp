@@ -23138,7 +23138,8 @@ struct ggml_sycl_expert_move_result {
     // How far the call's own give-backs moved the device WEIGHT zone's room epoch (ggml_sycl_expert_room_meter).
     uint64_t                                   room_self_delta = 0;
     // The call's cost to the boundary thread, in microseconds, which a refused call reports too. total_us is the
-    // whole call, on every exit that returns, a refusal before any preparation included. meta_us, copy_us and
+    // transaction's run and the settling of its outcomes, on every exit that returns, a refusal before any preparation
+    // included; building the list of moves is not timed. meta_us, copy_us and
     // remap_us are the parts the body times, so a call refused before its preparation leaves them 0. A call that
     // threw reports none of it: the entry rethrows before it copies the answer, and the swap driver counts a
     // transaction only once it has returned.
@@ -23172,6 +23173,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         moves[i].triplet   = i < n_evict ? request.evict[i] : request.admit[i - n_evict];
     }
     ggml_sycl_expert_loan_result answer;
+    // total_us runs from here to the answer copy below: the transaction run and the settle of its outcomes.
     const auto                   call_start = std::chrono::steady_clock::now();
     const ggml_sycl_txn_result   code       = ggml_sycl_expert_txn_run(
         ggml_sycl_expert_txn_direction::NAMED, device, moves.size(), 0, false, resolver, &answer, false, &moves);
@@ -29401,10 +29403,17 @@ std::string test_swap_prepare(test_loan_fixture & fx, int host_expert, int n_tab
         return "the retained store did not drain before the boundaries";
     }
     fx.cache->process_deferred_frees_public();
-    if (!moe_route_counts_install(fx.device, 1, n_table_experts)) {
-        return "the route table could not be installed";
+    if (!test_swap_install_table(fx.device, n_table_experts)) {
+        return "the route table installed is not the device's current one";
     }
     return {};
+}
+
+// A route table of one block and `n_experts` experts installed for `device`, and read back as the device's current
+// one: false when it is not (the device has no route table slot, which installs without replacing anything).
+bool test_swap_install_table(int device, int n_experts) {
+    const std::shared_ptr<moe_route_counts> table = moe_route_counts_install(device, 1, n_experts);
+    return table && moe_route_counts_current(device) == table;
 }
 
 // `pairs` routed decode pairs of block 0's `expert`, counted into the device's current route table.
@@ -29481,6 +29490,8 @@ std::string test_expert_swap_boundary_maps_an_evict_then_an_admit() {
             (unsigned long long) d->stats.txn_sent, (unsigned long long) d->stats.txn_total_us,
             (unsigned long long) d->stats.txn_copy_us);
     }
+    const uint64_t total_after_evict = d->stats.txn_total_us;
+    const uint64_t copy_after_evict  = d->stats.txn_copy_us;
     if (d->pending[0].block != 0 || d->pending[0].admit_expert != 2 || d->pending[0].evict_expert != 0 ||
         d->pending[0].restore) {
         return test_loan_fail("the pending admit is block %d expert %d for evicted expert %d (restore=%d), not 0, 2, 0",
@@ -29536,11 +29547,15 @@ std::string test_expert_swap_boundary_maps_an_evict_then_an_admit() {
             d->stats.refused.size(), d->stats.busy.size(), (unsigned long long) d->stats.boundaries,
             (unsigned long long) d->stats.decode_graphs);
     }
-    if (d->stats.txn_sent != 2 || d->stats.txn_total_us == 0 || d->stats.txn_copy_us == 0) {
+    // The figures add up over transactions, so the admit's own cost is what they grew by.
+    if (d->stats.txn_sent != 2 || d->stats.txn_total_us <= total_after_evict ||
+        d->stats.txn_copy_us <= copy_after_evict) {
         return test_loan_fail(
-            "after the admit boundary: txn_sent=%llu txn_total_us=%llu txn_copy_us=%llu (want 2, >0, >0)",
+            "after the admit boundary: txn_sent=%llu txn_total_us=%llu (was %llu) txn_copy_us=%llu (was %llu) (want 2, "
+            "more, more)",
             (unsigned long long) d->stats.txn_sent, (unsigned long long) d->stats.txn_total_us,
-            (unsigned long long) d->stats.txn_copy_us);
+            (unsigned long long) total_after_evict, (unsigned long long) d->stats.txn_copy_us,
+            (unsigned long long) copy_after_evict);
     }
     if (std::string why = fx.readmitted(0, 2); !why.empty()) {
         return "the driver's admit: " + why;
@@ -29595,8 +29610,8 @@ std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight() {
     }
 
     // The carry: a fresh table of the same shape.
-    if (!moe_route_counts_install(device, 1, 3)) {
-        return "the route table of the same shape could not be installed";
+    if (!test_swap_install_table(device, 3)) {
+        return "the route table of the same shape installed is not the device's current one";
     }
     test_swap_route(device, 0, 100);  // the evicted expert is now the hot one
     test_swap_route(device, 1, 5);
@@ -29653,8 +29668,8 @@ std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight() {
     if (!test_swap_report(device) || summaries() != 1) {
         return "a report with every boundary already reported printed its summary again";
     }
-    if (!moe_route_counts_install(device, 1, 4)) {
-        return "the route table of another shape could not be installed";
+    if (!test_swap_install_table(device, 4)) {
+        return "the route table of another shape installed is not the device's current one";
     }
     if (!test_swap_boundary(device, 1, 1, &resolver)) {
         return "the device's swap instance was claimed";
