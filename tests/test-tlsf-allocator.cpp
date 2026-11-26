@@ -1935,6 +1935,21 @@ static void test_expert_triplet_member_bytes() {
     std::cout << "test_expert_triplet_member_bytes: PASSED\n";
 }
 
+// What a triplet asks of the zone together: three slots when it has one, else
+// its members' own sizes summed, and the slot it has (0 for none).
+static void test_expert_triplet_zone_ask() {
+    const size_t                  iq4[3]  = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    const expert_triplet_zone_ask slotted = expert_triplet_zone_ask_of(iq4);
+    REQUIRE(slotted.slot == 921856 && "a slotted triplet asks its slot");
+    REQUIRE(slotted.total == 3 * 921856 && "and three of them");
+    const size_t                  mixed[3] = { MIXED_GATE_UP, MIXED_GATE_UP, MIXED_DOWN };
+    const expert_triplet_zone_ask own      = expert_triplet_zone_ask_of(mixed);
+    REQUIRE(own.slot == 0 && "a triplet with no slot says so");
+    REQUIRE(own.total == 2 * MIXED_GATE_UP + MIXED_DOWN && "and asks its members' own bytes");
+    REQUIRE(own.total != 3 * MIXED_DOWN && "not three of its largest member");
+    std::cout << "test_expert_triplet_zone_ask: PASSED\n";
+}
+
 // A triplet with no slot fragments the zone another way: a gate or up admit
 // splits a freed down-sized block and leaves a remainder no member fits.
 // Characterization of a known gap the slot rule leaves open on purpose.
@@ -2014,6 +2029,7 @@ int main() {
     test_expert_triplet_slot_bytes();
     test_expert_triplet_slot_padding_bound();
     test_expert_triplet_member_bytes();
+    test_expert_triplet_zone_ask();
     test_expert_swap_unslotted_mixed_quant_fragments();
     test_expert_swap_at_triplet_slot_admits_all();
 

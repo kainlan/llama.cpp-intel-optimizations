@@ -4212,8 +4212,9 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
 // expert under, key first; the lease on key's entry is the one returned. owner is the destination storage, minted
 // owner-first by the caller before it took any listed lock, so no allocation for the bytes runs under one: pinned host
 // storage that holds logical_bytes for a move to the host, and WEIGHT zone storage on the device for a move to the
-// device, exactly the triplet's slot (expert_triplet_slot_bytes() of the three members' staged_expert_bytes() as AOS,
-// from their type, ncols and logical_bytes), so every member of a triplet takes one WEIGHT-zone size.
+// device, exactly expert_triplet_member_bytes() of the three members' staged_expert_bytes() as AOS (from their type,
+// ncols and logical_bytes): the triplet's slot when it has one, so every member of such a triplet takes one WEIGHT-zone
+// size, else the member's own staged bytes.
 // type, ncols and logical_bytes are the weight's type, row width and bytes per expert (nb[2]), which the caller
 // resolves from its tensor. An expert's size is a fact of its tensor, never of a cache entry, whose storage may be
 // padded: each direction copies logical_bytes from offset 0 of its source, so a padded device entry's tail never
@@ -5053,9 +5054,9 @@ class unified_cache {
     // storage, which the direct mirror and the id mapping both name, with no device entry under the member's
     // direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry exists",
     // so a later boundary retries). A missing host copy refuses as "not lent", and one holding fewer than the member's
-    // logical_bytes as "host copy size". Each member's owner must be exactly the triplet's slot,
-    // expert_triplet_slot_bytes() of the three members' staged_expert_bytes() as AOS, never less than logical_bytes
-    // ("device storage size").
+    // logical_bytes as "host copy size". Each member's owner must be exactly expert_triplet_member_bytes() of the
+    // three members' staged_expert_bytes() as AOS (the triplet's slot when it has one, else the member's own staged
+    // bytes), never less than logical_bytes ("device storage size").
     // One member that fails refuses the triplet with a reason and leaves no state behind. Otherwise the three H2D
     // copies go on the BCS queue behind the host copy's writes, each moving logical_bytes from offset 0 of the host
     // copy and retaining its two owners until it completes, so the pinned storage outlives the read whatever happens to

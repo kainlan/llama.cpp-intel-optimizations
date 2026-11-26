@@ -3999,10 +3999,13 @@ def test_mutant_definitions_in_production_fail():
 # would pad the triplet by more than 1/128 of its members' own blocks), one gives each member's size from it
 # (expert_triplet_member_bytes, the slot or else the member's own staged size), and every mint of a member asks them:
 # the load's per-expert staging through ggml_sycl_expert_stage_bytes, the swap's and the refill's preparation, and the
-# cache's check of the storage it is handed; the planner charges each member of a slotted triplet the slot, at each
-# plan build and again after each multi-device pass that re-lays out experts, moving the device totals by the change.
-# The logical bytes stay the member's own: every copy moves them and no more. (The opt-in MXFP4 DPAS rollback restores
-# at the base layout's size: its reorder fill copies its whole destination, and MXFP4's members stage alike.)
+# cache's check of the storage it is handed; the planner charges each member of a slotted triplet the slot, and each
+# AOS member of a complete triplet with none its own staged size, at each plan build and again after each pass that
+# re-lays out experts (the single-device PP gate/up preparation, the pack, the I8 upgrades and the multi-device layout
+# passes), moving the totals of the device each changed entry is on, found by its target device, by the change, and
+# warning when that is past the device's room. The load's bulk staging, one stride for every expert, declines a tensor
+# whose triplets' slots exceed that stride, and the opt-in DPAS rollback restores an AOS base at its triplet's slot by
+# the load's own plain copy. The logical bytes stay the member's own: every copy moves them and no more.
 SLOT_HPP = read("ggml/src/ggml-sycl/expert-slot.hpp")
 SLOT_SIG = "inline size_t expert_triplet_slot_bytes(const size_t (&staged)[3])"
 SLOT_ROUND = "const size_t rounded = tlsf_allocator::round_request(bytes, tlsf_allocator::block_grain);"
@@ -4015,21 +4018,49 @@ MEMBER_BODY = "const size_t slot = expert_triplet_slot_bytes(staged); return slo
 RECHARGE_SIG = ("static inline std::vector<placement_charge_change> placement_entries_recharge_expert_slots("
                 "std::vector<placement_entry> & entries)")
 RECHARGE_CHARGES = "placement_entries_charge_expert_slots(entries);"
-PLANNER_RECHARGE_SIG = ("static size_t planner_recharge_expert_slots(placement_plan & plan, RoomOf room_of, "
-                        "const char * pass)")
-PLANNER_RECHARGE_READ = "placement_entries_recharge_expert_slots(plan.entries)"
-PLANNER_RECHARGE_MOVE = ("over += placement_charge_move(c.old_charge, c.new_charge, *room.remaining, "
-                         "plan.per_device_vram[room.index], plan.weight_vram_bytes, plan.vram_bytes);")
-PLANNER_RECHARGE_HOST = "if (!e.on_device) { continue; }"
+RECHARGE_ON_SIG = ("static inline size_t placement_entries_recharge_expert_slots_on("
+                   "std::vector<placement_entry> & entries,")
+RECHARGE_ON_READ = "placement_entries_recharge_expert_slots(entries)"
+RECHARGE_ON_HOST = "if (!e.on_device) { continue; }"
+RECHARGE_ON_KEY = "if (d.device_id != e.target_device || !d.remaining) { continue; }"
+RECHARGE_ON_MOVE = ("over += placement_charge_move(c.old_charge, c.new_charge, *d.remaining, "
+                    "d.device_vram ? *d.device_vram : untracked, weight_vram, vram);")
+PLANNER_RECHARGE_SIG = "static size_t planner_recharge_expert_slots(placement_plan & plan,"
+PLANNER_RECHARGE_CALL = ("const size_t over = placement_entries_recharge_expert_slots_on(plan.entries, devices, "
+                         "plan.weight_vram_bytes, plan.vram_bytes);")
+PLANNER_RECHARGE_WARN = 'if (over > 0) { GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged %.1f MB past the '
+ROOM_ONE_SIG = "static std::vector<placement_recharge_device> planner_recharge_device(int device_id,"
+ROOM_ONE_BODY = ("std::vector<placement_recharge_device> devices; "
+                 "devices.push_back({ device_id, &remaining, device_vram }); return devices;")
+ROOM_ALL_SIG = "static std::vector<placement_recharge_device> planner_recharge_devices_of(placement_plan & plan,"
+ROOM_ALL_BODY = ("std::vector<placement_recharge_device> devices; "
+                 "for (size_t d = 0; d < budgets.size() && d < remaining.size(); ++d) { "
+                 "size_t * device_vram = d < plan.per_device_vram.size() ? &plan.per_device_vram[d] : nullptr; "
+                 "devices.push_back({ budgets[d].device_id, &remaining[d], device_vram }); } return devices;")
 MULTI_LAYOUTS_SIG = "static void apply_multi_moe_per_target_layouts(placement_plan & plan,"
 MULTI_UPGRADE_SIG = "static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,"
-MULTI_RECHARGE = "planner_recharge_expert_slots(plan, [&]("
+MULTI_RECHARGE = "planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),"
 MULTI_LAYOUT_SET = "entry.dst_size = new_size;"
+UPGRADE_RECHARGE = ("planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining, "
+                    "&plan.per_device_vram[device_index]),")
+SINGLE_RECHARGE = "planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining),"
+PACK_PREPARE = ("prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope); } "
+                "placement_entries_charge_expert_slots(plan.entries); auto moe_groups = build_moe_triplet_groups(")
+PACK_RECHARGE = SINGLE_RECHARGE + ' "triplet pack");'
+PACK_HOST_SET = "entry.dst_size = entry.src_size;"
+DOWN_I8_RECHARGE = SINGLE_RECHARGE + ' "I8 down layout upgrades");'
+GATE_UP_I8_CALL = "maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);"
+GATE_UP_I8_RECHARGE = SINGLE_RECHARGE + ' "I8 gate/up layout upgrades");'
+MULTI_DOWN_I8_RECHARGE = MULTI_RECHARGE + ' "I8 down layout upgrades");'
 PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
 PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
 PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
 CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries)"
 CHARGE_SET = "e->vram_charge_size = placement_vram_charge_bytes(slot);"
+CHARGE_COMPLETE = "if (t.ambiguous || !members[0] || !members[1] || !members[2]) { continue; }"
+CHARGE_RESET = ("if (slot == 0) { for (placement_entry * e : t.e) { const size_t staged = "
+                "moe_expert_entry_staged_bytes(*e); if (staged != 0) { "
+                "e->vram_charge_size = placement_vram_charge_bytes(staged); } } continue; }")
 STAGE_BYTES_SIG = "static size_t ggml_sycl_expert_stage_bytes(const ggml_sycl::placement_plan & plan,"
 STAGE_BYTES_BODY = ("if (layout != GGML_LAYOUT_AOS) { return staged; } const size_t slot = "
                     "ggml_sycl::moe_expert_triplet_slot_bytes(plan, layer, expert); return slot >= staged ? slot : "
@@ -4039,6 +4070,17 @@ PRELOAD_SLOT = ("expert_preload_bytes = ggml_sycl_expert_stage_bytes(*ggml_sycl_
 PRELOAD_STAGE = ("ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, expert_size, "
                  "expert_preload_bytes, expert_preload_layout,")
 PRELOAD_LAYER = "expert_slot_layer = placement.layer_id;"
+BULK_LAYER = "bulk_layers.push_back(placement.layer_id);"
+BULK_SLOT = ("if (bulk_layout == GGML_LAYOUT_AOS) { for (size_t e = 0; e < bulk_layers.size(); ++e) { "
+             "if (ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), bulk_layers[e], "
+             "static_cast<int>(e), bulk_layout, bulk_expert_bytes) != bulk_expert_bytes) { return false; } } }")
+BULK_STAGE = "auto bulk_result = ggml_sycl::unified_cache_direct_stage_expert_tensor("
+DPAS_AOS_FILL = ("if (base_layout == GGML_LAYOUT_AOS) { restore_fill_fn = nullptr; restore_fill = nullptr; "
+                 "if (have_plan) {")
+DPAS_SLOT = ("restore_bytes = ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), placement.layer_id, "
+             "e, base_layout, expert_base_bytes);")
+DPAS_STAGE = ("auto rollback = ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, tensor->nb[2], "
+              "restore_bytes, base_layout, restore_fill_fn, restore_fill, s1_preload_q, &rollback_handle);")
 PLANNER_CHARGES = "placement_entries_charge_expert_slots(plan.entries);"
 FIXTURES_END = "#endif  // GGML_SYCL_PRIVATE_TESTING"
 FIXTURES_IF = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
@@ -4056,16 +4098,23 @@ def production(text: str) -> str:
 
 def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_hpp: str, slot_hpp: str) -> bool:
     """One function gives the slot, from the largest of the members' staged sizes rounded to the zone's grain, and
-    none past 1/128 of padding; one gives each member's size from it. The plan asks the slot of a triplet's three
-    entries, the preparation and the cache ask each member's size of the three members they are handed; the load's
-    per-expert staging mints at the plan's slot, through one helper, and the planner charges each member the slot at
-    each of its three plan builds and again after each of the two multi-device layout passes, moving the device
-    totals of each entry on a device by its change. Nothing else computes a slot."""
+    none past 1/128 of padding; one gives each member's size from it, and the plan header asks it in one place only.
+    The plan asks the slot of a triplet's three entries, the preparation and the cache ask each member's size of the
+    three members they are handed; the load's per-expert staging mints at the plan's slot, through one helper, its bulk
+    staging declines a tensor a slot would not fit, and the DPAS rollback restores an AOS base at the slot by the plain
+    copy. The planner charges each member of a slotted triplet the slot, and each AOS member of a complete triplet with
+    none its own staged size, at each of its three plan builds and after the single-device PP preparation, and
+    re-charges with accounting after the pack, the I8 upgrades and each multi-device layout pass: the change of each
+    entry on a device moves the totals of the device in the pass's list whose id is its target device (each list's
+    device and room taken from the pass's own, index by index), and a charge past the room warns. Nothing else
+    computes a slot."""
     s = norm(production(sycl))
     c = norm(production(cache))
     p = norm(plan_hpp)
     h = norm(slot_hpp)
     slot_body = body(h, SLOT_SIG)
+    charge = body(p, CHARGE_SIG)
+    recharge_on = body(p, RECHARGE_ON_SIG)
     planner_recharge = body(c, PLANNER_RECHARGE_SIG)
     multi_layouts = body(c, MULTI_LAYOUTS_SIG)
     multi_upgrade = body(c, MULTI_UPGRADE_SIG)
@@ -4073,18 +4122,30 @@ def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_h
             and slot_body.rstrip().endswith(SLOT_PAD + " }")
             and body(h, MEMBER_SIG).strip() == "{ " + MEMBER_BODY + " }"
             and body(p, RECHARGE_SIG).count(RECHARGE_CHARGES) == 1
-            and planner_recharge.count(PLANNER_RECHARGE_READ) == 1
-            and planner_recharge.count(PLANNER_RECHARGE_MOVE) == 1
-            and ordered(planner_recharge, PLANNER_RECHARGE_READ, PLANNER_RECHARGE_HOST, PLANNER_RECHARGE_MOVE)
+            and recharge_on.count(RECHARGE_ON_READ) == 1 and recharge_on.count(RECHARGE_ON_MOVE) == 1
+            and ordered(recharge_on, RECHARGE_ON_READ, RECHARGE_ON_HOST, RECHARGE_ON_KEY, RECHARGE_ON_MOVE)
+            and planner_recharge.count(PLANNER_RECHARGE_CALL) == 1
+            and ordered(planner_recharge, PLANNER_RECHARGE_CALL, PLANNER_RECHARGE_WARN)
+            and planner_recharge.count("GGML_LOG") == 1
+            and body(c, ROOM_ONE_SIG).strip() == "{ " + ROOM_ONE_BODY + " }"
+            and body(c, ROOM_ALL_SIG).strip() == "{ " + ROOM_ALL_BODY + " }"
             and multi_layouts.count(MULTI_RECHARGE) == 1 and ordered(multi_layouts, MULTI_LAYOUT_SET, MULTI_RECHARGE)
-            and multi_upgrade.count(MULTI_RECHARGE) == 1 and ordered(multi_upgrade, MULTI_LAYOUT_SET, MULTI_RECHARGE)
-            and len(re.findall(r"\bplanner_recharge_expert_slots\(", c)) == 3
+            and multi_upgrade.count(UPGRADE_RECHARGE) == 1
+            and ordered(multi_upgrade, MULTI_LAYOUT_SET, UPGRADE_RECHARGE)
+            and c.count(PACK_PREPARE) == 1 and ordered(c, PACK_PREPARE, PACK_HOST_SET, PACK_RECHARGE)
+            and ordered(c, PACK_RECHARGE, DOWN_I8_RECHARGE, GATE_UP_I8_CALL, GATE_UP_I8_RECHARGE)
+            and c.count(SINGLE_RECHARGE) == 3 and c.count(MULTI_DOWN_I8_RECHARGE) == 2
+            and len(re.findall(r"\bplanner_recharge_expert_slots\(", c)) == 8
             and body(p, PLAN_SLOT_SIG).count(PLAN_SLOT_CALL) == 1
+            and len(re.findall(r"\bexpert_triplet_slot_bytes\(", p)) == 1
             and PLAN_ENTRY_STAGED in p and p.count(CHARGE_SET) == 1 and ordered(p, CHARGE_SIG, CHARGE_SET)
+            and ordered(charge, CHARGE_COMPLETE, CHARGE_RESET, CHARGE_SET)
             and body(s, STAGE_BYTES_SIG).rstrip().endswith(STAGE_BYTES_BODY)
             and s.count(PRELOAD_LAYER) == 1 and s.count(PRELOAD_SLOT) == 1 and s.count(PRELOAD_STAGE) == 1
             and ordered(s, PRELOAD_LAYER, PRELOAD_SLOT, PRELOAD_STAGE)
-            and len(re.findall(r"\bggml_sycl_expert_stage_bytes\(", s)) == 2
+            and s.count(BULK_SLOT) == 1 and ordered(s, BULK_LAYER, BULK_SLOT, BULK_STAGE)
+            and s.count(DPAS_SLOT) == 1 and ordered(s, DPAS_AOS_FILL, DPAS_SLOT, DPAS_STAGE)
+            and len(re.findall(r"\bggml_sycl_expert_stage_bytes\(", s)) == 4
             and len(re.findall(r"\bexpert_triplet_slot_bytes\(", s)) == 0
             and len(re.findall(r"\bexpert_triplet_slot_bytes\(", c)) == 0
             and len(re.findall(r"\bexpert_triplet_member_bytes\(", s)) == 1
@@ -4157,24 +4218,125 @@ def test_mutant_member_takes_the_slot_even_with_none_fails():
 def test_mutant_multi_layouts_skip_the_recharge_fails():
     """The per-target layout pass charges a member it moved into AOS its own size, and nothing charges the slot back:
     the plan under-charges what the load stages, an OOM at load."""
-    mutant = _once_in(CACHE, MULTI_LAYOUTS_SIG, MULTI_RECHARGE, "skip_recharge(plan, [&](")
+    mutant = _once_in(CACHE, MULTI_LAYOUTS_SIG, MULTI_RECHARGE, "skip_recharge(plan, planner_recharge_devices_of(plan, "
+                      "device_budgets, remaining),")
     assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
 
 
 def test_mutant_multi_upgrade_skips_the_recharge_fails():
-    mutant = _once_in(CACHE, MULTI_UPGRADE_SIG, MULTI_RECHARGE, "skip_recharge(plan, [&](")
+    mutant = _once_in(CACHE, MULTI_UPGRADE_SIG, UPGRADE_RECHARGE, "skip_recharge(plan, planner_recharge_device("
+                      "device_id, remaining, &plan.per_device_vram[device_index]),")
     assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
 
 
 def test_mutant_recharge_moves_no_total_fails():
     """The re-charge sets the slot on the entries and leaves every device total where the pass put it."""
-    mutant = _once_in(CACHE, PLANNER_RECHARGE_SIG, PLANNER_RECHARGE_MOVE, "(void) c;")
-    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+    mutant = _once_in(PLAN_HPP, RECHARGE_ON_SIG, RECHARGE_ON_MOVE, "(void) c;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
 
 
 def test_mutant_recharge_charges_nothing_fails():
     mutant = _once_in(PLAN_HPP, RECHARGE_SIG, RECHARGE_CHARGES, "")
     assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_a_second_slot_call_in_the_plan_header_fails():
+    """A second place in the plan header asking the slot of staged sizes, which could disagree with the plan's own."""
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, CHARGE_SET, CHARGE_SET + " (void) expert_triplet_slot_bytes({ 1, 2, 3 });")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_lost_slot_keeps_its_charge_fails():
+    """A triplet that lost its slot keeps charging its AOS members the slot: the plan over-charges forever."""
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, "e->vram_charge_size = placement_vram_charge_bytes(staged);", "(void) e;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_recharge_ignores_the_target_device_fails():
+    """Every change moves the first device's room, whatever device the entry is on."""
+    mutant = _once_in(PLAN_HPP, RECHARGE_ON_SIG, RECHARGE_ON_KEY, "if (!d.remaining) { continue; }")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_multi_room_list_is_empty_fails():
+    """The multi-device list names no device, so no change moves any room."""
+    mutant = _once_in(CACHE, ROOM_ALL_SIG, "devices.push_back({ budgets[d].device_id, &remaining[d], device_vram });",
+                      "(void) device_vram;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_room_keys_every_room_to_the_first_device_fails():
+    mutant = _once_in(CACHE, ROOM_ALL_SIG, "{ budgets[d].device_id, &remaining[d],", "{ budgets[0].device_id, "
+                      "&remaining[d],")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_room_reads_another_devices_room_fails():
+    mutant = _once_in(CACHE, ROOM_ALL_SIG, "&remaining[d], device_vram", "&remaining[0], device_vram")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_room_ignores_its_device_fails():
+    mutant = _once_in(CACHE, ROOM_ONE_SIG, "{ device_id, &remaining, device_vram }", "{ -1, &remaining, device_vram }")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_room_reads_no_room_fails():
+    mutant = _once_in(CACHE, ROOM_ONE_SIG, "{ device_id, &remaining, device_vram }",
+                      "{ device_id, nullptr, device_vram }")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_recharge_overflow_demoted_to_debug_fails():
+    mutant = _once_in(CACHE, PLANNER_RECHARGE_SIG, 'GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged',
+                      'GGML_LOG_DEBUG("[PLACEMENT-MOE] %s: expert slots re-charged')
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_recharge_overflow_prefix_changed_fails():
+    mutant = _once_in(CACHE, PLANNER_RECHARGE_SIG, '"[PLACEMENT-MOE] %s: expert slots re-charged',
+                      '"[PLACEMENT-MOE-MULTI] %s: expert slots re-charged')
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_prepare_leaves_the_lost_slot_charged_fails():
+    """The single-device PP preparation moves a gate or up to SOA and the pack reads the stale slot charge."""
+    mutant = _once(CACHE, PACK_PREPARE, PACK_PREPARE.replace("placement_entries_charge_expert_slots(plan.entries); ",
+                                                             ""))
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_i8_down_skips_the_recharge_fails():
+    mutant = _once(CACHE, DOWN_I8_RECHARGE, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_i8_recharge_before_the_gate_up_upgrade_fails():
+    mutant = _once(_once(CACHE, GATE_UP_I8_RECHARGE, ""), GATE_UP_I8_CALL, GATE_UP_I8_RECHARGE + " " + GATE_UP_I8_CALL)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_i8_down_skips_the_recharge_fails():
+    n = norm(CACHE)
+    mutant = n.replace(MULTI_DOWN_I8_RECHARGE, "", 1)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_bulk_stages_past_the_slot_fails():
+    """The bulk copy stages a slotted triplet's members at their own stride while the plan charges the slot."""
+    mutant = _once(SYCL, BULK_SLOT, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_dpas_restores_at_the_base_size_fails():
+    mutant = _once(SYCL, DPAS_STAGE, DPAS_STAGE.replace("restore_bytes, base_layout", "expert_base_bytes, base_layout"))
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_dpas_restores_aos_by_the_reorder_fill_fails():
+    """The reorder fill writes its whole destination, so at the slot it would copy past the expert's bytes."""
+    mutant = _once(SYCL, DPAS_AOS_FILL, "if (base_layout == GGML_LAYOUT_AOS) { if (have_plan) {")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
 
 
 if __name__ == "__main__":

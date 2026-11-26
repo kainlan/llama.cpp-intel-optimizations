@@ -397,10 +397,16 @@ nearly free: the padding, three slots less the members' grain-rounded sizes,
 is at most 1/128 of those sizes. A triplet whose members differ by quant type
 (a Q4_K gate and up beside a Q5_K down) would pad by 14% or more, so each of
 its members keeps its own staged size everywhere, and the swap can still
-fragment such a zone (a gate split from a freed down-sized block). The
-multi-device layout passes re-charge the slot after they re-layout experts
-(`placement_entries_recharge_expert_slots`), so a member they move into AOS is
-charged what the load stages. A
+fragment such a zone (a gate split from a freed down-sized block). Every
+planner pass that re-lays out experts re-charges the triplets after it (the
+single-device PP gate/up preparation, the triplet pack, the I8 upgrades and the
+multi-device layout passes; `placement_entries_recharge_expert_slots_on`): a
+member moved into AOS is charged the slot its triplet now has, a triplet that
+lost its slot charges its AOS members their own staged sizes again, and the
+device totals move by each change. The load stages each member at that size: a
+tensor whose experts' triplets have a slot past their staged bytes is not
+bulk-staged, since the bulk copy has one stride, and is staged expert by expert;
+a DPAS promotion that rolls back restores an AOS base at its triplet's slot. A
 host copy may be longer than the expert when another writer padded it; a loan
 or an evict copies only the expert's bytes, so the host copies they make hold
 exactly `nb[2]` and a padded device entry's tail stays on the card. The copy

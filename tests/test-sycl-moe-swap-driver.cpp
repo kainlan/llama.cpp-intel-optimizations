@@ -1237,37 +1237,50 @@ static void test_a_throw_leaves_a_held_admit_pending() {
     CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
 }
 
-// The zone-refusal line names what the refused triplet needed (its three members at one slot each), the largest free
-// block the zone had when it refused, and what the zone had free after the batch, the sizes in bytes, under the
-// driver's prefix.
+// The zone-refusal line names what the refused triplet needed (three slots for a triplet with a slot, its members'
+// own bytes summed for one with none), the largest free block the zone had when it refused, and what the zone had
+// free after the batch, the sizes in bytes, under the driver's prefix.
 static void test_the_zone_refusal_line_names_its_figures() {
-    const std::string line = ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 921856, 917504, 331806720, 924928);
+    const std::string line =
+        ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 921856, 3 * 921856, 917504, 331806720, 924928);
     CHECK(line ==
           "[MOE-SWAP] device 1: WEIGHT zone refused 276 of 300 admits for room: a triplet needs 3 x 921856 = 2765568 "
           "bytes, largest free block at refusal 917504 bytes; after the batch zone_available 331806720 bytes, "
           "zone_largest_free 924928 bytes");
     std::printf("  zone-refusal line: %s\n", line.c_str());
+
+    // A Q4_K gate and up beside a Q5_K down: no slot, so the line names the members' own sum, not three of one.
+    const size_t      own = 2 * 589824 + 720896;
+    const std::string unslotted =
+        ggml_sycl::moe_swap_zone_refusal_line(0, 90, 1152, 0, own, 1179648, 201457664, 1179648);
+    CHECK(unslotted ==
+          "[MOE-SWAP] device 0: WEIGHT zone refused 90 of 1152 admits for room: a triplet needs 1900544 bytes, its "
+          "members at their own sizes (no slot), largest free block at refusal 1179648 bytes; after the batch "
+          "zone_available 201457664 bytes, zone_largest_free 1179648 bytes");
+    CHECK(unslotted.find(" x ") == std::string::npos);
 }
 
-// The free-block census names the zone's free blocks and bytes, how many slots they hold, and the largest sizes with
-// their counts, largest first, cut at `top` with the rest counted.
+// The free-block census names the zone's free blocks and bytes, how many allocations of the refused member's bytes
+// they hold (each block whole), and the largest sizes with their counts, largest first, cut at `top` with the rest
+// counted.
 static void test_the_zone_free_census_line_names_the_largest_sizes() {
     const std::vector<size_t> free_sizes = { 262144, 917504, 2000000, 917504, 262144, 921344, 917504, 262144, 262144 };
     const std::string         line       = ggml_sycl::moe_swap_zone_free_census_line(1, free_sizes, 921856, 3);
     CHECK(line ==
           "[MOE-SWAP] device 1: WEIGHT zone free blocks at the first refusal: 9 blocks, 6722432 bytes, room for 2 "
-          "slots of 921856 bytes; largest: 2000000 x 1, 921344 x 1, 917504 x 3, and 4 blocks of 1 smaller size");
+          "allocations of the refused member's 921856 bytes; largest: 2000000 x 1, 921344 x 1, 917504 x 3, and 4 "
+          "blocks of 1 smaller size");
     std::printf("  zone-census line: %s\n", line.c_str());
 
     const std::string all = ggml_sycl::moe_swap_zone_free_census_line(0, { 512, 1024, 512 }, 2048, 8);
     CHECK(all ==
           "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 3 blocks, 2048 bytes, room for 0 "
-          "slots of 2048 bytes; largest: 1024 x 1, 512 x 2");
+          "allocations of the refused member's 2048 bytes; largest: 1024 x 1, 512 x 2");
 
     const std::string none = ggml_sycl::moe_swap_zone_free_census_line(0, {}, 2048, 8);
     CHECK(none ==
-          "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 0 blocks, 0 bytes, room for 0 slots of "
-          "2048 bytes; largest: none");
+          "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 0 blocks, 0 bytes, room for 0 "
+          "allocations of the refused member's 2048 bytes; largest: none");
 }
 
 int main() {

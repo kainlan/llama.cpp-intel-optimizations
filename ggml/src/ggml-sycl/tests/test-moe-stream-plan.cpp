@@ -800,6 +800,80 @@ void test_charge_move() {
     CHECK(small_remaining == 200 && small_device == 0 && small_weight == 0 && small_vram == 0);
 }
 
+// A layout pass moves a slotted triplet's gate out of AOS, charging it its new layout's size: the triplet has no slot
+// now, so its AOS members go back to their own charge. The up member gives its slot back (921856 -> 921600); the down
+// member's own charge rounds to the slot already, so it does not change. A second re-charge changes nothing.
+void test_recharge_gives_back_a_lost_slot() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entries_charge_expert_slots(entries);
+    CHECK(entries[1].vram_charge_size == 921856);
+    entries[0].layout           = GGML_LAYOUT_SOA;
+    entries[0].vram_charge_size = 950272;
+    const std::vector<ggml_sycl::placement_charge_change> changes =
+        ggml_sycl::placement_entries_recharge_expert_slots(entries);
+    CHECK(changes.size() == 1);
+    if (changes.size() == 1) {
+        CHECK(changes[0].index == 1 && changes[0].old_charge == 921856 && changes[0].new_charge == 921600);
+    }
+    CHECK(entries[0].vram_charge_size == 950272 && entries[1].vram_charge_size == 921600);
+    CHECK(entries[2].vram_charge_size == 921856);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots(entries).empty());
+}
+
+// The accounted re-charge moves the totals of the device each changed entry is on, found by its target device among
+// the devices given: a device with no per-device total (a single-device plan) still moves its remaining room and the
+// plan's totals, and an entry on the host or on a device not given moves nothing.
+void test_recharge_on_moves_the_target_devices_room() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    for (size_t i = 3; i < 6; ++i) {
+        entries[i].target_device = 1;
+    }
+    for (size_t i = 6; i < 9; ++i) {
+        entries[i].on_device = false;
+    }
+    std::vector<ggml_sycl::placement_entry> plus = slot_triplets();
+    for (ggml_sycl::placement_entry & e : plus) {
+        e.layer_id      = 1;
+        e.target_device = 7;
+    }
+    entries.insert(entries.end(), plus.begin(), plus.end());
+    entries[3].vram_charge_size = 1000000;  // the mixed triplet on device 1 was charged more than its own size
+    entries[6].vram_charge_size = 1;        // a host member's charge moves no device total
+
+    size_t remaining0 = 10000;
+    size_t vram0      = 50000000;
+    size_t remaining1 = 20000;
+    size_t vram1      = 60000000;
+    size_t weight     = 70000000;
+    size_t vram       = 80000000;
+
+    const std::vector<ggml_sycl::placement_recharge_device> devices = {
+        { 1, &remaining1, &vram1  },
+        { 0, &remaining0, nullptr },
+    };
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(entries, devices, weight, vram) == 0);
+    // Device 0: gate and up take the slot, 256 bytes each.
+    CHECK(remaining0 == 10000 - 512 && vram0 == 50000000);
+    // Device 1: the mixed gate gives back what it was charged past its own size.
+    CHECK(remaining1 == 20000 + (1000000 - 589824) && vram1 == 60000000 - (1000000 - 589824));
+    CHECK(weight == 70000000 + 512 - (1000000 - 589824) && vram == 80000000 + 512 - (1000000 - 589824));
+    // Device 7 is not given: its slotted triplet is charged the slot and moves no total.
+    CHECK(entries[9].vram_charge_size == 921856 && entries[10].vram_charge_size == 921856);
+
+    // Past a device's remaining room the slot is still charged, and the excess is returned.
+    std::vector<ggml_sycl::placement_entry> tight           = slot_triplets();
+    size_t                                  remaining_tight = 300;
+    size_t                                  weight_tight    = 0;
+    size_t                                  vram_tight      = 0;
+
+    const std::vector<ggml_sycl::placement_recharge_device> tight_devices = {
+        { 0, &remaining_tight, nullptr },
+    };
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 212);
+    CHECK(remaining_tight == 0 && weight_tight == 512 && vram_tight == 512);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -894,6 +968,8 @@ int main() {
     test_charge_expert_slots_takes_the_slot_only_where_nearly_free();
     test_recharge_reports_each_changed_charge();
     test_charge_move();
+    test_recharge_gives_back_a_lost_slot();
+    test_recharge_on_moves_the_target_devices_room();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);

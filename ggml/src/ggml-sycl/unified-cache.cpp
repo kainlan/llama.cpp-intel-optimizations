@@ -34709,36 +34709,45 @@ static void add_multi_moe_decode_secondary_alternates(placement_plan &          
 }
 
 // After a pass that re-laid out expert entries, charging each the size it now stages alone: charge every member of a
-// triplet with a slot the slot again, as the load stages it, and move the totals of the device each changed entry is
-// on by its change. A host entry's charge moves no device total, and an entry on a device `room_of` gives no room for
-// moves none either, as the pass that changed it accounts only those devices. A device short of the difference is
-// still charged it, since the load stages the slot whatever the plan says, and the plan warns how far past its budget
-// that put the device. Returns the bytes charged past every device's remaining room.
-struct planner_device_room {
-    size_t   index     = 0;        // the device's index in plan.per_device_vram
-    size_t * remaining = nullptr;  // its remaining room, null for a device the pass does not account
-};
-
-template <typename RoomOf>
-static size_t planner_recharge_expert_slots(placement_plan & plan, RoomOf room_of, const char * pass) {
-    size_t over = 0;
-    for (const placement_charge_change & c : placement_entries_recharge_expert_slots(plan.entries)) {
-        const placement_entry & e = plan.entries[c.index];
-        if (!e.on_device) {
-            continue;
-        }
-        const planner_device_room room = room_of(e.target_device);
-        if (!room.remaining || room.index >= plan.per_device_vram.size()) {
-            continue;
-        }
-        over += placement_charge_move(c.old_charge, c.new_charge, *room.remaining, plan.per_device_vram[room.index],
-                                      plan.weight_vram_bytes, plan.vram_bytes);
-    }
+// triplet with a slot the slot again, as the load stages it, give a triplet that lost its slot its members' own
+// charges back, and move the totals of the device each changed entry is on by its change
+// (placement_entries_recharge_expert_slots_on). An entry on a device `devices` does not name moves no total, as the
+// pass that changed it accounts only those devices. A device short of the difference is still charged it, since the
+// load stages the slot whatever the plan says, and the plan warns how far past its budget that put the devices.
+// Returns the bytes charged past every device's remaining room.
+static size_t planner_recharge_expert_slots(placement_plan &                               plan,
+                                            const std::vector<placement_recharge_device> & devices,
+                                            const char *                                   pass) {
+    const size_t over =
+        placement_entries_recharge_expert_slots_on(plan.entries, devices, plan.weight_vram_bytes, plan.vram_bytes);
     if (over > 0) {
-        GGML_LOG_WARN("[PLACEMENT-MOE-MULTI] %s: expert slots re-charged %.1f MB past the devices' remaining room\n",
-                      pass, over / (1024.0 * 1024.0));
+        GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged %.1f MB past the devices' remaining room\n", pass,
+                      over / (1024.0 * 1024.0));
     }
     return over;
+}
+
+// The one device a single-device pass accounts, for planner_recharge_expert_slots: `device_id` with its remaining room
+// and its per-device total, which a single-device plan does not keep (null).
+static std::vector<placement_recharge_device> planner_recharge_device(int      device_id,
+                                                                      size_t & remaining,
+                                                                      size_t * device_vram = nullptr) {
+    std::vector<placement_recharge_device> devices;
+    devices.push_back({ device_id, &remaining, device_vram });
+    return devices;
+}
+
+// The devices a multi-device pass accounts, for planner_recharge_expert_slots: device_budgets[d] with remaining[d] and
+// the plan's per-device total d.
+static std::vector<placement_recharge_device> planner_recharge_devices_of(placement_plan &                   plan,
+                                                                          const std::vector<device_budget> & budgets,
+                                                                          std::vector<size_t> & remaining) {
+    std::vector<placement_recharge_device> devices;
+    for (size_t d = 0; d < budgets.size() && d < remaining.size(); ++d) {
+        size_t * device_vram = d < plan.per_device_vram.size() ? &plan.per_device_vram[d] : nullptr;
+        devices.push_back({ budgets[d].device_id, &remaining[d], device_vram });
+    }
+    return devices;
 }
 
 static void apply_multi_moe_per_target_layouts(placement_plan &                   plan,
@@ -34872,16 +34881,8 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
     }
 
     // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot.
-    planner_recharge_expert_slots(
-        plan,
-        [&](int device_id) {
-            const auto it = device_to_index.find(device_id);
-            if (it == device_to_index.end() || it->second >= remaining.size()) {
-                return planner_device_room{};
-            }
-            return planner_device_room{ it->second, &remaining[it->second] };
-        },
-        "per-target layouts");
+    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                  "per-target layouts");
 
     GGML_LOG_INFO(
         "[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=%zu host_changed=%zu xmx_tiled=%zu "
@@ -34979,12 +34980,9 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
     }
     // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. Only this
     // device's entries changed, so only its totals move.
-    planner_recharge_expert_slots(
-        plan,
-        [&](int target) {
-            return target == device_id ? planner_device_room{ device_index, &remaining } : planner_device_room{};
-        },
-        "primary executor layout upgrades");
+    planner_recharge_expert_slots(plan,
+                                  planner_recharge_device(device_id, remaining, &plan.per_device_vram[device_index]),
+                                  "primary executor layout upgrades");
 
     if (upgraded_entries > 0) {
         GGML_LOG_INFO(
@@ -39148,6 +39146,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         if (!planner_xmx_moe_forced()) {
             prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope);
         }
+        // A gate or up moved to SOA above leaves its triplet without a slot, and its AOS members keep the slot's charge
+        // until charged again. No expert is placed yet, so no total moves; the pack reads these charges.
+        placement_entries_charge_expert_slots(plan.entries);
         auto   moe_groups             = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
         size_t pp_alt_groups          = 0;
         size_t pp_alt_entries         = 0;
@@ -39266,8 +39267,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             }
         }
         // A host expert now stages as AOS, so its triplet may have a slot it lacked in another layout, and the charge a
-        // later move to the device reads is the slot's.
-        placement_entries_charge_expert_slots(plan.entries);
+        // later move to the device reads is the slot's. The pack charged each device triplet as charged above, so a
+        // device entry's charge does not change here; were it to, its change moves the totals.
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining), "triplet pack");
         room.expert_bytes  = stats.device_bytes;
         room.expert_groups = stats.device_groups;
 
@@ -39289,7 +39291,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         }
+        // An I8 member leaves AOS, so its triplet loses its slot and the AOS members give it back before the gate/up
+        // upgrade reads the room. A single-device plan keeps no per-device total.
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining), "I8 down layout upgrades");
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining),
+                                      "I8 gate/up layout upgrades");
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         record_moe_block_device_slots(plan, moe_groups);
         log_moe_spread_placement("PLACEMENT-MOE", plan, kv_info, stats.hotness, "every routed expert fits");
@@ -40888,6 +40895,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             if (!plan.per_device_vram.empty()) {
                 plan.per_device_vram[0] += primary_down_charged;
             }
+            planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                          "I8 down layout upgrades");
         }
         if (device_budgets.size() > 1) {
             std::vector<double> moe_device_scores(device_budgets.size(), 1.0);
@@ -41357,6 +41366,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     add_multi_moe_pp_executable_alternates(plan, remaining, device_budgets, kv_info, envelope);
                 }
                 plan.per_device_vram[0] += primary_down_charged;
+                planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                              "I8 down layout upgrades");
                 GGML_LOG_INFO(
                     "[PLACEMENT-MOE-MULTI] secondary executor layout is selected per planned route; current secondary "
                     "capability remains SOA until grouped secondary XMX dispatch is implemented\n");

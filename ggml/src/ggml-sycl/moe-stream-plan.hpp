@@ -1426,9 +1426,11 @@ static inline size_t moe_expert_triplet_slot_bytes(const placement_plan & plan, 
 }
 
 // Charges every member of each triplet that has a slot the slot's bytes, the WEIGHT-zone room its device copy takes,
-// so the plan and the zone agree on what one routed expert costs. Pure over `entries` and needs no index: the planner
-// runs it while it builds the plan, before an index exists. A triplet a role of which appears twice is left alone.
-// Returns the number of triplets charged.
+// so the plan and the zone agree on what one routed expert costs. A complete triplet with no slot charges each member
+// that stages as AOS its own staged bytes, so a member a layout pass left at a slot its triplet has lost gives the slot
+// back; a member that stages another way keeps the charge its layout pass gave it. Pure over `entries` and needs no
+// index: the planner runs it while it builds the plan, before an index exists. A triplet a role of which appears twice,
+// or that misses a role, is left alone. Returns the number of triplets charged a slot.
 static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries) {
     struct triplet_members {
         placement_entry * e[3]      = { nullptr, nullptr, nullptr };
@@ -1449,8 +1451,17 @@ static inline size_t placement_entries_charge_expert_slots(std::vector<placement
     for (auto & [key, t] : triplets) {
         GGML_UNUSED(key);
         const placement_entry * const members[3] = { t.e[0], t.e[1], t.e[2] };
-        const size_t                  slot       = t.ambiguous ? 0 : moe_expert_triplet_slot_bytes(members);
+        if (t.ambiguous || !members[0] || !members[1] || !members[2]) {
+            continue;
+        }
+        const size_t slot = moe_expert_triplet_slot_bytes(members);
         if (slot == 0) {
+            for (placement_entry * e : t.e) {
+                const size_t staged = moe_expert_entry_staged_bytes(*e);
+                if (staged != 0) {
+                    e->vram_charge_size = placement_vram_charge_bytes(staged);
+                }
+            }
             continue;
         }
         for (placement_entry * e : t.e) {
@@ -1468,10 +1479,11 @@ struct placement_charge_change {
     size_t new_charge = 0;
 };
 
-// Charges every member of each triplet that has a slot the slot again (placement_entries_charge_expert_slots), after a
-// pass that re-laid out expert entries and charged each its own size, and returns every entry whose charge that
-// changed, in entries order, with its charge before (a charge left 0 reads as its dst_size's) and after. The caller
-// moves the plan's totals by each change (placement_charge_move), so the plan charges what the load stages.
+// Charges the triplets again (placement_entries_charge_expert_slots) after a pass that re-laid out expert entries and
+// charged each its own size: each member of a triplet with a slot the slot, and each AOS member of a triplet that lost
+// its slot its own staged size. Returns every entry whose charge that changed, in entries order, with its charge before
+// (a charge left 0 reads as its dst_size's) and after. The caller moves the plan's totals by each change
+// (placement_charge_move), so the plan charges what the load stages.
 static inline std::vector<placement_charge_change> placement_entries_recharge_expert_slots(
     std::vector<placement_entry> & entries) {
     std::vector<size_t> before(entries.size());
@@ -1514,6 +1526,42 @@ static inline size_t placement_charge_move(size_t   old_charge,
     weight_vram = weight_vram > freed ? weight_vram - freed : 0;
     vram        = vram > freed ? vram - freed : 0;
     return 0;
+}
+
+// One device a re-charge accounts: its id, its remaining room, and its VRAM total in the plan, null where the plan
+// keeps no total per device (a single-device plan).
+struct placement_recharge_device {
+    int      device_id   = -1;
+    size_t * remaining   = nullptr;
+    size_t * device_vram = nullptr;
+};
+
+// Re-charges the entries (placement_entries_recharge_expert_slots) and moves, for each changed entry on a device, the
+// totals of the device in `devices` whose id is its target device by its change (placement_charge_move): its remaining
+// room, its VRAM total when it has one, and the plan's weight and VRAM totals. A host entry's charge moves no total,
+// nor does an entry on a device not in `devices`, which the caller's pass does not account. Returns the bytes charged
+// past the devices' remaining room.
+static inline size_t placement_entries_recharge_expert_slots_on(std::vector<placement_entry> &                 entries,
+                                                                const std::vector<placement_recharge_device> & devices,
+                                                                size_t & weight_vram,
+                                                                size_t & vram) {
+    size_t over = 0;
+    for (const placement_charge_change & c : placement_entries_recharge_expert_slots(entries)) {
+        const placement_entry & e = entries[c.index];
+        if (!e.on_device) {
+            continue;
+        }
+        for (const placement_recharge_device & d : devices) {
+            if (d.device_id != e.target_device || !d.remaining) {
+                continue;
+            }
+            size_t untracked = 0;
+            over += placement_charge_move(c.old_charge, c.new_charge, *d.remaining,
+                                          d.device_vram ? *d.device_vram : untracked, weight_vram, vram);
+            break;
+        }
+    }
+    return over;
 }
 
 // The lendable tail of the resident set on `device`: whole (gate, up, down) triplets, walking plan.entries in REVERSE

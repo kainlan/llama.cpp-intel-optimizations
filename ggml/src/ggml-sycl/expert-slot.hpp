@@ -63,4 +63,21 @@ inline size_t expert_triplet_member_bytes(const size_t (&staged)[3], int role) {
     return slot != 0 ? slot : staged[role];
 }
 
+// What a triplet whose members stage `staged` bytes asks of the zone when all three are minted: its slot (0 when it has
+// none) and its members' bytes summed (expert_triplet_member_bytes each), three slots for a triplet with a slot.
+struct expert_triplet_zone_ask {
+    size_t slot  = 0;
+    size_t total = 0;
+};
+
+inline expert_triplet_zone_ask expert_triplet_zone_ask_of(const size_t (&staged)[3]) {
+    expert_triplet_zone_ask ask;
+    ask.slot = expert_triplet_slot_bytes(staged);
+    for (int r = 0; r < 3; ++r) {
+        const size_t member = ask.slot != 0 ? ask.slot : staged[r];
+        ask.total           = member > SIZE_MAX - ask.total ? SIZE_MAX : ask.total + member;
+    }
+    return ask;
+}
+
 }  // namespace ggml_sycl
