@@ -1708,7 +1708,7 @@ if args.self_test:
                          "planned_scratch_owner", "0"), common, cache, zone)),
         ("f16 arm condition written twice", "the f16 arm's compile condition has one source",
          (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",
-                         "#    if GGML_SYCL_DEQUANT_F16_ARM", "#    if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)"),
+                         "#        if GGML_SYCL_DEQUANT_F16_ARM", "#        if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)"),
           common, cache, zone)),
         ("f16 walk exit skips the refresh", "the f16 walk's success exit refreshes the hold",
          (mutate_in_func(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\(",

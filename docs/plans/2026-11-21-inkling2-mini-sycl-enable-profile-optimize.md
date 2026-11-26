@@ -6810,6 +6810,89 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
   not compile while `mark` was public).
   (5) r7 (1)'s exit 77 names all three skips: no SYCL GPU, more than one card visible, weights not evictable.
 
+### Task 22: A dense BF16 weight's prompt `MUL_MAT` is one oneDNN bf16 GEMM (written 2026-11-26)
+
+**Track:** S3-prompt. **Base:** `185b44aa8e`.
+**Found by:** the Inkling long-prompt profile. The dense BF16 `MUL_MAT` nodes ran on the native executor's tiled kernel
+(`mulmat.bf16_native`), which has no XMX path: 4.43 s of device time on the long prompt.
+
+**What it does.** Above `SKINNY_MAX_COLS` (8) columns, `ggml_sycl_mul_mat_bf16_weight` first offers the op to
+`ggml_sycl_mul_mat_bf16_onednn`. That route rounds the F32 activations to bf16 (nearest even,
+`ggml_sycl_bf16::f32_to_bf16_rne`) into the planned dense src1 buffer, then submits one `DnnlGemmWrapper::gemm` of bf16
+x bf16 -> f32 with strict float math, in `gemm()`'s own orientation, on the weight as it is placed. A declined route has
+written nothing to dst, and the tiled kernel computes the op as before. Decode and the widths of 8 or fewer keep the
+skinny kernel.
+
+**Probe (2026-11-26).** `test-sycl-bf16-onednn-probe` at `4a0b8b6d2`, run once per card by the lead. The outputs are
+committed as `docs/backend/data/inkling2/t22-probe-b70-4a0b8b6d2.txt` and `t22-probe-b50-4a0b8b6d2.txt`. On both cards
+oneDNN 3.13.2 creates bf16 x bf16 -> f32 strict as `jit:gemm:any` with a 0 B scratchpad, in either orientation. The
+mixed f32 x bf16 primitives create only as `ocl:ref:any` and run at 0.07-0.41x the tiled kernel. The route
+(conversion plus GEMM) against the faster of the tiled kernel's two timings, from the files' `summary` lines:
+
+- 2304 x 3072 (K x M; up and gate) at N = 9: 2.59x on the B70 and 5.23x on the B50 (line 11 of each file).
+- 3072 x 2304 (down) at N = 9: 5.68x and 6.74x (line 61).
+- 2304 x 3072 at N = 512: 30.35x on the B70 (the route 75.2 us, the tiled kernel 2290.7 us) and 30.45x on the B50
+  (line 51).
+- 3072 x 2304 at N = 512: 27.78x and 27.74x (line 101).
+
+The conversion costs about 17 us of span at every width. Against double over bf16(x) the route's error is 8e-9 to
+4e-8 of sum |w*x|. Against double over F32 x it is 0.9e-4 to 1.5e-4, which is the rounding of the activations.
+
+**Rulings (2026-11-26).**
+- **Route.** Use the converted route in the fork orientation (the natural one gives nothing). Mixed types are out
+  (D1): the speedup is far below 4x.
+- **Threshold.** N > 8 stays. The route already wins at N = 9 on both cards, and decode is unchanged. The code
+  comment on `ggml_sycl_mul_mat_bf16_onednn_takes` cites the probe lines.
+- **R8, amended for BF16 weights only.** The bar is "at least as exact as the CPU reference's own arithmetic". The CPU
+  backend rounds a BF16 weight's activations to bf16 before its dot product: see `ggml/src/ggml-cpu/ggml-cpu.c:404-409`,
+  the BF16 type traits (`from_float = ggml_cpu_fp32_to_bf16`, `vec_dot_type = GGML_TYPE_BF16`). The bounds:
+  - an arm at N <= 8 is held to 1e-4 against double over F32 x;
+  - a route arm is held to 2e-4 x sum |w*x| against double over bf16(x), and must also be closer to that reference
+    than to the one over F32 x;
+  - the route against the tiled kernel is held to 4e-3 x sum |w*x|;
+  - the measured maxima are printed.
+- **D2.** `gemm()` gets an opt-in negative memo, `GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE`. A descriptor oneDNN cannot
+  create is remembered per engine and WARNed once, and `gemm()` returns `std::nullopt` for it from then on. Only this
+  route asks for the memo. Every other caller keeps the throw. The route has no catch. Both are pinned in
+  `scripts/check-sycl-dnnl-decline-consumers.py`.
+- **D4.** The route and the planner's mark are both gated on `ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)`. The
+  route is on by default, and `GGML_SYCL_ONEDNN_PP=0` turns both off (`docs/backend/sycl-env-vars.md`).
+- **Memory, option A.** The copy goes into `ctx.dequant_f16_src1_scratch`, which now holds 16-bit activations of either
+  type.
+  - The adapter marks a dense 2-D BF16 weight that is not an expert stack.
+  - The planned src1 row is the wider of the f16 arm's and the route's, each counted where its consumer is compiled
+    in (`zone_dense_src1_planned_bytes_per_token`, `test-zone-sizing` Case 52).
+  - The graph-entry walk counts the copy with the executor's own predicates. It ensures max(plan, demand), or refuses
+    and names the op.
+  - A buffer too short at dispatch makes the route decline. Nothing is allocated outside the buffer: the GEMM's
+    scratchpad, 0 B here, comes through the ONEDNN zone.
+  - `docs/backend/sycl-memory-design.md` describes it under "Who the dense f16 dequant plan covers".
+- **Profiler.** The GEMM's row carries op_context `bf16_weight`. The conversion's row is
+  `mulmat.bf16_onednn.act_to_bf16`.
+
+**Departures from the staging plan, by the implementer.**
+1. There is no check that the op runs on the main stream. `ctx.stream()` is the context's one in-order execution
+   queue once the cache exists, so the check would be dead code.
+2. The decline while a command graph is recorded is pinned only in source. Prompt graphs are never recorded, and the
+   device test runs with `GGML_SYCL_DISABLE_GRAPH=1`.
+
+**Tests.**
+- `test-zone-sizing` Case 52: the fold and the combined row.
+- `test-sycl-bf16-mul-mat`: the device rounding against `ggml_fp32_to_bf16` on the specials and on a sweep.
+- `test-sycl-bf16-native-source`: the route, its walk, its planner and adapter terms, and the probe citation, with
+  each new test shown to fail on a mutant.
+- `check-sycl-dnnl-decline-consumers.py`: the route's consumers and the memo, 207 mutants.
+- `test-sycl-bf16-mul-mat-backend`: N = 40 held to the amended bounds.
+- The device test `test-sycl-bf16-onednn-mul-mat-device` and its opt-out registration `-opt-out`. It covers:
+  - the Inkling shapes at N = 9, 129, 512 and 2048;
+  - Qwen3.8's BF16 matrices (hc_inject, ssm_alpha, hc_down and the shared-expert gate) at N = 9 and 512;
+  - N = 1 and 8 declined;
+  - a first case whose planned buffer is empty, which must decline.
+
+**Acceptance (the lead's runs).** On the Inkling long prompt the BF16 dense device time is expected to go from
+4.43 s to about 0.2-0.3 s. The acceptance gate stays at 1,100 ms or less. The probe covers only the Inkling shapes,
+so the Qwen shapes are in the device test for correctness, not speed.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
@@ -7113,6 +7196,17 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
 - `scripts/check-sycl-dnnl-decline-consumers.py` is not a usable gate: one of its mutants survives ("caller 1
   rethrows the named error as std::exception"), so it is red before and after any change.
 - The NVFP4 prompt kernel is now the largest part of an Inkling prompt: about 3.2 s of a 6.9 s 691-token prompt.
+
+*Left by Task 22 (2026-11-26):*
+- **The oneDNN primitive cache grows by one entry per distinct prompt-ubatch token count for each dense BF16 shape.**
+  The route's key contains N, as Task 20's batched key contains T. A server that sees many prompt lengths keeps one
+  primitive per (shape, N) for the life of the process. The same cures apply (runtime dimensions, or a bound on the
+  cache), and neither is adopted.
+- `gemm()`'s negative memo for a primitive oneDNN cannot create exists now, opt-in
+  (`GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE`). The batched F32 route still throws on a refused creation (Task 20's R5
+  item) and could pass it.
+- The route's speed was measured on the Inkling shapes only. Qwen3.8's BF16 matrices (M = 1, 4, 48 and 320) take it
+  by the same threshold, unmeasured: at a small M the GEMM may not beat the tiled kernel.
 
 *Left by the integration with master and the long-prompt arm (2026-11-24):*
 - **Mistral 7B refuses any prompt longer than one micro-batch with default flags, on master.** The auto micro-batch

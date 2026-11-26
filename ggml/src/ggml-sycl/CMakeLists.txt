@@ -5014,6 +5014,49 @@ set_tests_properties(test-sycl-mul-mat-f32-batched-device PROPERTIES
     SKIP_RETURN_CODE 77
     TIMEOUT 300
 )
+
+# The BF16 weight's oneDNN route: above SKINNY_MAX_COLS columns a dense BF16 MUL_MAT is a bf16 copy of its activations
+# and one oneDNN bf16 x bf16 -> f32 GEMM. Each case computes one MUL_MAT graph on the SYCL backend (the weight in a
+# WEIGHTS buffer), counts the "dnnl_gemm" site through the PRIVATE_TESTING seam (one submission for a taken case,
+# none for a declined one, the native kernel after an injected decline), and compares the output with double
+# references over bf16(x) and F32 x and with the native kernel's. GGML_SYCL_DISABLE_GRAPH=1: the route declines while
+# a command graph records. The second registration runs the cases with the route switched off (GGML_SYCL_ONEDNN_PP=0)
+# and expects none to reach gemm(). Touches the GPU with single-op graphs (at most ~75 MB) and loads no model;
+# labelled mem-handle so a sweep leaves it to the lead. Built the same way as the test above.
+add_executable(test-sycl-bf16-onednn-mul-mat-device
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-bf16-onednn-mul-mat-device.cpp
+)
+target_include_directories(test-sycl-bf16-onednn-mul-mat-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-bf16-onednn-mul-mat-device PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-bf16-onednn-mul-mat-device PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-bf16-onednn-mul-mat-device PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-bf16-onednn-mul-mat-device PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-bf16-onednn-mul-mat-device COMMAND test-sycl-bf16-onednn-mul-mat-device)
+set_tests_properties(test-sycl-bf16-onednn-mul-mat-device PROPERTIES
+    LABELS "sycl;bf16;device;mem-handle;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_DISABLE_GRAPH=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+add_test(NAME test-sycl-bf16-onednn-mul-mat-device-opt-out
+         COMMAND test-sycl-bf16-onednn-mul-mat-device --expect-opt-out)
+set_tests_properties(test-sycl-bf16-onednn-mul-mat-device-opt-out PROPERTIES
+    LABELS "sycl;bf16;device;mem-handle;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_DISABLE_GRAPH=1;GGML_SYCL_ONEDNN_PP=0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
 endif()
 # llama.cpp-9qjy: a BF16 dense weight uploaded to the SYCL backend is admitted by
 # supports_op and computed natively from the BF16 bytes through the real dispatch

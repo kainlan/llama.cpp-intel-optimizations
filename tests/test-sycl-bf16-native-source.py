@@ -23,8 +23,18 @@ executor in mul-mat-bf16.hpp. This gate pins, on the SOURCE, that
   * supports_op admits a BF16 weight through the same predicate the executor
     asserts, ggml_sycl_bf16_weight_native_route_available.
 
+Above SKINNY_MAX_COLS columns the executor first offers the op to its oneDNN
+route (ggml_sycl_mul_mat_bf16_onednn): a bf16 copy of the activations, rounded
+to nearest even, in the planned dense src1 buffer, then one bf16 x bf16 -> f32
+GEMM. The gate pins that the route allocates nothing and waits on nothing, that
+it declines (and the tiled kernel runs) while a graph is recorded, on a short
+buffer and on a primitive oneDNN cannot create, that the graph-entry walk counts
+its copy with the executor's own questions, and that the planner and the zone
+adapter plan that copy under the same gate.
+
 Source-level on purpose: none of this is observable without a SYCL device. The
-kernel arithmetic itself is checked by test-sycl-bf16-mul-mat (host device).
+kernel arithmetic itself is checked by test-sycl-bf16-mul-mat (host device), the
+route's by test-sycl-bf16-onednn-mul-mat-device (a GPU).
 """
 from pathlib import Path
 import re
@@ -34,6 +44,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
 KERNEL = ROOT / "ggml/src/ggml-sycl/mul-mat-bf16.hpp"
+CACHE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
+PROBE_DIR = ROOT / "docs/backend/data/inkling2"
+PROBES = ("t22-probe-b70-4a0b8b6d2.txt", "t22-probe-b50-4a0b8b6d2.txt")
 
 # Names that only the removed lazy-materialization route used. Each must be absent
 # from the code (comments excluded: the history is allowed to be discussed).
@@ -219,6 +232,123 @@ def test_route_predicate_composes_weight_shape_and_buffer_class():
         "mul-mat-bf16.hpp must define mul_mat_shape_supported"
     assert "ggml_sycl_bf16_weight_dispatch_available" in strip_comments(COMMON.read_text()), \
         "common.hpp must keep the pure weight predicate host tests call"
+
+
+def nows(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def _route() -> str:
+    return body_after(_code(), "static bool ggml_sycl_mul_mat_bf16_onednn(ggml_backend_sycl_context & ctx,")
+
+
+def test_executor_offers_the_gemm_route_before_the_native_launch():
+    executor = body_after(_code(), "static void ggml_sycl_mul_mat_bf16_weight(")
+    offer = nows(executor).find(
+        "if (ggml_sycl_mul_mat_bf16_onednn_takes(src0, src1, &act_bytes) && ggml_sycl_mul_mat_bf16_onednn(ctx, src0, "
+        "static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf, n_vecs, ldx, ldy, act_bytes)) { return; }")
+    assert offer >= 0, "the executor must offer the op to the oneDNN route (takes, then the route) and return on success"
+    assert offer < nows(executor).find("ggml_sycl_profile_submit("), \
+        "the route is offered before the native kernel is submitted, so a declined route leaves the tiled kernel to run"
+    assert offer > nows(executor).find("f32_columns_uniform(dst, &ldy)"), \
+        "the route is offered after the executor has checked the weight and the column strides it passes"
+
+
+def test_route_takes_asks_the_column_count_first():
+    takes = body_after(_code(), "static bool ggml_sycl_mul_mat_bf16_onednn_takes(")
+    assert "if constexpr (!ggml_sycl_bf16_onednn_scratch_drawable())" in takes, \
+        "a build without oneDNN never takes the route"
+    cols = takes.find("n_vecs <= ggml_sycl_bf16::SKINNY_MAX_COLS")
+    gate = takes.find("ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)")
+    assert 0 <= cols < gate, \
+        "the column count is asked before the admission, so decode leaves on one comparison; the gate is the BF16 " \
+        "oneDNN PP admission (GGML_SYCL_ONEDNN_PP=0 is the opt-out)"
+    assert "zone_dequant_f16_region_bytes(src0->ne[0] * n_vecs, act_bytes)" in nows(takes), \
+        "the copy's bytes are the dense dequant src1 buffer's own region arithmetic"
+
+
+def test_route_allocates_nothing_and_waits_on_nothing():
+    route = _route()
+    for forbidden in ("ensure_buffer", "ggml_sycl_resolve(", "unified_allocate", "unified_alloc(", "malloc_device",
+                      "malloc_host", "ggml_sycl_pool_alloc", "mem_copy", ".wait()", "->wait()", "ready_event",
+                      "depends_on", "catch"):
+        assert forbidden not in route, \
+            f"the BF16 oneDNN route must not use {forbidden!r} (nothing allocated, no host wait, gemm() declines)"
+    assert "ctx.dequant_f16_src1_scratch" in route, "the copy goes into the planned dense src1 buffer"
+    recording = nows(route).find(
+        "ggml_sycl_graph_recording_active() || stream->ext_oneapi_get_state() == "
+        "sycl::ext::oneapi::experimental::queue_state::recording")
+    short = route.find("buffer.capacity(ctx.device) < act_bytes")
+    draw = route.find("backing_handle.resolve(ctx.device)")
+    assert recording >= 0, "the route declines while a command graph is recorded (a new primitive would be created in it)"
+    assert 0 <= short < draw, "a buffer shorter than the copy is a decline, asked before the buffer is drawn"
+    assert "!act.on_device" in route, "a buffer that does not resolve on the device is a decline"
+
+
+def test_route_rounds_the_copy_to_nearest_even_in_a_profiler_row():
+    route = _route()
+    submit = route.find("ggml_sycl_profile_submit(")
+    rne = route.find("ggml_sycl_bf16::f32_to_bf16_rne(")
+    gemm = route.find("DnnlGemmWrapper::gemm(")
+    assert 0 <= submit < rne < gemm, \
+        "the conversion is launched inside ggml_sycl_profile_submit, rounds with f32_to_bf16_rne, and precedes the GEMM"
+    assert '"mulmat.bf16_onednn.act_to_bf16"' in route, "the conversion's profiler row is mulmat.bf16_onednn.act_to_bf16"
+    kernel = strip_comments(KERNEL.read_text())
+    assert "inline uint16_t f32_to_bf16_rne(float f)" in kernel, "mul-mat-bf16.hpp defines the device rounding"
+
+
+def test_route_gemm_is_strict_bf16_and_declines_on_a_failed_creation():
+    route = nows(_route())
+    call = route.find("const std::optional<sycl::event> bf16_gemm = DnnlGemmWrapper::gemm(")
+    assert call >= 0, "the route keeps gemm()'s optional, so a decline reaches the executor"
+    args = route[call:route.find(";", call)]
+    for arg in ("weight, bf16, 1, k,", "act_bf16, bf16, 1, k,", "dst_ddf, f32, stream, 1, 1,", '"bf16_weight"',
+                "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE"):
+        assert arg in args, f"the route's gemm() call must carry {arg!r}"
+    assert "return bf16_gemm.has_value();" in route, "the route returns whether gemm() ran"
+
+
+def test_walk_counts_the_route_with_the_executors_questions():
+    walk = body_after(_code(), "static bool ggml_sycl_dequant_f16_ensure_for_graph(")
+    assert walk.lstrip().startswith("#    if GGML_SYCL_DNNL\n"), \
+        "the walk is compiled wherever the route is (oneDNN), not only where the f16 arm is"
+    flat = nows(walk)
+    counted = flat.find(
+        "if (ggml_sycl_bf16_onednn_walk_counted() && ggml_sycl_mul_mat_bf16_onednn_takes(src0, src1, &act_bytes) && "
+        "ggml_sycl_bf16_weight_native_route_available(src0, src1, node, ctx.device) && "
+        "act_bytes > demand[ctx.device].src1_bytes) { demand[ctx.device].src1_bytes = act_bytes; "
+        "demand[ctx.device].src1_node = node; } continue;")
+    assert counted >= 0, \
+        "the walk counts a BF16 node's copy with the executor's predicate and the route's own takes, on this device"
+    loop = flat.find("for (int i = 0; i < cgraph->n_nodes; i++)")
+    arm = flat.find("# if GGML_SYCL_DEQUANT_F16_ARM", loop)
+    assert 0 <= loop < counted < arm, "the BF16 branch sits in the node loop, outside the f16 arm's compile condition"
+
+
+def test_planner_plans_the_wider_src1_row():
+    planner = body_after(_code(), "static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch(")
+    assert ("zone_dense_src1_planned_bytes_per_token(f16_drawable, maxima.dequant_f16_src1_bytes_per_token, "
+            "ggml_sycl_bf16_onednn_scratch_drawable(), maxima.bf16_onednn_src1_bytes_per_token)") in nows(planner), \
+        "the planned src1 row is the wider of the f16 arm's and the BF16 route's, each where its consumer is compiled in"
+
+
+def test_adapter_marks_the_bf16_copy_under_the_routes_gate():
+    adapter = nows(body_after(strip_comments(CACHE.read_text()),
+                              "std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory("))
+    mark = adapter.find("if (shaped && item.type == GGML_TYPE_BF16 && !is_expert && is_matrix && "
+                        "ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)) {")
+    assert mark >= 0, "the adapter marks a dense BF16 matrix under the route's own gate"
+    assert "desc.bf16_onednn_src1_bytes_per_token = src1_bytes;" in adapter[mark:], \
+        "the mark is the copy's bytes per token"
+
+
+def test_threshold_comment_cites_the_committed_probe():
+    raw = SOURCE.read_text()
+    takes_at = raw.find("static bool ggml_sycl_mul_mat_bf16_onednn_takes(")
+    comment = raw[max(0, takes_at - 2500):takes_at]
+    for probe in PROBES:
+        assert probe in comment, f"the route's threshold comment must cite {probe}"
+        assert (PROBE_DIR / probe).is_file(), f"the cited probe output must be committed at {PROBE_DIR / probe}"
 
 
 if __name__ == "__main__":

@@ -115,6 +115,13 @@ struct zone_tensor_desc {
     // scratch is enabled for and the oneDNN PP admission serves. The classifier keeps it only inside the oneDNN
     // reorder eligible set, the set the pair plan's weights half covers. Zero means "not such a weight".
     size_t onednn_pp_src1_bytes_per_token = 0;
+
+    // bf16 activation bytes per token a dense BF16 weight's oneDNN route rounds its F32 activations into before its
+    // bf16 x bf16 GEMM (zone_dequant_f16_src1_bytes_per_token(ne[0], ne[2], ne[3]): bf16 is two bytes, as f16 is). The
+    // copy is drawn from the dense dequant src1 buffer, which holds 16-bit activations of either type; the weight is
+    // multiplied as it is placed, so there is no weight figure. Supplied by the adapter for a BF16 matrix that is not
+    // an expert stack, when the oneDNN PP admission serves BF16 (the route's own gate). Zero means "not such a weight".
+    size_t bf16_onednn_src1_bytes_per_token = 0;
 };
 
 struct path_scoped_maxima {
@@ -159,6 +166,12 @@ struct path_scoped_maxima {
     // the scratch does NOT supply. Times the planning micro-batch it is the planned pair's activations half
     // (zone_onednn_pp_pair_plan).
     size_t onednn_pp_src1_bytes_per_token = 0;
+
+    // Widest bf16 activation row (bytes per token) of a BF16 weight's oneDNN route: a plain maximum of the adapter's
+    // marks (zone_tensor_desc::bf16_onednn_src1_bytes_per_token), gather-only tensors excluded. Kept apart from
+    // dequant_f16_src1_bytes_per_token because each counts only in a build that compiles its consumer
+    // (zone_dense_src1_planned_bytes_per_token).
+    size_t bf16_onednn_src1_bytes_per_token = 0;
 };
 
 // A (type, ne) group must have at least this many members to be a per-layer
@@ -431,6 +444,16 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
                                  uint32_t n_ubatch,
                                  size_t * src0_bytes,
                                  size_t * src1_bytes);
+
+// The activation row (bytes per token) the dense dequant src1 buffer is planned for. The buffer holds 16-bit
+// activations of either type: the f16 copy of the dequant arm (f16_bytes_per_token, the widest marked f16 row) and the
+// bf16 copy of a BF16 weight's oneDNN route (bf16_bytes_per_token). One op draws it at a time, so the buffer holds the
+// wider row; each counts only where its consumer is compiled into the build (`*_drawable`), so a reservation nothing
+// draws is never planned.
+size_t zone_dense_src1_planned_bytes_per_token(bool   f16_drawable,
+                                               size_t f16_bytes_per_token,
+                                               bool   bf16_drawable,
+                                               size_t bf16_bytes_per_token);
 
 // Whether a dense weight's f16 copies are planned into the dequant buffers because the oneDNN PP scratch will not
 // supply them (llama.cpp-8ony). The scratch supplies an op when it is enabled for the weight's type and the pair

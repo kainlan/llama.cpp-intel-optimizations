@@ -216,6 +216,8 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
             maxima.dequant_f16_src1_bytes_per_token = std::max(maxima.dequant_f16_src1_bytes_per_token,
                                                                tensor.dequant_f16_if_unsupplied_src1_bytes_per_token);
         }
+        maxima.bf16_onednn_src1_bytes_per_token =
+            std::max(maxima.bf16_onednn_src1_bytes_per_token, tensor.bf16_onednn_src1_bytes_per_token);
     }
     return maxima;
 }
@@ -525,6 +527,13 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     *src0_bytes           = (max_weight_bytes + align - 1) / align * align;
     *src1_bytes           = (acts_raw + align - 1) / align * align;
     return true;
+}
+
+size_t zone_dense_src1_planned_bytes_per_token(bool   f16_drawable,
+                                               size_t f16_bytes_per_token,
+                                               bool   bf16_drawable,
+                                               size_t bf16_bytes_per_token) {
+    return std::max(f16_drawable ? f16_bytes_per_token : 0, bf16_drawable ? bf16_bytes_per_token : 0);
 }
 
 // Whether a (weights, activations) pair fits `pair_bound_bytes`; a sum that is not representable does not fit.

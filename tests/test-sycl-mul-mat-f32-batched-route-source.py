@@ -36,8 +36,10 @@ whitespace-canonical text:
   GGML_SYCL_DNNL_FPMATH_BUILD, is the build's choice (fpmath f16 under GGML_SYCL_F16, otherwise nothing set); only
   GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT sets fpmath strict; the primitive cache key carries the mode in a field its
   equality and its hash both read, so a strict and an f16 primitive of one shape are two entries; the route op passes
-  NO_DOWNCONVERT, and no other caller does. The value does not say STRICT: every GGML_SYCL_*STRICT* name is the one
-  strict-leases abort switch or one of its named exceptions (test-sycl-context-tenant-plan-source.py, gate 22).
+  NO_DOWNCONVERT, and so does the BF16 weight's oneDNN route (ggml_sycl_mul_mat_bf16_onednn), which accumulates its
+  bf16 operands in F32 where the build's f16 float math would let oneDNN compute in f16; no other caller does. The
+  value does not say STRICT: every GGML_SYCL_*STRICT* name is the one strict-leases abort switch or one of its named
+  exceptions (test-sycl-context-tenant-plan-source.py, gate 22).
 
 Every clause has mutants that must fail it. Host-only; collected by pytest.
 """
@@ -678,6 +680,11 @@ def test_label_mutants():
 # ---- the route computes in F32; every other caller keeps the build's float math ----
 _STRICT = "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT"
 _BUILD = "GGML_SYCL_DNNL_FPMATH_BUILD"
+_BF16_ROUTE = (
+    "[[nodiscard]] static bool ggml_sycl_mul_mat_bf16_onednn(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, "
+    "const uint16_t * weight, const float * src1_ddf, float * dst_ddf, int64_t n_vecs, int64_t ldx, int64_t ldy, "
+    "size_t act_bytes)"
+)
 _FPMATH_PARAM = re.compile(r"ggml_sycl_dnnl_fpmath (\w+)=(\w+)")
 
 
@@ -739,14 +746,17 @@ def fpmath_errors(gemm_code: str, sycl_code: str, others: dict) -> list:
         if re.findall(r"\bkey\." + field + r"=([^;]*);", gb) != [param]:
             errs.append("gemm() does not put its float-math parameter in its key")
 
-    # the route op passes STRICT at that parameter's place, and nothing else names STRICT
-    route = function_body(sycl_code, _ROUTE_OP)
-    at = route.find("DnnlGemmWrapper::gemm(")
-    args = call_args(route, at + len("DnnlGemmWrapper::gemm")) if at != -1 else []
-    if len(args) <= index or args[index] != _STRICT:
-        errs.append("the route op does not pass %s as gemm()'s float math: %r" % (_STRICT, args[index:]))
-    if sycl_code.count(_STRICT) != route.count(_STRICT) or route.count(_STRICT) != 1:
-        errs.append("ggml-sycl.cpp names %s outside the one route call" % _STRICT)
+    # the route op and the BF16 route each pass STRICT at that parameter's place, and nothing else names STRICT
+    strict_callers = [("the route op", function_body(sycl_code, _ROUTE_OP)),
+                      ("the BF16 route", function_body(sycl_code, _BF16_ROUTE))]
+    for who, body in strict_callers:
+        at = body.find("DnnlGemmWrapper::gemm(")
+        args = call_args(body, at + len("DnnlGemmWrapper::gemm")) if at != -1 else []
+        if len(args) <= index or args[index] != _STRICT:
+            errs.append("%s does not pass %s as gemm()'s float math: %r" % (who, _STRICT, args[index:]))
+    if (any(body.count(_STRICT) != 1 for _, body in strict_callers)
+            or sycl_code.count(_STRICT) != sum(body.count(_STRICT) for _, body in strict_callers)):
+        errs.append("ggml-sycl.cpp names %s outside the route op's and the BF16 route's one call each" % _STRICT)
     if gemm_code.count(_STRICT) != 2:  # the enumerator and gemm()'s one test of it
         errs.append("gemm.hpp names %s %d times, not as the enumerator and its one test"
                     % (_STRICT, gemm_code.count(_STRICT)))
@@ -810,10 +820,19 @@ def test_fpmath_mutants():
 
     route_call = route[route.index("DnnlGemmWrapper::gemm(") :]
     route_call = route_call[: balanced_end(route_call, len("DnnlGemmWrapper::gemm"), "(", ")") + 1]
+    bf16_route = function_body(s, _BF16_ROUTE)
+    bf16_call = bf16_route[bf16_route.index("DnnlGemmWrapper::gemm(") :]
+    bf16_call = bf16_call[: balanced_end(bf16_call, len("DnnlGemmWrapper::gemm"), "(", ")") + 1]
     sycl_mutants = [
         ("the route passes the build's math", s.replace(route, mutate(route, route_call, route_call.replace(_STRICT, _BUILD)), 1)),
         ("the route omits the math", s.replace(route, mutate(route, route_call, route_call.replace("," + _STRICT, "")), 1)),
         ("the F16 batched route passes strict", s[:f16_args_end] + ",false," + _STRICT + s[f16_args_end:]),
+        ("the BF16 route passes the build's math",
+         s.replace(bf16_route, mutate(bf16_route, bf16_call, bf16_call.replace(_STRICT, _BUILD)), 1)),
+        ("the BF16 route omits the math",
+         s.replace(bf16_route, mutate(bf16_route, bf16_call, bf16_call.replace("," + _STRICT, "")), 1)),
+        ("the BF16 route names strict twice",
+         s.replace(bf16_route, mutate(bf16_route, bf16_call, bf16_call + ";(void)" + _STRICT), 1)),
     ]
     for name, new_s in sycl_mutants:
         assert new_s != s, f"mutant {name!r} changed nothing"

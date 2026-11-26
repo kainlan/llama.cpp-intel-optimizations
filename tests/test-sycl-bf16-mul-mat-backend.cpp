@@ -4,10 +4,18 @@
 // not just the kernel header test-sycl-bf16-mul-mat covers.
 //
 // The weight lives in a WEIGHTS-usage SYCL buffer under a real tensor name, as a
-// model weight does. One graph per activation width exercises both executor
-// kernels (N = 1 and 3 take the skinny kernel, N = 40 the tiled one). Reference:
-// double-precision sum over the BF16-decoded weights and the F32 activations;
-// the executor accumulates in F32, so the tolerance scales with sum |w * x|.
+// model weight does. One graph per activation width exercises the executor's
+// paths: N = 1 and 3 take the skinny kernel; N = 40 takes the oneDNN route
+// (a bf16 copy of the activations and a bf16 x bf16 -> f32 GEMM) where the build
+// has oneDNN and GGML_SYCL_ONEDNN_PP is not 0, and the tiled kernel otherwise.
+// References: double-precision sums over the BF16-decoded weights and the F32
+// activations, and over the same activations rounded to bf16, which is what the
+// CPU backend computes for a BF16 weight (its vec_dot_type is BF16). Every
+// tolerance scales with sum |w * x|. The native kernels accumulate the F32
+// activations in F32: 1e-4 against the F32 reference. The route reads the bf16
+// copy: 2e-4 against the bf16 reference, and closer to it than to the F32 one,
+// the witness that the route ran (test-sycl-bf16-onednn-mul-mat-device counts
+// its GEMM submissions).
 //
 // Before 9qjy this graph aborted or was declined whenever the planner had filled
 // VRAM, because the executor lazily allocated an unplanned F32 copy of the weight.
@@ -20,6 +28,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "mul-mat-bf16.hpp"
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 
@@ -31,6 +40,21 @@
 
 static constexpr int64_t K = 2048;
 static constexpr int64_t M = 256;
+
+static constexpr double TOL_NATIVE = 1e-4;  // the native kernels against double over F32 x
+static constexpr double TOL_ROUTE  = 2e-4;  // the oneDNN route against double over bf16(x)
+
+// Whether the oneDNN route computes an op of n_cols columns: a oneDNN build, the oneDNN PP admission on (its
+// environment term, read as the backend reads it), and more columns than the skinny kernel keeps.
+static bool route_expected(int64_t n_cols) {
+#if GGML_SYCL_DNNL
+    const char * env = std::getenv("GGML_SYCL_ONEDNN_PP");
+    return n_cols > ggml_sycl_bf16::SKINNY_MAX_COLS && (env == nullptr || std::atoi(env) != 0);
+#else
+    (void) n_cols;
+    return false;
+#endif
+}
 
 static bool run_width(ggml_backend_t             backend,
                       ggml_backend_t             cpu,
@@ -102,33 +126,52 @@ static bool run_width(ggml_backend_t             backend,
     std::vector<float> y(static_cast<size_t>(M * n_cols));
     ggml_backend_tensor_get(out, y.data(), 0, y.size() * sizeof(float));
 
-    int    bad     = 0;
-    double max_err = 0.0;
+    // The route is held to the reference over bf16(x), the native kernels to the one over F32 x.
+    const bool   route   = route_expected(n_cols);
+    const double tol     = route ? TOL_ROUTE : TOL_NATIVE;
+    int          bad     = 0;
+    double       err_f32 = 0.0;  // max err / sum|w*x| against double over F32 x
+    double       err_b16 = 0.0;  // max err / sum|w*x| against double over bf16(x)
     for (int64_t n = 0; n < n_cols; ++n) {
         for (int64_t m = 0; m < M; ++m) {
-            double ref = 0.0;
-            double mag = 0.0;
+            double ref_f = 0.0;
+            double ref_b = 0.0;
+            double mag   = 0.0;
             for (int64_t k = 0; k < K; ++k) {
-                const double p = static_cast<double>(w_dec[m * K + k]) * x_host[n * K + k];
-                ref += p;
-                mag += std::fabs(p);
+                const double w = w_dec[m * K + k];
+                const double x = x_host[n * K + k];
+                ref_f += w * x;
+                ref_b += w * ggml_bf16_to_fp32(ggml_fp32_to_bf16(x_host[n * K + k]));
+                mag += std::fabs(w * x);
             }
-            const double err = std::fabs(y[n * M + m] - ref);
-            max_err          = std::fmax(max_err, mag > 0.0 ? err / mag : err);
-            if (!(err <= 1e-4 * mag + 1e-30)) {
+            mag                = mag > 0.0 ? mag : 1.0;
+            const double got   = y[n * M + m];
+            const double rel_f = std::fabs(got - ref_f) / mag;
+            const double rel_b = std::fabs(got - ref_b) / mag;
+            err_f32            = std::fmax(err_f32, rel_f);
+            err_b16            = std::fmax(err_b16, rel_b);
+            if (!((route ? rel_b : rel_f) <= tol)) {
                 if (bad < 3) {
-                    std::fprintf(stderr, "  m=%lld n=%lld got=%.9g ref=%.9g\n", (long long) m, (long long) n,
-                                 (double) y[n * M + m], ref);
+                    std::fprintf(stderr, "  m=%lld n=%lld got=%.9g ref(f32 x)=%.9g ref(bf16 x)=%.9g\n", (long long) m,
+                                 (long long) n, got, ref_f, ref_b);
                 }
                 ++bad;
             }
         }
     }
-    std::printf("n_cols=%-3lld max_rel_err=%.3g %s\n", (long long) n_cols, max_err, bad == 0 ? "ok" : "BAD");
+    // A route that read the F32 activations would be no closer to the reference over bf16(x).
+    const bool signature = !route || err_b16 < err_f32;
+    std::printf("n_cols=%-3lld %s max err/S: vs ref(f32 x) %.3g, vs ref(bf16 x) %.3g (bound %.0e on the %s) %s\n",
+                (long long) n_cols, route ? "route " : "native", err_f32, err_b16, tol, route ? "bf16 one" : "f32 one",
+                bad == 0 && signature ? "ok" : "BAD");
+    if (!signature) {
+        std::fprintf(stderr, "FAIL: n_cols=%lld: the route is no closer to the reference over bf16(x)\n",
+                     (long long) n_cols);
+    }
 
     ggml_backend_sched_free(sched);
     ggml_free(ctx);
-    return bad == 0;
+    return bad == 0 && signature;
 }
 
 int main(int, char ** argv) {

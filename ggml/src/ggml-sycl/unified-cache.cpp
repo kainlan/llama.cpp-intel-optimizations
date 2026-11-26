@@ -35606,6 +35606,17 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                 desc.onednn_pp_src1_bytes_per_token = src1_bytes;
             }
         }
+        // A dense BF16 matrix runs as one oneDNN bf16 x bf16 GEMM above SKINNY_MAX_COLS columns
+        // (ggml_sycl_mul_mat_bf16_onednn), on a bf16 copy of its F32 activations in the dense dequant src1 buffer. The
+        // mark takes the route's own gate, the oneDNN PP admission for BF16, so GGML_SYCL_ONEDNN_PP=0 turns the route
+        // and its plan off together; and the native executor's shape, a 2-D weight that is not an expert stack.
+        if (shaped && item.type == GGML_TYPE_BF16 && !is_expert && is_matrix &&
+            ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)) {
+            size_t src1_bytes = 0;
+            if (zone_dequant_f16_src1_bytes_per_token(item.ne[0], 1, 1, &src1_bytes)) {
+                desc.bf16_onednn_src1_bytes_per_token = src1_bytes;
+            }
+        }
         zone_inventory.push_back(std::move(desc));
     }
     return zone_inventory;

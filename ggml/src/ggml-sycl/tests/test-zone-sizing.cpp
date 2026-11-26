@@ -4373,6 +4373,42 @@ int main() {
         CHECK(!zone_arena_runtime_surplus(zone_arena_sizes{}, need), "an absent arena had a surplus");
     }
 
+    // ---- Case 52: the BF16 weight's oneDNN route converts its activations into the planned src1 buffer -------------
+    // A dense BF16 MUL_MAT over more than eight columns runs as one oneDNN bf16 x bf16 GEMM on a bf16 copy of its
+    // activations, drawn from the dense dequant src1 buffer, which holds 16-bit activations of either type. The adapter
+    // marks the row (ne[0] * 2 bytes per token). The maxima take the widest marked row, a gather-only table excluded,
+    // and keep it apart from the f16 figure: the planner counts each only where its consumer is built.
+    {
+        using ggml_sycl::zone_dense_src1_planned_bytes_per_token;
+        const int        TYPE_BF16             = 30;
+        zone_tensor_desc up                    = desc("blk.0.ffn_up.weight", 1000, TYPE_BF16, 2304, 3072, 1, 1);
+        up.bf16_onednn_src1_bytes_per_token    = 2304 * 2;
+        zone_tensor_desc down                  = desc("blk.0.ffn_down.weight", 1000, TYPE_BF16, 3072, 2304, 1, 1);
+        down.bf16_onednn_src1_bytes_per_token  = 3072 * 2;
+        zone_tensor_desc table                 = desc("per_layer_token_embd.weight", 1000, TYPE_BF16, 8192, 4096, 1, 1);
+        table.bf16_onednn_src1_bytes_per_token = 8192 * 2;
+        table.get_rows_only                    = true;
+
+        const path_scoped_maxima m = zone_scoped_maxima({ up, down, table });
+        CHECK(m.bf16_onednn_src1_bytes_per_token == 3072 * 2,
+              "the BF16 route's activation row is the widest marked K, the gather-only table excluded");
+        CHECK(m.dequant_f16_src1_bytes_per_token == 0 && m.dequant_f16_weight_bytes == 0,
+              "a BF16 mark plans no f16 dequant copy: the route multiplies the weight as it is placed");
+        CHECK(zone_scoped_maxima({ table }).bf16_onednn_src1_bytes_per_token == 0,
+              "a gather-only BF16 table alone plans no activation row");
+
+        // The src1 buffer's row: each figure counts only where its consumer is compiled in, and the buffer holds the
+        // wider of the two that do.
+        CHECK(zone_dense_src1_planned_bytes_per_token(true, 4096, true, 6144) == 6144, "the wider row is planned");
+        CHECK(zone_dense_src1_planned_bytes_per_token(true, 8192, true, 6144) == 8192, "the wider row is planned");
+        CHECK(zone_dense_src1_planned_bytes_per_token(false, 8192, true, 6144) == 6144,
+              "a build without the f16 dequant arm plans only the BF16 route's row");
+        CHECK(zone_dense_src1_planned_bytes_per_token(true, 4096, false, 6144) == 4096,
+              "a build without oneDNN plans only the f16 row");
+        CHECK(zone_dense_src1_planned_bytes_per_token(false, 4096, false, 6144) == 0,
+              "a build with neither consumer plans nothing");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

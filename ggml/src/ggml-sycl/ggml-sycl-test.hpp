@@ -39,6 +39,9 @@ void test_clear_layout_override();
 bool test_get_layout_override(ggml_layout_mode * out);
 // Sets the model-load flag the SYCL_Host buffer type reads to choose its role and lifetime.
 void test_set_in_model_load(bool loading);
+// false leaves the BF16 weight's oneDNN route out of the graph-entry walk's src1 demand, so a test can hand the route
+// a planned buffer shorter than its activation copy and see it decline; true (the default) counts it.
+void test_set_bf16_onednn_walk_counted(bool counted);
 #endif
 void               test_clear_host_weight_registry();
 bool               test_backend_supports_graphs(ggml_backend_t backend);

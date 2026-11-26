@@ -289,11 +289,65 @@ static void check_split_policy() {
     }
 }
 
+static float f32_of_bits(uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+// The rounding the oneDNN route converts F32 activations to BF16 with (f32_to_bf16_rne) is the CPU backend's
+// (ggml_fp32_to_bf16): the route then multiplies the BF16 activations the CPU reference multiplies. Checked bit for
+// bit on the classes where two rounding rules can differ, against fixed expectations as well as against ggml, then
+// over a sweep of bit patterns. Host code: the function is plain bit arithmetic, the same on the device.
+static void check_bf16_rounding() {
+    using ggml_sycl_bf16::f32_to_bf16_rne;
+    const uint32_t special[] = {
+        0x00000000u, 0x80000000u,               // +0, -0
+        0x7f800000u, 0xff800000u,               // +inf, -inf
+        0x7fc00000u, 0xffc00000u,               // quiet NaNs
+        0x7f800001u, 0xff800001u, 0x7fbfffffu,  // signalling NaNs
+        0x00000001u, 0x007fffffu, 0x80008000u,  // subnormals, the last a tie
+        0x3f808000u, 0x3f818000u,               // ties: even below (stays), odd below (rounds up)
+        0x3f808001u, 0x3f807fffu,               // just above and just below a tie
+        0x7f7fffffu, 0xff7fffffu,               // +-FLT_MAX: round up to +-inf
+        0x7f7f7fffu,                            // the largest value that stays finite
+    };
+    for (uint32_t u : special) {
+        const uint16_t want = ggml_fp32_to_bf16(f32_of_bits(u)).bits;
+        const uint16_t got  = f32_to_bf16_rne(f32_of_bits(u));
+        CHECK(got == want, "f32_to_bf16_rne(0x%08x) = 0x%04x, the CPU rounds it to 0x%04x", u, got, want);
+    }
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x3f808000u)) == 0x3f80, "a tie with an even neighbour below stays");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x3f818000u)) == 0x3f82, "a tie with an odd neighbour below rounds up");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x3f808001u)) == 0x3f81, "just above a tie rounds up");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x3f807fffu)) == 0x3f80, "just below a tie rounds down");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x7f7fffffu)) == 0x7f80, "FLT_MAX rounds up to +inf");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x7f7f7fffu)) == 0x7f7f, "the largest finite stays finite");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x7f800000u)) == 0x7f80, "+inf stays +inf");
+    CHECK(f32_to_bf16_rne(f32_of_bits(0x80000000u)) == 0x8000, "-0 keeps its sign");
+    CHECK((f32_to_bf16_rne(f32_of_bits(0x7f800001u)) & 0x7fc0) == 0x7fc0, "a signalling NaN comes out a quiet NaN");
+    CHECK((f32_to_bf16_rne(f32_of_bits(0xff800001u)) & 0xffc0) == 0xffc0, "a NaN keeps its sign");
+    int mismatches = 0;
+    for (uint64_t u = 0; u <= 0xffffffffull; u += 4093) {
+        // every 4093rd pattern (prime: it walks every exponent and low-bit residue), and the three around its tie
+        const uint32_t base = static_cast<uint32_t>(u);
+        for (uint32_t v :
+             { base, (base & 0xffff0000u) | 0x7fffu, (base & 0xffff0000u) | 0x8000u, (base & 0xffff0000u) | 0x8001u }) {
+            if (f32_to_bf16_rne(f32_of_bits(v)) != ggml_fp32_to_bf16(f32_of_bits(v)).bits && mismatches++ < 5) {
+                std::printf("FAIL %s:%d: f32_to_bf16_rne(0x%08x) differs from the CPU's rounding\n", __FILE__, __LINE__,
+                            v);
+            }
+        }
+    }
+    CHECK(mismatches == 0, "%d swept bit patterns round differently from the CPU", mismatches);
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     check_shape_contract();
     check_split_policy();
+    check_bf16_rounding();
 
     sycl::queue q{ sycl::default_selector_v };
     std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());

@@ -90,6 +90,18 @@ inline float bf16_to_f32(uint16_t bits) {
     return sycl::bit_cast<float>(static_cast<uint32_t>(bits) << 16);
 }
 
+// F32 -> BF16 bits, rounded to nearest even, a NaN kept a NaN and made quiet: bit for bit the CPU backend's rounding
+// (ggml_compute_fp32_to_bf16 in ggml-impl.h). The CPU backend multiplies a BF16 weight by activations it first rounds
+// this way (the BF16 type traits' vec_dot_type, ggml-cpu.c), so the oneDNN route, which rounds them here before its
+// bf16 x bf16 GEMM, multiplies the same numbers. Plain bit arithmetic: host and device.
+inline uint16_t f32_to_bf16_rne(float f) {
+    const uint32_t u = sycl::bit_cast<uint32_t>(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return static_cast<uint16_t>((u >> 16) | 64u);
+    }
+    return static_cast<uint16_t>((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
+}
+
 // Sub-groups per output row for the skinny kernel. Decode runs hundreds of these ops per
 // token on one in-order queue, and the Qwen3.8 BF16 matrices are short and wide (M = 1, 4,
 // 48, 320 against K up to 10240): one sub-group per row would leave a handful of sub-groups
