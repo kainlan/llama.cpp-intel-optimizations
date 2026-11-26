@@ -4626,6 +4626,32 @@ resolver does not know is converted as AOS, which rests on the op handing over t
 refuse it by name). Mistral 7B Q4_K_M plans 112.0 MB of f16 weights (one `ffn_down`, 14336 x 4096) and 28 KB of f16
 activations per token; a claimed head would have been 250 MB (`test-zone-sizing`, Case 14l).
 
+**The src1 buffer's second consumer: the BF16 weight's oneDNN route.** The src1 buffer holds 16-bit activations of
+either type. Above `SKINNY_MAX_COLS` (8) columns a dense BF16 `MUL_MAT` runs as a bf16 copy of its F32 activations,
+rounded to nearest even into this buffer, and one oneDNN bf16 x bf16 -> f32 GEMM on the weight as it is placed
+(`ggml_sycl_mul_mat_bf16_onednn`); the weight itself is not copied, so the src0 buffer is not involved. The adapter
+marks a dense 2-D BF16 weight that is not an expert stack with its row of K x 2 bytes per token
+(`zone_tensor_desc::bf16_onednn_src1_bytes_per_token`) under the route's own gate, the oneDNN PP type admission for
+BF16, so `GGML_SYCL_ONEDNN_PP=0` turns the route and its mark off together. The fold keeps that maximum apart from the
+f16 arm's (`path_scoped_maxima::bf16_onednn_src1_bytes_per_token`), because the two consumers are compiled under
+different conditions: the f16 arm needs oneDNN and `GGML_SYCL_F16`, the route oneDNN only. The planned src1 row is the
+wider of the two, each where its consumer is compiled in (`zone_dense_src1_planned_bytes_per_token`, host-tested in
+`test-zone-sizing` Case 52), and the `[SYCL-PLAN] dense f16 dequant scratch` line prints both. The graph-entry walk
+counts the route's copy with the executor's own questions (the native route predicate and
+`ggml_sycl_mul_mat_bf16_onednn_takes`), apart from the f16 arm's demand, because the route has a next path and the f16
+arm has none. When the RUNTIME zone cannot hold max(plan, demand), the walk holds max(plan, f16 demand) and lets the
+route decline. It refuses the graph, naming the widest f16 op, only when an f16 op asked and the zone cannot hold
+max(plan, f16 demand); with no f16 op asking, a buffer it cannot grow is left as it was
+(`zone_walk_ensure_dense_buffer`, host-tested in `test-zone-sizing` Case 53). The route never grows the buffer: a
+buffer shorter than its copy at dispatch (a node the walk did not predict, or one it capped) is a decline to the native
+tiled kernel, loud as an op's growth of a planned buffer is. It warns once per device slot, on a flag of its own
+(`planned_scratch_stats::route_declined_warned`) so that it and the growth WARN do not silence each other. A copy
+wider than the plan counts an under-estimate against `mul-mat-dequant-f16-src1`; a copy within the plan is a zone
+short of its plan, which the WARN names instead. The route also declines while a command graph is recorded and when
+`gemm()` declines (a scratchpad, or a primitive oneDNN cannot create, remembered per descriptor), which it asks with
+`query_only` before its conversion, so such a decline writes nothing. The GEMM's scratchpad, if any, comes from the
+ONEDNN zone through `gemm()`; on the Battlemage cards the primitive is `jit:gemm:any` with a 0 B scratchpad.
+
 ### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
 
 The scheduler's compute buffer is a named RUNTIME consumer. Before p6i0 nobody planned it. The weight pack filled the

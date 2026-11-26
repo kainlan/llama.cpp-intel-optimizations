@@ -4373,6 +4373,137 @@ int main() {
         CHECK(!zone_arena_runtime_surplus(zone_arena_sizes{}, need), "an absent arena had a surplus");
     }
 
+    // ---- Case 52: the BF16 weight's oneDNN route converts its activations into the planned src1 buffer -------------
+    // A dense BF16 MUL_MAT over more than eight columns runs as one oneDNN bf16 x bf16 GEMM on a bf16 copy of its
+    // activations, drawn from the dense dequant src1 buffer, which holds 16-bit activations of either type. The adapter
+    // marks the row (ne[0] * 2 bytes per token). The maxima take the widest marked row, a gather-only table excluded,
+    // and keep it apart from the f16 figure: the planner counts each only where its consumer is built.
+    {
+        using ggml_sycl::zone_dense_src1_planned_bytes_per_token;
+        const int        TYPE_BF16             = 30;
+        zone_tensor_desc up                    = desc("blk.0.ffn_up.weight", 1000, TYPE_BF16, 2304, 3072, 1, 1);
+        up.bf16_onednn_src1_bytes_per_token    = 2304 * 2;
+        zone_tensor_desc down                  = desc("blk.0.ffn_down.weight", 1000, TYPE_BF16, 3072, 2304, 1, 1);
+        down.bf16_onednn_src1_bytes_per_token  = 3072 * 2;
+        zone_tensor_desc table                 = desc("per_layer_token_embd.weight", 1000, TYPE_BF16, 8192, 4096, 1, 1);
+        table.bf16_onednn_src1_bytes_per_token = 8192 * 2;
+        table.get_rows_only                    = true;
+
+        const path_scoped_maxima m = zone_scoped_maxima({ up, down, table });
+        CHECK(m.bf16_onednn_src1_bytes_per_token == 3072 * 2,
+              "the BF16 route's activation row is the widest marked K, the gather-only table excluded");
+        CHECK(m.dequant_f16_src1_bytes_per_token == 0 && m.dequant_f16_weight_bytes == 0,
+              "a BF16 mark plans no f16 dequant copy: the route multiplies the weight as it is placed");
+        CHECK(zone_scoped_maxima({ table }).bf16_onednn_src1_bytes_per_token == 0,
+              "a gather-only BF16 table alone plans no activation row");
+
+        // The src1 buffer's row: each figure counts only where its consumer is compiled in, and the buffer holds the
+        // wider of the two that do.
+        CHECK(zone_dense_src1_planned_bytes_per_token(true, 4096, true, 6144) == 6144, "the wider row is planned");
+        CHECK(zone_dense_src1_planned_bytes_per_token(true, 8192, true, 6144) == 8192, "the wider row is planned");
+        CHECK(zone_dense_src1_planned_bytes_per_token(false, 8192, true, 6144) == 6144,
+              "a build without the f16 dequant arm plans only the BF16 route's row");
+        CHECK(zone_dense_src1_planned_bytes_per_token(true, 4096, false, 6144) == 4096,
+              "a build without oneDNN plans only the f16 row");
+        CHECK(zone_dense_src1_planned_bytes_per_token(false, 4096, false, 6144) == 0,
+              "a build with neither consumer plans nothing");
+    }
+
+    // ---- Case 53: the graph-entry walk caps a buffer whose widest op has another path ---------------------------------
+    // The walk ensures each dense dequant buffer at max(plan, demand) before anything is submitted. The src1 buffer's
+    // demand may come from a BF16 weight's oneDNN route, which declines on a short buffer and leaves the op to the native
+    // tiled kernel; the f16 arm's copy has no such path. So when the RUNTIME zone cannot hold the widest demand, the walk
+    // holds the plan and the f16 demand (`required`) and lets the route decline, and it refuses the graph only when it
+    // cannot hold those. A fake RUNTIME zone of `zone` bytes stands in for ensure_buffer: a grow that does not fit fails
+    // and leaves the buffer as it was.
+    {
+        using ggml_sycl::ZONE_WALK_BUFFER_RESULT_CAPPED;
+        using ggml_sycl::ZONE_WALK_BUFFER_RESULT_HELD;
+        using ggml_sycl::ZONE_WALK_BUFFER_RESULT_REFUSED;
+        using ggml_sycl::zone_walk_ensure_dense_buffer;
+
+        struct fake_buffer {
+            explicit fake_buffer(size_t zone_bytes) : zone(zone_bytes) {}
+
+            size_t              zone     = 0;
+            size_t              capacity = 0;
+            std::vector<size_t> asked;
+
+            bool ensure(size_t bytes) {
+                asked.push_back(bytes);
+                if (bytes > zone) {
+                    return false;
+                }
+                capacity = bytes;
+                return true;
+            }
+        };
+
+        const auto walk = [](fake_buffer & b, size_t planned, size_t demand, size_t required) {
+            return zone_walk_ensure_dense_buffer(b.capacity, planned, demand, required,
+                                                 [&b](size_t bytes) { return b.ensure(bytes); });
+        };
+
+        fake_buffer route_only(100);
+        CHECK(walk(route_only, 0, 600, 0) == ZONE_WALK_BUFFER_RESULT_CAPPED,
+              "a demand that only the BF16 route makes, above the zone, does not refuse the graph");
+        CHECK(route_only.asked == std::vector<size_t>{ 600 } && route_only.capacity == 0,
+              "the walk asks for the route's demand once and grows nothing it cannot hold");
+
+        fake_buffer both(400);
+        CHECK(walk(both, 200, 600, 300) == ZONE_WALK_BUFFER_RESULT_CAPPED,
+              "an f16 demand the zone holds is held when the route's wider demand is not");
+        CHECK((both.asked == std::vector<size_t>{ 600, 300 }) && both.capacity == 300,
+              "the cap is max(plan, f16 demand)");
+
+        fake_buffer plan_held(400);
+        CHECK(walk(plan_held, 200, 600, 0) == ZONE_WALK_BUFFER_RESULT_CAPPED && plan_held.capacity == 200,
+              "a route-only demand above the zone still leaves the buffer at its plan");
+
+        // A zone that cannot hold even the plan, and no op without another path asked: nothing needs the buffer, so
+        // the route declines on what it holds rather than the graph being refused.
+        fake_buffer below_plan(100);
+        CHECK(walk(below_plan, 200, 600, 0) == ZONE_WALK_BUFFER_RESULT_CAPPED,
+              "a zone short of the plan does not refuse a graph whose only demand is the route's");
+        CHECK((below_plan.asked == std::vector<size_t>{ 600, 200 }) && below_plan.capacity == 0,
+              "the demand, then the plan, is asked for, and the buffer is left as it was");
+
+        fake_buffer already(300);
+        already.capacity = 300;
+        CHECK(walk(already, 200, 600, 250) == ZONE_WALK_BUFFER_RESULT_CAPPED,
+              "a buffer that already holds the plan and the f16 demand is capped without a second grow");
+        CHECK(already.asked == std::vector<size_t>{ 600 } && already.capacity == 300, "no second grow is asked for");
+
+        fake_buffer f16_only(400);
+        CHECK(walk(f16_only, 200, 500, 500) == ZONE_WALK_BUFFER_RESULT_REFUSED,
+              "an f16 demand the zone cannot hold refuses the graph: the f16 arm has no other path");
+        CHECK(f16_only.asked == std::vector<size_t>{ 500 }, "the f16 demand is asked for once");
+
+        fake_buffer f16_floor(400);
+        CHECK(walk(f16_floor, 200, 600, 450) == ZONE_WALK_BUFFER_RESULT_REFUSED,
+              "a route demand does not excuse an f16 demand the zone cannot hold");
+        CHECK((f16_floor.asked == std::vector<size_t>{ 600, 450 }), "the floor is asked for after the demand");
+
+        // The src1 plan is one figure for both rows (zone_dense_src1_planned_bytes_per_token), so the floor holds the
+        // plan even where the BF16 row made it wider: a zone that cannot hold that plan refuses an f16 demand it could
+        // hold. That is a zone short of its own plan, which the walk refuses by name.
+        fake_buffer plan_short(400);
+        CHECK(walk(plan_short, 500, 600, 300) == ZONE_WALK_BUFFER_RESULT_REFUSED,
+              "a zone that cannot hold the plan refuses, whichever row widened the plan");
+
+        fake_buffer fits(1000);
+        CHECK(walk(fits, 200, 300, 300) == ZONE_WALK_BUFFER_RESULT_HELD && fits.capacity == 300,
+              "a demand the zone holds is held");
+        fake_buffer plan_wider(1000);
+        CHECK(walk(plan_wider, 500, 300, 0) == ZONE_WALK_BUFFER_RESULT_HELD && plan_wider.capacity == 500,
+              "the buffer is held at max(plan, demand)");
+
+        fake_buffer enough(0);
+        enough.capacity = 700;
+        CHECK(walk(enough, 200, 600, 300) == ZONE_WALK_BUFFER_RESULT_HELD && enough.asked.empty(),
+              "a buffer that already holds max(plan, demand) is not grown");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

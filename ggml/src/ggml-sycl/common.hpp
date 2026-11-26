@@ -6416,7 +6416,11 @@ struct planned_scratch_stats {
     uint32_t allocs      = 0;      // backing allocations, the first one included, graph-entry or in-op
     uint32_t op_growths  = 0;      // growths forced by an op: the graph-entry prediction was short
     size_t   peak_demand = 0;      // largest single request seen
-    bool     warned      = false;  // the in-op growth WARN has been emitted for this slot
+    bool     warned      = false;  // the in-op growth WARN (ggml_sycl_planned_scratch_acquire) was emitted
+
+    // A decline WARN of the BF16 oneDNN route (ggml_sycl_mul_mat_bf16_onednn) was emitted for this slot. Apart from
+    // `warned`, so a route decline does not silence the growth WARN of an f16 op sharing the slot, nor the reverse.
+    bool route_declined_warned = false;
 
     // The recording attachment (graph_retention_token) and the backing (owner_control_id) this slot last pinned into
     // a graph's retention, so a recording pins a backing once rather than once per op.

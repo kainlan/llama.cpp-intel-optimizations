@@ -77,7 +77,7 @@ def test_gemm_metadata_construction_is_gated_and_wraps_return_events() -> None:
         assert re.search(r"gemm_label\.metadata\s*=\s*label_metadata\.c_str\(\);", gated)
     # gemm() must return the primitive's event (a nullopt only for a declined scratchpad, S3-4), not discard it (void before
     # this task -- neither execute call site had a profiler wrap at all).
-    assert re.search(r"static std::optional<sycl::event> gemm\(ggml_backend_sycl_context", gemm)
+    assert re.search(r"static std::optional<sycl::event> gemm\(\s*ggml_backend_sycl_context", gemm)
 
 
 def test_gemm_accepts_deps_and_optional_op_context_with_safe_defaults() -> None:

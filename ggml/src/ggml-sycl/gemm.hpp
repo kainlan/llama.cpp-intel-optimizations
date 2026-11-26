@@ -24,6 +24,7 @@
 #    include "dnnl_sycl.hpp"
 #    include "sycl-kernel-profiler.hpp"
 
+#    include <algorithm>
 #    include <array>
 #    include <atomic>
 #    include <chrono>
@@ -32,6 +33,7 @@
 #    include <optional>
 #    include <unordered_map>
 #    include <utility>
+#    include <vector>
 
 extern int g_ggml_sycl_debug;
 
@@ -89,6 +91,16 @@ inline std::atomic<int64_t> & args_map_calls_accum() {
 enum ggml_sycl_dnnl_fpmath {
     GGML_SYCL_DNNL_FPMATH_BUILD,
     GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT,
+};
+
+// What gemm() does when oneDNN cannot create the primitive for a descriptor. THROW is what every caller had before
+// the choice existed: the cache's failed creation falls through to a direct one, which throws the dnnl::error.
+// DECLINE is for a caller whose decline has a declared next path: the failure is remembered for the descriptor and
+// the engine (DnnlPrimitiveCache::creation_failed), and gemm() returns std::nullopt before anything is submitted, now
+// and on every later call with that descriptor, so the caller needs no catch and the creation is not retried per op.
+enum ggml_sycl_dnnl_create_failure {
+    GGML_SYCL_DNNL_CREATE_FAILURE_THROW,
+    GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE,
 };
 
 struct DnnlPrimitiveKey {
@@ -226,10 +238,31 @@ class DnnlPrimitiveCache {
         return it != cache_.end() ? &it->second : nullptr;
     }
 
-    // Clear the cache
+    // Whether creating the primitive for `key` on `eng` failed before, as noted by a caller that declines on that
+    // failure (GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE). get_or_create does not read it: a caller that throws keeps
+    // retrying the creation and throwing.
+    bool creation_failed(const DnnlPrimitiveKey & key, const dnnl::engine & eng) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto                        it = failed_.find(key);
+        return it != failed_.end() && std::find(it->second.begin(), it->second.end(), eng) != it->second.end();
+    }
+
+    // Remembers that creating the primitive for `key` on `eng` failed. Returns true the first time for that pair.
+    bool note_creation_failed(const DnnlPrimitiveKey & key, const dnnl::engine & eng) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<dnnl::engine> & engines = failed_[key];
+        if (std::find(engines.begin(), engines.end(), eng) != engines.end()) {
+            return false;
+        }
+        engines.push_back(eng);
+        return true;
+    }
+
+    // Clear the cache, the remembered creation failures with it
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         cache_.clear();
+        failed_.clear();
     }
 
     // Get cache size
@@ -252,6 +285,8 @@ class DnnlPrimitiveCache {
   private:
     mutable std::mutex                                                              mutex_;
     std::unordered_map<DnnlPrimitiveKey, DnnlCachedPrimitive, DnnlPrimitiveKeyHash> cache_;
+    // Descriptors whose creation failed, per engine they failed on (see creation_failed).
+    std::unordered_map<DnnlPrimitiveKey, std::vector<dnnl::engine>, DnnlPrimitiveKeyHash> failed_;
 };
 
 // Global primitive cache (shared across contexts)
@@ -326,40 +361,42 @@ class DnnlGemmWrapper {
     // short tag (e.g. ggml_type_name(src0->type)) callers that know the
     // originating ggml tensor type can pass for a richer metadata string;
     // callers that don't (outprod.cpp, the batch launcher) leave it null and
-    // get an m/variant-only tag. `deps` mirrors gemm_batch_strided's pattern
-    // (SYCL events this GEMM must wait on) even though no caller populates it
-    // today -- the event-form execute() needs the parameter to exist either
-    // way, and every other executor in this file already writes it this way.
+    // get an m/variant-only tag. `deps` mirrors gemm_batch_strided's pattern:
+    // SYCL events this GEMM must wait on, handed to the event-form execute()
+    // (the BF16 weight's route passes its activation conversion's event).
     // Returns std::nullopt when the scratchpad request was declined (nothing was submitted and c was not written);
     // the caller takes its declared next path (llama.cpp-23mk S3-4). A value is the primitive's completion event.
     // query_only asks the scratchpad question and stops: it submits nothing, does not count as an engaged call, and
     // returns an empty event when not declined. A caller that will run the same descriptor over many batches asks once
     // with it before its first write. fpmath is the primitive's float math (see ggml_sycl_dnnl_fpmath); the default
-    // keeps the build's.
-    [[nodiscard]] static std::optional<sycl::event> gemm(ggml_backend_sycl_context &      ctx,
-                                                         int                              m,
-                                                         int                              n,
-                                                         int                              k,
-                                                         const void *                     a,
-                                                         dt                               at,
-                                                         dnnl_dim_t                       stra0,
-                                                         dnnl_dim_t                       stra1,
-                                                         dnnl_dim_t                       stra2,
-                                                         const void *                     b,
-                                                         dt                               bt,
-                                                         dnnl_dim_t                       strb0,
-                                                         dnnl_dim_t                       strb1,
-                                                         dnnl_dim_t                       strb2,
-                                                         void *                           c,
-                                                         dt                               ct,
-                                                         const queue_ptr &                q,
-                                                         dnnl_dim_t                       batches_a,
-                                                         dnnl_dim_t                       batches_b,
-                                                         int                              ldc        = -1,
-                                                         const std::vector<sycl::event> & deps       = {},
-                                                         const char *                     op_context = nullptr,
-                                                         bool                             query_only = false,
-                                                         ggml_sycl_dnnl_fpmath fpmath = GGML_SYCL_DNNL_FPMATH_BUILD) {
+    // keeps the build's. on_create_failure says what a primitive oneDNN cannot create does (see
+    // ggml_sycl_dnnl_create_failure); the default throws, as before the choice existed.
+    [[nodiscard]] static std::optional<sycl::event> gemm(
+        ggml_backend_sycl_context &      ctx,
+        int                              m,
+        int                              n,
+        int                              k,
+        const void *                     a,
+        dt                               at,
+        dnnl_dim_t                       stra0,
+        dnnl_dim_t                       stra1,
+        dnnl_dim_t                       stra2,
+        const void *                     b,
+        dt                               bt,
+        dnnl_dim_t                       strb0,
+        dnnl_dim_t                       strb1,
+        dnnl_dim_t                       strb2,
+        void *                           c,
+        dt                               ct,
+        const queue_ptr &                q,
+        dnnl_dim_t                       batches_a,
+        dnnl_dim_t                       batches_b,
+        int                              ldc               = -1,
+        const std::vector<sycl::event> & deps              = {},
+        const char *                     op_context        = nullptr,
+        bool                             query_only        = false,
+        ggml_sycl_dnnl_fpmath            fpmath            = GGML_SYCL_DNNL_FPMATH_BUILD,
+        ggml_sycl_dnnl_create_failure    on_create_failure = GGML_SYCL_DNNL_CREATE_FAILURE_THROW) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
 
         auto stream = ctx.stream_dnnl(q);
@@ -420,8 +457,22 @@ class DnnlGemmWrapper {
         }
 
         // Get or create cached primitive
-        auto &                      cache  = get_dnnl_primitive_cache();
+        auto &     cache                     = get_dnnl_primitive_cache();
+        // A declining caller is not made to pay a failed creation again for every op with this descriptor.
+        const bool decline_on_create_failure = on_create_failure == GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE;
+        if (decline_on_create_failure && cache.creation_failed(key, eng)) {
+            return std::nullopt;
+        }
         const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_in_md, b_in_md, c_md, attr);
+        if (!cached && decline_on_create_failure) {
+            if (cache.note_creation_failed(key, eng)) {
+                GGML_LOG_WARN(
+                    "[ONEDNN] matmul primitive m=%d n=%d k=%d (%s) could not be created; the caller takes its "
+                    "fallback for this shape from now on\n",
+                    m, n, k, op_context ? op_context : "?");
+            }
+            return std::nullopt;
+        }
 
         if (!cached) {
             // Fallback: create primitive directly if caching fails

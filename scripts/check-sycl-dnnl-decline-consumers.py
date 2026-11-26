@@ -52,7 +52,10 @@ Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.c
     {}`, `return std::optional<...>()`) left after any of its notes (each note is checked, with the consumer's own
     decisions blanked), so "engaged" means the primitive is about to be submitted. The 2-D MXFP4 arm asks once before
     its batch loop. The old runtime_error and the deleted forwarders (woq_gemm_q4_0_packed, gemm_batch_array,
-    row_gemm_batch) and woq_gemm_q4_0_impl's dead packed-weights arm (b_is_packed, b_bytes) stay gone;
+    row_gemm_batch) and woq_gemm_q4_0_impl's dead packed-weights arm (b_is_packed, b_bytes) stay gone. gemm()'s memo
+    of a failed primitive creation (GEMM_MEMO_PINS) is opt-in: the default throws as before, a declining caller's
+    descriptor is looked up before the cache is asked, a failed creation is noted and returns std::nullopt, and the
+    cache's clear forgets the failures;
   - common.hpp: get_scratchpad_mem is [[nodiscard]] and opens with the size read and the 0 B early return of the empty
     memory before it takes dnnl_mutex, exactly once;
   - ggml-sycl.cpp and outprod.cpp (comment-stripped, whitespace-insensitive): the statements that carry a decline to its
@@ -61,8 +64,10 @@ Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.c
     (!consumer(...))` guard and of the `return consumer(...)` / `flag = consumer(...)` consumers (counted heads,
     out_prod's included), the single push of the MoE group event, the woq q4_0/q8_0 callers and the dequant arms that
     follow them, the hoisted pre-query's `return false` and the first slice's `b_a == 0` distinction, the MXFP4 PP and
-    unified PP fall-through, the MoE group break and stage failure, the mul_mat_id `return false`, and the batched F32
-    route's held gemm() result, returned as its has_value(), with the dispatch going on to the orchestrator on false.
+    unified PP fall-through, the MoE group break and stage failure, the mul_mat_id `return false`, the batched F32
+    route's held gemm() result, returned as its has_value(), with the dispatch going on to the orchestrator on false,
+    and the BF16 weight's oneDNN route, likewise held and returned, with its executor going on to the native tiled
+    kernel on false; that route is the one caller that passes GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching
 fails the gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on
@@ -148,13 +153,24 @@ MAIN_PINS = (
     # the polarity of every guard: a decline is the falsy result of a consumer, so each reads `if (!consumer(...))`
     ("if (!DnnlGemmWrapper::row_gemm(", 5),
     ("if (!DnnlGemmWrapper::gemm(", 3),
-    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each
-    ("return DnnlGemmWrapper::gemm(", 1),
+    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each; the second
+    # `return DnnlGemmWrapper::gemm(` is the BF16 route's gemm lambda, whose two uses are pinned below
+    ("return DnnlGemmWrapper::gemm(", 2),
     ("used_onednn_fp16 = DnnlGemmWrapper::row_gemm(", 1),
     # the batched F32 route: its one gemm's decline is false, and the dispatch goes on to the orchestrator's loop
     ("const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(", 1),
     ("return batched_gemm.has_value();", 1),
     ("src0_resolved, src1_resolved, dst_resolved, f32_batched_route)) { return; } else {", 1),
+    # the BF16 weight's route: its gemm's decline (a scratchpad, or a primitive oneDNN cannot create) is false, and the
+    # executor goes on to the native tiled kernel; it is the one caller that asks gemm() to decline on a creation. It
+    # asks one descriptor twice: with query_only before its conversion (a decline returns before anything is written),
+    # then to run, whose decline is the route's result
+    ("const auto bf16_gemm = [&](bool query_only, const std::vector<sycl::event> & deps) { return DnnlGemmWrapper::gemm(", 1),
+    ("if (!bf16_gemm(true, {})) { return false; }", 1),
+    ("return bf16_gemm(false, { converted }).has_value();", 1),
+    ("&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0, static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf, n_vecs, "
+     "ldx, ldy, act_bytes)) { return; }", 1),
+    ("GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", 1),
     # one push of the group event, after the decline check (review r3 Nit-2)
     ("gemm_events.push_back(*group_event)", 1),
     ("DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();", 1),
@@ -167,6 +183,17 @@ MAIN_PINS = (
     ('if (!used_woq) { decline = "primitive_declined"; }', 1),
     # mul_mat_id's f16-input PP helper reports a decline as "not done"
     ("DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }", 1),
+)
+# gemm()'s memo of a failed primitive creation: opt-in (the default throws, as every other caller expects), read before
+# the cache is asked, written and declined on a failed creation, and forgotten with the cache. text -> how many.
+GEMM_MEMO_PINS = (
+    ("ggml_sycl_dnnl_create_failure on_create_failure = GGML_SYCL_DNNL_CREATE_FAILURE_THROW) {", 1),
+    ("const bool decline_on_create_failure = on_create_failure == GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE; "
+     "if (decline_on_create_failure && cache.creation_failed(key, eng)) { return std::nullopt; } "
+     "const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_in_md, b_in_md, c_md, attr); "
+     "if (!cached && decline_on_create_failure) { if (cache.note_creation_failed(key, eng)) {", 1),
+    ("op_context ? op_context : \"?\"); } return std::nullopt; } if (!cached) {", 1),
+    ("cache_.clear(); failed_.clear();", 1),
 )
 OUTPROD_PIN = 'throw ggml_sycl_fallback_error("dnnl_gemm declined in out_prod'
 OUTPROD_GUARD = "if (!DnnlGemmWrapper::gemm("
@@ -402,6 +429,10 @@ def check_gemm(text):
             errs.append("%s: DnnlGemmWrapper::%s not found" % (GEMM, name))
         elif not decl.startswith("[[nodiscard]]") or not re.search(r"static\s+%s\s*$" % re.escape(rtype), decl):
             errs.append("%s: DnnlGemmWrapper::%s must be `[[nodiscard]] static %s`" % (GEMM, name, rtype))
+    for pin, want in GEMM_MEMO_PINS:
+        found = len(re.findall(ws_pattern(pin), text))
+        if found != want:
+            errs.append("%s: gemm()'s memo of a failed creation: expected %d of `%s`, found %d" % (GEMM, want, pin, found))
     return errs
 
 
@@ -686,6 +717,36 @@ def gemm_mutants(files, edit):
                 edit_pin(m, "return batched_gemm.has_value();", "return true;")))
     out.append(("M1f: the batched F32 route returns the negated result",
                 edit_pin(m, "return batched_gemm.has_value();", "return !batched_gemm.has_value();")))
+    # the BF16 weight's route and gemm()'s memo of a failed creation
+    bf16_run = "return bf16_gemm(false, { converted }).has_value();"
+    bf16_query = "if (!bf16_gemm(true, {})) { return false; }"
+    out.append(("the BF16 route reads a decline as done",
+                edit_pin(m, bf16_run, "(void) bf16_gemm(false, { converted }); return true;")))
+    out.append(("the BF16 route returns the negated result",
+                edit_pin(m, bf16_run, "return !bf16_gemm(false, { converted }).has_value();")))
+    out.append(("the BF16 route goes on after a declined query", edit_pin(m, bf16_query, "(void) bf16_gemm(true, {});")))
+    out.append(("the BF16 route reads a passed query as a decline",
+                edit_pin(m, bf16_query, "if (bf16_gemm(true, {})) { return false; }")))
+    out.append(("the BF16 executor returns on a declined route",
+                edit_pin(m, "&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0,", "&& !ggml_sycl_mul_mat_bf16_onednn(ctx, src0,")))
+    out.append(("the BF16 route throws on a failed creation",
+                edit_pin(m, "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", "GGML_SYCL_DNNL_CREATE_FAILURE_THROW")))
+    out.append(("a second caller asks gemm() to decline on a failed creation",
+                edit_pin(m, "return batched_gemm.has_value();",
+                         "(void) GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE; return batched_gemm.has_value();")))
+    memo_lookup = ("        if (decline_on_create_failure && cache.creation_failed(key, eng)) {\n"
+                   "            return std::nullopt;\n        }\n")
+    memo_return = "            return std::nullopt;\n        }\n\n        if (!cached) {"
+    for label, old, new in (
+            ("gemm()'s default declines on a failed creation", "GGML_SYCL_DNNL_CREATE_FAILURE_THROW) {",
+             "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE) {"),
+            ("gemm() declines for the callers that throw", "on_create_failure == GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE;",
+             "on_create_failure != GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE;"),
+            ("gemm() retries a remembered failed creation", memo_lookup, ""),
+            ("gemm() throws after noting a failed creation", memo_return, "        }\n\n        if (!cached) {"),
+            ("the cache's clear keeps the remembered failures", "        failed_.clear();\n", "")):
+        assert gt.count(old) == 1, "mutant anchor: %r in %s" % (old, g)
+        out.append((label, edit(g, old, new)))
     # review r3 Nit-1: a return after a note spelled other than `return false` / `return std::nullopt`
     for name, site in (("gemm", "DNNL_GEMM"), ("gemm_batch_strided", "DNNL_GEMM_BATCH"),
                        ("woq_gemm_batch_mxfp4", "DNNL_WOQ_MXFP4_BATCH")):
