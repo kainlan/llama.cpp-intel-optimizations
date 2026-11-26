@@ -26,6 +26,8 @@
 #include <functional>
 #include <initializer_list>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -38,6 +40,25 @@ using ggml_sycl::moe_pp_ring_weight;
 using ggml_sycl::moe_pp_ring_zone_answer;
 using ggml_sycl::placement_entry;
 using ggml_sycl::placement_plan;
+
+// Whether code outside the drop marks can call their mark() or their record(). Access is checked as part of the
+// substitution, so a private member reads as not callable. The positive control keeps the negative one from passing
+// on a signature that no longer matches.
+template <typename T, typename = void> struct marks_mark_callable : std::false_type {};
+
+template <typename T>
+struct marks_mark_callable<T, std::void_t<decltype(std::declval<T &>().mark(0, uint64_t(0)))>> : std::true_type {};
+
+template <typename T, typename = void> struct marks_record_callable : std::false_type {};
+
+template <typename T>
+struct marks_record_callable<
+    T,
+    std::void_t<decltype(std::declval<T &>().record(0, uint64_t(0), moe_pp_ring_decision::DROP))>> : std::true_type {};
+
+static_assert(marks_record_callable<moe_pp_ring_drop_marks>::value, "a load's pass records its decision");
+static_assert(!marks_mark_callable<moe_pp_ring_drop_marks>::value,
+              "only record() marks a device, and only for a drop: mark() is not callable outside the marks");
 
 constexpr int    k_experts = 4;
 constexpr size_t k_bytes   = 4096;
