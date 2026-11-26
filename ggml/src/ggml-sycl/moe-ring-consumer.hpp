@@ -24,15 +24,18 @@
 // (ggml_sycl_stage_drop_displacing_ring in ggml-sycl.cpp): a drop always means that. Where (d) fails, a drop would only
 // take the batched executor from the resident layers' prompts and give the experts nothing: a RUNTIME zone another
 // consumer sizes needs as much without the ring, a plan without the ring that would grow another zone (the SCRATCH
-// zone's MoE MMVQ bound is held to the room RUNTIME leaves beside it) would hand that zone the room, and an arena with
-// live allocations is not rebuilt in this load. The ring then stays published as it was and the plan made with it
-// stands.
+// zone's MoE MMVQ bound is held to the room RUNTIME leaves beside it) would hand that zone the room, a rebuild that
+// falls back from one chunk to several carves a KV share out of the WEIGHT zone, a planner that reads no WEIGHT zone (a
+// multi-device plan in GLOBAL cache mode packs every device to its budget) sees no room, and an arena with live
+// allocations is not rebuilt in this load. The ring then stays published as it was and the plan made with it stands,
+// unless a give-back rebuilt the arena and the zones asked for again with the ring leave less WEIGHT room than that plan
+// was packed against: the device is then planned once more with the ring (moe_pp_ring_kept_plan_again).
 //
 // Today the drop set is NVFP4 alone, and a plan changes only where all four hold: every weight of its ring is NVFP4 (one
 // IQ1_S, IQ1_M or IQ4_XS weight beside them keeps the ring, for want of another device prompt route), its NVFP4 experts
-// overflow the card, the ring enlarges the arena total (the ONEDNN, RUNTIME and SCRATCH zones) by room the WEIGHT zone
-// takes back once the ring is gone, and nothing points into the arena (a held arena keeps the ring, with a WARN).
-// Inkling 2 Mini on the B50 is the one measured. (b) exists because the ring is the only device prompt route of a
+// overflow the card, the ring enlarges the zones beside WEIGHT by room the WEIGHT zone takes back once the ring is gone,
+// and nothing points into the arena (a held arena keeps the ring, with a WARN). On the B50, Inkling 2 Mini drops it, and
+// Qwen3.6-35B NVFP4 keeps it in the load's early pass (no room there) and drops it in the late one. (b) exists because the ring is the only device prompt route of a
 // resident IQ1_S, IQ1_M or IQ4_XS layer (decode stays refused for them): a drop would leave a node the executor's claim
 // admits with no kernel to run it. A model whose experts of those types overflow a card therefore still pays the ring's
 // room. A ring with any STAGED or SOA_EXPERT use, or with any weight that has no other device route, is sized,
@@ -141,9 +144,10 @@ inline size_t moe_pp_ring_runtime_room(size_t with_ring, size_t without_ring) {
 // unified_cache_kv_weight_capacity), as the plan made with the ring found it and once the zones were asked for without
 // the ring with the RUNTIME zone's surplus given back (zone_arena_ensure_options::give_back); and whether the arena had
 // that surplus to give but something pointed into it, so it was kept as built. The WEIGHT zone is the measure, not the
-// RUNTIME zone: a rebuild that grows another zone with the room RUNTIME gives up leaves the WEIGHT zone as it was, and
-// so does an N-chunk arena whose tail chunk is at its cap, where the KV share at the head of that chunk takes the room.
-// A device with no arena has no zone: every figure is 0.
+// RUNTIME zone: a rebuild that grows another zone with the room RUNTIME gives up leaves the WEIGHT zone as it was, and a
+// rebuild that falls back from one chunk to several (a B50 arena reserved right after a destroy can) carves the tail
+// chunk's KV share out of it. Where the planner reads no WEIGHT zone (no active arena, or a multi-device plan in GLOBAL
+// cache mode) every figure is 0.
 struct moe_pp_ring_zone_answer {
     size_t weight_with_ring    = 0;
     size_t weight_without_ring = 0;
@@ -152,12 +156,26 @@ struct moe_pp_ring_zone_answer {
 
 // The answer the plan dry run decides on, from `runtime_room` (moe_pp_ring_runtime_room) alone. The dry run rebuilds no
 // arena, so it answers as a give-back on an arena nothing points into whose WEIGHT zone takes the whole RUNTIME room, as
-// a single chunk's does (its WEIGHT zone is the chunk less the ONEDNN, RUNTIME and SCRATCH zones), counted from 0. It
-// cannot see a plan without the ring that would grow another zone, for which a load keeps the ring.
+// an arena whose layout the give-back keeps does (its WEIGHT zone is the arena less the zones beside it, in one chunk or
+// several), counted from 0. It cannot see a plan without the ring that would grow another zone, or a rebuild that
+// changes the arena's layout, for either of which a load keeps the ring. Where the planner reads no WEIGHT zone it is
+// asked with 0, as a load reads no room there.
 inline moe_pp_ring_zone_answer moe_pp_ring_dry_run_answer(size_t runtime_room) {
     moe_pp_ring_zone_answer zone;
     zone.weight_without_ring = runtime_room;
     return zone;
+}
+
+// Whether the plan made with a ring the load keeps is made once more. A give-back rebuilt the arena without the ring and
+// the WEIGHT room did not grow, so the zones were asked for again with the ring put back: an ordinary rebuild, whose
+// layout is the reserve's to choose. `packed_against` is the WEIGHT room the plan made with the ring was packed against
+// and `weight_after` the room after that second ensure, both read as that plan's planner reads them
+// (ggml_sycl_ring_plan_weight_room in ggml-sycl.cpp). A plan never stands against a WEIGHT zone smaller than the one it
+// was packed for: materialization refuses a planned expert the zone cannot hold and aborts the load. Where the second
+// ensure lands in more chunks than the first, as a B50 arena reserved right after a destroy can, the WEIGHT room is the
+// KV share smaller. The same room or more, and the plan stands.
+inline bool moe_pp_ring_kept_plan_again(size_t packed_against, size_t weight_after) {
+    return weight_after < packed_against;
 }
 
 // What a load does with a device's ring after the plan made with it, and why.

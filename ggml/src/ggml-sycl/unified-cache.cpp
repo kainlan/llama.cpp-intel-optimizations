@@ -8141,8 +8141,12 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
             keep_arena_as_built();
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
             // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
-            // not shrink it.
-            onednn_zone_plan_keep_and_store(live_plan);
+            // not shrink it. A give-back whose plan needs a zone larger than built changes nothing and stores nothing:
+            // the stored plan is the one the zone was built or kept with, and the live plan would describe room the
+            // zone does not hold.
+            if (zones_sufficient) {
+                onednn_zone_plan_keep_and_store(live_plan);
+            }
             return true;
         }
 
