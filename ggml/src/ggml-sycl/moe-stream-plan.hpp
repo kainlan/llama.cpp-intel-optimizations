@@ -9,6 +9,7 @@
 #include "moe-exec-policy.hpp"
 #include "moe-mmvq-tables.hpp"  // moe_pp_batched_f16_window_experts: the window the ring is sized to
 #include "moe-stream-ring.hpp"
+#include "moe-swap-driver.hpp"  // moe_swap_plan_view: what moe_swap_plan_view_build fills
 #include "unified-cache.hpp"
 
 #include <algorithm>
@@ -1484,6 +1485,12 @@ static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,
 // plan's build_index() must have run. The cache checks the storage itself under its own locks, and its refusal is the
 // authority on whether a copy can move: this check says only what the plan already rules out.
 
+// The refusal the cache gives a move to the host whose device copy is not its entry's own whole allocation: a view
+// into a bulk-staged tensor's shared allocation (unified_cache::loan_expert_triplet). Every expert of such a tensor is
+// one, so the swap driver's caller reads it as a refusal every evict of the block would meet. One spelling, for the
+// cache that gives it and the callers that classify it.
+constexpr const char MOE_EXPERT_MOVE_SHARED_STORAGE[] = "shared storage";
+
 // One named triplet: the (gate, up, down) entries of expert_id in layer_id.
 struct moe_expert_triplet_ref {
     int layer_id  = -1;
@@ -1668,6 +1675,110 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
         }
         target = post;
     }
+}
+
+// The swap driver's view of `plan` for `device`, over the route table's n_blocks x n_experts cells (block = blk.N, the
+// plan's layer_id), into `out`. Per cell, resident: the whole triplet is on this card; admissible: the whole triplet
+// is on the host in pinned storage the cache owns and in a layout an admit stages, so an admit can copy it (a
+// file-mapped copy is not one: the admit refuses a host copy that is not pinned). Per block, eligible: every expert's
+// triplet is whole on one side, at least one is resident, and each resident one is individually owned, so an evict
+// can hand it back (a bulk-staged tensor is views into one allocation: moe_loan_triplet_is_lendable); a cell the plan
+// has no triplet for, a split triplet, or one on another card makes the block not eligible. pair_bytes: the pinned
+// host bytes an evict of one of the block's triplets takes, its three copies each aligned as the pinned pool aligns.
+// admissible_count: each block's admissible cells, so a boundary need not read them. file_mapped counts the
+// file-mapped host triplets of eligible blocks, the ones the driver passes over. device_held: a non-expert entry (or
+// its alternate, or the multi-device layer map) holds this card, so a plan that moves every expert off the card still
+// uses it. single_device: the plan does not span cards. `bulk_memo` keeps the bulk answers across builds of the same
+// plan. Reads the plan only: no device, no lock, no state of its own.
+static inline void moe_swap_plan_view_build(const placement_plan &               plan,
+                                            int                                  device,
+                                            int                                  n_blocks,
+                                            int                                  n_experts,
+                                            std::unordered_map<uint64_t, bool> & bulk_memo,
+                                            moe_swap_plan_view &                 out) {
+    const bool sized   = n_blocks > 0 && n_experts > 0;
+    out.n_blocks       = sized ? n_blocks : 0;
+    out.n_experts      = sized ? n_experts : 0;
+    const size_t nb    = sized ? static_cast<size_t>(n_blocks) : 0;
+    const size_t ne    = sized ? static_cast<size_t>(n_experts) : 0;
+    const size_t cells = nb * ne;
+    out.resident.assign(cells, 0);
+    out.admissible.assign(cells, 0);
+    out.eligible.assign(nb, 0);
+    out.pair_bytes.assign(nb, 0);
+    out.file_mapped   = 0;
+    out.single_device = !plan.multi_device;
+    out.device_held   = false;
+    for (const placement_entry & e : plan.entries) {
+        if (e.expert_id >= 0 && detail::moe_expert_role_is_triplet(e.expert_role)) {
+            continue;
+        }
+        bool held = e.on_device && e.target_device == device;
+        for (const placement_alternate_layout & alt : e.alternate_layouts) {
+            held = held || (alt.target_device >= 0 ? alt.target_device : e.target_device) == device;
+        }
+        if (held) {
+            out.device_held = true;
+            break;
+        }
+    }
+    for (const auto & ld : plan.layer_device) {
+        out.device_held = out.device_held || ld.second == device;
+    }
+
+    for (size_t b = 0; b < nb; ++b) {
+        bool     consistent = true;
+        size_t   n_resident = 0;
+        uint64_t mapped     = 0;
+        for (size_t x = 0; x < ne; ++x) {
+            const detail::moe_loan_triplet t =
+                detail::moe_loan_triplet_of(plan, static_cast<int>(b), static_cast<int>(x));
+            if (!t.complete()) {
+                consistent = false;
+                continue;
+            }
+            bool on_card = true;
+            bool on_host = true;
+            for (int r = 0; r < 3; ++r) {
+                on_card = on_card && t.e[r]->on_device && t.e[r]->target_device == device;
+                on_host = on_host && !t.e[r]->on_device;
+            }
+            if (out.pair_bytes[b] == 0) {
+                size_t bytes = 0;
+                for (int r = 0; r < 3; ++r) {
+                    const size_t a = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+                    bytes += (t.e[r]->src_size + a - 1) / a * a;
+                }
+                out.pair_bytes[b] = bytes;
+            }
+            if (on_card) {
+                out.resident[b * ne + x] = 1;
+                ++n_resident;
+                consistent = consistent && detail::moe_loan_triplet_is_lendable(t, plan, bulk_memo);
+            } else if (on_host) {
+                bool pinned    = true;
+                bool stageable = true;
+                bool file      = false;
+                for (int r = 0; r < 3; ++r) {
+                    pinned    = pinned && t.e[r]->host_backing == placement_host_backing::PINNED;
+                    stageable = stageable && detail::moe_admit_layout_stageable(*t.e[r]);
+                    file      = file || t.e[r]->host_backing == placement_host_backing::FILE_MAPPED;
+                }
+                if (pinned && stageable) {
+                    out.admissible[b * ne + x] = 1;
+                } else if (file) {
+                    ++mapped;
+                }
+            } else {
+                consistent = false;
+            }
+        }
+        out.eligible[b] = consistent && n_resident > 0 ? 1 : 0;
+        if (out.eligible[b] != 0) {
+            out.file_mapped += mapped;
+        }
+    }
+    moe_swap_plan_view_count_admissible(out);
 }
 
 }  // namespace ggml_sycl

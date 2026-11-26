@@ -413,8 +413,11 @@ event; it asks each slot's event for its status and refuses the table while a
 slot's copy is still in flight.
 
 The named move bounds memory as follows. An evict mints its pinned host copy
-before it retires the device copy, so a boundary evicts only as many triplets as
-the pinned pool has room for; the rest are BUSY "host pinned pool exhausted".
+before it retires the device copy, and mints it without growing the pinned host
+WEIGHT zone (`ggml_sycl_host_expert_alloc_no_growth`): a decode boundary must not
+take host memory the plan did not size. So a boundary evicts only as many
+triplets as the zone has free room for; the rest are BUSY "host pinned pool
+exhausted". A loan's host copy keeps the growing mint.
 The admit returns each admitted triplet's pinned
 host copy once that copy's last lease drains, so the experts' host pinned use
 stays within the triplets not on the card times the triplet size. It mints its
@@ -423,9 +426,62 @@ triplets as the WEIGHT zone has room for. A triplet the zone cannot hold is
 refused "WEIGHT zone full", BUSY, after giving back what its other members
 minted, and the plan the transaction publishes leaves it on the host; when no
 triplet fits, nothing is published. The caller retries at a later boundary.
-Planned headroom in the zone is the planner's job, not the transaction's. Only
-the private fixtures call the named move for now; the boundary driver that
-will name triplets is not yet written.
+Planned headroom in the zone is the planner's job, not the transaction's.
+
+Every copy a move publishes belongs to the models that owned the entry it
+replaces. A model load's end tags what the load staged with its owners
+(`owner_mask`, `owner_tagged`), and a moved copy is tagged by inheriting its
+source's owners and tag. A model teardown never reclaims an untagged entry, so a
+copy published after the load would otherwise outlive its model in the WEIGHT
+zone or the pinned host zone. One helper, `inherit_entry_ownership`, copies the
+owners and the tag, and copies the source's pending load only when the copy's
+own stamp left none: a copy made outside any load takes the pending load, so
+that load's end tags it, while a mover inside a load keeps that load's stamp,
+since that load published the copy. An admit's or a refill's device entry
+takes them from the host copy it withdraws, under the locks that re-check that
+copy; a loan's or an evict's host copy takes them from the device entry the
+loan retired, which the loan holds in place until its registrations return
+(`register_host_expert_owned`'s `moved_from`). A registration whose
+`moved_from` entry is gone refuses, with one WARN naming the key, before it
+changes anything, so the loan's rollback puts the device entries back rather
+than publish a copy no model owns.
+
+**The swap driver** (`GGML_SYCL_MOE_SWAP=1`, opt-in) is the named move's one
+production caller. At each synchronize after a graph, behind the refill, it asks
+the swap policy (`moe-swap-policy.hpp`) which resident triplet of a block leaves
+for which host triplet, from the route counters, and sends the answer through the
+named move (`moe-swap-driver.hpp` holds the rules, as a pure function of what the
+caller reads). One boundary sends one transaction at most: the evicts, and at the
+next boundary their admits, since an evict's device room comes back only when a
+deferred-free pass reaps the entries it retired. The evict batch is trimmed to
+the room the host zone can hand out without growing
+(`unified_cache::host_zone_no_growth_room`, read without a wait), the same figure
+the evict's mint is refused past. The driver waits for nothing and holds no lock
+across the policy step. On entry it checks once that no graph computes on any
+device and none is in flight; the named move checks again only on its own entry.
+Once two graph computes have overlapped, a latch nothing clears
+(`g_sycl_graph_multithreaded`) turns every later boundary off. Its state is one
+instance per device, keyed on the route table it reads, since that table is one
+per device and shared by every context on the card. A transaction that throws
+leaves its batch unsettled in that state, and the next boundary with no loans
+outstanding settles each move from the plan the move published before it
+rethrew; a loan's publication shows lent triplets off the card, so a boundary
+with loans outstanding settles nothing.
+
+A round is not free. Each accepted transaction publishes a plan, and a published
+plan bumps the exec-graph epoch. A context reads the epoch at its next graph
+compute and clears what it recorded only while it holds a whole-graph recording,
+valid one-slot segments (a prompt records those) or block graphs. That clear also
+retires the keyed decode slots, and each keyed split then runs direct once and
+records once before it replays again. A keyed decode sets none of the three
+again, so the first transaction after a prompt can cost that re-record, and the
+later transactions of the same decode clear nothing: their keyed slots keep
+replaying. That is sound because a keyed split keeps every `MUL_MAT_ID` out of
+its recorded segments, and the direct node resolves its experts at each call.
+That is the mechanism read from the code; no measured figure exists yet. The
+second `[MOE-SWAP]` summary line puts the accepted transactions, evicts and
+admits apart, beside the decode graphs they ran among, and the policy's margin
+and decay are what keep rounds rare once the routing settles.
 
 **Gates.** Three gates keep the rule enforceable.
 

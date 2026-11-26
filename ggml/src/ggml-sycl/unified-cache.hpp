@@ -35,6 +35,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -4236,7 +4237,13 @@ struct expert_move_member {
 // the entry's leases are gone and behind the copy, which is the entry's last write, and in device_keys[i] the key the
 // device entry was retired under: the caller drops every view it holds on the entry by that key, since a retired
 // entry refuses the resolve a view would otherwise be matched by once the cache generation moves. A move to the
-// device leaves both at their defaults.
+// device leaves both at their defaults. An accepted move also reports the host time it spent, in microseconds, in its
+// copy step (the submissions; a synchronous staged branch would show here as a wait) and in its handover (each id
+// handed to the new copy and the old one retired, under the cache locks), for the move's summary line. An accepted move
+// to the host hands the caller, in retired_leases[i], the lease that held each retired device entry in place: the
+// entry's retire is left out of the eviction latch because the caller's publication bumps the exec-graph epoch, so the
+// caller keeps the lease, and the deferred-free pass cannot reap the entry, until that bump has run or the caller has
+// set the latch instead. A move to the device leaves them empty.
 struct expert_move_record {
     bool                 accepted     = false;
     const char *         reason       = "none";
@@ -4246,7 +4253,18 @@ struct expert_move_record {
     expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
                                               expert_retire_status::INVALID };
     unified_cache_key    device_keys[3]   = {};
+    uint64_t             copy_us          = 0;
+    uint64_t             remap_us         = 0;
+
+    // The lease on each device entry a move to the host retired, for the caller to hold (above).
+    std::shared_ptr<mem_handle> retired_leases[3];
 };
+
+// Whole microseconds since `since`, for the expert move's timings.
+inline uint64_t expert_move_us_since(std::chrono::steady_clock::time_point since) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count());
+}
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Deterministic publication/lifecycle controls exist only in private fixtures.
@@ -4493,6 +4511,8 @@ struct unified_cache_entry {
     // decisions actually need.  owner_tagged distinguishes "no owner left"
     // (reclaimable) from "never attributed to any model" (e.g. materialized at
     // runtime, outside a load) -- the latter is kept while any model is live.
+    // A model load's end sets both; a copy an expert move publishes after it
+    // takes them from the entry it replaces (inherit_entry_ownership).
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
     uint64_t              pending_load_txn_id   = 0;
@@ -4503,6 +4523,11 @@ struct unified_cache_entry {
     // yield_optional_layouts_begin() acts on it, and only while no one but the
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
+
+    // Retired by an expert move (loan_expert_triplet(), copy_host_triplet_to_device()), which sets it at its retire
+    // and nowhere else; a restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not
+    // set has_evictions_ (see there). Any other retire of the same entry leaves it false, and its reap latches.
+    bool                  retired_by_expert_move = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -5002,12 +5027,14 @@ class unified_cache {
     // ("device entry size" otherwise) and its owner must hold them too ("host storage too small"). Otherwise the
     // three D2H copies go on the DMA queue, each moving the member's logical_bytes from offset 0 of its device entry,
     // so a padded entry's tail stays behind, and each retaining its two owners until it completes; each device
-    // entry's last write becomes its copy, so its storage is freed behind the copy; each device entry is retired
-    // exactly; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy as
-    // the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
+    // entry's last write becomes its copy, so its storage is freed behind the copy; each member's id is handed to its
+    // host copy's key and then its device entry is retired exactly, so no retire walks the cache for an entry to hand
+    // the id to; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy
+    // as the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
     // entries' whole size, which the deferred-free pass gives back once each entry is reaped. Nothing here waits and
     // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the device
-    // lease, and flips the plan.
+    // lease, and flips the plan; it holds out.retired_leases until its publication bumps the exec-graph epoch or it
+    // sets the eviction latch instead.
     bool loan_expert_triplet(const expert_move_member members[3], expert_move_record & out);
 
     // Whether the cache holds the entry a move copies from, not retired: for a move to the host, the AOS device entry
@@ -5115,14 +5142,20 @@ class unified_cache {
     // replace_existing = false refuses when the key already has an entry, of
     // any state, instead of replacing an idle one with its storage: a loan
     // must be able to undo every registration it made (c-mwmr-3).
-    bool register_host_expert_owned(ggml_sycl_cache_id  key,
-                                    void *              ptr,
-                                    size_t              size,
-                                    ggml_layout_mode    layout,
-                                    mem_handle *        out_handle,
-                                    const mem_handle &  allocation_owner,
-                                    const sycl::event * ready_event      = nullptr,
-                                    bool                replace_existing = true);
+    // A non-null moved_from names the entry a move publishes this copy in
+    // place of: a new entry takes that entry's model ownership, read under the
+    // registration's locks, since the copy holds the same weight. The caller
+    // keeps that entry in place until the registration returns; when it is
+    // gone, the registration refuses with one WARN before anything changes.
+    bool register_host_expert_owned(ggml_sycl_cache_id        key,
+                                    void *                    ptr,
+                                    size_t                    size,
+                                    ggml_layout_mode          layout,
+                                    mem_handle *              out_handle,
+                                    const mem_handle &        allocation_owner,
+                                    const sycl::event *       ready_event      = nullptr,
+                                    bool                      replace_existing = true,
+                                    const unified_cache_key * moved_from       = nullptr);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -5280,9 +5313,15 @@ class unified_cache {
     // Check if budget is exceeded (used > budget after eviction)
     bool is_budget_exceeded() const { return budget_exceeded_; }
 
-    // Returns true if any weight has been evicted from device memory.
-    // Once true, never resets. Used to disable graph replay with stale baked pointers.
+    // Returns true if any weight has been evicted from device memory since the last
+    // reclaim_weight_entries(); see has_evictions_ for what sets and clears it.
+    // Used to disable graph replay and persistent TG with stale baked pointers.
     bool has_evictions() const { return has_evictions_.load(std::memory_order_acquire); }
+
+    // Set the latch for device storage the cache released without setting it itself: an expert move's retires,
+    // which finalize leaves out because the move's publication bumps the exec-graph epoch, when that publication
+    // did not run (a lost plan swap, an exception). Without it those retired pointers would stay replayable.
+    void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }
 
     // Available memory
     size_t available() const {
@@ -5744,6 +5783,15 @@ class unified_cache {
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
     bool     test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_layout_mode layout, sycl::event event);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test-only: the last clears the eviction latch, which production code must never do outside a reclaim.
+    // The walks of entries_ the id remap has made over the cache's life (id_remap_walks_).
+    uint64_t test_id_remap_walks() const noexcept;
+    // The key `id` maps to, in *out; false when the id maps to nothing.
+    bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
+    // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
+    void     test_reset_evictions_latch() noexcept;
+#endif
     size_t   retired_pending_count_for_test() const noexcept {
         return retired_pending_count_.load(std::memory_order_acquire);
     }
@@ -6350,6 +6398,10 @@ class unified_cache {
     size_t host_zone_used(host_zone_id zone) const;
     size_t host_zone_capacity(host_zone_id zone) const;
     size_t host_zone_reserved_capacity(host_zone_id zone) const;
+    // The bytes `zone` can still hand out without growing: host_zone_no_growth_bound() less what it holds, or the
+    // capacity less what it holds for a zone with no bound, never below zero. A request that forbids host-zone growth
+    // is refused past it.
+    size_t host_zone_no_growth_room(host_zone_id zone) const;
     // Largest single-chunk contiguous free block in `zone`. Used by callers
     // that must hand out a contiguous pointer (the SYCL host buffer type)
     // and therefore cannot consume a fragmented multi-segment allocation.
@@ -6821,6 +6873,10 @@ class unified_cache {
     // Cache storage: (identity, type, layer/expert) -> entry
     entry_map entries_;
     id_map    id_to_key_;
+    // How often remap_or_extract_id_mapping_locked() walked entries_ for an entry to hand an id to: a retire whose
+    // id still named it. Each walk visits every entry under both locks, so a move hands its ids over before it
+    // retires and makes none; the device tests read the count across one.
+    std::atomic<uint64_t> id_remap_walks_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
@@ -7854,6 +7910,18 @@ class unified_cache {
     // to host, drop, or async evict.  Used by graph replay / persistent TG to know
     // that baked pointers may reference freed device memory.
     //
+    // Two releases leave it alone, each because something else already drops
+    // every recorded pointer to the storage (finalize_retired_entries_locked):
+    //   - an optional layout copy (a WOQ copy): only yield_optional_layouts_begin()
+    //     releases one, and that transaction bumps the exec-graph epoch, and
+    //     persistent TG never reads a WOQ copy;
+    //   - an expert move's retire (retired_by_expert_move): the move's publication
+    //     bumps the exec-graph epoch, so each context drops the exec graphs it
+    //     recorded before its next replay, and persistent TG refuses any graph
+    //     with a MUL_MAT_ID, so it holds no expert pointer. A move whose
+    //     publication did not run sets the latch through latch_evictions().
+    // A pressure eviction, a drop or an async evict of the same entry latches.
+    //
     // It is a latch, but NOT a process-lifetime one: reclaim_weight_entries()
     // clears it, so the flag is scoped to the current weight population rather
     // than to the cache object.  That clear is sound because every reclaim mode is
@@ -7928,15 +7996,18 @@ class unified_cache {
     // the entry's direct_alloc_owner. A non-null ready_event publishes the
     // entry IN_PROGRESS behind that event (the copy still filling it).
     // replace_existing = false refuses any key that already has an entry.
-    bool register_host_expert(ggml_sycl_cache_id    key,
-                              void *                ptr,
-                              size_t                size,
-                              ggml_layout_mode      layout,
-                              mem_handle *          out_handle,
-                              std::shared_ptr<void> storage_owner,
-                              const mem_handle &    typed_owner,
-                              const sycl::event *   ready_event      = nullptr,
-                              bool                  replace_existing = true);
+    // A non-null moved_from gives a new entry that entry's model ownership,
+    // and refuses the registration when that entry is gone.
+    bool register_host_expert(ggml_sycl_cache_id        key,
+                              void *                    ptr,
+                              size_t                    size,
+                              ggml_layout_mode          layout,
+                              mem_handle *              out_handle,
+                              std::shared_ptr<void>     storage_owner,
+                              const mem_handle &        typed_owner,
+                              const sycl::event *       ready_event      = nullptr,
+                              bool                      replace_existing = true,
+                              const unified_cache_key * moved_from       = nullptr);
 
     // What retire_expert_entry_at_locked() takes out of the lookup maps, kept as the maps' own nodes, so that
     // restore_expert_entry_at_locked() puts them back without building new ones and a loan's rollback allocates no

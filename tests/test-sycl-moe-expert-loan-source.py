@@ -19,7 +19,7 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     it in place, all three before any entry changes, since minting allocates; then each device entry's last write
     becomes its copy (has_write_event stamped from the copy, and the copy ran behind the fill), so
     release_entry_allocation_locked queues the free behind the copy; then it retires each entry exactly, registers
-    the host copy behind its copy event, and only then drops the leases;
+    the host copy behind its copy event, and only then hands the leases to the transaction (a rollback drops them);
   - the retire is exact: it withdraws only the device entry's key, and its mirror only while it names that entry, so
     the loan never calls the id-wide retire_expert_entry_exact;
   - a host registration the checks could not foresee failing puts every device entry back (un-retired, recounted,
@@ -285,8 +285,9 @@ HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_ent
 ENTRY_CHANGED = '{ refusal = "entry changed"; break; }'
 DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
-            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false)")
+            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false, &out.device_keys[i])")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
+HAND_HELD = "for (int i = 0; i < 3; ++i) { out.retired_leases[i] = std::move(held[i]); }"
 
 
 def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
@@ -294,10 +295,11 @@ def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
     bodies = loan_bodies(cache, sycl)
     once = (SRC_IS_OWNER, COPY, STAMP_EVENT, STAMP_FLAG, HOLD, DEVICE_RETIRE, REGISTER)
     return (all(bodies) and not any("host_task" in x for x in bodies) and all(b.count(x) == 1 for x in once)
-            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 2 and b.count(ENTRY_CHANGED) == 1
+            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 1 and b.count(HAND_HELD) == 1
+            and b.count(ENTRY_CHANGED) == 1
             and ordered(b, SRC_IS_OWNER, DMA_QUEUE, COPY, ENTRY_CHANGED, HOLD, STAMP_EVENT, STAMP_FLAG, DEVICE_RETIRE,
                         REGISTER)
-            and b.find(DROP_HELD) > b.find(REGISTER))
+            and b.find(DROP_HELD) > b.find(REGISTER) and b.find(HAND_HELD) > b.find(REGISTER))
 
 
 # --- the retire is exact --------------------------------------------------------------------------------------------
@@ -398,10 +400,11 @@ def claim_registration_checked_before_the_copies(cache: str) -> bool:
 # --- an existing host entry is never replaced (c-mwmr-3) ------------------------------------------------------------
 
 OWNED_SIG = "bool unified_cache::register_host_expert_owned("
-REG_BODY_SIG = "const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing)"
+REG_BODY_SIG = ("const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing, "
+                "const unified_cache_key * moved_from)")
 NO_REPLACE = "if (old != entries_.end()) { if (!replace_existing) { return false; }"
 REPLACE = "erase_entry_locked(old);"
-FORWARD = "ready_event, replace_existing);"
+FORWARD = "ready_event, replace_existing, moved_from);"
 STOP_FROM_RECORD = "stop = record.reason;"
 REFUSE_STOP = "return refuse(stop_code, stop);"
 # A loan never sets `transient`, so its refusals stay REFUSED; only a refill's transient refusal is BUSY.
@@ -634,7 +637,7 @@ def claim_batched_dispatch_skips_a_repeated_ready_event(sycl: str) -> bool:
 LAYOUT_CHECK = 'if (e.layout != GGML_LAYOUT_AOS) { refusal = "layout"; break; }'
 OWNER_CHECK = ("if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) || "
                "md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) "
-               '{ refusal = "shared storage"; break; }')
+               "{ refusal = MOE_EXPERT_MOVE_SHARED_STORAGE; break; }")
 USE_CHECK = 'if (e.direct_alloc_owner.owner_use_count() != 1) { refusal = "storage still referenced"; break; }'
 
 
@@ -913,7 +916,8 @@ SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror
 REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
 HOST_RETIRE = ("if (host != entries_.end() && !host->second.retired && "
                "host->second.direct_alloc_owner.owner_control_id() == src_control[i]) "
-               "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
+               "{ host->second.retired_by_expert_move = true; "
+               "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
 PUBLICATION_FAILED = 'refusal = "publication failed";'
 WITHDRAW_INSERTED = "for (int i = 0; i < inserted; ++i) { (void) transition_to_retired_locked("
 REFILL_CATCH = "} catch (const ggml_sycl_fallback_error &) { throw; } catch (...) { " + WITHDRAW_INSERTED
@@ -1225,7 +1229,7 @@ def claim_final_refusals_name_the_cache_refusals(cache: str, sycl: str) -> bool:
 
 # --- a lent triplet the refill can never prepare leaves the ledger, WARNed (llama.cpp-sif1) -------------------------
 
-RESOLVE_FAILED = "if (!e || !resolver(*e, target) || !target.extra) { return texts.no_tensor; }"
+RESOLVE_FAILED = "if (!resolved || !target.extra) { return texts.no_tensor; }"
 # The refill's row of the kind table: the words its preparation and its log use.
 REFILL_TEXTS = ('case ggml_sycl_expert_move_kind::REFILL: return { "no tensor for a lent expert", "not lent", '
                 '"exception while refilling", "refill" };')
@@ -1570,6 +1574,185 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
             and body(c, REFILL_BODY_SIG).count(REFILL_SIZE_GUARD) == 1)
 
 
+# --- a moved copy belongs to its source's models --------------------------------------------------------------------
+
+# A model load's end tags what it staged, and a model teardown never reclaims an untagged entry, so a copy a move
+# publishes after the load would outlive its model unless it is tagged by inheritance. Each copy takes the owners and
+# tag of the entry it replaces, and that entry's pending load when the copy's own stamp left none, through one helper:
+# the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces and before
+# it is inserted, its mirror keeping the entry's pending load; and the host copy a loan or an evict
+# registers, from the device entry the loan retired and holds in place, before the registration inserts it.
+INHERIT_DEF = ("void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept { "
+               "dst.owner_mask |= src.owner_mask; dst.owner_tagged = dst.owner_tagged || src.owner_tagged; "
+               "if (dst.pending_load_txn_id == 0) { dst.pending_load_txn_id = src.pending_load_txn_id; } }")
+ADMIT_INHERIT = "inherit_entry_ownership(device_entry[i], it->second);"
+ADMIT_MIRROR = "device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;"
+REGISTER_BODY_SIG = ("bool unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, size_t size, "
+                     "ggml_layout_mode layout, mem_handle * out_handle, std::shared_ptr<void> allocation_owner, "
+                     "const mem_handle & typed_owner,")
+REGISTER_OWNED_SIG = "bool unified_cache::register_host_expert_owned("
+REGISTER_STAMP = "stamp_pending_owner(cache_entry, load_effect_guard);"
+REGISTER_INHERIT = ("if (source) { inherit_entry_ownership(cache_entry, *source); "
+                    "mirror_pending_txn = cache_entry.pending_load_txn_id; }")
+REGISTER_INSERT = "entries_[cache_key] = cache_entry;"
+REGISTER_MIRROR_TXN = "entry.pending_load_txn_id = mirror_pending_txn;"
+LOAN_DEVICE_KEY = "out.device_keys[i] = device_key;"
+
+
+def claim_a_moved_copy_belongs_to_its_sources_models(cache: str) -> bool:
+    c = norm(cache)
+    admit = body(c, REFILL_BODY_SIG)
+    reg = body(c, REGISTER_BODY_SIG)
+    owned = body(c, REGISTER_OWNED_SIG)
+    loan = body(c, LOAN_SIG)
+    return (c.count(INHERIT_DEF) == 1 and c.count("inherit_entry_ownership(") == 3
+            and admit.count(ADMIT_INHERIT) == 1 and admit.count(ADMIT_MIRROR) == 1
+            and ordered(admit, REFILL_SESSION, CACHE_LOCKS, ADMIT_INHERIT, ADMIT_MIRROR, EMPLACE, SWAP_MIRROR)
+            and reg.count(REGISTER_INHERIT) == 1 and reg.count(REGISTER_MIRROR_TXN) == 1
+            and ordered(reg, REGISTER_STAMP, REGISTER_INHERIT, REGISTER_INSERT, REGISTER_MIRROR_TXN)
+            and owned.count(FORWARD) == 2
+            and loan.count(REGISTER) == 1 and ordered(loan, LOAN_DEVICE_KEY, REGISTER))
+
+
+# A moved copy whose source entry is gone would be published owned by nobody, and a model teardown never reclaims an
+# untagged entry. The mover holds its source in place until its registrations return, so a missing source means the
+# move is not what it was checked to be: the registration looks the source up first, under its locks, and refuses with
+# one WARN that names the key, before it can erase an existing entry under the key, insert the copy or write its
+# mirror row. The loan's rollback then withdraws the copies it registered and puts the device entries back.
+REGISTER_SOURCE_FIND = ("const unified_cache_entry * source = nullptr; if (moved_from) { "
+                        "const auto found = entries_.find(*moved_from); if (found == entries_.end()) {")
+REGISTER_SOURCE_WARN = ('GGML_LOG_WARN("[UNIFIED-CACHE] register_host_expert refused model=%llu name_hash=0x%llx: '
+                        'the entry its moved copy replaces is gone\\n", (unsigned long long) key.model_id, '
+                        "(unsigned long long) key.name_hash);")
+REGISTER_SOURCE_REFUSE = "return false; } source = &found->second; }"
+REGISTER_OLD_ERASE = "erase_entry_locked(old);"
+
+
+def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
+    reg = body(norm(cache), REGISTER_BODY_SIG)
+    return (reg.count(REGISTER_SOURCE_FIND) == 1
+            and ordered(reg, CACHE_LOCKS, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE,
+                        REGISTER_OLD_ERASE, REGISTER_INSERT, REGISTER_MIRROR_TXN))
+
+
+# --- the evict hands the id over before it retires ------------------------------------------------------------------
+
+# Direct staging maps the id to the device entry, so a retire that found the mapping still there walked every entry of
+# the cache under both locks looking for another to hand it to (13.6 ms a triplet at 75k entries). The loan names the
+# host copy's key first, as an admit names the device entry before it retires the host copy, so its retire finds the id
+# handed over and walks nothing, and the deferred-free pass that erases the entry later finds the same. A rollback hands
+# the id back to the device entry before it withdraws any host copy, so neither walk runs there either, unless the host
+# key is another registrant's live entry, which keeps it. A registration that fails after it named its copy under the
+# id hands the id back to the entry it was to replace, which its mover puts back, so the rollback finds the id to hand
+# back without building a mapping. The remap counts each walk, which the device test reads across an evict.
+LOAN_HOST_KEY = "const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };"
+LOAN_REPOINT = "if (mapped != id_to_key_.end() && mapped->second == device_key) { mapped->second = host_key; }"
+LOAN_HAND_BACK = ("if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) "
+                  "{ mapped->second = device_key; }")
+LOAN_HELD_BY_ANOTHER = ("const bool held_by_another = host != entries_.end() && !host->second.retired && "
+                        "host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();")
+REGISTER_HAND_BACK = ("if (id != id_to_key_.end() && id->second == cache_key) { if (moved_from && "
+                      "detail::cache_id_equal(moved_from->id, key)) { id->second = *moved_from; } "
+                      "else { id_to_key_.erase(id); } }")
+REMAP_EARLY = "if (mapped == id_to_key_.end() || !(mapped->second == removed_key)) { return; }"
+REMAP_WALK_COUNT = "id_remap_walks_.fetch_add(1, std::memory_order_relaxed);"
+REMAP_WALK = "for (const auto & pair : entries_) {"
+
+
+def claim_the_evict_hands_the_id_over_before_it_retires(cache: str) -> bool:
+    c = norm(cache)
+    loan = body(c, LOAN_SIG)
+    reg = body(c, REGISTER_BODY_SIG)
+    remap = body(c, REMAP_SIG)
+    return (loan.count(LOAN_REPOINT) == 1 and loan.count(LOAN_HAND_BACK) == 1 and loan.count(LOAN_HELD_BY_ANOTHER) == 1
+            and ordered(loan, STAMP_FLAG, LOAN_HOST_KEY, LOAN_REPOINT, DEVICE_RETIRE, REGISTER)
+            and ordered(loan, REGISTER_CATCH, LOAN_HELD_BY_ANOTHER, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
+            and reg.count(REGISTER_HAND_BACK) == 1
+            and remap.count(REMAP_WALK_COUNT) == 1 and ordered(remap, REMAP_EARLY, REMAP_WALK_COUNT, REMAP_WALK))
+
+
+def test_the_evict_hands_the_id_over_before_it_retires():
+    assert claim_the_evict_hands_the_id_over_before_it_retires(CACHE)
+
+
+def test_mutant_evict_retires_with_the_id_still_on_the_device_entry_fails():
+    """Without the hand-over the retire finds the id on its entry and walks the whole cache for a replacement."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, LOAN_SIG, LOAN_REPOINT, ""))
+
+
+def test_mutant_evict_hands_the_id_over_after_the_retire_fails():
+    moved = _once_in(CACHE, LOAN_SIG, LOAN_REPOINT, "")
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(moved, LOAN_SIG, DEVICE_RETIRE, DEVICE_RETIRE + " " + LOAN_REPOINT))
+
+
+def test_mutant_rollback_leaves_the_id_on_the_host_key_fails():
+    """The rollback puts the device entry back with the id still naming the host key its withdrawn copy held."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, ""))
+
+
+def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, LOAN_HAND_BACK.replace(" && !held_by_another", "")))
+
+
+def test_mutant_failed_registration_drops_the_moved_id_fails():
+    """A registration whose mirror fails erases the id its copy took, and the rollback has no mapping to hand back."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_HAND_BACK,
+                 "if (id != id_to_key_.end() && id->second == cache_key) { id_to_key_.erase(id); }"))
+
+
+def test_mutant_remap_walks_uncounted_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, REMAP_SIG, REMAP_WALK_COUNT, ""))
+
+
+# A rollback that finds the id mapping gone still puts the device entry back under its id. Something can erase the
+# mapping while the locks are released between step 3 and the rollback (an id-wide retire of the copy this loan
+# registered under the id finds no live entry to hand it to), and the restore re-inserts only a node its own retire
+# took out, which the hand-over left behind. So the loan mints a spare mapping node for each id it hands over, in the
+# check loop, where minting may still throw and nothing has changed, and the rollback inserts it when the id maps to
+# nothing: no node is built in the rollback.
+SPARE_DECL = "id_map::node_type spare_mapping[3];"
+SPARE_MINT = ("if (handed != id_to_key_.end() && handed->second == device_key) { id_map spare; "
+              "spare_mapping[i] = spare.extract(spare.emplace(members[i].key, device_key).first); }")
+SPARE_INSERT = ("else if (mapped == id_to_key_.end() && !spare_mapping[i].empty()) { "
+                "id_to_key_.insert(std::move(spare_mapping[i])); }")
+
+
+def claim_a_rollback_restores_a_lost_id(cache: str) -> bool:
+    loan = body(norm(cache), LOAN_SIG)
+    at = loan.find("if (failed) {")
+    rollback = loan[at:loan.find(REGISTRATION_REFUSED, at)] if at >= 0 else ""
+    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1 and loan.count(SPARE_INSERT) == 1
+            and ordered(loan, SPARE_DECL, HOLD, SPARE_MINT, LOAN_REPOINT)
+            and ordered(rollback, LOAN_HAND_BACK, SPARE_INSERT, HOST_WITHDRAW, RESTORE_CALL)
+            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS))
+
+
+def test_a_rollback_restores_a_lost_id():
+    assert claim_a_rollback_restores_a_lost_id(CACHE)
+
+
+def test_mutant_rollback_leaves_a_lost_id_lost_fails():
+    """The device entry goes back with no id mapping: every reader that resolves the expert through its id misses."""
+    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, LOAN_SIG, SPARE_INSERT, ""))
+
+
+def test_mutant_rollback_builds_the_mapping_fails():
+    """Emplaced in the rollback, the mapping allocates where nothing may throw."""
+    assert not claim_a_rollback_restores_a_lost_id(
+        _once_in(CACHE, LOAN_SIG, SPARE_INSERT,
+                 "else if (mapped == id_to_key_.end()) { id_to_key_.emplace(members[i].key, device_key); }"))
+
+
+def test_mutant_spare_minted_after_the_hand_over_fails():
+    """Minted once the ids are handed over, a throw would leave the entries changed."""
+    moved = _once_in(CACHE, LOAN_SIG, SPARE_MINT, "")
+    assert not claim_a_rollback_restores_a_lost_id(
+        _once_in(moved, LOAN_SIG, LOAN_REPOINT, LOAN_REPOINT + " " + SPARE_MINT))
+
+
 def test_loan_never_waits():
     assert claim_loan_never_waits(CACHE, SYCL)
 
@@ -1875,8 +2058,8 @@ def test_mutant_copy_not_behind_the_fill_fails():
 def test_mutant_host_copy_published_ready_fails():
     """The host entry published READY while its copy is still in flight: a reader could see stale bytes."""
     assert not claim_device_free_gated_on_the_copy(
-        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false)",
-                                                ", m.owner, nullptr, false)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false,",
+                                                ", m.owner, nullptr, false,")), SYCL)
 
 
 def test_mutant_loan_uses_the_id_wide_retire_fails():
@@ -1938,7 +2121,7 @@ def test_mutant_retiring_host_entry_named_as_live_fails():
 
 def test_mutant_loan_registration_may_replace_fails():
     assert not claim_existing_host_entry_never_replaced(
-        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false)", "&out.copy_events[i], true)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false,", "&out.copy_events[i], true,")), SYCL)
 
 
 def test_mutant_registration_ignores_replace_existing_fails():
@@ -1948,7 +2131,7 @@ def test_mutant_registration_ignores_replace_existing_fails():
 
 def test_mutant_typed_registration_drops_replace_existing_fails():
     owned = body(norm(CACHE), OWNED_SIG)
-    dropped = owned.replace(FORWARD, "ready_event);")
+    dropped = owned.replace(FORWARD, "ready_event, moved_from);")
     assert not claim_existing_host_entry_never_replaced(norm(CACHE).replace(owned, dropped, 1), SYCL)
 
 
@@ -3437,6 +3620,343 @@ def test_mutant_between_contexts_line_reads_as_the_exit_report_fails():
                       "(the context that lent them ended) [MOE-EXEC] refill device 0: 0/0 triplets re-admitted")
     assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)
 
+
+# --- a moved copy belongs to its source's models: mutants -----------------------------------------------------------
+
+def test_a_moved_copy_belongs_to_its_sources_models():
+    assert claim_a_moved_copy_belongs_to_its_sources_models(CACHE)
+
+
+def test_mutant_helper_drops_the_tag_fails():
+    """Owners copied without the tag: a copy whose owners all die reads as never attributed and is kept forever."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, "dst.owner_tagged = dst.owner_tagged || src.owner_tagged; ", ""))
+
+
+def test_mutant_admit_publishes_untagged_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, ADMIT_INHERIT + " ", ""))
+
+
+def test_mutant_admit_tags_after_the_insert_fails():
+    """The inserted entry is a copy of device_entry[i]: tagging the local after the insert tags nothing. The call is
+    moved, not dropped, so only the ordering clause (inside the second lock, before the insert) catches it."""
+    moved = _once(CACHE, ADMIT_INHERIT + " ", "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(moved, EMPLACE, EMPLACE + " " + ADMIT_INHERIT))
+
+
+def test_mutant_admit_mirror_keeps_the_stamp_fails():
+    """A mirror whose pending load differs from its entry's survives that load's abort, naming a retired entry."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, " " + ADMIT_MIRROR, ""))
+
+
+def test_mutant_registration_ignores_the_source_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, REGISTER_INHERIT, ""))
+
+
+def test_mutant_registration_tags_after_the_insert_fails():
+    moved = _once(CACHE, REGISTER_INHERIT, "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once_in(moved, REGISTER_BODY_SIG, REGISTER_INSERT, REGISTER_INSERT + " " + REGISTER_INHERIT))
+
+
+def test_mutant_registration_mirror_keeps_the_stamp_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, REGISTER_MIRROR_TXN, "entry.pending_load_txn_id = load_effect_guard.load_txn_id();"))
+
+
+def test_mutant_owned_registration_drops_the_source_fails():
+    """The typed overload forwards to the body without the source: every loan's host copy is published untagged."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, "allocation_owner, ready_event, replace_existing, moved_from);",
+              "allocation_owner, ready_event, replace_existing);"))
+
+
+def test_mutant_loan_names_no_source_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, REGISTER, REGISTER.replace(", &out.device_keys[i])", ", nullptr)")))
+
+
+def test_mutant_loan_names_its_source_after_the_registration_fails():
+    """The registration reads the key it is handed as the source: a key set only after the call names no entry."""
+    moved = _once_in(CACHE, LOAN_SIG, " " + LOAN_DEVICE_KEY, "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once_in(moved, LOAN_SIG, REGISTER + ";", REGISTER + "; " + LOAN_DEVICE_KEY))
+
+
+# --- a missing source refuses before the insert -----------------------------------------------------------------------
+
+def test_a_missing_source_refuses_before_the_insert():
+    assert claim_a_missing_source_refuses_before_the_insert(CACHE)
+
+
+def test_mutant_missing_source_publishes_untagged_fails():
+    """The WARN without the refusal: the copy is inserted and mirrored owned by nobody, and outlives its model."""
+    assert not claim_a_missing_source_refuses_before_the_insert(
+        _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE, "} else { source = &found->second; } }"))
+
+
+def test_mutant_missing_source_looked_up_before_the_locks_fails():
+    """The source looked up before the locks are taken: another thread can erase it between the lookup and the
+    insert, and the copy inherits from an entry that is gone."""
+    unlocked = _once_in(CACHE, REGISTER_BODY_SIG, " std::lock(direct_lock, cache_lock);", "")
+    assert not claim_a_missing_source_refuses_before_the_insert(
+        _once_in(unlocked, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE,
+                 REGISTER_SOURCE_REFUSE + " std::lock(direct_lock, cache_lock);"))
+
+
+
+# --- a member's ids come from an index, not a scan of the expert table ----------------------------------------------
+
+# A move resolves every member's canonical ids, and the table those come from has a row per expert per tensor (73728 on
+# Qwen), so a scan per member cost as much as the transaction's copies. The index is built from the table wherever the
+# table is replaced, in the same allocation epoch and swapped in under the same locks, so the two never disagree, and
+# the lookups walk only the rows of one tensor name and expert, in table order.
+GET_KEYS_SIG = "static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys("
+MATERIALIZE_SIG = "static bool ggml_sycl_materialize_planned_expert_layout("
+META_SCAN = "for (const auto & m : g_moe_expert_meta)"
+KEYS_LOOKUP = ("for (uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id); r != UINT32_MAX; "
+               "r = g_moe_expert_meta_index.next_row[r]) {")
+MATERIALIZE_LOOKUP = "const uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id);"
+INDEX_BUILT = "new_expert_meta_index = moe_expert_meta_index_build(new_expert_meta);"
+PUBLISH_LOCK = "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);"
+PUBLISH_TABLE = "g_moe_expert_meta.swap(new_expert_meta);"
+PUBLISH_INDEX = "g_moe_expert_meta_index.swap(new_expert_meta_index);"
+SEED_ROW = "g_moe_expert_meta.push_back({});"
+SEED_INDEX = "g_moe_expert_meta_index = moe_expert_meta_index_build(g_moe_expert_meta);"
+
+
+def claim_member_ids_come_from_the_meta_index(sycl: str) -> bool:
+    s = norm(sycl)
+    keys = body(s, GET_KEYS_SIG)
+    mat = body(s, MATERIALIZE_SIG)
+    return (bool(keys) and bool(mat) and META_SCAN not in keys and META_SCAN not in mat
+            and keys.count(KEYS_LOOKUP) == 1 and mat.count(MATERIALIZE_LOOKUP) == 1
+            and s.count("moe_expert_meta_index_build(") == 3 and s.count(INDEX_BUILT) == 1
+            and s.count(PUBLISH_INDEX) == 1 and ordered(s, INDEX_BUILT, PUBLISH_LOCK, PUBLISH_TABLE, PUBLISH_INDEX)
+            and s.count(SEED_INDEX) == 1 and ordered(s, SEED_ROW, SEED_INDEX))
+
+
+def test_member_ids_come_from_the_meta_index():
+    assert claim_member_ids_come_from_the_meta_index(SYCL)
+
+
+def test_mutant_member_ids_scan_the_table_fails():
+    """The scan per member back: every member of a move compares its name against every row of the table."""
+    assert not claim_member_ids_come_from_the_meta_index(
+        _once_in(SYCL, GET_KEYS_SIG, KEYS_LOOKUP, META_SCAN + " { const uint32_t r = 0; (void) r;"))
+
+
+def test_mutant_index_left_stale_by_a_new_table_fails():
+    """A new table published without its index: the lookups answer with the previous model's rows."""
+    assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, PUBLISH_INDEX, ""))
+
+
+def test_mutant_seeded_row_leaves_the_index_behind_fails():
+    """A test row seeded without its index: the lookups cannot see the row the test placed."""
+    assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, SEED_INDEX, ""))
+
+
+
+# --- an expert move's retires leave the eviction latch alone, while its publication covers them ---------------------
+
+# has_evictions_ turns off graph replay and persistent TG for the whole process until the next model load, so a decode
+# run that evicted once ran every later graph by direct dispatch. An expert move's retires do not need it: its
+# publication bumps the exec-graph epoch, which drops every exec graph that may bake a moved copy's pointer, and
+# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes, the loan's
+# device entries and the copy to the device's host copies, finalize leaves only marked entries out of the latch, and a
+# restore clears the mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
+# epoch has moved: the transaction arms a guard before each cache move, disarms it again for a move the cache refused
+# whole, and dismisses it only after the epoch bump in the won swap; on every other exit (a lost swap, a throw) its
+# destructor sets the latch through the cache's one public setter.
+CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
+FINALIZE_SIG = "size_t unified_cache::finalize_retired_entries_locked() {"
+FINALIZE_LATCH = re.compile(r"if \(([^{]*)\) \{ has_evictions_\.store\(true")
+MOVE_MARK_FIELD = "!entry.retired_by_expert_move"
+LOAN_MARK = "device_entry[i]->retired_by_expert_move = true;"
+ADMIT_MARK = "host->second.retired_by_expert_move = true;"
+ADMIT_RETIRE = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
+RESTORE_CLEAR = "it->second.retired_by_expert_move = false;"
+LATCH_SETTER = "void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }"
+GUARD_DTOR = "~ggml_sycl_expert_move_latch_guard() { if (armed && cache) { cache->latch_evictions(); } }"
+GUARD_DECL = "ggml_sycl_expert_move_latch_guard latch{ cache };"
+GUARD_ARM = "const bool armed_before = latch.armed; latch.armed = true;"
+GUARD_REFUSED = "if (!loaned) { latch.armed = armed_before; }"
+GUARD_DISMISS = "ggml_sycl_optional_layouts_retired(); latch.armed = false; }"
+SWAP_WON = "if (swapped) {"
+
+
+def claim_a_move_marks_its_retires_and_only_they_skip_the_latch(cache: str, hpp: str) -> bool:
+    c = norm(cache)
+    latch = FINALIZE_LATCH.search(body(c, FINALIZE_SIG))
+    loan = body(c, LOAN_SIG)
+    copy = body(c, REFILL_BODY_SIG)
+    return (latch is not None and MOVE_MARK_FIELD in latch.group(1) and "!entry.optional_layout" in latch.group(1)
+            and c.count("retired_by_expert_move = true;") == 2
+            and loan.count(LOAN_MARK) == 1 and ordered(loan, LOAN_MARK, DEVICE_RETIRE)
+            and copy.count(ADMIT_MARK) == 1 and ordered(copy, ADMIT_MARK, ADMIT_RETIRE)
+            and body(c, RESTORE_SIG).count(RESTORE_CLEAR) == 1
+            and "bool retired_by_expert_move = false;" in norm(hpp))
+
+
+def test_a_move_marks_its_retires_and_only_they_skip_the_latch():
+    assert claim_a_move_marks_its_retires_and_only_they_skip_the_latch(CACHE, CACHE_HPP)
+
+
+def test_mutant_finalize_latches_a_moves_retire_fails():
+    """The exemption gone: a decode run's first evict turns off graph replay until the next load."""
+    n = norm(CACHE)
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(n, FINALIZE_SIG, " && " + MOVE_MARK_FIELD, ""), CACHE_HPP)
+
+
+def test_mutant_loan_retire_left_unmarked_fails():
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(_once_in(CACHE, LOAN_SIG, LOAN_MARK, ""),
+                                                                           CACHE_HPP)
+
+
+def test_mutant_restore_keeps_the_mark_fails():
+    """A restored entry kept the mark: a later pressure eviction or drop of it would skip the latch."""
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(CACHE, RESTORE_SIG, RESTORE_CLEAR, ""), CACHE_HPP)
+
+
+def claim_an_unpublished_move_sets_the_latch(sycl: str, hpp: str) -> bool:
+    s = norm(sycl)
+    txn = body(s, TXN_SIG)
+    return (LATCH_SETTER in norm(hpp) and s.count(GUARD_DTOR) == 1
+            and txn.count(GUARD_DECL) == 1 and txn.count(GUARD_ARM) == 1 and txn.count(GUARD_REFUSED) == 1
+            and txn.count("latch.armed = false;") == 1 and txn.count(GUARD_DISMISS) == 1
+            and ordered(txn, GUARD_DECL, GUARD_ARM, MOVE_CALL, GUARD_REFUSED, SWAP_WON, PUBLISH, GUARD_DISMISS))
+
+
+def test_an_unpublished_move_sets_the_latch():
+    assert claim_an_unpublished_move_sets_the_latch(SYCL, CACHE_HPP)
+
+
+def test_mutant_guard_dismissed_before_the_swap_fails():
+    """Dismissed as the cache moves: a lost swap leaves retires no epoch covers out of the latch."""
+    n = norm(SYCL)
+    moved = _once_in(n, TXN_SIG, GUARD_DISMISS, "ggml_sycl_optional_layouts_retired(); }")
+    assert not claim_an_unpublished_move_sets_the_latch(
+        _once_in(moved, TXN_SIG, GUARD_REFUSED, GUARD_REFUSED + " latch.armed = false;"), CACHE_HPP)
+
+
+def test_mutant_guard_sets_nothing_fails():
+    assert not claim_an_unpublished_move_sets_the_latch(
+        _once(SYCL, GUARD_DTOR, "~ggml_sycl_expert_move_latch_guard() {}"), CACHE_HPP)
+
+
+def test_mutant_guard_never_armed_fails():
+    assert not claim_an_unpublished_move_sets_the_latch(_once_in(SYCL, TXN_SIG, GUARD_ARM, ""), CACHE_HPP)
+
+
+# (d) The retires stay unreapable until the latch question is settled. A retired device entry is reaped by the
+# deferred-free pass once its last lease goes, and the mark leaves that reap out of the latch, so a lease must hold
+# each entry until the publication has bumped the epoch, or until the guard has latched on an exit that did not
+# publish. The loan hands the leases that held its retires in place to the transaction (expert_move_record::
+# retired_leases) instead of dropping them; the transaction moves them into one vector, reserved before the first move
+# so taking them cannot throw, and declared before the guard, so the guard's destructor runs first on every exit. The
+# vector is never released by hand: it goes as the call returns, after the bump or after the latch.
+RECORD_LEASES = "std::shared_ptr<mem_handle> retired_leases[3];"
+LEASES_DECL = "std::vector<std::shared_ptr<ggml_sycl::mem_handle>> move_leases;"
+LEASES_RESERVE = "move_leases.reserve(3 * prepared.size());"
+LEASES_TAKEN = ("for (std::shared_ptr<ggml_sycl::mem_handle> & lease : record.retired_leases) { if (lease) { "
+                "move_leases.push_back(std::move(lease)); } }")
+
+
+def claim_a_moves_retires_stay_leased_until_published(cache: str, hpp: str, sycl: str) -> bool:
+    loan = body(norm(cache), LOAN_SIG)
+    txn = body(norm(sycl), TXN_SIG)
+    return (RECORD_LEASES in norm(hpp) and loan.count(HAND_HELD) == 1 and loan.count(DROP_HELD) == 1
+            and ordered(loan, "if (failed) {", DROP_HELD, "return false; }", HAND_HELD, "out.accepted = true;")
+            and txn.count("move_leases") == 3 and txn.count(LEASES_TAKEN) == 1
+            and ordered(txn, LEASES_DECL, LEASES_RESERVE, GUARD_DECL, MOVE_CALL, LEASES_TAKEN, GUARD_REFUSED))
+
+
+def test_a_moves_retires_stay_leased_until_published():
+    assert claim_a_moves_retires_stay_leased_until_published(CACHE, CACHE_HPP, SYCL)
+
+
+def test_mutant_loan_drops_its_retires_leases_fails():
+    """The loan dropped them as before: the deferred-free pass can reap a marked entry before any epoch moves."""
+    assert not claim_a_moves_retires_stay_leased_until_published(_once_in(CACHE, LOAN_SIG, HAND_HELD, DROP_HELD),
+                                                                 CACHE_HPP, SYCL)
+
+
+def test_mutant_txn_leaves_the_leases_on_the_record_fails():
+    """Left on the per-triplet record, each lease goes at the end of its loop iteration, before the publication."""
+    assert not claim_a_moves_retires_stay_leased_until_published(CACHE, CACHE_HPP,
+                                                                 _once_in(SYCL, TXN_SIG, LEASES_TAKEN, ""))
+
+
+def test_mutant_leases_outlived_by_the_guard_fails():
+    """Declared after the guard, the leases go before its destructor latches: a reap in between skips the latch."""
+    moved = _once_in(SYCL, TXN_SIG, LEASES_DECL + " " + LEASES_RESERVE, "")
+    assert not claim_a_moves_retires_stay_leased_until_published(
+        CACHE, CACHE_HPP, _once_in(moved, TXN_SIG, GUARD_DECL, GUARD_DECL + " " + LEASES_DECL + " " + LEASES_RESERVE))
+
+
+def test_mutant_leases_released_before_the_bump_fails():
+    assert not claim_a_moves_retires_stay_leased_until_published(
+        CACHE, CACHE_HPP, _once_in(SYCL, TXN_SIG, PUBLISH, "move_leases.clear(); " + PUBLISH))
+
+
+# The hooks the move cases read the latch and the id map through exist only in the testing build: a production caller
+# of test_reset_evictions_latch could clear the latch outside a reclaim and turn graph replay back on over a retire no
+# epoch covers.
+TEST_ONLY_HOOKS = ("test_id_remap_walks()", "test_id_mapping(ggml_sycl_cache_id id", "test_reset_evictions_latch()")
+PRIVATE_TESTING_IF = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+
+
+def _in_private_testing(text: str, needle: str) -> bool:
+    """Whether every occurrence of `needle` sits in the true branch of a GGML_SYCL_PRIVATE_TESTING conditional."""
+    lines = strip_comments(text).split("\n")
+    stack: list[bool] = []
+    seen = False
+    for line in lines:
+        directive = line.strip()
+        if directive.startswith("#if"):
+            stack.append(directive == PRIVATE_TESTING_IF)
+        elif directive.startswith("#el"):
+            stack[-1] = False
+        elif directive.startswith("#endif"):
+            stack.pop()
+        elif needle in line:
+            seen = True
+            if not any(stack):
+                return False
+    return seen
+
+
+def _raw_once(text: str, old: str, new: str) -> str:
+    """`text` with the one occurrence of `old` replaced on the raw text, for a mutant whose anchor is a line break."""
+    assert text.count(old) == 1, f"mutant anchor must match exactly once: {old!r} x{text.count(old)}"
+    return text.replace(old, new, 1)
+
+
+def claim_the_move_test_hooks_are_test_only(hpp: str, cache: str) -> bool:
+    return all(_in_private_testing(hpp, hook) and _in_private_testing(cache, "unified_cache::" + hook)
+               for hook in TEST_ONLY_HOOKS)
+
+
+def test_the_move_test_hooks_are_test_only():
+    assert claim_the_move_test_hooks_are_test_only(CACHE_HPP, CACHE)
+
+
+def test_mutant_latch_reset_in_production_fails():
+    """The declaration moved out of the guard: production code could clear the latch."""
+    hpp = _raw_once(CACHE_HPP, "    void     test_reset_evictions_latch() noexcept;\n", "")
+    hpp = _raw_once(hpp, PRIVATE_TESTING_IF + "\n    // Test-only",
+                "    void     test_reset_evictions_latch() noexcept;\n" + PRIVATE_TESTING_IF + "\n    // Test-only")
+    assert not claim_the_move_test_hooks_are_test_only(hpp, CACHE)
+
+
+def test_mutant_definitions_in_production_fail():
+    cache = _raw_once(CACHE, PRIVATE_TESTING_IF + "\nvoid unified_cache::test_reset_evictions_latch()",
+                  "void unified_cache::test_reset_evictions_latch()")
+    cache = _raw_once(cache, "    return true;\n}\n#endif\n\nuint64_t unified_cache::test_entry_pending_load_txn(",
+                  "    return true;\n}\n\nuint64_t unified_cache::test_entry_pending_load_txn(")
+    assert not claim_the_move_test_hooks_are_test_only(CACHE_HPP, cache)
 
 if __name__ == "__main__":
     import sys

@@ -22,8 +22,9 @@ shows that. This gate holds them:
   P8  the prompt count reads the prompt ids snapshot, after it is taken, on the gate tensor only, into the prompt
       counts only;
   P9  the table is sized at the hybrid init from the model's own blocks and experts, with no clamp;
-  P10 the counts feed nothing: the backend never reads one back, and takes the table in two places only (the record
-      build and the prompt helper);
+  P10 the counts feed only the expert swap driver (GGML_SYCL_MOE_SWAP=1): the backend takes the table in three places
+      only (the record build, the prompt helper and the swap driver), and reads a count back only in the swap driver,
+      the decode and the prompt count once each;
   P11 the header is plain host code: standard includes only, no SYCL, no device allocation;
   P12 lifetime: the record holds the table by shared_ptr, the registry replaces it under its lock and is never
       destroyed;
@@ -66,6 +67,7 @@ RESOLVE = "auto resolve = ["
 BUILD_FN = "static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_build("
 INIT_FN = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
 PROMPT_HELPER = "static void ggml_sycl_moe_route_counts_add_prompt("
+SWAP_FN = "static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {"
 REPORT_FN = "void moe_route_counts_report_final(int device, int64_t tokens) {"
 INSTALL_FN = "std::shared_ptr<moe_route_counts> moe_route_counts_install("
 COUNT_GUARD = "if (record->route_counts && record->route_block >= 0) {"
@@ -323,15 +325,23 @@ def check(s: Sources) -> None:
         raise ContractError("FAIL [pin P9]: the table's dimensions are clamped")
 
     # P10 ------------------------------------------------------------------------------------------------------------
-    if be.code.count("moe_route_counts_current(") != 2:
-        raise ContractError("FAIL [pin P10]: the backend takes the table other than in the record build and the helper")
-    readers = re.findall(
+    swap_b, swap_e = be.block_after(SWAP_FN, "P10")
+    swap = be.code[swap_b:swap_e]
+    if be.code.count("moe_route_counts_current(") != 3 or swap.count("moe_route_counts_current(") != 1:
+        raise ContractError("FAIL [pin P10]: the backend takes the table other than in the record build, the helper "
+                            "and the swap driver")
+    readers = list(re.finditer(
         r"\b(?:decode_count|prompt_count|block_hits|block_misses|block_resident|moe_route_top_n_coverage\w*|"
         r"moe_route_overall_hit_rate|moe_route_mean_resident_experts|moe_route_csv|moe_route_block_table)\(",
         be.code,
-    )
-    if readers:
-        raise ContractError(f"FAIL [pin P10]: the backend reads a route count back ({readers[0]})")
+    ))
+    outside = [m.group(0) for m in readers if not swap_b <= m.start() < swap_e]
+    if outside:
+        raise ContractError(f"FAIL [pin P10]: the backend reads a route count back outside the swap driver ({outside[0]})")
+    inside = sorted(m.group(0) for m in readers if swap_b <= m.start() < swap_e)
+    if inside != ["decode_count(", "prompt_count("]:
+        raise ContractError(f"FAIL [pin P10]: the swap driver reads other than the decode and prompt counts, once each "
+                            f"({', '.join(inside) or 'none'})")
 
     # P11 ------------------------------------------------------------------------------------------------------------
     hdr = s.header.code
@@ -587,7 +597,9 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("count-read-back", "P10", B,
                 [("        table->add_prompt(block, ids[i]);\n",
                   "        table->add_prompt(block, ids[i]);\n        (void) table->decode_count(block, ids[i]);\n")])
-    expect_fail("third-table-consumer", "P10", B,
+    expect_fail("swap-driver-reads-the-hits", "P10", B,
+                [("table->prompt_count(b, e);", "table->block_hits(b);")])
+    expect_fail("fourth-table-consumer", "P10", B,
                 [("    record->route_counts = ggml_sycl::moe_route_counts_current(device);",
                   "    record->route_counts = ggml_sycl::moe_route_counts_current(device);\n"
                   "        (void) ggml_sycl::moe_route_counts_current(device);")])

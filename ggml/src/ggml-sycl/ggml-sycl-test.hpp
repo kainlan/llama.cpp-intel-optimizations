@@ -725,6 +725,30 @@ std::string test_expert_evict_and_admit_cycles_return_the_room();
 std::string test_expert_evict_refusal_leaves_the_admit_list_alone();
 std::string test_expert_evict_room_is_not_an_admit_in_the_same_call();
 std::string test_expert_evict_takes_a_block_off_the_direct_route();
+// A named evict's host copies never grow the pinned host zone: into a full host WEIGHT zone it is BUSY "host pinned
+// pool exhausted" and the zone's capacity is unchanged; once the room is back the same evict moves.
+std::string test_expert_evict_without_host_room_is_busy_and_keeps_the_zone();
+// A move hands each member's id to the copy it publishes before it retires the entry the id named, so no retire and
+// no reaping walks the cache's entries for an entry to hand the id to, and a loan's rollback hands it back.
+std::string test_expert_evict_walks_no_entry_to_hand_over_its_id();
+std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry();
+// A move's retires leave the cache's eviction latch clear, since the move's publication bumps the exec-graph epoch: a
+// named evict, an admit and their reaps set nothing, while a drop of an expert's device entry outside a move latches.
+std::string test_expert_moves_leave_the_eviction_latch_clear();
+// A move whose plan swap loses publishes nothing and bumps no epoch, so the transaction sets the eviction latch as it
+// returns.
+std::string test_expert_move_whose_swap_lost_sets_the_eviction_latch();
+// A host copy registered in place of a device entry whose mirror cannot be published hands the id it took back to that
+// entry, and the same registration without the failure maps the id to the copy.
+std::string test_expert_failed_moved_copy_hands_its_id_back();
+// Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
+// it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
+// no model ever owned stays through the release. A copy made while its source's load is still pending takes that
+// load, so the load's end tags it.
+std::string test_expert_admit_belongs_to_the_host_copys_model();
+std::string test_expert_evict_host_copy_belongs_to_the_device_entrys_model();
+std::string test_expert_evict_host_copy_takes_the_sources_pending_load();
+std::string test_expert_refill_belongs_to_the_lending_model();
 #endif
 
 }  // namespace ggml_sycl

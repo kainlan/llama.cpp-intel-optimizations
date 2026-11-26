@@ -717,6 +717,66 @@ def witness_f_no_growth_bound_use_site(t):
     return t
 
 
+# --- G: the no-growth refusal WARN in unified_alloc. A WEIGHT refusal is a planning fault when the request is one the
+# planner sized the zone for: a persistent owner, or a request that leaves its failure to the cache's own log. A request
+# that suppresses its failure log and is no persistent owner (the evict's host copy at a decode boundary) is
+# back-pressure its caller retries and counts, so its refusal must not WARN once per retry. Each operand of the
+# condition is pinned alone, and the zone test with them: dropping `!suppress_failure_log` silences a planned owner
+# that reports through the cache's log, dropping `persistent_owner` silences the MMID host pool's sizing figures, and
+# dropping the zone test warns for the zones whose misses are back-pressure.
+REFUSE_NO_GROWTH_LAMBDA = "const auto refuse_no_growth = [&](host_zone_alloc_miss miss) -> void * {"
+REFUSAL_WARN_CALL = "host_zone_no_growth_refusal_warn("
+REFUSAL_WARN_CONDITION = ("if (zone == host_zone_id::WEIGHT && "
+                          "(!req.suppress_failure_log || req.intent.constraints.persistent_owner)) { "
+                          + REFUSAL_WARN_CALL)
+
+
+def refuse_no_growth_block(fn: str) -> str:
+    """The refuse_no_growth lambda in unified_alloc, brace-matched and whitespace-normalized, or "" when absent."""
+    return " ".join(function_window(fn, REFUSE_NO_GROWTH_LAMBDA, window=4000).split())
+
+
+def check_g_refusal_warn_condition(t):
+    block = refuse_no_growth_block(t["unified_alloc_fn"])
+    return (
+        bool(block)
+        and REFUSAL_WARN_CONDITION in block
+        and block.count(REFUSAL_WARN_CALL) == 1
+        and t["unified_alloc_fn"].count(REFUSAL_WARN_CALL) == 1
+    )
+
+
+def witness_g(replacement):
+    """A witness that rewrites the lambda's WARN condition (as the source spells it) into `replacement`."""
+    def apply(t):
+        fn = t["unified_alloc_fn"]
+        start = fn.find(REFUSE_NO_GROWTH_LAMBDA)
+        warn = fn.find("if (zone == host_zone_id::WEIGHT", start)
+        end = fn.find("{", warn)
+        if start < 0 or warn < 0 or end < 0:
+            return t
+        t["unified_alloc_fn"] = fn[:warn] + replacement + " " + fn[end:]
+        return t
+    return apply
+
+
+witness_g_drop_suppress_operand = witness_g(
+    "if (zone == host_zone_id::WEIGHT && (req.intent.constraints.persistent_owner))")
+witness_g_drop_persistent_operand = witness_g(
+    "if (zone == host_zone_id::WEIGHT && (!req.suppress_failure_log))")
+witness_g_drop_zone_operand = witness_g(
+    "if ((!req.suppress_failure_log || req.intent.constraints.persistent_owner))")
+witness_g_always_warn = witness_g("if (zone == host_zone_id::WEIGHT)")
+witness_g_never_warn = witness_g("if (false)")
+
+
+def witness_g_second_warn_site(t):
+    # A second, unconditional call to the WARN helper outside the lambda.
+    anchor = "if (!ptr && host_miss == host_zone_alloc_miss::NONE"
+    t["unified_alloc_fn"] = t["unified_alloc_fn"].replace(anchor, "host_zone_no_growth_refusal_warn();\n" + anchor, 1)
+    return t
+
+
 # (name, check, witness): the witness reproduces the defect textually in a
 # copy of `texts`; the check must then fail against that copy.
 checks = [
@@ -764,6 +824,19 @@ checks = [
      check_e_docs, witness_e_docs),
     ("F: unified_alloc's no-growth pre-check compares against host_zone_no_growth_bound(), not the reservation",
      check_f_no_growth_bound_use_site, witness_f_no_growth_bound_use_site),
+    ("G: the no-growth refusal WARN is dropped when the request suppresses its failure log and is no persistent owner "
+     "(drop !suppress_failure_log)",
+     check_g_refusal_warn_condition, witness_g_drop_suppress_operand),
+    ("G: the no-growth refusal WARN keeps a persistent owner (drop persistent_owner)",
+     check_g_refusal_warn_condition, witness_g_drop_persistent_operand),
+    ("G: the no-growth refusal WARN is WEIGHT-only (drop the zone test)",
+     check_g_refusal_warn_condition, witness_g_drop_zone_operand),
+    ("G: the no-growth refusal WARN is conditional (always warn for WEIGHT)",
+     check_g_refusal_warn_condition, witness_g_always_warn),
+    ("G: the no-growth refusal WARN is still emitted (never warn)",
+     check_g_refusal_warn_condition, witness_g_never_warn),
+    ("G: the no-growth refusal WARN has one call site",
+     check_g_refusal_warn_condition, witness_g_second_warn_site),
 ]
 
 failed = [name for name, check, _witness in checks if not check(texts)]

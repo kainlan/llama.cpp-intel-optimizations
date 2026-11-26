@@ -25,6 +25,18 @@
 //     the next boundary, so nothing is lost.
 //   - A prompt pass seeds usage and proposes nothing: its counts are absorbed with no decay, it does not count toward
 //     the period, so the first decode boundary after a prompt starts from the prompt's routing.
+//   - The prompt boundary. A prompt pass leaves a prompt boundary pending. The next decode call that carries a gate
+//     K > 0 (`prompt_gate`, which the driver sets to 2 x the CPU's expert rate / the host-to-device rate) takes it at
+//     once, whatever the period says: it absorbs, proposes every pair whose host expert's usage is at least the
+//     resident expert's plus G = max(margin, K), with no min_usage and no max_swaps, and does not decay. A pair that
+//     clears G pays for its copy: the prompt's routing says the host expert would cost more on the CPU over the next
+//     tokens than its move costs once. The token still counts toward the period, so the decode rule's next boundary
+//     is where it would have been. While swaps are in flight that call is IN_FLIGHT and the prompt boundary stays
+//     pending for the next one. A decode call with K <= 0 or NaN (an unprobed device) spends it: the decode rule
+//     follows. A driver that could move only part of the batch calls moe_swap_prompt_boundary_defer, and the next
+//     decode call takes the prompt boundary again for the rest.
+//   - A host expert the caller marks not admissible (its `admissible` flag zero: a file-mapped copy, say) is no
+//     candidate under either rule. Its usage is still followed and decayed.
 //
 // Inputs are cumulative counts, as the route counters keep them, not deltas: the state remembers the counts it last
 // saw and absorbs the difference. A count that is lower than the remembered one means the counter restarted, and
@@ -52,7 +64,9 @@
 //   - a boundary that has no candidate allocates nothing. The scratch vectors are sized for E experts when the state
 //     is built and the proposal pool grows only the first times a boundary has more proposals than before, so a
 //     boundary allocates only until its scratch has been as large as it gets. The caller's output vector is cleared
-//     and refilled, so it allocates only when it grows past its own capacity (never above max_swaps entries).
+//     and refilled, so it allocates only when it grows past its own capacity (never above max_swaps entries at a
+//     decode boundary; a prompt boundary has no cap, so its output can reach B * min(R, E - R) entries);
+//   - moe_swap_peek does O(1) work and allocates nothing.
 // State is 24 bytes per cell (usage and the two remembered counts).
 #pragma once
 
@@ -93,6 +107,7 @@ struct moe_swap_block_input {
     const uint64_t * decode_counts = nullptr;  // cumulative routed (token, expert) pairs of the decode route
     const uint64_t * prompt_counts = nullptr;  // the same for the prompt route
     const uint8_t *  resident      = nullptr;  // n_experts flags, nonzero = the expert is resident
+    const uint8_t *  admissible    = nullptr;  // n_experts flags, zero = this host expert cannot enter; null = all can
     bool             eligible      = false;    // may this block take part in a swap now
 };
 
@@ -104,13 +119,14 @@ struct moe_swap_call {
     int                          n_tokens     = 1;  // decode tokens this boundary stands for; ignored after a prompt
     bool                         in_flight    = false;  // an earlier swap has not finished
     bool                         after_prompt = false;  // this boundary follows a prompt pass, not a decode token
+    double                       prompt_gate  = 0.0;    // K: > 0 takes a pending prompt boundary; <= 0 or NaN does not
 };
 
 enum moe_swap_status {
     MOE_SWAP_STATUS_WAITING,    // a decode token that did not reach a period boundary: nothing was read
     MOE_SWAP_STATUS_SEEDED,     // a prompt pass: counts absorbed, no decay, no proposal
-    MOE_SWAP_STATUS_IN_FLIGHT,  // a period boundary skipped because swaps are in flight: no absorb, no decay
-    MOE_SWAP_STATUS_ADAPTED,    // a period boundary taken: proposals (possibly none) returned, usage decayed
+    MOE_SWAP_STATUS_IN_FLIGHT,  // a period or prompt boundary skipped because swaps are in flight: no absorb, no decay
+    MOE_SWAP_STATUS_ADAPTED,    // a boundary taken: proposals (possibly none) returned; a period boundary decays
     MOE_SWAP_STATUS_REJECTED,   // a shape or parameter that does not fit the contract: nothing was touched
 };
 
@@ -146,6 +162,7 @@ struct moe_swap_state {
     int                                           n_blocks  = 0;
     int                                           n_experts = 0;
     uint64_t                                      tokens    = 0;  // decode tokens seen, the period's clock
+    bool                                          prompt_pending = false;  // a prompt pass left its boundary untaken
     std::vector<double>                           usage;  // decayed usage per (block, expert), as of the last absorb
     std::vector<uint64_t>                         last_decode;  // cumulative decode counts at the last absorb
     std::vector<uint64_t>                         last_prompt;  // cumulative prompt counts at the last absorb
@@ -188,10 +205,18 @@ inline void moe_swap_absorb(moe_swap_state & s, const moe_swap_block_input * blo
     }
 }
 
-// The proposals of one block, appended to s.pool. Host candidates are ranked hottest first and residents coldest
-// first, both with ties to the lower expert index; the k-th candidate meets the k-th resident. Candidates fall and
-// residents rise along the ranking, so the first pair that fails ends the block.
-inline void moe_swap_collect_block(moe_swap_state & s, const moe_swap_params & p, int block, const uint8_t * resident) {
+// The proposals of one block, appended to s.pool. Host candidates (admissible, usage at least `usage_floor`) are
+// ranked hottest first and residents coldest first, both with ties to the lower expert index; the k-th candidate meets
+// the k-th resident, for at most `cap` pairs. Candidates fall and residents rise along the ranking, so the first pair
+// whose candidate is below its resident plus `margin` ends the block. The decode rule passes min_usage, margin and
+// max_swaps; the prompt boundary passes its gate as usage_floor and margin, and no cap.
+inline void moe_swap_collect_block(moe_swap_state & s,
+                                   int              block,
+                                   const uint8_t *  resident,
+                                   const uint8_t *  admissible,
+                                   double           usage_floor,
+                                   double           margin,
+                                   size_t           cap) {
     const size_t   ne = static_cast<size_t>(s.n_experts);
     const double * u  = s.usage.data() + static_cast<size_t>(block) * ne;
 
@@ -200,7 +225,7 @@ inline void moe_swap_collect_block(moe_swap_state & s, const moe_swap_params & p
     for (size_t e = 0; e < ne; ++e) {
         if (resident[e] != 0) {
             ++n_res;
-        } else if (u[e] >= p.min_usage) {
+        } else if (u[e] >= usage_floor && (admissible == nullptr || admissible[e] != 0)) {
             s.cands.push_back({ u[e], static_cast<int>(e) });
         }
     }
@@ -208,7 +233,7 @@ inline void moe_swap_collect_block(moe_swap_state & s, const moe_swap_params & p
         return;
     }
 
-    const size_t k = std::min(std::min(s.cands.size(), n_res), static_cast<size_t>(p.max_swaps));
+    const size_t k = std::min(std::min(s.cands.size(), n_res), cap);
     std::partial_sort(s.cands.begin(), s.cands.begin() + static_cast<std::ptrdiff_t>(k), s.cands.end(),
                       [](const moe_swap_ranked & a, const moe_swap_ranked & b) {
                           return a.usage != b.usage ? a.usage > b.usage : a.expert < b.expert;
@@ -226,7 +251,7 @@ inline void moe_swap_collect_block(moe_swap_state & s, const moe_swap_params & p
                       });
 
     for (size_t i = 0; i < k; ++i) {
-        if (!(s.cands[i].usage >= s.victs[i].usage + p.margin)) {
+        if (!(s.cands[i].usage >= s.victs[i].usage + margin)) {
             break;
         }
         s.pool.push_back({ block, s.victs[i].expert, s.cands[i].expert, s.cands[i].usage - s.victs[i].usage });
@@ -248,7 +273,66 @@ inline bool moe_swap_proposal_before(const moe_swap_proposal & a, const moe_swap
     return a.evict_expert < b.evict_expert;
 }
 
+// A prompt gate takes the prompt boundary only when it is a positive number: NaN compares false.
+inline bool moe_swap_gate_on(double gate) {
+    return gate > 0.0;
+}
+
+// The decode tokens a call stands for.
+inline uint64_t moe_swap_call_tokens(const moe_swap_call & c) {
+    return static_cast<uint64_t>(c.n_tokens > 0 ? c.n_tokens : 0);
+}
+
+// What a call does, decided without touching the state: the status it returns and, through *prompt, whether an
+// ADAPTED call is the prompt boundary. The step acts on this answer and moe_swap_peek returns it, so the two cannot
+// disagree.
+inline moe_swap_status moe_swap_decide(const moe_swap_state &  s,
+                                       const moe_swap_params & p,
+                                       const moe_swap_call &   c,
+                                       bool *                  prompt) {
+    *prompt = false;
+    if (!(p.decay >= 0.0 && p.decay <= 1.0) || !(p.margin >= 0.0) || p.min_usage != p.min_usage) {
+        return MOE_SWAP_STATUS_REJECTED;
+    }
+    if (s.n_blocks == 0 || s.n_experts == 0 || c.n_blocks != s.n_blocks || c.n_experts != s.n_experts ||
+        c.blocks == nullptr) {
+        return MOE_SWAP_STATUS_REJECTED;
+    }
+    if (c.after_prompt) {
+        return MOE_SWAP_STATUS_SEEDED;
+    }
+    const uint64_t n = moe_swap_call_tokens(c);
+    if (s.prompt_pending && n != 0 && moe_swap_gate_on(c.prompt_gate)) {
+        if (c.in_flight) {
+            return MOE_SWAP_STATUS_IN_FLIGHT;
+        }
+        *prompt = true;
+        return MOE_SWAP_STATUS_ADAPTED;
+    }
+    const uint64_t before = s.tokens;
+    if (p.period < 1 || (before + n) / static_cast<uint64_t>(p.period) == before / static_cast<uint64_t>(p.period)) {
+        return MOE_SWAP_STATUS_WAITING;
+    }
+    return c.in_flight ? MOE_SWAP_STATUS_IN_FLIGHT : MOE_SWAP_STATUS_ADAPTED;
+}
+
 }  // namespace moe_swap_detail
+
+// What moe_swap_step would return for this call, with nothing changed and nothing allocated; *prompt says whether an
+// ADAPTED answer is the prompt boundary. A driver asks first so it reads the counters only for a call that absorbs.
+inline moe_swap_status moe_swap_peek(const moe_swap_state &  s,
+                                     const moe_swap_params & p,
+                                     const moe_swap_call &   c,
+                                     bool *                  prompt) {
+    bool local = false;
+    return moe_swap_detail::moe_swap_decide(s, p, c, prompt != nullptr ? prompt : &local);
+}
+
+// The driver moved only part of a prompt boundary's proposals (its host room held no more): the next decode call that
+// carries a gate takes the prompt boundary again, for what is left.
+inline void moe_swap_prompt_boundary_defer(moe_swap_state & s) {
+    s.prompt_pending = true;
+}
 
 // One call at a graph boundary. `out` is cleared, and holds the proposals in execution order when the status is
 // MOE_SWAP_STATUS_ADAPTED. The caller applies them (a proposal whose block it can no longer swap it may drop; the
@@ -261,35 +345,48 @@ inline moe_swap_status moe_swap_step(moe_swap_state &                 s,
                                      const moe_swap_call &            c,
                                      std::vector<moe_swap_proposal> & out) {
     out.clear();
-    if (!(p.decay >= 0.0 && p.decay <= 1.0) || !(p.margin >= 0.0) || p.min_usage != p.min_usage) {
-        return MOE_SWAP_STATUS_REJECTED;
+    bool                  prompt = false;
+    const moe_swap_status st     = moe_swap_detail::moe_swap_decide(s, p, c, &prompt);
+    if (st == MOE_SWAP_STATUS_REJECTED) {
+        return st;
     }
-    if (s.n_blocks == 0 || s.n_experts == 0 || c.n_blocks != s.n_blocks || c.n_experts != s.n_experts ||
-        c.blocks == nullptr) {
-        return MOE_SWAP_STATUS_REJECTED;
-    }
-
-    if (c.after_prompt) {
+    if (st == MOE_SWAP_STATUS_SEEDED) {
         moe_swap_detail::moe_swap_absorb(s, c.blocks);
-        return MOE_SWAP_STATUS_SEEDED;
+        s.prompt_pending = true;
+        return st;
     }
 
-    const uint64_t before = s.tokens;
-    s.tokens += static_cast<uint64_t>(c.n_tokens > 0 ? c.n_tokens : 0);
-    if (p.period < 1 || s.tokens / static_cast<uint64_t>(p.period) == before / static_cast<uint64_t>(p.period)) {
-        return MOE_SWAP_STATUS_WAITING;
+    const uint64_t n = moe_swap_detail::moe_swap_call_tokens(c);
+    s.tokens += n;
+    // A decode token spends a pending prompt boundary, unless that token's gate found swaps in flight.
+    if (n != 0 && !(st == MOE_SWAP_STATUS_IN_FLIGHT && moe_swap_detail::moe_swap_gate_on(c.prompt_gate))) {
+        s.prompt_pending = false;
     }
-    if (c.in_flight) {
-        return MOE_SWAP_STATUS_IN_FLIGHT;
+    if (st != MOE_SWAP_STATUS_ADAPTED) {
+        return st;
     }
 
     moe_swap_detail::moe_swap_absorb(s, c.blocks);
 
     s.pool.clear();
+    if (prompt) {
+        const double gate = std::max(p.margin, c.prompt_gate);
+        for (int b = 0; b < s.n_blocks; ++b) {
+            if (c.blocks[b].eligible && c.blocks[b].resident != nullptr) {
+                moe_swap_detail::moe_swap_collect_block(s, b, c.blocks[b].resident, c.blocks[b].admissible, gate, gate,
+                                                        static_cast<size_t>(s.n_experts));
+            }
+        }
+        std::sort(s.pool.begin(), s.pool.end(), moe_swap_detail::moe_swap_proposal_before);
+        out.assign(s.pool.begin(), s.pool.end());
+        return st;
+    }
+
     if (p.max_swaps > 0) {
         for (int b = 0; b < s.n_blocks; ++b) {
             if (c.blocks[b].eligible && c.blocks[b].resident != nullptr) {
-                moe_swap_detail::moe_swap_collect_block(s, p, b, c.blocks[b].resident);
+                moe_swap_detail::moe_swap_collect_block(s, b, c.blocks[b].resident, c.blocks[b].admissible, p.min_usage,
+                                                        p.margin, static_cast<size_t>(p.max_swaps));
             }
         }
     }
@@ -305,7 +402,7 @@ inline moe_swap_status moe_swap_step(moe_swap_state &                 s,
                           moe_swap_detail::moe_swap_proposal_before);
         out.assign(s.pool.begin(), s.pool.begin() + static_cast<std::ptrdiff_t>(k));
     }
-    return MOE_SWAP_STATUS_ADAPTED;
+    return st;
 }
 
 }  // namespace ggml_sycl
