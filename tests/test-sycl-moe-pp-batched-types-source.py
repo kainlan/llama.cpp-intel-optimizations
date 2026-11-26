@@ -89,12 +89,13 @@ dequant. These claims pin that shape:
   (s) one type question for a host-staged weight (llama.cpp-3460): moe_pp_batched_takes_staged_type in
       moe-mmvq-tables.hpp is exactly a type without an immutable host recipe (moe_type_has_immutable_host_recipe:
       Q1_0 and NVFP4, whose host experts keep their own planned workspace, so NVFP4 is never staged although it has
-      an f16 row), an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The staged claim asks it through ggml_sycl_moe_pp_batched_claims_staged_type, which is exactly it beside the
-      runtime knobs (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost model's device-rate seed
-      (moe_exec_dev_gflops_seed) asks it before it seeds any type but MXFP4; none of them asks either table term
-      itself. So no type is seeded at the executor's rate while the claim refuses it (IQ1_S, IQ1_M
-      and IQ4_XS have the f16 row and no MMVQ-ID kernel), and (h) holds for the staged claim too: it never takes a
-      type with no MMVQ-ID kernel, so such a type is never admitted on a hybrid layer.
+      an f16 row), an MMVQ-ID kernel (moe_mmvq_admission_supports_type) and an f16 row at AOS. The staged claim asks it
+      through ggml_sycl_moe_pp_batched_claims_staged_type, which is exactly it beside the runtime knobs
+      (ggml_sycl_moe_pp_batched_takes_layout at AOS), and the cost model's device-rate seed (moe_exec_dev_gflops_seed)
+      asks it before it seeds any type but MXFP4; none of them asks either table term itself. So no type is seeded at
+      the executor's rate while the claim refuses it (IQ1_S, IQ1_M and IQ4_XS have the f16 row and no MMVQ-ID kernel),
+      and (h) holds for the staged claim too: it never takes a type with no MMVQ-ID kernel, so such a type is never
+      admitted on a hybrid layer.
   (t) the ring is planned only for a model with an expert a ring consumer runs. moe_pp_onednn_ring_serves_type in
       moe-mmvq-tables.hpp is exactly the WOQ and f16 tables over every layout, and asks no runtime knob. The publish
       helper, after it takes the inventory's ring and before it sizes and publishes it, plans no ring (weight slot and
@@ -128,9 +129,10 @@ FILES = {
 }
 
 # Every quantized type ggml_get_to_fp16_sycl_for_layout decodes on AOS, except MXFP4 (its own SOA arm) and Q1_0
-# (FORBIDDEN below). NVFP4 is last: Inkling 2 Mini's prompt experts that are all on the device. The first thirteen are the brief's list and the Qwen3.8 GSQ-RCO census (see the memory "a
-# GGUF file name is not its expert quant type"); the last seven complete the f16 arm's rule in moe-mmvq-tables.hpp,
-# that every type the converter decodes is admitted but the three above (llama.cpp-348c).
+# (FORBIDDEN below). NVFP4 is last: Inkling 2 Mini's prompt experts that are all on the device. The first thirteen are
+# the brief's list and the Qwen3.8 GSQ-RCO census (see the memory "a GGUF file name is not its expert quant type"); the
+# last seven complete the f16 arm's rule in moe-mmvq-tables.hpp, that every type the converter decodes is admitted but
+# the three above (llama.cpp-348c).
 REQUIRED_AOS = [
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K", "GGML_TYPE_IQ3_XXS",
     "GGML_TYPE_IQ3_S", "GGML_TYPE_IQ4_XS", "GGML_TYPE_IQ4_NL", "GGML_TYPE_Q2_0", "GGML_TYPE_IQ2_S",

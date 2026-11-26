@@ -4332,10 +4332,10 @@ int main() {
 
     // ---- Case 51: the RUNTIME zone a load gives back after it drops its PP MoE ring ---------------------------------
     // A load that dropped a ring which displaced experts asks the ensure for the RUNTIME zone's surplus back
-    // (zone_arena_ensure_options::give_back). Only an arena that holds every zone the plan needs and has a larger RUNTIME
-    // zone has a surplus; a zone that must grow is the ensure's ordinary rebuild, and an equal one has nothing to give.
-    // The rebuild gives back the RUNTIME zone alone: SCRATCH and ONEDNN stay as built, as a sufficient arena keeps them,
-    // even where the plan now asks for less of them.
+    // (zone_arena_ensure_options::give_back). Only an arena that holds every zone the plan needs and has a larger
+    // RUNTIME zone has a surplus; a zone that must grow is the ensure's ordinary rebuild, and an equal one has nothing
+    // to give. The rebuild gives back the RUNTIME zone alone: SCRATCH and ONEDNN stay as built, as a sufficient arena
+    // keeps them, even where the plan now asks for less of them.
     {
         constexpr size_t MiB = 1024ull * 1024ull;
         using ggml_sycl::zone_arena_give_back_sizes;

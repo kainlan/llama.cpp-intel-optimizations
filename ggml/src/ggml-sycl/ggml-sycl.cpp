@@ -16314,9 +16314,9 @@ static size_t ggml_sycl_ring_arena_runtime_zone_bytes(int device) {
 }
 
 // Whether the planner that made `plan` packs a device's weights against that device's WEIGHT zone where the device has
-// an active arena (kv_reads_device_arena): a single-device plan's always, a multi-device plan's unless the cache mode is
-// GLOBAL, whose one cache the multi-device planner lends to no device (multi_device_plan_arena_cache), so it packs each
-// device to its budget alone. Where it is false, ggml_sycl_ring_plan_weight_room reads no WEIGHT room.
+// an active arena (kv_reads_device_arena): a single-device plan's always, a multi-device plan's unless the cache mode
+// is GLOBAL, whose one cache the multi-device planner lends to no device (multi_device_plan_arena_cache), so it packs
+// each device to its budget alone. Where it is false, ggml_sycl_ring_plan_weight_room reads no WEIGHT room.
 static bool ggml_sycl_ring_planner_reads_zone(const ggml_sycl::placement_plan & plan) {
     return ggml_sycl::kv_reads_device_arena(plan.multi_device, ggml_sycl::unified_cache_mode_is_global());
 }
@@ -17196,9 +17196,9 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
 
 // The load that dropped each device's PP MoE oneDNN scratch ring (ggml_sycl_stage_drop_displacing_ring), by its load
 // transaction; moe_pp_ring_drop_marks says why one slot per device is enough: one load is open at a time. The inventory
-// intake of each pass publishes the ring the loader sized. Where the early pass dropped it, the late pass publishes none
-// again before its zones are asked for, so the zone the early pass gave back is not asked for again and the late plan is
-// made without the ring, as the early pass's last plan was. Written and read under g_tensor_inventory_mutex.
+// intake of each pass publishes the ring the loader sized. Where the early pass dropped it, the late pass publishes
+// none again before its zones are asked for, so the zone the early pass gave back is not asked for again and the late
+// plan is made without the ring, as the early pass's last plan was. Written and read under g_tensor_inventory_mutex.
 static ggml_sycl::moe_pp_ring_drop_marks g_sycl_ring_drop_marks;
 
 // Whether an earlier pass of this thread's staged load dropped `device`'s ring. Never for a direct planner entry.
@@ -17216,10 +17216,10 @@ static void ggml_sycl_stage_publish_no_ring(int device) {
     g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
 }
 
-// What a ring drop on `device` writes before it knows whether the drop returns room, as the plan made with the ring left
-// it: the ring and the planners' terms (ggml_sycl_put_back_ring_terms) and the inventory's copy of the ring. A ring the
-// decision keeps is published again from it, so the plan made with the ring stands on the terms it was made with and
-// never over a ring published as none.
+// What a ring drop on `device` writes before it knows whether the drop returns room, as the plan made with the ring
+// left it: the ring and the planners' terms (ggml_sycl_put_back_ring_terms) and the inventory's copy of the ring. A
+// ring the decision keeps is published again from it, so the plan made with the ring stands on the terms it was made
+// with and never over a ring published as none.
 struct ggml_sycl_stage_ring_published {
     ggml_sycl::load_published_terms terms;
     size_t                          inventory_weight_slot_bytes     = 0;
@@ -17237,10 +17237,10 @@ struct ggml_sycl_stage_ring_published {
         return published;
     }
 
-    // Puts the ring back on `device`. Where the drop moved the ring and the dense scratch from the ring's micro-batch to
-    // the load's planning shape (ggml_sycl_stage_unpublish_ring), the dense scratch is planned again at the ring's
-    // micro-batch first, from the inputs the explicit micro-batch's placement planned it from; the ring's own terms then
-    // go back as they were, over the slots that re-plan wrote.
+    // Puts the ring back on `device`. Where the drop moved the ring and the dense scratch from the ring's micro-batch
+    // to the load's planning shape (ggml_sycl_stage_unpublish_ring), the dense scratch is planned again at the ring's
+    // micro-batch first, from the inputs the explicit micro-batch's placement planned it from; the ring's own terms
+    // then go back as they were, over the slots that re-plan wrote.
     void put_back(int device, uint32_t planning_n_ubatch) const {
         if (terms.ring_n_ubatch != planning_n_ubatch) {
             (void) ggml_sycl_publish_load_ubatch_scratch(device, terms.ring_n_ubatch);
@@ -17953,8 +17953,8 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 // streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
 // nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
 // The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
-// resort, and it, the micro-batch's grow leg or the give-back after a dropped ring (ggml_sycl_stage_drop_displacing_ring)
-// may rebuild an arena nothing holds. A refused load's abort tears that
+// resort, and it, the micro-batch's grow leg or the give-back after a dropped ring
+// (ggml_sycl_stage_drop_displacing_ring) may rebuild an arena nothing holds. A refused load's abort tears that
 // arena down again when no model is live (ggml_sycl_release_last_model_effects), and the next load's start reserves
 // the early arena; an arena the load's own buffers still hold at the abort stays, and that start runs the release
 // again before its reserve. While a model is live on another device, the rebuilt arena (or, after a failed reserve,

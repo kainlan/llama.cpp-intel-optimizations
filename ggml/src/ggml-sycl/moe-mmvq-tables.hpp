@@ -459,11 +459,11 @@ inline bool moe_mmid_direct_route_runs_type(enum ggml_type type) {
 }
 
 // Whether the Q1_0/NVFP4 direct MMID route steps aside for a MUL_MAT_ID node so the batched prompt executor runs it:
-// a prompt (more than one token per expert row), a weight the executor claims on the device (every expert planned there,
-// in a layout its tables take: ggml_sycl_moe_pp_onednn_batched_claims_tensor), and a PP MoE oneDNN ring weight slot
-// planned on the device. Without the slot every dispatch of the executor declines (SCRATCH_UNPLANNED), so the route
-// keeps the node. Decode never steps aside: the executor runs prompts only. A node the executor declines before its
-// first submission runs again with the claim suppressed, and the route takes it then
+// a prompt (more than one token per expert row), a weight the executor claims on the device (every expert planned
+// there, in a layout its tables take: ggml_sycl_moe_pp_onednn_batched_claims_tensor), and a PP MoE oneDNN ring weight
+// slot planned on the device. Without the slot every dispatch of the executor declines (SCRATCH_UNPLANNED), so the
+// route keeps the node. Decode never steps aside: the executor runs prompts only. A node the executor declines before
+// its first submission runs again with the claim suppressed, and the route takes it then
 // (ggml_sycl_mul_mat_id_with_direct_reentry in ggml-sycl.cpp).
 inline bool moe_mmid_direct_defers_to_executor(bool prompt, bool executor_claims, size_t ring_weight_slot_bytes) {
     return prompt && executor_claims && ring_weight_slot_bytes > 0;

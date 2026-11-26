@@ -1044,11 +1044,12 @@ int main() {
     // gains or loses a use only with that table. The ring decision (moe_pp_ring_check_resident_only) reads two sets of
     // types from these tables, and both are pinned here by name. The resident-only set is the types that reach the
     // resident claim alone: NVFP4 (its host experts run an immutable recipe, so the ring never stages them) and IQ1_S,
-    // IQ1_M and IQ4_XS (no MMVQ id kernel, so the ring never stages them either). The drop set is the resident-only types
-    // the MMID direct route also runs (moe_mmid_direct_route_runs_type): NVFP4 alone. A load drops a ring only when its
-    // weights are all of the drop set and the plan made with it leaves one of their experts on the host; IQ1_S, IQ1_M and
-    // IQ4_XS keep it, because the ring is their resident layers' only device prompt route. A staged type (Qwen's IQ4_NL)
-    // and MXFP4, which the per-expert path stages at SOA, keep their ring as before. Q1_0 and F32 reach none.
+    // IQ1_M and IQ4_XS (no MMVQ id kernel, so the ring never stages them either). The drop set is the resident-only
+    // types the MMID direct route also runs (moe_mmid_direct_route_runs_type): NVFP4 alone. A load drops a ring only
+    // when its weights are all of the drop set and the plan made with it leaves one of their experts on the host;
+    // IQ1_S, IQ1_M and IQ4_XS keep it, because the ring is their resident layers' only device prompt route. A staged
+    // type (Qwen's IQ4_NL) and MXFP4, which the per-expert path stages at SOA, keep their ring as before. Q1_0 and F32
+    // reach none.
     {
         const auto check_uses = [&](ggml_type type, uint32_t want, const char * why) {
             const uint32_t got = moe_pp_ring_uses_of_type(type);
@@ -1068,8 +1069,8 @@ int main() {
         check_uses(GGML_TYPE_Q1_0, MOE_PP_RING_USE_NONE, "the MMID direct route draws on no ring");
         check_uses(GGML_TYPE_F32, MOE_PP_RING_USE_NONE, "a float expert keeps its own route");
         // Every bit against its own table, over every type: the function adds no type of its own, and a type with any
-        // use is one the ring is planned for (moe_pp_onednn_ring_serves_type). Then the two sets the ring decision reads,
-        // by name: a type that gains a kernel or a use leaves its set here, and a type that loses one joins it.
+        // use is one the ring is planned for (moe_pp_onednn_ring_serves_type). Then the two sets the ring decision
+        // reads, by name: a type that gains a kernel or a use leaves its set here, and a type that loses one joins it.
         const auto in_types = [](ggml_type type, std::initializer_list<ggml_type> types) {
             return std::find(types.begin(), types.end(), type) != types.end();
         };
@@ -1101,8 +1102,8 @@ int main() {
             }
         }
         // The use mask of every type the loop visits, by name. The checks above hold each bit to its own table, so a
-        // type that gains a use with its table (Q4_K gaining the SOA per-expert staging, say) still passes them; it fails
-        // here by name. A live type this table does not name fails as unlisted, and a slot whose type support was
+        // type that gains a use with its table (Q4_K gaining the SOA per-expert staging, say) still passes them; it
+        // fails here by name. A live type this table does not name fails as unlisted, and a slot whose type support was
         // removed (ggml_blck_size 0) reaches none.
         constexpr uint32_t use_none     = MOE_PP_RING_USE_NONE;
         constexpr uint32_t use_resident = MOE_PP_RING_USE_RESIDENT;

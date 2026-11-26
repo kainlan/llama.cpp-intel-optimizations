@@ -8134,9 +8134,9 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         const bool surplus_asked =
             options.give_back != nullptr && zone_arena_runtime_surplus(arena_zones, planned_zones);
         // A give-back asks for the RUNTIME zone's surplus and nothing else. With none to give, or with a zone the plan
-        // needs larger than built, the arena is kept as built: a give-back never takes the ordinary rebuild, so it never
-        // hands the room RUNTIME gives up to another zone (the SCRATCH zone's MoE MMVQ bound is held to the room beside
-        // RUNTIME), and its caller reads the WEIGHT zone unchanged.
+        // needs larger than built, the arena is kept as built: a give-back never takes the ordinary rebuild, so it
+        // never hands the room RUNTIME gives up to another zone (the SCRATCH zone's MoE MMVQ bound is held to the room
+        // beside RUNTIME), and its caller reads the WEIGHT zone unchanged.
         if (!surplus_asked && (zones_sufficient || options.give_back != nullptr)) {
             keep_arena_as_built();
             // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
@@ -8157,8 +8157,8 @@ bool unified_cache::ensure_planned_arena_zones(zone_arena_refusal *             
         const size_t       live_zone_bytes = holders.live_zone_bytes;
         const uint32_t     chunk_leases    = holders.chunk_leases;
         // A give-back rebuilds only an arena nothing points into: one a live model's allocations or a freed context's
-        // leftovers hold is kept as built, its surplus with it, as a sufficient arena always was. The rebuild gives back
-        // the RUNTIME zone alone (zone_arena_give_back_sizes), so the checks below, read on the same holders, pass
+        // leftovers hold is kept as built, its surplus with it, as a sufficient arena always was. The rebuild gives
+        // back the RUNTIME zone alone (zone_arena_give_back_sizes), so the checks below, read on the same holders, pass
         // through to it.
         if (surplus_asked && !zone_arena_rebuild_allowed(holders)) {
             options.give_back->held = true;
