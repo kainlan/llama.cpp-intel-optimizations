@@ -5017,9 +5017,11 @@ set_tests_properties(test-sycl-mul-mat-f32-batched-device PROPERTIES
 
 # The BF16 weight's oneDNN route: above SKINNY_MAX_COLS columns a dense BF16 MUL_MAT is a bf16 copy of its activations
 # and one oneDNN bf16 x bf16 -> f32 GEMM. Each case computes one MUL_MAT graph on the SYCL backend (the weight in a
-# WEIGHTS buffer), counts the "dnnl_gemm" site through the PRIVATE_TESTING seam (one submission for a taken case,
-# none for a declined one, the native kernel after an injected decline), and compares the output with double
-# references over bf16(x) and F32 x and with the native kernel's. GGML_SYCL_DISABLE_GRAPH=1: the route declines while
+# WEIGHTS buffer), counts the "dnnl_gemm" site through the PRIVATE_TESTING seam (a query and one submission for a taken
+# case, none for a declined one, the native kernel after a decline injected on either call), and compares the output
+# with double references over bf16(x) and F32 x and with the native kernel's. It also runs the route on an empty planned
+# buffer, with the walk's grows limited below the route's copy (the graph must still compute), and on strided src1,
+# strided dst and three-plane src1 layouts. GGML_SYCL_DISABLE_GRAPH=1: the route declines while
 # a command graph records. The second registration runs the cases with the route switched off (GGML_SYCL_ONEDNN_PP=0)
 # and expects none to reach gemm(). Touches the GPU with single-op graphs (at most ~75 MB) and loads no model;
 # labelled mem-handle so a sweep leaves it to the lead. Built the same way as the test above.

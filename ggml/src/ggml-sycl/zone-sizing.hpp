@@ -658,6 +658,40 @@ bool zone_unified_pp_draws_dequant(bool primary_unified,
 // degraded silently). Pure.
 bool zone_walk_f16_node_draws(bool prec_default, bool legacy_route_draws, bool unified_route_draws);
 
+// What the graph-entry walk made of one planned dense dequant buffer (ggml_sycl_dequant_f16_ensure_for_graph).
+enum zone_walk_buffer_result {
+    ZONE_WALK_BUFFER_HELD,     // the buffer holds the plan and the widest op's demand
+    ZONE_WALK_BUFFER_CAPPED,   // it holds the plan and every op that has no other path, not the widest op
+    ZONE_WALK_BUFFER_REFUSED,  // it cannot hold an op that has no other path: the graph is refused
+};
+
+// The walk's decision for one buffer. `demand` is the widest op's bytes; `required` is the widest among the ops that
+// have no other path (the f16 arm's copies; a BF16 weight's oneDNN route declines on a short buffer and the native
+// tiled kernel computes the op). `ensure(bytes)` grows the buffer to hold `bytes`, or fails and leaves it as it was
+// (ggml_sycl_runtime_scratch_ensure), so `capacity` still describes it after a failed grow.
+//
+// The buffer is held at max(plan, demand), so a later graph does not regrow (and retire) a backing a recorded graph
+// baked. When the RUNTIME zone cannot hold that, a demand that only an op with another path makes is not a reason to
+// refuse the graph: the buffer is held at max(plan, required) and the op with the wider demand declines. Only when
+// that floor does not fit, and some op does need it, is the graph refused.
+template <typename Ensure>
+zone_walk_buffer_result zone_walk_ensure_dense_buffer(size_t    capacity,
+                                                      size_t    planned,
+                                                      size_t    demand,
+                                                      size_t    required,
+                                                      Ensure && ensure) {
+    const size_t target = planned > demand ? planned : demand;
+    if (capacity >= target || ensure(target)) {
+        return ZONE_WALK_BUFFER_HELD;
+    }
+    const size_t floor = planned > required ? planned : required;
+    if (floor < target && (capacity >= floor || ensure(floor))) {
+        return ZONE_WALK_BUFFER_CAPPED;
+    }
+    // Nothing that lacks another path asked for the buffer: an op that has one declines on whatever it holds.
+    return required == 0 ? ZONE_WALK_BUFFER_CAPPED : ZONE_WALK_BUFFER_REFUSED;
+}
+
 // ---------------------------------------------------------------------------
 // The planned dense scratch as ONE reservation (llama.cpp-kpjw)
 // ---------------------------------------------------------------------------

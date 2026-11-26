@@ -42,6 +42,9 @@ void test_set_in_model_load(bool loading);
 // false leaves the BF16 weight's oneDNN route out of the graph-entry walk's src1 demand, so a test can hand the route
 // a planned buffer shorter than its activation copy and see it decline; true (the default) counts it.
 void test_set_bf16_onednn_walk_counted(bool counted);
+// The dense dequant buffers' graph-entry walk fails every grow above `bytes`, as a RUNTIME zone that cannot hold it
+// would; SIZE_MAX (the default) leaves the zone to decide.
+void test_set_dequant_f16_walk_limit(size_t bytes);
 #endif
 void               test_clear_host_weight_registry();
 bool               test_backend_supports_graphs(ggml_backend_t backend);

@@ -26,11 +26,16 @@ executor in mul-mat-bf16.hpp. This gate pins, on the SOURCE, that
 Above SKINNY_MAX_COLS columns the executor first offers the op to its oneDNN
 route (ggml_sycl_mul_mat_bf16_onednn): a bf16 copy of the activations, rounded
 to nearest even, in the planned dense src1 buffer, then one bf16 x bf16 -> f32
-GEMM. The gate pins that the route allocates nothing and waits on nothing, that
-it declines (and the tiled kernel runs) while a graph is recorded, on a short
-buffer and on a primitive oneDNN cannot create, that the graph-entry walk counts
-its copy with the executor's own questions, and that the planner and the zone
-adapter plan that copy under the same gate.
+GEMM. The gate pins that the route allocates nothing and waits on nothing; that
+it declines (and the tiled kernel runs) while a graph is recorded, before it
+reads its buffer; that a short or unresolved buffer is a loud decline (one WARN
+per device slot, an under-estimate on the buffer's cohort); that it asks oneDNN
+for the primitive before it converts anything and runs the GEMM on the
+conversion's event; that the graph-entry walk counts its copy with the
+executor's own questions, apart from the f16 arm's, and caps the buffer rather
+than refuse a graph over the route's share; and that the planner and the zone
+adapter plan that copy under the same gate. Every route check is also run
+against in-memory mutants of the source, each of which it must reject.
 
 Source-level on purpose: none of this is observable without a SYCL device. The
 kernel arithmetic itself is checked by test-sycl-bf16-mul-mat (host device), the
@@ -115,9 +120,10 @@ def matching_brace(text: str, open_idx: int) -> int:
     raise ValueError("unbalanced braces")
 
 
-def body_after(text: str, anchor: str) -> str:
-    """Body of the block opened by the first '{' after the first occurrence of
-    anchor that is followed by a definition (not a ';' declaration)."""
+def body_span(text: str, anchor: str) -> tuple:
+    """(start, end) of the body of the block opened by the first '{' after the
+    first occurrence of anchor that is followed by a definition (not a ';'
+    declaration)."""
     start = 0
     while True:
         idx = text.find(anchor, start)
@@ -126,8 +132,15 @@ def body_after(text: str, anchor: str) -> str:
         brace = text.find("{", idx)
         semi = text.find(";", idx)
         if brace >= 0 and (semi < 0 or brace < semi):
-            return text[brace + 1:matching_brace(text, brace)]
+            return brace + 1, matching_brace(text, brace)
         start = idx + len(anchor)
+
+
+def body_after(text: str, anchor: str) -> str:
+    """Body of the block opened by the first '{' after the first occurrence of
+    anchor that is followed by a definition (not a ';' declaration)."""
+    start, end = body_span(text, anchor)
+    return text[start:end]
 
 
 _CACHE = {}
@@ -238,12 +251,56 @@ def nows(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _raw() -> str:
+    if "raw" not in _CACHE:
+        _CACHE["raw"] = SOURCE.read_text()
+    return _CACHE["raw"]
+
+
+def _cache_code() -> str:
+    if "cache" not in _CACHE:
+        _CACHE["cache"] = strip_comments(CACHE.read_text())
+    return _CACHE["cache"]
+
+
+def _kernel() -> str:
+    if "kernel" not in _CACHE:
+        _CACHE["kernel"] = strip_comments(KERNEL.read_text())
+    return _CACHE["kernel"]
+
+
+ROUTE = "static bool ggml_sycl_mul_mat_bf16_onednn(ggml_backend_sycl_context & ctx,"
+EXECUTOR = "static void ggml_sycl_mul_mat_bf16_weight("
+TAKES = "static bool ggml_sycl_mul_mat_bf16_onednn_takes("
+WALK = "static bool ggml_sycl_dequant_f16_ensure_for_graph("
+PLANNER = "static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch("
+ADAPTER = "std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory("
+
+RECORDING = ("ggml_sycl_graph_recording_active() || stream->ext_oneapi_get_state() == "
+             "sycl::ext::oneapi::experimental::queue_state::recording;")
+RECORDING_DECLINE = "if (recording) { return false; }"
+QUERY = "if (!bf16_gemm(true, {})) { return false; }"
+CONVERSION = "const sycl::event converted = ggml_sycl_profile_submit("
+RUN = "return bf16_gemm(false, { converted }).has_value();"
+GEMM_LAMBDA = ("const auto bf16_gemm = [&](bool query_only, const std::vector<sycl::event> & deps) { "
+               "return DnnlGemmWrapper::gemm(")
+
+
 def _route() -> str:
-    return body_after(_code(), "static bool ggml_sycl_mul_mat_bf16_onednn(ggml_backend_sycl_context & ctx,")
+    return body_after(_code(), ROUTE)
+
+
+def _branch(flat: str, head: str) -> str:
+    """The body of the one block `head` opens in the flattened text `flat` (head ends with '{')."""
+    at = flat.find(head)
+    assert at >= 0, f"missing: {head!r}"
+    assert flat.find(head, at + 1) < 0, f"more than one: {head!r}"
+    brace = at + len(head) - 1
+    return flat[brace + 1:matching_brace(flat, brace)]
 
 
 def test_executor_offers_the_gemm_route_before_the_native_launch():
-    executor = body_after(_code(), "static void ggml_sycl_mul_mat_bf16_weight(")
+    executor = body_after(_code(), EXECUTOR)
     offer = nows(executor).find(
         "if (ggml_sycl_mul_mat_bf16_onednn_takes(src0, src1, &act_bytes) && ggml_sycl_mul_mat_bf16_onednn(ctx, src0, "
         "static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf, n_vecs, ldx, ldy, act_bytes)) { return; }")
@@ -255,7 +312,7 @@ def test_executor_offers_the_gemm_route_before_the_native_launch():
 
 
 def test_route_takes_asks_the_column_count_first():
-    takes = body_after(_code(), "static bool ggml_sycl_mul_mat_bf16_onednn_takes(")
+    takes = body_after(_code(), TAKES)
     assert "if constexpr (!ggml_sycl_bf16_onednn_scratch_drawable())" in takes, \
         "a build without oneDNN never takes the route"
     cols = takes.find("n_vecs <= ggml_sycl_bf16::SKINNY_MAX_COLS")
@@ -275,66 +332,132 @@ def test_route_allocates_nothing_and_waits_on_nothing():
         assert forbidden not in route, \
             f"the BF16 oneDNN route must not use {forbidden!r} (nothing allocated, no host wait, gemm() declines)"
     assert "ctx.dequant_f16_src1_scratch" in route, "the copy goes into the planned dense src1 buffer"
-    recording = nows(route).find(
-        "ggml_sycl_graph_recording_active() || stream->ext_oneapi_get_state() == "
-        "sycl::ext::oneapi::experimental::queue_state::recording")
-    short = route.find("buffer.capacity(ctx.device) < act_bytes")
-    draw = route.find("backing_handle.resolve(ctx.device)")
-    assert recording >= 0, "the route declines while a command graph is recorded (a new primitive would be created in it)"
-    assert 0 <= short < draw, "a buffer shorter than the copy is a decline, asked before the buffer is drawn"
-    assert "!act.on_device" in route, "a buffer that does not resolve on the device is a decline"
+
+
+def test_route_declines_while_recording_before_anything_else():
+    # The route creates a oneDNN primitive at its query; inside a recording that creation would be recorded too. So the
+    # recording decline comes before the route reads the buffer, asks gemm() or submits the conversion.
+    flat = nows(_route())
+    predicate = flat.find(RECORDING)
+    assert predicate >= 0, "the route asks whether a command graph records (the batched F32 route's condition)"
+    decline = flat.find(RECORDING_DECLINE)
+    assert decline > predicate, "the recording predicate is followed by the route's decline"
+    for later in ("buffer.capacity(", "backing_handle.resolve(", "bf16_gemm(true", "ggml_sycl_profile_submit("):
+        at = flat.find(later)
+        assert at >= 0, f"the route no longer has {later!r}"
+        assert decline < at, f"the recording decline must come before {later!r}"
+
+
+def test_route_declines_on_a_short_or_unresolved_buffer_loudly():
+    flat = nows(_route())
+    short = _branch(flat, "if (capacity < act_bytes) {")
+    assert "ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);" in short, \
+        "a buffer shorter than the copy counts the plan's under-estimate under the buffer's cohort"
+    assert "if (!stats.warned) { stats.warned = true; GGML_LOG_WARN(" in short, \
+        "a buffer shorter than the copy warns once per device slot"
+    assert short.rstrip().endswith("return false;"), "a buffer shorter than the copy is a decline"
+    unresolved = _branch(flat, "if (!act || !act.on_device) {")
+    assert "if (!stats.warned) { stats.warned = true; GGML_LOG_WARN(" in unresolved, \
+        "a buffer that does not resolve on the device warns once per device slot"
+    assert unresolved.rstrip().endswith("return false;"), "a buffer that does not resolve on the device is a decline"
+    assert "const size_t capacity = buffer.capacity(ctx.device);" in flat, "the decline reads the buffer's capacity"
+    assert flat.find("if (capacity < act_bytes) {") < flat.find("backing_handle.resolve(ctx.device)"), \
+        "a buffer shorter than the copy is a decline, asked before the buffer is drawn"
 
 
 def test_route_rounds_the_copy_to_nearest_even_in_a_profiler_row():
     route = _route()
     submit = route.find("ggml_sycl_profile_submit(")
     rne = route.find("ggml_sycl_bf16::f32_to_bf16_rne(")
-    gemm = route.find("DnnlGemmWrapper::gemm(")
-    assert 0 <= submit < rne < gemm, \
+    run = nows(route).find(RUN)
+    assert 0 <= submit < rne and nows(route).find("ggml_sycl_bf16::f32_to_bf16_rne(") < run, \
         "the conversion is launched inside ggml_sycl_profile_submit, rounds with f32_to_bf16_rne, and precedes the GEMM"
     assert '"mulmat.bf16_onednn.act_to_bf16"' in route, "the conversion's profiler row is mulmat.bf16_onednn.act_to_bf16"
-    kernel = strip_comments(KERNEL.read_text())
-    assert "inline uint16_t f32_to_bf16_rne(float f)" in kernel, "mul-mat-bf16.hpp defines the device rounding"
+    assert "inline uint16_t f32_to_bf16_rne(float f)" in _kernel(), "mul-mat-bf16.hpp defines the device rounding"
+
+
+def test_route_asks_gemm_before_converting_and_runs_on_the_conversion():
+    # A primitive oneDNN cannot create, or a declined scratchpad, ends the route before anything is written; the GEMM
+    # then waits on the conversion's event rather than on the queue order alone.
+    flat = nows(_route())
+    used = flat.find("stats.note_use(act_bytes);")
+    query = flat.find(QUERY)
+    convert = flat.find(CONVERSION)
+    run = flat.find(RUN)
+    assert 0 <= used < query, "gemm() is asked once the buffer is drawn"
+    assert 0 <= query < convert < run, \
+        "gemm() is asked with query_only before the conversion, and run on the conversion's event after it"
+    assert flat.count("bf16_gemm(") == 2, "the descriptor is asked exactly twice: the query and the run"
+    lambda_at = flat.find(GEMM_LAMBDA)
+    assert 0 <= lambda_at < query, "one gemm lambda serves both asks, so they describe the same primitive"
+    call = flat[lambda_at:flat.find(";", lambda_at)]
+    assert 'static_cast<int>(ldy), deps, "bf16_weight", query_only,' in call, \
+        "the lambda hands its deps and query_only to gemm()"
 
 
 def test_route_gemm_is_strict_bf16_and_declines_on_a_failed_creation():
     route = nows(_route())
-    call = route.find("const std::optional<sycl::event> bf16_gemm = DnnlGemmWrapper::gemm(")
+    call = route.find(GEMM_LAMBDA)
     assert call >= 0, "the route keeps gemm()'s optional, so a decline reaches the executor"
     args = route[call:route.find(";", call)]
     for arg in ("weight, bf16, 1, k,", "act_bf16, bf16, 1, k,", "dst_ddf, f32, stream, 1, 1,", '"bf16_weight"',
                 "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE"):
         assert arg in args, f"the route's gemm() call must carry {arg!r}"
-    assert "return bf16_gemm.has_value();" in route, "the route returns whether gemm() ran"
+    assert RUN in route, "the route returns whether gemm() ran"
 
 
 def test_walk_counts_the_route_with_the_executors_questions():
-    walk = body_after(_code(), "static bool ggml_sycl_dequant_f16_ensure_for_graph(")
+    walk = body_after(_code(), WALK)
     assert walk.lstrip().startswith("#    if GGML_SYCL_DNNL\n"), \
         "the walk is compiled wherever the route is (oneDNN), not only where the f16 arm is"
     flat = nows(walk)
     counted = flat.find(
         "if (ggml_sycl_bf16_onednn_walk_counted() && ggml_sycl_mul_mat_bf16_onednn_takes(src0, src1, &act_bytes) && "
         "ggml_sycl_bf16_weight_native_route_available(src0, src1, node, ctx.device) && "
-        "act_bytes > demand[ctx.device].src1_bytes) { demand[ctx.device].src1_bytes = act_bytes; "
-        "demand[ctx.device].src1_node = node; } continue;")
+        "act_bytes > demand[ctx.device].bf16_src1_bytes) { demand[ctx.device].bf16_src1_bytes = act_bytes; "
+        "demand[ctx.device].bf16_src1_node = node; } continue;")
     assert counted >= 0, \
-        "the walk counts a BF16 node's copy with the executor's predicate and the route's own takes, on this device"
+        "the walk counts a BF16 node's copy with the executor's predicate and the route's own takes, on this device, " \
+        "apart from the f16 arm's demand"
     loop = flat.find("for (int i = 0; i < cgraph->n_nodes; i++)")
     arm = flat.find("# if GGML_SYCL_DEQUANT_F16_ARM", loop)
     assert 0 <= loop < counted < arm, "the BF16 branch sits in the node loop, outside the f16 arm's compile condition"
 
 
+def test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand():
+    # The route has a next path (it declines on a short buffer), the f16 arm has none: a route demand the RUNTIME zone
+    # cannot hold caps the buffer, and only an f16 demand refuses the graph (zone_walk_ensure_dense_buffer; its cases
+    # are test-zone-sizing Case 53).
+    # Compared with no whitespace at all: these statements wrap differently as their names change.
+    walk = re.sub(r"\s+", "", body_after(_code(), WALK))
+
+    def at(text: str) -> int:
+        return walk.find(re.sub(r"\s+", "", text))
+
+    assert at('{ ctx.dequant_f16_src0_scratch, demand[d].src0_bytes, demand[d].src0_bytes, demand[d].node, "src0", '
+              'false },') >= 0, "every src0 demand is the f16 arm's: all of it is required"
+    assert at('{ ctx.dequant_f16_src1_scratch, std::max(demand[d].src1_bytes, demand[d].bf16_src1_bytes), '
+              'demand[d].src1_bytes, demand[d].src1_node, "src1", true },') >= 0, \
+        "the src1 buffer is asked for the wider demand and requires only the f16 arm's"
+    decide = at("ggml_sycl::zone_walk_ensure_dense_buffer(b.buffer.capacity(d), planned, b.demand, b.required, "
+                "[&](size_t bytes) { return bytes <= ggml_sycl_dequant_f16_walk_limit() && "
+                "b.buffer.ensure_buffer(bytes, d, queue) != nullptr; });")
+    assert decide >= 0, "the walk grows the buffer only through the decision, which may cap it"
+    assert walk.count("ensure_buffer(") == 1, "the decision's grow is the walk's only one"
+    refused = at("if (held != ggml_sycl::ZONE_WALK_BUFFER_REFUSED) { continue; }")
+    error = at('GGML_LOG_ERROR("[DEQUANT-F16] graph refused before submission')
+    assert 0 <= decide < refused < error, "a held or capped buffer goes on; only a refusal reaches the graph's refusal"
+
+
 def test_planner_plans_the_wider_src1_row():
-    planner = body_after(_code(), "static ggml_sycl_dense_scratch_planned ggml_sycl_plan_load_dense_scratch(")
+    planner = body_after(_code(), PLANNER)
     assert ("zone_dense_src1_planned_bytes_per_token(f16_drawable, maxima.dequant_f16_src1_bytes_per_token, "
             "ggml_sycl_bf16_onednn_scratch_drawable(), maxima.bf16_onednn_src1_bytes_per_token)") in nows(planner), \
         "the planned src1 row is the wider of the f16 arm's and the BF16 route's, each where its consumer is compiled in"
 
 
 def test_adapter_marks_the_bf16_copy_under_the_routes_gate():
-    adapter = nows(body_after(strip_comments(CACHE.read_text()),
-                              "std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory("))
+    adapter = nows(body_after(_cache_code(), ADAPTER))
     mark = adapter.find("if (shaped && item.type == GGML_TYPE_BF16 && !is_expert && is_matrix && "
                         "ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)) {")
     assert mark >= 0, "the adapter marks a dense BF16 matrix under the route's own gate"
@@ -343,12 +466,165 @@ def test_adapter_marks_the_bf16_copy_under_the_routes_gate():
 
 
 def test_threshold_comment_cites_the_committed_probe():
-    raw = SOURCE.read_text()
-    takes_at = raw.find("static bool ggml_sycl_mul_mat_bf16_onednn_takes(")
+    raw = _raw()
+    takes_at = raw.find(TAKES)
     comment = raw[max(0, takes_at - 2500):takes_at]
     for probe in PROBES:
         assert probe in comment, f"the route's threshold comment must cite {probe}"
         assert (PROBE_DIR / probe).is_file(), f"the cited probe output must be committed at {PROBE_DIR / probe}"
+
+
+# ---- each route check above fails on a mutant of the code it reads ----------------------------------------------
+
+def ws_pattern(text: str) -> str:
+    """A regex for `text` however it is wrapped: no whitespace is significant."""
+    return r"\s*".join(re.escape(c) for c in re.sub(r"\s+", "", text))
+
+
+def mutate(text: str, scope, old: str, new: str) -> str:
+    """`text` with the one whitespace-insensitive match of `old` inside the body of `scope` (the whole text when
+    `scope` is None) replaced by `new`."""
+    start, end = body_span(text, scope) if scope else (0, len(text))
+    region = text[start:end]
+    found = list(re.finditer(ws_pattern(old), region))
+    if len(found) != 1:
+        raise LookupError(f"mutant anchor {old!r} matches {len(found)} times in {scope or 'the file'}")
+    m = found[0]
+    return text[:start] + region[:m.start()] + new + region[m.end():] + text[end:]
+
+
+# (check, the text it reads, [(scope, old, new), ...] applied in order, what the mutant does)
+MUTANTS = [
+    (test_executor_offers_the_gemm_route_before_the_native_launch, "code",
+     [(EXECUTOR, "&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0,", "&& !ggml_sycl_mul_mat_bf16_onednn(ctx, src0,")],
+     "the executor returns on a declined route"),
+    (test_route_takes_asks_the_column_count_first, "code",
+     [(TAKES, "n_vecs <= ggml_sycl_bf16::SKINNY_MAX_COLS || !ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)",
+       "!ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16) || n_vecs <= ggml_sycl_bf16::SKINNY_MAX_COLS")],
+     "the admission is asked before the column count"),
+    (test_route_allocates_nothing_and_waits_on_nothing, "code",
+     [(ROUTE, "stats.note_use(act_bytes);",
+       "(void) buffer.ensure_buffer(act_bytes, ctx.device, *stream); stats.note_use(act_bytes);")],
+     "the route grows the buffer"),
+    (test_route_allocates_nothing_and_waits_on_nothing, "code",
+     [(ROUTE, RUN, "stream->wait(); " + RUN)],
+     "the route waits on the host"),
+    (test_route_declines_while_recording_before_anything_else, "code",
+     [(ROUTE, RECORDING_DECLINE, "")],
+     "the recording decline is deleted"),
+    (test_route_declines_while_recording_before_anything_else, "code",
+     [(ROUTE, RECORDING_DECLINE, ""), (ROUTE, RUN, RECORDING_DECLINE + " " + RUN)],
+     "the recording decline moves after the conversion"),
+    (test_route_declines_while_recording_before_anything_else, "code",
+     [(ROUTE, RECORDING_DECLINE, ""), (ROUTE, "std::string profile_metadata;",
+                                       RECORDING_DECLINE + " std::string profile_metadata;")],
+     "the recording decline moves between the query and the conversion"),
+    (test_route_declines_while_recording_before_anything_else, "code",
+     [(ROUTE, RECORDING_DECLINE, ""), (ROUTE, "const ggml_sycl::resolved_ptr act =",
+                                       RECORDING_DECLINE + " const ggml_sycl::resolved_ptr act =")],
+     "the recording decline moves after the buffer's capacity is asked"),
+    (test_route_declines_while_recording_before_anything_else, "code",
+     [(ROUTE, "ggml_sycl_graph_recording_active() ||", "")],
+     "the recording predicate loses the process-wide recording flag"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, "ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);", "")],
+     "a short buffer is not counted against the plan"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, "planned); if (!stats.warned) {", "planned); if (false) {")],
+     "a short buffer's decline is silent"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, "if (!act || !act.on_device) { if (!stats.warned) {", "if (!act || !act.on_device) { if (false) {")],
+     "an unresolved buffer's decline is silent"),
+    (test_route_rounds_the_copy_to_nearest_even_in_a_profiler_row, "code",
+     [(ROUTE, "ggml_sycl_bf16::f32_to_bf16_rne(", "ggml_sycl_bf16::f32_to_bf16_trunc(")],
+     "the copy truncates"),
+    (test_route_asks_gemm_before_converting_and_runs_on_the_conversion, "code",
+     [(ROUTE, QUERY, ""), (ROUTE, RUN, QUERY + " " + RUN)],
+     "the query moves after the conversion"),
+    (test_route_asks_gemm_before_converting_and_runs_on_the_conversion, "code",
+     [(ROUTE, RUN, "return bf16_gemm(false, {}).has_value();")],
+     "the GEMM does not wait on the conversion's event"),
+    (test_route_asks_gemm_before_converting_and_runs_on_the_conversion, "code",
+     [(ROUTE, 'static_cast<int>(ldy), deps, "bf16_weight", query_only,',
+       'static_cast<int>(ldy), {}, "bf16_weight", query_only,')],
+     "the lambda drops its deps"),
+    (test_route_asks_gemm_before_converting_and_runs_on_the_conversion, "code",
+     [(ROUTE, '"bf16_weight", query_only,', '"bf16_weight", false,')],
+     "the lambda runs the GEMM on the query"),
+    (test_route_gemm_is_strict_bf16_and_declines_on_a_failed_creation, "code",
+     [(ROUTE, "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", "GGML_SYCL_DNNL_CREATE_FAILURE_THROW")],
+     "a failed creation throws"),
+    (test_route_gemm_is_strict_bf16_and_declines_on_a_failed_creation, "code",
+     [(ROUTE, "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_FPMATH_BUILD")],
+     "the GEMM takes the build's float math"),
+    (test_walk_counts_the_route_with_the_executors_questions, "code",
+     [(WALK, "ggml_sycl_bf16_weight_native_route_available(src0, src1, node, ctx.device) &&", "")],
+     "the walk counts a node the executor does not serve"),
+    (test_walk_counts_the_route_with_the_executors_questions, "code",
+     [(WALK, "demand[ctx.device].bf16_src1_bytes = act_bytes;", "demand[ctx.device].src1_bytes = act_bytes;")],
+     "the walk counts the route's copy as the f16 arm's"),
+    (test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand, "code",
+     [(WALK, 'demand[d].src1_bytes, demand[d].src1_node, "src1", true },',
+       'std::max(demand[d].src1_bytes, demand[d].bf16_src1_bytes), demand[d].src1_node, "src1", true },')],
+     "the route's demand is required"),
+    (test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand, "code",
+     [(WALK, "if (held != ggml_sycl::ZONE_WALK_BUFFER_REFUSED) {", "if (held == ggml_sycl::ZONE_WALK_BUFFER_HELD) {")],
+     "a capped buffer refuses the graph"),
+    (test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand, "code",
+     [(WALK, "bytes <= ggml_sycl_dequant_f16_walk_limit() &&", "")],
+     "the walk's grows ignore the test limit"),
+    (test_planner_plans_the_wider_src1_row, "code",
+     [(PLANNER, "ggml_sycl_bf16_onednn_scratch_drawable(), maxima.bf16_onednn_src1_bytes_per_token)",
+       "ggml_sycl_bf16_onednn_scratch_drawable(), 0)")],
+     "the planner drops the BF16 row"),
+    (test_adapter_marks_the_bf16_copy_under_the_routes_gate, "cache",
+     [(ADAPTER, "&& ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16)", "")],
+     "the adapter marks without the route's gate"),
+    (test_threshold_comment_cites_the_committed_probe, "raw",
+     [(None, PROBES[0], "t22-probe-b70-0000000000.txt")],
+     "the comment cites a probe that is not committed"),
+]
+
+ROUTE_CHECKS = (
+    test_executor_offers_the_gemm_route_before_the_native_launch,
+    test_route_takes_asks_the_column_count_first,
+    test_route_allocates_nothing_and_waits_on_nothing,
+    test_route_declines_while_recording_before_anything_else,
+    test_route_declines_on_a_short_or_unresolved_buffer_loudly,
+    test_route_rounds_the_copy_to_nearest_even_in_a_profiler_row,
+    test_route_asks_gemm_before_converting_and_runs_on_the_conversion,
+    test_route_gemm_is_strict_bf16_and_declines_on_a_failed_creation,
+    test_walk_counts_the_route_with_the_executors_questions,
+    test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand,
+    test_planner_plans_the_wider_src1_row,
+    test_adapter_marks_the_bf16_copy_under_the_routes_gate,
+    test_threshold_comment_cites_the_committed_probe,
+)
+
+_READERS = {"code": _code, "cache": _cache_code, "raw": _raw}
+
+
+def test_every_route_check_fails_on_its_mutants():
+    missing = [check.__name__ for check in ROUTE_CHECKS if not any(m[0] is check for m in MUTANTS)]
+    assert not missing, f"route checks with no mutant: {missing}"
+    survived = []
+    for check, key, edits, what in MUTANTS:
+        original = _READERS[key]()
+        mutated = original
+        for scope, old, new in edits:
+            mutated = mutate(mutated, scope, old, new)
+        assert mutated != original, f"mutant {what!r} changed nothing"
+        _CACHE[key] = mutated
+        try:
+            check()
+            survived.append(f"{check.__name__}: {what}")
+        except AssertionError:
+            pass
+        except ValueError as exc:
+            survived.append(f"{check.__name__}: {what} (ended in {exc!r}, not in the check's assertion)")
+        finally:
+            _CACHE[key] = original
+    assert not survived, f"mutants the checks did not reject: {survived}"
 
 
 if __name__ == "__main__":

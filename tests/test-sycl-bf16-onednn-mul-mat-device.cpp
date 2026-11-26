@@ -4,19 +4,31 @@
 //
 // Each case computes one MUL_MAT graph directly on the SYCL backend: the weight in a WEIGHTS-usage SYCL buffer under a
 // real tensor name, as a model's is, the activations and the output in a COMPUTE buffer. The PRIVATE_TESTING scratchpad
-// seam counts the "dnnl_gemm" site, which every gemm() call passes once, and is the witness of which path ran:
+// seam counts the "dnnl_gemm" site, which every gemm() call that reaches its scratchpad passes once, and is the witness
+// of which path ran. The route asks gemm() twice: once with query_only before its conversion, once to run the GEMM.
 //
-//   taken     the route run must count calls == engaged == 1, declined == 0, and leave one primitive in the cache it
-//             cleared first. The case is computed again with a decline injected on that call: the conversion has
-//             written only the planned buffer, gemm() returns no event, and the native kernel computes the op, so that
-//             run counts calls == 1, declined == 1, engaged == 0. Its output is the second oracle;
+//   taken     the route run must count calls == 2, engaged == 1, declined == 0, and leave one primitive in the cache it
+//             cleared first. The case is computed twice more with a decline injected: on the first call (the query),
+//             so nothing is written and the native kernel computes the op (calls == 1, declined == 1, engaged == 0);
+//             and on the second (the GEMM, after the conversion has written the planned buffer), so the native kernel
+//             computes the op on the same inputs (calls == 2, declined == 1, engaged == 0). The two native outputs
+//             must be bit-identical, and they are the second oracle;
 //   declined  a node of at most SKINNY_MAX_COLS columns (decode, and the widths the skinny kernel keeps) never reaches
 //             gemm(): calls == 0. So does every node with the route switched off (GGML_SYCL_ONEDNN_PP=0, run with
 //             --expect-opt-out by the second registration).
 //
-// The first case runs on the fresh backend with the route's demand left out of the graph-entry walk
-// (ggml_sycl::test_set_bf16_onednn_walk_counted(false)), so the planned src1 buffer is empty when the route asks for it:
-// the route must decline (calls == 0) without growing it, and the native kernel computes the op.
+// Two cases run first, on the fresh backend, while the planned src1 buffer is still empty:
+//   * the route's demand left out of the graph-entry walk (ggml_sycl::test_set_bf16_onednn_walk_counted(false)): the
+//     route must decline (calls == 0) without growing the buffer, count one under-estimate against the buffer's
+//     cohort, and the native kernel computes the op;
+//   * the route's demand counted, with the walk's grows limited below it (ggml_sycl::test_set_dequant_f16_walk_limit),
+//     as a RUNTIME zone that cannot hold the copy: the graph must still compute (the walk caps the buffer and does not
+//     refuse the graph for a demand with another path), the route declines with one under-estimate counted, and the
+//     native kernel computes the op.
+// Three layouts the route's arithmetic reads through strides run on the up projection at 129 columns, taken and with
+// both injected declines: src1 a view whose columns are wider than K (ldx > K, the padding NaN, so a read of it shows
+// in the output), dst columns wider than M (ldy != M, the padding a sentinel that must survive), and src1 of three
+// planes (ne2 > 1).
 //
 // Tolerances. Every comparison is scaled by S = sum over k of |w[m][k] * x[k][n]| for its element, in double.
 //   The route against the double reference over bf16(x): err <= 2e-4. The CPU backend computes a BF16 weight's MUL_MAT
@@ -52,6 +64,7 @@
 #include "mul-mat-bf16.hpp"
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "zone-sizing.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -73,6 +86,18 @@ constexpr const char * SITE                = "dnnl_gemm";
 constexpr double       TOL_ROUTE           = 2e-4;  // the route against double over bf16(x)
 constexpr double       TOL_NATIVE          = 1e-4;  // the native kernel against double over F32 x
 constexpr double       TOL_ROUTE_VS_NATIVE = 4e-3;
+// The planned src1 buffer's cohort: a short buffer counts its under-estimate under this name.
+constexpr const char * SRC1_COHORT         = "mul-mat-dequant-f16-src1";
+constexpr int64_t      PAD                 = 7;           // extra elements per column in the strided layouts
+constexpr float        DST_SENTINEL        = -12345.25f;  // dst padding: no path may write it
+
+// How a case lays out its activations and its output.
+enum case_layout {
+    LAYOUT_PLAIN,         // src1 [K, N] and dst [M, N], contiguous
+    LAYOUT_STRIDED_SRC1,  // src1 a view of [K + PAD, N]: ldx = K + PAD, the padding NaN
+    LAYOUT_STRIDED_DST,   // dst columns of M + PAD: ldy = M + PAD, the padding DST_SENTINEL
+    LAYOUT_SRC1_3D,       // src1 [K, N / 3, 3] and dst [M, N / 3, 3]: three planes
+};
 
 float input_value(int64_t i, int64_t salt) {
     // a deterministic spread over [-1, 1) with no short period
@@ -142,7 +167,8 @@ run_result run_case(ggml_backend_t        backend,
                     const placed_weight & pw,
                     int64_t               N,
                     int                   inject,
-                    const std::string &   label) {
+                    const std::string &   label,
+                    case_layout           layout = LAYOUT_PLAIN) {
     run_result res;
     ggml_sycl_test_scratchpad_sites_reset();
     if (inject != 0 && !ggml_sycl_test_inject_scratchpad_decline(SITE, inject)) {
@@ -160,10 +186,28 @@ run_result run_case(ggml_backend_t        backend,
         fprintf(stderr, "FAIL: %s: ggml_init failed\n", label.c_str());
         return res;
     }
-    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pw.K, N);
-    ggml_set_input(x);
+    // `x_in` is the tensor the activations are written to: x itself, or the wider tensor a strided x views.
+    const int64_t x_cols = layout == LAYOUT_STRIDED_SRC1 ? pw.K + PAD : pw.K;
+    ggml_tensor * x_in   = nullptr;
+    ggml_tensor * x      = nullptr;
+    if (layout == LAYOUT_SRC1_3D) {
+        x_in = x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, pw.K, N / 3, 3);
+    } else {
+        x_in = x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x_cols, N);
+        if (layout == LAYOUT_STRIDED_SRC1) {
+            x = ggml_view_2d(ctx, x_in, pw.K, N, x_in->nb[1], 0);
+        }
+    }
+    ggml_set_input(x_in);
     ggml_tensor * out = ggml_mul_mat(ctx, pw.w, x);
     ggml_set_output(out);
+    const int64_t ldy = layout == LAYOUT_STRIDED_DST ? pw.M + PAD : pw.M;
+    if (layout == LAYOUT_STRIDED_DST) {
+        // Set before the tensor is allocated, so its allocation holds the padded columns.
+        out->nb[1] = (size_t) ldy * sizeof(float);
+        out->nb[2] = out->nb[1] * (size_t) out->ne[1];
+        out->nb[3] = out->nb[2] * (size_t) out->ne[2];
+    }
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
     ggml_build_forward_expand(gf, out);
     // The executor aborts on an op outside its predicate: ask the admission first, so such a case fails by name.
@@ -181,13 +225,15 @@ run_result run_case(ggml_backend_t        backend,
     }
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
-    std::vector<float> xv((size_t) (pw.K * N));
+    std::vector<float> xv((size_t) (x_cols * N), std::nanf(""));
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t k = 0; k < pw.K; ++k) {
-            xv[(size_t) (k + pw.K * n)] = x_value(pw.K, k, n);
+            xv[(size_t) (k + x_cols * n)] = x_value(pw.K, k, n);
         }
     }
-    ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+    ggml_backend_tensor_set(x_in, xv.data(), 0, xv.size() * sizeof(float));
+    std::vector<float> raw(ggml_nbytes(out) / sizeof(float), DST_SENTINEL);
+    ggml_backend_tensor_set(out, raw.data(), 0, raw.size() * sizeof(float));
 
     const ggml_status status = ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
@@ -207,10 +253,25 @@ run_result run_case(ggml_backend_t        backend,
         ggml_free(ctx);
         return res;
     }
-    res.out.resize((size_t) ggml_nelements(out));
-    ggml_backend_tensor_get(out, res.out.data(), 0, res.out.size() * sizeof(float));
+    ggml_backend_tensor_get(out, raw.data(), 0, raw.size() * sizeof(float));
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
+    // Compact the output to [M, N] and check that the padding between dst columns kept the sentinel.
+    res.out.resize((size_t) (pw.M * N));
+    for (int64_t n = 0; n < N; ++n) {
+        // The last column ends at row M: the allocation holds no padding after it.
+        const int64_t rows = n + 1 < N ? ldy : pw.M;
+        for (int64_t m = 0; m < rows; ++m) {
+            const float v = raw[(size_t) (m + ldy * n)];
+            if (m < pw.M) {
+                res.out[(size_t) (m + pw.M * n)] = v;
+            } else if (std::memcmp(&v, &DST_SENTINEL, sizeof(float)) != 0) {
+                fprintf(stderr, "FAIL: %s: dst padding at row %lld of column %lld was written (%g)\n", label.c_str(),
+                        (long long) m, (long long) n, (double) v);
+                return res;
+            }
+        }
+    }
 
     if (!ggml_sycl_test_scratchpad_site_counts(SITE, &res.calls, &res.declined, &res.engaged)) {
         fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", label.c_str(), SITE);
@@ -302,19 +363,28 @@ bool check_declined(const std::string & label, const run_result & first, const e
     return ok;
 }
 
-bool check_taken(const std::string & label, const run_result & first, const run_result & fallen, const errors & e) {
+bool check_taken(const std::string & label,
+                 const run_result &  first,
+                 const run_result &  fallen,
+                 const run_result &  late,
+                 const errors &      e) {
     bool ok = true;
     printf("  route: calls=%llu declined=%llu engaged=%llu | primitive cache entries=%zu scratchpad=%zu bytes\n",
            (unsigned long long) first.calls, (unsigned long long) first.declined, (unsigned long long) first.engaged,
            first.cache_entries, first.scratchpad_bytes);
-    printf("  injected decline: calls=%llu declined=%llu engaged=%llu\n", (unsigned long long) fallen.calls,
+    printf("  query declined: calls=%llu declined=%llu engaged=%llu\n", (unsigned long long) fallen.calls,
            (unsigned long long) fallen.declined, (unsigned long long) fallen.engaged);
+    printf("  GEMM declined after the conversion: calls=%llu declined=%llu engaged=%llu\n",
+           (unsigned long long) late.calls, (unsigned long long) late.declined, (unsigned long long) late.engaged);
     printf(
         "  max err/S: route vs ref(bf16 x) %.3e, route vs ref(f32 x) %.3e, native vs ref(f32 x) %.3e, route vs native "
         "%.3e\n",
         e.first_vs_bf16, e.first_vs_f32, e.second_vs_f32, e.first_vs_second);
-    if (first.calls != 1 || first.engaged != 1 || first.declined != 0) {
-        fprintf(stderr, "FAIL: %s: the route did not make exactly one GEMM submission\n", label.c_str());
+    if (first.calls != 2 || first.engaged != 1 || first.declined != 0) {
+        fprintf(stderr,
+                "FAIL: %s: the route did not ask gemm() once with query_only and make one GEMM submission (want "
+                "calls=2 declined=0 engaged=1)\n",
+                label.c_str());
         ok = false;
     }
     if (first.cache_entries != 1) {
@@ -326,8 +396,23 @@ bool check_taken(const std::string & label, const run_result & first, const run_
     }
     if (fallen.calls != 1 || fallen.declined != 1 || fallen.engaged != 0) {
         fprintf(stderr,
-                "FAIL: %s: after the injected decline the native kernel did not compute the op alone (want calls=1 "
+                "FAIL: %s: after a declined query the route went on (want calls=1 declined=1 engaged=0: no conversion, "
+                "no GEMM)\n",
+                label.c_str());
+        ok = false;
+    }
+    if (late.calls != 2 || late.declined != 1 || late.engaged != 0) {
+        fprintf(stderr,
+                "FAIL: %s: after a declined GEMM the native kernel did not compute the op alone (want calls=2 "
                 "declined=1 engaged=0)\n",
+                label.c_str());
+        ok = false;
+    }
+    if (fallen.out.size() != late.out.size() ||
+        std::memcmp(fallen.out.data(), late.out.data(), fallen.out.size() * sizeof(float)) != 0) {
+        fprintf(stderr,
+                "FAIL: %s: the native kernel's output after a declined GEMM differs from its output after a declined "
+                "query: the conversion's write reached dst\n",
                 label.c_str());
         ok = false;
     }
@@ -405,6 +490,57 @@ int main(int argc, char ** argv) {
         { "blk.0.ffn_gate_inp_shexp.weight", 2048,  1,    { 9, 512 }                  },
     };
 
+    // A case the route takes: the route's run, then the same case with a decline injected on the query (1) and on the
+    // GEMM after the conversion (2).
+    const auto run_taken = [&](const placed_weight & pw, int64_t N, const std::string & label, case_layout layout) {
+        const run_result first = run_case(backend, pw, N, 0, label, layout);
+        if (!first.ok) {
+            return false;
+        }
+        const run_result fallen = run_case(backend, pw, N, 1, label + " (query declined)", layout);
+        if (!fallen.ok) {
+            return false;
+        }
+        const run_result late = run_case(backend, pw, N, 2, label + " (GEMM declined)", layout);
+        if (!late.ok) {
+            return false;
+        }
+        const errors e       = compare(pw, N, first.out, fallen.out);
+        const bool   case_ok = check_taken(label, first, fallen, late, e) && e.finite;
+        if (!e.finite) {
+            fprintf(stderr, "FAIL: %s: a non-finite output\n", label.c_str());
+        }
+        return case_ok;
+    };
+    // A case on an empty planned buffer the route must decline: no gemm() call, one under-estimate counted against the
+    // buffer's cohort, and the native kernel's output.
+    const auto run_short = [&](const placed_weight & pw, int64_t N, const std::string & label) {
+        const size_t     before = ggml_sycl::zone_sizing_underestimate_count(SRC1_COHORT);
+        const run_result first  = run_case(backend, pw, N, 0, label);
+        if (!first.ok) {
+            return false;
+        }
+        const size_t counted = ggml_sycl::zone_sizing_underestimate_count(SRC1_COHORT) - before;
+        printf("  under-estimates counted against %s: %zu\n", SRC1_COHORT, counted);
+        const errors e       = compare(pw, N, first.out, {});
+        bool         case_ok = check_declined(label, first, e);
+        if (counted != 1) {
+            fprintf(stderr, "FAIL: %s: the route's decline on a short buffer counted %zu under-estimates, not 1\n",
+                    label.c_str(), counted);
+            case_ok = false;
+        }
+        if (!e.finite) {
+            fprintf(stderr, "FAIL: %s: a non-finite output\n", label.c_str());
+            case_ok = false;
+        }
+        return case_ok;
+    };
+    const auto report = [&](bool case_ok) {
+        printf("  %s\n", case_ok ? "ok" : "FAILED");
+        fflush(stdout);
+        ok = ok && case_ok;
+    };
+
     int64_t salt = 11;
     for (const weight_spec & spec : specs) {
         const std::unique_ptr<placed_weight> pw = place_weight(spec.name, spec.K, spec.M, salt++);
@@ -413,24 +549,29 @@ int main(int argc, char ** argv) {
             ok = false;
             continue;
         }
-        // The first case of the run: the walk leaves the route's demand out, so the planned buffer is empty.
+        // The first two cases of the run, while the planned buffer is still empty.
         if (&spec == &specs[0] && !expect_opt_out) {
-            const std::string label = std::string(spec.name) + " N=129, planned buffer empty";
+            std::string label = std::string(spec.name) + " N=129, walk leaves the route out";
             printf("case %-48s K=%lld M=%lld: running\n", label.c_str(), (long long) spec.K, (long long) spec.M);
             fflush(stdout);
             ggml_sycl::test_set_bf16_onednn_walk_counted(false);
-            const run_result first = run_case(backend, *pw, 129, 0, label);
+            bool case_ok = run_short(*pw, 129, label);
             ggml_sycl::test_set_bf16_onednn_walk_counted(true);
-            bool case_ok = first.ok;
-            if (first.ok) {
-                const errors e = compare(*pw, 129, first.out, {});
-                case_ok        = check_declined(label, first, e) && e.finite;
-                if (!e.finite) {
-                    fprintf(stderr, "FAIL: %s: a non-finite output\n", label.c_str());
-                }
+            report(case_ok);
+
+            size_t act_bytes = 0;
+            if (!ggml_sycl::zone_dequant_f16_region_bytes(spec.K * 129, &act_bytes) || act_bytes == 0) {
+                fprintf(stderr, "FAIL: the route's copy size for K=%lld N=129 does not compute\n", (long long) spec.K);
+                ok = false;
+                continue;
             }
-            printf("  %s\n", case_ok ? "ok" : "FAILED");
-            ok = ok && case_ok;
+            label = std::string(spec.name) + " N=129, zone below the route's copy";
+            printf("case %-48s K=%lld M=%lld: running\n", label.c_str(), (long long) spec.K, (long long) spec.M);
+            fflush(stdout);
+            ggml_sycl::test_set_dequant_f16_walk_limit(act_bytes - 1);
+            case_ok = run_short(*pw, 129, label);
+            ggml_sycl::test_set_dequant_f16_walk_limit(SIZE_MAX);
+            report(case_ok);
         }
         for (const int64_t N : spec.widths) {
             const bool        taken = N > ggml_sycl_bf16::SKINNY_MAX_COLS && !expect_opt_out;
@@ -438,29 +579,41 @@ int main(int argc, char ** argv) {
             printf("case %-48s K=%lld M=%lld %s: running\n", label.c_str(), (long long) spec.K, (long long) spec.M,
                    taken ? "(route)" : "(native)");
             fflush(stdout);
-
+            if (taken) {
+                report(run_taken(*pw, N, label, LAYOUT_PLAIN));
+                continue;
+            }
             const run_result first = run_case(backend, *pw, N, 0, label);
             if (!first.ok) {
                 ok = false;
                 continue;
             }
-            run_result fallen;
-            if (taken) {
-                fallen = run_case(backend, *pw, N, 1, label + " (injected decline)");
-                if (!fallen.ok) {
-                    ok = false;
-                    continue;
-                }
-            }
-            const errors e       = compare(*pw, N, first.out, fallen.out);
-            bool         case_ok = taken ? check_taken(label, first, fallen, e) : check_declined(label, first, e);
+            const errors e       = compare(*pw, N, first.out, {});
+            bool         case_ok = check_declined(label, first, e);
             if (!e.finite) {
                 fprintf(stderr, "FAIL: %s: a non-finite output\n", label.c_str());
                 case_ok = false;
             }
-            printf("  %s\n", case_ok ? "ok" : "FAILED");
-            fflush(stdout);
-            ok = ok && case_ok;
+            report(case_ok);
+        }
+        // The layouts the route reads through strides, on the up projection.
+        if (&spec == &specs[0] && !expect_opt_out) {
+            const struct {
+                case_layout  layout;
+                const char * name;
+            } layouts[] = {
+                { LAYOUT_STRIDED_SRC1, "src1 columns wider than K" },
+                { LAYOUT_STRIDED_DST,  "dst columns wider than M"  },
+                { LAYOUT_SRC1_3D,      "src1 of three planes"      },
+            };
+
+            for (const auto & l : layouts) {
+                const std::string label = std::string(spec.name) + " N=129, " + l.name;
+                printf("case %-48s K=%lld M=%lld (route): running\n", label.c_str(), (long long) spec.K,
+                       (long long) spec.M);
+                fflush(stdout);
+                report(run_taken(*pw, 129, label, l.layout));
+            }
         }
     }
 

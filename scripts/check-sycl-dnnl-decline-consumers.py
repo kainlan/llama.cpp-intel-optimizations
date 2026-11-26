@@ -153,17 +153,21 @@ MAIN_PINS = (
     # the polarity of every guard: a decline is the falsy result of a consumer, so each reads `if (!consumer(...))`
     ("if (!DnnlGemmWrapper::row_gemm(", 5),
     ("if (!DnnlGemmWrapper::gemm(", 3),
-    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each
-    ("return DnnlGemmWrapper::gemm(", 1),
+    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each; the second
+    # `return DnnlGemmWrapper::gemm(` is the BF16 route's gemm lambda, whose two uses are pinned below
+    ("return DnnlGemmWrapper::gemm(", 2),
     ("used_onednn_fp16 = DnnlGemmWrapper::row_gemm(", 1),
     # the batched F32 route: its one gemm's decline is false, and the dispatch goes on to the orchestrator's loop
     ("const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(", 1),
     ("return batched_gemm.has_value();", 1),
     ("src0_resolved, src1_resolved, dst_resolved, f32_batched_route)) { return; } else {", 1),
-    # the BF16 weight's route: its one gemm's decline (a scratchpad, or a primitive oneDNN cannot create) is false, and
-    # the executor goes on to the native tiled kernel; it is the one caller that asks gemm() to decline on a creation
-    ("const std::optional<sycl::event> bf16_gemm = DnnlGemmWrapper::gemm(", 1),
-    ("return bf16_gemm.has_value();", 1),
+    # the BF16 weight's route: its gemm's decline (a scratchpad, or a primitive oneDNN cannot create) is false, and the
+    # executor goes on to the native tiled kernel; it is the one caller that asks gemm() to decline on a creation. It
+    # asks one descriptor twice: with query_only before its conversion (a decline returns before anything is written),
+    # then to run, whose decline is the route's result
+    ("const auto bf16_gemm = [&](bool query_only, const std::vector<sycl::event> & deps) { return DnnlGemmWrapper::gemm(", 1),
+    ("if (!bf16_gemm(true, {})) { return false; }", 1),
+    ("return bf16_gemm(false, { converted }).has_value();", 1),
     ("&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0, static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf, n_vecs, "
      "ldx, ldy, act_bytes)) { return; }", 1),
     ("GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", 1),
@@ -714,9 +718,15 @@ def gemm_mutants(files, edit):
     out.append(("M1f: the batched F32 route returns the negated result",
                 edit_pin(m, "return batched_gemm.has_value();", "return !batched_gemm.has_value();")))
     # the BF16 weight's route and gemm()'s memo of a failed creation
-    out.append(("the BF16 route reads a decline as done", edit_pin(m, "return bf16_gemm.has_value();", "return true;")))
+    bf16_run = "return bf16_gemm(false, { converted }).has_value();"
+    bf16_query = "if (!bf16_gemm(true, {})) { return false; }"
+    out.append(("the BF16 route reads a decline as done",
+                edit_pin(m, bf16_run, "(void) bf16_gemm(false, { converted }); return true;")))
     out.append(("the BF16 route returns the negated result",
-                edit_pin(m, "return bf16_gemm.has_value();", "return !bf16_gemm.has_value();")))
+                edit_pin(m, bf16_run, "return !bf16_gemm(false, { converted }).has_value();")))
+    out.append(("the BF16 route goes on after a declined query", edit_pin(m, bf16_query, "(void) bf16_gemm(true, {});")))
+    out.append(("the BF16 route reads a passed query as a decline",
+                edit_pin(m, bf16_query, "if (bf16_gemm(true, {})) { return false; }")))
     out.append(("the BF16 executor returns on a declined route",
                 edit_pin(m, "&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0,", "&& !ggml_sycl_mul_mat_bf16_onednn(ctx, src0,")))
     out.append(("the BF16 route throws on a failed creation",

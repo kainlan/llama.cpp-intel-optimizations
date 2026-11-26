@@ -361,10 +361,9 @@ class DnnlGemmWrapper {
     // short tag (e.g. ggml_type_name(src0->type)) callers that know the
     // originating ggml tensor type can pass for a richer metadata string;
     // callers that don't (outprod.cpp, the batch launcher) leave it null and
-    // get an m/variant-only tag. `deps` mirrors gemm_batch_strided's pattern
-    // (SYCL events this GEMM must wait on) even though no caller populates it
-    // today -- the event-form execute() needs the parameter to exist either
-    // way, and every other executor in this file already writes it this way.
+    // get an m/variant-only tag. `deps` mirrors gemm_batch_strided's pattern:
+    // SYCL events this GEMM must wait on, handed to the event-form execute()
+    // (the BF16 weight's route passes its activation conversion's event).
     // Returns std::nullopt when the scratchpad request was declined (nothing was submitted and c was not written);
     // the caller takes its declared next path (llama.cpp-23mk S3-4). A value is the primitive's completion event.
     // query_only asks the scratchpad question and stops: it submits nothing, does not count as an engaged call, and

@@ -79791,20 +79791,35 @@ static bool ggml_sycl_mul_mat_bf16_onednn_takes(const ggml_tensor * src0,
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Lets a device test leave the route's demand out of the graph-entry walk (ggml_sycl::test_set_bf16_onednn_walk_counted)
 // so that the route meets a planned src1 buffer shorter than its copy and must decline.
-static std::atomic<bool> g_test_bf16_onednn_walk_counted{ true };
+static std::atomic<bool>   g_test_bf16_onednn_walk_counted{ true };
+// Lets a device test stand in for a RUNTIME zone that cannot hold the walk's demand
+// (ggml_sycl::test_set_dequant_f16_walk_limit): the walk's grows above the limit fail as a full zone's would.
+static std::atomic<size_t> g_test_dequant_f16_walk_limit{ SIZE_MAX };
 
 namespace ggml_sycl {
 void test_set_bf16_onednn_walk_counted(bool counted) {
     g_test_bf16_onednn_walk_counted.store(counted, std::memory_order_release);
+}
+
+void test_set_dequant_f16_walk_limit(size_t bytes) {
+    g_test_dequant_f16_walk_limit.store(bytes, std::memory_order_release);
 }
 }  // namespace ggml_sycl
 
 static bool ggml_sycl_bf16_onednn_walk_counted() {
     return g_test_bf16_onednn_walk_counted.load(std::memory_order_acquire);
 }
+
+static size_t ggml_sycl_dequant_f16_walk_limit() {
+    return g_test_dequant_f16_walk_limit.load(std::memory_order_acquire);
+}
 #else
 static constexpr bool ggml_sycl_bf16_onednn_walk_counted() {
     return true;
+}
+
+static constexpr size_t ggml_sycl_dequant_f16_walk_limit() {
+    return SIZE_MAX;
 }
 #endif
 
@@ -79812,16 +79827,23 @@ static constexpr bool ggml_sycl_bf16_onednn_walk_counted() {
 // into the planned dense src1 buffer (profiler row mulmat.bf16_onednn.act_to_bf16), then one gemm() in the dispatch's
 // orientation (a = the weight, m = ne01 rows of K; b = the copy, n_vecs columns of K; dst column n at n * ldy), its
 // profiler row the oneDNN GEMM's with op_context bf16_weight. Both run on ctx.stream(), the in-order queue the
-// graph-entry walk ensured the buffer on, so the copy is ordered after the last op that read the buffer.
+// graph-entry walk ensured the buffer on, so the copy is ordered after the last op that read the buffer; the GEMM also
+// names the conversion's event as its dependency, so the order does not rest on the queue alone.
 //
 // Returns false, a decline with nothing written to dst, so the executor's native tiled kernel computes the op:
 //   * while a command graph records (the batched F32 route's condition), so no primitive is created inside it. A MoE
 //     model's prompt splits run directly; a dense model's can record from the second same-sized micro-batch on;
-//   * when the planned buffer is shorter than the copy. The graph-entry walk (ggml_sycl_dequant_f16_ensure_for_graph)
-//     sized it for this op before anything was submitted, so this is a node the walk did not predict. The route has a
-//     next path, so a short buffer is a decline: nothing is allocated here, and the buffer does not grow;
+//   * when the planned buffer is shorter than the copy, or does not resolve on the device. The graph-entry walk
+//     (ggml_sycl_dequant_f16_ensure_for_graph) sized it for this op before anything was submitted, unless the RUNTIME
+//     zone could not hold the copy (the walk then holds the buffer at what the ops with no other path need,
+//     zone_walk_ensure_dense_buffer) or the walk did not predict this node. The route has a next path, so this is a
+//     decline: nothing is allocated here, and the buffer does not grow. It is loud, as an op that grows a planned
+//     buffer is (ggml_sycl_planned_scratch_acquire): one WARN per device slot, and a short buffer is counted against
+//     the plan (zone_sizing_record_underestimate under the buffer's cohort);
 //   * when gemm() declines: its scratchpad, or a primitive oneDNN cannot create (remembered per shape, with one WARN,
-//     so the creation is not retried per op). The conversion has then written only the buffer.
+//     so the creation is not retried per op). gemm() is asked first with query_only, before the conversion, so such a
+//     decline writes nothing at all. A decline of the second call, after the query passed, leaves the conversion's
+//     write in the buffer only.
 [[nodiscard]] static bool ggml_sycl_mul_mat_bf16_onednn(ggml_backend_sycl_context & ctx,
                                                         const ggml_tensor *         src0,
                                                         const uint16_t *            weight,
@@ -79839,18 +79861,53 @@ static constexpr bool ggml_sycl_bf16_onednn_walk_counted() {
         return false;
     }
     // The buffer holds 16-bit activations of either type: the f16 dequant arm's f16 copy, or this route's bf16 copy.
-    ggml_backend_sycl_context::dequant_f16_scratch_t & buffer = ctx.dequant_f16_src1_scratch;
-    if (buffer.capacity(ctx.device) < act_bytes) {
+    ggml_backend_sycl_context::dequant_f16_scratch_t & buffer   = ctx.dequant_f16_src1_scratch;
+    planned_scratch_stats &                            stats    = buffer.stats(ctx.device);
+    const size_t                                       capacity = buffer.capacity(ctx.device);
+    const char *                                       name     = src0->name[0] != '\0' ? src0->name : "?";
+    if (capacity < act_bytes) {
+        const size_t planned = ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(ctx.device, /*src1=*/true);
+        ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);
+        if (!stats.warned) {
+            stats.warned = true;
+            GGML_LOG_WARN(
+                "[SCRATCH] %s device %d: the BF16 oneDNN route needs %zu bytes for %s but the planned buffer holds %zu "
+                "(plan %zu); the route declines and the native tiled kernel computes the op\n",
+                buffer.cohort_id, ctx.device, act_bytes, name, capacity, planned);
+        }
         return false;
     }
     const ggml_sycl::resolved_ptr act = buffer.slot(ctx.device).backing_handle.resolve(ctx.device);
     if (!act || !act.on_device) {
+        if (!stats.warned) {
+            stats.warned = true;
+            GGML_LOG_WARN(
+                "[SCRATCH] %s device %d: the planned buffer (%zu bytes) does not resolve on the device; the BF16 "
+                "oneDNN route declines and the native tiled kernel computes %s\n",
+                buffer.cohort_id, ctx.device, capacity, name);
+        }
         return false;
     }
-    buffer.stats(ctx.device).note_use(act_bytes);
+    stats.note_use(act_bytes);
     uint16_t *    act_bf16 = static_cast<uint16_t *>(act.ptr);
     const int64_t K        = src0->ne[0];
     const int64_t M        = src0->ne[1];
+
+    const auto bf16      = DnnlGemmWrapper::dt::bf16;
+    const auto f32       = DnnlGemmWrapper::to_dt<float>();
+    const int  m         = static_cast<int>(M);
+    const int  n         = static_cast<int>(n_vecs);
+    const int  k         = static_cast<int>(K);
+    // One descriptor asked twice: with query_only before the conversion, then to run after it, on its event.
+    const auto bf16_gemm = [&](bool query_only, const std::vector<sycl::event> & deps) {
+        return DnnlGemmWrapper::gemm(ctx, m, n, k, weight, bf16, 1, k, static_cast<dnnl_dim_t>(k) * m, act_bf16, bf16,
+                                     1, k, static_cast<dnnl_dim_t>(k) * n, dst_ddf, f32, stream, 1, 1,
+                                     static_cast<int>(ldy), deps, "bf16_weight", query_only,
+                                     GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);
+    };
+    if (!bf16_gemm(true, {})) {
+        return false;
+    }
 
     std::string profile_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
@@ -79863,26 +79920,15 @@ static constexpr bool ggml_sycl_bf16_onednn_walk_counted() {
     convert_label.queue_kind = "compute";
     convert_label.metadata   = profile_metadata.c_str();
     convert_label.device     = ctx.device;
-    (void) ggml_sycl_profile_submit(*stream, convert_label, [&](sycl::queue & queue) {
-        return queue.parallel_for(sycl::range<2>(static_cast<size_t>(n_vecs), static_cast<size_t>(K)),
-                                  [=](sycl::id<2> i) {
-                                      const int64_t col     = static_cast<int64_t>(i[0]);
-                                      const int64_t k       = static_cast<int64_t>(i[1]);
-                                      act_bf16[col * K + k] = ggml_sycl_bf16::f32_to_bf16_rne(src1_ddf[col * ldx + k]);
-                                  });
+    const sycl::event converted = ggml_sycl_profile_submit(*stream, convert_label, [&](sycl::queue & queue) {
+        return queue.parallel_for(
+            sycl::range<2>(static_cast<size_t>(n_vecs), static_cast<size_t>(K)), [=](sycl::id<2> i) {
+                const int64_t col      = static_cast<int64_t>(i[0]);
+                const int64_t kk       = static_cast<int64_t>(i[1]);
+                act_bf16[col * K + kk] = ggml_sycl_bf16::f32_to_bf16_rne(src1_ddf[col * ldx + kk]);
+            });
     });
-
-    const auto                       bf16 = DnnlGemmWrapper::dt::bf16;
-    const auto                       f32  = DnnlGemmWrapper::to_dt<float>();
-    const int                        m    = static_cast<int>(M);
-    const int                        n    = static_cast<int>(n_vecs);
-    const int                        k    = static_cast<int>(K);
-    const std::optional<sycl::event> bf16_gemm =
-        DnnlGemmWrapper::gemm(ctx, m, n, k, weight, bf16, 1, k, static_cast<dnnl_dim_t>(k) * m, act_bf16, bf16, 1, k,
-                              static_cast<dnnl_dim_t>(k) * n, dst_ddf, f32, stream, 1, 1, static_cast<int>(ldy),
-                              /* deps = */ {}, "bf16_weight", /* query_only = */ false,
-                              GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);
-    return bf16_gemm.has_value();
+    return bf16_gemm(false, { converted }).has_value();
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(src0);
@@ -120266,24 +120312,30 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
 //
 // The two buffers are sized by their own maxima (the src0 copy and the src1 copy are separate buffers), which is
 // the shape of the plan figure; each target is max(plan, demand) so a buffer is never smaller than the planner
-// said once a node that uses it appears. The f16 arm only runs on a device that holds every row of the weight
-// (row_diff == ne01), so a row-split device that holds a slice is not counted. Decode (one src1 row) is skipped
-// before the router is asked, which keeps the walk off the token-generation hot path. The router is asked inside
-// a quiet scope: it would otherwise repeat, once per node per graph, the "kernel not eligible" WARNs that the
+// said once a node that uses it appears (the one exception is a zone that cannot hold even the plan when only the
+// BF16 route below draws the buffer: the route declines). The f16 arm only runs on a device that holds every row of
+// the weight (row_diff == ne01), so a row-split device that holds a slice is not counted. Decode (one src1 row) is
+// skipped before the router is asked, which keeps the walk off the token-generation hot path. The router is asked
+// inside a quiet scope: it would otherwise repeat, once per node per graph, the "kernel not eligible" WARNs that the
 // dispatch itself logs for the same node.
 //
 // The src1 buffer holds 16-bit activations of either type, so a BF16 weight's oneDNN route
 // (ggml_sycl_mul_mat_bf16_onednn) is counted here too: its bf16 copy of the activations goes into that buffer. Its
 // node is the one the BF16 executor serves (the native predicate, which refuses a split weight, so the demand is
 // this context's device) and the route takes (ggml_sycl_mul_mat_bf16_onednn_takes, the executor's own question).
-// The route's decline on a short buffer is the fallback for a node this walk did not predict, not for one it did.
+// The route's demand is kept apart from the f16 arm's: the route has a next path (it declines on a short buffer and
+// the native tiled kernel computes the op), the f16 arm has none. So a route demand the RUNTIME zone cannot hold
+// caps the buffer at max(plan, f16 demand) and the route declines, loudly; the graph is refused only for an f16
+// demand (zone_walk_ensure_dense_buffer).
 static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
 #    if GGML_SYCL_DNNL
     struct device_demand_t {
-        size_t              src0_bytes = 0;
-        size_t              src1_bytes = 0;
-        const ggml_tensor * node       = nullptr;  // the op that sets src0_bytes
-        const ggml_tensor * src1_node  = nullptr;  // the op that sets src1_bytes
+        size_t              src0_bytes      = 0;
+        size_t              src1_bytes      = 0;        // the f16 arm's copy: no other path
+        size_t              bf16_src1_bytes = 0;        // the BF16 route's copy: it declines on a short buffer
+        const ggml_tensor * node            = nullptr;  // the op that sets src0_bytes
+        const ggml_tensor * src1_node       = nullptr;  // the op that sets src1_bytes
+        const ggml_tensor * bf16_src1_node  = nullptr;  // the op that sets bf16_src1_bytes
     };
 
     device_demand_t demand[GGML_SYCL_MAX_DEVICES];
@@ -120305,9 +120357,9 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
             size_t act_bytes = 0;
             if (ggml_sycl_bf16_onednn_walk_counted() && ggml_sycl_mul_mat_bf16_onednn_takes(src0, src1, &act_bytes) &&
                 ggml_sycl_bf16_weight_native_route_available(src0, src1, node, ctx.device) &&
-                act_bytes > demand[ctx.device].src1_bytes) {
-                demand[ctx.device].src1_bytes = act_bytes;
-                demand[ctx.device].src1_node  = node;
+                act_bytes > demand[ctx.device].bf16_src1_bytes) {
+                demand[ctx.device].bf16_src1_bytes = act_bytes;
+                demand[ctx.device].bf16_src1_node  = node;
             }
             continue;  // the dispatch sends every BF16 weight to its executor, never to the f16 arm
         }
@@ -120383,37 +120435,41 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
 
     struct dequant_buffer_t {
         ggml_backend_sycl_context::dequant_f16_scratch_t & buffer;
-        size_t                                             demand;
-        const ggml_tensor *                                widest;
+        size_t                                             demand;    // the widest op's bytes
+        size_t                                             required;  // the widest among the ops with no other path
+        const ggml_tensor *                                widest;    // the op that sets `required`
         const char *                                       role;
         bool                                               is_src1;
     };
 
     for (int d = 0; d < device_count; ++d) {
         const dequant_buffer_t buffers[] = {
-            { ctx.dequant_f16_src0_scratch, demand[d].src0_bytes, demand[d].node,      "src0", false },
-            { ctx.dequant_f16_src1_scratch, demand[d].src1_bytes, demand[d].src1_node, "src1", true  },
+            { ctx.dequant_f16_src0_scratch, demand[d].src0_bytes, demand[d].src0_bytes, demand[d].node, "src0", false },
+            { ctx.dequant_f16_src1_scratch, std::max(demand[d].src1_bytes, demand[d].bf16_src1_bytes),
+             demand[d].src1_bytes, demand[d].src1_node, "src1", true },
         };
         for (const dequant_buffer_t & b : buffers) {
             if (b.demand == 0) {
                 continue;
             }
-            const size_t target =
-                std::max(ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, b.is_src1), b.demand);
-            if (b.buffer.capacity(d) >= target) {
-                continue;
-            }
-            if (b.buffer.ensure_buffer(target, d, *ctx.stream(d, 0)) != nullptr) {
+            const size_t  planned = ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, b.is_src1);
+            sycl::queue & queue   = *ctx.stream(d, 0);
+            const auto    held    = ggml_sycl::zone_walk_ensure_dense_buffer(
+                b.buffer.capacity(d), planned, b.demand, b.required, [&](size_t bytes) {
+                    return bytes <= ggml_sycl_dequant_f16_walk_limit() &&
+                           b.buffer.ensure_buffer(bytes, d, queue) != nullptr;
+                });
+            if (held != ggml_sycl::ZONE_WALK_BUFFER_REFUSED) {
                 continue;
             }
             ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
-            // The src1 buffer's widest op may be a BF16 weight's: the buffer holds its bf16 copy of the activations.
             GGML_LOG_ERROR(
                 "[DEQUANT-F16] graph refused before submission on device %d: the dense f16 dequant %s buffer needs "
                 "%.1f MB (widest op %s) but the RUNTIME zone cannot hold it (planned %.1f MB for both buffers at the "
                 "runtime n_ubatch=%u, buffer holds %.1f MB, zone has %.1f MB free). Reduce -ub, or free RUNTIME-zone "
                 "demand; this is a plan-accounting refusal, not a missing kernel (llama.cpp-479i)\n",
-                d, b.role, target / (1024.0 * 1024.0), b.widest && b.widest->name[0] ? b.widest->name : "?",
+                d, b.role, std::max(planned, b.required) / (1024.0 * 1024.0),
+                b.widest && b.widest->name[0] ? b.widest->name : "?",
                 ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(d) / (1024.0 * 1024.0),
                 (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, /*f16=*/true),
                 b.buffer.capacity(d) / (1024.0 * 1024.0),

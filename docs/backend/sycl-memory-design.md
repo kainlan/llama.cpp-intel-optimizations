@@ -4638,10 +4638,15 @@ different conditions: the f16 arm needs oneDNN and `GGML_SYCL_F16`, the route on
 wider of the two, each where its consumer is compiled in (`zone_dense_src1_planned_bytes_per_token`, host-tested in
 `test-zone-sizing` Case 52), and the `[SYCL-PLAN] dense f16 dequant scratch` line prints both. The graph-entry walk
 counts the route's copy with the executor's own questions (the native route predicate and
-`ggml_sycl_mul_mat_bf16_onednn_takes`) and names the widest op when it refuses. The route never grows the buffer: a
-buffer shorter than its copy at dispatch is a node the walk did not predict, and the route declines to the native
-tiled kernel, as it does while a command graph is recorded and when `gemm()` declines (a scratchpad, or a primitive
-oneDNN cannot create, remembered per descriptor). The GEMM's scratchpad, if any, comes from the ONEDNN zone through
+`ggml_sycl_mul_mat_bf16_onednn_takes`), apart from the f16 arm's demand, because the route has a next path and the f16
+arm has none. When the RUNTIME zone cannot hold max(plan, demand), the walk holds max(plan, f16 demand) and lets the
+route decline; it refuses the graph, naming the widest f16 op, only for an f16 demand it cannot hold
+(`zone_walk_ensure_dense_buffer`, host-tested in `test-zone-sizing` Case 53). The route never grows the buffer: a
+buffer shorter than its copy at dispatch (a node the walk did not predict, or one it capped) is a decline to the native
+tiled kernel, loud as an op's growth of a planned buffer is (one WARN per device slot, an under-estimate counted
+against `mul-mat-dequant-f16-src1`). The route also declines while a command graph is recorded and when `gemm()`
+declines (a scratchpad, or a primitive oneDNN cannot create, remembered per descriptor), which it asks with
+`query_only` before its conversion, so such a decline writes nothing. The GEMM's scratchpad, if any, comes from the ONEDNN zone through
 `gemm()`; on the Battlemage cards the primitive is `jit:gemm:any` with a 0 B scratchpad.
 
 ### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)

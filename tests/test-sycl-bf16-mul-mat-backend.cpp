@@ -34,7 +34,6 @@
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -44,12 +43,16 @@ static constexpr int64_t M = 256;
 static constexpr double TOL_NATIVE = 1e-4;  // the native kernels against double over F32 x
 static constexpr double TOL_ROUTE  = 2e-4;  // the oneDNN route against double over bf16(x)
 
-// Whether the oneDNN route computes an op of n_cols columns: a oneDNN build, the oneDNN PP admission on (its
-// environment term, read as the backend reads it), and more columns than the skinny kernel keeps.
+// The oneDNN PP admission the route takes (ggml_sycl_mul_mat_bf16_onednn_takes) and the planner marks under; declared
+// in common.hpp and exported by libggml-sycl, so this test asks the backend's own answer rather than re-reading its
+// environment.
+bool ggml_sycl_onednn_pp_type_admitted(ggml_type type);
+
+// Whether the oneDNN route computes an op of n_cols columns: a oneDNN build, the oneDNN PP admission for BF16, and more
+// columns than the skinny kernel keeps.
 static bool route_expected(int64_t n_cols) {
 #if GGML_SYCL_DNNL
-    const char * env = std::getenv("GGML_SYCL_ONEDNN_PP");
-    return n_cols > ggml_sycl_bf16::SKINNY_MAX_COLS && (env == nullptr || std::atoi(env) != 0);
+    return n_cols > ggml_sycl_bf16::SKINNY_MAX_COLS && ggml_sycl_onednn_pp_type_admitted(GGML_TYPE_BF16);
 #else
     (void) n_cols;
     return false;
